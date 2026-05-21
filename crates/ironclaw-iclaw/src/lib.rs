@@ -427,12 +427,19 @@ where
         .call(
             "audit.list",
             serde_json::json!({"since": "24h", "limit": 5}),
-            caller,
+            caller.clone(),
         )
         .await
     {
         Ok(v) => v,
         Err(e) => return RunOutput::failure(format_step_error("audit.list", &e)),
+    };
+    let dropped = match transport
+        .call("dropped-messages.list", serde_json::json!({}), caller)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return RunOutput::failure(format_step_error("dropped-messages.list", &e)),
     };
 
     let mut running = 0usize;
@@ -460,6 +467,7 @@ where
             "sessions_running": running,
             "sessions_idle": idle,
             "sessions_stopped": stopped,
+            "dropped_messages": array_len(&dropped),
             "recent_audit": audit,
         });
         let mut out = render_json_pretty(&summary);
@@ -481,6 +489,10 @@ where
     out.push_str(&format!("  running:         {running}\n"));
     out.push_str(&format!("  idle:            {idle}\n"));
     out.push_str(&format!("  stopped:         {stopped}\n"));
+    out.push_str(&format!(
+        "dropped messages:  {}\n",
+        array_len(&dropped)
+    ));
     out.push('\n');
     if array_len(&audit) > 0 {
         out.push_str("recent mutations (24h, up to 5)\n");
