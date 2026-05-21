@@ -136,24 +136,37 @@ build and install to `~/.local/bin`.
 
 ## Quickstart
 
-The fast path from zero to a working chat:
+The fast path from zero to a working chat — one terminal:
 
 ```bash
-ironclaw-setup              # interactive; press Enter to accept defaults
-ironclaw run                # boot the host; idles waiting for inbound
+ironclaw-setup                # interactive; press Enter to accept defaults
+ironclaw start && iclaw chat  # background the host, drop into the REPL
 ```
 
-In a second terminal:
+`iclaw chat` auto-starts the host the first time you run it, so
+`ironclaw start` is optional — it's there for the case where you
+want to confirm the host booted before opening the chat. Pass
+`--no-autostart` to `iclaw chat` to keep the historic "fail
+loudly when the host isn't running" behaviour for scripted use.
+
+Other useful lifecycle commands:
 
 ```bash
-iclaw doctor                # diagnose; every non-OK row prints a `fix:`
-iclaw chat                  # interactive REPL against the CLI channel
+ironclaw status               # PID, uptime, paths, active session count
+ironclaw status --json        # machine-readable status
+ironclaw logs -f              # tail the host log
+ironclaw stop                 # graceful SIGTERM (SIGKILL after grace)
+ironclaw run                  # original foreground flow (for systemd / launchd)
+iclaw doctor                  # composite probe; every FAIL prints a `fix:`
+iclaw health                  # sessions, audit, dropped-messages snapshot
+iclaw usage --since 24h       # per-group token rollup
+iclaw audit list --since 1h   # recent mutations against the host socket
 ```
 
 `ironclaw-setup` auto-creates a default `cli/stdin` messaging group
 wired to an agent group named `first` with session mode `shared`,
-so `iclaw chat` Just Works on the very first `ironclaw run`. Opt
-out with `IRONCLAW_SETUP_QUICKSTART=no`.
+so `iclaw chat` Just Works on the very first start. Opt out with
+`IRONCLAW_SETUP_QUICKSTART=no`.
 
 ### Headless / scripted install
 
