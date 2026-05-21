@@ -1409,6 +1409,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironclaw-channels-line"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "bytes",
+ "chrono",
+ "hex",
+ "hmac",
+ "ironclaw-channels-core",
+ "ironclaw-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "ironclaw-channels-linear"
 version = "0.1.0"
 dependencies = [
@@ -1776,6 +1801,7 @@ dependencies = [
  "ironclaw-channels-gchat",
  "ironclaw-channels-github",
  "ironclaw-channels-imessage",
+ "ironclaw-channels-line",
  "ironclaw-channels-linear",
  "ironclaw-channels-matrix",
  "ironclaw-channels-mattermost",
