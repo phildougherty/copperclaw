@@ -40,6 +40,9 @@ and the endpoint stays off; the rest of the host runs normally.
 | `ironclaw_containers_spawned_total` | none | container manager, after a successful `runtime.spawn` |
 | `ironclaw_containers_crashed_total` | none | container manager, on `CrashRestart` (heartbeat stale) |
 | `ironclaw_image_rebuild_failed_total` | none | container manager, when `runtime.build_image` errors (the spawn falls back to the last-known-good tag) |
+| `ironclaw_budget_exhausted_total` | `agent_group_id`, `gate` | container manager budget gate, every time it refuses to spawn. `gate` is one of `daily_tokens`, `turns_per_minute`, `turns_per_hour`. |
+| `ironclaw_budget_exhausted_replies_total` | `agent_group_id` | container manager, every time a budget- or rate-limit notice is actually written to outbound (AFTER the per-group dedup window check) |
+| `ironclaw_budget_exhausted_suppressed_total` | `agent_group_id` | container manager, every time a refusal notice is suppressed by the per-group dedup window |
 
 #### Histograms
 
@@ -61,6 +64,16 @@ and the endpoint stays off; the rest of the host runs normally.
 - `rate(ironclaw_delivery_failed_total[15m]) > 0` — a channel is
   dropping messages after 3 retries; check the channel's auth /
   rate-limit headers via the delivery logs.
+- `sum by (agent_group_id, gate) (rate(ironclaw_budget_exhausted_total[15m])) > 0`
+  — an agent group is repeatedly hitting a budget or rate-limit gate.
+  Refusals come in three flavours via the `gate` label: `daily_tokens`
+  (the daily-token cap), `turns_per_minute`, and `turns_per_hour`. The
+  fix is operator-side: raise the cap with `iclaw groups budget set` or
+  investigate why the group is burning tokens / turns so fast. Pair
+  with `ironclaw_budget_exhausted_replies_total` (notices that actually
+  went to the user) and `ironclaw_budget_exhausted_suppressed_total`
+  (notices the dedup window swallowed) to see the user-visible
+  notification rate independent of refusal volume.
 
 ### Scrape config
 

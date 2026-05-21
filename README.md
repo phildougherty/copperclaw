@@ -493,7 +493,10 @@ Counters: `ironclaw_messages_inbound_total`,
 `ironclaw_containers_crashed_total`,
 `ironclaw_delivery_failed_total`,
 `ironclaw_image_rebuild_failed_total`,
-`ironclaw_secrets_rotated_total`.
+`ironclaw_secrets_rotated_total`,
+`ironclaw_budget_exhausted_total{agent_group_id, gate}`,
+`ironclaw_budget_exhausted_replies_total{agent_group_id}`,
+`ironclaw_budget_exhausted_suppressed_total{agent_group_id}`.
 
 Histograms: `ironclaw_llm_call_seconds`,
 `ironclaw_llm_tokens_input`, `ironclaw_llm_tokens_output`,

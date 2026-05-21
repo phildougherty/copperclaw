@@ -1862,6 +1862,8 @@ dependencies = [
  "ironclaw-runner",
  "ironclaw-skills",
  "ironclaw-types",
+ "metrics",
+ "metrics-exporter-prometheus",
  "regex",
  "rusqlite",
  "serde",
