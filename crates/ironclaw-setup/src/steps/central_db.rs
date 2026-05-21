@@ -8,6 +8,7 @@ use crate::prompt::Prompt;
 use crate::state::SetupState;
 use crate::steps::{Step, StepError, StepResult};
 use ironclaw_db::central::CentralDb;
+use ironclaw_db::migrate::{applied_central_schema_version, expected_central_schema_version};
 
 /// Step implementation.
 #[derive(Debug, Default)]
@@ -35,6 +36,13 @@ impl Step for CentralDbStep {
         if cfg.central_db_path.as_os_str().is_empty() {
             cfg.central_db_path = cfg.data_dir.join("data").join("ironclaw.db");
         }
+        // Detect a downgrade scenario before touching the file:
+        // if the DB already exists and reports more applied
+        // migrations than this binary knows about, refuse to
+        // proceed rather than silently running against a future
+        // schema. Mirrors `ironclaw_host::boot::check_schema_version`
+        // (exit code 5 / `BootError::SchemaMismatch`).
+        check_schema_version(&cfg.central_db_path)?;
         open_and_migrate(&cfg.central_db_path)?;
         Ok(StepResult::ok(format!(
             "central DB initialised at {}",
@@ -47,6 +55,41 @@ impl Step for CentralDbStep {
 /// surface a friendly error.
 pub fn open_and_migrate(path: &std::path::Path) -> Result<(), StepError> {
     CentralDb::open(path).map_err(|e| StepError::Other(format!("central DB open failed: {e}")))?;
+    Ok(())
+}
+
+/// Refuse to proceed when the DB at `path` already exists and reports
+/// more applied migrations than the binary's expected migration set.
+///
+/// This mirrors `ironclaw_host::boot::check_schema_version`: the wizard
+/// must not run against a "future" schema (an older binary touching a
+/// DB that was migrated by a newer ironclaw release). Pre-existing
+/// fresh / equal / behind DBs all return `Ok(())`; the open step
+/// applies any pending migrations afterward.
+pub fn check_schema_version(path: &std::path::Path) -> Result<(), StepError> {
+    if !path.exists() {
+        return Ok(());
+    }
+    // Open the DB read-only via a fresh rusqlite handle. We deliberately
+    // don't go through `CentralDb::open` here because that path runs
+    // migrations as a side-effect — the whole point of this check is to
+    // catch the downgrade before we touch the schema.
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )
+    .map_err(|e| StepError::Other(format!("open central DB for schema check: {e}")))?;
+    let expected = expected_central_schema_version();
+    let applied = applied_central_schema_version(&conn)
+        .map_err(|e| StepError::Other(format!("read schema version: {e}")))?
+        .unwrap_or(0);
+    if applied > expected {
+        return Err(StepError::Other(format!(
+            "schema mismatch: on-disk DB has {applied} applied migrations but \
+             this binary only knows {expected}; refusing to run against a future \
+             schema (downgrade detected)"
+        )));
+    }
     Ok(())
 }
 
