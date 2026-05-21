@@ -6,6 +6,43 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (production hardening slice — three parallel-agent items)
+
+- **Secret rotation via SIGHUP.** New `RotatableConfig` struct +
+  `Arc<RwLock<...>>` on `ContainerManager` holds the rotatable
+  surface (`ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, web-search
+  provider keys). `ContainerManager::reload_env(env_file)` parses
+  the `.env` and updates the lock so subsequent container spawns
+  pick up rotated values. SIGHUP handler wired in
+  `wait_for_signal_or_sighup`; `run_host` gains an `env_file`
+  parameter that the SIGHUP handler reads on each signal. New
+  metric `ironclaw_secrets_rotated_total`. Running containers see
+  rotated keys after idle-stop + respawn (default 5 min).
+- **Webhooks TLS documentation.** New
+  [`docs/webhooks-tls.md`](docs/webhooks-tls.md) covers the
+  reverse-proxy patterns (Caddy / nginx / Cloudflare Tunnel) and
+  explains why native rustls is deliberately not in 0.1.0.
+- **Per-group LLM rate limits.** New columns
+  `agent_turns_per_minute_cap` + `agent_turns_per_hour_cap` on
+  `group_budgets` (migration `009_rate_limit_caps`). Container
+  manager gates spawn on both windows in `maybe_spawn`; an
+  in-channel reply explains the cap via the same outbound-write
+  path the budget gate uses, dedup'd on a 1-minute window. New
+  `iclaw budgets set --turns-per-minute N --turns-per-hour N`.
+- **Versioned migrations.** New `expected_central_schema_version()`
+  and `applied_central_schema_version()` helpers in
+  `ironclaw-db::migrate`. Boot now refuses to start with
+  `BootError::SchemaMismatch` (exit code 5) when the on-disk
+  schema is newer than this binary expects (downgrade detection).
+  New `iclaw schema-version` subcommand prints `{expected, applied,
+  status}` as JSON.
+- **`sessions/sessions/` path cleanup.** `HostConfig::sessions_root()`
+  now returns `data_dir` directly; the double-`sessions/` layout
+  is gone. New `migrate_sessions_layout()` runs at boot, moving
+  contents from `data_dir/sessions/sessions/<ag>/<sess>/` up one
+  level when present. Collisions log a warn and skip; the inner
+  directory is only removed when all entries moved successfully.
+
 ### Added (onboarding polish slice)
 
 - `iclaw doctor` — first-run / ongoing health probe. Walks the

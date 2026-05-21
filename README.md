@@ -221,6 +221,8 @@ See `docs/cutover.md` for migrating from a predecessor data directory.
   restore procedure.
 - [`docs/web-search.md`](docs/web-search.md) — multi-provider
   `web_search` tool: Tavily / Exa / Brave / SerpAPI.
+- [`docs/webhooks-tls.md`](docs/webhooks-tls.md) — TLS termination
+  for webhook channels via Caddy / nginx / Cloudflare Tunnel.
 - [`docs/cutover.md`](docs/cutover.md) — operator playbook for
   switching a predecessor installation onto Ironclaw.
 - [`docs/replay-fixtures.md`](docs/replay-fixtures.md) — design of

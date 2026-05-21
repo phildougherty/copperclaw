@@ -437,10 +437,19 @@ pub async fn install_modules(host_ctx: Arc<HostContext>) {
 ///
 /// `runtime` may be provided by the caller (for tests); when `None` the
 /// real runtime is detected via [`ironclaw_container_rt::detect`].
+///
+/// `env_file` is the `.env` path used by the SIGHUP secret-rotation
+/// handler. When `Some`, a SIGHUP re-reads this file and updates the
+/// container manager's forwarded env vars (provider keys, base URL)
+/// so subsequent container spawns pick up rotated values without a
+/// host restart. When `None`, SIGHUP is logged but is otherwise a
+/// no-op.
+#[allow(clippy::too_many_lines)] // Boot sequence is intentionally sequential.
 pub async fn run_host(
     cfg: HostConfig,
     runtime: Option<Box<dyn ContainerRuntime>>,
     shutdown: CancellationToken,
+    env_file: Option<std::path::PathBuf>,
 ) -> Result<(), BootError> {
     info!(
         data_dir = %cfg.data_dir.display(),
@@ -549,12 +558,19 @@ pub async fn run_host(
     // 13. Sweep loop.
     let sweep_loop = tokio::spawn(Arc::clone(&state.sweep).run_loop(shutdown.clone()));
 
-    let manager_task = spawn_container_manager(
+    let spawned = spawn_container_manager(
         &cfg,
         state.central.clone(),
         Arc::clone(&runtime),
         shutdown.clone(),
     );
+    let (manager_task, manager_handle): (
+        Option<tokio::task::JoinHandle<()>>,
+        Option<Arc<crate::container_manager::ContainerManager>>,
+    ) = match spawned {
+        Some((task, mgr)) => (Some(task), Some(mgr)),
+        None => (None, None),
+    };
 
     // 14. Spawn socket server.
     let socket_path = cfg.ncl_socket_path.clone();
@@ -567,8 +583,10 @@ pub async fn run_host(
     print_ready_banner(&cfg, &initialized);
     info!("ironclaw boot complete; idling");
 
-    // 15. Idle until shutdown.
-    wait_for_signal(shutdown.clone()).await;
+    // 15. Idle until shutdown. SIGHUP triggers a secret-rotation
+    // reload on the container manager (when one is spawned) and
+    // resumes waiting; only SIGINT/SIGTERM/external-cancel exit.
+    wait_for_signal_or_sighup(shutdown.clone(), manager_handle.clone(), env_file).await;
 
     info!("shutdown requested; cancelling tasks");
     shutdown.cancel();
@@ -591,8 +609,18 @@ pub async fn run_host(
 }
 
 /// Block until a SIGINT/SIGTERM is observed, or `shutdown` is cancelled
-/// externally (whichever comes first).
-pub async fn wait_for_signal(shutdown: CancellationToken) {
+/// externally (whichever comes first). SIGHUP is handled in a loop:
+/// each one re-reads `env_file` and applies the change to
+/// `manager.reload_env`, then resumes waiting. Only SIGINT, SIGTERM,
+/// and external cancellation exit.
+///
+/// On non-Unix platforms there is no signal support; the function
+/// blocks on `shutdown.cancelled()` only.
+pub async fn wait_for_signal_or_sighup(
+    shutdown: CancellationToken,
+    manager: Option<Arc<crate::container_manager::ContainerManager>>,
+    env_file: Option<std::path::PathBuf>,
+) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -612,16 +640,58 @@ pub async fn wait_for_signal(shutdown: CancellationToken) {
                 return;
             }
         };
-        tokio::select! {
-            _ = sigint.recv() => info!("SIGINT received"),
-            _ = sigterm.recv() => info!("SIGTERM received"),
-            () = shutdown.cancelled() => info!("external cancellation"),
+        let mut sighup = match signal(SignalKind::hangup()) {
+            Ok(s) => Some(s),
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "could not install SIGHUP handler; secret rotation on SIGHUP unavailable"
+                );
+                None
+            }
+        };
+        loop {
+            if let Some(ref mut hup) = sighup {
+                tokio::select! {
+                    _ = sigint.recv() => { info!("SIGINT received"); return; }
+                    _ = sigterm.recv() => { info!("SIGTERM received"); return; }
+                    () = shutdown.cancelled() => { info!("external cancellation"); return; }
+                    _ = hup.recv() => {
+                        info!("SIGHUP received; reloading .env for secret rotation");
+                        if let Some(ref mgr) = manager {
+                            let changed = mgr.reload_env(env_file.as_deref());
+                            if changed.is_empty() {
+                                info!("SIGHUP: no secret vars changed");
+                            } else {
+                                info!(keys = ?changed, "SIGHUP: secret vars rotated (key names only)");
+                            }
+                        } else {
+                            info!("SIGHUP: container manager not running; env reload skipped");
+                        }
+                    }
+                }
+            } else {
+                tokio::select! {
+                    _ = sigint.recv() => { info!("SIGINT received"); return; }
+                    _ = sigterm.recv() => { info!("SIGTERM received"); return; }
+                    () = shutdown.cancelled() => { info!("external cancellation"); return; }
+                }
+            }
         }
     }
     #[cfg(not(unix))]
     {
+        let _ = manager;
+        let _ = env_file;
         let _ = shutdown.cancelled().await;
     }
+}
+
+/// Backwards-compat wrapper: SIGINT/SIGTERM only, no SIGHUP handling.
+/// Used by tests that don't need rotation. Production code should
+/// prefer [`wait_for_signal_or_sighup`].
+pub async fn wait_for_signal(shutdown: CancellationToken) {
+    wait_for_signal_or_sighup(shutdown, None, None).await;
 }
 
 /// Path under which channels keep their per-instance data directory. Exposed
@@ -630,15 +700,25 @@ pub fn channel_data_dir(data_root: &std::path::Path, channel_type: &str) -> Path
     data_root.join("channels").join(channel_type)
 }
 
-/// Spawn the container-manager task. Returns `Some(handle)` when the
-/// default image tag is known; otherwise logs a warning and returns
-/// `None` so the host still boots (sessions just won't get a runner).
+/// Result of [`spawn_container_manager`]: the task handle (driving
+/// the poll loop) and the `Arc` the SIGHUP handler uses to call
+/// `reload_env` on rotation.
+type SpawnedManager = (
+    tokio::task::JoinHandle<()>,
+    Arc<crate::container_manager::ContainerManager>,
+);
+
+/// Spawn the container-manager task. Returns `Some((handle, manager))`
+/// when the default image tag is known; otherwise logs a warning and
+/// returns `None` so the host still boots (sessions just won't get
+/// a runner). The returned `manager` is what the SIGHUP handler holds
+/// to apply secret rotation.
 fn spawn_container_manager(
     cfg: &HostConfig,
     central: ironclaw_db::central::CentralDb,
     runtime: Arc<dyn ContainerRuntime>,
     shutdown: CancellationToken,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Option<SpawnedManager> {
     let Some(image_tag) = cfg.default_image_tag.clone() else {
         warn!(
             "no IRONCLAW_DEFAULT_IMAGE_TAG configured; container manager disabled. \
@@ -677,7 +757,8 @@ fn spawn_container_manager(
         runtime,
         manager_cfg,
     ));
-    Some(tokio::spawn(manager.run_loop(shutdown)))
+    let task = tokio::spawn(Arc::clone(&manager).run_loop(shutdown));
+    Some((task, manager))
 }
 
 /// Collect operator-supplied env vars that should be forwarded into
@@ -1007,7 +1088,7 @@ mod tests {
         let rt: Box<dyn ContainerRuntime> = Box::new(crate::tests::NoopRuntime::default());
         let cancel = shutdown.clone();
         let task = tokio::spawn(async move {
-            run_host(cfg, Some(rt), cancel).await.unwrap();
+            run_host(cfg, Some(rt), cancel, None).await.unwrap();
         });
         // Wait briefly so the socket file appears.
         for _ in 0..80 {
@@ -1040,7 +1121,7 @@ mod tests {
         );
         let cancel = shutdown.clone();
         let task = tokio::spawn(async move {
-            run_host(cfg, Some(rt), cancel).await.unwrap();
+            run_host(cfg, Some(rt), cancel, None).await.unwrap();
         });
         shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(5), task)
@@ -1340,7 +1421,7 @@ mod tests {
         let rt: Box<dyn ContainerRuntime> = Box::new(crate::tests::NoopRuntime::default());
         let cancel = shutdown.clone();
         let task = tokio::spawn(async move {
-            run_host(cfg, Some(rt), cancel).await.unwrap();
+            run_host(cfg, Some(rt), cancel, None).await.unwrap();
         });
         for _ in 0..80 {
             if tmp.path().join("channels").join("cli").exists() {

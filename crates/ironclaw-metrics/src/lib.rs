@@ -54,6 +54,7 @@ pub const MESSAGES_OUTBOUND_TOTAL: &str = "ironclaw_messages_outbound_total";
 pub const CONTAINERS_SPAWNED_TOTAL: &str = "ironclaw_containers_spawned_total";
 pub const CONTAINERS_CRASHED_TOTAL: &str = "ironclaw_containers_crashed_total";
 pub const IMAGE_REBUILD_FAILED_TOTAL: &str = "ironclaw_image_rebuild_failed_total";
+pub const SECRETS_ROTATED_TOTAL: &str = "ironclaw_secrets_rotated_total";
 pub const DELIVERY_FAILED_TOTAL: &str = "ironclaw_delivery_failed_total";
 pub const LLM_CALL_SECONDS: &str = "ironclaw_llm_call_seconds";
 pub const LLM_TOKENS_INPUT: &str = "ironclaw_llm_tokens_input";
@@ -88,6 +89,14 @@ pub fn inc_containers_crashed() {
 /// when one exists so the agent group is not blocked.
 pub fn inc_image_rebuild_failed() {
     counter!(IMAGE_REBUILD_FAILED_TOTAL).increment(1);
+}
+
+/// Increment `ironclaw_secrets_rotated_total`. Fired by the host's
+/// SIGHUP handler each time it re-reads the install's `.env` to
+/// pick up rotated provider keys. Incremented even when no values
+/// changed — the metric measures rotation *attempts*, not deltas.
+pub fn inc_secrets_rotated() {
+    counter!(SECRETS_ROTATED_TOTAL).increment(1);
 }
 
 /// Increment `ironclaw_delivery_failed_total{channel_type=<ct>}`.
@@ -407,6 +416,7 @@ mod tests {
         inc_containers_crashed();
         inc_delivery_failed("slack");
         inc_image_rebuild_failed();
+        inc_secrets_rotated();
     }
 
     #[test]
@@ -427,6 +437,7 @@ mod tests {
             CONTAINERS_SPAWNED_TOTAL,
             CONTAINERS_CRASHED_TOTAL,
             IMAGE_REBUILD_FAILED_TOTAL,
+            SECRETS_ROTATED_TOTAL,
             DELIVERY_FAILED_TOTAL,
             LLM_CALL_SECONDS,
             LLM_TOKENS_INPUT,

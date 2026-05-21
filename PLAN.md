@@ -78,12 +78,12 @@ file paths that landed the change.
 
 | Metric | Value |
 | - | - |
-| `cargo test --workspace` | 4597 passing / 0 failing / 4 ignored |
+| `cargo test --workspace` | 4633 passing / 0 failing / 4 ignored |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | Channel crates | 21 |
 | In-tree tools the agent can call | 20 (15 messaging/scheduling/self-mod + 4 computer-use + 1 multi-provider web search) |
 | Skill docs | 22 |
-| Latest milestone | Onboarding polish — `iclaw doctor`, auto-bootstrapped default group, budget-exhausted in-channel reply |
+| Latest milestone | Production hardening — SIGHUP secret rotation, webhooks TLS doc, per-group rate limits, versioned migrations, sessions/sessions cleanup |
 
 Older M-section "totals" lines are historical snapshots and will drift —
 trust the table above.
@@ -827,55 +827,83 @@ run footgun.
 quickstart-group + 4 budget-reply + 3 misc fix-ups). 0 failing.
 Clippy clean.
 
+### Production hardening slice (3 parallel agents)
+
+Three worktree-isolated agents landed in one slice. After-merge:
+- One renumbering (agent B's migration 007 → 009 to avoid
+  collision with 007/008 from prior slices).
+- Two of three notification text fixes during merge (agent B's
+  per-hour text said "Per-minute"; agent B's helper wrote to
+  inbound DB while main's pattern writes to outbound — unified
+  via a new `post_cap_reply` helper that both paths share).
+- Agent A's hand-rolled `ironclaw-metrics` collided with the
+  real crate landed in observability — counter ported across
+  via `inc_secrets_rotated()`.
+
+- [x] **Secret rotation via SIGHUP** (`PLAN.md` was Next #1).
+  `RotatableConfig` struct (anthropic_api_key, anthropic_base_url,
+  forward_env) held behind an `Arc<RwLock<...>>` on
+  `ContainerManager`. `reload_env(env_file)` parses `.env`
+  without touching the process env (hand-rolled `parse_dotenv_content`
+  handles quotes / comments / `export` prefixes) and swaps the
+  lock. `wait_for_signal_or_sighup` loops on SIGHUP, calling
+  `mgr.reload_env(env_file.as_deref())`. `run_host` gained an
+  `env_file: Option<PathBuf>` parameter the main binary fills
+  from `cli.env_file`. New metric
+  `ironclaw_secrets_rotated_total`. Running containers see the
+  rotated keys after idle-stop + respawn (default 5 min).
+
+- [x] **Webhooks TLS termination doc** (was Next #2). New
+  `docs/webhooks-tls.md` (204 lines) covers Caddy / nginx /
+  Cloudflare Tunnel patterns, the bind-address override, and the
+  design rationale for not bundling rustls in 0.1.0.
+
+- [x] **Host-side rate limiting** (was Next #3). Two new columns
+  on `group_budgets` (`agent_turns_per_minute_cap`,
+  `agent_turns_per_hour_cap`) via migration `009_rate_limit_caps`.
+  New `agent_turns::turns_since` count helper. Container manager
+  gate fires in `maybe_spawn` after the budget gate: checks both
+  windows, posts an in-channel reply on the outbound path (same
+  `post_cap_reply` helper as the budget gate) with a 1-minute
+  dedup window. `iclaw budgets set` extended with
+  `--turns-per-minute` and `--turns-per-hour` flags.
+
+- [x] **Versioned migrations** (was Next #5).
+  `expected_central_schema_version()` (= `CENTRAL.len()`) and
+  `applied_central_schema_version()` helpers in
+  `ironclaw-db::migrate`. `BootError::SchemaMismatch` (exit code
+  5) fires when applied > expected (downgrade detection).
+  `iclaw schema-version` subcommand returns
+  `{ "expected": N, "applied": M, "status": "ok|pending|future" }`.
+
+- [x] **Double `sessions/sessions/` path cleanup** (was Next #6).
+  `HostConfig::sessions_root()` returns `data_dir` directly;
+  the layout flattens to `data_dir/sessions/<ag>/<sess>/`. New
+  `migrate_sessions_layout()` runs at boot, moving contents from
+  the old nested path up one level. Collision-safe: logs + skips
+  when the destination exists, only removes the inner directory
+  when all entries moved successfully.
+
+**Slice totals**: 4597 → 4633 passing (+36 tests across the three
+agents and the merge resolution). 0 failing. Clippy clean.
+
 ---
 
 ## Next things to address
 
-The full Top 10 from the prior slice landed (the 9 hardening items
-in the parallel-agent merge, then `web_search` in this slice). The
-remaining items, ranked by impact × leverage:
+The five highest-impact items from the prior list landed in this
+slice. The remaining items, ranked:
 
-1. **Secret rotation without restart**. Rotating
-   `ANTHROPIC_API_KEY` today requires restarting the host so
-   the spawned containers pick up the new env. A SIGHUP handler
-   that rereads `.env` and re-emits to running containers is
-   the minimum viable change. _(M13 security)_
-
-2. **Webhooks TLS termination story**. Every webhook channel
-   binds plain HTTP on `127.0.0.1` by default. Production
-   deployments need either native TLS (rustls) or documented
-   reverse-proxy patterns (Caddy / nginx / Cloudflare Tunnel)
-   per channel. Pick one and ship it. _(M13 security)_
-
-3. **Host-side rate limiting**. Per-group max LLM calls per
-   minute / hour. LLM 429s already retry with `Retry-After`,
-   but the host-side cap is missing — partially covered by
-   budgets, but a separate guard against runaway loops. _(M13
-   cost/safety)_
-
-4. **Replay-fixture harness implementation** (M11 acceptance
+1. **Replay-fixture harness implementation** (M11 acceptance
    gate). Design is in `docs/replay-fixtures.md`. Implement the
    in-process harness against `Fixture::load` /
    `ReplayHarness::{boot_host, run, compare}` plus a first
    captured fixture. _(M11)_
 
-5. **Release 0.1.0**. Cut the tag, bump
+2. **Release 0.1.0**. Cut the tag, bump
    `workspace.package.version`, publish release notes from
    `CHANGELOG.md`. The candidate status in README is the
    honest one until this lands. _(M11)_
-
-6. **Bugfix: double `sessions/sessions/` path layout**. Host
-   code uses `FsSessionRoot::new(cfg.sessions_root())` which
-   produces `data_dir/sessions/sessions/<ag>/<session>` — fine
-   but weird. Pick one (likely just
-   `data_dir/sessions/<ag>/<session>`) and migrate. The
-   container manager already has a comment documenting the
-   workaround. _(M13 cleanup)_
-
-7. **Versioned migrations**. `ironclaw migrate` already runs the
-   central migrations but there's no schema-version table the
-   host can check on boot to refuse a downgrade or warn about
-   an in-progress upgrade. _(M13 reliability)_
 
 ---
 

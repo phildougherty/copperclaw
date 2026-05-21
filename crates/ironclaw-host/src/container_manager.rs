@@ -39,8 +39,8 @@ use ironclaw_db::central::CentralDb;
 use ironclaw_db::session::{open_inbound, open_outbound, SessionPaths};
 use ironclaw_db::tables::{container_configs, messages_in, sessions};
 use ironclaw_types::{AgentGroupId, ContainerStatus, Session, SessionStatus};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -77,6 +77,74 @@ pub const DEFAULT_HEARTBEAT_STALE_SECS: u64 = 60;
 /// Grace period passed to `runtime.stop` on idle / crash transitions.
 /// 5s is enough for the runner to flush an in-flight HTTP call.
 pub const DEFAULT_STOP_GRACE_SECS: u64 = 5;
+
+/// Env-var names treated as secrets that the SIGHUP handler re-reads
+/// from the install's `.env`. Missing keys after rotation are dropped
+/// from the forwarded set — we never fall back to a stale value.
+pub const ROTATABLE_ENV_KEYS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "TAVILY_API_KEY",
+    "EXA_API_KEY",
+    "BRAVE_SEARCH_API_KEY",
+    "SERPAPI_API_KEY",
+];
+
+/// Subset of [`ManagerConfig`] that the SIGHUP handler can hot-swap.
+/// Held behind an `Arc<RwLock<...>>` on [`ContainerManager`] so the
+/// handler can update it without restarting the host. Reads during
+/// `build_spec` take a short-lived read-lock; writes during
+/// `reload_env` take a write-lock.
+///
+/// Note on already-running containers: Docker's env is immutable
+/// post-creation. A rotated key only takes effect for containers
+/// spawned **after** the reload. With the default
+/// `idle_timeout_secs = 300`, an idle container respawns within
+/// 5 minutes of the next inbound message and picks up the new key
+/// at that point.
+#[derive(Debug, Clone, Default)]
+pub struct RotatableConfig {
+    /// Current `ANTHROPIC_API_KEY`. `None` means the var is absent
+    /// (or was removed during rotation).
+    pub anthropic_api_key: Option<String>,
+    /// Current `ANTHROPIC_BASE_URL` override.
+    pub anthropic_base_url: Option<String>,
+    /// Additional provider-key env-vars to forward into spawned
+    /// containers. Keys here are only forwarded when their value is
+    /// non-empty. Tracks the web-search provider keys today
+    /// (`TAVILY_API_KEY`, `EXA_API_KEY`, `BRAVE_SEARCH_API_KEY`,
+    /// `SERPAPI_API_KEY`).
+    pub forward_env: Vec<(String, String)>,
+}
+
+impl RotatableConfig {
+    /// Build from a flat env-var map (typically the process env
+    /// snapshot at boot or a re-read of `.env` on SIGHUP). Empty
+    /// strings are treated as absent.
+    pub fn from_env_map(map: &std::collections::HashMap<String, String>) -> Self {
+        let anthropic_api_key = map
+            .get("ANTHROPIC_API_KEY")
+            .filter(|v| !v.is_empty())
+            .cloned();
+        let anthropic_base_url = map
+            .get("ANTHROPIC_BASE_URL")
+            .filter(|v| !v.is_empty())
+            .cloned();
+        let forward_env = ROTATABLE_ENV_KEYS[2..]
+            .iter()
+            .filter_map(|k| {
+                map.get(*k)
+                    .filter(|v| !v.is_empty())
+                    .map(|v| ((*k).to_string(), v.clone()))
+            })
+            .collect();
+        Self {
+            anthropic_api_key,
+            anthropic_base_url,
+            forward_env,
+        }
+    }
+}
 
 /// Host-side knobs that don't change per-session.
 #[derive(Debug, Clone)]
@@ -148,6 +216,12 @@ pub struct ContainerManager {
     rate_limit_notified: std::sync::Mutex<
         std::collections::HashMap<AgentGroupId, chrono::DateTime<chrono::Utc>>,
     >,
+    /// Hot-swappable subset of the config (provider API keys + base
+    /// URL + forwarded provider keys). Initialized from `cfg` at
+    /// construction; updated by [`Self::reload_env`] on SIGHUP. Reads
+    /// during `build_spec` / `runner_config_for` take a short-lived
+    /// read-lock so the spawn path stays fast.
+    rotatable: Arc<RwLock<RotatableConfig>>,
 }
 
 impl ContainerManager {
@@ -161,10 +235,71 @@ impl ContainerManager {
         Self {
             central,
             runtime,
-            cfg,
             last_budget_notice: std::sync::Mutex::new(std::collections::HashMap::new()),
             rate_limit_notified: std::sync::Mutex::new(std::collections::HashMap::new()),
+            rotatable: Arc::new(RwLock::new(RotatableConfig {
+                anthropic_api_key: cfg.anthropic_api_key.clone(),
+                anthropic_base_url: cfg.anthropic_base_url.clone(),
+                forward_env: cfg.forward_env.clone(),
+            })),
+            cfg,
         }
+    }
+
+    /// Re-read the `.env` file at `env_file` (or use no file when
+    /// `None`) and update [`Self::rotatable`]. Logs which key
+    /// **names** changed (never the values) and increments the
+    /// `ironclaw_secrets_rotated_total` metric counter.
+    ///
+    /// Returns the list of key names that were added, removed, or
+    /// changed so the SIGHUP handler can log a summary line.
+    pub fn reload_env(&self, env_file: Option<&Path>) -> Vec<String> {
+        let new_map = read_env_file(env_file);
+        let new_cfg = RotatableConfig::from_env_map(&new_map);
+
+        let mut changed: Vec<String> = Vec::new();
+        {
+            let old = self
+                .rotatable
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if old.anthropic_api_key != new_cfg.anthropic_api_key {
+                changed.push("ANTHROPIC_API_KEY".to_string());
+            }
+            if old.anthropic_base_url != new_cfg.anthropic_base_url {
+                changed.push("ANTHROPIC_BASE_URL".to_string());
+            }
+            let old_map: std::collections::HashMap<&str, &str> = old
+                .forward_env
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            let new_map_fwd: std::collections::HashMap<&str, &str> = new_cfg
+                .forward_env
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            for (k, v) in &old_map {
+                if new_map_fwd.get(k) != Some(v) {
+                    changed.push((*k).to_string());
+                }
+            }
+            for k in new_map_fwd.keys() {
+                if !old_map.contains_key(k) {
+                    changed.push((*k).to_string());
+                }
+            }
+        }
+
+        {
+            let mut w = self
+                .rotatable
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *w = new_cfg;
+        }
+        ironclaw_metrics::inc_secrets_rotated();
+        changed
     }
 
     /// Poll loop. Returns when `shutdown` is cancelled.
@@ -582,6 +717,7 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
     /// only across the lookup + insert, then writes a Chat-kind
     /// outbound row routed via `session_routing` so the delivery
     /// loop dispatches it through the channel adapter.
+    #[allow(clippy::unused_self)] // kept as a method so callers can use `self.dispatch_cap_reply(...)`.
     fn post_cap_reply(
         &self,
         session: &Session,
@@ -708,7 +844,12 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
             model,
             system,
             api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
-            api_base_url: self.cfg.anthropic_base_url.clone(),
+            api_base_url: self
+                .rotatable
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .anthropic_base_url
+                .clone(),
             assistant_name,
             max_messages_per_prompt: max_messages,
         }
@@ -774,16 +915,26 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
         spec.entrypoint
             .extend(vec!["--config".to_string(), format!("{CONTAINER_SESSION_DIR}/{RUNNER_CONFIG_FILENAME}")]);
 
-        if let Some(key) = self.cfg.anthropic_api_key.as_deref() {
+        // All three forwarded surfaces (anthropic key, base URL,
+        // provider keys) live behind the rotatable read-lock so the
+        // SIGHUP handler can swap them mid-process without a host
+        // restart.
+        let rotatable = self
+            .rotatable
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(key) = rotatable.anthropic_api_key.as_deref() {
             spec = spec.with_env("ANTHROPIC_API_KEY", key);
         }
-        if let Some(base) = self.cfg.anthropic_base_url.as_deref() {
+        if let Some(base) = rotatable.anthropic_base_url.as_deref() {
             spec = spec.with_env("ANTHROPIC_BASE_URL", base);
         }
         // Operator-configured forwards (search API keys, etc.). Skip
         // empty values — an unset env var should not appear in the
-        // container env at all.
-        for (k, v) in &self.cfg.forward_env {
+        // container env at all. After a SIGHUP rotation that
+        // *removes* a key, the missing entry is correctly dropped.
+        for (k, v) in &rotatable.forward_env {
             if !v.is_empty() {
                 spec = spec.with_env(k, v);
             }
@@ -818,6 +969,63 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
 /// names are globally unique and DNS-safe.
 fn container_name(_agent: AgentGroupId, session: ironclaw_types::SessionId) -> String {
     format!("ironclaw-{}", session.as_uuid())
+}
+
+/// Read the `.env` file at `explicit_path` (or return an empty map
+/// when `None`). We **do not** call `dotenvy` here because dotenvy
+/// mutates the process env, which would race with other handlers and
+/// leak rotated-away values to anything that's already read the env.
+/// Instead we parse a minimal subset by hand.
+fn read_env_file(explicit_path: Option<&Path>) -> std::collections::HashMap<String, String> {
+    let Some(path) = explicit_path else {
+        return std::collections::HashMap::new();
+    };
+    let content = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(err) => {
+            warn!(path = %path.display(), ?err, "SIGHUP: could not read env file");
+            return std::collections::HashMap::new();
+        }
+    };
+    parse_dotenv_content(&content)
+}
+
+/// Parse a `.env`-style document. Handles comments (`#`), blank
+/// lines, optional `export` prefixes, and single-/double-quoted
+/// values. The parser is deliberately small: it does not expand
+/// `${VAR}` references or honour escape sequences inside quotes.
+pub(crate) fn parse_dotenv_content(content: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let value = strip_quotes(v.trim()).to_string();
+        out.insert(key.to_string(), value);
+    }
+    out
+}
+
+/// Strip a single layer of matching single or double quotes.
+fn strip_quotes(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
 }
 
 /// Assemble the agent's system prompt from the global skills directory
@@ -1987,5 +2195,103 @@ mod tests {
         let replies = count_outbound_text_replies(&paths);
         assert_eq!(replies.len(), 1);
         assert_eq!(replies[0], text);
+    }
+
+    // ── SIGHUP secret rotation ─────────────────────────────────────
+
+    #[test]
+    fn parse_dotenv_content_handles_quotes_export_and_comments() {
+        let raw = "
+# leading comment
+ANTHROPIC_API_KEY=sk-plain
+export TAVILY_API_KEY=\"tav-quoted\"
+BRAVE_SEARCH_API_KEY='br-single'
+
+# trailing comment
+SERPAPI_API_KEY=
+NOT_A_PAIR_LINE
+";
+        let map = parse_dotenv_content(raw);
+        assert_eq!(map.get("ANTHROPIC_API_KEY"), Some(&"sk-plain".to_string()));
+        assert_eq!(map.get("TAVILY_API_KEY"), Some(&"tav-quoted".to_string()));
+        assert_eq!(map.get("BRAVE_SEARCH_API_KEY"), Some(&"br-single".to_string()));
+        assert_eq!(map.get("SERPAPI_API_KEY"), Some(&String::new()));
+        assert!(!map.contains_key("NOT_A_PAIR_LINE"));
+    }
+
+    #[test]
+    fn rotatable_config_drops_empty_values() {
+        let mut m = std::collections::HashMap::new();
+        m.insert("ANTHROPIC_API_KEY".into(), "sk-1".into());
+        m.insert("ANTHROPIC_BASE_URL".into(), String::new());
+        m.insert("TAVILY_API_KEY".into(), "tav-1".into());
+        let cfg = RotatableConfig::from_env_map(&m);
+        assert_eq!(cfg.anthropic_api_key.as_deref(), Some("sk-1"));
+        assert!(cfg.anthropic_base_url.is_none(), "empty value must be dropped");
+        assert_eq!(cfg.forward_env.len(), 1);
+        assert_eq!(cfg.forward_env[0], ("TAVILY_API_KEY".into(), "tav-1".into()));
+    }
+
+    #[test]
+    fn reload_env_updates_rotatable_and_returns_changed_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let env_path = tmp.path().join(".env");
+        std::fs::write(&env_path, "ANTHROPIC_API_KEY=rotated-key\nEXA_API_KEY=exa-1\n").unwrap();
+        let changed = mgr.reload_env(Some(&env_path));
+        assert!(changed.contains(&"ANTHROPIC_API_KEY".to_string()), "{changed:?}");
+        assert!(changed.contains(&"EXA_API_KEY".to_string()), "{changed:?}");
+        // RwLock now reflects the rotation.
+        let r = mgr.rotatable.read().unwrap();
+        assert_eq!(r.anthropic_api_key.as_deref(), Some("rotated-key"));
+        assert!(r.forward_env.iter().any(|(k, v)| k == "EXA_API_KEY" && v == "exa-1"));
+    }
+
+    #[test]
+    fn reload_env_drops_keys_that_disappear() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        // Seed an EXA_API_KEY at construction time so it's in the
+        // initial RotatableConfig; the env file rotation will drop it.
+        cfg.forward_env = vec![("EXA_API_KEY".into(), "exa-old".into())];
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let env_path = tmp.path().join(".env");
+        // New env has no EXA_API_KEY → the key should be dropped.
+        std::fs::write(&env_path, "ANTHROPIC_API_KEY=sk-new\n").unwrap();
+        let changed = mgr.reload_env(Some(&env_path));
+        assert!(changed.contains(&"EXA_API_KEY".to_string()));
+        let r = mgr.rotatable.read().unwrap();
+        assert!(
+            r.forward_env.iter().all(|(k, _)| k != "EXA_API_KEY"),
+            "EXA_API_KEY must be dropped after rotation, got: {:?}",
+            r.forward_env
+        );
+    }
+
+    #[test]
+    fn reload_env_with_no_file_returns_empty_changed_when_nothing_was_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.anthropic_api_key = None;
+        cfg.anthropic_base_url = None;
+        cfg.forward_env = vec![];
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let changed = mgr.reload_env(None);
+        assert!(changed.is_empty(), "{changed:?}");
     }
 }

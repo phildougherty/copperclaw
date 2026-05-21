@@ -109,7 +109,7 @@ async fn main() -> ExitCode {
     };
 
     match cli.command.unwrap_or(Command::Run) {
-        Command::Run => match run_host(cfg, None, CancellationToken::new()).await {
+        Command::Run => match run_host(cfg, None, CancellationToken::new(), cli.env_file.clone()).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 error!(?err, "ironclaw exited with error");
