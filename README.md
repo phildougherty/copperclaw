@@ -74,17 +74,39 @@ agent> Boxes hold the world,
 
 ## Install
 
-Ironclaw needs Rust 1.85+ (pinned by `rust-toolchain.toml`) and a
-container runtime (Docker on Linux, Docker or Apple Container on
-macOS).
+One command, on Linux or macOS:
 
-```bash
-git clone https://github.com/example/ironclaw
-cd ironclaw
-cargo build --release --workspace
+```
+curl -fsSL https://raw.githubusercontent.com/phildougherty/ironclaw/main/install.sh | bash
 ```
 
-Three binaries land in `target/release/`:
+What it does:
+
+1. Detects your platform (Linux x86_64 / aarch64, macOS arm64 / x86_64).
+2. Checks for Docker or Podman (won't install one for you — too
+   invasive — but tells you exactly what to install).
+3. Installs `ironclaw`, `iclaw`, and `ironclaw-setup` to `~/.local/bin`.
+   Prefers a prebuilt release tarball; falls back to `cargo install
+   --git` (needs the Rust toolchain) or, from a checkout, `cargo
+   install --path`.
+4. Launches `ironclaw-setup` to walk provider credentials, the data
+   directory, and the first channel.
+
+Re-running is safe — it detects an existing install and offers to
+upgrade, skip, or resume setup. Useful environment overrides:
+
+```
+IRONCLAW_REPO=owner/fork                 # pull from a fork
+IRONCLAW_INSTALL_DIR=$HOME/.local/bin    # where binaries land
+IRONCLAW_RELEASE_TAG=v0.2.0              # pin a specific release
+IRONCLAW_SKIP_SETUP=1                    # install binaries only
+IRONCLAW_SETUP_HEADLESS=1                # pass --headless to setup
+```
+
+Windows is supported via WSL2 — run the same one-liner inside your
+WSL shell.
+
+Three binaries land on your PATH:
 
 | Binary | Role |
 | --- | --- |
@@ -94,6 +116,21 @@ Three binaries land in `target/release/`:
 
 A pre-built Debian-slim container image is produced as part of
 setup; rebuilds are automatic on config change.
+
+### Manual install
+
+Requires Rust 1.85+ (pinned by `rust-toolchain.toml`) and a container
+runtime (Docker on Linux, Docker or Apple Container on macOS).
+
+```bash
+git clone https://github.com/phildougherty/ironclaw
+cd ironclaw
+cargo build --release --workspace
+```
+
+The three binaries land in `target/release/`. Add them to your PATH
+or run `./install.sh` from the checkout — it'll detect the local
+build and install to `~/.local/bin`.
 
 ---
 
