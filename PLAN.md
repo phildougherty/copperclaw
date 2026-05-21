@@ -78,12 +78,12 @@ file paths that landed the change.
 
 | Metric | Value |
 | - | - |
-| `cargo test --workspace` | 4436 passing / 0 failing / 4 ignored |
+| `cargo test --workspace` | 4540 passing / 0 failing / 4 ignored |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | Channel crates | 21 |
 | In-tree tools the agent can call | 19 (15 messaging/scheduling/self-mod + 4 computer-use) |
 | Skill docs | 17 |
-| Latest milestone | M14 follow-up (skill content auto-loaded into system prompt) |
+| Latest milestone | M13 hardening slice (parallel-agent landing of Top 10 #1, #2, #3, #5, #6, #7, #8, #9, #10) |
 
 Older M-section "totals" lines are historical snapshots and will drift —
 trust the table above.
@@ -615,102 +615,178 @@ slice closes that gap.
 across `ironclaw-skills` (+7), `ironclaw-host` (+12), and
 `ironclaw-setup` (+1).
 
+### M13 hardening — parallel-agent Top 10 sweep
+
+Four worktree-isolated agents working in parallel landed nine of the
+ten "next" items in a single slice (`web_search` deliberately skipped
+per operator direction). Their outputs were merged sequentially after
+fixing a duplicate migration number (Agent A and Agent B both
+allocated `007_*`; Agent B's was renumbered to `008_*`) and a small
+cross-agent integration gap (`UpsertContainerConfig` grew three new
+fields under Agent A that Agent B's `mcp::add` path didn't know
+about).
+
+**Agent A — Container lifecycle hardening**
+
+- [x] **Image rebuild on `container_config` change** (Top 10 #1).
+  New `container_configs.config_fingerprint` sha256 column over the
+  rebuild-relevant fields (`packages_apt`, `packages_npm`, `skills`,
+  `mcp_servers`); manager diffs it pre-spawn and triggers a rebuild
+  via the M2 image-build machinery, persisting the new tag onto
+  `image_tag`. Closes the loop on `install_packages` /
+  `add_mcp_server` so the agent's own tools take effect on the
+  next spawn.
+- [x] **Container egress allow-list** (Top 10 #6). New
+  `container_configs.egress_allow` (JSON array of `host:port` pairs).
+  Default empty == allow-all (default-allow + opt-in lockdown). Docker
+  runtime applies via `--add-host` + a user-defined network; Apple
+  runtime surfaces as `Unsupported`. Plumbed through `ContainerSpec`.
+- [x] **Per-group resource caps** (Top 10 #8). New
+  `container_configs.resource_limits` JSON (`cpus`, `memory_mb`,
+  `pids_limit`; all optional). Docker runtime translates to
+  `--cpus`, `--memory`, `--pids-limit`. Apple runtime: best-effort
+  fall-through. New `iclaw groups config set-resource-limits` /
+  `set-egress-allow` subcommands.
+
+Migration `007_container_config_extensions.sql` adds the three
+columns. Audit log captures the new mutation commands.
+
+**Agent B — Operator iclaw commands**
+
+- [x] **Central DB backup / restore** (Top 10 #5). `iclaw db backup
+  <path>` runs `PRAGMA wal_checkpoint(TRUNCATE)` then writes a
+  temp file + atomic `rename`. `iclaw db restore <path>` refuses
+  with `host_running` when the host is up (the central DB has an
+  open writer; you can't safely swap it). Both commands route
+  through the iclaw socket and write `audit_log` rows; both are in
+  `HOST_ONLY_COMMANDS`.
+- [x] **Outbound dead-letter replay** (Top 10 #7). New
+  `outbound_dropped_messages` table (migration `008_*` after
+  renumbering — see merge note above). Delivery loop writes a
+  dead-letter row when an outbound exhausts its retries. New
+  commands `iclaw dropped-messages outbound-list --since <window>
+  --limit N` and `iclaw dropped-messages replay <id>`. `replay`
+  fetches the dead-letter, opens the per-session `outbound.db`,
+  inserts a fresh `WriteOutbound`, and deletes the dead-letter row
+  so the delivery loop picks it up again. `parse_since` accepts
+  ISO-8601 or relative shorthands (`24h`, `30m`, `7d`).
+- [x] **MCP server registry + first-class iclaw subcommand**
+  (Top 10 #3). Curated preset library (`postgres`, `linear`,
+  `github`, `notion`, `filesystem`, `browserbase`) shipped as a
+  static `McpPreset` const array. `iclaw mcp list-presets`
+  (no-socket; pure local catalog) and `iclaw mcp add <preset>
+  --agent-group-id <id> [--env KEY=VAL]...` merge the chosen
+  preset into `container_configs.mcp_servers` (JSON object keyed
+  by server name). Audited mutation.
+
+**Agent C — Sender approval notifications in-channel**
+
+- [x] **Approval notifications** (Top 10 #2). `ApprovalsModule`
+  grew `with_new_pending_notifier`; the boot wiring builds a
+  closure that (a) checks `unregistered_senders` to de-dup, (b)
+  resolves the agent group's primary messaging group, and (c)
+  dispatches a plain-ASCII notification via the existing
+  `DeliveryDispatcher`. Notification text: `Unknown sender pending
+  approval. Run: iclaw approvals approve --channel <ct> --identity
+  <id>` plus a small structured block (channel / identity /
+  display name / first contact). Silently no-ops when the group
+  has no messaging group attached. `pending_sender_approvals::
+  upsert` was updated to return `(row, newly_inserted)` and a new
+  `exists_for` helper added; both wired but the dedup actually
+  uses `unregistered_senders` which is the right source of truth.
+
+**Agent D — Observability**
+
+- [x] **Prometheus metrics endpoint** (Top 10 #9). New
+  `ironclaw-metrics` crate. Opt-in via `IRONCLAW_METRICS_ADDR=
+  127.0.0.1:9090` (bare port auto-prefixed to `127.0.0.1:`); off
+  by default per the conservative-defaults tenet. Counters:
+  `ironclaw_messages_inbound_total{channel_type}`,
+  `ironclaw_messages_outbound_total{channel_type}`,
+  `ironclaw_containers_spawned_total`,
+  `ironclaw_containers_crashed_total`,
+  `ironclaw_delivery_failed_total{channel_type}`. Histograms:
+  `ironclaw_llm_call_seconds`, `ironclaw_llm_tokens_input`,
+  `ironclaw_llm_tokens_output`, `ironclaw_container_spawn_seconds`.
+  Hand-rolled `tokio::net::TcpListener` accept-loop, no axum/warp.
+  Bumps live in router (inbound after DB write), delivery (outbound
+  on success + final-failure), container manager (spawn success +
+  CrashRestart), and runner (LLM call timing/tokens after
+  `run_llm_turn`).
+- [x] **Log rotation** (Top 10 #10). `tracing-appender::rolling`
+  daily file writer wired into the host's main, opt-in via
+  `IRONCLAW_LOG_DIR=<path>` (default off; stderr-only behaviour
+  unchanged). Pinned versions: `tracing-appender = "0.2"`,
+  `metrics = "0.24"`, `metrics-exporter-prometheus = "0.16"`.
+
+**Slice totals**: 4436 → 4540 passing (+104 tests). 0 failing.
+Clippy clean. New crate: `ironclaw-metrics`. New migrations:
+`007_container_config_extensions`, `008_outbound_dropped_messages`.
+New iclaw subcommands: `db backup/restore`, `dropped-messages
+outbound-list/replay`, `mcp list-presets/add`, `groups config
+set-resource-limits/set-egress-allow`.
+
 ---
 
-## Top 10 next things to address
+## Next things to address
 
-Ranked by impact × leverage given the current state. Each item
-links to the M-section that owns it.
+Nine of the previous Top 10 landed in the M13-hardening parallel-agent
+slice above. The remaining items, ranked by impact × leverage:
 
-1. **Image rebuild on `container_config` change**. The
-   agent already has `install_packages` and `add_mcp_server`
-   as tools, but invoking them today writes to
-   `container_configs` and then nothing happens until an
-   operator manually rebuilds. Manager should fingerprint
-   `container_configs` per-group and rebuild on diff. Closes
-   the loop on user-extensible agents. _(M13)_
+1. **`web_search` tool** (Brave or Tavily). `web_fetch` gives the
+   agent a URL → body pipe, but it can't *find* URLs. Search
+   closes the gap; without it the agent either has to guess URLs
+   or ask the user. One new tool in `tools/computer_use.rs`, one
+   env-var-configured API key. _(M14 follow-up — deferred per
+   operator direction)_
 
-2. **Approval notifications in-channel**. When a new sender
-   lands in pending, the operator can't see it without
-   running `iclaw approvals list`. Post a deliverable
-   "approve?" card to the agent group's primary channel
-   when an unknown sender is dropped. _(M13 sender approval)_
+2. **Secret rotation without restart**. Rotating
+   `ANTHROPIC_API_KEY` today requires restarting the host so
+   the spawned containers pick up the new env. A SIGHUP handler
+   that rereads `.env` and re-emits to running containers is
+   the minimum viable change. _(M13 security)_
 
-3. **MCP server registry + first-class iclaw subcommand**.
-   `add_mcp_server` exists as a tool the agent can call, but
-   the operator-facing path (`iclaw groups config
-   add-mcp-server …`) is undocumented and the schema is
-   freeform JSON. Document a small library of curated MCP
-   servers (Postgres, Linear, GitHub, Notion, Filesystem,
-   Browserbase) and ship a `iclaw mcp add <preset>`
-   shortcut that wires the right config. The "easy
-   expansion path" the project promises. _(new)_
+3. **Webhooks TLS termination story**. Every webhook channel
+   binds plain HTTP on `127.0.0.1` by default. Production
+   deployments need either native TLS (rustls) or documented
+   reverse-proxy patterns (Caddy / nginx / Cloudflare Tunnel)
+   per channel. Pick one and ship it. _(M13 security)_
 
-4. **`web_search` tool** (Brave or Tavily). `web_fetch`
-   gives the agent a URL → body pipe, but it can't *find*
-   URLs. Search closes the gap; without it the agent
-   either has to guess URLs or ask the user. One new tool
-   in `tools/computer_use.rs`, one env-var-configured API
-   key. _(M14 follow-up)_
+4. **Host-side rate limiting**. Per-group max LLM calls per
+   minute / hour. LLM 429s already retry with `Retry-After`,
+   but the host-side cap is missing — partially covered by
+   budgets, but a separate guard against runaway loops. _(M13
+   cost/safety)_
 
-5. **Central DB backup / restore**. `iclaw db backup
-   <path>` (WAL checkpoint + file copy) and `iclaw db
-   restore <path>` (atomic swap). The central DB is one
-   SQLite file holding every group, wiring, audit row, and
-   token-usage record — a disk corruption today loses
-   everything. _(M13 reliability)_
+5. **Replay-fixture harness implementation** (M11 acceptance
+   gate). Design is in `docs/replay-fixtures.md`. Implement the
+   in-process harness against `Fixture::load` /
+   `ReplayHarness::{boot_host, run, compare}` plus a first
+   captured fixture. _(M11)_
 
-6. **Container egress allow-list**. With `web_fetch`
-   landed, an agent can reach any URL on the open
-   internet. Per-group `container_configs.egress_allow`
-   (host:port allow-list) translated to Docker network
-   policy at spawn. Default-deny would be the OpenBSD
-   move, but default-allow + opt-in lockdown is more
-   practical. _(M13 security)_
+6. **Release 0.1.0**. Cut the tag, bump
+   `workspace.package.version`, publish release notes from
+   `CHANGELOG.md`. The candidate status in README is the
+   honest one until this lands. _(M11)_
 
-7. **Outbound dead-letter replay**. `iclaw health` shows
-   the dropped-message count, but operators can't inspect
-   *what* dropped or retry. Add `iclaw dropped-messages
-   list --since <window>` (already exists for inbound;
-   extend to outbound failures) and `iclaw
-   dropped-messages replay <id>`. _(M13 reliability)_
+7. **Bugfix: double `sessions/sessions/` path layout**. Host
+   code uses `FsSessionRoot::new(cfg.sessions_root())` which
+   produces `data_dir/sessions/sessions/<ag>/<session>` — fine
+   but weird. Pick one (likely just
+   `data_dir/sessions/<ag>/<session>`) and migrate. The
+   container manager already has a comment documenting the
+   workaround. _(M13 cleanup)_
 
-8. **Per-group resource caps**. `ContainerSpec` doesn't
-   carry cpu / memory / pids / network limits. A runaway
-   agent can starve the host. Add
-   `container_configs.resource_limits` JSON, apply at
-   spawn via Docker's `--cpus`, `--memory`, `--pids-limit`.
-   The bounded-blast-radius story is incomplete without
-   this. _(M13 container lifecycle)_
+8. **Versioned migrations**. `ironclaw migrate` already runs the
+   central migrations but there's no schema-version table the
+   host can check on boot to refuse a downgrade or warn about
+   an in-progress upgrade. _(M13 reliability)_
 
-9. **Prometheus metrics endpoint**. Counters for
-    `messages_inbound_total`, `messages_outbound_total`,
-    `containers_spawned_total`, `containers_crashed_total`,
-    `delivery_failed_total`; histograms for
-    `llm_call_seconds`, `llm_tokens_input`,
-    `llm_tokens_output`, `container_spawn_seconds`.
-    Reuse the data `iclaw health` already collects. Off by
-    default; opt in via `IRONCLAW_METRICS_ADDR=127.0.0.1:9090`.
-    _(M13 observability)_
-
-10. **Log rotation**. `chat.log` and `host.log` grow unbounded
-    when ironclaw runs as a long-lived daemon. Either ship a
-    recommended logrotate config in `docs/` or switch to
-    `tracing-appender::rolling`. Cheap, prevents a slow
-    disk-fill in real deployments. _(M13 observability)_
-
-Honorable mentions that didn't make the cut:
-
-- **Secret rotation without restart** (SIGHUP handler;
-  niche, can document the manual restart for now).
-- **Webhooks TLS termination** (most users deploy behind a
-  reverse proxy already; can document the recommended
-  Caddy/Cloudflare-Tunnel pattern).
-- **Rate limiting** (LLM 429s already retry with
-  `Retry-After`; explicit host-side cap is mainly a cost
-  guard, partially covered by budgets).
-- **Bugfix: double `sessions/sessions/` path** (cosmetic;
-  container manager has the workaround documented).
+9. **Budget-exhausted notification to original sender**. The
+   budget gate refuses to spawn when over-cap but the
+   inbound sender is left in the dark. Surface a
+   "budget exhausted; try again after UTC midnight" reply
+   on the originating channel. _(M13 cost/safety)_
 
 ---
 
