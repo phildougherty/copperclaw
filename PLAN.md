@@ -8,6 +8,67 @@
 
 ---
 
+## Project tenets — "OpenBSD of claw agents"
+
+Ironclaw's defining posture is the OpenBSD playbook applied to agent
+runtimes. Every operational decision in M13 onwards is judged against
+these invariants. They are not aspirations; a PR that violates one is
+not landing.
+
+1. **No stubs in tree.** A half-implemented adapter is worse than no
+   adapter — it lies to the registry and fails at message time. If a
+   crate can't be finished, it gets deleted (whatsapp native crate,
+   M12). The "no stubs" rule is what made the workspace ~7600 LOC
+   smaller and made the chat loop possible to debug.
+2. **Secure-by-default, public-by-deliberate-act.** Every webhook
+   binds `127.0.0.1` unless the operator explicitly chooses
+   otherwise. The cli channel pre-approves only the literal local
+   sender. The `.env` is `0o600`. The host writes tracing to
+   stderr so log capture never contaminates the data path. Add
+   capabilities, never default to them.
+3. **One process, single binary.** `ironclaw` is the host;
+   `ironclaw-runner` runs inside containers; `iclaw` is the admin
+   client. No daemons-spawning-daemons. No optional foreground /
+   background mode flags. Setup writes one `.env` and one
+   service-unit and that's the deploy surface.
+4. **Documentation is a deliverable.** Every crate's `lib.rs`
+   doc-string explains what the crate does, what its inputs are,
+   and what the error paths mean. Every command in `iclaw` has
+   `--help` text written for an operator, not a developer. The
+   bar is OpenSSH's man pages, not "auto-generated from docstrings".
+5. **Conservative defaults.** Idle-stop timeout: minutes, not
+   hours. Retry cap: 3, not infinity. Token / cost budget: opt-in
+   capped, not unlimited. Rate limit: present even when low.
+   Surprises always cost money.
+6. **Audit everything that mutates.** Every iclaw socket call
+   that writes — `groups.create`, `wirings.create`, etc. — lands
+   in an `audit_log` table with caller, command, args, and
+   result. Read paths excluded. The host can be forensically
+   reconstructed from the log + the central DB snapshot.
+7. **Reproducible builds.** Image fingerprints include the
+   runner binary bytes. Same source → same sha-tag → same
+   deployable artifact. No "latest" tags, no float, no
+   yesterday's image silently running today.
+8. **Pinned upstreams.** Workspace deps are version-pinned in
+   `Cargo.toml`. `Cargo.lock` is checked in. CI runs
+   `cargo deny` against an explicit allow-list of licenses + a
+   block-list of yanked / unmaintained crates.
+9. **Signed releases.** Every release tag is GPG-signed. The
+   `release-checklist.md` includes the signing step; CI verifies
+   the tag's signature before publishing artifacts.
+10. **Errors over silent fallback.** A misconfigured channel
+    fails loudly at boot — it does not silently disable itself.
+    A bad webhook signature returns 401 — it does not silently
+    accept. An unknown sender goes to a pending queue — it is
+    not silently routed. Operators learn fast or not at all.
+
+The 0.1.0 release ships when M13 is checked through and the
+remaining items in M11 (replay-fixture harness, 0.1.0 tag) are
+shipped. Until then the README's "candidate" status is the
+honest one.
+
+---
+
 ## Progress
 
 Tick boxes as work completes. Each tick should reference the commit or
@@ -175,6 +236,243 @@ These items closed open stubs and added coverage the earlier milestones had expl
 - [x] **Telegram + Deltachat attachment downloads** — flipped both channels from `MessageKind::System` placeholders to real downloads. Telegram adds `get_file` + binary stream + `attachment_download` (default true) / `max_attachment_bytes` (default 20 MB) config knobs (+42 tests → 162). Deltachat calls `download_full_msg` when `download_state != "Done"`, then `stat` + `open`-verifies the blob (with optional `blob_dir` override) and surfaces the resolved path under `content.attachment.bytes_path` (+24 tests → 165). Oversized / auth-failure / network-failure paths demote to `System` with a captured reason.
 
 **Hardening totals (this slice):** ~165 new tests across 6 deliverables. Workspace **4564 passing tests, 4 ignored, 0 failures**. Clippy clean on `cargo clippy --workspace --all-targets -- -D warnings`.
+
+### M12 — Local-chat slice (this slice; closes the round-trip)
+
+The end-to-end chat path was never wired in M0–M11: every layer
+shipped tested in isolation but nothing connected `inbound.db` to a
+running container that called the provider. M12 closes that gap and
+the cosmetic follow-ups it surfaced.
+
+- [x] **Native whatsapp crate removed.** The previous `StubBackend`
+  → `DalekBackend` migration left an adapter whose `deliver` still
+  returned `Unsupported` until the Signal-Protocol session layer
+  above the primitives was built. Per the project invariant of
+  "no stubs in tree", the whole crate (~7.6k LOC, ~384 tests) was
+  removed. `whatsapp-cloud` (Meta Cloud Business API) remains as
+  the supported WhatsApp path.
+- [x] **OpenRouter / Anthropic-compatible providers.** Added
+  `api_base_url` to `RunnerConfigFile`/`RunnerConfig`,
+  `ANTHROPIC_BASE_URL` env-var passthrough in
+  `AnthropicProvider::with_base_url`, and a trailing-`/v1` strip
+  so users can paste `https://openrouter.ai/api/v1` verbatim.
+- [x] **Setup writes a complete `.env`.** Auth step now persists
+  `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`,
+  `IRONCLAW_DATA_DIR`, `ICLAW_SOCKET`, and the
+  `IRONCLAW_DEFAULT_IMAGE_TAG` from the image build step. Host
+  auto-loads `.env` from the platform install root before falling
+  back to CWD-dotenv, so `ironclaw run` works from any cwd.
+- [x] **Container manager** — new `ironclaw_host::container_manager`
+  module. Polls `sessions` every 1s; for any row with
+  `container_status='stopped'` and `messages_in.count_due > 0`,
+  writes a `runner.json` (mirrored `RunnerConfigFile` schema) into
+  the session dir and calls `runtime.spawn` with the right env /
+  bind / labels / entrypoint. 6 unit tests + a `NoopRuntime`
+  `spawn_calls()` introspection helper.
+- [x] **Image bakes the runner binary.** Setup's image step finds
+  `ironclaw-runner` next to its own exe (or via
+  `IRONCLAW_RUNNER_BIN` / `PATH`) and copies it into the image at
+  `/usr/local/bin/ironclaw-runner`. Image fingerprint includes
+  the binary bytes, so re-cargo-build → re-image-build is
+  automatic.
+- [x] **Router seeds `session_routing`.** On session create the
+  router now writes `(channel_type, platform_id, thread_id)` from
+  the inbound event into the per-session `session_routing` table.
+  Without this the delivery loop marked every outbound `NoRoute`
+  because the runner emits text with no explicit destination.
+- [x] **`ApprovalsModule` pre-seeded with `cli:local`.** The cli
+  channel's only sender is the operator running `ironclaw run`,
+  not a remote identity that warrants approval. Boot now
+  constructs `ApprovalsModule::with_initial_approved` with the
+  `cli:local` identity baked in; everything else still flows
+  through the unregistered-sender gate.
+- [x] **Stale `container_status=running` reset on boot.** After
+  `cleanup_orphans` removes leftover containers from a prior run,
+  the host now walks `sessions::list_running` and resets each to
+  `stopped` so the manager respawns them. Without this, sessions
+  that were running when the host died sat un-handled forever.
+- [x] **Runner opens `inbound.db` RW.** The poll loop calls
+  `messages_in::mark_completed` (an UPDATE) after every turn, but
+  the runner was opening inbound via the RO `open_inbound_ro_no_mmap`
+  helper, so the update silently no-op'd and the same message was
+  reprocessed every poll. Added a sibling `open_inbound_rw_no_mmap`
+  (same no-mmap WAL avoidance, RW) and switched the runner's
+  `main.rs` to use it.
+
+**Verified live** against OpenRouter from this host:
+
+    > What's the capital of France? One word only.
+    agent> Paris
+
+    > Reply with just a haiku about containers.
+    agent> Boxes hold the world,
+           Isolated, yet deployed—
+           Code sails everywhere.
+
+Each prompt produced exactly one reply; the inbound rows were
+marked `completed`; the same session container served every turn.
+
+**Slice totals:** 4365 passing, 0 failing. Clippy clean. The drop
+from 4564 → 4365 is the whatsapp crate removal; the rest of the
+workspace gained ~185 tests across the manager + provider + setup
+changes.
+
+### M13 — Operational hardening (TODO)
+
+End-to-end chat works, but standing up a production install
+exposes gaps the earlier milestones never touched. Items in this
+slice are required before a 0.1.0 release feels honest.
+
+#### Container lifecycle
+
+- [ ] **Idle-stop**. Sessions keep their container running until
+  host shutdown. Need a configurable idle window (default 5 min)
+  after which the manager calls `runtime.stop(name, grace)` and
+  flips `container_status=idle`. Next inbound respawns.
+- [ ] **Crash-restart**. When a container exits non-zero outside
+  the idle path, the manager should detect (via the heartbeat
+  file's missing/stale mtime, which sweep already surfaces as
+  `heartbeat_stale`) and respawn after backoff.
+- [ ] **Sweep ↔ manager wiring**. Sweep's `SweepReport` already
+  carries `heartbeat_stale` counts but nothing acts on them. Wire
+  sweep to mark stale sessions back to `stopped` so the manager
+  picks them up.
+- [ ] **Per-group resource caps**. `ContainerSpec` doesn't carry
+  cpu / memory / pids / network limits. Add them, plumb through
+  `container_configs.resource_limits` JSON, and apply at spawn.
+- [ ] **Image rebuild on `container_config` change**. When a user
+  updates `container_configs.packages_apt` or
+  `container_configs.skills`, the manager should rebuild that
+  group's image before the next spawn rather than reusing the
+  default sha-tagged image.
+
+#### Observability
+
+- [ ] **`iclaw health` / `/healthz`**. One-shot status: host
+  uptime, image tag, n running containers, n active sessions,
+  last delivery error timestamp, last provider error timestamp.
+  Either a new `iclaw` subcommand or a Unix-socket admin verb;
+  the existing `iclaw status` is a list view, not a health
+  probe.
+- [ ] **Prometheus metrics endpoint**. Counters for
+  `messages_inbound_total`, `messages_outbound_total`,
+  `containers_spawned_total`, `containers_crashed_total`,
+  `delivery_failed_total`; histograms for
+  `llm_call_seconds`, `llm_tokens_input`, `llm_tokens_output`,
+  `container_spawn_seconds`. Optional bind, default off.
+- [ ] **Log rotation**. `chat.log` and `host.log` grow unbounded
+  when ironclaw is run as a long-lived daemon; setup's systemd /
+  launchd units don't currently wire up logrotate or
+  size-capping. Either document the recommended logrotate config
+  or use `tracing-appender::rolling`.
+- [ ] **Audit log of iclaw socket actions**. Every mutation
+  (`groups.create`, `messaging-groups.upsert`, `wirings.create`,
+  etc.) lands in a new `audit_log` table with caller, command,
+  args, and result. Read-paths excluded.
+
+#### Cost and safety
+
+- [ ] **Token accounting**. The runner already sees Anthropic's
+  `usage.input_tokens`/`usage.output_tokens` per turn — record
+  them in a new `agent_turns` table keyed by session + sequence.
+  Required for any per-group budget.
+- [ ] **Per-group budgets**. `container_configs.daily_token_cap`
+  and `daily_cost_cap_usd`; manager refuses to spawn when budget
+  is exhausted and surfaces a "budget exhausted" `System` row on
+  the next inbound.
+- [ ] **Rate limiting**. Per-group max LLM calls per minute /
+  hour. Manager throttles spawn rate; runner backs off on 429
+  with `Retry-After` (already wired) but the host-side cap is
+  missing.
+
+#### Sender approval
+
+- [ ] **`iclaw approvals approve/deny <id>`**. Today the
+  `ApprovalsModule` keeps an in-memory `known_senders` list with
+  no CLI surface. New users can never be approved without a host
+  restart that pre-seeds them. Wire the iclaw approvals
+  subcommand to mutate the module's in-memory list AND persist
+  to the existing `pending_sender_approvals` /
+  `pending_channel_approvals` tables.
+- [ ] **Persist `known_senders` across restarts**. The module
+  loses its in-memory approvals when the host process restarts.
+  Source-of-truth should be the central `users` table (queried
+  on each gate evaluation) rather than a Mutex<Vec>.
+- [ ] **Approval notifications**. When a sender lands in
+  `pending` state, post a deliverable "approve?" prompt through
+  the original messaging group so the operator can decide
+  in-channel.
+
+#### Reliability
+
+- [ ] **Outbound dead-letter**. After 3 retries the delivery
+  loop marks an outbound row `failed` and moves on. Need a
+  `dropped_messages` flow (table already exists) so an operator
+  can replay or inspect failures.
+- [ ] **Central DB backup / restore**. `iclaw db backup <path>`
+  + `iclaw db restore <path>`. The central DB is single-file
+  SQLite; a backup is a copy under a held WAL checkpoint.
+- [ ] **Versioned migrations**. `ironclaw migrate` already
+  runs the central migrations but there's no
+  schema-version table the host can check on boot to refuse a
+  downgrade or warn about an in-progress upgrade.
+
+#### Security
+
+- [ ] **Webhooks TLS termination story**. Every webhook channel
+  binds plain HTTP on `127.0.0.1` by default. Production
+  deployments need either native TLS (rustls) or documented
+  reverse-proxy patterns (Caddy / nginx / Cloudflare Tunnel)
+  per channel. Pick one and ship it.
+- [ ] **Secret rotation without restart**. Rotating
+  `ANTHROPIC_API_KEY` today requires restarting the host so the
+  spawned containers pick up the new env. A SIGHUP handler that
+  rereads `.env` and re-emits to running containers is the
+  minimum viable change.
+- [ ] **Container egress allow-list**. Spawned containers can
+  reach the whole internet via the host's network. Add a
+  `container_configs.egress_allow` list (set of host:port pairs)
+  the manager translates into `--add-host` and an in-container
+  iptables / nftables rule, or use Docker's network policy
+  flags.
+
+#### Setup polish
+
+- [ ] **OpenRouter as a first-class provider in setup**. Today
+  the user has to know to set `ANTHROPIC_BASE_URL` themselves.
+  Setup should ask "which provider?" with OpenRouter / native
+  Anthropic / corporate proxy as choices and write the right
+  base URL.
+- [ ] **systemd `Restart=on-failure`** in the generated unit, plus
+  a `User=` directive matching the install owner. Today the unit
+  emits the command line but not the restart policy.
+- [ ] **`iclaw chat` shell**. The user-facing chat UX is "echo
+  into a FIFO + tail a log" — fine for piping but not a real
+  REPL. A small `iclaw chat` subcommand that opens the socket,
+  binds to the install's cli channel, and shows replies inline
+  would close the loop.
+
+#### Bugs to clean up
+
+- [ ] **Double `sessions/sessions/` path layout**. Host code uses
+  `FsSessionRoot::new(cfg.sessions_root())` which produces
+  `data_dir/sessions/sessions/<ag>/<session>` — fine but weird.
+  Pick one (likely just `data_dir/sessions/<ag>/<session>`) and
+  migrate. Container manager already has a comment explaining the
+  workaround.
+- [ ] **`base_url_does_not_strip_v1_in_the_middle_of_the_path`
+  edge case**. Provider strips a trailing `/v1` but a user
+  base URL like `https://corp.example/v1` followed by tenant
+  segments wouldn't trip the heuristic. Document the rule or
+  switch to an explicit `--api-base-no-suffix-append` mode.
+- [ ] **Heartbeat-stale detection is logged but not acted on**.
+  `sweep_report.heartbeat_stale > 0` is a clear signal a runner
+  has died — wire it through to the manager (see "Crash-restart"
+  above).
+- [ ] **PLAN.md test counts diverge from `cargo test --workspace`**.
+  Snapshots in M-section progress lines are written-once and
+  drift fast. Move the count to a single line near the top that's
+  the only spot that needs an update per slice.
 
 ---
 
