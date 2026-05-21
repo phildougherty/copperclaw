@@ -82,7 +82,48 @@ approvals, and an `iclaw chat` REPL.
   `agent> 56`, `iclaw usage` recorded 7787 input + 7 output
   tokens.
 
-## Build
+## Install
+
+One command, on Linux or macOS:
+
+```
+curl -fsSL https://raw.githubusercontent.com/phildougherty/ironclaw/main/install.sh | bash
+```
+
+What it does:
+
+1. Detects your platform (Linux x86_64 / aarch64, macOS arm64 / x86_64).
+2. Checks for Docker or Podman (it won't install one for you — that's
+   too invasive — but it'll tell you exactly what to install).
+3. Installs the `ironclaw`, `iclaw`, and `ironclaw-setup` binaries to
+   `~/.local/bin`. Prefers a prebuilt release tarball; falls back to
+   `cargo install --git` (requires the Rust toolchain) or, if you're
+   running it from a checkout, `cargo install --path`.
+4. Launches `ironclaw-setup` to walk you through provider credentials,
+   the data directory, and the first channel.
+
+Re-running is safe — it detects an existing install and offers to
+upgrade, skip, or resume setup. Useful environment overrides:
+
+```
+IRONCLAW_REPO=owner/fork                 # pull from a fork
+IRONCLAW_INSTALL_DIR=$HOME/.local/bin    # where binaries land
+IRONCLAW_RELEASE_TAG=v0.2.0              # pin a specific release
+IRONCLAW_SKIP_SETUP=1                    # install binaries only
+IRONCLAW_SETUP_HEADLESS=1                # pass --headless to setup
+```
+
+Windows is supported via WSL2 — run the same one-liner inside your
+WSL shell.
+
+After install:
+
+```
+ironclaw run             # in one terminal
+iclaw chat               # in another
+```
+
+### Manual install
 
 Requires Rust 1.85+ (pinned via `rust-toolchain.toml`).
 
@@ -97,7 +138,7 @@ The release artifacts are:
 - `target/release/iclaw` — admin client.
 - `target/release/ironclaw-setup` — interactive setup helper.
 
-## Quick start
+Then, from a fresh box:
 
 ```
 # First-time setup walks every step with defaults you can override.

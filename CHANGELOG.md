@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- One-command installer at `install.sh`: detects platform (Linux
+  x86_64/aarch64, macOS arm64/x86_64), verifies Docker or Podman is
+  reachable, then installs `ironclaw`, `iclaw`, and `ironclaw-setup`
+  to `~/.local/bin` — preferring a prebuilt release tarball, falling
+  back to `cargo install --git`, and finally `cargo install --path`
+  when run inside a checkout. Re-running detects an existing install
+  and offers upgrade/skip; setup state is resumed in place. Respects
+  `NO_COLOR`, non-tty stdout, and quiets verbose output unless
+  something fails.
+- README "Install" section now leads with the one-liner; the
+  longstanding `cargo build` instructions move under a "Manual install"
+  subsection.
 - Initial Rust workspace with 16 crates across the host, runner,
   providers, MCP server, modules, skills, container runtime, OneCLI
   gateway, iclaw admin client, and interactive setup.
