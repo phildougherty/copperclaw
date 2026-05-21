@@ -365,10 +365,16 @@ impl DeliveryService {
                 .await;
             self.inflight.remove(&key);
 
+            let channel_label = row
+                .channel_type
+                .as_ref()
+                .map_or_else(|| "unknown".to_owned(), |ct| ct.as_str().to_owned());
+
             match result {
                 Ok(()) => {
                     self.retries.remove(&key);
                     report.delivered += 1;
+                    ironclaw_metrics::inc_messages_outbound(&channel_label);
                 }
                 Err(err) if err.is_retryable() => {
                     let outcome = self.bump_retry(&key);
@@ -382,6 +388,7 @@ impl DeliveryService {
                             delivered::insert(&in_conn, row.id, None, "failed")?;
                             self.retries.remove(&key);
                             report.failed += 1;
+                            ironclaw_metrics::inc_delivery_failed(&channel_label);
                             warn!(?err, ?row.id, "exhausted retry budget, marking failed");
                         }
                     }
@@ -393,6 +400,7 @@ impl DeliveryService {
                     delivered::insert(&in_conn, row.id, None, "failed")?;
                     self.retries.remove(&key);
                     report.failed += 1;
+                    ironclaw_metrics::inc_delivery_failed(&channel_label);
                     warn!(reason, ?row.id, "system action failed");
                 }
                 Err(DeliveryError::NoAdapter(ct)) => {
@@ -405,6 +413,7 @@ impl DeliveryService {
                     delivered::insert(&in_conn, row.id, None, "failed")?;
                     self.retries.remove(&key);
                     report.failed += 1;
+                    ironclaw_metrics::inc_delivery_failed(&channel_label);
                     warn!(?row.id, "no route resolvable, marking failed");
                 }
                 Err(err) => {
@@ -413,6 +422,7 @@ impl DeliveryService {
                     delivered::insert(&in_conn, row.id, None, "failed")?;
                     self.retries.remove(&key);
                     report.failed += 1;
+                    ironclaw_metrics::inc_delivery_failed(&channel_label);
                     warn!(?err, ?row.id, "non-retryable failure, marking failed");
                 }
             }

@@ -266,6 +266,7 @@ impl ContainerManager {
                 let _ = self.runtime.remove(&name).await;
                 sessions::mark_container_stopped(&self.central, session.id)
                     .map_err(ManagerError::Db)?;
+                ironclaw_metrics::inc_containers_crashed();
                 warn!(
                     session = %session.id.as_uuid(),
                     "heartbeat stale; running → stopped (will respawn)"
@@ -343,12 +344,16 @@ impl ContainerManager {
         // crash-restart the new spawn before its runner could write
         // its first heartbeat.
         let _ = std::fs::remove_file(&paths.heartbeat);
+        let spawn_started = std::time::Instant::now();
         let handle = self
             .runtime
             .spawn(spec)
             .await
             .map_err(ManagerError::Spawn)?;
+        let spawn_elapsed = spawn_started.elapsed().as_secs_f64();
         sessions::mark_container_running(&self.central, session.id).map_err(ManagerError::Db)?;
+        ironclaw_metrics::inc_containers_spawned();
+        ironclaw_metrics::observe_container_spawn_seconds(spawn_elapsed);
         info!(
             session = %session.id.as_uuid(),
             container = %handle.id,

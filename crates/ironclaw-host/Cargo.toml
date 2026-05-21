@@ -45,11 +45,13 @@ ironclaw-channels-x        = { workspace = true }
 ironclaw-modules       = { workspace = true }
 ironclaw-skills        = { workspace = true }
 ironclaw-onecli        = { workspace = true }
+ironclaw-metrics       = { workspace = true }
 ironclaw-iclaw           = { path = "../ironclaw-iclaw" }
 tokio                  = { workspace = true }
 tokio-util             = "0.7"
 tracing                = { workspace = true }
 tracing-subscriber     = { workspace = true }
+tracing-appender       = { workspace = true }
 anyhow                 = { workspace = true }
 clap                   = { workspace = true }
 dotenvy                = { workspace = true }
