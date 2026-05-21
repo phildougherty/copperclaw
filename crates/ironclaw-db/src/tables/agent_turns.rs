@@ -108,6 +108,28 @@ pub fn rollup_since(
     Ok(rows)
 }
 
+/// Count LLM-call rows for `agent_group_id` since `since`.
+/// Used by the container manager to enforce per-minute and per-hour
+/// spawn-rate caps without pulling the full token history.
+pub fn turns_since(
+    db: &CentralDb,
+    agent_group_id: &str,
+    since: DateTime<Utc>,
+) -> Result<i64, DbError> {
+    let conn = db.conn()?;
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM agent_turns
+             WHERE agent_group_id = ?1 AND ended_at >= ?2",
+            params![agent_group_id, since.to_rfc3339()],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    Ok(n)
+}
+
 /// Sum input + output tokens for `agent_group_id` since `since`.
 /// Used by the container manager to enforce daily budgets without
 /// pulling the full per-row history.
@@ -230,6 +252,27 @@ mod tests {
             rollup_since(&db, Utc::now() - chrono::Duration::hours(24)).unwrap();
         assert_eq!(rollups.len(), 1);
         assert_eq!(rollups[0].agent_group_id, "ag-recent");
+    }
+
+    #[test]
+    fn turns_since_counts_correctly() {
+        let db = CentralDb::open_in_memory().unwrap();
+        // Two recent turns for ag-1, one old turn.
+        insert(&db, &turn("ag-1", 10, 20)).unwrap();
+        insert(&db, &turn("ag-1", 30, 40)).unwrap();
+        let mut old = turn("ag-1", 5, 5);
+        old.started_at = Utc::now() - chrono::Duration::hours(2);
+        old.ended_at = Utc::now() - chrono::Duration::hours(2);
+        insert(&db, &old).unwrap();
+        // With a 1-hour window only the two recent turns count.
+        let count =
+            turns_since(&db, "ag-1", Utc::now() - chrono::Duration::hours(1)).unwrap();
+        assert_eq!(count, 2);
+        // Other group not counted.
+        insert(&db, &turn("ag-2", 1, 1)).unwrap();
+        let count2 =
+            turns_since(&db, "ag-2", Utc::now() - chrono::Duration::hours(1)).unwrap();
+        assert_eq!(count2, 1);
     }
 
     #[test]

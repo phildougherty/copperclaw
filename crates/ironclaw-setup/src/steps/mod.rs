@@ -14,6 +14,7 @@ pub mod auth;
 pub mod central_db;
 pub mod channel;
 pub mod cli_agent;
+pub mod quickstart_group;
 pub mod data_dir;
 pub mod env_check;
 pub mod first_chat;
@@ -114,6 +115,7 @@ pub fn all_steps() -> Vec<BoxedStep> {
         Box::new(timezone::TimezoneStep),
         Box::new(channel::ChannelStep),
         Box::new(verify::VerifyStep),
+        Box::new(quickstart_group::QuickstartGroupStep),
         Box::new(first_chat::FirstChatStep),
     ]
 }
@@ -185,7 +187,7 @@ mod tests {
     }
 
     #[test]
-    fn all_steps_has_thirteen_in_order() {
+    fn all_steps_run_in_canonical_order() {
         let names: Vec<&'static str> = all_steps().iter().map(|s| s.name()).collect();
         assert_eq!(
             names,
@@ -202,6 +204,7 @@ mod tests {
                 "timezone",
                 "channel",
                 "verify",
+                "quickstart_group",
                 "first_chat",
             ]
         );

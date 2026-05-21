@@ -78,12 +78,12 @@ file paths that landed the change.
 
 | Metric | Value |
 | - | - |
-| `cargo test --workspace` | 4416 passing / 0 failing / 4 ignored |
+| `cargo test --workspace` | 4634 passing / 0 failing / 4 ignored |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | Channel crates | 21 |
-| In-tree tools the agent can call | 19 (15 messaging/scheduling/self-mod + 4 computer-use) |
-| Skill docs | 17 |
-| Latest milestone | M14 (agent capability — tool wiring + computer-use) |
+| In-tree tools the agent can call | 20 (15 messaging/scheduling/self-mod + 4 computer-use + 1 multi-provider web search) |
+| Skill docs | 22 |
+| Latest milestone | Replay-fixture harness — M11 acceptance gate (in-process harness + first cli/text-reply fixture) |
 
 Older M-section "totals" lines are historical snapshots and will drift —
 trust the table above.
@@ -236,7 +236,7 @@ M8 totals (3 slices + tail): 2433 new tests across 15 channels (batch 1: 114 + 1
 - [x] Cutover docs — `docs/cutover.md` (preflight → quiesce → snapshot → migrate → verify → switch ingress → first-hour watch → rollback)
 - [x] Replay-fixture suite design — `docs/replay-fixtures.md` (fixture layout, harness internals, capture/redact workflow)
 - [x] Release-checklist + CI — `docs/release-checklist.md`; `.github/workflows/ci.yml` runs fmt + clippy + test on Linux/macOS with an 85% coverage gate; `CHANGELOG.md` seeded with the Keep-a-Changelog `[Unreleased]` section
-- [ ] Replay-fixture harness implementation + first captured fixture (the M11 acceptance gate — design is in-tree, in-process harness against `Fixture::load` / `ReplayHarness::{boot_host, run, compare}` still to be written)
+- [x] Replay-fixture harness implementation + first captured fixture (the M11 acceptance gate). In-process harness lives under `crates/ironclaw-host/tests/replay/` (`fixture.rs` + `diff.rs` + `harness.rs`); first fixture lives under `fixtures/cli/text-reply/`. Drives `Router::route` → in-process `run_loop` (with a wiremock-served Anthropic SSE stub) → `DeliveryService::process_session_once` → `MockAdapter::deliveries()`, then diffs the four captured JSONL streams (inbound-events / messages-in / messages-out / delivered) against `expected/*.jsonl` with manifest-driven regex substitutions for non-deterministic UUIDs and timestamps.
 - [ ] Release 0.1.0 (cut the tag, bump `workspace.package.version`, publish release notes from CHANGELOG)
 
 ### M11 — Post-M10 hardening (this slice)
@@ -580,107 +580,374 @@ container; nothing in that output came from training data.
 
 **Slice totals**: 4416 passing, 0 failing. Clippy clean.
 
+### M14 follow-up — Skill content auto-loaded into system prompt
+
+The agent shipped M14 with 19 tools wired through but a vanilla one-
+liner for a system prompt. The runner received the tool schemas but
+not the per-skill prose explaining when to reach for each one. This
+slice closes that gap.
+
+- [x] **`ironclaw-skills` exposes a body reader**. New
+  `frontmatter::skip_frontmatter(&str) -> &str` and
+  `registry::read_skill_body(&Skill) -> Result<String, _>` return
+  the markdown body with the YAML frontmatter stripped (BOM + CRLF
+  aware). Lets the host inline a SKILL.md without re-parsing.
+- [x] **`HostConfig` learns `skills_dir` + `groups_dir`**. Two new
+  env-var fields (`IRONCLAW_SKILLS_DIR`, `IRONCLAW_GROUPS_DIR`) both
+  optional and unset by default. Empty strings collapse to `None` so
+  an unset variable means "skip skill injection".
+- [x] **`ContainerManager::runner_config_for` populates `system`**.
+  At spawn time the manager scans the global skills dir (optionally
+  with a per-group override under `<groups_dir>/<ag_uuid>/skills/`),
+  filters through the group's `SkillsSelector` (defaulting to
+  `All` when no `container_config` exists), and concatenates each
+  skill's body inside an `<skill name="…" description="…">` block
+  preceded by a short framing sentence. Read or parse failures for
+  individual skills are logged and skipped — the spawn still
+  succeeds with the remaining content.
+- [x] **`ironclaw-setup` writes both env vars**. `EnvFileSpec` gains
+  `skills_dir` + `groups_dir`; `AuthStep` defaults them to
+  `<data_dir>/skills` and `<data_dir>/groups` respectively (env-var
+  override takes precedence). Empty paths omit the line so existing
+  installs that haven't re-run setup stay unchanged.
+
+**Slice totals**: 4436 passing, 0 failing. Clippy clean. +20 tests
+across `ironclaw-skills` (+7), `ironclaw-host` (+12), and
+`ironclaw-setup` (+1).
+
+### M13 hardening — parallel-agent Top 10 sweep
+
+Four worktree-isolated agents working in parallel landed nine of the
+ten "next" items in a single slice (`web_search` deliberately skipped
+per operator direction). Their outputs were merged sequentially after
+fixing a duplicate migration number (Agent A and Agent B both
+allocated `007_*`; Agent B's was renumbered to `008_*`) and a small
+cross-agent integration gap (`UpsertContainerConfig` grew three new
+fields under Agent A that Agent B's `mcp::add` path didn't know
+about).
+
+**Agent A — Container lifecycle hardening**
+
+- [x] **Image rebuild on `container_config` change** (Top 10 #1).
+  New `container_configs.config_fingerprint` sha256 column over the
+  rebuild-relevant fields (`packages_apt`, `packages_npm`, `skills`,
+  `mcp_servers`); manager diffs it pre-spawn and triggers a rebuild
+  via the M2 image-build machinery, persisting the new tag onto
+  `image_tag`. Closes the loop on `install_packages` /
+  `add_mcp_server` so the agent's own tools take effect on the
+  next spawn.
+- [x] **Container egress allow-list** (Top 10 #6). New
+  `container_configs.egress_allow` (JSON array of `host:port` pairs).
+  Default empty == allow-all (default-allow + opt-in lockdown). Docker
+  runtime applies via `--add-host` + a user-defined network; Apple
+  runtime surfaces as `Unsupported`. Plumbed through `ContainerSpec`.
+- [x] **Per-group resource caps** (Top 10 #8). New
+  `container_configs.resource_limits` JSON (`cpus`, `memory_mb`,
+  `pids_limit`; all optional). Docker runtime translates to
+  `--cpus`, `--memory`, `--pids-limit`. Apple runtime: best-effort
+  fall-through. New `iclaw groups config set-resource-limits` /
+  `set-egress-allow` subcommands.
+
+Migration `007_container_config_extensions.sql` adds the three
+columns. Audit log captures the new mutation commands.
+
+**Agent B — Operator iclaw commands**
+
+- [x] **Central DB backup / restore** (Top 10 #5). `iclaw db backup
+  <path>` runs `PRAGMA wal_checkpoint(TRUNCATE)` then writes a
+  temp file + atomic `rename`. `iclaw db restore <path>` refuses
+  with `host_running` when the host is up (the central DB has an
+  open writer; you can't safely swap it). Both commands route
+  through the iclaw socket and write `audit_log` rows; both are in
+  `HOST_ONLY_COMMANDS`.
+- [x] **Outbound dead-letter replay** (Top 10 #7). New
+  `outbound_dropped_messages` table (migration `008_*` after
+  renumbering — see merge note above). Delivery loop writes a
+  dead-letter row when an outbound exhausts its retries. New
+  commands `iclaw dropped-messages outbound-list --since <window>
+  --limit N` and `iclaw dropped-messages replay <id>`. `replay`
+  fetches the dead-letter, opens the per-session `outbound.db`,
+  inserts a fresh `WriteOutbound`, and deletes the dead-letter row
+  so the delivery loop picks it up again. `parse_since` accepts
+  ISO-8601 or relative shorthands (`24h`, `30m`, `7d`).
+- [x] **MCP server registry + first-class iclaw subcommand**
+  (Top 10 #3). Curated preset library (`postgres`, `linear`,
+  `github`, `notion`, `filesystem`, `browserbase`) shipped as a
+  static `McpPreset` const array. `iclaw mcp list-presets`
+  (no-socket; pure local catalog) and `iclaw mcp add <preset>
+  --agent-group-id <id> [--env KEY=VAL]...` merge the chosen
+  preset into `container_configs.mcp_servers` (JSON object keyed
+  by server name). Audited mutation.
+
+**Agent C — Sender approval notifications in-channel**
+
+- [x] **Approval notifications** (Top 10 #2). `ApprovalsModule`
+  grew `with_new_pending_notifier`; the boot wiring builds a
+  closure that (a) checks `unregistered_senders` to de-dup, (b)
+  resolves the agent group's primary messaging group, and (c)
+  dispatches a plain-ASCII notification via the existing
+  `DeliveryDispatcher`. Notification text: `Unknown sender pending
+  approval. Run: iclaw approvals approve --channel <ct> --identity
+  <id>` plus a small structured block (channel / identity /
+  display name / first contact). Silently no-ops when the group
+  has no messaging group attached. `pending_sender_approvals::
+  upsert` was updated to return `(row, newly_inserted)` and a new
+  `exists_for` helper added; both wired but the dedup actually
+  uses `unregistered_senders` which is the right source of truth.
+
+**Agent D — Observability**
+
+- [x] **Prometheus metrics endpoint** (Top 10 #9). New
+  `ironclaw-metrics` crate. Opt-in via `IRONCLAW_METRICS_ADDR=
+  127.0.0.1:9090` (bare port auto-prefixed to `127.0.0.1:`); off
+  by default per the conservative-defaults tenet. Counters:
+  `ironclaw_messages_inbound_total{channel_type}`,
+  `ironclaw_messages_outbound_total{channel_type}`,
+  `ironclaw_containers_spawned_total`,
+  `ironclaw_containers_crashed_total`,
+  `ironclaw_delivery_failed_total{channel_type}`. Histograms:
+  `ironclaw_llm_call_seconds`, `ironclaw_llm_tokens_input`,
+  `ironclaw_llm_tokens_output`, `ironclaw_container_spawn_seconds`.
+  Hand-rolled `tokio::net::TcpListener` accept-loop, no axum/warp.
+  Bumps live in router (inbound after DB write), delivery (outbound
+  on success + final-failure), container manager (spawn success +
+  CrashRestart), and runner (LLM call timing/tokens after
+  `run_llm_turn`).
+- [x] **Log rotation** (Top 10 #10). `tracing-appender::rolling`
+  daily file writer wired into the host's main, opt-in via
+  `IRONCLAW_LOG_DIR=<path>` (default off; stderr-only behaviour
+  unchanged). Pinned versions: `tracing-appender = "0.2"`,
+  `metrics = "0.24"`, `metrics-exporter-prometheus = "0.16"`.
+
+**Slice totals**: 4436 → 4540 passing (+104 tests). 0 failing.
+Clippy clean. New crate: `ironclaw-metrics`. New migrations:
+`007_container_config_extensions`, `008_outbound_dropped_messages`.
+New iclaw subcommands: `db backup/restore`, `dropped-messages
+outbound-list/replay`, `mcp list-presets/add`, `groups config
+set-resource-limits/set-egress-allow`.
+
+### Post-merge hardening (docs + edge cases + gap fixes)
+
+- [x] **Audit-log env redaction.** `iclaw mcp add postgres --env
+  DATABASE_URL=postgres://u:p@h/d` used to persist the connection
+  string in `audit_log.args`. Added a per-command redactor in
+  `socket.rs` that masks values under any `env` block for
+  `mcp.add` and `groups.config.set-mcp-servers` while keeping the
+  keys. 4 new tests.
+- [x] **Image-rebuild failure fallback.** A bad apt name used to
+  block the whole agent group indefinitely. The manager now falls
+  back to the last-known-good image, emits
+  `ironclaw_image_rebuild_failed_total`, and keeps the
+  fingerprint unchanged so the rebuild retries on the next spawn
+  when the operator fixes the config.
+- [x] **`install_packages` / `add_mcp_server` were silent no-ops.**
+  The tools emitted system rows that no handler picked up. The
+  delivery loop now intercepts them inline (mirroring the
+  `usage_report` pattern), merges them into `container_configs`,
+  and the next spawn rebuilds. 7 new tests.
+- [x] **Documentation:** `docs/observability.md`,
+  `docs/db-backup.md`, `docs/container-config.md`. Updated
+  README + CHANGELOG, refreshed `install-packages` /
+  `add-mcp-server` skills to reflect automatic rebuild semantics.
+  New skill docs for the four computer-use tools (`shell`,
+  `read-file`, `write-file`, `web-fetch`).
+
+### M14 follow-up — `web_search` tool
+
+The agent could fetch URLs but couldn't find them. This slice adds a
+multi-provider search tool that auto-routes based on which API key
+the operator has configured.
+
+- [x] **`web_search` tool** with four provider backends:
+  - **Tavily** (`TAVILY_API_KEY`) — agent-tuned default.
+  - **Exa** (`EXA_API_KEY`) — neural / semantic search.
+  - **Brave** (`BRAVE_SEARCH_API_KEY`) — keyword-friendly
+    independent index.
+  - **`SerpAPI`** (`SERPAPI_API_KEY`) — Google/Bing/etc. wrapper.
+- [x] **Normalised output shape** across all four providers
+  (`{title, url, snippet, published?, score?}`) so the agent's
+  downstream behaviour is provider-agnostic.
+- [x] **Provider resolution**: explicit `provider` arg →
+  `IRONCLAW_WEB_SEARCH_PROVIDER` env → auto-detect from configured
+  keys in the order `tavily, exa, brave, serpapi`. No keys → loud
+  validation error naming all four env vars.
+- [x] **Per-call result cap** (1–25, default 10) and per-result
+  snippet cap (4 KiB, UTF-8-safe truncation with ellipsis).
+- [x] **Host env-forwarding**: new `ManagerConfig.forward_env`
+  field; `boot.rs::collect_forward_env` pushes the five
+  `web_search` env vars into every spawned container so the
+  operator only sets them once in `.env`. Empty values are
+  skipped so an unset var doesn't leak into the container env.
+- [x] **`skills/web-search/SKILL.md`** + operator-facing
+  [`docs/web-search.md`](docs/web-search.md).
+
+**Slice totals**: 4540 → 4576 passing (+36 tests: 25 in the
+web_search module, 11 in host edge-case / delivery-apply / config
+ensure paths). 0 failing. Clippy clean.
+
+### Onboarding polish slice
+
+Smoothing the gap between "I ran `ironclaw-setup`" and "my agent is
+talking back to me". Three changes, each closing a distinct first-
+run footgun.
+
+- [x] **`iclaw doctor`** — composite first-run diagnostic.
+  Sequence: host reachability via `groups.list` → agent group
+  count → wiring count → active session count → recent audit
+  errors (1h, top 3 by `result=error`) → dropped-message
+  backlog → `ANTHROPIC_API_KEY` presence in this shell's env →
+  web-search provider keys (informational). Each check renders
+  `[OK   |WARN |FAIL ]` + name + detail, and non-OK rows print a
+  `fix:` line the operator can copy-paste. `--json` emits
+  `{ "status": "ok|fail", "checks": [...] }` for CI. Non-zero
+  exit when any FAIL is present.
+- [x] **Setup auto-bootstraps a default cli group + wiring.**
+  New `quickstart_group` step (between `verify` and
+  `first_chat`) writes a `(cli, stdin)` messaging group, an
+  agent group named `first`, and a pattern-`.*` wiring with
+  `session_mode = Shared`. Idempotent against any pre-existing
+  agent group. The `first_chat` step's "what to do next" output
+  flips to recommend `iclaw chat` directly when the bootstrap
+  landed, falling back to the `iclaw quickstart cli` instruction
+  when the operator declined. Opt out via
+  `IRONCLAW_SETUP_QUICKSTART=no`; rename the slug via
+  `IRONCLAW_SETUP_QUICKSTART_NAME`.
+- [x] **Budget-exhausted reply to original sender.** When the
+  container manager's spawn gate refuses because today's tokens
+  exceeded `group_budgets.daily_token_cap`, the host now posts
+  a one-line in-channel reply via the session's `outbound.db`
+  (routed through `session_routing` so it lands back on the
+  user's channel). Dedup per-agent-group on a 1 h window via a
+  process-local `last_budget_notice` map so a chatty user gets
+  one explanation, not ten. Silent skip when
+  `session_routing` is empty (no inbound to anchor the routing
+  yet).
+
+**Slice totals**: 4576 → 4597 passing (+21 tests: 7 doctor + 7
+quickstart-group + 4 budget-reply + 3 misc fix-ups). 0 failing.
+Clippy clean.
+
+### Production hardening slice (3 parallel agents)
+
+Three worktree-isolated agents landed in one slice. After-merge:
+- One renumbering (agent B's migration 007 → 009 to avoid
+  collision with 007/008 from prior slices).
+- Two of three notification text fixes during merge (agent B's
+  per-hour text said "Per-minute"; agent B's helper wrote to
+  inbound DB while main's pattern writes to outbound — unified
+  via a new `post_cap_reply` helper that both paths share).
+- Agent A's hand-rolled `ironclaw-metrics` collided with the
+  real crate landed in observability — counter ported across
+  via `inc_secrets_rotated()`.
+
+- [x] **Secret rotation via SIGHUP** (`PLAN.md` was Next #1).
+  `RotatableConfig` struct (anthropic_api_key, anthropic_base_url,
+  forward_env) held behind an `Arc<RwLock<...>>` on
+  `ContainerManager`. `reload_env(env_file)` parses `.env`
+  without touching the process env (hand-rolled `parse_dotenv_content`
+  handles quotes / comments / `export` prefixes) and swaps the
+  lock. `wait_for_signal_or_sighup` loops on SIGHUP, calling
+  `mgr.reload_env(env_file.as_deref())`. `run_host` gained an
+  `env_file: Option<PathBuf>` parameter the main binary fills
+  from `cli.env_file`. New metric
+  `ironclaw_secrets_rotated_total`. Running containers see the
+  rotated keys after idle-stop + respawn (default 5 min).
+
+- [x] **Webhooks TLS termination doc** (was Next #2). New
+  `docs/webhooks-tls.md` (204 lines) covers Caddy / nginx /
+  Cloudflare Tunnel patterns, the bind-address override, and the
+  design rationale for not bundling rustls in 0.1.0.
+
+- [x] **Host-side rate limiting** (was Next #3). Two new columns
+  on `group_budgets` (`agent_turns_per_minute_cap`,
+  `agent_turns_per_hour_cap`) via migration `009_rate_limit_caps`.
+  New `agent_turns::turns_since` count helper. Container manager
+  gate fires in `maybe_spawn` after the budget gate: checks both
+  windows, posts an in-channel reply on the outbound path (same
+  `post_cap_reply` helper as the budget gate) with a 1-minute
+  dedup window. `iclaw budgets set` extended with
+  `--turns-per-minute` and `--turns-per-hour` flags.
+
+- [x] **Versioned migrations** (was Next #5).
+  `expected_central_schema_version()` (= `CENTRAL.len()`) and
+  `applied_central_schema_version()` helpers in
+  `ironclaw-db::migrate`. `BootError::SchemaMismatch` (exit code
+  5) fires when applied > expected (downgrade detection).
+  `iclaw schema-version` subcommand returns
+  `{ "expected": N, "applied": M, "status": "ok|pending|future" }`.
+
+- [x] **Double `sessions/sessions/` path cleanup** (was Next #6).
+  `HostConfig::sessions_root()` returns `data_dir` directly;
+  the layout flattens to `data_dir/sessions/<ag>/<sess>/`. New
+  `migrate_sessions_layout()` runs at boot, moving contents from
+  the old nested path up one level. Collision-safe: logs + skips
+  when the destination exists, only removes the inner directory
+  when all entries moved successfully.
+
+**Slice totals**: 4597 → 4633 passing (+36 tests across the three
+agents and the merge resolution). 0 failing. Clippy clean.
+
+### Replay-fixture harness slice (M11 acceptance gate)
+
+The plan's "Next #1" closed in this slice. The harness is
+deliberately scoped down from the design doc's capture-and-redact
+pipeline to the smallest thing that proves the differential test
+loop: load a hand-authored fixture, drive the host's internal
+services end-to-end against a wiremock-served Anthropic stub, and
+diff the four captured streams against `expected/*.jsonl` with
+substitution-aware comparison.
+
+- [x] `crates/ironclaw-host/tests/replay/fixture.rs` — load
+  `manifest.json` + `central.sql` + `inbound/*` + `claude/*` +
+  `expected/*.jsonl` from a fixture directory. JSON manifest for
+  v1 (TOML deferred behind an unused dep).
+- [x] `crates/ironclaw-host/tests/replay/diff.rs` — substitution
+  table (regex → replacement, applied to the serialized form of
+  both sides before reparse), `walk`-based JSON-pointer-path
+  mismatch reporter.
+- [x] `crates/ironclaw-host/tests/replay/harness.rs` —
+  `ReplayHarness` driving `Router::route` against an in-memory
+  `CentralDb`, an in-process runner via `run_loop` with
+  `max_turns = Some(1)` against `wiremock`-served Anthropic SSE,
+  and `DeliveryService::process_session_once` against a
+  `MockAdapter`. Per-fixture cleanup via `tempfile::TempDir`. Skips
+  the full `run_host` boot dance (no channel mpsc consumer, no
+  socket server, no signal handling, no container manager) — the
+  harness is a structural-not-faithful reproduction of the host.
+- [x] `fixtures/cli/text-reply/` — first fixture. Single-line cli
+  inbound, one Claude turn, one outbound chat row, one delivery.
+  Manifest substitutions normalise UUIDs (`[0-9a-f]{8}-...{12}`)
+  and three timestamp shapes (`timestamp` / `started_at` /
+  `ended_at`).
+- [x] `crates/ironclaw-host/tests/replay.rs` — integration test
+  entry. One `#[tokio::test]` loads the cli fixture and asserts
+  `harness.compare().is_clean()`.
+
+**Slice totals**: 4633 → 4634 passing (+1 integration test;
+harness internals are exercised through it). 0 failing. Clippy
+clean. New dev-deps in `ironclaw-host`: `wiremock`, `regex`,
+`ironclaw-runner` / `-providers` / `-mcp` as workspace path deps.
+
 ---
 
-## Top 10 next things to address
+## Next things to address
 
-Ranked by impact × leverage given the current state. Each item
-links to the M-section that owns it.
+The five highest-impact items from the prior list landed in
+earlier slices; the M11 acceptance gate landed in this slice. The
+remaining items, ranked:
 
-1. **Skill content auto-loads into the system prompt**. The
-   agent has 19 tools and 17 skill docs, but the runner's
-   system prompt is a vanilla one-liner. The model often
-   doesn't know it *can* call a tool until you spell it out.
-   Concatenate `skills/*/SKILL.md` (filtered by a per-group
-   include-list) into the system prompt at container spawn.
-   The single highest-leverage change to make the agent
-   actually *use* its capabilities. _(M14 follow-up)_
+1. **Release 0.1.0**. Cut the tag, bump
+   `workspace.package.version`, publish release notes from
+   `CHANGELOG.md`. With the replay harness landed the candidate
+   status in README can flip to a real release. _(M11)_
 
-2. **Image rebuild on `container_config` change**. The
-   agent already has `install_packages` and `add_mcp_server`
-   as tools, but invoking them today writes to
-   `container_configs` and then nothing happens until an
-   operator manually rebuilds. Manager should fingerprint
-   `container_configs` per-group and rebuild on diff. Closes
-   the loop on user-extensible agents. _(M13)_
-
-3. **Approval notifications in-channel**. When a new sender
-   lands in pending, the operator can't see it without
-   running `iclaw approvals list`. Post a deliverable
-   "approve?" card to the agent group's primary channel
-   when an unknown sender is dropped. _(M13 sender approval)_
-
-4. **MCP server registry + first-class iclaw subcommand**.
-   `add_mcp_server` exists as a tool the agent can call, but
-   the operator-facing path (`iclaw groups config
-   add-mcp-server …`) is undocumented and the schema is
-   freeform JSON. Document a small library of curated MCP
-   servers (Postgres, Linear, GitHub, Notion, Filesystem,
-   Browserbase) and ship a `iclaw mcp add <preset>`
-   shortcut that wires the right config. The "easy
-   expansion path" the project promises. _(new)_
-
-5. **`web_search` tool** (Brave or Tavily). `web_fetch`
-   gives the agent a URL → body pipe, but it can't *find*
-   URLs. Search closes the gap; without it the agent
-   either has to guess URLs or ask the user. One new tool
-   in `tools/computer_use.rs`, one env-var-configured API
-   key. _(M14 follow-up)_
-
-6. **Central DB backup / restore**. `iclaw db backup
-   <path>` (WAL checkpoint + file copy) and `iclaw db
-   restore <path>` (atomic swap). The central DB is one
-   SQLite file holding every group, wiring, audit row, and
-   token-usage record — a disk corruption today loses
-   everything. _(M13 reliability)_
-
-7. **Container egress allow-list**. With `web_fetch`
-   landed, an agent can reach any URL on the open
-   internet. Per-group `container_configs.egress_allow`
-   (host:port allow-list) translated to Docker network
-   policy at spawn. Default-deny would be the OpenBSD
-   move, but default-allow + opt-in lockdown is more
-   practical. _(M13 security)_
-
-8. **Outbound dead-letter replay**. `iclaw health` shows
-   the dropped-message count, but operators can't inspect
-   *what* dropped or retry. Add `iclaw dropped-messages
-   list --since <window>` (already exists for inbound;
-   extend to outbound failures) and `iclaw
-   dropped-messages replay <id>`. _(M13 reliability)_
-
-9. **Per-group resource caps**. `ContainerSpec` doesn't
-   carry cpu / memory / pids / network limits. A runaway
-   agent can starve the host. Add
-   `container_configs.resource_limits` JSON, apply at
-   spawn via Docker's `--cpus`, `--memory`, `--pids-limit`.
-   The bounded-blast-radius story is incomplete without
-   this. _(M13 container lifecycle)_
-
-10. **Prometheus metrics endpoint**. Counters for
-    `messages_inbound_total`, `messages_outbound_total`,
-    `containers_spawned_total`, `containers_crashed_total`,
-    `delivery_failed_total`; histograms for
-    `llm_call_seconds`, `llm_tokens_input`,
-    `llm_tokens_output`, `container_spawn_seconds`.
-    Reuse the data `iclaw health` already collects. Off by
-    default; opt in via `IRONCLAW_METRICS_ADDR=127.0.0.1:9090`.
-    _(M13 observability)_
-
-Honorable mentions that didn't make the cut:
-
-- **Log rotation** (low effort but install can ship with a
-  recommended logrotate config in `docs/`; not blocking).
-- **Secret rotation without restart** (SIGHUP handler;
-  niche, can document the manual restart for now).
-- **Webhooks TLS termination** (most users deploy behind a
-  reverse proxy already; can document the recommended
-  Caddy/Cloudflare-Tunnel pattern).
-- **Rate limiting** (LLM 429s already retry with
-  `Retry-After`; explicit host-side cap is mainly a cost
-  guard, partially covered by budgets).
-- **Bugfix: double `sessions/sessions/` path** (cosmetic;
-  container manager has the workaround documented).
+2. **Grow the fixture suite.** The first cli fixture proves the
+   harness works end-to-end, but the suite has real value only
+   when more channels and more behaviours are captured. Highest-
+   leverage next captures: a telegram webhook with a
+   `getFile`-backed attachment download, a slack
+   `app_mention` with HMAC signature, and a runner tool-use loop
+   (one `shell` round-trip).
 
 ---
 
@@ -1423,7 +1690,7 @@ Items deliberately deferred from 0.1.0; tracked here so they don't get rediscove
 - **Scheduled tasks table.** A first-class `scheduled_tasks` table for recurring agent jobs (independent of the per-message `recurrence` column). The MCP `schedule_task` tool currently writes into `messages_in` with a recurrence and a `process_after`; a dedicated table would let us list/cancel without scanning the message log.
 - **WhatsApp Signal Protocol session state.** The Curve25519 / Ed25519 / HKDF / AES-GCM primitives in `crates/ironclaw-channels/whatsapp/src/crypto/dalek.rs` are RFC-tested and ready. What sits above them — X3DH key agreement, the Double Ratchet, Sender Keys for group chat, the WA wire-envelope construction — is the next-contributor task. Adapter `deliver()` surfaces a distinct error message so the gap is testable.
 - **Docker Sandbox runtime backend.** A third `ContainerRuntime` impl using a micro-VM (`firecracker`, `cloud-hypervisor`, or Apple's `Virtualization.framework`) for installations that want a stronger isolation boundary than a Docker container.
-- **Replay-fixture harness.** Designed in `docs/replay-fixtures.md`; the in-tree `crates/ironclaw-host/tests/replay/` module and the first round of captured fixtures are the M11 acceptance gate.
+- **Replay-fixture capture tooling.** The harness reads hand-authored or captured fixtures (see `docs/replay-fixtures.md` and `fixtures/cli/text-reply/`). The capture-time tooling described in the design doc — `IRONCLAW_FIXTURE_CAPTURE=<dir>` taps in the channel adapter, router, provider, and DB layer, plus an `ironclaw fixture redact <dir>` pass — is still unwritten. Until it lands new fixtures must be hand-authored.
 
 
 ## Sign-off

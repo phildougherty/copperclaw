@@ -18,6 +18,18 @@
 //! | `IRONCLAW_DEFAULT_MODEL` | unset | Default Anthropic model id. |
 //! | `IRONCLAW_CHANNELS` | `cli` | Comma-separated list of channels to initialize. |
 //! | `IRONCLAW_CHANNELS_CONFIG` | `{}` | JSON object keyed by channel type; per-channel `setup.config`. |
+//! | `IRONCLAW_SKILLS_DIR` | unset | Directory of `SKILL.md` skill bundles auto-loaded into the agent system prompt. |
+//! | `IRONCLAW_GROUPS_DIR` | unset | Directory under which per-group `<ag_id>/skills/` overrides live. |
+//! | `IRONCLAW_METRICS_ADDR` | unset | Enable the Prometheus `/metrics` endpoint. Accepts `host:port` or a bare port (auto-prefixed to `127.0.0.1:`). Off by default per the conservative-defaults tenet. |
+//! | `IRONCLAW_LOG_DIR` | unset | When set, fan tracing output to `<dir>/host.log.<date>` via `tracing-appender::rolling::daily` in addition to stderr. Default off keeps the legacy stderr-only behaviour. |
+//! | `IRONCLAW_DEFAULT_IMAGE_TAG` | unset | sha-pinned default image tag for sessions when the per-group `container_configs.image_tag` is unset. Written by `ironclaw-setup` after building the image. |
+//! | `ANTHROPIC_API_KEY` | unset | API key forwarded into each session container as an env var. |
+//! | `ANTHROPIC_BASE_URL` | unset | Override the provider base URL (e.g. `https://openrouter.ai/api/v1`). |
+//! | `IRONCLAW_WEB_SEARCH_PROVIDER` | unset | Default `web_search` provider (`tavily` \| `exa` \| `brave` \| `serpapi`). Auto-detected from set API keys when unset. |
+//! | `TAVILY_API_KEY` | unset | Tavily search API key, forwarded to the container so `web_search` can dispatch. |
+//! | `EXA_API_KEY` | unset | Exa.ai search API key (semantic / neural search). |
+//! | `BRAVE_SEARCH_API_KEY` | unset | Brave Search API key (keyword search). |
+//! | `SERPAPI_API_KEY` | unset | `SerpAPI` key (Google/Bing/etc. wrapper). |
 //!
 //! The `cli` channel is always implicitly known but is only initialized if it
 //! appears in `IRONCLAW_CHANNELS`. Unknown channel names log a warning and
@@ -81,6 +93,16 @@ pub struct HostConfig {
     /// after building the image; the host's container manager
     /// requires this to spawn containers on demand.
     pub default_image_tag: Option<String>,
+    /// Directory of `SKILL.md` bundles auto-loaded into the agent
+    /// system prompt at container spawn. When unset, no skill content
+    /// is injected and the system prompt is whatever the runner
+    /// receives in its config file (empty by default).
+    pub skills_dir: Option<PathBuf>,
+    /// Per-agent-group root: when set, `<groups_dir>/<ag_uuid>/skills/`
+    /// is treated as an override directory that shadows global skills
+    /// with the same name. Optional; absent groups fall back to the
+    /// global skills directory.
+    pub groups_dir: Option<PathBuf>,
     /// Channels to initialize at boot.
     pub channels: Vec<ChannelInit>,
 }
@@ -118,6 +140,16 @@ impl HostConfig {
             .get("IRONCLAW_DEFAULT_IMAGE_TAG")
             .cloned()
             .filter(|s| !s.is_empty());
+        let skills_dir = map
+            .get("IRONCLAW_SKILLS_DIR")
+            .cloned()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        let groups_dir = map
+            .get("IRONCLAW_GROUPS_DIR")
+            .cloned()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
 
         let channels_list = map
             .get("IRONCLAW_CHANNELS")
@@ -158,6 +190,8 @@ impl HostConfig {
             default_provider,
             default_model,
             default_image_tag,
+            skills_dir,
+            groups_dir,
             channels,
         })
     }
@@ -167,9 +201,18 @@ impl HostConfig {
         self.data_dir.join("ironclaw.db")
     }
 
-    /// Per-session data root (`<data_dir>/sessions`).
+    /// Per-session data root. This is the data directory itself; the
+    /// per-session layout (`sessions/<agent_group>/<session>/`) is
+    /// appended by [`ironclaw_db::session::SessionPaths::new`] when it
+    /// is called with this value as `data_root`.
+    ///
+    /// Previously this method returned `data_dir/sessions`, which —
+    /// combined with `SessionPaths::new`'s own `/sessions/` prefix —
+    /// produced the double `data_dir/sessions/sessions/` path. The fix
+    /// is to pass `data_dir` directly and let `SessionPaths::new` add
+    /// exactly one `sessions/` component.
     pub fn sessions_root(&self) -> PathBuf {
-        self.data_dir.join("sessions")
+        self.data_dir.clone()
     }
 
     /// Borrow the data root.
@@ -282,9 +325,11 @@ mod tests {
         let cfg = HostConfig::from_map(&m(&[("IRONCLAW_DATA_DIR", "/srv/ironclaw")])).unwrap();
         assert_eq!(cfg.ncl_socket_path, PathBuf::from("/srv/ironclaw/iclaw.sock"));
         assert_eq!(cfg.central_db_path(), PathBuf::from("/srv/ironclaw/ironclaw.db"));
+        // sessions_root() returns data_dir itself; SessionPaths::new then
+        // appends sessions/<ag>/<session> to produce the flat layout.
         assert_eq!(
             cfg.sessions_root(),
-            PathBuf::from("/srv/ironclaw/sessions")
+            PathBuf::from("/srv/ironclaw")
         );
     }
 
@@ -338,6 +383,38 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.default_provider.as_deref(), Some("claude"));
         assert_eq!(cfg.default_model.as_deref(), Some("claude-3-5"));
+    }
+
+    #[test]
+    fn skills_dir_env_var_parses() {
+        let cfg = HostConfig::from_map(&m(&[(
+            "IRONCLAW_SKILLS_DIR",
+            "/opt/ironclaw/skills",
+        )]))
+        .unwrap();
+        assert_eq!(
+            cfg.skills_dir.as_deref(),
+            Some(Path::new("/opt/ironclaw/skills"))
+        );
+    }
+
+    #[test]
+    fn skills_dir_empty_is_none() {
+        let cfg = HostConfig::from_map(&m(&[("IRONCLAW_SKILLS_DIR", "")])).unwrap();
+        assert!(cfg.skills_dir.is_none());
+    }
+
+    #[test]
+    fn groups_dir_env_var_parses() {
+        let cfg = HostConfig::from_map(&m(&[(
+            "IRONCLAW_GROUPS_DIR",
+            "/opt/ironclaw/groups",
+        )]))
+        .unwrap();
+        assert_eq!(
+            cfg.groups_dir.as_deref(),
+            Some(Path::new("/opt/ironclaw/groups"))
+        );
     }
 
     #[test]

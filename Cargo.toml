@@ -38,6 +38,7 @@ members = [
     "crates/ironclaw-iclaw",
     "crates/ironclaw-setup",
     "crates/ironclaw-onecli",
+    "crates/ironclaw-metrics",
 ]
 
 [workspace.package]
@@ -79,9 +80,11 @@ ironclaw-channels-x        = { path = "crates/ironclaw-channels/x" }
 ironclaw-modules        = { path = "crates/ironclaw-modules" }
 ironclaw-skills         = { path = "crates/ironclaw-skills" }
 ironclaw-onecli         = { path = "crates/ironclaw-onecli" }
+ironclaw-metrics        = { path = "crates/ironclaw-metrics" }
 ironclaw-host-router    = { path = "crates/ironclaw-host-router" }
 ironclaw-host-delivery  = { path = "crates/ironclaw-host-delivery" }
 ironclaw-host-sweep     = { path = "crates/ironclaw-host-sweep" }
+ironclaw-runner         = { path = "crates/ironclaw-runner" }
 
 tokio              = { version = "1", features = ["full"] }
 serde              = { version = "1", features = ["derive"] }
@@ -120,6 +123,10 @@ hkdf               = "0.12"
 aes-gcm            = "0.10"
 rand               = "0.8"
 rand_core          = "0.6"
+metrics            = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false }
+tokio-util         = "0.7"
+tracing-appender   = "0.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

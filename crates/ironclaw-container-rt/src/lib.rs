@@ -27,7 +27,7 @@ pub mod spec;
 pub use crate::apple::AppleContainerRuntime;
 pub use crate::build::{ExtraFile, ImageBuildSpec};
 pub use crate::docker::DockerRuntime;
-pub use crate::spec::{ContainerHandle, ContainerSpec, Mount};
+pub use crate::spec::{ContainerHandle, ContainerSpec, Mount, ResourceLimits};
 
 /// Every fallible container-runtime call returns this.
 #[derive(Debug, Error)]
@@ -42,6 +42,12 @@ pub enum RtError {
     /// Underlying I/O error (tempfile create, socket open, etc.).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// The requested feature is not supported by this backend. Per the
+    /// project tenets ("errors over silent fallback"), callers should
+    /// treat this as a hard failure rather than silently ignoring the
+    /// requested capability.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
 }
 
 /// Container-runtime trait. Both backends implement this; see crate
@@ -245,6 +251,12 @@ mod tests {
     fn rt_error_display_container() {
         let e = RtError::Container("boom".into());
         assert_eq!(e.to_string(), "container error: boom");
+    }
+
+    #[test]
+    fn rt_error_display_unsupported() {
+        let e = RtError::Unsupported("egress_allow".into());
+        assert_eq!(e.to_string(), "unsupported: egress_allow");
     }
 
     #[test]

@@ -64,6 +64,14 @@ pub struct SetupConfig {
     pub timezone: String,
     /// First channel kind the user configured (e.g. `cli`).
     pub first_channel: String,
+    /// `true` once the `quickstart_group` step has successfully
+    /// bootstrapped a default cli agent group + wiring. Read by
+    /// the first-chat step to tailor its "what to do next"
+    /// instructions: when this is set we tell the user to run
+    /// `iclaw chat` directly; otherwise we point them at
+    /// `iclaw quickstart cli` as the manual fallback.
+    #[serde(default)]
+    pub quickstart_group_created: bool,
 }
 
 impl SetupConfig {
@@ -160,6 +168,7 @@ mod tests {
             service_unit_path: PathBuf::from("/tmp/x/ironclaw.service"),
             timezone: "Etc/UTC".into(),
             first_channel: "cli".into(),
+            quickstart_group_created: true,
         };
         let s = serde_json::to_string(&c).unwrap();
         let back: SetupConfig = serde_json::from_str(&s).unwrap();

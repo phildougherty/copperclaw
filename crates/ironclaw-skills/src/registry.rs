@@ -190,6 +190,19 @@ impl SkillRegistry {
     }
 }
 
+/// Read a discovered skill's `SKILL.md` and return the markdown body
+/// (everything after the YAML frontmatter). The frontmatter itself is
+/// dropped — callers that need it should consult [`Skill::description`]
+/// and friends, which already capture the parsed fields.
+///
+/// # Errors
+/// - [`SkillError::Io`] if the file is unreadable.
+pub fn read_skill_body(skill: &Skill) -> Result<String, SkillError> {
+    let path = skill.dir.join("SKILL.md");
+    let raw = fs::read_to_string(&path).map_err(|e| SkillError::io(&path, e))?;
+    Ok(crate::frontmatter::skip_frontmatter(&raw).to_string())
+}
+
 /// List immediate subdirectories of `dir`. Treats a missing `dir` as empty.
 fn scan_dir(dir: &Path) -> Result<Vec<PathBuf>, SkillError> {
     if !dir.exists() {
@@ -516,6 +529,34 @@ mod tests {
         let reg = SkillRegistry::scan(&global, None).unwrap();
         let listed = reg.list_for_group(AgentGroupId::new(), &SkillsSelector::Explicit(vec![]));
         assert!(listed.is_empty());
+    }
+
+    #[test]
+    fn read_skill_body_strips_frontmatter() {
+        let td = TempDir::new().unwrap();
+        let dir = td.path().join("hello");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: hello\ndescription: d\n---\n\n# Hello\nbody text\n",
+        )
+        .unwrap();
+        let skill = load_skill(&dir, SkillSource::Global).unwrap();
+        let body = read_skill_body(&skill).unwrap();
+        assert_eq!(body, "# Hello\nbody text\n");
+    }
+
+    #[test]
+    fn read_skill_body_io_error_when_missing() {
+        let td = TempDir::new().unwrap();
+        let dir = td.path().join("hello");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), "---\nname: hello\ndescription: d\n---\nb\n").unwrap();
+        let skill = load_skill(&dir, SkillSource::Global).unwrap();
+        // Remove the file after loading to force an IO error on body read.
+        fs::remove_file(dir.join("SKILL.md")).unwrap();
+        let err = read_skill_body(&skill).unwrap_err();
+        assert!(matches!(err, SkillError::Io { .. }));
     }
 
     #[test]

@@ -14,13 +14,16 @@ use dashmap::DashMap;
 use ironclaw_channels_core::ChannelAdapter;
 use ironclaw_container_rt::{ContainerRuntime, RtError};
 use ironclaw_db::central::CentralDb;
-use ironclaw_db::migrate::{run_migrations, MigrationSet};
+use ironclaw_db::migrate::{
+    applied_central_schema_version, expected_central_schema_version, run_migrations, MigrationSet,
+};
 use ironclaw_host_delivery::DeliveryService;
 use ironclaw_host_router::Router;
 use ironclaw_host_sweep::SweepService;
 use ironclaw_modules::{
     AgentToAgentModule, ApprovalsModule, InteractiveModule, Module, MountSecurityModule,
-    PermissionsModule, SchedulingModule, SelfModModule, TypingConfig, TypingModule,
+    NewPendingCtx, NewPendingNotifier, PermissionsModule, SchedulingModule, SelfModModule,
+    TypingConfig, TypingModule,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,11 +33,130 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+/// Notification text shown in-channel when an unknown sender is first seen.
+///
+/// The text is plain ASCII per the project's "no emojis" rule. It is
+/// intentionally terse: a longer block would clutter the channel.
+const PENDING_SENDER_NOTICE: &str = concat!(
+    "Unknown sender pending approval.\n",
+    "Run: iclaw approvals approve --channel <channel_type> --identity <identity>",
+);
+
+/// Build the closure wired to [`ApprovalsModule::with_new_pending_notifier`].
+///
+/// The notifier fires synchronously inside the router's sender-scope gate on
+/// every inbound from an unknown sender. It must be fast:
+///
+/// 1. Check [`ironclaw_db::tables::unregistered_senders`] — if a row already
+///    exists, the operator was already notified (the router writes the row
+///    after the gate returns, so a pre-existing row means the sender has been
+///    seen before). Skip.
+/// 2. Look up the messaging groups wired to the agent group. Take the first
+///    one (ordered by priority desc, then creation time — consistent with the
+///    router's own list). If none exist, log at info and return.
+/// 3. Dispatch a text notification to that messaging group via the
+///    [`ironclaw_modules::DeliveryDispatcher`].
+///
+/// The dispatcher call itself is synchronous (the host implementation spawns
+/// the adapter work in the background), so the gate hot-path is unblocked.
+fn build_pending_notifier(central: ironclaw_db::central::CentralDb) -> NewPendingNotifier {
+    Arc::new(move |ctx: NewPendingCtx, dispatcher| {
+        // De-dupe: if this sender has been seen before, a notification was
+        // already posted. The `unregistered_senders` row is written by the
+        // router AFTER the gate returns, so absence of the row means this is
+        // the sender's first ever contact.
+        let already_seen = ironclaw_db::tables::unregistered_senders::get(
+            &central,
+            &ctx.sender.channel_type,
+            &ctx.sender.identity,
+        )
+        .ok()
+        .flatten()
+        .is_some();
+        if already_seen {
+            return;
+        }
+
+        // Resolve the primary messaging group for this agent group. "Primary"
+        // is defined as the first wiring ordered by priority desc, then
+        // created_at asc — the same ordering the router uses in list_for_mg.
+        let wirings = match ironclaw_db::tables::messaging_group_agents::list_for_ag(
+            &central,
+            ctx.agent_group_id,
+        ) {
+            Ok(w) => w,
+            Err(err) => {
+                tracing::info!(
+                    agent_group_id = %ctx.agent_group_id.as_uuid(),
+                    ?err,
+                    "approvals: could not list wirings for pending-sender notification; skipping"
+                );
+                return;
+            }
+        };
+        let Some(wiring) = wirings.first() else {
+            tracing::info!(
+                agent_group_id = %ctx.agent_group_id.as_uuid(),
+                "approvals: agent group has no messaging groups; skipping pending-sender notification"
+            );
+            return;
+        };
+
+        // Resolve the messaging group's channel + platform coordinates.
+        let mg = match ironclaw_db::tables::messaging_groups::get(&central, wiring.messaging_group_id) {
+            Ok(g) => g,
+            Err(err) => {
+                tracing::info!(
+                    messaging_group_id = %wiring.messaging_group_id.as_uuid(),
+                    ?err,
+                    "approvals: could not fetch messaging group; skipping pending-sender notification"
+                );
+                return;
+            }
+        };
+
+        // Build the notification text. Plain ASCII, no emojis.
+        let display = ctx
+            .sender
+            .display_name
+            .as_deref()
+            .unwrap_or(ctx.sender.identity.as_str());
+        let text = format!(
+            "{notice}\n\nChannel: {ct}\nIdentity: {id}\nDisplay name: {dn}\nFirst contact: {ts}",
+            notice = PENDING_SENDER_NOTICE,
+            ct = ctx.sender.channel_type.as_str(),
+            id = ctx.sender.identity,
+            dn = display,
+            ts = ctx.first_seen.to_rfc3339(),
+        );
+
+        let target = ironclaw_modules::DispatchTarget::channel(
+            mg.channel_type.clone(),
+            mg.platform_id.clone(),
+            None,
+        );
+        let message = ironclaw_types::OutboundMessage {
+            kind: ironclaw_types::MessageKind::Chat,
+            content: serde_json::json!({"text": text}),
+            files: vec![],
+        };
+        dispatcher.dispatch(&target, &message);
+        tracing::info!(
+            channel_type = ctx.sender.channel_type.as_str(),
+            identity = ctx.sender.identity.as_str(),
+            notify_channel = mg.channel_type.as_str(),
+            notify_platform_id = mg.platform_id.as_str(),
+            "approvals: posted pending-sender notification to primary messaging group"
+        );
+    })
+}
+
 /// Boot-time errors that abort startup.
 ///
 /// Maps onto the exit codes documented in the brief:
 /// - migrations -> exit 2
 /// - runtime detect -> exit 3
+/// - schema mismatch (downgrade) -> exit 5
 #[derive(Debug, Error)]
 pub enum BootError {
     /// Migrations could not be applied.
@@ -49,6 +171,17 @@ pub enum BootError {
     /// Socket server returned an unexpected I/O error before shutdown.
     #[error("socket server error: {0}")]
     Socket(#[source] std::io::Error),
+    /// The on-disk schema is newer than what this binary expects.
+    ///
+    /// This means a newer ironclaw binary has already migrated the DB and
+    /// this (older) binary refuses to touch it to avoid corrupting state.
+    /// Upgrade the binary or restore from a backup.
+    #[error(
+        "schema mismatch: on-disk DB has {applied} applied migrations but \
+         this binary only knows {expected}; refusing to run against a future \
+         schema (downgrade detected)"
+    )]
+    SchemaMismatch { expected: usize, applied: usize },
 }
 
 impl BootError {
@@ -58,6 +191,7 @@ impl BootError {
             Self::Migrate(_) | Self::OpenCentral(_) => 2,
             Self::RuntimeDetect(_) => 3,
             Self::Socket(_) => 4,
+            Self::SchemaMismatch { .. } => 5,
         }
     }
 }
@@ -72,6 +206,111 @@ pub fn run_migrations_only(cfg: &HostConfig) -> Result<(), BootError> {
     let mut conn = db.conn().map_err(BootError::OpenCentral)?;
     run_migrations(&mut conn, MigrationSet::Central).map_err(BootError::Migrate)?;
     Ok(())
+}
+
+/// Check that the on-disk schema version is compatible with this binary.
+///
+/// - `applied == expected` → log info, continue.
+/// - `applied < expected`  → log warn (migrations pending — shouldn't happen
+///   after `run_migrations_only`, but defence in depth).
+/// - `applied > expected`  → return `Err(BootError::SchemaMismatch)` so the
+///   host refuses to boot against a future schema it doesn't understand.
+/// - `applied == None` (fresh DB) → treat as 0 applied; if expected > 0 that
+///   is "pending", which again shouldn't happen after `run_migrations_only`.
+pub fn check_schema_version(cfg: &HostConfig) -> Result<(), BootError> {
+    let path = cfg.central_db_path();
+    let db = CentralDb::open(&path).map_err(BootError::OpenCentral)?;
+    let conn = db.conn().map_err(BootError::OpenCentral)?;
+    let expected = expected_central_schema_version();
+    let applied = applied_central_schema_version(&conn)
+        .map_err(BootError::Migrate)?
+        .unwrap_or(0);
+
+    match applied.cmp(&expected) {
+        std::cmp::Ordering::Equal => {
+            info!(schema_version = applied, "schema version up to date");
+        }
+        std::cmp::Ordering::Less => {
+            warn!(
+                applied,
+                expected,
+                "schema version behind expected; migrations may be pending"
+            );
+        }
+        std::cmp::Ordering::Greater => {
+            return Err(BootError::SchemaMismatch { expected, applied });
+        }
+    }
+    Ok(())
+}
+
+/// Migrate old `data_dir/sessions/sessions/<ag>/<session>/` layout to
+/// `data_dir/sessions/<ag>/<session>/`.
+///
+/// The double `sessions/` path was an inadvertent artifact of passing
+/// `cfg.sessions_root()` (which returned `data_dir/sessions`) into
+/// `FsSessionRoot::new`, while `SessionPaths::new` then appended
+/// another `/sessions/<ag>/<session>` on top. This one-shot migrator
+/// moves contents of the inner `sessions/` directory up one level and
+/// removes the now-empty inner dir.
+///
+/// Skips (logs + continues) rather than failing when:
+/// - The old path doesn't exist (already migrated or fresh install).
+/// - A destination path already exists (collision — would overwrite data).
+pub fn migrate_sessions_layout(data_dir: &std::path::Path) {
+    let old_inner = data_dir.join("sessions").join("sessions");
+    if !old_inner.exists() {
+        return; // Already on the flat layout or fresh install — nothing to do.
+    }
+    let new_root = data_dir.join("sessions");
+    info!(
+        old = %old_inner.display(),
+        new = %new_root.display(),
+        "migrating double sessions/ path layout"
+    );
+    let entries = match std::fs::read_dir(&old_inner) {
+        Ok(e) => e,
+        Err(err) => {
+            warn!(?err, "sessions layout migration: read_dir failed; skipping");
+            return;
+        }
+    };
+    let mut migrated = 0usize;
+    let mut skipped = 0usize;
+    for entry in entries.flatten() {
+        let src = entry.path();
+        let name = entry.file_name();
+        let dst = new_root.join(&name);
+        if dst.exists() {
+            warn!(
+                src = %src.display(),
+                dst = %dst.display(),
+                "sessions layout migration: destination already exists; skipping to avoid collision"
+            );
+            skipped += 1;
+            continue;
+        }
+        match std::fs::rename(&src, &dst) {
+            Ok(()) => migrated += 1,
+            Err(err) => {
+                warn!(
+                    src = %src.display(),
+                    dst = %dst.display(),
+                    ?err,
+                    "sessions layout migration: rename failed; skipping"
+                );
+                skipped += 1;
+            }
+        }
+    }
+    // Only remove the inner dir when we successfully moved everything and there
+    // were no skipped entries (skips mean the inner dir may not be empty).
+    if skipped == 0 {
+        if let Err(err) = std::fs::remove_dir(&old_inner) {
+            warn!(?err, "sessions layout migration: remove inner dir failed; continuing");
+        }
+    }
+    info!(migrated, skipped, "sessions layout migration complete");
 }
 
 /// Construct the assembled host state. Exposed for tests so they can poke
@@ -176,7 +415,8 @@ pub async fn install_modules(host_ctx: Arc<HostContext>) {
                     .flatten()
                     .is_some()
                 })
-            }),
+            })
+            .with_new_pending_notifier(build_pending_notifier(host_ctx.central().clone())),
         ),
         Box::new(InteractiveModule::default()),
         Box::new(SchedulingModule),
@@ -197,10 +437,19 @@ pub async fn install_modules(host_ctx: Arc<HostContext>) {
 ///
 /// `runtime` may be provided by the caller (for tests); when `None` the
 /// real runtime is detected via [`ironclaw_container_rt::detect`].
+///
+/// `env_file` is the `.env` path used by the SIGHUP secret-rotation
+/// handler. When `Some`, a SIGHUP re-reads this file and updates the
+/// container manager's forwarded env vars (provider keys, base URL)
+/// so subsequent container spawns pick up rotated values without a
+/// host restart. When `None`, SIGHUP is logged but is otherwise a
+/// no-op.
+#[allow(clippy::too_many_lines)] // Boot sequence is intentionally sequential.
 pub async fn run_host(
     cfg: HostConfig,
     runtime: Option<Box<dyn ContainerRuntime>>,
     shutdown: CancellationToken,
+    env_file: Option<std::path::PathBuf>,
 ) -> Result<(), BootError> {
     info!(
         data_dir = %cfg.data_dir.display(),
@@ -210,6 +459,15 @@ pub async fn run_host(
 
     // 1-4. Migrations.
     run_migrations_only(&cfg)?;
+
+    // 4b. Schema version check. After migration, verify applied == expected
+    // (warn on pending, error on downgrade). This is defence-in-depth; the
+    // normal case is that run_migrations_only just brought applied == expected.
+    check_schema_version(&cfg)?;
+
+    // 4c. Session layout migration. Move data_dir/sessions/sessions/ → data_dir/sessions/
+    // if the old double-sessions layout exists. Idempotent and non-fatal per entry.
+    migrate_sessions_layout(&cfg.data_dir);
 
     // 5. Detect container runtime. Wrap in an Arc so we can hand one
     // clone to the orphan-cleanup call and another to the container
@@ -227,6 +485,10 @@ pub async fn run_host(
     if let Err(err) = cleanup_orphans(runtime.as_ref(), &cfg.install_slug).await {
         warn!(?err, "orphan cleanup failed; continuing boot");
     }
+
+    // 6b. Optional Prometheus metrics endpoint. Reads IRONCLAW_METRICS_ADDR;
+    // no-ops when unset. Warns on bind failure but does not abort boot.
+    ironclaw_metrics::maybe_start_server(Some(shutdown.clone())).await;
 
     // 7. Build channel registry.
     let registry = build_registry();
@@ -296,12 +558,19 @@ pub async fn run_host(
     // 13. Sweep loop.
     let sweep_loop = tokio::spawn(Arc::clone(&state.sweep).run_loop(shutdown.clone()));
 
-    let manager_task = spawn_container_manager(
+    let spawned = spawn_container_manager(
         &cfg,
         state.central.clone(),
         Arc::clone(&runtime),
         shutdown.clone(),
     );
+    let (manager_task, manager_handle): (
+        Option<tokio::task::JoinHandle<()>>,
+        Option<Arc<crate::container_manager::ContainerManager>>,
+    ) = match spawned {
+        Some((task, mgr)) => (Some(task), Some(mgr)),
+        None => (None, None),
+    };
 
     // 14. Spawn socket server.
     let socket_path = cfg.ncl_socket_path.clone();
@@ -314,8 +583,10 @@ pub async fn run_host(
     print_ready_banner(&cfg, &initialized);
     info!("ironclaw boot complete; idling");
 
-    // 15. Idle until shutdown.
-    wait_for_signal(shutdown.clone()).await;
+    // 15. Idle until shutdown. SIGHUP triggers a secret-rotation
+    // reload on the container manager (when one is spawned) and
+    // resumes waiting; only SIGINT/SIGTERM/external-cancel exit.
+    wait_for_signal_or_sighup(shutdown.clone(), manager_handle.clone(), env_file).await;
 
     info!("shutdown requested; cancelling tasks");
     shutdown.cancel();
@@ -338,8 +609,18 @@ pub async fn run_host(
 }
 
 /// Block until a SIGINT/SIGTERM is observed, or `shutdown` is cancelled
-/// externally (whichever comes first).
-pub async fn wait_for_signal(shutdown: CancellationToken) {
+/// externally (whichever comes first). SIGHUP is handled in a loop:
+/// each one re-reads `env_file` and applies the change to
+/// `manager.reload_env`, then resumes waiting. Only SIGINT, SIGTERM,
+/// and external cancellation exit.
+///
+/// On non-Unix platforms there is no signal support; the function
+/// blocks on `shutdown.cancelled()` only.
+pub async fn wait_for_signal_or_sighup(
+    shutdown: CancellationToken,
+    manager: Option<Arc<crate::container_manager::ContainerManager>>,
+    env_file: Option<std::path::PathBuf>,
+) {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
@@ -359,16 +640,58 @@ pub async fn wait_for_signal(shutdown: CancellationToken) {
                 return;
             }
         };
-        tokio::select! {
-            _ = sigint.recv() => info!("SIGINT received"),
-            _ = sigterm.recv() => info!("SIGTERM received"),
-            () = shutdown.cancelled() => info!("external cancellation"),
+        let mut sighup = match signal(SignalKind::hangup()) {
+            Ok(s) => Some(s),
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "could not install SIGHUP handler; secret rotation on SIGHUP unavailable"
+                );
+                None
+            }
+        };
+        loop {
+            if let Some(ref mut hup) = sighup {
+                tokio::select! {
+                    _ = sigint.recv() => { info!("SIGINT received"); return; }
+                    _ = sigterm.recv() => { info!("SIGTERM received"); return; }
+                    () = shutdown.cancelled() => { info!("external cancellation"); return; }
+                    _ = hup.recv() => {
+                        info!("SIGHUP received; reloading .env for secret rotation");
+                        if let Some(ref mgr) = manager {
+                            let changed = mgr.reload_env(env_file.as_deref());
+                            if changed.is_empty() {
+                                info!("SIGHUP: no secret vars changed");
+                            } else {
+                                info!(keys = ?changed, "SIGHUP: secret vars rotated (key names only)");
+                            }
+                        } else {
+                            info!("SIGHUP: container manager not running; env reload skipped");
+                        }
+                    }
+                }
+            } else {
+                tokio::select! {
+                    _ = sigint.recv() => { info!("SIGINT received"); return; }
+                    _ = sigterm.recv() => { info!("SIGTERM received"); return; }
+                    () = shutdown.cancelled() => { info!("external cancellation"); return; }
+                }
+            }
         }
     }
     #[cfg(not(unix))]
     {
+        let _ = manager;
+        let _ = env_file;
         let _ = shutdown.cancelled().await;
     }
+}
+
+/// Backwards-compat wrapper: SIGINT/SIGTERM only, no SIGHUP handling.
+/// Used by tests that don't need rotation. Production code should
+/// prefer [`wait_for_signal_or_sighup`].
+pub async fn wait_for_signal(shutdown: CancellationToken) {
+    wait_for_signal_or_sighup(shutdown, None, None).await;
 }
 
 /// Path under which channels keep their per-instance data directory. Exposed
@@ -377,15 +700,25 @@ pub fn channel_data_dir(data_root: &std::path::Path, channel_type: &str) -> Path
     data_root.join("channels").join(channel_type)
 }
 
-/// Spawn the container-manager task. Returns `Some(handle)` when the
-/// default image tag is known; otherwise logs a warning and returns
-/// `None` so the host still boots (sessions just won't get a runner).
+/// Result of [`spawn_container_manager`]: the task handle (driving
+/// the poll loop) and the `Arc` the SIGHUP handler uses to call
+/// `reload_env` on rotation.
+type SpawnedManager = (
+    tokio::task::JoinHandle<()>,
+    Arc<crate::container_manager::ContainerManager>,
+);
+
+/// Spawn the container-manager task. Returns `Some((handle, manager))`
+/// when the default image tag is known; otherwise logs a warning and
+/// returns `None` so the host still boots (sessions just won't get
+/// a runner). The returned `manager` is what the SIGHUP handler holds
+/// to apply secret rotation.
 fn spawn_container_manager(
     cfg: &HostConfig,
     central: ironclaw_db::central::CentralDb,
     runtime: Arc<dyn ContainerRuntime>,
     shutdown: CancellationToken,
-) -> Option<tokio::task::JoinHandle<()>> {
+) -> Option<SpawnedManager> {
     let Some(image_tag) = cfg.default_image_tag.clone() else {
         warn!(
             "no IRONCLAW_DEFAULT_IMAGE_TAG configured; container manager disabled. \
@@ -396,12 +729,10 @@ fn spawn_container_manager(
     };
     let manager_cfg = crate::container_manager::ManagerConfig {
         install_slug: cfg.install_slug.clone(),
-        // The router/delivery/sweep build SessionPaths via
-        // `FsSessionRoot::new(cfg.sessions_root())`, which means the
-        // actual on-disk root is `data_dir/sessions` (and
-        // `SessionPaths::new` appends another `/sessions/<ag>/<session>`
-        // on top of that). Match the same shape here so we open the
-        // same inbound.db the rest of the host writes to.
+        // sessions_root() returns data_dir itself; SessionPaths::new
+        // appends sessions/<ag>/<session> to produce data_dir/sessions/<ag>/<session>.
+        // The router/delivery/sweep use FsSessionRoot::new(cfg.sessions_root())
+        // which resolves to the same path.
         data_dir: cfg.sessions_root(),
         default_image_tag: image_tag,
         default_provider: cfg
@@ -417,13 +748,42 @@ fn spawn_container_manager(
         idle_timeout_secs: crate::container_manager::DEFAULT_IDLE_TIMEOUT_SECS,
         heartbeat_stale_secs: crate::container_manager::DEFAULT_HEARTBEAT_STALE_SECS,
         stop_grace_secs: crate::container_manager::DEFAULT_STOP_GRACE_SECS,
+        skills_dir: cfg.skills_dir.clone(),
+        groups_dir: cfg.groups_dir.clone(),
+        forward_env: collect_forward_env(),
     };
     let manager = Arc::new(crate::container_manager::ContainerManager::new(
         central,
         runtime,
         manager_cfg,
     ));
-    Some(tokio::spawn(manager.run_loop(shutdown)))
+    let task = tokio::spawn(Arc::clone(&manager).run_loop(shutdown));
+    Some((task, manager))
+}
+
+/// Collect operator-supplied env vars that should be forwarded into
+/// every spawned session container. Today this is the web-search
+/// provider keys + the explicit provider override; the list is kept
+/// here (rather than spread across the modules that need them) so
+/// the host has one place to audit what leaks into the container.
+fn collect_forward_env() -> Vec<(String, String)> {
+    const FORWARDED: &[&str] = &[
+        // Web-search providers (web_search tool).
+        "IRONCLAW_WEB_SEARCH_PROVIDER",
+        "TAVILY_API_KEY",
+        "EXA_API_KEY",
+        "BRAVE_SEARCH_API_KEY",
+        "SERPAPI_API_KEY",
+    ];
+    let mut out = Vec::with_capacity(FORWARDED.len());
+    for key in FORWARDED {
+        if let Ok(v) = std::env::var(key) {
+            if !v.is_empty() {
+                out.push(((*key).to_string(), v));
+            }
+        }
+    }
+    out
 }
 
 /// Print a one-screen summary of the running host so an operator can see
@@ -489,6 +849,10 @@ mod tests {
             BootError::Socket(std::io::Error::other("x")).exit_code(),
             4
         );
+        assert_eq!(
+            BootError::SchemaMismatch { expected: 4, applied: 7 }.exit_code(),
+            5
+        );
     }
 
     #[test]
@@ -503,6 +867,109 @@ mod tests {
                 .to_string()
                 .contains("no container runtime")
         );
+        let msg = BootError::SchemaMismatch { expected: 4, applied: 7 }.to_string();
+        assert!(msg.contains("downgrade"), "expected 'downgrade' in: {msg}");
+        assert!(msg.contains('4') && msg.contains('7'));
+    }
+
+    // --- schema version check ------------------------------------------------
+
+    #[test]
+    fn check_schema_version_ok_after_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = HostConfig {
+            data_dir: tmp.path().to_path_buf(),
+            ..HostConfig::default()
+        };
+        run_migrations_only(&cfg).unwrap();
+        check_schema_version(&cfg).unwrap(); // must not error
+    }
+
+    #[test]
+    fn check_schema_version_errors_on_future_schema() {
+        use ironclaw_db::central::CentralDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = HostConfig {
+            data_dir: tmp.path().to_path_buf(),
+            ..HostConfig::default()
+        };
+        run_migrations_only(&cfg).unwrap();
+        // Inject a future migration row so applied > expected.
+        {
+            let db = CentralDb::open(cfg.central_db_path()).unwrap();
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "INSERT INTO schema_version (name, applied) \
+                 VALUES ('999_future', '2099-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+        let err = check_schema_version(&cfg).unwrap_err();
+        assert!(matches!(err, BootError::SchemaMismatch { .. }));
+        assert_eq!(err.exit_code(), 5);
+    }
+
+    // --- session layout migration --------------------------------------------
+
+    #[test]
+    fn migrate_sessions_layout_noop_on_flat_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No inner sessions/sessions/ dir — should be a no-op.
+        migrate_sessions_layout(tmp.path());
+        // No new files created.
+        assert!(!tmp.path().join("sessions").exists());
+    }
+
+    #[test]
+    fn migrate_sessions_layout_moves_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_inner = tmp.path().join("sessions").join("sessions");
+        let agent_dir = old_inner.join("agent-1234");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("inbound.db"), b"fake").unwrap();
+
+        migrate_sessions_layout(tmp.path());
+
+        // Content moved to the flat location.
+        let new_agent = tmp.path().join("sessions").join("agent-1234");
+        assert!(new_agent.exists(), "agent dir should exist at flat path");
+        assert!(new_agent.join("inbound.db").exists());
+        // Inner sessions/ dir removed.
+        assert!(!old_inner.exists(), "inner sessions/ dir should be gone");
+    }
+
+    #[test]
+    fn migrate_sessions_layout_skips_on_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_inner = tmp.path().join("sessions").join("sessions");
+        let old_agent = old_inner.join("agent-abc");
+        std::fs::create_dir_all(&old_agent).unwrap();
+        // Pre-create the destination so it collides.
+        let new_agent = tmp.path().join("sessions").join("agent-abc");
+        std::fs::create_dir_all(&new_agent).unwrap();
+        std::fs::write(new_agent.join("existing.db"), b"keep").unwrap();
+
+        migrate_sessions_layout(tmp.path());
+
+        // Collision was logged + skipped — existing data intact.
+        assert!(new_agent.join("existing.db").exists());
+        // The old inner dir still exists because we skipped entries.
+        // (Whether it stays or goes depends on the skipped count > 0 guard.)
+        assert!(old_inner.exists(), "inner dir should remain when there were skips");
+    }
+
+    #[test]
+    fn migrate_sessions_layout_idempotent_after_successful_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_inner = tmp.path().join("sessions").join("sessions");
+        let agent_dir = old_inner.join("agent-xyz");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+
+        migrate_sessions_layout(tmp.path()); // first call moves + removes inner
+        // Second call: old_inner no longer exists → no-op.
+        migrate_sessions_layout(tmp.path()); // must not panic
     }
 
     #[test]
@@ -621,7 +1088,7 @@ mod tests {
         let rt: Box<dyn ContainerRuntime> = Box::new(crate::tests::NoopRuntime::default());
         let cancel = shutdown.clone();
         let task = tokio::spawn(async move {
-            run_host(cfg, Some(rt), cancel).await.unwrap();
+            run_host(cfg, Some(rt), cancel, None).await.unwrap();
         });
         // Wait briefly so the socket file appears.
         for _ in 0..80 {
@@ -654,13 +1121,288 @@ mod tests {
         );
         let cancel = shutdown.clone();
         let task = tokio::spawn(async move {
-            run_host(cfg, Some(rt), cancel).await.unwrap();
+            run_host(cfg, Some(rt), cancel, None).await.unwrap();
         });
         shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(5), task)
             .await
             .unwrap()
             .unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // build_pending_notifier tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a wired DB with one agent group and one messaging group.
+    fn notifier_fixture() -> (
+        ironclaw_db::central::CentralDb,
+        ironclaw_types::AgentGroupId,
+        ironclaw_types::MessagingGroupId,
+        ironclaw_types::ChannelType,
+        String, // platform_id
+    ) {
+        use ironclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+        use ironclaw_db::tables::messaging_group_agents::{upsert as upsert_wire, UpsertWiring};
+        use ironclaw_db::tables::messaging_groups::{upsert as upsert_mg, UpsertMessagingGroup};
+        use ironclaw_types::{ChannelType, EngageMode, SessionMode};
+
+        let db = ironclaw_db::central::CentralDb::open_in_memory().unwrap();
+        let ag = create_ag(
+            &db,
+            CreateAgentGroup {
+                name: "notifier-test-ag".into(),
+                folder: "nt".into(),
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        let ct = ChannelType::new("telegram");
+        let pid = "chat-notify".to_string();
+        let mg = upsert_mg(
+            &db,
+            UpsertMessagingGroup {
+                channel_type: ct.clone(),
+                platform_id: pid.clone(),
+                name: Some("Notify Group".into()),
+                is_group: true,
+                unknown_sender_policy: "strict".into(),
+            },
+        )
+        .unwrap();
+        upsert_wire(
+            &db,
+            UpsertWiring {
+                messaging_group_id: mg.id,
+                agent_group_id: ag.id,
+                engage_mode: EngageMode::Mention,
+                engage_pattern: None,
+                sender_scope: "known".into(),
+                ignored_message_policy: "drop".into(),
+                session_mode: SessionMode::Shared,
+                priority: 0,
+            },
+        )
+        .unwrap();
+        (db, ag.id, mg.id, ct, pid)
+    }
+
+    #[test]
+    fn notifier_dispatches_for_new_sender() {
+        use ironclaw_modules::context::MockDispatcher;
+        use ironclaw_modules::DeliveryDispatcher;
+        use ironclaw_types::{ChannelType, SenderIdentity};
+
+        let (db, ag_id, _mg_id, _ct, _pid) = notifier_fixture();
+        let notifier = build_pending_notifier(db);
+
+        let mock = MockDispatcher::new();
+        let dispatcher: Arc<dyn DeliveryDispatcher> = mock.clone();
+
+        let ctx = NewPendingCtx {
+            sender: SenderIdentity {
+                channel_type: ChannelType::new("slack"),
+                identity: "U-new".into(),
+                display_name: Some("New User".into()),
+            },
+            agent_group_id: ag_id,
+            messaging_group_id: None,
+            first_seen: chrono::Utc::now(),
+        };
+        notifier(ctx, dispatcher);
+        assert_eq!(mock.dispatched_count(), 1, "should dispatch a notification");
+        let dispatched_msgs = mock.dispatched.lock().unwrap();
+        let (target, msg) = &dispatched_msgs[0];
+        // Target should be the telegram group wired to this agent group.
+        assert_eq!(
+            target.channel_type.as_ref().map(ChannelType::as_str),
+            Some("telegram")
+        );
+        let text = msg.content.get("text").unwrap().as_str().unwrap();
+        assert!(
+            text.contains("iclaw approvals approve"),
+            "notification must include approval command: {text}"
+        );
+        assert!(
+            text.contains("U-new"),
+            "notification must include sender identity: {text}"
+        );
+        // Check notification is plain ASCII (no emojis).
+        assert!(
+            text.is_ascii(),
+            "notification text must be plain ASCII: {text}"
+        );
+    }
+
+    #[test]
+    fn notifier_skips_repeat_sender() {
+        use ironclaw_db::tables::unregistered_senders::{upsert as upsert_unreg, UpsertUnregisteredSender};
+        use ironclaw_modules::context::MockDispatcher;
+        use ironclaw_modules::DeliveryDispatcher;
+        use ironclaw_types::{ChannelType, SenderIdentity};
+
+        let (db, ag_id, _mg_id, _ct, _pid) = notifier_fixture();
+
+        // Pre-populate unregistered_senders so the notifier thinks this
+        // sender has already been seen (and notified) before.
+        let ct = ChannelType::new("slack");
+        let identity = "U-repeat".to_string();
+        upsert_unreg(
+            &db,
+            UpsertUnregisteredSender {
+                channel_type: ct.clone(),
+                platform_id: identity.clone(),
+                user_id: None,
+                sender_name: None,
+                reason: "scope_pending".into(),
+                messaging_group_id: None,
+                agent_group_id: None,
+            },
+        )
+        .unwrap();
+
+        let notifier = build_pending_notifier(db);
+        let mock = MockDispatcher::new();
+        let dispatcher: Arc<dyn DeliveryDispatcher> = mock.clone();
+
+        let ctx = NewPendingCtx {
+            sender: SenderIdentity {
+                channel_type: ct,
+                identity,
+                display_name: None,
+            },
+            agent_group_id: ag_id,
+            messaging_group_id: None,
+            first_seen: chrono::Utc::now(),
+        };
+        notifier(ctx, dispatcher);
+        assert_eq!(
+            mock.dispatched_count(),
+            0,
+            "should NOT dispatch for a repeat sender"
+        );
+    }
+
+    #[test]
+    fn notifier_skips_when_no_messaging_group_wired() {
+        use ironclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+        use ironclaw_modules::context::MockDispatcher;
+        use ironclaw_modules::DeliveryDispatcher;
+        use ironclaw_types::{ChannelType, SenderIdentity};
+
+        // Agent group with NO wired messaging group.
+        let db = ironclaw_db::central::CentralDb::open_in_memory().unwrap();
+        let ag = create_ag(
+            &db,
+            CreateAgentGroup {
+                name: "no-mg-ag".into(),
+                folder: "nm".into(),
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+
+        let notifier = build_pending_notifier(db);
+        let mock = MockDispatcher::new();
+        let dispatcher: Arc<dyn DeliveryDispatcher> = mock.clone();
+
+        let ctx = NewPendingCtx {
+            sender: SenderIdentity {
+                channel_type: ChannelType::new("discord"),
+                identity: "D-orphan".into(),
+                display_name: None,
+            },
+            agent_group_id: ag.id,
+            messaging_group_id: None,
+            first_seen: chrono::Utc::now(),
+        };
+        notifier(ctx, dispatcher);
+        // Must silently skip — no dispatch, no panic.
+        assert_eq!(mock.dispatched_count(), 0);
+    }
+
+    #[test]
+    fn notifier_multiple_agent_groups_routes_independently() {
+        use ironclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+        use ironclaw_db::tables::messaging_group_agents::{upsert as upsert_wire, UpsertWiring};
+        use ironclaw_db::tables::messaging_groups::{upsert as upsert_mg, UpsertMessagingGroup};
+        use ironclaw_modules::context::MockDispatcher;
+        use ironclaw_modules::DeliveryDispatcher;
+        use ironclaw_types::{ChannelType, EngageMode, SenderIdentity, SessionMode};
+
+        let db = ironclaw_db::central::CentralDb::open_in_memory().unwrap();
+
+        // Agent group A → slack channel.
+        let ag_a = create_ag(&db, CreateAgentGroup { name: "ag-a".into(), folder: "a".into(), agent_provider: None }).unwrap();
+        let mg_slack = upsert_mg(&db, UpsertMessagingGroup {
+            channel_type: ChannelType::new("slack"),
+            platform_id: "C-slack".into(),
+            name: None,
+            is_group: true,
+            unknown_sender_policy: "strict".into(),
+        }).unwrap();
+        upsert_wire(&db, UpsertWiring {
+            messaging_group_id: mg_slack.id,
+            agent_group_id: ag_a.id,
+            engage_mode: EngageMode::Mention,
+            engage_pattern: None,
+            sender_scope: "known".into(),
+            ignored_message_policy: "drop".into(),
+            session_mode: SessionMode::Shared,
+            priority: 0,
+        }).unwrap();
+
+        // Agent group B → discord channel.
+        let ag_b = create_ag(&db, CreateAgentGroup { name: "ag-b".into(), folder: "b".into(), agent_provider: None }).unwrap();
+        let mg_discord = upsert_mg(&db, UpsertMessagingGroup {
+            channel_type: ChannelType::new("discord"),
+            platform_id: "C-discord".into(),
+            name: None,
+            is_group: true,
+            unknown_sender_policy: "strict".into(),
+        }).unwrap();
+        upsert_wire(&db, UpsertWiring {
+            messaging_group_id: mg_discord.id,
+            agent_group_id: ag_b.id,
+            engage_mode: EngageMode::Mention,
+            engage_pattern: None,
+            sender_scope: "known".into(),
+            ignored_message_policy: "drop".into(),
+            session_mode: SessionMode::Shared,
+            priority: 0,
+        }).unwrap();
+
+        let notifier = build_pending_notifier(db);
+
+        let mock = MockDispatcher::new();
+        let dispatcher: Arc<dyn DeliveryDispatcher> = mock.clone();
+
+        // Fire notifier for a sender targeting agent group A.
+        let ctx_a = NewPendingCtx {
+            sender: SenderIdentity { channel_type: ChannelType::new("gchat"), identity: "user-a".into(), display_name: None },
+            agent_group_id: ag_a.id,
+            messaging_group_id: None,
+            first_seen: chrono::Utc::now(),
+        };
+        notifier(ctx_a, Arc::clone(&dispatcher));
+
+        // Fire notifier for a different sender targeting agent group B.
+        let ctx_b = NewPendingCtx {
+            sender: SenderIdentity { channel_type: ChannelType::new("gchat"), identity: "user-b".into(), display_name: None },
+            agent_group_id: ag_b.id,
+            messaging_group_id: None,
+            first_seen: chrono::Utc::now(),
+        };
+        notifier(ctx_b, dispatcher);
+
+        let all_dispatched = mock.dispatched.lock().unwrap();
+        assert_eq!(all_dispatched.len(), 2, "each agent group gets its own notification");
+        let targets: Vec<_> = all_dispatched
+            .iter()
+            .map(|(t, _)| t.channel_type.as_ref().map_or("", ChannelType::as_str))
+            .collect();
+        assert!(targets.contains(&"slack"), "ag-a should notify via slack");
+        assert!(targets.contains(&"discord"), "ag-b should notify via discord");
     }
 
     #[tokio::test]
@@ -679,7 +1421,7 @@ mod tests {
         let rt: Box<dyn ContainerRuntime> = Box::new(crate::tests::NoopRuntime::default());
         let cancel = shutdown.clone();
         let task = tokio::spawn(async move {
-            run_host(cfg, Some(rt), cancel).await.unwrap();
+            run_host(cfg, Some(rt), cancel, None).await.unwrap();
         });
         for _ in 0..80 {
             if tmp.path().join("channels").join("cli").exists() {

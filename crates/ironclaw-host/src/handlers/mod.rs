@@ -24,12 +24,15 @@ use serde_json::Value;
 pub mod approvals;
 pub mod audit;
 pub mod budgets;
+pub mod db;
 pub mod destinations;
 pub mod dropped_messages;
 pub mod groups;
 pub mod members;
 pub mod messaging_groups;
+pub mod mcp;
 pub mod roles;
+pub mod schema;
 pub mod sessions;
 pub mod usage;
 pub mod user_dms;
@@ -51,6 +54,8 @@ pub const HOST_ONLY_COMMANDS: &[&str] = &[
     "groups.config.remove-mcp-server",
     "groups.config.add-package",
     "groups.config.remove-package",
+    "groups.config.set-egress-allow",
+    "groups.config.set-resource-limits",
     "messaging-groups.create",
     "messaging-groups.update",
     "messaging-groups.delete",
@@ -67,6 +72,10 @@ pub const HOST_ONLY_COMMANDS: &[&str] = &[
     "destinations.remove",
     "approvals.approve_sender",
     "budgets.set",
+    "db.backup",
+    "db.restore",
+    "dropped-messages.replay",
+    "mcp.add",
 ];
 
 /// True when `command` requires `Caller::Host`.

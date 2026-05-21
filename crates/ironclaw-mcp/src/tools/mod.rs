@@ -24,6 +24,7 @@ pub mod core;
 pub mod interactive;
 pub mod scheduling;
 pub mod self_mod;
+pub mod web_search;
 
 /// A registered tool: its schema plus a type-erased async handler.
 pub struct ToolEntry {
@@ -70,6 +71,7 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         computer_use::read_file::entry(),
         computer_use::write_file::entry(),
         computer_use::web_fetch::entry(),
+        web_search::entry(),
     ]
 }
 
@@ -155,6 +157,7 @@ mod tests {
             "read_file",
             "write_file",
             "web_fetch",
+            "web_search",
         ];
         assert_eq!(set.len(), expected.len());
         for tool in &expected {

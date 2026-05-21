@@ -65,6 +65,34 @@ pub fn parse(input: &str) -> Result<Frontmatter, SkillError> {
     Ok(fm)
 }
 
+/// Return the markdown body portion of a `SKILL.md` (everything after the
+/// closing `---` delimiter), or the unchanged input when no frontmatter
+/// is present. Used by callers that want to splice the body into a
+/// larger document (e.g. an agent system prompt) without re-parsing the
+/// frontmatter.
+///
+/// Leading newlines immediately following the closing delimiter are
+/// trimmed so the body starts at the first meaningful character.
+pub fn skip_frontmatter(input: &str) -> &str {
+    let body = strip_bom(input);
+    let Some(rest) = body
+        .strip_prefix("---\n")
+        .or_else(|| body.strip_prefix("---\r\n"))
+    else {
+        return input;
+    };
+    let Some(end) = find_closing_delimiter(rest) else {
+        return input;
+    };
+    let after = &rest[end..];
+    // Consume the closing `---` line itself.
+    let after = after
+        .strip_prefix("---\n")
+        .or_else(|| after.strip_prefix("---\r\n"))
+        .unwrap_or(after);
+    after.trim_start_matches(['\n', '\r'])
+}
+
 fn strip_bom(s: &str) -> &str {
     s.strip_prefix('\u{feff}').unwrap_or(s)
 }
@@ -167,6 +195,36 @@ mod tests {
         let input = "---\nname: \"   \"\ndescription: y\n---\n";
         let err = parse(input).unwrap_err();
         assert!(err.to_string().contains("name"));
+    }
+
+    #[test]
+    fn skip_frontmatter_strips_yaml_and_leading_blank() {
+        let input = "---\nname: x\ndescription: y\n---\n\n# body\nhello\n";
+        assert_eq!(skip_frontmatter(input), "# body\nhello\n");
+    }
+
+    #[test]
+    fn skip_frontmatter_handles_crlf() {
+        let input = "---\r\nname: x\r\ndescription: y\r\n---\r\n# body\r\n";
+        assert_eq!(skip_frontmatter(input), "# body\r\n");
+    }
+
+    #[test]
+    fn skip_frontmatter_handles_bom() {
+        let input = "\u{feff}---\nname: x\ndescription: y\n---\nbody\n";
+        assert_eq!(skip_frontmatter(input), "body\n");
+    }
+
+    #[test]
+    fn skip_frontmatter_returns_input_when_no_frontmatter() {
+        let input = "no frontmatter here\n# header\n";
+        assert_eq!(skip_frontmatter(input), input);
+    }
+
+    #[test]
+    fn skip_frontmatter_returns_input_when_unterminated() {
+        let input = "---\nname: x\nno closing delim";
+        assert_eq!(skip_frontmatter(input), input);
     }
 
     #[test]

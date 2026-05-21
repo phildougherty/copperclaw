@@ -6,6 +6,189 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (production hardening slice — three parallel-agent items)
+
+- **Secret rotation via SIGHUP.** New `RotatableConfig` struct +
+  `Arc<RwLock<...>>` on `ContainerManager` holds the rotatable
+  surface (`ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, web-search
+  provider keys). `ContainerManager::reload_env(env_file)` parses
+  the `.env` and updates the lock so subsequent container spawns
+  pick up rotated values. SIGHUP handler wired in
+  `wait_for_signal_or_sighup`; `run_host` gains an `env_file`
+  parameter that the SIGHUP handler reads on each signal. New
+  metric `ironclaw_secrets_rotated_total`. Running containers see
+  rotated keys after idle-stop + respawn (default 5 min).
+- **Webhooks TLS documentation.** New
+  [`docs/webhooks-tls.md`](docs/webhooks-tls.md) covers the
+  reverse-proxy patterns (Caddy / nginx / Cloudflare Tunnel) and
+  explains why native rustls is deliberately not in 0.1.0.
+- **Per-group LLM rate limits.** New columns
+  `agent_turns_per_minute_cap` + `agent_turns_per_hour_cap` on
+  `group_budgets` (migration `009_rate_limit_caps`). Container
+  manager gates spawn on both windows in `maybe_spawn`; an
+  in-channel reply explains the cap via the same outbound-write
+  path the budget gate uses, dedup'd on a 1-minute window. New
+  `iclaw budgets set --turns-per-minute N --turns-per-hour N`.
+- **Versioned migrations.** New `expected_central_schema_version()`
+  and `applied_central_schema_version()` helpers in
+  `ironclaw-db::migrate`. Boot now refuses to start with
+  `BootError::SchemaMismatch` (exit code 5) when the on-disk
+  schema is newer than this binary expects (downgrade detection).
+  New `iclaw schema-version` subcommand prints `{expected, applied,
+  status}` as JSON.
+- **`sessions/sessions/` path cleanup.** `HostConfig::sessions_root()`
+  now returns `data_dir` directly; the double-`sessions/` layout
+  is gone. New `migrate_sessions_layout()` runs at boot, moving
+  contents from `data_dir/sessions/sessions/<ag>/<sess>/` up one
+  level when present. Collisions log a warn and skip; the inner
+  directory is only removed when all entries moved successfully.
+
+### Added (onboarding polish slice)
+
+- `iclaw doctor` — first-run / ongoing health probe. Walks the
+  install end-to-end (host reachability, agent groups, wirings,
+  active sessions, recent audit errors, dropped-message backlog,
+  `ANTHROPIC_API_KEY` presence, web-search provider keys) and
+  prints a per-row OK / WARN / FAIL with a `fix:` line on every
+  non-OK row. Non-zero exit when any check is in FAIL so CI scripts
+  can branch. `--json` for machine-readable output, `--no-ping` to
+  skip the live LLM ping.
+- Setup auto-bootstraps a default cli agent group + wiring. New
+  `quickstart_group` step runs after `verify` and writes a
+  `(cli, stdin)` messaging group + agent group + pattern-`.*`
+  wiring directly to the central DB so `iclaw chat` works on the
+  very first `ironclaw run`. Idempotent (skips when any agent group
+  already exists). Opt out with `IRONCLAW_SETUP_QUICKSTART=no` or
+  decline the interactive prompt. Override the slug with
+  `IRONCLAW_SETUP_QUICKSTART_NAME`. The `first_chat` step's
+  "what to do next" output flips to recommend `iclaw chat`
+  directly when the bootstrap landed.
+- Budget-exhausted reply to original sender. When the container
+  manager's spawn gate refuses because today's tokens exceeded
+  the group's `daily_token_cap`, the host now posts a one-line
+  in-channel reply ("I have reached this agent's daily token
+  budget. New requests will resume after &lt;next UTC midnight&gt;…") via
+  the session's `outbound.db`. Dedupes per-group on a one-hour
+  window so a chatty user gets one explanation, not ten. Skips
+  silently when `session_routing` is empty.
+
+### Added (M14 follow-up — web search)
+
+- New `web_search` MCP tool, the 20th in-tree tool the agent can
+  call. Closes the M14 follow-up gap: `web_fetch` could read a URL
+  but the agent couldn't *find* one.
+- Four provider backends in a single tool, normalised to one
+  `{title, url, snippet, published?, score?}` result schema:
+  - **Tavily** — agent-tuned default. `TAVILY_API_KEY`.
+  - **Exa** — neural / semantic search with `text` snippets.
+    `EXA_API_KEY`.
+  - **Brave** — independent keyword index. `BRAVE_SEARCH_API_KEY`.
+  - **SerpAPI** — Google / Bing / etc. wrapper. `SERPAPI_API_KEY`.
+- Provider resolution: explicit `provider` arg → `IRONCLAW_WEB_SEARCH_PROVIDER`
+  env → auto-detect from configured keys in order
+  `tavily, exa, brave, serpapi`. No keys configured surfaces a
+  validation error naming all four env vars (errors over silent
+  fallback).
+- Host's `ContainerManager` now forwards
+  `IRONCLAW_WEB_SEARCH_PROVIDER` + the four provider keys into the
+  session container at spawn via a new `forward_env` field, so the
+  operator only configures keys once in the host's `.env`.
+- New skill: `skills/web-search/SKILL.md` (auto-loaded into the
+  system prompt under the existing
+  `IRONCLAW_SKILLS_DIR` mechanism).
+- New doc: [`docs/web-search.md`](docs/web-search.md) — operator
+  setup, provider trade-offs, egress allow-list interaction.
+
+### Added (M14 — agent capability)
+
+- `ProviderEvent::ToolCall` and a tool-use outer loop in the runner.
+  The model now actually receives the schema for every in-tree tool
+  and can call them per turn until it produces a turn without tool
+  use (capped at 20 inner LLM rounds).
+- Four computer-use tools wired through to the agent: `shell` (bash
+  in container, 64 KiB output cap, 60 s default / 600 s ceiling),
+  `read_file` (UTF-8 read, 1 MiB cap), `write_file` (create/append
+  with auto-mkdir), `web_fetch` (HTTP GET/POST, 256 KiB body cap,
+  30 s default / 120 s ceiling).
+- Skill content auto-loaded into the agent's system prompt.
+  `IRONCLAW_SKILLS_DIR` points at the SKILL.md library, optional
+  `IRONCLAW_GROUPS_DIR` enables per-agent-group overrides under
+  `<groups_dir>/<ag_uuid>/skills/`. Setup writes both env vars.
+- New skills documenting the computer-use tools: `shell`,
+  `read-file`, `write-file`, `web-fetch`.
+
+### Added (M13 hardening — parallel-agent slice)
+
+- **Image rebuild on `container_configs` change.** The manager
+  fingerprints (`config_fingerprint` column) the rebuild-relevant
+  fields and rebuilds + retags before the next spawn when they
+  change. Rebuild failures log + emit
+  `ironclaw_image_rebuild_failed_total` and fall back to the
+  last-known-good image so the agent group is not blocked.
+- **Container egress allow-list.** New
+  `container_configs.egress_allow` (JSON array of host:port).
+  Default empty == allow-all (default-allow + opt-in lockdown).
+  Docker runtime translates to user-defined network policy; Apple
+  Container runtime returns `RtError::Unsupported`. New
+  `iclaw groups config set-egress-allow <id> --allow host:port ...`.
+- **Per-group resource caps.** New
+  `container_configs.resource_limits` JSON
+  (`cpus` / `memory_mb` / `pids_limit`, all optional). Docker
+  runtime applies via `--cpus` / `--memory` / `--pids-limit`. New
+  `iclaw groups config set-resource-limits`.
+- **Auto-applied `install_packages` / `add_mcp_server`.** The
+  delivery loop now intercepts these system actions and writes
+  directly to `container_configs.packages_apt` /
+  `packages_npm` / `mcp_servers`. Combined with the rebuild
+  fingerprint, the next spawn picks up the agent's tool calls
+  automatically — no operator step required.
+- **Central DB backup / restore.** `iclaw db backup <path>` runs
+  a WAL checkpoint and atomically copies the file. `iclaw db
+  restore <path>` always refuses with `host_running`; the
+  operator-facing procedure is documented in
+  `docs/db-backup.md` (stop host, copy file, restart).
+- **Outbound dead-letter replay.** New
+  `outbound_dropped_messages` table (migration `008_*`). Delivery
+  failures that exhaust 3 retries land here.
+  `iclaw dropped-messages outbound-list --since <window>` and
+  `iclaw dropped-messages replay <id>` give the operator
+  inspection / retry.
+- **MCP server preset registry.** `iclaw mcp list-presets` shows
+  the curated library (postgres, linear, github, notion,
+  filesystem, browserbase). `iclaw mcp add <preset>
+  --agent-group-id <id> --env K=V` writes the chosen preset into
+  `container_configs.mcp_servers` (env values are redacted in the
+  audit log).
+- **Sender approval notifications in-channel.** When a new sender
+  lands in `pending` for the first time, the host posts a plain-
+  ASCII "approve?" notification to the agent group's primary
+  messaging group. Dedup uses `unregistered_senders` so repeat
+  senders don't re-spam.
+- **Prometheus metrics endpoint.** Opt-in via
+  `IRONCLAW_METRICS_ADDR=127.0.0.1:9090` (bare port auto-prefixes
+  to loopback). Counters:
+  `ironclaw_messages_inbound_total{channel_type}`,
+  `ironclaw_messages_outbound_total{channel_type}`,
+  `ironclaw_containers_spawned_total`,
+  `ironclaw_containers_crashed_total`,
+  `ironclaw_delivery_failed_total{channel_type}`,
+  `ironclaw_image_rebuild_failed_total`. Histograms:
+  `ironclaw_llm_call_seconds`, `ironclaw_llm_tokens_input`,
+  `ironclaw_llm_tokens_output`, `ironclaw_container_spawn_seconds`.
+  New crate `ironclaw-metrics`.
+- **Log rotation.** Opt-in via `IRONCLAW_LOG_DIR=<path>`. Adds a
+  daily-rotating file writer (`host.log.<YYYY-MM-DD>`) alongside
+  the existing stderr writer. `IRONCLAW_LOG` filter applies to
+  both. Default stderr-only behaviour unchanged.
+- **Audit-log env redaction.** The host's audit dispatch now masks
+  values under any `env` block for `mcp.add` and
+  `groups.config.set-mcp-servers` before serialising into
+  `audit_log.args`. Keys are preserved; values become
+  `<redacted>`.
+- New docs: [`docs/container-config.md`](docs/container-config.md),
+  [`docs/observability.md`](docs/observability.md),
+  [`docs/db-backup.md`](docs/db-backup.md).
+
 ### Added
 
 - Initial Rust workspace with 16 crates across the host, runner,

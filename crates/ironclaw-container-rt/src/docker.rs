@@ -25,7 +25,7 @@ use bytes::Bytes;
 use futures::stream::StreamExt;
 
 use crate::build::ImageBuildSpec;
-use crate::spec::{ContainerHandle, ContainerSpec, Mount};
+use crate::spec::{ContainerHandle, ContainerSpec, Mount, ResourceLimits};
 use crate::{ContainerRuntime, RtError};
 
 /// Bollard-backed Docker runtime.
@@ -196,6 +196,16 @@ impl ContainerRuntime for DockerRuntime {
 // ---- pure translation helpers ------------------------------------------
 
 /// Translate a [`ContainerSpec`] into a bollard [`Config`].
+///
+/// Resource limits from [`ContainerSpec::resource_limits`] are mapped:
+/// - `cpus` → `HostConfig::nano_cpus` (cpus × 10⁹)
+/// - `memory_mb` → `HostConfig::memory` (MiB × 2²⁰)
+/// - `pids_limit` → `HostConfig::pids_limit`
+///
+/// Egress enforcement is a host-level concern; the `HostConfig` below wires
+/// `extra_hosts` which is the foundation for static host resolution, but
+/// full iptables-based egress filtering requires a post-spawn hook outside
+/// the scope of the bollard `create_container` call.
 pub(crate) fn container_config(spec: &ContainerSpec) -> Config<String> {
     let env: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let labels: HashMap<String, String> = spec.labels.clone();
@@ -208,11 +218,7 @@ pub(crate) fn container_config(spec: &ContainerSpec) -> Config<String> {
         .map(|(host, ip)| format!("{host}:{ip}"))
         .collect();
 
-    let host_config = HostConfig {
-        mounts: Some(mounts),
-        extra_hosts: Some(extra_hosts),
-        ..Default::default()
-    };
+    let host_config = host_config_with_limits(&spec.resource_limits, mounts, extra_hosts);
 
     Config {
         image: Some(spec.image.clone()),
@@ -225,6 +231,37 @@ pub(crate) fn container_config(spec: &ContainerSpec) -> Config<String> {
         user: spec.user.clone(),
         labels: if labels.is_empty() { None } else { Some(labels) },
         host_config: Some(host_config),
+        ..Default::default()
+    }
+}
+
+/// Build the `HostConfig` applying any resource limits.
+pub(crate) fn host_config_with_limits(
+    limits: &ResourceLimits,
+    mounts: Vec<DockerMount>,
+    extra_hosts: Vec<String>,
+) -> HostConfig {
+    // Docker's CPU quota is in nano-CPUs (1 CPU = 1_000_000_000 nano-CPUs).
+    // The f64->i64 truncation is intentional: fractional nano-CPUs are meaningless.
+    // Wrap for memory_mb and pids_limit: practical values are well below i64::MAX.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let nano_cpus = limits
+        .cpus
+        .map(|c| (c * 1_000_000_000.0) as i64);
+    // Memory is in bytes.
+    #[allow(clippy::cast_possible_wrap)]
+    let memory = limits
+        .memory_mb
+        .map(|mb| (mb * 1024 * 1024) as i64);
+    #[allow(clippy::cast_possible_wrap)]
+    let pids_limit = limits.pids_limit.map(|p| p as i64);
+
+    HostConfig {
+        mounts: Some(mounts),
+        extra_hosts: Some(extra_hosts),
+        nano_cpus,
+        memory,
+        pids_limit,
         ..Default::default()
     }
 }
@@ -477,6 +514,41 @@ mod tests {
         let host = cfg.host_config.expect("host config");
         assert_eq!(host.extra_hosts.as_deref(), Some(&[] as &[String]));
         assert_eq!(host.mounts.as_deref(), Some(&[] as &[DockerMount]));
+        // No resource limits set → all None.
+        assert!(host.nano_cpus.is_none());
+        assert!(host.memory.is_none());
+        assert!(host.pids_limit.is_none());
+    }
+
+    #[test]
+    fn container_config_resource_limits_applied() {
+        let spec = ContainerSpec::new("c", "img").with_resource_limits(ResourceLimits {
+            cpus: Some(1.5),
+            memory_mb: Some(512),
+            pids_limit: Some(256),
+        });
+        let cfg = container_config(&spec);
+        let host = cfg.host_config.unwrap();
+        // 1.5 CPUs = 1_500_000_000 nano-CPUs
+        assert_eq!(host.nano_cpus, Some(1_500_000_000));
+        // 512 MiB = 512 * 1024 * 1024 bytes = 536870912
+        assert_eq!(host.memory, Some(512 * 1024 * 1024));
+        assert_eq!(host.pids_limit, Some(256));
+    }
+
+    #[test]
+    fn container_config_partial_resource_limits() {
+        // Only memory set; others absent.
+        let spec = ContainerSpec::new("c", "img").with_resource_limits(ResourceLimits {
+            cpus: None,
+            memory_mb: Some(128),
+            pids_limit: None,
+        });
+        let cfg = container_config(&spec);
+        let host = cfg.host_config.unwrap();
+        assert!(host.nano_cpus.is_none());
+        assert_eq!(host.memory, Some(128 * 1024 * 1024));
+        assert!(host.pids_limit.is_none());
     }
 
     #[test]

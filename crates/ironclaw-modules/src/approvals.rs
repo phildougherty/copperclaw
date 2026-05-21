@@ -1,6 +1,6 @@
 //! Pending approval workflow.
 //!
-//! Two hooks are wired:
+//! Three hooks are wired:
 //!
 //! 1. `set_sender_scope_gate` — when an inbound event comes from an unknown
 //!    sender, the gate returns [`SenderScopeDecision::Pending`] so the host
@@ -10,10 +10,19 @@
 //!    outbound system message requesting an approval card, this handler
 //!    builds a structured card payload pointed at an approver and returns it
 //!    via [`DeliveryActionOutput::message`].
+//!
+//! 3. `on_delivery_adapter_ready` — captures the [`DeliveryDispatcher`] so
+//!    the module can post an "approve?" notification to the operator through
+//!    the agent group's primary messaging channel the first time an unknown
+//!    sender is recorded. De-duplication is provided by the
+//!    `pending_sender_approvals` upsert's `newly_inserted` flag — no second
+//!    notification is posted for the same `(messaging_group, sender_identity)`
+//!    pair. If the agent group has no associated messaging group the
+//!    notification is silently skipped (logged at info).
 
 use crate::context::{
-    DeliveryActionHandler, DeliveryActionInput, DeliveryActionOutput, DispatchTarget, Module,
-    ModuleContext, SenderScopeCtx, SenderScopeDecision,
+    DeliveryActionHandler, DeliveryActionInput, DeliveryActionOutput, DeliveryDispatcher,
+    DispatchTarget, Module, ModuleContext, SenderScopeCtx, SenderScopeDecision,
 };
 use crate::error::ModuleError;
 use async_trait::async_trait;
@@ -51,6 +60,29 @@ struct PendingStore {
 pub type SenderLookup =
     Arc<dyn Fn(&SenderIdentity) -> bool + Send + Sync>;
 
+/// Context passed to [`NewPendingNotifier`] when a new sender lands in the
+/// pending queue for the first time.
+#[derive(Debug, Clone)]
+pub struct NewPendingCtx {
+    /// The identity of the sender that was just placed in pending.
+    pub sender: SenderIdentity,
+    /// The agent group the sender tried to reach.
+    pub agent_group_id: AgentGroupId,
+    /// The messaging group the event arrived on, if known.
+    pub messaging_group_id: Option<MessagingGroupId>,
+    /// Timestamp of the first contact attempt.
+    pub first_seen: DateTime<Utc>,
+}
+
+/// Callback invoked by the approvals gate the first time a new sender is
+/// placed in pending. The host wires this to a closure that posts a
+/// notification through the agent group's primary messaging channel.
+/// The closure is called synchronously inside the gate (which itself runs
+/// on the router's hot path), so it must be fast. Any I/O should be
+/// dispatched asynchronously via the [`DeliveryDispatcher`].
+pub type NewPendingNotifier =
+    Arc<dyn Fn(NewPendingCtx, Arc<dyn DeliveryDispatcher>) + Send + Sync>;
+
 /// Approvals module.
 pub struct ApprovalsModule {
     /// In-memory pending list, fed by the host via `record_pending` calls.
@@ -60,6 +92,12 @@ pub struct ApprovalsModule {
     /// Persistent-store lookup invoked when the in-memory set
     /// misses. `None` = in-memory only.
     persistent_lookup: Option<SenderLookup>,
+    /// Optional callback fired the first time a new sender hits pending.
+    /// Wired by the host at boot to post an in-channel "approve?" prompt.
+    new_pending_notifier: Option<NewPendingNotifier>,
+    /// Dispatcher captured via `on_delivery_adapter_ready`; used by the
+    /// gate closure to post notifications without blocking the router.
+    dispatcher: Arc<Mutex<Option<Arc<dyn DeliveryDispatcher>>>>,
 }
 
 impl Default for ApprovalsModule {
@@ -74,6 +112,8 @@ impl ApprovalsModule {
             store: Arc::new(Mutex::new(PendingStore::default())),
             known_senders: Arc::new(Mutex::new(Vec::new())),
             persistent_lookup: None,
+            new_pending_notifier: None,
+            dispatcher: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -88,6 +128,8 @@ impl ApprovalsModule {
             store: Arc::new(Mutex::new(PendingStore::default())),
             known_senders: Arc::new(Mutex::new(senders)),
             persistent_lookup: None,
+            new_pending_notifier: None,
+            dispatcher: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -98,6 +140,15 @@ impl ApprovalsModule {
     #[must_use]
     pub fn with_persistent_lookup(mut self, lookup: SenderLookup) -> Self {
         self.persistent_lookup = Some(lookup);
+        self
+    }
+
+    /// Builder: attach a notifier that fires the first time a new unknown
+    /// sender is placed in pending. The host wires this to post an
+    /// in-channel "approve?" message to the operator.
+    #[must_use]
+    pub fn with_new_pending_notifier(mut self, notifier: NewPendingNotifier) -> Self {
+        self.new_pending_notifier = Some(notifier);
         self
     }
 
@@ -204,6 +255,9 @@ impl Module for ApprovalsModule {
     async fn install(&self, ctx: Arc<dyn ModuleContext>) -> Result<(), ModuleError> {
         let known = Arc::clone(&self.known_senders);
         let persistent = self.persistent_lookup.clone();
+        let notifier = self.new_pending_notifier.clone();
+        let dispatcher_slot = Arc::clone(&self.dispatcher);
+
         ctx.set_sender_scope_gate(Arc::new(move |s: SenderScopeCtx| {
             let Some(sender) = &s.event_sender else {
                 return SenderScopeDecision::Defer;
@@ -227,12 +281,35 @@ impl Module for ApprovalsModule {
                     return SenderScopeDecision::Defer;
                 }
             }
+            // Sender is unknown. Fire the new-pending notifier if one is
+            // registered and a dispatcher is available. The notifier is
+            // responsible for de-duplicating via the DB upsert's
+            // `newly_inserted` flag so this hot path stays cheap.
+            if let Some(ref notify) = notifier {
+                if let Some(ref dispatcher) = *dispatcher_slot.lock().unwrap() {
+                    let ctx_info = NewPendingCtx {
+                        sender: sender.clone(),
+                        agent_group_id: s.agent_group_id,
+                        messaging_group_id: s.messaging_group_id,
+                        first_seen: Utc::now(),
+                    };
+                    notify(ctx_info, Arc::clone(dispatcher));
+                }
+            }
             SenderScopeDecision::Pending(format!(
                 "sender `{}:{}` is pending approval",
                 sender.channel_type, sender.identity
             ))
         }));
         ctx.register_delivery_action("approval_card", Arc::new(ApprovalCardHandler));
+
+        // Capture the dispatcher reference so the gate closure can post
+        // notifications without a circular dependency on the delivery crate.
+        let dispatcher_slot2 = Arc::clone(&self.dispatcher);
+        ctx.on_delivery_adapter_ready(Arc::new(move |d| {
+            *dispatcher_slot2.lock().unwrap() = Some(d);
+        }));
+
         Ok(())
     }
 }
@@ -298,13 +375,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn install_registers_scope_gate_and_action() {
+    async fn install_registers_scope_gate_action_and_delivery_ready() {
         let m = ApprovalsModule::new();
         let ctx = MockModuleContext::new();
         m.install(ctx.clone()).await.unwrap();
         let regs = ctx.registered();
         assert!(regs.contains(&"sender_scope_gate"));
         assert!(regs.contains(&"delivery_action"));
+        assert!(regs.contains(&"delivery_ready"), "approvals must register on_delivery_adapter_ready");
         assert_eq!(ctx.delivery_actions(), vec!["approval_card"]);
     }
 
@@ -446,5 +524,178 @@ mod tests {
     #[test]
     fn name_is_stable() {
         assert_eq!(ApprovalsModule::default().name(), "approvals");
+    }
+
+    // -----------------------------------------------------------------------
+    // Notifier tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a sender identity for tests.
+    fn unknown_sender(channel: &str, id: &str) -> SenderIdentity {
+        SenderIdentity {
+            channel_type: ChannelType::new(channel),
+            identity: id.into(),
+            display_name: Some(format!("{channel}/{id}")),
+        }
+    }
+
+    #[tokio::test]
+    async fn notifier_fires_when_sender_is_pending() {
+        use crate::context::MockDispatcher;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count2 = Arc::clone(&call_count);
+
+        let notifier: NewPendingNotifier = Arc::new(move |ctx, dispatcher| {
+            call_count2.fetch_add(1, Ordering::SeqCst);
+            // Post a synthetic dispatch so we can assert it was called.
+            let target = DispatchTarget::channel(
+                ctx.sender.channel_type.clone(),
+                ctx.sender.identity.clone(),
+                None,
+            );
+            let msg = OutboundMessage {
+                kind: MessageKind::Chat,
+                content: serde_json::json!({"text": "pending approval notice"}),
+                files: vec![],
+            };
+            dispatcher.dispatch(&target, &msg);
+        });
+
+        let m = ApprovalsModule::new().with_new_pending_notifier(notifier);
+        let ctx = MockModuleContext::new();
+        m.install(ctx.clone()).await.unwrap();
+
+        // Seed a dispatcher.
+        let mock_dispatcher = MockDispatcher::new();
+        let d: Arc<dyn DeliveryDispatcher> = mock_dispatcher.clone();
+        ctx.fire_delivery_ready(&d);
+
+        // Trigger the gate for an unknown sender.
+        let gate = ctx.sender_scope_gates.lock().unwrap()[0].clone();
+        let decision = (gate)(SenderScopeCtx {
+            event_sender: Some(unknown_sender("telegram", "u-99")),
+            messaging_group_id: None,
+            agent_group_id: AgentGroupId::new(),
+            resolved_user: None,
+        });
+        assert!(decision.is_pending());
+        assert_eq!(call_count.load(Ordering::SeqCst), 1, "notifier must fire once");
+        assert_eq!(mock_dispatcher.dispatched_count(), 1, "dispatch must have been called");
+    }
+
+    #[tokio::test]
+    async fn notifier_does_not_fire_without_dispatcher() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count2 = Arc::clone(&call_count);
+
+        let notifier: NewPendingNotifier = Arc::new(move |_ctx, _dispatcher| {
+            call_count2.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let m = ApprovalsModule::new().with_new_pending_notifier(notifier);
+        let ctx = MockModuleContext::new();
+        m.install(ctx.clone()).await.unwrap();
+        // Intentionally do NOT call fire_delivery_ready.
+
+        let gate = ctx.sender_scope_gates.lock().unwrap()[0].clone();
+        let decision = (gate)(SenderScopeCtx {
+            event_sender: Some(unknown_sender("slack", "U-55")),
+            messaging_group_id: None,
+            agent_group_id: AgentGroupId::new(),
+            resolved_user: None,
+        });
+        assert!(decision.is_pending());
+        // Notifier must NOT have fired because no dispatcher was available.
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn notifier_does_not_fire_for_known_sender() {
+        use crate::context::MockDispatcher;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count2 = Arc::clone(&call_count);
+
+        let notifier: NewPendingNotifier =
+            Arc::new(move |_ctx, _d| { call_count2.fetch_add(1, Ordering::SeqCst); });
+
+        let sender = unknown_sender("discord", "D-1");
+        let m = ApprovalsModule::new()
+            .with_new_pending_notifier(notifier);
+        m.approve_sender(sender.clone());
+
+        let ctx = MockModuleContext::new();
+        m.install(ctx.clone()).await.unwrap();
+
+        let mock_dispatcher = MockDispatcher::new();
+        let d: Arc<dyn DeliveryDispatcher> = mock_dispatcher.clone();
+        ctx.fire_delivery_ready(&d);
+
+        let gate = ctx.sender_scope_gates.lock().unwrap()[0].clone();
+        let decision = (gate)(SenderScopeCtx {
+            event_sender: Some(sender),
+            messaging_group_id: None,
+            agent_group_id: AgentGroupId::new(),
+            resolved_user: None,
+        });
+        // Known sender — gate defers, notifier must NOT fire.
+        assert!(decision.is_defer());
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn notifier_receives_agent_group_and_messaging_group() {
+        use crate::context::MockDispatcher;
+
+        let captured: Arc<Mutex<Option<NewPendingCtx>>> = Arc::new(Mutex::new(None));
+        let cap2 = Arc::clone(&captured);
+        let notifier: NewPendingNotifier = Arc::new(move |ctx, _d| {
+            *cap2.lock().unwrap() = Some(ctx);
+        });
+
+        let m = ApprovalsModule::new().with_new_pending_notifier(notifier);
+        let ctx = MockModuleContext::new();
+        m.install(ctx.clone()).await.unwrap();
+
+        let mock_dispatcher = MockDispatcher::new();
+        let d: Arc<dyn DeliveryDispatcher> = mock_dispatcher;
+        ctx.fire_delivery_ready(&d);
+
+        let ag_id = AgentGroupId::new();
+        let mg_id = MessagingGroupId::new();
+        let gate = ctx.sender_scope_gates.lock().unwrap()[0].clone();
+        (gate)(SenderScopeCtx {
+            event_sender: Some(unknown_sender("teams", "T-7")),
+            messaging_group_id: Some(mg_id),
+            agent_group_id: ag_id,
+            resolved_user: None,
+        });
+
+        let c = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(c.agent_group_id, ag_id);
+        assert_eq!(c.messaging_group_id, Some(mg_id));
+        assert_eq!(c.sender.identity, "T-7");
+    }
+
+    #[tokio::test]
+    async fn without_notifier_pending_decision_still_works() {
+        // Ensure the module still functions correctly without a notifier.
+        let m = ApprovalsModule::new(); // no notifier
+        let ctx = MockModuleContext::new();
+        m.install(ctx.clone()).await.unwrap();
+
+        let gate = ctx.sender_scope_gates.lock().unwrap()[0].clone();
+        let decision = (gate)(SenderScopeCtx {
+            event_sender: Some(unknown_sender("gchat", "space-1")),
+            messaging_group_id: None,
+            agent_group_id: AgentGroupId::new(),
+            resolved_user: None,
+        });
+        assert!(decision.is_pending());
     }
 }

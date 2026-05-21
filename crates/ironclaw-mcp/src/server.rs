@@ -170,8 +170,8 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert_eq!(names[0], "send_message");
         // The 15 messaging/scheduling/agent tools come first, then
-        // the `computer_use` family. `web_fetch` is the current tail.
-        assert_eq!(*names.last().unwrap(), "web_fetch");
+        // the `computer_use` family, then `web_search` as the current tail.
+        assert_eq!(*names.last().unwrap(), "web_search");
         assert_eq!(tools.len(), crate::tools::build_tool_set().len());
     }
 

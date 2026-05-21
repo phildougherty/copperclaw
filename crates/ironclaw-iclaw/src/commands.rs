@@ -161,6 +161,19 @@ pub enum TopCommand {
     Status,
     /// One-shot operator health check.
     Health,
+    /// First-run diagnostic. Walks the install end-to-end and reports
+    /// what's wired, what's missing, and what command to run to fix
+    /// each missing piece. Designed so a fresh user can paste the
+    /// output into the README's troubleshooting section.
+    ///
+    /// Returns a non-zero exit when any check is in FAIL state so CI
+    /// and pre-flight scripts can branch on it.
+    Doctor {
+        /// Skip the live LLM provider ping (saves a round-trip + a
+        /// token when you only want local checks).
+        #[arg(long)]
+        no_ping: bool,
+    },
     /// Per-group daily budget caps.
     Budgets {
         #[command(subcommand)]
@@ -197,6 +210,93 @@ pub enum TopCommand {
     Completions {
         /// Target shell. Supports `bash`, `zsh`, `fish`, `elvish`, `powershell`.
         shell: clap_complete::Shell,
+    },
+    /// Central database backup and restore.
+    ///
+    /// Backup copies the central `ironclaw.db` file after running a WAL
+    /// checkpoint. Restore always refuses while the host is running and tells
+    /// the operator to stop the host first.
+    Db {
+        #[command(subcommand)]
+        action: DbCmd,
+    },
+    /// MCP server preset registry.
+    ///
+    /// `iclaw mcp list-presets` shows the built-in catalog of curated MCP
+    /// server configurations. `iclaw mcp add <preset>` writes the chosen
+    /// preset into an agent group's container config so it starts at the
+    /// next container spawn.
+    Mcp {
+        #[command(subcommand)]
+        action: McpCmd,
+    },
+    /// Print the central DB schema version summary.
+    ///
+    /// Prints a JSON object `{ "expected": N, "applied": M, "status": "ok|pending|future" }`
+    /// where:
+    /// - `expected` is the number of migrations compiled into this binary.
+    /// - `applied` is the number of migrations already recorded in the DB.
+    /// - `status` is `"ok"` when equal, `"pending"` when applied < expected,
+    ///   `"future"` when applied > expected (downgrade detected).
+    #[command(name = "schema-version")]
+    SchemaVersion,
+}
+
+// --- db --------------------------------------------------------------------
+
+/// `iclaw db ...` — central database backup / restore.
+#[derive(Debug, Subcommand)]
+pub enum DbCmd {
+    /// Backup the central DB to `<path>`. Runs a WAL checkpoint first, then
+    /// atomically copies the `SQLite` file. The backup is a valid standalone
+    /// `SQLite` database that can be opened immediately.
+    ///
+    /// The host does not need to be stopped for a backup; the WAL checkpoint
+    /// ensures the copy is consistent. A non-zero `wal_pages_remaining` in
+    /// the response means a write transaction was open during the checkpoint
+    /// and some WAL data was included — this is safe and expected under load.
+    Backup {
+        /// Destination file path. Parent directories are created automatically.
+        path: String,
+    },
+    /// Refuse to restore while the host is running.
+    ///
+    /// Restoring requires an exclusive lock on the `SQLite` file; the host
+    /// holds an open WAL connection. Stop the host first, then copy the
+    /// backup file over `<data_dir>/ironclaw.db` manually and restart.
+    Restore {
+        /// Backup file to restore from.
+        path: String,
+    },
+}
+
+// --- mcp -------------------------------------------------------------------
+
+/// `iclaw mcp ...` — MCP server preset registry.
+#[derive(Debug, Subcommand)]
+pub enum McpCmd {
+    /// List all built-in MCP server presets. No socket round-trip required.
+    #[command(name = "list-presets")]
+    ListPresets,
+    /// Add a preset MCP server to an agent group's container config.
+    ///
+    /// The preset entry is written into `container_configs.mcp_servers` and
+    /// takes effect at the next container spawn for that group. If a server
+    /// with the same name already exists it is replaced (idempotent).
+    ///
+    /// Example:
+    ///   iclaw mcp add postgres --agent-group-id <id> \\
+    ///       --env `POSTGRES_CONNECTION_STRING=postgres://localhost/mydb`
+    Add {
+        /// Preset name from `iclaw mcp list-presets`.
+        preset: String,
+        /// Agent group to configure.
+        #[arg(long = "agent-group-id")]
+        agent_group_id: String,
+        /// Environment variable overrides in `KEY=VALUE` form.
+        /// May be specified multiple times.
+        #[arg(long)]
+        env: Vec<String>,
     },
 }
 
@@ -308,6 +408,37 @@ pub enum GroupConfigCmd {
         id: String,
         #[command(flatten)]
         which: PackageFlag,
+    },
+    /// Set (or replace) the egress allow-list for this group.
+    ///
+    /// Each entry must be a `host:port` pair (e.g. `api.example.com:443`).
+    /// Passing no `--allow` arguments clears the list, restoring the
+    /// default allow-all policy.
+    #[command(name = "set-egress-allow")]
+    SetEgressAllow {
+        id: String,
+        /// Host:port entries to allow. May be repeated. Pass no `--allow`
+        /// flags to clear the list.
+        #[arg(long = "allow", num_args = 0..)]
+        allow: Vec<String>,
+    },
+    /// Set (or replace) the per-group resource caps.
+    ///
+    /// All flags are optional. To clear an existing cap, omit its flag.
+    /// Docker runtime: --cpus / --memory / --pids-limit applied at spawn.
+    /// Apple Container runtime: returns an error if any limit is set.
+    #[command(name = "set-resource-limits")]
+    SetResourceLimits {
+        id: String,
+        /// CPU quota as a fraction of one CPU (e.g. `1.5` for 1.5 CPUs).
+        #[arg(long)]
+        cpus: Option<String>,
+        /// Memory cap in mebibytes (e.g. `512` for 512 MiB).
+        #[arg(long)]
+        memory_mb: Option<u64>,
+        /// Maximum number of processes the container may create.
+        #[arg(long)]
+        pids_limit: Option<u64>,
     },
 }
 
@@ -562,9 +693,30 @@ pub enum UserDmsCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum DroppedMessagesCmd {
+    /// List inbound messages the router dropped (no messaging group found,
+    /// unknown sender, etc.).
     List {
         #[arg(long)]
         since: Option<String>,
+    },
+    /// List outbound messages the delivery loop could not deliver after all
+    /// retries were exhausted. These rows are candidates for replay.
+    #[command(name = "outbound-list")]
+    OutboundList {
+        /// Look-back window. ISO-8601 timestamp or relative shorthand
+        /// (`1h`, `24h`, `7d`). Omit to list all.
+        #[arg(long)]
+        since: Option<String>,
+        /// Maximum number of rows to return (default: 50).
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+    /// Re-queue an outbound dead-letter row. The row is re-inserted into the
+    /// originating session's `messages_out` table with a fresh `deliver_after`
+    /// so the delivery loop picks it up on its next sweep.
+    Replay {
+        /// Dead-letter row id returned by `iclaw dropped-messages outbound-list`.
+        id: String,
     },
 }
 
@@ -588,18 +740,27 @@ pub enum ApprovalsCmd {
     },
 }
 
-/// `iclaw budgets ...` — per-agent-group daily caps.
+/// `iclaw budgets ...` — per-agent-group daily and rate-limit caps.
 #[derive(Debug, Subcommand)]
 pub enum BudgetsCmd {
-    /// List all configured budgets.
+    /// List all configured budgets (daily token cap + rate caps).
     List,
-    /// Set or update a group's daily token cap. `--daily-tokens 0`
-    /// or `--clear` removes the cap.
+    /// Set or update a group's caps.
+    ///
+    /// `--daily-tokens 0` or `--clear` removes the daily token cap.
+    /// `--turns-per-minute 0` removes the per-minute rate cap.
+    /// `--turns-per-hour 0` removes the per-hour rate cap.
     Set {
         #[arg(long)]
         agent_group_id: String,
         #[arg(long)]
         daily_tokens: Option<i64>,
+        /// Max LLM calls per trailing 60-second window. 0 = remove cap.
+        #[arg(long)]
+        turns_per_minute: Option<i64>,
+        /// Max LLM calls per trailing 3600-second window. 0 = remove cap.
+        #[arg(long)]
+        turns_per_hour: Option<i64>,
         #[arg(long)]
         clear: bool,
     },
@@ -667,8 +828,13 @@ impl TopCommand {
             Self::Audit { action } => action.to_call(),
             Self::Budgets { action } => action.to_call(),
             Self::Quickstart { action } => action.to_call(),
+            Self::Db { action } => action.to_call(),
+            Self::Mcp { action } => action.to_call(),
             Self::Status => ParsedCall::new("composite.status", json!({})),
             Self::Health => ParsedCall::new("composite.health", json!({})),
+            Self::Doctor { no_ping } => {
+                ParsedCall::new("composite.doctor", json!({ "no_ping": no_ping }))
+            }
             Self::Usage { since } => {
                 ParsedCall::new("usage.rollup", json!({"since": since}))
             }
@@ -689,6 +855,7 @@ impl TopCommand {
                 "composite.completions",
                 json!({ "shell": shell.to_string() }),
             ),
+            Self::SchemaVersion => ParsedCall::new("schema.version", json!({})),
         }
     }
 }
@@ -734,6 +901,43 @@ fn parse_field(spec: &str) -> (String, Value) {
     // Try to interpret the value as JSON; fall back to a JSON string.
     let parsed = serde_json::from_str::<Value>(&value).unwrap_or(Value::String(value));
     (key, parsed)
+}
+
+impl DbCmd {
+    pub fn to_call(&self) -> ParsedCall {
+        match self {
+            Self::Backup { path } => ParsedCall::new("db.backup", json!({"path": path})),
+            Self::Restore { path } => ParsedCall::new("db.restore", json!({"path": path})),
+        }
+    }
+}
+
+impl McpCmd {
+    pub fn to_call(&self) -> ParsedCall {
+        match self {
+            Self::ListPresets => ParsedCall::new("mcp.list-presets", json!({})),
+            Self::Add {
+                preset,
+                agent_group_id,
+                env,
+            } => {
+                let mut env_obj = serde_json::Map::new();
+                for kv in env {
+                    if let Some((k, v)) = kv.split_once('=') {
+                        env_obj.insert(k.to_string(), Value::String(v.to_string()));
+                    }
+                }
+                ParsedCall::new(
+                    "mcp.add",
+                    json!({
+                        "preset": preset,
+                        "agent_group_id": agent_group_id,
+                        "env": env_obj,
+                    }),
+                )
+            }
+        }
+    }
 }
 
 impl GroupsCmd {
@@ -802,6 +1006,35 @@ impl GroupConfigCmd {
             }
             Self::RemovePackage { id, which } => {
                 ParsedCall::new("groups.config.remove-package", package_args(id, which))
+            }
+            Self::SetEgressAllow { id, allow } => {
+                let allow_json: Vec<Value> =
+                    allow.iter().map(|s| Value::String(s.clone())).collect();
+                ParsedCall::new(
+                    "groups.config.set-egress-allow",
+                    json!({"id": id, "allow": Value::Array(allow_json)}),
+                )
+            }
+            Self::SetResourceLimits {
+                id,
+                cpus,
+                memory_mb,
+                pids_limit,
+            } => {
+                let mut limits = Map::new();
+                if let Some(c) = cpus {
+                    limits.insert("cpus".into(), c.clone().into());
+                }
+                if let Some(m) = memory_mb {
+                    limits.insert("memory_mb".into(), (*m).into());
+                }
+                if let Some(p) = pids_limit {
+                    limits.insert("pids_limit".into(), (*p).into());
+                }
+                ParsedCall::new(
+                    "groups.config.set-resource-limits",
+                    json!({"id": id, "limits": Value::Object(limits)}),
+                )
             }
         }
     }
@@ -1052,6 +1285,15 @@ impl DroppedMessagesCmd {
                 insert_opt(&mut o, "since", since.clone());
                 ParsedCall::new("dropped-messages.list", Value::Object(o))
             }
+            Self::OutboundList { since, limit } => {
+                let mut o = Map::new();
+                insert_opt(&mut o, "since", since.clone());
+                o.insert("limit".into(), (*limit).into());
+                ParsedCall::new("dropped-messages.outbound-list", Value::Object(o))
+            }
+            Self::Replay { id } => {
+                ParsedCall::new("dropped-messages.replay", json!({"id": id}))
+            }
         }
     }
 }
@@ -1094,6 +1336,8 @@ impl BudgetsCmd {
             Self::Set {
                 agent_group_id,
                 daily_tokens,
+                turns_per_minute,
+                turns_per_hour,
                 clear,
             } => {
                 let mut o = Map::new();
@@ -1102,6 +1346,13 @@ impl BudgetsCmd {
                     o.insert("daily_tokens".into(), Value::Null);
                 } else if let Some(n) = daily_tokens {
                     o.insert("daily_tokens".into(), (*n).into());
+                }
+                // 0 means "remove the cap" (normalised to null by the host).
+                if let Some(n) = turns_per_minute {
+                    o.insert("turns_per_minute".into(), (*n).into());
+                }
+                if let Some(n) = turns_per_hour {
+                    o.insert("turns_per_hour".into(), (*n).into());
                 }
                 ParsedCall::new("budgets.set", Value::Object(o))
             }
@@ -1124,6 +1375,8 @@ pub const ALL_COMMANDS: &[&str] = &[
     "groups.config.remove-mcp-server",
     "groups.config.add-package",
     "groups.config.remove-package",
+    "groups.config.set-egress-allow",
+    "groups.config.set-resource-limits",
     "messaging-groups.list",
     "messaging-groups.get",
     "messaging-groups.create",
@@ -1151,6 +1404,12 @@ pub const ALL_COMMANDS: &[&str] = &[
     "sessions.get",
     "user-dms.list",
     "dropped-messages.list",
+    "dropped-messages.outbound-list",
+    "dropped-messages.replay",
+    "db.backup",
+    "db.restore",
+    "mcp.list-presets",
+    "mcp.add",
     "approvals.list",
     "approvals.get",
     "approvals.approve_sender",
@@ -1158,6 +1417,7 @@ pub const ALL_COMMANDS: &[&str] = &[
     "budgets.list",
     "budgets.set",
     "usage.rollup",
+    "schema.version",
 ];
 
 #[cfg(test)]
@@ -1368,6 +1628,83 @@ mod tests {
         ]);
         // clap will reject both being set when group has multiple=false.
         assert!(err.to_string().contains("cannot be used") || err.to_string().contains("conflict"));
+    }
+
+    // --- groups config set-egress-allow ------------------------------------
+
+    #[test]
+    fn groups_config_set_egress_allow_with_entries() {
+        let p = parse(&[
+            "iclaw",
+            "groups",
+            "config",
+            "set-egress-allow",
+            "id1",
+            "--allow",
+            "api.example.com:443",
+            "--allow",
+            "db.local:5432",
+        ]);
+        assert_eq!(p.command, "groups.config.set-egress-allow");
+        assert_eq!(
+            p.args,
+            json!({"id": "id1", "allow": ["api.example.com:443", "db.local:5432"]})
+        );
+    }
+
+    #[test]
+    fn groups_config_set_egress_allow_empty_clears() {
+        let p = parse(&[
+            "iclaw", "groups", "config", "set-egress-allow", "id1",
+        ]);
+        assert_eq!(p.command, "groups.config.set-egress-allow");
+        assert_eq!(p.args, json!({"id": "id1", "allow": []}));
+    }
+
+    // --- groups config set-resource-limits ---------------------------------
+
+    #[test]
+    fn groups_config_set_resource_limits_full() {
+        let p = parse(&[
+            "iclaw",
+            "groups",
+            "config",
+            "set-resource-limits",
+            "id1",
+            "--cpus",
+            "1.5",
+            "--memory-mb",
+            "512",
+            "--pids-limit",
+            "256",
+        ]);
+        assert_eq!(p.command, "groups.config.set-resource-limits");
+        assert_eq!(
+            p.args,
+            json!({
+                "id": "id1",
+                "limits": {"cpus": "1.5", "memory_mb": 512u64, "pids_limit": 256u64}
+            })
+        );
+    }
+
+    #[test]
+    fn groups_config_set_resource_limits_partial_cpus_only() {
+        let p = parse(&[
+            "iclaw", "groups", "config", "set-resource-limits", "id1",
+            "--cpus", "2.0",
+        ]);
+        assert_eq!(p.command, "groups.config.set-resource-limits");
+        assert_eq!(p.args, json!({"id": "id1", "limits": {"cpus": "2.0"}}));
+    }
+
+    #[test]
+    fn groups_config_set_resource_limits_empty_clears() {
+        let p = parse(&[
+            "iclaw", "groups", "config", "set-resource-limits", "id1",
+        ]);
+        assert_eq!(p.command, "groups.config.set-resource-limits");
+        assert_eq!(p.args, json!({"id": "id1", "limits": {}}));
     }
 
     // --- messaging-groups --------------------------------------------------
@@ -1806,6 +2143,8 @@ mod tests {
                 "--npm",
                 "p",
             ],
+            &["iclaw", "groups", "config", "set-egress-allow", "x"],
+            &["iclaw", "groups", "config", "set-resource-limits", "x"],
             &["iclaw", "messaging-groups", "list"],
             &["iclaw", "messaging-groups", "get", "x"],
             &[
@@ -1852,6 +2191,19 @@ mod tests {
             &["iclaw", "sessions", "get", "x"],
             &["iclaw", "user-dms", "list"],
             &["iclaw", "dropped-messages", "list"],
+            &["iclaw", "dropped-messages", "outbound-list"],
+            &["iclaw", "dropped-messages", "replay", "00000000-0000-0000-0000-000000000000"],
+            &["iclaw", "db", "backup", "/tmp/ironclaw.db.bak"],
+            &["iclaw", "db", "restore", "/tmp/ironclaw.db.bak"],
+            &["iclaw", "mcp", "list-presets"],
+            &[
+                "iclaw",
+                "mcp",
+                "add",
+                "postgres",
+                "--agent-group-id",
+                "00000000-0000-0000-0000-000000000000",
+            ],
             &["iclaw", "approvals", "list"],
             &["iclaw", "approvals", "get", "x"],
             &[
@@ -1873,8 +2225,13 @@ mod tests {
                 "ag-1",
                 "--daily-tokens",
                 "10000",
+                "--turns-per-minute",
+                "5",
+                "--turns-per-hour",
+                "60",
             ],
             &["iclaw", "usage"],
+            &["iclaw", "schema-version"],
             // Note: composite-only commands (`iclaw status`,
             // `iclaw health`, `iclaw quickstart`, `iclaw chat`,
             // `iclaw completions`) intentionally produce
@@ -1981,5 +2338,87 @@ mod tests {
     fn user_socket_for_other_os_falls_back_to_dot_dir() {
         let p = user_socket_for(std::path::Path::new("/h"), "freebsd");
         assert_eq!(p, std::path::PathBuf::from("/h/.ironclaw/data/iclaw.sock"));
+    }
+
+    // --- schema-version -------------------------------------------------------
+
+    #[test]
+    fn schema_version_produces_correct_call() {
+        let p = parse(&["iclaw", "schema-version"]);
+        assert_eq!(p.command, "schema.version");
+        assert_eq!(p.args, json!({}));
+    }
+
+    #[test]
+    fn schema_version_is_in_all_commands() {
+        assert!(ALL_COMMANDS.contains(&"schema.version"));
+    }
+
+    // --- budgets rate-limit flags ------------------------------------------
+
+    #[test]
+    fn budgets_set_accepts_turns_per_minute() {
+        let p = parse(&[
+            "iclaw",
+            "budgets",
+            "set",
+            "--agent-group-id",
+            "ag-1",
+            "--turns-per-minute",
+            "10",
+        ]);
+        assert_eq!(p.command, "budgets.set");
+        assert_eq!(p.args["agent_group_id"], "ag-1");
+        assert_eq!(p.args["turns_per_minute"], 10);
+        assert!(p.args.get("daily_tokens").is_none());
+    }
+
+    #[test]
+    fn budgets_set_accepts_turns_per_hour() {
+        let p = parse(&[
+            "iclaw",
+            "budgets",
+            "set",
+            "--agent-group-id",
+            "ag-1",
+            "--turns-per-hour",
+            "120",
+        ]);
+        assert_eq!(p.command, "budgets.set");
+        assert_eq!(p.args["turns_per_hour"], 120);
+    }
+
+    #[test]
+    fn budgets_set_accepts_all_caps_together() {
+        let p = parse(&[
+            "iclaw",
+            "budgets",
+            "set",
+            "--agent-group-id",
+            "ag-1",
+            "--daily-tokens",
+            "50000",
+            "--turns-per-minute",
+            "5",
+            "--turns-per-hour",
+            "60",
+        ]);
+        assert_eq!(p.args["daily_tokens"], 50000);
+        assert_eq!(p.args["turns_per_minute"], 5);
+        assert_eq!(p.args["turns_per_hour"], 60);
+    }
+
+    #[test]
+    fn budgets_set_zero_turns_per_minute_emits_zero() {
+        let p = parse(&[
+            "iclaw",
+            "budgets",
+            "set",
+            "--agent-group-id",
+            "ag-1",
+            "--turns-per-minute",
+            "0",
+        ]);
+        assert_eq!(p.args["turns_per_minute"], 0);
     }
 }

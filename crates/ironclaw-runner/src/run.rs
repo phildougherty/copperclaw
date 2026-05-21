@@ -419,6 +419,23 @@ async fn run_llm_turn(
     } else {
         TurnOutcome::Done
     };
+
+    // Emit Prometheus metrics for this LLM call.
+    let elapsed_ms = (chrono::Utc::now() - turn_started_at)
+        .num_milliseconds()
+        .max(0);
+    // i64 -> f64 loses precision for large values (> 2^53 ms = ~285 years);
+    // acceptable here since we're measuring LLM call durations in seconds.
+    #[allow(clippy::cast_precision_loss)]
+    let elapsed_secs = elapsed_ms as f64 / 1000.0;
+    ironclaw_metrics::observe_llm_call_seconds(elapsed_secs.max(0.0));
+    if input_tokens > 0 {
+        ironclaw_metrics::observe_llm_tokens_input(input_tokens);
+    }
+    if output_tokens > 0 {
+        ironclaw_metrics::observe_llm_tokens_output(output_tokens);
+    }
+
     emit_usage_report(deps, input_tokens, output_tokens, turn_started_at, &outcome).await;
     Ok(out)
 }

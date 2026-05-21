@@ -5,6 +5,18 @@
 //! - `ironclaw migrate` — run central migrations only, exit.
 //! - `ironclaw version` — print version, exit.
 //!
+//! ## Tracing / log configuration
+//!
+//! By default all tracing output goes to **stderr** so the cli channel's
+//! stdout stays clean for chat I/O.
+//!
+//! When `IRONCLAW_LOG_DIR=<path>` is set the host additionally writes
+//! daily-rotating log files to `<path>/host.log.<YYYY-MM-DD>` using
+//! `tracing-appender::rolling::daily`.  Stderr output is kept in place so
+//! interactive runs continue to show logs on screen.  The log-dir is
+//! created automatically if it doesn't exist; creation failures are written
+//! to stderr but do not abort the host.
+//!
 //! See `PLAN.md` § 6 T3.
 
 #![forbid(unsafe_code)]
@@ -14,6 +26,7 @@ use ironclaw_host::{boot, config, run_host, HostConfig};
 use std::process::ExitCode;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
+use tracing_subscriber::prelude::*;
 
 #[derive(Debug, Parser)]
 #[command(name = "ironclaw", version, about = "ironclaw host orchestrator")]
@@ -53,14 +66,50 @@ async fn main() -> ExitCode {
     // I/O without log lines interleaving with agent replies. Strip ANSI
     // when stderr isn't a TTY (journald, log files, container capture).
     let use_ansi = std::io::IsTerminal::is_terminal(&std::io::stderr());
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(&cfg.log_filter))
-        .with_writer(std::io::stderr)
-        .with_ansi(use_ansi)
-        .init();
+
+    // Optional file-based rolling appender. Enabled when IRONCLAW_LOG_DIR
+    // is set in the environment (or the loaded .env file). Off by default
+    // so existing installs see no change in behaviour.
+    //
+    // We need to keep the `_guard` alive for the duration of `main` — when
+    // it drops, the background writer thread is joined and the file is
+    // flushed. Binding it to a `let` in `main` achieves that.
+    let log_dir = std::env::var("IRONCLAW_LOG_DIR").ok();
+    let _appender_guard = if let Some(ref dir) = log_dir {
+        // Create the directory if it doesn't exist.  A failure here is
+        // non-fatal — we log the error to stderr and continue without
+        // file logging.
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("warning: could not create IRONCLAW_LOG_DIR {dir:?}: {e}; file logging disabled");
+            setup_stderr_only(&cfg, use_ansi);
+            None
+        } else {
+            let file_appender = tracing_appender::rolling::daily(dir, "host.log");
+            let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+            // Fan-out: stderr + rolling file.
+            let stderr_layer = tracing_subscriber::fmt::layer()
+                .with_ansi(use_ansi)
+                .with_writer(std::io::stderr);
+            let file_layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(non_blocking);
+
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::EnvFilter::new(&cfg.log_filter))
+                .with(stderr_layer)
+                .with(file_layer)
+                .init();
+
+            Some(guard)
+        }
+    } else {
+        setup_stderr_only(&cfg, use_ansi);
+        None
+    };
 
     match cli.command.unwrap_or(Command::Run) {
-        Command::Run => match run_host(cfg, None, CancellationToken::new()).await {
+        Command::Run => match run_host(cfg, None, CancellationToken::new(), cli.env_file.clone()).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 error!(?err, "ironclaw exited with error");
@@ -79,4 +128,14 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
     }
+}
+
+/// Install the stderr-only tracing subscriber (the default path when
+/// `IRONCLAW_LOG_DIR` is not set).
+fn setup_stderr_only(cfg: &HostConfig, use_ansi: bool) {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(&cfg.log_filter))
+        .with_writer(std::io::stderr)
+        .with_ansi(use_ansi)
+        .init();
 }

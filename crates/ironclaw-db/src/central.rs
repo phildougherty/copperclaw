@@ -12,6 +12,9 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct CentralDb {
     inner: Arc<Pool<SqliteConnectionManager>>,
+    /// Filesystem path to the `SQLite` file, if it was opened from a real file
+    /// (as opposed to an in-memory DB). `None` for in-memory databases.
+    db_path: Option<std::path::PathBuf>,
 }
 
 impl CentralDb {
@@ -47,7 +50,10 @@ impl CentralDb {
             run_migrations(&mut conn, MigrationSet::Central)?;
         }
 
-        Ok(Self { inner: Arc::new(pool) })
+        Ok(Self {
+            inner: Arc::new(pool),
+            db_path: Some(path.to_path_buf()),
+        })
     }
 
     /// Open an in-memory database for tests.
@@ -64,7 +70,17 @@ impl CentralDb {
             let mut conn = pool.get()?;
             run_migrations(&mut conn, MigrationSet::Central)?;
         }
-        Ok(Self { inner: Arc::new(pool) })
+        Ok(Self {
+            inner: Arc::new(pool),
+            db_path: None,
+        })
+    }
+
+    /// Return the filesystem path to the `SQLite` file, or `None` for
+    /// in-memory databases. Used by the backup handler to locate the source
+    /// file for the copy.
+    pub fn path(&self) -> Option<&std::path::Path> {
+        self.db_path.as_deref()
     }
 
     /// Borrow a pooled connection.

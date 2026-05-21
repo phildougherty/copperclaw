@@ -371,6 +371,8 @@ impl Router {
         };
         let seq = pool.with_conn(|c| insert_in(c, &write))?;
 
+        ironclaw_metrics::inc_messages_inbound(event.channel_type.as_str());
+
         Ok(FanoutOutcome::Delivered(DeliveredTo {
             agent_group_id: session.agent_group_id,
             session_id: session.id,
