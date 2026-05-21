@@ -20,6 +20,35 @@ adheres to [Semantic Versioning](https://semver.org/).
   needed: `mount_claude_turns` already dispenses pre-recorded turns
   sequentially across all LLM calls (not just one per inbound).
 
+### Added (failure-mode replay fixtures)
+
+- Three new fixtures under `fixtures/cli/` that exercise the runner's
+  and host's failure modes deterministically:
+  - **`empty-llm-response/`** — LLM returns a successful turn with no
+    content blocks. Pins the `drive_turn` no-content branch: inbound
+    completes, usage_report is still written, no chat outbound emitted.
+    Active in `replay.rs`.
+  - **`provider-5xx-retry/`** — first `/v1/messages` call returns 503,
+    second succeeds. Documents the post-retry shape an eventual
+    `provider.query()` retry loop should land. `#[ignore]`d in
+    `replay.rs` until that retry exists.
+  - **`provider-timeout/`** — provider hangs past the per-call budget.
+    Documents the give-up-and-mark-failed shape an eventual runner-side
+    deadline should land. `#[ignore]`d in `replay.rs` until that
+    deadline exists.
+- **`crates/ironclaw-host/tests/replay/fixture.rs`** — new optional
+  `provider_responses` array on the fixture manifest. Each entry is one
+  scripted response: `{"kind": "success", "file": "001-turn.json"}`,
+  `{"kind": "error", "status": 503}`, or
+  `{"kind": "timeout", "delay_ms": 60000}`. When absent, the harness
+  keeps the legacy "i-th `claude/NNN-turn.json` for the i-th request"
+  behaviour, so existing fixtures stay untouched.
+- **`crates/ironclaw-host/tests/replay/harness.rs`** — honours the new
+  field via `mount_provider_responses`, and now captures (instead of
+  panicking on) per-turn `run_loop` errors so failure-mode fixtures
+  can snapshot post-state even when the runner bails. Three new
+  `#[tokio::test]` entries in `replay.rs`.
+
 ### Added (E2E chat round-trip integration test)
 
 - **`crates/ironclaw-host/tests/e2e_chat.rs`** — boots
