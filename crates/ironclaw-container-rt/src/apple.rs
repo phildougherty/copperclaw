@@ -164,6 +164,19 @@ impl ContainerRuntime for AppleContainerRuntime {
         }
         Ok(tag)
     }
+
+    async fn image_exists(&self, tag: &str) -> Result<bool, RtError> {
+        // `container image inspect <tag>` exits non-zero with the image
+        // missing from the local store. We swallow stderr — distinguishing
+        // "not found" from a real failure is best-effort; the build that
+        // follows will surface any real runtime issue.
+        let out = Command::new(&self.binary)
+            .args(image_inspect_args(tag))
+            .output()
+            .await
+            .map_err(|e| RtError::Container(format!("container image inspect: {e}")))?;
+        Ok(out.status.success())
+    }
 }
 
 // ---- pure arg builders (unit-tested without the binary) ----------------
@@ -294,6 +307,12 @@ pub(crate) fn build_args(context_dir: &std::path::Path, tag: &str) -> Vec<String
         tag.into(),
         context_dir.to_string_lossy().into_owned(),
     ]
+}
+
+/// `container image inspect <tag>` — exits non-zero when the image is
+/// not in the local store.
+pub(crate) fn image_inspect_args(tag: &str) -> Vec<String> {
+    vec!["image".into(), "inspect".into(), tag.into()]
 }
 
 /// Materialize an `ImageBuildSpec` into a freshly-created temp directory

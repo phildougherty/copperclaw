@@ -49,10 +49,23 @@ impl Step for ImageBuildStep {
         }
 
         let spec = default_spec();
-        let tag = run_build(&spec)?;
-        cfg.image_tag.clone_from(&tag);
-        Ok(StepResult::ok(format!("built image: {tag}")))
+        let outcome = run_build(&spec)?;
+        cfg.image_tag.clone_from(&outcome.tag);
+        let verb = if outcome.was_cached { "reused" } else { "built" };
+        Ok(StepResult::ok(format!("{verb} image: {}", outcome.tag)))
     }
+}
+
+/// Result of [`run_build`]. `was_cached` is `true` when the image's tag
+/// already existed in the runtime's local store before the build call —
+/// which means the build was a near-instant no-op rather than a real
+/// `docker build`. Used to produce a more honest setup message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildOutcome {
+    /// Final image tag (sha256-pinned via `ImageBuildSpec::image_tag`).
+    pub tag: String,
+    /// Whether the tag was already present before the build call.
+    pub was_cached: bool,
 }
 
 /// Default minimal image spec used by the setup binary.
@@ -63,23 +76,30 @@ pub fn default_spec() -> ImageBuildSpec {
 
 /// Drive the async build on the current Tokio runtime, returning the
 /// resulting image tag (or a friendly error when no runtime is reachable).
-pub fn run_build(spec: &ImageBuildSpec) -> Result<String, StepError> {
+///
+/// The runtime is asked whether the target tag already exists before the
+/// build kicks off so the caller can distinguish "first install, real
+/// `docker build`" from "re-running setup on a hash-stable spec".
+pub fn run_build(spec: &ImageBuildSpec) -> Result<BuildOutcome, StepError> {
     let spec = spec.clone();
     let handle = tokio::runtime::Handle::try_current()
         .map_err(|_| StepError::Other("no Tokio runtime available for image build".into()))?;
-    let result: Result<String, StepError> = tokio::task::block_in_place(|| {
+    tokio::task::block_in_place(|| {
         handle.block_on(async move {
             let rt = ironclaw_container_rt::detect()
                 .await
                 .map_err(|e| StepError::Other(format!("detect runtime: {e}")))?;
+            let target_tag = spec.image_tag();
+            // `image_exists` is best-effort; treat a probe failure the same
+            // as "not present" rather than aborting the build.
+            let was_cached = rt.image_exists(&target_tag).await.unwrap_or(false);
             let tag = rt
                 .build_image(spec)
                 .await
                 .map_err(|e| StepError::Other(format!("build image: {e}")))?;
-            Ok(tag)
+            Ok(BuildOutcome { tag, was_cached })
         })
-    });
-    result
+    })
 }
 
 #[cfg(test)]

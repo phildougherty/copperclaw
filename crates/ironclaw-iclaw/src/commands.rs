@@ -20,9 +20,11 @@ use serde_json::{Map, Value, json};
     propagate_version = true
 )]
 pub struct Cli {
-    /// Path to the Unix-domain socket the host is listening on.
-    #[arg(long, env = "ICLAW_SOCKET", default_value = "data/iclaw.sock", global = true)]
-    pub socket: std::path::PathBuf,
+    /// Path to the Unix-domain socket the host is listening on. When
+    /// unset, [`Cli::resolve_socket`] picks a sensible default based on
+    /// the platform's user-data dir, falling back to `./data/iclaw.sock`.
+    #[arg(long, env = "ICLAW_SOCKET", global = true)]
+    pub socket: Option<std::path::PathBuf>,
 
     /// Emit raw JSON instead of the formatted table.
     #[arg(long, global = true)]
@@ -30,6 +32,58 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: TopCommand,
+}
+
+impl Cli {
+    /// Resolve the socket path the client should dial.
+    ///
+    /// Priority order:
+    /// 1. Explicit `--socket` / `ICLAW_SOCKET` (clap populates `self.socket`).
+    /// 2. Platform-default install root + `/data/iclaw.sock` (matches the
+    ///    layout that `ironclaw-setup` produces with no `--data-dir`).
+    /// 3. Legacy relative `./data/iclaw.sock` so behaviour is unchanged for
+    ///    callers that ran the host out of a project-local checkout.
+    pub fn resolve_socket(&self) -> std::path::PathBuf {
+        if let Some(p) = &self.socket {
+            return p.clone();
+        }
+        if let Some(p) = default_user_socket() {
+            return p;
+        }
+        std::path::PathBuf::from("data/iclaw.sock")
+    }
+}
+
+/// Platform-specific user-scoped socket path. `None` when `$HOME` is not
+/// set (CI containers etc.) — callers should fall back to the legacy
+/// relative default in that case.
+#[must_use]
+pub fn default_user_socket() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let home = std::path::PathBuf::from(home);
+    Some(user_socket_for(&home, std::env::consts::OS))
+}
+
+/// Pure variant of [`default_user_socket`] for tests. Mirrors the platform
+/// rules used by `ironclaw-setup::steps::data_dir::default_data_dir_for`,
+/// so the two binaries agree on where a fresh install lives.
+#[must_use]
+pub fn user_socket_for(home: &std::path::Path, os: &str) -> std::path::PathBuf {
+    let root = match os {
+        "macos" => home
+            .join("Library")
+            .join("Application Support")
+            .join("ironclaw"),
+        "linux" => std::env::var_os("XDG_DATA_HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|x| !x.as_os_str().is_empty())
+            .map_or_else(
+                || home.join(".local").join("share").join("ironclaw"),
+                |xdg| xdg.join("ironclaw"),
+            ),
+        _ => home.join(".ironclaw"),
+    };
+    root.join("data").join("iclaw.sock")
 }
 
 /// Top-level resource groups.
@@ -92,6 +146,41 @@ pub enum TopCommand {
     Approvals {
         #[command(subcommand)]
         action: ApprovalsCmd,
+    },
+    /// One-shot composite installers for getting a fresh host chatable.
+    Quickstart {
+        #[command(subcommand)]
+        action: QuickstartCmd,
+    },
+}
+
+// --- quickstart ------------------------------------------------------------
+
+/// Composite installer commands. Each one fans out into the underlying
+/// `groups` / `messaging-groups` / `wirings` calls on the client side; the
+/// host needs no new handlers.
+#[derive(Debug, Subcommand)]
+pub enum QuickstartCmd {
+    /// Wire a fresh agent group to the cli channel so messages typed at
+    /// the host's stdin route to the new group. Equivalent to running:
+    ///
+    ///   iclaw groups create --folder <folder> --name <name>
+    ///   iclaw messaging-groups create --channel-type cli --platform-id stdin --name <name>
+    ///   iclaw wirings create --mg <new-mg-id> --ag <new-ag-id> --engage pattern --pattern '.*'
+    Cli {
+        /// Display name for both the agent group and the messaging group.
+        #[arg(long)]
+        name: String,
+        /// Folder slug for the new agent group. Defaults to the name.
+        #[arg(long)]
+        folder: Option<String>,
+        /// Regex pattern the wiring will match against inbound messages.
+        /// Defaults to `.*` so every line is routed.
+        #[arg(long)]
+        pattern: Option<String>,
+        /// Optional agent provider override (e.g. `anthropic`, `codex`).
+        #[arg(long)]
+        provider: Option<String>,
     },
 }
 
@@ -482,6 +571,34 @@ impl TopCommand {
             Self::UserDms { action } => action.to_call(),
             Self::DroppedMessages { action } => action.to_call(),
             Self::Approvals { action } => action.to_call(),
+            Self::Quickstart { action } => action.to_call(),
+        }
+    }
+}
+
+impl QuickstartCmd {
+    /// Build the marker `ParsedCall` for a composite quickstart op.
+    ///
+    /// Composites aren't a single wire call; `run_cli` recognises the
+    /// `quickstart.*` command prefix and dispatches to a sequence of real
+    /// wire calls before this would ever reach the transport. The args
+    /// payload below is the shape that the client-side orchestrator
+    /// consumes.
+    pub fn to_call(&self) -> ParsedCall {
+        match self {
+            Self::Cli {
+                name,
+                folder,
+                pattern,
+                provider,
+            } => {
+                let mut o = Map::new();
+                o.insert("name".into(), name.clone().into());
+                insert_opt(&mut o, "folder", folder.clone());
+                insert_opt(&mut o, "pattern", pattern.clone());
+                insert_opt(&mut o, "provider", provider.clone());
+                ParsedCall::new("quickstart.cli", Value::Object(o))
+            }
         }
     }
 }
@@ -1619,5 +1736,43 @@ mod tests {
     fn cli_to_call_delegates() {
         let cli = Cli::try_parse_from(["iclaw", "groups", "list"]).unwrap();
         assert_eq!(cli.to_call().command, "groups.list");
+    }
+
+    #[test]
+    fn resolve_socket_prefers_explicit_flag() {
+        let cli =
+            Cli::try_parse_from(["iclaw", "--socket", "/tmp/x.sock", "groups", "list"]).unwrap();
+        assert_eq!(cli.resolve_socket(), std::path::PathBuf::from("/tmp/x.sock"));
+    }
+
+    #[test]
+    fn user_socket_for_linux_uses_xdg_share() {
+        // Sidestep the parent env's XDG_DATA_HOME via a deterministic check
+        // on the no-XDG branch.
+        if std::env::var_os("XDG_DATA_HOME").is_some() {
+            return;
+        }
+        let p = user_socket_for(std::path::Path::new("/home/u"), "linux");
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/home/u/.local/share/ironclaw/data/iclaw.sock")
+        );
+    }
+
+    #[test]
+    fn user_socket_for_macos_uses_app_support() {
+        let p = user_socket_for(std::path::Path::new("/Users/u"), "macos");
+        assert_eq!(
+            p,
+            std::path::PathBuf::from(
+                "/Users/u/Library/Application Support/ironclaw/data/iclaw.sock"
+            )
+        );
+    }
+
+    #[test]
+    fn user_socket_for_other_os_falls_back_to_dot_dir() {
+        let p = user_socket_for(std::path::Path::new("/h"), "freebsd");
+        assert_eq!(p, std::path::PathBuf::from("/h/.ironclaw/data/iclaw.sock"));
     }
 }

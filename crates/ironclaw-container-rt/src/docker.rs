@@ -151,6 +151,18 @@ impl ContainerRuntime for DockerRuntime {
         }
         Ok(image_tag)
     }
+
+    async fn image_exists(&self, tag: &str) -> Result<bool, RtError> {
+        match self.docker.inspect_image(tag).await {
+            Ok(_) => Ok(true),
+            // `inspect_image` returns a 404 wrapped in `DockerResponseServerError`
+            // for missing images. Anything else is a real runtime failure.
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(false),
+            Err(e) => Err(RtError::Container(format!("inspect image {tag}: {e}"))),
+        }
+    }
 }
 
 // ---- pure translation helpers ------------------------------------------

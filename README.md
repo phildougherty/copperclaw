@@ -78,6 +78,12 @@ ironclaw --env-file ~/.local/share/ironclaw/.env run
 # In another terminal, source the same .env (or export ICLAW_SOCKET)
 # and drive it via iclaw.
 set -a; . ~/.local/share/ironclaw/.env; set +a
+
+# One-shot bootstrap: creates an agent group, a cli/stdin messaging
+# group, and a `.*` wiring between them so anything typed at the
+# host's stdin routes to the new group.
+iclaw quickstart cli --name first
+
 iclaw groups list
 iclaw sessions list --status active
 ```

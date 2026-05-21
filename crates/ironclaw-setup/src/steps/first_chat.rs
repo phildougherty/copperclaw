@@ -71,10 +71,9 @@ pub fn instructions(cfg: &SetupConfig) -> Vec<String> {
                     .to_string(),
             );
             out.push(
-                "Use `iclaw groups create --help`, `iclaw messaging-groups create --help`,"
-                    .to_string(),
+                "The single-line shortcut for that is:".to_string(),
             );
-            out.push("and `iclaw wirings create --help` to assemble the wiring.".to_string());
+            out.push("  iclaw quickstart cli --name first".to_string());
         }
         other => {
             out.push(format!(
@@ -106,10 +105,10 @@ mod tests {
         };
         let out = instructions(&cfg);
         // Points at the real binary + --env-file (not a non-existent
-        // `ironclaw run --data-dir` form) and at iclaw subcommands that
-        // actually exist (not the imaginary `iclaw chat`).
+        // `ironclaw run --data-dir` form) and at the composite quickstart
+        // command (not the imaginary `iclaw chat`).
         assert!(out.iter().any(|m| m.contains("ironclaw --env-file")));
-        assert!(out.iter().any(|m| m.contains("iclaw groups create --help")));
+        assert!(out.iter().any(|m| m.contains("iclaw quickstart cli")));
     }
 
     #[test]

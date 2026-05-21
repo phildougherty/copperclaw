@@ -11,12 +11,16 @@ use ironclaw_iclaw::{Cli, IclawClient, SocketTransport, run_cli};
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
     // Resolve the socket path up-front so the transport is ready before
-    // we delegate to `run_cli`. If the argv fails to parse we fall back
-    // to the default path; `run_cli` will re-parse and emit a helpful
+    // we delegate to `run_cli`. If the argv fails to parse we use the
+    // platform's default install location (or the legacy relative path
+    // when HOME is unset); `run_cli` will re-parse and emit clap's
     // diagnostic.
     let socket_path = Cli::try_parse().map_or_else(
-        |_| std::path::PathBuf::from("data/iclaw.sock"),
-        |cli| cli.socket,
+        |_| {
+            ironclaw_iclaw::default_user_socket()
+                .unwrap_or_else(|| std::path::PathBuf::from("data/iclaw.sock"))
+        },
+        |cli| cli.resolve_socket(),
     );
 
     let client = IclawClient::connect(socket_path);

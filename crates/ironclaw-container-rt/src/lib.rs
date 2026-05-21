@@ -67,6 +67,16 @@ pub trait ContainerRuntime: Send + Sync {
     /// specs map to identical tags via [`ImageBuildSpec::fingerprint`],
     /// so callers can skip a rebuild when the tag already exists.
     async fn build_image(&self, spec: ImageBuildSpec) -> Result<String, RtError>;
+
+    /// Whether an image with `tag` already exists locally. Callers use
+    /// this to distinguish a fresh build from a reuse of a cached image
+    /// without re-implementing each runtime's inspection API. The default
+    /// impl returns `Ok(false)`, which is conservative — concrete runtimes
+    /// should override it.
+    async fn image_exists(&self, tag: &str) -> Result<bool, RtError> {
+        let _ = tag;
+        Ok(false)
+    }
 }
 
 /// Picker for [`detect`] / explicit selection.

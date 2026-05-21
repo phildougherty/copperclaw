@@ -20,7 +20,7 @@ pub mod output;
 pub mod protocol;
 
 pub use client::{ClientError, IclawClient, DEFAULT_TIMEOUT};
-pub use commands::{Cli, ParsedCall, TopCommand, ALL_COMMANDS};
+pub use commands::{default_user_socket, Cli, ParsedCall, TopCommand, ALL_COMMANDS};
 pub use output::{render, render_json_pretty};
 pub use protocol::{
     Caller, ErrorPayload, ProtoError, Request, Response, read_frame, read_request,
@@ -199,6 +199,11 @@ where
     };
 
     let call = cli.to_call();
+    // Composite client-side ops produce a `quickstart.*` marker command
+    // that we recognise here before reaching the transport.
+    if let Some(suffix) = call.command.strip_prefix("quickstart.") {
+        return run_quickstart(suffix, &call.args, transport, caller, cli.json).await;
+    }
     match transport.call(&call.command, call.args, caller).await {
         Ok(data) => {
             let text = if cli.json {
@@ -217,6 +222,145 @@ where
             e.message, e.code
         )),
         Err(other) => RunOutput::failure(format!("{other}\n")),
+    }
+}
+
+/// Dispatch a composite `iclaw quickstart <op>` client-side. Each op
+/// fans out into a sequence of real wire calls and aggregates the
+/// responses into a single JSON summary.
+async fn run_quickstart<T>(
+    op: &str,
+    args: &serde_json::Value,
+    transport: &T,
+    caller: Caller,
+    as_json: bool,
+) -> RunOutput
+where
+    T: CallTransport + ?Sized,
+{
+    match op {
+        "cli" => run_quickstart_cli(args, transport, caller, as_json).await,
+        other => RunOutput::failure(format!("unknown quickstart op: {other}\n")),
+    }
+}
+
+async fn run_quickstart_cli<T>(
+    args: &serde_json::Value,
+    transport: &T,
+    caller: Caller,
+    as_json: bool,
+) -> RunOutput
+where
+    T: CallTransport + ?Sized,
+{
+    let Some(name) = args.get("name").and_then(serde_json::Value::as_str) else {
+        return RunOutput::failure("quickstart.cli: missing name\n".to_string());
+    };
+    let folder = args
+        .get("folder")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(name)
+        .to_string();
+    let pattern = args
+        .get("pattern")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(".*")
+        .to_string();
+    let provider = args.get("provider").and_then(serde_json::Value::as_str);
+
+    // 1) Create the agent group.
+    let mut group_args = serde_json::Map::new();
+    group_args.insert("folder".into(), folder.into());
+    group_args.insert("name".into(), name.into());
+    if let Some(p) = provider {
+        group_args.insert("provider".into(), p.into());
+    }
+    let group = match transport
+        .call("groups.create", serde_json::Value::Object(group_args), caller.clone())
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return RunOutput::failure(format_step_error("groups.create", &e)),
+    };
+    let Some(ag_id) = group.get("id").and_then(serde_json::Value::as_str) else {
+        return RunOutput::failure(
+            "quickstart.cli: groups.create returned no id\n".to_string(),
+        );
+    };
+
+    // 2) Create a messaging group bound to the cli/stdin channel.
+    let mg = match transport
+        .call(
+            "messaging-groups.create",
+            serde_json::json!({
+                "channel_type": "cli",
+                "platform_id": "stdin",
+                "name": name,
+                "is_group": false,
+            }),
+            caller.clone(),
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return RunOutput::failure(format_step_error("messaging-groups.create", &e)),
+    };
+    let Some(mg_id) = mg.get("id").and_then(serde_json::Value::as_str) else {
+        return RunOutput::failure(
+            "quickstart.cli: messaging-groups.create returned no id\n".to_string(),
+        );
+    };
+
+    // 3) Wire them with a pattern-match engage mode.
+    let wiring = match transport
+        .call(
+            "wirings.create",
+            serde_json::json!({
+                "agent_group_id": ag_id,
+                "messaging_group_id": mg_id,
+                "engage": "pattern",
+                "pattern": pattern,
+            }),
+            caller,
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return RunOutput::failure(format_step_error("wirings.create", &e)),
+    };
+
+    let summary = serde_json::json!({
+        "agent_group": group,
+        "messaging_group": mg,
+        "wiring": wiring,
+    });
+    let text = if as_json {
+        render_json_pretty(&summary)
+    } else {
+        format!(
+            "agent group {name} ({ag}) is now wired to cli/stdin via messaging group {mg} (wiring {w}).\n",
+            name = name,
+            ag = ag_id,
+            mg = mg_id,
+            w = wiring
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("?"),
+        )
+    };
+    let mut out = text;
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    RunOutput::success(out)
+}
+
+fn format_step_error(step: &str, e: &ClientError) -> String {
+    match e {
+        ClientError::Remote(p) => {
+            format!("quickstart.cli: {step} failed: {} ({})\n", p.message, p.code)
+        }
+        other => format!("quickstart.cli: {step} failed: {other}\n"),
     }
 }
 
@@ -402,5 +546,117 @@ mod tests {
         let inner = ClientError::Timeout;
         let e = RunError::Client(inner);
         assert!(e.to_string().contains("timed out"));
+    }
+
+    // ---- quickstart ------------------------------------------------------
+
+    /// Stub that returns one queued response per call and records the
+    /// `(command, args)` pairs in order.
+    struct SequencedTransport {
+        responses: Mutex<Vec<Result<serde_json::Value, ClientError>>>,
+        calls: Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    impl SequencedTransport {
+        fn new(responses: Vec<Result<serde_json::Value, ClientError>>) -> Self {
+            Self {
+                responses: Mutex::new(responses),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CallTransport for SequencedTransport {
+        async fn call(
+            &self,
+            command: &str,
+            args: serde_json::Value,
+            _caller: Caller,
+        ) -> Result<serde_json::Value, ClientError> {
+            self.calls.lock().unwrap().push((command.to_string(), args));
+            let mut q = self.responses.lock().unwrap();
+            if q.is_empty() {
+                return Err(ClientError::Timeout);
+            }
+            q.remove(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn quickstart_cli_fans_out_three_calls() {
+        let t = SequencedTransport::new(vec![
+            Ok(json!({"id": "ag-1", "name": "demo", "folder": "demo"})),
+            Ok(json!({"id": "mg-1", "channel_type": "cli", "platform_id": "stdin"})),
+            Ok(json!({"id": "w-1"})),
+        ]);
+        let out = run_cli(
+            ["iclaw", "quickstart", "cli", "--name", "demo"],
+            &t,
+        )
+        .await;
+        assert!(out.stderr.is_empty(), "stderr={:?}", out.stderr);
+        let calls = t.calls.lock().unwrap();
+        assert_eq!(calls[0].0, "groups.create");
+        assert_eq!(calls[0].1["folder"], "demo");
+        assert_eq!(calls[0].1["name"], "demo");
+        assert_eq!(calls[1].0, "messaging-groups.create");
+        assert_eq!(calls[1].1["channel_type"], "cli");
+        assert_eq!(calls[1].1["platform_id"], "stdin");
+        assert_eq!(calls[2].0, "wirings.create");
+        assert_eq!(calls[2].1["agent_group_id"], "ag-1");
+        assert_eq!(calls[2].1["messaging_group_id"], "mg-1");
+        assert_eq!(calls[2].1["engage"], "pattern");
+        assert_eq!(calls[2].1["pattern"], ".*");
+        assert!(out.stdout.contains("ag-1"));
+        assert!(out.stdout.contains("mg-1"));
+        assert!(out.stdout.contains("w-1"));
+    }
+
+    #[tokio::test]
+    async fn quickstart_cli_folder_override_propagates() {
+        let t = SequencedTransport::new(vec![
+            Ok(json!({"id": "ag-1"})),
+            Ok(json!({"id": "mg-1"})),
+            Ok(json!({"id": "w-1"})),
+        ]);
+        let _ = run_cli(
+            [
+                "iclaw",
+                "quickstart",
+                "cli",
+                "--name",
+                "demo",
+                "--folder",
+                "homedir",
+                "--pattern",
+                "^hi",
+            ],
+            &t,
+        )
+        .await;
+        let calls = t.calls.lock().unwrap();
+        assert_eq!(calls[0].1["folder"], "homedir");
+        assert_eq!(calls[2].1["pattern"], "^hi");
+    }
+
+    #[tokio::test]
+    async fn quickstart_cli_stops_on_first_error() {
+        // First call fails — second/third should never run.
+        let t = SequencedTransport::new(vec![Err(ClientError::Remote(ErrorPayload {
+            code: "validation".into(),
+            message: "folder required".into(),
+            retryable: false,
+            data: None,
+        }))]);
+        let out = run_cli(
+            ["iclaw", "quickstart", "cli", "--name", "demo"],
+            &t,
+        )
+        .await;
+        assert!(!out.stderr.is_empty());
+        assert!(out.stderr.contains("groups.create"));
+        let calls = t.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
     }
 }
