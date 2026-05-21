@@ -49,6 +49,47 @@ adheres to [Semantic Versioning](https://semver.org/).
   can snapshot post-state even when the runner bails. Three new
   `#[tokio::test]` entries in `replay.rs`.
 
+### Added (operational-gate replay fixtures)
+
+- Three new replay fixtures exercise host gates that previously had no
+  fixture coverage. Together they take the M11 acceptance gate from
+  4,782 to 4,785 passing tests with the rest of the suite unchanged.
+  - **`fixtures/cli/sender-not-approved/`** — drives the approvals
+    sender-scope gate. An inbound from an unknown `cli:stranger`
+    identity hits the gate, the router returns
+    `RouteOutcome::Pending`, and the approvals module's new-pending
+    notifier dispatches an in-channel "approve this sender?" notice
+    through the delivery dispatcher. Asserts no `messages_in` /
+    `messages_out` row was written.
+  - **`fixtures/cli/budget-exhausted/`** — seeds `group_budgets`
+    (`daily_token_cap = 100`) plus an `agent_turns` row for 200 tokens
+    spent today. The container manager's budget gate refuses to spawn,
+    writes the "budget exhausted" reply to `messages_out`, and the
+    delivery loop fans it through cli. A second inbound exercises the
+    per-agent-group dedup window — only one reply is posted within
+    the hour.
+  - **`fixtures/cli/scheduled-wake/`** — pre-seeds an `idle` session
+    plus a `messages_in` row with `process_after` in the past and
+    `kind = 'task'`. The harness runs a single
+    `SweepService::run_once()` pass; the wake check transitions the
+    session to `running`; the in-process runner serves a canned
+    Claude reply; the delivery loop fans it out.
+- **`crates/ironclaw-host/tests/replay/harness.rs`** — extends the
+  replay harness with three small seams to drive the above:
+  - `Manifest.gates: ["approvals" | "budget"]` opt-in. The harness
+    installs `ApprovalsModule` (with a `users`-table persistent
+    lookup and a notifier that dispatches through the delivery
+    adapter) on the router's hook chain, or drives a cached
+    `ContainerManager::tick()` instead of an in-process runner so
+    the daily-token-cap gate fires + dedupes correctly across steps.
+  - `Manifest.trigger_sweep: true` runs a `SweepService::run_once()`
+    pass after seed but before any inbound events, then runs a turn
+    + delivery pass for every woken session.
+  - Optional `inbound.sql` file applied to every active session's
+    `inbound.db` so fixtures can seed due-now `messages_in` rows
+    without going through the router. `RouteOutcome::Pending` is now
+    a non-fatal outcome for approvals-gated fixtures.
+
 ### Added (E2E chat round-trip integration test)
 
 - **`crates/ironclaw-host/tests/e2e_chat.rs`** — boots

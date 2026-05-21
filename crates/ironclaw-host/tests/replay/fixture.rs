@@ -49,6 +49,29 @@ pub struct Manifest {
     /// Each entry maps to one upstream call. See [`ProviderResponseSpec`].
     #[serde(default)]
     pub provider_responses: Vec<ProviderResponseSpec>,
+    /// Optional list of host-side gates the harness must wire BEFORE
+    /// running the fixture. Accepted values:
+    ///
+    /// - `"approvals"` — installs [`ironclaw_modules::ApprovalsModule`]
+    ///   on the router so unknown senders trigger the sender-scope gate
+    ///   (returning `Pending` and dispatching the "approve?" notice
+    ///   through the delivery dispatcher).
+    /// - `"budget"` — instead of running the in-process runner after
+    ///   route, the harness drives a `ContainerManager::tick()`. This
+    ///   exercises the daily-token-cap gate which posts a
+    ///   "budget exhausted" reply to the session's outbound DB.
+    ///
+    /// Default: empty (existing happy-path fixtures don't set this).
+    #[serde(default)]
+    pub gates: Vec<String>,
+    /// When true, the harness calls `SweepService::run_once()` after
+    /// applying `central.sql` and BEFORE processing any inbound events.
+    /// Used by the `scheduled-wake` fixture to deterministically drive
+    /// the due-message wake check without waiting for the 60s sweep
+    /// tick. The seeded session is then processed through the in-
+    /// process runner as if a fresh inbound had arrived.
+    #[serde(default)]
+    pub trigger_sweep: bool,
 }
 
 /// One scripted response from the harness's LLM stub. `kind` decides what
@@ -116,6 +139,16 @@ pub struct Fixture {
     pub root: PathBuf,
     pub manifest: Manifest,
     pub central_sql: String,
+    /// Optional SQL applied to every active session's inbound.db AFTER
+    /// migrations + `central.sql` but BEFORE any inbound events are
+    /// processed (and before `trigger_sweep` fires). Used by the
+    /// scheduled-wake fixture to seed a "due now" `messages_in` row in
+    /// a session that already exists in `central.sql`.
+    ///
+    /// Loaded from `inbound.sql` in the fixture root if present; empty
+    /// when the file is absent. The harness applies the SQL once per
+    /// session listed in `sessions::list_active(central)`.
+    pub inbound_sql: String,
     /// Inbound `InboundEvent`s in file-name order.
     pub inbound: Vec<InboundEvent>,
     /// Claude turn responses in file-name order. Element `i` is served
@@ -150,6 +183,13 @@ impl Fixture {
         let manifest = load_manifest(&root.join("manifest.json"))?;
         let central_sql = fs::read_to_string(root.join("central.sql"))
             .with_context(|| format!("read central.sql from {}", root.display()))?;
+        let inbound_sql_path = root.join("inbound.sql");
+        let inbound_sql = if inbound_sql_path.exists() {
+            fs::read_to_string(&inbound_sql_path)
+                .with_context(|| format!("read inbound.sql from {}", inbound_sql_path.display()))?
+        } else {
+            String::new()
+        };
         let inbound = load_inbound(&root.join("inbound"))?;
         let (claude_turns, claude_turns_by_name) = load_claude(&root.join("claude"))?;
         let expected = load_expected(&root.join("expected"))?;
@@ -157,6 +197,7 @@ impl Fixture {
             root,
             manifest,
             central_sql,
+            inbound_sql,
             inbound,
             claude_turns,
             claude_turns_by_name,

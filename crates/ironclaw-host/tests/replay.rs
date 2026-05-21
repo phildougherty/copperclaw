@@ -127,3 +127,18 @@ async fn cli_provider_5xx_retry() {
 async fn cli_provider_timeout() {
     run_fixture("cli", "provider-timeout").await;
 }
+
+#[tokio::test]
+async fn cli_sender_not_approved() {
+    run_fixture("cli", "sender-not-approved").await;
+}
+
+#[tokio::test]
+async fn cli_budget_exhausted() {
+    run_fixture("cli", "budget-exhausted").await;
+}
+
+#[tokio::test]
+async fn cli_scheduled_wake() {
+    run_fixture("cli", "scheduled-wake").await;
+}
