@@ -159,6 +159,27 @@ Run `ironclaw-setup --list-steps` for the canonical list and use
 `--skip-step <name>` for any optional step you want to leave for later.
 See `docs/cutover.md` for migrating from a predecessor data directory.
 
+## Agent skills
+
+Skills under `skills/` are markdown bundles auto-discovered by
+`ironclaw-skills` and inlined into the running agent's system
+prompt. Capability docs (`send-message`, `install-packages`, …)
+describe the in-tree MCP tools; guided-flow skills describe a
+multi-turn interaction the agent runs with the user:
+
+- `skills/customize/` — change the model, install a package or
+  MCP server, edit the per-group behavior prompt, raise/lower the
+  daily-token budget. The agent prints the exact `iclaw` command
+  for any host-only mutation.
+- `skills/debug/` — triage a "you didn't reply" / "it's slow"
+  report: pull what's reachable from inside the container, then
+  hand `iclaw health`, `iclaw audit list`, and
+  `iclaw dropped-messages list` to the operator.
+
+Drop a new directory with a `SKILL.md` (YAML frontmatter +
+markdown body) into `skills/` and the next container boot picks
+it up — no registry edits required.
+
 ## Documentation
 
 - [`PLAN.md`](PLAN.md) — full team-by-team design and milestone

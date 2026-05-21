@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- Two guided-flow agent skills under `skills/`: `customize` (walks
+  the user through model swaps, package/MCP installs, behavior
+  prompt edits, and budget changes, routing host-only mutations to
+  the operator with the exact `iclaw` command) and `debug` (pulls
+  diagnostics reachable from inside the container and prints the
+  `iclaw health` / `audit list` / `dropped-messages list` commands
+  the operator must run to complete triage).
 - Initial Rust workspace with 16 crates across the host, runner,
   providers, MCP server, modules, skills, container runtime, OneCLI
   gateway, iclaw admin client, and interactive setup.
