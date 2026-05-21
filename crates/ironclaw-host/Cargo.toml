@@ -68,7 +68,12 @@ rusqlite               = { workspace = true }
 tempfile = "3"
 filetime = "0.2"
 ironclaw-iclaw = { path = "../ironclaw-iclaw" }
+ironclaw-runner = { workspace = true }
+ironclaw-providers = { workspace = true }
+ironclaw-mcp = { workspace = true }
 tokio = { workspace = true }
+wiremock = "=0.6.2"
+regex = "1"
 
 [lints]
 workspace = true

@@ -1852,11 +1852,15 @@ dependencies = [
  "ironclaw-host-router",
  "ironclaw-host-sweep",
  "ironclaw-iclaw",
+ "ironclaw-mcp",
  "ironclaw-metrics",
  "ironclaw-modules",
  "ironclaw-onecli",
+ "ironclaw-providers",
+ "ironclaw-runner",
  "ironclaw-skills",
  "ironclaw-types",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1868,6 +1872,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

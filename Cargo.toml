@@ -84,6 +84,7 @@ ironclaw-metrics        = { path = "crates/ironclaw-metrics" }
 ironclaw-host-router    = { path = "crates/ironclaw-host-router" }
 ironclaw-host-delivery  = { path = "crates/ironclaw-host-delivery" }
 ironclaw-host-sweep     = { path = "crates/ironclaw-host-sweep" }
+ironclaw-runner         = { path = "crates/ironclaw-runner" }
 
 tokio              = { version = "1", features = ["full"] }
 serde              = { version = "1", features = ["derive"] }

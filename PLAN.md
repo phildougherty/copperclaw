@@ -78,12 +78,12 @@ file paths that landed the change.
 
 | Metric | Value |
 | - | - |
-| `cargo test --workspace` | 4633 passing / 0 failing / 4 ignored |
+| `cargo test --workspace` | 4634 passing / 0 failing / 4 ignored |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | Channel crates | 21 |
 | In-tree tools the agent can call | 20 (15 messaging/scheduling/self-mod + 4 computer-use + 1 multi-provider web search) |
 | Skill docs | 22 |
-| Latest milestone | Production hardening — SIGHUP secret rotation, webhooks TLS doc, per-group rate limits, versioned migrations, sessions/sessions cleanup |
+| Latest milestone | Replay-fixture harness — M11 acceptance gate (in-process harness + first cli/text-reply fixture) |
 
 Older M-section "totals" lines are historical snapshots and will drift —
 trust the table above.
@@ -236,7 +236,7 @@ M8 totals (3 slices + tail): 2433 new tests across 15 channels (batch 1: 114 + 1
 - [x] Cutover docs — `docs/cutover.md` (preflight → quiesce → snapshot → migrate → verify → switch ingress → first-hour watch → rollback)
 - [x] Replay-fixture suite design — `docs/replay-fixtures.md` (fixture layout, harness internals, capture/redact workflow)
 - [x] Release-checklist + CI — `docs/release-checklist.md`; `.github/workflows/ci.yml` runs fmt + clippy + test on Linux/macOS with an 85% coverage gate; `CHANGELOG.md` seeded with the Keep-a-Changelog `[Unreleased]` section
-- [ ] Replay-fixture harness implementation + first captured fixture (the M11 acceptance gate — design is in-tree, in-process harness against `Fixture::load` / `ReplayHarness::{boot_host, run, compare}` still to be written)
+- [x] Replay-fixture harness implementation + first captured fixture (the M11 acceptance gate). In-process harness lives under `crates/ironclaw-host/tests/replay/` (`fixture.rs` + `diff.rs` + `harness.rs`); first fixture lives under `fixtures/cli/text-reply/`. Drives `Router::route` → in-process `run_loop` (with a wiremock-served Anthropic SSE stub) → `DeliveryService::process_session_once` → `MockAdapter::deliveries()`, then diffs the four captured JSONL streams (inbound-events / messages-in / messages-out / delivered) against `expected/*.jsonl` with manifest-driven regex substitutions for non-deterministic UUIDs and timestamps.
 - [ ] Release 0.1.0 (cut the tag, bump `workspace.package.version`, publish release notes from CHANGELOG)
 
 ### M11 — Post-M10 hardening (this slice)
@@ -887,23 +887,67 @@ Three worktree-isolated agents landed in one slice. After-merge:
 **Slice totals**: 4597 → 4633 passing (+36 tests across the three
 agents and the merge resolution). 0 failing. Clippy clean.
 
+### Replay-fixture harness slice (M11 acceptance gate)
+
+The plan's "Next #1" closed in this slice. The harness is
+deliberately scoped down from the design doc's capture-and-redact
+pipeline to the smallest thing that proves the differential test
+loop: load a hand-authored fixture, drive the host's internal
+services end-to-end against a wiremock-served Anthropic stub, and
+diff the four captured streams against `expected/*.jsonl` with
+substitution-aware comparison.
+
+- [x] `crates/ironclaw-host/tests/replay/fixture.rs` — load
+  `manifest.json` + `central.sql` + `inbound/*` + `claude/*` +
+  `expected/*.jsonl` from a fixture directory. JSON manifest for
+  v1 (TOML deferred behind an unused dep).
+- [x] `crates/ironclaw-host/tests/replay/diff.rs` — substitution
+  table (regex → replacement, applied to the serialized form of
+  both sides before reparse), `walk`-based JSON-pointer-path
+  mismatch reporter.
+- [x] `crates/ironclaw-host/tests/replay/harness.rs` —
+  `ReplayHarness` driving `Router::route` against an in-memory
+  `CentralDb`, an in-process runner via `run_loop` with
+  `max_turns = Some(1)` against `wiremock`-served Anthropic SSE,
+  and `DeliveryService::process_session_once` against a
+  `MockAdapter`. Per-fixture cleanup via `tempfile::TempDir`. Skips
+  the full `run_host` boot dance (no channel mpsc consumer, no
+  socket server, no signal handling, no container manager) — the
+  harness is a structural-not-faithful reproduction of the host.
+- [x] `fixtures/cli/text-reply/` — first fixture. Single-line cli
+  inbound, one Claude turn, one outbound chat row, one delivery.
+  Manifest substitutions normalise UUIDs (`[0-9a-f]{8}-...{12}`)
+  and three timestamp shapes (`timestamp` / `started_at` /
+  `ended_at`).
+- [x] `crates/ironclaw-host/tests/replay.rs` — integration test
+  entry. One `#[tokio::test]` loads the cli fixture and asserts
+  `harness.compare().is_clean()`.
+
+**Slice totals**: 4633 → 4634 passing (+1 integration test;
+harness internals are exercised through it). 0 failing. Clippy
+clean. New dev-deps in `ironclaw-host`: `wiremock`, `regex`,
+`ironclaw-runner` / `-providers` / `-mcp` as workspace path deps.
+
 ---
 
 ## Next things to address
 
-The five highest-impact items from the prior list landed in this
-slice. The remaining items, ranked:
+The five highest-impact items from the prior list landed in
+earlier slices; the M11 acceptance gate landed in this slice. The
+remaining items, ranked:
 
-1. **Replay-fixture harness implementation** (M11 acceptance
-   gate). Design is in `docs/replay-fixtures.md`. Implement the
-   in-process harness against `Fixture::load` /
-   `ReplayHarness::{boot_host, run, compare}` plus a first
-   captured fixture. _(M11)_
-
-2. **Release 0.1.0**. Cut the tag, bump
+1. **Release 0.1.0**. Cut the tag, bump
    `workspace.package.version`, publish release notes from
-   `CHANGELOG.md`. The candidate status in README is the
-   honest one until this lands. _(M11)_
+   `CHANGELOG.md`. With the replay harness landed the candidate
+   status in README can flip to a real release. _(M11)_
+
+2. **Grow the fixture suite.** The first cli fixture proves the
+   harness works end-to-end, but the suite has real value only
+   when more channels and more behaviours are captured. Highest-
+   leverage next captures: a telegram webhook with a
+   `getFile`-backed attachment download, a slack
+   `app_mention` with HMAC signature, and a runner tool-use loop
+   (one `shell` round-trip).
 
 ---
 
@@ -1646,7 +1690,7 @@ Items deliberately deferred from 0.1.0; tracked here so they don't get rediscove
 - **Scheduled tasks table.** A first-class `scheduled_tasks` table for recurring agent jobs (independent of the per-message `recurrence` column). The MCP `schedule_task` tool currently writes into `messages_in` with a recurrence and a `process_after`; a dedicated table would let us list/cancel without scanning the message log.
 - **WhatsApp Signal Protocol session state.** The Curve25519 / Ed25519 / HKDF / AES-GCM primitives in `crates/ironclaw-channels/whatsapp/src/crypto/dalek.rs` are RFC-tested and ready. What sits above them — X3DH key agreement, the Double Ratchet, Sender Keys for group chat, the WA wire-envelope construction — is the next-contributor task. Adapter `deliver()` surfaces a distinct error message so the gap is testable.
 - **Docker Sandbox runtime backend.** A third `ContainerRuntime` impl using a micro-VM (`firecracker`, `cloud-hypervisor`, or Apple's `Virtualization.framework`) for installations that want a stronger isolation boundary than a Docker container.
-- **Replay-fixture harness.** Designed in `docs/replay-fixtures.md`; the in-tree `crates/ironclaw-host/tests/replay/` module and the first round of captured fixtures are the M11 acceptance gate.
+- **Replay-fixture capture tooling.** The harness reads hand-authored or captured fixtures (see `docs/replay-fixtures.md` and `fixtures/cli/text-reply/`). The capture-time tooling described in the design doc — `IRONCLAW_FIXTURE_CAPTURE=<dir>` taps in the channel adapter, router, provider, and DB layer, plus an `ironclaw fixture redact <dir>` pass — is still unwritten. Until it lands new fixtures must be hand-authored.
 
 
 ## Sign-off
