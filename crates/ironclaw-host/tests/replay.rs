@@ -72,3 +72,8 @@ async fn slack_event_message_round_trip() {
 async fn cli_multi_turn_round_trip() {
     run_fixture("cli", "multi-turn").await;
 }
+
+#[tokio::test]
+async fn cli_tool_use_shell() {
+    run_fixture("cli", "tool-use-shell").await;
+}

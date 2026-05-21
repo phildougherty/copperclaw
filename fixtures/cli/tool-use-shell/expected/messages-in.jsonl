@@ -1,0 +1,1 @@
+{"id":"<UUID>","seq":2,"kind":"chat","timestamp":"<TS>","status":"completed","process_after":null,"recurrence":null,"series_id":null,"tries":0,"trigger":true,"platform_id":"stdin","channel_type":"cli","thread_id":null,"content":{"text":"run 'echo hello'"},"source_session_id":null,"on_wake":false}
