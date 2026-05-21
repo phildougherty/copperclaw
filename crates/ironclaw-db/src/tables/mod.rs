@@ -21,7 +21,6 @@ pub mod user_roles;
 pub mod users;
 pub mod pending_questions;
 pub mod pending_approvals;
-pub mod pending_sender_approvals;
 pub mod pending_channel_approvals;
 pub mod delivered;
 pub mod destinations;

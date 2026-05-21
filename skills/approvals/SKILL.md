@@ -18,27 +18,26 @@ and how a human resolves them via `iclaw`.
 
 | Kind | Triggered by | Row table |
 |---|---|---|
-| `Sender`           | unknown platform user sending into a wired channel | `pending_sender_approvals` |
+| `Sender`           | unknown platform user sending into a wired channel | `unregistered_senders` |
 | `Channel`          | first message arriving on a channel + platform id not yet known | `pending_channel_approvals` |
 | `InstallPackages`  | `install_packages` MCP tool                          | `pending_approvals` |
 | `AddMcpServer`     | `add_mcp_server` MCP tool                            | `pending_approvals` |
 | `OneCli`           | first OneCLI device link                             | `pending_approvals` |
 
 `pending_approvals` carries a typed `kind` and a `payload` JSON blob
-describing the request. The other two tables exist because senders
-and channels need a richer per-row state (last-seen times, denial
-flags) than a generic payload can carry.
+describing the request. The other tables exist because senders and
+channels need a richer per-row state (last-seen times, denial flags)
+than a generic payload can carry.
 
 ## Sender approvals
 
 When an inbound event arrives whose sender identity is not in
-`users` and is not already approved or denied, the router writes a
-`pending_sender_approvals` row keyed by
-`(messaging_group_id, sender_identity)`. The agent does **not**
-process the message until the admin approves the sender.
-
-The router still records the sender in `unregistered_senders` so
-the admin can see who is knocking (and how often).
+`users` and is not already approved, the router writes an
+`unregistered_senders` row keyed by
+`(channel_type, platform_id)` and returns `Pending`. The agent does
+**not** process the message until the admin approves the sender via
+`iclaw approvals approve --channel <ct> --identity <id>`, which
+inserts a `users` row.
 
 ## Channel approvals
 

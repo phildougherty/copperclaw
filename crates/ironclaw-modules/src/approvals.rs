@@ -4,7 +4,7 @@
 //!
 //! 1. `set_sender_scope_gate` — when an inbound event comes from an unknown
 //!    sender, the gate returns [`SenderScopeDecision::Pending`] so the host
-//!    will record a `pending_sender_approvals` row and drop the event.
+//!    will record an `unregistered_senders` row and drop the event.
 //!
 //! 2. `register_delivery_action("approval_card")` — when an agent emits an
 //!    outbound system message requesting an approval card, this handler
@@ -14,8 +14,8 @@
 //! 3. `on_delivery_adapter_ready` — captures the [`DeliveryDispatcher`] so
 //!    the module can post an "approve?" notification to the operator through
 //!    the agent group's primary messaging channel the first time an unknown
-//!    sender is recorded. De-duplication is provided by the
-//!    `pending_sender_approvals` upsert's `newly_inserted` flag — no second
+//!    sender is recorded. De-duplication is provided by the host-side
+//!    notifier consulting `unregistered_senders` before posting — no second
 //!    notification is posted for the same `(messaging_group, sender_identity)`
 //!    pair. If the agent group has no associated messaging group the
 //!    notification is silently skipped (logged at info).

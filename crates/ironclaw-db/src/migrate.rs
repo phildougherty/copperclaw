@@ -201,7 +201,6 @@ mod tests {
             "sessions",
             "pending_questions",
             "pending_approvals",
-            "pending_sender_approvals",
             "pending_channel_approvals",
             "agent_destinations",
             "unregistered_senders",

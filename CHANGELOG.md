@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Removed (dead `pending_sender_approvals` module)
+
+- **`crates/ironclaw-db/src/tables/pending_sender_approvals.rs`** and
+  the `pending_sender_approvals` table from migration `001_initial.sql`
+  are gone. The CRUD module shipped with full schema + insert/select +
+  12 unit tests but no host code ever called it. The real
+  sender-approval flow uses `unregistered_senders` (audit / dedup) and
+  `users` (the approved-sender truth set): the router writes the
+  unregistered row on every unknown-sender inbound, the approvals
+  module's host-side notifier reads it for dedup before posting the
+  in-channel "approve this sender?" prompt, and
+  `iclaw approvals approve_sender` upserts into `users`. With no
+  release yet on the `001_initial` schema the table is removed in
+  place rather than via an additional drop migration. Doc strings in
+  `crates/ironclaw-modules/src/{approvals.rs,context.rs}` and
+  `skills/approvals/SKILL.md` updated to point at the real table.
+
 ### Added (replay-fixture coverage for tool-use loop)
 
 - **`fixtures/cli/tool-use-shell/`** — new replay fixture that drives

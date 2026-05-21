@@ -115,22 +115,6 @@ CREATE TABLE pending_approvals (
 CREATE INDEX idx_pending_approvals_action_status
   ON pending_approvals(action, status);
 
-CREATE TABLE pending_sender_approvals (
-  id                 TEXT PRIMARY KEY,
-  messaging_group_id TEXT NOT NULL REFERENCES messaging_groups(id),
-  agent_group_id     TEXT NOT NULL REFERENCES agent_groups(id),
-  sender_identity    TEXT NOT NULL,
-  sender_name        TEXT,
-  original_message   TEXT NOT NULL,
-  approver_user_id   TEXT NOT NULL,
-  created_at         TEXT NOT NULL,
-  title              TEXT NOT NULL DEFAULT '',
-  options_json       TEXT NOT NULL DEFAULT '[]',
-  UNIQUE(messaging_group_id, sender_identity)
-);
-CREATE INDEX idx_pending_sender_approvals_mg
-  ON pending_sender_approvals(messaging_group_id);
-
 CREATE TABLE pending_channel_approvals (
   messaging_group_id TEXT PRIMARY KEY REFERENCES messaging_groups(id),
   agent_group_id     TEXT NOT NULL REFERENCES agent_groups(id),
