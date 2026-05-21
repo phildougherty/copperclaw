@@ -394,6 +394,9 @@ fn spawn_container_manager(
             .unwrap_or_else(|| "claude-sonnet-4-5".into()),
         anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
         anthropic_base_url: std::env::var("ANTHROPIC_BASE_URL").ok(),
+        idle_timeout_secs: crate::container_manager::DEFAULT_IDLE_TIMEOUT_SECS,
+        heartbeat_stale_secs: crate::container_manager::DEFAULT_HEARTBEAT_STALE_SECS,
+        stop_grace_secs: crate::container_manager::DEFAULT_STOP_GRACE_SECS,
     };
     let manager = Arc::new(crate::container_manager::ContainerManager::new(
         central,

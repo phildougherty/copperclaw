@@ -62,6 +62,22 @@ pub const RUNNER_CONFIG_FILENAME: &str = "runner.json";
 /// match the path baked into the session image at build time.
 pub const CONTAINER_RUNNER_PATH: &str = "/usr/local/bin/ironclaw-runner";
 
+/// Default idle window before the manager stops a running container.
+/// 300s (5 min) matches the OpenBSD-of-claw-agents "conservative
+/// defaults" tenet — long enough to avoid thrashing on quiet groups,
+/// short enough that an unattended host doesn't burn memory.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
+
+/// Default heartbeat-staleness threshold. The runner refreshes its
+/// `.heartbeat` file's mtime every ~1s as part of the poll loop; if
+/// the host hasn't seen a refresh for this long, the runner is
+/// presumed dead and the container is reset for respawn.
+pub const DEFAULT_HEARTBEAT_STALE_SECS: u64 = 60;
+
+/// Grace period passed to `runtime.stop` on idle / crash transitions.
+/// 5s is enough for the runner to flush an in-flight HTTP call.
+pub const DEFAULT_STOP_GRACE_SECS: u64 = 5;
+
 /// Host-side knobs that don't change per-session.
 #[derive(Debug, Clone)]
 pub struct ManagerConfig {
@@ -84,6 +100,16 @@ pub struct ManagerConfig {
     /// Optional override base URL (e.g. `OpenRouter`'s
     /// `https://openrouter.ai/api/v1`).
     pub anthropic_base_url: Option<String>,
+    /// Seconds without inbound activity before the manager stops the
+    /// container and flips `container_status=idle`.
+    pub idle_timeout_secs: u64,
+    /// Seconds without heartbeat refresh before the manager
+    /// considers the runner dead, stops the container (best effort),
+    /// and resets `container_status=stopped` for respawn.
+    pub heartbeat_stale_secs: u64,
+    /// Grace period for `runtime.stop` calls — sent as SIGTERM
+    /// timeout. The runtime sends SIGKILL after.
+    pub stop_grace_secs: u64,
 }
 
 /// Manager service. Cheap to clone via `Arc`.
@@ -123,26 +149,120 @@ impl ContainerManager {
         }
     }
 
-    /// One iteration: spawn containers for every stopped session that
-    /// has pending inbound.
+    /// One iteration. Walks every active session and reconciles its
+    /// `container_status` with reality:
+    ///
+    /// - `Stopped` + pending inbound → spawn → `Running`.
+    /// - `Idle`    + pending inbound → reset to `Stopped` so the next
+    ///   tick spawns; we don't try to start a container at the same
+    ///   time we mark it stopped, because spawning needs the most
+    ///   recent state.
+    /// - `Running` + heartbeat stale → crash detected, stop best-effort,
+    ///   reset to `Stopped` (manager will respawn next tick).
+    /// - `Running` + `last_active` stale → idle, stop, mark `Idle`.
+    /// - `Running` + alive + recently active → leave alone.
     pub async fn tick(&self) -> Result<(), ManagerError> {
         let sessions = sessions::list_active(&self.central).map_err(ManagerError::Db)?;
         for session in sessions {
             if !matches!(session.status, SessionStatus::Active) {
                 continue;
             }
-            if !matches!(session.container_status, ContainerStatus::Stopped) {
-                continue;
-            }
-            if let Err(err) = self.maybe_spawn(&session).await {
+            let action = self.classify(&session);
+            if let Err(err) = self.apply(&session, action).await {
                 warn!(
                     session = %session.id.as_uuid(),
                     ?err,
-                    "spawn failed; will retry on next tick"
+                    "session reconcile failed; will retry on next tick"
                 );
             }
         }
         Ok(())
+    }
+
+    /// Decide what to do with a single session based on its
+    /// `container_status`, the inbound pending count, the heartbeat
+    /// file's mtime, and the `last_active` timestamp. Pure: takes no
+    /// async work and no DB writes so the state machine is unit-
+    /// testable.
+    fn classify(&self, session: &Session) -> ReconcileAction {
+        let paths = SessionPaths::new(
+            &self.cfg.data_dir,
+            session.agent_group_id,
+            session.id,
+        );
+        let pending = Self::has_pending_inbound(&paths).unwrap_or(false);
+        match session.container_status {
+            ContainerStatus::Stopped => {
+                if pending {
+                    ReconcileAction::Spawn
+                } else {
+                    ReconcileAction::Noop
+                }
+            }
+            ContainerStatus::Idle => {
+                if pending {
+                    ReconcileAction::WakeFromIdle
+                } else {
+                    ReconcileAction::Noop
+                }
+            }
+            ContainerStatus::Running => {
+                if Self::heartbeat_stale(&paths, self.cfg.heartbeat_stale_secs)
+                    .unwrap_or(false)
+                {
+                    ReconcileAction::CrashRestart
+                } else if Self::session_idle(session, self.cfg.idle_timeout_secs) {
+                    ReconcileAction::IdleStop
+                } else {
+                    ReconcileAction::Noop
+                }
+            }
+        }
+    }
+
+    async fn apply(
+        &self,
+        session: &Session,
+        action: ReconcileAction,
+    ) -> Result<(), ManagerError> {
+        match action {
+            ReconcileAction::Noop => Ok(()),
+            ReconcileAction::Spawn => {
+                self.maybe_spawn(session).await?;
+                Ok(())
+            }
+            ReconcileAction::WakeFromIdle => {
+                sessions::mark_container_stopped(&self.central, session.id)
+                    .map_err(ManagerError::Db)?;
+                info!(session = %session.id.as_uuid(), "idle → stopped (pending inbound)");
+                Ok(())
+            }
+            ReconcileAction::IdleStop => {
+                let name = container_name(session.agent_group_id, session.id);
+                let _ = self
+                    .runtime
+                    .stop(&name, Duration::from_secs(self.cfg.stop_grace_secs))
+                    .await;
+                sessions::mark_container_idle(&self.central, session.id)
+                    .map_err(ManagerError::Db)?;
+                info!(session = %session.id.as_uuid(), "running → idle (no activity)");
+                Ok(())
+            }
+            ReconcileAction::CrashRestart => {
+                let name = container_name(session.agent_group_id, session.id);
+                let _ = self
+                    .runtime
+                    .stop(&name, Duration::from_secs(self.cfg.stop_grace_secs))
+                    .await;
+                sessions::mark_container_stopped(&self.central, session.id)
+                    .map_err(ManagerError::Db)?;
+                warn!(
+                    session = %session.id.as_uuid(),
+                    "heartbeat stale; running → stopped (will respawn)"
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Try to spawn a container for `session`. Returns `Ok(true)` when
@@ -195,6 +315,27 @@ impl ContainerManager {
         let conn = open_inbound(paths).map_err(ManagerError::Db)?;
         let n = messages_in::count_due(&conn).map_err(ManagerError::Db)?;
         Ok(n > 0)
+    }
+
+    /// Whether the runner has stopped refreshing its `.heartbeat`
+    /// file. Treats the file's mtime as the truth source; if the
+    /// file doesn't exist yet, that's *not* stale — the runner may
+    /// not have started writing it yet (containers take a moment to
+    /// boot).
+    fn heartbeat_stale(paths: &SessionPaths, threshold_secs: u64) -> Result<bool, ManagerError> {
+        let mtime = paths.heartbeat_mtime().map_err(ManagerError::Io)?;
+        let Some(mtime) = mtime else { return Ok(false) };
+        let age = std::time::SystemTime::now()
+            .duration_since(mtime)
+            .unwrap_or(std::time::Duration::ZERO);
+        Ok(age > std::time::Duration::from_secs(threshold_secs))
+    }
+
+    /// Whether `last_active` is older than the configured idle window.
+    fn session_idle(session: &Session, idle_window_secs: u64) -> bool {
+        let now = chrono::Utc::now();
+        let elapsed = now.signed_duration_since(session.last_active);
+        elapsed.num_seconds() > i64::try_from(idle_window_secs).unwrap_or(i64::MAX)
     }
 
     fn runner_config_for(
@@ -298,6 +439,27 @@ struct RunnerConfigForFile {
     max_messages_per_prompt: Option<u32>,
 }
 
+/// What the reconcile loop wants to do with a session this tick.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReconcileAction {
+    /// Nothing to do — session is in a healthy steady state.
+    Noop,
+    /// Spawn a fresh container for a `Stopped` session with pending
+    /// inbound.
+    Spawn,
+    /// `Idle` session got new inbound; mark it `Stopped` so the next
+    /// tick spawns. Two-step transition (rather than spawning here)
+    /// because spawn needs to read the current `container_status`
+    /// row and we don't want to race ourselves.
+    WakeFromIdle,
+    /// `Running` session has been quiet long enough — stop the
+    /// container and mark `Idle`.
+    IdleStop,
+    /// `Running` session's heartbeat is stale — the runner has likely
+    /// crashed. Stop best-effort and reset to `Stopped` for respawn.
+    CrashRestart,
+}
+
 /// Errors raised by the manager's poll loop.
 #[derive(Debug, thiserror::Error)]
 pub enum ManagerError {
@@ -331,6 +493,9 @@ mod tests {
             default_model: "claude-sonnet-4-5".into(),
             anthropic_api_key: Some("sk-test".into()),
             anthropic_base_url: Some("https://openrouter.ai/api/v1".into()),
+            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+            heartbeat_stale_secs: DEFAULT_HEARTBEAT_STALE_SECS,
+            stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
         }
     }
 
@@ -505,5 +670,195 @@ mod tests {
         }));
         // Runner config got written.
         assert!(paths.root.join(RUNNER_CONFIG_FILENAME).is_file());
+    }
+
+    // ---- state machine classification ----
+
+    fn make_mgr(tmp: &tempfile::TempDir) -> (ContainerManager, CentralDb) {
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        (mgr, db)
+    }
+
+    #[test]
+    fn classify_stopped_without_pending_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        // container_status defaults to Stopped per create_session.
+        assert_eq!(mgr.classify(&session), ReconcileAction::Noop);
+    }
+
+    #[test]
+    fn classify_stopped_with_pending_is_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        let conn = open_inbound(&paths).unwrap();
+        messages_in::insert(
+            &conn,
+            &messages_in::WriteInbound {
+                id: ironclaw_types::MessageId::new(),
+                kind: ironclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "hi"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("stdin".into()),
+                channel_type: Some(ironclaw_types::ChannelType::new("cli")),
+                thread_id: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(mgr.classify(&session), ReconcileAction::Spawn);
+    }
+
+    #[test]
+    fn classify_running_with_fresh_heartbeat_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let mut session = fixture_session(&db);
+        sessions::mark_container_running(&db, session.id).unwrap();
+        session.container_status = ContainerStatus::Running;
+        session.last_active = chrono::Utc::now();
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        std::fs::write(&paths.heartbeat, b"").unwrap();
+        assert_eq!(mgr.classify(&session), ReconcileAction::Noop);
+    }
+
+    #[test]
+    fn classify_running_with_stale_heartbeat_is_crash_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let mut session = fixture_session(&db);
+        sessions::mark_container_running(&db, session.id).unwrap();
+        session.container_status = ContainerStatus::Running;
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        std::fs::write(&paths.heartbeat, b"").unwrap();
+        // Backdate the heartbeat mtime to before the staleness window.
+        let old =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        filetime::set_file_mtime(
+            &paths.heartbeat,
+            filetime::FileTime::from_system_time(old),
+        )
+        .unwrap();
+        assert_eq!(mgr.classify(&session), ReconcileAction::CrashRestart);
+    }
+
+    #[test]
+    fn classify_running_with_quiet_session_is_idle_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let mut session = fixture_session(&db);
+        sessions::mark_container_running(&db, session.id).unwrap();
+        session.container_status = ContainerStatus::Running;
+        // last_active is set to "now" at session create; backdate it.
+        session.last_active = chrono::Utc::now()
+            - chrono::Duration::seconds(
+                i64::try_from(DEFAULT_IDLE_TIMEOUT_SECS).unwrap() + 10,
+            );
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        std::fs::write(&paths.heartbeat, b"").unwrap();
+        assert_eq!(mgr.classify(&session), ReconcileAction::IdleStop);
+    }
+
+    #[test]
+    fn classify_idle_without_pending_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let mut session = fixture_session(&db);
+        sessions::mark_container_idle(&db, session.id).unwrap();
+        session.container_status = ContainerStatus::Idle;
+        assert_eq!(mgr.classify(&session), ReconcileAction::Noop);
+    }
+
+    #[test]
+    fn classify_idle_with_pending_is_wake_from_idle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let mut session = fixture_session(&db);
+        sessions::mark_container_idle(&db, session.id).unwrap();
+        session.container_status = ContainerStatus::Idle;
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        let conn = open_inbound(&paths).unwrap();
+        messages_in::insert(
+            &conn,
+            &messages_in::WriteInbound {
+                id: ironclaw_types::MessageId::new(),
+                kind: ironclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "hi"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("stdin".into()),
+                channel_type: Some(ironclaw_types::ChannelType::new("cli")),
+                thread_id: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(mgr.classify(&session), ReconcileAction::WakeFromIdle);
+    }
+
+    #[tokio::test]
+    async fn apply_wake_from_idle_marks_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let mut session = fixture_session(&db);
+        sessions::mark_container_idle(&db, session.id).unwrap();
+        session.container_status = ContainerStatus::Idle;
+        mgr.apply(&session, ReconcileAction::WakeFromIdle).await.unwrap();
+        let updated = sessions::get(&db, session.id).unwrap();
+        assert!(matches!(updated.container_status, ContainerStatus::Stopped));
+    }
+
+    #[tokio::test]
+    async fn apply_idle_stop_marks_idle_and_calls_runtime_stop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let runtime = std::sync::Arc::new(crate::tests::NoopRuntime::default());
+        let mgr = ContainerManager::new(
+            db.clone(),
+            runtime.clone(),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let mut session = fixture_session(&db);
+        sessions::mark_container_running(&db, session.id).unwrap();
+        session.container_status = ContainerStatus::Running;
+        mgr.apply(&session, ReconcileAction::IdleStop).await.unwrap();
+        let updated = sessions::get(&db, session.id).unwrap();
+        assert!(matches!(updated.container_status, ContainerStatus::Idle));
+    }
+
+    #[tokio::test]
+    async fn apply_crash_restart_marks_stopped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let mut session = fixture_session(&db);
+        sessions::mark_container_running(&db, session.id).unwrap();
+        session.container_status = ContainerStatus::Running;
+        mgr.apply(&session, ReconcileAction::CrashRestart)
+            .await
+            .unwrap();
+        let updated = sessions::get(&db, session.id).unwrap();
+        assert!(matches!(updated.container_status, ContainerStatus::Stopped));
     }
 }
