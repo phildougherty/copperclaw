@@ -19,9 +19,11 @@ See `PLAN.md` for the team-by-team design and milestone history.
 
 ## Status
 
-0.1.0 candidate. The workspace covers M0 through M10 of `PLAN.md` and
-the M11 documentation set; the differential-replay harness lands as
-the final M11 deliverable.
+0.1.0 candidate. The workspace covers M0 through M10 of `PLAN.md`,
+the M11 documentation set, and the M12 / M13 operational-hardening
+slices: container-lifecycle reconciliation, an append-only audit
+log, token accounting, per-group budgets, persistent sender
+approvals, and an `iclaw chat` REPL.
 
 - **21 in-tree channel crates**: cli, telegram, slack, discord,
   resend, github, linear, webex, matrix, teams, mattermost (REST v4
@@ -35,31 +37,50 @@ the final M11 deliverable.
   no stubbed crypto, no placeholder backends.
 - **Provider variants**: Anthropic HTTP-streaming with tool-use and
   compaction, plus subprocess-bridged Codex / OpenCode and an
-  Ollama-via-Anthropic-base-URL variant.
+  Ollama-via-Anthropic-base-URL variant. `ironclaw-setup` accepts
+  `openrouter` as a friendly shortcut at the base-URL prompt.
 - **Full host pipeline**: router, delivery (1s active + 60s sweep,
-  exponential backoff, 3-attempt cap), and a 60s sweep loop for stuck
-  detection / recurrence fanout / processing-ack reset.
+  exponential backoff, 3-attempt cap), a 60s sweep loop for stuck
+  detection / recurrence fanout / processing-ack reset, and a
+  container manager that reconciles per-session state across
+  Stopped / Idle / Running with heartbeat-driven crash-restart and
+  configurable idle-stop (5-minute default).
+- **Operator surface**: `iclaw health` (one-shot probe — session
+  breakdown by container_status, recent mutations, dropped-message
+  count), `iclaw audit list` (append-only mutation log;
+  truncated-args, latency_ms, caller kind), `iclaw usage` (per-
+  group token rollup from the `agent_turns` table the runner
+  populates from provider `usage` events), `iclaw budgets set`
+  (per-group `daily_token_cap`; manager refuses to spawn when
+  today's tokens exceed the cap), `iclaw approvals approve`
+  (persistent sender approval; gate consults the central `users`
+  table on every inbound), and `iclaw chat` (interactive REPL
+  against the install's cli channel).
 - **OneCLI gateway** for centralised credential issuance with full
   wiremock coverage of 401/404/409/429/5xx and `Retry-After`.
-- **`iclaw` admin client** over a Unix socket inside the host (41
-  documented commands; CLI-scope-aware so agents can call read paths
-  but not mutations).
+- **`iclaw` admin client** over a Unix socket inside the host (46
+  wire commands plus 5 composite client-side fan-outs;
+  CLI-scope-aware so agents can call read paths but not mutations;
+  every mutation lands in `audit_log`).
 - **Interactive setup binary** (`ironclaw-setup`) with systemd /
-  launchd unit generators and a `--migrate-from` data-directory
-  migrator.
+  launchd unit generators (including `Restart=on-failure`) and a
+  `--migrate-from` data-directory migrator.
 - **17 authored skills** under `skills/`.
-- **4365 passing tests**, 0 failing. `cargo clippy --workspace
+- **4406 passing tests**, 0 failing. `cargo clippy --workspace
   --all-targets -- -D warnings` clean. CI runs fmt + clippy + test on
   Linux and macOS with an 85% coverage gate.
 - **End-to-end chat works** against any Anthropic-API-compatible
   provider (Anthropic native or OpenRouter via
   `ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1`). The host's
   container manager spawns a runner-in-container per session, the
-  runner reads inbound.db, calls the provider, writes outbound.db,
-  marks the inbound completed, and the delivery loop fans the reply
-  back via the cli channel. Verified live: typed
-  `What's the capital of France? One word only.` into the host's
-  stdin, got back `agent> Paris` in ~1s.
+  runner reads inbound.db, calls the provider, writes outbound.db
+  plus a `usage_report` system row (which the delivery loop folds
+  into `agent_turns`), marks the inbound completed, and the
+  delivery loop fans the reply back via the channel adapter.
+  Verified live against OpenRouter: typed
+  `What is 7*8? Number only.` through `iclaw chat`, got back
+  `agent> 56`, `iclaw usage` recorded 7787 input + 7 output
+  tokens.
 
 ## Build
 
@@ -82,7 +103,8 @@ The release artifacts are:
 # First-time setup walks every step with defaults you can override.
 # Picks an install root per-platform (Linux: $XDG_DATA_HOME/ironclaw,
 # falling back to ~/.local/share/ironclaw; macOS: ~/Library/Application
-# Support/ironclaw). Pass --data-dir to override.
+# Support/ironclaw). Pass --data-dir to override. At the provider-
+# URL prompt, type `openrouter` (or leave blank for Anthropic).
 ironclaw-setup
 
 # Boot the host. With no `--env-file`, ironclaw auto-discovers the
@@ -93,8 +115,11 @@ ironclaw run
 # In another terminal — iclaw also resolves the install's socket
 # without configuration, so the commands Just Work from any cwd.
 iclaw quickstart cli --name first    # group + mg + wiring in one call
-iclaw status                          # everything wired up at a glance
-iclaw sessions list --status active
+iclaw status                          # full wiring digest
+iclaw health                          # operator probe (sessions, audit, drops)
+iclaw chat                            # interactive REPL against the cli channel
+iclaw usage --since 24h               # per-group token rollup
+iclaw audit list --since 1h           # mutations against the host socket
 ```
 
 `ironclaw run` resolution order for the `.env`: `--env-file <path>` →
