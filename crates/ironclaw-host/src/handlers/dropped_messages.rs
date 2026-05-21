@@ -1,11 +1,19 @@
-//! Handler for `dropped-messages.list`.
+//! Handlers for `dropped-messages.list`, `dropped-messages.outbound-list`,
+//! and `dropped-messages.replay`.
+//!
+//! The first handler lists *inbound* dropped messages (router refusals). The
+//! latter two are for *outbound* dead-letter rows: delivery failures after
+//! all retries were exhausted.
 
 use super::{db_err, opt_str};
 use chrono::DateTime;
 use ironclaw_db::central::CentralDb;
-use ironclaw_db::tables::dropped_messages;
+use ironclaw_db::session::{open_outbound, SessionPaths};
+use ironclaw_db::tables::{dropped_messages, messages_out, outbound_dropped_messages};
 use ironclaw_iclaw::ErrorPayload;
+use ironclaw_types::MessageId;
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 pub fn list(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     let since = match opt_str(args, "since") {
@@ -36,6 +44,133 @@ pub fn list(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
         })
         .collect();
     Ok(json!(out))
+}
+
+/// Parse a `--since` argument value. Accepts ISO-8601 timestamps and simple
+/// relative windows like `24h`, `1h`, `30m`, `7d`.
+fn parse_since(s: &str) -> Result<DateTime<chrono::Utc>, ErrorPayload> {
+    // Try ISO-8601 first.
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&chrono::Utc));
+    }
+    // Relative shorthand: <N>(s|m|h|d)
+    let (digits, unit) = s.split_at(s.len().saturating_sub(1));
+    let n: i64 = digits.parse().map_err(|_| {
+        ErrorPayload::new(
+            "bad_request",
+            format!("invalid `since` value `{s}`; use an ISO-8601 timestamp or a shorthand like `24h`, `30m`, `7d`"),
+        )
+    })?;
+    let duration = match unit {
+        "s" => chrono::Duration::seconds(n),
+        "m" => chrono::Duration::minutes(n),
+        "h" => chrono::Duration::hours(n),
+        "d" => chrono::Duration::days(n),
+        _ => {
+            return Err(ErrorPayload::new(
+                "bad_request",
+                format!("invalid `since` value `{s}`; use an ISO-8601 timestamp or a shorthand like `24h`, `30m`, `7d`"),
+            ));
+        }
+    };
+    Ok(chrono::Utc::now() - duration)
+}
+
+/// `dropped-messages.outbound-list` — list outbound dead-letter rows.
+///
+/// Returns rows from `outbound_dropped_messages` ordered most-recent first.
+/// Optional `since` filter and `limit` cap (default 50).
+pub fn outbound_list(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
+    let since = match opt_str(args, "since") {
+        Some(s) => Some(parse_since(&s)?),
+        None => None,
+    };
+    let limit: Option<i64> = args.get("limit").and_then(Value::as_i64);
+
+    let rows = outbound_dropped_messages::list(central, since, limit).map_err(db_err)?;
+    let out: Vec<Value> = rows
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id.to_string(),
+                "session_id": r.session_id.as_uuid().to_string(),
+                "agent_group_id": r.agent_group_id.as_uuid().to_string(),
+                "message_out_id": r.message_out_id.as_uuid().to_string(),
+                "channel_type": r.channel_type.as_ref().map(ironclaw_types::ChannelType::as_str),
+                "platform_id": r.platform_id,
+                "thread_id": r.thread_id,
+                "kind": r.kind.as_str(),
+                "last_error": r.last_error,
+                "dropped_at": r.dropped_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    Ok(json!(out))
+}
+
+/// `dropped-messages.replay` — re-queue an outbound dead-letter row.
+///
+/// Looks up the dead-letter row by its id, opens the originating session's
+/// `outbound.db`, inserts a fresh copy of the message with reset status, then
+/// deletes the dead-letter row so it doesn't appear again in `outbound-list`.
+///
+/// The `data_dir` must be passed through from the `HandlerCtx`; this handler
+/// signature takes it as a separate string parameter for testability.
+pub fn replay_with_data_dir(
+    args: &Value,
+    central: &CentralDb,
+    data_dir: &std::path::Path,
+) -> Result<Value, ErrorPayload> {
+    let id_str = super::req_str(args, "id")?;
+    let id = Uuid::parse_str(&id_str)
+        .map_err(|e| ErrorPayload::new("bad_request", format!("invalid dead-letter id: {e}")))?;
+
+    let record = outbound_dropped_messages::get(central, id).map_err(|e| match e {
+        ironclaw_db::DbError::NotFound => {
+            ErrorPayload::new("not_found", format!("no outbound dead-letter row with id {id}"))
+        }
+        other => db_err(other),
+    })?;
+
+    // Open the session's outbound DB and insert a fresh copy of the message.
+    let paths = SessionPaths::new(
+        data_dir,
+        record.agent_group_id,
+        record.session_id,
+    );
+    let conn = open_outbound(&paths).map_err(|e| {
+        ErrorPayload::new(
+            "io_error",
+            format!("could not open outbound DB for session {}: {e}", record.session_id.as_uuid()),
+        )
+    })?;
+    let new_id = MessageId::new();
+    let msg = messages_out::WriteOutbound {
+        id: new_id,
+        in_reply_to: None,
+        timestamp: chrono::Utc::now(),
+        deliver_after: None,
+        recurrence: None,
+        kind: record.kind,
+        platform_id: record.platform_id.clone(),
+        channel_type: record.channel_type.clone(),
+        thread_id: record.thread_id.clone(),
+        content: record.content.clone(),
+    };
+    messages_out::insert(&conn, &msg).map_err(|e| {
+        ErrorPayload::new("db_error", format!("failed to re-insert message: {e}"))
+    })?;
+
+    // Delete the dead-letter row so it doesn't show up in outbound-list again.
+    outbound_dropped_messages::delete(central, id).map_err(db_err)?;
+
+    Ok(json!({
+        "replayed": true,
+        "dead_letter_id": id.to_string(),
+        "new_message_id": new_id.as_uuid().to_string(),
+        "session_id": record.session_id.as_uuid().to_string(),
+        "agent_group_id": record.agent_group_id.as_uuid().to_string(),
+    }))
 }
 
 #[cfg(test)]
