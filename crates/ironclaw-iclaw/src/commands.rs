@@ -167,6 +167,23 @@ pub enum TopCommand {
         #[arg(long, default_value = "24h")]
         since: String,
     },
+    /// Interactive REPL: read lines from this terminal, write them
+    /// into the host's chat fifo, tail `chat.log` for replies.
+    ///
+    /// The host must already be running with a `cli` channel wired
+    /// (see `iclaw quickstart cli`). Path defaults to the standard
+    /// install layout; override with `--fifo` / `--log` for tests
+    /// or non-default installs.
+    Chat {
+        /// FIFO the host reads its stdin from. Defaults to
+        /// `<install_root>/chat.fifo`.
+        #[arg(long)]
+        fifo: Option<std::path::PathBuf>,
+        /// Log the host writes its stdout to. Defaults to
+        /// `<install_root>/chat.log`.
+        #[arg(long)]
+        log: Option<std::path::PathBuf>,
+    },
     /// Emit shell completion script for `iclaw`.
     ///
     /// Pipe the output into your shell's completion dir, e.g.
@@ -631,6 +648,16 @@ impl TopCommand {
             Self::Health => ParsedCall::new("composite.health", json!({})),
             Self::Usage { since } => {
                 ParsedCall::new("usage.rollup", json!({"since": since}))
+            }
+            Self::Chat { fifo, log } => {
+                let mut o = Map::new();
+                if let Some(p) = fifo {
+                    o.insert("fifo".into(), p.to_string_lossy().into_owned().into());
+                }
+                if let Some(p) = log {
+                    o.insert("log".into(), p.to_string_lossy().into_owned().into());
+                }
+                ParsedCall::new("composite.chat", Value::Object(o))
             }
             // Completions are emitted entirely client-side; the marker
             // command carries the requested shell name so `run_cli`
@@ -1791,6 +1818,13 @@ mod tests {
             ],
             &["iclaw", "audit", "list"],
             &["iclaw", "usage"],
+            // Note: composite-only commands (`iclaw status`,
+            // `iclaw health`, `iclaw quickstart`, `iclaw chat`,
+            // `iclaw completions`) intentionally produce
+            // `composite.*` marker commands that aren't in
+            // ALL_COMMANDS. They're client-side fan-outs, not
+            // wire calls, so they don't belong in the ALL_COMMANDS
+            // contract.
         ];
         for args in invocations {
             let p = parse(args);

@@ -243,8 +243,156 @@ where
         "status" => run_status(transport, caller, as_json).await,
         "health" => run_health(transport, caller, as_json).await,
         "completions" => run_completions(args),
+        "chat" => run_chat(args).await,
         other => RunOutput::failure(format!("unknown composite op: {other}\n")),
     }
+}
+
+/// `iclaw chat` — interactive REPL against the local cli channel.
+///
+/// Reads lines from this terminal's stdin, writes them into the host's
+/// chat FIFO, and tails `chat.log` for replies. Doesn't touch the
+/// socket at all — it's pure file I/O against the install layout
+/// `ironclaw-setup` produces. Exits on EOF (Ctrl-D) or Ctrl-C.
+///
+/// Long-but-flat: every branch is necessary for friendly errors.
+#[allow(clippy::too_many_lines)]
+async fn run_chat(args: &serde_json::Value) -> RunOutput {
+    use std::path::PathBuf;
+    use tokio::fs::OpenOptions;
+    use tokio::io::{AsyncBufReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
+
+    let Some(install_root) = resolve_install_root() else {
+        return RunOutput::failure(
+            "iclaw chat: could not resolve install root; pass --fifo / --log\n"
+                .to_string(),
+        );
+    };
+    let fifo_path: PathBuf = args
+        .get("fifo")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(
+            || install_root.join("chat.fifo"),
+            PathBuf::from,
+        );
+    let log_path: PathBuf = args
+        .get("log")
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(
+            || install_root.join("chat.log"),
+            PathBuf::from,
+        );
+
+    if !fifo_path.exists() {
+        return RunOutput::failure(format!(
+            "iclaw chat: no FIFO at {} — make sure the host is running and \
+             the chat.fifo keepalive is up.\n",
+            fifo_path.display()
+        ));
+    }
+    if !log_path.exists() {
+        return RunOutput::failure(format!(
+            "iclaw chat: no log at {}\n",
+            log_path.display()
+        ));
+    }
+
+    let mut fifo = match OpenOptions::new().write(true).open(&fifo_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            return RunOutput::failure(format!(
+                "iclaw chat: open fifo {}: {e}\n",
+                fifo_path.display()
+            ));
+        }
+    };
+    let log_file = match OpenOptions::new().read(true).open(&log_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            return RunOutput::failure(format!(
+                "iclaw chat: open log {}: {e}\n",
+                log_path.display()
+            ));
+        }
+    };
+    // Seek to end so we only show NEW replies, not history.
+    let mut log_reader = BufReader::new(log_file);
+    let _ = log_reader.seek(std::io::SeekFrom::End(0)).await;
+
+    eprintln!(
+        "iclaw chat: connected (fifo={}, log={})\n\
+         type a message and press enter. Ctrl-D to exit.\n",
+        fifo_path.display(),
+        log_path.display()
+    );
+
+    // Tail the log on a background task; print every new line to stdout.
+    let log_task = tokio::spawn(async move {
+        let mut reader = log_reader;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line).await {
+                Ok(0) => {
+                    // EOF — wait for more.
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                }
+                Ok(_) => {
+                    if line.ends_with('\n') {
+                        print!("{line}");
+                    } else {
+                        println!("{line}");
+                    }
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // Read terminal stdin line by line; pipe each into the FIFO.
+    let mut stdin = BufReader::new(tokio::io::stdin());
+    loop {
+        let mut line = String::new();
+        match stdin.read_line(&mut line).await {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                if let Err(e) = fifo.write_all(line.as_bytes()).await {
+                    eprintln!("iclaw chat: write to fifo failed: {e}");
+                    break;
+                }
+                let _ = fifo.flush().await;
+            }
+            Err(e) => {
+                eprintln!("iclaw chat: stdin read failed: {e}");
+                break;
+            }
+        }
+    }
+    log_task.abort();
+    RunOutput::success(String::new())
+}
+
+/// Platform-default ironclaw install root. Mirrors the resolver in
+/// `ironclaw-host::config::default_install_env_file` / setup's
+/// `default_data_dir_for` so chat's defaults agree with where setup
+/// put things.
+fn resolve_install_root() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    let os = std::env::consts::OS;
+    Some(match os {
+        "macos" => home
+            .join("Library")
+            .join("Application Support")
+            .join("ironclaw"),
+        "linux" => std::env::var_os("XDG_DATA_HOME")
+            .map(std::path::PathBuf::from)
+            .filter(|x| !x.as_os_str().is_empty())
+            .map_or_else(
+                || home.join(".local").join("share").join("ironclaw"),
+                |xdg| xdg.join("ironclaw"),
+            ),
+        _ => home.join(".ironclaw"),
+    })
 }
 
 /// `iclaw health` — one-shot operator probe. Lists session-state
