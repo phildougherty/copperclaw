@@ -323,6 +323,74 @@ pub fn dispatch_request(table: &DispatchTable, ctx: &HandlerCtx, req: &Request) 
     resp
 }
 
+/// Mask string used in place of redacted secrets in the audit log.
+const REDACTED_PLACEHOLDER: &str = "<redacted>";
+
+/// Per-command rule for fields whose values must never reach the audit
+/// log in plaintext. The host receives these args from operators (or
+/// agents) and writes them into `audit_log.args`; without this filter
+/// `iclaw mcp add postgres --env DATABASE_URL=postgres://u:p@h/d` would
+/// persist the connection string in cleartext.
+///
+/// Returns a deep-cloned, redacted variant of `args` suitable for
+/// serialising into `audit_log.args`. The original argument value flows
+/// to the handler unchanged.
+fn redact_sensitive_args(command: &str, args: &Value) -> Value {
+    let mut out = args.clone();
+    match command {
+        // `mcp.add` carries operator-supplied env values that are almost
+        // always API keys / connection strings. Mask every value under
+        // the top-level `env` object; keep the keys so the audit row
+        // still records "which env vars were set" without leaking the
+        // contents.
+        "mcp.add" => {
+            if let Some(env) = out.get_mut("env").and_then(Value::as_object_mut) {
+                for v in env.values_mut() {
+                    *v = Value::String(REDACTED_PLACEHOLDER.to_string());
+                }
+            }
+        }
+        // `groups.config.set-mcp-servers` writes the full JSON blob
+        // verbatim. The values are operator-defined and may include
+        // env-style secrets (Postgres URLs, API tokens) so we mask every
+        // string leaf under any `env` sub-object.
+        "groups.config.set-mcp-servers" => {
+            if let Some(servers) = out.get_mut("mcp_servers") {
+                redact_env_objects(servers);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Walk `v` and replace every value in any sub-object literally named
+/// `env` with the redacted placeholder. Best-effort: arbitrary
+/// container-config shapes are tolerated.
+fn redact_env_objects(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            for (k, child) in map.iter_mut() {
+                if k == "env" {
+                    if let Some(env) = child.as_object_mut() {
+                        for val in env.values_mut() {
+                            *val = Value::String(REDACTED_PLACEHOLDER.to_string());
+                        }
+                    }
+                } else {
+                    redact_env_objects(child);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                redact_env_objects(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Best-effort `audit_log` insert. Truncates large argument payloads
 /// so a buggy / malicious client can't pump the table full of
 /// megabytes.
@@ -348,8 +416,11 @@ fn audit_dispatch(
         ),
     };
     let args_str = {
-        // Compact JSON, capped at 4KiB to keep audit rows small.
-        let s = serde_json::to_string(args).unwrap_or_else(|_| String::from("\"<unserializable>\""));
+        // Redact known-sensitive fields before serialising so secrets
+        // never reach disk. Then compact-JSON-serialise + cap at 4KiB.
+        let redacted = redact_sensitive_args(command, args);
+        let s = serde_json::to_string(&redacted)
+            .unwrap_or_else(|_| String::from("\"<unserializable>\""));
         if s.len() > 4096 {
             // Truncate on a char boundary.
             let mut cap = 4096;
@@ -509,6 +580,73 @@ mod tests {
 
     fn central() -> CentralDb {
         CentralDb::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn redact_mcp_add_masks_env_values_but_keeps_keys() {
+        let args = json!({
+            "preset": "postgres",
+            "agent_group_id": "00000000-0000-0000-0000-000000000000",
+            "env": {
+                "DATABASE_URL": "postgres://user:secret@host:5432/db",
+                "PGPASSWORD": "hunter2",
+            }
+        });
+        let out = redact_sensitive_args("mcp.add", &args);
+        // Top-level fields unchanged.
+        assert_eq!(out["preset"], "postgres");
+        // Env keys preserved.
+        assert!(out["env"]["DATABASE_URL"].is_string());
+        assert!(out["env"]["PGPASSWORD"].is_string());
+        // Env values replaced.
+        assert_eq!(out["env"]["DATABASE_URL"], REDACTED_PLACEHOLDER);
+        assert_eq!(out["env"]["PGPASSWORD"], REDACTED_PLACEHOLDER);
+        // Plaintext secret must not appear anywhere in the serialised
+        // output (defense-in-depth — catches future shape changes).
+        let s = serde_json::to_string(&out).unwrap();
+        assert!(!s.contains("hunter2"), "leak: {s}");
+        assert!(!s.contains("secret@host"), "leak: {s}");
+    }
+
+    #[test]
+    fn redact_mcp_add_tolerates_missing_env() {
+        let args = json!({"preset": "filesystem"});
+        let out = redact_sensitive_args("mcp.add", &args);
+        assert_eq!(out, args);
+    }
+
+    #[test]
+    fn redact_set_mcp_servers_masks_nested_env_values() {
+        let args = json!({
+            "agent_group_id": "00000000-0000-0000-0000-000000000000",
+            "mcp_servers": {
+                "github": {
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-github"],
+                    "env": { "GITHUB_TOKEN": "ghp_secrettoken" }
+                },
+                "postgres": {
+                    "command": "uvx",
+                    "env": { "DATABASE_URL": "postgres://x:y@h/d" }
+                }
+            }
+        });
+        let out = redact_sensitive_args("groups.config.set-mcp-servers", &args);
+        assert_eq!(out["mcp_servers"]["github"]["env"]["GITHUB_TOKEN"], REDACTED_PLACEHOLDER);
+        assert_eq!(out["mcp_servers"]["postgres"]["env"]["DATABASE_URL"], REDACTED_PLACEHOLDER);
+        // Non-env fields are preserved.
+        assert_eq!(out["mcp_servers"]["github"]["command"], "npx");
+        let s = serde_json::to_string(&out).unwrap();
+        assert!(!s.contains("ghp_secrettoken"));
+        assert!(!s.contains("x:y@h"));
+    }
+
+    #[test]
+    fn redact_unknown_command_is_identity() {
+        let args = json!({"foo": "bar", "env": {"X": "y"}});
+        let out = redact_sensitive_args("groups.list", &args);
+        // Not a known sensitive-command: leave args untouched.
+        assert_eq!(out, args);
     }
 
     #[test]

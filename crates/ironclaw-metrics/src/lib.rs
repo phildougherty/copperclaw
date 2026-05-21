@@ -53,6 +53,7 @@ pub const MESSAGES_INBOUND_TOTAL: &str = "ironclaw_messages_inbound_total";
 pub const MESSAGES_OUTBOUND_TOTAL: &str = "ironclaw_messages_outbound_total";
 pub const CONTAINERS_SPAWNED_TOTAL: &str = "ironclaw_containers_spawned_total";
 pub const CONTAINERS_CRASHED_TOTAL: &str = "ironclaw_containers_crashed_total";
+pub const IMAGE_REBUILD_FAILED_TOTAL: &str = "ironclaw_image_rebuild_failed_total";
 pub const DELIVERY_FAILED_TOTAL: &str = "ironclaw_delivery_failed_total";
 pub const LLM_CALL_SECONDS: &str = "ironclaw_llm_call_seconds";
 pub const LLM_TOKENS_INPUT: &str = "ironclaw_llm_tokens_input";
@@ -79,6 +80,14 @@ pub fn inc_containers_spawned() {
 /// Increment `ironclaw_containers_crashed_total`.
 pub fn inc_containers_crashed() {
     counter!(CONTAINERS_CRASHED_TOTAL).increment(1);
+}
+
+/// Increment `ironclaw_image_rebuild_failed_total`. Fired by the
+/// container manager when an image rebuild call to the runtime errors
+/// out; the manager falls back to the last-known-good `image_tag`
+/// when one exists so the agent group is not blocked.
+pub fn inc_image_rebuild_failed() {
+    counter!(IMAGE_REBUILD_FAILED_TOTAL).increment(1);
 }
 
 /// Increment `ironclaw_delivery_failed_total{channel_type=<ct>}`.
@@ -397,6 +406,7 @@ mod tests {
         inc_containers_spawned();
         inc_containers_crashed();
         inc_delivery_failed("slack");
+        inc_image_rebuild_failed();
     }
 
     #[test]
@@ -416,6 +426,7 @@ mod tests {
             MESSAGES_OUTBOUND_TOTAL,
             CONTAINERS_SPAWNED_TOTAL,
             CONTAINERS_CRASHED_TOTAL,
+            IMAGE_REBUILD_FAILED_TOTAL,
             DELIVERY_FAILED_TOTAL,
             LLM_CALL_SECONDS,
             LLM_TOKENS_INPUT,

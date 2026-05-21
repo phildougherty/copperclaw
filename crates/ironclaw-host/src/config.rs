@@ -20,6 +20,11 @@
 //! | `IRONCLAW_CHANNELS_CONFIG` | `{}` | JSON object keyed by channel type; per-channel `setup.config`. |
 //! | `IRONCLAW_SKILLS_DIR` | unset | Directory of `SKILL.md` skill bundles auto-loaded into the agent system prompt. |
 //! | `IRONCLAW_GROUPS_DIR` | unset | Directory under which per-group `<ag_id>/skills/` overrides live. |
+//! | `IRONCLAW_METRICS_ADDR` | unset | Enable the Prometheus `/metrics` endpoint. Accepts `host:port` or a bare port (auto-prefixed to `127.0.0.1:`). Off by default per the conservative-defaults tenet. |
+//! | `IRONCLAW_LOG_DIR` | unset | When set, fan tracing output to `<dir>/host.log.<date>` via `tracing-appender::rolling::daily` in addition to stderr. Default off keeps the legacy stderr-only behaviour. |
+//! | `IRONCLAW_DEFAULT_IMAGE_TAG` | unset | sha-pinned default image tag for sessions when the per-group `container_configs.image_tag` is unset. Written by `ironclaw-setup` after building the image. |
+//! | `ANTHROPIC_API_KEY` | unset | API key forwarded into each session container as an env var. |
+//! | `ANTHROPIC_BASE_URL` | unset | Override the provider base URL (e.g. `https://openrouter.ai/api/v1`). |
 //!
 //! The `cli` channel is always implicitly known but is only initialized if it
 //! appears in `IRONCLAW_CHANNELS`. Unknown channel names log a warning and

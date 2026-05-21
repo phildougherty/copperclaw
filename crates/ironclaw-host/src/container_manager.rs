@@ -317,6 +317,15 @@ impl ContainerManager {
         // differs from the current config (or is absent), rebuild the image
         // before spawning.  The new tag + fingerprint are persisted back to
         // `container_configs` so subsequent spawns reuse the cached image.
+        //
+        // Failure handling: if the rebuild itself fails (bad apt name,
+        // network blip during `apt-get update`, etc.) we fall back to the
+        // last-known-good `image_tag` so the session still spawns. The
+        // fingerprint is NOT updated on fallback, so the next spawn retries
+        // the rebuild — the operator can fix the broken config without the
+        // group going dark in the meantime. When there is no fallback tag
+        // (first-ever build, no cached image), the error propagates and the
+        // session stays Stopped for the next tick to retry.
         let image_tag = if let Some(ref cfg) = cfg_row {
             let live_fp = container_configs::compute_fingerprint(cfg);
             let stored_fp = cfg.config_fingerprint.as_deref().unwrap_or("");
@@ -324,8 +333,23 @@ impl ContainerManager {
             if stored_fp == live_fp {
                 base_tag
             } else {
-                // Config changed (or was never fingerprinted): rebuild.
-                self.rebuild_image(session.agent_group_id, cfg).await?
+                match self.rebuild_image(session.agent_group_id, cfg).await {
+                    Ok(new_tag) => new_tag,
+                    Err(err) if !base_tag.is_empty() => {
+                        warn!(
+                            agent_group = %session.agent_group_id.as_uuid(),
+                            fallback_tag = %base_tag,
+                            ?err,
+                            "image rebuild failed; spawning on last-known-good tag (operator must fix config to pick up changes)"
+                        );
+                        ironclaw_metrics::inc_image_rebuild_failed();
+                        base_tag
+                    }
+                    Err(err) => {
+                        ironclaw_metrics::inc_image_rebuild_failed();
+                        return Err(err);
+                    }
+                }
             }
         } else {
             self.cfg.default_image_tag.clone()
