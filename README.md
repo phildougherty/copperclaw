@@ -20,10 +20,10 @@ See `PLAN.md` for the team-by-team design and milestone history.
 ## Status
 
 0.1.0 candidate. The workspace covers M0 through M10 of `PLAN.md`,
-the M11 documentation set, and the M12 / M13 operational-hardening
-slices: container-lifecycle reconciliation, an append-only audit
-log, token accounting, per-group budgets, persistent sender
-approvals, and an `iclaw chat` REPL.
+the M11 documentation set, the M12 chat-loop slice, the M13
+operational-hardening slice, M14 (agent capability — tool wiring +
+computer-use), and the M14 follow-up that auto-loads skill content
+into the system prompt.
 
 - **21 in-tree channel crates**: cli, telegram, slack, discord,
   resend, github, linear, webex, matrix, teams, mattermost (REST v4
@@ -39,34 +39,70 @@ approvals, and an `iclaw chat` REPL.
   compaction, plus subprocess-bridged Codex / OpenCode and an
   Ollama-via-Anthropic-base-URL variant. `ironclaw-setup` accepts
   `openrouter` as a friendly shortcut at the base-URL prompt.
+- **Agent tool inventory**: 19 in-tree tools — 15 messaging /
+  scheduling / self-mod (`send_message`, `send_file`,
+  `edit_message`, `add_reaction`, `ask_user_question`, `send_card`,
+  `create_agent`, `install_packages`, `add_mcp_server`,
+  `schedule_task`, `list_tasks`, `cancel_task`, `pause_task`,
+  `resume_task`, `update_task`) plus 4 computer-use
+  (`shell`, `read_file`, `write_file`, `web_fetch`).
+- **System-prompt skill auto-load**: when `IRONCLAW_SKILLS_DIR` is
+  set, the container manager inlines each enabled SKILL.md body
+  into the runner's system prompt at spawn so the model knows
+  *when* to reach for each tool.
 - **Full host pipeline**: router, delivery (1s active + 60s sweep,
   exponential backoff, 3-attempt cap), a 60s sweep loop for stuck
   detection / recurrence fanout / processing-ack reset, and a
   container manager that reconciles per-session state across
-  Stopped / Idle / Running with heartbeat-driven crash-restart and
-  configurable idle-stop (5-minute default).
+  Stopped / Idle / Running with heartbeat-driven crash-restart,
+  configurable idle-stop (5-minute default), per-group
+  `egress_allow` + `resource_limits`, and automatic image rebuild
+  on `container_configs` diff (sha256 fingerprint over
+  `packages_apt` / `packages_npm` / `skills` / `mcp_servers`;
+  rebuild failures fall back to the last-known-good tag and emit
+  `ironclaw_image_rebuild_failed_total`).
 - **Operator surface**: `iclaw health` (one-shot probe — session
   breakdown by container_status, recent mutations, dropped-message
   count), `iclaw audit list` (append-only mutation log;
-  truncated-args, latency_ms, caller kind), `iclaw usage` (per-
-  group token rollup from the `agent_turns` table the runner
-  populates from provider `usage` events), `iclaw budgets set`
-  (per-group `daily_token_cap`; manager refuses to spawn when
-  today's tokens exceed the cap), `iclaw approvals approve`
-  (persistent sender approval; gate consults the central `users`
-  table on every inbound), and `iclaw chat` (interactive REPL
-  against the install's cli channel).
+  truncated-args, latency_ms, caller kind, env-value redaction on
+  sensitive commands), `iclaw usage` (per-group token rollup from
+  `agent_turns` the runner populates from provider `usage`
+  events), `iclaw budgets set` (per-group `daily_token_cap`;
+  manager refuses to spawn when today's tokens exceed the cap),
+  `iclaw approvals approve` (persistent sender approval; gate
+  consults the central `users` table on every inbound, with
+  in-channel "approve?" notifications on first contact),
+  `iclaw chat` (interactive REPL against the install's cli
+  channel), `iclaw db backup <path>` (WAL-checkpointed atomic
+  copy), `iclaw dropped-messages outbound-list` /
+  `iclaw dropped-messages replay <id>` (dead-letter
+  inspect/replay), `iclaw mcp list-presets` /
+  `iclaw mcp add <preset>` (curated MCP server library:
+  postgres, linear, github, notion, filesystem, browserbase), and
+  `iclaw groups config set-egress-allow` /
+  `set-resource-limits`.
+- **Observability** (opt-in): Prometheus `/metrics` endpoint via
+  `IRONCLAW_METRICS_ADDR=127.0.0.1:9090` (bare port shorthand
+  supported); counters for inbound / outbound / spawned /
+  crashed / delivery-failed / image-rebuild-failed; histograms
+  for LLM call seconds, input / output tokens, container spawn
+  seconds. Log rotation via `IRONCLAW_LOG_DIR=<path>` enables a
+  daily-rotating file appender alongside stderr. Off by default.
+  See [`docs/observability.md`](docs/observability.md).
 - **OneCLI gateway** for centralised credential issuance with full
   wiremock coverage of 401/404/409/429/5xx and `Retry-After`.
-- **`iclaw` admin client** over a Unix socket inside the host (46
-  wire commands plus 5 composite client-side fan-outs;
+- **`iclaw` admin client** over a Unix socket inside the host (50+
+  wire commands plus composite client-side fan-outs;
   CLI-scope-aware so agents can call read paths but not mutations;
-  every mutation lands in `audit_log`).
+  every mutation lands in `audit_log` with env-value redaction on
+  sensitive commands).
 - **Interactive setup binary** (`ironclaw-setup`) with systemd /
   launchd unit generators (including `Restart=on-failure`) and a
-  `--migrate-from` data-directory migrator.
-- **17 authored skills** under `skills/`.
-- **4406 passing tests**, 0 failing. `cargo clippy --workspace
+  `--migrate-from` data-directory migrator. Writes
+  `IRONCLAW_SKILLS_DIR` + `IRONCLAW_GROUPS_DIR` so the install's
+  skills directory is discoverable on first boot.
+- **21 authored skills** under `skills/`.
+- **4551 passing tests**, 0 failing. `cargo clippy --workspace
   --all-targets -- -D warnings` clean. CI runs fmt + clippy + test on
   Linux and macOS with an 85% coverage gate.
 - **End-to-end chat works** against any Anthropic-API-compatible
@@ -165,6 +201,12 @@ See `docs/cutover.md` for migrating from a predecessor data directory.
   progress.
 - [`docs/adding-a-channel.md`](docs/adding-a-channel.md) — how to ship
   a new channel adapter.
+- [`docs/container-config.md`](docs/container-config.md) — per-group
+  image rebuild, egress allow-list, and resource caps.
+- [`docs/observability.md`](docs/observability.md) — Prometheus
+  metrics endpoint and log rotation.
+- [`docs/db-backup.md`](docs/db-backup.md) — central DB backup and
+  restore procedure.
 - [`docs/cutover.md`](docs/cutover.md) — operator playbook for
   switching a predecessor installation onto Ironclaw.
 - [`docs/replay-fixtures.md`](docs/replay-fixtures.md) — design of

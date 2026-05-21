@@ -445,7 +445,7 @@ impl DeliveryService {
 
         match row.kind {
             MessageKind::System => {
-                self.handle_system(row, &target, inbound_pool).await?;
+                self.handle_system(sess, row, &target, inbound_pool).await?;
             }
             MessageKind::Agent => {
                 // Agent-to-agent delivery: the agent_to_agent module owns the
@@ -474,6 +474,7 @@ impl DeliveryService {
 
     async fn handle_system(
         &self,
+        sess: &Session,
         row: &MessageOutRow,
         target: &DispatchTarget,
         inbound_pool: &SessionPool,
@@ -494,6 +495,44 @@ impl DeliveryService {
         // the delivery service, not a module.
         if action.name == "usage_report" {
             record_usage_report(&self.central, row, &action.payload);
+            let in_conn = inbound_pool.connect()?;
+            delivered::insert(&in_conn, row.id, None, "ok")?;
+            return Ok(());
+        }
+
+        // `install_packages` / `add_mcp_server` are emitted by the runner
+        // when the agent calls the corresponding MCP tool. They are
+        // mutations against `container_configs` — applying them here
+        // (rather than via the action registry) keeps the central-DB
+        // dependency contained, mirrors `usage_report`'s pattern, and
+        // ensures the container_configs fingerprint diff machinery in
+        // the container manager picks up the change on the next spawn.
+        if action.name == "install_packages" {
+            if let Err(err) =
+                apply_install_packages(&self.central, sess.agent_group_id, &action.payload)
+            {
+                warn!(
+                    session = %sess.id.as_uuid(),
+                    agent_group = %sess.agent_group_id.as_uuid(),
+                    ?err,
+                    "install_packages: failed to update container_configs; dropping"
+                );
+            }
+            let in_conn = inbound_pool.connect()?;
+            delivered::insert(&in_conn, row.id, None, "ok")?;
+            return Ok(());
+        }
+        if action.name == "add_mcp_server" {
+            if let Err(err) =
+                apply_add_mcp_server(&self.central, sess.agent_group_id, &action.payload)
+            {
+                warn!(
+                    session = %sess.id.as_uuid(),
+                    agent_group = %sess.agent_group_id.as_uuid(),
+                    ?err,
+                    "add_mcp_server: failed to update container_configs; dropping"
+                );
+            }
             let in_conn = inbound_pool.connect()?;
             delivered::insert(&in_conn, row.id, None, "ok")?;
             return Ok(());
@@ -761,6 +800,123 @@ fn record_usage_report(
     }
 }
 
+/// Ensure a `container_configs` row exists for `agent_group_id`,
+/// creating a default one if absent. Mirrors the host's MCP-handler
+/// `ensure_config_row` so the apply helpers below don't trip on a
+/// fresh group that hasn't been configured yet.
+fn ensure_config_row(
+    central: &ironclaw_db::central::CentralDb,
+    agent_group_id: ironclaw_types::AgentGroupId,
+) -> Result<(), ironclaw_db::DbError> {
+    use ironclaw_db::tables::container_configs;
+    if container_configs::get(central, agent_group_id)?.is_some() {
+        return Ok(());
+    }
+    container_configs::upsert(
+        central,
+        container_configs::UpsertContainerConfig {
+            agent_group_id,
+            provider: None,
+            model: None,
+            effort: None,
+            image_tag: None,
+            assistant_name: None,
+            max_messages_per_prompt: None,
+            skills: container_configs::SkillsSelector::All,
+            mcp_servers: serde_json::json!({}),
+            packages_apt: vec![],
+            packages_npm: vec![],
+            additional_mounts: serde_json::json!([]),
+            cli_scope: container_configs::CliScope::Group,
+            config_fingerprint: None,
+            egress_allow: vec![],
+            resource_limits: serde_json::json!({}),
+        },
+    )?;
+    Ok(())
+}
+
+/// Apply an `install_packages` system payload to the group's
+/// `container_configs.packages_apt` / `packages_npm`. Idempotent —
+/// packages already present are left in place; only new ones are
+/// appended. The next container spawn detects the fingerprint diff
+/// and triggers an image rebuild.
+///
+/// Expected payload shape:
+/// ```json
+/// { "apt": ["jq", "ripgrep"], "npm": ["typescript"], "reason": "..." }
+/// ```
+fn apply_install_packages(
+    central: &ironclaw_db::central::CentralDb,
+    agent_group_id: ironclaw_types::AgentGroupId,
+    payload: &serde_json::Value,
+) -> Result<(), ironclaw_db::DbError> {
+    use ironclaw_db::tables::container_configs;
+    let str_list = |key: &str| -> Vec<String> {
+        payload
+            .get(key)
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let apt_new = str_list("apt");
+    let npm_new = str_list("npm");
+    if apt_new.is_empty() && npm_new.is_empty() {
+        return Ok(());
+    }
+    ensure_config_row(central, agent_group_id)?;
+    for p in apt_new {
+        container_configs::add_package_apt(central, agent_group_id, p)?;
+    }
+    for p in npm_new {
+        container_configs::add_package_npm(central, agent_group_id, p)?;
+    }
+    Ok(())
+}
+
+/// Apply an `add_mcp_server` system payload to the group's
+/// `container_configs.mcp_servers` JSON. Merges the new entry under
+/// its `name`, replacing any pre-existing entry with the same name
+/// so the agent can refresh a server's transport without operator
+/// help.
+///
+/// Expected payload shape:
+/// ```json
+/// {
+///   "name": "linear",
+///   "transport": { "command": "npx", "args": ["..."], "env": {"...": "..."} },
+///   "reason": "..."
+/// }
+/// ```
+fn apply_add_mcp_server(
+    central: &ironclaw_db::central::CentralDb,
+    agent_group_id: ironclaw_types::AgentGroupId,
+    payload: &serde_json::Value,
+) -> Result<(), ironclaw_db::DbError> {
+    use ironclaw_db::tables::container_configs;
+    let name = match payload.get("name").and_then(serde_json::Value::as_str) {
+        Some(n) if !n.trim().is_empty() => n.to_string(),
+        _ => return Ok(()),
+    };
+    let transport = payload.get("transport").cloned().unwrap_or(serde_json::Value::Null);
+    ensure_config_row(central, agent_group_id)?;
+    let mut current = container_configs::get_mcp_servers(central, agent_group_id)?;
+    if !current.is_object() {
+        current = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let Some(obj) = current.as_object_mut() {
+        obj.insert(name, transport);
+    }
+    container_configs::set_mcp_servers(central, agent_group_id, current)?;
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -769,6 +925,7 @@ mod tests {
     use chrono::Utc;
     use ironclaw_channels_core::testing::MockAdapter;
     use ironclaw_channels_core::AdapterError;
+    use ironclaw_db::tables::container_configs;
     use ironclaw_db::tables::messages_out::WriteOutbound;
     use ironclaw_modules::context::MockDispatcher;
     use ironclaw_modules::{DeliveryActionHandler, DeliveryActionInput, DeliveryActionOutput};
@@ -1400,5 +1557,154 @@ mod tests {
             root,
             vec![(ChannelType::new("mock"), mock)],
         );
+    }
+
+    // ── install_packages / add_mcp_server apply ───────────────────────────
+
+    fn central_with_ag() -> (ironclaw_db::central::CentralDb, AgentGroupId) {
+        use ironclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+        let db = ironclaw_db::central::CentralDb::open_in_memory().unwrap();
+        let ag = create_ag(
+            &db,
+            CreateAgentGroup {
+                name: "demo".into(),
+                folder: "demo".into(),
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        (db, ag.id)
+    }
+
+    #[test]
+    fn apply_install_packages_appends_apt_and_npm() {
+        let (db, ag) = central_with_ag();
+        let payload = json!({"apt": ["jq", "ripgrep"], "npm": ["typescript"], "reason": "x"});
+        apply_install_packages(&db, ag, &payload).unwrap();
+        let cfg = ironclaw_db::tables::container_configs::get(&db, ag)
+            .unwrap()
+            .unwrap();
+        assert!(cfg.packages_apt.contains(&"jq".to_string()));
+        assert!(cfg.packages_apt.contains(&"ripgrep".to_string()));
+        assert!(cfg.packages_npm.contains(&"typescript".to_string()));
+    }
+
+    #[test]
+    fn apply_install_packages_is_idempotent() {
+        let (db, ag) = central_with_ag();
+        let payload = json!({"apt": ["jq"]});
+        apply_install_packages(&db, ag, &payload).unwrap();
+        apply_install_packages(&db, ag, &payload).unwrap();
+        let cfg = ironclaw_db::tables::container_configs::get(&db, ag)
+            .unwrap()
+            .unwrap();
+        let count = cfg.packages_apt.iter().filter(|p| *p == "jq").count();
+        assert_eq!(count, 1, "duplicate writes must not double-add");
+    }
+
+    #[test]
+    fn apply_install_packages_ignores_blank_and_non_string_entries() {
+        let (db, ag) = central_with_ag();
+        let payload = json!({"apt": ["", "  ", 42, "jq"]});
+        apply_install_packages(&db, ag, &payload).unwrap();
+        let cfg = ironclaw_db::tables::container_configs::get(&db, ag)
+            .unwrap()
+            .unwrap();
+        assert_eq!(cfg.packages_apt, vec!["jq".to_string()]);
+    }
+
+    #[test]
+    fn apply_install_packages_empty_payload_is_noop() {
+        let (db, ag) = central_with_ag();
+        apply_install_packages(&db, ag, &json!({})).unwrap();
+        // Row may or may not exist; either way, no apt/npm contributions.
+        let cfg = ironclaw_db::tables::container_configs::get(&db, ag).unwrap();
+        if let Some(c) = cfg {
+            assert!(c.packages_apt.is_empty());
+            assert!(c.packages_npm.is_empty());
+        }
+    }
+
+    #[test]
+    fn apply_add_mcp_server_inserts_named_entry() {
+        let (db, ag) = central_with_ag();
+        // Seed an empty config row (required for set_mcp_servers to work).
+        container_configs::upsert(
+            &db,
+            container_configs::UpsertContainerConfig {
+                agent_group_id: ag,
+                provider: None,
+                model: None,
+                effort: None,
+                image_tag: None,
+                assistant_name: None,
+                max_messages_per_prompt: None,
+                skills: container_configs::SkillsSelector::All,
+                mcp_servers: json!({}),
+                packages_apt: vec![],
+                packages_npm: vec![],
+                additional_mounts: json!([]),
+                cli_scope: container_configs::CliScope::Group,
+                config_fingerprint: None,
+                egress_allow: vec![],
+                resource_limits: json!({}),
+            },
+        )
+        .unwrap();
+        let payload = json!({
+            "name": "linear",
+            "transport": { "command": "npx", "args": ["-y", "@linear/mcp"] },
+            "reason": "ticket lookups",
+        });
+        apply_add_mcp_server(&db, ag, &payload).unwrap();
+        let servers = container_configs::get_mcp_servers(&db, ag).unwrap();
+        assert_eq!(servers["linear"]["command"], "npx");
+    }
+
+    #[test]
+    fn apply_add_mcp_server_replaces_existing_name() {
+        let (db, ag) = central_with_ag();
+        container_configs::upsert(
+            &db,
+            container_configs::UpsertContainerConfig {
+                agent_group_id: ag,
+                provider: None,
+                model: None,
+                effort: None,
+                image_tag: None,
+                assistant_name: None,
+                max_messages_per_prompt: None,
+                skills: container_configs::SkillsSelector::All,
+                mcp_servers: json!({"linear": {"command": "old"}}),
+                packages_apt: vec![],
+                packages_npm: vec![],
+                additional_mounts: json!([]),
+                cli_scope: container_configs::CliScope::Group,
+                config_fingerprint: None,
+                egress_allow: vec![],
+                resource_limits: json!({}),
+            },
+        )
+        .unwrap();
+        let payload = json!({
+            "name": "linear",
+            "transport": { "command": "new" },
+        });
+        apply_add_mcp_server(&db, ag, &payload).unwrap();
+        let servers = container_configs::get_mcp_servers(&db, ag).unwrap();
+        assert_eq!(servers["linear"]["command"], "new");
+    }
+
+    #[test]
+    fn apply_add_mcp_server_blank_name_is_noop() {
+        let (db, ag) = central_with_ag();
+        apply_add_mcp_server(&db, ag, &json!({"name": "", "transport": {}})).unwrap();
+        apply_add_mcp_server(&db, ag, &json!({"transport": {}})).unwrap();
+        // No exception; container_config row should still be unset.
+        let cfg = ironclaw_db::tables::container_configs::get(&db, ag).unwrap();
+        assert!(cfg.is_none() || !cfg.unwrap().mcp_servers.is_object()
+            || ironclaw_db::tables::container_configs::get_mcp_servers(&db, ag)
+                .map(|v| v.as_object().is_some_and(serde_json::Map::is_empty))
+                .unwrap_or(false));
     }
 }

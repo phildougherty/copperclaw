@@ -6,6 +6,96 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M14 — agent capability)
+
+- `ProviderEvent::ToolCall` and a tool-use outer loop in the runner.
+  The model now actually receives the schema for every in-tree tool
+  and can call them per turn until it produces a turn without tool
+  use (capped at 20 inner LLM rounds).
+- Four computer-use tools wired through to the agent: `shell` (bash
+  in container, 64 KiB output cap, 60 s default / 600 s ceiling),
+  `read_file` (UTF-8 read, 1 MiB cap), `write_file` (create/append
+  with auto-mkdir), `web_fetch` (HTTP GET/POST, 256 KiB body cap,
+  30 s default / 120 s ceiling).
+- Skill content auto-loaded into the agent's system prompt.
+  `IRONCLAW_SKILLS_DIR` points at the SKILL.md library, optional
+  `IRONCLAW_GROUPS_DIR` enables per-agent-group overrides under
+  `<groups_dir>/<ag_uuid>/skills/`. Setup writes both env vars.
+- New skills documenting the computer-use tools: `shell`,
+  `read-file`, `write-file`, `web-fetch`.
+
+### Added (M13 hardening — parallel-agent slice)
+
+- **Image rebuild on `container_configs` change.** The manager
+  fingerprints (`config_fingerprint` column) the rebuild-relevant
+  fields and rebuilds + retags before the next spawn when they
+  change. Rebuild failures log + emit
+  `ironclaw_image_rebuild_failed_total` and fall back to the
+  last-known-good image so the agent group is not blocked.
+- **Container egress allow-list.** New
+  `container_configs.egress_allow` (JSON array of host:port).
+  Default empty == allow-all (default-allow + opt-in lockdown).
+  Docker runtime translates to user-defined network policy; Apple
+  Container runtime returns `RtError::Unsupported`. New
+  `iclaw groups config set-egress-allow <id> --allow host:port ...`.
+- **Per-group resource caps.** New
+  `container_configs.resource_limits` JSON
+  (`cpus` / `memory_mb` / `pids_limit`, all optional). Docker
+  runtime applies via `--cpus` / `--memory` / `--pids-limit`. New
+  `iclaw groups config set-resource-limits`.
+- **Auto-applied `install_packages` / `add_mcp_server`.** The
+  delivery loop now intercepts these system actions and writes
+  directly to `container_configs.packages_apt` /
+  `packages_npm` / `mcp_servers`. Combined with the rebuild
+  fingerprint, the next spawn picks up the agent's tool calls
+  automatically — no operator step required.
+- **Central DB backup / restore.** `iclaw db backup <path>` runs
+  a WAL checkpoint and atomically copies the file. `iclaw db
+  restore <path>` always refuses with `host_running`; the
+  operator-facing procedure is documented in
+  `docs/db-backup.md` (stop host, copy file, restart).
+- **Outbound dead-letter replay.** New
+  `outbound_dropped_messages` table (migration `008_*`). Delivery
+  failures that exhaust 3 retries land here.
+  `iclaw dropped-messages outbound-list --since <window>` and
+  `iclaw dropped-messages replay <id>` give the operator
+  inspection / retry.
+- **MCP server preset registry.** `iclaw mcp list-presets` shows
+  the curated library (postgres, linear, github, notion,
+  filesystem, browserbase). `iclaw mcp add <preset>
+  --agent-group-id <id> --env K=V` writes the chosen preset into
+  `container_configs.mcp_servers` (env values are redacted in the
+  audit log).
+- **Sender approval notifications in-channel.** When a new sender
+  lands in `pending` for the first time, the host posts a plain-
+  ASCII "approve?" notification to the agent group's primary
+  messaging group. Dedup uses `unregistered_senders` so repeat
+  senders don't re-spam.
+- **Prometheus metrics endpoint.** Opt-in via
+  `IRONCLAW_METRICS_ADDR=127.0.0.1:9090` (bare port auto-prefixes
+  to loopback). Counters:
+  `ironclaw_messages_inbound_total{channel_type}`,
+  `ironclaw_messages_outbound_total{channel_type}`,
+  `ironclaw_containers_spawned_total`,
+  `ironclaw_containers_crashed_total`,
+  `ironclaw_delivery_failed_total{channel_type}`,
+  `ironclaw_image_rebuild_failed_total`. Histograms:
+  `ironclaw_llm_call_seconds`, `ironclaw_llm_tokens_input`,
+  `ironclaw_llm_tokens_output`, `ironclaw_container_spawn_seconds`.
+  New crate `ironclaw-metrics`.
+- **Log rotation.** Opt-in via `IRONCLAW_LOG_DIR=<path>`. Adds a
+  daily-rotating file writer (`host.log.<YYYY-MM-DD>`) alongside
+  the existing stderr writer. `IRONCLAW_LOG` filter applies to
+  both. Default stderr-only behaviour unchanged.
+- **Audit-log env redaction.** The host's audit dispatch now masks
+  values under any `env` block for `mcp.add` and
+  `groups.config.set-mcp-servers` before serialising into
+  `audit_log.args`. Keys are preserved; values become
+  `<redacted>`.
+- New docs: [`docs/container-config.md`](docs/container-config.md),
+  [`docs/observability.md`](docs/observability.md),
+  [`docs/db-backup.md`](docs/db-backup.md).
+
 ### Added
 
 - Initial Rust workspace with 16 crates across the host, runner,
