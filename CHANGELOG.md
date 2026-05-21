@@ -6,6 +6,27 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (replay fixture coverage)
+
+- **Three new replay fixtures** under `fixtures/`:
+  `telegram/inbound-text-message/`, `slack/event-message/`, and
+  `cli/multi-turn/`. Each runs through the existing in-process
+  `ReplayHarness` in `crates/ironclaw-host/tests/replay.rs`. The
+  telegram and slack fixtures exercise the inbound -> router ->
+  runner -> outbound -> delivery pipeline for those channel types
+  (against `MockAdapter`s pre-registered in the harness), and
+  `cli/multi-turn` drives two inbound chat lines and two Claude turns
+  through a single shared session to assert runner state continuity.
+- **Harness now pre-registers a `MockAdapter` for each known channel
+  type** (`cli`, `telegram`, `slack`, plus whatever the fixture
+  manifest names if it falls outside that list) and aggregates
+  `deliver()` calls across them. `expected/delivered.jsonl` rows now
+  include a `channel_type` field so multi-channel fixtures can assert
+  per-channel routing.
+- **Harness test entry points are deduplicated** behind a single
+  `run_fixture(channel, scenario)` helper. Adding a new fixture is
+  now a one-line `#[tokio::test]` in `crates/ironclaw-host/tests/replay.rs`.
+
 ### Fixed (cli channel bridge)
 
 - **`iclaw chat` now actually reaches the host.** The cli channel

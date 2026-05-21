@@ -54,7 +54,13 @@ pub struct ReplayHarness {
     pub central: CentralDb,
     pub router: Arc<Router>,
     pub delivery: Arc<DeliveryService>,
-    pub adapter: Arc<MockAdapter>,
+    /// Channel-type -> `MockAdapter` map. The harness pre-registers a
+    /// `MockAdapter` for the channel named in `manifest.channel` plus a
+    /// short builtin allow-list (`cli`, `telegram`, `slack`) so multi-
+    /// channel fixtures (e.g. inter-agent fan-out) don't need extra
+    /// wiring. `snapshot_delivered` aggregates deliveries across all of
+    /// them in registration order.
+    pub adapters: Vec<(ChannelType, Arc<MockAdapter>)>,
     pub anthropic_server: MockServer,
     /// Session IDs created or referenced by the router across the run.
     /// Used by `compare` to scan the right per-session DBs for actuals.
@@ -82,13 +88,31 @@ impl ReplayHarness {
 
         let delivery_root: Arc<dyn DeliverySessionRoot> =
             Arc::new(DeliveryRoot::new(tempdir.path().to_path_buf()));
-        let adapter = Arc::new(MockAdapter::new(ChannelType::CLI));
-        let adapter_dyn: Arc<dyn ChannelAdapter> = adapter.clone();
-        let delivery = DeliveryService::with_default_dispatcher(
-            central.clone(),
-            delivery_root,
-            vec![(ChannelType::new(ChannelType::CLI), adapter_dyn)],
-        );
+
+        // Pre-register a deterministic `MockAdapter` for every channel
+        // type we expect a fixture to drive. The order is fixed so
+        // `snapshot_delivered` aggregates in a stable order across runs.
+        let mut channel_types: Vec<ChannelType> = vec![
+            ChannelType::new(ChannelType::CLI),
+            ChannelType::new("telegram"),
+            ChannelType::new("slack"),
+        ];
+        // Ensure the fixture's own channel is present even if it's some
+        // future name (e.g. "discord") not in the built-in list.
+        let fixture_ct = ChannelType::new(fixture.manifest.channel.as_str());
+        if !channel_types.iter().any(|ct| ct == &fixture_ct) {
+            channel_types.push(fixture_ct);
+        }
+
+        let mut adapters: Vec<(ChannelType, Arc<MockAdapter>)> = Vec::new();
+        let mut initial: Vec<(ChannelType, Arc<dyn ChannelAdapter>)> = Vec::new();
+        for ct in channel_types {
+            let mock = Arc::new(MockAdapter::new(ct.as_str()));
+            initial.push((ct.clone(), mock.clone() as Arc<dyn ChannelAdapter>));
+            adapters.push((ct, mock));
+        }
+        let delivery =
+            DeliveryService::with_default_dispatcher(central.clone(), delivery_root, initial);
 
         let anthropic_server = MockServer::start().await;
         mount_claude_turns(&anthropic_server, &fixture.claude_turns).await;
@@ -99,7 +123,7 @@ impl ReplayHarness {
             central,
             router,
             delivery,
-            adapter,
+            adapters,
             anthropic_server,
             touched_sessions: Vec::new(),
             played_inbound: Vec::new(),
@@ -348,19 +372,20 @@ impl ReplayHarness {
     }
 
     fn snapshot_delivered(&self) -> Vec<serde_json::Value> {
-        self.adapter
-            .deliveries()
-            .into_iter()
-            .map(|d| {
-                serde_json::json!({
+        let mut out: Vec<serde_json::Value> = Vec::new();
+        for (ct, adapter) in &self.adapters {
+            for d in adapter.deliveries() {
+                out.push(serde_json::json!({
+                    "channel_type": ct.as_str(),
                     "platform_id": d.platform_id,
                     "thread_id": d.thread_id,
                     "kind": d.message.kind.as_str(),
                     "content": d.message.content,
                     "files": d.message.files.len(),
-                })
-            })
-            .collect()
+                }));
+            }
+        }
+        out
     }
 }
 
