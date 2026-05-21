@@ -35,6 +35,21 @@ pub struct EnvFileSpec {
     pub default_image_tag: String,
 }
 
+/// `OpenRouter`'s Anthropic-compatible base URL. The runner's
+/// `AnthropicProvider` strips trailing `/v1` so this works verbatim.
+pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+/// Recognize friendly shortcuts in the base-URL prompt and expand
+/// them to the real URLs (or to "" for the Anthropic default).
+#[must_use]
+pub fn expand_provider_shortcut(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "anthropic" | "default" => String::new(),
+        "openrouter" | "or" => OPENROUTER_BASE_URL.to_string(),
+        _ => raw.trim().to_string(),
+    }
+}
+
 /// Step implementation.
 #[derive(Debug, Default)]
 pub struct AuthStep;
@@ -62,11 +77,16 @@ impl Step for AuthStep {
             Ok(v) if !v.trim().is_empty() => v,
             _ => prompt.secret("ANTHROPIC_API_KEY", "Anthropic API key")?,
         };
-        // Optional override base URL — captured from the process env or
-        // a setup-level env var so headless installs targeting
-        // OpenRouter / a proxy can configure it in one shot. Falls back
-        // to empty (omit the line) so existing installs stay
+        // Optional override base URL — captured from the process env
+        // or a setup-level env var so headless installs targeting
+        // OpenRouter / a proxy can configure it in one shot. Falls
+        // back to empty (omit the line) so existing installs stay
         // unchanged.
+        //
+        // We also expand the friendly shortcut `openrouter` to the
+        // OpenRouter base URL so the operator doesn't have to type or
+        // paste it — `anthropic` collapses to empty (use the default
+        // Anthropic API).
         let base_url = std::env::var("ANTHROPIC_BASE_URL")
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -74,12 +94,13 @@ impl Step for AuthStep {
                 prompt
                     .input(
                         "ANTHROPIC_BASE_URL",
-                        "Override Anthropic base URL (blank for default)",
+                        "Provider base URL — type `openrouter`, `anthropic`, or paste a custom https:// URL (blank = anthropic)",
                         Some(""),
                     )
                     .ok()
                     .filter(|v| !v.trim().is_empty())
             })
+            .map(|raw| expand_provider_shortcut(&raw))
             .unwrap_or_default();
         let env_path = cfg.data_dir.join(".env");
         let host_data_dir = if cfg.central_db_path.as_os_str().is_empty() {
@@ -265,5 +286,35 @@ mod tests {
         assert_eq!(s.name(), "auth");
         assert!(!s.description().is_empty());
         assert!(!s.is_skippable());
+    }
+
+    #[test]
+    fn expand_openrouter_shortcut() {
+        assert_eq!(expand_provider_shortcut("openrouter"), OPENROUTER_BASE_URL);
+        assert_eq!(expand_provider_shortcut("OpenRouter"), OPENROUTER_BASE_URL);
+        assert_eq!(expand_provider_shortcut("  openrouter  "), OPENROUTER_BASE_URL);
+        assert_eq!(expand_provider_shortcut("or"), OPENROUTER_BASE_URL);
+    }
+
+    #[test]
+    fn expand_anthropic_shortcut_clears() {
+        assert_eq!(expand_provider_shortcut("anthropic"), "");
+        assert_eq!(expand_provider_shortcut("Anthropic"), "");
+        assert_eq!(expand_provider_shortcut("default"), "");
+        assert_eq!(expand_provider_shortcut(""), "");
+        assert_eq!(expand_provider_shortcut("   "), "");
+    }
+
+    #[test]
+    fn expand_passes_through_real_urls() {
+        assert_eq!(
+            expand_provider_shortcut("https://my-proxy.example.com/v1"),
+            "https://my-proxy.example.com/v1"
+        );
+        // Trimmed.
+        assert_eq!(
+            expand_provider_shortcut("  https://x.example.com  "),
+            "https://x.example.com"
+        );
     }
 }
