@@ -26,6 +26,7 @@ members = [
     "crates/ironclaw-channels/imessage",
     "crates/ironclaw-channels/wechat",
     "crates/ironclaw-channels/whatsapp-cloud",
+    "crates/ironclaw-channels/webhooks",
     "crates/ironclaw-channels/signal",
     "crates/ironclaw-channels/deltachat",
     "crates/ironclaw-channels/emacs",
@@ -66,6 +67,7 @@ ironclaw-channels-gchat    = { path = "crates/ironclaw-channels/gchat" }
 ironclaw-channels-imessage = { path = "crates/ironclaw-channels/imessage" }
 ironclaw-channels-wechat   = { path = "crates/ironclaw-channels/wechat" }
 ironclaw-channels-whatsapp-cloud = { path = "crates/ironclaw-channels/whatsapp-cloud" }
+ironclaw-channels-webhooks = { path = "crates/ironclaw-channels/webhooks" }
 ironclaw-channels-signal   = { path = "crates/ironclaw-channels/signal" }
 ironclaw-channels-deltachat = { path = "crates/ironclaw-channels/deltachat" }
 ironclaw-channels-emacs    = { path = "crates/ironclaw-channels/emacs" }

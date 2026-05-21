@@ -35,6 +35,7 @@ ironclaw-channels-gchat    = { workspace = true }
 ironclaw-channels-imessage = { workspace = true }
 ironclaw-channels-wechat   = { workspace = true }
 ironclaw-channels-whatsapp-cloud = { workspace = true }
+ironclaw-channels-webhooks = { workspace = true }
 ironclaw-channels-signal   = { workspace = true }
 ironclaw-channels-deltachat = { workspace = true }
 ironclaw-channels-emacs    = { workspace = true }
