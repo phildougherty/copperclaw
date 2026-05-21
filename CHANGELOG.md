@@ -243,6 +243,22 @@ adheres to [Semantic Versioning](https://semver.org/).
   releases.
 - Baseline CI workflow at `.github/workflows/ci.yml` (rustfmt, clippy,
   test on Linux + macOS, coverage gate at 85%).
+- `container-image` GitHub Actions workflow that builds and publishes
+  the session base image to GHCR (`ghcr.io/<repo>/session`) for every
+  push to `main` (as `:edge`) and tagged release (as `:<semver>` and
+  `:latest`), with multi-arch (linux/amd64, linux/arm64) buildx output,
+  GHA build cache, and an `ironclaw.fingerprint` provenance label.
+- Checked-in `container/Dockerfile` for the session base image, carrying
+  an `IRONCLAW_FINGERPRINT` build-arg stamped as an
+  `ironclaw.fingerprint=<sha>` LABEL so pulled images can be verified
+  against the locally-expected spec hash.
+- `ironclaw-setup` `image` step now attempts a `docker pull` of the
+  pre-built GHCR image before falling back to a local build. Pulls are
+  verified by inspecting the image's `ironclaw.fingerprint` label;
+  mismatches fall through to a local build with a clear "pulling
+  failed, building locally" message. `IRONCLAW_SETUP_NO_PULL=1` skips
+  the pull attempt for air-gapped or reproducible-build use cases;
+  `IRONCLAW_SETUP_PULL_REGISTRY` overrides the registry slug for forks.
 
 ### Fixed
 

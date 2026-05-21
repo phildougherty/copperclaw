@@ -1,0 +1,100 @@
+name: container-image
+
+# Build and publish the ironclaw session base image to GHCR so first-run
+# `ironclaw-setup` can `docker pull` it instead of paying a 1-2 minute
+# `docker build` cold-start.
+#
+# Triggers:
+#   * push to main          -> build + push :edge
+#   * tag v*                -> build + push :<version> and :latest
+#   * pull_request -> main  -> build only (no push) as a sanity check
+#
+# TODO(team-c): once the per-session fingerprint becomes decoupled from
+# the runner binary, this workflow should also stamp the image with the
+# spec fingerprint so `ironclaw-setup` can confirm a pulled image
+# matches the locally-expected build inputs before tagging it.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  # Image name is lower-cased by the metadata-action; GHCR rejects
+  # mixed-case repo segments. github.repository is `<owner>/<repo>`.
+  IMAGE_NAME: ghcr.io/${{ github.repository }}/session
+
+jobs:
+  build-and-push:
+    name: build + push (${{ github.event_name }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (for arm64 emulation)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute Dockerfile fingerprint
+        id: fingerprint
+        # The setup step computes its own fingerprint over the rendered
+        # Dockerfile + extra files. We approximate that here with a
+        # sha256 over the checked-in container/Dockerfile so the image
+        # carries a stable provenance label even before per-spec
+        # fingerprints are exposed as a build artifact.
+        run: |
+          fp=$(sha256sum container/Dockerfile | awk '{print $1}')
+          echo "value=${fp}" >> "${GITHUB_OUTPUT}"
+          echo "Dockerfile fingerprint: ${fp}"
+
+      - name: Log in to GHCR
+        # Only authenticate for events that actually push.
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          # Lowercase the image name (GHCR requires it).
+          flavor: |
+            latest=false
+          tags: |
+            # Push :edge for every main commit.
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+            # Tag releases as :<semver> and :latest.
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            # Always stamp the Dockerfile content hash so consumers can
+            # pin by provenance. Disabled on PRs (no push).
+            type=raw,value=sha256-${{ steps.fingerprint.outputs.value }},enable=${{ github.event_name != 'pull_request' }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: container
+          file: container/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            ironclaw.fingerprint=${{ steps.fingerprint.outputs.value }}
+          build-args: |
+            IRONCLAW_FINGERPRINT=${{ steps.fingerprint.outputs.value }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
