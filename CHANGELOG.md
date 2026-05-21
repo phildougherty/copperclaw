@@ -6,6 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (E2E chat round-trip integration test)
+
+- **`crates/ironclaw-host/tests/e2e_chat.rs`** — boots
+  `ironclaw_host::run_host` in-process against a tempdir install root,
+  mounts a `wiremock` Anthropic-flavoured streaming stub, writes
+  `"hello\n"` into the cli channel's real FIFO, and asserts the mocked
+  reply (`"hi from the mock"`) appears in `<install_root>/chat.log`.
+  The host's container manager is left disabled and an in-process
+  runner driver (mirroring `replay/harness.rs`'s seam) processes
+  inbound for each new session, so the test runs without Docker or
+  network access. A second smaller test drives `iclaw chat
+  --no-autostart` via `ironclaw_iclaw::run_cli` against a missing
+  FIFO and asserts the friendly "run `ironclaw start`" hint. This
+  pair is the gate that would have caught the FIFO-vs-stdin wiring
+  bug that motivated M11.
+
 ### Fixed (cli channel bridge)
 
 - **`iclaw chat` now actually reaches the host.** The cli channel
