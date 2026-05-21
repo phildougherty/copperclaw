@@ -20,9 +20,11 @@ use crate::config::SetupConfig;
 use crate::prompt::Prompt;
 use crate::state::SetupState;
 use crate::steps::{Step, StepError, StepResult};
+use crate::steps::telegram::append_env_var;
 use ironclaw_db::central::CentralDb;
 use ironclaw_db::tables::{agent_groups, messaging_group_agents, messaging_groups};
 use ironclaw_types::{ChannelType, EngageMode, SessionMode};
+use std::path::{Path, PathBuf};
 
 /// Slug used when the user accepts the default and doesn't set the
 /// `IRONCLAW_SETUP_QUICKSTART_NAME` env override.
@@ -103,13 +105,165 @@ impl Step for QuickstartGroupStep {
         bootstrap_default_cli_group(&db, &name)?;
         cfg.quickstart_group_created = true;
 
+        let mut messages = vec![format!(
+            "bootstrapped default cli group `{name}` (cli/stdin) — `iclaw chat` is ready"
+        )];
+
+        // Wire the cli-channel <-> iclaw-chat bridge: a named pipe
+        // (chat.fifo) for inbound and an append-log (chat.log) for
+        // outbound. `iclaw chat` writes to the FIFO and tails the
+        // log; the host's cli channel reads the FIFO and writes the
+        // log. Without this bridge the cli channel reads the host's
+        // own terminal stdin instead, which is precisely the bug
+        // we're fixing.
+        match ensure_cli_bridge(cfg)? {
+            Some(BridgeOutcome { fifo, log, env_updated }) => {
+                if env_updated {
+                    messages.push(format!(
+                        "wired cli-chat bridge: fifo={}, log={} (env vars written to .env)",
+                        fifo.display(),
+                        log.display(),
+                    ));
+                } else {
+                    messages.push(format!(
+                        "cli-chat bridge already present: fifo={}, log={}",
+                        fifo.display(),
+                        log.display(),
+                    ));
+                }
+            }
+            None => {
+                messages.push(
+                    "skipped cli-chat bridge wiring (data_dir unset)".to_string(),
+                );
+            }
+        }
+
         Ok(StepResult {
-            messages: vec![format!(
-                "bootstrapped default cli group `{name}` (cli/stdin) — `iclaw chat` is ready"
-            )],
+            messages,
             config_changed: true,
         })
     }
+}
+
+/// What [`ensure_cli_bridge`] actually did, for the operator-facing
+/// status line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BridgeOutcome {
+    fifo: PathBuf,
+    log: PathBuf,
+    /// `true` when one or both env vars were newly written / updated
+    /// in this run; `false` when the `.env` already contained them.
+    env_updated: bool,
+}
+
+/// Create the `chat.fifo` + `chat.log` pair under the install root
+/// and persist `IRONCLAW_CLI_FIFO` / `IRONCLAW_CLI_LOG` in the install's
+/// `.env` so the host picks them up on next boot. Idempotent:
+/// re-running setup against an already-wired install is a no-op
+/// (existing FIFO/log are left alone; existing env lines are not
+/// duplicated).
+fn ensure_cli_bridge(cfg: &SetupConfig) -> Result<Option<BridgeOutcome>, StepError> {
+    if cfg.data_dir.as_os_str().is_empty() {
+        return Ok(None);
+    }
+    let fifo = cfg.data_dir.join("chat.fifo");
+    let log = cfg.data_dir.join("chat.log");
+    ensure_fifo(&fifo)?;
+    ensure_log(&log)?;
+
+    let env_path = if cfg.env_file.as_os_str().is_empty() {
+        cfg.data_dir.join(".env")
+    } else {
+        cfg.env_file.clone()
+    };
+    let env_updated = update_bridge_env(&env_path, &fifo, &log)?;
+
+    Ok(Some(BridgeOutcome {
+        fifo,
+        log,
+        env_updated,
+    }))
+}
+
+/// Create the FIFO at `path` (mode 0o600) if it doesn't exist.
+/// Shells out to `mkfifo` because the workspace forbids `unsafe`,
+/// so we can't call `libc::mkfifo` directly.
+fn ensure_fifo(path: &Path) -> Result<(), StepError> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let status = std::process::Command::new("mkfifo")
+        .arg("-m")
+        .arg("0600")
+        .arg(path)
+        .status()?;
+    if !status.success() {
+        return Err(StepError::Other(format!(
+            "mkfifo {} exited with {status}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Touch the log at `path` (creating with mode 0o600 if missing).
+fn ensure_log(path: &Path) -> Result<(), StepError> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let _file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(path)?.permissions();
+        perms.set_mode(0o600);
+        std::fs::set_permissions(path, perms)?;
+    }
+    Ok(())
+}
+
+/// Write the two `IRONCLAW_CLI_*` lines into the install's `.env`.
+/// Returns `true` when either line was newly added (or updated),
+/// `false` when both lines already matched the desired values.
+fn update_bridge_env(env_path: &Path, fifo: &Path, log: &Path) -> Result<bool, StepError> {
+    let fifo_str = fifo.display().to_string();
+    let log_str = log.display().to_string();
+    let existing = if env_path.exists() {
+        std::fs::read_to_string(env_path).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let already_has = |key: &str, val: &str| -> bool {
+        existing
+            .lines()
+            .any(|line| line == format!("{key}={val}"))
+    };
+    let need_fifo = !already_has("IRONCLAW_CLI_FIFO", &fifo_str);
+    let need_log = !already_has("IRONCLAW_CLI_LOG", &log_str);
+    if !need_fifo && !need_log {
+        return Ok(false);
+    }
+    if need_fifo {
+        append_env_var(env_path, "IRONCLAW_CLI_FIFO", &fifo_str)?;
+    }
+    if need_log {
+        append_env_var(env_path, "IRONCLAW_CLI_LOG", &log_str)?;
+    }
+    Ok(true)
 }
 
 /// Pure helper: write the trio (agent group, cli/stdin messaging
@@ -321,6 +475,86 @@ mod tests {
             "unexpected: {:?}",
             res.messages
         );
+    }
+
+    #[test]
+    fn ensure_cli_bridge_creates_fifo_log_and_env_lines() {
+        let dir = tempdir().unwrap();
+        let cfg = SetupConfig {
+            data_dir: dir.path().to_path_buf(),
+            env_file: dir.path().join(".env"),
+            ..SetupConfig::default()
+        };
+        let outcome = ensure_cli_bridge(&cfg).unwrap().unwrap();
+        assert!(outcome.env_updated);
+        assert!(outcome.fifo.exists(), "FIFO should exist");
+        assert!(outcome.log.exists(), "log should exist");
+        let env_body = std::fs::read_to_string(dir.path().join(".env")).unwrap();
+        let fifo_str = outcome.fifo.display().to_string();
+        let log_str = outcome.log.display().to_string();
+        assert!(
+            env_body.contains(&format!("IRONCLAW_CLI_FIFO={fifo_str}")),
+            "env body: {env_body}"
+        );
+        assert!(
+            env_body.contains(&format!("IRONCLAW_CLI_LOG={log_str}")),
+            "env body: {env_body}"
+        );
+    }
+
+    #[test]
+    fn ensure_cli_bridge_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let cfg = SetupConfig {
+            data_dir: dir.path().to_path_buf(),
+            env_file: dir.path().join(".env"),
+            ..SetupConfig::default()
+        };
+        let first = ensure_cli_bridge(&cfg).unwrap().unwrap();
+        assert!(first.env_updated);
+        let second = ensure_cli_bridge(&cfg).unwrap().unwrap();
+        // Existing FIFO + log + env lines → nothing to do.
+        assert!(!second.env_updated);
+        // The env body should contain exactly one IRONCLAW_CLI_FIFO line.
+        let body = std::fs::read_to_string(dir.path().join(".env")).unwrap();
+        let fifo_lines = body
+            .lines()
+            .filter(|l| l.starts_with("IRONCLAW_CLI_FIFO="))
+            .count();
+        assert_eq!(fifo_lines, 1, "duplicate IRONCLAW_CLI_FIFO lines: {body}");
+        let log_lines = body
+            .lines()
+            .filter(|l| l.starts_with("IRONCLAW_CLI_LOG="))
+            .count();
+        assert_eq!(log_lines, 1, "duplicate IRONCLAW_CLI_LOG lines: {body}");
+    }
+
+    #[test]
+    fn ensure_cli_bridge_returns_none_when_data_dir_unset() {
+        let cfg = SetupConfig::default();
+        assert!(ensure_cli_bridge(&cfg).unwrap().is_none());
+    }
+
+    #[test]
+    fn step_run_writes_bridge_env_lines() {
+        let dir = tempdir().unwrap();
+        crate::steps::central_db::open_and_migrate(&dir.path().join("ironclaw.db"))
+            .unwrap();
+        let mut cfg = fresh_cfg(dir.path());
+        cfg.env_file = dir.path().join(".env");
+        let mut state = SetupState::new();
+        let prompt = Scripted::new().with("IRONCLAW_SETUP_QUICKSTART", "yes");
+        let res = QuickstartGroupStep.run(&mut cfg, &prompt, &mut state).unwrap();
+        assert!(
+            res.messages.iter().any(|m| m.contains("cli-chat bridge")),
+            "messages: {:?}",
+            res.messages
+        );
+        assert!(dir.path().join("chat.fifo").exists());
+        assert!(dir.path().join("chat.log").exists());
+        let body = std::fs::read_to_string(dir.path().join(".env")).unwrap();
+        assert!(body.contains("IRONCLAW_CLI_FIFO="));
+        assert!(body.contains("IRONCLAW_CLI_LOG="));
     }
 
     #[test]
