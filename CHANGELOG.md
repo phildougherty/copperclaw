@@ -214,6 +214,17 @@ adheres to [Semantic Versioning](https://semver.org/).
   the chat FIFO is missing; pass `--no-autostart` to keep the old
   "fail loudly" behaviour for scripted / CI use. Quick start
   collapses to `ironclaw start && iclaw chat` in one terminal.
+- Interactive Telegram pairing wizard inside `ironclaw-setup`'s
+  `channel` step. When the operator picks `telegram`, the wizard walks
+  them through `@BotFather`, validates the token format
+  (`^\d+:[A-Za-z0-9_-]+$`), verifies it via Telegram's `getMe`
+  endpoint (10 s timeout, soft-fail on network errors), optionally
+  polls `getUpdates` for ~60 s to capture the first chat id, and
+  appends `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` to the data-dir
+  `.env`. Headless mode is driven by
+  `IRONCLAW_SETUP_TELEGRAM_BOT_TOKEN` and
+  `IRONCLAW_SETUP_TELEGRAM_CHAT_ID`. Tokens are never logged — the
+  audit messages use `<digits>:****<last-4>` redaction.
 - Initial Rust workspace with 16 crates across the host, runner,
   providers, MCP server, modules, skills, container runtime, OneCLI
   gateway, iclaw admin client, and interactive setup.

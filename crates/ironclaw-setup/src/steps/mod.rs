@@ -22,6 +22,7 @@ pub mod image;
 pub mod mounts;
 pub mod onecli;
 pub mod service_unit;
+pub mod telegram;
 pub mod timezone;
 pub mod verify;
 

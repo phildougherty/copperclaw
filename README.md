@@ -188,6 +188,8 @@ defer a step. See the per-prompt table below.
 | `IRONCLAW_SETUP_WRITE_SERVICE_UNIT` | `no` | Drop a systemd/launchd unit. |
 | `IRONCLAW_SETUP_TIMEZONE` | system | Container timezone. |
 | `IRONCLAW_SETUP_FIRST_CHANNEL` | `cli` | Which channel to wire first. |
+| `IRONCLAW_SETUP_TELEGRAM_BOT_TOKEN` | _empty_ | Bot token; required when `FIRST_CHANNEL=telegram` and `--headless`. Verified via `getMe`. |
+| `IRONCLAW_SETUP_TELEGRAM_CHAT_ID` | _empty_ | Optional chat id; supplied means setup skips the `/start` polling step. |
 | `IRONCLAW_SETUP_QUICKSTART` | `yes` | Auto-create the default CLI agent group + wiring. |
 
 ### Choosing a provider
@@ -198,6 +200,33 @@ or paste any Anthropic-compatible base URL verbatim — a trailing
 `/v1` is stripped automatically. The provider key is then
 forwarded into every session container via
 `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL`.
+
+### Wire your first channel
+
+At the `channel` setup step you can pick `cli` (default — works out
+of the box) or `telegram` (supported turnkey). Selecting `telegram`
+launches an interactive pairing wizard that walks you through
+creating a bot with `@BotFather`, validates the token format, calls
+Telegram's `getMe` to confirm the credentials, and offers to capture
+the first chat id by polling `getUpdates` for ~60 seconds while you
+send `/start` to the bot. The validated `TELEGRAM_BOT_TOKEN` (and
+optional `TELEGRAM_CHAT_ID`) are appended to the data-dir `.env`
+with `0600` perms; tokens are never echoed in logs.
+
+For headless installs supply the answers via env vars:
+
+```
+IRONCLAW_SETUP_FIRST_CHANNEL=telegram \
+IRONCLAW_SETUP_TELEGRAM_BOT_TOKEN=123456:ABC-DEF... \
+IRONCLAW_SETUP_TELEGRAM_CHAT_ID=42      # optional — skips /start poll \
+ironclaw-setup --headless
+```
+
+Network reachability to `api.telegram.org` is tested at setup
+time (10 s timeout); if the call fails the token is still persisted
+with a loud warning so air-gapped installs aren't blocked. Slack /
+Discord pairings are still manual (`iclaw channel ...`); the wizard
+is built to extend.
 
 ---
 
