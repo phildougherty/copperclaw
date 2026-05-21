@@ -38,7 +38,7 @@ the final M11 deliverable.
 - **`iclaw` admin client** over a Unix socket inside the host (41
   documented commands; CLI-scope-aware so agents can call read paths
   but not mutations).
-- **Interactive setup binary** (`ironclaw setup`) with systemd /
+- **Interactive setup binary** (`ironclaw-setup`) with systemd /
   launchd unit generators and a `--migrate-from` data-directory
   migrator.
 - **17 authored skills** under `skills/`.
@@ -65,19 +65,45 @@ The release artifacts are:
 
 ```
 # First-time setup walks every step with defaults you can override.
-ironclaw setup
+# Picks an install root per-platform (Linux: $XDG_DATA_HOME/ironclaw,
+# falling back to ~/.local/share/ironclaw; macOS: ~/Library/Application
+# Support/ironclaw). Pass --data-dir to override.
+ironclaw-setup
 
-# Boot the host. Defaults to data-dir = ~/.local/share/ironclaw.
-ironclaw run
+# Boot the host using the .env that setup wrote inside the install
+# root. The .env carries IRONCLAW_DATA_DIR and ICLAW_SOCKET so iclaw
+# can find the running host without extra config.
+ironclaw --env-file ~/.local/share/ironclaw/.env run
 
-# In another terminal, drive it via iclaw.
+# In another terminal, source the same .env (or export ICLAW_SOCKET)
+# and drive it via iclaw.
+set -a; . ~/.local/share/ironclaw/.env; set +a
 iclaw groups list
 iclaw sessions list --status active
 ```
 
-For headless / scripted installs, set the `IRONCLAW_SETUP_*` env vars
-and pass `--non-interactive` to `ironclaw setup`. See
-`docs/cutover.md` for migrating from a predecessor data directory.
+Without `--env-file`, `ironclaw run` reads `IRONCLAW_DATA_DIR` from the
+process env and defaults to `./data` relative to the working dir; the
+companion `iclaw` defaults to `data/iclaw.sock` and also honours
+`ICLAW_SOCKET`.
+
+For headless / scripted installs, pass `--headless` (alias
+`--non-interactive`) to `ironclaw-setup` and supply each prompt as an
+`IRONCLAW_SETUP_*` env var. The common set for a CLI-only install:
+
+```
+IRONCLAW_SETUP_ANTHROPIC_API_KEY   # required
+IRONCLAW_SETUP_USE_ONECLI=no
+IRONCLAW_SETUP_BUILD_IMAGE=yes     # or `no` to skip the image build
+IRONCLAW_SETUP_MOUNTS=             # comma-separated host paths, or empty
+IRONCLAW_SETUP_WRITE_SERVICE_UNIT=no
+IRONCLAW_SETUP_TIMEZONE=Etc/UTC
+IRONCLAW_SETUP_FIRST_CHANNEL=cli
+```
+
+Run `ironclaw-setup --list-steps` for the canonical list and use
+`--skip-step <name>` for any optional step you want to leave for later.
+See `docs/cutover.md` for migrating from a predecessor data directory.
 
 ## Documentation
 

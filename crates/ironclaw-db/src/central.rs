@@ -34,7 +34,13 @@ impl CentralDb {
                 )
             });
 
-        let pool = Pool::builder().max_size(8).build(manager)?;
+        // `min_idle(0)` skips r2d2's eager pre-warming. Without this, the
+        // builder opens `max_size` connections in parallel, all running the
+        // `PRAGMA journal_mode=WAL` init batch — they race the first writer
+        // and r2d2 logs `ERROR database is locked` for each loser. The pool
+        // still succeeds (it retries), but the log noise looks like a real
+        // failure. Lazy creation avoids the race entirely.
+        let pool = Pool::builder().max_size(8).min_idle(Some(0)).build(manager)?;
 
         {
             let mut conn = pool.get()?;

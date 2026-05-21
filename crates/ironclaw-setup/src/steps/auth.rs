@@ -1,13 +1,30 @@
 //! Step 6 — Anthropic API key capture.
 //!
 //! Reads `ANTHROPIC_API_KEY` from the environment or prompts for it, then
-//! writes a `.env` file inside the data directory with mode `0o600`.
+//! writes a `.env` file inside the data directory with mode `0o600`. The
+//! file also carries the `IRONCLAW_DATA_DIR` and `ICLAW_SOCKET` pointers
+//! that the host and admin client expect, so the README's quickstart
+//! (`ironclaw --env-file <.env> run` / `iclaw groups list`) works without
+//! the user having to re-export anything by hand.
 
 use crate::config::SetupConfig;
 use crate::prompt::Prompt;
 use crate::state::SetupState;
 use crate::steps::{Step, StepError, StepResult};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Inputs the `.env` writer needs to wire setup to the host runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvFileSpec {
+    /// API key persisted as `ANTHROPIC_API_KEY=...`.
+    pub anthropic_api_key: String,
+    /// Value of `IRONCLAW_DATA_DIR` — the dir that holds `ironclaw.db`,
+    /// `sessions/`, and the iclaw socket. Empty to omit the line.
+    pub data_dir: PathBuf,
+    /// Value of `ICLAW_SOCKET` — the socket the host listens on. Empty to
+    /// omit the line.
+    pub iclaw_socket: PathBuf,
+}
 
 /// Step implementation.
 #[derive(Debug, Default)]
@@ -37,7 +54,20 @@ impl Step for AuthStep {
             _ => prompt.secret("ANTHROPIC_API_KEY", "Anthropic API key")?,
         };
         let env_path = cfg.data_dir.join(".env");
-        write_env_file(&env_path, &key)?;
+        let host_data_dir = if cfg.central_db_path.as_os_str().is_empty() {
+            cfg.data_dir.join("data")
+        } else {
+            cfg.central_db_path
+                .parent()
+                .map_or_else(|| cfg.data_dir.join("data"), Path::to_path_buf)
+        };
+        let iclaw_socket = host_data_dir.join("iclaw.sock");
+        let spec = EnvFileSpec {
+            anthropic_api_key: key,
+            data_dir: host_data_dir,
+            iclaw_socket,
+        };
+        write_env_file(&env_path, &spec)?;
         cfg.env_file.clone_from(&env_path);
         Ok(StepResult::ok(format!(
             "wrote {} (0600)",
@@ -46,22 +76,30 @@ impl Step for AuthStep {
     }
 }
 
-/// Write `key=value` lines into a `.env` file at `path` and chmod it to
-/// `0o600` on Unix.
-pub fn write_env_file(path: &Path, anthropic_api_key: &str) -> Result<(), StepError> {
+/// Write the `.env` body described by `spec` and chmod it to `0o600` on
+/// Unix.
+pub fn write_env_file(path: &Path, spec: &EnvFileSpec) -> Result<(), StepError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let contents = render_env_file(anthropic_api_key);
+    let contents = render_env_file(spec);
     std::fs::write(path, contents)?;
     restrict_permissions(path)?;
     Ok(())
 }
 
-/// Render the `.env` body for `key`.
+/// Render the `.env` body for `spec`. Keys with empty values are omitted.
 #[must_use]
-pub fn render_env_file(anthropic_api_key: &str) -> String {
-    format!("ANTHROPIC_API_KEY={anthropic_api_key}\n")
+pub fn render_env_file(spec: &EnvFileSpec) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("ANTHROPIC_API_KEY={}\n", spec.anthropic_api_key));
+    if !spec.data_dir.as_os_str().is_empty() {
+        out.push_str(&format!("IRONCLAW_DATA_DIR={}\n", spec.data_dir.display()));
+    }
+    if !spec.iclaw_socket.as_os_str().is_empty() {
+        out.push_str(&format!("ICLAW_SOCKET={}\n", spec.iclaw_socket.display()));
+    }
+    out
 }
 
 #[cfg(unix)]
@@ -85,19 +123,40 @@ mod tests {
     use crate::prompt::Scripted;
     use tempfile::tempdir;
 
+    fn spec(key: &str) -> EnvFileSpec {
+        EnvFileSpec {
+            anthropic_api_key: key.into(),
+            data_dir: PathBuf::from("/srv/iron/data"),
+            iclaw_socket: PathBuf::from("/srv/iron/data/iclaw.sock"),
+        }
+    }
+
     #[test]
-    fn render_env_file_includes_key() {
-        let s = render_env_file("sk-abc");
-        assert_eq!(s, "ANTHROPIC_API_KEY=sk-abc\n");
+    fn render_env_file_includes_key_and_paths() {
+        let s = render_env_file(&spec("sk-abc"));
+        assert!(s.contains("ANTHROPIC_API_KEY=sk-abc\n"));
+        assert!(s.contains("IRONCLAW_DATA_DIR=/srv/iron/data\n"));
+        assert!(s.contains("ICLAW_SOCKET=/srv/iron/data/iclaw.sock\n"));
+    }
+
+    #[test]
+    fn render_env_file_omits_empty_paths() {
+        let s = render_env_file(&EnvFileSpec {
+            anthropic_api_key: "sk".into(),
+            data_dir: PathBuf::new(),
+            iclaw_socket: PathBuf::new(),
+        });
+        assert_eq!(s, "ANTHROPIC_API_KEY=sk\n");
     }
 
     #[test]
     fn write_env_file_creates_with_restricted_perms() {
         let dir = tempdir().unwrap();
         let path = dir.path().join(".env");
-        write_env_file(&path, "sk-xyz").unwrap();
+        write_env_file(&path, &spec("sk-xyz")).unwrap();
         let body = std::fs::read_to_string(&path).unwrap();
         assert!(body.contains("ANTHROPIC_API_KEY=sk-xyz"));
+        assert!(body.contains("IRONCLAW_DATA_DIR=/srv/iron/data"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -110,7 +169,7 @@ mod tests {
     fn write_env_file_creates_parent_dir() {
         let dir = tempdir().unwrap();
         let nested = dir.path().join("nested/.env");
-        write_env_file(&nested, "sk-1").unwrap();
+        write_env_file(&nested, &spec("sk-1")).unwrap();
         assert!(nested.exists());
     }
 
@@ -124,6 +183,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut cfg = SetupConfig {
             data_dir: dir.path().to_path_buf(),
+            central_db_path: dir.path().join("data/ironclaw.db"),
             ..SetupConfig::default()
         };
         let mut state = SetupState::new();
@@ -132,6 +192,14 @@ mod tests {
         assert!(res.config_changed);
         let written = std::fs::read_to_string(dir.path().join(".env")).unwrap();
         assert!(written.contains("sk-from-prompt"));
+        assert!(written.contains(&format!(
+            "IRONCLAW_DATA_DIR={}\n",
+            dir.path().join("data").display()
+        )));
+        assert!(written.contains(&format!(
+            "ICLAW_SOCKET={}\n",
+            dir.path().join("data/iclaw.sock").display()
+        )));
     }
 
     #[test]

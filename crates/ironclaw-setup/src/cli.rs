@@ -177,12 +177,31 @@ pub fn run_steps(
 }
 
 /// Parse argv-style args and run.
+///
+/// `--help` and `--version` are routed through clap's own writer (stdout,
+/// exit 0) rather than being treated as failures. Other parse errors flow
+/// out as `StepError::Other` so callers can decide how to surface them.
 pub fn run_from_args<I, T>(args: I) -> Result<i32, StepError>
 where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    let cli = Cli::try_parse_from(args).map_err(|e| StepError::Other(e.to_string()))?;
+    use clap::error::ErrorKind;
+    let cli = match Cli::try_parse_from(args) {
+        Ok(cli) => cli,
+        Err(e) => {
+            if matches!(
+                e.kind(),
+                ErrorKind::DisplayHelp
+                    | ErrorKind::DisplayVersion
+                    | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+            ) {
+                let _ = e.print();
+                return Ok(0);
+            }
+            return Err(StepError::Other(e.to_string()));
+        }
+    };
     run_cli(cli)
 }
 
@@ -373,5 +392,17 @@ mod tests {
     fn run_from_args_bad_flag_errors() {
         let err = run_from_args(["ironclaw-setup", "--no-such-flag"]).unwrap_err();
         assert!(matches!(err, StepError::Other(_)));
+    }
+
+    #[test]
+    fn run_from_args_help_returns_zero() {
+        let code = run_from_args(["ironclaw-setup", "--help"]).unwrap();
+        assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn run_from_args_version_returns_zero() {
+        let code = run_from_args(["ironclaw-setup", "--version"]).unwrap();
+        assert_eq!(code, 0);
     }
 }
