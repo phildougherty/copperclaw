@@ -1,12 +1,19 @@
 //! Step 11 — first channel selection.
 //!
 //! Picks a channel kind to use immediately after setup. The CLI channel is
-//! the safe default and works without external credentials. Operators
-//! configure other channels via `iclaw` after first start.
+//! the safe default and works without external credentials. When the
+//! operator picks `telegram` the step also runs the interactive
+//! [`super::telegram`] pairing wizard (`BotFather` walkthrough,
+//! `getMe` verification, optional chat-id capture, `.env` persistence).
+//! Other non-`cli` channels still defer to manual `iclaw channel ...`
+//! configuration.
 
 use crate::config::SetupConfig;
 use crate::prompt::Prompt;
 use crate::state::SetupState;
+use crate::steps::telegram::{
+    self, PairingOutcome, TELEGRAM_BOT_TOKEN_ENV, TELEGRAM_CHAT_ID_ENV,
+};
 use crate::steps::{Step, StepError, StepResult};
 
 /// Channels surfaced to the operator at setup time.
@@ -47,16 +54,58 @@ impl Step for ChannelStep {
         }
         cfg.first_channel.clone_from(&channel);
         let mut messages = vec![format!("first channel: {channel}")];
-        if channel != "cli" {
-            messages.push(
-                "configure additional credentials via `iclaw channel ...` after setup".to_string(),
-            );
+
+        match channel.as_str() {
+            "telegram" => {
+                run_telegram_pairing(cfg, prompt, &mut messages)?;
+            }
+            "cli" => {}
+            // TODO(team-d): generalize for other channels — Slack /
+            // Discord pairing wizards plug in here.
+            _ => {
+                messages.push(
+                    "configure additional credentials via `iclaw channel ...` after setup"
+                        .to_string(),
+                );
+            }
         }
+
         Ok(StepResult {
             messages,
             config_changed: true,
         })
     }
+}
+
+/// Drive the Telegram pairing wizard and persist its outputs.
+fn run_telegram_pairing(
+    cfg: &SetupConfig,
+    prompt: &dyn Prompt,
+    messages: &mut Vec<String>,
+) -> Result<Option<PairingOutcome>, StepError> {
+    let outcome = telegram::run_pairing(prompt, telegram::DEFAULT_API_BASE, messages)?;
+    let Some(outcome) = outcome else {
+        // Operator typed `skip` — leave the .env untouched. Tell them
+        // they can wire it later via `iclaw channel ...`.
+        return Ok(None);
+    };
+
+    let env_path = if cfg.env_file.as_os_str().is_empty() {
+        cfg.data_dir.join(".env")
+    } else {
+        cfg.env_file.clone()
+    };
+    telegram::append_env_var(&env_path, TELEGRAM_BOT_TOKEN_ENV, &outcome.token)?;
+    messages.push(format!(
+        "wrote {TELEGRAM_BOT_TOKEN_ENV} to {} (redacted: {})",
+        env_path.display(),
+        telegram::redact_token(&outcome.token)
+    ));
+    if let Some(chat_id) = outcome.chat_id {
+        telegram::append_env_var(&env_path, TELEGRAM_CHAT_ID_ENV, &chat_id.to_string())?;
+        messages.push(format!("wrote {TELEGRAM_CHAT_ID_ENV}={chat_id}"));
+    }
+    Ok(Some(outcome))
 }
 
 /// Whether `name` is among the channel kinds setup knows about.
@@ -69,6 +118,8 @@ pub fn is_known_channel(name: &str) -> bool {
 mod tests {
     use super::*;
     use crate::prompt::Scripted;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
 
     #[test]
     fn known_channels_contains_each() {
@@ -96,9 +147,9 @@ mod tests {
     fn step_accepts_non_cli_with_followup_message() {
         let mut cfg = SetupConfig::default();
         let mut state = SetupState::new();
-        let prompt = Scripted::new().with("FIRST_CHANNEL", "telegram");
+        let prompt = Scripted::new().with("FIRST_CHANNEL", "slack");
         let res = ChannelStep.run(&mut cfg, &prompt, &mut state).unwrap();
-        assert_eq!(cfg.first_channel, "telegram");
+        assert_eq!(cfg.first_channel, "slack");
         assert!(res.messages.iter().any(|m| m.contains("iclaw channel")));
     }
 
@@ -130,4 +181,29 @@ mod tests {
         assert!(!s.description().is_empty());
         assert!(s.is_skippable());
     }
+
+    #[test]
+    fn step_telegram_skip_does_not_touch_env_file() {
+        // Pick telegram, then immediately skip the pairing wizard. The
+        // .env file should not be created / modified.
+        let dir = tempdir().unwrap();
+        let env_path = dir.path().join(".env");
+        let mut cfg = SetupConfig {
+            data_dir: dir.path().to_path_buf(),
+            env_file: PathBuf::new(),
+            ..SetupConfig::default()
+        };
+        let mut state = SetupState::new();
+        let prompt = Scripted::new()
+            .with("FIRST_CHANNEL", "telegram")
+            .with(super::telegram::HEADLESS_TOKEN_KEY, "skip");
+        let res = ChannelStep.run(&mut cfg, &prompt, &mut state).unwrap();
+        assert_eq!(cfg.first_channel, "telegram");
+        assert!(res.messages.iter().any(|m| m.contains("skipped")));
+        assert!(!env_path.exists());
+    }
+
+    // run_telegram_pairing happy path requires HTTP — covered in
+    // telegram.rs tests. Here we only verify the step calls the wizard
+    // when channel=telegram and the user opts to skip.
 }

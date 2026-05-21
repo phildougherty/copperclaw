@@ -133,6 +133,33 @@ those, the host falls back to `IRONCLAW_DATA_DIR=./data` so
 `iclaw completions <bash|zsh|fish>` to drop a completion script into
 your shell.
 
+### Wire your first channel
+
+At the `channel` setup step you can pick `cli` (default — works out of
+the box) or `telegram` (supported turnkey). Selecting `telegram`
+launches an interactive pairing wizard that walks you through creating
+a bot with `@BotFather`, validates the token format, calls Telegram's
+`getMe` to confirm the credentials, and offers to capture the first
+chat id by polling `getUpdates` for ~60 seconds while you send `/start`
+to the bot. The validated `TELEGRAM_BOT_TOKEN` (and optional
+`TELEGRAM_CHAT_ID`) are appended to the data-dir `.env` with `0600`
+perms; tokens are never echoed in logs.
+
+For headless installs supply the answers via env vars:
+
+```
+IRONCLAW_SETUP_FIRST_CHANNEL=telegram \
+IRONCLAW_SETUP_TELEGRAM_BOT_TOKEN=123456:ABC-DEF... \
+IRONCLAW_SETUP_TELEGRAM_CHAT_ID=42      # optional — skips the /start poll \
+ironclaw-setup --headless
+```
+
+Network reachability to `api.telegram.org` is tested at setup time
+(10 s timeout); if the call fails the token is still persisted with a
+loud warning so air-gapped installs aren't blocked. Slack / Discord
+pairings are still manual (`iclaw channel ...`); the wizard is built
+to extend.
+
 For headless / scripted installs, pass `--headless` (alias
 `--non-interactive`) to `ironclaw-setup` and supply each prompt as an
 `IRONCLAW_SETUP_*` env var. The only required variable is the API
@@ -153,6 +180,8 @@ IRONCLAW_SETUP_MOUNTS=             # comma-separated host paths, default empty
 IRONCLAW_SETUP_WRITE_SERVICE_UNIT=no  # default: no
 IRONCLAW_SETUP_TIMEZONE=Etc/UTC    # default: detect from system
 IRONCLAW_SETUP_FIRST_CHANNEL=cli   # default: cli
+IRONCLAW_SETUP_TELEGRAM_BOT_TOKEN= # required when FIRST_CHANNEL=telegram
+IRONCLAW_SETUP_TELEGRAM_CHAT_ID=   # optional, skips the /start polling
 ```
 
 Run `ironclaw-setup --list-steps` for the canonical list and use
