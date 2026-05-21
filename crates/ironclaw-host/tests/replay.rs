@@ -106,24 +106,20 @@ async fn cli_empty_llm_response() {
     run_fixture("cli", "empty-llm-response").await;
 }
 
-/// Provider 5xx + retry. The runner currently has no retry loop at the
-/// `provider.query()` level (only the in-stream `ProviderEvent::Error`
-/// path marks the inbound failed), so this fixture documents the gap
-/// rather than a passing behaviour.
-// TODO(team-o): un-ignore once the runner gains a retry policy.
+/// Provider 5xx + retry. The runner wraps `provider.query()` in an
+/// exponential-backoff retry loop honouring
+/// [`ProviderError::is_retryable`]: the first 503 reissues the call,
+/// the second response succeeds, and the inbound completes normally.
 #[tokio::test]
-#[ignore = "runner has no provider.query() retry loop yet (see fixture README)"]
 async fn cli_provider_5xx_retry() {
     run_fixture("cli", "provider-5xx-retry").await;
 }
 
-/// Provider timeout. The runner has no per-call deadline, so today the
-/// only thing that would trip is reqwest's 600s client timeout. This
-/// fixture documents the gap; un-ignore once a runner-level deadline
-/// exists.
-// TODO(team-o): un-ignore once the runner gains a per-LLM-call deadline.
+/// Provider timeout. The wiremock mock delays its response past the
+/// runner's per-call deadline; the runner retries up to
+/// `MAX_PROVIDER_ATTEMPTS` times, each time hitting the deadline, then
+/// gives up and marks the inbound failed.
 #[tokio::test]
-#[ignore = "runner has no per-call deadline yet (see fixture README)"]
 async fn cli_provider_timeout() {
     run_fixture("cli", "provider-timeout").await;
 }

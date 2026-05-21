@@ -47,6 +47,21 @@ pub enum ProviderError {
     /// carries the upstream message.
     #[error("bad request: {0}")]
     BadRequest(String),
+
+    /// The runner's per-call deadline elapsed (after all retries) before
+    /// the provider produced a response. Terminal — the runner has
+    /// already given up by the time this variant is constructed.
+    ///
+    /// Carries the deadline in milliseconds and the attempt count that
+    /// was reached so callers / log scrapers can see how many shots
+    /// were taken before giving up.
+    #[error("provider deadline exceeded after {attempts} attempt(s) ({deadline_ms} ms each)")]
+    DeadlineExceeded {
+        /// Per-call deadline that tripped, in milliseconds.
+        deadline_ms: u64,
+        /// Number of attempts that were made before giving up.
+        attempts: u32,
+    },
 }
 
 impl ProviderError {
@@ -64,7 +79,8 @@ impl ProviderError {
             Self::SessionInvalid
             | Self::Decode(_)
             | Self::Cancelled
-            | Self::BadRequest(_) => false,
+            | Self::BadRequest(_)
+            | Self::DeadlineExceeded { .. } => false,
         }
     }
 }
@@ -155,5 +171,20 @@ mod tests {
     #[test]
     fn not_retryable_bad_request() {
         assert!(!ProviderError::BadRequest("x".into()).is_retryable());
+    }
+
+    #[test]
+    fn display_deadline_exceeded() {
+        let e = ProviderError::DeadlineExceeded { deadline_ms: 1000, attempts: 3 };
+        assert_eq!(
+            e.to_string(),
+            "provider deadline exceeded after 3 attempt(s) (1000 ms each)"
+        );
+    }
+
+    #[test]
+    fn not_retryable_deadline_exceeded() {
+        let e = ProviderError::DeadlineExceeded { deadline_ms: 1000, attempts: 3 };
+        assert!(!e.is_retryable());
     }
 }

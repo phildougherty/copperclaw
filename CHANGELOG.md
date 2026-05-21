@@ -23,6 +23,42 @@ adheres to [Semantic Versioning](https://semver.org/).
   `crates/ironclaw-modules/src/{approvals.rs,context.rs}` and
   `skills/approvals/SKILL.md` updated to point at the real table.
 
+### Added (runner: provider retry loop + per-call deadline)
+
+- **`crates/ironclaw-runner/src/run.rs`** — `provider.query()` is now
+  wrapped in an exponential-backoff retry loop with a per-attempt
+  deadline. The new helper `query_with_retry()` honours
+  `ProviderError::is_retryable()` (5xx, transport, overload retry; 4xx
+  and `SessionInvalid` fail-fast), retries up to
+  `MAX_PROVIDER_ATTEMPTS = 3` times with 250ms → 500ms → 1s backoffs,
+  and wraps each attempt in `tokio::time::timeout(provider_deadline,
+  ...)`. Terminal failures mark the inbound `status='failed'` via the
+  existing `finalize_messages` path; the runner never panics.
+- **`crates/ironclaw-runner/src/run.rs`** — new `provider_deadline`
+  field on `RunnerDeps`, defaulting to
+  `DEFAULT_PROVIDER_DEADLINE_MS = 60_000`. Configurable per-process via
+  the new env var `IRONCLAW_RUNNER_PROVIDER_DEADLINE_MS` (clamped to
+  the `[30_000, 300_000]` ms range; out-of-range values warn and fall
+  back to the default). `resolve_provider_deadline(env)` is re-exported
+  from the crate root so the runner binary picks it up at startup.
+- **`crates/ironclaw-providers/src/error.rs`** — new
+  `ProviderError::DeadlineExceeded { deadline_ms, attempts }` variant
+  emitted by the runner once all retries trip the per-call deadline.
+  Non-retryable; carries the deadline and attempt count so log scrapers
+  can spot flapping upstreams.
+- **`crates/ironclaw-metrics/src/lib.rs`** — two new counters:
+  `ironclaw_provider_retry_total{provider}` (fires once per retry
+  decision) and `ironclaw_provider_deadline_total{provider}` (fires
+  when the retry budget is exhausted by deadline trips).
+- **`crates/ironclaw-host/tests/replay.rs`** — un-`#[ignore]`d
+  `cli_provider_5xx_retry` and `cli_provider_timeout`; both pass
+  against the new runner behaviour. The harness sets a short
+  `provider_deadline` (200ms) so the timeout fixture finishes in well
+  under a second.
+- **`fixtures/cli/provider-timeout/manifest.json`** — updated to mount
+  three `kind=timeout` mocks (one per retry attempt) and bumped
+  `step_timeout_ms` to 10s to accommodate the worst-case retry budget.
+
 ### Added (replay-fixture coverage for tool-use loop)
 
 - **`fixtures/cli/tool-use-shell/`** — new replay fixture that drives

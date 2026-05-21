@@ -558,6 +558,11 @@ impl ReplayHarness {
             turn_seq: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             tool_map,
             max_tool_turns: 5,
+            // Short replay-side deadline so the `provider-timeout`
+            // fixture (which sets a deliberately long wiremock delay)
+            // trips quickly and the retry budget runs to completion
+            // inside the per-step `step_timeout_ms` budget.
+            provider_deadline: Duration::from_millis(200),
         };
         run_loop(deps).await.context("runner one-turn")?;
         Ok(())

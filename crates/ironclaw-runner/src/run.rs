@@ -11,14 +11,14 @@ use ironclaw_db::tables::{
     container_state, messages_in, processing_ack,
 };
 use ironclaw_mcp::{ToolContext, ToolEntry};
-use ironclaw_providers::{AgentProvider, HistoryMessage, QueryInput, ToolDef};
+use ironclaw_providers::{AgentProvider, AgentQuery, HistoryMessage, ProviderError, QueryInput, ToolDef};
 #[cfg_attr(not(test), allow(unused_imports))]
 use ironclaw_types::MessageId;
 use ironclaw_types::{Effort, MessageInRow, ProviderEvent};
 use std::collections::HashMap;
 use rusqlite::Connection;
 use tokio::sync::Mutex;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 
 use crate::compaction::{compact, estimate_tokens, CompactionCfg};
 use crate::disallowed::is_disallowed;
@@ -29,6 +29,78 @@ use crate::state::{load_state, save_state};
 pub const POLL_INTERVAL_MS: u64 = 1000;
 /// Active poll interval (ms) while messages are still flowing.
 pub const ACTIVE_POLL_INTERVAL_MS: u64 = 500;
+
+/// Default per-LLM-call deadline (milliseconds). Wraps the
+/// `provider.query()` call inside `run_llm_turn`. Each attempt gets the
+/// full budget independently — i.e. with 3 attempts the worst-case wall
+/// time is `3 * DEFAULT_PROVIDER_DEADLINE_MS` + accumulated backoff
+/// (~1.75s).
+///
+/// Overridable per-process via `IRONCLAW_RUNNER_PROVIDER_DEADLINE_MS`.
+pub const DEFAULT_PROVIDER_DEADLINE_MS: u64 = 60_000;
+
+/// Environment variable read at runner startup to override
+/// [`DEFAULT_PROVIDER_DEADLINE_MS`]. Values outside the
+/// [`MIN_PROVIDER_DEADLINE_MS`]..=[`MAX_PROVIDER_DEADLINE_MS`] range are
+/// rejected with a warning (the default is used instead) so an operator
+/// can't accidentally disable the deadline by setting it to 0.
+pub const PROVIDER_DEADLINE_ENV: &str = "IRONCLAW_RUNNER_PROVIDER_DEADLINE_MS";
+
+/// Lower bound for the per-call deadline (ms). The spec calls out
+/// "don't make the deadline default <30s"; the validator enforces the
+/// same on user-supplied values so a typo of `60` (intending seconds)
+/// doesn't trip every call.
+pub const MIN_PROVIDER_DEADLINE_MS: u64 = 30_000;
+
+/// Upper bound for the per-call deadline (ms). Anything higher than
+/// 5 minutes per attempt is almost certainly a misconfiguration —
+/// reqwest's own client timeout is 600s and 3 attempts past that would
+/// hang the runner for 25 minutes.
+pub const MAX_PROVIDER_DEADLINE_MS: u64 = 300_000;
+
+/// Maximum number of `provider.query()` attempts (including the first)
+/// before the runner gives up and marks the inbound failed. Hard-coded
+/// rather than configurable: 3 strikes is the standard SRE default for
+/// idempotent retries and we don't want to give operators a footgun for
+/// "infinite retry on a flapping API".
+const MAX_PROVIDER_ATTEMPTS: u32 = 3;
+
+/// Initial backoff between retries; doubles each attempt:
+/// 250ms → 500ms → 1s.
+const INITIAL_PROVIDER_BACKOFF: Duration = Duration::from_millis(250);
+
+/// Resolve the per-call provider deadline from the env. Out-of-range or
+/// unparseable values fall back to [`DEFAULT_PROVIDER_DEADLINE_MS`]
+/// (with a warning).
+///
+/// Pulled out as a free function so the runner binary and tests can
+/// share the same clamping logic. The trait bound matches
+/// `config::EnvLookup`.
+#[must_use]
+pub fn resolve_provider_deadline(env: &dyn crate::config::EnvLookup) -> Duration {
+    let Some(raw) = env.get(PROVIDER_DEADLINE_ENV) else {
+        return Duration::from_millis(DEFAULT_PROVIDER_DEADLINE_MS);
+    };
+    let Ok(parsed) = raw.parse::<u64>() else {
+        tracing::warn!(
+            env = PROVIDER_DEADLINE_ENV,
+            value = %raw,
+            "could not parse provider deadline; using default"
+        );
+        return Duration::from_millis(DEFAULT_PROVIDER_DEADLINE_MS);
+    };
+    if !(MIN_PROVIDER_DEADLINE_MS..=MAX_PROVIDER_DEADLINE_MS).contains(&parsed) {
+        tracing::warn!(
+            env = PROVIDER_DEADLINE_ENV,
+            value = parsed,
+            min = MIN_PROVIDER_DEADLINE_MS,
+            max = MAX_PROVIDER_DEADLINE_MS,
+            "provider deadline out of range; using default"
+        );
+        return Duration::from_millis(DEFAULT_PROVIDER_DEADLINE_MS);
+    }
+    Duration::from_millis(parsed)
+}
 
 /// Dependencies injected into [`run_loop`]. Holding all of these in a struct
 /// keeps the signature small and makes it easy to fan out variations from
@@ -83,6 +155,16 @@ pub struct RunnerDeps {
     /// Hard cap on consecutive tool-use turns per inbound. Stops a
     /// confused model from looping forever. Default 20.
     pub max_tool_turns: usize,
+    /// Per-LLM-call deadline. Wraps each `provider.query()` attempt in
+    /// `tokio::time::timeout`. On expiry the attempt is treated as a
+    /// retryable failure and reissued (with backoff) up to
+    /// [`MAX_PROVIDER_ATTEMPTS`] times before terminal failure.
+    ///
+    /// Default in [`RunnerDeps::minimal`] is
+    /// [`DEFAULT_PROVIDER_DEADLINE_MS`]. The runner binary picks the
+    /// value up from `IRONCLAW_RUNNER_PROVIDER_DEADLINE_MS`; tests can
+    /// shorten it to make failure-mode fixtures finish quickly.
+    pub provider_deadline: Duration,
 }
 
 impl RunnerDeps {
@@ -124,6 +206,7 @@ impl RunnerDeps {
             max_turns: None,
             idle_sleep: Duration::from_millis(POLL_INTERVAL_MS),
             heartbeat_path: None,
+            provider_deadline: Duration::from_millis(DEFAULT_PROVIDER_DEADLINE_MS),
         }
     }
 }
@@ -340,12 +423,63 @@ async fn run_llm_turn(
         display_name: None,
     };
     let turn_started_at = chrono::Utc::now();
-    let mut query = deps
-        .provider
-        .query(input)
-        .await
-        .context("provider query failed")?;
+    let mut query = match query_with_retry(deps, input).await {
+        Ok(q) => q,
+        Err(err) => {
+            // All retries exhausted (or the failure was non-retryable).
+            // Mark this turn as a terminal failure so the caller flips
+            // the inbound to `failed` and emits a usage_report with
+            // status=error. Do NOT bubble — the runner must stay up.
+            tracing::error!(
+                error = %err,
+                provider = deps.provider.name(),
+                "provider query failed terminally; marking turn as failed"
+            );
+            let out = LlmTurnOutput {
+                failed: true,
+                ..LlmTurnOutput::default()
+            };
+            emit_usage_report(deps, 0, 0, turn_started_at, &TurnOutcome::Failed).await;
+            return Ok(out);
+        }
+    };
 
+    let (out, input_tokens, output_tokens) = pump_events(deps, query.as_mut()).await?;
+    query.abort().await;
+    let outcome = if out.failed {
+        TurnOutcome::Failed
+    } else {
+        TurnOutcome::Done
+    };
+
+    // Emit Prometheus metrics for this LLM call.
+    let elapsed_ms = (chrono::Utc::now() - turn_started_at)
+        .num_milliseconds()
+        .max(0);
+    // i64 -> f64 loses precision for large values (> 2^53 ms = ~285 years);
+    // acceptable here since we're measuring LLM call durations in seconds.
+    #[allow(clippy::cast_precision_loss)]
+    let elapsed_secs = elapsed_ms as f64 / 1000.0;
+    ironclaw_metrics::observe_llm_call_seconds(elapsed_secs.max(0.0));
+    if input_tokens > 0 {
+        ironclaw_metrics::observe_llm_tokens_input(input_tokens);
+    }
+    if output_tokens > 0 {
+        ironclaw_metrics::observe_llm_tokens_output(output_tokens);
+    }
+
+    emit_usage_report(deps, input_tokens, output_tokens, turn_started_at, &outcome).await;
+    Ok(out)
+}
+
+/// Pump events off a live [`AgentQuery`] until the stream ends or
+/// emits a terminal event ([`ProviderEvent::Result`] /
+/// [`ProviderEvent::Error`]). Returns the accumulated turn output plus
+/// the latest seen `(input_tokens, output_tokens)` counts.
+async fn pump_events(
+    deps: &RunnerDeps,
+    query: &mut dyn AgentQuery,
+) -> Result<(LlmTurnOutput, u32, u32)> {
     let mut out = LlmTurnOutput::default();
     let mut input_tokens: u32 = 0;
     let mut output_tokens: u32 = 0;
@@ -384,22 +518,13 @@ async fn run_llm_turn(
                 set_current_tool(deps, &name, declared_timeout_ms).await?;
             }
             ProviderEvent::ToolCall { id, name, input } => {
-                if is_disallowed(&name) {
-                    // Synthesise a refusal result inline; the model
-                    // sees it on the next turn via the tool_result.
-                    out.tool_calls.push(PendingToolCall {
-                        id,
-                        name: name.clone(),
-                        input,
-                    });
-                    out.tool_calls.last_mut().unwrap();
-                    // Mark the tool as disallowed so invoke_tool can
-                    // produce the refusal text without re-checking
-                    // here. The actual refusal happens at
-                    // invoke_tool below.
-                } else {
-                    out.tool_calls.push(PendingToolCall { id, name, input });
-                }
+                // `is_disallowed` is checked here AND inside
+                // `invoke_tool`; the second check is the one that
+                // synthesises the refusal text. We still push the
+                // PendingToolCall either way so the model sees a
+                // matching `tool_result` on the next turn.
+                let _ = is_disallowed(&name);
+                out.tool_calls.push(PendingToolCall { id, name, input });
             }
             ProviderEvent::ToolEnd => {
                 clear_current_tool(deps).await?;
@@ -413,31 +538,131 @@ async fn run_llm_turn(
             }
         }
     }
-    query.abort().await;
-    let outcome = if out.failed {
-        TurnOutcome::Failed
-    } else {
-        TurnOutcome::Done
-    };
+    Ok((out, input_tokens, output_tokens))
+}
 
-    // Emit Prometheus metrics for this LLM call.
-    let elapsed_ms = (chrono::Utc::now() - turn_started_at)
-        .num_milliseconds()
-        .max(0);
-    // i64 -> f64 loses precision for large values (> 2^53 ms = ~285 years);
-    // acceptable here since we're measuring LLM call durations in seconds.
-    #[allow(clippy::cast_precision_loss)]
-    let elapsed_secs = elapsed_ms as f64 / 1000.0;
-    ironclaw_metrics::observe_llm_call_seconds(elapsed_secs.max(0.0));
-    if input_tokens > 0 {
-        ironclaw_metrics::observe_llm_tokens_input(input_tokens);
-    }
-    if output_tokens > 0 {
-        ironclaw_metrics::observe_llm_tokens_output(output_tokens);
-    }
+/// Call `provider.query()` with a per-attempt deadline and exponential
+/// backoff. Returns the live [`AgentQuery`] once a call succeeds, or a
+/// terminal [`ProviderError`] once retries are exhausted (or the failure
+/// was non-retryable).
+///
+/// Behaviour:
+/// - Each attempt is wrapped in [`tokio::time::timeout`] with
+///   `deps.provider_deadline`.
+/// - A timeout is treated as a retryable failure — counts toward the
+///   attempt cap just like a 5xx.
+/// - Retryable [`ProviderError`]s (`is_retryable() == true`) trigger
+///   exponential backoff (250ms → 500ms → 1s) and another attempt.
+/// - Non-retryable errors fail-fast on attempt 1.
+/// - Final attempt's timeout is converted to
+///   [`ProviderError::DeadlineExceeded`].
+///
+/// All retries fire a `ironclaw_provider_retry_total` counter so the
+/// operator dashboard can spot flapping upstreams. Timeout-final fires
+/// `ironclaw_provider_deadline_total`.
+async fn query_with_retry(
+    deps: &RunnerDeps,
+    input: QueryInput,
+) -> std::result::Result<Box<dyn AgentQuery>, ProviderError> {
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        let attempt_started = std::time::Instant::now();
+        // Clone the input for this attempt; the previous attempt may
+        // have consumed it on a successful call but we never reach
+        // here once query() returns Ok, so the borrow checker is fine
+        // with a fresh clone per loop iteration.
+        let result = timeout(deps.provider_deadline, deps.provider.query(input.clone())).await;
 
-    emit_usage_report(deps, input_tokens, output_tokens, turn_started_at, &outcome).await;
-    Ok(out)
+        let err: ProviderError = match result {
+            Ok(Ok(query)) => return Ok(query),
+            Ok(Err(err)) => err,
+            Err(_elapsed) => {
+                // Per-call deadline tripped.
+                tracing::warn!(
+                    attempt,
+                    max = MAX_PROVIDER_ATTEMPTS,
+                    deadline_ms = u64_from_dur(deps.provider_deadline),
+                    elapsed_ms = u64_from_dur(attempt_started.elapsed()),
+                    provider = deps.provider.name(),
+                    "provider query deadline exceeded"
+                );
+                if attempt >= MAX_PROVIDER_ATTEMPTS {
+                    ironclaw_metrics::inc_provider_deadline(deps.provider.name());
+                    tracing::error!(
+                        attempt,
+                        max = MAX_PROVIDER_ATTEMPTS,
+                        deadline_ms = u64_from_dur(deps.provider_deadline),
+                        provider = deps.provider.name(),
+                        "provider deadline exceeded after {ms}ms (attempt {attempt}/{max})",
+                        ms = u64_from_dur(deps.provider_deadline),
+                        attempt = attempt,
+                        max = MAX_PROVIDER_ATTEMPTS,
+                    );
+                    return Err(ProviderError::DeadlineExceeded {
+                        deadline_ms: u64_from_dur(deps.provider_deadline),
+                        attempts: attempt,
+                    });
+                }
+                // Treat as retryable; fall through to backoff.
+                ironclaw_metrics::inc_provider_retry(deps.provider.name());
+                backoff_for_attempt(attempt).await;
+                continue;
+            }
+        };
+
+        // We have a ProviderError. Decide whether to retry.
+        if err.is_retryable() && attempt < MAX_PROVIDER_ATTEMPTS {
+            tracing::warn!(
+                attempt,
+                max = MAX_PROVIDER_ATTEMPTS,
+                provider = deps.provider.name(),
+                error = %err,
+                "provider query failed; retrying after backoff"
+            );
+            ironclaw_metrics::inc_provider_retry(deps.provider.name());
+            backoff_for_attempt(attempt).await;
+            continue;
+        }
+
+        // Terminal: either non-retryable, or we've exhausted attempts.
+        if err.is_retryable() {
+            tracing::error!(
+                attempt,
+                max = MAX_PROVIDER_ATTEMPTS,
+                provider = deps.provider.name(),
+                error = %err,
+                "provider query failed; retry budget exhausted"
+            );
+        } else {
+            tracing::error!(
+                attempt,
+                provider = deps.provider.name(),
+                error = %err,
+                "provider query failed with non-retryable error"
+            );
+        }
+        return Err(err);
+    }
+}
+
+/// Compute the backoff delay for the *next* attempt given the current
+/// attempt number. With [`INITIAL_PROVIDER_BACKOFF`] = 250ms:
+/// - after attempt 1 → 250ms (before attempt 2)
+/// - after attempt 2 → 500ms (before attempt 3)
+async fn backoff_for_attempt(attempt: u32) {
+    let exp = attempt.saturating_sub(1).min(16); // cap shift just in case
+    let delay = INITIAL_PROVIDER_BACKOFF
+        .checked_mul(1u32 << exp)
+        .unwrap_or(Duration::from_secs(60));
+    sleep(delay).await;
+}
+
+/// Saturating `Duration::as_millis()` → `u64`. The standard
+/// `as_millis()` returns `u128`; for tracing fields and the
+/// `DeadlineExceeded` variant we want a plain `u64`.
+fn u64_from_dur(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Execute one tool call against the runner's tool map. Returns the
@@ -1056,5 +1281,477 @@ mod tests {
         let g = outbound.lock().await;
         let claim = processing_ack::get(&g, id).unwrap().unwrap();
         assert_eq!(claim.status, processing_ack::ProcessingStatus::Processing);
+    }
+
+    // ── query_with_retry / per-call deadline ──────────────────────────────
+
+    /// A provider whose `query()` either:
+    /// - sleeps `delay` then succeeds (with the events the caller scripted),
+    /// - returns a pre-scripted `ProviderError`.
+    ///
+    /// Each call consumes the next entry from `plan`.
+    struct PlanProvider {
+        plan: StdMutex<Vec<PlanStep>>,
+        observed_attempts: std::sync::atomic::AtomicU32,
+    }
+
+    #[derive(Clone)]
+    enum PlanStep {
+        /// Sleep `delay`, then succeed with `events`.
+        Ok {
+            delay: Duration,
+            events: Vec<ProviderEvent>,
+        },
+        /// Return this error.
+        Err(ProviderErrorKind),
+    }
+
+    /// Cheap clone-able mirror of [`ProviderError`] variants we need in
+    /// tests. `ProviderError` itself is not `Clone` (the `thiserror`
+    /// macros don't synthesise it), so we synthesise a fresh value per
+    /// call instead.
+    #[derive(Clone, Copy)]
+    enum ProviderErrorKind {
+        Api { status: u16 },
+        BadRequest,
+        Transport,
+    }
+
+    impl ProviderErrorKind {
+        fn into_err(self) -> ProviderError {
+            match self {
+                Self::Api { status } => ProviderError::Api {
+                    status,
+                    message: "scripted".into(),
+                },
+                Self::BadRequest => ProviderError::BadRequest("scripted".into()),
+                Self::Transport => ProviderError::Transport("scripted".into()),
+            }
+        }
+    }
+
+    impl PlanProvider {
+        fn new(plan: Vec<PlanStep>) -> Arc<Self> {
+            Arc::new(Self {
+                plan: StdMutex::new(plan),
+                observed_attempts: std::sync::atomic::AtomicU32::new(0),
+            })
+        }
+        fn attempts(&self) -> u32 {
+            self.observed_attempts
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
+    }
+
+    #[async_trait]
+    impl AgentProvider for PlanProvider {
+        fn name(&self) -> &'static str {
+            "plan"
+        }
+        async fn query(
+            &self,
+            _input: QueryInput,
+        ) -> Result<Box<dyn AgentQuery>, ProviderError> {
+            self.observed_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let step = {
+                let mut g = self.plan.lock().unwrap();
+                if g.is_empty() {
+                    // No more scripted steps — return a 500 so the test
+                    // panics loudly if it loops past expectation.
+                    return Err(ProviderError::Api {
+                        status: 500,
+                        message: "plan exhausted".into(),
+                    });
+                }
+                g.remove(0)
+            };
+            match step {
+                PlanStep::Ok { delay, events } => {
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    Ok(Box::new(ScriptedQuery {
+                        events: StdMutex::new(events),
+                    }))
+                }
+                PlanStep::Err(kind) => Err(kind.into_err()),
+            }
+        }
+        fn is_session_invalid(&self, _err: &ProviderError) -> bool {
+            false
+        }
+    }
+
+    fn dummy_input() -> QueryInput {
+        QueryInput {
+            system: "sys".into(),
+            model: "m".into(),
+            effort: Effort::Medium,
+            previous_continuation: None,
+            history: Vec::new(),
+            tools: Vec::new(),
+            max_tokens: 16,
+            temperature: None,
+            assistant_name: None,
+            display_name: None,
+        }
+    }
+
+    /// Build a minimal `RunnerDeps` wired to the supplied provider. The
+    /// rest of the dependencies are valid-but-unused stubs because
+    /// `query_with_retry` only reads `provider`, `provider_deadline`,
+    /// and `provider.name()`.
+    fn deps_with_provider(provider: Arc<dyn AgentProvider>, deadline: Duration) -> RunnerDeps {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let inbound = Arc::new(Mutex::new(open_inbound(&paths).unwrap()));
+        let outbound = Arc::new(Mutex::new(open_outbound(&paths).unwrap()));
+        let tool_ctx: Arc<dyn ToolContext> =
+            Arc::new(RunnerToolCtx::new(outbound.clone(), paths.outbox.clone()));
+        let mut deps = RunnerDeps::minimal(
+            provider,
+            tool_ctx,
+            inbound,
+            outbound,
+            paths.outbox.join("_compactions"),
+        );
+        deps.provider_deadline = deadline;
+        // Leak the tempdir into the deps — these tests don't poke at
+        // the on-disk state, so dropping it after the call is fine.
+        std::mem::forget(tmp);
+        deps
+    }
+
+    #[tokio::test]
+    async fn retry_succeeds_after_one_503() {
+        let provider = PlanProvider::new(vec![
+            PlanStep::Err(ProviderErrorKind::Api { status: 503 }),
+            PlanStep::Ok {
+                delay: Duration::ZERO,
+                events: vec![ProviderEvent::Result {
+                    text: Some("hi".into()),
+                }],
+            },
+        ]);
+        let deps = deps_with_provider(provider.clone(), Duration::from_secs(5));
+
+        let started = std::time::Instant::now();
+        let result = query_with_retry(&deps, dummy_input()).await;
+        let elapsed = started.elapsed();
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.map(|_| ()));
+        assert_eq!(provider.attempts(), 2);
+        // One backoff (250ms) should have fired between attempts.
+        assert!(
+            elapsed >= Duration::from_millis(200),
+            "expected at least one backoff, elapsed={elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_gives_up_after_three_503s() {
+        let provider = PlanProvider::new(vec![
+            PlanStep::Err(ProviderErrorKind::Api { status: 503 }),
+            PlanStep::Err(ProviderErrorKind::Api { status: 503 }),
+            PlanStep::Err(ProviderErrorKind::Api { status: 503 }),
+        ]);
+        let deps = deps_with_provider(provider.clone(), Duration::from_secs(5));
+
+        let err = match query_with_retry(&deps, dummy_input()).await {
+            Ok(_) => panic!("expected terminal failure"),
+            Err(e) => e,
+        };
+        assert!(matches!(
+            err,
+            ProviderError::Api { status: 503, .. }
+        ));
+        assert_eq!(provider.attempts(), MAX_PROVIDER_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn non_retryable_error_does_not_retry() {
+        let provider = PlanProvider::new(vec![PlanStep::Err(ProviderErrorKind::BadRequest)]);
+        let deps = deps_with_provider(provider.clone(), Duration::from_secs(5));
+
+        let err = match query_with_retry(&deps, dummy_input()).await {
+            Ok(_) => panic!("expected terminal failure"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, ProviderError::BadRequest(_)));
+        assert_eq!(provider.attempts(), 1, "non-retryable should fail fast");
+    }
+
+    #[tokio::test]
+    async fn session_invalid_does_not_retry() {
+        // Construct a provider that returns SessionInvalid directly.
+        struct Always;
+        #[async_trait]
+        impl AgentProvider for Always {
+            fn name(&self) -> &'static str {
+                "always"
+            }
+            async fn query(
+                &self,
+                _input: QueryInput,
+            ) -> Result<Box<dyn AgentQuery>, ProviderError> {
+                Err(ProviderError::SessionInvalid)
+            }
+            fn is_session_invalid(&self, _err: &ProviderError) -> bool {
+                true
+            }
+        }
+        let deps = deps_with_provider(Arc::new(Always), Duration::from_secs(5));
+        let err = match query_with_retry(&deps, dummy_input()).await {
+            Ok(_) => panic!("expected terminal failure"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, ProviderError::SessionInvalid));
+    }
+
+    #[tokio::test]
+    async fn transport_error_retries_then_succeeds() {
+        let provider = PlanProvider::new(vec![
+            PlanStep::Err(ProviderErrorKind::Transport),
+            PlanStep::Ok {
+                delay: Duration::ZERO,
+                events: vec![ProviderEvent::Result {
+                    text: Some("ok".into()),
+                }],
+            },
+        ]);
+        let deps = deps_with_provider(provider.clone(), Duration::from_secs(5));
+        let result = query_with_retry(&deps, dummy_input()).await;
+        assert!(result.is_ok());
+        assert_eq!(provider.attempts(), 2);
+    }
+
+    #[tokio::test]
+    async fn timeout_retries_and_eventually_succeeds() {
+        let provider = PlanProvider::new(vec![
+            // First attempt: sleeps long enough to trip a 50ms deadline.
+            PlanStep::Ok {
+                delay: Duration::from_millis(500),
+                events: vec![ProviderEvent::Result {
+                    text: Some("never seen".into()),
+                }],
+            },
+            // Second attempt: returns immediately.
+            PlanStep::Ok {
+                delay: Duration::ZERO,
+                events: vec![ProviderEvent::Result {
+                    text: Some("ok".into()),
+                }],
+            },
+        ]);
+        let deps = deps_with_provider(provider.clone(), Duration::from_millis(50));
+        let result = query_with_retry(&deps, dummy_input()).await;
+        assert!(result.is_ok(), "expected eventual success");
+        assert_eq!(provider.attempts(), 2);
+    }
+
+    #[tokio::test]
+    async fn timeout_exhausts_to_deadline_exceeded() {
+        // Every attempt hangs past the deadline. After 3 strikes the
+        // terminal error is `DeadlineExceeded`.
+        let provider = PlanProvider::new(vec![
+            PlanStep::Ok {
+                delay: Duration::from_millis(500),
+                events: vec![],
+            },
+            PlanStep::Ok {
+                delay: Duration::from_millis(500),
+                events: vec![],
+            },
+            PlanStep::Ok {
+                delay: Duration::from_millis(500),
+                events: vec![],
+            },
+        ]);
+        let deps = deps_with_provider(provider.clone(), Duration::from_millis(30));
+        let err = match query_with_retry(&deps, dummy_input()).await {
+            Ok(_) => panic!("expected DeadlineExceeded"),
+            Err(e) => e,
+        };
+        match err {
+            ProviderError::DeadlineExceeded {
+                deadline_ms,
+                attempts,
+            } => {
+                assert_eq!(deadline_ms, 30);
+                assert_eq!(attempts, MAX_PROVIDER_ATTEMPTS);
+            }
+            other => panic!("expected DeadlineExceeded, got {other:?}"),
+        }
+        assert_eq!(provider.attempts(), MAX_PROVIDER_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn backoff_sequence_is_correct() {
+        // Tail-call the backoff helper directly and time each sleep.
+        // Allow generous slack for CI but verify the doubling shape.
+        let t1 = std::time::Instant::now();
+        backoff_for_attempt(1).await;
+        let d1 = t1.elapsed();
+
+        let t2 = std::time::Instant::now();
+        backoff_for_attempt(2).await;
+        let d2 = t2.elapsed();
+
+        let t3 = std::time::Instant::now();
+        backoff_for_attempt(3).await;
+        let d3 = t3.elapsed();
+
+        // Expected: 250ms, 500ms, 1000ms.
+        assert!(d1 >= Duration::from_millis(240) && d1 < Duration::from_millis(450));
+        assert!(d2 >= Duration::from_millis(490) && d2 < Duration::from_millis(800));
+        assert!(d3 >= Duration::from_millis(990) && d3 < Duration::from_millis(1500));
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_deadline_uses_env_when_in_range() {
+        let env = crate::config::MapEnv::from_pairs([(
+            PROVIDER_DEADLINE_ENV,
+            "45000",
+        )]);
+        let d = resolve_provider_deadline(&env);
+        assert_eq!(d, Duration::from_millis(45_000));
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_deadline_falls_back_when_unset() {
+        let env = crate::config::MapEnv::default();
+        let d = resolve_provider_deadline(&env);
+        assert_eq!(d, Duration::from_millis(DEFAULT_PROVIDER_DEADLINE_MS));
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_deadline_rejects_out_of_range() {
+        let env =
+            crate::config::MapEnv::from_pairs([(PROVIDER_DEADLINE_ENV, "1000")]);
+        let d = resolve_provider_deadline(&env);
+        // Below MIN_PROVIDER_DEADLINE_MS → default.
+        assert_eq!(d, Duration::from_millis(DEFAULT_PROVIDER_DEADLINE_MS));
+
+        let env =
+            crate::config::MapEnv::from_pairs([(PROVIDER_DEADLINE_ENV, "999999")]);
+        let d = resolve_provider_deadline(&env);
+        assert_eq!(d, Duration::from_millis(DEFAULT_PROVIDER_DEADLINE_MS));
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_deadline_rejects_garbage() {
+        let env = crate::config::MapEnv::from_pairs([(
+            PROVIDER_DEADLINE_ENV,
+            "not-a-number",
+        )]);
+        let d = resolve_provider_deadline(&env);
+        assert_eq!(d, Duration::from_millis(DEFAULT_PROVIDER_DEADLINE_MS));
+    }
+
+    /// End-to-end: a 503 followed by success goes through `run_loop`
+    /// and the message is marked completed. Validates that the retry
+    /// loop is wired into the public entry point.
+    #[tokio::test]
+    async fn run_loop_retries_503_then_completes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let inbound = Arc::new(Mutex::new(open_inbound(&paths).unwrap()));
+        let outbound = Arc::new(Mutex::new(open_outbound(&paths).unwrap()));
+        let provider = PlanProvider::new(vec![
+            PlanStep::Err(ProviderErrorKind::Api { status: 503 }),
+            PlanStep::Ok {
+                delay: Duration::ZERO,
+                events: vec![
+                    ProviderEvent::Init {
+                        continuation: "c1".into(),
+                    },
+                    ProviderEvent::Result {
+                        text: Some("recovered".into()),
+                    },
+                ],
+            },
+        ]);
+        let tool_ctx: Arc<dyn ToolContext> =
+            Arc::new(RunnerToolCtx::new(outbound.clone(), paths.outbox.clone()));
+        let mut deps = RunnerDeps::minimal(
+            provider,
+            tool_ctx,
+            inbound.clone(),
+            outbound.clone(),
+            paths.outbox.join("_compactions"),
+        );
+        deps.max_turns = Some(1);
+        deps.idle_sleep = Duration::from_millis(1);
+        deps.provider_deadline = Duration::from_secs(2);
+
+        let id = {
+            let g = inbound.lock().await;
+            insert_pending(&g, "ping")
+        };
+        run_loop(deps).await.unwrap();
+
+        let inbound = open_inbound(&paths).unwrap();
+        let status: String = inbound
+            .query_row(
+                "SELECT status FROM messages_in WHERE id = ?1",
+                rusqlite::params![id.as_uuid().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
+    }
+
+    /// End-to-end: timeout-on-every-attempt drives the inbound to
+    /// `failed`. Exercises the integration of the retry loop with
+    /// `finalize_messages`.
+    #[tokio::test]
+    async fn run_loop_marks_failed_when_deadline_exhausted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let inbound = Arc::new(Mutex::new(open_inbound(&paths).unwrap()));
+        let outbound = Arc::new(Mutex::new(open_outbound(&paths).unwrap()));
+        let provider = PlanProvider::new(vec![
+            PlanStep::Ok {
+                delay: Duration::from_millis(500),
+                events: vec![],
+            },
+            PlanStep::Ok {
+                delay: Duration::from_millis(500),
+                events: vec![],
+            },
+            PlanStep::Ok {
+                delay: Duration::from_millis(500),
+                events: vec![],
+            },
+        ]);
+        let tool_ctx: Arc<dyn ToolContext> =
+            Arc::new(RunnerToolCtx::new(outbound.clone(), paths.outbox.clone()));
+        let mut deps = RunnerDeps::minimal(
+            provider,
+            tool_ctx,
+            inbound.clone(),
+            outbound.clone(),
+            paths.outbox.join("_compactions"),
+        );
+        deps.max_turns = Some(1);
+        deps.idle_sleep = Duration::from_millis(1);
+        // Short enough that each attempt trips before the wiremock sleep.
+        deps.provider_deadline = Duration::from_millis(30);
+
+        let id = {
+            let g = inbound.lock().await;
+            insert_pending(&g, "ping")
+        };
+        run_loop(deps).await.unwrap();
+
+        let inbound = open_inbound(&paths).unwrap();
+        let status: String = inbound
+            .query_row(
+                "SELECT status FROM messages_in WHERE id = ?1",
+                rusqlite::params![id.as_uuid().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
     }
 }

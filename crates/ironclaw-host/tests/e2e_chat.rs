@@ -345,6 +345,10 @@ async fn run_one_turn(
         turn_seq: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         tool_map,
         max_tool_turns: 5,
+        // Tests run against wiremock; keep the deadline tight so
+        // accidental hangs surface as a test timeout instead of a
+        // 60-second stall.
+        provider_deadline: Duration::from_millis(5_000),
     };
     run_loop(deps).await.context("runner one-turn")?;
     Ok(())
