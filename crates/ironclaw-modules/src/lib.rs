@@ -32,7 +32,7 @@ pub mod self_mod;
 pub mod typing;
 
 pub use agent_to_agent::{AgentRef, AgentToAgentModule};
-pub use approvals::{ApprovalsModule, ApprovalSummary};
+pub use approvals::{ApprovalsModule, ApprovalSummary, NewPendingCtx, NewPendingNotifier};
 pub use context::{
     ChannelRequestCtx, DeliveryActionHandler, DeliveryActionInput, DeliveryActionOutput,
     DeliveryDispatcher, DispatchTarget, GateCtx, GateDecision, InterceptorCtx, InterceptorDecision,

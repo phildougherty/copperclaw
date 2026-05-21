@@ -20,7 +20,8 @@ use ironclaw_host_router::Router;
 use ironclaw_host_sweep::SweepService;
 use ironclaw_modules::{
     AgentToAgentModule, ApprovalsModule, InteractiveModule, Module, MountSecurityModule,
-    PermissionsModule, SchedulingModule, SelfModModule, TypingConfig, TypingModule,
+    NewPendingCtx, NewPendingNotifier, PermissionsModule, SchedulingModule, SelfModModule,
+    TypingConfig, TypingModule,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -29,6 +30,124 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+
+/// Notification text shown in-channel when an unknown sender is first seen.
+///
+/// The text is plain ASCII per the project's "no emojis" rule. It is
+/// intentionally terse: a longer block would clutter the channel.
+const PENDING_SENDER_NOTICE: &str = concat!(
+    "Unknown sender pending approval.\n",
+    "Run: iclaw approvals approve --channel <channel_type> --identity <identity>",
+);
+
+/// Build the closure wired to [`ApprovalsModule::with_new_pending_notifier`].
+///
+/// The notifier fires synchronously inside the router's sender-scope gate on
+/// every inbound from an unknown sender. It must be fast:
+///
+/// 1. Check [`ironclaw_db::tables::unregistered_senders`] — if a row already
+///    exists, the operator was already notified (the router writes the row
+///    after the gate returns, so a pre-existing row means the sender has been
+///    seen before). Skip.
+/// 2. Look up the messaging groups wired to the agent group. Take the first
+///    one (ordered by priority desc, then creation time — consistent with the
+///    router's own list). If none exist, log at info and return.
+/// 3. Dispatch a text notification to that messaging group via the
+///    [`ironclaw_modules::DeliveryDispatcher`].
+///
+/// The dispatcher call itself is synchronous (the host implementation spawns
+/// the adapter work in the background), so the gate hot-path is unblocked.
+fn build_pending_notifier(central: ironclaw_db::central::CentralDb) -> NewPendingNotifier {
+    Arc::new(move |ctx: NewPendingCtx, dispatcher| {
+        // De-dupe: if this sender has been seen before, a notification was
+        // already posted. The `unregistered_senders` row is written by the
+        // router AFTER the gate returns, so absence of the row means this is
+        // the sender's first ever contact.
+        let already_seen = ironclaw_db::tables::unregistered_senders::get(
+            &central,
+            &ctx.sender.channel_type,
+            &ctx.sender.identity,
+        )
+        .ok()
+        .flatten()
+        .is_some();
+        if already_seen {
+            return;
+        }
+
+        // Resolve the primary messaging group for this agent group. "Primary"
+        // is defined as the first wiring ordered by priority desc, then
+        // created_at asc — the same ordering the router uses in list_for_mg.
+        let wirings = match ironclaw_db::tables::messaging_group_agents::list_for_ag(
+            &central,
+            ctx.agent_group_id,
+        ) {
+            Ok(w) => w,
+            Err(err) => {
+                tracing::info!(
+                    agent_group_id = %ctx.agent_group_id.as_uuid(),
+                    ?err,
+                    "approvals: could not list wirings for pending-sender notification; skipping"
+                );
+                return;
+            }
+        };
+        let Some(wiring) = wirings.first() else {
+            tracing::info!(
+                agent_group_id = %ctx.agent_group_id.as_uuid(),
+                "approvals: agent group has no messaging groups; skipping pending-sender notification"
+            );
+            return;
+        };
+
+        // Resolve the messaging group's channel + platform coordinates.
+        let mg = match ironclaw_db::tables::messaging_groups::get(&central, wiring.messaging_group_id) {
+            Ok(g) => g,
+            Err(err) => {
+                tracing::info!(
+                    messaging_group_id = %wiring.messaging_group_id.as_uuid(),
+                    ?err,
+                    "approvals: could not fetch messaging group; skipping pending-sender notification"
+                );
+                return;
+            }
+        };
+
+        // Build the notification text. Plain ASCII, no emojis.
+        let display = ctx
+            .sender
+            .display_name
+            .as_deref()
+            .unwrap_or(ctx.sender.identity.as_str());
+        let text = format!(
+            "{notice}\n\nChannel: {ct}\nIdentity: {id}\nDisplay name: {dn}\nFirst contact: {ts}",
+            notice = PENDING_SENDER_NOTICE,
+            ct = ctx.sender.channel_type.as_str(),
+            id = ctx.sender.identity,
+            dn = display,
+            ts = ctx.first_seen.to_rfc3339(),
+        );
+
+        let target = ironclaw_modules::DispatchTarget::channel(
+            mg.channel_type.clone(),
+            mg.platform_id.clone(),
+            None,
+        );
+        let message = ironclaw_types::OutboundMessage {
+            kind: ironclaw_types::MessageKind::Chat,
+            content: serde_json::json!({"text": text}),
+            files: vec![],
+        };
+        dispatcher.dispatch(&target, &message);
+        tracing::info!(
+            channel_type = ctx.sender.channel_type.as_str(),
+            identity = ctx.sender.identity.as_str(),
+            notify_channel = mg.channel_type.as_str(),
+            notify_platform_id = mg.platform_id.as_str(),
+            "approvals: posted pending-sender notification to primary messaging group"
+        );
+    })
+}
 
 /// Boot-time errors that abort startup.
 ///
@@ -176,7 +295,8 @@ pub async fn install_modules(host_ctx: Arc<HostContext>) {
                     .flatten()
                     .is_some()
                 })
-            }),
+            })
+            .with_new_pending_notifier(build_pending_notifier(host_ctx.central().clone())),
         ),
         Box::new(InteractiveModule::default()),
         Box::new(SchedulingModule),
@@ -663,6 +783,281 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // build_pending_notifier tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build a wired DB with one agent group and one messaging group.
+    fn notifier_fixture() -> (
+        ironclaw_db::central::CentralDb,
+        ironclaw_types::AgentGroupId,
+        ironclaw_types::MessagingGroupId,
+        ironclaw_types::ChannelType,
+        String, // platform_id
+    ) {
+        use ironclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+        use ironclaw_db::tables::messaging_group_agents::{upsert as upsert_wire, UpsertWiring};
+        use ironclaw_db::tables::messaging_groups::{upsert as upsert_mg, UpsertMessagingGroup};
+        use ironclaw_types::{ChannelType, EngageMode, SessionMode};
+
+        let db = ironclaw_db::central::CentralDb::open_in_memory().unwrap();
+        let ag = create_ag(
+            &db,
+            CreateAgentGroup {
+                name: "notifier-test-ag".into(),
+                folder: "nt".into(),
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        let ct = ChannelType::new("telegram");
+        let pid = "chat-notify".to_string();
+        let mg = upsert_mg(
+            &db,
+            UpsertMessagingGroup {
+                channel_type: ct.clone(),
+                platform_id: pid.clone(),
+                name: Some("Notify Group".into()),
+                is_group: true,
+                unknown_sender_policy: "strict".into(),
+            },
+        )
+        .unwrap();
+        upsert_wire(
+            &db,
+            UpsertWiring {
+                messaging_group_id: mg.id,
+                agent_group_id: ag.id,
+                engage_mode: EngageMode::Mention,
+                engage_pattern: None,
+                sender_scope: "known".into(),
+                ignored_message_policy: "drop".into(),
+                session_mode: SessionMode::Shared,
+                priority: 0,
+            },
+        )
+        .unwrap();
+        (db, ag.id, mg.id, ct, pid)
+    }
+
+    #[test]
+    fn notifier_dispatches_for_new_sender() {
+        use ironclaw_modules::context::MockDispatcher;
+        use ironclaw_modules::DeliveryDispatcher;
+        use ironclaw_types::{ChannelType, SenderIdentity};
+
+        let (db, ag_id, _mg_id, _ct, _pid) = notifier_fixture();
+        let notifier = build_pending_notifier(db);
+
+        let mock = MockDispatcher::new();
+        let dispatcher: Arc<dyn DeliveryDispatcher> = mock.clone();
+
+        let ctx = NewPendingCtx {
+            sender: SenderIdentity {
+                channel_type: ChannelType::new("slack"),
+                identity: "U-new".into(),
+                display_name: Some("New User".into()),
+            },
+            agent_group_id: ag_id,
+            messaging_group_id: None,
+            first_seen: chrono::Utc::now(),
+        };
+        notifier(ctx, dispatcher);
+        assert_eq!(mock.dispatched_count(), 1, "should dispatch a notification");
+        let dispatched_msgs = mock.dispatched.lock().unwrap();
+        let (target, msg) = &dispatched_msgs[0];
+        // Target should be the telegram group wired to this agent group.
+        assert_eq!(
+            target.channel_type.as_ref().map(ChannelType::as_str),
+            Some("telegram")
+        );
+        let text = msg.content.get("text").unwrap().as_str().unwrap();
+        assert!(
+            text.contains("iclaw approvals approve"),
+            "notification must include approval command: {text}"
+        );
+        assert!(
+            text.contains("U-new"),
+            "notification must include sender identity: {text}"
+        );
+        // Check notification is plain ASCII (no emojis).
+        assert!(
+            text.is_ascii(),
+            "notification text must be plain ASCII: {text}"
+        );
+    }
+
+    #[test]
+    fn notifier_skips_repeat_sender() {
+        use ironclaw_db::tables::unregistered_senders::{upsert as upsert_unreg, UpsertUnregisteredSender};
+        use ironclaw_modules::context::MockDispatcher;
+        use ironclaw_modules::DeliveryDispatcher;
+        use ironclaw_types::{ChannelType, SenderIdentity};
+
+        let (db, ag_id, _mg_id, _ct, _pid) = notifier_fixture();
+
+        // Pre-populate unregistered_senders so the notifier thinks this
+        // sender has already been seen (and notified) before.
+        let ct = ChannelType::new("slack");
+        let identity = "U-repeat".to_string();
+        upsert_unreg(
+            &db,
+            UpsertUnregisteredSender {
+                channel_type: ct.clone(),
+                platform_id: identity.clone(),
+                user_id: None,
+                sender_name: None,
+                reason: "scope_pending".into(),
+                messaging_group_id: None,
+                agent_group_id: None,
+            },
+        )
+        .unwrap();
+
+        let notifier = build_pending_notifier(db);
+        let mock = MockDispatcher::new();
+        let dispatcher: Arc<dyn DeliveryDispatcher> = mock.clone();
+
+        let ctx = NewPendingCtx {
+            sender: SenderIdentity {
+                channel_type: ct,
+                identity,
+                display_name: None,
+            },
+            agent_group_id: ag_id,
+            messaging_group_id: None,
+            first_seen: chrono::Utc::now(),
+        };
+        notifier(ctx, dispatcher);
+        assert_eq!(
+            mock.dispatched_count(),
+            0,
+            "should NOT dispatch for a repeat sender"
+        );
+    }
+
+    #[test]
+    fn notifier_skips_when_no_messaging_group_wired() {
+        use ironclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+        use ironclaw_modules::context::MockDispatcher;
+        use ironclaw_modules::DeliveryDispatcher;
+        use ironclaw_types::{ChannelType, SenderIdentity};
+
+        // Agent group with NO wired messaging group.
+        let db = ironclaw_db::central::CentralDb::open_in_memory().unwrap();
+        let ag = create_ag(
+            &db,
+            CreateAgentGroup {
+                name: "no-mg-ag".into(),
+                folder: "nm".into(),
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+
+        let notifier = build_pending_notifier(db);
+        let mock = MockDispatcher::new();
+        let dispatcher: Arc<dyn DeliveryDispatcher> = mock.clone();
+
+        let ctx = NewPendingCtx {
+            sender: SenderIdentity {
+                channel_type: ChannelType::new("discord"),
+                identity: "D-orphan".into(),
+                display_name: None,
+            },
+            agent_group_id: ag.id,
+            messaging_group_id: None,
+            first_seen: chrono::Utc::now(),
+        };
+        notifier(ctx, dispatcher);
+        // Must silently skip — no dispatch, no panic.
+        assert_eq!(mock.dispatched_count(), 0);
+    }
+
+    #[test]
+    fn notifier_multiple_agent_groups_routes_independently() {
+        use ironclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+        use ironclaw_db::tables::messaging_group_agents::{upsert as upsert_wire, UpsertWiring};
+        use ironclaw_db::tables::messaging_groups::{upsert as upsert_mg, UpsertMessagingGroup};
+        use ironclaw_modules::context::MockDispatcher;
+        use ironclaw_modules::DeliveryDispatcher;
+        use ironclaw_types::{ChannelType, EngageMode, SenderIdentity, SessionMode};
+
+        let db = ironclaw_db::central::CentralDb::open_in_memory().unwrap();
+
+        // Agent group A → slack channel.
+        let ag_a = create_ag(&db, CreateAgentGroup { name: "ag-a".into(), folder: "a".into(), agent_provider: None }).unwrap();
+        let mg_slack = upsert_mg(&db, UpsertMessagingGroup {
+            channel_type: ChannelType::new("slack"),
+            platform_id: "C-slack".into(),
+            name: None,
+            is_group: true,
+            unknown_sender_policy: "strict".into(),
+        }).unwrap();
+        upsert_wire(&db, UpsertWiring {
+            messaging_group_id: mg_slack.id,
+            agent_group_id: ag_a.id,
+            engage_mode: EngageMode::Mention,
+            engage_pattern: None,
+            sender_scope: "known".into(),
+            ignored_message_policy: "drop".into(),
+            session_mode: SessionMode::Shared,
+            priority: 0,
+        }).unwrap();
+
+        // Agent group B → discord channel.
+        let ag_b = create_ag(&db, CreateAgentGroup { name: "ag-b".into(), folder: "b".into(), agent_provider: None }).unwrap();
+        let mg_discord = upsert_mg(&db, UpsertMessagingGroup {
+            channel_type: ChannelType::new("discord"),
+            platform_id: "C-discord".into(),
+            name: None,
+            is_group: true,
+            unknown_sender_policy: "strict".into(),
+        }).unwrap();
+        upsert_wire(&db, UpsertWiring {
+            messaging_group_id: mg_discord.id,
+            agent_group_id: ag_b.id,
+            engage_mode: EngageMode::Mention,
+            engage_pattern: None,
+            sender_scope: "known".into(),
+            ignored_message_policy: "drop".into(),
+            session_mode: SessionMode::Shared,
+            priority: 0,
+        }).unwrap();
+
+        let notifier = build_pending_notifier(db);
+
+        let mock = MockDispatcher::new();
+        let dispatcher: Arc<dyn DeliveryDispatcher> = mock.clone();
+
+        // Fire notifier for a sender targeting agent group A.
+        let ctx_a = NewPendingCtx {
+            sender: SenderIdentity { channel_type: ChannelType::new("gchat"), identity: "user-a".into(), display_name: None },
+            agent_group_id: ag_a.id,
+            messaging_group_id: None,
+            first_seen: chrono::Utc::now(),
+        };
+        notifier(ctx_a, Arc::clone(&dispatcher));
+
+        // Fire notifier for a different sender targeting agent group B.
+        let ctx_b = NewPendingCtx {
+            sender: SenderIdentity { channel_type: ChannelType::new("gchat"), identity: "user-b".into(), display_name: None },
+            agent_group_id: ag_b.id,
+            messaging_group_id: None,
+            first_seen: chrono::Utc::now(),
+        };
+        notifier(ctx_b, dispatcher);
+
+        let all_dispatched = mock.dispatched.lock().unwrap();
+        assert_eq!(all_dispatched.len(), 2, "each agent group gets its own notification");
+        let targets: Vec<_> = all_dispatched
+            .iter()
+            .map(|(t, _)| t.channel_type.as_ref().map_or("", ChannelType::as_str))
+            .collect();
+        assert!(targets.contains(&"slack"), "ag-a should notify via slack");
+        assert!(targets.contains(&"discord"), "ag-b should notify via discord");
     }
 
     #[tokio::test]
