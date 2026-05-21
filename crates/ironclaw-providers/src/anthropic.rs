@@ -277,12 +277,28 @@ struct AnthropicEventEnvelope {
     content_block: Option<ContentBlock>,
     #[serde(default)]
     error: Option<ApiError>,
+    /// `message_delta` events carry incremental usage updates; the
+    /// final values are what we record in `agent_turns`.
+    #[serde(default)]
+    usage: Option<UsageEvent>,
 }
 
 #[derive(Debug, Deserialize)]
 struct MessageStart {
     #[serde(default)]
     id: Option<String>,
+    #[serde(default)]
+    usage: Option<UsageEvent>,
+}
+
+/// Slice of Anthropic's `usage` block. Multiple SSE events can
+/// repeat fields; the latest non-None value wins.
+#[derive(Debug, Deserialize, Default, Clone, Copy)]
+struct UsageEvent {
+    #[serde(default)]
+    input_tokens: Option<u32>,
+    #[serde(default)]
+    output_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -330,6 +346,11 @@ where
 }
 
 /// Returns `false` if the pump should exit (terminal event sent).
+///
+/// Long-but-flat: the body is a single match on the Anthropic SSE
+/// event-type string, so splitting it just to satisfy a line-count
+/// cap would hurt readability more than it helps.
+#[allow(clippy::too_many_lines)]
 async fn handle_sse_event(
     ev: &eventsource_stream::Event,
     tx: &mpsc::Sender<ProviderEvent>,
@@ -352,13 +373,22 @@ async fn handle_sse_event(
 
     match env.event_type.as_str() {
         "message_start" => {
-            let continuation = env
-                .message
+            let message = env.message;
+            let usage = message.as_ref().and_then(|m| m.usage);
+            let continuation = message
                 .and_then(|m| m.id)
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
             *saw_init = true;
             if tx.send(ProviderEvent::Init { continuation }).await.is_err() {
                 return false;
+            }
+            if let Some(u) = usage {
+                let _ = tx
+                    .send(ProviderEvent::Usage {
+                        input_tokens: u.input_tokens.unwrap_or(0),
+                        output_tokens: u.output_tokens.unwrap_or(0),
+                    })
+                    .await;
             }
         }
         "content_block_start" => {
@@ -426,9 +456,21 @@ async fn handle_sse_event(
                 .await;
             return false;
         }
-        "ping" | "message_delta" => {
-            // Heartbeat / usage update — surface as Activity.
+        "ping" => {
             let _ = tx.send(ProviderEvent::Activity).await;
+        }
+        "message_delta" => {
+            // Heartbeat + usage update. Always surface Activity for
+            // liveness; emit Usage when the event carries one.
+            let _ = tx.send(ProviderEvent::Activity).await;
+            if let Some(u) = env.usage {
+                let _ = tx
+                    .send(ProviderEvent::Usage {
+                        input_tokens: u.input_tokens.unwrap_or(0),
+                        output_tokens: u.output_tokens.unwrap_or(0),
+                    })
+                    .await;
+            }
         }
         _ => {
             // Unknown event — ignore, keep streaming.

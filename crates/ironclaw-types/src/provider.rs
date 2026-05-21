@@ -29,6 +29,15 @@ pub enum ProviderEvent {
         declared_timeout_ms: Option<u64>,
     },
     ToolEnd,
+    /// Per-turn token usage as reported by the provider. Emitted at
+    /// least once before [`ProviderEvent::Result`] when the provider
+    /// surfaces it (Anthropic's `message_delta.usage` field). The
+    /// runner accumulates these into the `agent_turns` table for
+    /// observability and per-group budgeting.
+    Usage {
+        input_tokens: u32,
+        output_tokens: u32,
+    },
 }
 
 /// Provider config materialized into the container at spawn time. Stored in

@@ -30,6 +30,7 @@ pub mod members;
 pub mod messaging_groups;
 pub mod roles;
 pub mod sessions;
+pub mod usage;
 pub mod user_dms;
 pub mod users;
 pub mod wirings;

@@ -61,6 +61,16 @@ pub struct RunnerDeps {
     pub idle_sleep: Duration,
     /// Heartbeat path the runner touches once per iteration (None to skip).
     pub heartbeat_path: Option<PathBuf>,
+    /// Session id this runner is bound to. Stamped on every
+    /// `usage_report` system row so the host can join to
+    /// `agent_turns.session_id`.
+    pub session_id: ironclaw_types::SessionId,
+    /// Agent group id. Same use as `session_id`.
+    pub agent_group_id: ironclaw_types::AgentGroupId,
+    /// Runner-local turn counter. Bumped by the `usage_report` emitter
+    /// after each turn so `agent_turns.seq` is monotonically
+    /// increasing per session.
+    pub turn_seq: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl RunnerDeps {
@@ -86,6 +96,9 @@ impl RunnerDeps {
             max_tokens: 4096,
             temperature: None,
             assistant_name: None,
+            session_id: ironclaw_types::SessionId(uuid::Uuid::nil()),
+            agent_group_id: ironclaw_types::AgentGroupId(uuid::Uuid::nil()),
+            turn_seq: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             compaction: CompactionCfg {
                 model_input_window: 200_000,
                 safety_margin_tokens: 8_000,
@@ -201,14 +214,30 @@ async fn drive_turn(
         assistant_name: deps.assistant_name.clone(),
         display_name: None,
     };
+    let turn_started_at = chrono::Utc::now();
     let mut query = deps.provider.query(input).await.context("provider query failed")?;
     let mut continuation: Option<String> = None;
     let mut outcome = TurnOutcome::Done;
+    // Per-turn usage. Anthropic ships these as a running total, so we
+    // always take the latest value rather than summing increments.
+    let mut input_tokens: u32 = 0;
+    let mut output_tokens: u32 = 0;
 
     while let Some(event) = query.next_event().await {
         match event {
             ProviderEvent::Init { continuation: c } => {
                 continuation = Some(c);
+            }
+            ProviderEvent::Usage {
+                input_tokens: it,
+                output_tokens: ot,
+            } => {
+                if it > 0 {
+                    input_tokens = it;
+                }
+                if ot > 0 {
+                    output_tokens = ot;
+                }
             }
             ProviderEvent::Result { text } => {
                 if let Some(t) = &text {
@@ -266,7 +295,67 @@ async fn drive_turn(
         }
     }
     query.abort().await;
+    // Emit a `usage_report` system outbound row so the host's delivery
+    // loop can record the turn in `agent_turns`. Best-effort: a failure
+    // here gets logged, not propagated, since the turn itself is done.
+    emit_usage_report(
+        deps,
+        input_tokens,
+        output_tokens,
+        turn_started_at,
+        &outcome,
+    )
+    .await;
     Ok(TurnResult { continuation, outcome })
+}
+
+/// Append a `usage_report` system row to `outbound.db`. The host's
+/// delivery service intercepts this kind of system action (instead of
+/// dispatching it to a channel adapter) and writes the corresponding
+/// `agent_turns` row.
+async fn emit_usage_report(
+    deps: &RunnerDeps,
+    input_tokens: u32,
+    output_tokens: u32,
+    started_at: chrono::DateTime<chrono::Utc>,
+    outcome: &TurnOutcome,
+) {
+    use ironclaw_db::tables::messages_out::{insert as insert_out, WriteOutbound};
+    let payload = serde_json::json!({
+        "usage_report": {
+            "session_id": deps.session_id.to_string(),
+            "agent_group_id": deps.agent_group_id.to_string(),
+            "seq": deps.turn_seq.load(std::sync::atomic::Ordering::Relaxed),
+            "model": deps.model,
+            "provider": deps.provider.name(),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "started_at": started_at.to_rfc3339(),
+            "ended_at": chrono::Utc::now().to_rfc3339(),
+            "status": match outcome {
+                TurnOutcome::Done => "ok",
+                TurnOutcome::Failed => "error",
+            },
+        }
+    });
+    let row = WriteOutbound {
+        id: ironclaw_types::MessageId::new(),
+        in_reply_to: None,
+        timestamp: chrono::Utc::now(),
+        deliver_after: None,
+        recurrence: None,
+        kind: ironclaw_types::MessageKind::System,
+        platform_id: None,
+        channel_type: None,
+        thread_id: None,
+        content: payload,
+    };
+    let outbound = deps.outbound.lock().await;
+    let conn: &rusqlite::Connection = &outbound;
+    if let Err(err) = insert_out(conn, &row) {
+        tracing::warn!(?err, "usage_report insert failed");
+    }
+    deps.turn_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 async fn ack_picked_up(deps: &RunnerDeps, rows: &[MessageInRow]) -> Result<()> {
@@ -501,11 +590,17 @@ mod tests {
         setup.deps.max_turns = Some(1);
         run_loop(setup.deps).await.unwrap();
 
-        // Outbound row landed.
+        // Outbound row landed. After M13 the runner also writes a
+        // `MessageKind::System` `usage_report` row per turn, so we
+        // pick the chat row explicitly rather than asserting on
+        // `.last()`.
         let outbound = open_outbound(&setup.paths).unwrap();
         let rows = messages_out::list_due(&outbound).unwrap();
-        assert!(!rows.is_empty());
-        assert_eq!(rows.last().unwrap().content["text"], "hello back");
+        let chat = rows
+            .iter()
+            .find(|r| r.kind == ironclaw_types::MessageKind::Chat)
+            .expect("expected one Chat outbound row");
+        assert_eq!(chat.content["text"], "hello back");
         // Inbound message marked completed.
         let inbound = open_inbound(&setup.paths).unwrap();
         let status: String = inbound
@@ -634,7 +729,16 @@ mod tests {
         run_loop(setup.deps).await.unwrap();
         let outbound = open_outbound(&setup.paths).unwrap();
         let rows = messages_out::list_due(&outbound).unwrap();
-        assert!(rows.is_empty(), "no outbound row expected for empty result");
+        // M13 emits a `usage_report` System row per turn; the chat
+        // path still shouldn't emit anything for an empty result.
+        let chat_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == ironclaw_types::MessageKind::Chat)
+            .collect();
+        assert!(
+            chat_rows.is_empty(),
+            "no Chat outbound row expected for empty result, got {chat_rows:?}"
+        );
     }
 
     #[tokio::test]

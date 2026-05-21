@@ -475,6 +475,20 @@ impl DeliveryService {
             return Ok(());
         };
 
+        // `usage_report` is an action the runner emits at the end of
+        // every turn. We intercept it here rather than going through
+        // the module action registry because the recorder needs the
+        // CentralDb the delivery service already holds; passing it
+        // through `DeliveryActionHandler` would mean extending the
+        // module trait surface. Tradeoff: usage recording belongs to
+        // the delivery service, not a module.
+        if action.name == "usage_report" {
+            record_usage_report(&self.central, row, &action.payload);
+            let in_conn = inbound_pool.connect()?;
+            delivered::insert(&in_conn, row.id, None, "ok")?;
+            return Ok(());
+        }
+
         let handler = self.actions.get(&action.name).map(|r| r.clone());
         let Some(handler) = handler else {
             info!(name = %action.name, "no handler for system action; skipping");
@@ -657,6 +671,84 @@ pub(crate) fn is_container_running(s: &Session) -> bool {
 /// Helper used by tests / the sweep loop to filter on session status.
 pub(crate) fn is_session_active(s: &Session) -> bool {
     s.status == SessionStatus::Active
+}
+
+/// Translate a `usage_report` system payload into an `agent_turns`
+/// row. Best-effort: a malformed payload is logged and dropped so the
+/// runner can't poison the delivery loop. The runner schema:
+///
+/// ```json
+/// {
+///   "name": "usage_report",
+///   "payload": {
+///     "agent_group_id": "<uuid>",
+///     "session_id":     "<uuid>",
+///     "seq":            <i64>,
+///     "model":          "<provider model id>",
+///     "provider":       "<provider name>",
+///     "input_tokens":   <u32>,
+///     "output_tokens":  <u32>,
+///     "started_at":     "<rfc3339>",
+///     "ended_at":       "<rfc3339>",
+///     "status":         "ok" | "error",
+///     "error":          <string?>
+///   }
+/// }
+/// ```
+fn record_usage_report(
+    central: &ironclaw_db::central::CentralDb,
+    _row: &MessageOutRow,
+    payload: &serde_json::Value,
+) {
+    use ironclaw_db::tables::agent_turns;
+    let pick_str = |k: &str| {
+        payload
+            .get(k)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let pick_i64 = |k: &str| payload.get(k).and_then(serde_json::Value::as_i64);
+    let pick_ts = |k: &str| {
+        pick_str(k)
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|d| d.with_timezone(&chrono::Utc))
+    };
+
+    let Some(session_id) = pick_str("session_id") else {
+        warn!("usage_report missing session_id; dropping");
+        return;
+    };
+    let Some(agent_group_id) = pick_str("agent_group_id") else {
+        warn!("usage_report missing agent_group_id; dropping");
+        return;
+    };
+    let now = chrono::Utc::now();
+    let started_at = pick_ts("started_at").unwrap_or(now);
+    let ended_at = pick_ts("ended_at").unwrap_or(now);
+    let model = pick_str("model").unwrap_or_else(|| "unknown".to_string());
+    let provider = pick_str("provider").unwrap_or_else(|| "unknown".to_string());
+    let seq = pick_i64("seq").unwrap_or(0);
+    let input_tokens = pick_i64("input_tokens").unwrap_or(0);
+    let output_tokens = pick_i64("output_tokens").unwrap_or(0);
+    let status = pick_str("status").unwrap_or_else(|| "ok".to_string());
+    let error = pick_str("error");
+
+    let turn = agent_turns::NewAgentTurn {
+        session_id,
+        agent_group_id,
+        seq,
+        model,
+        provider,
+        input_tokens,
+        output_tokens,
+        started_at,
+        ended_at,
+        status,
+        error,
+    };
+    if let Err(err) = agent_turns::insert(central, &turn) {
+        warn!(?err, "agent_turns insert failed; dropping usage report");
+    }
 }
 
 

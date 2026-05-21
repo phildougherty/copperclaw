@@ -160,6 +160,7 @@ pub fn build_dispatch_table() -> DispatchTable {
     ins!("approvals.list", handlers::approvals::list, false);
     ins!("approvals.get", handlers::approvals::get, false);
     ins!("audit.list", handlers::audit::list, false);
+    ins!("usage.rollup", handlers::usage::rollup, false);
 
     t
 }

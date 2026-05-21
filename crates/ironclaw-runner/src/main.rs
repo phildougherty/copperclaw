@@ -101,6 +101,9 @@ async fn main() -> Result<()> {
             ironclaw_runner::POLL_INTERVAL_MS,
         ),
         heartbeat_path: Some(paths.heartbeat.clone()),
+        session_id: cfg.session_id,
+        agent_group_id: cfg.agent_group_id,
+        turn_seq: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
     };
 
     tracing::info!(

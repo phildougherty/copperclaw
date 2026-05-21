@@ -161,6 +161,12 @@ pub enum TopCommand {
     Status,
     /// One-shot operator health check.
     Health,
+    /// Per-group token usage rollup.
+    Usage {
+        /// Look-back window. Same format as `audit list --since`.
+        #[arg(long, default_value = "24h")]
+        since: String,
+    },
     /// Emit shell completion script for `iclaw`.
     ///
     /// Pipe the output into your shell's completion dir, e.g.
@@ -611,6 +617,9 @@ impl TopCommand {
             Self::Quickstart { action } => action.to_call(),
             Self::Status => ParsedCall::new("composite.status", json!({})),
             Self::Health => ParsedCall::new("composite.health", json!({})),
+            Self::Usage { since } => {
+                ParsedCall::new("usage.rollup", json!({"since": since}))
+            }
             // Completions are emitted entirely client-side; the marker
             // command carries the requested shell name so `run_cli`
             // can short-circuit before any transport call.
@@ -1050,6 +1059,7 @@ pub const ALL_COMMANDS: &[&str] = &[
     "approvals.list",
     "approvals.get",
     "audit.list",
+    "usage.rollup",
 ];
 
 #[cfg(test)]
@@ -1747,6 +1757,7 @@ mod tests {
             &["iclaw", "approvals", "list"],
             &["iclaw", "approvals", "get", "x"],
             &["iclaw", "audit", "list"],
+            &["iclaw", "usage"],
         ];
         for args in invocations {
             let p = parse(args);
