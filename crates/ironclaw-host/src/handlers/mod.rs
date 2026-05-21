@@ -32,6 +32,7 @@ pub mod members;
 pub mod messaging_groups;
 pub mod mcp;
 pub mod roles;
+pub mod schema;
 pub mod sessions;
 pub mod usage;
 pub mod user_dms;

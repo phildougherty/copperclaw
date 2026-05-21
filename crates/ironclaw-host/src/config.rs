@@ -201,9 +201,18 @@ impl HostConfig {
         self.data_dir.join("ironclaw.db")
     }
 
-    /// Per-session data root (`<data_dir>/sessions`).
+    /// Per-session data root. This is the data directory itself; the
+    /// per-session layout (`sessions/<agent_group>/<session>/`) is
+    /// appended by [`ironclaw_db::session::SessionPaths::new`] when it
+    /// is called with this value as `data_root`.
+    ///
+    /// Previously this method returned `data_dir/sessions`, which —
+    /// combined with `SessionPaths::new`'s own `/sessions/` prefix —
+    /// produced the double `data_dir/sessions/sessions/` path. The fix
+    /// is to pass `data_dir` directly and let `SessionPaths::new` add
+    /// exactly one `sessions/` component.
     pub fn sessions_root(&self) -> PathBuf {
-        self.data_dir.join("sessions")
+        self.data_dir.clone()
     }
 
     /// Borrow the data root.
@@ -316,9 +325,11 @@ mod tests {
         let cfg = HostConfig::from_map(&m(&[("IRONCLAW_DATA_DIR", "/srv/ironclaw")])).unwrap();
         assert_eq!(cfg.ncl_socket_path, PathBuf::from("/srv/ironclaw/iclaw.sock"));
         assert_eq!(cfg.central_db_path(), PathBuf::from("/srv/ironclaw/ironclaw.db"));
+        // sessions_root() returns data_dir itself; SessionPaths::new then
+        // appends sessions/<ag>/<session> to produce the flat layout.
         assert_eq!(
             cfg.sessions_root(),
-            PathBuf::from("/srv/ironclaw/sessions")
+            PathBuf::from("/srv/ironclaw")
         );
     }
 

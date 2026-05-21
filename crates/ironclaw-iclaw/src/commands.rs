@@ -230,6 +230,16 @@ pub enum TopCommand {
         #[command(subcommand)]
         action: McpCmd,
     },
+    /// Print the central DB schema version summary.
+    ///
+    /// Prints a JSON object `{ "expected": N, "applied": M, "status": "ok|pending|future" }`
+    /// where:
+    /// - `expected` is the number of migrations compiled into this binary.
+    /// - `applied` is the number of migrations already recorded in the DB.
+    /// - `status` is `"ok"` when equal, `"pending"` when applied < expected,
+    ///   `"future"` when applied > expected (downgrade detected).
+    #[command(name = "schema-version")]
+    SchemaVersion,
 }
 
 // --- db --------------------------------------------------------------------
@@ -836,6 +846,7 @@ impl TopCommand {
                 "composite.completions",
                 json!({ "shell": shell.to_string() }),
             ),
+            Self::SchemaVersion => ParsedCall::new("schema.version", json!({})),
         }
     }
 }
@@ -1388,6 +1399,7 @@ pub const ALL_COMMANDS: &[&str] = &[
     "budgets.list",
     "budgets.set",
     "usage.rollup",
+    "schema.version",
 ];
 
 #[cfg(test)]
@@ -2197,6 +2209,7 @@ mod tests {
                 "10000",
             ],
             &["iclaw", "usage"],
+            &["iclaw", "schema-version"],
             // Note: composite-only commands (`iclaw status`,
             // `iclaw health`, `iclaw quickstart`, `iclaw chat`,
             // `iclaw completions`) intentionally produce
@@ -2303,5 +2316,19 @@ mod tests {
     fn user_socket_for_other_os_falls_back_to_dot_dir() {
         let p = user_socket_for(std::path::Path::new("/h"), "freebsd");
         assert_eq!(p, std::path::PathBuf::from("/h/.ironclaw/data/iclaw.sock"));
+    }
+
+    // --- schema-version -------------------------------------------------------
+
+    #[test]
+    fn schema_version_produces_correct_call() {
+        let p = parse(&["iclaw", "schema-version"]);
+        assert_eq!(p.command, "schema.version");
+        assert_eq!(p.args, json!({}));
+    }
+
+    #[test]
+    fn schema_version_is_in_all_commands() {
+        assert!(ALL_COMMANDS.contains(&"schema.version"));
     }
 }
