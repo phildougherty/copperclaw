@@ -6,6 +6,27 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (release automation)
+
+- **Binary release workflow** at `.github/workflows/release.yml`.
+  Triggered by `git push` of a `v*` tag (and manually via
+  `workflow_dispatch` for smoke tests). Builds `ironclaw`, `iclaw`,
+  and `ironclaw-setup` in parallel for four targets
+  (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
+  `x86_64-apple-darwin`, `aarch64-apple-darwin`), strips each
+  binary, packages one `ironclaw-<target>.tar.gz` per target with
+  binaries at the top level (the layout `install.sh` expects),
+  generates a combined `SHA256SUMS`, extracts release notes from
+  `CHANGELOG.md` for the tagged version, and publishes a GitHub
+  Release with the tarballs + `SHA256SUMS` attached. Linux arm64
+  is cross-compiled with the apt `gcc-aarch64-linux-gnu` linker;
+  macOS x86_64 is cross-compiled on the `macos-14` arm64 runner.
+  Co-exists with the container-image workflow so one tag push
+  cuts both the binary release and the GHCR image.
+- `install.sh`'s prebuilt-tarball strategy now actually resolves
+  on tagged releases — no more silent fallback to `cargo install
+  --git` for every install.
+
 ### Added (production hardening slice — three parallel-agent items)
 
 - **Secret rotation via SIGHUP.** New `RotatableConfig` struct +

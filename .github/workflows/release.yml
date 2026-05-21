@@ -1,0 +1,290 @@
+name: release
+
+# Cuts a tagged release of the three ironclaw binaries (ironclaw,
+# iclaw, ironclaw-setup) as one tar.gz per target triple, attaches a
+# SHA256SUMS manifest, and uploads everything to a GitHub Release with
+# notes extracted from CHANGELOG.md. The naming convention
+# (`ironclaw-<target>.tar.gz`, binaries at the top level) is what
+# install.sh expects in `install_via_release`; do not change it
+# without updating install.sh in lockstep.
+#
+# Triggers:
+#   * push of a `v*` tag    -> full build + attach assets to the release
+#   * workflow_dispatch     -> manual smoke test; builds binaries but
+#                              does NOT touch any release (the upload
+#                              step is gated on the `v*` ref)
+#
+# Co-exists with `.github/workflows/container-image.yml`: a single
+# `git tag v0.2.0 && git push --tags` cuts both the binary release
+# and the GHCR container image.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  # Cancel an in-progress build for the same ref (tag or manual run)
+  # so a quick retag doesn't pile up parallel runs racing the same
+  # release asset uploads. Distinct tags get distinct concurrency
+  # groups, so cutting v0.2.1 right after v0.2.0 still works.
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Three binaries from three workspace crates. Mirrors install.sh's
+  # BINARIES array; keep in sync.
+  IRONCLAW_BINARIES: "ironclaw iclaw ironclaw-setup"
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            cross: true
+            # apt cross-compile route; cross-rs adds a docker indirection
+            # we don't need just to swap a linker.
+            linker_pkg: gcc-aarch64-linux-gnu
+            linker_bin: aarch64-linux-gnu-gcc
+          - target: x86_64-apple-darwin
+            runner: macos-14
+            cross: false
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            cross: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (with target)
+        # dtolnay/rust-toolchain reads rust-toolchain.toml; passing
+        # `targets` adds the cross target alongside the host one.
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install aarch64 Linux cross-linker
+        if: matrix.cross && runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ${{ matrix.linker_pkg }}
+
+      - name: Configure cross-linker for aarch64-unknown-linux-gnu
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          # Tell cargo which linker to invoke for the cross target.
+          # Capitalised env name is the standard cargo override form.
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Distinct cache per target so the linux-gnu and apple-darwin
+          # builds don't fight over the same key.
+          key: ${{ matrix.target }}
+
+      - name: Build binaries
+        # Build only the three binary-bearing crates via -p so we
+        # avoid compiling every workspace crate (saves several
+        # minutes on the channels crates that aren't in any binary
+        # path). Each of these crates has exactly one [[bin]], so
+        # `--bins` resolves unambiguously. `--locked` matches CI.
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} \
+            -p ironclaw-host \
+            -p ironclaw-iclaw \
+            -p ironclaw-setup \
+            --bins
+
+      - name: Strip binaries
+        # `strip = "symbols"` already runs in the release profile via
+        # workspace Cargo.toml; this is a belt-and-braces pass that
+        # also covers anything the profile may have missed and keeps
+        # the workflow honest if the profile is ever relaxed.
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="target/${{ matrix.target }}/release"
+          for bin in $IRONCLAW_BINARIES; do
+            path="$out/$bin"
+            [ -f "$path" ] || { echo "missing binary: $path" >&2; exit 1; }
+            if [ "${{ runner.os }}" = "macOS" ]; then
+              # -x: keep external (global) symbols. Required on Darwin
+              # since `strip` with no flags is more aggressive and can
+              # break some dylib linking.
+              strip -x "$path"
+            else
+              strip "$path"
+            fi
+          done
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="target/${{ matrix.target }}/release"
+          stage="$(mktemp -d)"
+          # Binaries land at the top level of the archive — install.sh
+          # tolerates a versioned subdir but top-level is what its
+          # `find -type f -name <bin> -print -quit` resolves first.
+          for bin in $IRONCLAW_BINARIES; do
+            cp "$out/$bin" "$stage/$bin"
+          done
+          mkdir -p dist
+          tarball="dist/ironclaw-${{ matrix.target }}.tar.gz"
+          # GNU tar (Linux runner) and bsdtar (macOS runner) both
+          # accept this basic form; we skip --owner/--group rather
+          # than fork the command, since the tarball is consumed by
+          # `install`(1) which sets perms anyway.
+          tar -czf "$tarball" -C "$stage" $IRONCLAW_BINARIES
+          ls -lh "$tarball"
+          # Quick sanity check: archive must contain exactly the
+          # three binaries at the top level. Catches accidental
+          # subdir nesting before it confuses install.sh consumers.
+          echo "---- tarball contents ----"
+          tar -tzf "$tarball"
+
+      - name: Generate per-target SHA256
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "ironclaw-${{ matrix.target }}.tar.gz" > "ironclaw-${{ matrix.target }}.tar.gz.sha256"
+          else
+            # macOS doesn't ship sha256sum; shasum -a 256 matches the
+            # `<hash>  <file>` format sha256sum produces.
+            shasum -a 256 "ironclaw-${{ matrix.target }}.tar.gz" > "ironclaw-${{ matrix.target }}.tar.gz.sha256"
+          fi
+          cat "ironclaw-${{ matrix.target }}.tar.gz.sha256"
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ironclaw-${{ matrix.target }}
+          path: |
+            dist/ironclaw-${{ matrix.target }}.tar.gz
+            dist/ironclaw-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish GitHub Release
+    needs: build
+    # Only fire on a tag push; workflow_dispatch runs stop at `build`
+    # (smoke test mode).
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        # Needed for the CHANGELOG extraction below. Shallow clone is
+        # fine — we only read the working tree.
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-staging
+
+      - name: Collect release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          # Artifacts download into per-name subdirectories; flatten.
+          find dist-staging -type f \
+            \( -name "ironclaw-*.tar.gz" -o -name "ironclaw-*.tar.gz.sha256" \) \
+            -exec cp {} release/ \;
+          ls -lh release/
+          # Combine per-target .sha256 files into one SHA256SUMS that
+          # `sha256sum -c SHA256SUMS` can verify in one shot.
+          ( cd release && cat ironclaw-*.tar.gz.sha256 > SHA256SUMS )
+          # Drop the per-target .sha256 files now that SHA256SUMS
+          # supersedes them — keeps the release page tidy.
+          rm -f release/ironclaw-*.tar.gz.sha256
+          echo "---- final release assets ----"
+          ls -lh release/
+          echo "---- SHA256SUMS ----"
+          cat release/SHA256SUMS
+
+      - name: Extract release notes from CHANGELOG
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF##refs/tags/}"
+          # Strip the leading `v` to match `## [X.Y.Z]` headers.
+          version="${tag#v}"
+          # Tiny inline Python — no third-party action just to slice
+          # a markdown file. Reads CHANGELOG.md, finds the section
+          # whose header matches `## [<version>]` or, failing that,
+          # `## [Unreleased]`, and writes everything until the next
+          # `## ` header to release-notes.md.
+          python3 - "$version" <<'PY'
+          import re, sys, pathlib
+          version = sys.argv[1]
+          src = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          # Match `## [X.Y.Z]` (optionally with trailing date) or `## [Unreleased]`.
+          want = [
+              re.compile(rf"^##\s+\[{re.escape(version)}\][^\n]*$", re.M),
+              re.compile(r"^##\s+\[Unreleased\][^\n]*$", re.M),
+          ]
+          start = None
+          for pat in want:
+              m = pat.search(src)
+              if m:
+                  start = m.end()
+                  break
+          if start is None:
+              body = f"Release {version}. See CHANGELOG.md for details."
+          else:
+              # Find the next `## ` header after our section start.
+              nxt = re.search(r"^##\s+", src[start:], re.M)
+              body = src[start:start + nxt.start()] if nxt else src[start:]
+              body = body.strip() or f"Release {version}."
+          pathlib.Path("release-notes.md").write_text(body, encoding="utf-8")
+          print(f"---- release notes ({len(body)} chars) ----")
+          print(body[:2000])
+          PY
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          # Tag name comes from the ref; explicit for clarity.
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: |
+            release/ironclaw-*.tar.gz
+            release/SHA256SUMS
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+# TODO(team-g): Apple notarization + signing is intentionally out of
+# scope for this workflow — see the brief. macOS users running the
+# unsigned binaries will see a Gatekeeper warning on first launch and
+# need to `xattr -d com.apple.quarantine <bin>` once. Worth a doc
+# follow-up before this gets handed to non-developers.
+#
+# TODO(team-g): aarch64-unknown-linux-gnu uses the apt
+# gcc-aarch64-linux-gnu cross-linker rather than `cross` — assumed
+# fine because no workspace crate currently invokes a C build script
+# that needs a full sysroot. If a future dependency (e.g. a new C-FFI
+# crate) breaks, swap to `cross build --target aarch64-unknown-linux-gnu`
+# or matrix this target onto `ubuntu-24.04-arm` if/when GitHub
+# stabilises native arm64 runners for public repos.

@@ -132,6 +132,18 @@ The three binaries land in `target/release/`. Add them to your PATH
 or run `./install.sh` from the checkout — it'll detect the local
 build and install to `~/.local/bin`.
 
+Tagged releases also ship prebuilt binary tarballs (Linux x86_64 /
+aarch64, macOS arm64 / x86_64) on the GitHub Releases page — one
+`.tar.gz` per target, plus a `SHA256SUMS` manifest:
+
+```
+https://github.com/phildougherty/ironclaw/releases/download/<TAG>/ironclaw-<TARGET>.tar.gz
+```
+
+`install.sh` resolves the right tarball for your platform
+automatically; downloading by hand is only useful for air-gapped or
+mirrored installs.
+
 ---
 
 ## Quickstart
