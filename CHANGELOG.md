@@ -8,6 +8,20 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `iclaw` with no subcommand now prints a one-shot operator dashboard
+  (install root, agent groups, wirings, active sessions, recent audit
+  + drop activity, 24h budget usage, and up to three heuristic
+  next-step suggestions). Fans out to existing read-only handlers in
+  parallel via `tokio::join!`; `--json` emits the same payload as a
+  single object. When the host socket is unreachable the dashboard
+  exits non-zero with a friendly "host not running" pointer.
+- `iclaw groups config edit <id>` — opens the container config as
+  TOML in `$EDITOR` (falls back to `$VISUAL`, then `vi`), diffs on
+  save, and applies the changes via the existing `groups.config.*`
+  socket commands. Supports `--dry-run` to preview the diff without
+  committing. Read-only fields (`agent_group_id`, `updated_at`) are
+  rendered as comments and ignored on save; TOML parse errors are
+  re-rendered inline with a `(r)etry / (a)bort` prompt.
 - Initial Rust workspace with 16 crates across the host, runner,
   providers, MCP server, modules, skills, container runtime, OneCLI
   gateway, iclaw admin client, and interactive setup.

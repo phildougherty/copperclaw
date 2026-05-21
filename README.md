@@ -45,17 +45,22 @@ approvals, and an `iclaw chat` REPL.
   container manager that reconciles per-session state across
   Stopped / Idle / Running with heartbeat-driven crash-restart and
   configurable idle-stop (5-minute default).
-- **Operator surface**: `iclaw health` (one-shot probe — session
-  breakdown by container_status, recent mutations, dropped-message
-  count), `iclaw audit list` (append-only mutation log;
-  truncated-args, latency_ms, caller kind), `iclaw usage` (per-
-  group token rollup from the `agent_turns` table the runner
+- **Operator surface**: `iclaw` with no args prints a one-shot
+  dashboard (groups, wirings, sessions, recent audit + drops,
+  budget usage, next-step suggestions) — see `Operator commands`
+  below. Other entry points: `iclaw health` (one-shot probe —
+  session breakdown by container_status, recent mutations,
+  dropped-message count), `iclaw audit list` (append-only mutation
+  log; truncated-args, latency_ms, caller kind), `iclaw usage`
+  (per-group token rollup from the `agent_turns` table the runner
   populates from provider `usage` events), `iclaw budgets set`
   (per-group `daily_token_cap`; manager refuses to spawn when
   today's tokens exceed the cap), `iclaw approvals approve`
   (persistent sender approval; gate consults the central `users`
-  table on every inbound), and `iclaw chat` (interactive REPL
-  against the install's cli channel).
+  table on every inbound), `iclaw groups config edit <id>`
+  (multi-field config edits via `$EDITOR` with TOML round-trip and
+  `--dry-run`), and `iclaw chat` (interactive REPL against the
+  install's cli channel).
 - **OneCLI gateway** for centralised credential issuance with full
   wiremock coverage of 401/404/409/429/5xx and `Retry-After`.
 - **`iclaw` admin client** over a Unix socket inside the host (46
@@ -115,9 +120,11 @@ ironclaw run
 # In another terminal — iclaw also resolves the install's socket
 # without configuration, so the commands Just Work from any cwd.
 iclaw quickstart cli --name first    # group + mg + wiring in one call
+iclaw                                 # one-shot operator dashboard
 iclaw status                          # full wiring digest
 iclaw health                          # operator probe (sessions, audit, drops)
 iclaw chat                            # interactive REPL against the cli channel
+iclaw groups config edit <id>         # multi-field config edit in $EDITOR
 iclaw usage --since 24h               # per-group token rollup
 iclaw audit list --since 1h           # mutations against the host socket
 ```

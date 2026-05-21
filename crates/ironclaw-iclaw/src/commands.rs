@@ -30,8 +30,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Top-level subcommand. When omitted, `iclaw` emits a one-shot
+    /// operator dashboard via the `composite.dashboard` marker. The
+    /// dashboard contract is in `crate::run_dashboard`.
     #[command(subcommand)]
-    pub command: TopCommand,
+    pub command: Option<TopCommand>,
 }
 
 impl Cli {
@@ -308,6 +311,18 @@ pub enum GroupConfigCmd {
         id: String,
         #[command(flatten)]
         which: PackageFlag,
+    },
+    /// Open the container config as TOML in `$EDITOR` (falls back to
+    /// `$VISUAL`, then `vi`). On save the diff is converted into one
+    /// `groups.config.update` (or dedicated mcp/package) call per
+    /// changed field. Read-only fields (`agent_group_id`, `updated_at`)
+    /// are rendered as comments and ignored if edited. Pass `--dry-run`
+    /// to print the diff without committing anything.
+    Edit {
+        id: String,
+        /// Skip the update step; just print what would change.
+        #[arg(long = "dry-run")]
+        dry_run: bool,
     },
 }
 
@@ -644,8 +659,14 @@ impl ParsedCall {
 
 impl Cli {
     /// Convert the parsed CLI invocation into the wire-level call shape.
+    ///
+    /// When no subcommand is supplied, emits the `composite.dashboard`
+    /// marker so [`crate::run_cli`] can dispatch the no-args dashboard.
     pub fn to_call(&self) -> ParsedCall {
-        self.command.to_call()
+        match &self.command {
+            Some(cmd) => cmd.to_call(),
+            None => ParsedCall::new("composite.dashboard", json!({})),
+        }
     }
 }
 
@@ -803,6 +824,10 @@ impl GroupConfigCmd {
             Self::RemovePackage { id, which } => {
                 ParsedCall::new("groups.config.remove-package", package_args(id, which))
             }
+            Self::Edit { id, dry_run } => ParsedCall::new(
+                "composite.groups.config-edit",
+                json!({"id": id, "dry_run": *dry_run}),
+            ),
         }
     }
 }
@@ -1297,6 +1322,25 @@ mod tests {
             "not-json",
         ]);
         assert_eq!(p.args, json!({"id":"id1","server":"not-json"}));
+    }
+
+    #[test]
+    fn groups_config_edit_emits_composite() {
+        let p = parse(&["iclaw", "groups", "config", "edit", "id1"]);
+        assert_eq!(p.command, "composite.groups.config-edit");
+        assert_eq!(p.args, json!({"id": "id1", "dry_run": false}));
+
+        let p = parse(&[
+            "iclaw", "groups", "config", "edit", "id1", "--dry-run",
+        ]);
+        assert_eq!(p.args, json!({"id": "id1", "dry_run": true}));
+    }
+
+    #[test]
+    fn no_subcommand_emits_dashboard_composite() {
+        let cli = Cli::try_parse_from(["iclaw"]).unwrap();
+        let p = cli.to_call();
+        assert_eq!(p.command, "composite.dashboard");
     }
 
     #[test]
