@@ -39,8 +39,9 @@ use ironclaw_db::central::CentralDb;
 use ironclaw_db::session::{open_inbound, SessionPaths};
 use ironclaw_db::tables::{container_configs, messages_in, sessions};
 use ironclaw_types::{AgentGroupId, ContainerStatus, Session, SessionStatus};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -117,6 +118,11 @@ pub struct ContainerManager {
     central: CentralDb,
     runtime: Arc<dyn ContainerRuntime>,
     cfg: ManagerConfig,
+    /// Dedup map: records when we last posted a rate-limit notification
+    /// for each group so we don't flood the channel every tick.
+    /// Keyed by `AgentGroupId`; value is the UTC time of the last
+    /// notification sent (minute OR hour cap, whichever fired).
+    rate_limit_notified: Mutex<HashMap<AgentGroupId, chrono::DateTime<chrono::Utc>>>,
 }
 
 impl ContainerManager {
@@ -131,6 +137,7 @@ impl ContainerManager {
             central,
             runtime,
             cfg,
+            rate_limit_notified: Mutex::new(HashMap::new()),
         }
     }
 
@@ -295,6 +302,20 @@ impl ContainerManager {
             return Ok(false);
         }
 
+        // Rate-limit gate. If the group has a per-minute or per-hour
+        // LLM-call cap and the trailing window count already meets/exceeds
+        // it, refuse to spawn and post a one-per-window notification to the
+        // inbound channel.
+        if let Some(msg) = self.rate_limit_message(session)? {
+            warn!(
+                session = %session.id.as_uuid(),
+                agent_group = %session.agent_group_id.as_uuid(),
+                "rate limit reached; spawn deferred"
+            );
+            self.maybe_post_rate_limit_notification(session, &msg);
+            return Ok(false);
+        }
+
         let cfg_row = container_configs::get(&self.central, session.agent_group_id)
             .map_err(ManagerError::Db)?;
         let runner_cfg = self.runner_config_for(session, cfg_row.as_ref());
@@ -361,6 +382,116 @@ impl ContainerManager {
         )
         .map_err(ManagerError::Db)?;
         Ok(used >= cap)
+    }
+
+    /// Returns `Some(notification_text)` when a rate cap has been reached,
+    /// `None` when both caps are clear (or unset).
+    ///
+    /// Checks per-minute cap first (tighter window), then per-hour.
+    /// The notification text is ready for in-channel delivery.
+    fn rate_limit_message(&self, session: &Session) -> Result<Option<String>, ManagerError> {
+        use ironclaw_db::tables::{agent_turns, group_budgets};
+        let Some(budget) = group_budgets::get(&self.central, session.agent_group_id)
+            .map_err(ManagerError::Db)?
+        else {
+            return Ok(None);
+        };
+
+        let ag_id = session.agent_group_id.as_uuid().to_string();
+        let now = chrono::Utc::now();
+
+        if let Some(cap) = budget.agent_turns_per_minute_cap {
+            let since = now - chrono::Duration::seconds(60);
+            let count = agent_turns::turns_since(&self.central, &ag_id, since)
+                .map_err(ManagerError::Db)?;
+            if count >= cap {
+                let resume_secs = 60
+                    - now
+                        .signed_duration_since(since)
+                        .num_seconds()
+                        .min(60);
+                let resume_secs = resume_secs.max(1);
+                return Ok(Some(format!(
+                    "Per-minute LLM rate limit reached for this agent \
+                     ({count} calls/minute). New requests resume in ~{resume_secs} seconds."
+                )));
+            }
+        }
+
+        if let Some(cap) = budget.agent_turns_per_hour_cap {
+            let since = now - chrono::Duration::seconds(3600);
+            let count = agent_turns::turns_since(&self.central, &ag_id, since)
+                .map_err(ManagerError::Db)?;
+            if count >= cap {
+                let resume_secs = 3600
+                    - now
+                        .signed_duration_since(since)
+                        .num_seconds()
+                        .min(3600);
+                let resume_secs = resume_secs.max(1);
+                return Ok(Some(format!(
+                    "Per-minute LLM rate limit reached for this agent \
+                     ({count} calls/hour). New requests resume in ~{resume_secs} seconds."
+                )));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Post a rate-limit notification to the inbound DB at most once per
+    /// cap window. Uses the `rate_limit_notified` map as the dedup key:
+    /// if we posted within the last 60 seconds, skip.
+    ///
+    /// The notification is a `MessageKind::System` row with the given text
+    /// written to the session's inbound DB, so the runner will surface it
+    /// back to the user on the next spawn (after the cap expires).
+    fn maybe_post_rate_limit_notification(&self, session: &Session, text: &str) {
+        let now = chrono::Utc::now();
+        let dedup_window = chrono::Duration::seconds(60);
+
+        {
+            let mut map = self.rate_limit_notified.lock().unwrap();
+            if let Some(last) = map.get(&session.agent_group_id) {
+                if now.signed_duration_since(*last) < dedup_window {
+                    return;
+                }
+            }
+            map.insert(session.agent_group_id, now);
+        }
+
+        // Write a system message into the session's inbound DB so the
+        // runner delivers it to the user.
+        let paths = SessionPaths::new(
+            &self.cfg.data_dir,
+            session.agent_group_id,
+            session.id,
+        );
+        let conn = match open_inbound(&paths) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(?e, "rate_limit_notify: could not open inbound db");
+                return;
+            }
+        };
+        let write = messages_in::WriteInbound {
+            id: ironclaw_types::MessageId::new(),
+            kind: ironclaw_types::MessageKind::System,
+            timestamp: now,
+            content: serde_json::json!({"text": text}),
+            trigger: false,
+            on_wake: false,
+            process_after: None,
+            recurrence: None,
+            series_id: None,
+            platform_id: None,
+            channel_type: None,
+            thread_id: None,
+            source_session_id: None,
+        };
+        if let Err(e) = messages_in::insert(&conn, &write) {
+            warn!(?e, "rate_limit_notify: could not write inbound system message");
+        }
     }
 
     fn has_pending_inbound(paths: &SessionPaths) -> Result<bool, ManagerError> {
@@ -914,5 +1045,213 @@ mod tests {
             .unwrap();
         let updated = sessions::get(&db, session.id).unwrap();
         assert!(matches!(updated.container_status, ContainerStatus::Stopped));
+    }
+
+    // ---- rate-limit gate --------------------------------------------------
+
+    /// Seed `count` recent `agent_turns` for the session's group.
+    fn seed_turns(db: &CentralDb, ag: AgentGroupId, count: usize) {
+        use ironclaw_db::tables::agent_turns::{insert, NewAgentTurn};
+        let now = chrono::Utc::now();
+        for i in 0..count {
+            #[allow(clippy::cast_possible_wrap)]
+            let seq = i as i64;
+            insert(
+                db,
+                &NewAgentTurn {
+                    session_id: "sess-test".into(),
+                    agent_group_id: ag.as_uuid().to_string(),
+                    seq,
+                    model: "claude-sonnet-4-6".into(),
+                    provider: "anthropic".into(),
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    started_at: now - chrono::Duration::seconds(5),
+                    ended_at: now - chrono::Duration::seconds(1),
+                    status: "ok".into(),
+                    error: None,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    /// Upsert a `group_budgets` row with only rate-limit caps set.
+    fn set_rate_caps(
+        db: &CentralDb,
+        ag: AgentGroupId,
+        per_min: Option<i64>,
+        per_hour: Option<i64>,
+    ) {
+        use ironclaw_db::tables::group_budgets::{upsert, UpsertGroupBudget};
+        upsert(
+            db,
+            UpsertGroupBudget {
+                agent_group_id: ag,
+                daily_token_cap: None,
+                daily_cost_cap: None,
+                agent_turns_per_minute_cap: per_min,
+                agent_turns_per_hour_cap: per_hour,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn rate_limit_message_none_when_caps_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        // No budget row at all.
+        assert!(mgr.rate_limit_message(&session).unwrap().is_none());
+        // Budget row with NULL caps.
+        set_rate_caps(&db, session.agent_group_id, None, None);
+        assert!(mgr.rate_limit_message(&session).unwrap().is_none());
+    }
+
+    #[test]
+    fn rate_limit_message_fires_on_per_minute_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        set_rate_caps(&db, session.agent_group_id, Some(3), None);
+        // 2 turns — under cap.
+        seed_turns(&db, session.agent_group_id, 2);
+        assert!(mgr.rate_limit_message(&session).unwrap().is_none());
+        // 3rd turn reaches the cap.
+        seed_turns(&db, session.agent_group_id, 1);
+        let msg = mgr.rate_limit_message(&session).unwrap();
+        assert!(msg.is_some());
+        let text = msg.unwrap();
+        assert!(text.contains("calls/minute"), "expected 'calls/minute' in: {text}");
+        assert!(text.contains('3'), "expected cap count in: {text}");
+    }
+
+    #[test]
+    fn rate_limit_message_fires_on_per_hour_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        // Only hour cap set; minute cap is None.
+        set_rate_caps(&db, session.agent_group_id, None, Some(5));
+        seed_turns(&db, session.agent_group_id, 5);
+        let msg = mgr.rate_limit_message(&session).unwrap();
+        assert!(msg.is_some());
+        let text = msg.unwrap();
+        assert!(text.contains("calls/hour"), "expected 'calls/hour' in: {text}");
+    }
+
+    #[tokio::test]
+    async fn tick_refuses_spawn_when_per_minute_cap_reached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let runtime = std::sync::Arc::new(crate::tests::NoopRuntime::default());
+        let mgr = ContainerManager::new(
+            db.clone(),
+            runtime.clone(),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        // Seed pending inbound so the manager would normally spawn.
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        let conn = open_inbound(&paths).unwrap();
+        messages_in::insert(
+            &conn,
+            &messages_in::WriteInbound {
+                id: ironclaw_types::MessageId::new(),
+                kind: ironclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "hi"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("stdin".into()),
+                channel_type: Some(ironclaw_types::ChannelType::new("cli")),
+                thread_id: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
+        // Set per-minute cap to 1 and seed 1 turn — cap is reached.
+        set_rate_caps(&db, session.agent_group_id, Some(1), None);
+        seed_turns(&db, session.agent_group_id, 1);
+        mgr.tick().await.unwrap();
+        // Container must NOT have been spawned.
+        let updated = sessions::get(&db, session.id).unwrap();
+        assert!(matches!(updated.container_status, ContainerStatus::Stopped));
+        assert!(runtime.spawn_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tick_refuses_spawn_when_per_hour_cap_reached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let runtime = std::sync::Arc::new(crate::tests::NoopRuntime::default());
+        let mgr = ContainerManager::new(
+            db.clone(),
+            runtime.clone(),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        let conn = open_inbound(&paths).unwrap();
+        messages_in::insert(
+            &conn,
+            &messages_in::WriteInbound {
+                id: ironclaw_types::MessageId::new(),
+                kind: ironclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "hi"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("stdin".into()),
+                channel_type: Some(ironclaw_types::ChannelType::new("cli")),
+                thread_id: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
+        // Only hour cap; minute cap is None.
+        set_rate_caps(&db, session.agent_group_id, None, Some(2));
+        seed_turns(&db, session.agent_group_id, 2);
+        mgr.tick().await.unwrap();
+        let updated = sessions::get(&db, session.id).unwrap();
+        assert!(matches!(updated.container_status, ContainerStatus::Stopped));
+        assert!(runtime.spawn_calls().is_empty());
+    }
+
+    #[test]
+    fn dedup_window_prevents_repeated_notifications() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        // Open (create) the inbound DB so it exists on disk.
+        let _conn = open_inbound(&paths).unwrap();
+
+        // First notification: should be written.
+        let msg = "test rate limit message";
+        mgr.maybe_post_rate_limit_notification(&session, msg);
+        // Verify by opening a fresh handle to the DB.
+        let verify = open_inbound(&paths).unwrap();
+        let count1: i64 = verify
+            .query_row("SELECT COUNT(*) FROM messages_in", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count1, 1, "first notification should have been written");
+
+        // Second notification immediately after: dedup should suppress it.
+        mgr.maybe_post_rate_limit_notification(&session, msg);
+        let count2: i64 = verify
+            .query_row("SELECT COUNT(*) FROM messages_in", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count2, 1, "second notification should have been suppressed");
     }
 }

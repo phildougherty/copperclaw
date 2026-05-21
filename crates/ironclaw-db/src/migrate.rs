@@ -38,6 +38,10 @@ const CENTRAL: &[Migration] = &[
         name: "006_group_budgets",
         sql: include_str!("../migrations/006_group_budgets.sql"),
     },
+    Migration {
+        name: "007_rate_limit_caps",
+        sql: include_str!("../migrations/007_rate_limit_caps.sql"),
+    },
 ];
 
 const SESSION_INBOUND: &[Migration] = &[Migration {
