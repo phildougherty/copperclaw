@@ -47,7 +47,7 @@ license = "MIT"
 rust-version = "1.85"
 version = "0.1.0"
 authors = ["Ironclaw Contributors"]
-repository = "https://github.com/example/ironclaw"
+repository = "https://github.com/phildougherty/ironclaw"
 
 [workspace.dependencies]
 ironclaw-types          = { path = "crates/ironclaw-types" }
