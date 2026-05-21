@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use ironclaw_db::session::{open_inbound_ro_no_mmap, open_outbound, SessionPaths};
+use ironclaw_db::session::{open_inbound_rw_no_mmap, open_outbound, SessionPaths};
 use ironclaw_providers::AnthropicProvider;
 use ironclaw_runner::{
     compaction::CompactionCfg, run_loop, RunnerConfig, RunnerDeps, RunnerToolCtx,
@@ -55,7 +55,7 @@ async fn main() -> Result<()> {
     };
     paths.ensure_dirs().context("ensure session dir tree")?;
 
-    let inbound = open_inbound_ro_no_mmap(&paths).context("open inbound.db (ro)")?;
+    let inbound = open_inbound_rw_no_mmap(&paths).context("open inbound.db (rw)")?;
     let outbound = open_outbound(&paths).context("open outbound.db (rw)")?;
 
     let inbound = Arc::new(Mutex::new(inbound));

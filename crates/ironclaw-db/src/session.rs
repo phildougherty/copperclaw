@@ -113,6 +113,23 @@ pub fn open_inbound_ro_no_mmap(paths: &SessionPaths) -> Result<Connection, DbErr
     Ok(conn)
 }
 
+/// Open `inbound.db` read-write with mmap disabled. Used by the
+/// container poll loop when it needs to update `messages_in.status`
+/// (mark completed / failed) after a successful turn. Same no-mmap
+/// gymnastics as [`open_inbound_ro_no_mmap`] — WAL + mmap doesn't
+/// propagate writes across a bind mount, so we stay in DELETE mode.
+pub fn open_inbound_rw_no_mmap(paths: &SessionPaths) -> Result<Connection, DbError> {
+    let conn = Connection::open_with_flags(
+        &paths.inbound_db,
+        OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )?;
+    conn.execute_batch(
+        "PRAGMA mmap_size=0;
+         PRAGMA busy_timeout=5000;",
+    )?;
+    Ok(conn)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

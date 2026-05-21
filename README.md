@@ -56,7 +56,10 @@ the final M11 deliverable.
   `ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1`). The host's
   container manager spawns a runner-in-container per session, the
   runner reads inbound.db, calls the provider, writes outbound.db,
-  and the delivery loop fans the reply back via the cli channel.
+  marks the inbound completed, and the delivery loop fans the reply
+  back via the cli channel. Verified live: typed
+  `What's the capital of France? One word only.` into the host's
+  stdin, got back `agent> Paris` in ~1s.
 
 ## Build
 

@@ -202,7 +202,8 @@ pub async fn run_host(
             .into(),
     };
 
-    // 6. Orphan cleanup (best effort).
+    // 6. Orphan cleanup (best effort). Removes any leftover session
+    // containers from a previous host process.
     if let Err(err) = cleanup_orphans(runtime.as_ref(), &cfg.install_slug).await {
         warn!(?err, "orphan cleanup failed; continuing boot");
     }
@@ -221,6 +222,27 @@ pub async fn run_host(
 
     // 9. Assemble core services.
     let state = assemble(&cfg, adapters)?;
+
+    // 9b. Reset stale `container_status=running` rows. After the orphan
+    // cleanup above, the previous-run's containers no longer exist,
+    // but the sessions table may still claim they're alive. Without
+    // this reset the container manager skips those sessions forever
+    // because it only spawns for `container_status=stopped`.
+    if let Ok(running) = ironclaw_db::tables::sessions::list_running(&state.central) {
+        for s in &running {
+            if let Err(err) =
+                ironclaw_db::tables::sessions::mark_container_stopped(&state.central, s.id)
+            {
+                warn!(session = %s.id.as_uuid(), ?err, "reset to stopped failed");
+            }
+        }
+        if !running.is_empty() {
+            info!(
+                count = running.len(),
+                "reset stale running sessions after orphan cleanup"
+            );
+        }
+    }
 
     // 10. Install modules.
     let host_ctx = HostContext::for_router(Arc::clone(&state.router), Arc::clone(&state.delivery));
