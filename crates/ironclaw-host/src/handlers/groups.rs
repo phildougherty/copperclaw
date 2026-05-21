@@ -160,6 +160,9 @@ pub fn config_update(args: &Value, central: &CentralDb) -> Result<Value, ErrorPa
             packages_npm: existing.packages_npm,
             additional_mounts: existing.additional_mounts,
             cli_scope: existing.cli_scope,
+            config_fingerprint: existing.config_fingerprint,
+            egress_allow: existing.egress_allow,
+            resource_limits: existing.resource_limits,
         },
     )
     .map_err(db_err)?;
@@ -243,6 +246,74 @@ pub fn config_remove_package(args: &Value, central: &CentralDb) -> Result<Value,
     Ok(json!({"removed": {"kind": kind, "name": name}}))
 }
 
+/// `groups.config.set-egress-allow`
+pub fn config_set_egress_allow(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
+    let id = parse_agent_group_id(args, "id")?;
+    let allow_val = args
+        .get("allow")
+        .cloned()
+        .ok_or_else(|| ErrorPayload::new("bad_request", "missing `allow` array"))?;
+    let allow: Vec<String> = allow_val
+        .as_array()
+        .ok_or_else(|| ErrorPayload::new("bad_request", "`allow` must be a JSON array"))?
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| ErrorPayload::new("bad_request", "`allow` entries must be strings"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    // Validate each entry looks like "host:port".
+    for entry in &allow {
+        validate_egress_entry(entry)?;
+    }
+    ensure_config_row(central, id)?;
+    container_configs::set_egress_allow(central, id, &allow).map_err(db_err)?;
+    Ok(serde_json::json!({"egress_allow": allow}))
+}
+
+/// `groups.config.set-resource-limits`
+pub fn config_set_resource_limits(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
+    let id = parse_agent_group_id(args, "id")?;
+    let limits = args
+        .get("limits")
+        .cloned()
+        .ok_or_else(|| ErrorPayload::new("bad_request", "missing `limits` object"))?;
+    if !limits.is_object() {
+        return Err(ErrorPayload::new("bad_request", "`limits` must be a JSON object"));
+    }
+    // Validate via ResourceLimits::from_json to catch bad types eagerly.
+    ironclaw_container_rt::ResourceLimits::from_json(&limits)
+        .map_err(|e| ErrorPayload::new("bad_request", e))?;
+    ensure_config_row(central, id)?;
+    container_configs::set_resource_limits(central, id, &limits).map_err(db_err)?;
+    Ok(serde_json::json!({"resource_limits": limits}))
+}
+
+/// Validate that an egress entry is a `"host:port"` pair where port is a
+/// valid TCP/UDP port number (1–65535).
+fn validate_egress_entry(entry: &str) -> Result<(), ErrorPayload> {
+    let (_, port_str) = entry.rsplit_once(':').ok_or_else(|| {
+        ErrorPayload::new(
+            "bad_request",
+            format!("egress entry `{entry}` must be in `host:port` format"),
+        )
+    })?;
+    let port: u32 = port_str.parse().map_err(|_| {
+        ErrorPayload::new(
+            "bad_request",
+            format!("egress entry `{entry}` has an invalid port `{port_str}`"),
+        )
+    })?;
+    if port == 0 || port > 65535 {
+        return Err(ErrorPayload::new(
+            "bad_request",
+            format!("egress entry `{entry}` port must be 1–65535"),
+        ));
+    }
+    Ok(())
+}
+
 fn default_config(id: AgentGroupId) -> container_configs::ContainerConfig {
     container_configs::ContainerConfig {
         agent_group_id: id,
@@ -258,6 +329,9 @@ fn default_config(id: AgentGroupId) -> container_configs::ContainerConfig {
         packages_npm: Vec::new(),
         additional_mounts: Value::Object(serde_json::Map::new()),
         cli_scope: container_configs::CliScope::Disabled,
+        config_fingerprint: None,
+        egress_allow: Vec::new(),
+        resource_limits: Value::Object(serde_json::Map::new()),
         updated_at: chrono::Utc::now(),
     }
 }
@@ -281,6 +355,9 @@ fn ensure_config_row(central: &CentralDb, id: AgentGroupId) -> Result<(), ErrorP
                 packages_npm: row.packages_npm,
                 additional_mounts: row.additional_mounts,
                 cli_scope: row.cli_scope,
+                config_fingerprint: row.config_fingerprint,
+                egress_allow: row.egress_allow,
+                resource_limits: row.resource_limits,
             },
         )
         .map_err(db_err)?;
@@ -312,6 +389,9 @@ fn container_config_to_json(c: &container_configs::ContainerConfig) -> Value {
         "packages_npm": c.packages_npm,
         "additional_mounts": c.additional_mounts,
         "cli_scope": c.cli_scope,
+        "config_fingerprint": c.config_fingerprint,
+        "egress_allow": c.egress_allow,
+        "resource_limits": c.resource_limits,
         "updated_at": c.updated_at.to_rfc3339(),
     })
 }
@@ -659,6 +739,161 @@ mod tests {
         let g = make_group(&db, "g");
         let err = config_remove_package(
             &json!({"id": g.id.as_uuid().to_string(), "kind": "snap", "name": "x"}),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+    }
+
+    #[test]
+    fn config_set_egress_allow_valid_entries() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let v = config_set_egress_allow(
+            &json!({
+                "id": g.id.as_uuid().to_string(),
+                "allow": ["api.example.com:443", "db.local:5432"]
+            }),
+            &db,
+        )
+        .unwrap();
+        let allow = v["egress_allow"].as_array().unwrap();
+        assert_eq!(allow.len(), 2);
+        assert_eq!(allow[0], "api.example.com:443");
+    }
+
+    #[test]
+    fn config_set_egress_allow_empty_clears_list() {
+        let db = db();
+        let g = make_group(&db, "g");
+        // First set something.
+        config_set_egress_allow(
+            &json!({"id": g.id.as_uuid().to_string(), "allow": ["x.local:80"]}),
+            &db,
+        )
+        .unwrap();
+        // Then clear.
+        let v = config_set_egress_allow(
+            &json!({"id": g.id.as_uuid().to_string(), "allow": []}),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["egress_allow"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn config_set_egress_allow_rejects_missing_port() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let err = config_set_egress_allow(
+            &json!({"id": g.id.as_uuid().to_string(), "allow": ["no-port"]}),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+    }
+
+    #[test]
+    fn config_set_egress_allow_rejects_port_zero() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let err = config_set_egress_allow(
+            &json!({"id": g.id.as_uuid().to_string(), "allow": ["host:0"]}),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+    }
+
+    #[test]
+    fn config_set_egress_allow_rejects_port_too_large() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let err = config_set_egress_allow(
+            &json!({"id": g.id.as_uuid().to_string(), "allow": ["host:99999"]}),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+    }
+
+    #[test]
+    fn config_set_egress_allow_requires_allow_key() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let err = config_set_egress_allow(
+            &json!({"id": g.id.as_uuid().to_string()}),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+    }
+
+    #[test]
+    fn config_set_resource_limits_full() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let v = config_set_resource_limits(
+            &json!({
+                "id": g.id.as_uuid().to_string(),
+                "limits": {"cpus": "1.5", "memory_mb": 512u64, "pids_limit": 256u64}
+            }),
+            &db,
+        )
+        .unwrap();
+        let lim = &v["resource_limits"];
+        assert_eq!(lim["cpus"], "1.5");
+        assert_eq!(lim["memory_mb"], 512);
+        assert_eq!(lim["pids_limit"], 256);
+    }
+
+    #[test]
+    fn config_set_resource_limits_empty_clears() {
+        let db = db();
+        let g = make_group(&db, "g");
+        config_set_resource_limits(
+            &json!({"id": g.id.as_uuid().to_string(), "limits": {"memory_mb": 256u64}}),
+            &db,
+        )
+        .unwrap();
+        let v = config_set_resource_limits(
+            &json!({"id": g.id.as_uuid().to_string(), "limits": {}}),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["resource_limits"], json!({}));
+    }
+
+    #[test]
+    fn config_set_resource_limits_rejects_bad_cpus_type() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let err = config_set_resource_limits(
+            &json!({"id": g.id.as_uuid().to_string(), "limits": {"cpus": 1}}),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+    }
+
+    #[test]
+    fn config_set_resource_limits_rejects_non_object_limits() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let err = config_set_resource_limits(
+            &json!({"id": g.id.as_uuid().to_string(), "limits": "big"}),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+    }
+
+    #[test]
+    fn config_set_resource_limits_requires_limits_key() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let err = config_set_resource_limits(
+            &json!({"id": g.id.as_uuid().to_string()}),
             &db,
         )
         .unwrap_err();

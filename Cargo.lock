@@ -1780,6 +1780,7 @@ name = "ironclaw-db"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "hex",
  "ironclaw-types",
  "libc",
  "r2d2",
@@ -1787,6 +1788,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",

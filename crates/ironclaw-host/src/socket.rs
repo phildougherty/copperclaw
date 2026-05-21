@@ -122,6 +122,16 @@ pub fn build_dispatch_table() -> DispatchTable {
         handlers::groups::config_remove_package,
         true
     );
+    ins!(
+        "groups.config.set-egress-allow",
+        handlers::groups::config_set_egress_allow,
+        true
+    );
+    ins!(
+        "groups.config.set-resource-limits",
+        handlers::groups::config_set_resource_limits,
+        true
+    );
 
     ins!("messaging-groups.list", handlers::messaging_groups::list, false);
     ins!("messaging-groups.get", handlers::messaging_groups::get, false);

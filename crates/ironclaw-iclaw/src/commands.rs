@@ -309,6 +309,37 @@ pub enum GroupConfigCmd {
         #[command(flatten)]
         which: PackageFlag,
     },
+    /// Set (or replace) the egress allow-list for this group.
+    ///
+    /// Each entry must be a `host:port` pair (e.g. `api.example.com:443`).
+    /// Passing no `--allow` arguments clears the list, restoring the
+    /// default allow-all policy.
+    #[command(name = "set-egress-allow")]
+    SetEgressAllow {
+        id: String,
+        /// Host:port entries to allow. May be repeated. Pass no `--allow`
+        /// flags to clear the list.
+        #[arg(long = "allow", num_args = 0..)]
+        allow: Vec<String>,
+    },
+    /// Set (or replace) the per-group resource caps.
+    ///
+    /// All flags are optional. To clear an existing cap, omit its flag.
+    /// Docker runtime: --cpus / --memory / --pids-limit applied at spawn.
+    /// Apple Container runtime: returns an error if any limit is set.
+    #[command(name = "set-resource-limits")]
+    SetResourceLimits {
+        id: String,
+        /// CPU quota as a fraction of one CPU (e.g. `1.5` for 1.5 CPUs).
+        #[arg(long)]
+        cpus: Option<String>,
+        /// Memory cap in mebibytes (e.g. `512` for 512 MiB).
+        #[arg(long)]
+        memory_mb: Option<u64>,
+        /// Maximum number of processes the container may create.
+        #[arg(long)]
+        pids_limit: Option<u64>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -803,6 +834,35 @@ impl GroupConfigCmd {
             Self::RemovePackage { id, which } => {
                 ParsedCall::new("groups.config.remove-package", package_args(id, which))
             }
+            Self::SetEgressAllow { id, allow } => {
+                let allow_json: Vec<Value> =
+                    allow.iter().map(|s| Value::String(s.clone())).collect();
+                ParsedCall::new(
+                    "groups.config.set-egress-allow",
+                    json!({"id": id, "allow": Value::Array(allow_json)}),
+                )
+            }
+            Self::SetResourceLimits {
+                id,
+                cpus,
+                memory_mb,
+                pids_limit,
+            } => {
+                let mut limits = Map::new();
+                if let Some(c) = cpus {
+                    limits.insert("cpus".into(), c.clone().into());
+                }
+                if let Some(m) = memory_mb {
+                    limits.insert("memory_mb".into(), (*m).into());
+                }
+                if let Some(p) = pids_limit {
+                    limits.insert("pids_limit".into(), (*p).into());
+                }
+                ParsedCall::new(
+                    "groups.config.set-resource-limits",
+                    json!({"id": id, "limits": Value::Object(limits)}),
+                )
+            }
         }
     }
 }
@@ -1124,6 +1184,8 @@ pub const ALL_COMMANDS: &[&str] = &[
     "groups.config.remove-mcp-server",
     "groups.config.add-package",
     "groups.config.remove-package",
+    "groups.config.set-egress-allow",
+    "groups.config.set-resource-limits",
     "messaging-groups.list",
     "messaging-groups.get",
     "messaging-groups.create",
@@ -1368,6 +1430,83 @@ mod tests {
         ]);
         // clap will reject both being set when group has multiple=false.
         assert!(err.to_string().contains("cannot be used") || err.to_string().contains("conflict"));
+    }
+
+    // --- groups config set-egress-allow ------------------------------------
+
+    #[test]
+    fn groups_config_set_egress_allow_with_entries() {
+        let p = parse(&[
+            "iclaw",
+            "groups",
+            "config",
+            "set-egress-allow",
+            "id1",
+            "--allow",
+            "api.example.com:443",
+            "--allow",
+            "db.local:5432",
+        ]);
+        assert_eq!(p.command, "groups.config.set-egress-allow");
+        assert_eq!(
+            p.args,
+            json!({"id": "id1", "allow": ["api.example.com:443", "db.local:5432"]})
+        );
+    }
+
+    #[test]
+    fn groups_config_set_egress_allow_empty_clears() {
+        let p = parse(&[
+            "iclaw", "groups", "config", "set-egress-allow", "id1",
+        ]);
+        assert_eq!(p.command, "groups.config.set-egress-allow");
+        assert_eq!(p.args, json!({"id": "id1", "allow": []}));
+    }
+
+    // --- groups config set-resource-limits ---------------------------------
+
+    #[test]
+    fn groups_config_set_resource_limits_full() {
+        let p = parse(&[
+            "iclaw",
+            "groups",
+            "config",
+            "set-resource-limits",
+            "id1",
+            "--cpus",
+            "1.5",
+            "--memory-mb",
+            "512",
+            "--pids-limit",
+            "256",
+        ]);
+        assert_eq!(p.command, "groups.config.set-resource-limits");
+        assert_eq!(
+            p.args,
+            json!({
+                "id": "id1",
+                "limits": {"cpus": "1.5", "memory_mb": 512u64, "pids_limit": 256u64}
+            })
+        );
+    }
+
+    #[test]
+    fn groups_config_set_resource_limits_partial_cpus_only() {
+        let p = parse(&[
+            "iclaw", "groups", "config", "set-resource-limits", "id1",
+            "--cpus", "2.0",
+        ]);
+        assert_eq!(p.command, "groups.config.set-resource-limits");
+        assert_eq!(p.args, json!({"id": "id1", "limits": {"cpus": "2.0"}}));
+    }
+
+    #[test]
+    fn groups_config_set_resource_limits_empty_clears() {
+        let p = parse(&[
+            "iclaw", "groups", "config", "set-resource-limits", "id1",
+        ]);
+        assert_eq!(p.command, "groups.config.set-resource-limits");
+        assert_eq!(p.args, json!({"id": "id1", "limits": {}}));
     }
 
     // --- messaging-groups --------------------------------------------------
@@ -1806,6 +1945,8 @@ mod tests {
                 "--npm",
                 "p",
             ],
+            &["iclaw", "groups", "config", "set-egress-allow", "x"],
+            &["iclaw", "groups", "config", "set-resource-limits", "x"],
             &["iclaw", "messaging-groups", "list"],
             &["iclaw", "messaging-groups", "get", "x"],
             &[
