@@ -740,18 +740,27 @@ pub enum ApprovalsCmd {
     },
 }
 
-/// `iclaw budgets ...` — per-agent-group daily caps.
+/// `iclaw budgets ...` — per-agent-group daily and rate-limit caps.
 #[derive(Debug, Subcommand)]
 pub enum BudgetsCmd {
-    /// List all configured budgets.
+    /// List all configured budgets (daily token cap + rate caps).
     List,
-    /// Set or update a group's daily token cap. `--daily-tokens 0`
-    /// or `--clear` removes the cap.
+    /// Set or update a group's caps.
+    ///
+    /// `--daily-tokens 0` or `--clear` removes the daily token cap.
+    /// `--turns-per-minute 0` removes the per-minute rate cap.
+    /// `--turns-per-hour 0` removes the per-hour rate cap.
     Set {
         #[arg(long)]
         agent_group_id: String,
         #[arg(long)]
         daily_tokens: Option<i64>,
+        /// Max LLM calls per trailing 60-second window. 0 = remove cap.
+        #[arg(long)]
+        turns_per_minute: Option<i64>,
+        /// Max LLM calls per trailing 3600-second window. 0 = remove cap.
+        #[arg(long)]
+        turns_per_hour: Option<i64>,
         #[arg(long)]
         clear: bool,
     },
@@ -1327,6 +1336,8 @@ impl BudgetsCmd {
             Self::Set {
                 agent_group_id,
                 daily_tokens,
+                turns_per_minute,
+                turns_per_hour,
                 clear,
             } => {
                 let mut o = Map::new();
@@ -1335,6 +1346,13 @@ impl BudgetsCmd {
                     o.insert("daily_tokens".into(), Value::Null);
                 } else if let Some(n) = daily_tokens {
                     o.insert("daily_tokens".into(), (*n).into());
+                }
+                // 0 means "remove the cap" (normalised to null by the host).
+                if let Some(n) = turns_per_minute {
+                    o.insert("turns_per_minute".into(), (*n).into());
+                }
+                if let Some(n) = turns_per_hour {
+                    o.insert("turns_per_hour".into(), (*n).into());
                 }
                 ParsedCall::new("budgets.set", Value::Object(o))
             }
@@ -2207,6 +2225,10 @@ mod tests {
                 "ag-1",
                 "--daily-tokens",
                 "10000",
+                "--turns-per-minute",
+                "5",
+                "--turns-per-hour",
+                "60",
             ],
             &["iclaw", "usage"],
             &["iclaw", "schema-version"],
@@ -2330,5 +2352,73 @@ mod tests {
     #[test]
     fn schema_version_is_in_all_commands() {
         assert!(ALL_COMMANDS.contains(&"schema.version"));
+    }
+
+    // --- budgets rate-limit flags ------------------------------------------
+
+    #[test]
+    fn budgets_set_accepts_turns_per_minute() {
+        let p = parse(&[
+            "iclaw",
+            "budgets",
+            "set",
+            "--agent-group-id",
+            "ag-1",
+            "--turns-per-minute",
+            "10",
+        ]);
+        assert_eq!(p.command, "budgets.set");
+        assert_eq!(p.args["agent_group_id"], "ag-1");
+        assert_eq!(p.args["turns_per_minute"], 10);
+        assert!(p.args.get("daily_tokens").is_none());
+    }
+
+    #[test]
+    fn budgets_set_accepts_turns_per_hour() {
+        let p = parse(&[
+            "iclaw",
+            "budgets",
+            "set",
+            "--agent-group-id",
+            "ag-1",
+            "--turns-per-hour",
+            "120",
+        ]);
+        assert_eq!(p.command, "budgets.set");
+        assert_eq!(p.args["turns_per_hour"], 120);
+    }
+
+    #[test]
+    fn budgets_set_accepts_all_caps_together() {
+        let p = parse(&[
+            "iclaw",
+            "budgets",
+            "set",
+            "--agent-group-id",
+            "ag-1",
+            "--daily-tokens",
+            "50000",
+            "--turns-per-minute",
+            "5",
+            "--turns-per-hour",
+            "60",
+        ]);
+        assert_eq!(p.args["daily_tokens"], 50000);
+        assert_eq!(p.args["turns_per_minute"], 5);
+        assert_eq!(p.args["turns_per_hour"], 60);
+    }
+
+    #[test]
+    fn budgets_set_zero_turns_per_minute_emits_zero() {
+        let p = parse(&[
+            "iclaw",
+            "budgets",
+            "set",
+            "--agent-group-id",
+            "ag-1",
+            "--turns-per-minute",
+            "0",
+        ]);
+        assert_eq!(p.args["turns_per_minute"], 0);
     }
 }

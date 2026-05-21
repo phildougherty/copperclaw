@@ -141,6 +141,13 @@ pub struct ContainerManager {
     last_budget_notice: std::sync::Mutex<
         std::collections::HashMap<AgentGroupId, chrono::DateTime<chrono::Utc>>,
     >,
+    /// Same shape as `last_budget_notice` but for per-minute /
+    /// per-hour LLM rate-limit notifications. Keyed by
+    /// `AgentGroupId`; value is the UTC time of the last
+    /// notification sent (minute OR hour cap, whichever fired).
+    rate_limit_notified: std::sync::Mutex<
+        std::collections::HashMap<AgentGroupId, chrono::DateTime<chrono::Utc>>,
+    >,
 }
 
 impl ContainerManager {
@@ -156,6 +163,7 @@ impl ContainerManager {
             runtime,
             cfg,
             last_budget_notice: std::sync::Mutex::new(std::collections::HashMap::new()),
+            rate_limit_notified: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -331,6 +339,21 @@ impl ContainerManager {
             return Ok(false);
         }
 
+        // Rate-limit gate. If the group has a per-minute or per-hour
+        // LLM-call cap and the trailing window count already meets/exceeds
+        // it, refuse to spawn and post a one-per-window in-channel reply.
+        if let Some(msg) = self.rate_limit_message(session)? {
+            warn!(
+                session = %session.id.as_uuid(),
+                agent_group = %session.agent_group_id.as_uuid(),
+                "rate limit reached; spawn deferred"
+            );
+            if let Err(err) = self.maybe_post_rate_limit_reply(session, &paths, &msg) {
+                warn!(?err, "could not post rate-limit reply");
+            }
+            return Ok(false);
+        }
+
         let cfg_row = container_configs::get(&self.central, session.agent_group_id)
             .map_err(ManagerError::Db)?;
         let runner_cfg = self.runner_config_for(session, cfg_row.as_ref());
@@ -448,6 +471,12 @@ impl ContainerManager {
     /// follow-up if they're still chatting an hour later.
     const BUDGET_NOTICE_WINDOW_SECS: i64 = 3600;
 
+    /// Dedup window for the rate-limit gate. Shorter than the budget
+    /// window because the cap itself recovers on a minute / hour
+    /// cadence — a user retrying after the cap clears should not be
+    /// suppressed.
+    const RATE_LIMIT_NOTICE_WINDOW_SECS: i64 = 60;
+
     /// When the budget gate refuses to spawn, post an in-channel
     /// reply telling the user the cap is hit and when it resets.
     /// Dedups per agent-group via [`Self::last_budget_notice`]; logs
@@ -462,42 +491,9 @@ impl ContainerManager {
         session: &Session,
         paths: &SessionPaths,
     ) -> Result<(), ManagerError> {
-        // Dedup gate — quickly return when we already notified this
-        // group recently. Hold the mutex only for the read so we
-        // don't hold it across the DB writes below.
-        let now = chrono::Utc::now();
-        {
-            let mut state = self.last_budget_notice.lock().expect("budget-notice mutex poisoned");
-            if let Some(prev) = state.get(&session.agent_group_id) {
-                let elapsed = now.signed_duration_since(*prev).num_seconds();
-                if elapsed.abs() < Self::BUDGET_NOTICE_WINDOW_SECS {
-                    return Ok(());
-                }
-            }
-            // Set the marker *before* doing the work. If the post
-            // fails we'll still log a warning; we accept that one
-            // notice may be lost in exchange for never spamming.
-            state.insert(session.agent_group_id, now);
-        }
-
-        // Resolve where the reply should go. The router writes
-        // `(channel_type, platform_id, thread_id)` into the per-
-        // session `session_routing` table on first inbound; without
-        // it we have nowhere to address the reply.
-        let routing = {
-            let conn = open_inbound(paths).map_err(ManagerError::Db)?;
-            ironclaw_db::tables::session_routing::read(&conn).map_err(ManagerError::Db)?
-        };
-        let Some(routing) = routing else {
-            warn!(
-                session = %session.id.as_uuid(),
-                "budget-exhausted notice skipped: no session_routing target",
-            );
-            return Ok(());
-        };
-
         // Compute next midnight UTC so the reply tells the user when
         // the cap resets.
+        let now = chrono::Utc::now();
         let next_reset = (now.date_naive() + chrono::Duration::days(1))
             .and_hms_opt(0, 0, 0)
             .expect("00:00:00 is always valid")
@@ -507,9 +503,121 @@ impl ContainerManager {
 Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> --daily-tokens N`.",
             next_reset.format("%Y-%m-%d %H:%M"),
         );
+        self.post_cap_reply(
+            session,
+            paths,
+            &text,
+            &self.last_budget_notice,
+            Self::BUDGET_NOTICE_WINDOW_SECS,
+            "budget-exhausted",
+        )
+    }
 
-        // Use `Chat` kind so the delivery loop routes via the
-        // channel adapter rather than the system-action registry.
+    /// Returns `Some(notification_text)` when a per-minute or per-hour
+    /// LLM rate cap has been reached, `None` when both caps are clear
+    /// (or unset). Used by the spawn gate to short-circuit before
+    /// calling the runtime and to derive the message for the
+    /// in-channel notification.
+    fn rate_limit_message(&self, session: &Session) -> Result<Option<String>, ManagerError> {
+        use ironclaw_db::tables::{agent_turns, group_budgets};
+        let Some(budget) = group_budgets::get(&self.central, session.agent_group_id)
+            .map_err(ManagerError::Db)?
+        else {
+            return Ok(None);
+        };
+        let ag_id = session.agent_group_id.as_uuid().to_string();
+        let now = chrono::Utc::now();
+
+        if let Some(cap) = budget.agent_turns_per_minute_cap {
+            let since = now - chrono::Duration::seconds(60);
+            let count = agent_turns::turns_since(&self.central, &ag_id, since)
+                .map_err(ManagerError::Db)?;
+            if count >= cap {
+                return Ok(Some(format!(
+                    "Per-minute LLM rate limit reached for this agent \
+                     ({count} calls in the last minute, cap is {cap}). \
+                     New requests resume within a minute. \
+                     Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> --turns-per-minute N`."
+                )));
+            }
+        }
+
+        if let Some(cap) = budget.agent_turns_per_hour_cap {
+            let since = now - chrono::Duration::seconds(3600);
+            let count = agent_turns::turns_since(&self.central, &ag_id, since)
+                .map_err(ManagerError::Db)?;
+            if count >= cap {
+                return Ok(Some(format!(
+                    "Per-hour LLM rate limit reached for this agent \
+                     ({count} calls in the last hour, cap is {cap}). \
+                     New requests resume within the hour. \
+                     Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> --turns-per-hour N`."
+                )));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Same dispatch path as the budget-exhausted reply, but with the
+    /// dedup map keyed off [`Self::rate_limit_notified`] and a shorter
+    /// window so a user retrying after the cap clears isn't silenced.
+    fn maybe_post_rate_limit_reply(
+        &self,
+        session: &Session,
+        paths: &SessionPaths,
+        text: &str,
+    ) -> Result<(), ManagerError> {
+        self.post_cap_reply(
+            session,
+            paths,
+            text,
+            &self.rate_limit_notified,
+            Self::RATE_LIMIT_NOTICE_WINDOW_SECS,
+            "rate-limit",
+        )
+    }
+
+    /// Shared body for the cap-reply paths. Holds the dedup mutex
+    /// only across the lookup + insert, then writes a Chat-kind
+    /// outbound row routed via `session_routing` so the delivery
+    /// loop dispatches it through the channel adapter.
+    fn post_cap_reply(
+        &self,
+        session: &Session,
+        paths: &SessionPaths,
+        text: &str,
+        dedup: &std::sync::Mutex<
+            std::collections::HashMap<AgentGroupId, chrono::DateTime<chrono::Utc>>,
+        >,
+        window_secs: i64,
+        label: &'static str,
+    ) -> Result<(), ManagerError> {
+        let now = chrono::Utc::now();
+        {
+            let mut state = dedup.lock().expect("cap-reply dedup mutex poisoned");
+            if let Some(prev) = state.get(&session.agent_group_id) {
+                let elapsed = now.signed_duration_since(*prev).num_seconds();
+                if elapsed.abs() < window_secs {
+                    return Ok(());
+                }
+            }
+            state.insert(session.agent_group_id, now);
+        }
+
+        let routing = {
+            let conn = open_inbound(paths).map_err(ManagerError::Db)?;
+            ironclaw_db::tables::session_routing::read(&conn).map_err(ManagerError::Db)?
+        };
+        let Some(routing) = routing else {
+            warn!(
+                session = %session.id.as_uuid(),
+                kind = label,
+                "cap notice skipped: no session_routing target",
+            );
+            return Ok(());
+        };
+
         let outbound = open_outbound(paths).map_err(ManagerError::Db)?;
         let row = ironclaw_db::tables::messages_out::WriteOutbound {
             id: ironclaw_types::MessageId::new(),
@@ -528,7 +636,8 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
             session = %session.id.as_uuid(),
             agent_group = %session.agent_group_id.as_uuid(),
             channel_type = ?routing.channel_type,
-            "posted budget-exhausted reply to original sender"
+            kind = label,
+            "posted cap reply to original sender"
         );
         Ok(())
     }
@@ -1557,9 +1666,63 @@ mod tests {
                 agent_group_id: ag,
                 daily_token_cap: Some(cap),
                 daily_cost_cap: None,
+                agent_turns_per_minute_cap: None,
+                agent_turns_per_hour_cap: None,
             },
         )
         .unwrap();
+    }
+
+    /// Upsert a `group_budgets` row with only the per-minute / per-hour
+    /// rate caps set. Used by the rate-limit tests.
+    fn set_rate_caps(
+        db: &CentralDb,
+        ag: AgentGroupId,
+        per_min: Option<i64>,
+        per_hour: Option<i64>,
+    ) {
+        use ironclaw_db::tables::group_budgets::{upsert, UpsertGroupBudget};
+        upsert(
+            db,
+            UpsertGroupBudget {
+                agent_group_id: ag,
+                daily_token_cap: None,
+                daily_cost_cap: None,
+                agent_turns_per_minute_cap: per_min,
+                agent_turns_per_hour_cap: per_hour,
+            },
+        )
+        .unwrap();
+    }
+
+    /// Seed `count` recent `agent_turns` for the session's group so
+    /// the rate-limit gate sees them. Each turn is timestamped within
+    /// the last 5 seconds (well inside both the per-minute and
+    /// per-hour windows).
+    fn seed_turns(db: &CentralDb, ag: AgentGroupId, count: usize) {
+        use ironclaw_db::tables::agent_turns::{insert, NewAgentTurn};
+        let now = chrono::Utc::now();
+        for i in 0..count {
+            #[allow(clippy::cast_possible_wrap)]
+            let seq = i as i64;
+            insert(
+                db,
+                &NewAgentTurn {
+                    session_id: "sess-test".into(),
+                    agent_group_id: ag.as_uuid().to_string(),
+                    seq,
+                    model: "claude-sonnet-4-6".into(),
+                    provider: "anthropic".into(),
+                    input_tokens: 10,
+                    output_tokens: 20,
+                    started_at: now - chrono::Duration::seconds(5),
+                    ended_at: now - chrono::Duration::seconds(1),
+                    status: "ok".into(),
+                    error: None,
+                },
+            )
+            .unwrap();
+        }
     }
 
     fn record_today_tokens(db: &CentralDb, ag: AgentGroupId, input: i64, output: i64) {
@@ -1613,6 +1776,29 @@ mod tests {
             .collect()
     }
 
+    fn seed_pending_chat_inbound(paths: &SessionPaths) {
+        let conn = open_inbound(paths).unwrap();
+        messages_in::insert(
+            &conn,
+            &messages_in::WriteInbound {
+                id: ironclaw_types::MessageId::new(),
+                kind: ironclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "hi"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("stdin".into()),
+                channel_type: Some(ironclaw_types::ChannelType::new("cli")),
+                thread_id: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
+    }
+
     #[test]
     fn maybe_post_budget_exhausted_writes_reply_when_routing_known() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1651,7 +1837,6 @@ mod tests {
         mgr.maybe_post_budget_exhausted(&session, &paths).unwrap();
         mgr.maybe_post_budget_exhausted(&session, &paths).unwrap();
 
-        // Exactly one reply lands despite three calls.
         let replies = count_outbound_text_replies(&paths);
         assert_eq!(replies.len(), 1);
     }
@@ -1667,8 +1852,6 @@ mod tests {
         );
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        // ensure_dirs lazily so open_inbound succeeds, but do NOT
-        // write session_routing → handler should bail with a warn.
         paths.ensure_dirs().unwrap();
         let _ = open_inbound(&paths).unwrap();
 
@@ -1691,39 +1874,118 @@ mod tests {
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
         paths.ensure_dirs().unwrap();
         seed_routing(&paths);
+        seed_pending_chat_inbound(&paths);
 
-        // Seed an inbound message so has_pending_inbound() returns true.
-        let conn = open_inbound(&paths).unwrap();
-        ironclaw_db::tables::messages_in::insert(
-            &conn,
-            &ironclaw_db::tables::messages_in::WriteInbound {
-                id: ironclaw_types::MessageId::new(),
-                kind: ironclaw_types::MessageKind::Chat,
-                timestamp: chrono::Utc::now(),
-                content: serde_json::json!({"text": "hi"}),
-                trigger: true,
-                on_wake: false,
-                process_after: None,
-                recurrence: None,
-                series_id: None,
-                platform_id: Some("stdin".into()),
-                channel_type: Some(ironclaw_types::ChannelType::new("cli")),
-                thread_id: None,
-                source_session_id: None,
-            },
-        )
-        .unwrap();
-
-        // Cap = 100; usage = 200 → over budget.
         set_daily_cap(&db, session.agent_group_id, 100);
         record_today_tokens(&db, session.agent_group_id, 150, 50);
 
-        // First tick posts the reply; second tick dedups.
         let spawned1 = mgr.maybe_spawn(&session).await.unwrap();
         let spawned2 = mgr.maybe_spawn(&session).await.unwrap();
         assert!(!spawned1, "must not spawn when over budget");
         assert!(!spawned2);
         let replies = count_outbound_text_replies(&paths);
         assert_eq!(replies.len(), 1);
+    }
+
+    // ---- rate-limit gate (per-minute / per-hour) -------------------------
+
+    #[test]
+    fn rate_limit_message_none_when_caps_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        assert!(mgr.rate_limit_message(&session).unwrap().is_none());
+        set_rate_caps(&db, session.agent_group_id, None, None);
+        assert!(mgr.rate_limit_message(&session).unwrap().is_none());
+    }
+
+    #[test]
+    fn rate_limit_message_fires_on_per_minute_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        set_rate_caps(&db, session.agent_group_id, Some(3), None);
+        seed_turns(&db, session.agent_group_id, 2);
+        assert!(mgr.rate_limit_message(&session).unwrap().is_none());
+        seed_turns(&db, session.agent_group_id, 1);
+        let msg = mgr.rate_limit_message(&session).unwrap().unwrap();
+        assert!(msg.contains("Per-minute"), "{msg}");
+        assert!(msg.contains("cap is 3"), "{msg}");
+    }
+
+    #[test]
+    fn rate_limit_message_fires_on_per_hour_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        set_rate_caps(&db, session.agent_group_id, None, Some(5));
+        seed_turns(&db, session.agent_group_id, 5);
+        let msg = mgr.rate_limit_message(&session).unwrap().unwrap();
+        assert!(msg.contains("Per-hour"), "{msg}");
+        assert!(msg.contains("cap is 5"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn tick_refuses_spawn_when_per_minute_cap_reached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let runtime = std::sync::Arc::new(crate::tests::NoopRuntime::default());
+        let mgr = ContainerManager::new(
+            db.clone(),
+            runtime.clone(),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        seed_pending_chat_inbound(&paths);
+
+        set_rate_caps(&db, session.agent_group_id, Some(1), None);
+        seed_turns(&db, session.agent_group_id, 1);
+        mgr.tick().await.unwrap();
+        let updated = sessions::get(&db, session.id).unwrap();
+        assert!(matches!(updated.container_status, ContainerStatus::Stopped));
+        assert!(runtime.spawn_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tick_refuses_spawn_when_per_hour_cap_reached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let runtime = std::sync::Arc::new(crate::tests::NoopRuntime::default());
+        let mgr = ContainerManager::new(
+            db.clone(),
+            runtime.clone(),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        seed_pending_chat_inbound(&paths);
+
+        set_rate_caps(&db, session.agent_group_id, None, Some(2));
+        seed_turns(&db, session.agent_group_id, 2);
+        mgr.tick().await.unwrap();
+        let updated = sessions::get(&db, session.id).unwrap();
+        assert!(matches!(updated.container_status, ContainerStatus::Stopped));
+        assert!(runtime.spawn_calls().is_empty());
+    }
+
+    #[test]
+    fn rate_limit_dedup_within_window_emits_exactly_one_reply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        seed_routing(&paths);
+
+        let text = "rate-limit reply text";
+        mgr.maybe_post_rate_limit_reply(&session, &paths, text).unwrap();
+        mgr.maybe_post_rate_limit_reply(&session, &paths, text).unwrap();
+        mgr.maybe_post_rate_limit_reply(&session, &paths, text).unwrap();
+
+        let replies = count_outbound_text_replies(&paths);
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0], text);
     }
 }

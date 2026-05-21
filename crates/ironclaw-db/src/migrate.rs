@@ -46,6 +46,10 @@ const CENTRAL: &[Migration] = &[
         name: "008_outbound_dropped_messages",
         sql: include_str!("../migrations/008_outbound_dropped_messages.sql"),
     },
+    Migration {
+        name: "009_rate_limit_caps",
+        sql: include_str!("../migrations/009_rate_limit_caps.sql"),
+    },
 ];
 
 const SESSION_INBOUND: &[Migration] = &[Migration {
