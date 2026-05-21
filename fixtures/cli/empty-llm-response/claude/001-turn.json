@@ -1,0 +1,6 @@
+{
+  "events": [
+    {"type": "message_start", "message": {"id": "msg_replay_empty"}},
+    {"type": "message_stop"}
+  ]
+}

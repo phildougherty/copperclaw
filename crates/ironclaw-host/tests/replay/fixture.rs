@@ -43,6 +43,34 @@ pub struct Manifest {
     /// across runs.
     #[serde(default)]
     pub substitutions: BTreeMap<String, String>,
+    /// Optional per-LLM-call response plan for failure-mode fixtures.
+    /// When absent the harness falls back to the legacy behaviour of
+    /// dispensing the i-th `claude/NNN-turn.json` for the i-th request.
+    /// Each entry maps to one upstream call. See [`ProviderResponseSpec`].
+    #[serde(default)]
+    pub provider_responses: Vec<ProviderResponseSpec>,
+}
+
+/// One scripted response from the harness's LLM stub. `kind` decides what
+/// the wiremock-served `/v1/messages` endpoint does on the i-th call:
+///
+/// - `"success"` — return the `claude/NNN-turn.json` file named by
+///   `file` (defaults to the i-th turn file in directory order).
+/// - `"error"` — return an HTTP error with `status` (default 503) and
+///   `message` (default `"service unavailable"`).
+/// - `"timeout"` — never respond. Combined with a tight per-step budget
+///   on the test side this simulates an upstream that hangs.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderResponseSpec {
+    pub kind: String,
+    #[serde(default)]
+    pub file: Option<String>,
+    #[serde(default)]
+    pub status: Option<u16>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub delay_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -91,8 +119,13 @@ pub struct Fixture {
     /// Inbound `InboundEvent`s in file-name order.
     pub inbound: Vec<InboundEvent>,
     /// Claude turn responses in file-name order. Element `i` is served
-    /// for the i-th call into the Anthropic mock.
+    /// for the i-th call into the Anthropic mock when the manifest does
+    /// not declare an explicit `provider_responses` plan.
     pub claude_turns: Vec<ClaudeTurn>,
+    /// Same payloads as `claude_turns`, keyed by file basename, so
+    /// `provider_responses` entries can refer to a specific turn file by
+    /// name regardless of the directory ordering.
+    pub claude_turns_by_name: BTreeMap<String, ClaudeTurn>,
     pub expected: ExpectedStreams,
 }
 
@@ -118,7 +151,7 @@ impl Fixture {
         let central_sql = fs::read_to_string(root.join("central.sql"))
             .with_context(|| format!("read central.sql from {}", root.display()))?;
         let inbound = load_inbound(&root.join("inbound"))?;
-        let claude_turns = load_claude(&root.join("claude"))?;
+        let (claude_turns, claude_turns_by_name) = load_claude(&root.join("claude"))?;
         let expected = load_expected(&root.join("expected"))?;
         Ok(Self {
             root,
@@ -126,6 +159,7 @@ impl Fixture {
             central_sql,
             inbound,
             claude_turns,
+            claude_turns_by_name,
             expected,
         })
     }
@@ -152,20 +186,24 @@ fn load_inbound(dir: &Path) -> Result<Vec<InboundEvent>> {
     Ok(events)
 }
 
-fn load_claude(dir: &Path) -> Result<Vec<ClaudeTurn>> {
+fn load_claude(dir: &Path) -> Result<(Vec<ClaudeTurn>, BTreeMap<String, ClaudeTurn>)> {
     if !dir.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), BTreeMap::new()));
     }
     let entries = sorted_files(dir, &["json"])?;
     let mut turns = Vec::with_capacity(entries.len());
+    let mut by_name: BTreeMap<String, ClaudeTurn> = BTreeMap::new();
     for path in entries {
         let bytes = fs::read(&path)
             .with_context(|| format!("read claude turn at {}", path.display()))?;
         let turn: ClaudeTurn = serde_json::from_slice(&bytes)
             .with_context(|| format!("parse claude turn at {}", path.display()))?;
+        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+            by_name.insert(name.to_string(), turn.clone());
+        }
         turns.push(turn);
     }
-    Ok(turns)
+    Ok((turns, by_name))
 }
 
 fn load_expected(dir: &Path) -> Result<ExpectedStreams> {

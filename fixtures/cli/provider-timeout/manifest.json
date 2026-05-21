@@ -1,0 +1,19 @@
+{
+  "name": "cli-provider-timeout",
+  "channel": "cli",
+  "description": "Provider's /v1/messages call never responds within the per-call budget. Expected behaviour: runner marks the inbound failed and emits no chat outbound.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "provider_responses": [
+    {"kind": "timeout", "delay_ms": 60000}
+  ],
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

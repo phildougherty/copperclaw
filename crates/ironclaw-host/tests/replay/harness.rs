@@ -45,7 +45,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::diff::{diff_stream, DiffReport, Substitutions};
-use crate::fixture::{ClaudeTurn, Fixture};
+use crate::fixture::{ClaudeTurn, Fixture, ProviderResponseSpec};
 
 /// Booted harness.
 pub struct ReplayHarness {
@@ -68,6 +68,12 @@ pub struct ReplayHarness {
     /// Replay of `inbound/*.json` events as they were driven, so the
     /// `inbound-events.jsonl` diff has a concrete actual stream.
     pub played_inbound: Vec<InboundEvent>,
+    /// Per-turn `run_loop` errors that were caught instead of bubbled
+    /// (so failure-mode fixtures can still snapshot post-state). The
+    /// harness exposes these via `Display` on `DiffReport` only when
+    /// `compare()` finds other mismatches; otherwise they're treated as
+    /// expected for the fixture.
+    pub runner_errors: Vec<String>,
 }
 
 impl ReplayHarness {
@@ -115,7 +121,11 @@ impl ReplayHarness {
             DeliveryService::with_default_dispatcher(central.clone(), delivery_root, initial);
 
         let anthropic_server = MockServer::start().await;
-        mount_claude_turns(&anthropic_server, &fixture.claude_turns).await;
+        if fixture.manifest.provider_responses.is_empty() {
+            mount_claude_turns(&anthropic_server, &fixture.claude_turns).await;
+        } else {
+            mount_provider_responses(&anthropic_server, &fixture).await?;
+        }
 
         Ok(Self {
             fixture,
@@ -127,6 +137,7 @@ impl ReplayHarness {
             anthropic_server,
             touched_sessions: Vec::new(),
             played_inbound: Vec::new(),
+            runner_errors: Vec::new(),
         })
     }
 
@@ -178,13 +189,21 @@ impl ReplayHarness {
             }
 
             // One turn per inbound step. The runner exits when
-            // `max_turns` is reached.
+            // `max_turns` is reached. Failure-mode fixtures may make the
+            // runner return Err (e.g. `provider.query()` bailing on a
+            // 503 before the in-stream Error path has a chance to run).
+            // Treat that as captured state rather than a harness panic
+            // so the diff layer can compare against the fixture's
+            // expected post-state.
             let (ag, sess) = self
                 .touched_sessions
                 .last()
                 .copied()
                 .ok_or_else(|| anyhow!("no session touched by route"))?;
-            self.run_one_turn(ag, sess).await?;
+            if let Err(err) = self.run_one_turn(ag, sess).await {
+                self.runner_errors.push(err.to_string());
+                tracing::warn!(error = %err, "runner errored on turn (captured)");
+            }
 
             // Drain outbound for this session through the mock adapter.
             self.deliver_session(ag, sess).await?;
@@ -386,6 +405,107 @@ impl ReplayHarness {
             }
         }
         out
+    }
+}
+
+/// Mount one mock per `provider_responses` entry. Honors three kinds:
+///
+/// - `success`: serve the SSE turn at `file` (or the i-th legacy
+///   `claude/NNN-turn.json` when `file` is omitted).
+/// - `error`:   reply with `status` (default 503) and an error body so
+///   the upstream `AnthropicProvider` maps it to `ProviderError::Api`.
+/// - `timeout`: delay the (still-OK) response by `delay_ms`. Combined
+///   with a small per-call deadline on the runner side (when one is
+///   added) this simulates an upstream that hangs. Today the runner
+///   has no per-call deadline, so timeout fixtures are `#[ignore]`d.
+///
+/// Each mock has `up_to_n_times(1)` and a unique priority so the i-th
+/// upstream request consumes the i-th scripted response in order.
+async fn mount_provider_responses(server: &MockServer, fixture: &Fixture) -> Result<()> {
+    for (i, spec) in fixture.manifest.provider_responses.iter().enumerate() {
+        let pri = u8::try_from(i + 1).unwrap_or(u8::MAX);
+        let response = build_provider_response(spec, fixture, i)?;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(response)
+            .up_to_n_times(1)
+            .with_priority(pri)
+            .mount(server)
+            .await;
+    }
+    Ok(())
+}
+
+fn build_provider_response(
+    spec: &ProviderResponseSpec,
+    fixture: &Fixture,
+    index: usize,
+) -> Result<ResponseTemplate> {
+    match spec.kind.as_str() {
+        "success" => {
+            let turn = lookup_turn(spec, fixture, index)?;
+            let body = encode_sse(&turn);
+            Ok(ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body))
+        }
+        "error" => {
+            let status = spec.status.unwrap_or(503);
+            let message = spec
+                .message
+                .clone()
+                .unwrap_or_else(|| "service unavailable".to_string());
+            // Anthropic's error envelope shape; the provider's
+            // `map_http_error` is robust to anything 5xx so this mainly
+            // gives a useful body in test logs.
+            let body = serde_json::json!({
+                "type": "error",
+                "error": { "type": "api_error", "message": message },
+            });
+            Ok(ResponseTemplate::new(status).set_body_json(body))
+        }
+        "timeout" => {
+            // The wiremock-side delay is best-effort: any caller-side
+            // deadline shorter than this will trip first, which is the
+            // whole point of the fixture. The dummy turn body keeps
+            // wiremock happy if the deadline never fires.
+            let delay = Duration::from_millis(spec.delay_ms.unwrap_or(60_000));
+            let dummy = ClaudeTurn { events: Vec::new() };
+            Ok(ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(encode_sse(&dummy))
+                .set_delay(delay))
+        }
+        other => Err(anyhow!("unknown provider_responses kind: {other}")),
+    }
+}
+
+fn lookup_turn(
+    spec: &ProviderResponseSpec,
+    fixture: &Fixture,
+    index: usize,
+) -> Result<ClaudeTurn> {
+    if let Some(name) = spec.file.as_deref() {
+        fixture
+            .claude_turns_by_name
+            .get(name)
+            .cloned()
+            .ok_or_else(|| anyhow!("no claude turn file named {name} in fixture"))
+    } else {
+        // Fall back to the i-th turn file in directory order. This
+        // matches the legacy behaviour for a fixture that lists only
+        // `success` entries.
+        fixture
+            .claude_turns
+            .get(index)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "provider_responses[{index}] has kind=success but no \
+                     `file` and only {} turn files were found",
+                    fixture.claude_turns.len()
+                )
+            })
     }
 }
 

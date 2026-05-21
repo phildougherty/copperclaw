@@ -72,3 +72,33 @@ async fn slack_event_message_round_trip() {
 async fn cli_multi_turn_round_trip() {
     run_fixture("cli", "multi-turn").await;
 }
+
+/// Empty-content LLM response: runner completes the inbound without
+/// emitting a chat outbound. Pins the no-content branch in `drive_turn`
+/// so a regression that crashed on empty responses would surface.
+#[tokio::test]
+async fn cli_empty_llm_response() {
+    run_fixture("cli", "empty-llm-response").await;
+}
+
+/// Provider 5xx + retry. The runner currently has no retry loop at the
+/// `provider.query()` level (only the in-stream `ProviderEvent::Error`
+/// path marks the inbound failed), so this fixture documents the gap
+/// rather than a passing behaviour.
+// TODO(team-o): un-ignore once the runner gains a retry policy.
+#[tokio::test]
+#[ignore = "runner has no provider.query() retry loop yet (see fixture README)"]
+async fn cli_provider_5xx_retry() {
+    run_fixture("cli", "provider-5xx-retry").await;
+}
+
+/// Provider timeout. The runner has no per-call deadline, so today the
+/// only thing that would trip is reqwest's 600s client timeout. This
+/// fixture documents the gap; un-ignore once a runner-level deadline
+/// exists.
+// TODO(team-o): un-ignore once the runner gains a per-LLM-call deadline.
+#[tokio::test]
+#[ignore = "runner has no per-call deadline yet (see fixture README)"]
+async fn cli_provider_timeout() {
+    run_fixture("cli", "provider-timeout").await;
+}

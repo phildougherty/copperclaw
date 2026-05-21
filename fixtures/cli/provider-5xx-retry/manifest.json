@@ -1,0 +1,20 @@
+{
+  "name": "cli-provider-5xx-retry",
+  "channel": "cli",
+  "description": "First /v1/messages call returns 503; second succeeds. Expected behaviour: runner retries and delivers the second call's reply.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "provider_responses": [
+    {"kind": "error", "status": 503, "message": "service unavailable"},
+    {"kind": "success", "file": "001-turn.json"}
+  ],
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}
