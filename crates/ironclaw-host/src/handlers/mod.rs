@@ -64,6 +64,7 @@ pub const HOST_ONLY_COMMANDS: &[&str] = &[
     "members.remove",
     "destinations.add",
     "destinations.remove",
+    "approvals.approve_sender",
 ];
 
 /// True when `command` requires `Caller::Host`.

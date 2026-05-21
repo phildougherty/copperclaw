@@ -552,6 +552,18 @@ pub enum DroppedMessagesCmd {
 pub enum ApprovalsCmd {
     List,
     Get { id: String },
+    /// Approve a sender by `(channel_type, identity)`. Persists a
+    /// `users` row keyed on that pair; the host's sender-scope
+    /// gate consults `users` on every inbound, so the approval
+    /// takes effect on the next message without a host restart.
+    Approve {
+        #[arg(long)]
+        channel: String,
+        #[arg(long)]
+        identity: String,
+        #[arg(long)]
+        display_name: Option<String>,
+    },
 }
 
 /// `iclaw audit ...` — read the mutation audit log.
@@ -999,6 +1011,17 @@ impl ApprovalsCmd {
         match self {
             Self::List => ParsedCall::new("approvals.list", json!({})),
             Self::Get { id } => ParsedCall::new("approvals.get", json!({"id": id})),
+            Self::Approve {
+                channel,
+                identity,
+                display_name,
+            } => {
+                let mut o = Map::new();
+                o.insert("channel_type".into(), channel.clone().into());
+                o.insert("identity".into(), identity.clone().into());
+                insert_opt(&mut o, "display_name", display_name.clone());
+                ParsedCall::new("approvals.approve_sender", Value::Object(o))
+            }
         }
     }
 }
@@ -1058,6 +1081,7 @@ pub const ALL_COMMANDS: &[&str] = &[
     "dropped-messages.list",
     "approvals.list",
     "approvals.get",
+    "approvals.approve_sender",
     "audit.list",
     "usage.rollup",
 ];
@@ -1756,6 +1780,15 @@ mod tests {
             &["iclaw", "dropped-messages", "list"],
             &["iclaw", "approvals", "list"],
             &["iclaw", "approvals", "get", "x"],
+            &[
+                "iclaw",
+                "approvals",
+                "approve",
+                "--channel",
+                "telegram",
+                "--identity",
+                "user-42",
+            ],
             &["iclaw", "audit", "list"],
             &["iclaw", "usage"],
         ];

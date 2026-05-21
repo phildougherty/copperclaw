@@ -159,6 +159,11 @@ pub fn build_dispatch_table() -> DispatchTable {
     ins!("dropped-messages.list", handlers::dropped_messages::list, false);
     ins!("approvals.list", handlers::approvals::list, false);
     ins!("approvals.get", handlers::approvals::get, false);
+    ins!(
+        "approvals.approve_sender",
+        handlers::approvals::approve_sender,
+        true
+    );
     ins!("audit.list", handlers::audit::list, false);
     ins!("usage.rollup", handlers::usage::rollup, false);
 

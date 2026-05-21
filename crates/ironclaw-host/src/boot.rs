@@ -149,15 +149,35 @@ pub async fn install_modules(host_ctx: Arc<HostContext>) {
         // there's no meaningful approval gate to apply. Without this
         // pre-seed, every interactive chat would silently deadlock on
         // a missing approval CLI surface.
-        Box::new(ApprovalsModule::with_initial_approved(vec![
-            ironclaw_types::SenderIdentity {
-                channel_type: ironclaw_types::ChannelType::new(
-                    ironclaw_types::ChannelType::CLI,
-                ),
-                identity: "local".to_string(),
-                display_name: Some("local".to_string()),
-            },
-        ])),
+        //
+        // For every other sender, the gate's persistent fallback
+        // queries the central `users` table — that's how `iclaw
+        // approvals approve` lands without a host restart.
+        Box::new(
+            ApprovalsModule::with_initial_approved(vec![
+                ironclaw_types::SenderIdentity {
+                    channel_type: ironclaw_types::ChannelType::new(
+                        ironclaw_types::ChannelType::CLI,
+                    ),
+                    identity: "local".to_string(),
+                    display_name: Some("local".to_string()),
+                },
+            ])
+            .with_persistent_lookup({
+                let central = host_ctx.central().clone();
+                std::sync::Arc::new(move |sender| {
+                    let kind = sender.channel_type.as_str();
+                    ironclaw_db::tables::users::get_by_identity(
+                        &central,
+                        kind,
+                        &sender.identity,
+                    )
+                    .ok()
+                    .flatten()
+                    .is_some()
+                })
+            }),
+        ),
         Box::new(InteractiveModule::default()),
         Box::new(SchedulingModule),
         Box::new(AgentToAgentModule),

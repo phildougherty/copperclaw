@@ -41,23 +41,35 @@ impl HookSink {
 pub struct HostContext {
     sink: HookSink,
     delivery: Arc<DeliveryService>,
+    central: ironclaw_db::central::CentralDb,
 }
 
 impl HostContext {
+    /// Read access to the central DB. Exposed so the host can build
+    /// module closures (e.g. `ApprovalsModule`'s persistent lookup)
+    /// without threading the DB through every module constructor.
+    pub fn central(&self) -> &ironclaw_db::central::CentralDb {
+        &self.central
+    }
+
     /// Build a host context that forwards hook installs into `router.hooks()`.
     pub fn for_router(router: Arc<Router>, delivery: Arc<DeliveryService>) -> Arc<Self> {
+        let central = delivery.central().clone();
         Arc::new(Self {
             sink: HookSink::Router(router),
             delivery,
+            central,
         })
     }
 
     /// Build a host context that writes hooks into a standalone chain.
     /// Used by tests where constructing a full router is overkill.
     pub fn new(hooks: Arc<HookChain>, delivery: Arc<DeliveryService>) -> Arc<Self> {
+        let central = delivery.central().clone();
         Arc::new(Self {
             sink: HookSink::Chain(hooks),
             delivery,
+            central,
         })
     }
 

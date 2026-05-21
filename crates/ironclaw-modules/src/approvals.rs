@@ -42,12 +42,24 @@ struct PendingStore {
     pending: Vec<ApprovalSummary>,
 }
 
+/// Persistent-store lookup the gate consults when its in-memory
+/// `known_senders` set misses. Returns `true` to approve the sender,
+/// `false` to leave the decision to the in-memory list (and then
+/// Pending). Sourced from the central `users` table by the host;
+/// kept as a closure here so the modules crate doesn't take a
+/// circular dep on `ironclaw-db`.
+pub type SenderLookup =
+    Arc<dyn Fn(&SenderIdentity) -> bool + Send + Sync>;
+
 /// Approvals module.
 pub struct ApprovalsModule {
     /// In-memory pending list, fed by the host via `record_pending` calls.
     store: Arc<Mutex<PendingStore>>,
     /// Set of `(channel_type, identity)` tuples that are already approved.
     known_senders: Arc<Mutex<Vec<SenderIdentity>>>,
+    /// Persistent-store lookup invoked when the in-memory set
+    /// misses. `None` = in-memory only.
+    persistent_lookup: Option<SenderLookup>,
 }
 
 impl Default for ApprovalsModule {
@@ -61,6 +73,7 @@ impl ApprovalsModule {
         Self {
             store: Arc::new(Mutex::new(PendingStore::default())),
             known_senders: Arc::new(Mutex::new(Vec::new())),
+            persistent_lookup: None,
         }
     }
 
@@ -74,7 +87,18 @@ impl ApprovalsModule {
         Self {
             store: Arc::new(Mutex::new(PendingStore::default())),
             known_senders: Arc::new(Mutex::new(senders)),
+            persistent_lookup: None,
         }
+    }
+
+    /// Builder: attach a persistent-store lookup. The gate consults
+    /// it after the in-memory set; only on a double miss is the
+    /// sender declared `Pending`. The host wires this to a closure
+    /// that queries the central `users` table.
+    #[must_use]
+    pub fn with_persistent_lookup(mut self, lookup: SenderLookup) -> Self {
+        self.persistent_lookup = Some(lookup);
+        self
     }
 
     /// Mark a sender as approved so the gate stops returning `Pending` for
@@ -179,22 +203,34 @@ impl Module for ApprovalsModule {
 
     async fn install(&self, ctx: Arc<dyn ModuleContext>) -> Result<(), ModuleError> {
         let known = Arc::clone(&self.known_senders);
+        let persistent = self.persistent_lookup.clone();
         ctx.set_sender_scope_gate(Arc::new(move |s: SenderScopeCtx| {
             let Some(sender) = &s.event_sender else {
                 return SenderScopeDecision::Defer;
             };
-            let known = known.lock().unwrap();
-            if known
-                .iter()
-                .any(|k| k.channel_type == sender.channel_type && k.identity == sender.identity)
+            // Fast path: in-memory pre-approved list.
             {
-                SenderScopeDecision::Defer
-            } else {
-                SenderScopeDecision::Pending(format!(
-                    "sender `{}:{}` is pending approval",
-                    sender.channel_type, sender.identity
-                ))
+                let known = known.lock().unwrap();
+                if known.iter().any(|k| {
+                    k.channel_type == sender.channel_type
+                        && k.identity == sender.identity
+                }) {
+                    return SenderScopeDecision::Defer;
+                }
             }
+            // Persistent path: ask the host. The closure is the
+            // central `users` table lookup so an `iclaw approvals
+            // approve` mutation is reflected here on the very next
+            // inbound, no host restart needed.
+            if let Some(lookup) = &persistent {
+                if lookup(sender) {
+                    return SenderScopeDecision::Defer;
+                }
+            }
+            SenderScopeDecision::Pending(format!(
+                "sender `{}:{}` is pending approval",
+                sender.channel_type, sender.identity
+            ))
         }));
         ctx.register_delivery_action("approval_card", Arc::new(ApprovalCardHandler));
         Ok(())

@@ -1,8 +1,8 @@
 //! Handlers for `approvals.*` commands.
 
-use super::{db_err, parse_uuid, req_str};
+use super::{db_err, opt_str, parse_uuid, req_str};
 use ironclaw_db::central::CentralDb;
-use ironclaw_db::tables::pending_approvals;
+use ironclaw_db::tables::{pending_approvals, users};
 use ironclaw_iclaw::ErrorPayload;
 use ironclaw_types::ApprovalId;
 use serde_json::{json, Value};
@@ -16,6 +16,37 @@ pub fn get(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     let id = ApprovalId(parse_uuid(&req_str(args, "id")?)?);
     let row = pending_approvals::get(central, id).map_err(db_err)?;
     Ok(approval_to_json(&row))
+}
+
+/// Approve a sender by `(channel_type, identity)` via an upsert into
+/// the central `users` table. The `ApprovalsModule`'s gate reads
+/// `users` on every inbound, so the approval is effective on the
+/// next message.
+pub fn approve_sender(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
+    let channel = req_str(args, "channel_type")?;
+    let identity = req_str(args, "identity")?;
+    if channel.is_empty() || identity.is_empty() {
+        return Err(ErrorPayload::new(
+            "bad_request".to_string(),
+            "channel_type and identity are required and must be non-empty".to_string(),
+        ));
+    }
+    let display_name = opt_str(args, "display_name");
+    let user = users::upsert(
+        central,
+        users::UpsertUser {
+            kind: channel.clone(),
+            identity: identity.clone(),
+            display_name: display_name.clone(),
+        },
+    )
+    .map_err(db_err)?;
+    Ok(json!({
+        "user_id": user.id.as_uuid().to_string(),
+        "channel_type": channel,
+        "identity": identity,
+        "display_name": display_name,
+    }))
 }
 
 fn approval_to_json(a: &pending_approvals::PendingApproval) -> Value {
