@@ -188,6 +188,11 @@ pub enum TopCommand {
         /// `<install_root>/chat.log`.
         #[arg(long)]
         log: Option<std::path::PathBuf>,
+        /// Refuse to auto-start the host if it isn't already running.
+        /// By default `iclaw chat` will run `ironclaw start` for you
+        /// when the host's FIFO is missing.
+        #[arg(long)]
+        no_autostart: bool,
     },
     /// Emit shell completion script for `iclaw`.
     ///
@@ -672,13 +677,20 @@ impl TopCommand {
             Self::Usage { since } => {
                 ParsedCall::new("usage.rollup", json!({"since": since}))
             }
-            Self::Chat { fifo, log } => {
+            Self::Chat {
+                fifo,
+                log,
+                no_autostart,
+            } => {
                 let mut o = Map::new();
                 if let Some(p) = fifo {
                     o.insert("fifo".into(), p.to_string_lossy().into_owned().into());
                 }
                 if let Some(p) = log {
                     o.insert("log".into(), p.to_string_lossy().into_owned().into());
+                }
+                if *no_autostart {
+                    o.insert("no_autostart".into(), Value::Bool(true));
                 }
                 ParsedCall::new("composite.chat", Value::Object(o))
             }
@@ -1981,5 +1993,37 @@ mod tests {
     fn user_socket_for_other_os_falls_back_to_dot_dir() {
         let p = user_socket_for(std::path::Path::new("/h"), "freebsd");
         assert_eq!(p, std::path::PathBuf::from("/h/.ironclaw/data/iclaw.sock"));
+    }
+
+    // --- chat autostart flag ----------------------------------------------
+
+    #[test]
+    fn chat_default_has_no_autostart_flag() {
+        let p = parse(&["iclaw", "chat"]);
+        assert_eq!(p.command, "composite.chat");
+        // Without the flag the marker payload omits `no_autostart` so
+        // the default (run-it) wins in `run_chat`.
+        assert!(p.args.get("no_autostart").is_none());
+    }
+
+    #[test]
+    fn chat_no_autostart_flag_propagates() {
+        let p = parse(&["iclaw", "chat", "--no-autostart"]);
+        assert_eq!(p.command, "composite.chat");
+        assert_eq!(p.args["no_autostart"], json!(true));
+    }
+
+    #[test]
+    fn chat_explicit_paths_carry_through() {
+        let p = parse(&[
+            "iclaw",
+            "chat",
+            "--fifo",
+            "/tmp/foo.fifo",
+            "--log",
+            "/tmp/foo.log",
+        ]);
+        assert_eq!(p.args["fifo"], json!("/tmp/foo.fifo"));
+        assert_eq!(p.args["log"], json!("/tmp/foo.log"));
     }
 }

@@ -107,20 +107,46 @@ The release artifacts are:
 # URL prompt, type `openrouter` (or leave blank for Anthropic).
 ironclaw-setup
 
-# Boot the host. With no `--env-file`, ironclaw auto-discovers the
-# .env setup wrote inside the platform install root, so both the data
-# dir and the iclaw socket path get picked up automatically.
-ironclaw run
+# Boot the host in the background and start chatting — one terminal,
+# no separate `ironclaw run` window. `iclaw chat` will auto-start the
+# host if it isn't already up; pass `--no-autostart` to opt out.
+ironclaw start && iclaw chat
 
-# In another terminal — iclaw also resolves the install's socket
-# without configuration, so the commands Just Work from any cwd.
+# Or skip `ironclaw start` entirely and let chat boot the host for
+# you the first time:
 iclaw quickstart cli --name first    # group + mg + wiring in one call
+iclaw chat                            # auto-starts host if needed
+
+# Other useful commands:
+ironclaw status                       # PID, uptime, paths, session count
+ironclaw status --json                # machine-readable status
+ironclaw logs -f                      # tail the host log
+ironclaw stop                         # graceful SIGTERM (escalates to SIGKILL)
 iclaw status                          # full wiring digest
 iclaw health                          # operator probe (sessions, audit, drops)
-iclaw chat                            # interactive REPL against the cli channel
 iclaw usage --since 24h               # per-group token rollup
 iclaw audit list --since 1h           # mutations against the host socket
+
+# `ironclaw run` still works for the original foreground-blocking
+# flow — useful for debugging or running under systemd / launchd.
 ```
+
+### Lifecycle commands
+
+The `ironclaw` binary now wraps its own daemon lifecycle, so you don't
+need systemd or a second terminal for local use:
+
+- `ironclaw start` — fork the host into the background, redirect logs
+  to `<data_dir>/logs/ironclaw.log`, write `<data_dir>/ironclaw.pid`,
+  return once the admin socket is listening (up to a 10s grace).
+- `ironclaw stop` — SIGTERM the PID file's owner, wait up to 10s,
+  then SIGKILL. Removes the PID file on success. `--strict` exits
+  non-zero if the host wasn't running.
+- `ironclaw status [--json]` — print PID, uptime, paths and active
+  session count. Exits 0 if running, non-zero otherwise (CI-friendly).
+- `ironclaw logs [-f] [-n N]` — print the last N (default 50) lines
+  of the log, optionally following.
+- `ironclaw run` — original foreground behaviour, untouched.
 
 `ironclaw run` resolution order for the `.env`: `--env-file <path>` →
 `./.env` → platform install (`$XDG_DATA_HOME/ironclaw/.env` on Linux,

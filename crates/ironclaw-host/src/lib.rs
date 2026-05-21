@@ -14,6 +14,7 @@ pub mod channels_init;
 pub mod config;
 pub mod container_manager;
 pub mod context;
+pub mod daemon;
 pub mod handlers;
 pub mod orphans;
 pub mod sessions;

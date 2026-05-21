@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- One-terminal operator flow for the `ironclaw` binary: new
+  `ironclaw start` (daemonize, write PID file, wait for admin socket
+  ready), `ironclaw stop` (SIGTERM with SIGKILL escalation after a
+  10s grace), `ironclaw status [--json]` (PID, uptime, paths, active
+  session count; exits non-zero when not running for CI use), and
+  `ironclaw logs [-f] [-n N]` (tail the host log). `ironclaw run`
+  is preserved for foreground / service-managed deployments.
+- `iclaw chat` now auto-starts the host via `ironclaw start` when
+  the chat FIFO is missing; pass `--no-autostart` to keep the old
+  "fail loudly" behaviour for scripted / CI use. Quick start
+  collapses to `ironclaw start && iclaw chat` in one terminal.
 - Initial Rust workspace with 16 crates across the host, runner,
   providers, MCP server, modules, skills, container runtime, OneCLI
   gateway, iclaw admin client, and interactive setup.
