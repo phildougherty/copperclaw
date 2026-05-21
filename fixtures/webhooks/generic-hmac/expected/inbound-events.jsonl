@@ -1,0 +1,1 @@
+{"channel_type":"webhooks","platform_id":"grafana","thread_id":null,"message":{"id":"wh-001","kind":"webhook","content":{"alertname":"HighErrorRate","status":"firing","labels":{"severity":"warning","service":"api"}},"timestamp":"2026-01-01T00:00:00Z","is_mention":null,"is_group":null},"reply_to":null,"sender":null}

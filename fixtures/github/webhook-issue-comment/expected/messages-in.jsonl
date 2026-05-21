@@ -1,0 +1,1 @@
+{"id":"<UUID>","seq":2,"kind":"chat","timestamp":"<TS>","status":"completed","process_after":null,"recurrence":null,"series_id":null,"tries":0,"trigger":true,"platform_id":"octocat/hello#7","channel_type":"github","thread_id":null,"content":{"text":"please take a look"},"source_session_id":null,"on_wake":false}

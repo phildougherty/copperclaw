@@ -1,0 +1,23 @@
+{
+  "channel_type": "discord",
+  "platform_id": "c1",
+  "thread_id": null,
+  "message": {
+    "id": "100",
+    "kind": "chat",
+    "content": {
+      "text": "hello there",
+      "embeds": [],
+      "attachments": []
+    },
+    "timestamp": "2026-01-01T00:00:00Z",
+    "is_mention": false,
+    "is_group": true
+  },
+  "reply_to": null,
+  "sender": {
+    "channel_type": "discord",
+    "identity": "u1",
+    "display_name": "Alice"
+  }
+}
