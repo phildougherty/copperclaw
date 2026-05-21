@@ -8,3 +8,4 @@
 /logs
 **/*.rs.bk
 Cargo.lock.bak
+.claude/

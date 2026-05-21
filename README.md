@@ -303,12 +303,15 @@ authored under `skills/`.
 socket. The most-used commands:
 
 ```bash
+iclaw                                 # no-args dashboard: groups, wirings,
+                                      # sessions, recent activity, next steps
 iclaw doctor                          # composite first-run / ongoing diagnostic
 iclaw health                          # one-shot probe — session breakdown + audit + drops
 iclaw chat                            # interactive REPL against the cli channel
 iclaw status                          # wiring digest
 
 iclaw groups list                     # configured agent groups
+iclaw groups config edit <id>         # multi-field config edit via $EDITOR (TOML)
 iclaw messaging-groups list           # channel groups (e.g. slack/C12345)
 iclaw wirings list                    # which messaging group → which agent group
 
