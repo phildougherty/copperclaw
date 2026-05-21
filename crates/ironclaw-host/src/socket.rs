@@ -135,6 +135,7 @@ impl CommandHandler for CtxFnHandler {
 pub type DispatchTable = HashMap<&'static str, Arc<dyn CommandHandler>>;
 
 /// Build the production dispatch table.
+#[allow(clippy::too_many_lines)] // Registration table; one line per command.
 pub fn build_dispatch_table() -> DispatchTable {
     let mut t: DispatchTable = HashMap::new();
     macro_rules! ins {

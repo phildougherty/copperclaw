@@ -255,6 +255,9 @@ fn ensure_config_row(central: &CentralDb, id: AgentGroupId) -> Result<(), ErrorP
                 packages_npm: vec![],
                 additional_mounts: json!([]),
                 cli_scope: CliScope::Group,
+                config_fingerprint: None,
+                egress_allow: vec![],
+                resource_limits: json!({}),
             },
         )
         .map_err(db_err)?;
