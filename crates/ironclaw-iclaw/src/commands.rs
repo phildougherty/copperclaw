@@ -204,9 +204,12 @@ pub enum GroupsCmd {
     /// Fetch a single agent group by id.
     Get { id: String },
     /// Create a new agent group.
+    ///
+    /// `--folder` is the on-disk slug under `<data>/groups/`; defaults
+    /// to `--name` when omitted so the common case is a single arg.
     Create {
         #[arg(long)]
-        folder: String,
+        folder: Option<String>,
         #[arg(long)]
         name: String,
         #[arg(long)]
@@ -649,7 +652,11 @@ impl GroupsCmd {
                 provider,
             } => {
                 let mut o = Map::new();
-                o.insert("folder".into(), folder.clone().into());
+                // Default `folder` to `name` so most callers can run
+                // `iclaw groups create --name X` and have the slug
+                // chosen for them.
+                let folder_value = folder.clone().unwrap_or_else(|| name.clone());
+                o.insert("folder".into(), folder_value.into());
                 o.insert("name".into(), name.clone().into());
                 insert_opt(&mut o, "provider", provider.clone());
                 ParsedCall::new("groups.create", Value::Object(o))
@@ -1052,6 +1059,15 @@ mod tests {
 
         let p = parse(&["iclaw", "groups", "create", "--folder", "f", "--name", "n"]);
         assert_eq!(p.args, json!({"folder":"f","name":"n"}));
+    }
+
+    #[test]
+    fn groups_create_folder_defaults_to_name() {
+        // When --folder is omitted, the slug mirrors --name so the common
+        // single-arg form `iclaw groups create --name demo` Just Works.
+        let p = parse(&["iclaw", "groups", "create", "--name", "demo"]);
+        assert_eq!(p.command, "groups.create");
+        assert_eq!(p.args, json!({"folder":"demo","name":"demo"}));
     }
 
     #[test]

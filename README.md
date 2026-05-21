@@ -42,7 +42,7 @@ the final M11 deliverable.
   launchd unit generators and a `--migrate-from` data-directory
   migrator.
 - **17 authored skills** under `skills/`.
-- **4406 passing tests**, 0 failing. `cargo clippy --workspace
+- **4583 passing tests**, 0 failing. `cargo clippy --workspace
   --all-targets -- -D warnings` clean. CI runs fmt + clippy + test on
   Linux and macOS with an 85% coverage gate.
 
@@ -95,16 +95,24 @@ your shell.
 
 For headless / scripted installs, pass `--headless` (alias
 `--non-interactive`) to `ironclaw-setup` and supply each prompt as an
-`IRONCLAW_SETUP_*` env var. The common set for a CLI-only install:
+`IRONCLAW_SETUP_*` env var. The only required variable is the API
+key; the rest have sensible defaults so an unattended install can be
+as short as:
+
+```
+IRONCLAW_SETUP_ANTHROPIC_API_KEY=sk-ant-... ironclaw-setup --headless
+```
+
+The full set of overrides for a CLI-only install:
 
 ```
 IRONCLAW_SETUP_ANTHROPIC_API_KEY   # required
-IRONCLAW_SETUP_USE_ONECLI=no
-IRONCLAW_SETUP_BUILD_IMAGE=yes     # or `no` to skip the image build
-IRONCLAW_SETUP_MOUNTS=             # comma-separated host paths, or empty
-IRONCLAW_SETUP_WRITE_SERVICE_UNIT=no
-IRONCLAW_SETUP_TIMEZONE=Etc/UTC
-IRONCLAW_SETUP_FIRST_CHANNEL=cli
+IRONCLAW_SETUP_USE_ONECLI=no       # default: no
+IRONCLAW_SETUP_BUILD_IMAGE=yes     # default: yes (`no` skips docker build)
+IRONCLAW_SETUP_MOUNTS=             # comma-separated host paths, default empty
+IRONCLAW_SETUP_WRITE_SERVICE_UNIT=no  # default: no
+IRONCLAW_SETUP_TIMEZONE=Etc/UTC    # default: detect from system
+IRONCLAW_SETUP_FIRST_CHANNEL=cli   # default: cli
 ```
 
 Run `ironclaw-setup --list-steps` for the canonical list and use

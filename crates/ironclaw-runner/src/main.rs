@@ -30,10 +30,13 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let use_ansi = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    // Same reasoning as ironclaw-host: runner shares stdout with the
+    // container poll loop's formatter output; tracing belongs on stderr.
+    let use_ansi = std::io::IsTerminal::is_terminal(&std::io::stderr());
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with_target(false)
+        .with_writer(std::io::stderr)
         .with_ansi(use_ansi)
         .init();
 

@@ -38,42 +38,28 @@ impl Step for FirstChatStep {
 /// Build the instruction lines that should be shown after setup completes.
 #[must_use]
 pub fn instructions(cfg: &SetupConfig) -> Vec<String> {
-    let env_file = if cfg.env_file.as_os_str().is_empty() {
-        cfg.data_dir.join(".env")
-    } else {
-        cfg.env_file.clone()
-    };
-    let mut out = Vec::new();
-    out.push("Setup is complete. To start the host:".to_string());
-    out.push(format!(
-        "  ironclaw --env-file {} run",
-        env_file.display()
-    ));
-    out.push(String::new());
-    out.push(
-        "Then, in a second terminal, source the .env to pick up ICLAW_SOCKET".to_string(),
-    );
-    out.push("and drive the host via iclaw:".to_string());
-    out.push(format!("  set -a; . {} ; set +a", env_file.display()));
-    out.push("  iclaw groups list".to_string());
+    let mut out: Vec<String> = vec![
+        "Setup is complete. To start the host:".to_string(),
+        "  ironclaw run".to_string(),
+        String::new(),
+        "(`ironclaw run` auto-discovers the .env in this install root; the".to_string(),
+        "companion `iclaw` resolves the same socket without flags.)".to_string(),
+    ];
     match cfg.first_channel.as_str() {
         "cli" => {
             out.push(String::new());
-            out.push(
-                "The cli channel reads from the host's stdin, so type messages into".to_string(),
-            );
-            out.push(
-                "the host's terminal once it idles. Before that does anything, an"
-                    .to_string(),
-            );
-            out.push(
-                "agent group must be wired to a messaging group with channel_type=cli."
-                    .to_string(),
-            );
-            out.push(
-                "The single-line shortcut for that is:".to_string(),
-            );
+            out.push("Then, in a second terminal:".to_string());
             out.push("  iclaw quickstart cli --name first".to_string());
+            out.push("  iclaw status".to_string());
+            out.push(String::new());
+            out.push(
+                "The cli channel reads from the host's stdin, so once the host"
+                    .to_string(),
+            );
+            out.push(
+                "prints its ready banner, type messages directly into that terminal."
+                    .to_string(),
+            );
         }
         other => {
             out.push(format!(
@@ -104,11 +90,13 @@ mod tests {
             ..SetupConfig::default()
         };
         let out = instructions(&cfg);
-        // Points at the real binary + --env-file (not a non-existent
+        // Points at the real binary (not a non-existent
         // `ironclaw run --data-dir` form) and at the composite quickstart
-        // command (not the imaginary `iclaw chat`).
-        assert!(out.iter().any(|m| m.contains("ironclaw --env-file")));
+        // command (not the imaginary `iclaw chat`). Auto-discovery means
+        // no `--env-file` flag in the printed command.
+        assert!(out.iter().any(|m| m.trim() == "ironclaw run"));
         assert!(out.iter().any(|m| m.contains("iclaw quickstart cli")));
+        assert!(out.iter().any(|m| m.contains("iclaw status")));
     }
 
     #[test]

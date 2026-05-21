@@ -49,12 +49,13 @@ async fn main() -> ExitCode {
         }
     };
 
-    // Strip ANSI escapes when stdout isn't a TTY (logs piped to a file,
-    // systemd journal, container stdout capture, etc.) — leaving them in
-    // pollutes log aggregators with `\x1b[2m` noise.
-    let use_ansi = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    // Write logs to stderr so the cli channel can own stdout for chat
+    // I/O without log lines interleaving with agent replies. Strip ANSI
+    // when stderr isn't a TTY (journald, log files, container capture).
+    let use_ansi = std::io::IsTerminal::is_terminal(&std::io::stderr());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(&cfg.log_filter))
+        .with_writer(std::io::stderr)
         .with_ansi(use_ansi)
         .init();
 

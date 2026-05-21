@@ -245,6 +245,7 @@ pub async fn run_host(
         run_server(socket_path, socket_central, socket_cancel).await
     });
 
+    print_ready_banner(&cfg, &initialized);
     info!("ironclaw boot complete; idling");
 
     // 15. Idle until shutdown.
@@ -307,6 +308,47 @@ pub fn channel_data_dir(data_root: &std::path::Path, channel_type: &str) -> Path
     data_root.join("channels").join(channel_type)
 }
 
+/// Print a one-screen summary of the running host so an operator can see
+/// what's wired without scrolling through tracing output.
+///
+/// The banner is written to stderr alongside the tracing logs so that
+/// stdout stays clean for the cli channel.
+pub(crate) fn print_ready_banner(
+    cfg: &HostConfig,
+    channels: &[crate::channels_init::InitializedChannel],
+) {
+    let lines = ready_banner_lines(cfg, channels);
+    let mut stderr = std::io::stderr().lock();
+    for line in lines {
+        let _ = std::io::Write::write_all(&mut stderr, line.as_bytes());
+        let _ = std::io::Write::write_all(&mut stderr, b"\n");
+    }
+}
+
+/// Pure formatter for [`print_ready_banner`]. Lives separately so it can be
+/// unit-tested without poking real stderr.
+#[must_use]
+pub fn ready_banner_lines(
+    cfg: &HostConfig,
+    channels: &[crate::channels_init::InitializedChannel],
+) -> Vec<String> {
+    let channels = if channels.is_empty() {
+        "(none)".to_string()
+    } else {
+        channels
+            .iter()
+            .map(|c| c.channel_type.as_str().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    vec![
+        format!("ironclaw {} ready", env!("CARGO_PKG_VERSION")),
+        format!("  data:     {}", cfg.data_dir.display()),
+        format!("  socket:   {}", cfg.ncl_socket_path.display()),
+        format!("  channels: {channels}"),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,6 +385,35 @@ mod tests {
                 .to_string()
                 .contains("no container runtime")
         );
+    }
+
+    #[test]
+    fn ready_banner_includes_paths_and_no_channels_marker() {
+        let cfg = HostConfig {
+            data_dir: PathBuf::from("/srv/iron/data"),
+            ncl_socket_path: PathBuf::from("/srv/iron/data/iclaw.sock"),
+            ..HostConfig::default()
+        };
+        let lines = ready_banner_lines(&cfg, &[]);
+        assert!(lines[0].contains("ironclaw"));
+        assert!(lines.iter().any(|l| l.contains("/srv/iron/data")));
+        assert!(lines.iter().any(|l| l.contains("iclaw.sock")));
+        assert!(lines.iter().any(|l| l.contains("(none)")));
+    }
+
+    #[test]
+    fn ready_banner_lists_channels() {
+        use crate::channels_init::InitializedChannel;
+        use ironclaw_channels_core::testing::MockAdapter;
+        use ironclaw_types::ChannelType;
+        let cfg = HostConfig::default();
+        let mk = |name: &str| InitializedChannel {
+            channel_type: ChannelType::from(name),
+            adapter: Arc::new(MockAdapter::new(name)),
+        };
+        let lines = ready_banner_lines(&cfg, &[mk("cli"), mk("telegram")]);
+        let joined = lines.join("\n");
+        assert!(joined.contains("cli, telegram"), "actual: {joined}");
     }
 
     #[test]
