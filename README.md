@@ -48,9 +48,15 @@ the final M11 deliverable.
   launchd unit generators and a `--migrate-from` data-directory
   migrator.
 - **17 authored skills** under `skills/`.
-- **4355 passing tests**, 0 failing. `cargo clippy --workspace
+- **4365 passing tests**, 0 failing. `cargo clippy --workspace
   --all-targets -- -D warnings` clean. CI runs fmt + clippy + test on
   Linux and macOS with an 85% coverage gate.
+- **End-to-end chat works** against any Anthropic-API-compatible
+  provider (Anthropic native or OpenRouter via
+  `ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1`). The host's
+  container manager spawns a runner-in-container per session, the
+  runner reads inbound.db, calls the provider, writes outbound.db,
+  and the delivery loop fans the reply back via the cli channel.
 
 ## Build
 

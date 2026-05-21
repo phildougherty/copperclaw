@@ -28,6 +28,11 @@ pub struct EnvFileSpec {
     /// Value of `ICLAW_SOCKET` — the socket the host listens on. Empty to
     /// omit the line.
     pub iclaw_socket: PathBuf,
+    /// Value of `IRONCLAW_DEFAULT_IMAGE_TAG` — the sha-pinned tag of
+    /// the session image setup just built. The host's container
+    /// manager uses this when an agent group has no
+    /// `container_config.image_tag` of its own. Empty to omit.
+    pub default_image_tag: String,
 }
 
 /// Step implementation.
@@ -90,6 +95,7 @@ impl Step for AuthStep {
             anthropic_base_url: base_url,
             data_dir: host_data_dir,
             iclaw_socket,
+            default_image_tag: cfg.image_tag.clone(),
         };
         write_env_file(&env_path, &spec)?;
         cfg.env_file.clone_from(&env_path);
@@ -129,6 +135,12 @@ pub fn render_env_file(spec: &EnvFileSpec) -> String {
     if !spec.iclaw_socket.as_os_str().is_empty() {
         out.push_str(&format!("ICLAW_SOCKET={}\n", spec.iclaw_socket.display()));
     }
+    if !spec.default_image_tag.is_empty() {
+        out.push_str(&format!(
+            "IRONCLAW_DEFAULT_IMAGE_TAG={}\n",
+            spec.default_image_tag
+        ));
+    }
     out
 }
 
@@ -159,6 +171,7 @@ mod tests {
             anthropic_base_url: String::new(),
             data_dir: PathBuf::from("/srv/iron/data"),
             iclaw_socket: PathBuf::from("/srv/iron/data/iclaw.sock"),
+            default_image_tag: String::new(),
         }
     }
 
@@ -177,6 +190,7 @@ mod tests {
             anthropic_base_url: String::new(),
             data_dir: PathBuf::new(),
             iclaw_socket: PathBuf::new(),
+            default_image_tag: String::new(),
         });
         assert_eq!(s, "ANTHROPIC_API_KEY=sk\n");
     }

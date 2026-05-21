@@ -143,7 +143,21 @@ pub async fn install_modules(host_ctx: Arc<HostContext>) {
         Box::new(TypingModule::new(TypingConfig::default())),
         Box::new(MountSecurityModule::new()),
         Box::new(PermissionsModule::deny_all()),
-        Box::new(ApprovalsModule::new()),
+        // Pre-approve the cli channel's deterministic `local` sender.
+        // The cli channel reads the host's own stdin — the only
+        // "sender" is the operator running `ironclaw run` already, so
+        // there's no meaningful approval gate to apply. Without this
+        // pre-seed, every interactive chat would silently deadlock on
+        // a missing approval CLI surface.
+        Box::new(ApprovalsModule::with_initial_approved(vec![
+            ironclaw_types::SenderIdentity {
+                channel_type: ironclaw_types::ChannelType::new(
+                    ironclaw_types::ChannelType::CLI,
+                ),
+                identity: "local".to_string(),
+                display_name: Some("local".to_string()),
+            },
+        ])),
         Box::new(InteractiveModule::default()),
         Box::new(SchedulingModule),
         Box::new(AgentToAgentModule),
@@ -177,12 +191,15 @@ pub async fn run_host(
     // 1-4. Migrations.
     run_migrations_only(&cfg)?;
 
-    // 5. Detect container runtime.
-    let runtime = match runtime {
-        Some(r) => r,
+    // 5. Detect container runtime. Wrap in an Arc so we can hand one
+    // clone to the orphan-cleanup call and another to the container
+    // manager later in this fn.
+    let runtime: Arc<dyn ContainerRuntime> = match runtime {
+        Some(r) => Arc::from(r),
         None => ironclaw_container_rt::detect()
             .await
-            .map_err(BootError::RuntimeDetect)?,
+            .map_err(BootError::RuntimeDetect)?
+            .into(),
     };
 
     // 6. Orphan cleanup (best effort).
@@ -237,6 +254,13 @@ pub async fn run_host(
     // 13. Sweep loop.
     let sweep_loop = tokio::spawn(Arc::clone(&state.sweep).run_loop(shutdown.clone()));
 
+    let manager_task = spawn_container_manager(
+        &cfg,
+        state.central.clone(),
+        Arc::clone(&runtime),
+        shutdown.clone(),
+    );
+
     // 14. Spawn socket server.
     let socket_path = cfg.ncl_socket_path.clone();
     let socket_central = state.central.clone();
@@ -261,6 +285,9 @@ pub async fn run_host(
         let _ = active.await;
         let _ = sweep_delivery.await;
         let _ = sweep_loop.await;
+        if let Some(t) = manager_task {
+            let _ = t.await;
+        }
         let _ = socket_task.await;
     })
     .await;
@@ -306,6 +333,52 @@ pub async fn wait_for_signal(shutdown: CancellationToken) {
 /// here so other crates can resolve the same location.
 pub fn channel_data_dir(data_root: &std::path::Path, channel_type: &str) -> PathBuf {
     data_root.join("channels").join(channel_type)
+}
+
+/// Spawn the container-manager task. Returns `Some(handle)` when the
+/// default image tag is known; otherwise logs a warning and returns
+/// `None` so the host still boots (sessions just won't get a runner).
+fn spawn_container_manager(
+    cfg: &HostConfig,
+    central: ironclaw_db::central::CentralDb,
+    runtime: Arc<dyn ContainerRuntime>,
+    shutdown: CancellationToken,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let Some(image_tag) = cfg.default_image_tag.clone() else {
+        warn!(
+            "no IRONCLAW_DEFAULT_IMAGE_TAG configured; container manager disabled. \
+             Sessions will accept inbound but no agent will respond. Run \
+             `ironclaw-setup` to build the image and write the tag to .env."
+        );
+        return None;
+    };
+    let manager_cfg = crate::container_manager::ManagerConfig {
+        install_slug: cfg.install_slug.clone(),
+        // The router/delivery/sweep build SessionPaths via
+        // `FsSessionRoot::new(cfg.sessions_root())`, which means the
+        // actual on-disk root is `data_dir/sessions` (and
+        // `SessionPaths::new` appends another `/sessions/<ag>/<session>`
+        // on top of that). Match the same shape here so we open the
+        // same inbound.db the rest of the host writes to.
+        data_dir: cfg.sessions_root(),
+        default_image_tag: image_tag,
+        default_provider: cfg
+            .default_provider
+            .clone()
+            .unwrap_or_else(|| "anthropic".into()),
+        default_model: cfg
+            .default_model
+            .clone()
+            .unwrap_or_else(|| "claude-sonnet-4-5".into()),
+        anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
+        anthropic_base_url: std::env::var("ANTHROPIC_BASE_URL").ok(),
+    };
+    let manager = Arc::new(crate::container_manager::ContainerManager::new(
+        central,
+        runtime,
+        manager_cfg,
+    ));
+    Some(tokio::spawn(manager.run_loop(shutdown)))
 }
 
 /// Print a one-screen summary of the running host so an operator can see

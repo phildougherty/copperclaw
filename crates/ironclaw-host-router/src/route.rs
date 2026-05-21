@@ -424,9 +424,27 @@ impl Router {
         // Touch the inbound.db so migrations run; otherwise the first
         // `insert_in` would do it as a side effect, but doing it eagerly
         // surfaces failures here instead of mid-write.
-        let _pool = self
+        let pool = self
             .session_paths
             .inbound_pool(&created.agent_group_id, &created.id)?;
+        // Seed `session_routing` so the runner's `to: None` outbound
+        // reply path knows where to send replies. Without this, an
+        // agent that just emits text (the common case for the cli
+        // channel) produces outbound rows with no destination, and
+        // the delivery service marks them failed with `NoRoute`. The
+        // host's wiring picks the channel/platform/thread off the
+        // inbound event itself rather than relying on a per-mg
+        // routing table because the cli channel's `platform_id` is
+        // always `stdin` regardless of mg.
+        let routing = ironclaw_types::routing::SessionRouting {
+            channel_type: Some(event.channel_type.clone()),
+            platform_id: Some(event.platform_id.clone()),
+            thread_id: event.thread_id.clone(),
+        };
+        pool.with_conn(|conn| {
+            ironclaw_db::tables::session_routing::write(conn, &routing)
+        })
+        .map_err(|e| RouterError::session_create(format!("write session_routing: {e}")))?;
         Ok(TargetSession {
             agent_group_id: created.agent_group_id,
             id: created.id,

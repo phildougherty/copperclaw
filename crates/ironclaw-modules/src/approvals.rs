@@ -64,6 +64,19 @@ impl ApprovalsModule {
         }
     }
 
+    /// Build a module that starts with the supplied senders already
+    /// approved. Used by the host to pre-trust deterministic
+    /// platform-side identities (e.g. the `cli` channel's `local`
+    /// sender, where the "user" is the operator running `ironclaw run`
+    /// itself — there is nothing meaningful to approve).
+    #[must_use]
+    pub fn with_initial_approved(senders: Vec<SenderIdentity>) -> Self {
+        Self {
+            store: Arc::new(Mutex::new(PendingStore::default())),
+            known_senders: Arc::new(Mutex::new(senders)),
+        }
+    }
+
     /// Mark a sender as approved so the gate stops returning `Pending` for
     /// them.
     pub fn approve_sender(&self, identity: SenderIdentity) {

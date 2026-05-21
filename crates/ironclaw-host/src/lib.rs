@@ -12,6 +12,7 @@
 pub mod boot;
 pub mod channels_init;
 pub mod config;
+pub mod container_manager;
 pub mod context;
 pub mod handlers;
 pub mod orphans;
@@ -19,6 +20,7 @@ pub mod sessions;
 pub mod socket;
 
 pub use boot::{run_host, BootError};
+pub use container_manager::{ContainerManager, ManagerConfig};
 pub use config::{ChannelInit, HostConfig, HostConfigError};
 pub use context::HostContext;
 pub use sessions::FsSessionRoot;
@@ -38,12 +40,13 @@ pub(crate) mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    /// No-op runtime. Records the last orphan-cleanup slug it saw so tests
-    /// can assert against it.
+    /// No-op runtime. Records the last orphan-cleanup slug and every
+    /// spawn call's container name so tests can assert against them.
     #[derive(Default)]
     pub struct NoopRuntime {
         pub last_orphan_slug: Mutex<Option<String>>,
         pub fail_next: Mutex<Option<RtError>>,
+        pub spawn_log: Mutex<Vec<String>>,
     }
 
     impl NoopRuntime {
@@ -57,6 +60,11 @@ pub(crate) mod tests {
         /// Snapshot of the last `cleanup_orphans` slug.
         pub fn last_orphan_slug(&self) -> Option<String> {
             self.last_orphan_slug.lock().unwrap().clone()
+        }
+
+        /// Snapshot of every spawn call's container name, in order.
+        pub fn spawn_calls(&self) -> Vec<String> {
+            self.spawn_log.lock().unwrap().clone()
         }
     }
 
@@ -84,6 +92,7 @@ pub(crate) mod tests {
         }
 
         async fn spawn(&self, spec: ContainerSpec) -> Result<ContainerHandle, RtError> {
+            self.spawn_log.lock().unwrap().push(spec.name.clone());
             if let Some(err) = self.fail_next.lock().unwrap().take() {
                 return Err(err);
             }

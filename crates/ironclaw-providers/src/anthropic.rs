@@ -54,16 +54,26 @@ impl AnthropicProvider {
 
     /// Build a provider that talks to a custom base URL (used by tests via
     /// wiremock; the path `/v1/messages` is appended automatically).
+    ///
+    /// Users sometimes pass base URLs that already end in `/v1` —
+    /// e.g. `OpenRouter`'s Anthropic-compatible endpoint at
+    /// `https://openrouter.ai/api/v1`. To make those Just Work without
+    /// a footgun double-`/v1` path, the constructor strips a trailing
+    /// `/v1` segment off the supplied base before the suffix is
+    /// appended at call time.
     #[must_use]
     pub fn with_base_url(api_key: impl Into<String>, base_url: impl Into<String>) -> Self {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(600))
             .build()
             .expect("reqwest client builds");
+        let raw = base_url.into();
+        let trimmed = raw.trim_end_matches('/');
+        let normalized = trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string();
         Self {
             inner: Arc::new(Inner {
                 http,
-                base_url: base_url.into().trim_end_matches('/').to_string(),
+                base_url: normalized,
                 api_key: api_key.into(),
             }),
         }
@@ -571,5 +581,36 @@ mod tests {
     fn base_url_trims_trailing_slash() {
         let p = AnthropicProvider::with_base_url("k", "https://example.com/");
         assert_eq!(p.inner.base_url, "https://example.com");
+    }
+
+    #[test]
+    fn base_url_strips_trailing_v1_so_users_can_paste_openrouter_url_verbatim() {
+        // `https://openrouter.ai/api/v1` is the canonical form
+        // OpenRouter docs hand operators. The provider appends
+        // `/v1/messages` later, so the trailing `/v1` would yield a
+        // double-`/v1` 404 if we naively concatenated.
+        let p = AnthropicProvider::with_base_url("k", "https://openrouter.ai/api/v1");
+        assert_eq!(p.inner.base_url, "https://openrouter.ai/api");
+    }
+
+    #[test]
+    fn base_url_strips_trailing_v1_even_with_trailing_slash() {
+        let p = AnthropicProvider::with_base_url("k", "https://openrouter.ai/api/v1/");
+        assert_eq!(p.inner.base_url, "https://openrouter.ai/api");
+    }
+
+    #[test]
+    fn base_url_without_v1_suffix_unchanged() {
+        let p = AnthropicProvider::with_base_url("k", "https://api.anthropic.com");
+        assert_eq!(p.inner.base_url, "https://api.anthropic.com");
+    }
+
+    #[test]
+    fn base_url_does_not_strip_v1_in_the_middle_of_the_path() {
+        // We only strip a trailing `/v1`, not an embedded one — a
+        // versioned proxy path like `/v1/projects/123/anthropic`
+        // must round-trip untouched.
+        let p = AnthropicProvider::with_base_url("k", "https://proxy.example/v1/anthropic");
+        assert_eq!(p.inner.base_url, "https://proxy.example/v1/anthropic");
     }
 }

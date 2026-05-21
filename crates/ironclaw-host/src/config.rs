@@ -76,6 +76,11 @@ pub struct HostConfig {
     pub default_provider: Option<String>,
     /// Default model id (or `None`).
     pub default_model: Option<String>,
+    /// Default sha-pinned image tag for sessions when the per-group
+    /// `container_config.image_tag` is unset. Set by `ironclaw-setup`
+    /// after building the image; the host's container manager
+    /// requires this to spawn containers on demand.
+    pub default_image_tag: Option<String>,
     /// Channels to initialize at boot.
     pub channels: Vec<ChannelInit>,
 }
@@ -109,6 +114,10 @@ impl HostConfig {
             .map_or_else(|| data_dir.join("iclaw.sock"), PathBuf::from);
         let default_provider = map.get("IRONCLAW_DEFAULT_PROVIDER").cloned();
         let default_model = map.get("IRONCLAW_DEFAULT_MODEL").cloned();
+        let default_image_tag = map
+            .get("IRONCLAW_DEFAULT_IMAGE_TAG")
+            .cloned()
+            .filter(|s| !s.is_empty());
 
         let channels_list = map
             .get("IRONCLAW_CHANNELS")
@@ -148,6 +157,7 @@ impl HostConfig {
             ncl_socket_path,
             default_provider,
             default_model,
+            default_image_tag,
             channels,
         })
     }
@@ -185,20 +195,25 @@ fn env_to_map() -> HashMap<String, String> {
 ///
 /// Resolution order:
 /// 1. Explicit `path` (passed via `--env-file`).
-/// 2. `.env` in the current working directory (via `dotenvy::dotenv`).
-/// 3. `.env` inside the platform's default ironclaw install dir
-///    (XDG share on Linux, Application Support on macOS), which is
-///    where `ironclaw-setup` writes by default. This means
-///    `ironclaw run` works from any directory after a default install.
+/// 2. The platform install root's `.env`
+///    (`$XDG_DATA_HOME/ironclaw/.env` on Linux,
+///    `~/Library/Application Support/ironclaw/.env` on macOS), which
+///    is where `ironclaw-setup` writes by default.
+/// 3. `.env` in the current working directory (via `dotenvy::dotenv`)
+///    as a last-resort supplement. `dotenvy` walks parents looking
+///    for the file, so anything above the CWD also counts.
+///
+/// Vars loaded in step (2) win over step (3) — both `dotenvy` calls
+/// only set variables that aren't already in the process env, so the
+/// install-root values take precedence by virtue of going first.
 pub fn load_dotenv_optional(path: Option<&Path>) -> bool {
     if let Some(p) = path {
         return dotenvy::from_path(p).is_ok();
     }
-    if dotenvy::dotenv().is_ok() {
-        return true;
-    }
-    default_install_env_file()
-        .is_some_and(|p| p.is_file() && dotenvy::from_path(&p).is_ok())
+    let install_loaded = default_install_env_file()
+        .is_some_and(|p| p.is_file() && dotenvy::from_path(&p).is_ok());
+    let cwd_loaded = dotenvy::dotenv().is_ok();
+    install_loaded || cwd_loaded
 }
 
 /// Platform-default install-dir `.env` path. Mirrors
