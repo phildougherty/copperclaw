@@ -65,7 +65,10 @@ async fn main() -> Result<()> {
         .api_key
         .clone()
         .context("provider api key not set; configure `api_key_env`")?;
-    let provider = Arc::new(AnthropicProvider::new(api_key));
+    let provider = Arc::new(match cfg.api_base_url.as_deref() {
+        Some(base) => AnthropicProvider::with_base_url(api_key, base),
+        None => AnthropicProvider::new(api_key),
+    });
     let tool_ctx: Arc<dyn ironclaw_mcp::ToolContext> = Arc::new(RunnerToolCtx::new(
         outbound.clone(),
         paths.outbox.clone(),

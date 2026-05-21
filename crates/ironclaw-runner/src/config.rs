@@ -57,6 +57,11 @@ pub struct RunnerConfigFile {
     pub system: Option<String>,
     /// Name of the environment variable to read the API key from.
     pub api_key_env: Option<String>,
+    /// Override the default Anthropic base URL. Set to e.g.
+    /// `https://openrouter.ai/api/v1` to route requests through an
+    /// Anthropic-API-compatible gateway (`OpenRouter`, an internal proxy,
+    /// etc.). Falls back to the provider's hard-coded default when None.
+    pub api_base_url: Option<String>,
     /// Override token window (defaults to `compaction::DEFAULT_INPUT_WINDOW`).
     pub model_input_window: Option<usize>,
     /// Override compaction safety margin in tokens.
@@ -86,6 +91,9 @@ pub struct RunnerConfig {
     pub system: String,
     /// API key value, resolved at startup from `api_key_env`.
     pub api_key: Option<String>,
+    /// Override the Anthropic base URL. Passed straight through to
+    /// `AnthropicProvider::with_base_url` when present.
+    pub api_base_url: Option<String>,
     /// Token window.
     pub model_input_window: usize,
     /// Safety margin.
@@ -118,6 +126,12 @@ impl RunnerConfig {
         let model = file.model.ok_or(ConfigError::MissingField("model"))?;
         let system = file.system.unwrap_or_default();
         let api_key = file.api_key_env.as_deref().and_then(|name| env.get(name));
+        // Prefer the explicit file field; otherwise pick up
+        // `ANTHROPIC_BASE_URL` from the environment so a single env var
+        // configures every session (matches how api_key is sourced).
+        let api_base_url = file
+            .api_base_url
+            .or_else(|| env.get("ANTHROPIC_BASE_URL"));
         Ok(Self {
             session_id,
             agent_group_id,
@@ -126,6 +140,7 @@ impl RunnerConfig {
             effort: file.effort.unwrap_or(Effort::Medium),
             system,
             api_key,
+            api_base_url,
             model_input_window: file
                 .model_input_window
                 .unwrap_or(crate::compaction::DEFAULT_INPUT_WINDOW),
@@ -212,6 +227,7 @@ mod tests {
             effort: Some(Effort::High),
             system: Some("you are an agent".into()),
             api_key_env: Some("ANTHROPIC_API_KEY".into()),
+            api_base_url: None,
             model_input_window: Some(200_000),
             safety_margin_tokens: Some(8_000),
             max_tokens: Some(4096),
@@ -237,6 +253,46 @@ mod tests {
         let env = MapEnv::default();
         let cfg = RunnerConfig::from_file_struct(good_file(), &env).unwrap();
         assert!(cfg.api_key.is_none());
+    }
+
+    #[test]
+    fn api_base_url_picked_up_from_file_field() {
+        let mut file = good_file();
+        file.api_base_url = Some("https://openrouter.ai/api/v1".into());
+        let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "k")]);
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert_eq!(
+            cfg.api_base_url.as_deref(),
+            Some("https://openrouter.ai/api/v1")
+        );
+    }
+
+    #[test]
+    fn api_base_url_picked_up_from_env_when_file_silent() {
+        let env = MapEnv::from_pairs([
+            ("ANTHROPIC_API_KEY", "k"),
+            ("ANTHROPIC_BASE_URL", "https://proxy.example/v1"),
+        ]);
+        let cfg = RunnerConfig::from_file_struct(good_file(), &env).unwrap();
+        assert_eq!(
+            cfg.api_base_url.as_deref(),
+            Some("https://proxy.example/v1")
+        );
+    }
+
+    #[test]
+    fn api_base_url_file_overrides_env() {
+        let mut file = good_file();
+        file.api_base_url = Some("https://file.example/v1".into());
+        let env = MapEnv::from_pairs([
+            ("ANTHROPIC_API_KEY", "k"),
+            ("ANTHROPIC_BASE_URL", "https://env.example/v1"),
+        ]);
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert_eq!(
+            cfg.api_base_url.as_deref(),
+            Some("https://file.example/v1")
+        );
     }
 
     #[test]

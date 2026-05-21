@@ -18,6 +18,10 @@ use std::path::{Path, PathBuf};
 pub struct EnvFileSpec {
     /// API key persisted as `ANTHROPIC_API_KEY=...`.
     pub anthropic_api_key: String,
+    /// Optional override base URL. When non-empty written as
+    /// `ANTHROPIC_BASE_URL=...`. Used to route through
+    /// Anthropic-API-compatible gateways like `OpenRouter`.
+    pub anthropic_base_url: String,
     /// Value of `IRONCLAW_DATA_DIR` — the dir that holds `ironclaw.db`,
     /// `sessions/`, and the iclaw socket. Empty to omit the line.
     pub data_dir: PathBuf,
@@ -53,6 +57,25 @@ impl Step for AuthStep {
             Ok(v) if !v.trim().is_empty() => v,
             _ => prompt.secret("ANTHROPIC_API_KEY", "Anthropic API key")?,
         };
+        // Optional override base URL — captured from the process env or
+        // a setup-level env var so headless installs targeting
+        // OpenRouter / a proxy can configure it in one shot. Falls back
+        // to empty (omit the line) so existing installs stay
+        // unchanged.
+        let base_url = std::env::var("ANTHROPIC_BASE_URL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| {
+                prompt
+                    .input(
+                        "ANTHROPIC_BASE_URL",
+                        "Override Anthropic base URL (blank for default)",
+                        Some(""),
+                    )
+                    .ok()
+                    .filter(|v| !v.trim().is_empty())
+            })
+            .unwrap_or_default();
         let env_path = cfg.data_dir.join(".env");
         let host_data_dir = if cfg.central_db_path.as_os_str().is_empty() {
             cfg.data_dir.join("data")
@@ -64,6 +87,7 @@ impl Step for AuthStep {
         let iclaw_socket = host_data_dir.join("iclaw.sock");
         let spec = EnvFileSpec {
             anthropic_api_key: key,
+            anthropic_base_url: base_url,
             data_dir: host_data_dir,
             iclaw_socket,
         };
@@ -93,6 +117,12 @@ pub fn write_env_file(path: &Path, spec: &EnvFileSpec) -> Result<(), StepError> 
 pub fn render_env_file(spec: &EnvFileSpec) -> String {
     let mut out = String::new();
     out.push_str(&format!("ANTHROPIC_API_KEY={}\n", spec.anthropic_api_key));
+    if !spec.anthropic_base_url.is_empty() {
+        out.push_str(&format!(
+            "ANTHROPIC_BASE_URL={}\n",
+            spec.anthropic_base_url
+        ));
+    }
     if !spec.data_dir.as_os_str().is_empty() {
         out.push_str(&format!("IRONCLAW_DATA_DIR={}\n", spec.data_dir.display()));
     }
@@ -126,6 +156,7 @@ mod tests {
     fn spec(key: &str) -> EnvFileSpec {
         EnvFileSpec {
             anthropic_api_key: key.into(),
+            anthropic_base_url: String::new(),
             data_dir: PathBuf::from("/srv/iron/data"),
             iclaw_socket: PathBuf::from("/srv/iron/data/iclaw.sock"),
         }
@@ -143,10 +174,22 @@ mod tests {
     fn render_env_file_omits_empty_paths() {
         let s = render_env_file(&EnvFileSpec {
             anthropic_api_key: "sk".into(),
+            anthropic_base_url: String::new(),
             data_dir: PathBuf::new(),
             iclaw_socket: PathBuf::new(),
         });
         assert_eq!(s, "ANTHROPIC_API_KEY=sk\n");
+    }
+
+    #[test]
+    fn render_env_file_includes_base_url_when_set() {
+        let mut s = spec("sk");
+        s.anthropic_base_url = "https://openrouter.ai/api/v1".into();
+        let body = render_env_file(&s);
+        assert!(
+            body.contains("ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1\n"),
+            "body: {body}"
+        );
     }
 
     #[test]

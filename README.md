@@ -23,10 +23,12 @@ See `PLAN.md` for the team-by-team design and milestone history.
 the M11 documentation set; the differential-replay harness lands as
 the final M11 deliverable.
 
-- **19 in-tree channel crates**: cli, telegram, slack, discord,
-  resend, github, linear, webex, matrix, teams, gchat, whatsapp-cloud,
-  signal, deltachat, emacs, x, wechat (Work Weixin), imessage, and a
-  whatsapp (native Baileys) skeleton with a stubbed `CryptoBackend`.
+- **18 in-tree channel crates**: cli, telegram, slack, discord,
+  resend, github, linear, webex, matrix, teams, gchat, whatsapp-cloud
+  (Meta Cloud Business API), signal (via signal-cli RPC), deltachat,
+  emacs, x, wechat (Work Weixin), imessage. Every shipped channel is
+  a complete implementation — no stubbed crypto, no placeholder
+  backends.
 - **Provider variants**: Anthropic HTTP-streaming with tool-use and
   compaction, plus subprocess-bridged Codex / OpenCode and an
   Ollama-via-Anthropic-base-URL variant.
@@ -42,7 +44,7 @@ the final M11 deliverable.
   launchd unit generators and a `--migrate-from` data-directory
   migrator.
 - **17 authored skills** under `skills/`.
-- **4583 passing tests**, 0 failing. `cargo clippy --workspace
+- **4199 passing tests**, 0 failing. `cargo clippy --workspace
   --all-targets -- -D warnings` clean. CI runs fmt + clippy + test on
   Linux and macOS with an 85% coverage gate.
 
