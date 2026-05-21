@@ -1457,6 +1457,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironclaw-channels-mattermost"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "ironclaw-channels-core",
+ "ironclaw-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "ironclaw-channels-resend"
 version = "0.1.0"
 dependencies = [
@@ -1757,6 +1778,7 @@ dependencies = [
  "ironclaw-channels-imessage",
  "ironclaw-channels-linear",
  "ironclaw-channels-matrix",
+ "ironclaw-channels-mattermost",
  "ironclaw-channels-resend",
  "ironclaw-channels-signal",
  "ironclaw-channels-slack",

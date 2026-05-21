@@ -31,6 +31,7 @@ ironclaw-channels-linear   = { workspace = true }
 ironclaw-channels-webex    = { workspace = true }
 ironclaw-channels-matrix   = { workspace = true }
 ironclaw-channels-teams    = { workspace = true }
+ironclaw-channels-mattermost = { workspace = true }
 ironclaw-channels-gchat    = { workspace = true }
 ironclaw-channels-imessage = { workspace = true }
 ironclaw-channels-wechat   = { workspace = true }

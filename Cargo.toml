@@ -22,6 +22,7 @@ members = [
     "crates/ironclaw-channels/webex",
     "crates/ironclaw-channels/matrix",
     "crates/ironclaw-channels/teams",
+    "crates/ironclaw-channels/mattermost",
     "crates/ironclaw-channels/gchat",
     "crates/ironclaw-channels/imessage",
     "crates/ironclaw-channels/wechat",
@@ -63,6 +64,7 @@ ironclaw-channels-linear   = { path = "crates/ironclaw-channels/linear" }
 ironclaw-channels-webex    = { path = "crates/ironclaw-channels/webex" }
 ironclaw-channels-matrix   = { path = "crates/ironclaw-channels/matrix" }
 ironclaw-channels-teams    = { path = "crates/ironclaw-channels/teams" }
+ironclaw-channels-mattermost = { path = "crates/ironclaw-channels/mattermost" }
 ironclaw-channels-gchat    = { path = "crates/ironclaw-channels/gchat" }
 ironclaw-channels-imessage = { path = "crates/ironclaw-channels/imessage" }
 ironclaw-channels-wechat   = { path = "crates/ironclaw-channels/wechat" }

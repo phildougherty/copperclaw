@@ -23,14 +23,15 @@ See `PLAN.md` for the team-by-team design and milestone history.
 the M11 documentation set; the differential-replay harness lands as
 the final M11 deliverable.
 
-- **19 in-tree channel crates**: cli, telegram, slack, discord,
-  resend, github, linear, webex, matrix, teams, gchat, whatsapp-cloud
-  (Meta Cloud Business API), webhooks (generic HMAC-signed HTTP
-  inbound — one adapter for Stripe / Grafana / Sentry / Vercel /
-  Shopify / IoT / hand-rolled CI hooks), signal (via signal-cli
-  RPC), deltachat, emacs, x, wechat (Work Weixin), imessage. Every
-  shipped channel is a complete implementation — no stubbed crypto,
-  no placeholder backends.
+- **20 in-tree channel crates**: cli, telegram, slack, discord,
+  resend, github, linear, webex, matrix, teams, mattermost (REST v4
+  + outgoing-webhook ingress), gchat, whatsapp-cloud (Meta Cloud
+  Business API), webhooks (generic HMAC-signed HTTP inbound — one
+  adapter for Stripe / Grafana / Sentry / Vercel / Shopify / IoT /
+  hand-rolled CI hooks), signal (via signal-cli RPC), deltachat,
+  emacs, x, wechat (Work Weixin), imessage. Every shipped channel
+  is a complete implementation — no stubbed crypto, no placeholder
+  backends.
 - **Provider variants**: Anthropic HTTP-streaming with tool-use and
   compaction, plus subprocess-bridged Codex / OpenCode and an
   Ollama-via-Anthropic-base-URL variant.
@@ -46,7 +47,7 @@ the final M11 deliverable.
   launchd unit generators and a `--migrate-from` data-directory
   migrator.
 - **17 authored skills** under `skills/`.
-- **4243 passing tests**, 0 failing. `cargo clippy --workspace
+- **4302 passing tests**, 0 failing. `cargo clippy --workspace
   --all-targets -- -D warnings` clean. CI runs fmt + clippy + test on
   Linux and macOS with an 85% coverage gate.
 
