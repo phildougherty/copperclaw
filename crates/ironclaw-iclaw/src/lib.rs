@@ -199,10 +199,10 @@ where
     };
 
     let call = cli.to_call();
-    // Composite client-side ops produce a `quickstart.*` marker command
+    // Composite client-side ops produce a `composite.*` marker command
     // that we recognise here before reaching the transport.
-    if let Some(suffix) = call.command.strip_prefix("quickstart.") {
-        return run_quickstart(suffix, &call.args, transport, caller, cli.json).await;
+    if let Some(suffix) = call.command.strip_prefix("composite.") {
+        return run_composite(suffix, &call.args, transport, caller, cli.json).await;
     }
     match transport.call(&call.command, call.args, caller).await {
         Ok(data) => {
@@ -225,10 +225,10 @@ where
     }
 }
 
-/// Dispatch a composite `iclaw quickstart <op>` client-side. Each op
-/// fans out into a sequence of real wire calls and aggregates the
-/// responses into a single JSON summary.
-async fn run_quickstart<T>(
+/// Dispatch a `composite.*` client-side op. Each composite fans out
+/// into a sequence of real wire calls and aggregates the responses
+/// into a single rendered summary.
+async fn run_composite<T>(
     op: &str,
     args: &serde_json::Value,
     transport: &T,
@@ -239,9 +239,130 @@ where
     T: CallTransport + ?Sized,
 {
     match op {
-        "cli" => run_quickstart_cli(args, transport, caller, as_json).await,
-        other => RunOutput::failure(format!("unknown quickstart op: {other}\n")),
+        "quickstart-cli" => run_quickstart_cli(args, transport, caller, as_json).await,
+        "status" => run_status(transport, caller, as_json).await,
+        "completions" => run_completions(args),
+        other => RunOutput::failure(format!("unknown composite op: {other}\n")),
     }
+}
+
+/// `iclaw completions <shell>` — render the clap-generated completion
+/// script to stdout. No transport call; pure client-side.
+fn run_completions(args: &serde_json::Value) -> RunOutput {
+    use clap::CommandFactory as _;
+    let Some(shell_str) = args.get("shell").and_then(serde_json::Value::as_str) else {
+        return RunOutput::failure("completions: missing shell\n".to_string());
+    };
+    let Ok(shell) = shell_str.parse::<clap_complete::Shell>() else {
+        return RunOutput::failure(format!("completions: unknown shell {shell_str}\n"));
+    };
+    let mut cmd = Cli::command();
+    let mut buf: Vec<u8> = Vec::new();
+    clap_complete::generate(shell, &mut cmd, "iclaw", &mut buf);
+    let text = String::from_utf8(buf)
+        .unwrap_or_else(|e| format!("completions: invalid utf8 from generator: {e}\n"));
+    RunOutput::success(text)
+}
+
+/// `iclaw status` — gather a one-shot install overview by hitting four
+/// list endpoints in parallel-ish (sequential round-trips, since the
+/// transport doesn't support batching). Renders a digest of counts
+/// plus a small table per resource so the user can immediately see
+/// what's wired up.
+async fn run_status<T>(transport: &T, caller: Caller, as_json: bool) -> RunOutput
+where
+    T: CallTransport + ?Sized,
+{
+    let groups = match transport
+        .call("groups.list", serde_json::json!({}), caller.clone())
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return RunOutput::failure(format_step_error("groups.list", &e)),
+    };
+    let mgs = match transport
+        .call("messaging-groups.list", serde_json::json!({}), caller.clone())
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return RunOutput::failure(format_step_error("messaging-groups.list", &e)),
+    };
+    let wirings = match transport
+        .call("wirings.list", serde_json::json!({}), caller.clone())
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return RunOutput::failure(format_step_error("wirings.list", &e)),
+    };
+    let sessions = match transport
+        .call(
+            "sessions.list",
+            serde_json::json!({"status": "active"}),
+            caller,
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return RunOutput::failure(format_step_error("sessions.list", &e)),
+    };
+
+    if as_json {
+        let summary = serde_json::json!({
+            "agent_groups": groups,
+            "messaging_groups": mgs,
+            "wirings": wirings,
+            "active_sessions": sessions,
+        });
+        let mut out = render_json_pretty(&summary);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        return RunOutput::success(out);
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "agent groups:      {}\n",
+        array_len(&groups)
+    ));
+    out.push_str(&format!(
+        "messaging groups:  {}\n",
+        array_len(&mgs)
+    ));
+    out.push_str(&format!("wirings:           {}\n", array_len(&wirings)));
+    out.push_str(&format!(
+        "active sessions:   {}\n",
+        array_len(&sessions)
+    ));
+    out.push('\n');
+    if array_len(&groups) > 0 {
+        out.push_str("agent groups\n");
+        out.push_str(&render(&groups));
+        out.push_str("\n\n");
+    }
+    if array_len(&mgs) > 0 {
+        out.push_str("messaging groups\n");
+        out.push_str(&render(&mgs));
+        out.push_str("\n\n");
+    }
+    if array_len(&wirings) > 0 {
+        out.push_str("wirings\n");
+        out.push_str(&render(&wirings));
+        out.push_str("\n\n");
+    }
+    if array_len(&sessions) > 0 {
+        out.push_str("active sessions\n");
+        out.push_str(&render(&sessions));
+        out.push_str("\n\n");
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    RunOutput::success(out)
+}
+
+fn array_len(v: &serde_json::Value) -> usize {
+    v.as_array().map_or(0, Vec::len)
 }
 
 async fn run_quickstart_cli<T>(
@@ -638,6 +759,46 @@ mod tests {
         let calls = t.calls.lock().unwrap();
         assert_eq!(calls[0].1["folder"], "homedir");
         assert_eq!(calls[2].1["pattern"], "^hi");
+    }
+
+    #[tokio::test]
+    async fn completions_bash_renders_without_transport() {
+        // Use a transport that would error if dialled — completions
+        // must not hit it.
+        let t = SequencedTransport::new(vec![]);
+        let out = run_cli(["iclaw", "completions", "bash"], &t).await;
+        assert!(out.stderr.is_empty());
+        assert!(out.stdout.starts_with("_iclaw()"));
+        assert!(t.calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn completions_zsh_starts_with_compdef() {
+        let t = SequencedTransport::new(vec![]);
+        let out = run_cli(["iclaw", "completions", "zsh"], &t).await;
+        assert!(out.stdout.starts_with("#compdef iclaw"));
+    }
+
+    #[tokio::test]
+    async fn status_fans_out_four_list_calls() {
+        let t = SequencedTransport::new(vec![
+            Ok(json!([{"id": "ag-1", "name": "demo"}])),
+            Ok(json!([{"id": "mg-1", "channel_type": "cli"}])),
+            Ok(json!([{"id": "w-1"}])),
+            Ok(json!([])),
+        ]);
+        let out = run_cli(["iclaw", "status"], &t).await;
+        assert!(out.stderr.is_empty(), "stderr={:?}", out.stderr);
+        let calls = t.calls.lock().unwrap();
+        assert_eq!(calls[0].0, "groups.list");
+        assert_eq!(calls[1].0, "messaging-groups.list");
+        assert_eq!(calls[2].0, "wirings.list");
+        assert_eq!(calls[3].0, "sessions.list");
+        assert_eq!(calls[3].1["status"], "active");
+        assert!(out.stdout.contains("agent groups:      1"));
+        assert!(out.stdout.contains("messaging groups:  1"));
+        assert!(out.stdout.contains("wirings:           1"));
+        assert!(out.stdout.contains("active sessions:   0"));
     }
 
     #[tokio::test]

@@ -152,6 +152,17 @@ pub enum TopCommand {
         #[command(subcommand)]
         action: QuickstartCmd,
     },
+    /// One-shot overview of what's wired up on the host.
+    Status,
+    /// Emit shell completion script for `iclaw`.
+    ///
+    /// Pipe the output into your shell's completion dir, e.g.
+    /// `iclaw completions bash > /etc/bash_completion.d/iclaw` or
+    /// `iclaw completions zsh > ~/.zfunc/_iclaw`.
+    Completions {
+        /// Target shell. Supports `bash`, `zsh`, `fish`, `elvish`, `powershell`.
+        shell: clap_complete::Shell,
+    },
 }
 
 // --- quickstart ------------------------------------------------------------
@@ -572,6 +583,14 @@ impl TopCommand {
             Self::DroppedMessages { action } => action.to_call(),
             Self::Approvals { action } => action.to_call(),
             Self::Quickstart { action } => action.to_call(),
+            Self::Status => ParsedCall::new("composite.status", json!({})),
+            // Completions are emitted entirely client-side; the marker
+            // command carries the requested shell name so `run_cli`
+            // can short-circuit before any transport call.
+            Self::Completions { shell } => ParsedCall::new(
+                "composite.completions",
+                json!({ "shell": shell.to_string() }),
+            ),
         }
     }
 }
@@ -580,7 +599,7 @@ impl QuickstartCmd {
     /// Build the marker `ParsedCall` for a composite quickstart op.
     ///
     /// Composites aren't a single wire call; `run_cli` recognises the
-    /// `quickstart.*` command prefix and dispatches to a sequence of real
+    /// `composite.*` command prefix and dispatches to a sequence of real
     /// wire calls before this would ever reach the transport. The args
     /// payload below is the shape that the client-side orchestrator
     /// consumes.
@@ -597,7 +616,7 @@ impl QuickstartCmd {
                 insert_opt(&mut o, "folder", folder.clone());
                 insert_opt(&mut o, "pattern", pattern.clone());
                 insert_opt(&mut o, "provider", provider.clone());
-                ParsedCall::new("quickstart.cli", Value::Object(o))
+                ParsedCall::new("composite.quickstart-cli", Value::Object(o))
             }
         }
     }

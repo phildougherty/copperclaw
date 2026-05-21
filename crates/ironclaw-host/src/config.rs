@@ -180,14 +180,55 @@ fn env_to_map() -> HashMap<String, String> {
         .collect()
 }
 
-/// Try to load an `.env` file from the current working directory or from the
-/// path the user supplied. Errors are swallowed (returning `false`) because
-/// running without a dotfile is the default case.
+/// Try to load an `.env` file. Errors are swallowed (returning `false`)
+/// because running without a dotfile is the default case.
+///
+/// Resolution order:
+/// 1. Explicit `path` (passed via `--env-file`).
+/// 2. `.env` in the current working directory (via `dotenvy::dotenv`).
+/// 3. `.env` inside the platform's default ironclaw install dir
+///    (XDG share on Linux, Application Support on macOS), which is
+///    where `ironclaw-setup` writes by default. This means
+///    `ironclaw run` works from any directory after a default install.
 pub fn load_dotenv_optional(path: Option<&Path>) -> bool {
-    match path {
-        Some(p) => dotenvy::from_path(p).is_ok(),
-        None => dotenvy::dotenv().is_ok(),
+    if let Some(p) = path {
+        return dotenvy::from_path(p).is_ok();
     }
+    if dotenvy::dotenv().is_ok() {
+        return true;
+    }
+    default_install_env_file()
+        .is_some_and(|p| p.is_file() && dotenvy::from_path(&p).is_ok())
+}
+
+/// Platform-default install-dir `.env` path. Mirrors
+/// `ironclaw-setup`'s `default_data_dir_for` so the two binaries
+/// agree on where a fresh install lives. Returns `None` when neither
+/// `$HOME` nor a platform-specific override is available.
+#[must_use]
+pub fn default_install_env_file() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    Some(install_env_file_for(&home, std::env::consts::OS))
+}
+
+/// Pure variant of [`default_install_env_file`] used by tests.
+#[must_use]
+pub fn install_env_file_for(home: &Path, os: &str) -> PathBuf {
+    let root = match os {
+        "macos" => home
+            .join("Library")
+            .join("Application Support")
+            .join("ironclaw"),
+        "linux" => std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .filter(|x| !x.as_os_str().is_empty())
+            .map_or_else(
+                || home.join(".local").join("share").join("ironclaw"),
+                |xdg| xdg.join("ironclaw"),
+            ),
+        _ => home.join(".ironclaw"),
+    };
+    root.join(".env")
 }
 
 #[cfg(test)]
@@ -323,5 +364,29 @@ mod tests {
         // Just ensure no panic in the no-env happy path. We don't mutate the
         // process env in tests (it's `unsafe` under edition 2024).
         let _ = HostConfig::from_env().unwrap();
+    }
+
+    #[test]
+    fn install_env_file_for_macos() {
+        let p = install_env_file_for(Path::new("/Users/u"), "macos");
+        assert_eq!(
+            p,
+            PathBuf::from("/Users/u/Library/Application Support/ironclaw/.env")
+        );
+    }
+
+    #[test]
+    fn install_env_file_for_linux_fallback() {
+        if std::env::var_os("XDG_DATA_HOME").is_some() {
+            return;
+        }
+        let p = install_env_file_for(Path::new("/home/u"), "linux");
+        assert_eq!(p, PathBuf::from("/home/u/.local/share/ironclaw/.env"));
+    }
+
+    #[test]
+    fn install_env_file_for_other_os() {
+        let p = install_env_file_for(Path::new("/h"), "freebsd");
+        assert_eq!(p, PathBuf::from("/h/.ironclaw/.env"));
     }
 }

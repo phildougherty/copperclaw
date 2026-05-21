@@ -30,9 +30,11 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let use_ansi = std::io::IsTerminal::is_terminal(&std::io::stdout());
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with_target(false)
+        .with_ansi(use_ansi)
         .init();
 
     let cli = Cli::parse();

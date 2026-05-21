@@ -49,8 +49,13 @@ async fn main() -> ExitCode {
         }
     };
 
+    // Strip ANSI escapes when stdout isn't a TTY (logs piped to a file,
+    // systemd journal, container stdout capture, etc.) — leaving them in
+    // pollutes log aggregators with `\x1b[2m` noise.
+    let use_ansi = std::io::IsTerminal::is_terminal(&std::io::stdout());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(&cfg.log_filter))
+        .with_ansi(use_ansi)
         .init();
 
     match cli.command.unwrap_or(Command::Run) {

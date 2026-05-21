@@ -70,28 +70,28 @@ The release artifacts are:
 # Support/ironclaw). Pass --data-dir to override.
 ironclaw-setup
 
-# Boot the host using the .env that setup wrote inside the install
-# root. The .env carries IRONCLAW_DATA_DIR and ICLAW_SOCKET so iclaw
-# can find the running host without extra config.
-ironclaw --env-file ~/.local/share/ironclaw/.env run
+# Boot the host. With no `--env-file`, ironclaw auto-discovers the
+# .env setup wrote inside the platform install root, so both the data
+# dir and the iclaw socket path get picked up automatically.
+ironclaw run
 
-# In another terminal, source the same .env (or export ICLAW_SOCKET)
-# and drive it via iclaw.
-set -a; . ~/.local/share/ironclaw/.env; set +a
-
-# One-shot bootstrap: creates an agent group, a cli/stdin messaging
-# group, and a `.*` wiring between them so anything typed at the
-# host's stdin routes to the new group.
-iclaw quickstart cli --name first
-
-iclaw groups list
+# In another terminal — iclaw also resolves the install's socket
+# without configuration, so the commands Just Work from any cwd.
+iclaw quickstart cli --name first    # group + mg + wiring in one call
+iclaw status                          # everything wired up at a glance
 iclaw sessions list --status active
 ```
 
-Without `--env-file`, `ironclaw run` reads `IRONCLAW_DATA_DIR` from the
-process env and defaults to `./data` relative to the working dir; the
-companion `iclaw` defaults to `data/iclaw.sock` and also honours
-`ICLAW_SOCKET`.
+`ironclaw run` resolution order for the `.env`: `--env-file <path>` →
+`./.env` → platform install (`$XDG_DATA_HOME/ironclaw/.env` on Linux,
+`~/Library/Application Support/ironclaw/.env` on macOS). With none of
+those, the host falls back to `IRONCLAW_DATA_DIR=./data` so
+`cargo run -p ironclaw-host` from a checkout still works.
+
+`iclaw` resolves the socket in the same order: `--socket` → `ICLAW_SOCKET`
+→ platform install → `./data/iclaw.sock`. Run
+`iclaw completions <bash|zsh|fish>` to drop a completion script into
+your shell.
 
 For headless / scripted installs, pass `--headless` (alias
 `--non-interactive`) to `ironclaw-setup` and supply each prompt as an

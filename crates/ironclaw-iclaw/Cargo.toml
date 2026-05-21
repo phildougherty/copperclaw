@@ -19,6 +19,7 @@ ironclaw-db = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 clap = { workspace = true }
+clap_complete = "4"
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
