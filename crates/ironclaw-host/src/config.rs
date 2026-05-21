@@ -18,6 +18,8 @@
 //! | `IRONCLAW_DEFAULT_MODEL` | unset | Default Anthropic model id. |
 //! | `IRONCLAW_CHANNELS` | `cli` | Comma-separated list of channels to initialize. |
 //! | `IRONCLAW_CHANNELS_CONFIG` | `{}` | JSON object keyed by channel type; per-channel `setup.config`. |
+//! | `IRONCLAW_CLI_FIFO` | `<install_root>/chat.fifo` | Named pipe the cli channel reads from. `iclaw chat` writes one message per line into this FIFO. When unset, defaults to `<install_root>/chat.fifo` if `IRONCLAW_DATA_DIR` is set (`install_root` = parent of data dir), otherwise the cli channel falls back to reading from the host's own stdin (developer REPL mode). |
+//! | `IRONCLAW_CLI_LOG` | `<install_root>/chat.log` | Append-only log the cli channel writes outbound replies to; `iclaw chat` tails it. Same default-resolution rules as `IRONCLAW_CLI_FIFO`. |
 //! | `IRONCLAW_SKILLS_DIR` | unset | Directory of `SKILL.md` skill bundles auto-loaded into the agent system prompt. |
 //! | `IRONCLAW_GROUPS_DIR` | unset | Directory under which per-group `<ag_id>/skills/` overrides live. |
 //! | `IRONCLAW_METRICS_ADDR` | unset | Enable the Prometheus `/metrics` endpoint. Accepts `host:port` or a bare port (auto-prefixed to `127.0.0.1:`). Off by default per the conservative-defaults tenet. |
@@ -166,15 +168,44 @@ impl HostConfig {
             return Err(HostConfigError::ChannelsConfigShape);
         }
 
-        let channels = channels_list
+        // CLI-channel bridge paths: explicit env vars win over the
+        // install-root default. The bridge is what makes `iclaw chat`
+        // round-trip into the host without colliding with the host's
+        // own terminal stdin.
+        let cli_fifo = map
+            .get("IRONCLAW_CLI_FIFO")
+            .cloned()
+            .filter(|s| !s.is_empty());
+        let cli_log = map
+            .get("IRONCLAW_CLI_LOG")
+            .cloned()
+            .filter(|s| !s.is_empty());
+        let install_root = install_root_from_data_dir(&data_dir);
+        let default_fifo = install_root
+            .as_ref()
+            .map(|root| root.join("chat.fifo").display().to_string());
+        let default_log = install_root
+            .as_ref()
+            .map(|root| root.join("chat.log").display().to_string());
+        let cli_fifo_resolved = cli_fifo.or(default_fifo);
+        let cli_log_resolved = cli_log.or(default_log);
+
+        let channels: Vec<ChannelInit> = channels_list
             .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|name| {
-                let config = channels_config
+                let mut config = channels_config
                     .get(name)
                     .cloned()
                     .unwrap_or(Value::Object(serde_json::Map::new()));
+                if name == "cli" {
+                    inject_cli_bridge_paths(
+                        &mut config,
+                        cli_fifo_resolved.as_deref(),
+                        cli_log_resolved.as_deref(),
+                    );
+                }
                 ChannelInit {
                     channel_type: name.to_owned(),
                     config,
@@ -231,6 +262,41 @@ fn env_to_map() -> HashMap<String, String> {
     std::env::vars()
         .filter(|(k, _)| k.starts_with("IRONCLAW_"))
         .collect()
+}
+
+/// Resolve the install root from `IRONCLAW_DATA_DIR`. The install
+/// layout `ironclaw-setup` writes places `data/` under the install
+/// root, so the parent of `IRONCLAW_DATA_DIR` is where `chat.fifo`
+/// and `chat.log` live by default. Returns `None` when the data dir
+/// has no parent (e.g. a relative `data` with no parent component,
+/// or `/`), in which case the cli channel falls back to its
+/// developer-REPL stdin/stdout mode.
+fn install_root_from_data_dir(data_dir: &Path) -> Option<PathBuf> {
+    data_dir
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+}
+
+/// Insert `fifo` / `log` keys into the cli channel's config object
+/// when they aren't already present. The author of an
+/// `IRONCLAW_CHANNELS_CONFIG` blob wins; this only fills in the
+/// defaults so the common case (no JSON config) wires the bridge
+/// automatically.
+fn inject_cli_bridge_paths(config: &mut Value, fifo: Option<&str>, log: Option<&str>) {
+    // The caller already replaced non-objects with `{}` in the
+    // default path; if a caller passed a non-object explicitly,
+    // leave it alone so the channel's own validator emits a
+    // clear BadRequest.
+    let Value::Object(obj) = config else { return };
+    if let Some(f) = fifo {
+        obj.entry("fifo".to_string())
+            .or_insert_with(|| Value::String(f.to_owned()));
+    }
+    if let Some(l) = log {
+        obj.entry("log".to_string())
+            .or_insert_with(|| Value::String(l.to_owned()));
+    }
 }
 
 /// Try to load an `.env` file. Errors are swallowed (returning `false`)
@@ -351,6 +417,73 @@ mod tests {
         // slack listed but has no config blob — defaults to empty object.
         assert_eq!(cfg.channels[2].channel_type, "slack");
         assert!(cfg.channels[2].config.is_object());
+    }
+
+    #[test]
+    fn cli_bridge_paths_default_from_install_root() {
+        // IRONCLAW_DATA_DIR=/srv/ironclaw/data → install_root=/srv/ironclaw
+        let cfg = HostConfig::from_map(&m(&[
+            ("IRONCLAW_DATA_DIR", "/srv/ironclaw/data"),
+            ("IRONCLAW_CHANNELS", "cli"),
+        ]))
+        .unwrap();
+        let cli = &cfg.channels[0];
+        assert_eq!(cli.channel_type, "cli");
+        assert_eq!(cli.config["fifo"], "/srv/ironclaw/chat.fifo");
+        assert_eq!(cli.config["log"], "/srv/ironclaw/chat.log");
+    }
+
+    #[test]
+    fn cli_bridge_paths_env_var_overrides_default() {
+        let cfg = HostConfig::from_map(&m(&[
+            ("IRONCLAW_DATA_DIR", "/srv/ironclaw/data"),
+            ("IRONCLAW_CHANNELS", "cli"),
+            ("IRONCLAW_CLI_FIFO", "/tmp/x.fifo"),
+            ("IRONCLAW_CLI_LOG", "/tmp/x.log"),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.channels[0].config["fifo"], "/tmp/x.fifo");
+        assert_eq!(cfg.channels[0].config["log"], "/tmp/x.log");
+    }
+
+    #[test]
+    fn cli_bridge_paths_channels_config_json_wins() {
+        // Explicit `IRONCLAW_CHANNELS_CONFIG` for cli must NOT be
+        // clobbered by the env var defaults.
+        let cfg = HostConfig::from_map(&m(&[
+            ("IRONCLAW_DATA_DIR", "/srv/ironclaw/data"),
+            ("IRONCLAW_CHANNELS", "cli"),
+            (
+                "IRONCLAW_CHANNELS_CONFIG",
+                "{\"cli\": {\"fifo\": \"/custom/fifo\", \"log\": \"/custom/log\"}}",
+            ),
+        ]))
+        .unwrap();
+        assert_eq!(cfg.channels[0].config["fifo"], "/custom/fifo");
+        assert_eq!(cfg.channels[0].config["log"], "/custom/log");
+    }
+
+    #[test]
+    fn cli_bridge_paths_omitted_when_no_install_root() {
+        // Default `data` is relative, has no parent component → bridge
+        // is not auto-configured. Other channels are unaffected.
+        let cfg = HostConfig::from_map(&m(&[("IRONCLAW_CHANNELS", "cli")])).unwrap();
+        assert!(cfg.channels[0].config.get("fifo").is_none());
+        assert!(cfg.channels[0].config.get("log").is_none());
+    }
+
+    #[test]
+    fn cli_bridge_paths_only_inject_into_cli_channel() {
+        // The injector must not poke `fifo` / `log` keys into other
+        // channels' configs.
+        let cfg = HostConfig::from_map(&m(&[
+            ("IRONCLAW_DATA_DIR", "/srv/ironclaw/data"),
+            ("IRONCLAW_CHANNELS", "cli,telegram"),
+        ]))
+        .unwrap();
+        let tg = cfg.channels.iter().find(|c| c.channel_type == "telegram").unwrap();
+        assert!(tg.config.get("fifo").is_none());
+        assert!(tg.config.get("log").is_none());
     }
 
     #[test]

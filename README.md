@@ -180,6 +180,25 @@ wired to an agent group named `first` with session mode `shared`,
 so `iclaw chat` Just Works on the very first start. Opt out with
 `IRONCLAW_SETUP_QUICKSTART=no`.
 
+The setup step also wires the `iclaw chat` bridge: a named pipe at
+`<install_root>/chat.fifo` (read by the host) and an append-log at
+`<install_root>/chat.log` (written by the host, tailed by
+`iclaw chat`). The host picks both paths up automatically via
+`IRONCLAW_CLI_FIFO` and `IRONCLAW_CLI_LOG` (written to the
+install's `.env`). To relocate them — e.g. onto `tmpfs` for lower
+write latency, or out of the install root for permissions reasons
+— set the env vars explicitly:
+
+```bash
+IRONCLAW_CLI_FIFO=/run/ironclaw/chat.fifo
+IRONCLAW_CLI_LOG=/var/log/ironclaw/chat.log
+```
+
+When neither var is set and `IRONCLAW_DATA_DIR` is unset (e.g. you
+ran `cargo run -p ironclaw-host run` in a checkout), the cli channel
+falls back to reading/writing the host process's own stdin / stdout
+— the historic developer REPL.
+
 ### Headless / scripted install
 
 ```bash

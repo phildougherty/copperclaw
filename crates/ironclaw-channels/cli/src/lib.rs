@@ -1,16 +1,37 @@
-//! CLI (stdin/stdout) channel adapter — used for tests and local REPL.
+//! CLI channel adapter — used for tests, local REPL, and the
+//! `iclaw chat` bridge.
+//!
+//! Two modes:
+//!
+//! 1. **stdio mode** (default). Reads lines from the host's own
+//!    `tokio::io::stdin()` and writes labelled outbound replies to
+//!    `tokio::io::stdout()`. This is the developer REPL used by
+//!    `cargo run -p ironclaw-host run` in a terminal.
+//!
+//! 2. **FIFO/log mode**. Reads lines from a named pipe and appends
+//!    outbound replies to a plain log file. This is the bridge that
+//!    backs `iclaw chat`: the cli command writes to the FIFO and tails
+//!    the log, while the host (running anywhere — foreground, systemd,
+//!    `ironclaw start` background daemon) reads the FIFO and appends
+//!    to the log.
+//!
+//! ## FIFO survival across writer drain
+//!
+//! The FIFO is opened with `O_RDWR | O_NONBLOCK`. Holding a writer
+//! handle ourselves keeps the kernel from sending us EOF when every
+//! external writer (e.g. an `iclaw chat` invocation) closes the FIFO.
+//! Without this the read loop would hit EOF on the first Ctrl-D and
+//! the cli channel would die for the rest of the host's lifetime.
+//!
+//! ## Wire format
+//!
+//! One message per line, plain UTF-8 text, no JSON wrapping. Each
+//! inbound line becomes an `InboundEvent` with `channel_type = "cli"`,
+//! `platform_id = "stdin"` (legacy name — kept stable so existing
+//! messaging-group rows match regardless of which mode the host runs
+//! in), and a chat `InboundMessage` carrying `{"text": <line>}`.
 //!
 //! See `PLAN.md` § 6 (T6a).
-//!
-//! Each line read from `stdin` becomes an `InboundEvent` with
-//! `channel_type = "cli"`, `platform_id = "stdin"`, and a chat
-//! `InboundMessage` carrying `{"text": <line>}`.
-//!
-//! Each outbound message is rendered to `stdout` as a single line prefixed
-//! with a configurable label (default `"agent> "`).
-//!
-//! For tests the reader and writer are pluggable; the default
-//! [`CliFactory`] binds to `tokio::io::stdin`/`tokio::io::stdout`.
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -21,6 +42,7 @@ use ironclaw_types::{
     ChannelType, InboundEvent, InboundMessage, MessageKind, OutboundMessage, SenderIdentity,
 };
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
@@ -35,16 +57,22 @@ pub const CHANNEL_TYPE_STR: &str = ChannelType::CLI;
 
 /// Configuration read from `ChannelSetup::config`.
 ///
-/// All fields optional: an empty `{}` is valid and produces the defaults.
+/// All fields optional: an empty `{}` is valid and produces the
+/// stdio-mode defaults. When `fifo` and/or `log` are present, the
+/// adapter switches to the named-pipe bridge used by `iclaw chat`.
 #[derive(Debug, Clone)]
 struct CliConfig {
     label: String,
+    fifo: Option<PathBuf>,
+    log: Option<PathBuf>,
 }
 
 impl Default for CliConfig {
     fn default() -> Self {
         Self {
             label: DEFAULT_LABEL.to_owned(),
+            fifo: None,
+            log: None,
         }
     }
 }
@@ -66,20 +94,54 @@ impl CliConfig {
                 ));
             }
         };
-        Ok(Self { label })
+        let fifo = match obj.get("fifo") {
+            Some(Value::String(s)) if !s.is_empty() => Some(PathBuf::from(s)),
+            Some(Value::Null | Value::String(_)) | None => None,
+            Some(_) => {
+                return Err(AdapterError::BadRequest(
+                    "cli config field `fifo` must be a string".into(),
+                ));
+            }
+        };
+        let log = match obj.get("log") {
+            Some(Value::String(s)) if !s.is_empty() => Some(PathBuf::from(s)),
+            Some(Value::Null | Value::String(_)) | None => None,
+            Some(_) => {
+                return Err(AdapterError::BadRequest(
+                    "cli config field `log` must be a string".into(),
+                ));
+            }
+        };
+        Ok(Self { label, fifo, log })
     }
 }
 
 /// CLI channel adapter.
 ///
 /// Holds the shared writer (behind a `Mutex` so concurrent `deliver` calls
-/// produce intact lines) and the join handle for the stdin-reader task.
+/// produce intact lines) and the join handle for the reader task.
 pub struct CliAdapter {
     channel_type: ChannelType,
     label: String,
     writer: Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>,
     reader_task: Mutex<Option<JoinHandle<()>>>,
+    /// When the adapter is in FIFO mode we keep a writer handle to the
+    /// FIFO open for the adapter's whole lifetime. This is the
+    /// "reader is its own writer" trick that prevents the kernel from
+    /// sending us EOF when external writers (e.g. `iclaw chat`)
+    /// disconnect. Dropping this handle when the adapter is dropped
+    /// closes the kernel-side write end cleanly.
+    _fifo_writer_keepalive: Option<FifoKeepalive>,
 }
+
+/// Owned file descriptor whose only job is to keep the FIFO's write
+/// side open. On Unix we hold a `std::fs::File`; on non-Unix this is
+/// just a placeholder that the code never constructs (FIFO mode
+/// returns an error before reaching the field on those platforms).
+#[cfg(unix)]
+type FifoKeepalive = std::fs::File;
+#[cfg(not(unix))]
+type FifoKeepalive = ();
 
 impl CliAdapter {
     /// Construct an adapter with explicit reader/writer. Spawns a background
@@ -101,6 +163,7 @@ impl CliAdapter {
             label: label.into(),
             writer: Arc::new(Mutex::new(Box::new(writer))),
             reader_task: Mutex::new(Some(task)),
+            _fifo_writer_keepalive: None,
         }
     }
 
@@ -114,13 +177,166 @@ impl CliAdapter {
         )
     }
 
-    /// Abort the background stdin reader (used by tests; not part of the
+    /// Construct an adapter in FIFO/log mode.
+    ///
+    /// `fifo` and `log` are optional independently: when only `fifo` is
+    /// set, replies still go to `stdout`; when only `log` is set,
+    /// inbound still reads from `stdin`. Practically the host wires
+    /// both, but the partial modes keep tests and tooling flexible.
+    ///
+    /// Returns the adapter, or an `AdapterError::Io` if the FIFO can't
+    /// be created, the log can't be touched, or the FIFO can't be
+    /// opened with `O_RDWR | O_NONBLOCK`.
+    pub async fn new_with_paths(
+        fifo: Option<&Path>,
+        log: Option<&Path>,
+        inbound_tx: Sender<InboundEvent>,
+        label: impl Into<String>,
+    ) -> Result<Self, AdapterError> {
+        #[cfg(unix)]
+        let mut keepalive: Option<FifoKeepalive> = None;
+        #[cfg(not(unix))]
+        let keepalive: Option<FifoKeepalive> = None;
+
+        let reader_task: JoinHandle<()> = if let Some(fifo_path) = fifo {
+            #[cfg(unix)]
+            {
+                ensure_fifo(fifo_path).map_err(|e| {
+                    AdapterError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("cli channel: ensure fifo {}: {e}", fifo_path.display()),
+                    ))
+                })?;
+                let (receiver, keep) = open_fifo_receiver(fifo_path).map_err(|e| {
+                    AdapterError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("cli channel: open fifo {}: {e}", fifo_path.display()),
+                    ))
+                })?;
+                keepalive = Some(keep);
+                let reader = BufReader::new(receiver);
+                tokio::spawn(read_loop(reader, inbound_tx))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = fifo_path;
+                return Err(AdapterError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "FIFO mode is only supported on Unix",
+                )));
+            }
+        } else {
+            tokio::spawn(read_loop(
+                BufReader::new(tokio::io::stdin()),
+                inbound_tx,
+            ))
+        };
+
+        let writer: Box<dyn AsyncWrite + Send + Unpin> = if let Some(log_path) = log {
+            let file = ensure_and_open_log(log_path).await.map_err(|e| {
+                AdapterError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("cli channel: open log {}: {e}", log_path.display()),
+                ))
+            })?;
+            Box::new(file)
+        } else {
+            Box::new(tokio::io::stdout())
+        };
+
+        Ok(Self {
+            channel_type: ChannelType::new(ChannelType::CLI),
+            label: label.into(),
+            writer: Arc::new(Mutex::new(writer)),
+            reader_task: Mutex::new(Some(reader_task)),
+            _fifo_writer_keepalive: keepalive,
+        })
+    }
+
+    /// Abort the background reader (used by tests; not part of the
     /// trait surface).
     pub async fn shutdown_reader(&self) {
         if let Some(handle) = self.reader_task.lock().await.take() {
             handle.abort();
         }
     }
+}
+
+/// Create the FIFO at `path` if it doesn't already exist. Mode is
+/// `0o600`. The workspace forbids `unsafe`, so we shell out to
+/// `/usr/bin/env mkfifo` rather than call `libc::mkfifo` directly. The
+/// extra fork is fine; this runs exactly once per host boot.
+fn ensure_fifo(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let status = std::process::Command::new("mkfifo")
+        .arg("-m")
+        .arg("0600")
+        .arg(path)
+        .status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "mkfifo exited with {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// Open the FIFO at `path` for reading via tokio's
+/// [`tokio::net::unix::pipe::Receiver`], plus a sibling keepalive
+/// writer handle to prevent EOF when external writers drain.
+///
+/// Both descriptors are opened with `O_RDWR | O_NONBLOCK`. The
+/// receiver is the tokio pipe wrapper (proper epoll/kqueue
+/// integration); the keepalive is a plain `std::fs::File` whose only
+/// purpose is to keep the kernel's writer-end refcount above zero.
+///
+/// We open twice rather than dup-ing because `tokio::net::unix::pipe`
+/// doesn't expose a public dup-style API; opening the FIFO inode twice
+/// gives us two independent descriptors that share the underlying pipe
+/// buffer.
+#[cfg(unix)]
+fn open_fifo_receiver(
+    path: &Path,
+) -> std::io::Result<(tokio::net::unix::pipe::Receiver, FifoKeepalive)> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true);
+    opts.custom_flags(libc::O_NONBLOCK);
+    let read_file = opts.open(path)?;
+
+    let mut keep_opts = std::fs::OpenOptions::new();
+    keep_opts.read(true).write(true);
+    keep_opts.custom_flags(libc::O_NONBLOCK);
+    let keepalive = keep_opts.open(path)?;
+
+    let receiver = tokio::net::unix::pipe::Receiver::from_file_unchecked(read_file)?;
+    Ok((receiver, keepalive))
+}
+
+/// Create the log file if missing (mode `0o600`) and return an
+/// append-mode handle. Each `deliver` call flushes after writing so
+/// the tailing reader in `iclaw chat` sees output promptly.
+async fn ensure_and_open_log(path: &Path) -> std::io::Result<tokio::fs::File> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+    }
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o600);
+    }
+    opts.open(path).await
 }
 
 async fn read_loop<R>(reader: R, tx: Sender<InboundEvent>)
@@ -131,6 +347,11 @@ where
     loop {
         match lines.next_line().await {
             Ok(Some(line)) => {
+                // Ignore stray blank lines so the FIFO opening dance
+                // doesn't generate a spurious `{"text":""}` event.
+                if line.is_empty() {
+                    continue;
+                }
                 let event = build_inbound_event(&line);
                 if tx.send(event).await.is_err() {
                     // Receiver dropped — exit loop quietly.
@@ -139,7 +360,7 @@ where
             }
             Ok(None) => break,
             Err(err) => {
-                tracing::warn!(error = %err, "cli channel stdin read failed");
+                tracing::warn!(error = %err, "cli channel read failed");
                 break;
             }
         }
@@ -236,16 +457,29 @@ impl ChannelAdapter for CliAdapter {
 
 /// Factory for [`CliAdapter`].
 ///
-/// Default `init` reads `setup.config` for an optional `label` string and
-/// binds to `tokio::io::stdin`/`tokio::io::stdout`. Tests that need a
-/// hermetic reader/writer should construct [`CliAdapter`] directly via
-/// [`CliAdapter::new_with_io`].
+/// Default `init` reads `setup.config` for an optional `label` string,
+/// `fifo` path, and `log` path. With no paths set the factory binds to
+/// `tokio::io::stdin`/`tokio::io::stdout` (the developer REPL); with a
+/// `fifo` and `log` set, it bridges `iclaw chat`.
 #[derive(Debug, Default)]
-pub struct CliFactory;
+pub struct CliFactory {
+    fifo: Option<PathBuf>,
+    log: Option<PathBuf>,
+}
 
 impl CliFactory {
+    /// Construct a factory that uses stdio unless overridden by
+    /// `setup.config` (`fifo` / `log` keys).
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Construct a factory pre-bound to a FIFO and/or log file. Values
+    /// in the `setup.config` JSON still win — this is purely a default
+    /// the host can pass via a typed constructor instead of stuffing
+    /// the same fields into JSON.
+    pub fn with_paths(fifo: Option<PathBuf>, log: Option<PathBuf>) -> Self {
+        Self { fifo, log }
     }
 }
 
@@ -256,11 +490,31 @@ impl ChannelFactory for CliFactory {
     }
 
     async fn init(&self, setup: ChannelSetup) -> Result<Arc<dyn ChannelAdapter>, AdapterError> {
-        let config = CliConfig::from_value(&setup.config)?;
-        Ok(Arc::new(CliAdapter::new_stdio(
-            setup.inbound_tx,
-            config.label,
-        )))
+        let mut config = CliConfig::from_value(&setup.config)?;
+        // Factory-level defaults fill in when the JSON didn't specify.
+        if config.fifo.is_none() {
+            config.fifo.clone_from(&self.fifo);
+        }
+        if config.log.is_none() {
+            config.log.clone_from(&self.log);
+        }
+
+        match (config.fifo.as_deref(), config.log.as_deref()) {
+            (None, None) => Ok(Arc::new(CliAdapter::new_stdio(
+                setup.inbound_tx,
+                config.label,
+            ))),
+            (fifo, log) => {
+                let adapter = CliAdapter::new_with_paths(
+                    fifo,
+                    log,
+                    setup.inbound_tx,
+                    config.label,
+                )
+                .await?;
+                Ok(Arc::new(adapter))
+            }
+        }
     }
 
     async fn shutdown(&self) -> Result<(), AdapterError> {
@@ -350,17 +604,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blank_lines_are_skipped() {
+        // Stray blank lines (e.g. from the FIFO opening dance, or a
+        // user pressing Enter on an empty prompt) MUST NOT generate
+        // `{"text":""}` events — that was the original bug.
+        let input = "\n\nhello\n\n";
+        let reader = BufReader::new(Cursor::new(input.as_bytes()));
+        let writer: Vec<u8> = Vec::new();
+        let (tx, mut rx) = mpsc::channel::<InboundEvent>(8);
+        let _adapter = CliAdapter::new_with_io(reader, writer, tx, DEFAULT_LABEL);
+
+        let evt = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(evt.message.content["text"], "hello");
+        // No further events should arrive.
+        let res = timeout(Duration::from_millis(100), rx.recv()).await;
+        match res {
+            Ok(None) | Err(_) => {}
+            Ok(Some(evt)) => panic!("unexpected event: {evt:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn deliver_writes_label_and_text() {
         let reader = BufReader::new(Cursor::new(b""));
-        let buf: Vec<u8> = Vec::new();
-        let writer = Cursor::new(buf);
-        let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
-        // Use a duplex-able writer: capture in a Vec via Arc<Mutex<_>>.
-        // Simplest path: write into an in-memory buffer behind the adapter
-        // by passing it as the writer; then read it out via shutdown_reader trick.
-        // Instead, use a `tokio::io::duplex` so we can read what was written.
-        drop((tx, writer));
-
         let (mut client, server) = tokio::io::duplex(1024);
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let adapter = CliAdapter::new_with_io(reader, server, tx, "agent> ");
@@ -607,6 +876,8 @@ mod tests {
     fn cli_config_defaults_when_null() {
         let c = CliConfig::from_value(&Value::Null).unwrap();
         assert_eq!(c.label, DEFAULT_LABEL);
+        assert!(c.fifo.is_none());
+        assert!(c.log.is_none());
     }
 
     #[test]
@@ -628,7 +899,190 @@ mod tests {
     }
 
     #[test]
+    fn cli_config_reads_fifo_and_log_paths() {
+        let c =
+            CliConfig::from_value(&json!({"fifo": "/tmp/x.fifo", "log": "/tmp/x.log"}))
+                .unwrap();
+        assert_eq!(c.fifo.as_deref(), Some(Path::new("/tmp/x.fifo")));
+        assert_eq!(c.log.as_deref(), Some(Path::new("/tmp/x.log")));
+    }
+
+    #[test]
+    fn cli_config_empty_string_path_is_none() {
+        let c = CliConfig::from_value(&json!({"fifo": "", "log": ""})).unwrap();
+        assert!(c.fifo.is_none());
+        assert!(c.log.is_none());
+    }
+
+    #[test]
     fn channel_type_str_constant_matches() {
         assert_eq!(CHANNEL_TYPE_STR, "cli");
+    }
+
+    // -------------------------------------------------------------------
+    // FIFO/log mode integration tests
+    // -------------------------------------------------------------------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_mode_round_trip_emits_inbound_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("chat.fifo");
+        let log = dir.path().join("chat.log");
+        let (tx, mut rx) = mpsc::channel::<InboundEvent>(8);
+        let adapter = CliAdapter::new_with_paths(Some(&fifo), Some(&log), tx, "agent> ")
+            .await
+            .unwrap();
+        assert!(fifo.exists(), "FIFO should have been created");
+        assert!(log.exists(), "log should have been created");
+
+        // Open the FIFO as a writer and send a line.
+        let mut writer = tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&fifo)
+            .await
+            .unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut writer, b"hello from chat\n")
+            .await
+            .unwrap();
+        drop(writer);
+
+        let evt = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(evt.message.content["text"], "hello from chat");
+        assert_eq!(evt.channel_type.as_str(), "cli");
+        assert_eq!(evt.platform_id, "stdin");
+
+        // Deliver writes to the log.
+        adapter
+            .deliver("p", None, &outbound_text("reply"))
+            .await
+            .unwrap();
+        let log_contents = tokio::fs::read_to_string(&log).await.unwrap();
+        assert_eq!(log_contents, "agent> reply\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fifo_survives_writer_drain() {
+        // Open the FIFO via our adapter, then open + drop an external
+        // writer, then open + send via another writer. The adapter
+        // must still emit the second event — which proves the
+        // O_RDWR-keepalive trick prevents EOF on writer disconnect.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("chat.fifo");
+        let log = dir.path().join("chat.log");
+        let (tx, mut rx) = mpsc::channel::<InboundEvent>(8);
+        let _adapter = CliAdapter::new_with_paths(Some(&fifo), Some(&log), tx, "agent> ")
+            .await
+            .unwrap();
+
+        // First "iclaw chat": writes one line and closes.
+        {
+            let mut w = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&fifo)
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut w, b"hello\n")
+                .await
+                .unwrap();
+        }
+        let evt1 = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(evt1.message.content["text"], "hello");
+
+        // Second "iclaw chat" — a real EOF crash would mean this
+        // never reaches the adapter.
+        {
+            let mut w = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&fifo)
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut w, b"world\n")
+                .await
+                .unwrap();
+        }
+        let evt2 = timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(evt2.message.content["text"], "world");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn log_mode_appends_and_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("chat.log");
+        // Seed an existing line so we can verify append (not truncate).
+        tokio::fs::write(&log, b"prior\n").await.unwrap();
+        let (tx, _rx) = mpsc::channel::<InboundEvent>(2);
+        let adapter = CliAdapter::new_with_paths(None, Some(&log), tx, "agent> ")
+            .await
+            .unwrap();
+        adapter
+            .deliver("p", None, &outbound_text("first"))
+            .await
+            .unwrap();
+        adapter
+            .deliver("p", None, &outbound_text("second"))
+            .await
+            .unwrap();
+        let body = tokio::fs::read_to_string(&log).await.unwrap();
+        assert_eq!(body, "prior\nagent> first\nagent> second\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn factory_init_with_fifo_and_log_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("chat.fifo");
+        let log = dir.path().join("chat.log");
+        let f = CliFactory::new();
+        let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
+        let setup = ChannelSetup::new(
+            json!({
+                "fifo": fifo.to_string_lossy(),
+                "log": log.to_string_lossy(),
+            }),
+            tx,
+            dir.path(),
+        );
+        let adapter = f.init(setup).await.unwrap();
+        assert_eq!(adapter.channel_type().as_str(), "cli");
+        assert!(fifo.exists());
+        assert!(log.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn factory_with_paths_uses_constructor_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("chat.fifo");
+        let log = dir.path().join("chat.log");
+        let f = CliFactory::with_paths(Some(fifo.clone()), Some(log.clone()));
+        let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
+        // Empty JSON config — factory falls back to the constructor paths.
+        let setup = ChannelSetup::new(json!({}), tx, dir.path());
+        let _adapter = f.init(setup).await.unwrap();
+        assert!(fifo.exists());
+        assert!(log.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_fifo_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("x.fifo");
+        ensure_fifo(&p).unwrap();
+        // Second call must not error even though the FIFO already exists.
+        ensure_fifo(&p).unwrap();
+        assert!(p.exists());
     }
 }

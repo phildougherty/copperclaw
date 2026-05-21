@@ -6,6 +6,35 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (cli channel bridge)
+
+- **`iclaw chat` now actually reaches the host.** The cli channel
+  adapter previously read from the host process's own `tokio::io::stdin()`
+  and wrote outbound replies to `tokio::io::stdout()` — so messages
+  typed into `iclaw chat` (which wrote to `<install_root>/chat.fifo`)
+  were never picked up, and replies were never appended to
+  `<install_root>/chat.log` for the chat tailing loop to see. The
+  adapter gains a FIFO/log mode: when `IRONCLAW_CLI_FIFO` and/or
+  `IRONCLAW_CLI_LOG` are set (or defaulted from `IRONCLAW_DATA_DIR`'s
+  parent), the cli channel opens the FIFO with `O_RDWR | O_NONBLOCK`
+  via `tokio::net::unix::pipe::Receiver` and appends outbound to the
+  log, flushing each line. The `O_RDWR` open is the standard
+  "reader is its own writer" trick that keeps the pipe alive across
+  external-writer disconnects (Ctrl-D in one `iclaw chat` no longer
+  EOFs the host's read side). With no paths configured the adapter
+  still falls back to stdin/stdout for the developer REPL.
+- **Setup wires the bridge by default.** `ironclaw-setup`'s
+  `quickstart_group` step now also `mkfifo`s `chat.fifo` (0600),
+  touches `chat.log` (0600), and writes `IRONCLAW_CLI_FIFO` and
+  `IRONCLAW_CLI_LOG` lines into the install's `.env` so the host
+  picks them up on next boot. Idempotent — re-running setup leaves
+  an existing FIFO / log / env line alone.
+- **Stray blank lines are no longer reified into `{"text":""}`
+  inbound events.** The cli channel's read loop now skips empty
+  lines, eliminating the spurious empty-message inbound that the
+  original buggy stdin path produced when a terminal flushed a
+  newline.
+
 ### Added (release automation)
 
 - **Binary release workflow** at `.github/workflows/release.yml`.
