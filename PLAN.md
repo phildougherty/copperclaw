@@ -158,9 +158,23 @@ M8 totals (3 slices + tail): 2433 new tests across 15 channels (batch 1: 114 + 1
 - [x] Document the "adding a channel" workflow — `docs/adding-a-channel.md` (500 lines): traits, crate layout, inbound/outbound mapping, error mapping, testing strategy, host wiring, PR checklist
 
 ### M11 — Differential testing + release
-- [ ] Replay fixture suite against the host
-- [ ] Cutover docs
-- [ ] Release 0.1.0
+- [x] Cutover docs — `docs/cutover.md` (preflight → quiesce → snapshot → migrate → verify → switch ingress → first-hour watch → rollback)
+- [x] Replay-fixture suite design — `docs/replay-fixtures.md` (fixture layout, harness internals, capture/redact workflow)
+- [x] Release-checklist + CI — `docs/release-checklist.md`; `.github/workflows/ci.yml` runs fmt + clippy + test on Linux/macOS with an 85% coverage gate; `CHANGELOG.md` seeded with the Keep-a-Changelog `[Unreleased]` section
+- [ ] Replay-fixture harness implementation + first captured fixture (the M11 acceptance gate — design is in-tree, in-process harness against `Fixture::load` / `ReplayHarness::{boot_host, run, compare}` still to be written)
+- [ ] Release 0.1.0 (cut the tag, bump `workspace.package.version`, publish release notes from CHANGELOG)
+
+### M11 — Post-M10 hardening (this slice)
+
+These items closed open stubs and added coverage the earlier milestones had explicitly deferred. Each ships as part of the 0.1.0 candidate.
+
+- [x] **Matrix `/sync` cancellation fix** — wrapped the inbound `mpsc::send` in `select!` against the shutdown token so the loop exits cleanly even when the channel is saturated. Re-enabled `sync_loop_pushes_events_and_persists_next_batch`; matrix now ships 147 passing tests with no `#[ignore]` markers.
+- [x] **MCP HTTP-SSE transport** — enabled rmcp's `transport-sse-client` + `reqwest` features and replaced the `connect_http_sse` placeholder. Static headers (auth bearer, etc.) thread through via a pre-loaded `reqwest::Client`. 15 client tests including malformed-header rejection, invalid-URL classification, and a wiremock check that wrong `content-type` lands as `Transport`.
+- [x] **`groups.restart` wired** — replaced the `{"queued": true}` stub with a `sessions::list_for_agent_group` (new) + `mark_container_stopped` loop. Returns `{agent_group_id, sessions_marked_stopped, sessions}`; sessions already in `stopped` state are counted as no-change. 5 new handler tests + 2 new DB tests cover the happy path, the no-sessions case, the unknown-group not-found, and cross-group isolation.
+- [x] **WhatsApp `DalekBackend`** — replaced `StubBackend` as the default `CryptoBackend` with a real Curve25519 + Ed25519 + HKDF-SHA256 + AES-256-GCM impl on `x25519-dalek` + `ed25519-dalek` + `hkdf` + `aes-gcm`. 80 new tests including RFC 7748 § 5.2, RFC 5869 A.1/A.2/A.3, and RFC 8032 § 7.1 vectors. Outbound `deliver` is still gated on the Signal Protocol session state above the primitives; the adapter surfaces a distinct error string for that branch so the gap is testable.
+- [x] **Telegram + Deltachat attachment downloads** — flipped both channels from `MessageKind::System` placeholders to real downloads. Telegram adds `get_file` + binary stream + `attachment_download` (default true) / `max_attachment_bytes` (default 20 MB) config knobs (+42 tests → 162). Deltachat calls `download_full_msg` when `download_state != "Done"`, then `stat` + `open`-verifies the blob (with optional `blob_dir` override) and surfaces the resolved path under `content.attachment.bytes_path` (+24 tests → 165). Oversized / auth-failure / network-failure paths demote to `System` with a captured reason.
+
+**Hardening totals (this slice):** ~165 new tests across 6 deliverables. Workspace **4564 passing tests, 4 ignored, 0 failures**. Clippy clean on `cargo clippy --workspace --all-targets -- -D warnings`.
 
 ---
 
