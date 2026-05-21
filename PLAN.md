@@ -78,12 +78,12 @@ file paths that landed the change.
 
 | Metric | Value |
 | - | - |
-| `cargo test --workspace` | 4416 passing / 0 failing / 4 ignored |
+| `cargo test --workspace` | 4436 passing / 0 failing / 4 ignored |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | Channel crates | 21 |
 | In-tree tools the agent can call | 19 (15 messaging/scheduling/self-mod + 4 computer-use) |
 | Skill docs | 17 |
-| Latest milestone | M14 (agent capability — tool wiring + computer-use) |
+| Latest milestone | M14 follow-up (skill content auto-loaded into system prompt) |
 
 Older M-section "totals" lines are historical snapshots and will drift —
 trust the table above.
@@ -580,6 +580,41 @@ container; nothing in that output came from training data.
 
 **Slice totals**: 4416 passing, 0 failing. Clippy clean.
 
+### M14 follow-up — Skill content auto-loaded into system prompt
+
+The agent shipped M14 with 19 tools wired through but a vanilla one-
+liner for a system prompt. The runner received the tool schemas but
+not the per-skill prose explaining when to reach for each one. This
+slice closes that gap.
+
+- [x] **`ironclaw-skills` exposes a body reader**. New
+  `frontmatter::skip_frontmatter(&str) -> &str` and
+  `registry::read_skill_body(&Skill) -> Result<String, _>` return
+  the markdown body with the YAML frontmatter stripped (BOM + CRLF
+  aware). Lets the host inline a SKILL.md without re-parsing.
+- [x] **`HostConfig` learns `skills_dir` + `groups_dir`**. Two new
+  env-var fields (`IRONCLAW_SKILLS_DIR`, `IRONCLAW_GROUPS_DIR`) both
+  optional and unset by default. Empty strings collapse to `None` so
+  an unset variable means "skip skill injection".
+- [x] **`ContainerManager::runner_config_for` populates `system`**.
+  At spawn time the manager scans the global skills dir (optionally
+  with a per-group override under `<groups_dir>/<ag_uuid>/skills/`),
+  filters through the group's `SkillsSelector` (defaulting to
+  `All` when no `container_config` exists), and concatenates each
+  skill's body inside an `<skill name="…" description="…">` block
+  preceded by a short framing sentence. Read or parse failures for
+  individual skills are logged and skipped — the spawn still
+  succeeds with the remaining content.
+- [x] **`ironclaw-setup` writes both env vars**. `EnvFileSpec` gains
+  `skills_dir` + `groups_dir`; `AuthStep` defaults them to
+  `<data_dir>/skills` and `<data_dir>/groups` respectively (env-var
+  override takes precedence). Empty paths omit the line so existing
+  installs that haven't re-run setup stay unchanged.
+
+**Slice totals**: 4436 passing, 0 failing. Clippy clean. +20 tests
+across `ironclaw-skills` (+7), `ironclaw-host` (+12), and
+`ironclaw-setup` (+1).
+
 ---
 
 ## Top 10 next things to address
@@ -587,16 +622,7 @@ container; nothing in that output came from training data.
 Ranked by impact × leverage given the current state. Each item
 links to the M-section that owns it.
 
-1. **Skill content auto-loads into the system prompt**. The
-   agent has 19 tools and 17 skill docs, but the runner's
-   system prompt is a vanilla one-liner. The model often
-   doesn't know it *can* call a tool until you spell it out.
-   Concatenate `skills/*/SKILL.md` (filtered by a per-group
-   include-list) into the system prompt at container spawn.
-   The single highest-leverage change to make the agent
-   actually *use* its capabilities. _(M14 follow-up)_
-
-2. **Image rebuild on `container_config` change**. The
+1. **Image rebuild on `container_config` change**. The
    agent already has `install_packages` and `add_mcp_server`
    as tools, but invoking them today writes to
    `container_configs` and then nothing happens until an
@@ -604,13 +630,13 @@ links to the M-section that owns it.
    `container_configs` per-group and rebuild on diff. Closes
    the loop on user-extensible agents. _(M13)_
 
-3. **Approval notifications in-channel**. When a new sender
+2. **Approval notifications in-channel**. When a new sender
    lands in pending, the operator can't see it without
    running `iclaw approvals list`. Post a deliverable
    "approve?" card to the agent group's primary channel
    when an unknown sender is dropped. _(M13 sender approval)_
 
-4. **MCP server registry + first-class iclaw subcommand**.
+3. **MCP server registry + first-class iclaw subcommand**.
    `add_mcp_server` exists as a tool the agent can call, but
    the operator-facing path (`iclaw groups config
    add-mcp-server …`) is undocumented and the schema is
@@ -620,21 +646,21 @@ links to the M-section that owns it.
    shortcut that wires the right config. The "easy
    expansion path" the project promises. _(new)_
 
-5. **`web_search` tool** (Brave or Tavily). `web_fetch`
+4. **`web_search` tool** (Brave or Tavily). `web_fetch`
    gives the agent a URL → body pipe, but it can't *find*
    URLs. Search closes the gap; without it the agent
    either has to guess URLs or ask the user. One new tool
    in `tools/computer_use.rs`, one env-var-configured API
    key. _(M14 follow-up)_
 
-6. **Central DB backup / restore**. `iclaw db backup
+5. **Central DB backup / restore**. `iclaw db backup
    <path>` (WAL checkpoint + file copy) and `iclaw db
    restore <path>` (atomic swap). The central DB is one
    SQLite file holding every group, wiring, audit row, and
    token-usage record — a disk corruption today loses
    everything. _(M13 reliability)_
 
-7. **Container egress allow-list**. With `web_fetch`
+6. **Container egress allow-list**. With `web_fetch`
    landed, an agent can reach any URL on the open
    internet. Per-group `container_configs.egress_allow`
    (host:port allow-list) translated to Docker network
@@ -642,14 +668,14 @@ links to the M-section that owns it.
    move, but default-allow + opt-in lockdown is more
    practical. _(M13 security)_
 
-8. **Outbound dead-letter replay**. `iclaw health` shows
+7. **Outbound dead-letter replay**. `iclaw health` shows
    the dropped-message count, but operators can't inspect
    *what* dropped or retry. Add `iclaw dropped-messages
    list --since <window>` (already exists for inbound;
    extend to outbound failures) and `iclaw
    dropped-messages replay <id>`. _(M13 reliability)_
 
-9. **Per-group resource caps**. `ContainerSpec` doesn't
+8. **Per-group resource caps**. `ContainerSpec` doesn't
    carry cpu / memory / pids / network limits. A runaway
    agent can starve the host. Add
    `container_configs.resource_limits` JSON, apply at
@@ -657,7 +683,7 @@ links to the M-section that owns it.
    The bounded-blast-radius story is incomplete without
    this. _(M13 container lifecycle)_
 
-10. **Prometheus metrics endpoint**. Counters for
+9. **Prometheus metrics endpoint**. Counters for
     `messages_inbound_total`, `messages_outbound_total`,
     `containers_spawned_total`, `containers_crashed_total`,
     `delivery_failed_total`; histograms for
@@ -667,10 +693,14 @@ links to the M-section that owns it.
     default; opt in via `IRONCLAW_METRICS_ADDR=127.0.0.1:9090`.
     _(M13 observability)_
 
+10. **Log rotation**. `chat.log` and `host.log` grow unbounded
+    when ironclaw runs as a long-lived daemon. Either ship a
+    recommended logrotate config in `docs/` or switch to
+    `tracing-appender::rolling`. Cheap, prevents a slow
+    disk-fill in real deployments. _(M13 observability)_
+
 Honorable mentions that didn't make the cut:
 
-- **Log rotation** (low effort but install can ship with a
-  recommended logrotate config in `docs/`; not blocking).
 - **Secret rotation without restart** (SIGHUP handler;
   niche, can document the manual restart for now).
 - **Webhooks TLS termination** (most users deploy behind a

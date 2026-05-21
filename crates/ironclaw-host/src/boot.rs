@@ -417,6 +417,8 @@ fn spawn_container_manager(
         idle_timeout_secs: crate::container_manager::DEFAULT_IDLE_TIMEOUT_SECS,
         heartbeat_stale_secs: crate::container_manager::DEFAULT_HEARTBEAT_STALE_SECS,
         stop_grace_secs: crate::container_manager::DEFAULT_STOP_GRACE_SECS,
+        skills_dir: cfg.skills_dir.clone(),
+        groups_dir: cfg.groups_dir.clone(),
     };
     let manager = Arc::new(crate::container_manager::ContainerManager::new(
         central,

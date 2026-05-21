@@ -110,6 +110,15 @@ pub struct ManagerConfig {
     /// Grace period for `runtime.stop` calls — sent as SIGTERM
     /// timeout. The runtime sends SIGKILL after.
     pub stop_grace_secs: u64,
+    /// Directory containing global `SKILL.md` bundles. When set, the
+    /// manager loads each enabled skill's body into the runner's
+    /// system prompt at spawn so the model knows what tools it has.
+    /// `None` keeps the system prompt empty (legacy behaviour).
+    pub skills_dir: Option<PathBuf>,
+    /// Per-group override root. When set, `<groups_dir>/<ag_uuid>/skills/`
+    /// is scanned alongside the global skills directory and skills
+    /// with matching names shadow the global ones.
+    pub groups_dir: Option<PathBuf>,
 }
 
 /// Manager service. Cheap to clone via `Arc`.
@@ -409,6 +418,15 @@ impl ContainerManager {
             .unwrap_or_else(|| self.cfg.default_model.clone());
         let assistant_name = cc.and_then(|c| c.assistant_name.clone());
         let max_messages = cc.and_then(|c| c.max_messages_per_prompt);
+        let selector = cc.map_or(ironclaw_skills::SkillsSelector::All, |c| {
+            db_selector_to_skills_selector(&c.skills)
+        });
+        let system = build_skill_system_prompt(
+            self.cfg.skills_dir.as_deref(),
+            self.cfg.groups_dir.as_deref(),
+            session.agent_group_id,
+            &selector,
+        );
 
         RunnerConfigForFile {
             session_id: session.id.as_uuid().to_string(),
@@ -418,7 +436,7 @@ impl ContainerManager {
             // looks for `inbound.db`/`outbound.db`.
             session_dir: CONTAINER_SESSION_DIR.to_string(),
             model,
-            system: String::new(),
+            system,
             api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
             api_base_url: self.cfg.anthropic_base_url.clone(),
             assistant_name,
@@ -467,6 +485,105 @@ impl ContainerManager {
 /// names are globally unique and DNS-safe.
 fn container_name(_agent: AgentGroupId, session: ironclaw_types::SessionId) -> String {
     format!("ironclaw-{}", session.as_uuid())
+}
+
+/// Assemble the agent's system prompt from the global skills directory
+/// (optional per-group override), filtered through the group's
+/// `SkillsSelector`. Each skill's `SKILL.md` body is inlined as a
+/// labelled `<skill>` block; the wrapper tags help the model treat
+/// each one as a discrete unit while keeping the underlying markdown
+/// intact.
+///
+/// Returns an empty string when no skills directory is configured or
+/// when the selector resolves to zero skills. Read or parse failures
+/// for individual skills are logged and that skill is dropped —
+/// failing to load a single skill does not cause the whole spawn to
+/// fail.
+fn build_skill_system_prompt(
+    skills_dir: Option<&std::path::Path>,
+    groups_dir: Option<&std::path::Path>,
+    agent_group_id: AgentGroupId,
+    selector: &ironclaw_skills::SkillsSelector,
+) -> String {
+    let Some(global) = skills_dir else {
+        return String::new();
+    };
+    let group_override = groups_dir
+        .map(|root| {
+            root.join(agent_group_id.as_uuid().to_string())
+                .join("skills")
+        })
+        .filter(|p| p.is_dir())
+        .map(|p| (agent_group_id, p));
+
+    let registry = match ironclaw_skills::SkillRegistry::scan(
+        global,
+        group_override
+            .as_ref()
+            .map(|(id, p)| (*id, p.as_path())),
+    ) {
+        Ok(r) => r,
+        Err(err) => {
+            warn!(?err, dir = %global.display(), "skill scan failed; system prompt will be empty");
+            return String::new();
+        }
+    };
+
+    let selected = registry.list_for_group(agent_group_id, selector);
+    if selected.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::with_capacity(8 * 1024);
+    out.push_str(
+        "The following skills document the capabilities available to you. \
+Each <skill> block is the rendered SKILL.md for one capability — read \
+them all before deciding which tool to call.\n",
+    );
+    for skill in &selected {
+        let body = match ironclaw_skills::read_skill_body(skill) {
+            Ok(b) => b,
+            Err(err) => {
+                warn!(
+                    skill = %skill.name,
+                    ?err,
+                    "skill body read failed; skipping"
+                );
+                continue;
+            }
+        };
+        out.push_str("\n<skill name=\"");
+        out.push_str(&skill.name);
+        out.push_str("\" description=\"");
+        out.push_str(&escape_attr(&skill.description));
+        out.push_str("\">\n");
+        out.push_str(body.trim_end());
+        out.push_str("\n</skill>\n");
+    }
+    out
+}
+
+/// Minimal escape for a description embedded in an XML-like attribute
+/// value. We only need to neutralise the quote and ampersand — the
+/// agent doesn't parse this strictly, but unbalanced quotes would
+/// confuse a casual reader.
+fn escape_attr(s: &str) -> String {
+    s.replace('&', "&amp;").replace('"', "&quot;")
+}
+
+/// Translate the db crate's [`container_configs::SkillsSelector`] to
+/// the skills crate's [`ironclaw_skills::SkillsSelector`]. They share
+/// a JSON shape but are distinct types because the two crates don't
+/// (and shouldn't) depend on each other.
+fn db_selector_to_skills_selector(
+    sel: &container_configs::SkillsSelector,
+) -> ironclaw_skills::SkillsSelector {
+    match sel {
+        container_configs::SkillsSelector::All => ironclaw_skills::SkillsSelector::All,
+        container_configs::SkillsSelector::Explicit(names) => {
+            ironclaw_skills::SkillsSelector::Explicit(names.clone())
+        }
+    }
 }
 
 /// `RunnerConfigFile` lives in `ironclaw-runner`, but pulling the
@@ -550,6 +667,8 @@ mod tests {
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             heartbeat_stale_secs: DEFAULT_HEARTBEAT_STALE_SECS,
             stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
+            skills_dir: None,
+            groups_dir: None,
         }
     }
 
@@ -914,5 +1033,161 @@ mod tests {
             .unwrap();
         let updated = sessions::get(&db, session.id).unwrap();
         assert!(matches!(updated.container_status, ContainerStatus::Stopped));
+    }
+
+    // ---- skill system prompt assembly ----
+
+    fn write_skill_md(parent: &std::path::Path, name: &str, body: &str) {
+        let dir = parent.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let content = format!(
+            "---\nname: {name}\ndescription: desc-of-{name}\n---\n\n{body}"
+        );
+        std::fs::write(dir.join("SKILL.md"), content).unwrap();
+    }
+
+    #[test]
+    fn build_skill_system_prompt_empty_when_no_dir() {
+        let prompt = build_skill_system_prompt(
+            None,
+            None,
+            AgentGroupId::new(),
+            &ironclaw_skills::SkillsSelector::All,
+        );
+        assert!(prompt.is_empty());
+    }
+
+    #[test]
+    fn build_skill_system_prompt_all_includes_each_skill_body() {
+        let td = tempfile::tempdir().unwrap();
+        let skills = td.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write_skill_md(&skills, "alpha", "# alpha\nAlpha body\n");
+        write_skill_md(&skills, "beta", "# beta\nBeta body\n");
+        let prompt = build_skill_system_prompt(
+            Some(&skills),
+            None,
+            AgentGroupId::new(),
+            &ironclaw_skills::SkillsSelector::All,
+        );
+        assert!(prompt.contains("<skill name=\"alpha\""));
+        assert!(prompt.contains("Alpha body"));
+        assert!(prompt.contains("<skill name=\"beta\""));
+        assert!(prompt.contains("Beta body"));
+        assert!(prompt.contains("desc-of-alpha"));
+        // Frontmatter delimiters must not leak into the prompt.
+        assert!(!prompt.contains("---\nname: alpha"));
+    }
+
+    #[test]
+    fn build_skill_system_prompt_explicit_filters() {
+        let td = tempfile::tempdir().unwrap();
+        let skills = td.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write_skill_md(&skills, "alpha", "alpha body\n");
+        write_skill_md(&skills, "beta", "beta body\n");
+        write_skill_md(&skills, "gamma", "gamma body\n");
+        let prompt = build_skill_system_prompt(
+            Some(&skills),
+            None,
+            AgentGroupId::new(),
+            &ironclaw_skills::SkillsSelector::Explicit(vec!["beta".into()]),
+        );
+        assert!(!prompt.contains("alpha body"));
+        assert!(prompt.contains("beta body"));
+        assert!(!prompt.contains("gamma body"));
+    }
+
+    #[test]
+    fn build_skill_system_prompt_empty_when_no_skills_selected() {
+        let td = tempfile::tempdir().unwrap();
+        let skills = td.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write_skill_md(&skills, "alpha", "a\n");
+        let prompt = build_skill_system_prompt(
+            Some(&skills),
+            None,
+            AgentGroupId::new(),
+            &ironclaw_skills::SkillsSelector::Explicit(vec![]),
+        );
+        assert!(prompt.is_empty());
+    }
+
+    #[test]
+    fn build_skill_system_prompt_group_override_shadows_global() {
+        let td = tempfile::tempdir().unwrap();
+        let skills = td.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write_skill_md(&skills, "send-message", "global body\n");
+
+        let ag = AgentGroupId::new();
+        let groups = td.path().join("groups");
+        let group_skills = groups
+            .join(ag.as_uuid().to_string())
+            .join("skills");
+        std::fs::create_dir_all(&group_skills).unwrap();
+        write_skill_md(&group_skills, "send-message", "group override body\n");
+
+        let prompt = build_skill_system_prompt(
+            Some(&skills),
+            Some(&groups),
+            ag,
+            &ironclaw_skills::SkillsSelector::All,
+        );
+        assert!(prompt.contains("group override body"));
+        assert!(!prompt.contains("global body"));
+    }
+
+    #[test]
+    fn build_skill_system_prompt_missing_dir_returns_empty() {
+        let prompt = build_skill_system_prompt(
+            Some(std::path::Path::new("/definitely/does/not/exist")),
+            None,
+            AgentGroupId::new(),
+            &ironclaw_skills::SkillsSelector::All,
+        );
+        assert!(prompt.is_empty());
+    }
+
+    #[test]
+    fn escape_attr_neutralises_quote_and_amp() {
+        assert_eq!(escape_attr("plain"), "plain");
+        assert_eq!(escape_attr("a&b"), "a&amp;b");
+        assert_eq!(escape_attr("\"hi\""), "&quot;hi&quot;");
+    }
+
+    #[test]
+    fn db_selector_conversion_roundtrips() {
+        use ironclaw_db::tables::container_configs::SkillsSelector as DbSel;
+        assert!(matches!(
+            db_selector_to_skills_selector(&DbSel::All),
+            ironclaw_skills::SkillsSelector::All
+        ));
+        let names = vec!["a".to_string(), "b".to_string()];
+        let mapped = db_selector_to_skills_selector(&DbSel::Explicit(names.clone()));
+        match mapped {
+            ironclaw_skills::SkillsSelector::Explicit(out) => assert_eq!(out, names),
+            ironclaw_skills::SkillsSelector::All => panic!("expected Explicit, got All"),
+        }
+    }
+
+    #[test]
+    fn runner_config_uses_skill_dir_when_configured() {
+        let td = tempfile::tempdir().unwrap();
+        let skills = td.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write_skill_md(&skills, "alpha", "alpha body\n");
+        let mut cfg = manager_cfg(td.path().to_path_buf());
+        cfg.skills_dir = Some(skills);
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let rc = mgr.runner_config_for(&session, None);
+        assert!(rc.system.contains("alpha body"));
+        assert!(rc.system.contains("<skill name=\"alpha\""));
     }
 }

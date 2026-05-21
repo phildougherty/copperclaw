@@ -18,6 +18,8 @@
 //! | `IRONCLAW_DEFAULT_MODEL` | unset | Default Anthropic model id. |
 //! | `IRONCLAW_CHANNELS` | `cli` | Comma-separated list of channels to initialize. |
 //! | `IRONCLAW_CHANNELS_CONFIG` | `{}` | JSON object keyed by channel type; per-channel `setup.config`. |
+//! | `IRONCLAW_SKILLS_DIR` | unset | Directory of `SKILL.md` skill bundles auto-loaded into the agent system prompt. |
+//! | `IRONCLAW_GROUPS_DIR` | unset | Directory under which per-group `<ag_id>/skills/` overrides live. |
 //!
 //! The `cli` channel is always implicitly known but is only initialized if it
 //! appears in `IRONCLAW_CHANNELS`. Unknown channel names log a warning and
@@ -81,6 +83,16 @@ pub struct HostConfig {
     /// after building the image; the host's container manager
     /// requires this to spawn containers on demand.
     pub default_image_tag: Option<String>,
+    /// Directory of `SKILL.md` bundles auto-loaded into the agent
+    /// system prompt at container spawn. When unset, no skill content
+    /// is injected and the system prompt is whatever the runner
+    /// receives in its config file (empty by default).
+    pub skills_dir: Option<PathBuf>,
+    /// Per-agent-group root: when set, `<groups_dir>/<ag_uuid>/skills/`
+    /// is treated as an override directory that shadows global skills
+    /// with the same name. Optional; absent groups fall back to the
+    /// global skills directory.
+    pub groups_dir: Option<PathBuf>,
     /// Channels to initialize at boot.
     pub channels: Vec<ChannelInit>,
 }
@@ -118,6 +130,16 @@ impl HostConfig {
             .get("IRONCLAW_DEFAULT_IMAGE_TAG")
             .cloned()
             .filter(|s| !s.is_empty());
+        let skills_dir = map
+            .get("IRONCLAW_SKILLS_DIR")
+            .cloned()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        let groups_dir = map
+            .get("IRONCLAW_GROUPS_DIR")
+            .cloned()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
 
         let channels_list = map
             .get("IRONCLAW_CHANNELS")
@@ -158,6 +180,8 @@ impl HostConfig {
             default_provider,
             default_model,
             default_image_tag,
+            skills_dir,
+            groups_dir,
             channels,
         })
     }
@@ -338,6 +362,38 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.default_provider.as_deref(), Some("claude"));
         assert_eq!(cfg.default_model.as_deref(), Some("claude-3-5"));
+    }
+
+    #[test]
+    fn skills_dir_env_var_parses() {
+        let cfg = HostConfig::from_map(&m(&[(
+            "IRONCLAW_SKILLS_DIR",
+            "/opt/ironclaw/skills",
+        )]))
+        .unwrap();
+        assert_eq!(
+            cfg.skills_dir.as_deref(),
+            Some(Path::new("/opt/ironclaw/skills"))
+        );
+    }
+
+    #[test]
+    fn skills_dir_empty_is_none() {
+        let cfg = HostConfig::from_map(&m(&[("IRONCLAW_SKILLS_DIR", "")])).unwrap();
+        assert!(cfg.skills_dir.is_none());
+    }
+
+    #[test]
+    fn groups_dir_env_var_parses() {
+        let cfg = HostConfig::from_map(&m(&[(
+            "IRONCLAW_GROUPS_DIR",
+            "/opt/ironclaw/groups",
+        )]))
+        .unwrap();
+        assert_eq!(
+            cfg.groups_dir.as_deref(),
+            Some(Path::new("/opt/ironclaw/groups"))
+        );
     }
 
     #[test]

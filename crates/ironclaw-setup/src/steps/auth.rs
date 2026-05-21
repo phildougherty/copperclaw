@@ -33,6 +33,14 @@ pub struct EnvFileSpec {
     /// manager uses this when an agent group has no
     /// `container_config.image_tag` of its own. Empty to omit.
     pub default_image_tag: String,
+    /// Value of `IRONCLAW_SKILLS_DIR` — the directory of `SKILL.md`
+    /// bundles auto-loaded into the agent system prompt at container
+    /// spawn. Empty to omit the line (no skills are injected).
+    pub skills_dir: PathBuf,
+    /// Value of `IRONCLAW_GROUPS_DIR` — the per-agent-group override
+    /// root scanned alongside `skills_dir` (skills with matching
+    /// names shadow the global ones). Empty to omit.
+    pub groups_dir: PathBuf,
 }
 
 /// `OpenRouter`'s Anthropic-compatible base URL. The runner's
@@ -111,12 +119,27 @@ impl Step for AuthStep {
                 .map_or_else(|| cfg.data_dir.join("data"), Path::to_path_buf)
         };
         let iclaw_socket = host_data_dir.join("iclaw.sock");
+        // Default `IRONCLAW_SKILLS_DIR` to `<data_dir>/skills` and
+        // `IRONCLAW_GROUPS_DIR` to `<data_dir>/groups`. Operators can
+        // override either by exporting the env var before running
+        // setup. An empty path skips the line entirely so an unset
+        // override means "don't write it".
+        let skills_dir = std::env::var("IRONCLAW_SKILLS_DIR")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map_or_else(|| host_data_dir.join("skills"), PathBuf::from);
+        let groups_dir = std::env::var("IRONCLAW_GROUPS_DIR")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .map_or_else(|| host_data_dir.join("groups"), PathBuf::from);
         let spec = EnvFileSpec {
             anthropic_api_key: key,
             anthropic_base_url: base_url,
             data_dir: host_data_dir,
             iclaw_socket,
             default_image_tag: cfg.image_tag.clone(),
+            skills_dir,
+            groups_dir,
         };
         write_env_file(&env_path, &spec)?;
         cfg.env_file.clone_from(&env_path);
@@ -162,6 +185,18 @@ pub fn render_env_file(spec: &EnvFileSpec) -> String {
             spec.default_image_tag
         ));
     }
+    if !spec.skills_dir.as_os_str().is_empty() {
+        out.push_str(&format!(
+            "IRONCLAW_SKILLS_DIR={}\n",
+            spec.skills_dir.display()
+        ));
+    }
+    if !spec.groups_dir.as_os_str().is_empty() {
+        out.push_str(&format!(
+            "IRONCLAW_GROUPS_DIR={}\n",
+            spec.groups_dir.display()
+        ));
+    }
     out
 }
 
@@ -193,6 +228,8 @@ mod tests {
             data_dir: PathBuf::from("/srv/iron/data"),
             iclaw_socket: PathBuf::from("/srv/iron/data/iclaw.sock"),
             default_image_tag: String::new(),
+            skills_dir: PathBuf::new(),
+            groups_dir: PathBuf::new(),
         }
     }
 
@@ -212,8 +249,26 @@ mod tests {
             data_dir: PathBuf::new(),
             iclaw_socket: PathBuf::new(),
             default_image_tag: String::new(),
+            skills_dir: PathBuf::new(),
+            groups_dir: PathBuf::new(),
         });
         assert_eq!(s, "ANTHROPIC_API_KEY=sk\n");
+    }
+
+    #[test]
+    fn render_env_file_writes_skills_and_groups_dir() {
+        let mut s = spec("sk");
+        s.skills_dir = PathBuf::from("/srv/iron/data/skills");
+        s.groups_dir = PathBuf::from("/srv/iron/data/groups");
+        let body = render_env_file(&s);
+        assert!(
+            body.contains("IRONCLAW_SKILLS_DIR=/srv/iron/data/skills\n"),
+            "body: {body}"
+        );
+        assert!(
+            body.contains("IRONCLAW_GROUPS_DIR=/srv/iron/data/groups\n"),
+            "body: {body}"
+        );
     }
 
     #[test]
