@@ -1,0 +1,16 @@
+{
+  "name": "cli-multi-turn",
+  "channel": "cli",
+  "description": "Two inbound CLI lines (ping / what was my last message?) drive two Claude turns producing pong + a recall reply. Tests shared-session continuity across multiple inbounds.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "channel_type": "slack",
+  "platform_id": "C1",
+  "thread_id": null,
+  "message": {
+    "id": "1700000001.000001",
+    "kind": "chat",
+    "content": {"text": "hi from slack"},
+    "timestamp": "2026-01-01T00:00:00Z",
+    "is_mention": true,
+    "is_group": true
+  },
+  "reply_to": null,
+  "sender": {
+    "channel_type": "slack",
+    "identity": "U1",
+    "display_name": null
+  }
+}

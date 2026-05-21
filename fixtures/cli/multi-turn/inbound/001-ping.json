@@ -1,0 +1,13 @@
+{
+  "channel_type": "cli",
+  "platform_id": "stdin",
+  "thread_id": null,
+  "message": {
+    "id": "fixture-multi-msg-001",
+    "kind": "chat",
+    "content": {"text": "ping"},
+    "timestamp": "2026-01-01T00:00:00Z"
+  },
+  "reply_to": null,
+  "sender": null
+}

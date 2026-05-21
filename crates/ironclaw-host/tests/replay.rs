@@ -39,9 +39,8 @@ fn fixture_path(channel: &str, scenario: &str) -> PathBuf {
         .join(scenario)
 }
 
-#[tokio::test]
-async fn cli_text_reply_round_trip() {
-    let path = fixture_path("cli", "text-reply");
+async fn run_fixture(channel: &str, scenario: &str) {
+    let path = fixture_path(channel, scenario);
     assert!(
         path.exists(),
         "fixture missing at {} — see docs/replay-fixtures.md",
@@ -52,4 +51,24 @@ async fn cli_text_reply_round_trip() {
     harness.run().await.expect("run harness");
     let report = harness.compare().expect("compare");
     assert!(report.is_clean(), "{report}");
+}
+
+#[tokio::test]
+async fn cli_text_reply_round_trip() {
+    run_fixture("cli", "text-reply").await;
+}
+
+#[tokio::test]
+async fn telegram_inbound_text_message_round_trip() {
+    run_fixture("telegram", "inbound-text-message").await;
+}
+
+#[tokio::test]
+async fn slack_event_message_round_trip() {
+    run_fixture("slack", "event-message").await;
+}
+
+#[tokio::test]
+async fn cli_multi_turn_round_trip() {
+    run_fixture("cli", "multi-turn").await;
 }
