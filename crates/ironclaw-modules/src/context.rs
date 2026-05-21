@@ -152,7 +152,7 @@ pub enum SenderScopeDecision {
     /// `dropped_messages` with this reason.
     Deny(String),
     /// Sender is unknown; the approvals flow should be invoked. The host
-    /// writes a `pending_sender_approvals` row and drops the event.
+    /// writes an `unregistered_senders` row and drops the event.
     Pending(String),
     /// No opinion; defer to the next gate.
     Defer,
