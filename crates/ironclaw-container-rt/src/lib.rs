@@ -63,6 +63,16 @@ pub trait ContainerRuntime: Send + Sync {
     /// the runtime sends SIGKILL.
     async fn stop(&self, name: &str, grace: Duration) -> Result<(), RtError>;
 
+    /// Force-remove a container by name (stop + rm). Used by the
+    /// host's crash-restart path so the next spawn doesn't fail with
+    /// a "name already in use" conflict. Default impl is a best-
+    /// effort `stop`-then-success: concrete runtimes override with
+    /// the real removal.
+    async fn remove(&self, name: &str) -> Result<(), RtError> {
+        let _ = self.stop(name, Duration::from_secs(2)).await;
+        Ok(())
+    }
+
     /// Build (or rebuild) an image and return its full tag. Identical
     /// specs map to identical tags via [`ImageBuildSpec::fingerprint`],
     /// so callers can skip a rebuild when the tag already exists.

@@ -108,6 +108,28 @@ pub fn rollup_since(
     Ok(rows)
 }
 
+/// Sum input + output tokens for `agent_group_id` since `since`.
+/// Used by the container manager to enforce daily budgets without
+/// pulling the full per-row history.
+pub fn tokens_since(
+    db: &CentralDb,
+    agent_group_id: &str,
+    since: DateTime<Utc>,
+) -> Result<i64, DbError> {
+    let conn = db.conn()?;
+    let n: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(input_tokens + output_tokens), 0)
+             FROM agent_turns
+             WHERE agent_group_id = ?1 AND ended_at >= ?2",
+            params![agent_group_id, since.to_rfc3339()],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    Ok(n)
+}
+
 /// Count rows in the table. Cheap diagnostic.
 pub fn count(db: &CentralDb) -> Result<i64, DbError> {
     let conn = db.conn()?;

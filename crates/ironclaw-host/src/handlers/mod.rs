@@ -23,6 +23,7 @@ use serde_json::Value;
 
 pub mod approvals;
 pub mod audit;
+pub mod budgets;
 pub mod destinations;
 pub mod dropped_messages;
 pub mod groups;
@@ -65,6 +66,7 @@ pub const HOST_ONLY_COMMANDS: &[&str] = &[
     "destinations.add",
     "destinations.remove",
     "approvals.approve_sender",
+    "budgets.set",
 ];
 
 /// True when `command` requires `Caller::Host`.

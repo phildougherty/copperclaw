@@ -165,6 +165,8 @@ pub fn build_dispatch_table() -> DispatchTable {
         true
     );
     ins!("audit.list", handlers::audit::list, false);
+    ins!("budgets.list", handlers::budgets::list, false);
+    ins!("budgets.set", handlers::budgets::set, true);
     ins!("usage.rollup", handlers::usage::rollup, false);
 
     t

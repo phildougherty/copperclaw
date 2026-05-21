@@ -249,11 +249,12 @@ impl ContainerManager {
                 Ok(())
             }
             ReconcileAction::CrashRestart => {
+                // Remove (not just stop) so the next spawn doesn't
+                // collide on the container name. `remove` is a
+                // stop+rm that treats 404 as success, so it's safe
+                // to call even when the container is already gone.
                 let name = container_name(session.agent_group_id, session.id);
-                let _ = self
-                    .runtime
-                    .stop(&name, Duration::from_secs(self.cfg.stop_grace_secs))
-                    .await;
+                let _ = self.runtime.remove(&name).await;
                 sessions::mark_container_stopped(&self.central, session.id)
                     .map_err(ManagerError::Db)?;
                 warn!(
@@ -281,6 +282,19 @@ impl ContainerManager {
             return Ok(false);
         }
 
+        // Budget gate. If the group has a daily_token_cap and today's
+        // turns already meet/exceed it, refuse to spawn. The inbound
+        // sits in the row until the cap resets at UTC midnight or the
+        // operator raises it via `iclaw groups budget set`.
+        if self.is_over_budget(session)? {
+            warn!(
+                session = %session.id.as_uuid(),
+                agent_group = %session.agent_group_id.as_uuid(),
+                "daily token budget exhausted; spawn deferred"
+            );
+            return Ok(false);
+        }
+
         let cfg_row = container_configs::get(&self.central, session.agent_group_id)
             .map_err(ManagerError::Db)?;
         let runner_cfg = self.runner_config_for(session, cfg_row.as_ref());
@@ -294,6 +308,12 @@ impl ContainerManager {
             .unwrap_or_else(|| self.cfg.default_image_tag.clone());
 
         let spec = self.build_spec(session, &paths, &image_tag);
+        // Defensive: if a previous container with this name lingered
+        // (e.g. host crashed mid-cycle, orphan cleanup missed it,
+        // crash-restart's remove() raced the spawn) the create call
+        // would 409. Best-effort remove is a no-op when nothing
+        // matches, so it's cheap to always do.
+        let _ = self.runtime.remove(&spec.name).await;
         let handle = self
             .runtime
             .spawn(spec)
@@ -307,6 +327,34 @@ impl ContainerManager {
             "spawned session container"
         );
         Ok(true)
+    }
+
+    /// Returns true when the group's `daily_token_cap` is set AND
+    /// today's accumulated input + output tokens already meet or
+    /// exceed it. Day boundary = UTC midnight, matching what an
+    /// operator setting "daily" cap would naturally expect.
+    fn is_over_budget(&self, session: &Session) -> Result<bool, ManagerError> {
+        use ironclaw_db::tables::{agent_turns, group_budgets};
+        let Some(budget) = group_budgets::get(&self.central, session.agent_group_id)
+            .map_err(ManagerError::Db)?
+        else {
+            return Ok(false);
+        };
+        let Some(cap) = budget.daily_token_cap else {
+            return Ok(false);
+        };
+        let midnight = chrono::Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("00:00:00 is a valid time")
+            .and_utc();
+        let used = agent_turns::tokens_since(
+            &self.central,
+            &session.agent_group_id.as_uuid().to_string(),
+            midnight,
+        )
+        .map_err(ManagerError::Db)?;
+        Ok(used >= cap)
     }
 
     fn has_pending_inbound(paths: &SessionPaths) -> Result<bool, ManagerError> {

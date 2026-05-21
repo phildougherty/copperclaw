@@ -161,6 +161,11 @@ pub enum TopCommand {
     Status,
     /// One-shot operator health check.
     Health,
+    /// Per-group daily budget caps.
+    Budgets {
+        #[command(subcommand)]
+        action: BudgetsCmd,
+    },
     /// Per-group token usage rollup.
     Usage {
         /// Look-back window. Same format as `audit list --since`.
@@ -583,6 +588,23 @@ pub enum ApprovalsCmd {
     },
 }
 
+/// `iclaw budgets ...` — per-agent-group daily caps.
+#[derive(Debug, Subcommand)]
+pub enum BudgetsCmd {
+    /// List all configured budgets.
+    List,
+    /// Set or update a group's daily token cap. `--daily-tokens 0`
+    /// or `--clear` removes the cap.
+    Set {
+        #[arg(long)]
+        agent_group_id: String,
+        #[arg(long)]
+        daily_tokens: Option<i64>,
+        #[arg(long)]
+        clear: bool,
+    },
+}
+
 /// `iclaw audit ...` — read the mutation audit log.
 #[derive(Debug, Subcommand)]
 pub enum AuditCmd {
@@ -643,6 +665,7 @@ impl TopCommand {
             Self::DroppedMessages { action } => action.to_call(),
             Self::Approvals { action } => action.to_call(),
             Self::Audit { action } => action.to_call(),
+            Self::Budgets { action } => action.to_call(),
             Self::Quickstart { action } => action.to_call(),
             Self::Status => ParsedCall::new("composite.status", json!({})),
             Self::Health => ParsedCall::new("composite.health", json!({})),
@@ -1064,6 +1087,28 @@ impl AuditCmd {
     }
 }
 
+impl BudgetsCmd {
+    pub fn to_call(&self) -> ParsedCall {
+        match self {
+            Self::List => ParsedCall::new("budgets.list", json!({})),
+            Self::Set {
+                agent_group_id,
+                daily_tokens,
+                clear,
+            } => {
+                let mut o = Map::new();
+                o.insert("agent_group_id".into(), agent_group_id.clone().into());
+                if *clear {
+                    o.insert("daily_tokens".into(), Value::Null);
+                } else if let Some(n) = daily_tokens {
+                    o.insert("daily_tokens".into(), (*n).into());
+                }
+                ParsedCall::new("budgets.set", Value::Object(o))
+            }
+        }
+    }
+}
+
 /// All `command` strings this binary can emit. Useful for the host to
 /// register matching handlers; also referenced by tests in this crate.
 pub const ALL_COMMANDS: &[&str] = &[
@@ -1110,6 +1155,8 @@ pub const ALL_COMMANDS: &[&str] = &[
     "approvals.get",
     "approvals.approve_sender",
     "audit.list",
+    "budgets.list",
+    "budgets.set",
     "usage.rollup",
 ];
 
@@ -1817,6 +1864,16 @@ mod tests {
                 "user-42",
             ],
             &["iclaw", "audit", "list"],
+            &["iclaw", "budgets", "list"],
+            &[
+                "iclaw",
+                "budgets",
+                "set",
+                "--agent-group-id",
+                "ag-1",
+                "--daily-tokens",
+                "10000",
+            ],
             &["iclaw", "usage"],
             // Note: composite-only commands (`iclaw status`,
             // `iclaw health`, `iclaw quickstart`, `iclaw chat`,

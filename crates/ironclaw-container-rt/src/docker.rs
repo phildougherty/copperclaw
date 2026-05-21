@@ -131,6 +131,34 @@ impl ContainerRuntime for DockerRuntime {
             .map_err(|e| RtError::Container(format!("stop container {name}: {e}")))
     }
 
+    async fn remove(&self, name: &str) -> Result<(), RtError> {
+        // Stop first (best-effort; the container may already be down)
+        // then force-remove. We don't propagate the stop error because
+        // a missing-container 404 from stop is precisely what we want
+        // when the container has already exited — the rm call gives
+        // us the same outcome either way.
+        let _ = self
+            .docker
+            .stop_container(name, Some(StopContainerOptions { t: 2 }))
+            .await;
+        let opts = RemoveContainerOptions {
+            force: true,
+            ..Default::default()
+        };
+        // 404 = already gone — fold into success.
+        let res = self.docker.remove_container(name, Some(opts)).await;
+        match res {
+            Ok(())
+            | Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                ..
+            }) => Ok(()),
+            Err(e) => Err(RtError::Container(format!(
+                "remove container {name}: {e}"
+            ))),
+        }
+    }
+
     async fn build_image(&self, spec: ImageBuildSpec) -> Result<String, RtError> {
         let image_tag = spec.image_tag();
         let context_bytes = build_context_tar(&spec);

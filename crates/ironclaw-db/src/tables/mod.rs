@@ -10,6 +10,7 @@ pub mod agent_group_members;
 pub mod agent_groups;
 pub mod agent_turns;
 pub mod audit_log;
+pub mod group_budgets;
 pub mod messages_in;
 pub mod messages_out;
 pub mod messaging_group_agents;
