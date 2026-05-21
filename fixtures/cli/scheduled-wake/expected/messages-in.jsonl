@@ -1,0 +1,1 @@
+{"id":"<UUID>","seq":2,"kind":"task","timestamp":"<TS>","status":"completed","process_after":"2026-01-01T00:00:00Z","recurrence":null,"series_id":null,"tries":0,"trigger":true,"platform_id":"stdin","channel_type":"cli","thread_id":null,"content":{"text":"scheduled wake fired"},"source_session_id":null,"on_wake":false}

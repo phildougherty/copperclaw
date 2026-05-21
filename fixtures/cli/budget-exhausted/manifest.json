@@ -1,0 +1,16 @@
+{
+  "name": "cli-budget-exhausted",
+  "channel": "cli",
+  "description": "Inbound from `cli:local` arrives at an agent group whose `daily_token_cap` is 100 and whose `agent_turns` already shows 200 tokens used today. The container manager's budget gate refuses to spawn, writes a 'budget exhausted' Chat reply to `messages_out`, and the delivery loop fans it back to `cli/stdin`. Re-issuing the same inbound within the dedup window does NOT generate a second reply.",
+  "schema": 1,
+  "gates": ["budget"],
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "New requests will resume after [^.]+\\.": "New requests will resume after <RESET>."
+  }
+}

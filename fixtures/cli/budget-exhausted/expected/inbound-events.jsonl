@@ -1,0 +1,2 @@
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"message":{"id":"fixture-msg-001","kind":"chat","content":{"text":"anything?"},"timestamp":"<TS>","is_mention":null,"is_group":null},"reply_to":null,"sender":null}
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"message":{"id":"fixture-msg-002","kind":"chat","content":{"text":"still here?"},"timestamp":"<TS>","is_mention":null,"is_group":null},"reply_to":null,"sender":null}

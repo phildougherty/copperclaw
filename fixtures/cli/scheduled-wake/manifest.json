@@ -1,0 +1,17 @@
+{
+  "name": "cli-scheduled-wake",
+  "channel": "cli",
+  "description": "An idle session has a `messages_in` row with `process_after = 2026-01-01T00:00:00Z` (long in the past) and `kind = 'task'`. A single `SweepService::run_once()` pass wakes the session; the harness then runs one turn and the runner-emitted reply is fanned out through the cli adapter.",
+  "schema": 1,
+  "trigger_sweep": true,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

@@ -72,3 +72,18 @@ async fn slack_event_message_round_trip() {
 async fn cli_multi_turn_round_trip() {
     run_fixture("cli", "multi-turn").await;
 }
+
+#[tokio::test]
+async fn cli_sender_not_approved() {
+    run_fixture("cli", "sender-not-approved").await;
+}
+
+#[tokio::test]
+async fn cli_budget_exhausted() {
+    run_fixture("cli", "budget-exhausted").await;
+}
+
+#[tokio::test]
+async fn cli_scheduled_wake() {
+    run_fixture("cli", "scheduled-wake").await;
+}
