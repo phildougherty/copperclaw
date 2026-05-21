@@ -198,6 +198,83 @@ pub enum TopCommand {
         /// Target shell. Supports `bash`, `zsh`, `fish`, `elvish`, `powershell`.
         shell: clap_complete::Shell,
     },
+    /// Central database backup and restore.
+    ///
+    /// Backup copies the central `ironclaw.db` file after running a WAL
+    /// checkpoint. Restore always refuses while the host is running and tells
+    /// the operator to stop the host first.
+    Db {
+        #[command(subcommand)]
+        action: DbCmd,
+    },
+    /// MCP server preset registry.
+    ///
+    /// `iclaw mcp list-presets` shows the built-in catalog of curated MCP
+    /// server configurations. `iclaw mcp add <preset>` writes the chosen
+    /// preset into an agent group's container config so it starts at the
+    /// next container spawn.
+    Mcp {
+        #[command(subcommand)]
+        action: McpCmd,
+    },
+}
+
+// --- db --------------------------------------------------------------------
+
+/// `iclaw db ...` — central database backup / restore.
+#[derive(Debug, Subcommand)]
+pub enum DbCmd {
+    /// Backup the central DB to `<path>`. Runs a WAL checkpoint first, then
+    /// atomically copies the `SQLite` file. The backup is a valid standalone
+    /// `SQLite` database that can be opened immediately.
+    ///
+    /// The host does not need to be stopped for a backup; the WAL checkpoint
+    /// ensures the copy is consistent. A non-zero `wal_pages_remaining` in
+    /// the response means a write transaction was open during the checkpoint
+    /// and some WAL data was included — this is safe and expected under load.
+    Backup {
+        /// Destination file path. Parent directories are created automatically.
+        path: String,
+    },
+    /// Refuse to restore while the host is running.
+    ///
+    /// Restoring requires an exclusive lock on the `SQLite` file; the host
+    /// holds an open WAL connection. Stop the host first, then copy the
+    /// backup file over `<data_dir>/ironclaw.db` manually and restart.
+    Restore {
+        /// Backup file to restore from.
+        path: String,
+    },
+}
+
+// --- mcp -------------------------------------------------------------------
+
+/// `iclaw mcp ...` — MCP server preset registry.
+#[derive(Debug, Subcommand)]
+pub enum McpCmd {
+    /// List all built-in MCP server presets. No socket round-trip required.
+    #[command(name = "list-presets")]
+    ListPresets,
+    /// Add a preset MCP server to an agent group's container config.
+    ///
+    /// The preset entry is written into `container_configs.mcp_servers` and
+    /// takes effect at the next container spawn for that group. If a server
+    /// with the same name already exists it is replaced (idempotent).
+    ///
+    /// Example:
+    ///   iclaw mcp add postgres --agent-group-id <id> \\
+    ///       --env `POSTGRES_CONNECTION_STRING=postgres://localhost/mydb`
+    Add {
+        /// Preset name from `iclaw mcp list-presets`.
+        preset: String,
+        /// Agent group to configure.
+        #[arg(long = "agent-group-id")]
+        agent_group_id: String,
+        /// Environment variable overrides in `KEY=VALUE` form.
+        /// May be specified multiple times.
+        #[arg(long)]
+        env: Vec<String>,
+    },
 }
 
 // --- quickstart ------------------------------------------------------------
@@ -593,9 +670,30 @@ pub enum UserDmsCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum DroppedMessagesCmd {
+    /// List inbound messages the router dropped (no messaging group found,
+    /// unknown sender, etc.).
     List {
         #[arg(long)]
         since: Option<String>,
+    },
+    /// List outbound messages the delivery loop could not deliver after all
+    /// retries were exhausted. These rows are candidates for replay.
+    #[command(name = "outbound-list")]
+    OutboundList {
+        /// Look-back window. ISO-8601 timestamp or relative shorthand
+        /// (`1h`, `24h`, `7d`). Omit to list all.
+        #[arg(long)]
+        since: Option<String>,
+        /// Maximum number of rows to return (default: 50).
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+    /// Re-queue an outbound dead-letter row. The row is re-inserted into the
+    /// originating session's `messages_out` table with a fresh `deliver_after`
+    /// so the delivery loop picks it up on its next sweep.
+    Replay {
+        /// Dead-letter row id returned by `iclaw dropped-messages outbound-list`.
+        id: String,
     },
 }
 
@@ -698,6 +796,8 @@ impl TopCommand {
             Self::Audit { action } => action.to_call(),
             Self::Budgets { action } => action.to_call(),
             Self::Quickstart { action } => action.to_call(),
+            Self::Db { action } => action.to_call(),
+            Self::Mcp { action } => action.to_call(),
             Self::Status => ParsedCall::new("composite.status", json!({})),
             Self::Health => ParsedCall::new("composite.health", json!({})),
             Self::Usage { since } => {
@@ -765,6 +865,43 @@ fn parse_field(spec: &str) -> (String, Value) {
     // Try to interpret the value as JSON; fall back to a JSON string.
     let parsed = serde_json::from_str::<Value>(&value).unwrap_or(Value::String(value));
     (key, parsed)
+}
+
+impl DbCmd {
+    pub fn to_call(&self) -> ParsedCall {
+        match self {
+            Self::Backup { path } => ParsedCall::new("db.backup", json!({"path": path})),
+            Self::Restore { path } => ParsedCall::new("db.restore", json!({"path": path})),
+        }
+    }
+}
+
+impl McpCmd {
+    pub fn to_call(&self) -> ParsedCall {
+        match self {
+            Self::ListPresets => ParsedCall::new("mcp.list-presets", json!({})),
+            Self::Add {
+                preset,
+                agent_group_id,
+                env,
+            } => {
+                let mut env_obj = serde_json::Map::new();
+                for kv in env {
+                    if let Some((k, v)) = kv.split_once('=') {
+                        env_obj.insert(k.to_string(), Value::String(v.to_string()));
+                    }
+                }
+                ParsedCall::new(
+                    "mcp.add",
+                    json!({
+                        "preset": preset,
+                        "agent_group_id": agent_group_id,
+                        "env": env_obj,
+                    }),
+                )
+            }
+        }
+    }
 }
 
 impl GroupsCmd {
@@ -1112,6 +1249,15 @@ impl DroppedMessagesCmd {
                 insert_opt(&mut o, "since", since.clone());
                 ParsedCall::new("dropped-messages.list", Value::Object(o))
             }
+            Self::OutboundList { since, limit } => {
+                let mut o = Map::new();
+                insert_opt(&mut o, "since", since.clone());
+                o.insert("limit".into(), (*limit).into());
+                ParsedCall::new("dropped-messages.outbound-list", Value::Object(o))
+            }
+            Self::Replay { id } => {
+                ParsedCall::new("dropped-messages.replay", json!({"id": id}))
+            }
         }
     }
 }
@@ -1213,6 +1359,12 @@ pub const ALL_COMMANDS: &[&str] = &[
     "sessions.get",
     "user-dms.list",
     "dropped-messages.list",
+    "dropped-messages.outbound-list",
+    "dropped-messages.replay",
+    "db.backup",
+    "db.restore",
+    "mcp.list-presets",
+    "mcp.add",
     "approvals.list",
     "approvals.get",
     "approvals.approve_sender",
@@ -1993,6 +2145,19 @@ mod tests {
             &["iclaw", "sessions", "get", "x"],
             &["iclaw", "user-dms", "list"],
             &["iclaw", "dropped-messages", "list"],
+            &["iclaw", "dropped-messages", "outbound-list"],
+            &["iclaw", "dropped-messages", "replay", "00000000-0000-0000-0000-000000000000"],
+            &["iclaw", "db", "backup", "/tmp/ironclaw.db.bak"],
+            &["iclaw", "db", "restore", "/tmp/ironclaw.db.bak"],
+            &["iclaw", "mcp", "list-presets"],
+            &[
+                "iclaw",
+                "mcp",
+                "add",
+                "postgres",
+                "--agent-group-id",
+                "00000000-0000-0000-0000-000000000000",
+            ],
             &["iclaw", "approvals", "list"],
             &["iclaw", "approvals", "get", "x"],
             &[

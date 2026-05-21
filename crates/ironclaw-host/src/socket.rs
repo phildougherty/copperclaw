@@ -24,11 +24,24 @@ use tracing::{debug, info, warn};
 /// Context handed to every [`CommandHandler::handle`] call.
 pub struct HandlerCtx {
     pub central: CentralDb,
+    /// Data directory root for per-session file lookups (e.g. outbound.db
+    /// paths used by the dead-letter replay handler).
+    pub data_dir: std::path::PathBuf,
 }
 
 impl HandlerCtx {
     pub fn new(central: CentralDb) -> Self {
-        Self { central }
+        Self {
+            central,
+            data_dir: std::path::PathBuf::from("data"),
+        }
+    }
+
+    pub fn with_data_dir(central: CentralDb, data_dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            central,
+            data_dir: data_dir.into(),
+        }
     }
 }
 
@@ -79,6 +92,45 @@ impl CommandHandler for FnHandler {
     }
 }
 
+/// Handler variant that receives the full [`HandlerCtx`] rather than just the
+/// central DB. Used for commands that need additional context (e.g. `data_dir`
+/// for the dead-letter replay handler).
+type CtxHandlerFn = dyn Fn(&Value, &HandlerCtx) -> Result<Value, ErrorPayload> + Send + Sync;
+
+pub struct CtxFnHandler {
+    f: Box<CtxHandlerFn>,
+    requires_host: bool,
+}
+
+impl CtxFnHandler {
+    pub fn new<F>(f: F, requires_host: bool) -> Self
+    where
+        F: Fn(&Value, &HandlerCtx) -> Result<Value, ErrorPayload> + Send + Sync + 'static,
+    {
+        Self {
+            f: Box::new(f),
+            requires_host,
+        }
+    }
+}
+
+impl CommandHandler for CtxFnHandler {
+    fn handle(
+        &self,
+        args: &Value,
+        caller: &Caller,
+        ctx: &HandlerCtx,
+    ) -> Result<Value, ErrorPayload> {
+        if self.requires_host && !matches!(caller, Caller::Host) {
+            return Err(ErrorPayload::new(
+                "permission_denied",
+                "command is host-only",
+            ));
+        }
+        (self.f)(args, ctx)
+    }
+}
+
 /// In-memory mapping of dotted command names to their handler.
 pub type DispatchTable = HashMap<&'static str, Arc<dyn CommandHandler>>;
 
@@ -90,6 +142,15 @@ pub fn build_dispatch_table() -> DispatchTable {
             t.insert(
                 $name,
                 Arc::new(FnHandler::new(|a, c| ($fn)(a, c), $host)) as Arc<dyn CommandHandler>,
+            );
+        };
+    }
+    // Variant for handlers that need the full HandlerCtx (e.g. data_dir).
+    macro_rules! ins_ctx {
+        ($name:literal, $fn:expr, $host:expr) => {
+            t.insert(
+                $name,
+                Arc::new(CtxFnHandler::new($fn, $host)) as Arc<dyn CommandHandler>,
             );
         };
     }
@@ -167,6 +228,20 @@ pub fn build_dispatch_table() -> DispatchTable {
 
     ins!("user-dms.list", handlers::user_dms::list, false);
     ins!("dropped-messages.list", handlers::dropped_messages::list, false);
+    ins!(
+        "dropped-messages.outbound-list",
+        handlers::dropped_messages::outbound_list,
+        false
+    );
+    ins_ctx!(
+        "dropped-messages.replay",
+        |a, ctx| handlers::dropped_messages::replay_with_data_dir(a, &ctx.central, &ctx.data_dir),
+        true
+    );
+    ins!("db.backup", handlers::db::backup, true);
+    ins!("db.restore", handlers::db::restore, true);
+    ins!("mcp.list-presets", handlers::mcp::list_presets, false);
+    ins!("mcp.add", handlers::mcp::add, true);
     ins!("approvals.list", handlers::approvals::list, false);
     ins!("approvals.get", handlers::approvals::get, false);
     ins!(

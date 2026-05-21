@@ -24,11 +24,13 @@ use serde_json::Value;
 pub mod approvals;
 pub mod audit;
 pub mod budgets;
+pub mod db;
 pub mod destinations;
 pub mod dropped_messages;
 pub mod groups;
 pub mod members;
 pub mod messaging_groups;
+pub mod mcp;
 pub mod roles;
 pub mod sessions;
 pub mod usage;
@@ -69,6 +71,10 @@ pub const HOST_ONLY_COMMANDS: &[&str] = &[
     "destinations.remove",
     "approvals.approve_sender",
     "budgets.set",
+    "db.backup",
+    "db.restore",
+    "dropped-messages.replay",
+    "mcp.add",
 ];
 
 /// True when `command` requires `Caller::Host`.

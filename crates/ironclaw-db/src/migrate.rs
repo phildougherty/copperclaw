@@ -42,6 +42,10 @@ const CENTRAL: &[Migration] = &[
         name: "007_container_config_extensions",
         sql: include_str!("../migrations/007_container_config_extensions.sql"),
     },
+    Migration {
+        name: "008_outbound_dropped_messages",
+        sql: include_str!("../migrations/008_outbound_dropped_messages.sql"),
+    },
 ];
 
 const SESSION_INBOUND: &[Migration] = &[Migration {
@@ -163,6 +167,7 @@ mod tests {
             "agent_destinations",
             "unregistered_senders",
             "dropped_messages",
+            "outbound_dropped_messages",
             "container_configs",
         ] {
             let exists: i64 = conn
