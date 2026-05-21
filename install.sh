@@ -15,6 +15,13 @@
 #
 # Out of scope: installing Docker or Rust. The script detects them and
 # prints the appropriate platform-specific install hint if missing.
+#
+# Test-only escape hatches (default-off; preserve normal behaviour):
+#   INSTALL_SH_SKIP_DOCKER_CHECK=1   # skip the container-runtime check
+#   IRONCLAW_INSTALL_DRY_RUN=1       # print the release-tarball URL and exit 0
+#   IRONCLAW_FORCE_TARGET=<triple>   # override platform detection (e.g.
+#                                    # aarch64-unknown-linux-gnu) — pairs with
+#                                    # the dry-run mode for tarball-URL tests.
 
 set -euo pipefail
 
@@ -25,6 +32,11 @@ IRONCLAW_INSTALL_DIR="${IRONCLAW_INSTALL_DIR:-$HOME/.local/bin}"
 IRONCLAW_SKIP_SETUP="${IRONCLAW_SKIP_SETUP:-0}"
 IRONCLAW_FORCE_REINSTALL="${IRONCLAW_FORCE_REINSTALL:-0}"
 IRONCLAW_RELEASE_TAG="${IRONCLAW_RELEASE_TAG:-latest}"
+# TODO(team-j): test-only knobs. Default off; do not document beyond the
+# header comment. Used by tests/install/test_install_sh.sh.
+INSTALL_SH_SKIP_DOCKER_CHECK="${INSTALL_SH_SKIP_DOCKER_CHECK:-0}"
+IRONCLAW_INSTALL_DRY_RUN="${IRONCLAW_INSTALL_DRY_RUN:-0}"
+IRONCLAW_FORCE_TARGET="${IRONCLAW_FORCE_TARGET:-}"
 
 BINARIES=(ironclaw iclaw ironclaw-setup)
 # crate path per binary, used by the --path fallback.
@@ -100,6 +112,26 @@ run_quiet() {
 
 detect_platform() {
     local uname_s uname_m os arch triple
+    # TODO(team-j): IRONCLAW_FORCE_TARGET lets the install-sh integration test
+    # exercise the per-triple tarball URL without faking uname. No effect when
+    # unset.
+    if [ -n "$IRONCLAW_FORCE_TARGET" ]; then
+        case "$IRONCLAW_FORCE_TARGET" in
+            x86_64-unknown-linux-gnu)   os="linux";  arch="x86_64" ;;
+            aarch64-unknown-linux-gnu)  os="linux";  arch="aarch64" ;;
+            x86_64-apple-darwin)        os="macos";  arch="x86_64" ;;
+            aarch64-apple-darwin)       os="macos";  arch="aarch64" ;;
+            *)
+                err "IRONCLAW_FORCE_TARGET=$IRONCLAW_FORCE_TARGET is not a recognised triple"
+                exit 1 ;;
+        esac
+        PLATFORM_OS="$os"
+        # shellcheck disable=SC2034  # exposed for completeness / future use
+        PLATFORM_ARCH="$arch"
+        PLATFORM_TRIPLE="$IRONCLAW_FORCE_TARGET"
+        ok "platform: $os/$arch ($IRONCLAW_FORCE_TARGET) [forced]"
+        return 0
+    fi
     uname_s="$(uname -s 2>/dev/null || echo unknown)"
     uname_m="$(uname -m 2>/dev/null || echo unknown)"
 
@@ -138,6 +170,7 @@ detect_platform() {
     fi
 
     PLATFORM_OS="$os"
+    # shellcheck disable=SC2034  # exposed for completeness / future use
     PLATFORM_ARCH="$arch"
     PLATFORM_TRIPLE="$triple"
     ok "platform: $os/$arch ($triple)"
@@ -146,6 +179,12 @@ detect_platform() {
 # ----- container runtime check ----------------------------------------------
 
 check_container_runtime() {
+    # TODO(team-j): the install-sh integration test runs in containers that
+    # don't have Docker/Podman available — opt out cleanly.
+    if [ "$INSTALL_SH_SKIP_DOCKER_CHECK" = "1" ]; then
+        dim "container-runtime check skipped (INSTALL_SH_SKIP_DOCKER_CHECK=1)"
+        return 0
+    fi
     local found=""
     if command -v docker >/dev/null 2>&1; then
         if docker info >/dev/null 2>&1; then
@@ -527,9 +566,28 @@ EOF
 
 # ----- main ------------------------------------------------------------------
 
+print_release_url() {
+    local tag="$IRONCLAW_RELEASE_TAG" base
+    if [ "$tag" = "latest" ]; then
+        base="https://github.com/${IRONCLAW_REPO}/releases/latest/download"
+    else
+        base="https://github.com/${IRONCLAW_REPO}/releases/download/${tag}"
+    fi
+    printf '%s/ironclaw-%s.tar.gz\n' "$base" "$PLATFORM_TRIPLE"
+}
+
 main() {
     step "ironclaw installer"
     detect_platform
+
+    # TODO(team-j): dry-run prints the tarball URL the installer would fetch
+    # and exits 0, without touching docker, cargo, or the filesystem. Used by
+    # the platform-detection test case.
+    if [ "$IRONCLAW_INSTALL_DRY_RUN" = "1" ]; then
+        print_release_url
+        exit 0
+    fi
+
     check_container_runtime
 
     if already_installed && [ "$IRONCLAW_FORCE_REINSTALL" != "1" ]; then
