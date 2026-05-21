@@ -6,6 +6,35 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (onboarding polish slice)
+
+- `iclaw doctor` — first-run / ongoing health probe. Walks the
+  install end-to-end (host reachability, agent groups, wirings,
+  active sessions, recent audit errors, dropped-message backlog,
+  `ANTHROPIC_API_KEY` presence, web-search provider keys) and
+  prints a per-row OK / WARN / FAIL with a `fix:` line on every
+  non-OK row. Non-zero exit when any check is in FAIL so CI scripts
+  can branch. `--json` for machine-readable output, `--no-ping` to
+  skip the live LLM ping.
+- Setup auto-bootstraps a default cli agent group + wiring. New
+  `quickstart_group` step runs after `verify` and writes a
+  `(cli, stdin)` messaging group + agent group + pattern-`.*`
+  wiring directly to the central DB so `iclaw chat` works on the
+  very first `ironclaw run`. Idempotent (skips when any agent group
+  already exists). Opt out with `IRONCLAW_SETUP_QUICKSTART=no` or
+  decline the interactive prompt. Override the slug with
+  `IRONCLAW_SETUP_QUICKSTART_NAME`. The `first_chat` step's
+  "what to do next" output flips to recommend `iclaw chat`
+  directly when the bootstrap landed.
+- Budget-exhausted reply to original sender. When the container
+  manager's spawn gate refuses because today's tokens exceeded
+  the group's `daily_token_cap`, the host now posts a one-line
+  in-channel reply ("I have reached this agent's daily token
+  budget. New requests will resume after &lt;next UTC midnight&gt;…") via
+  the session's `outbound.db`. Dedupes per-group on a one-hour
+  window so a chatty user gets one explanation, not ten. Skips
+  silently when `session_routing` is empty.
+
 ### Added (M14 follow-up — web search)
 
 - New `web_search` MCP tool, the 20th in-tree tool the agent can

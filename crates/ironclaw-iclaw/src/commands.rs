@@ -161,6 +161,19 @@ pub enum TopCommand {
     Status,
     /// One-shot operator health check.
     Health,
+    /// First-run diagnostic. Walks the install end-to-end and reports
+    /// what's wired, what's missing, and what command to run to fix
+    /// each missing piece. Designed so a fresh user can paste the
+    /// output into the README's troubleshooting section.
+    ///
+    /// Returns a non-zero exit when any check is in FAIL state so CI
+    /// and pre-flight scripts can branch on it.
+    Doctor {
+        /// Skip the live LLM provider ping (saves a round-trip + a
+        /// token when you only want local checks).
+        #[arg(long)]
+        no_ping: bool,
+    },
     /// Per-group daily budget caps.
     Budgets {
         #[command(subcommand)]
@@ -800,6 +813,9 @@ impl TopCommand {
             Self::Mcp { action } => action.to_call(),
             Self::Status => ParsedCall::new("composite.status", json!({})),
             Self::Health => ParsedCall::new("composite.health", json!({})),
+            Self::Doctor { no_ping } => {
+                ParsedCall::new("composite.doctor", json!({ "no_ping": no_ping }))
+            }
             Self::Usage { since } => {
                 ParsedCall::new("usage.rollup", json!({"since": since}))
             }

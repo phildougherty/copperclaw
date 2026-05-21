@@ -78,12 +78,12 @@ file paths that landed the change.
 
 | Metric | Value |
 | - | - |
-| `cargo test --workspace` | 4576 passing / 0 failing / 4 ignored |
+| `cargo test --workspace` | 4597 passing / 0 failing / 4 ignored |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | Channel crates | 21 |
 | In-tree tools the agent can call | 20 (15 messaging/scheduling/self-mod + 4 computer-use + 1 multi-provider web search) |
 | Skill docs | 22 |
-| Latest milestone | M14 follow-up — `web_search` tool with Tavily / Exa / Brave / `SerpAPI` providers |
+| Latest milestone | Onboarding polish — `iclaw doctor`, auto-bootstrapped default group, budget-exhausted in-channel reply |
 
 Older M-section "totals" lines are historical snapshots and will drift —
 trust the table above.
@@ -785,6 +785,48 @@ the operator has configured.
 web_search module, 11 in host edge-case / delivery-apply / config
 ensure paths). 0 failing. Clippy clean.
 
+### Onboarding polish slice
+
+Smoothing the gap between "I ran `ironclaw-setup`" and "my agent is
+talking back to me". Three changes, each closing a distinct first-
+run footgun.
+
+- [x] **`iclaw doctor`** — composite first-run diagnostic.
+  Sequence: host reachability via `groups.list` → agent group
+  count → wiring count → active session count → recent audit
+  errors (1h, top 3 by `result=error`) → dropped-message
+  backlog → `ANTHROPIC_API_KEY` presence in this shell's env →
+  web-search provider keys (informational). Each check renders
+  `[OK   |WARN |FAIL ]` + name + detail, and non-OK rows print a
+  `fix:` line the operator can copy-paste. `--json` emits
+  `{ "status": "ok|fail", "checks": [...] }` for CI. Non-zero
+  exit when any FAIL is present.
+- [x] **Setup auto-bootstraps a default cli group + wiring.**
+  New `quickstart_group` step (between `verify` and
+  `first_chat`) writes a `(cli, stdin)` messaging group, an
+  agent group named `first`, and a pattern-`.*` wiring with
+  `session_mode = Shared`. Idempotent against any pre-existing
+  agent group. The `first_chat` step's "what to do next" output
+  flips to recommend `iclaw chat` directly when the bootstrap
+  landed, falling back to the `iclaw quickstart cli` instruction
+  when the operator declined. Opt out via
+  `IRONCLAW_SETUP_QUICKSTART=no`; rename the slug via
+  `IRONCLAW_SETUP_QUICKSTART_NAME`.
+- [x] **Budget-exhausted reply to original sender.** When the
+  container manager's spawn gate refuses because today's tokens
+  exceeded `group_budgets.daily_token_cap`, the host now posts
+  a one-line in-channel reply via the session's `outbound.db`
+  (routed through `session_routing` so it lands back on the
+  user's channel). Dedup per-agent-group on a 1 h window via a
+  process-local `last_budget_notice` map so a chatty user gets
+  one explanation, not ten. Silent skip when
+  `session_routing` is empty (no inbound to anchor the routing
+  yet).
+
+**Slice totals**: 4576 → 4597 passing (+21 tests: 7 doctor + 7
+quickstart-group + 4 budget-reply + 3 misc fix-ups). 0 failing.
+Clippy clean.
+
 ---
 
 ## Next things to address
@@ -834,12 +876,6 @@ remaining items, ranked by impact × leverage:
    central migrations but there's no schema-version table the
    host can check on boot to refuse a downgrade or warn about
    an in-progress upgrade. _(M13 reliability)_
-
-8. **Budget-exhausted notification to original sender**. The
-   budget gate refuses to spawn when over-cap but the
-   inbound sender is left in the dark. Surface a
-   "budget exhausted; try again after UTC midnight" reply
-   on the originating channel. _(M13 cost/safety)_
 
 ---
 

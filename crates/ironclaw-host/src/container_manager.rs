@@ -36,7 +36,7 @@
 
 use ironclaw_container_rt::{ContainerRuntime, ContainerSpec, ImageBuildSpec, Mount, ResourceLimits, RtError};
 use ironclaw_db::central::CentralDb;
-use ironclaw_db::session::{open_inbound, SessionPaths};
+use ironclaw_db::session::{open_inbound, open_outbound, SessionPaths};
 use ironclaw_db::tables::{container_configs, messages_in, sessions};
 use ironclaw_types::{AgentGroupId, ContainerStatus, Session, SessionStatus};
 use std::path::PathBuf;
@@ -133,6 +133,14 @@ pub struct ContainerManager {
     central: CentralDb,
     runtime: Arc<dyn ContainerRuntime>,
     cfg: ManagerConfig,
+    /// Per-agent-group timestamps of the last in-channel "budget
+    /// exhausted" notice we emitted. Used to dedup so a user who
+    /// sends ten messages while over the cap gets one explanation,
+    /// not ten. Process-local — a host restart re-notifies once,
+    /// which is acceptable.
+    last_budget_notice: std::sync::Mutex<
+        std::collections::HashMap<AgentGroupId, chrono::DateTime<chrono::Utc>>,
+    >,
 }
 
 impl ContainerManager {
@@ -147,6 +155,7 @@ impl ContainerManager {
             central,
             runtime,
             cfg,
+            last_budget_notice: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -303,12 +312,22 @@ impl ContainerManager {
         // turns already meet/exceed it, refuse to spawn. The inbound
         // sits in the row until the cap resets at UTC midnight or the
         // operator raises it via `iclaw groups budget set`.
+        //
+        // The user gets one in-channel reply per agent group per
+        // notice window — without that, a chat goes silent and the
+        // user has no idea why. See `maybe_post_budget_exhausted` for
+        // the dedup window + the message text.
         if self.is_over_budget(session)? {
             warn!(
                 session = %session.id.as_uuid(),
                 agent_group = %session.agent_group_id.as_uuid(),
                 "daily token budget exhausted; spawn deferred"
             );
+            if let Err(err) = self.maybe_post_budget_exhausted(session, &paths) {
+                // Notification failure is non-fatal; the spawn is
+                // still deferred and the warning above is in the log.
+                warn!(?err, "could not post budget-exhausted reply");
+            }
             return Ok(false);
         }
 
@@ -420,6 +439,98 @@ impl ContainerManager {
         )
         .map_err(ManagerError::Db)?;
         Ok(used >= cap)
+    }
+
+    /// Dedup window: if we already posted a budget-exhausted notice
+    /// for this group inside the last hour, skip emitting another
+    /// one. Picked to be long enough that a chatty user doesn't get
+    /// repeated reminders but short enough that they get *some*
+    /// follow-up if they're still chatting an hour later.
+    const BUDGET_NOTICE_WINDOW_SECS: i64 = 3600;
+
+    /// When the budget gate refuses to spawn, post an in-channel
+    /// reply telling the user the cap is hit and when it resets.
+    /// Dedups per agent-group via [`Self::last_budget_notice`]; logs
+    /// + swallows errors so the gate stays the source of truth.
+    ///
+    /// The reply is routed via `session_routing` (the
+    /// `(channel_type, platform_id, thread_id)` the router stored on
+    /// session create) so the user sees it back on the channel that
+    /// asked the question.
+    fn maybe_post_budget_exhausted(
+        &self,
+        session: &Session,
+        paths: &SessionPaths,
+    ) -> Result<(), ManagerError> {
+        // Dedup gate — quickly return when we already notified this
+        // group recently. Hold the mutex only for the read so we
+        // don't hold it across the DB writes below.
+        let now = chrono::Utc::now();
+        {
+            let mut state = self.last_budget_notice.lock().expect("budget-notice mutex poisoned");
+            if let Some(prev) = state.get(&session.agent_group_id) {
+                let elapsed = now.signed_duration_since(*prev).num_seconds();
+                if elapsed.abs() < Self::BUDGET_NOTICE_WINDOW_SECS {
+                    return Ok(());
+                }
+            }
+            // Set the marker *before* doing the work. If the post
+            // fails we'll still log a warning; we accept that one
+            // notice may be lost in exchange for never spamming.
+            state.insert(session.agent_group_id, now);
+        }
+
+        // Resolve where the reply should go. The router writes
+        // `(channel_type, platform_id, thread_id)` into the per-
+        // session `session_routing` table on first inbound; without
+        // it we have nowhere to address the reply.
+        let routing = {
+            let conn = open_inbound(paths).map_err(ManagerError::Db)?;
+            ironclaw_db::tables::session_routing::read(&conn).map_err(ManagerError::Db)?
+        };
+        let Some(routing) = routing else {
+            warn!(
+                session = %session.id.as_uuid(),
+                "budget-exhausted notice skipped: no session_routing target",
+            );
+            return Ok(());
+        };
+
+        // Compute next midnight UTC so the reply tells the user when
+        // the cap resets.
+        let next_reset = (now.date_naive() + chrono::Duration::days(1))
+            .and_hms_opt(0, 0, 0)
+            .expect("00:00:00 is always valid")
+            .and_utc();
+        let text = format!(
+            "I have reached this agent's daily token budget. New requests will resume after {} UTC. \
+Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> --daily-tokens N`.",
+            next_reset.format("%Y-%m-%d %H:%M"),
+        );
+
+        // Use `Chat` kind so the delivery loop routes via the
+        // channel adapter rather than the system-action registry.
+        let outbound = open_outbound(paths).map_err(ManagerError::Db)?;
+        let row = ironclaw_db::tables::messages_out::WriteOutbound {
+            id: ironclaw_types::MessageId::new(),
+            in_reply_to: None,
+            timestamp: now,
+            deliver_after: None,
+            recurrence: None,
+            kind: ironclaw_types::MessageKind::Chat,
+            platform_id: routing.platform_id.clone(),
+            channel_type: routing.channel_type.clone(),
+            thread_id: routing.thread_id.clone(),
+            content: serde_json::json!({ "text": text }),
+        };
+        ironclaw_db::tables::messages_out::insert(&outbound, &row).map_err(ManagerError::Db)?;
+        info!(
+            session = %session.id.as_uuid(),
+            agent_group = %session.agent_group_id.as_uuid(),
+            channel_type = ?routing.channel_type,
+            "posted budget-exhausted reply to original sender"
+        );
+        Ok(())
     }
 
     fn has_pending_inbound(paths: &SessionPaths) -> Result<bool, ManagerError> {
@@ -1435,5 +1546,184 @@ mod tests {
         let rc = mgr.runner_config_for(&session, None);
         assert!(rc.system.contains("alpha body"));
         assert!(rc.system.contains("<skill name=\"alpha\""));
+    }
+
+    // ── budget-exhausted reply ──────────────────────────────────────
+
+    fn set_daily_cap(db: &CentralDb, ag: AgentGroupId, cap: i64) {
+        ironclaw_db::tables::group_budgets::upsert(
+            db,
+            ironclaw_db::tables::group_budgets::UpsertGroupBudget {
+                agent_group_id: ag,
+                daily_token_cap: Some(cap),
+                daily_cost_cap: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn record_today_tokens(db: &CentralDb, ag: AgentGroupId, input: i64, output: i64) {
+        ironclaw_db::tables::agent_turns::insert(
+            db,
+            &ironclaw_db::tables::agent_turns::NewAgentTurn {
+                agent_group_id: ag.as_uuid().to_string(),
+                session_id: SessionId(uuid::Uuid::new_v4()).as_uuid().to_string(),
+                seq: 1,
+                model: "stub".into(),
+                provider: "stub".into(),
+                started_at: chrono::Utc::now(),
+                ended_at: chrono::Utc::now(),
+                input_tokens: input,
+                output_tokens: output,
+                status: "ok".into(),
+                error: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn seed_routing(paths: &SessionPaths) {
+        paths.ensure_dirs().unwrap();
+        let conn = open_inbound(paths).unwrap();
+        ironclaw_db::tables::session_routing::write(
+            &conn,
+            &ironclaw_types::routing::SessionRouting {
+                channel_type: Some(ironclaw_types::ChannelType::new("cli")),
+                platform_id: Some("stdin".into()),
+                thread_id: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn count_outbound_text_replies(paths: &SessionPaths) -> Vec<String> {
+        let conn = open_outbound(paths).unwrap();
+        let rows = ironclaw_db::tables::messages_out::list_due(&conn).unwrap();
+        rows.into_iter()
+            .filter_map(|r| {
+                if matches!(r.kind, ironclaw_types::MessageKind::Chat) {
+                    r.content
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn maybe_post_budget_exhausted_writes_reply_when_routing_known() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        seed_routing(&paths);
+
+        mgr.maybe_post_budget_exhausted(&session, &paths).unwrap();
+
+        let replies = count_outbound_text_replies(&paths);
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].contains("daily token budget"));
+        assert!(replies[0].contains("iclaw groups budget set"));
+    }
+
+    #[test]
+    fn maybe_post_budget_exhausted_dedups_within_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        seed_routing(&paths);
+
+        mgr.maybe_post_budget_exhausted(&session, &paths).unwrap();
+        mgr.maybe_post_budget_exhausted(&session, &paths).unwrap();
+        mgr.maybe_post_budget_exhausted(&session, &paths).unwrap();
+
+        // Exactly one reply lands despite three calls.
+        let replies = count_outbound_text_replies(&paths);
+        assert_eq!(replies.len(), 1);
+    }
+
+    #[test]
+    fn maybe_post_budget_exhausted_skips_when_no_routing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        // ensure_dirs lazily so open_inbound succeeds, but do NOT
+        // write session_routing → handler should bail with a warn.
+        paths.ensure_dirs().unwrap();
+        let _ = open_inbound(&paths).unwrap();
+
+        mgr.maybe_post_budget_exhausted(&session, &paths).unwrap();
+
+        let replies = count_outbound_text_replies(&paths);
+        assert!(replies.is_empty());
+    }
+
+    #[tokio::test]
+    async fn maybe_spawn_posts_one_reply_per_window_when_over_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        seed_routing(&paths);
+
+        // Seed an inbound message so has_pending_inbound() returns true.
+        let conn = open_inbound(&paths).unwrap();
+        ironclaw_db::tables::messages_in::insert(
+            &conn,
+            &ironclaw_db::tables::messages_in::WriteInbound {
+                id: ironclaw_types::MessageId::new(),
+                kind: ironclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "hi"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("stdin".into()),
+                channel_type: Some(ironclaw_types::ChannelType::new("cli")),
+                thread_id: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
+
+        // Cap = 100; usage = 200 → over budget.
+        set_daily_cap(&db, session.agent_group_id, 100);
+        record_today_tokens(&db, session.agent_group_id, 150, 50);
+
+        // First tick posts the reply; second tick dedups.
+        let spawned1 = mgr.maybe_spawn(&session).await.unwrap();
+        let spawned2 = mgr.maybe_spawn(&session).await.unwrap();
+        assert!(!spawned1, "must not spawn when over budget");
+        assert!(!spawned2);
+        let replies = count_outbound_text_replies(&paths);
+        assert_eq!(replies.len(), 1);
     }
 }

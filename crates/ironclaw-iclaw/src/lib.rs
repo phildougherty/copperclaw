@@ -242,6 +242,7 @@ where
         "quickstart-cli" => run_quickstart_cli(args, transport, caller, as_json).await,
         "status" => run_status(transport, caller, as_json).await,
         "health" => run_health(transport, caller, as_json).await,
+        "doctor" => run_doctor(args, transport, caller, as_json).await,
         "completions" => run_completions(args),
         "chat" => run_chat(args).await,
         other => RunOutput::failure(format!("unknown composite op: {other}\n")),
@@ -502,6 +503,336 @@ where
         out.push_str("recent mutations (24h): none\n");
     }
     RunOutput::success(out)
+}
+
+/// Severity of a single `doctor` check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckLevel {
+    Ok,
+    Warn,
+    Fail,
+}
+
+impl CheckLevel {
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Ok => "OK   ",
+            Self::Warn => "WARN ",
+            Self::Fail => "FAIL ",
+        }
+    }
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Warn => "warn",
+            Self::Fail => "fail",
+        }
+    }
+}
+
+/// One result from `iclaw doctor`. `fix` is shown to the operator
+/// only when level != Ok, so an all-green report stays short.
+#[derive(Debug, Clone)]
+struct Check {
+    name: &'static str,
+    level: CheckLevel,
+    detail: String,
+    /// Optional shell command the operator can run to remediate.
+    fix: Option<String>,
+}
+
+impl Check {
+    fn ok(name: &'static str, detail: impl Into<String>) -> Self {
+        Self { name, level: CheckLevel::Ok, detail: detail.into(), fix: None }
+    }
+    fn warn(name: &'static str, detail: impl Into<String>, fix: Option<&str>) -> Self {
+        Self {
+            name,
+            level: CheckLevel::Warn,
+            detail: detail.into(),
+            fix: fix.map(String::from),
+        }
+    }
+    fn fail(name: &'static str, detail: impl Into<String>, fix: Option<&str>) -> Self {
+        Self {
+            name,
+            level: CheckLevel::Fail,
+            detail: detail.into(),
+            fix: fix.map(String::from),
+        }
+    }
+    fn to_json(&self) -> serde_json::Value {
+        let mut o = serde_json::Map::new();
+        o.insert("name".into(), serde_json::Value::String(self.name.into()));
+        o.insert(
+            "level".into(),
+            serde_json::Value::String(self.level.as_str().into()),
+        );
+        o.insert("detail".into(), serde_json::Value::String(self.detail.clone()));
+        if let Some(f) = &self.fix {
+            o.insert("fix".into(), serde_json::Value::String(f.clone()));
+        }
+        serde_json::Value::Object(o)
+    }
+}
+
+/// `iclaw doctor` — composite first-run diagnostic. Walks the install
+/// end-to-end and reports per-check status plus a `fix:` line on each
+/// non-OK row so an operator can copy-paste their way to a working
+/// install.
+///
+/// Sequence:
+/// 1. `groups.list` — central DB reachable through the host socket.
+///    Subsumes "host process running" + "socket file present" +
+///    "central DB readable".
+/// 2. Group / wiring counts — gating for `iclaw chat` to do
+///    anything useful.
+/// 3. Recent audit errors — surfacing flapping mutations.
+/// 4. Dropped-message backlog.
+/// 5. Env-var sanity — `ANTHROPIC_API_KEY` present, plus a courtesy
+///    note about which `web_search` providers are wired up.
+///
+/// The transport calls run sequentially because the iclaw socket is
+/// strictly single-flight per connection; ~5 round-trips total against
+/// a Unix socket is sub-millisecond in practice.
+#[allow(clippy::too_many_lines)] // Sequential checks are easier to follow inline.
+async fn run_doctor<T>(
+    args: &serde_json::Value,
+    transport: &T,
+    caller: Caller,
+    as_json: bool,
+) -> RunOutput
+where
+    T: CallTransport + ?Sized,
+{
+    let _no_ping = args.get("no_ping").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let mut checks: Vec<Check> = Vec::new();
+
+    // 1. Host reachable + central DB readable.
+    let groups = match transport
+        .call("groups.list", serde_json::json!({}), caller.clone())
+        .await
+    {
+        Ok(v) => {
+            checks.push(Check::ok(
+                "host-reachable",
+                "iclaw socket responded; central DB is readable",
+            ));
+            v
+        }
+        Err(e) => {
+            checks.push(Check::fail(
+                "host-reachable",
+                format!("could not reach the host socket: {e}"),
+                Some("start the host: `ironclaw run` (or `systemctl start ironclaw` if installed as a service)"),
+            ));
+            return finalise_doctor(&checks, as_json);
+        }
+    };
+
+    // 2. At least one agent group must exist for any of the messaging
+    //    paths to fire.
+    let group_count = array_len(&groups);
+    if group_count == 0 {
+        checks.push(Check::fail(
+            "agent-group",
+            "no agent groups configured — there is no one for inbound messages to route to",
+            Some("create the default group: `iclaw quickstart cli --name first`"),
+        ));
+    } else {
+        checks.push(Check::ok(
+            "agent-group",
+            format!("{group_count} group(s) configured"),
+        ));
+    }
+
+    // 3. Wirings — messaging-group ↔ agent-group bindings.
+    let wirings = transport
+        .call("wirings.list", serde_json::json!({}), caller.clone())
+        .await
+        .ok();
+    match wirings.as_ref().map(array_len) {
+        Some(0) => checks.push(Check::warn(
+            "wiring",
+            "no messaging-group wirings — agent groups exist but nothing routes inbound to them",
+            Some("`iclaw quickstart cli --name first` creates the default group + wiring in one call"),
+        )),
+        Some(n) => checks.push(Check::ok("wiring", format!("{n} wiring(s) configured"))),
+        None => checks.push(Check::warn(
+            "wiring",
+            "could not list wirings",
+            Some("re-run `iclaw doctor` after the host comes back; check stderr for `wirings.list` errors"),
+        )),
+    }
+
+    // 4. Sessions snapshot (informational, never fatal — having zero
+    //    sessions is the steady state for a brand-new install).
+    if let Ok(active) = transport
+        .call(
+            "sessions.list",
+            serde_json::json!({"status": "active"}),
+            caller.clone(),
+        )
+        .await
+    {
+        let n = array_len(&active);
+        if n > 0 {
+            checks.push(Check::ok("sessions", format!("{n} active session(s)")));
+        } else {
+            checks.push(Check::ok(
+                "sessions",
+                "no active sessions yet — send a message via `iclaw chat` to create one",
+            ));
+        }
+    }
+
+    // 5. Recent audit failures — anything that flapped in the last
+    //    hour points the operator at the broken command.
+    if let Ok(audit) = transport
+        .call(
+            "audit.list",
+            serde_json::json!({"since": "1h", "limit": 50}),
+            caller.clone(),
+        )
+        .await
+    {
+        let bad: Vec<&serde_json::Value> = audit
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|r| {
+                        r.get("result").and_then(serde_json::Value::as_str)
+                            == Some("error")
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if bad.is_empty() {
+            checks.push(Check::ok("audit-errors", "no failed mutations in the last hour"));
+        } else {
+            let sample: Vec<String> = bad
+                .iter()
+                .take(3)
+                .map(|r| {
+                    let cmd = r
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?");
+                    let code = r
+                        .get("error_code")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?");
+                    format!("{cmd} -> {code}")
+                })
+                .collect();
+            checks.push(Check::warn(
+                "audit-errors",
+                format!("{} failed mutation(s) in the last hour: {}", bad.len(), sample.join(", ")),
+                Some("`iclaw audit list --since 1h` to see the full set"),
+            ));
+        }
+    }
+
+    // 6. Dropped-message backlog.
+    if let Ok(dropped) = transport
+        .call("dropped-messages.list", serde_json::json!({}), caller.clone())
+        .await
+    {
+        let n = array_len(&dropped);
+        if n == 0 {
+            checks.push(Check::ok("dropped-messages", "no dropped inbound messages"));
+        } else {
+            checks.push(Check::warn(
+                "dropped-messages",
+                format!("{n} dropped inbound message(s)"),
+                Some("`iclaw dropped-messages list` to inspect; usually means a sender hit the approval gate"),
+            ));
+        }
+    }
+
+    // 7. Env-var sanity (local checks, no transport call). These
+    //    look at the iclaw client's env which is the operator's env;
+    //    the host inherits the same env when launched from a
+    //    setup-written `.env` file, so a missing var here is almost
+    //    certainly the same one the host saw on boot.
+    if std::env::var("ANTHROPIC_API_KEY").map(|s| !s.is_empty()).unwrap_or(false) {
+        checks.push(Check::ok(
+            "anthropic-key",
+            "ANTHROPIC_API_KEY is set in this shell's env",
+        ));
+    } else {
+        checks.push(Check::warn(
+            "anthropic-key",
+            "ANTHROPIC_API_KEY is unset in this shell — the host reads it from its own env / .env, so this is only conclusive when you launched `ironclaw run` from this shell",
+            Some("set ANTHROPIC_API_KEY in the install's .env (typically under $XDG_DATA_HOME/ironclaw/.env on Linux)"),
+        ));
+    }
+
+    // 8. Web-search providers (informational only — none configured
+    //    is a perfectly valid install).
+    let providers: Vec<&'static str> = [
+        ("TAVILY_API_KEY", "tavily"),
+        ("EXA_API_KEY", "exa"),
+        ("BRAVE_SEARCH_API_KEY", "brave"),
+        ("SERPAPI_API_KEY", "serpapi"),
+    ]
+    .iter()
+    .filter_map(|(var, name)| {
+        std::env::var(var).ok().filter(|s| !s.is_empty()).map(|_| *name)
+    })
+    .collect();
+    if providers.is_empty() {
+        checks.push(Check::ok(
+            "web-search",
+            "no web_search providers configured (the tool will surface a friendly error if the agent calls it)",
+        ));
+    } else {
+        checks.push(Check::ok(
+            "web-search",
+            format!("{} provider(s) configured: {}", providers.len(), providers.join(", ")),
+        ));
+    }
+
+    finalise_doctor(&checks, as_json)
+}
+
+/// Render the collected `doctor` checks and pick the exit code.
+fn finalise_doctor(checks: &[Check], as_json: bool) -> RunOutput {
+    let any_fail = checks.iter().any(|c| c.level == CheckLevel::Fail);
+    if as_json {
+        let payload = serde_json::json!({
+            "status": if any_fail { "fail" } else { "ok" },
+            "checks": checks.iter().map(Check::to_json).collect::<Vec<_>>(),
+        });
+        let mut out = render_json_pretty(&payload);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        return if any_fail {
+            RunOutput::failure(out)
+        } else {
+            RunOutput::success(out)
+        };
+    }
+    let mut out = String::new();
+    for c in checks {
+        out.push_str(&format!("[{}] {:<18} {}\n", c.level.tag(), c.name, c.detail));
+        if c.level != CheckLevel::Ok {
+            if let Some(fix) = &c.fix {
+                out.push_str(&format!("       fix: {fix}\n"));
+            }
+        }
+    }
+    if any_fail {
+        out.push_str("\nat least one check is in FAIL state; see the `fix:` lines above\n");
+        RunOutput::failure(out)
+    } else if checks.iter().any(|c| c.level == CheckLevel::Warn) {
+        out.push_str("\ninstall is reachable but has warnings; see the `fix:` lines above\n");
+        RunOutput::success(out)
+    } else {
+        out.push_str("\nall checks passed; install is ready for `iclaw chat`\n");
+        RunOutput::success(out)
+    }
 }
 
 /// `iclaw completions <shell>` — render the clap-generated completion
@@ -1077,5 +1408,155 @@ mod tests {
         assert!(out.stderr.contains("groups.create"));
         let calls = t.calls.lock().unwrap();
         assert_eq!(calls.len(), 1);
+    }
+
+    // ── iclaw doctor ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn doctor_socket_unreachable_fails_with_fix() {
+        // First call (groups.list) errors → doctor bails out with a FAIL row
+        // pointing at `ironclaw run`.
+        let t = SequencedTransport::new(vec![Err(ClientError::Timeout)]);
+        let out = run_cli(["iclaw", "doctor"], &t).await;
+        assert!(out.stdout.is_empty(), "doctor must use stderr for fail: stdout={:?}", out.stdout);
+        assert!(out.stderr.contains("FAIL"));
+        assert!(out.stderr.contains("host-reachable"));
+        assert!(out.stderr.contains("ironclaw run"));
+        // It should *not* keep going and hit downstream endpoints once
+        // the socket is gone.
+        let calls = t.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn doctor_empty_install_warns_about_groups_and_wirings() {
+        // groups=[], wirings=[], active sessions=[], audit=[], dropped=[]
+        let t = SequencedTransport::new(vec![
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!([])),
+        ]);
+        let out = run_cli(["iclaw", "doctor"], &t).await;
+        let combined = format!("{}{}", out.stdout, out.stderr);
+        assert!(combined.contains("FAIL"), "must include FAIL for missing agent group");
+        assert!(combined.contains("agent-group"));
+        assert!(combined.contains("iclaw quickstart cli"));
+        // Wirings is gated on group existence; with zero groups the
+        // wiring row will show WARN (no wirings). Either way, the
+        // remediation hint mentions quickstart.
+    }
+
+    #[tokio::test]
+    async fn doctor_happy_path_has_no_fails() {
+        // groups=1, wirings=1, sessions=[], audit=[], dropped=[]
+        // We deliberately do NOT assert on the ANTHROPIC_API_KEY check
+        // result — the iclaw process inherits the test runner's env,
+        // which may or may not have the key set, and doctor's purpose
+        // is to surface that mismatch as a WARN rather than treating
+        // it as a hard failure.
+        let t = SequencedTransport::new(vec![
+            Ok(json!([{"id": "ag-1"}])),
+            Ok(json!([{"id": "w-1"}])),
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!([])),
+        ]);
+        let out = run_cli(["iclaw", "doctor"], &t).await;
+        // Happy-path doctor never lands in stderr because no checks fail.
+        assert!(
+            out.stderr.is_empty(),
+            "expected no stderr on happy doctor; got: {:?}",
+            out.stderr,
+        );
+        assert!(out.stdout.contains("OK"));
+        assert!(out.stdout.contains("host-reachable"));
+        assert!(out.stdout.contains("agent-group"));
+        assert!(out.stdout.contains("wiring"));
+        // No FAIL rows, and the trailer is one of the two non-failure
+        // forms ("all checks passed" or "install is reachable but has
+        // warnings"), never the failure trailer.
+        assert!(!out.stdout.contains("FAIL"));
+        assert!(
+            out.stdout.contains("all checks passed")
+                || out.stdout.contains("install is reachable but has warnings"),
+            "unexpected trailer: {:?}",
+            out.stdout,
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_surfaces_recent_audit_errors() {
+        // Group + wiring present, but the audit list returns a failing row.
+        let t = SequencedTransport::new(vec![
+            Ok(json!([{"id": "ag-1"}])),
+            Ok(json!([{"id": "w-1"}])),
+            Ok(json!([])),
+            Ok(json!([
+                {
+                    "command": "groups.create",
+                    "result": "error",
+                    "error_code": "invalid_input"
+                }
+            ])),
+            Ok(json!([])),
+        ]);
+        let out = run_cli(["iclaw", "doctor"], &t).await;
+        let combined = format!("{}{}", out.stdout, out.stderr);
+        assert!(combined.contains("WARN"));
+        assert!(combined.contains("audit-errors"));
+        assert!(combined.contains("groups.create -> invalid_input"));
+    }
+
+    #[tokio::test]
+    async fn doctor_dropped_messages_warn() {
+        let t = SequencedTransport::new(vec![
+            Ok(json!([{"id": "ag-1"}])),
+            Ok(json!([{"id": "w-1"}])),
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!([{"id": "drop-1"}, {"id": "drop-2"}])),
+        ]);
+        let out = run_cli(["iclaw", "doctor"], &t).await;
+        let combined = format!("{}{}", out.stdout, out.stderr);
+        assert!(combined.contains("dropped-messages"));
+        assert!(combined.contains("2 dropped"));
+    }
+
+    #[tokio::test]
+    async fn doctor_json_mode_emits_structured_payload() {
+        let t = SequencedTransport::new(vec![
+            Ok(json!([{"id": "ag-1"}])),
+            Ok(json!([{"id": "w-1"}])),
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!([])),
+        ]);
+        let out = run_cli(["iclaw", "--json", "doctor"], &t).await;
+        let payload: serde_json::Value = serde_json::from_str(out.stdout.trim())
+            .expect("doctor --json must be parseable JSON");
+        assert_eq!(payload["status"], "ok");
+        let checks = payload["checks"].as_array().unwrap();
+        assert!(checks.iter().any(|c| c["name"] == "host-reachable"));
+        assert!(checks.iter().any(|c| c["name"] == "agent-group"));
+        // Every entry must have a level + detail; failing rows must have fix.
+        for c in checks {
+            assert!(c["level"].is_string());
+            assert!(c["detail"].is_string());
+            if c["level"] == "fail" {
+                assert!(c["fix"].is_string());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn doctor_json_fail_status_when_any_check_fails() {
+        let t = SequencedTransport::new(vec![Err(ClientError::Timeout)]);
+        let out = run_cli(["iclaw", "--json", "doctor"], &t).await;
+        // FAIL paths go to stderr per RunOutput::failure convention.
+        let payload: serde_json::Value = serde_json::from_str(out.stderr.trim())
+            .expect("--json fail must still emit JSON");
+        assert_eq!(payload["status"], "fail");
     }
 }

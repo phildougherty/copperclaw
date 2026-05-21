@@ -63,9 +63,10 @@ into the system prompt.
   `packages_apt` / `packages_npm` / `skills` / `mcp_servers`;
   rebuild failures fall back to the last-known-good tag and emit
   `ironclaw_image_rebuild_failed_total`).
-- **Operator surface**: `iclaw health` (one-shot probe — session
-  breakdown by container_status, recent mutations, dropped-message
-  count), `iclaw audit list` (append-only mutation log;
+- **Operator surface**: `iclaw doctor` (first-run / ongoing
+  diagnostic with a `fix:` line on every non-OK row), `iclaw health`
+  (one-shot probe — session breakdown by container_status, recent
+  mutations, dropped-message count), `iclaw audit list` (append-only mutation log;
   truncated-args, latency_ms, caller kind, env-value redaction on
   sensitive commands), `iclaw usage` (per-group token rollup from
   `agent_turns` the runner populates from provider `usage`
@@ -102,9 +103,12 @@ into the system prompt.
   launchd unit generators (including `Restart=on-failure`) and a
   `--migrate-from` data-directory migrator. Writes
   `IRONCLAW_SKILLS_DIR` + `IRONCLAW_GROUPS_DIR` so the install's
-  skills directory is discoverable on first boot.
+  skills directory is discoverable on first boot. The new
+  `quickstart_group` step auto-creates a default cli agent group +
+  wiring so `iclaw chat` works on the very first `ironclaw run`
+  (opt out via `IRONCLAW_SETUP_QUICKSTART=no`).
 - **22 authored skills** under `skills/`.
-- **4576 passing tests**, 0 failing. `cargo clippy --workspace
+- **4597 passing tests**, 0 failing. `cargo clippy --workspace
   --all-targets -- -D warnings` clean. CI runs fmt + clippy + test on
   Linux and macOS with an 85% coverage gate.
 - **End-to-end chat works** against any Anthropic-API-compatible
@@ -152,12 +156,18 @@ ironclaw run
 
 # In another terminal — iclaw also resolves the install's socket
 # without configuration, so the commands Just Work from any cwd.
-iclaw quickstart cli --name first    # group + mg + wiring in one call
+# Setup auto-creates the default cli agent group + wiring, so chat
+# works on first run.
+iclaw doctor                          # diagnose any setup issue (run this first if chat doesn't respond)
+iclaw chat                            # interactive REPL against the cli channel
 iclaw status                          # full wiring digest
 iclaw health                          # operator probe (sessions, audit, drops)
-iclaw chat                            # interactive REPL against the cli channel
 iclaw usage --since 24h               # per-group token rollup
 iclaw audit list --since 1h           # mutations against the host socket
+
+# If you skipped the quickstart prompt during setup (or set
+# IRONCLAW_SETUP_QUICKSTART=no), create the default group manually:
+iclaw quickstart cli --name first
 ```
 
 `ironclaw run` resolution order for the `.env`: `--env-file <path>` →
