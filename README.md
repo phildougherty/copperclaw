@@ -514,6 +514,27 @@ The `--generate-unit <systemd|launchd>` flag still works as before for
 operators who want to render a unit to stdout / a file for their
 config-management tool without going through the full wizard.
 
+## Agent skills
+
+Skills under `skills/` are markdown bundles auto-discovered by
+`ironclaw-skills` and inlined into the running agent's system
+prompt. Capability docs (`send-message`, `install-packages`, …)
+describe the in-tree MCP tools; guided-flow skills describe a
+multi-turn interaction the agent runs with the user:
+
+- `skills/customize/` — change the model, install a package or
+  MCP server, edit the per-group behavior prompt, raise/lower the
+  daily-token budget. The agent prints the exact `iclaw` command
+  for any host-only mutation.
+- `skills/debug/` — triage a "you didn't reply" / "it's slow"
+  report: pull what's reachable from inside the container, then
+  hand `iclaw health`, `iclaw audit list`, and
+  `iclaw dropped-messages list` to the operator.
+
+Drop a new directory with a `SKILL.md` (YAML frontmatter +
+markdown body) into `skills/` and the next container boot picks
+it up — no registry edits required.
+
 ## Documentation
 
 Operator-facing guides:
