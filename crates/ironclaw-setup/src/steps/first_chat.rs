@@ -38,20 +38,47 @@ impl Step for FirstChatStep {
 /// Build the instruction lines that should be shown after setup completes.
 #[must_use]
 pub fn instructions(cfg: &SetupConfig) -> Vec<String> {
+    let env_file = if cfg.env_file.as_os_str().is_empty() {
+        cfg.data_dir.join(".env")
+    } else {
+        cfg.env_file.clone()
+    };
     let mut out = Vec::new();
     out.push("Setup is complete. To start the host:".to_string());
     out.push(format!(
-        "  ironclaw run --data-dir {}",
-        cfg.data_dir.display()
+        "  ironclaw --env-file {} run",
+        env_file.display()
     ));
+    out.push(String::new());
+    out.push(
+        "Then, in a second terminal, source the .env to pick up ICLAW_SOCKET".to_string(),
+    );
+    out.push("and drive the host via iclaw:".to_string());
+    out.push(format!("  set -a; . {} ; set +a", env_file.display()));
+    out.push("  iclaw groups list".to_string());
     match cfg.first_channel.as_str() {
         "cli" => {
-            out.push("Then connect via the CLI channel:".to_string());
-            out.push("  iclaw chat".to_string());
+            out.push(String::new());
+            out.push(
+                "The cli channel reads from the host's stdin, so type messages into".to_string(),
+            );
+            out.push(
+                "the host's terminal once it idles. Before that does anything, an"
+                    .to_string(),
+            );
+            out.push(
+                "agent group must be wired to a messaging group with channel_type=cli."
+                    .to_string(),
+            );
+            out.push(
+                "Use `iclaw groups create --help`, `iclaw messaging-groups create --help`,"
+                    .to_string(),
+            );
+            out.push("and `iclaw wirings create --help` to assemble the wiring.".to_string());
         }
         other => {
             out.push(format!(
-                "Then configure the {other} channel via `iclaw channel add {other}`."
+                "Then bind the {other} channel — see docs/adding-a-channel.md."
             ));
         }
     }
@@ -78,18 +105,21 @@ mod tests {
             ..SetupConfig::default()
         };
         let out = instructions(&cfg);
-        assert!(out.iter().any(|m| m.contains("ironclaw run")));
-        assert!(out.iter().any(|m| m.contains("iclaw chat")));
+        // Points at the real binary + --env-file (not a non-existent
+        // `ironclaw run --data-dir` form) and at iclaw subcommands that
+        // actually exist (not the imaginary `iclaw chat`).
+        assert!(out.iter().any(|m| m.contains("ironclaw --env-file")));
+        assert!(out.iter().any(|m| m.contains("iclaw groups create --help")));
     }
 
     #[test]
-    fn instructions_telegram_mentions_ncl_add() {
+    fn instructions_telegram_points_at_docs() {
         let cfg = SetupConfig {
             first_channel: "telegram".into(),
             ..SetupConfig::default()
         };
         let out = instructions(&cfg);
-        assert!(out.iter().any(|m| m.contains("iclaw channel add telegram")));
+        assert!(out.iter().any(|m| m.contains("docs/adding-a-channel.md")));
     }
 
     #[test]
