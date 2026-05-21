@@ -111,7 +111,7 @@ pub fn all_steps() -> Vec<BoxedStep> {
         Box::new(onecli::OneCliStep),
         Box::new(auth::AuthStep),
         Box::new(mounts::MountsStep),
-        Box::new(service_unit::ServiceUnitStep),
+        Box::new(service_unit::ServiceUnitStep::default()),
         Box::new(cli_agent::CliAgentStep),
         Box::new(timezone::TimezoneStep),
         Box::new(channel::ChannelStep),
