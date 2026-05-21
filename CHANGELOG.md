@@ -6,6 +6,33 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M14 follow-up — web search)
+
+- New `web_search` MCP tool, the 20th in-tree tool the agent can
+  call. Closes the M14 follow-up gap: `web_fetch` could read a URL
+  but the agent couldn't *find* one.
+- Four provider backends in a single tool, normalised to one
+  `{title, url, snippet, published?, score?}` result schema:
+  - **Tavily** — agent-tuned default. `TAVILY_API_KEY`.
+  - **Exa** — neural / semantic search with `text` snippets.
+    `EXA_API_KEY`.
+  - **Brave** — independent keyword index. `BRAVE_SEARCH_API_KEY`.
+  - **SerpAPI** — Google / Bing / etc. wrapper. `SERPAPI_API_KEY`.
+- Provider resolution: explicit `provider` arg → `IRONCLAW_WEB_SEARCH_PROVIDER`
+  env → auto-detect from configured keys in order
+  `tavily, exa, brave, serpapi`. No keys configured surfaces a
+  validation error naming all four env vars (errors over silent
+  fallback).
+- Host's `ContainerManager` now forwards
+  `IRONCLAW_WEB_SEARCH_PROVIDER` + the four provider keys into the
+  session container at spawn via a new `forward_env` field, so the
+  operator only configures keys once in the host's `.env`.
+- New skill: `skills/web-search/SKILL.md` (auto-loaded into the
+  system prompt under the existing
+  `IRONCLAW_SKILLS_DIR` mechanism).
+- New doc: [`docs/web-search.md`](docs/web-search.md) — operator
+  setup, provider trade-offs, egress allow-list interaction.
+
 ### Added (M14 — agent capability)
 
 - `ProviderEvent::ToolCall` and a tool-use outer loop in the runner.

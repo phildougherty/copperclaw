@@ -39,13 +39,15 @@ into the system prompt.
   compaction, plus subprocess-bridged Codex / OpenCode and an
   Ollama-via-Anthropic-base-URL variant. `ironclaw-setup` accepts
   `openrouter` as a friendly shortcut at the base-URL prompt.
-- **Agent tool inventory**: 19 in-tree tools — 15 messaging /
+- **Agent tool inventory**: 20 in-tree tools — 15 messaging /
   scheduling / self-mod (`send_message`, `send_file`,
   `edit_message`, `add_reaction`, `ask_user_question`, `send_card`,
   `create_agent`, `install_packages`, `add_mcp_server`,
   `schedule_task`, `list_tasks`, `cancel_task`, `pause_task`,
-  `resume_task`, `update_task`) plus 4 computer-use
-  (`shell`, `read_file`, `write_file`, `web_fetch`).
+  `resume_task`, `update_task`), 4 computer-use (`shell`,
+  `read_file`, `write_file`, `web_fetch`), and 1 multi-provider
+  web search (`web_search` — routes to Tavily / Exa / Brave /
+  SerpAPI based on which API key the operator has wired up).
 - **System-prompt skill auto-load**: when `IRONCLAW_SKILLS_DIR` is
   set, the container manager inlines each enabled SKILL.md body
   into the runner's system prompt at spawn so the model knows
@@ -101,8 +103,8 @@ into the system prompt.
   `--migrate-from` data-directory migrator. Writes
   `IRONCLAW_SKILLS_DIR` + `IRONCLAW_GROUPS_DIR` so the install's
   skills directory is discoverable on first boot.
-- **21 authored skills** under `skills/`.
-- **4551 passing tests**, 0 failing. `cargo clippy --workspace
+- **22 authored skills** under `skills/`.
+- **4576 passing tests**, 0 failing. `cargo clippy --workspace
   --all-targets -- -D warnings` clean. CI runs fmt + clippy + test on
   Linux and macOS with an 85% coverage gate.
 - **End-to-end chat works** against any Anthropic-API-compatible
@@ -207,6 +209,8 @@ See `docs/cutover.md` for migrating from a predecessor data directory.
   metrics endpoint and log rotation.
 - [`docs/db-backup.md`](docs/db-backup.md) — central DB backup and
   restore procedure.
+- [`docs/web-search.md`](docs/web-search.md) — multi-provider
+  `web_search` tool: Tavily / Exa / Brave / SerpAPI.
 - [`docs/cutover.md`](docs/cutover.md) — operator playbook for
   switching a predecessor installation onto Ironclaw.
 - [`docs/replay-fixtures.md`](docs/replay-fixtures.md) — design of

@@ -25,6 +25,11 @@
 //! | `IRONCLAW_DEFAULT_IMAGE_TAG` | unset | sha-pinned default image tag for sessions when the per-group `container_configs.image_tag` is unset. Written by `ironclaw-setup` after building the image. |
 //! | `ANTHROPIC_API_KEY` | unset | API key forwarded into each session container as an env var. |
 //! | `ANTHROPIC_BASE_URL` | unset | Override the provider base URL (e.g. `https://openrouter.ai/api/v1`). |
+//! | `IRONCLAW_WEB_SEARCH_PROVIDER` | unset | Default `web_search` provider (`tavily` \| `exa` \| `brave` \| `serpapi`). Auto-detected from set API keys when unset. |
+//! | `TAVILY_API_KEY` | unset | Tavily search API key, forwarded to the container so `web_search` can dispatch. |
+//! | `EXA_API_KEY` | unset | Exa.ai search API key (semantic / neural search). |
+//! | `BRAVE_SEARCH_API_KEY` | unset | Brave Search API key (keyword search). |
+//! | `SERPAPI_API_KEY` | unset | `SerpAPI` key (Google/Bing/etc. wrapper). |
 //!
 //! The `cli` channel is always implicitly known but is only initialized if it
 //! appears in `IRONCLAW_CHANNELS`. Unknown channel names log a warning and

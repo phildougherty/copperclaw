@@ -543,6 +543,7 @@ fn spawn_container_manager(
         stop_grace_secs: crate::container_manager::DEFAULT_STOP_GRACE_SECS,
         skills_dir: cfg.skills_dir.clone(),
         groups_dir: cfg.groups_dir.clone(),
+        forward_env: collect_forward_env(),
     };
     let manager = Arc::new(crate::container_manager::ContainerManager::new(
         central,
@@ -550,6 +551,31 @@ fn spawn_container_manager(
         manager_cfg,
     ));
     Some(tokio::spawn(manager.run_loop(shutdown)))
+}
+
+/// Collect operator-supplied env vars that should be forwarded into
+/// every spawned session container. Today this is the web-search
+/// provider keys + the explicit provider override; the list is kept
+/// here (rather than spread across the modules that need them) so
+/// the host has one place to audit what leaks into the container.
+fn collect_forward_env() -> Vec<(String, String)> {
+    const FORWARDED: &[&str] = &[
+        // Web-search providers (web_search tool).
+        "IRONCLAW_WEB_SEARCH_PROVIDER",
+        "TAVILY_API_KEY",
+        "EXA_API_KEY",
+        "BRAVE_SEARCH_API_KEY",
+        "SERPAPI_API_KEY",
+    ];
+    let mut out = Vec::with_capacity(FORWARDED.len());
+    for key in FORWARDED {
+        if let Ok(v) = std::env::var(key) {
+            if !v.is_empty() {
+                out.push(((*key).to_string(), v));
+            }
+        }
+    }
+    out
 }
 
 /// Print a one-screen summary of the running host so an operator can see

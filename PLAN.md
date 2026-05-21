@@ -78,12 +78,12 @@ file paths that landed the change.
 
 | Metric | Value |
 | - | - |
-| `cargo test --workspace` | 4540 passing / 0 failing / 4 ignored |
+| `cargo test --workspace` | 4576 passing / 0 failing / 4 ignored |
 | `cargo clippy --workspace --all-targets -- -D warnings` | clean |
 | Channel crates | 21 |
-| In-tree tools the agent can call | 19 (15 messaging/scheduling/self-mod + 4 computer-use) |
-| Skill docs | 17 |
-| Latest milestone | M13 hardening slice (parallel-agent landing of Top 10 #1, #2, #3, #5, #6, #7, #8, #9, #10) |
+| In-tree tools the agent can call | 20 (15 messaging/scheduling/self-mod + 4 computer-use + 1 multi-provider web search) |
+| Skill docs | 22 |
+| Latest milestone | M14 follow-up — `web_search` tool with Tavily / Exa / Brave / `SerpAPI` providers |
 
 Older M-section "totals" lines are historical snapshots and will drift —
 trust the table above.
@@ -726,50 +726,103 @@ New iclaw subcommands: `db backup/restore`, `dropped-messages
 outbound-list/replay`, `mcp list-presets/add`, `groups config
 set-resource-limits/set-egress-allow`.
 
+### Post-merge hardening (docs + edge cases + gap fixes)
+
+- [x] **Audit-log env redaction.** `iclaw mcp add postgres --env
+  DATABASE_URL=postgres://u:p@h/d` used to persist the connection
+  string in `audit_log.args`. Added a per-command redactor in
+  `socket.rs` that masks values under any `env` block for
+  `mcp.add` and `groups.config.set-mcp-servers` while keeping the
+  keys. 4 new tests.
+- [x] **Image-rebuild failure fallback.** A bad apt name used to
+  block the whole agent group indefinitely. The manager now falls
+  back to the last-known-good image, emits
+  `ironclaw_image_rebuild_failed_total`, and keeps the
+  fingerprint unchanged so the rebuild retries on the next spawn
+  when the operator fixes the config.
+- [x] **`install_packages` / `add_mcp_server` were silent no-ops.**
+  The tools emitted system rows that no handler picked up. The
+  delivery loop now intercepts them inline (mirroring the
+  `usage_report` pattern), merges them into `container_configs`,
+  and the next spawn rebuilds. 7 new tests.
+- [x] **Documentation:** `docs/observability.md`,
+  `docs/db-backup.md`, `docs/container-config.md`. Updated
+  README + CHANGELOG, refreshed `install-packages` /
+  `add-mcp-server` skills to reflect automatic rebuild semantics.
+  New skill docs for the four computer-use tools (`shell`,
+  `read-file`, `write-file`, `web-fetch`).
+
+### M14 follow-up — `web_search` tool
+
+The agent could fetch URLs but couldn't find them. This slice adds a
+multi-provider search tool that auto-routes based on which API key
+the operator has configured.
+
+- [x] **`web_search` tool** with four provider backends:
+  - **Tavily** (`TAVILY_API_KEY`) — agent-tuned default.
+  - **Exa** (`EXA_API_KEY`) — neural / semantic search.
+  - **Brave** (`BRAVE_SEARCH_API_KEY`) — keyword-friendly
+    independent index.
+  - **`SerpAPI`** (`SERPAPI_API_KEY`) — Google/Bing/etc. wrapper.
+- [x] **Normalised output shape** across all four providers
+  (`{title, url, snippet, published?, score?}`) so the agent's
+  downstream behaviour is provider-agnostic.
+- [x] **Provider resolution**: explicit `provider` arg →
+  `IRONCLAW_WEB_SEARCH_PROVIDER` env → auto-detect from configured
+  keys in the order `tavily, exa, brave, serpapi`. No keys → loud
+  validation error naming all four env vars.
+- [x] **Per-call result cap** (1–25, default 10) and per-result
+  snippet cap (4 KiB, UTF-8-safe truncation with ellipsis).
+- [x] **Host env-forwarding**: new `ManagerConfig.forward_env`
+  field; `boot.rs::collect_forward_env` pushes the five
+  `web_search` env vars into every spawned container so the
+  operator only sets them once in `.env`. Empty values are
+  skipped so an unset var doesn't leak into the container env.
+- [x] **`skills/web-search/SKILL.md`** + operator-facing
+  [`docs/web-search.md`](docs/web-search.md).
+
+**Slice totals**: 4540 → 4576 passing (+36 tests: 25 in the
+web_search module, 11 in host edge-case / delivery-apply / config
+ensure paths). 0 failing. Clippy clean.
+
 ---
 
 ## Next things to address
 
-Nine of the previous Top 10 landed in the M13-hardening parallel-agent
-slice above. The remaining items, ranked by impact × leverage:
+The full Top 10 from the prior slice landed (the 9 hardening items
+in the parallel-agent merge, then `web_search` in this slice). The
+remaining items, ranked by impact × leverage:
 
-1. **`web_search` tool** (Brave or Tavily). `web_fetch` gives the
-   agent a URL → body pipe, but it can't *find* URLs. Search
-   closes the gap; without it the agent either has to guess URLs
-   or ask the user. One new tool in `tools/computer_use.rs`, one
-   env-var-configured API key. _(M14 follow-up — deferred per
-   operator direction)_
-
-2. **Secret rotation without restart**. Rotating
+1. **Secret rotation without restart**. Rotating
    `ANTHROPIC_API_KEY` today requires restarting the host so
    the spawned containers pick up the new env. A SIGHUP handler
    that rereads `.env` and re-emits to running containers is
    the minimum viable change. _(M13 security)_
 
-3. **Webhooks TLS termination story**. Every webhook channel
+2. **Webhooks TLS termination story**. Every webhook channel
    binds plain HTTP on `127.0.0.1` by default. Production
    deployments need either native TLS (rustls) or documented
    reverse-proxy patterns (Caddy / nginx / Cloudflare Tunnel)
    per channel. Pick one and ship it. _(M13 security)_
 
-4. **Host-side rate limiting**. Per-group max LLM calls per
+3. **Host-side rate limiting**. Per-group max LLM calls per
    minute / hour. LLM 429s already retry with `Retry-After`,
    but the host-side cap is missing — partially covered by
    budgets, but a separate guard against runaway loops. _(M13
    cost/safety)_
 
-5. **Replay-fixture harness implementation** (M11 acceptance
+4. **Replay-fixture harness implementation** (M11 acceptance
    gate). Design is in `docs/replay-fixtures.md`. Implement the
    in-process harness against `Fixture::load` /
    `ReplayHarness::{boot_host, run, compare}` plus a first
    captured fixture. _(M11)_
 
-6. **Release 0.1.0**. Cut the tag, bump
+5. **Release 0.1.0**. Cut the tag, bump
    `workspace.package.version`, publish release notes from
    `CHANGELOG.md`. The candidate status in README is the
    honest one until this lands. _(M11)_
 
-7. **Bugfix: double `sessions/sessions/` path layout**. Host
+6. **Bugfix: double `sessions/sessions/` path layout**. Host
    code uses `FsSessionRoot::new(cfg.sessions_root())` which
    produces `data_dir/sessions/sessions/<ag>/<session>` — fine
    but weird. Pick one (likely just
@@ -777,12 +830,12 @@ slice above. The remaining items, ranked by impact × leverage:
    container manager already has a comment documenting the
    workaround. _(M13 cleanup)_
 
-8. **Versioned migrations**. `ironclaw migrate` already runs the
+7. **Versioned migrations**. `ironclaw migrate` already runs the
    central migrations but there's no schema-version table the
    host can check on boot to refuse a downgrade or warn about
    an in-progress upgrade. _(M13 reliability)_
 
-9. **Budget-exhausted notification to original sender**. The
+8. **Budget-exhausted notification to original sender**. The
    budget gate refuses to spawn when over-cap but the
    inbound sender is left in the dark. Surface a
    "budget exhausted; try again after UTC midnight" reply

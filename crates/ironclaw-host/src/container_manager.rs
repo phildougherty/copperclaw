@@ -119,6 +119,13 @@ pub struct ManagerConfig {
     /// is scanned alongside the global skills directory and skills
     /// with matching names shadow the global ones.
     pub groups_dir: Option<PathBuf>,
+    /// Extra environment variables to forward into every spawned
+    /// session container. Used to plumb operator-supplied API keys
+    /// (Tavily / Exa / Brave / `SerpAPI` / etc.) and arbitrary
+    /// `IRONCLAW_*` settings through to the runner. Keys with empty
+    /// values are skipped so an unset operator env doesn't write
+    /// `FOO=` lines into the container env.
+    pub forward_env: Vec<(String, String)>,
 }
 
 /// Manager service. Cheap to clone via `Arc`.
@@ -553,6 +560,14 @@ impl ContainerManager {
         if let Some(base) = self.cfg.anthropic_base_url.as_deref() {
             spec = spec.with_env("ANTHROPIC_BASE_URL", base);
         }
+        // Operator-configured forwards (search API keys, etc.). Skip
+        // empty values — an unset env var should not appear in the
+        // container env at all.
+        for (k, v) in &self.cfg.forward_env {
+            if !v.is_empty() {
+                spec = spec.with_env(k, v);
+            }
+        }
 
         // Per-group resource limits (Top 10 #8 / M13).
         if let Some(c) = cfg {
@@ -767,6 +782,7 @@ mod tests {
             stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
             skills_dir: None,
             groups_dir: None,
+            forward_env: Vec::new(),
         }
     }
 
@@ -836,6 +852,33 @@ mod tests {
         assert_eq!(spec.labels.get("ironclaw.install").map(String::as_str), Some("test"));
         assert!(spec.labels.contains_key("ironclaw.session"));
         assert!(spec.labels.contains_key("ironclaw.agent_group"));
+    }
+
+    #[test]
+    fn build_spec_forwards_extra_env_and_skips_empty_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.forward_env = vec![
+            ("TAVILY_API_KEY".to_string(), "tav-secret".to_string()),
+            ("EXA_API_KEY".to_string(), "exa-secret".to_string()),
+            // Empty values must not appear in the container env.
+            ("BRAVE_SEARCH_API_KEY".to_string(), String::new()),
+        ];
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None);
+        assert!(spec.env.iter().any(|(k, v)| k == "TAVILY_API_KEY" && v == "tav-secret"));
+        assert!(spec.env.iter().any(|(k, v)| k == "EXA_API_KEY" && v == "exa-secret"));
+        assert!(
+            spec.env.iter().all(|(k, _)| k != "BRAVE_SEARCH_API_KEY"),
+            "empty-valued forward must be skipped"
+        );
     }
 
     #[test]
