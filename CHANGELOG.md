@@ -8,6 +8,17 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- `ironclaw-setup` `service_unit` step now installs and enables the
+  generated systemd unit / launchd plist end-to-end rather than just
+  writing it to disk. Operators pick a scope at the prompt
+  (`system` / `user` / `print`) or via
+  `IRONCLAW_SETUP_SERVICE_SCOPE`; `IRONCLAW_SETUP_SERVICE_ENABLE`
+  controls whether `systemctl enable --now` / `launchctl bootstrap`
+  fires. The step polls the admin socket for ~10s after enabling and
+  prints a clear "service is running" / "didn't come up — check
+  journalctl" line. `system` scope refuses to silently shell out to
+  `sudo` and falls back to `user` when not root. Idempotent on re-
+  run: identical bodies are detected and the step is skipped.
 - Initial Rust workspace with 16 crates across the host, runner,
   providers, MCP server, modules, skills, container runtime, OneCLI
   gateway, iclaw admin client, and interactive setup.

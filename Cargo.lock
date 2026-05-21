@@ -2034,7 +2034,6 @@ dependencies = [
  "ironclaw-db",
  "ironclaw-onecli",
  "ironclaw-types",
- "libc",
  "serde",
  "serde_json",
  "tempfile",

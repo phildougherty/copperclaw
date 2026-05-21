@@ -151,6 +151,8 @@ IRONCLAW_SETUP_USE_ONECLI=no       # default: no
 IRONCLAW_SETUP_BUILD_IMAGE=yes     # default: yes (`no` skips docker build)
 IRONCLAW_SETUP_MOUNTS=             # comma-separated host paths, default empty
 IRONCLAW_SETUP_WRITE_SERVICE_UNIT=no  # default: no
+IRONCLAW_SETUP_SERVICE_SCOPE=print    # system|user|print (default: print)
+IRONCLAW_SETUP_SERVICE_ENABLE=yes     # default: yes when scope != print
 IRONCLAW_SETUP_TIMEZONE=Etc/UTC    # default: detect from system
 IRONCLAW_SETUP_FIRST_CHANNEL=cli   # default: cli
 ```
@@ -158,6 +160,43 @@ IRONCLAW_SETUP_FIRST_CHANNEL=cli   # default: cli
 Run `ironclaw-setup --list-steps` for the canonical list and use
 `--skip-step <name>` for any optional step you want to leave for later.
 See `docs/cutover.md` for migrating from a predecessor data directory.
+
+### Running as a service
+
+For local / developer installs the `ironclaw start` / `ironclaw stop`
+lifecycle commands are usually enough. For server installs that need
+auto-start at boot, `ironclaw-setup`'s `service_unit` step now handles
+the whole install end-to-end instead of just printing the unit file.
+
+At the prompt (or via `IRONCLAW_SETUP_SERVICE_SCOPE`) pick one of:
+
+- `system` — install to `/etc/systemd/system/ironclaw.service` (or
+  `/Library/LaunchDaemons/com.ironclaw.host.plist`), then
+  `systemctl daemon-reload` + `systemctl enable --now ironclaw`
+  (`launchctl bootstrap system <plist>` on macOS). Requires the
+  wizard to be running as root — re-run setup under `sudo` if needed.
+  When the wizard is not root, it falls back to `user` scope and
+  prints a warning rather than prompting for the sudo password mid-
+  run.
+- `user` — install to `~/.config/systemd/user/ironclaw.service` (or
+  `~/Library/LaunchAgents/com.ironclaw.host.plist`), then
+  `systemctl --user enable --now` (`launchctl bootstrap gui/<uid>` on
+  macOS). No privilege elevation needed.
+- `print` — write the unit to the per-user default path and print the
+  enable command for you to run by hand. This is the pre-batch
+  behavior and the default for headless installs so unattended
+  pipelines don't change shape unless they opt in.
+
+After enabling, setup polls the `iclaw.sock` admin socket for ~10s and
+prints either `ironclaw service is running, socket at <path>` or
+`service didn't come up — check journalctl -u ironclaw` (or
+`launchctl print gui/<uid>/com.ironclaw.host` on macOS). Re-running
+setup with the same scope is idempotent: if the on-disk unit already
+matches the generated body, the step is a no-op.
+
+The `--generate-unit <systemd|launchd>` flag still works as before for
+operators who want to render a unit to stdout / a file for their
+config-management tool without going through the full wizard.
 
 ## Documentation
 
