@@ -6,6 +6,34 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (setup wizard e2e harness)
+
+- **End-to-end wizard integration test** at
+  `crates/ironclaw-setup/tests/wizard_e2e.rs`. Drives the full step
+  loop against a fresh `tempfile::tempdir` and asserts the install
+  layout an operator would actually rely on: central DB migrated to
+  `expected_central_schema_version()`, `.env` with the right keys at
+  mode `0600`, `chat.fifo` is a FIFO, `chat.log` is a regular file at
+  mode `0600`, `setup-state.json` records the completed steps, and the
+  central DB has exactly one agent group + `(cli, stdin)` messaging
+  group + wiring. Four scenarios: happy path, idempotent re-run,
+  partial-failure recovery (auth step fails on a read-only data dir,
+  then resumes after the lock is lifted), and downgrade refusal
+  (manually bumping `schema_version` past the binary's expected count
+  must surface a schema-mismatch error). Skips the container-image
+  build and runs with `service_scope=print` so no real systemd /
+  launchd units are touched.
+
+### Changed (setup wizard schema-mismatch guard)
+
+- **`central_db` step now refuses to run against a future schema.**
+  Mirrors `ironclaw_host::boot::check_schema_version`: if the on-disk
+  `schema_version` table reports more applied migrations than
+  `expected_central_schema_version()`, the step returns an error
+  rather than silently running migrations against a DB that was
+  migrated by a newer binary. This protects operators who try to
+  downgrade ironclaw without restoring from a backup.
+
 ### Fixed (cli channel bridge)
 
 - **`iclaw chat` now actually reaches the host.** The cli channel

@@ -2080,6 +2080,7 @@ dependencies = [
  "ironclaw-onecli",
  "ironclaw-types",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
