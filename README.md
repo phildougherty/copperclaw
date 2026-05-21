@@ -144,6 +144,23 @@ https://github.com/phildougherty/ironclaw/releases/download/<TAG>/ironclaw-<TARG
 automatically; downloading by hand is only useful for air-gapped or
 mirrored installs.
 
+### Testing install.sh
+
+`tests/install/test_install_sh.sh` drives the installer inside a
+clean Ubuntu 24.04 container under several scenarios (missing
+container runtime, dry-run platform detection, idempotent re-run).
+Requires Docker (or Podman via `CONTAINER_BIN=podman`):
+
+```bash
+bash tests/install/test_install_sh.sh
+```
+
+The full suite runs in under five seconds.  Pass
+`IRONCLAW_INSTALL_TEST_RUN_BUILD=1` to also exercise the
+`cargo install --path` strategy (slow — adds ~5 minutes).  The CI
+job at `.github/workflows/ci.yml#install-sh` only runs on PRs that
+touch `install.sh`, `tests/install/**`, or the workflow itself.
+
 ---
 
 ## Quickstart

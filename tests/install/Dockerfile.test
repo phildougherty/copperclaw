@@ -1,0 +1,42 @@
+# tests/install/Dockerfile.test
+#
+# Minimal Ubuntu image for the install.sh integration suite.  Has bash,
+# curl, sudo, and (for case 2) the rust toolchain.  Deliberately does NOT
+# install docker: install.sh's docker check is exercised via the
+# INSTALL_SH_SKIP_DOCKER_CHECK escape hatch.
+#
+# Built by tests/install/test_install_sh.sh; not used at runtime.
+
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        curl \
+        sudo \
+        coreutils \
+        findutils \
+        tar \
+        gzip \
+        rustc \
+        cargo \
+        pkg-config \
+        libssl-dev \
+        build-essential \
+ && rm -rf /var/lib/apt/lists/*
+
+# Non-root tester user with a writable HOME.  install.sh writes binaries
+# under $HOME/.local/bin so we want a real user account here.
+# Ubuntu 24.04 ships with a pre-existing uid-1000 'ubuntu' user — drop it.
+RUN userdel -r ubuntu 2>/dev/null || true \
+ && useradd -m -s /bin/bash -u 1000 tester \
+ && echo "tester ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+
+USER tester
+WORKDIR /home/tester
+ENV HOME=/home/tester \
+    PATH=/home/tester/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+CMD ["/bin/bash"]

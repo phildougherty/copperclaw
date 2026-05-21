@@ -50,6 +50,29 @@ adheres to [Semantic Versioning](https://semver.org/).
   migrated by a newer binary. This protects operators who try to
   downgrade ironclaw without restoring from a backup.
 
+### Added (install.sh integration test)
+
+- **Containerised integration test for `install.sh`** at
+  `tests/install/test_install_sh.sh`.  Spins up a clean Ubuntu 24.04
+  container, mounts the repo read-only, and drives the installer
+  through four scenarios: (1) missing-Docker clean-failure path,
+  (2) full binary install via `cargo install --path` (opt-in via
+  `IRONCLAW_INSTALL_TEST_RUN_BUILD=1`; default-skipped because it
+  adds ~5 minutes), (3) re-run idempotency — pre-existing binaries
+  survive a dry-run re-invocation, (4) platform detection across all
+  four supported triples plus an explicit `IRONCLAW_RELEASE_TAG`.
+  Default suite runtime: ~3 s after the image is cached.
+- New CI job `install-sh` in `.github/workflows/ci.yml` runs the
+  suite on `ubuntu-latest` and shellchecks both files, with a
+  path-filter (`install.sh`, `tests/install/**`, the workflow
+  itself) so the job is skipped on unrelated PRs.
+- Three test-only escape hatches added to `install.sh`,
+  default-off and silent unless explicitly set:
+  `INSTALL_SH_SKIP_DOCKER_CHECK=1` skips the container-runtime
+  check; `IRONCLAW_INSTALL_DRY_RUN=1` prints the tarball URL the
+  installer would fetch and exits 0; `IRONCLAW_FORCE_TARGET=<triple>`
+  overrides platform detection for the URL test.
+
 ### Fixed (cli channel bridge)
 
 - **`iclaw chat` now actually reaches the host.** The cli channel
