@@ -325,18 +325,18 @@ slice are required before a 0.1.0 release feels honest.
 
 #### Container lifecycle
 
-- [ ] **Idle-stop**. Sessions keep their container running until
-  host shutdown. Need a configurable idle window (default 5 min)
-  after which the manager calls `runtime.stop(name, grace)` and
-  flips `container_status=idle`. Next inbound respawns.
-- [ ] **Crash-restart**. When a container exits non-zero outside
-  the idle path, the manager should detect (via the heartbeat
-  file's missing/stale mtime, which sweep already surfaces as
-  `heartbeat_stale`) and respawn after backoff.
-- [ ] **Sweep ↔ manager wiring**. Sweep's `SweepReport` already
-  carries `heartbeat_stale` counts but nothing acts on them. Wire
-  sweep to mark stale sessions back to `stopped` so the manager
-  picks them up.
+- [x] **Idle-stop**. ContainerManager now reconciles four states
+  (Stopped/Idle/Running with a fifth WakeFromIdle transition);
+  Running + last_active > idle_timeout_secs (default 300s) →
+  runtime.stop + container_status=idle. Idle + pending inbound →
+  Stopped → next tick respawns.
+- [x] **Crash-restart**. Heartbeat-stale detection in the manager
+  itself (DEFAULT_HEARTBEAT_STALE_SECS=60). Stale → runtime.stop
+  best-effort + mark Stopped for respawn. Sweep's report becomes
+  observational; the manager owns the action path so the loop is
+  one tick, not "sweep → manager → next tick".
+- [x] **Sweep ↔ manager wiring**. Resolved by the above —
+  manager reads heartbeat mtime directly, no IPC needed.
 - [ ] **Per-group resource caps**. `ContainerSpec` doesn't carry
   cpu / memory / pids / network limits. Add them, plumb through
   `container_configs.resource_limits` JSON, and apply at spawn.
@@ -348,12 +348,12 @@ slice are required before a 0.1.0 release feels honest.
 
 #### Observability
 
-- [ ] **`iclaw health` / `/healthz`**. One-shot status: host
-  uptime, image tag, n running containers, n active sessions,
-  last delivery error timestamp, last provider error timestamp.
-  Either a new `iclaw` subcommand or a Unix-socket admin verb;
-  the existing `iclaw status` is a list view, not a health
-  probe.
+- [x] **`iclaw health`**. New composite command. Sequential
+  round-trips to `sessions.list` (all + active filter) and
+  `audit.list`; reports session count, breakdown by
+  container_status (running/idle/stopped), and last 5 audit
+  entries. `--json` flag for a structured payload a future
+  `/healthz` HTTP endpoint can reuse verbatim.
 - [ ] **Prometheus metrics endpoint**. Counters for
   `messages_inbound_total`, `messages_outbound_total`,
   `containers_spawned_total`, `containers_crashed_total`,
@@ -365,17 +365,25 @@ slice are required before a 0.1.0 release feels honest.
   launchd units don't currently wire up logrotate or
   size-capping. Either document the recommended logrotate config
   or use `tracing-appender::rolling`.
-- [ ] **Audit log of iclaw socket actions**. Every mutation
-  (`groups.create`, `messaging-groups.upsert`, `wirings.create`,
-  etc.) lands in a new `audit_log` table with caller, command,
-  args, and result. Read-paths excluded.
+- [x] **Audit log of iclaw socket actions**. Migration
+  `004_audit_log.sql`, `tables::audit_log` module, dispatch
+  hook in `ironclaw-host::socket` writes one row per mutation
+  with caller / command / args (truncated at 4KiB) / result /
+  error_code / error_message / latency_ms. Read paths
+  excluded. New `iclaw audit list --since <window> --limit N`
+  subcommand renders the table.
 
 #### Cost and safety
 
-- [ ] **Token accounting**. The runner already sees Anthropic's
-  `usage.input_tokens`/`usage.output_tokens` per turn — record
-  them in a new `agent_turns` table keyed by session + sequence.
-  Required for any per-group budget.
+- [x] **Token accounting**. New `ProviderEvent::Usage` variant
+  emitted by AnthropicProvider from `message_start.usage` and
+  `message_delta.usage`. Runner accumulates per-turn (taking
+  the latest cumulative value rather than summing increments)
+  and writes a `MessageKind::System` row keyed `usage_report`
+  at end-of-turn. Host's delivery loop intercepts that action
+  and writes a row into the new `agent_turns` table
+  (migration `005_agent_turns.sql`). New
+  `iclaw usage --since <window>` rolls up per-group totals.
 - [ ] **Per-group budgets**. `container_configs.daily_token_cap`
   and `daily_cost_cap_usd`; manager refuses to spawn when budget
   is exhausted and surfaces a "budget exhausted" `System` row on
@@ -387,17 +395,17 @@ slice are required before a 0.1.0 release feels honest.
 
 #### Sender approval
 
-- [ ] **`iclaw approvals approve/deny <id>`**. Today the
-  `ApprovalsModule` keeps an in-memory `known_senders` list with
-  no CLI surface. New users can never be approved without a host
-  restart that pre-seeds them. Wire the iclaw approvals
-  subcommand to mutate the module's in-memory list AND persist
-  to the existing `pending_sender_approvals` /
-  `pending_channel_approvals` tables.
-- [ ] **Persist `known_senders` across restarts**. The module
-  loses its in-memory approvals when the host process restarts.
-  Source-of-truth should be the central `users` table (queried
-  on each gate evaluation) rather than a Mutex<Vec>.
+- [x] **`iclaw approvals approve`** + DB-backed gate. New
+  subcommand `iclaw approvals approve --channel <ct> --identity
+  <id> --display-name <name?>` upserts the central `users` row.
+  ApprovalsModule grows an optional `SenderLookup` closure the
+  host wires to `users::get_by_identity` — the gate checks the
+  in-memory pre-approved set first, then the central DB. cli/local
+  stays pre-seeded; everything else flows through the DB.
+- [x] **Persist `known_senders` across restarts**. Source-of-
+  truth is now the central `users` table; the in-memory list
+  is just the cli/local pre-approval. Restarts no longer drop
+  approvals.
 - [ ] **Approval notifications**. When a sender lands in
   `pending` state, post a deliverable "approve?" prompt through
   the original messaging group so the operator can decide
