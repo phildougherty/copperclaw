@@ -113,6 +113,24 @@ impl ContainerRuntime for AppleContainerRuntime {
     }
 
     async fn spawn(&self, spec: ContainerSpec) -> Result<ContainerHandle, RtError> {
+        // Apple Container runtime does not support per-container resource
+        // limits or egress allow-lists.  Per the "errors over silent
+        // fallback" tenet we refuse to spawn rather than silently
+        // ignoring the requested capability.
+        if !spec.resource_limits.is_empty() {
+            return Err(RtError::Unsupported(
+                "resource_limits (cpus/memory_mb/pids_limit) are not supported \
+                 by the Apple Container runtime; use Docker or clear the limits"
+                    .into(),
+            ));
+        }
+        if !spec.egress_allow.is_empty() {
+            return Err(RtError::Unsupported(
+                "egress_allow is not supported by the Apple Container runtime; \
+                 use Docker or clear the egress allow-list"
+                    .into(),
+            ));
+        }
         let args = run_args(&spec);
         let out = Command::new(&self.binary)
             .args(&args)
@@ -572,5 +590,45 @@ mod tests {
         let spec = ImageBuildSpec::new("r", "debian:12-slim");
         let err = rt.build_image(spec).await.unwrap_err();
         assert!(matches!(err, RtError::Container(_)));
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_resource_limits() {
+        let rt = AppleContainerRuntime::with_binary("/no/such/binary-9b3f");
+        let spec = ContainerSpec::new("c", "img")
+            .with_resource_limits(crate::ResourceLimits {
+                cpus: Some(1.0),
+                ..Default::default()
+            });
+        let err = rt.spawn(spec).await.unwrap_err();
+        assert!(
+            matches!(err, RtError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_egress_allow() {
+        let rt = AppleContainerRuntime::with_binary("/no/such/binary-9b3f");
+        let spec = ContainerSpec::new("c", "img")
+            .with_egress_allow(vec!["api.example.com:443".into()]);
+        let err = rt.spawn(spec).await.unwrap_err();
+        assert!(
+            matches!(err, RtError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_without_limits_falls_through_to_binary() {
+        // No resource limits, no egress allow-list: the check passes and
+        // we try to exec the (missing) binary → Container error, not Unsupported.
+        let rt = AppleContainerRuntime::with_binary("/no/such/binary-9b3f");
+        let spec = ContainerSpec::new("c", "img");
+        let err = rt.spawn(spec).await.unwrap_err();
+        assert!(
+            matches!(err, RtError::Container(_)),
+            "expected Container (missing binary), got {err:?}"
+        );
     }
 }

@@ -34,7 +34,7 @@
 //! than the table currently exposes. The runner writes a heartbeat
 //! file under the session dir so a future sweep can read it.
 
-use ironclaw_container_rt::{ContainerRuntime, ContainerSpec, Mount, RtError};
+use ironclaw_container_rt::{ContainerRuntime, ContainerSpec, ImageBuildSpec, Mount, ResourceLimits, RtError};
 use ironclaw_db::central::CentralDb;
 use ironclaw_db::session::{open_inbound, SessionPaths};
 use ironclaw_db::tables::{container_configs, messages_in, sessions};
@@ -302,12 +302,26 @@ impl ContainerManager {
         std::fs::write(paths.root.join(RUNNER_CONFIG_FILENAME), runner_json)
             .map_err(ManagerError::Io)?;
 
-        let image_tag = cfg_row
-            .as_ref()
-            .and_then(|c| c.image_tag.clone())
-            .unwrap_or_else(|| self.cfg.default_image_tag.clone());
+        // Image rebuild gate (Top 10 #1 / M13).  Compute the fingerprint of
+        // the rebuild-relevant config fields.  If the stored fingerprint
+        // differs from the current config (or is absent), rebuild the image
+        // before spawning.  The new tag + fingerprint are persisted back to
+        // `container_configs` so subsequent spawns reuse the cached image.
+        let image_tag = if let Some(ref cfg) = cfg_row {
+            let live_fp = container_configs::compute_fingerprint(cfg);
+            let stored_fp = cfg.config_fingerprint.as_deref().unwrap_or("");
+            let base_tag = cfg.image_tag.clone().unwrap_or_else(|| self.cfg.default_image_tag.clone());
+            if stored_fp == live_fp {
+                base_tag
+            } else {
+                // Config changed (or was never fingerprinted): rebuild.
+                self.rebuild_image(session.agent_group_id, cfg).await?
+            }
+        } else {
+            self.cfg.default_image_tag.clone()
+        };
 
-        let spec = self.build_spec(session, &paths, &image_tag);
+        let spec = self.build_spec(session, &paths, &image_tag, cfg_row.as_ref());
         // Defensive: if a previous container with this name lingered
         // (e.g. host crashed mid-cycle, orphan cleanup missed it,
         // crash-restart's remove() raced the spawn) the create call
@@ -426,11 +440,44 @@ impl ContainerManager {
         }
     }
 
+    /// Build the image for an agent group whose config has changed.
+    ///
+    /// Uses the `ImageBuildSpec` machinery to produce a sha256-tagged image
+    /// from `packages_apt` / `packages_npm` (`mcp_servers` and skills are
+    /// runtime config, not image config — they don't affect the Dockerfile).
+    /// After a successful build the new tag + fingerprint are written back to
+    /// `container_configs` so future spawns can reuse the cached image.
+    async fn rebuild_image(
+        &self,
+        agent_group_id: AgentGroupId,
+        cfg: &container_configs::ContainerConfig,
+    ) -> Result<String, ManagerError> {
+        let mut build_spec = ImageBuildSpec::new("ironclaw/session", "debian:trixie-slim");
+        build_spec.apt_packages.clone_from(&cfg.packages_apt);
+        build_spec.npm_packages.clone_from(&cfg.packages_npm);
+        let tag = self.runtime.build_image(build_spec).await.map_err(ManagerError::Spawn)?;
+        let live_fp = container_configs::compute_fingerprint(cfg);
+        container_configs::set_image_tag_and_fingerprint(
+            &self.central,
+            agent_group_id,
+            &tag,
+            &live_fp,
+        )
+        .map_err(ManagerError::Db)?;
+        info!(
+            agent_group = %agent_group_id.as_uuid(),
+            image = %tag,
+            "rebuilt image for config change"
+        );
+        Ok(tag)
+    }
+
     fn build_spec(
         &self,
         session: &Session,
         paths: &SessionPaths,
         image_tag: &str,
+        cfg: Option<&container_configs::ContainerConfig>,
     ) -> ContainerSpec {
         let mut spec = ContainerSpec::new(container_name(session.agent_group_id, session.id), image_tag)
             .with_entrypoint(vec![CONTAINER_RUNNER_PATH.to_string()])
@@ -459,6 +506,28 @@ impl ContainerManager {
         if let Some(base) = self.cfg.anthropic_base_url.as_deref() {
             spec = spec.with_env("ANTHROPIC_BASE_URL", base);
         }
+
+        // Per-group resource limits (Top 10 #8 / M13).
+        if let Some(c) = cfg {
+            match ResourceLimits::from_json(&c.resource_limits) {
+                Ok(limits) if !limits.is_empty() => {
+                    spec = spec.with_resource_limits(limits);
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(
+                        agent_group = %session.agent_group_id.as_uuid(),
+                        error = %e,
+                        "ignoring invalid resource_limits JSON; spawning without caps"
+                    );
+                }
+            }
+            // Egress allow-list (Top 10 #6 / M13).
+            if !c.egress_allow.is_empty() {
+                spec = spec.with_egress_allow(c.egress_allow.clone());
+            }
+        }
+
         spec
     }
 }
@@ -594,7 +663,7 @@ mod tests {
         );
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        let spec = mgr.build_spec(&session, &paths, "ironclaw/session:abc");
+        let spec = mgr.build_spec(&session, &paths, "ironclaw/session:abc", None);
         // Image
         assert_eq!(spec.image, "ironclaw/session:abc");
         // Entrypoint includes the runner path + --config arg
@@ -634,8 +703,113 @@ mod tests {
         );
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        let spec = mgr.build_spec(&session, &paths, "img");
+        let spec = mgr.build_spec(&session, &paths, "img", None);
         assert!(spec.env.iter().all(|(k, _)| k != "ANTHROPIC_BASE_URL"));
+    }
+
+    #[test]
+    fn build_spec_applies_resource_limits_from_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        // Build a minimal ContainerConfig with resource limits set.
+        let cfg = container_configs::ContainerConfig {
+            agent_group_id: session.agent_group_id,
+            provider: None,
+            model: None,
+            effort: None,
+            image_tag: None,
+            assistant_name: None,
+            max_messages_per_prompt: None,
+            skills: container_configs::SkillsSelector::All,
+            mcp_servers: serde_json::json!({}),
+            packages_apt: vec![],
+            packages_npm: vec![],
+            additional_mounts: serde_json::json!([]),
+            cli_scope: container_configs::CliScope::Group,
+            config_fingerprint: None,
+            egress_allow: vec![],
+            resource_limits: serde_json::json!({"cpus": "1.5", "memory_mb": 512u64}),
+            updated_at: chrono::Utc::now(),
+        };
+        let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg));
+        assert!(!spec.resource_limits.is_empty());
+        assert!((spec.resource_limits.cpus.unwrap() - 1.5).abs() < f64::EPSILON);
+        assert_eq!(spec.resource_limits.memory_mb, Some(512));
+    }
+
+    #[test]
+    fn build_spec_applies_egress_allow_from_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let cfg = container_configs::ContainerConfig {
+            agent_group_id: session.agent_group_id,
+            provider: None,
+            model: None,
+            effort: None,
+            image_tag: None,
+            assistant_name: None,
+            max_messages_per_prompt: None,
+            skills: container_configs::SkillsSelector::All,
+            mcp_servers: serde_json::json!({}),
+            packages_apt: vec![],
+            packages_npm: vec![],
+            additional_mounts: serde_json::json!([]),
+            cli_scope: container_configs::CliScope::Group,
+            config_fingerprint: None,
+            egress_allow: vec!["api.example.com:443".into(), "db.local:5432".into()],
+            resource_limits: serde_json::json!({}),
+            updated_at: chrono::Utc::now(),
+        };
+        let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg));
+        assert_eq!(spec.egress_allow, vec!["api.example.com:443", "db.local:5432"]);
+    }
+
+    #[test]
+    fn build_spec_empty_egress_allow_stays_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let cfg = container_configs::ContainerConfig {
+            agent_group_id: session.agent_group_id,
+            provider: None,
+            model: None,
+            effort: None,
+            image_tag: None,
+            assistant_name: None,
+            max_messages_per_prompt: None,
+            skills: container_configs::SkillsSelector::All,
+            mcp_servers: serde_json::json!({}),
+            packages_apt: vec![],
+            packages_npm: vec![],
+            additional_mounts: serde_json::json!([]),
+            cli_scope: container_configs::CliScope::Group,
+            config_fingerprint: None,
+            egress_allow: vec![],
+            resource_limits: serde_json::json!({}),
+            updated_at: chrono::Utc::now(),
+        };
+        let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg));
+        assert!(spec.egress_allow.is_empty());
     }
 
     #[test]

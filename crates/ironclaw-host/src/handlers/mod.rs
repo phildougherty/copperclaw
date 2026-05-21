@@ -51,6 +51,8 @@ pub const HOST_ONLY_COMMANDS: &[&str] = &[
     "groups.config.remove-mcp-server",
     "groups.config.add-package",
     "groups.config.remove-package",
+    "groups.config.set-egress-allow",
+    "groups.config.set-resource-limits",
     "messaging-groups.create",
     "messaging-groups.update",
     "messaging-groups.delete",
