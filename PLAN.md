@@ -74,6 +74,20 @@ honest one.
 Tick boxes as work completes. Each tick should reference the commit or
 file paths that landed the change.
 
+**Workspace snapshot** (single source of truth — update only here per slice):
+
+| Metric | Value |
+| - | - |
+| `cargo test --workspace` | 4416 passing / 0 failing / 4 ignored |
+| `cargo clippy --workspace --all-targets -- -D warnings` | clean |
+| Channel crates | 21 |
+| In-tree tools the agent can call | 19 (15 messaging/scheduling/self-mod + 4 computer-use) |
+| Skill docs | 17 |
+| Latest milestone | M14 (agent capability — tool wiring + computer-use) |
+
+Older M-section "totals" lines are historical snapshots and will drift —
+trust the table above.
+
 ### M0 — Workspace skeleton + T1 types (gate)
 - [x] Create `/home/phil/dev/ironclaw/` and `git init`
 - [x] Write workspace `Cargo.toml`, `rust-toolchain.toml`, `.gitignore`
@@ -317,11 +331,14 @@ from 4564 → 4365 is the whatsapp crate removal; the rest of the
 workspace gained ~185 tests across the manager + provider + setup
 changes.
 
-### M13 — Operational hardening (TODO)
+### M13 — Operational hardening
 
-End-to-end chat works, but standing up a production install
-exposes gaps the earlier milestones never touched. Items in this
-slice are required before a 0.1.0 release feels honest.
+Most of M13 shipped over an autonomous slice. The remaining
+items moved to the "Top 10 next" list at the end of M14.
+Container lifecycle, observability (audit log + `iclaw health`),
+cost/safety (token accounting + per-group budgets), sender
+approval (persistent users-table-backed), and setup polish
+(OpenRouter shortcut, `iclaw chat` REPL) are all live.
 
 #### Container lifecycle
 
@@ -490,6 +507,180 @@ slice are required before a 0.1.0 release feels honest.
   Snapshots in M-section progress lines are written-once and
   drift fast. Move the count to a single line near the top that's
   the only spot that needs an update per slice.
+
+### M14 — Agent capability (tool wiring + computer-use)
+
+Before this slice the agent could only generate text. The runner
+passed `tools: Vec::new()` to the provider, and even with a
+`ToolDef` list the per-turn loop never called handlers — `ToolStart`
+/ `ToolEnd` were telemetry only.
+
+- [x] **`ProviderEvent::ToolCall`**. New variant carries
+  `(id, name, input)` parsed from a `tool_use` content block.
+  Anthropic SSE pump rewritten around an `SseState` struct that
+  tracks the in-flight tool_use block, captures the `id` at
+  `content_block_start`, accumulates `input_json_delta` chunks,
+  parses to `Value` at `content_block_stop`.
+- [x] **Tool-use loop in the runner**. `drive_turn` refactored
+  into an outer tool-use loop and an inner `run_llm_turn`.
+  Outer loop runs LLM → execute tools → LLM → … until the
+  model produces a turn with no tool_use blocks (cap:
+  `max_tool_turns`, default 20). Each tool's result becomes a
+  `HistoryMessage::Tool` so the next turn sees what happened.
+  Each LLM round emits its own `usage_report`, so `agent_turns`
+  records each call separately.
+- [x] **15 messaging / scheduling / self-mod tools wired**.
+  `main.rs` builds the `tool_map` from
+  `ironclaw_mcp::build_tool_set()` once at startup; the same
+  pass produces the `ToolDef` list for the provider. The
+  model now actually receives the schemas for `send_message`,
+  `send_file`, `edit_message`, `add_reaction`,
+  `ask_user_question`, `send_card`, `create_agent`,
+  `install_packages`, `add_mcp_server`, `schedule_task`,
+  `list_tasks`, `cancel_task`, `pause_task`, `resume_task`,
+  `update_task`.
+- [x] **4 computer-use tools added**
+  (`crates/ironclaw-mcp/src/tools/computer_use.rs`):
+  * `shell(command, cwd?, timeout_secs?)` — bash inside the
+    container. Returns stdout/stderr/exit/elapsed. 64 KiB
+    output cap, 60 s default timeout, 600 s ceiling.
+  * `read_file(path)` — UTF-8 read with 1 MiB cap and
+    char-boundary-safe truncation.
+  * `write_file(path, content, create_parents?, append?)`
+    — create or append; auto-mkdir-p.
+  * `web_fetch(url, method?, body?, timeout_secs?)` — HTTP
+    GET/POST. 256 KiB body cap, 30 s default, 120 s ceiling.
+  Each ships with unit tests; full computer-use family is 11
+  new tests.
+- [x] **Heartbeat actually bumps mtime**. `touch_heartbeat`
+  was opening but not writing; Linux only updates mtime on
+  actual writes. Now writes a single byte per tick. Also,
+  manager removes the heartbeat file at spawn so the new
+  container starts with a clean slate.
+- [x] **Base image bumped to `debian:trixie-slim`**
+  (glibc 2.41) from `debian:12-slim` (glibc 2.36). Symptoms
+  of the mismatch: container start crashed with
+  `version GLIBC_2.39 not found` when the runner was built
+  against any reasonably-modern host glibc.
+- [x] **Default model bumped to `claude-sonnet-4-6`** from
+  `claude-sonnet-4-5`. Six call sites updated in lockstep.
+
+**Verified live** (OpenRouter, local cli channel via
+`iclaw chat`):
+
+    > Use the shell tool to run: whoami && uname -a && pwd.
+    > Report the output exactly.
+    agent> The output shows:
+      - User: root
+      - System: Linux ed8a01f860ad 6.17.0-14-generic …
+      - Current directory: /
+
+The bash command actually executed inside the session
+container; nothing in that output came from training data.
+
+**Slice totals**: 4416 passing, 0 failing. Clippy clean.
+
+---
+
+## Top 10 next things to address
+
+Ranked by impact × leverage given the current state. Each item
+links to the M-section that owns it.
+
+1. **Skill content auto-loads into the system prompt**. The
+   agent has 19 tools and 17 skill docs, but the runner's
+   system prompt is a vanilla one-liner. The model often
+   doesn't know it *can* call a tool until you spell it out.
+   Concatenate `skills/*/SKILL.md` (filtered by a per-group
+   include-list) into the system prompt at container spawn.
+   The single highest-leverage change to make the agent
+   actually *use* its capabilities. _(M14 follow-up)_
+
+2. **Image rebuild on `container_config` change**. The
+   agent already has `install_packages` and `add_mcp_server`
+   as tools, but invoking them today writes to
+   `container_configs` and then nothing happens until an
+   operator manually rebuilds. Manager should fingerprint
+   `container_configs` per-group and rebuild on diff. Closes
+   the loop on user-extensible agents. _(M13)_
+
+3. **Approval notifications in-channel**. When a new sender
+   lands in pending, the operator can't see it without
+   running `iclaw approvals list`. Post a deliverable
+   "approve?" card to the agent group's primary channel
+   when an unknown sender is dropped. _(M13 sender approval)_
+
+4. **MCP server registry + first-class iclaw subcommand**.
+   `add_mcp_server` exists as a tool the agent can call, but
+   the operator-facing path (`iclaw groups config
+   add-mcp-server …`) is undocumented and the schema is
+   freeform JSON. Document a small library of curated MCP
+   servers (Postgres, Linear, GitHub, Notion, Filesystem,
+   Browserbase) and ship a `iclaw mcp add <preset>`
+   shortcut that wires the right config. The "easy
+   expansion path" the project promises. _(new)_
+
+5. **`web_search` tool** (Brave or Tavily). `web_fetch`
+   gives the agent a URL → body pipe, but it can't *find*
+   URLs. Search closes the gap; without it the agent
+   either has to guess URLs or ask the user. One new tool
+   in `tools/computer_use.rs`, one env-var-configured API
+   key. _(M14 follow-up)_
+
+6. **Central DB backup / restore**. `iclaw db backup
+   <path>` (WAL checkpoint + file copy) and `iclaw db
+   restore <path>` (atomic swap). The central DB is one
+   SQLite file holding every group, wiring, audit row, and
+   token-usage record — a disk corruption today loses
+   everything. _(M13 reliability)_
+
+7. **Container egress allow-list**. With `web_fetch`
+   landed, an agent can reach any URL on the open
+   internet. Per-group `container_configs.egress_allow`
+   (host:port allow-list) translated to Docker network
+   policy at spawn. Default-deny would be the OpenBSD
+   move, but default-allow + opt-in lockdown is more
+   practical. _(M13 security)_
+
+8. **Outbound dead-letter replay**. `iclaw health` shows
+   the dropped-message count, but operators can't inspect
+   *what* dropped or retry. Add `iclaw dropped-messages
+   list --since <window>` (already exists for inbound;
+   extend to outbound failures) and `iclaw
+   dropped-messages replay <id>`. _(M13 reliability)_
+
+9. **Per-group resource caps**. `ContainerSpec` doesn't
+   carry cpu / memory / pids / network limits. A runaway
+   agent can starve the host. Add
+   `container_configs.resource_limits` JSON, apply at
+   spawn via Docker's `--cpus`, `--memory`, `--pids-limit`.
+   The bounded-blast-radius story is incomplete without
+   this. _(M13 container lifecycle)_
+
+10. **Prometheus metrics endpoint**. Counters for
+    `messages_inbound_total`, `messages_outbound_total`,
+    `containers_spawned_total`, `containers_crashed_total`,
+    `delivery_failed_total`; histograms for
+    `llm_call_seconds`, `llm_tokens_input`,
+    `llm_tokens_output`, `container_spawn_seconds`.
+    Reuse the data `iclaw health` already collects. Off by
+    default; opt in via `IRONCLAW_METRICS_ADDR=127.0.0.1:9090`.
+    _(M13 observability)_
+
+Honorable mentions that didn't make the cut:
+
+- **Log rotation** (low effort but install can ship with a
+  recommended logrotate config in `docs/`; not blocking).
+- **Secret rotation without restart** (SIGHUP handler;
+  niche, can document the manual restart for now).
+- **Webhooks TLS termination** (most users deploy behind a
+  reverse proxy already; can document the recommended
+  Caddy/Cloudflare-Tunnel pattern).
+- **Rate limiting** (LLM 429s already retry with
+  `Retry-After`; explicit host-side cap is mainly a cost
+  guard, partially covered by budgets).
+- **Bugfix: double `sessions/sessions/` path** (cosmetic;
+  container manager has the workaround documented).
 
 ---
 
