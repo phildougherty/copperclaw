@@ -384,10 +384,15 @@ slice are required before a 0.1.0 release feels honest.
   and writes a row into the new `agent_turns` table
   (migration `005_agent_turns.sql`). New
   `iclaw usage --since <window>` rolls up per-group totals.
-- [ ] **Per-group budgets**. `container_configs.daily_token_cap`
-  and `daily_cost_cap_usd`; manager refuses to spawn when budget
-  is exhausted and surfaces a "budget exhausted" `System` row on
-  the next inbound.
+- [x] **Per-group budgets**. New `group_budgets` table
+  (`daily_token_cap`, `daily_cost_cap`; cost reserved) +
+  `iclaw budgets list` / `iclaw budgets set --agent-group-id <id>
+  --daily-tokens N`. Manager's `is_over_budget` check runs before
+  every spawn, summing today's `agent_turns` (UTC midnight day
+  boundary). Over-budget refusal is soft: the inbound row stays
+  pending until the operator raises the cap or the day rolls
+  over. The "budget exhausted" deliverable-to-original-sender
+  variant is still open.
 - [ ] **Rate limiting**. Per-group max LLM calls per minute /
   hour. Manager throttles spawn rate; runner backs off on 429
   with `Retry-After` (already wired) but the host-side cap is
@@ -446,19 +451,23 @@ slice are required before a 0.1.0 release feels honest.
 
 #### Setup polish
 
-- [ ] **OpenRouter as a first-class provider in setup**. Today
-  the user has to know to set `ANTHROPIC_BASE_URL` themselves.
-  Setup should ask "which provider?" with OpenRouter / native
-  Anthropic / corporate proxy as choices and write the right
-  base URL.
-- [ ] **systemd `Restart=on-failure`** in the generated unit, plus
-  a `User=` directive matching the install owner. Today the unit
-  emits the command line but not the restart policy.
-- [ ] **`iclaw chat` shell**. The user-facing chat UX is "echo
-  into a FIFO + tail a log" — fine for piping but not a real
-  REPL. A small `iclaw chat` subcommand that opens the socket,
-  binds to the install's cli channel, and shows replies inline
-  would close the loop.
+- [x] **OpenRouter as a first-class provider in setup**. The
+  auth step's base-URL prompt accepts friendly shortcuts:
+  `openrouter`/`or` expands to the OpenRouter API base, blank
+  /`anthropic`/`default` uses the upstream API, anything else
+  passes through (trimmed). `OPENROUTER_BASE_URL` is a
+  `pub const` so headless installs can refer to it without
+  hard-coding.
+- [x] **systemd `Restart=on-failure`** in the generated unit.
+  Already in `units::render_systemd` since the unit template
+  was first written — kept as [x] for the audit trail.
+- [x] **`iclaw chat` shell**. New `iclaw chat` interactive REPL
+  opens the install's `chat.fifo` for writing and tails
+  `chat.log` from EOF for new replies. Pure file I/O — no
+  socket call. Path defaults match the setup-produced layout
+  on Linux/macOS; `--fifo` / `--log` overrides for non-default
+  installs. Replaces the documented "echo into FIFO + tail log"
+  pattern.
 
 #### Bugs to clean up
 
