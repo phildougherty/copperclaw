@@ -159,12 +159,17 @@ pub fn build_dispatch_table() -> DispatchTable {
     ins!("dropped-messages.list", handlers::dropped_messages::list, false);
     ins!("approvals.list", handlers::approvals::list, false);
     ins!("approvals.get", handlers::approvals::get, false);
+    ins!("audit.list", handlers::audit::list, false);
 
     t
 }
 
 /// Dispatch one parsed [`Request`] against the table. Returns the matching
 /// [`Response`]. Test-friendly because it bypasses the socket I/O.
+///
+/// Mutating calls (every command in [`handlers::HOST_ONLY_COMMANDS`])
+/// emit an `audit_log` row on the way out — success or error. The write
+/// is best-effort: an audit failure must never fail the request.
 pub fn dispatch_request(table: &DispatchTable, ctx: &HandlerCtx, req: &Request) -> Response {
     let Request::Call {
         id,
@@ -172,30 +177,125 @@ pub fn dispatch_request(table: &DispatchTable, ctx: &HandlerCtx, req: &Request) 
         args,
         caller,
     } = req;
+    let is_mutation = handlers::HOST_ONLY_COMMANDS.contains(&command.as_str());
+    let started_at = std::time::Instant::now();
+
     let Some(handler) = table.get(command.as_str()) else {
-        return Response::err(
+        let resp = Response::err(
             id,
             ErrorPayload::new("unknown_command", format!("no handler for `{command}`")),
         );
+        // Don't audit unknown commands — we couldn't have run the
+        // mutation anyway, and noisily logging probes of nonexistent
+        // verbs swamps the table.
+        return resp;
     };
     // Apply the central caller-scope policy in addition to whatever the
     // handler enforces internally. Host-only handlers re-check, but a
     // handler-side default of `false` plus this central check still keeps
     // mutations safe.
-    if handlers::HOST_ONLY_COMMANDS.contains(&command.as_str())
-        && !matches!(caller, Caller::Host)
-    {
-        return Response::err(
+    if is_mutation && !matches!(caller, Caller::Host) {
+        let resp = Response::err(
             id,
             ErrorPayload::new(
                 "permission_denied",
                 format!("command `{command}` requires host caller"),
             ),
         );
+        audit_dispatch(
+            &ctx.central,
+            command,
+            args,
+            caller,
+            &resp,
+            started_at.elapsed(),
+        );
+        return resp;
     }
-    match handler.handle(args, caller, ctx) {
+    let resp = match handler.handle(args, caller, ctx) {
         Ok(data) => Response::ok(id, data),
         Err(err) => Response::err(id, err),
+    };
+    if is_mutation {
+        audit_dispatch(
+            &ctx.central,
+            command,
+            args,
+            caller,
+            &resp,
+            started_at.elapsed(),
+        );
+    }
+    resp
+}
+
+/// Best-effort `audit_log` insert. Truncates large argument payloads
+/// so a buggy / malicious client can't pump the table full of
+/// megabytes.
+fn audit_dispatch(
+    central: &CentralDb,
+    command: &str,
+    args: &Value,
+    caller: &Caller,
+    resp: &Response,
+    latency: std::time::Duration,
+) {
+    use ironclaw_db::tables::audit_log;
+    let (caller_kind, session, ag) = match caller {
+        Caller::Host => ("host".to_string(), None, None),
+        Caller::Agent {
+            session_id,
+            agent_group_id,
+            ..
+        } => (
+            "agent".to_string(),
+            Some(session_id.as_uuid().to_string()),
+            Some(agent_group_id.as_uuid().to_string()),
+        ),
+    };
+    let args_str = {
+        // Compact JSON, capped at 4KiB to keep audit rows small.
+        let s = serde_json::to_string(args).unwrap_or_else(|_| String::from("\"<unserializable>\""));
+        if s.len() > 4096 {
+            // Truncate on a char boundary.
+            let mut cap = 4096;
+            while !s.is_char_boundary(cap) {
+                cap -= 1;
+            }
+            format!("{}…[truncated]", &s[..cap])
+        } else {
+            s
+        }
+    };
+    let (result, error_code, error_message) = match resp {
+        Response::Ok { .. } => ("ok".to_string(), None, None),
+        Response::Err { error, .. } => (
+            "error".to_string(),
+            Some(error.code.clone()),
+            Some(error.message.clone()),
+        ),
+    };
+    let entry = audit_log::AuditEntry {
+        ts: chrono::Utc::now(),
+        caller_kind,
+        caller_session: session,
+        caller_agent_group: ag,
+        command: command.to_string(),
+        args: args_str,
+        result,
+        error_code,
+        error_message,
+        latency_ms: i64::try_from(latency.as_millis()).unwrap_or(i64::MAX),
+    };
+    if let Err(err) = audit_log::insert(central, &entry) {
+        // Don't propagate — the request already produced a response.
+        // Log loud enough for an operator to notice but not loud
+        // enough to spam.
+        warn!(
+            ?err,
+            command,
+            "audit_log insert failed; request proceeded"
+        );
     }
 }
 

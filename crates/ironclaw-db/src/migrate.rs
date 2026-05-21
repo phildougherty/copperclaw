@@ -21,10 +21,16 @@ struct Migration {
     sql: &'static str,
 }
 
-const CENTRAL: &[Migration] = &[Migration {
-    name: "001_initial",
-    sql: include_str!("../migrations/001_initial.sql"),
-}];
+const CENTRAL: &[Migration] = &[
+    Migration {
+        name: "001_initial",
+        sql: include_str!("../migrations/001_initial.sql"),
+    },
+    Migration {
+        name: "004_audit_log",
+        sql: include_str!("../migrations/004_audit_log.sql"),
+    },
+];
 
 const SESSION_INBOUND: &[Migration] = &[Migration {
     name: "002_session_inbound",
@@ -106,7 +112,12 @@ mod tests {
         let mut conn = fresh();
         run_migrations(&mut conn, MigrationSet::Central).unwrap();
         let applied = applied_migrations(&conn).unwrap();
-        assert_eq!(applied, vec!["001_initial".to_string()]);
+        // Order-independent: the central set grows over time but the
+        // contents are fully specified by the const tables here.
+        let expected: std::collections::HashSet<String> =
+            CENTRAL.iter().map(|m| m.name.to_string()).collect();
+        let got: std::collections::HashSet<String> = applied.into_iter().collect();
+        assert_eq!(got, expected);
     }
 
     #[test]
@@ -115,7 +126,9 @@ mod tests {
         run_migrations(&mut conn, MigrationSet::Central).unwrap();
         run_migrations(&mut conn, MigrationSet::Central).unwrap();
         let applied = applied_migrations(&conn).unwrap();
-        assert_eq!(applied.len(), 1);
+        // Idempotent — running twice produces the same set, not a
+        // doubled count.
+        assert_eq!(applied.len(), CENTRAL.len());
     }
 
     #[test]

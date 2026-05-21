@@ -22,6 +22,7 @@ use ironclaw_types::AgentGroupId;
 use serde_json::Value;
 
 pub mod approvals;
+pub mod audit;
 pub mod destinations;
 pub mod dropped_messages;
 pub mod groups;

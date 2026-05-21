@@ -147,6 +147,11 @@ pub enum TopCommand {
         #[command(subcommand)]
         action: ApprovalsCmd,
     },
+    /// Mutation audit log.
+    Audit {
+        #[command(subcommand)]
+        action: AuditCmd,
+    },
     /// One-shot composite installers for getting a fresh host chatable.
     Quickstart {
         #[command(subcommand)]
@@ -154,6 +159,8 @@ pub enum TopCommand {
     },
     /// One-shot overview of what's wired up on the host.
     Status,
+    /// One-shot operator health check.
+    Health,
     /// Emit shell completion script for `iclaw`.
     ///
     /// Pipe the output into your shell's completion dir, e.g.
@@ -541,6 +548,21 @@ pub enum ApprovalsCmd {
     Get { id: String },
 }
 
+/// `iclaw audit ...` — read the mutation audit log.
+#[derive(Debug, Subcommand)]
+pub enum AuditCmd {
+    /// List recent audit entries.
+    List {
+        /// Window to look back. Accepts plain seconds (`3600`) or
+        /// `Ns`/`Nm`/`Nh`/`Nd` shorthand. Default 24h.
+        #[arg(long, default_value = "24h")]
+        since: String,
+        /// Max rows returned. Default 50.
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Conversion from clap structures to `(command, args)` pairs.
 // ---------------------------------------------------------------------------
@@ -585,8 +607,10 @@ impl TopCommand {
             Self::UserDms { action } => action.to_call(),
             Self::DroppedMessages { action } => action.to_call(),
             Self::Approvals { action } => action.to_call(),
+            Self::Audit { action } => action.to_call(),
             Self::Quickstart { action } => action.to_call(),
             Self::Status => ParsedCall::new("composite.status", json!({})),
+            Self::Health => ParsedCall::new("composite.health", json!({})),
             // Completions are emitted entirely client-side; the marker
             // command carries the requested shell name so `run_cli`
             // can short-circuit before any transport call.
@@ -970,6 +994,17 @@ impl ApprovalsCmd {
     }
 }
 
+impl AuditCmd {
+    pub fn to_call(&self) -> ParsedCall {
+        match self {
+            Self::List { since, limit } => ParsedCall::new(
+                "audit.list",
+                json!({ "since": since, "limit": limit }),
+            ),
+        }
+    }
+}
+
 /// All `command` strings this binary can emit. Useful for the host to
 /// register matching handlers; also referenced by tests in this crate.
 pub const ALL_COMMANDS: &[&str] = &[
@@ -1014,6 +1049,7 @@ pub const ALL_COMMANDS: &[&str] = &[
     "dropped-messages.list",
     "approvals.list",
     "approvals.get",
+    "audit.list",
 ];
 
 #[cfg(test)]
@@ -1710,6 +1746,7 @@ mod tests {
             &["iclaw", "dropped-messages", "list"],
             &["iclaw", "approvals", "list"],
             &["iclaw", "approvals", "get", "x"],
+            &["iclaw", "audit", "list"],
         ];
         for args in invocations {
             let p = parse(args);

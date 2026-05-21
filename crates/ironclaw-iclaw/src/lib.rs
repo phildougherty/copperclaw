@@ -241,9 +241,107 @@ where
     match op {
         "quickstart-cli" => run_quickstart_cli(args, transport, caller, as_json).await,
         "status" => run_status(transport, caller, as_json).await,
+        "health" => run_health(transport, caller, as_json).await,
         "completions" => run_completions(args),
         other => RunOutput::failure(format!("unknown composite op: {other}\n")),
     }
+}
+
+/// `iclaw health` — one-shot operator probe. Lists session-state
+/// counts (running / idle / stopped) and the last 5 audit entries
+/// so the operator can see at a glance whether the host is alive
+/// and whether anything has recently mutated state. Designed to be
+/// cheap and side-effect-free; a real `/healthz` HTTP endpoint can
+/// reuse the same data.
+async fn run_health<T>(transport: &T, caller: Caller, as_json: bool) -> RunOutput
+where
+    T: CallTransport + ?Sized,
+{
+    let sessions_all = match transport
+        .call("sessions.list", serde_json::json!({}), caller.clone())
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return RunOutput::failure(format_step_error("sessions.list", &e)),
+    };
+    let sessions_active = match transport
+        .call(
+            "sessions.list",
+            serde_json::json!({"status": "active"}),
+            caller.clone(),
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return RunOutput::failure(format_step_error("sessions.list", &e)),
+    };
+    let audit = match transport
+        .call(
+            "audit.list",
+            serde_json::json!({"since": "24h", "limit": 5}),
+            caller,
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => return RunOutput::failure(format_step_error("audit.list", &e)),
+    };
+
+    let mut running = 0usize;
+    let mut idle = 0usize;
+    let mut stopped = 0usize;
+    if let Some(rows) = sessions_active.as_array() {
+        for r in rows {
+            match r
+                .get("container_status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+            {
+                "running" => running += 1,
+                "idle" => idle += 1,
+                "stopped" => stopped += 1,
+                _ => {}
+            }
+        }
+    }
+
+    if as_json {
+        let summary = serde_json::json!({
+            "sessions_total": array_len(&sessions_all),
+            "sessions_active": array_len(&sessions_active),
+            "sessions_running": running,
+            "sessions_idle": idle,
+            "sessions_stopped": stopped,
+            "recent_audit": audit,
+        });
+        let mut out = render_json_pretty(&summary);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        return RunOutput::success(out);
+    }
+
+    let mut out = String::new();
+    out.push_str(&format!(
+        "sessions total:    {}\n",
+        array_len(&sessions_all)
+    ));
+    out.push_str(&format!(
+        "sessions active:   {}\n",
+        array_len(&sessions_active)
+    ));
+    out.push_str(&format!("  running:         {running}\n"));
+    out.push_str(&format!("  idle:            {idle}\n"));
+    out.push_str(&format!("  stopped:         {stopped}\n"));
+    out.push('\n');
+    if array_len(&audit) > 0 {
+        out.push_str("recent mutations (24h, up to 5)\n");
+        out.push_str(&render(&audit));
+        out.push('\n');
+    } else {
+        out.push_str("recent mutations (24h): none\n");
+    }
+    RunOutput::success(out)
 }
 
 /// `iclaw completions <shell>` — render the clap-generated completion
