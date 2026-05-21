@@ -14,7 +14,9 @@ use dashmap::DashMap;
 use ironclaw_channels_core::ChannelAdapter;
 use ironclaw_container_rt::{ContainerRuntime, RtError};
 use ironclaw_db::central::CentralDb;
-use ironclaw_db::migrate::{run_migrations, MigrationSet};
+use ironclaw_db::migrate::{
+    applied_central_schema_version, expected_central_schema_version, run_migrations, MigrationSet,
+};
 use ironclaw_host_delivery::DeliveryService;
 use ironclaw_host_router::Router;
 use ironclaw_host_sweep::SweepService;
@@ -35,6 +37,7 @@ use tracing::{info, warn};
 /// Maps onto the exit codes documented in the brief:
 /// - migrations -> exit 2
 /// - runtime detect -> exit 3
+/// - schema mismatch (downgrade) -> exit 5
 #[derive(Debug, Error)]
 pub enum BootError {
     /// Migrations could not be applied.
@@ -49,6 +52,17 @@ pub enum BootError {
     /// Socket server returned an unexpected I/O error before shutdown.
     #[error("socket server error: {0}")]
     Socket(#[source] std::io::Error),
+    /// The on-disk schema is newer than what this binary expects.
+    ///
+    /// This means a newer ironclaw binary has already migrated the DB and
+    /// this (older) binary refuses to touch it to avoid corrupting state.
+    /// Upgrade the binary or restore from a backup.
+    #[error(
+        "schema mismatch: on-disk DB has {applied} applied migrations but \
+         this binary only knows {expected}; refusing to run against a future \
+         schema (downgrade detected)"
+    )]
+    SchemaMismatch { expected: usize, applied: usize },
 }
 
 impl BootError {
@@ -58,6 +72,7 @@ impl BootError {
             Self::Migrate(_) | Self::OpenCentral(_) => 2,
             Self::RuntimeDetect(_) => 3,
             Self::Socket(_) => 4,
+            Self::SchemaMismatch { .. } => 5,
         }
     }
 }
@@ -72,6 +87,111 @@ pub fn run_migrations_only(cfg: &HostConfig) -> Result<(), BootError> {
     let mut conn = db.conn().map_err(BootError::OpenCentral)?;
     run_migrations(&mut conn, MigrationSet::Central).map_err(BootError::Migrate)?;
     Ok(())
+}
+
+/// Check that the on-disk schema version is compatible with this binary.
+///
+/// - `applied == expected` → log info, continue.
+/// - `applied < expected`  → log warn (migrations pending — shouldn't happen
+///   after `run_migrations_only`, but defence in depth).
+/// - `applied > expected`  → return `Err(BootError::SchemaMismatch)` so the
+///   host refuses to boot against a future schema it doesn't understand.
+/// - `applied == None` (fresh DB) → treat as 0 applied; if expected > 0 that
+///   is "pending", which again shouldn't happen after `run_migrations_only`.
+pub fn check_schema_version(cfg: &HostConfig) -> Result<(), BootError> {
+    let path = cfg.central_db_path();
+    let db = CentralDb::open(&path).map_err(BootError::OpenCentral)?;
+    let conn = db.conn().map_err(BootError::OpenCentral)?;
+    let expected = expected_central_schema_version();
+    let applied = applied_central_schema_version(&conn)
+        .map_err(BootError::Migrate)?
+        .unwrap_or(0);
+
+    match applied.cmp(&expected) {
+        std::cmp::Ordering::Equal => {
+            info!(schema_version = applied, "schema version up to date");
+        }
+        std::cmp::Ordering::Less => {
+            warn!(
+                applied,
+                expected,
+                "schema version behind expected; migrations may be pending"
+            );
+        }
+        std::cmp::Ordering::Greater => {
+            return Err(BootError::SchemaMismatch { expected, applied });
+        }
+    }
+    Ok(())
+}
+
+/// Migrate old `data_dir/sessions/sessions/<ag>/<session>/` layout to
+/// `data_dir/sessions/<ag>/<session>/`.
+///
+/// The double `sessions/` path was an inadvertent artifact of passing
+/// `cfg.sessions_root()` (which returned `data_dir/sessions`) into
+/// `FsSessionRoot::new`, while `SessionPaths::new` then appended
+/// another `/sessions/<ag>/<session>` on top. This one-shot migrator
+/// moves contents of the inner `sessions/` directory up one level and
+/// removes the now-empty inner dir.
+///
+/// Skips (logs + continues) rather than failing when:
+/// - The old path doesn't exist (already migrated or fresh install).
+/// - A destination path already exists (collision — would overwrite data).
+pub fn migrate_sessions_layout(data_dir: &std::path::Path) {
+    let old_inner = data_dir.join("sessions").join("sessions");
+    if !old_inner.exists() {
+        return; // Already on the flat layout or fresh install — nothing to do.
+    }
+    let new_root = data_dir.join("sessions");
+    info!(
+        old = %old_inner.display(),
+        new = %new_root.display(),
+        "migrating double sessions/ path layout"
+    );
+    let entries = match std::fs::read_dir(&old_inner) {
+        Ok(e) => e,
+        Err(err) => {
+            warn!(?err, "sessions layout migration: read_dir failed; skipping");
+            return;
+        }
+    };
+    let mut migrated = 0usize;
+    let mut skipped = 0usize;
+    for entry in entries.flatten() {
+        let src = entry.path();
+        let name = entry.file_name();
+        let dst = new_root.join(&name);
+        if dst.exists() {
+            warn!(
+                src = %src.display(),
+                dst = %dst.display(),
+                "sessions layout migration: destination already exists; skipping to avoid collision"
+            );
+            skipped += 1;
+            continue;
+        }
+        match std::fs::rename(&src, &dst) {
+            Ok(()) => migrated += 1,
+            Err(err) => {
+                warn!(
+                    src = %src.display(),
+                    dst = %dst.display(),
+                    ?err,
+                    "sessions layout migration: rename failed; skipping"
+                );
+                skipped += 1;
+            }
+        }
+    }
+    // Only remove the inner dir when we successfully moved everything and there
+    // were no skipped entries (skips mean the inner dir may not be empty).
+    if skipped == 0 {
+        if let Err(err) = std::fs::remove_dir(&old_inner) {
+            warn!(?err, "sessions layout migration: remove inner dir failed; continuing");
+        }
+    }
+    info!(migrated, skipped, "sessions layout migration complete");
 }
 
 /// Construct the assembled host state. Exposed for tests so they can poke
@@ -210,6 +330,15 @@ pub async fn run_host(
 
     // 1-4. Migrations.
     run_migrations_only(&cfg)?;
+
+    // 4b. Schema version check. After migration, verify applied == expected
+    // (warn on pending, error on downgrade). This is defence-in-depth; the
+    // normal case is that run_migrations_only just brought applied == expected.
+    check_schema_version(&cfg)?;
+
+    // 4c. Session layout migration. Move data_dir/sessions/sessions/ → data_dir/sessions/
+    // if the old double-sessions layout exists. Idempotent and non-fatal per entry.
+    migrate_sessions_layout(&cfg.data_dir);
 
     // 5. Detect container runtime. Wrap in an Arc so we can hand one
     // clone to the orphan-cleanup call and another to the container
@@ -396,12 +525,10 @@ fn spawn_container_manager(
     };
     let manager_cfg = crate::container_manager::ManagerConfig {
         install_slug: cfg.install_slug.clone(),
-        // The router/delivery/sweep build SessionPaths via
-        // `FsSessionRoot::new(cfg.sessions_root())`, which means the
-        // actual on-disk root is `data_dir/sessions` (and
-        // `SessionPaths::new` appends another `/sessions/<ag>/<session>`
-        // on top of that). Match the same shape here so we open the
-        // same inbound.db the rest of the host writes to.
+        // sessions_root() returns data_dir itself; SessionPaths::new
+        // appends sessions/<ag>/<session> to produce data_dir/sessions/<ag>/<session>.
+        // The router/delivery/sweep use FsSessionRoot::new(cfg.sessions_root())
+        // which resolves to the same path.
         data_dir: cfg.sessions_root(),
         default_image_tag: image_tag,
         default_provider: cfg
@@ -489,6 +616,10 @@ mod tests {
             BootError::Socket(std::io::Error::other("x")).exit_code(),
             4
         );
+        assert_eq!(
+            BootError::SchemaMismatch { expected: 4, applied: 7 }.exit_code(),
+            5
+        );
     }
 
     #[test]
@@ -503,6 +634,109 @@ mod tests {
                 .to_string()
                 .contains("no container runtime")
         );
+        let msg = BootError::SchemaMismatch { expected: 4, applied: 7 }.to_string();
+        assert!(msg.contains("downgrade"), "expected 'downgrade' in: {msg}");
+        assert!(msg.contains('4') && msg.contains('7'));
+    }
+
+    // --- schema version check ------------------------------------------------
+
+    #[test]
+    fn check_schema_version_ok_after_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = HostConfig {
+            data_dir: tmp.path().to_path_buf(),
+            ..HostConfig::default()
+        };
+        run_migrations_only(&cfg).unwrap();
+        check_schema_version(&cfg).unwrap(); // must not error
+    }
+
+    #[test]
+    fn check_schema_version_errors_on_future_schema() {
+        use ironclaw_db::central::CentralDb;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = HostConfig {
+            data_dir: tmp.path().to_path_buf(),
+            ..HostConfig::default()
+        };
+        run_migrations_only(&cfg).unwrap();
+        // Inject a future migration row so applied > expected.
+        {
+            let db = CentralDb::open(cfg.central_db_path()).unwrap();
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "INSERT INTO schema_version (name, applied) \
+                 VALUES ('999_future', '2099-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        }
+        let err = check_schema_version(&cfg).unwrap_err();
+        assert!(matches!(err, BootError::SchemaMismatch { .. }));
+        assert_eq!(err.exit_code(), 5);
+    }
+
+    // --- session layout migration --------------------------------------------
+
+    #[test]
+    fn migrate_sessions_layout_noop_on_flat_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No inner sessions/sessions/ dir — should be a no-op.
+        migrate_sessions_layout(tmp.path());
+        // No new files created.
+        assert!(!tmp.path().join("sessions").exists());
+    }
+
+    #[test]
+    fn migrate_sessions_layout_moves_contents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_inner = tmp.path().join("sessions").join("sessions");
+        let agent_dir = old_inner.join("agent-1234");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("inbound.db"), b"fake").unwrap();
+
+        migrate_sessions_layout(tmp.path());
+
+        // Content moved to the flat location.
+        let new_agent = tmp.path().join("sessions").join("agent-1234");
+        assert!(new_agent.exists(), "agent dir should exist at flat path");
+        assert!(new_agent.join("inbound.db").exists());
+        // Inner sessions/ dir removed.
+        assert!(!old_inner.exists(), "inner sessions/ dir should be gone");
+    }
+
+    #[test]
+    fn migrate_sessions_layout_skips_on_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_inner = tmp.path().join("sessions").join("sessions");
+        let old_agent = old_inner.join("agent-abc");
+        std::fs::create_dir_all(&old_agent).unwrap();
+        // Pre-create the destination so it collides.
+        let new_agent = tmp.path().join("sessions").join("agent-abc");
+        std::fs::create_dir_all(&new_agent).unwrap();
+        std::fs::write(new_agent.join("existing.db"), b"keep").unwrap();
+
+        migrate_sessions_layout(tmp.path());
+
+        // Collision was logged + skipped — existing data intact.
+        assert!(new_agent.join("existing.db").exists());
+        // The old inner dir still exists because we skipped entries.
+        // (Whether it stays or goes depends on the skipped count > 0 guard.)
+        assert!(old_inner.exists(), "inner dir should remain when there were skips");
+    }
+
+    #[test]
+    fn migrate_sessions_layout_idempotent_after_successful_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_inner = tmp.path().join("sessions").join("sessions");
+        let agent_dir = old_inner.join("agent-xyz");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+
+        migrate_sessions_layout(tmp.path()); // first call moves + removes inner
+        // Second call: old_inner no longer exists → no-op.
+        migrate_sessions_layout(tmp.path()); // must not panic
     }
 
     #[test]

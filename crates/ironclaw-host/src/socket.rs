@@ -168,6 +168,7 @@ pub fn build_dispatch_table() -> DispatchTable {
     ins!("budgets.list", handlers::budgets::list, false);
     ins!("budgets.set", handlers::budgets::set, true);
     ins!("usage.rollup", handlers::usage::rollup, false);
+    ins!("schema.version", handlers::schema::version, false);
 
     t
 }

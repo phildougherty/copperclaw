@@ -107,6 +107,41 @@ pub fn applied_migrations(conn: &Connection) -> Result<Vec<String>, DbError> {
     Ok(names.collect::<Result<_, _>>()?)
 }
 
+/// The "expected" schema version for the central DB: the number of
+/// entries in the in-binary [`CENTRAL`] migrations list.
+///
+/// Design rationale: migrations are append-only (never removed or
+/// reordered), so the count is monotonically increasing and is
+/// equivalent to the highest sequence number. Comparing this value
+/// against [`applied_central_schema_version`] lets the host detect
+/// both forward- and backward-compatibility problems at boot.
+#[must_use]
+pub fn expected_central_schema_version() -> usize {
+    CENTRAL.len()
+}
+
+/// The "applied" schema version for the central DB: the number of
+/// rows recorded in `schema_version` (i.e. the count of migrations
+/// that have actually been run against this database file).
+///
+/// Returns `Ok(None)` when `schema_version` doesn't exist yet (a
+/// completely fresh DB that hasn't been migrated). Returns `Ok(Some(n))`
+/// otherwise.
+pub fn applied_central_schema_version(conn: &Connection) -> Result<Option<usize>, DbError> {
+    // Check whether the table exists at all first (fresh DB, pre-migrate).
+    let table_exists: bool = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_version'",
+        [],
+        |r| r.get::<_, i64>(0),
+    ).map(|n| n > 0)?;
+    if !table_exists {
+        return Ok(None);
+    }
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM schema_version", [], |r| r.get(0))?;
+    // COUNT(*) is always non-negative; the try_from can't fail in practice.
+    Ok(Some(usize::try_from(count).unwrap_or(0)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,6 +221,40 @@ mod tests {
                 .unwrap();
             assert_eq!(exists, 1, "missing table `{table}`");
         }
+    }
+
+    #[test]
+    fn expected_central_schema_version_matches_central_list_length() {
+        assert_eq!(expected_central_schema_version(), CENTRAL.len());
+        assert!(expected_central_schema_version() > 0);
+    }
+
+    #[test]
+    fn applied_central_schema_version_is_none_on_fresh_db() {
+        let conn = fresh();
+        let v = applied_central_schema_version(&conn).unwrap();
+        assert_eq!(v, None);
+    }
+
+    #[test]
+    fn applied_central_schema_version_equals_expected_after_migration() {
+        let mut conn = fresh();
+        run_migrations(&mut conn, MigrationSet::Central).unwrap();
+        let applied = applied_central_schema_version(&conn).unwrap();
+        assert_eq!(applied, Some(expected_central_schema_version()));
+    }
+
+    #[test]
+    fn applied_central_schema_version_reflects_future_row() {
+        let mut conn = fresh();
+        run_migrations(&mut conn, MigrationSet::Central).unwrap();
+        // Simulate a future migration written by a newer binary.
+        conn.execute(
+            "INSERT INTO schema_version (name, applied) VALUES ('999_future', '2099-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+        let applied = applied_central_schema_version(&conn).unwrap();
+        assert_eq!(applied, Some(expected_central_schema_version() + 1));
     }
 
     #[test]
