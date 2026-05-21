@@ -1,0 +1,133 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ironclaw-types",
+    "crates/ironclaw-db",
+    "crates/ironclaw-host",
+    "crates/ironclaw-host-router",
+    "crates/ironclaw-host-delivery",
+    "crates/ironclaw-host-sweep",
+    "crates/ironclaw-container-rt",
+    "crates/ironclaw-runner",
+    "crates/ironclaw-providers",
+    "crates/ironclaw-mcp",
+    "crates/ironclaw-channels/core",
+    "crates/ironclaw-channels/cli",
+    "crates/ironclaw-channels/telegram",
+    "crates/ironclaw-channels/slack",
+    "crates/ironclaw-channels/discord",
+    "crates/ironclaw-channels/resend",
+    "crates/ironclaw-channels/github",
+    "crates/ironclaw-channels/linear",
+    "crates/ironclaw-channels/webex",
+    "crates/ironclaw-channels/matrix",
+    "crates/ironclaw-channels/teams",
+    "crates/ironclaw-channels/gchat",
+    "crates/ironclaw-channels/imessage",
+    "crates/ironclaw-channels/wechat",
+    "crates/ironclaw-channels/whatsapp-cloud",
+    "crates/ironclaw-channels/whatsapp",
+    "crates/ironclaw-channels/signal",
+    "crates/ironclaw-channels/deltachat",
+    "crates/ironclaw-channels/emacs",
+    "crates/ironclaw-channels/x",
+    "crates/ironclaw-modules",
+    "crates/ironclaw-skills",
+    "crates/ironclaw-iclaw",
+    "crates/ironclaw-setup",
+    "crates/ironclaw-onecli",
+]
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+version = "0.1.0"
+authors = ["Ironclaw Contributors"]
+repository = "https://github.com/example/ironclaw"
+
+[workspace.dependencies]
+ironclaw-types          = { path = "crates/ironclaw-types" }
+ironclaw-db             = { path = "crates/ironclaw-db" }
+ironclaw-container-rt   = { path = "crates/ironclaw-container-rt" }
+ironclaw-providers      = { path = "crates/ironclaw-providers" }
+ironclaw-mcp            = { path = "crates/ironclaw-mcp" }
+ironclaw-channels-core  = { path = "crates/ironclaw-channels/core" }
+ironclaw-channels-cli   = { path = "crates/ironclaw-channels/cli" }
+ironclaw-channels-telegram = { path = "crates/ironclaw-channels/telegram" }
+ironclaw-channels-slack    = { path = "crates/ironclaw-channels/slack" }
+ironclaw-channels-discord  = { path = "crates/ironclaw-channels/discord" }
+ironclaw-channels-resend   = { path = "crates/ironclaw-channels/resend" }
+ironclaw-channels-github   = { path = "crates/ironclaw-channels/github" }
+ironclaw-channels-linear   = { path = "crates/ironclaw-channels/linear" }
+ironclaw-channels-webex    = { path = "crates/ironclaw-channels/webex" }
+ironclaw-channels-matrix   = { path = "crates/ironclaw-channels/matrix" }
+ironclaw-channels-teams    = { path = "crates/ironclaw-channels/teams" }
+ironclaw-channels-gchat    = { path = "crates/ironclaw-channels/gchat" }
+ironclaw-channels-imessage = { path = "crates/ironclaw-channels/imessage" }
+ironclaw-channels-wechat   = { path = "crates/ironclaw-channels/wechat" }
+ironclaw-channels-whatsapp-cloud = { path = "crates/ironclaw-channels/whatsapp-cloud" }
+ironclaw-channels-whatsapp = { path = "crates/ironclaw-channels/whatsapp" }
+ironclaw-channels-signal   = { path = "crates/ironclaw-channels/signal" }
+ironclaw-channels-deltachat = { path = "crates/ironclaw-channels/deltachat" }
+ironclaw-channels-emacs    = { path = "crates/ironclaw-channels/emacs" }
+ironclaw-channels-x        = { path = "crates/ironclaw-channels/x" }
+ironclaw-modules        = { path = "crates/ironclaw-modules" }
+ironclaw-skills         = { path = "crates/ironclaw-skills" }
+ironclaw-onecli         = { path = "crates/ironclaw-onecli" }
+ironclaw-host-router    = { path = "crates/ironclaw-host-router" }
+ironclaw-host-delivery  = { path = "crates/ironclaw-host-delivery" }
+ironclaw-host-sweep     = { path = "crates/ironclaw-host-sweep" }
+
+tokio              = { version = "1", features = ["full"] }
+serde              = { version = "1", features = ["derive"] }
+serde_json         = "1"
+rusqlite           = { version = "0.32", features = ["bundled", "chrono", "serde_json"] }
+r2d2_sqlite        = "0.25"
+r2d2               = "0.8"
+clap               = { version = "4", features = ["derive", "env"] }
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+reqwest            = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+axum               = "0.7"
+tower              = "0.5"
+rmcp               = "0.2"
+bollard            = "0.18"
+croner             = "2"
+notify             = "7"
+anyhow             = "1"
+thiserror          = "2"
+dotenvy            = "0.15"
+async-trait        = "0.1"
+dialoguer          = "0.11"
+indicatif          = "0.17"
+chrono             = { version = "0.4", features = ["serde"] }
+uuid               = { version = "1", features = ["v4", "v5", "v7", "serde"] }
+eventsource-stream = "0.2"
+futures            = "0.3"
+bytes              = "1"
+url                = "2"
+hex                = "0.4"
+sha2               = "0.10"
+dashmap            = "6"
+x25519-dalek       = { version = "2", features = ["static_secrets"] }
+ed25519-dalek      = "2"
+hkdf               = "0.12"
+aes-gcm            = "0.10"
+rand               = "0.8"
+rand_core          = "0.6"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

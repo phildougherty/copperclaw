@@ -1,0 +1,686 @@
+//! Microsoft Graph API client for the slice of endpoints the Teams adapter
+//! needs.
+//!
+//! All calls authenticate with `Authorization: Bearer <bot_token>`. HTTP
+//! status codes are mapped onto [`AdapterError`] variants according to the
+//! contract documented in `docs/adding-a-channel.md`:
+//!
+//! - 401 / 403 → [`AdapterError::Auth`].
+//! - 404 → [`AdapterError::BadRequest`].
+//! - 429 → [`AdapterError::Rate`] (honoring `Retry-After` when present).
+//! - 5xx → [`AdapterError::Transport`].
+//! - 400 / 422 → [`AdapterError::BadRequest`].
+
+use ironclaw_channels_core::AdapterError;
+use reqwest::{Client, Method, Response, StatusCode};
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+/// Response from a message-create or message-edit call. Only the `id` field
+/// (the Microsoft Graph chat-message id) is interesting to us.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatMessageResponse {
+    /// Microsoft Graph chat-message id.
+    pub id: String,
+}
+
+/// Response from `GET /chats/{id}`. We use it to decide `is_group`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatInfoResponse {
+    /// `oneOnOne`, `group`, `meeting`, or `unknownFutureValue`.
+    #[serde(default, rename = "chatType")]
+    pub chat_type: Option<String>,
+}
+
+/// Minimal Microsoft Graph client.
+#[derive(Debug, Clone)]
+pub struct TeamsApi {
+    client: Client,
+    graph_base: String,
+    bot_token: String,
+}
+
+impl TeamsApi {
+    /// Build a client using the configured token and base URL.
+    #[must_use]
+    pub fn new(graph_base: impl Into<String>, bot_token: impl Into<String>) -> Self {
+        Self::with_client(Client::new(), graph_base, bot_token)
+    }
+
+    /// Construct with a caller-supplied [`reqwest::Client`]. Useful for tests
+    /// that want a shared connection pool or custom timeouts.
+    #[must_use]
+    pub fn with_client(
+        client: Client,
+        graph_base: impl Into<String>,
+        bot_token: impl Into<String>,
+    ) -> Self {
+        Self {
+            client,
+            graph_base: graph_base.into(),
+            bot_token: bot_token.into(),
+        }
+    }
+
+    /// Build an absolute URL by appending `suffix` to the configured base.
+    pub(crate) fn url(&self, suffix: &str) -> String {
+        let base = self.graph_base.trim_end_matches('/');
+        let suffix = suffix.trim_start_matches('/');
+        format!("{base}/{suffix}")
+    }
+
+    /// `POST /teams/{teamId}/channels/{channelId}/messages` — create a new
+    /// channel post.
+    pub async fn post_channel_message(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        content: &str,
+        content_type: &str,
+    ) -> Result<ChatMessageResponse, AdapterError> {
+        let url = self.url(&format!(
+            "teams/{team_id}/channels/{channel_id}/messages"
+        ));
+        let body = json!({"body": {"contentType": content_type, "content": content}});
+        let resp = self.send_json(Method::POST, &url, &body).await?;
+        decode_message(resp).await
+    }
+
+    /// `POST /teams/{teamId}/channels/{channelId}/messages/{messageId}/replies`
+    /// — reply within an existing channel thread.
+    pub async fn post_channel_reply(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        parent_message_id: &str,
+        content: &str,
+        content_type: &str,
+    ) -> Result<ChatMessageResponse, AdapterError> {
+        let url = self.url(&format!(
+            "teams/{team_id}/channels/{channel_id}/messages/{parent_message_id}/replies"
+        ));
+        let body = json!({"body": {"contentType": content_type, "content": content}});
+        let resp = self.send_json(Method::POST, &url, &body).await?;
+        decode_message(resp).await
+    }
+
+    /// `POST /chats/{chatId}/messages` — post into a one-on-one or group chat.
+    pub async fn post_chat_message(
+        &self,
+        chat_id: &str,
+        content: &str,
+        content_type: &str,
+    ) -> Result<ChatMessageResponse, AdapterError> {
+        let url = self.url(&format!("chats/{chat_id}/messages"));
+        let body = json!({"body": {"contentType": content_type, "content": content}});
+        let resp = self.send_json(Method::POST, &url, &body).await?;
+        decode_message(resp).await
+    }
+
+    /// `PATCH /teams/{teamId}/channels/{channelId}/messages/{messageId}` —
+    /// edit a previously-sent channel message body.
+    pub async fn edit_channel_message(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        message_id: &str,
+        content: &str,
+    ) -> Result<(), AdapterError> {
+        let url = self.url(&format!(
+            "teams/{team_id}/channels/{channel_id}/messages/{message_id}"
+        ));
+        let body = json!({"body": {"contentType": "html", "content": content}});
+        let resp = self.send_json(Method::PATCH, &url, &body).await?;
+        let _ = consume_ok(resp).await?;
+        Ok(())
+    }
+
+    /// `PATCH /chats/{chatId}/messages/{messageId}` — edit a chat message body.
+    pub async fn edit_chat_message(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        content: &str,
+    ) -> Result<(), AdapterError> {
+        let url = self.url(&format!("chats/{chat_id}/messages/{message_id}"));
+        let body = json!({"body": {"contentType": "html", "content": content}});
+        let resp = self.send_json(Method::PATCH, &url, &body).await?;
+        let _ = consume_ok(resp).await?;
+        Ok(())
+    }
+
+    /// `POST .../messages/{id}/setReaction` for a channel message.
+    pub async fn set_channel_reaction(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        message_id: &str,
+        reaction_type: &str,
+    ) -> Result<(), AdapterError> {
+        let url = self.url(&format!(
+            "teams/{team_id}/channels/{channel_id}/messages/{message_id}/setReaction"
+        ));
+        let body = json!({"reactionType": reaction_type});
+        let resp = self.send_json(Method::POST, &url, &body).await?;
+        let _ = consume_ok(resp).await?;
+        Ok(())
+    }
+
+    /// `POST /chats/{id}/messages/{mid}/setReaction` — set a reaction on a
+    /// chat message.
+    pub async fn set_chat_reaction(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        reaction_type: &str,
+    ) -> Result<(), AdapterError> {
+        let url = self.url(&format!(
+            "chats/{chat_id}/messages/{message_id}/setReaction"
+        ));
+        let body = json!({"reactionType": reaction_type});
+        let resp = self.send_json(Method::POST, &url, &body).await?;
+        let _ = consume_ok(resp).await?;
+        Ok(())
+    }
+
+    /// `GET /teams/{teamId}/channels/{channelId}/messages/{messageId}` —
+    /// fetch a channel message. Returns the raw JSON for the caller to mine.
+    pub async fn get_channel_message(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        message_id: &str,
+    ) -> Result<Value, AdapterError> {
+        let url = self.url(&format!(
+            "teams/{team_id}/channels/{channel_id}/messages/{message_id}"
+        ));
+        let resp = self.send_empty(Method::GET, &url).await?;
+        consume_json(resp).await
+    }
+
+    /// `GET /chats/{chatId}/messages/{messageId}` — fetch a chat message.
+    pub async fn get_chat_message(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+    ) -> Result<Value, AdapterError> {
+        let url = self.url(&format!("chats/{chat_id}/messages/{message_id}"));
+        let resp = self.send_empty(Method::GET, &url).await?;
+        consume_json(resp).await
+    }
+
+    /// `GET /chats/{chatId}` — fetch chat metadata (used to compute
+    /// `is_group` for inbound chat notifications).
+    pub async fn get_chat(&self, chat_id: &str) -> Result<ChatInfoResponse, AdapterError> {
+        let url = self.url(&format!("chats/{chat_id}"));
+        let resp = self.send_empty(Method::GET, &url).await?;
+        let value = consume_json(resp).await?;
+        serde_json::from_value(value)
+            .map_err(|e| AdapterError::Transport(format!("get chat decode: {e}")))
+    }
+
+    async fn send_json(
+        &self,
+        method: Method,
+        url: &str,
+        body: &Value,
+    ) -> Result<Response, AdapterError> {
+        self.client
+            .request(method, url)
+            .bearer_auth(&self.bot_token)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| AdapterError::Transport(e.to_string()))
+    }
+
+    async fn send_empty(&self, method: Method, url: &str) -> Result<Response, AdapterError> {
+        self.client
+            .request(method, url)
+            .bearer_auth(&self.bot_token)
+            .send()
+            .await
+            .map_err(|e| AdapterError::Transport(e.to_string()))
+    }
+}
+
+/// Translate a Microsoft Graph HTTP response into an [`AdapterError`] or
+/// return the raw response on success.
+pub(crate) async fn consume_ok(resp: Response) -> Result<Response, AdapterError> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    let retry_after = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    let body = resp.text().await.unwrap_or_default();
+    Err(map_status_error(status, &body, retry_after))
+}
+
+/// Like [`consume_ok`] but additionally decodes the body as JSON.
+pub(crate) async fn consume_json(resp: Response) -> Result<Value, AdapterError> {
+    let resp = consume_ok(resp).await?;
+    resp.json::<Value>()
+        .await
+        .map_err(|e| AdapterError::Transport(format!("graph response not JSON: {e}")))
+}
+
+async fn decode_message(resp: Response) -> Result<ChatMessageResponse, AdapterError> {
+    let value = consume_json(resp).await?;
+    serde_json::from_value(value)
+        .map_err(|e| AdapterError::Transport(format!("graph message decode: {e}")))
+}
+
+/// Map an HTTP status (with optional body and retry-after) onto an
+/// [`AdapterError`].
+pub(crate) fn map_status_error(
+    status: StatusCode,
+    body: &str,
+    retry_after: Option<u64>,
+) -> AdapterError {
+    let snippet = body.chars().take(256).collect::<String>();
+    match status.as_u16() {
+        401 | 403 => AdapterError::Auth(format!("{status}: {snippet}")),
+        429 => AdapterError::Rate { retry_after },
+        400 | 404 | 422 => AdapterError::BadRequest(format!("{status}: {snippet}")),
+        _ => AdapterError::Transport(format!("{status}: {snippet}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn api_for(server: &MockServer) -> TeamsApi {
+        TeamsApi::new(server.uri(), "tok-123")
+    }
+
+    #[test]
+    fn url_builds_correctly_with_trailing_slash() {
+        let api = TeamsApi::new("https://example.test/v1.0/", "tok");
+        assert_eq!(api.url("teams/x"), "https://example.test/v1.0/teams/x");
+        let api = TeamsApi::new("https://example.test/v1.0", "tok");
+        assert_eq!(api.url("/teams/x"), "https://example.test/v1.0/teams/x");
+    }
+
+    #[test]
+    fn map_status_auth_codes() {
+        for code in [401u16, 403] {
+            let s = StatusCode::from_u16(code).unwrap();
+            match map_status_error(s, "denied", None) {
+                AdapterError::Auth(_) => {}
+                other => panic!("expected Auth for {code}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn map_status_404_is_bad_request() {
+        match map_status_error(StatusCode::NOT_FOUND, "missing", None) {
+            AdapterError::BadRequest(_) => {}
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_status_429_is_rate_with_retry_after() {
+        match map_status_error(StatusCode::TOO_MANY_REQUESTS, "slow down", Some(7)) {
+            AdapterError::Rate { retry_after } => assert_eq!(retry_after, Some(7)),
+            other => panic!("expected Rate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_status_400_is_bad_request() {
+        match map_status_error(StatusCode::BAD_REQUEST, "bad", None) {
+            AdapterError::BadRequest(_) => {}
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_status_422_is_bad_request() {
+        match map_status_error(StatusCode::UNPROCESSABLE_ENTITY, "bad", None) {
+            AdapterError::BadRequest(_) => {}
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_status_5xx_is_transport() {
+        match map_status_error(StatusCode::SERVICE_UNAVAILABLE, "down", None) {
+            AdapterError::Transport(_) => {}
+            other => panic!("got {other:?}"),
+        }
+        match map_status_error(StatusCode::INTERNAL_SERVER_ERROR, "boom", None) {
+            AdapterError::Transport(_) => {}
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_status_other_is_transport() {
+        // Status 418 (teapot) is not specially classified.
+        match map_status_error(StatusCode::IM_A_TEAPOT, "no coffee", None) {
+            AdapterError::Transport(_) => {}
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn post_channel_message_returns_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/teams/T1/channels/C1/messages"))
+            .and(header("authorization", "Bearer tok-123"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(json!({"id": "1700000000000"})),
+            )
+            .mount(&server)
+            .await;
+        let api = api_for(&server);
+        let resp = api
+            .post_channel_message("T1", "C1", "hi", "text")
+            .await
+            .unwrap();
+        assert_eq!(resp.id, "1700000000000");
+    }
+
+    #[tokio::test]
+    async fn post_channel_reply_returns_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/teams/T1/channels/C1/messages/PARENT/replies"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "RID"})))
+            .mount(&server)
+            .await;
+        let api = api_for(&server);
+        let resp = api
+            .post_channel_reply("T1", "C1", "PARENT", "yo", "text")
+            .await
+            .unwrap();
+        assert_eq!(resp.id, "RID");
+    }
+
+    #[tokio::test]
+    async fn post_chat_message_returns_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chats/CHAT1/messages"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "CMID"})))
+            .mount(&server)
+            .await;
+        let api = api_for(&server);
+        let resp = api.post_chat_message("CHAT1", "yo", "text").await.unwrap();
+        assert_eq!(resp.id, "CMID");
+    }
+
+    #[tokio::test]
+    async fn edit_channel_message_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/teams/T1/channels/C1/messages/MID"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let api = api_for(&server);
+        api.edit_channel_message("T1", "C1", "MID", "new").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn edit_chat_message_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/chats/CHAT1/messages/MID"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let api = api_for(&server);
+        api.edit_chat_message("CHAT1", "MID", "new").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_channel_reaction_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/teams/T1/channels/C1/messages/MID/setReaction"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let api = api_for(&server);
+        api.set_channel_reaction("T1", "C1", "MID", "like")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_chat_reaction_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chats/CHAT1/messages/MID/setReaction"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let api = api_for(&server);
+        api.set_chat_reaction("CHAT1", "MID", "heart")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_channel_message_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/teams/T1/channels/C1/messages/MID"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"id":"MID","body":{"content":"<p>hi</p>"}})),
+            )
+            .mount(&server)
+            .await;
+        let api = api_for(&server);
+        let v = api.get_channel_message("T1", "C1", "MID").await.unwrap();
+        assert_eq!(v["body"]["content"], "<p>hi</p>");
+    }
+
+    #[tokio::test]
+    async fn get_chat_message_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/chats/CHAT1/messages/MID"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"id":"MID","body":{"content":"hi"}})),
+            )
+            .mount(&server)
+            .await;
+        let api = api_for(&server);
+        let v = api.get_chat_message("CHAT1", "MID").await.unwrap();
+        assert_eq!(v["id"], "MID");
+    }
+
+    #[tokio::test]
+    async fn get_chat_ok() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/chats/CHAT1"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"chatType": "oneOnOne"})),
+            )
+            .mount(&server)
+            .await;
+        let api = api_for(&server);
+        let info = api.get_chat("CHAT1").await.unwrap();
+        assert_eq!(info.chat_type.as_deref(), Some("oneOnOne"));
+    }
+
+    #[tokio::test]
+    async fn returns_auth_on_401() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/teams/T1/channels/C1/messages"))
+            .respond_with(
+                ResponseTemplate::new(401).set_body_string("Unauthorized"),
+            )
+            .mount(&server)
+            .await;
+        let api = api_for(&server);
+        match api.post_channel_message("T1", "C1", "x", "text").await {
+            Err(AdapterError::Auth(_)) => {}
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_auth_on_403() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/teams/T1/channels/C1/messages"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("Forbidden"))
+            .mount(&server)
+            .await;
+        let api = api_for(&server);
+        match api.post_channel_message("T1", "C1", "x", "text").await {
+            Err(AdapterError::Auth(_)) => {}
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_bad_request_on_404() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/teams/T1/channels/C1/messages"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
+            .mount(&server)
+            .await;
+        let api = api_for(&server);
+        match api.post_channel_message("T1", "C1", "x", "text").await {
+            Err(AdapterError::BadRequest(_)) => {}
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_bad_request_on_400() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/teams/T1/channels/C1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad"))
+            .mount(&server)
+            .await;
+        let api = api_for(&server);
+        match api.post_channel_message("T1", "C1", "x", "text").await {
+            Err(AdapterError::BadRequest(_)) => {}
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_rate_on_429_with_retry_after() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/teams/T1/channels/C1/messages"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "13")
+                    .set_body_string("too many"),
+            )
+            .mount(&server)
+            .await;
+        let api = api_for(&server);
+        match api.post_channel_message("T1", "C1", "x", "text").await {
+            Err(AdapterError::Rate { retry_after }) => assert_eq!(retry_after, Some(13)),
+            other => panic!("expected Rate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_rate_on_429_without_retry_after() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/teams/T1/channels/C1/messages"))
+            .respond_with(ResponseTemplate::new(429).set_body_string("too many"))
+            .mount(&server)
+            .await;
+        let api = api_for(&server);
+        match api.post_channel_message("T1", "C1", "x", "text").await {
+            Err(AdapterError::Rate { retry_after }) => assert_eq!(retry_after, None),
+            other => panic!("expected Rate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn returns_transport_on_5xx() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/teams/T1/channels/C1/messages"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("upstream"))
+            .mount(&server)
+            .await;
+        let api = api_for(&server);
+        match api.post_channel_message("T1", "C1", "x", "text").await {
+            Err(AdapterError::Transport(_)) => {}
+            other => panic!("expected Transport, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_on_unreachable_host() {
+        // 1 is a reserved port that will refuse connections, exercising the
+        // reqwest::Error -> Transport mapping.
+        let api = TeamsApi::new("http://127.0.0.1:1", "tok");
+        match api.post_channel_message("T1", "C1", "x", "text").await {
+            Err(AdapterError::Transport(_)) => {}
+            other => panic!("expected Transport, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_json_body_yields_transport() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/teams/T1/channels/C1/messages"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string("not-json"),
+            )
+            .mount(&server)
+            .await;
+        let api = api_for(&server);
+        match api.post_channel_message("T1", "C1", "x", "text").await {
+            Err(AdapterError::Transport(_)) => {}
+            other => panic!("expected Transport, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn message_id_missing_yields_transport() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/teams/T1/channels/C1/messages"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"foo":"bar"})))
+            .mount(&server)
+            .await;
+        let api = api_for(&server);
+        match api.post_channel_message("T1", "C1", "x", "text").await {
+            Err(AdapterError::Transport(_)) => {}
+            other => panic!("expected Transport, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn api_clone_and_debug() {
+        let api = TeamsApi::new("https://example.test/v1.0", "tok-1");
+        let _ = api.clone();
+        let s = format!("{api:?}");
+        assert!(s.contains("tok-1"));
+    }
+}

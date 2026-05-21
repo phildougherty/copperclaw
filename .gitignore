@@ -1,0 +1,10 @@
+/target
+/data
+*.db
+*.db-shm
+*.db-wal
+.env
+.env.local
+/logs
+**/*.rs.bk
+Cargo.lock.bak

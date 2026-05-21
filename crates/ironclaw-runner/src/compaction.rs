@@ -1,0 +1,467 @@
+//! Context compaction.
+//!
+//! When the input transcript approaches the model's input window the runner
+//! asks the provider to summarise the oldest half of the conversation,
+//! archives the pre-compaction transcript to `outbox/_compactions/<RFC3339>.md`,
+//! and replaces the summarised slice with a synthetic
+//! `HistoryMessage::User { content: "compact_boundary: <summary>" }` entry.
+//!
+//! The strategy is deliberately conservative — "summarise oldest half" is
+//! the cheap, predictable shape we want for the first port. A future iter
+//! may switch to a tokens-based slice; the call site only needs
+//! [`compact`] so we can swap the implementation behind it.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+use chrono::Utc;
+use ironclaw_providers::{AgentProvider, HistoryMessage, QueryInput};
+use ironclaw_types::{Effort, ProviderEvent};
+
+/// Default conservative window we plan against (Claude Sonnet 4.5 / 4.7).
+pub const DEFAULT_INPUT_WINDOW: usize = 200_000;
+/// Default safety margin in tokens before we trigger compaction.
+pub const DEFAULT_SAFETY_MARGIN: usize = 8_000;
+/// System prompt the runner sends to the provider when asking for a summary.
+pub const SUMMARY_SYSTEM_PROMPT: &str =
+    "Summarize the following conversation succinctly. Preserve any decisions, \
+open questions, identifiers, and unresolved tool requests. Be terse.";
+
+/// Tuning knobs for compaction. Defaults match the constants above.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionCfg {
+    /// Total input window of the target model in tokens.
+    pub model_input_window: usize,
+    /// How much headroom to keep below the window. Compaction fires when the
+    /// estimated transcript size exceeds `window - margin`.
+    pub safety_margin_tokens: usize,
+    /// Provider model name to use for the summarisation turn.
+    pub summary_model: String,
+    /// Effort hint for the summarisation turn.
+    pub summary_effort: Effort,
+    /// Max output tokens for the summarisation turn.
+    pub summary_max_tokens: u32,
+    /// Where to archive pre-compaction transcripts. Typically
+    /// `<session_dir>/outbox/_compactions`.
+    pub archive_dir: PathBuf,
+}
+
+impl CompactionCfg {
+    /// True iff `estimated_tokens` has crossed the threshold.
+    #[must_use]
+    pub fn should_compact(&self, estimated_tokens: usize) -> bool {
+        estimated_tokens > self.model_input_window.saturating_sub(self.safety_margin_tokens)
+    }
+}
+
+/// Rough token estimate: 4 characters per token. Counts the textual payload
+/// of each [`HistoryMessage`] variant; tool-use input JSON is rendered as a
+/// compact string for sizing purposes.
+#[must_use]
+pub fn estimate_tokens(messages: &[HistoryMessage]) -> usize {
+    let mut chars: usize = 0;
+    for m in messages {
+        chars += chars_of(m);
+    }
+    chars / 4
+}
+
+fn chars_of(m: &HistoryMessage) -> usize {
+    match m {
+        HistoryMessage::User { content } | HistoryMessage::Assistant { content } => {
+            content.chars().count()
+        }
+        HistoryMessage::ToolUse { id, name, input } => {
+            id.chars().count() + name.chars().count() + input.to_string().chars().count()
+        }
+        HistoryMessage::Tool {
+            tool_use_id,
+            content,
+            is_error: _,
+        } => tool_use_id.chars().count() + content.chars().count(),
+    }
+}
+
+/// Replace the oldest half of `history` with a single summarised user-side
+/// `compact_boundary` entry. Writes the pre-compaction transcript to
+/// `cfg.archive_dir/<RFC3339>.md` as a side effect.
+///
+/// If `history.len() < 4` the function is a no-op and returns the input
+/// unchanged — there isn't enough material to summarise meaningfully.
+pub async fn compact(
+    history: Vec<HistoryMessage>,
+    provider: &dyn AgentProvider,
+    cfg: &CompactionCfg,
+) -> Result<Vec<HistoryMessage>> {
+    if history.len() < 4 {
+        return Ok(history);
+    }
+    let pivot = history.len() / 2;
+    let oldest = history[..pivot].to_vec();
+    let newest = history[pivot..].to_vec();
+
+    write_archive(&cfg.archive_dir, &history)
+        .with_context(|| format!("archive transcript to {}", cfg.archive_dir.display()))?;
+
+    let summary = summarise(provider, cfg, oldest).await?;
+
+    let mut out = Vec::with_capacity(newest.len() + 1);
+    out.push(HistoryMessage::User {
+        content: format!("compact_boundary: {summary}"),
+    });
+    out.extend(newest);
+    Ok(out)
+}
+
+/// Drive one summarisation turn against the provider, collecting the final
+/// [`ProviderEvent::Result`] text into a string.
+async fn summarise(
+    provider: &dyn AgentProvider,
+    cfg: &CompactionCfg,
+    oldest: Vec<HistoryMessage>,
+) -> Result<String> {
+    let input = QueryInput {
+        system: SUMMARY_SYSTEM_PROMPT.into(),
+        model: cfg.summary_model.clone(),
+        effort: cfg.summary_effort,
+        previous_continuation: None,
+        history: oldest,
+        tools: Vec::new(),
+        max_tokens: cfg.summary_max_tokens,
+        temperature: Some(0.0),
+        assistant_name: None,
+        display_name: None,
+    };
+    let mut query = provider
+        .query(input)
+        .await
+        .context("summarisation provider query failed")?;
+    let mut summary = String::new();
+    while let Some(event) = query.next_event().await {
+        match event {
+            ProviderEvent::Result { text } => {
+                if let Some(t) = text {
+                    summary.push_str(&t);
+                }
+                break;
+            }
+            ProviderEvent::Error { message, .. } => {
+                anyhow::bail!("summarisation error from provider: {message}");
+            }
+            _ => continue,
+        }
+    }
+    if summary.trim().is_empty() {
+        anyhow::bail!("provider returned an empty summary");
+    }
+    Ok(summary)
+}
+
+fn write_archive(dir: &Path, history: &[HistoryMessage]) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let stamp = Utc::now().to_rfc3339();
+    let safe = stamp.replace(':', "-");
+    let target = dir.join(format!("{safe}.md"));
+    let mut body = String::new();
+    body.push_str("# Compaction archive\n\n");
+    body.push_str("Archived at ");
+    body.push_str(&stamp);
+    body.push_str("\n\n");
+    for (i, m) in history.iter().enumerate() {
+        body.push_str(&format!("## {i}. "));
+        match m {
+            HistoryMessage::User { content } => {
+                body.push_str("user\n\n");
+                body.push_str(content);
+            }
+            HistoryMessage::Assistant { content } => {
+                body.push_str("assistant\n\n");
+                body.push_str(content);
+            }
+            HistoryMessage::ToolUse { id, name, input } => {
+                body.push_str("tool_use\n\n");
+                body.push_str(&format!("id: {id}\nname: {name}\ninput: {input}"));
+            }
+            HistoryMessage::Tool {
+                tool_use_id,
+                content,
+                is_error,
+            } => {
+                body.push_str("tool_result\n\n");
+                body.push_str(&format!(
+                    "tool_use_id: {tool_use_id}\nis_error: {is_error}\n\n{content}"
+                ));
+            }
+        }
+        body.push_str("\n\n");
+    }
+    std::fs::write(&target, body)?;
+    Ok(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use ironclaw_providers::{AgentProvider, AgentQuery, ProviderError};
+    use std::sync::Mutex;
+
+    fn cfg_with_dir(dir: PathBuf) -> CompactionCfg {
+        CompactionCfg {
+            model_input_window: 200_000,
+            safety_margin_tokens: 8_000,
+            summary_model: "claude-sonnet-4-5".into(),
+            summary_effort: Effort::Low,
+            summary_max_tokens: 1024,
+            archive_dir: dir,
+        }
+    }
+
+    #[test]
+    fn should_compact_threshold() {
+        let cfg = cfg_with_dir(PathBuf::from("/tmp/x"));
+        assert!(!cfg.should_compact(100));
+        assert!(!cfg.should_compact(192_000));
+        assert!(cfg.should_compact(192_001));
+        assert!(cfg.should_compact(1_000_000));
+    }
+
+    #[test]
+    fn should_compact_when_margin_exceeds_window() {
+        let cfg = CompactionCfg {
+            model_input_window: 100,
+            safety_margin_tokens: 500,
+            ..cfg_with_dir(PathBuf::from("/tmp"))
+        };
+        // saturating_sub keeps threshold at 0; any positive estimate compacts.
+        assert!(cfg.should_compact(1));
+    }
+
+    #[test]
+    fn estimate_tokens_for_simple_text() {
+        let h = vec![HistoryMessage::User {
+            content: "a".repeat(8),
+        }];
+        assert_eq!(estimate_tokens(&h), 2);
+    }
+
+    #[test]
+    fn estimate_tokens_handles_all_variants() {
+        let h = vec![
+            HistoryMessage::User { content: "abcd".into() },
+            HistoryMessage::Assistant { content: "wxyz".into() },
+            HistoryMessage::ToolUse {
+                id: "tu_1".into(),
+                name: "tool".into(),
+                input: serde_json::json!({"k": "v"}),
+            },
+            HistoryMessage::Tool {
+                tool_use_id: "tu_1".into(),
+                content: "result".into(),
+                is_error: false,
+            },
+        ];
+        // Just sanity-check that we got a positive number and didn't panic.
+        assert!(estimate_tokens(&h) > 0);
+    }
+
+    #[test]
+    fn estimate_tokens_empty() {
+        assert_eq!(estimate_tokens(&[]), 0);
+    }
+
+    /// Provider stub that returns a canned summary text.
+    struct StubProvider {
+        canned_summary: String,
+    }
+
+    #[async_trait]
+    impl AgentProvider for StubProvider {
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+        async fn query(
+            &self,
+            _input: QueryInput,
+        ) -> Result<Box<dyn AgentQuery>, ProviderError> {
+            Ok(Box::new(StubQuery {
+                events: Mutex::new(vec![
+                    ProviderEvent::Init {
+                        continuation: "c1".into(),
+                    },
+                    ProviderEvent::Result {
+                        text: Some(self.canned_summary.clone()),
+                    },
+                ]),
+            }))
+        }
+        fn is_session_invalid(&self, _err: &ProviderError) -> bool {
+            false
+        }
+    }
+
+    /// Provider stub that returns an Error event.
+    struct ErrorProvider;
+
+    #[async_trait]
+    impl AgentProvider for ErrorProvider {
+        fn name(&self) -> &'static str {
+            "err"
+        }
+        async fn query(
+            &self,
+            _input: QueryInput,
+        ) -> Result<Box<dyn AgentQuery>, ProviderError> {
+            Ok(Box::new(StubQuery {
+                events: Mutex::new(vec![ProviderEvent::Error {
+                    message: "synthetic".into(),
+                    retryable: false,
+                }]),
+            }))
+        }
+        fn is_session_invalid(&self, _err: &ProviderError) -> bool {
+            false
+        }
+    }
+
+    struct StubQuery {
+        events: Mutex<Vec<ProviderEvent>>,
+    }
+
+    #[async_trait]
+    impl AgentQuery for StubQuery {
+        async fn push(&mut self, _message: String) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<ProviderEvent> {
+            let mut g = self.events.lock().unwrap();
+            if g.is_empty() {
+                None
+            } else {
+                Some(g.remove(0))
+            }
+        }
+        async fn abort(&mut self) {}
+    }
+
+    fn long_history(n: usize) -> Vec<HistoryMessage> {
+        (0..n)
+            .map(|i| HistoryMessage::User {
+                content: format!("msg-{i}"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn compact_replaces_oldest_half_with_summary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_dir(tmp.path().to_path_buf());
+        let provider = StubProvider {
+            canned_summary: "SUMMARY".into(),
+        };
+        let h = long_history(8);
+        let out = compact(h, &provider, &cfg).await.unwrap();
+        assert_eq!(out.len(), 5);
+        match &out[0] {
+            HistoryMessage::User { content } => {
+                assert!(content.starts_with("compact_boundary: "));
+                assert!(content.contains("SUMMARY"));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_archives_transcript_to_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_dir(tmp.path().to_path_buf());
+        let provider = StubProvider {
+            canned_summary: "S".into(),
+        };
+        let _ = compact(long_history(4), &provider, &cfg).await.unwrap();
+        // At least one archive file landed in the directory.
+        let files: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(!files.is_empty(), "expected an archive file");
+        // And it has the markdown shape we wrote.
+        let body = std::fs::read_to_string(files[0].path()).unwrap();
+        assert!(body.starts_with("# Compaction archive"));
+    }
+
+    #[tokio::test]
+    async fn compact_noop_for_tiny_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_dir(tmp.path().to_path_buf());
+        let provider = StubProvider {
+            canned_summary: "S".into(),
+        };
+        let h = long_history(3);
+        let out = compact(h.clone(), &provider, &cfg).await.unwrap();
+        assert_eq!(out, h);
+    }
+
+    #[tokio::test]
+    async fn compact_propagates_provider_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_dir(tmp.path().to_path_buf());
+        let provider = ErrorProvider;
+        let err = compact(long_history(8), &provider, &cfg)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("synthetic"));
+    }
+
+    #[tokio::test]
+    async fn compact_errors_on_empty_summary() {
+        struct EmptyProvider;
+        #[async_trait]
+        impl AgentProvider for EmptyProvider {
+            fn name(&self) -> &'static str {
+                "empty"
+            }
+            async fn query(
+                &self,
+                _input: QueryInput,
+            ) -> Result<Box<dyn AgentQuery>, ProviderError> {
+                Ok(Box::new(StubQuery {
+                    events: Mutex::new(vec![ProviderEvent::Result {
+                        text: Some(String::new()),
+                    }]),
+                }))
+            }
+            fn is_session_invalid(&self, _err: &ProviderError) -> bool {
+                false
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_dir(tmp.path().to_path_buf());
+        let err = compact(long_history(8), &EmptyProvider, &cfg)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("empty summary"));
+    }
+
+    #[test]
+    fn summary_system_prompt_is_non_empty() {
+        // Static assertion: a runtime check on a const string is optimised
+        // out, so encode the invariant in `const _: () =`.
+        const _: () = assert!(!SUMMARY_SYSTEM_PROMPT.is_empty());
+        // And give the test something dynamic to look at so the test is
+        // visible in coverage reports.
+        let copy = SUMMARY_SYSTEM_PROMPT.to_string();
+        assert_eq!(copy, SUMMARY_SYSTEM_PROMPT);
+    }
+
+    #[test]
+    fn default_constants_are_positive() {
+        const _: () = assert!(DEFAULT_INPUT_WINDOW > DEFAULT_SAFETY_MARGIN);
+        // Runtime touch so the symbols are referenced from the test binary.
+        let _ = DEFAULT_INPUT_WINDOW.to_string();
+        let _ = DEFAULT_SAFETY_MARGIN.to_string();
+    }
+}

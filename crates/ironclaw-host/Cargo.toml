@@ -1,0 +1,69 @@
+[package]
+name = "ironclaw-host"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "ironclaw_host"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ironclaw"
+path = "src/main.rs"
+
+[dependencies]
+ironclaw-types         = { workspace = true }
+ironclaw-db            = { workspace = true }
+ironclaw-container-rt  = { workspace = true }
+ironclaw-host-router   = { workspace = true }
+ironclaw-host-delivery = { workspace = true }
+ironclaw-host-sweep    = { workspace = true }
+ironclaw-channels-core = { workspace = true }
+ironclaw-channels-cli  = { workspace = true }
+ironclaw-channels-telegram = { workspace = true }
+ironclaw-channels-slack    = { workspace = true }
+ironclaw-channels-discord  = { workspace = true }
+ironclaw-channels-resend   = { workspace = true }
+ironclaw-channels-github   = { workspace = true }
+ironclaw-channels-linear   = { workspace = true }
+ironclaw-channels-webex    = { workspace = true }
+ironclaw-channels-matrix   = { workspace = true }
+ironclaw-channels-teams    = { workspace = true }
+ironclaw-channels-gchat    = { workspace = true }
+ironclaw-channels-imessage = { workspace = true }
+ironclaw-channels-wechat   = { workspace = true }
+ironclaw-channels-whatsapp-cloud = { workspace = true }
+ironclaw-channels-whatsapp = { workspace = true }
+ironclaw-channels-signal   = { workspace = true }
+ironclaw-channels-deltachat = { workspace = true }
+ironclaw-channels-emacs    = { workspace = true }
+ironclaw-channels-x        = { workspace = true }
+ironclaw-modules       = { workspace = true }
+ironclaw-skills        = { workspace = true }
+ironclaw-onecli        = { workspace = true }
+ironclaw-iclaw           = { path = "../ironclaw-iclaw" }
+tokio                  = { workspace = true }
+tokio-util             = "0.7"
+tracing                = { workspace = true }
+tracing-subscriber     = { workspace = true }
+anyhow                 = { workspace = true }
+clap                   = { workspace = true }
+dotenvy                = { workspace = true }
+chrono                 = { workspace = true }
+serde                  = { workspace = true }
+serde_json             = { workspace = true }
+dashmap                = { workspace = true }
+async-trait            = { workspace = true }
+thiserror              = { workspace = true }
+uuid                   = { workspace = true }
+rusqlite               = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+ironclaw-iclaw = { path = "../ironclaw-iclaw" }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

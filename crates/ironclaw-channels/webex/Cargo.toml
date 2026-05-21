@@ -1,0 +1,35 @@
+[package]
+name = "ironclaw-channels-webex"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+ironclaw-types = { workspace = true }
+ironclaw-channels-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true, features = ["json", "multipart"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+bytes = { workspace = true }
+sha2 = { workspace = true }
+sha1 = "0.10"
+hex = { workspace = true }
+hmac = "0.12"
+subtle = "2"
+
+[dev-dependencies]
+wiremock = "=0.6.2"
+tempfile = "3"
+
+[lints]
+workspace = true
