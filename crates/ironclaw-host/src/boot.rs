@@ -228,6 +228,10 @@ pub async fn run_host(
         warn!(?err, "orphan cleanup failed; continuing boot");
     }
 
+    // 6b. Optional Prometheus metrics endpoint. Reads IRONCLAW_METRICS_ADDR;
+    // no-ops when unset. Warns on bind failure but does not abort boot.
+    ironclaw_metrics::maybe_start_server(Some(shutdown.clone())).await;
+
     // 7. Build channel registry.
     let registry = build_registry();
 

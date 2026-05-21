@@ -6,10 +6,11 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-ironclaw-types = { workspace = true }
-ironclaw-db = { workspace = true }
+ironclaw-types         = { workspace = true }
+ironclaw-db            = { workspace = true }
 ironclaw-channels-core = { workspace = true }
-ironclaw-modules = { workspace = true }
+ironclaw-modules       = { workspace = true }
+ironclaw-metrics       = { workspace = true }
 rusqlite = { workspace = true }
 tokio = { workspace = true }
 tokio-util = "0.7"

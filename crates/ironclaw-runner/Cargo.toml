@@ -14,10 +14,11 @@ name = "ironclaw_runner"
 path = "src/lib.rs"
 
 [dependencies]
-ironclaw-types = { workspace = true }
-ironclaw-db = { workspace = true }
+ironclaw-types    = { workspace = true }
+ironclaw-db       = { workspace = true }
 ironclaw-providers = { workspace = true }
-ironclaw-mcp = { workspace = true }
+ironclaw-mcp      = { workspace = true }
+ironclaw-metrics  = { workspace = true }
 rmcp = { workspace = true, features = ["server"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
