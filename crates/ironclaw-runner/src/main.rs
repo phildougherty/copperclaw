@@ -14,7 +14,8 @@ use clap::Parser;
 use ironclaw_db::session::{open_inbound_rw_no_mmap, open_outbound, SessionPaths};
 use ironclaw_providers::AnthropicProvider;
 use ironclaw_runner::{
-    compaction::CompactionCfg, run_loop, RunnerConfig, RunnerDeps, RunnerToolCtx,
+    compaction::CompactionCfg, resolve_provider_deadline, run_loop, RunnerConfig, RunnerDeps,
+    RunnerToolCtx,
 };
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
@@ -136,6 +137,7 @@ async fn main() -> Result<()> {
         turn_seq: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         tool_map,
         max_tool_turns: 20,
+        provider_deadline: resolve_provider_deadline(&env),
     };
 
     tracing::info!(

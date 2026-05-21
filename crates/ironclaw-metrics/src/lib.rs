@@ -38,6 +38,8 @@
 //! | Histogram | `ironclaw_llm_tokens_input`        | —              |
 //! | Histogram | `ironclaw_llm_tokens_output`       | —              |
 //! | Histogram | `ironclaw_container_spawn_seconds` | —              |
+//! | Counter   | `ironclaw_provider_deadline_total` | `provider`     |
+//! | Counter   | `ironclaw_provider_retry_total`    | `provider`     |
 
 use metrics::{counter, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -60,6 +62,8 @@ pub const LLM_CALL_SECONDS: &str = "ironclaw_llm_call_seconds";
 pub const LLM_TOKENS_INPUT: &str = "ironclaw_llm_tokens_input";
 pub const LLM_TOKENS_OUTPUT: &str = "ironclaw_llm_tokens_output";
 pub const CONTAINER_SPAWN_SECONDS: &str = "ironclaw_container_spawn_seconds";
+pub const PROVIDER_DEADLINE_TOTAL: &str = "ironclaw_provider_deadline_total";
+pub const PROVIDER_RETRY_TOTAL: &str = "ironclaw_provider_retry_total";
 
 // ── Counter helpers ────────────────────────────────────────────────────────
 
@@ -102,6 +106,21 @@ pub fn inc_secrets_rotated() {
 /// Increment `ironclaw_delivery_failed_total{channel_type=<ct>}`.
 pub fn inc_delivery_failed(channel_type: &str) {
     counter!(DELIVERY_FAILED_TOTAL, "channel_type" => channel_type.to_owned()).increment(1);
+}
+
+/// Increment `ironclaw_provider_deadline_total{provider=<p>}`. Fired by
+/// the runner each time the per-LLM-call deadline trips AND all retries
+/// have been exhausted — i.e. the inbound is about to be marked failed.
+pub fn inc_provider_deadline(provider: &str) {
+    counter!(PROVIDER_DEADLINE_TOTAL, "provider" => provider.to_owned()).increment(1);
+}
+
+/// Increment `ironclaw_provider_retry_total{provider=<p>}`. Fired by the
+/// runner each time it backs off and re-issues a `provider.query()`
+/// call after a retryable failure (5xx, transport, overloaded, or
+/// per-call timeout).
+pub fn inc_provider_retry(provider: &str) {
+    counter!(PROVIDER_RETRY_TOTAL, "provider" => provider.to_owned()).increment(1);
 }
 
 // ── Histogram helpers ──────────────────────────────────────────────────────
@@ -417,6 +436,8 @@ mod tests {
         inc_delivery_failed("slack");
         inc_image_rebuild_failed();
         inc_secrets_rotated();
+        inc_provider_deadline("anthropic");
+        inc_provider_retry("anthropic");
     }
 
     #[test]
@@ -443,6 +464,8 @@ mod tests {
             LLM_TOKENS_INPUT,
             LLM_TOKENS_OUTPUT,
             CONTAINER_SPAWN_SECONDS,
+            PROVIDER_DEADLINE_TOTAL,
+            PROVIDER_RETRY_TOTAL,
         ];
         for name in names {
             assert!(

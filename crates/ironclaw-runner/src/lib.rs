@@ -26,6 +26,10 @@ pub use config::{RunnerConfig, RunnerConfigFile};
 pub use destinations::{resolve_recipient, ResolvedRoute};
 pub use disallowed::{is_disallowed, DISALLOWED_TOOLS};
 pub use formatter::{format_messages, FormattedTurn};
-pub use run::{run_loop, RunnerDeps, POLL_INTERVAL_MS, ACTIVE_POLL_INTERVAL_MS};
+pub use run::{
+    resolve_provider_deadline, run_loop, RunnerDeps, ACTIVE_POLL_INTERVAL_MS,
+    DEFAULT_PROVIDER_DEADLINE_MS, MAX_PROVIDER_DEADLINE_MS, MIN_PROVIDER_DEADLINE_MS,
+    POLL_INTERVAL_MS, PROVIDER_DEADLINE_ENV,
+};
 pub use state::{load_state, save_state, PersistedState};
 pub use tools::RunnerToolCtx;

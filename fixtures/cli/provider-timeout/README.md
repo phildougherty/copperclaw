@@ -1,10 +1,14 @@
 ## cli / provider-timeout
 
-Simulates the upstream LLM hanging past the configured per-call budget.
-Expected behaviour: the runner gives up after the cap, marks the inbound
-`failed`, and emits no chat outbound.
+Simulates the upstream LLM hanging past the runner's per-call deadline.
+The runner retries up to `MAX_PROVIDER_ATTEMPTS = 3` times (each
+attempt wrapped in `tokio::time::timeout(provider_deadline, ...)`),
+exhausts the retry budget, marks the inbound `failed`, and emits no
+chat outbound.
 
-Gap: the runner has no per-`provider.query()` deadline today — only the
-provider's own 600s reqwest client timeout. This fixture is `#[ignore]`d
-in `replay.rs` until a runner-side deadline is added; the data pins the
-post-timeout shape so flipping the gate is one un-ignore away.
+The wiremock plan lists three `kind=timeout` responses (one per
+attempt). Each `delay_ms` exceeds the harness-side deadline so every
+attempt trips. In production the deadline is sourced from
+`IRONCLAW_RUNNER_PROVIDER_DEADLINE_MS` (default 60s, range 30-300s);
+the replay harness sets a much smaller value so the fixture finishes
+in well under a second.
