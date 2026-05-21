@@ -72,3 +72,23 @@ async fn slack_event_message_round_trip() {
 async fn cli_multi_turn_round_trip() {
     run_fixture("cli", "multi-turn").await;
 }
+
+#[tokio::test]
+async fn discord_inbound_message_round_trip() {
+    run_fixture("discord", "inbound-message").await;
+}
+
+#[tokio::test]
+async fn matrix_room_message_round_trip() {
+    run_fixture("matrix", "room-message").await;
+}
+
+#[tokio::test]
+async fn github_webhook_issue_comment_round_trip() {
+    run_fixture("github", "webhook-issue-comment").await;
+}
+
+#[tokio::test]
+async fn webhooks_generic_hmac_round_trip() {
+    run_fixture("webhooks", "generic-hmac").await;
+}

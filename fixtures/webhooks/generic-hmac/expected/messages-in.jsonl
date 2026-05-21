@@ -1,0 +1,1 @@
+{"id":"<UUID>","seq":2,"kind":"webhook","timestamp":"<TS>","status":"completed","process_after":null,"recurrence":null,"series_id":null,"tries":0,"trigger":true,"platform_id":"grafana","channel_type":"webhooks","thread_id":null,"content":{"alertname":"HighErrorRate","status":"firing","labels":{"severity":"warning","service":"api"}},"source_session_id":null,"on_wake":false}

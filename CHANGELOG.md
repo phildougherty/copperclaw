@@ -73,6 +73,20 @@ adheres to [Semantic Versioning](https://semver.org/).
   installer would fetch and exits 0; `IRONCLAW_FORCE_TARGET=<triple>`
   overrides platform detection for the URL test.
 
+### Added (replay fixture coverage — round 2)
+
+- **Four new replay fixtures** under `fixtures/`, lifting in-tree
+  coverage from 3 channel types to 7:
+  `discord/inbound-message/` (Discord guild-channel message),
+  `matrix/room-message/` (Matrix `m.room.message` `m.text`),
+  `github/webhook-issue-comment/` (GitHub `issue_comment.created`),
+  and `webhooks/generic-hmac/` (generic HMAC-signed webhook, e.g.
+  Grafana / Stripe / Sentry style). Each runs through the existing
+  in-process `ReplayHarness` in `crates/ironclaw-host/tests/replay.rs`
+  via four new `#[tokio::test]` entries, exercising the inbound ->
+  router -> runner -> outbound -> delivery pipeline for those channel
+  types against the harness's per-channel-type `MockAdapter`s.
+
 ### Added (replay fixture coverage)
 
 - **Three new replay fixtures** under `fixtures/`:
