@@ -92,3 +92,8 @@ async fn github_webhook_issue_comment_round_trip() {
 async fn webhooks_generic_hmac_round_trip() {
     run_fixture("webhooks", "generic-hmac").await;
 }
+
+#[tokio::test]
+async fn cli_tool_use_shell() {
+    run_fixture("cli", "tool-use-shell").await;
+}

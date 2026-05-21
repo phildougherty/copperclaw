@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (replay-fixture coverage for tool-use loop)
+
+- **`fixtures/cli/tool-use-shell/`** — new replay fixture that drives
+  one CLI inbound (`run 'echo hello'`) through the runner's tool-use
+  outer loop. Two Claude turns: turn 1 is a `tool_use` content block
+  requesting the `shell` tool with `command: "echo hello"`; the runner
+  executes real bash, feeds the `tool_result` back; turn 2 streams the
+  final assistant text. Asserts the full inbound → router → runner →
+  outbound → delivery pipeline still completes when the model uses a
+  tool mid-turn. Backed by `cli_tool_use_shell` in
+  `crates/ironclaw-host/tests/replay.rs`. No harness changes were
+  needed: `mount_claude_turns` already dispenses pre-recorded turns
+  sequentially across all LLM calls (not just one per inbound).
+
 ### Added (E2E chat round-trip integration test)
 
 - **`crates/ironclaw-host/tests/e2e_chat.rs`** — boots
