@@ -411,7 +411,7 @@ fn spawn_container_manager(
         default_model: cfg
             .default_model
             .clone()
-            .unwrap_or_else(|| "claude-sonnet-4-5".into()),
+            .unwrap_or_else(|| "claude-sonnet-4-6".into()),
         anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
         anthropic_base_url: std::env::var("ANTHROPIC_BASE_URL").ok(),
         idle_timeout_secs: crate::container_manager::DEFAULT_IDLE_TIMEOUT_SECS,

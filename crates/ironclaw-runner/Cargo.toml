@@ -18,6 +18,7 @@ ironclaw-types = { workspace = true }
 ironclaw-db = { workspace = true }
 ironclaw-providers = { workspace = true }
 ironclaw-mcp = { workspace = true }
+rmcp = { workspace = true, features = ["server"] }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

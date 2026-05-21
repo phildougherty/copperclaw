@@ -62,7 +62,7 @@ pub enum HistoryMessage {
 pub struct QueryInput {
     /// System prompt prepended to every turn.
     pub system: String,
-    /// Provider-native model identifier (e.g. `claude-sonnet-4-5`).
+    /// Provider-native model identifier (e.g. `claude-sonnet-4-6`).
     pub model: String,
     /// Tier-of-effort hint.
     pub effort: Effort,
@@ -133,9 +133,9 @@ mod tests {
 
     #[test]
     fn new_sets_system_and_model() {
-        let q = QueryInput::new("you are helpful", "claude-sonnet-4-5");
+        let q = QueryInput::new("you are helpful", "claude-sonnet-4-6");
         assert_eq!(q.system, "you are helpful");
-        assert_eq!(q.model, "claude-sonnet-4-5");
+        assert_eq!(q.model, "claude-sonnet-4-6");
     }
 
     #[test]

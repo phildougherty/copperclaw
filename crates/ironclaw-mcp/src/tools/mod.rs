@@ -19,6 +19,7 @@ use crate::context::{ToolContext, ToolEffectAck};
 use crate::error::ToolError;
 
 pub mod agents;
+pub mod computer_use;
 pub mod core;
 pub mod interactive;
 pub mod scheduling;
@@ -43,7 +44,11 @@ pub trait ToolHandler: Send + Sync {
     ) -> Result<CallToolResult, ToolError>;
 }
 
-/// Build the full set of 15 tools, in the order described in `PLAN.md`.
+/// Build the full set of in-process tools the agent can call. Order
+/// matches `PLAN.md` § 7 (messaging → interactive → agents → self-
+/// mod → scheduling), with the new `computer_use` family appended.
+/// Adding a tool here exposes it to the model on the *next* container
+/// spawn — no schema migration, no other wiring.
 pub fn build_tool_set() -> Vec<ToolEntry> {
     vec![
         core::send_message::entry(),
@@ -61,6 +66,10 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         scheduling::pause_task::entry(),
         scheduling::resume_task::entry(),
         scheduling::update_task::entry(),
+        computer_use::shell::entry(),
+        computer_use::read_file::entry(),
+        computer_use::write_file::entry(),
+        computer_use::web_fetch::entry(),
     ]
 }
 
@@ -121,11 +130,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tool_set_has_fifteen_tools() {
+    fn tool_set_lists_every_in_process_tool() {
         let set = build_tool_set();
-        assert_eq!(set.len(), 15);
         let names: Vec<&str> = set.iter().map(|t| t.tool.name.as_ref()).collect();
-        for expected in [
+        // Messaging core + interactive + agents + self-mod +
+        // scheduling + computer_use. Each name listed exactly once.
+        let expected: Vec<&str> = vec![
             "send_message",
             "send_file",
             "edit_message",
@@ -141,18 +151,24 @@ mod tests {
             "pause_task",
             "resume_task",
             "update_task",
-        ] {
+            "shell",
+            "read_file",
+            "write_file",
+            "web_fetch",
+        ];
+        assert_eq!(set.len(), expected.len());
+        for tool in &expected {
             assert!(
-                names.contains(&expected),
-                "missing tool: {expected} in {names:?}"
+                names.contains(tool),
+                "missing tool: {tool} in {names:?}"
             );
         }
     }
 
     #[test]
-    fn tool_map_has_unique_names() {
+    fn tool_map_keys_match_tool_set_count() {
         let m = build_tool_map();
-        assert_eq!(m.len(), 15);
+        assert_eq!(m.len(), build_tool_set().len());
     }
 
     #[test]

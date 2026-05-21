@@ -32,7 +32,7 @@ fn expect_query_err<T>(r: Result<T, ProviderError>) -> ProviderError {
 }
 
 fn basic_input() -> QueryInput {
-    let mut q = QueryInput::new("you are helpful", "claude-sonnet-4-5");
+    let mut q = QueryInput::new("you are helpful", "claude-sonnet-4-6");
     q.history.push(HistoryMessage::User { content: "hi".into() });
     q
 }

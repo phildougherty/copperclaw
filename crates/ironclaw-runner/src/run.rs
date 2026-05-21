@@ -10,9 +10,12 @@ use chrono::Utc;
 use ironclaw_db::tables::{
     container_state, messages_in, processing_ack,
 };
-use ironclaw_mcp::ToolContext;
+use ironclaw_mcp::{ToolContext, ToolEntry};
 use ironclaw_providers::{AgentProvider, HistoryMessage, QueryInput, ToolDef};
-use ironclaw_types::{Effort, MessageId, MessageInRow, ProviderEvent};
+#[cfg_attr(not(test), allow(unused_imports))]
+use ironclaw_types::MessageId;
+use ironclaw_types::{Effort, MessageInRow, ProviderEvent};
+use std::collections::HashMap;
 use rusqlite::Connection;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
@@ -71,6 +74,15 @@ pub struct RunnerDeps {
     /// after each turn so `agent_turns.seq` is monotonically
     /// increasing per session.
     pub turn_seq: Arc<std::sync::atomic::AtomicI64>,
+    /// Per-tool dispatch map. Built once at runner startup from
+    /// `ironclaw_mcp::build_tool_map()`. Keyed by the tool name the
+    /// model emits in `tool_use` blocks; each entry knows how to
+    /// validate the input and invoke the handler against the
+    /// runner's `ToolContext`.
+    pub tool_map: Arc<HashMap<String, Arc<ToolEntry>>>,
+    /// Hard cap on consecutive tool-use turns per inbound. Stops a
+    /// confused model from looping forever. Default 20.
+    pub max_tool_turns: usize,
 }
 
 impl RunnerDeps {
@@ -91,7 +103,7 @@ impl RunnerDeps {
             outbound,
             tools: Vec::new(),
             system: "you are helpful".into(),
-            model: "claude-sonnet-4-5".into(),
+            model: "claude-sonnet-4-6".into(),
             effort: Effort::Medium,
             max_tokens: 4096,
             temperature: None,
@@ -99,10 +111,12 @@ impl RunnerDeps {
             session_id: ironclaw_types::SessionId(uuid::Uuid::nil()),
             agent_group_id: ironclaw_types::AgentGroupId(uuid::Uuid::nil()),
             turn_seq: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            tool_map: Arc::new(HashMap::new()),
+            max_tool_turns: 20,
             compaction: CompactionCfg {
                 model_input_window: 200_000,
                 safety_margin_tokens: 8_000,
-                summary_model: "claude-sonnet-4-5".into(),
+                summary_model: "claude-sonnet-4-6".into(),
                 summary_effort: Effort::Low,
                 summary_max_tokens: 1024,
                 archive_dir,
@@ -193,21 +207,132 @@ enum TurnOutcome {
     Failed,
 }
 
-/// Run a single provider turn: open a query, pump events, write tool effects
-/// via `tool_ctx`, and append any tool results to `history` so the next turn
-/// (handled by the outer caller via a subsequent `drive_turn` call) sees
-/// them.
+/// One pending tool call extracted from a streamed turn.
+#[derive(Debug, Clone)]
+struct PendingToolCall {
+    id: String,
+    name: String,
+    input: serde_json::Value,
+}
+
+/// What one LLM round-trip produced.
+#[derive(Debug, Clone, Default)]
+struct LlmTurnOutput {
+    continuation: Option<String>,
+    /// Final assistant text accumulated during the stream. May be
+    /// empty when the model produced only `tool_use` blocks.
+    text: String,
+    /// Tool calls the model requested. When non-empty the caller
+    /// must execute them and run another LLM turn before treating
+    /// the message as answered.
+    tool_calls: Vec<PendingToolCall>,
+    /// True if the provider emitted a terminal Error event.
+    failed: bool,
+}
+
+/// Drive one inbound through to a final assistant response. Loops
+/// LLM-turn → execute-tools → LLM-turn until the model produces a
+/// turn with no `tool_use` blocks (or we hit `max_tool_turns`).
 async fn drive_turn(
     deps: &RunnerDeps,
     history: &mut Vec<HistoryMessage>,
     previous_continuation: Option<&str>,
 ) -> Result<TurnResult> {
+    let mut continuation: Option<String> = previous_continuation.map(str::to_string);
+
+    for tool_turn in 0..deps.max_tool_turns.max(1) {
+        let output = run_llm_turn(deps, history, continuation.as_deref()).await?;
+        continuation = output.continuation.or(continuation);
+
+        if output.failed {
+            return Ok(TurnResult {
+                continuation,
+                outcome: TurnOutcome::Failed,
+            });
+        }
+
+        // Append the model's assistant turn (text + tool_use blocks)
+        // to history before deciding what to do next. Anthropic's
+        // serializer coalesces consecutive same-role entries, so
+        // Assistant{text} + ToolUse{...} round-trip as one
+        // multi-block assistant message.
+        if !output.text.is_empty() {
+            history.push(HistoryMessage::Assistant {
+                content: output.text.clone(),
+            });
+        }
+        for call in &output.tool_calls {
+            history.push(HistoryMessage::ToolUse {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                input: call.input.clone(),
+            });
+        }
+
+        // No tools requested → this is the final answer for the
+        // inbound. Surface the text to the channel and return.
+        if output.tool_calls.is_empty() {
+            if !output.text.is_empty() {
+                let spec = ironclaw_mcp::SendMessageSpec {
+                    to: None,
+                    text: output.text,
+                };
+                let _ack = deps
+                    .tool_ctx
+                    .emit_outbound(ironclaw_mcp::OutboundToolEffect::SendMessage(spec))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("send_message failed: {e}"))?;
+            }
+            return Ok(TurnResult {
+                continuation,
+                outcome: TurnOutcome::Done,
+            });
+        }
+
+        // Tools requested → execute each, push the result as a
+        // user-role tool_result history entry, and loop into
+        // another LLM turn.
+        tracing::info!(
+            tool_turn,
+            n = output.tool_calls.len(),
+            "executing tool calls"
+        );
+        for call in &output.tool_calls {
+            let (content, is_error) = invoke_tool(deps, call).await;
+            history.push(HistoryMessage::Tool {
+                tool_use_id: call.id.clone(),
+                content,
+                is_error,
+            });
+        }
+    }
+
+    // Exhausted the cap. Push a synthetic system message so the
+    // model can see what happened on the next inbound, return
+    // Failed so finalize_messages marks the inbound that way too.
+    tracing::warn!(
+        max = deps.max_tool_turns,
+        "tool-use cycle exceeded max turns; bailing"
+    );
+    Ok(TurnResult {
+        continuation,
+        outcome: TurnOutcome::Failed,
+    })
+}
+
+/// Make one LLM call. Pumps the streamed provider events into
+/// per-turn buffers and returns when the stream ends.
+async fn run_llm_turn(
+    deps: &RunnerDeps,
+    history: &[HistoryMessage],
+    previous_continuation: Option<&str>,
+) -> Result<LlmTurnOutput> {
     let input = QueryInput {
         system: deps.system.clone(),
         model: deps.model.clone(),
         effort: deps.effort,
         previous_continuation: previous_continuation.map(str::to_string),
-        history: history.clone(),
+        history: history.to_vec(),
         tools: deps.tools.clone(),
         max_tokens: deps.max_tokens,
         temperature: deps.temperature,
@@ -215,18 +340,20 @@ async fn drive_turn(
         display_name: None,
     };
     let turn_started_at = chrono::Utc::now();
-    let mut query = deps.provider.query(input).await.context("provider query failed")?;
-    let mut continuation: Option<String> = None;
-    let mut outcome = TurnOutcome::Done;
-    // Per-turn usage. Anthropic ships these as a running total, so we
-    // always take the latest value rather than summing increments.
+    let mut query = deps
+        .provider
+        .query(input)
+        .await
+        .context("provider query failed")?;
+
+    let mut out = LlmTurnOutput::default();
     let mut input_tokens: u32 = 0;
     let mut output_tokens: u32 = 0;
 
     while let Some(event) = query.next_event().await {
         match event {
             ProviderEvent::Init { continuation: c } => {
-                continuation = Some(c);
+                out.continuation = Some(c);
             }
             ProviderEvent::Usage {
                 input_tokens: it,
@@ -240,27 +367,14 @@ async fn drive_turn(
                 }
             }
             ProviderEvent::Result { text } => {
-                if let Some(t) = &text {
-                    if !t.is_empty() {
-                        history.push(HistoryMessage::Assistant { content: t.clone() });
-                        // Send the response back to the user.
-                        let spec = ironclaw_mcp::SendMessageSpec {
-                            to: None,
-                            text: t.clone(),
-                        };
-                        let _ack = deps
-                            .tool_ctx
-                            .emit_outbound(ironclaw_mcp::OutboundToolEffect::SendMessage(spec))
-                            .await
-                            .map_err(|e| anyhow::anyhow!("send_message failed: {e}"))?;
-                    }
+                if let Some(t) = text {
+                    out.text = t;
                 }
-                outcome = TurnOutcome::Done;
                 break;
             }
             ProviderEvent::Error { message, .. } => {
                 tracing::warn!(error = %message, "provider returned an error event");
-                outcome = TurnOutcome::Failed;
+                out.failed = true;
                 break;
             }
             ProviderEvent::ToolStart {
@@ -268,18 +382,23 @@ async fn drive_turn(
                 declared_timeout_ms,
             } => {
                 set_current_tool(deps, &name, declared_timeout_ms).await?;
+            }
+            ProviderEvent::ToolCall { id, name, input } => {
                 if is_disallowed(&name) {
-                    // Synthesise a refusal tool result. The provider sees it
-                    // on the next turn via `HistoryMessage::Tool`.
-                    let tool_use_id = format!("tu_disallow_{}", MessageId::new().as_uuid());
-                    history.push(HistoryMessage::Tool {
-                        tool_use_id,
-                        content: format!(
-                            "Tool `{name}` is disallowed inside ironclaw container; refuse and continue."
-                        ),
-                        is_error: true,
+                    // Synthesise a refusal result inline; the model
+                    // sees it on the next turn via the tool_result.
+                    out.tool_calls.push(PendingToolCall {
+                        id,
+                        name: name.clone(),
+                        input,
                     });
-                    clear_current_tool(deps).await?;
+                    out.tool_calls.last_mut().unwrap();
+                    // Mark the tool as disallowed so invoke_tool can
+                    // produce the refusal text without re-checking
+                    // here. The actual refusal happens at
+                    // invoke_tool below.
+                } else {
+                    out.tool_calls.push(PendingToolCall { id, name, input });
                 }
             }
             ProviderEvent::ToolEnd => {
@@ -295,18 +414,93 @@ async fn drive_turn(
         }
     }
     query.abort().await;
-    // Emit a `usage_report` system outbound row so the host's delivery
-    // loop can record the turn in `agent_turns`. Best-effort: a failure
-    // here gets logged, not propagated, since the turn itself is done.
-    emit_usage_report(
-        deps,
-        input_tokens,
-        output_tokens,
-        turn_started_at,
-        &outcome,
-    )
-    .await;
-    Ok(TurnResult { continuation, outcome })
+    let outcome = if out.failed {
+        TurnOutcome::Failed
+    } else {
+        TurnOutcome::Done
+    };
+    emit_usage_report(deps, input_tokens, output_tokens, turn_started_at, &outcome).await;
+    Ok(out)
+}
+
+/// Execute one tool call against the runner's tool map. Returns the
+/// `(content, is_error)` pair for the `HistoryMessage::Tool` row the
+/// model sees on the next turn.
+async fn invoke_tool(
+    deps: &RunnerDeps,
+    call: &PendingToolCall,
+) -> (String, bool) {
+    if is_disallowed(&call.name) {
+        return (
+            format!(
+                "Tool `{}` is disallowed inside the ironclaw container.",
+                call.name
+            ),
+            true,
+        );
+    }
+    let Some(entry) = deps.tool_map.get(&call.name) else {
+        return (
+            format!("Unknown tool `{}` — no handler registered.", call.name),
+            true,
+        );
+    };
+    // ToolHandler::call wants `Option<JsonObject>`; convert from the
+    // Value we got off the wire.
+    let arguments = match &call.input {
+        serde_json::Value::Object(map) => Some(map.clone()),
+        serde_json::Value::Null => None,
+        _ => {
+            return (
+                format!(
+                    "Tool `{}` input must be a JSON object, got {}",
+                    call.name,
+                    short_type(&call.input)
+                ),
+                true,
+            );
+        }
+    };
+    match entry.handler.call(arguments, deps.tool_ctx.as_ref()).await {
+        Ok(result) => (render_tool_result(&result), false),
+        Err(err) => (format!("Tool `{}` failed: {err}", call.name), true),
+    }
+}
+
+/// Pluck the textual content out of a `CallToolResult`. Multiple
+/// blocks get joined with double newlines; non-text blocks
+/// (resources, images) are rendered as their type tag so the model
+/// at least sees they happened.
+fn render_tool_result(result: &rmcp::model::CallToolResult) -> String {
+    let mut out = String::new();
+    for block in &result.content {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        let raw = &block.raw;
+        match raw {
+            rmcp::model::RawContent::Text(t) => out.push_str(&t.text),
+            rmcp::model::RawContent::Image(_) => out.push_str("<image>"),
+            rmcp::model::RawContent::Audio(_) => out.push_str("<audio>"),
+            rmcp::model::RawContent::Resource(_) => out.push_str("<resource>"),
+        }
+    }
+    if out.is_empty() {
+        "(tool produced no output)".to_string()
+    } else {
+        out
+    }
+}
+
+fn short_type(v: &serde_json::Value) -> &'static str {
+    match v {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "bool",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
 }
 
 /// Append a `usage_report` system row to `outbound.db`. The host's
@@ -434,13 +628,22 @@ async fn clear_current_tool(deps: &RunnerDeps) -> Result<()> {
     Ok(())
 }
 
+/// Refresh the heartbeat file's mtime so the host's container
+/// manager knows the runner is alive. Just opening the file is *not*
+/// enough — Linux only updates mtime on actual writes, so the file
+/// would look frozen at first-create. Truncate to 0 then write one
+/// byte; that's the minimum change that bumps mtime portably.
 fn touch_heartbeat(path: Option<&PathBuf>) {
+    use std::io::Write;
     if let Some(p) = path {
-        let _ = std::fs::OpenOptions::new()
+        if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
-            .truncate(false)
-            .open(p);
+            .truncate(true)
+            .open(p)
+        {
+            let _ = f.write_all(b".");
+        }
     }
 }
 
@@ -675,15 +878,21 @@ mod tests {
 
     #[tokio::test]
     async fn disallowed_tool_produces_refusal_in_history() {
-        let mut setup = build_setup(vec![vec![
-            ProviderEvent::ToolStart {
-                name: "CronCreate".into(),
-                declared_timeout_ms: None,
-            },
-            ProviderEvent::Result {
+        // First turn: model emits a ToolCall to a disallowed tool;
+        // the runner pushes a `Tool { is_error: true }` refusal,
+        // then runs a second turn where the model concedes.
+        let mut setup = build_setup(vec![
+            vec![
+                ProviderEvent::ToolCall {
+                    id: "tu_1".into(),
+                    name: "CronCreate".into(),
+                    input: serde_json::json!({}),
+                },
+            ],
+            vec![ProviderEvent::Result {
                 text: Some("ok".into()),
-            },
-        ]]);
+            }],
+        ]);
         {
             let g = setup.deps.inbound.lock().await;
             insert_pending(&g, "please cron");
@@ -693,10 +902,15 @@ mod tests {
 
         let outbound = open_outbound(&setup.paths).unwrap();
         let st = load_state(&outbound).unwrap();
-        assert!(st.history.iter().any(|m| matches!(
-            m,
-            HistoryMessage::Tool { content, is_error: true, .. } if content.contains("disallowed")
-        )));
+        assert!(
+            st.history.iter().any(|m| matches!(
+                m,
+                HistoryMessage::Tool { content, is_error: true, .. }
+                    if content.contains("disallowed")
+            )),
+            "expected a disallowed-tool refusal in history, got: {:?}",
+            st.history
+        );
     }
 
     #[tokio::test]

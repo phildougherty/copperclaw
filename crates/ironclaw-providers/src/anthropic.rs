@@ -307,6 +307,20 @@ struct ContentBlock {
     block_type: String,
     #[serde(default)]
     name: Option<String>,
+    /// Present on `tool_use` blocks. Echoes back as
+    /// `tool_result.tool_use_id` on the follow-up turn.
+    #[serde(default)]
+    id: Option<String>,
+}
+
+/// Tracks an in-flight `tool_use` content block. Anthropic streams
+/// the JSON input as `input_json_delta` chunks; we accumulate them
+/// here and parse at `content_block_stop`.
+#[derive(Debug, Default)]
+struct ToolUseAccumulator {
+    id: String,
+    name: String,
+    input_json: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -321,14 +335,12 @@ async fn pump_sse<S>(mut stream: S, tx: mpsc::Sender<ProviderEvent>)
 where
     S: futures::Stream<Item = Result<eventsource_stream::Event, eventsource_stream::EventStreamError<reqwest::Error>>> + Unpin,
 {
-    let mut buffered_text = String::new();
-    let mut in_tool_use = false;
-    let mut saw_init = false;
+    let mut state = SseState::default();
 
     while let Some(item) = stream.next().await {
         match item {
             Ok(ev) => {
-                if !handle_sse_event(&ev, &tx, &mut buffered_text, &mut in_tool_use, &mut saw_init).await {
+                if !handle_sse_event(&ev, &tx, &mut state).await {
                     return;
                 }
             }
@@ -345,6 +357,19 @@ where
     }
 }
 
+/// SSE-pump scratch state. Lives across `handle_sse_event` calls for
+/// one streaming response.
+#[derive(Debug, Default)]
+struct SseState {
+    buffered_text: String,
+    /// Set while we're inside a `tool_use` content block. `None`
+    /// otherwise. Anthropic streams a tool's JSON input across
+    /// multiple `input_json_delta` events under a single
+    /// `content_block_start` → `content_block_stop` envelope.
+    tool_use: Option<ToolUseAccumulator>,
+    saw_init: bool,
+}
+
 /// Returns `false` if the pump should exit (terminal event sent).
 ///
 /// Long-but-flat: the body is a single match on the Anthropic SSE
@@ -354,10 +379,10 @@ where
 async fn handle_sse_event(
     ev: &eventsource_stream::Event,
     tx: &mpsc::Sender<ProviderEvent>,
-    buffered_text: &mut String,
-    in_tool_use: &mut bool,
-    saw_init: &mut bool,
+    state: &mut SseState,
 ) -> bool {
+    let buffered_text = &mut state.buffered_text;
+    let saw_init = &mut state.saw_init;
     let env: AnthropicEventEnvelope = match serde_json::from_str(&ev.data) {
         Ok(v) => v,
         Err(e) => {
@@ -394,8 +419,13 @@ async fn handle_sse_event(
         "content_block_start" => {
             if let Some(block) = env.content_block {
                 if block.block_type == "tool_use" {
-                    *in_tool_use = true;
                     let name = block.name.unwrap_or_default();
+                    let id = block.id.unwrap_or_default();
+                    state.tool_use = Some(ToolUseAccumulator {
+                        id,
+                        name: name.clone(),
+                        input_json: String::new(),
+                    });
                     if tx
                         .send(ProviderEvent::ToolStart {
                             name,
@@ -414,11 +444,49 @@ async fn handle_sse_event(
                 if let Some(text) = delta.get("text").and_then(Value::as_str) {
                     buffered_text.push_str(text);
                 }
+                // `input_json_delta` carries one chunk of a tool_use
+                // block's JSON input. Anthropic guarantees the
+                // concatenation parses as JSON at content_block_stop.
+                if let Some(chunk) = delta.get("partial_json").and_then(Value::as_str) {
+                    if let Some(acc) = state.tool_use.as_mut() {
+                        acc.input_json.push_str(chunk);
+                    }
+                }
             }
         }
         "content_block_stop" => {
-            if *in_tool_use {
-                *in_tool_use = false;
+            if let Some(acc) = state.tool_use.take() {
+                // Empty input is the typical zero-arg call.
+                let input = if acc.input_json.is_empty() {
+                    Value::Object(serde_json::Map::new())
+                } else {
+                    match serde_json::from_str::<Value>(&acc.input_json) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = tx
+                                .send(ProviderEvent::Error {
+                                    message: format!(
+                                        "tool_use input json parse failed for {}: {e}",
+                                        acc.name
+                                    ),
+                                    retryable: false,
+                                })
+                                .await;
+                            return false;
+                        }
+                    }
+                };
+                if tx
+                    .send(ProviderEvent::ToolCall {
+                        id: acc.id,
+                        name: acc.name,
+                        input,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return false;
+                }
                 if tx.send(ProviderEvent::ToolEnd).await.is_err() {
                     return false;
                 }
@@ -486,10 +554,10 @@ mod tests {
 
     #[test]
     fn build_request_body_minimal() {
-        let mut q = QueryInput::new("you are helpful", "claude-sonnet-4-5");
+        let mut q = QueryInput::new("you are helpful", "claude-sonnet-4-6");
         q.history.push(HistoryMessage::User { content: "hi".into() });
         let body = build_request_body(&q);
-        assert_eq!(body["model"], "claude-sonnet-4-5");
+        assert_eq!(body["model"], "claude-sonnet-4-6");
         assert_eq!(body["stream"], true);
         assert_eq!(body["max_tokens"], 4096);
         assert_eq!(body["system"], "you are helpful");

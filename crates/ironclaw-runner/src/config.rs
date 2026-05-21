@@ -223,7 +223,7 @@ mod tests {
             session_id: Some(uuid::Uuid::nil().to_string()),
             agent_group_id: Some(uuid::Uuid::nil().to_string()),
             session_dir: Some("/tmp/ironclaw/session".into()),
-            model: Some("claude-sonnet-4-5".into()),
+            model: Some("claude-sonnet-4-6".into()),
             effort: Some(Effort::High),
             system: Some("you are an agent".into()),
             api_key_env: Some("ANTHROPIC_API_KEY".into()),
@@ -240,7 +240,7 @@ mod tests {
     fn from_file_struct_happy_path() {
         let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "key-xyz")]);
         let cfg = RunnerConfig::from_file_struct(good_file(), &env).unwrap();
-        assert_eq!(cfg.model, "claude-sonnet-4-5");
+        assert_eq!(cfg.model, "claude-sonnet-4-6");
         assert_eq!(cfg.effort, Effort::High);
         assert_eq!(cfg.api_key.as_deref(), Some("key-xyz"));
         assert_eq!(cfg.system, "you are an agent");
@@ -371,7 +371,7 @@ mod tests {
         std::fs::write(&path, serde_json::to_vec(&good_file()).unwrap()).unwrap();
         let env = MapEnv::default();
         let cfg = RunnerConfig::from_file(&path, &env).unwrap();
-        assert_eq!(cfg.model, "claude-sonnet-4-5");
+        assert_eq!(cfg.model, "claude-sonnet-4-6");
     }
 
     #[test]

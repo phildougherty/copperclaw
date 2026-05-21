@@ -314,6 +314,12 @@ impl ContainerManager {
         // would 409. Best-effort remove is a no-op when nothing
         // matches, so it's cheap to always do.
         let _ = self.runtime.remove(&spec.name).await;
+        // Reset the heartbeat file so the new container starts with
+        // a clean slate. Without this, the previous container's
+        // last (now-stale) mtime persists and the manager would
+        // crash-restart the new spawn before its runner could write
+        // its first heartbeat.
+        let _ = std::fs::remove_file(&paths.heartbeat);
         let handle = self
             .runtime
             .spawn(spec)
@@ -538,7 +544,7 @@ mod tests {
             data_dir,
             default_image_tag: "ironclaw/session:test".into(),
             default_provider: "anthropic".into(),
-            default_model: "claude-sonnet-4-5".into(),
+            default_model: "claude-sonnet-4-6".into(),
             anthropic_api_key: Some("sk-test".into()),
             anthropic_base_url: Some("https://openrouter.ai/api/v1".into()),
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
@@ -643,7 +649,7 @@ mod tests {
         );
         let session = fixture_session(&db);
         let cfg = mgr.runner_config_for(&session, None);
-        assert_eq!(cfg.model, "claude-sonnet-4-5");
+        assert_eq!(cfg.model, "claude-sonnet-4-6");
         assert_eq!(cfg.session_dir, CONTAINER_SESSION_DIR);
         assert_eq!(cfg.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
         assert_eq!(

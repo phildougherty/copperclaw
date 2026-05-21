@@ -210,7 +210,7 @@ mod tests {
         CompactionCfg {
             model_input_window: 200_000,
             safety_margin_tokens: 8_000,
-            summary_model: "claude-sonnet-4-5".into(),
+            summary_model: "claude-sonnet-4-6".into(),
             summary_effort: Effort::Low,
             summary_max_tokens: 1024,
             archive_dir: dir,

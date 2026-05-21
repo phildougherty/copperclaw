@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Tier-of-effort hint passed to the underlying model. Each provider maps
 /// this onto its own knob.
@@ -29,6 +30,22 @@ pub enum ProviderEvent {
         declared_timeout_ms: Option<u64>,
     },
     ToolEnd,
+    /// A complete tool-use request from the model. Emitted at
+    /// `content_block_stop` for a `tool_use` block, after the
+    /// provider has reassembled the streamed `input_json_delta`
+    /// chunks into the full input value. The runner dispatches
+    /// to the registered tool handler and feeds the result back
+    /// as a `HistoryMessage::Tool` on the next turn.
+    ToolCall {
+        /// Provider-side tool-use id. Must echo back as the
+        /// matching `tool_result.tool_use_id` next turn.
+        id: String,
+        /// Tool name (matches a key in the runner's tool map).
+        name: String,
+        /// Fully-parsed input. Empty object if the model called
+        /// the tool with no arguments.
+        input: Value,
+    },
     /// Per-turn token usage as reported by the provider. Emitted at
     /// least once before [`ProviderEvent::Result`] when the provider
     /// surfaces it (Anthropic's `message_delta.usage` field). The

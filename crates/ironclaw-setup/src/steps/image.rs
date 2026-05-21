@@ -16,7 +16,13 @@ use std::path::{Path, PathBuf};
 pub const DEFAULT_REPO: &str = "ironclaw/session";
 
 /// Default base image used for the container build step.
-pub const DEFAULT_BASE_IMAGE: &str = "debian:12-slim";
+///
+/// `trixie` (Debian 13) ships glibc 2.41, which covers any
+/// reasonably-recent host build of `ironclaw-runner`. `bookworm`
+/// (Debian 12) has glibc 2.36, which is too old for runners built
+/// against glibc 2.39+ — the symptom is a `version GLIBC_2.39 not
+/// found` error on container start.
+pub const DEFAULT_BASE_IMAGE: &str = "debian:trixie-slim";
 
 /// Step implementation.
 #[derive(Debug, Default)]

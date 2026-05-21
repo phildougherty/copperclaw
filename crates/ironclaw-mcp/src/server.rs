@@ -161,14 +161,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lists_all_15_tools() {
+    async fn lists_all_in_process_tools() {
         let ctx = Arc::new(MockToolContext::new());
         let server = build_server(ctx);
         let tools = server.tool_descriptors();
-        assert_eq!(tools.len(), 15);
+        // Order is fixed in `build_tool_set` — first and last should
+        // be stable as new tools get appended.
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert_eq!(names[0], "send_message");
-        assert_eq!(names[14], "update_task");
+        // The 15 messaging/scheduling/agent tools come first, then
+        // the `computer_use` family. `web_fetch` is the current tail.
+        assert_eq!(*names.last().unwrap(), "web_fetch");
+        assert_eq!(tools.len(), crate::tools::build_tool_set().len());
     }
 
     #[tokio::test]

@@ -83,12 +83,42 @@ async fn main() -> Result<()> {
         archive_dir: paths.outbox.join("_compactions"),
     };
 
+    // Build the in-process MCP tool inventory once and reuse it on
+    // every turn: the `ToolDef` list goes to the provider so the
+    // model can call tools, and the `tool_map` lets the runner
+    // dispatch the calls back to their handlers against the same
+    // `ToolContext` the model sees.
+    let tool_set = ironclaw_mcp::build_tool_set();
+    let tool_defs: Vec<ironclaw_providers::ToolDef> = tool_set
+        .iter()
+        .map(|e| ironclaw_providers::ToolDef {
+            name: e.tool.name.to_string(),
+            description: e
+                .tool
+                .description
+                .as_deref()
+                .unwrap_or("")
+                .to_string(),
+            input_schema: serde_json::Value::Object(
+                (*e.tool.input_schema).clone(),
+            ),
+        })
+        .collect();
+    let tool_map: std::sync::Arc<
+        std::collections::HashMap<String, std::sync::Arc<ironclaw_mcp::ToolEntry>>,
+    > = std::sync::Arc::new(
+        tool_set
+            .into_iter()
+            .map(|e| (e.tool.name.to_string(), std::sync::Arc::new(e)))
+            .collect(),
+    );
+
     let deps = RunnerDeps {
         provider,
         tool_ctx,
         inbound,
         outbound,
-        tools: Vec::new(),
+        tools: tool_defs,
         system: cfg.system.clone(),
         model: cfg.model.clone(),
         effort: cfg.effort,
@@ -104,6 +134,8 @@ async fn main() -> Result<()> {
         session_id: cfg.session_id,
         agent_group_id: cfg.agent_group_id,
         turn_seq: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
+        tool_map,
+        max_tool_turns: 20,
     };
 
     tracing::info!(

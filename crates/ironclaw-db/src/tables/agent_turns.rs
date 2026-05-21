@@ -181,7 +181,7 @@ mod tests {
             session_id: "sess-1".into(),
             agent_group_id: ag.into(),
             seq: 1,
-            model: "claude-sonnet-4-5".into(),
+            model: "claude-sonnet-4-6".into(),
             provider: "anthropic".into(),
             input_tokens: input,
             output_tokens: output,
