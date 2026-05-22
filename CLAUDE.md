@@ -14,9 +14,13 @@ design + milestone history.
 
 **The one command:** `./rebuild.sh`
 
-Rebuilds + reinstalls the three binaries to `~/.local/bin`, stops the
-running host, starts the new one. Run it after every code change you want
-to exercise live. Flags:
+Rebuilds + reinstalls the four binaries (`ironclaw`, `iclaw`,
+`ironclaw-setup`, `ironclaw-runner`) to `~/.local/bin`, stops the
+running host, rebakes the session container image so the new runner
+binary actually reaches the agent (otherwise the host upgrades but the
+agent keeps running yesterday's runner), pins the new image tag in
+`.env`, and starts the host back up. Run it after every code change
+you want to exercise live. Flags:
 
   - `./rebuild.sh --no-start`  — install, don't boot the host.
   - `./rebuild.sh --no-stop`   — install on top of a running host (risky).

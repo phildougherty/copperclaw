@@ -36,7 +36,7 @@ do_stop=1
 do_start=1
 do_clean=1
 build_mode=release
-crates=(ironclaw-host ironclaw-iclaw ironclaw-setup)
+crates=(ironclaw-host ironclaw-iclaw ironclaw-setup ironclaw-runner)
 
 for arg in "$@"; do
     case "$arg" in
@@ -133,6 +133,65 @@ for crate in "${crates[@]}"; do
     say "  cargo install -p $crate"
     cargo install "${install_flags[@]}" --path "crates/$crate"
 done
+
+# ── Step 3b: rebake the session container image with the new runner ──
+# The host invokes /usr/local/bin/ironclaw-runner inside the container.
+# If the host is upgraded but the container image is stale, the new
+# code (apology-on-failure, new tools, etc.) never reaches the agent.
+# Re-run the setup wizard's `image` step so the runner binary we just
+# built lands in a freshly-tagged image. Also point the install at it
+# via IRONCLAW_DEFAULT_IMAGE_TAG so the next session spawn uses it.
+#
+# Skipped when --skip-cli is set (the runner binary isn't in the
+# rebuild list under --skip-cli, so the existing image is still
+# coherent with the on-disk host).
+if [ "$do_clean" = 1 ] && [ -d "$INSTALL_ROOT" ] && [ "${crates[*]}" != "ironclaw-host" ]; then
+    say "rebuilding session container image (so the new runner reaches the agent)"
+    # The image step locates the runner binary next to ironclaw-setup
+    # by default. Force-clear the `image` step from setup-state so it
+    # re-runs even though it already completed once.
+    state_file="$INSTALL_ROOT/setup-state.json"
+    if [ -f "$state_file" ] && command -v python3 >/dev/null 2>&1; then
+        python3 - "$state_file" <<'PY'
+import json, sys
+p = sys.argv[1]
+with open(p) as f:
+    d = json.load(f)
+steps = d.get("completed_steps", [])
+if "image" in steps:
+    d["completed_steps"] = [s for s in steps if s != "image"]
+    with open(p, "w") as f:
+        json.dump(d, f, indent=2)
+PY
+    fi
+
+    # Run only the image step, headless. Other steps are already done
+    # and will short-circuit; --skip-step on the rest avoids any
+    # accidental side effects (channel re-prompts, mount changes).
+    env_file="$INSTALL_ROOT/.env"
+    if [ -f "$env_file" ]; then
+        api_key="$(grep '^ANTHROPIC_API_KEY=' "$env_file" | cut -d= -f2-)"
+        export IRONCLAW_SETUP_ANTHROPIC_API_KEY="${api_key:-rebuild-placeholder}"
+    fi
+    export IRONCLAW_SETUP_QUICKSTART=no
+    if "$INSTALL_DIR/ironclaw-setup" --headless 2>&1 | grep -E '^\[step\] image|reused image:|building locally' | tail -5; then
+        :
+    fi
+
+    # Pin the install at the new tag so the manager picks it up.
+    if [ -f "$state_file" ]; then
+        new_tag="$(python3 -c "import json; print(json.load(open('$state_file')).get('config',{}).get('image_tag',''))" 2>/dev/null)"
+        if [ -n "$new_tag" ] && [ -f "$env_file" ]; then
+            if grep -q '^IRONCLAW_DEFAULT_IMAGE_TAG=' "$env_file"; then
+                sed -i.bak "s|^IRONCLAW_DEFAULT_IMAGE_TAG=.*|IRONCLAW_DEFAULT_IMAGE_TAG=$new_tag|" "$env_file"
+                rm -f "$env_file.bak"
+            else
+                printf '\nIRONCLAW_DEFAULT_IMAGE_TAG=%s\n' "$new_tag" >> "$env_file"
+            fi
+            say "pinned IRONCLAW_DEFAULT_IMAGE_TAG=$new_tag"
+        fi
+    fi
+fi
 
 # ── Step 4: start ─────────────────────────────────────────────────────
 if [ "$do_start" = 1 ]; then

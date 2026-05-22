@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (rebuild.sh: rebake session image so new runner reaches the agent)
+
+- **`rebuild.sh`** — now also rebuilds the session container image
+  (and pins the new sha256 tag in `.env`) after installing fresh
+  binaries. Previously a code change to `ironclaw-runner` landed on
+  disk but the agent inside the container kept running the old runner
+  baked into the stale image, so new tools / new fixes never reached
+  the live agent. Caught live: model kept hitting the `send_file`
+  malformed-JSON tic on the old image's old runner, with no apology
+  emit because that fix only existed in the on-disk-but-unbaked
+  binary. The script now triggers `ironclaw-setup --headless` after
+  install (with `image` cleared from `setup-state.json`'s completed
+  list), reads the resulting image tag, and rewrites
+  `IRONCLAW_DEFAULT_IMAGE_TAG` so the next session spawn picks it up.
+- **`rebuild.sh` install list** now includes `ironclaw-runner` so
+  the binary the image step bakes in is current.
+- **`CLAUDE.md`** — documents the new step in the "Local development
+  loop" section.
+
 ### Changed (web_fetch: auto-convert HTML responses to markdown)
 
 - **`crates/ironclaw-mcp/src/tools/computer_use.rs`** — `web_fetch`
