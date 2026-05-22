@@ -45,8 +45,9 @@
 //! | Counter   | `ironclaw_provider_deadline_total` | `provider`     |
 //! | Counter   | `ironclaw_provider_retry_total`    | `provider`     |
 //! | Counter   | `ironclaw_stuck_inbound_apology_total` | `agent_group_id`, `reason` |
+//! | Gauge     | `ironclaw_degraded_state`          | `reason`       |
 
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -75,6 +76,7 @@ pub const CONTAINER_SPAWN_SECONDS: &str = "ironclaw_container_spawn_seconds";
 pub const PROVIDER_DEADLINE_TOTAL: &str = "ironclaw_provider_deadline_total";
 pub const PROVIDER_RETRY_TOTAL: &str = "ironclaw_provider_retry_total";
 pub const STUCK_INBOUND_APOLOGY_TOTAL: &str = "ironclaw_stuck_inbound_apology_total";
+pub const DEGRADED_STATE: &str = "ironclaw_degraded_state";
 
 // ── Reason label values for the `reason` label of
 // `ironclaw_stuck_inbound_apology_total`. Use these constants instead of
@@ -87,6 +89,15 @@ pub const STUCK_REASON_PENDING_TOO_LONG: &str = "pending_too_long";
 /// The session's `container_status='stopped'` with a pending inbound
 /// and the container manager has exhausted its spawn-retry budget.
 pub const STUCK_REASON_CONTAINER_SPAWN_FAILED: &str = "container_spawn_failed";
+
+// ── Degraded-state reason label values for `ironclaw_degraded_state`.
+// Use these constants instead of stringly-typed literals at call sites
+// so a typo is a compile error.
+pub const DEGRADED_REASON_IMAGE_NOT_FOUND: &str = "image_not_found";
+pub const DEGRADED_REASON_RUNNER_BINARY_MISSING: &str = "runner_binary_missing";
+pub const DEGRADED_REASON_RUNNER_BINARY_NOT_EXECUTABLE: &str = "runner_binary_not_executable";
+pub const DEGRADED_REASON_HEALTH_CHECK_TIMEOUT: &str = "health_check_timeout";
+pub const DEGRADED_REASON_HEALTH_CHECK_FAILED: &str = "health_check_failed";
 
 // ── Budget-gate label values for the `gate` label of
 // `ironclaw_budget_exhausted_total`. Use these constants instead of
@@ -242,6 +253,25 @@ pub fn observe_llm_tokens_output(tokens: u32) {
 /// Record container spawn duration (seconds).
 pub fn observe_container_spawn_seconds(secs: f64) {
     histogram!(CONTAINER_SPAWN_SECONDS).record(secs);
+}
+
+// ── Gauge helpers ──────────────────────────────────────────────────────────
+
+/// Set `ironclaw_degraded_state{reason=<reason>}` to 1. Fired by the
+/// boot-time image health check when it detects the session image is
+/// missing or stale; the host continues to run (so the admin socket
+/// stays reachable) but the container manager refuses to spawn new
+/// sessions until the operator runs `./rebuild.sh` to refresh the
+/// image and restart the host.
+pub fn set_degraded_state(reason: &str) {
+    gauge!(DEGRADED_STATE, "reason" => reason.to_owned()).set(1.0);
+}
+
+/// Clear `ironclaw_degraded_state{reason=<reason>}` (i.e. set to 0).
+/// Used by tests; production code does not transition out of degraded
+/// without a host restart, so this is mostly for symmetry / hygiene.
+pub fn clear_degraded_state(reason: &str) {
+    gauge!(DEGRADED_STATE, "reason" => reason.to_owned()).set(0.0);
 }
 
 // ── Address parsing ────────────────────────────────────────────────────────
@@ -641,6 +671,7 @@ mod tests {
             PROVIDER_DEADLINE_TOTAL,
             PROVIDER_RETRY_TOTAL,
             STUCK_INBOUND_APOLOGY_TOTAL,
+            DEGRADED_STATE,
         ];
         for name in names {
             assert!(

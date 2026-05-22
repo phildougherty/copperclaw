@@ -41,6 +41,7 @@ use ironclaw_db::tables::{container_configs, messages_in, sessions};
 use ironclaw_host_sweep::SpawnAttemptTracker;
 use ironclaw_types::{AgentGroupId, ContainerStatus, Session, SessionStatus};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -230,6 +231,15 @@ pub struct ContainerManager {
     /// Defaults to an empty tracker so test code that calls
     /// [`Self::new`] without wiring sweep still works.
     spawn_tracker: Arc<SpawnAttemptTracker>,
+    /// Set by [`Self::set_degraded`] when the boot-time image health
+    /// check fails. When `true`, every call to [`Self::maybe_spawn`]
+    /// short-circuits with [`ManagerError::HostDegraded`] — the host
+    /// keeps running (so `iclaw doctor` still works) but no new
+    /// containers are launched until the operator runs
+    /// `./rebuild.sh` to refresh the session image and restart.
+    /// Stored as an `AtomicBool` so the read-side on the spawn hot
+    /// path is lock-free.
+    degraded: AtomicBool,
 }
 
 impl ContainerManager {
@@ -251,6 +261,7 @@ impl ContainerManager {
                 forward_env: cfg.forward_env.clone(),
             })),
             spawn_tracker: Arc::new(SpawnAttemptTracker::new()),
+            degraded: AtomicBool::new(false),
             cfg,
         }
     }
@@ -270,6 +281,25 @@ impl ContainerManager {
     /// sweep service.
     pub fn spawn_tracker(&self) -> &Arc<SpawnAttemptTracker> {
         &self.spawn_tracker
+    }
+
+    /// Flag the manager as degraded — subsequent
+    /// [`Self::maybe_spawn`] calls will reject with
+    /// [`ManagerError::HostDegraded`] until the host restarts. There
+    /// is intentionally no live `clear_degraded` companion: the host
+    /// does not try to do degraded → healthy transitions without a
+    /// restart (the boot-time image health check would have to
+    /// re-run, the metric gauge would have to be re-set, etc. —
+    /// trickier than the operator just re-running `./rebuild.sh`).
+    pub fn set_degraded(&self) {
+        self.degraded.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the manager is in degraded mode (boot-time image
+    /// health check failed).
+    #[must_use]
+    pub fn is_degraded(&self) -> bool {
+        self.degraded.load(Ordering::SeqCst)
     }
 
     /// Re-read the `.env` file at `env_file` (or use no file when
@@ -422,8 +452,18 @@ impl ContainerManager {
         match action {
             ReconcileAction::Noop => Ok(()),
             ReconcileAction::Spawn => {
-                self.maybe_spawn(session).await?;
-                Ok(())
+                // Degraded mode is a sticky, expected state — the
+                // session stays Stopped and the inbound row stays
+                // pending until the operator runs `./rebuild.sh`
+                // and restarts. Surfacing it every tick would spam
+                // the host log, so we collapse Ok(_) and
+                // Err(HostDegraded) into Ok here. The startup
+                // banner and the metric are the source of truth
+                // for "host is degraded".
+                match self.maybe_spawn(session).await {
+                    Ok(_) | Err(ManagerError::HostDegraded) => Ok(()),
+                    Err(err) => Err(err),
+                }
             }
             ReconcileAction::WakeFromIdle => {
                 sessions::mark_container_stopped(&self.central, session.id)
@@ -465,8 +505,17 @@ impl ContainerManager {
     /// a container was actually spawned (i.e. pending work was found
     /// and the runtime call succeeded), `Ok(false)` when there was
     /// nothing pending, and `Err(...)` for real failures.
+    ///
+    /// Refuses with [`ManagerError::HostDegraded`] when
+    /// [`Self::is_degraded`] is `true`. This is the boot-time image
+    /// health gate's runtime tail: when the host couldn't verify
+    /// the session image at boot, it refuses to silently spawn
+    /// containers that might be using a stale runner.
     #[allow(clippy::too_many_lines)] // spawn flow has several gates that are clearer inline
-    async fn maybe_spawn(&self, session: &Session) -> Result<bool, ManagerError> {
+    pub async fn maybe_spawn(&self, session: &Session) -> Result<bool, ManagerError> {
+        if self.is_degraded() {
+            return Err(ManagerError::HostDegraded);
+        }
         let paths = SessionPaths::new(
             &self.cfg.data_dir,
             session.agent_group_id,
@@ -1277,6 +1326,11 @@ pub enum ManagerError {
     /// Container runtime spawn failed.
     #[error("spawn: {0}")]
     Spawn(#[source] RtError),
+    /// The host entered degraded mode at boot (e.g. session image is
+    /// missing or stale). Sessions cannot be spawned until the
+    /// operator runs `./rebuild.sh` and restarts the host.
+    #[error("host degraded; refusing to spawn sessions until the operator restarts after `./rebuild.sh`")]
+    HostDegraded,
 }
 
 /// Choose the base image for a per-group rebuild. Returns the install's
@@ -2596,6 +2650,129 @@ NOT_A_PAIR_LINE
             "EXA_API_KEY must be dropped after rotation, got: {:?}",
             r.forward_env
         );
+    }
+
+    // ── degraded mode ──────────────────────────────────────────────
+
+    /// Boot-time image health check failed → host enters degraded
+    /// mode → `maybe_spawn` refuses with `HostDegraded`.
+    #[tokio::test]
+    async fn degraded_mode_refuses_spawn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let runtime = std::sync::Arc::new(crate::tests::NoopRuntime::default());
+        let mgr = ContainerManager::new(
+            db.clone(),
+            runtime.clone(),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        // Seed pending inbound so the gate would otherwise spawn.
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        seed_pending_chat_inbound(&paths);
+
+        // Flip into degraded mode programmatically (in production
+        // this is done by run_host after the image health check
+        // returns an Err).
+        mgr.set_degraded();
+        assert!(mgr.is_degraded(), "manager should report degraded");
+
+        let err = mgr
+            .maybe_spawn(&session)
+            .await
+            .expect_err("must refuse to spawn when degraded");
+        assert!(
+            matches!(err, ManagerError::HostDegraded),
+            "expected HostDegraded, got {err:?}"
+        );
+        // The runtime must NOT have been called.
+        assert!(
+            runtime.spawn_calls().is_empty(),
+            "no runtime spawn allowed in degraded mode"
+        );
+    }
+
+    /// `enter_degraded_mode` writes an apology row to every session
+    /// with a pending chat inbound, routed via that inbound's
+    /// `(channel_type, platform_id, thread_id)`.
+    #[test]
+    fn degraded_mode_emits_apology_to_pending_inbounds() {
+        use crate::image_health::{enter_degraded_mode, HealthDegradedReason, DEGRADED_APOLOGY_TEXT};
+        use ironclaw_db::tables::sessions::{create as create_session, CreateSession};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+
+        // Two sessions, each with a pending chat inbound. Use
+        // distinct agent groups so the unique-folder constraint
+        // doesn't trip.
+        let ag1 = create_ag(
+            &db,
+            CreateAgentGroup {
+                name: "deg-a".into(),
+                folder: "deg-a".into(),
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        let ag2 = create_ag(
+            &db,
+            CreateAgentGroup {
+                name: "deg-b".into(),
+                folder: "deg-b".into(),
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        let s1 = create_session(
+            &db,
+            CreateSession {
+                agent_group_id: ag1.id,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        let s2 = create_session(
+            &db,
+            CreateSession {
+                agent_group_id: ag2.id,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        let paths1 = SessionPaths::new(tmp.path(), s1.agent_group_id, s1.id);
+        let paths2 = SessionPaths::new(tmp.path(), s2.agent_group_id, s2.id);
+        paths1.ensure_dirs().unwrap();
+        paths2.ensure_dirs().unwrap();
+        seed_pending_chat_inbound(&paths1);
+        seed_pending_chat_inbound(&paths2);
+
+        let reason = HealthDegradedReason::ImageNotFound {
+            tag: "ironclaw/session:nope".into(),
+        };
+        let notified = enter_degraded_mode(&db, tmp.path(), &reason);
+        assert_eq!(notified, 2, "expected 2 sessions notified, got {notified}");
+
+        for paths in [&paths1, &paths2] {
+            let replies = count_outbound_text_replies(paths);
+            assert_eq!(
+                replies.len(),
+                1,
+                "each session should get exactly one apology row, got {replies:?}"
+            );
+            let body = &replies[0];
+            assert!(
+                body.contains("temporarily degraded"),
+                "apology text must mention degraded state: {body}"
+            );
+            // The exact text matches DEGRADED_APOLOGY_TEXT.
+            assert_eq!(body.as_str(), DEGRADED_APOLOGY_TEXT);
+        }
     }
 
     #[test]
