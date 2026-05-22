@@ -245,6 +245,32 @@ impl ChannelAdapter for TelegramAdapter {
         Ok(Some(m.message_id.to_string()))
     }
 
+    async fn edit_message(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        external_id: &str,
+        new_text: &str,
+    ) -> Result<(), AdapterError> {
+        // Telegram's `editMessageText` is addressed by (chat_id, message_id);
+        // thread context is implicit in the message_id so we discard it.
+        self.api
+            .edit_message_text(platform_id, external_id, new_text)
+            .await
+    }
+
+    async fn add_reaction(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        external_id: &str,
+        emoji: &str,
+    ) -> Result<(), AdapterError> {
+        self.api
+            .set_message_reaction(platform_id, external_id, emoji)
+            .await
+    }
+
     async fn open_dm(&self, user_id: &str) -> Result<Option<DmHandle>, AdapterError> {
         // Telegram requires the user to message the bot first. Once that's
         // happened the platform_id of the DM equals the user id, so we can
@@ -830,6 +856,83 @@ mod tests {
         // The agent opts into MarkdownV2 / HTML / Markdown by setting
         // `content.parse_mode` on the outbound row.
         assert_eq!(DEFAULT_PARSE_MODE, "");
+    }
+
+    #[tokio::test]
+    async fn telegram_edit_message_calls_api() {
+        let s = MockServer::start().await;
+        empty_get_updates(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/bottok/editMessageText"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": { "message_id": 7 }
+            })))
+            .mount(&s)
+            .await;
+        let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
+        let dir = temp_dir();
+        let adapter = TelegramAdapter::start(
+            lp_config(&s.uri()),
+            None,
+            tx,
+            dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        adapter
+            .edit_message("100", Some("thread-1"), "7", "edited text")
+            .await
+            .unwrap();
+        let reqs = s.received_requests().await.unwrap();
+        let edit_req = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/editMessageText"))
+            .expect("editMessageText request");
+        let body: serde_json::Value =
+            serde_json::from_slice(&edit_req.body).expect("json body");
+        assert_eq!(body["chat_id"], "100");
+        assert_eq!(body["message_id"], 7);
+        assert_eq!(body["text"], "edited text");
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn telegram_add_reaction_calls_api() {
+        let s = MockServer::start().await;
+        empty_get_updates(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/bottok/setMessageReaction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": true
+            })))
+            .mount(&s)
+            .await;
+        let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
+        let dir = temp_dir();
+        let adapter = TelegramAdapter::start(
+            lp_config(&s.uri()),
+            None,
+            tx,
+            dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        adapter
+            .add_reaction("100", None, "7", "\u{1F44D}")
+            .await
+            .unwrap();
+        let reqs = s.received_requests().await.unwrap();
+        let req = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/setMessageReaction"))
+            .expect("setMessageReaction request");
+        let body: serde_json::Value =
+            serde_json::from_slice(&req.body).expect("json body");
+        assert_eq!(body["chat_id"], "100");
+        assert_eq!(body["message_id"], 7);
+        assert_eq!(body["reaction"][0]["type"], "emoji");
+        assert_eq!(body["reaction"][0]["emoji"], "\u{1F44D}");
+        adapter.shutdown().await;
     }
 
     #[tokio::test]

@@ -21,6 +21,24 @@ pub struct DeliveredMessage {
     pub message: OutboundMessage,
 }
 
+/// Captured `edit_message` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedEdit {
+    pub platform_id: String,
+    pub thread_id: Option<String>,
+    pub external_id: String,
+    pub new_text: String,
+}
+
+/// Captured `add_reaction` call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapturedReaction {
+    pub platform_id: String,
+    pub thread_id: Option<String>,
+    pub external_id: String,
+    pub emoji: String,
+}
+
 /// Deterministic adapter for tests. Tracks every `deliver` call and lets
 /// callers override behavior with optional canned outcomes.
 pub struct MockAdapter {
@@ -37,6 +55,14 @@ pub struct MockAdapter {
     /// adapter that owns a real fallback path without depending on a
     /// concrete channel crate.
     plain_text_fallback_enabled: Mutex<bool>,
+    edits: Mutex<Vec<CapturedEdit>>,
+    reactions: Mutex<Vec<CapturedReaction>>,
+    /// When `true`, [`ChannelAdapter::edit_message`] returns `Unsupported`
+    /// instead of recording the call. Used to simulate channels (CLI,
+    /// webhooks, etc.) whose default impl falls through.
+    edit_returns_unsupported: Mutex<bool>,
+    /// Same shape as `edit_returns_unsupported` but for `add_reaction`.
+    reaction_returns_unsupported: Mutex<bool>,
 }
 
 impl MockAdapter {
@@ -52,7 +78,32 @@ impl MockAdapter {
             deliver_should_error: Mutex::new(VecDeque::new()),
             open_dm_result: Mutex::new(None),
             plain_text_fallback_enabled: Mutex::new(false),
+            edits: Mutex::new(vec![]),
+            reactions: Mutex::new(vec![]),
+            edit_returns_unsupported: Mutex::new(false),
+            reaction_returns_unsupported: Mutex::new(false),
         }
+    }
+
+    /// Snapshot the recorded `edit_message` calls.
+    pub fn edits(&self) -> Vec<CapturedEdit> {
+        self.edits.lock().expect("poisoned").clone()
+    }
+
+    /// Snapshot the recorded `add_reaction` calls.
+    pub fn reactions(&self) -> Vec<CapturedReaction> {
+        self.reactions.lock().expect("poisoned").clone()
+    }
+
+    /// Cause `edit_message` to return `AdapterError::Unsupported(_)` instead
+    /// of recording the call. Used to drive the host's fallback path.
+    pub fn set_edit_unsupported(&self, on: bool) {
+        *self.edit_returns_unsupported.lock().expect("poisoned") = on;
+    }
+
+    /// Same as [`Self::set_edit_unsupported`] but for `add_reaction`.
+    pub fn set_reaction_unsupported(&self, on: bool) {
+        *self.reaction_returns_unsupported.lock().expect("poisoned") = on;
     }
 
     /// Toggle whether the adapter reports thread support.
@@ -132,6 +183,47 @@ impl ChannelAdapter for MockAdapter {
 
     async fn open_dm(&self, _user_id: &str) -> Result<Option<DmHandle>, AdapterError> {
         Ok(self.open_dm_result.lock().expect("poisoned").clone())
+    }
+
+    async fn edit_message(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        external_id: &str,
+        new_text: &str,
+    ) -> Result<(), AdapterError> {
+        if *self.edit_returns_unsupported.lock().expect("poisoned") {
+            return Err(AdapterError::Unsupported("edit_message".into()));
+        }
+        self.edits.lock().expect("poisoned").push(CapturedEdit {
+            platform_id: platform_id.to_owned(),
+            thread_id: thread_id.map(str::to_owned),
+            external_id: external_id.to_owned(),
+            new_text: new_text.to_owned(),
+        });
+        Ok(())
+    }
+
+    async fn add_reaction(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        external_id: &str,
+        emoji: &str,
+    ) -> Result<(), AdapterError> {
+        if *self.reaction_returns_unsupported.lock().expect("poisoned") {
+            return Err(AdapterError::Unsupported("add_reaction".into()));
+        }
+        self.reactions
+            .lock()
+            .expect("poisoned")
+            .push(CapturedReaction {
+                platform_id: platform_id.to_owned(),
+                thread_id: thread_id.map(str::to_owned),
+                external_id: external_id.to_owned(),
+                emoji: emoji.to_owned(),
+            });
+        Ok(())
     }
 
     fn plain_text_fallback(&self, msg: &OutboundMessage) -> Option<OutboundMessage> {

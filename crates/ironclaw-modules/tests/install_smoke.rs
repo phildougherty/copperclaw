@@ -40,13 +40,21 @@ async fn every_module_installs_and_registers_expected_hooks() {
             "expected `{hook}` to be registered; got {regs:?}"
         );
     }
-    // Approvals registers a delivery action named approval_card; interactive
-    // registers ask_user_question + send_card.
+    // Approvals registers approval_card; interactive registers
+    // ask_user_question + send_card + edit + reaction; scheduling
+    // registers schedule.
     let mut actions = ctx.delivery_actions();
     actions.sort();
     assert_eq!(
         actions,
-        vec!["approval_card", "ask_user_question", "schedule", "send_card"]
+        vec![
+            "approval_card",
+            "ask_user_question",
+            "edit",
+            "reaction",
+            "schedule",
+            "send_card",
+        ]
     );
     // Names are all unique and stable.
     let names: Vec<&'static str> = modules.iter().map(|m| m.name()).collect();

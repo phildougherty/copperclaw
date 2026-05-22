@@ -165,6 +165,32 @@ impl ChannelAdapter for SlackAdapter {
         Ok(ts)
     }
 
+    async fn edit_message(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        external_id: &str,
+        new_text: &str,
+    ) -> Result<(), AdapterError> {
+        // Slack's `chat.update` is addressed by (channel, ts); thread context
+        // is implicit via the original ts so we discard the thread_id.
+        self.api.chat_update(platform_id, external_id, new_text).await?;
+        Ok(())
+    }
+
+    async fn add_reaction(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        external_id: &str,
+        emoji: &str,
+    ) -> Result<(), AdapterError> {
+        // Slack reactions are addressed by name (no surrounding `:`); strip
+        // any colons the agent might have left behind.
+        let name = emoji.trim_matches(':');
+        self.api.reactions_add(platform_id, external_id, name).await
+    }
+
     async fn open_dm(&self, _user_id: &str) -> Result<Option<DmHandle>, AdapterError> {
         // Slack DMs are addressed by user id directly via `chat.postMessage`,
         // so we don't need a pre-opened conversations.open handle. Returning
@@ -620,6 +646,62 @@ mod tests {
             "[reduced formatting] hello"
         );
         assert_eq!(fallback.kind, MessageKind::Chat);
+    }
+
+    #[tokio::test]
+    async fn slack_edit_message_calls_chat_update() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat.update"))
+            .and(header("authorization", "Bearer xoxb-test"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"ok": true, "ts": "5.0"})),
+            )
+            .mount(&server)
+            .await;
+        let adapter = adapter_for(&server);
+        adapter
+            .edit_message("C1", Some("100.000"), "100.000", "updated body")
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        let req = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/chat.update"))
+            .expect("chat.update request");
+        let body: serde_json::Value =
+            serde_json::from_slice(&req.body).expect("json body");
+        assert_eq!(body["channel"], "C1");
+        assert_eq!(body["ts"], "100.000");
+        assert_eq!(body["text"], "updated body");
+    }
+
+    #[tokio::test]
+    async fn slack_add_reaction_calls_reactions_add() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/reactions.add"))
+            .and(header("authorization", "Bearer xoxb-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .mount(&server)
+            .await;
+        let adapter = adapter_for(&server);
+        // Verify colon-stripping: the agent may emit `:thumbsup:` or
+        // `thumbsup`; Slack expects the bare name.
+        adapter
+            .add_reaction("C1", None, "100.000", ":thumbsup:")
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        let req = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/reactions.add"))
+            .expect("reactions.add request");
+        let body: serde_json::Value =
+            serde_json::from_slice(&req.body).expect("json body");
+        assert_eq!(body["channel"], "C1");
+        assert_eq!(body["timestamp"], "100.000");
+        assert_eq!(body["name"], "thumbsup");
     }
 
     #[tokio::test]

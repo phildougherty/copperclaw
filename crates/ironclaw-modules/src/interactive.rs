@@ -213,6 +213,72 @@ impl DeliveryActionHandler for AskHandler {
     }
 }
 
+/// `edit` action: registered so the host's delivery service routes the
+/// system row to us. The service first tries the channel adapter's typed
+/// edit API (`ChannelAdapter::edit_message`); if the adapter returns
+/// `Unsupported` (CLI / webhooks / etc.) or the original platform message
+/// id can't be located, the service falls through to this handler, which
+/// returns a synthetic chat message of the form `"(edit) <new_text>"`.
+///
+/// The handler intentionally does not look up the adapter or the session
+/// DBs itself — modules don't depend on `ironclaw-channels-core` or
+/// `ironclaw-db`, so the typed-adapter call lives in the delivery service
+/// and the module owns only the fallback shape.
+struct EditHandler;
+
+impl DeliveryActionHandler for EditHandler {
+    fn handle(
+        &self,
+        input: DeliveryActionInput,
+    ) -> Result<DeliveryActionOutput, ModuleError> {
+        let text = input
+            .payload
+            .get("text")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ModuleError::other("interactive", "edit payload missing text"))?
+            .to_owned();
+        let dispatch = dispatch_from_payload(&input.payload)
+            .or_else(|| Some(input.target.clone()));
+        Ok(DeliveryActionOutput {
+            dispatch,
+            message: Some(OutboundMessage {
+                kind: MessageKind::Chat,
+                content: serde_json::json!({ "text": format!("(edit) {text}") }),
+                files: vec![],
+            }),
+        })
+    }
+}
+
+/// `reaction` action: shares the same fallback contract as [`EditHandler`].
+/// When the channel adapter doesn't expose a reaction API the service
+/// invokes us and we return `"(reaction: <emoji>)"` as a regular chat row.
+struct ReactionHandler;
+
+impl DeliveryActionHandler for ReactionHandler {
+    fn handle(
+        &self,
+        input: DeliveryActionInput,
+    ) -> Result<DeliveryActionOutput, ModuleError> {
+        let emoji = input
+            .payload
+            .get("emoji")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| ModuleError::other("interactive", "reaction payload missing emoji"))?
+            .to_owned();
+        let dispatch = dispatch_from_payload(&input.payload)
+            .or_else(|| Some(input.target.clone()));
+        Ok(DeliveryActionOutput {
+            dispatch,
+            message: Some(OutboundMessage {
+                kind: MessageKind::Chat,
+                content: serde_json::json!({ "text": format!("(reaction: {emoji})") }),
+                files: vec![],
+            }),
+        })
+    }
+}
+
 /// `send_card` action: wraps payload's `card` field into an outbound message.
 struct CardHandler;
 
@@ -273,6 +339,8 @@ impl Module for InteractiveModule {
             }),
         );
         ctx.register_delivery_action("send_card", Arc::new(CardHandler));
+        ctx.register_delivery_action("edit", Arc::new(EditHandler));
+        ctx.register_delivery_action("reaction", Arc::new(ReactionHandler));
         Ok(())
     }
 }
@@ -364,13 +432,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn install_registers_two_actions() {
+    async fn install_registers_four_actions() {
         let m = InteractiveModule::default();
         let ctx = MockModuleContext::new();
         m.install(ctx.clone()).await.unwrap();
         let mut actions = ctx.delivery_actions();
         actions.sort();
-        assert_eq!(actions, vec!["ask_user_question", "send_card"]);
+        assert_eq!(
+            actions,
+            vec!["ask_user_question", "edit", "reaction", "send_card"]
+        );
     }
 
     #[tokio::test]
@@ -501,6 +572,152 @@ mod tests {
             session_id: None,
         });
         assert!(out.is_err());
+    }
+
+    #[tokio::test]
+    async fn edit_handler_routes_to_correct_adapter() {
+        // The handler doesn't drive the adapter directly — that's the
+        // delivery service's job. This test pins the contract the service
+        // depends on: given a target whose channel_type is "telegram",
+        // the dispatch surfaced back to the service preserves the channel
+        // type so the service knows which adapter to call.
+        let m = InteractiveModule::default();
+        let ctx = MockModuleContext::new();
+        m.install(ctx.clone()).await.unwrap();
+        let handlers = ctx.action_handlers.lock().unwrap();
+        let (_, handler) = handlers.iter().find(|(n, _)| n == "edit").unwrap();
+        let out = handler
+            .handle(DeliveryActionInput {
+                action: "edit".into(),
+                payload: serde_json::json!({ "seq": 7, "text": "edited" }),
+                target: DispatchTarget {
+                    channel_type: Some(ChannelType::new("telegram")),
+                    platform_id: Some("chat-1".into()),
+                    thread_id: None,
+                    agent_group_id: None,
+                },
+            })
+            .unwrap();
+        let dispatch = out.dispatch.expect("dispatch target");
+        assert_eq!(
+            dispatch.channel_type.as_ref().map(ChannelType::as_str),
+            Some("telegram")
+        );
+        assert_eq!(dispatch.platform_id.as_deref(), Some("chat-1"));
+        let msg = out.message.expect("fallback message");
+        assert_eq!(msg.kind, MessageKind::Chat);
+        assert_eq!(msg.content["text"].as_str().unwrap(), "(edit) edited");
+    }
+
+    #[tokio::test]
+    async fn reaction_handler_routes_to_correct_adapter() {
+        let m = InteractiveModule::default();
+        let ctx = MockModuleContext::new();
+        m.install(ctx.clone()).await.unwrap();
+        let handlers = ctx.action_handlers.lock().unwrap();
+        let (_, handler) = handlers.iter().find(|(n, _)| n == "reaction").unwrap();
+        let out = handler
+            .handle(DeliveryActionInput {
+                action: "reaction".into(),
+                payload: serde_json::json!({ "seq": 7, "emoji": "thumbsup" }),
+                target: DispatchTarget {
+                    channel_type: Some(ChannelType::new("slack")),
+                    platform_id: Some("C-1".into()),
+                    thread_id: Some("100.0".into()),
+                    agent_group_id: None,
+                },
+            })
+            .unwrap();
+        let dispatch = out.dispatch.expect("dispatch target");
+        assert_eq!(
+            dispatch.channel_type.as_ref().map(ChannelType::as_str),
+            Some("slack")
+        );
+        assert_eq!(dispatch.thread_id.as_deref(), Some("100.0"));
+        let msg = out.message.expect("fallback message");
+        assert_eq!(
+            msg.content["text"].as_str().unwrap(),
+            "(reaction: thumbsup)"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_handler_falls_back_when_external_id_missing() {
+        // This test stands in for "the service couldn't find an external_id,
+        // so it invoked the handler to obtain a fallback message". The
+        // handler doesn't observe the external_id directly — it just
+        // emits the `"(edit) <text>"` chat message; we verify the shape.
+        let m = InteractiveModule::default();
+        let ctx = MockModuleContext::new();
+        m.install(ctx.clone()).await.unwrap();
+        let handlers = ctx.action_handlers.lock().unwrap();
+        let (_, handler) = handlers.iter().find(|(n, _)| n == "edit").unwrap();
+        let out = handler
+            .handle(DeliveryActionInput {
+                action: "edit".into(),
+                payload: serde_json::json!({ "seq": 99, "text": "second try" }),
+                target: DispatchTarget {
+                    channel_type: Some(ChannelType::new("cli")),
+                    platform_id: Some("plat".into()),
+                    thread_id: None,
+                    agent_group_id: None,
+                },
+            })
+            .unwrap();
+        let msg = out.message.expect("fallback message");
+        assert_eq!(msg.kind, MessageKind::Chat);
+        assert_eq!(msg.content["text"].as_str().unwrap(), "(edit) second try");
+        // Dispatch defaults back to the inbound target so the service can
+        // route the fallback chat row to the same channel.
+        let dispatch = out.dispatch.expect("dispatch target");
+        assert_eq!(
+            dispatch.channel_type.as_ref().map(ChannelType::as_str),
+            Some("cli")
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_handler_rejects_missing_text() {
+        let m = InteractiveModule::default();
+        let ctx = MockModuleContext::new();
+        m.install(ctx.clone()).await.unwrap();
+        let handlers = ctx.action_handlers.lock().unwrap();
+        let (_, handler) = handlers.iter().find(|(n, _)| n == "edit").unwrap();
+        let err = handler
+            .handle(DeliveryActionInput {
+                action: "edit".into(),
+                payload: serde_json::json!({ "seq": 1 }),
+                target: DispatchTarget {
+                    channel_type: None,
+                    platform_id: None,
+                    thread_id: None,
+                    agent_group_id: None,
+                },
+            })
+            .unwrap_err();
+        assert!(format!("{err}").contains("text"));
+    }
+
+    #[tokio::test]
+    async fn reaction_handler_rejects_missing_emoji() {
+        let m = InteractiveModule::default();
+        let ctx = MockModuleContext::new();
+        m.install(ctx.clone()).await.unwrap();
+        let handlers = ctx.action_handlers.lock().unwrap();
+        let (_, handler) = handlers.iter().find(|(n, _)| n == "reaction").unwrap();
+        let err = handler
+            .handle(DeliveryActionInput {
+                action: "reaction".into(),
+                payload: serde_json::json!({ "seq": 1 }),
+                target: DispatchTarget {
+                    channel_type: None,
+                    platform_id: None,
+                    thread_id: None,
+                    agent_group_id: None,
+                },
+            })
+            .unwrap_err();
+        assert!(format!("{err}").contains("emoji"));
     }
 
     #[test]
