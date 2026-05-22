@@ -6,6 +6,27 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (rebuild.sh: don't let `ironclaw-setup --headless` wipe channel config from .env)
+
+- **`rebuild.sh`** — the image-rebake step invokes the full
+  `ironclaw-setup --headless` wizard, which rewrites `.env` from
+  scratch with only the keys it knows about (`ANTHROPIC_API_KEY`,
+  `IRONCLAW_DATA_DIR`, `IRONCLAW_DEFAULT_IMAGE_TAG`, etc.) — silently
+  dropping channel-specific keys (`TELEGRAM_BOT_TOKEN`,
+  `IRONCLAW_CHANNELS`, `IRONCLAW_CHANNELS_CONFIG`) and third-party
+  provider keys (`TAVILY_API_KEY`, etc.). Caught live: a `./rebuild.sh`
+  run silently disabled the Telegram channel by wiping its config.
+  Real users would notice nothing — the host log would say
+  "channels: cli, telegram" because the literal channel ENUM list
+  survives, but the per-channel config and bot token would be gone
+  and the Telegram polling would never start.
+- The script now snapshots `.env` before invoking setup, runs setup,
+  then re-appends any `KEY=VALUE` lines whose `KEY` is missing from
+  the post-setup `.env`. Effectively makes the wizard additive for
+  the rebuild use case. The proper long-term fix is to add an
+  `ironclaw-setup image` subcommand that runs ONLY the image build
+  without touching `.env` — filed for a follow-up.
+
 ### Fixed (recover from malformed tool_use JSON by feeding the parse error back to the model)
 
 - **`crates/ironclaw-types/src/provider.rs`** — new

@@ -165,17 +165,47 @@ if "image" in steps:
 PY
     fi
 
-    # Run only the image step, headless. Other steps are already done
-    # and will short-circuit; --skip-step on the rest avoids any
-    # accidental side effects (channel re-prompts, mount changes).
+    # Snapshot the .env BEFORE running setup. The headless wizard rewrites
+    # .env from scratch and only repopulates keys it knows about
+    # (ANTHROPIC_API_KEY, IRONCLAW_DATA_DIR, IRONCLAW_DEFAULT_IMAGE_TAG,
+    # etc.) — anything channel- or feature-specific (TELEGRAM_BOT_TOKEN,
+    # IRONCLAW_CHANNELS, IRONCLAW_CHANNELS_CONFIG, third-party API keys
+    # like TAVILY_API_KEY) gets dropped. We snapshot every existing key
+    # here and re-append the missing ones after setup runs, so the wizard
+    # is effectively additive for the rebuild use case.
     env_file="$INSTALL_ROOT/.env"
+    env_snapshot=""
     if [ -f "$env_file" ]; then
+        env_snapshot="$(mktemp)"
+        cp "$env_file" "$env_snapshot"
         api_key="$(grep '^ANTHROPIC_API_KEY=' "$env_file" | cut -d= -f2-)"
         export IRONCLAW_SETUP_ANTHROPIC_API_KEY="${api_key:-rebuild-placeholder}"
     fi
     export IRONCLAW_SETUP_QUICKSTART=no
     if "$INSTALL_DIR/ironclaw-setup" --headless 2>&1 | grep -E '^\[step\] image|reused image:|building locally' | tail -5; then
         :
+    fi
+
+    # Restore any keys the wizard dropped. Compare key names (left of
+    # first `=`) — append originals back if not present after.
+    if [ -n "$env_snapshot" ] && [ -f "$env_snapshot" ] && [ -f "$env_file" ]; then
+        restored=0
+        while IFS= read -r line; do
+            case "$line" in
+                ''|\#*) continue ;;
+                *=*)
+                    key="${line%%=*}"
+                    if ! grep -q "^${key}=" "$env_file"; then
+                        printf '%s\n' "$line" >> "$env_file"
+                        restored=$((restored + 1))
+                    fi
+                    ;;
+            esac
+        done < "$env_snapshot"
+        rm -f "$env_snapshot"
+        if [ "$restored" -gt 0 ]; then
+            say "restored $restored .env key(s) the wizard dropped"
+        fi
     fi
 
     # Pin the install at the new tag so the manager picks it up.
