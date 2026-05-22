@@ -6,6 +6,62 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (web_fetch: auto-convert HTML responses to markdown)
+
+- **`crates/ironclaw-mcp/src/tools/computer_use.rs`** — `web_fetch`
+  now detects HTML responses by Content-Type (`text/html`, including
+  parametrised forms like `text/html; charset=utf-8`, plus
+  `application/xhtml+xml`) and runs them through the pure-Rust `htmd`
+  crate (a turndown.js port) before returning to the model. Markdown
+  bodies are typically 5-10x smaller than the raw HTML, dramatically
+  shrinking the model's input window for routine URL reads. The
+  response gains three new fields when conversion fires —
+  `content_type: "text/html → markdown"`, `raw_html_bytes`, and
+  `markdown_bytes` — so the agent (and humans skimming traces) can
+  tell at a glance what happened. Non-HTML responses (JSON, plain
+  text, binary) are returned unchanged.
+- **New `raw: true` opt-out** on the tool input — when the agent
+  genuinely needs the original HTML (scraping `<meta>` tags, parsing
+  embedded JSON-LD, etc.) it can pass `raw: true` and the body is
+  returned untouched. Existing call sites without the field continue
+  to work unchanged; the only behavioural difference is the body
+  string content for HTML responses.
+- **`skills/web-fetch/SKILL.md`** — documents the new default
+  behaviour and the `raw` flag.
+- **`crates/ironclaw-mcp/Cargo.toml`** — adds `htmd = "0.2"`. Pinned
+  to 0.2 because 0.3+ require Rust 1.88's let-chains feature and the
+  workspace pins 1.85. License is Apache-2.0, MIT-compatible.
+- Four wiremock-backed tests pin the new behaviour:
+  HTML-with-charset-param converts, plain JSON passes through, the
+  `raw` flag suppresses conversion, and a Content-Type unit test
+  covers the parser permutations.
+
+### Changed (shell: persist working directory and env vars across calls)
+
+- **`crates/ironclaw-mcp/src/tools/computer_use.rs`** — environment
+  variables exported during a `shell` call now persist to subsequent
+  `shell` calls in the same session, and `cd` carries forward
+  between calls. Previously every call started in `/` with a fresh
+  env, forcing the agent to thread `cwd` through every invocation
+  and re-export anything it needed. The implementation sources a
+  per-session state file (`/data/.shell_state`, where `/data` is the
+  session's bind-mounted directory) before running the user's
+  command, then captures the resulting `PWD` plus `export -p` and
+  writes it back. Long agent workflows — clone a repo, `cd` into it,
+  run a multi-call build — now feel like a normal interactive shell.
+- **`reset: true` flag** on the tool input wipes the state file
+  before running, so the agent can deliberately start clean (e.g.
+  after a misconfigured env var).
+- **Secret hygiene**: env vars matching `*_TOKEN`, `*_KEY`,
+  `*_SECRET`, or starting with `ANTHROPIC_` are filtered out of the
+  persisted snapshot so credentials don't bleed into the state
+  file. They remain visible within the call that exported them.
+- **`skills/shell/SKILL.md`** — documents the new persistence,
+  reset, and secret-filtering rules.
+- Six new tests pin: env-var persistence, cwd persistence, `reset`
+  clears, `ANTHROPIC_*` filter, `_TOKEN`/`_KEY`/`_SECRET` filter,
+  and the wrapped-command shape.
+
 ### Fixed (runner: surface a reply when a turn fails terminally)
 
 - **`crates/ironclaw-runner/src/run.rs`** — `finalize_messages` now
