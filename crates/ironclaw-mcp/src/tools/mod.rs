@@ -22,6 +22,11 @@ pub mod agents;
 pub mod computer_use;
 pub mod core;
 pub mod edit_file;
+pub(crate) mod git_common;
+pub mod git_blame;
+pub mod git_diff;
+pub mod git_log;
+pub mod git_status;
 pub mod glob;
 pub mod grep;
 pub mod interactive;
@@ -75,6 +80,12 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         computer_use::read_file::entry(),
         computer_use::write_file::entry(),
         computer_use::web_fetch::entry(),
+        // Git inspection tools — read-only structured access to a
+        // libgit2-backed repository view. Registered alphabetically.
+        git_blame::entry(),
+        git_diff::entry(),
+        git_log::entry(),
+        git_status::entry(),
         glob::entry(),
         grep::entry(),
         web_search::entry(),
@@ -164,6 +175,10 @@ mod tests {
             "read_file",
             "write_file",
             "web_fetch",
+            "git_blame",
+            "git_diff",
+            "git_log",
+            "git_status",
             "glob",
             "grep",
             "web_search",

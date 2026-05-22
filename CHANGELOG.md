@@ -125,6 +125,52 @@ adheres to [Semantic Versioning](https://semver.org/).
   22. Existing schema-stability tests pass; the
   `tool_set_lists_every_in_process_tool` inventory test is updated.
 
+### Added (agent tools: native git inspection via libgit2)
+
+- **`crates/ironclaw-mcp/src/tools/git_status.rs`,
+  `git_log.rs`, `git_diff.rs`, `git_blame.rs`** — four read-only
+  git tools, backed by `git2` (libgit2 with the `vendored-libgit2`
+  feature, so no host-side libgit2 install required). Output is
+  structured JSON instead of `git ...` text the model has to
+  parse:
+  - `git_status` — branch, ahead/behind vs upstream, and per-file
+    staged / unstaged / untracked lists with porcelain letter
+    flags. Handles unborn HEAD (`git init`) and detached HEAD
+    gracefully.
+  - `git_log` — commit objects with `sha`/`short_sha`/`author`/
+    `email`/RFC3339 `date`/`subject`/`body`/`files_changed`.
+    Supports `ref`, `max_count` (default 20, cap 200), `since`
+    (ISO date or RFC 3339), and a `files` pathspec filter.
+  - `git_diff` — unified patch text plus a per-file
+    additions/deletions summary. Working-tree mode when both
+    `from` and `to` are omitted; ref-to-ref otherwise. `context`
+    knob (default 3) and `max_bytes` cap (default 200 KiB, hard
+    cap 1 MiB) with a `truncated` flag.
+  - `git_blame` — per-line blame rows with short SHA / author /
+    RFC 3339 date / line text. Range via `from_line`/`to_line`;
+    out-of-bounds clamps to the file's actual size.
+- **`crates/ironclaw-mcp/src/tools/git_common.rs`** — shared
+  repository discovery, path resolution, libgit2 error wrapping,
+  and short-OID / RFC 3339 helpers so the four tools render
+  errors identically.
+- **`crates/ironclaw-mcp/src/tools/mod.rs`** — registers all
+  four entries in `build_tool_set()`. The crate's smoke test in
+  `lib.rs` notes git tools test themselves (they need an on-disk
+  repo the smoke harness doesn't stand up).
+- **`skills/git/SKILL.md`** — one combined skill covering when
+  to reach for each of the four tools, common patterns ("what
+  changed in the last hour", "who wrote this function", "is the
+  working tree clean"), and the explicit "these are read-only;
+  hand mutations back to the operator" reminder.
+- **`crates/ironclaw-mcp/Cargo.toml`** — pins `git2 = "0.19"`
+  with `default-features = false, features = ["vendored-libgit2"]`
+  so the build is self-contained (cmake + cc pulled in at
+  compile time only; the resulting binary statically links
+  libgit2). Workspace clippy stays clean at `-D warnings`; 23
+  new unit tests cover every tool's happy path, validation
+  errors, range clamping, truncation, empty-repo handling, and
+  ref-not-found.
+
 ### Fixed (runner: surface a reply when a turn fails terminally)
 
 - **`crates/ironclaw-runner/src/run.rs`** — `finalize_messages` now

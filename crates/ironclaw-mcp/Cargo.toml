@@ -21,6 +21,12 @@ htmd = "0.2"
 ignore = { workspace = true }
 globset = { workspace = true }
 regex = { workspace = true }
+# git2 is libgit2-sys under the hood. We pin a recent stable line and use
+# the vendored libgit2 build so the workspace doesn't grow a runtime
+# dependency on the host's system libgit2 (which is missing on many
+# minimal CI images). Vendored-libgit2 also pulls in `cc`/`cmake` at
+# build time only; the resulting binary statically links libgit2.
+git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 
 [dev-dependencies]
 tokio = { workspace = true }

@@ -37,15 +37,17 @@ agent> Boxes hold the world,
   `outbound.db` (container writes, host reads) — plus a central
   identity / wiring database. The single-writer rule is enforced
   by code, not convention.
-- **First-class agent tools.** 23 in-tree tools the model can call:
+- **First-class agent tools.** 27 in-tree tools the model can call:
   send / edit / react / file / card / question, schedule and
   manage recurring tasks, install packages, register MCP servers,
   spawn sibling agents, seven computer-use tools (`shell`,
   `edit_file`, `read_file`, `write_file`, `web_fetch`, `grep`,
   `glob`) backed by structured `{path, line, text}` rows and
-  `.gitignore`-aware traversal, and a multi-provider `web_search`
-  tool that auto-routes to Tavily / Exa / Brave / SerpAPI based on
-  which API key is configured.
+  `.gitignore`-aware traversal, four read-only git inspection
+  tools (`git_status`, `git_log`, `git_diff`, `git_blame`) backed
+  by libgit2 with structured JSON output, and a multi-provider
+  `web_search` tool that auto-routes to Tavily / Exa / Brave /
+  SerpAPI based on which API key is configured.
 - **Multiple providers.** Anthropic native (HTTP streaming with
   tool use and automatic compaction), Anthropic-compatible
   gateways (OpenRouter, internal proxies — set
@@ -316,7 +318,7 @@ template.
 
 ## Agent tools
 
-The runner inside each container exposes 23 tools to the model:
+The runner inside each container exposes 27 tools to the model:
 
 **Messaging.** `send_message`, `send_file`, `edit_message`,
 `add_reaction`, `ask_user_question`, `send_card`.
@@ -339,6 +341,16 @@ via temp + rename; preserves mode), `web_fetch` (HTTP GET/POST,
 (gitignore-style glob, sorted paths, default cap 1000 / ceiling
 10000).
 
+**Git inspection.** `git_status`, `git_log`, `git_diff`,
+`git_blame` — read-only structured access to a libgit2-backed
+repository view (no shelling to the `git` binary). Each returns a
+stable JSON shape: branch / ahead-behind / staged-unstaged-
+untracked lists for status; commit objects with sha / author /
+RFC3339 date / subject / body for log; unified diff plus per-file
+additions/deletions for diff; per-line blame rows for blame.
+Mutations (commit / push / branch) are intentionally absent —
+hand those back to the operator.
+
 **Web search.** `web_search` with a normalised
 `{title, url, snippet, published?, score?}` shape, routing
 automatically based on which key is configured: `TAVILY_API_KEY`,
@@ -348,8 +360,9 @@ at 4 KiB.
 
 Per-skill SKILL.md prose is auto-inlined into the runner's system
 prompt at spawn so the model knows *when* to reach for each tool,
-not just what each tool's schema looks like. 27 skill bundles are
-authored under `skills/`.
+not just what each tool's schema looks like. 28 skill bundles are
+authored under `skills/` (the `git` bundle covers all four
+inspection tools at once).
 
 ---
 
