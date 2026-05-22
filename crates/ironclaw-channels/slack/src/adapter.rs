@@ -712,4 +712,76 @@ mod tests {
         assert!(s.contains("SlackAdapter"));
         assert!(s.contains("slack"));
     }
+
+    // -----------------------------------------------------------------
+    // Team CHN audit additions: adapter-level edge cases.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn deliver_empty_text_still_posts_message() {
+        // Slack happily posts an empty `text` (the call succeeds and
+        // the user sees nothing). We don't want to silently drop it on
+        // our side — confirm the API does get called.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"ok": true, "ts": "1.0"})),
+            )
+            .mount(&server)
+            .await;
+        let adapter = adapter_for(&server);
+        let msg = OutboundMessage {
+            kind: MessageKind::Chat,
+            content: json!({}),
+            files: vec![],
+        };
+        let id = adapter.deliver("C1", None, &msg).await.unwrap();
+        assert_eq!(id.as_deref(), Some("1.0"));
+    }
+
+    #[tokio::test]
+    async fn deliver_non_object_content_treats_as_empty_text() {
+        // content as a JSON array — no `text` key reachable; the adapter
+        // falls back to empty text and still hits the API. Verify it
+        // doesn't panic on the unexpected shape.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"ok": true, "ts": "2.0"})),
+            )
+            .mount(&server)
+            .await;
+        let adapter = adapter_for(&server);
+        let msg = OutboundMessage {
+            kind: MessageKind::Chat,
+            content: json!([1, 2, 3]),
+            files: vec![],
+        };
+        let id = adapter.deliver("C1", None, &msg).await.unwrap();
+        assert_eq!(id.as_deref(), Some("2.0"));
+    }
+
+    #[tokio::test]
+    async fn deliver_429_with_retry_after_surfaces_rate_to_adapter_caller() {
+        // Sanity-check: even when the api maps the rate-limit, the
+        // adapter passes the Rate variant straight through.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat.postMessage"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "11")
+                    .set_body_string(""),
+            )
+            .mount(&server)
+            .await;
+        let adapter = adapter_for(&server);
+        let err = adapter.deliver("C1", None, &text("hi")).await.unwrap_err();
+        match err {
+            AdapterError::Rate { retry_after } => assert_eq!(retry_after, Some(11)),
+            other => panic!("expected Rate, got {other:?}"),
+        }
+    }
 }

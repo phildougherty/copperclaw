@@ -989,4 +989,128 @@ mod tests {
         adapter.shutdown().await;
     }
 
+    // -----------------------------------------------------------------
+    // Team CHN audit additions: adapter-level edge cases for rate-limit
+    // and malformed-response paths. The api-level tests cover the same
+    // shapes; these confirm the adapter surfaces the error variant
+    // unchanged through the trait boundary.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn deliver_propagates_rate_limit_with_retry_after() {
+        let s = MockServer::start().await;
+        empty_get_updates(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/bottok/sendMessage"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "42")
+                    .set_body_json(json!({
+                        "ok": false,
+                        "error_code": 429,
+                        "description": "Too Many Requests: retry after 42",
+                        "parameters": { "retry_after": 42 }
+                    })),
+            )
+            .mount(&s)
+            .await;
+        let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
+        let dir = temp_dir();
+        let adapter = TelegramAdapter::start(
+            lp_config(&s.uri()),
+            None,
+            tx,
+            dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let err = adapter
+            .deliver(
+                "100",
+                None,
+                &OutboundMessage {
+                    kind: MessageKind::Chat,
+                    content: json!({"text": "hi"}),
+                    files: vec![],
+                },
+            )
+            .await
+            .unwrap_err();
+        match err {
+            AdapterError::Rate { retry_after } => {
+                assert_eq!(retry_after, Some(42));
+            }
+            other => panic!("expected Rate, got {other:?}"),
+        }
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_malformed_response_body_is_transport() {
+        let s = MockServer::start().await;
+        empty_get_updates(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/bottok/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json at all"))
+            .mount(&s)
+            .await;
+        let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
+        let dir = temp_dir();
+        let adapter = TelegramAdapter::start(
+            lp_config(&s.uri()),
+            None,
+            tx,
+            dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let err = adapter
+            .deliver(
+                "100",
+                None,
+                &OutboundMessage {
+                    kind: MessageKind::Chat,
+                    content: json!({"text": "hi"}),
+                    files: vec![],
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AdapterError::Transport(_)),
+            "expected Transport, got {err:?}"
+        );
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_non_object_content_with_no_text_errors() {
+        // content as a bare JSON array — no `text` key reachable.
+        let s = MockServer::start().await;
+        empty_get_updates(&s).await;
+        let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
+        let dir = temp_dir();
+        let adapter = TelegramAdapter::start(
+            lp_config(&s.uri()),
+            None,
+            tx,
+            dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let err = adapter
+            .deliver(
+                "100",
+                None,
+                &OutboundMessage {
+                    kind: MessageKind::Chat,
+                    content: json!([1, 2, 3]),
+                    files: vec![],
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AdapterError::BadRequest(_)));
+        adapter.shutdown().await;
+    }
 }

@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (Team CHN: channel adapter audit + edge-case tests)
+
+- `docs/channels/` (NEW) — audit summary plus 21 per-channel reports.
+  Confirms zero adapters have `todo!()` / `unimplemented!()` in the
+  production deliver path; every adapter either calls the platform or
+  returns a typed `AdapterError::Unsupported` / `BadRequest`. One
+  MED-severity finding documented (imessage empty body returns silently,
+  enshrined in an existing test). Each per-channel doc lists tested
+  edges + deferred punch list with line-level pointers.
+- `crates/ironclaw-channels/telegram/src/adapter.rs` — 3 new
+  adapter-level edge tests: rate-limit retry-after,
+  malformed-response-body → Transport, non-object content → BadRequest.
+- `crates/ironclaw-channels/slack/src/adapter.rs` — 3 new
+  adapter-level edge tests: empty text still posts, non-object content
+  as empty text, 429 Retry-After → AdapterError::Rate.
+- `crates/ironclaw-channels/discord/src/adapter.rs` — 3 new
+  adapter-level edge tests: empty content object still posts,
+  non-object content renders as JSON, 429 Retry-After → AdapterError::Rate.
+
 ### Fixed (scheduling: persist tasks and fire due ones from the sweep loop)
 
 - **`crates/ironclaw-modules/src/scheduling.rs`** — `SchedulingModule::install`

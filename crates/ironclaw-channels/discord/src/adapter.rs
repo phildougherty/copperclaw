@@ -815,4 +815,68 @@ mod tests {
         // assertion keeps the test green and documents the intent.
         let _ = frame;
     }
+
+    // -----------------------------------------------------------------
+    // Team CHN audit additions: adapter-level edge cases.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn deliver_empty_content_object_posts_empty_message() {
+        // No `text` key — render falls back to JSON form `{}`. Discord
+        // would render it as the literal text but the call still goes
+        // through; we don't silently drop.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/channels/c1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"m-empty"})))
+            .mount(&server)
+            .await;
+        let (a, _rx) = build_adapter(&server);
+        let msg = OutboundMessage {
+            kind: MessageKind::Chat,
+            content: json!({}),
+            files: vec![],
+        };
+        let id = a.deliver("c1", None, &msg).await.unwrap();
+        assert_eq!(id.as_deref(), Some("m-empty"));
+    }
+
+    #[tokio::test]
+    async fn deliver_non_object_content_renders_as_json_and_posts() {
+        // A bare array - no `text` key - renders as compact JSON.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/channels/c1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"m-arr"})))
+            .mount(&server)
+            .await;
+        let (a, _rx) = build_adapter(&server);
+        let msg = OutboundMessage {
+            kind: MessageKind::Chat,
+            content: json!([1, 2, 3]),
+            files: vec![],
+        };
+        let id = a.deliver("c1", None, &msg).await.unwrap();
+        assert_eq!(id.as_deref(), Some("m-arr"));
+    }
+
+    #[tokio::test]
+    async fn deliver_429_with_retry_after_propagates_rate_variant() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/channels/c1/messages"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("retry-after", "7")
+                    .set_body_string(""),
+            )
+            .mount(&server)
+            .await;
+        let (a, _rx) = build_adapter(&server);
+        let err = a.deliver("c1", None, &outbound_text("hi")).await.unwrap_err();
+        match err {
+            AdapterError::Rate { retry_after } => assert_eq!(retry_after, Some(7)),
+            other => panic!("expected Rate, got {other:?}"),
+        }
+    }
 }
