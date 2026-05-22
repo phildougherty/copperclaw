@@ -6,5 +6,6 @@ pub mod apology;
 pub mod heartbeat;
 pub mod processing;
 pub mod recurrence;
+pub mod scheduling;
 pub mod stuck;
 pub mod wake;

@@ -11,6 +11,7 @@ pub mod clock;
 pub mod error;
 pub mod service;
 pub mod spawn_tracker;
+pub mod task_store;
 
 #[cfg(test)]
 mod test_support;
@@ -22,6 +23,7 @@ pub use service::{
     MessageReset, SeriesFanout, SessionPool, SessionRoot, SweepReport, SweepService,
 };
 pub use spawn_tracker::{SpawnAttemptTracker, SPAWN_FAIL_THRESHOLD};
+pub use task_store::SqliteTaskStore;
 
 /// Wall-clock age threshold for a pending chat inbound before the
 /// sweep emits a user-visible apology. Matches the container

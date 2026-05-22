@@ -50,6 +50,10 @@ const CENTRAL: &[Migration] = &[
         name: "009_rate_limit_caps",
         sql: include_str!("../migrations/009_rate_limit_caps.sql"),
     },
+    Migration {
+        name: "010_tasks",
+        sql: include_str!("../migrations/010_tasks.sql"),
+    },
 ];
 
 const SESSION_INBOUND: &[Migration] = &[Migration {
@@ -207,6 +211,7 @@ mod tests {
             "dropped_messages",
             "outbound_dropped_messages",
             "container_configs",
+            "tasks",
         ] {
             let exists: i64 = conn
                 .query_row(

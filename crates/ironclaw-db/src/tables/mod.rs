@@ -33,3 +33,4 @@ pub mod unregistered_senders;
 pub mod dropped_messages;
 pub mod outbound_dropped_messages;
 pub mod container_configs;
+pub mod tasks;
