@@ -6,6 +6,41 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (agent tools: `grep` and `glob` for structured filesystem search)
+
+- **`crates/ironclaw-mcp/src/tools/grep.rs`** — new in-process tool
+  that regex-searches files under a path and returns structured
+  `{path, line, text, context_before, context_after}` rows. Uses
+  the `ignore` crate (the same one `ripgrep` uses) for `.gitignore`-
+  aware traversal and the `regex` crate for matching. Default cap of
+  100 results with a hard ceiling of 1000, per-line byte cap of 4 KiB
+  (truncated on a UTF-8 char boundary with a `…[truncated]` marker),
+  binary files skipped automatically by NUL-byte sniff, and
+  `target/` / `node_modules/` / `.git/` skipped unconditionally
+  on top of whatever `.gitignore` says. Optional flags: `glob`
+  filename filter (e.g. `*.rs`), `case_insensitive`, `context_lines`
+  (cap 20), and `no_ignore` to bypass `.gitignore`/`.ignore` for
+  cases like log file search.
+- **`crates/ironclaw-mcp/src/tools/glob.rs`** — companion tool that
+  lists files under a path matching a gitignore-style glob. Uses
+  `globset` for the pattern and the same `ignore`-walker for
+  traversal. Default cap of 1000 results with a hard ceiling of
+  10000. Returns sorted paths (workspace-relative when the search
+  root was relative, absolute otherwise) so callers can snapshot
+  the output reliably. No matches returns an empty array, not an
+  error.
+- **`skills/grep/SKILL.md`** and **`skills/glob/SKILL.md`** —
+  auto-loaded skill docs telling the agent when to reach for these
+  tools over `shell rg` / `shell find`. Both stress the
+  structured-output win (no parsing) and explain the cap / ignore /
+  binary-skip semantics.
+- **Workspace `Cargo.toml`** — three new pinned workspace deps:
+  `ignore = "0.4"`, `globset = "0.4"`, and `regex = "1"`.
+- The new tools land in `build_tool_set()` alphabetically among the
+  computer-use family, bringing the in-tree tool count from 20 to
+  22. Existing schema-stability tests pass; the
+  `tool_set_lists_every_in_process_tool` inventory test is updated.
+
 ### Fixed (runner: surface a reply when a turn fails terminally)
 
 - **`crates/ironclaw-runner/src/run.rs`** — `finalize_messages` now

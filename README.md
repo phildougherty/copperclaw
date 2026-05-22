@@ -37,13 +37,15 @@ agent> Boxes hold the world,
   `outbound.db` (container writes, host reads) — plus a central
   identity / wiring database. The single-writer rule is enforced
   by code, not convention.
-- **First-class agent tools.** 20 in-tree tools the model can call:
+- **First-class agent tools.** 22 in-tree tools the model can call:
   send / edit / react / file / card / question, schedule and
   manage recurring tasks, install packages, register MCP servers,
-  spawn sibling agents, plus four computer-use tools (`shell`,
-  `read_file`, `write_file`, `web_fetch`) and a multi-provider
-  `web_search` tool that auto-routes to Tavily / Exa / Brave /
-  SerpAPI based on which API key is configured.
+  spawn sibling agents, six computer-use tools (`shell`,
+  `read_file`, `write_file`, `web_fetch`, `grep`, `glob`) backed
+  by structured `{path, line, text}` rows and `.gitignore`-aware
+  traversal, and a multi-provider `web_search` tool that auto-routes
+  to Tavily / Exa / Brave / SerpAPI based on which API key is
+  configured.
 - **Multiple providers.** Anthropic native (HTTP streaming with
   tool use and automatic compaction), Anthropic-compatible
   gateways (OpenRouter, internal proxies — set
@@ -314,7 +316,7 @@ template.
 
 ## Agent tools
 
-The runner inside each container exposes 20 tools to the model:
+The runner inside each container exposes 22 tools to the model:
 
 **Messaging.** `send_message`, `send_file`, `edit_message`,
 `add_reaction`, `ask_user_question`, `send_card`.
@@ -329,7 +331,10 @@ registration), `create_agent` (spin up a sibling agent group).
 **Computer use.** `shell` (bash inside the container, 60s default
 timeout, 64 KiB output cap), `read_file` (UTF-8, 1 MiB cap),
 `write_file` (auto-mkdir-p, create or append), `web_fetch` (HTTP
-GET/POST, 256 KiB body cap, 30s default).
+GET/POST, 256 KiB body cap, 30s default), `grep` (regex search
+with `.gitignore`-aware traversal, structured `{path, line, text}`
+rows, default cap 100 / ceiling 1000), `glob` (gitignore-style
+glob, sorted paths, default cap 1000 / ceiling 10000).
 
 **Web search.** `web_search` with a normalised
 `{title, url, snippet, published?, score?}` shape, routing
@@ -340,7 +345,7 @@ at 4 KiB.
 
 Per-skill SKILL.md prose is auto-inlined into the runner's system
 prompt at spawn so the model knows *when* to reach for each tool,
-not just what each tool's schema looks like. 22 skill bundles are
+not just what each tool's schema looks like. 24 skill bundles are
 authored under `skills/`.
 
 ---
