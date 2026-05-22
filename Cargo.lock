@@ -2111,12 +2111,15 @@ dependencies = [
  "async-trait",
  "chrono",
  "croner",
+ "ironclaw-db",
  "ironclaw-types",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -31,7 +31,10 @@ pub mod scheduling;
 pub mod self_mod;
 pub mod typing;
 
-pub use agent_to_agent::{AgentRef, AgentToAgentModule};
+pub use agent_to_agent::{
+    always_allow as create_agent_always_allow, always_deny as create_agent_always_deny, AgentRef,
+    AgentToAgentModule, CreateAgentHandler, CreateAgentModule, CreateAgentPermissionCheck,
+};
 pub use approvals::{ApprovalsModule, ApprovalSummary, NewPendingCtx, NewPendingNotifier};
 pub use context::{
     ChannelRequestCtx, DeliveryActionHandler, DeliveryActionInput, DeliveryActionOutput,

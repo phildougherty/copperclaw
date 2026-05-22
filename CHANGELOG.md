@@ -6,6 +6,48 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (modules: wire the `create_agent` delivery action)
+
+- **`crates/ironclaw-modules/src/agent_to_agent.rs`** — the
+  `AgentToAgentModule` now registers a `create_agent` delivery action
+  via `register_delivery_action`. Previously the runner emitted the
+  `{"create_agent": {...}}` system row but the host had no handler, so
+  rows fell through to `no handler for system action; skipping
+  name=create_agent` and silently dropped the request. The new
+  `CreateAgentHandler` parses `{name, instructions, channel}`, gates on
+  a configurable `CreateAgentPermissionCheck` closure (production wires
+  this to a `users` / `user_roles` lookup; tests use `always_allow`),
+  refuses requests originating from previously-spawned agent groups
+  (max nesting = 1 to prevent fork-bombs), then `agent_groups::create`
+  + `sessions::create` + (when `channel` is set) a synthetic
+  `messaging_groups` + `messaging_group_agents` upsert. The container
+  manager's reconcile loop picks up the new session on its next tick.
+- **Parent notification** — after the central-DB mutations succeed,
+  the handler writes a `kind=system` row to the *parent* session's
+  `inbound.db` with content
+  `{"create_agent_result": {"status": "created", "session_id": "...", "agent_group_id": "..."}}`
+  so the calling agent learns the real ids on its next turn (the
+  runner's `apply_create_agent` had returned a synthetic ack). Denied,
+  rejected (nested), and invalid-payload requests surface a matching
+  status row.
+- **`crates/ironclaw-modules/src/lib.rs`** — re-exports
+  `CreateAgentHandler`, `CreateAgentPermissionCheck`,
+  `create_agent_always_allow`, `create_agent_always_deny` for host
+  wiring + tests.
+- **`crates/ironclaw-modules/Cargo.toml`** — adds `ironclaw-db` as a
+  dependency (previously the modules crate avoided the dep by routing
+  DB access through closures, but the create-agent flow's CRUD surface
+  is too wide to plumb that way cleanly). `tempfile` added under
+  `dev-dependencies` for the new tests.
+- **Tests**: five new tests in `agent_to_agent.rs` —
+  `create_agent_inserts_agent_group_and_session`,
+  `create_agent_emits_result_to_parent_inbound`,
+  `create_agent_with_channel_creates_wiring`,
+  `create_agent_denied_when_permission_missing`,
+  `create_agent_refuses_nesting`, plus
+  `create_agent_invalid_payload_surfaces_back` and
+  `install_registers_create_agent_action_when_deps_present`.
+
 ### Fixed (runner: route chat outbounds back to the originating channel)
 
 - **`crates/ironclaw-runner/src/tools.rs`** and
