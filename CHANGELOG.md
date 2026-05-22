@@ -6,6 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (skill ↔ tool coverage tests + `skills/README.md` conventions)
+
+- **`crates/ironclaw-skills/tests/coverage.rs`** — new integration test
+  file pinning the `tools ↔ skills` matrix. Nine tests:
+  (1) every `skills/<dirname>/SKILL.md` has frontmatter `name:` equal
+  to `<dirname>`; (2) every tool returned by
+  `ironclaw_mcp::tools::build_tool_set` is mentioned in at least one
+  skill, so the model always learns when to reach for it;
+  (3) every backtick-quoted "looks like a tool" token in any skill
+  body resolves to a real registry entry (catches typos and
+  references to deprecated tools — uses a `VERB_PREFIXES` heuristic
+  plus an explicit `NON_TOOL_TOKEN_ALLOWLIST` for schema-field
+  tokens); (4) every skill description is at least 30 characters;
+  (5) every skill body contains at least one WHEN-trigger word
+  (`when`, `use this`, `reach for`, `if you need`, `prefer`,
+  `before`, `after`) — lenient (allows up to one skill to lack a
+  trigger, currently the meta-skill `discovering-tools`);
+  (6) `SkillRegistry::scan` iterates skills in alphabetical order;
+  (7) every `SKILL.md` body is under 8 KiB
+  (TODO(team-skl): spec target is 4 KiB; bumped to 8 KiB until a
+  cull pass on the long-form skills `explore`, `web-search`,
+  `add-mcp-server`, etc.); (8) no skill body contains
+  unprocessed `{{ }}` template markers or `<TODO>` / `[PLACEHOLDER]`
+  WIP markers; (9) the reserved `tools:` frontmatter key, if
+  present, lists only real registry tools (currently unused —
+  documented in `skills/README.md`). All nine pass against the
+  current `skills/` tree without any skill content changes.
+- **`skills/README.md`** — new file documenting the conventions the
+  coverage tests enforce: kebab-case directory naming, frontmatter
+  shape, the WHEN-trigger requirement, the 8 KiB body cap, the
+  `allowed-tools:` / reserved `tools:` distinction, and the two
+  workflows that need to touch both sides (adding a new skill,
+  renaming/deleting an MCP tool).
+
 ### Fixed (scheduling: persist tasks and fire due ones from the sweep loop)
 
 - **`crates/ironclaw-modules/src/scheduling.rs`** — `SchedulingModule::install`
