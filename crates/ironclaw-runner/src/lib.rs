@@ -19,6 +19,7 @@ pub mod disallowed;
 pub mod formatter;
 pub mod run;
 pub mod state;
+pub mod subagent;
 pub mod tools;
 
 pub use compaction::{compact, estimate_tokens, CompactionCfg};
@@ -32,4 +33,7 @@ pub use run::{
     POLL_INTERVAL_MS, PROVIDER_DEADLINE_ENV,
 };
 pub use state::{load_state, save_state, PersistedState};
-pub use tools::RunnerToolCtx;
+pub use subagent::{
+    build_subagent_system, run_inner_loop, SubagentDeps, SubagentInputs, SUBAGENT_PREAMBLE,
+};
+pub use tools::{RunnerToolCtx, SubagentRunnerDeps};

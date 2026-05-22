@@ -15,7 +15,7 @@ use ironclaw_db::session::{open_inbound_rw_no_mmap, open_outbound, SessionPaths}
 use ironclaw_providers::AnthropicProvider;
 use ironclaw_runner::{
     compaction::CompactionCfg, resolve_provider_deadline, run_loop, RunnerConfig, RunnerDeps,
-    RunnerToolCtx,
+    RunnerToolCtx, SubagentRunnerDeps,
 };
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
@@ -30,6 +30,7 @@ struct Cli {
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)] // single linear startup; splitting hurts clarity.
 async fn main() -> Result<()> {
     // Same reasoning as ironclaw-host: runner shares stdout with the
     // container poll loop's formatter output; tracing belongs on stderr.
@@ -66,14 +67,11 @@ async fn main() -> Result<()> {
         .api_key
         .clone()
         .context("provider api key not set; configure `api_key_env`")?;
-    let provider = Arc::new(match cfg.api_base_url.as_deref() {
-        Some(base) => AnthropicProvider::with_base_url(api_key, base),
-        None => AnthropicProvider::new(api_key),
-    });
-    let tool_ctx: Arc<dyn ironclaw_mcp::ToolContext> = Arc::new(RunnerToolCtx::new(
-        outbound.clone(),
-        paths.outbox.clone(),
-    ));
+    let provider: Arc<dyn ironclaw_providers::AgentProvider> =
+        Arc::new(match cfg.api_base_url.as_deref() {
+            Some(base) => AnthropicProvider::with_base_url(api_key, base),
+            None => AnthropicProvider::new(api_key),
+        });
 
     let compaction = CompactionCfg {
         model_input_window: cfg.model_input_window,
@@ -114,6 +112,26 @@ async fn main() -> Result<()> {
             .collect(),
     );
 
+    // Wire the subagent deps onto the ctx so the `explore` tool can
+    // open a fresh bounded LLM loop with the same provider, model,
+    // and tool inventory the parent runner uses.
+    let provider_deadline = resolve_provider_deadline(&env);
+    let subagent_deps = SubagentRunnerDeps {
+        provider: provider.clone(),
+        tool_map: tool_map.clone(),
+        system: cfg.system.clone(),
+        model: cfg.model.clone(),
+        effort: cfg.effort,
+        per_turn_max_tokens: cfg.max_tokens,
+        temperature: cfg.temperature,
+        assistant_name: cfg.assistant_name.clone(),
+        provider_deadline,
+    };
+    let tool_ctx: Arc<dyn ironclaw_mcp::ToolContext> = Arc::new(
+        RunnerToolCtx::new(outbound.clone(), paths.outbox.clone())
+            .with_subagent(subagent_deps),
+    );
+
     let deps = RunnerDeps {
         provider,
         tool_ctx,
@@ -137,7 +155,7 @@ async fn main() -> Result<()> {
         turn_seq: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         tool_map,
         max_tool_turns: 20,
-        provider_deadline: resolve_provider_deadline(&env),
+        provider_deadline,
     };
 
     tracing::info!(

@@ -37,13 +37,15 @@ agent> Boxes hold the world,
   `outbound.db` (container writes, host reads) — plus a central
   identity / wiring database. The single-writer rule is enforced
   by code, not convention.
-- **First-class agent tools.** 20 in-tree tools the model can call:
+- **First-class agent tools.** 21 in-tree tools the model can call:
   send / edit / react / file / card / question, schedule and
   manage recurring tasks, install packages, register MCP servers,
   spawn sibling agents, plus four computer-use tools (`shell`,
-  `read_file`, `write_file`, `web_fetch`) and a multi-provider
+  `read_file`, `write_file`, `web_fetch`), a multi-provider
   `web_search` tool that auto-routes to Tavily / Exa / Brave /
-  SerpAPI based on which API key is configured.
+  SerpAPI based on which API key is configured, and `explore` —
+  a lightweight in-process subagent for "go look at these files
+  and tell me what's there" without spawning a whole new container.
 - **Multiple providers.** Anthropic native (HTTP streaming with
   tool use and automatic compaction), Anthropic-compatible
   gateways (OpenRouter, internal proxies — set
@@ -314,7 +316,7 @@ template.
 
 ## Agent tools
 
-The runner inside each container exposes 20 tools to the model:
+The runner inside each container exposes 21 tools to the model:
 
 **Messaging.** `send_message`, `send_file`, `edit_message`,
 `add_reaction`, `ask_user_question`, `send_card`.
@@ -337,6 +339,17 @@ automatically based on which key is configured: `TAVILY_API_KEY`,
 `EXA_API_KEY`, `BRAVE_SEARCH_API_KEY`, or `SERPAPI_API_KEY`. Per-
 call result cap 1–25 (default 10), UTF-8-safe snippet truncation
 at 4 KiB.
+
+**Lightweight subagent.** `explore` opens a fresh bounded LLM
+loop against the same upstream the parent uses, with a
+caller-supplied `task` string as the only input. Read-only tools
+by default (`grep`, `glob`, `read_file`, `web_fetch`); hard caps
+of 10 turns, 200 KiB cumulative input tokens, and a 60-second
+wall-clock. Returns a single summary string — intermediate
+exploration never enters the parent's context. Nested `explore`
+calls are refused. Useful when an answer needs 3+ file reads or
+2+ search queries; for trivial one-file lookups, use `read_file`
+directly. See `skills/explore/SKILL.md`.
 
 Per-skill SKILL.md prose is auto-inlined into the runner's system
 prompt at spawn so the model knows *when* to reach for each tool,

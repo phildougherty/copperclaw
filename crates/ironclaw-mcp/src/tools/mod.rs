@@ -21,6 +21,7 @@ use crate::error::ToolError;
 pub mod agents;
 pub mod computer_use;
 pub mod core;
+pub mod explore;
 pub mod interactive;
 pub mod scheduling;
 pub mod self_mod;
@@ -72,6 +73,7 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         computer_use::write_file::entry(),
         computer_use::web_fetch::entry(),
         web_search::entry(),
+        explore::entry(),
     ]
 }
 
@@ -158,6 +160,7 @@ mod tests {
             "write_file",
             "web_fetch",
             "web_search",
+            "explore",
         ];
         assert_eq!(set.len(), expected.len());
         for tool in &expected {
