@@ -20,9 +20,17 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALL_DIR="${IRONCLAW_INSTALL_DIR:-$HOME/.local/bin}"
-DATA_DIR="${IRONCLAW_DATA_DIR:-$HOME/.local/share/ironclaw}"
-INSTALL_ROOT="$(dirname "$DATA_DIR" 2>/dev/null || true)"
-[ "$INSTALL_ROOT" = "$DATA_DIR" ] && INSTALL_ROOT="$DATA_DIR"
+# Install root is the parent of the data dir; the setup wizard puts the
+# data dir at <install_root>/data and chat.fifo at <install_root>/chat.fifo.
+# Default install root is platform-specific (XDG on Linux, ~/Library on macOS).
+if [ -n "${IRONCLAW_DATA_DIR:-}" ]; then
+    INSTALL_ROOT="$(dirname "$IRONCLAW_DATA_DIR")"
+elif [ "$(uname -s)" = "Darwin" ]; then
+    INSTALL_ROOT="$HOME/Library/Application Support/ironclaw"
+else
+    INSTALL_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}/ironclaw"
+fi
+DATA_DIR="$INSTALL_ROOT/data"
 
 do_stop=1
 do_start=1
