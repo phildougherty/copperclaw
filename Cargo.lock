@@ -2034,6 +2034,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "ironclaw-db",
+ "ironclaw-metrics",
  "ironclaw-modules",
  "ironclaw-types",
  "rusqlite",

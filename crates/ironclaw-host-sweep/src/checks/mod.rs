@@ -2,6 +2,7 @@
 //! takes the session context and current instant and returns its branch of
 //! the [`crate::SweepReport`].
 
+pub mod apology;
 pub mod heartbeat;
 pub mod processing;
 pub mod recurrence;
