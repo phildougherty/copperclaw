@@ -6,6 +6,51 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (Test (structural): every runner-emitted action has a handler)
+
+- **`crates/ironclaw-host/tests/action_handler_coverage.rs`** — new
+  integration test file that ships four structural meta-tests sealing
+  the bug class behind today's seven silently-inert subsystems
+  (`ask_question` vs `ask_user_question`, `card` vs `send_card`,
+  `SchedulingModule::install` no-op, `AgentToAgentModule` registering
+  nothing, missing `edit`/`reaction` handlers, swallowed
+  `install_packages`/`add_mcp_server` failures). All seven compiled,
+  had passing unit tests on both sides, and shipped to production —
+  nothing in CI cross-checked the runner's emit set against the
+  host's handler set end-to-end.
+  Tests:
+  (1) `every_runner_emit_has_a_host_handler` enumerates every system
+  action name the runner emits as `MessageKind::System`
+  (`usage_report`, `edit`, `reaction`, `ask_user_question`,
+  `send_card`, `create_agent`, `install_packages`, `add_mcp_server`,
+  `schedule`) and asserts each one is either inline-handled in
+  `DeliveryService::handle_system` or registered by a built-in
+  module via `register_delivery_action`. The module set is captured
+  by installing the same module list as
+  `boot::install_modules` (`TypingModule`, `MountSecurityModule`,
+  `PermissionsModule`, `ApprovalsModule`, `InteractiveModule`,
+  `SchedulingModule`, `AgentToAgentModule`, `SelfModModule`) against
+  a `MockModuleContext` and reading back `delivery_actions()`.
+  (2) `runner_emit_set_matches_source` re-derives the runner emit
+  set from `crates/ironclaw-runner/src/tools.rs` (`fn apply_*`
+  bodies) and `crates/ironclaw-runner/src/run.rs`
+  (`fn emit_usage_report` body) via a brace-matching parser +
+  regex over `serde_json::json!({ "<name>": …`; asserts no drift
+  from the hard-coded list in (1).
+  (3) `host_handle_set_matches_inline_arms` scans
+  `crates/ironclaw-host-delivery/src/service.rs` for every
+  `if action.name == "…"` arm plus the typed `match action_name`
+  block in `try_action_via_adapter`; asserts no drift.
+  (4) `every_module_action_name_is_lowercase_snake` — every name
+  registered against the dispatcher matches `^[a-z][a-z0-9_]*$`.
+  On initial run, test (1) caught one extant gap: `create_agent`
+  has a fully-implemented `CreateAgentModule` (added by team-CA)
+  but `boot::install_modules` only installs `AgentToAgentModule`
+  (the unit-struct interceptor sibling), so the `create_agent`
+  delivery action is unwired in production. Tests (2)-(4) pass.
+  Tracked as a follow-up: add `CreateAgentModule::new(…)` to the
+  `install_modules` vec in `crates/ironclaw-host/src/boot.rs`.
+
 ### Added (skill ↔ tool coverage tests + `skills/README.md` conventions)
 
 - **`crates/ironclaw-skills/tests/coverage.rs`** — new integration test
