@@ -281,6 +281,71 @@ pub struct TaskSummary {
     pub recurrence: Option<String>,
 }
 
+/// Request handed to [`ToolContext::spawn_subagent`] by the `explore` tool.
+///
+/// The fields are deliberately small: the runner reuses its own
+/// provider, model, and base system prompt — the caller just supplies the
+/// task, the allowlisted tools, and the bounded budgets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentRequest {
+    /// Free-text task description. Becomes the subagent's user message.
+    pub task: String,
+    /// Maximum LLM turns. Hard-capped by the host to
+    /// [`SUBAGENT_MAX_TURNS_LIMIT`].
+    pub max_turns: u32,
+    /// Maximum cumulative input tokens across all turns. Hard-capped
+    /// by the host to [`SUBAGENT_MAX_TOKENS_LIMIT`].
+    pub max_tokens: u32,
+    /// Tool name allowlist. Anything outside this list is refused
+    /// with a synthetic tool-result error.
+    pub tools_allowed: Vec<String>,
+    /// True when this request is itself originating from inside a
+    /// subagent. The runner refuses nested explore calls; the mock
+    /// records-then-refuses.
+    pub nested: bool,
+}
+
+/// Hard cap on the `max_turns` field of [`SubagentRequest`].
+pub const SUBAGENT_MAX_TURNS_LIMIT: u32 = 10;
+/// Hard cap on the `max_tokens` field of [`SubagentRequest`]. This is
+/// an *input* budget — the subagent's cumulative `input_tokens` across
+/// turns must stay under this. Output tokens are accounted but not
+/// budgeted (the model's own `max_tokens` per turn bounds them).
+pub const SUBAGENT_MAX_TOKENS_LIMIT: u32 = 200_000;
+/// Hard wall-clock cap on a single subagent invocation. Enforced as a
+/// `tokio::time::timeout` around the whole loop.
+pub const SUBAGENT_WALL_CLOCK_SECS: u64 = 60;
+
+/// One tool call observed during a subagent run. Surfaced verbatim in
+/// the `explore` tool's response so the parent agent can audit what
+/// the subagent actually did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentToolCall {
+    /// Tool name the subagent invoked (or attempted to invoke — entries
+    /// for refused calls are kept too so the audit trail is complete).
+    pub name: String,
+    /// Verbatim input the subagent passed. Truncated by callers if it
+    /// would explode the parent's context; this struct itself does not
+    /// elide.
+    pub input: serde_json::Value,
+}
+
+/// Result returned by [`ToolContext::spawn_subagent`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentResult {
+    /// Final assistant text. Empty when the loop exited without a
+    /// final text turn (e.g. cap hit on `tool_use`); the caller is
+    /// expected to surface `summary` as-is.
+    pub summary: String,
+    /// How many LLM turns actually fired. Always `<= max_turns`.
+    pub turns_used: u32,
+    /// Cumulative input + output tokens across the run. The runner
+    /// charges these against the parent's daily budget.
+    pub tokens_used: u32,
+    /// Tool calls the subagent made, in order.
+    pub tools_called: Vec<SubagentToolCall>,
+}
+
 /// The contract that every tool handler relies on for side effects.
 ///
 /// Implementations: the runner (writes to outbound.db, mutates scheduler);
@@ -299,6 +364,29 @@ pub trait ToolContext: Send + Sync {
     /// pathway. Implementors may delegate to whatever scheduler state they
     /// own; the mock keeps a synthetic table.
     async fn list_tasks(&self) -> Result<Vec<TaskSummary>, ToolError>;
+
+    /// Open an in-process LLM subagent loop. Default impl returns
+    /// `ToolError::Context("subagent not supported in this context")` so
+    /// existing test contexts work without modification — only the
+    /// runner's [`crate::ToolContext`] impl and contexts that opt in
+    /// (notably `MockToolContext` in tests) override this.
+    ///
+    /// The `explore` tool calls into this method wrapped in a 60s
+    /// wall-clock timeout enforced inside the tool. Implementations
+    /// may add their own deadlines.
+    ///
+    /// Nested calls (a subagent itself calling `explore`) are refused
+    /// at the tool layer by checking `req.nested == true` and
+    /// returning `ToolError::Validation`.
+    async fn spawn_subagent(
+        &self,
+        req: SubagentRequest,
+    ) -> Result<SubagentResult, ToolError> {
+        let _ = req;
+        Err(ToolError::Context(
+            "subagent not supported in this context".into(),
+        ))
+    }
 }
 
 /// In-memory recording implementation used by tests.
@@ -321,6 +409,14 @@ struct MockInner {
     task_summaries: Vec<TaskSummary>,
     /// Override ack returned by the next `emit_outbound`.
     next_ack: Option<ToolEffectAck>,
+    /// Subagent requests recorded in order.
+    subagent_calls: Vec<SubagentRequest>,
+    /// Pre-seeded subagent result returned by the next
+    /// `spawn_subagent`. When `None`, the mock returns a canned
+    /// `SubagentResult { summary: "mock subagent: <task>", ... }`.
+    next_subagent_result: Option<SubagentResult>,
+    /// If set, the next `spawn_subagent` returns this Err instead.
+    next_subagent_err: Option<ToolError>,
 }
 
 impl MockToolContext {
@@ -378,6 +474,31 @@ impl MockToolContext {
             .expect("MockToolContext mutex poisoned")
             .task_summaries = tasks;
     }
+
+    /// Snapshot of subagent requests recorded so far.
+    pub fn subagent_calls(&self) -> Vec<SubagentRequest> {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .subagent_calls
+            .clone()
+    }
+
+    /// Override the result returned by the next `spawn_subagent`.
+    pub fn set_next_subagent_result(&self, result: SubagentResult) {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .next_subagent_result = Some(result);
+    }
+
+    /// Cause the *next* `spawn_subagent` to fail.
+    pub fn fail_next_subagent(&self, err: ToolError) {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .next_subagent_err = Some(err);
+    }
 }
 
 #[async_trait]
@@ -401,6 +522,25 @@ impl ToolContext for MockToolContext {
             return Err(err);
         }
         Ok(g.task_summaries.clone())
+    }
+
+    async fn spawn_subagent(
+        &self,
+        req: SubagentRequest,
+    ) -> Result<SubagentResult, ToolError> {
+        let mut g = self.inner.lock().expect("MockToolContext mutex poisoned");
+        if let Some(err) = g.next_subagent_err.take() {
+            return Err(err);
+        }
+        let canned = SubagentResult {
+            summary: format!("mock subagent: {}", req.task),
+            turns_used: 1,
+            tokens_used: 0,
+            tools_called: Vec::new(),
+        };
+        let result = g.next_subagent_result.take().unwrap_or(canned);
+        g.subagent_calls.push(req);
+        Ok(result)
     }
 }
 

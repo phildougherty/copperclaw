@@ -22,6 +22,7 @@ pub mod agents;
 pub mod computer_use;
 pub mod core;
 pub mod edit_file;
+pub mod explore;
 pub(crate) mod git_common;
 pub mod git_blame;
 pub mod git_diff;
@@ -89,6 +90,7 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         glob::entry(),
         grep::entry(),
         web_search::entry(),
+        explore::entry(),
     ]
 }
 
@@ -182,6 +184,7 @@ mod tests {
             "glob",
             "grep",
             "web_search",
+            "explore",
         ];
         assert_eq!(set.len(), expected.len());
         for tool in &expected {

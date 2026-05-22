@@ -25,8 +25,10 @@
 //! `chat`-kind row whose `content` includes a `files` array pointing at the
 //! filename.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -36,15 +38,53 @@ use ironclaw_db::DbError;
 use ironclaw_mcp::{
     AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec, EditMessageSpec,
     InstallSpec, OutboundToolEffect, ScheduleSpec, SendCardSpec, SendFileSpec, SendMessageSpec,
-    TaskSummary, ToolContext, ToolEffectAck, ToolError, UpdateTaskSpec,
+    SubagentRequest, SubagentResult, TaskSummary, ToolContext, ToolEffectAck, ToolEntry,
+    ToolError, UpdateTaskSpec,
 };
-use ironclaw_types::{MessageId, MessageKind};
+use ironclaw_providers::AgentProvider;
+use ironclaw_types::{Effort, MessageId, MessageKind};
 use rusqlite::Connection;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::subagent::{run_inner_loop, SubagentDeps, SubagentInputs};
+
 /// Shared, async-safe handle to the runner's `outbound.db` connection.
 pub type SharedOutbound = Arc<Mutex<Connection>>;
+
+/// Bundle of dependencies the [`RunnerToolCtx::spawn_subagent`] impl
+/// needs in addition to the outbound-write set. Populated at runner
+/// startup from [`crate::RunnerDeps`] and handed to the ctx via
+/// [`RunnerToolCtx::with_subagent`].
+///
+/// Kept as a separate struct rather than inlined into `RunnerToolCtx`
+/// so existing callers (most of the runner's tests) can construct a
+/// context without any subagent wiring — `spawn_subagent` then falls
+/// back to the trait default ("subagent not supported in this
+/// context").
+#[derive(Clone)]
+pub struct SubagentRunnerDeps {
+    /// Provider handle, shared with the parent's loop.
+    pub provider: Arc<dyn AgentProvider>,
+    /// Full in-process tool inventory. The subagent loop filters this
+    /// down to the caller's allowlist; tools not on the allowlist
+    /// surface as `is_error=true` `tool_result` blocks.
+    pub tool_map: Arc<HashMap<String, Arc<ToolEntry>>>,
+    /// Base system prompt (skills already inlined by the runner).
+    pub system: String,
+    /// Provider-native model id.
+    pub model: String,
+    /// Effort hint.
+    pub effort: Effort,
+    /// Per-turn `max_tokens` for the provider call.
+    pub per_turn_max_tokens: u32,
+    /// Sampling temperature, if any.
+    pub temperature: Option<f32>,
+    /// Display name for the assistant, if any.
+    pub assistant_name: Option<String>,
+    /// Per-LLM-call deadline applied around `provider.query()`.
+    pub provider_deadline: Duration,
+}
 
 /// `ToolContext` implementation backed by the per-session `outbound.db` plus
 /// the session's `outbox/` directory.
@@ -54,19 +94,41 @@ pub type SharedOutbound = Arc<Mutex<Connection>>;
 /// surfaced to the host via `system`-kind outbound rows (see
 /// [`OutboundToolEffect::ScheduleTask`] et al.) and the host writes any
 /// resulting state into its own central DB.
+///
+/// `spawn_subagent` is wired through [`SubagentRunnerDeps`] when the
+/// runner binary builds the ctx in `main.rs`; tests / minimal builds
+/// can skip the wiring and rely on the trait default (returns
+/// `ToolError::Context("subagent not supported in this context")`).
 pub struct RunnerToolCtx {
     outbound: SharedOutbound,
     outbox_root: PathBuf,
+    subagent: Option<SubagentRunnerDeps>,
+    /// Re-entrancy guard so a subagent calling `explore` is detected
+    /// and refused, even before the explore tool's own nested-check
+    /// fires. Bumped on entry to `spawn_subagent` and checked on
+    /// re-entry.
+    in_subagent: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RunnerToolCtx {
     /// Build a fresh context around the given outbound DB handle and outbox
-    /// directory.
+    /// directory. The resulting context cannot spawn subagents — call
+    /// [`Self::with_subagent`] to wire that in.
     pub fn new(outbound: SharedOutbound, outbox_root: impl Into<PathBuf>) -> Self {
         Self {
             outbound,
             outbox_root: outbox_root.into(),
+            subagent: None,
+            in_subagent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Attach the subagent dependencies so the `explore` tool's
+    /// `spawn_subagent` path can run.
+    #[must_use]
+    pub fn with_subagent(mut self, deps: SubagentRunnerDeps) -> Self {
+        self.subagent = Some(deps);
+        self
     }
 
     /// Snapshot accessor for tests.
@@ -95,6 +157,111 @@ impl ToolContext for RunnerToolCtx {
         // message and await the host's response via `messages_in`. Until
         // that flow exists we surface an empty list.
         Ok(Vec::new())
+    }
+
+    async fn spawn_subagent(
+        &self,
+        req: SubagentRequest,
+    ) -> Result<SubagentResult, ToolError> {
+        let Some(deps) = self.subagent.as_ref() else {
+            return Err(ToolError::Context(
+                "subagent deps not wired into RunnerToolCtx".into(),
+            ));
+        };
+        // Hard-deny nested calls (subagent → subagent). The flag is
+        // also threaded into the inner explore tool by re-entering
+        // the context with `nested = true` set on the request, but
+        // doing the check here too means we still refuse even if a
+        // future caller forgets to set it.
+        if req.nested
+            || self
+                .in_subagent
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(ToolError::Validation(
+                "nested `explore` calls are not allowed".into(),
+            ));
+        }
+        self.in_subagent
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Build a fresh ctx for the subagent. We hand it `self` so
+        // the model can still emit outbound effects (if the
+        // allowlist permits any) without recursing into another
+        // subagent — the `in_subagent` flag above blocks that
+        // explicitly.
+        //
+        // The subagent's `ToolContext` is currently the same
+        // `RunnerToolCtx` the parent uses. That means a subagent
+        // tool call to `send_message` would actually post a message;
+        // the `tools_allowed` allowlist (defaults to read-only) is
+        // what prevents that. The two are intentionally redundant.
+        let provider = deps.provider.clone();
+        let tool_ctx: Arc<dyn ToolContext> = Arc::new(SubagentCtxAdapter {
+            inner: self.outbound.clone(),
+            outbox_root: self.outbox_root.clone(),
+        });
+        let sub_deps = SubagentDeps {
+            provider: &provider,
+            tool_ctx: &tool_ctx,
+            tool_map: &deps.tool_map,
+            system: &deps.system,
+            model: &deps.model,
+            effort: deps.effort,
+            per_turn_max_tokens: deps.per_turn_max_tokens,
+            temperature: deps.temperature,
+            assistant_name: deps.assistant_name.as_deref(),
+            provider_deadline: deps.provider_deadline,
+        };
+        let inputs = SubagentInputs {
+            task: req.task,
+            tools_allowed: req.tools_allowed,
+            max_turns: req.max_turns,
+            max_input_tokens: req.max_tokens,
+            wall_clock: Duration::from_secs(ironclaw_mcp::SUBAGENT_WALL_CLOCK_SECS),
+        };
+        let result = run_inner_loop(&sub_deps, inputs).await;
+        self.in_subagent
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        result.map_err(|err| ToolError::Context(format!("subagent provider error: {err}")))
+    }
+}
+
+/// A `ToolContext` adapter the subagent loop hands to its tool
+/// handlers. Forwards outbound effects to the parent's outbound DB but
+/// blocks `spawn_subagent` (no nested explore) and pretends task
+/// listing is empty (same as the runner's main path).
+///
+/// We don't reuse `RunnerToolCtx` here because that would pull the
+/// `subagent` deps along — letting a subagent's tool emit
+/// `OutboundToolEffect` rows into the same DB is fine; letting it
+/// recurse into another full subagent loop is the footgun we are
+/// preventing. Distinct type, distinct trait impl, no surprise.
+struct SubagentCtxAdapter {
+    inner: SharedOutbound,
+    outbox_root: PathBuf,
+}
+
+#[async_trait]
+impl ToolContext for SubagentCtxAdapter {
+    async fn emit_outbound(
+        &self,
+        effect: OutboundToolEffect,
+    ) -> Result<ToolEffectAck, ToolError> {
+        let outbox = self.outbox_root.clone();
+        let mut guard = self.inner.lock().await;
+        let conn: &mut Connection = &mut guard;
+        apply_effect(conn, &outbox, effect).map_err(to_tool_error)
+    }
+    async fn list_tasks(&self) -> Result<Vec<TaskSummary>, ToolError> {
+        Ok(Vec::new())
+    }
+    async fn spawn_subagent(
+        &self,
+        _req: SubagentRequest,
+    ) -> Result<SubagentResult, ToolError> {
+        Err(ToolError::Validation(
+            "nested `explore` calls are not allowed".into(),
+        ))
     }
 }
 
@@ -698,5 +865,142 @@ mod tests {
         let (_tmp, ctx) = fresh_ctx();
         let tasks = ctx.list_tasks().await.unwrap();
         assert!(tasks.is_empty());
+    }
+
+    // ── spawn_subagent / explore integration ────────────────────────
+
+    use async_trait::async_trait;
+    use ironclaw_providers::{AgentProvider, AgentQuery, ProviderError, QueryInput};
+    use ironclaw_types::ProviderEvent;
+    use std::sync::Mutex as StdMutex;
+
+    struct OneShotProvider {
+        events: StdMutex<Option<Vec<ProviderEvent>>>,
+    }
+
+    impl OneShotProvider {
+        fn new(events: Vec<ProviderEvent>) -> Arc<Self> {
+            Arc::new(Self {
+                events: StdMutex::new(Some(events)),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl AgentProvider for OneShotProvider {
+        fn name(&self) -> &'static str {
+            "oneshot"
+        }
+        async fn query(
+            &self,
+            _input: QueryInput,
+        ) -> Result<Box<dyn AgentQuery>, ProviderError> {
+            let events = self.events.lock().unwrap().take().unwrap_or_default();
+            Ok(Box::new(OneShotQuery {
+                events: StdMutex::new(events),
+            }))
+        }
+        fn is_session_invalid(&self, _err: &ProviderError) -> bool {
+            false
+        }
+    }
+
+    struct OneShotQuery {
+        events: StdMutex<Vec<ProviderEvent>>,
+    }
+
+    #[async_trait]
+    impl AgentQuery for OneShotQuery {
+        async fn push(&mut self, _: String) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<ProviderEvent> {
+            let mut g = self.events.lock().unwrap();
+            if g.is_empty() {
+                None
+            } else {
+                Some(g.remove(0))
+            }
+        }
+        async fn abort(&mut self) {}
+    }
+
+    fn ctx_with_subagent(
+        provider_events: Vec<ProviderEvent>,
+    ) -> (tempfile::TempDir, RunnerToolCtx) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(
+            tmp.path(),
+            AgentGroupId::new(),
+            SessionId::new(),
+        );
+        let conn = open_outbound(&paths).unwrap();
+        let outbound = Arc::new(Mutex::new(conn));
+        let provider: Arc<dyn AgentProvider> = OneShotProvider::new(provider_events);
+        let tool_map = Arc::new(HashMap::new());
+        let deps = SubagentRunnerDeps {
+            provider,
+            tool_map,
+            system: "parent system".into(),
+            model: "test-model".into(),
+            effort: Effort::Low,
+            per_turn_max_tokens: 4096,
+            temperature: None,
+            assistant_name: None,
+            provider_deadline: Duration::from_secs(5),
+        };
+        let ctx = RunnerToolCtx::new(outbound, paths.outbox.clone())
+            .with_subagent(deps);
+        (tmp, ctx)
+    }
+
+    #[tokio::test]
+    async fn spawn_subagent_happy_returns_summary() {
+        let (_tmp, ctx) = ctx_with_subagent(vec![ProviderEvent::Result {
+            text: Some("from subagent".into()),
+        }]);
+        let req = SubagentRequest {
+            task: "look at thing".into(),
+            max_turns: 3,
+            max_tokens: 10_000,
+            tools_allowed: vec!["read_file".into()],
+            nested: false,
+        };
+        let out = ctx.spawn_subagent(req).await.unwrap();
+        assert_eq!(out.summary, "from subagent");
+        assert_eq!(out.turns_used, 1);
+    }
+
+    #[tokio::test]
+    async fn spawn_subagent_refuses_nested() {
+        let (_tmp, ctx) = ctx_with_subagent(vec![ProviderEvent::Result {
+            text: Some("never".into()),
+        }]);
+        let req = SubagentRequest {
+            task: "look".into(),
+            max_turns: 1,
+            max_tokens: 1000,
+            tools_allowed: vec![],
+            nested: true,
+        };
+        let err = ctx.spawn_subagent(req).await.unwrap_err();
+        assert!(matches!(err, ToolError::Validation(s) if s.contains("nested")));
+    }
+
+    #[tokio::test]
+    async fn spawn_subagent_without_deps_returns_context_error() {
+        let (_tmp, ctx) = fresh_ctx();
+        let req = SubagentRequest {
+            task: "x".into(),
+            max_turns: 1,
+            max_tokens: 1000,
+            tools_allowed: vec![],
+            nested: false,
+        };
+        let err = ctx.spawn_subagent(req).await.unwrap_err();
+        assert!(matches!(err, ToolError::Context(s) if s.contains("subagent deps not wired")));
     }
 }

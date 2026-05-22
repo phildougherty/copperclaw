@@ -171,6 +171,61 @@ adheres to [Semantic Versioning](https://semver.org/).
   errors, range clamping, truncation, empty-repo handling, and
   ref-not-found.
 
+### Added (agent tools: `explore` — lightweight in-process subagent)
+
+- **`crates/ironclaw-mcp/src/tools/explore.rs`** — new `explore` tool
+  that opens a bounded LLM loop against the same upstream the parent
+  runner uses (same provider, same model, same API key, same base
+  URL) and returns a single summary string. Built for "go look at
+  these files and tell me what's there" without the cost of
+  `create_agent`'s full container spawn. Default budgets: 5 LLM
+  turns, 50_000 cumulative input tokens, 60s wall-clock. Hard caps:
+  10 turns, 200_000 tokens. Read-only tool allowlist by default
+  (`grep`, `glob`, `read_file`, `web_fetch`); caller can pass an
+  explicit `tools` array to widen. Nested `explore` (subagent calling
+  `explore` from inside itself) is refused at validation. Tool count
+  in `build_tool_set` goes from 20 to 21; the smoke test in
+  `crates/ironclaw-mcp/src/lib.rs::smoke` and the order pin in
+  `crates/ironclaw-mcp/src/server.rs::tests` are updated accordingly.
+- **`crates/ironclaw-mcp/src/context.rs`** — adds `SubagentRequest`,
+  `SubagentResult`, `SubagentToolCall` types, plus a new
+  `ToolContext::spawn_subagent` trait method with a default impl that
+  returns `ToolError::Context("subagent not supported in this
+  context")`. `MockToolContext` records subagent calls and returns
+  canned results so the `explore` tool's unit tests stay
+  transport-free.
+- **`crates/ironclaw-runner/src/subagent.rs`** — new module containing
+  `run_inner_loop`, the slimmed-down sibling of `run::drive_turn`. It
+  does not touch `outbound.db`, does not emit `send_message`, does
+  not write `usage_report`, and filters the tool inventory to the
+  caller's allowlist. Wall-clock + token-budget gates are polled
+  cooperatively *between turns* so the partial last-assistant-text
+  survives an overrun; the hard `tokio::time::timeout` lives in
+  `explore.rs` as the outer fallback. Canonical exit summaries:
+  `"explore stopped: max_turns reached"`, `"explore stopped: token
+  budget exceeded"`, `"explore stopped: wall-clock timeout"`,
+  `"explore stopped: provider error"`.
+- **`crates/ironclaw-runner/src/tools.rs`** — `RunnerToolCtx` gains
+  optional `SubagentRunnerDeps` (provider + tool_map + model + system
+  prompt + per-turn max_tokens + provider deadline) wired in via a
+  new `with_subagent(...)` builder method. `spawn_subagent` flips a
+  re-entrancy guard so a subagent's own tool calls can write to
+  `outbound.db` but can never recurse into another full subagent
+  loop. The subagent's `ToolContext` is a fresh `SubagentCtxAdapter`
+  whose `spawn_subagent` impl unconditionally refuses, giving us
+  defense-in-depth against the nested case.
+- **`crates/ironclaw-runner/src/main.rs`** — populates the
+  `SubagentRunnerDeps` after building the tool map / provider /
+  config, so the `explore` tool is fully wired the moment the runner
+  starts.
+- **`skills/explore/SKILL.md`** — usage guidance for the model:
+  prefer `explore` for any question needing 3+ file reads or 2+
+  search queries; pass a self-contained `task` (the subagent does
+  not see the parent's history); keep the read-only default unless
+  you have a concrete reason.
+- **`README.md`** — Agent tools section bumped from 20 → 21 and the
+  new tool documented.
+
 ### Fixed (runner: surface a reply when a turn fails terminally)
 
 - **`crates/ironclaw-runner/src/run.rs`** — `finalize_messages` now

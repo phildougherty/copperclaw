@@ -28,7 +28,9 @@ pub use client::{McpClient, RemoteTool, SharedMcpClient};
 pub use context::{
     AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec, EditMessageSpec,
     InstallSpec, MockToolContext, OutboundToolEffect, Recipient, ScheduleSpec, SendCardSpec,
-    SendFileSpec, SendMessageSpec, TaskSummary, ToolContext, ToolEffectAck, UpdateTaskSpec,
+    SendFileSpec, SendMessageSpec, SubagentRequest, SubagentResult, SubagentToolCall,
+    TaskSummary, ToolContext, ToolEffectAck, UpdateTaskSpec, SUBAGENT_MAX_TOKENS_LIMIT,
+    SUBAGENT_MAX_TURNS_LIMIT, SUBAGENT_WALL_CLOCK_SECS,
 };
 pub use error::{McpError, ToolError};
 pub use server::{build_server, IronclawServer};
@@ -95,6 +97,7 @@ mod smoke {
             // git_* smoke covered in each tool's own test module — they
             // need a real on-disk repo, which the smoke harness doesn't
             // set up. Skipping here is intentional.
+            ("explore", serde_json::json!({"task": "go look"})),
         ];
 
         for (name, body) in inputs {
