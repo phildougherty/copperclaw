@@ -13,8 +13,8 @@
 //! ```json
 //! { "edit":          { "seq": 7, "text": "..." } }
 //! { "reaction":      { "seq": 7, "emoji": "..." } }
-//! { "ask_question":  { "id": "q_<uuid>", "title": "...", "options": [...], "to": {...} } }
-//! { "card":          { "to": {...}, "card": {...} } }
+//! { "ask_user_question": { "id": "q_<uuid>", "title": "...", "options": [...], "to": {...} } }
+//! { "send_card":          { "to": {...}, "card": {...} } }
 //! { "create_agent":  { "name": "...", "instructions": "...", "channel": "..." } }
 //! { "install_packages": { "apt": [...], "npm": [...], "reason": "..." } }
 //! { "add_mcp_server":   { "name": "...", "transport": {...}, "reason": "..." } }
@@ -512,7 +512,11 @@ fn apply_ask_question(
     if let Some(t) = spec.to {
         q.insert("to".into(), serde_json::to_value(t).unwrap_or_default());
     }
-    let payload = serde_json::json!({ "ask_question": q });
+    // Action name must match what `InteractiveModule::install` registers
+    // (`ask_user_question`). Until this round it was `"ask_question"`,
+    // which fell through to "no handler; skipping" — the user never saw
+    // the question card.
+    let payload = serde_json::json!({ "ask_user_question": q });
     insert_row(conn, MessageKind::System, payload)?;
     Ok(ToolEffectAck::Question { id: qid })
 }
@@ -527,7 +531,9 @@ fn apply_send_card(
         body.insert("to".into(), serde_json::to_value(t).unwrap_or_default());
     }
     body.insert("card".into(), spec.card);
-    let payload = serde_json::json!({ "card": body });
+    // Action name must match what `InteractiveModule::install` registers
+    // (`send_card`). Previously emitted as `"card"` which fell through.
+    let payload = serde_json::json!({ "send_card": body });
     let seq = insert_row(conn, MessageKind::System, payload)?;
     Ok(ToolEffectAck::Message { seq })
 }
@@ -840,8 +846,8 @@ mod tests {
         assert!(qid.starts_with("q_"));
         let row = last_row(&ctx).await;
         assert_eq!(row.kind, MessageKind::System);
-        assert_eq!(row.content["ask_question"]["id"], qid);
-        assert_eq!(row.content["ask_question"]["title"], "ok?");
+        assert_eq!(row.content["ask_user_question"]["id"], qid);
+        assert_eq!(row.content["ask_user_question"]["title"], "ok?");
     }
 
     #[tokio::test]
@@ -855,7 +861,7 @@ mod tests {
         .unwrap();
         let row = last_row(&ctx).await;
         assert_eq!(row.kind, MessageKind::System);
-        assert_eq!(row.content["card"]["card"]["hi"], 1);
+        assert_eq!(row.content["send_card"]["card"]["hi"], 1);
     }
 
     #[tokio::test]
