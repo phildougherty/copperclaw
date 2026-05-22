@@ -34,6 +34,9 @@
 //! | Counter   | `ironclaw_containers_spawned_total`| —              |
 //! | Counter   | `ironclaw_containers_crashed_total`| —              |
 //! | Counter   | `ironclaw_delivery_failed_total`   | `channel_type` |
+//! | Counter   | `ironclaw_budget_exhausted_total`  | `agent_group_id`, `gate` |
+//! | Counter   | `ironclaw_budget_exhausted_replies_total` | `agent_group_id` |
+//! | Counter   | `ironclaw_budget_exhausted_suppressed_total` | `agent_group_id` |
 //! | Histogram | `ironclaw_llm_call_seconds`        | —              |
 //! | Histogram | `ironclaw_llm_tokens_input`        | —              |
 //! | Histogram | `ironclaw_llm_tokens_output`       | —              |
@@ -58,12 +61,22 @@ pub const CONTAINERS_CRASHED_TOTAL: &str = "ironclaw_containers_crashed_total";
 pub const IMAGE_REBUILD_FAILED_TOTAL: &str = "ironclaw_image_rebuild_failed_total";
 pub const SECRETS_ROTATED_TOTAL: &str = "ironclaw_secrets_rotated_total";
 pub const DELIVERY_FAILED_TOTAL: &str = "ironclaw_delivery_failed_total";
+pub const BUDGET_EXHAUSTED_TOTAL: &str = "ironclaw_budget_exhausted_total";
+pub const BUDGET_EXHAUSTED_REPLIES_TOTAL: &str = "ironclaw_budget_exhausted_replies_total";
+pub const BUDGET_EXHAUSTED_SUPPRESSED_TOTAL: &str = "ironclaw_budget_exhausted_suppressed_total";
 pub const LLM_CALL_SECONDS: &str = "ironclaw_llm_call_seconds";
 pub const LLM_TOKENS_INPUT: &str = "ironclaw_llm_tokens_input";
 pub const LLM_TOKENS_OUTPUT: &str = "ironclaw_llm_tokens_output";
 pub const CONTAINER_SPAWN_SECONDS: &str = "ironclaw_container_spawn_seconds";
 pub const PROVIDER_DEADLINE_TOTAL: &str = "ironclaw_provider_deadline_total";
 pub const PROVIDER_RETRY_TOTAL: &str = "ironclaw_provider_retry_total";
+
+// ── Budget-gate label values for the `gate` label of
+// `ironclaw_budget_exhausted_total`. Use these constants instead of
+// stringly-typed literals at call sites so a typo is a compile error.
+pub const BUDGET_GATE_DAILY_TOKENS: &str = "daily_tokens";
+pub const BUDGET_GATE_TURNS_PER_MINUTE: &str = "turns_per_minute";
+pub const BUDGET_GATE_TURNS_PER_HOUR: &str = "turns_per_hour";
 
 // ── Counter helpers ────────────────────────────────────────────────────────
 
@@ -121,6 +134,44 @@ pub fn inc_provider_deadline(provider: &str) {
 /// per-call timeout).
 pub fn inc_provider_retry(provider: &str) {
     counter!(PROVIDER_RETRY_TOTAL, "provider" => provider.to_owned()).increment(1);
+}
+
+/// Increment `ironclaw_budget_exhausted_total{agent_group_id, gate}`. Fired by
+/// the container manager every time a budget gate refuses to spawn — once
+/// per refusal regardless of whether the in-channel reply is then deduped.
+/// `gate` should be one of [`BUDGET_GATE_DAILY_TOKENS`],
+/// [`BUDGET_GATE_TURNS_PER_MINUTE`], or [`BUDGET_GATE_TURNS_PER_HOUR`].
+pub fn inc_budget_exhausted(agent_group_id: &str, gate: &str) {
+    counter!(
+        BUDGET_EXHAUSTED_TOTAL,
+        "agent_group_id" => agent_group_id.to_owned(),
+        "gate" => gate.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Increment `ironclaw_budget_exhausted_replies_total{agent_group_id}`.
+/// Fired by the container manager when a budget-exhausted (or rate-limit)
+/// reply is *actually* written to outbound — i.e. AFTER the dedup window
+/// check. Pairs with [`inc_budget_exhausted_suppressed`] which fires when
+/// the reply is suppressed by the dedup window instead.
+pub fn inc_budget_exhausted_reply(agent_group_id: &str) {
+    counter!(
+        BUDGET_EXHAUSTED_REPLIES_TOTAL,
+        "agent_group_id" => agent_group_id.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Increment `ironclaw_budget_exhausted_suppressed_total{agent_group_id}`.
+/// Fired by the container manager when a refusal is detected but the
+/// per-group dedup window suppresses the in-channel reply.
+pub fn inc_budget_exhausted_suppressed(agent_group_id: &str) {
+    counter!(
+        BUDGET_EXHAUSTED_SUPPRESSED_TOTAL,
+        "agent_group_id" => agent_group_id.to_owned(),
+    )
+    .increment(1);
 }
 
 // ── Histogram helpers ──────────────────────────────────────────────────────
@@ -438,6 +489,74 @@ mod tests {
         inc_secrets_rotated();
         inc_provider_deadline("anthropic");
         inc_provider_retry("anthropic");
+        inc_budget_exhausted("ag-test", BUDGET_GATE_DAILY_TOKENS);
+        inc_budget_exhausted("ag-test", BUDGET_GATE_TURNS_PER_MINUTE);
+        inc_budget_exhausted("ag-test", BUDGET_GATE_TURNS_PER_HOUR);
+        inc_budget_exhausted_reply("ag-test");
+        inc_budget_exhausted_suppressed("ag-test");
+    }
+
+    #[test]
+    fn budget_gate_label_constants_are_snake_case() {
+        for label in [
+            BUDGET_GATE_DAILY_TOKENS,
+            BUDGET_GATE_TURNS_PER_MINUTE,
+            BUDGET_GATE_TURNS_PER_HOUR,
+        ] {
+            assert!(
+                !label.contains("__"),
+                "label {label:?} must not contain double underscores"
+            );
+            assert!(
+                label
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()),
+                "label {label:?} must be snake_case ASCII"
+            );
+        }
+    }
+
+    #[test]
+    fn budget_exhausted_counter_renders_with_labels() {
+        // Install an isolated recorder via build_recorder() so this test
+        // doesn't depend on (or interfere with) other tests' state.
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            inc_budget_exhausted("ag-abc-123", BUDGET_GATE_DAILY_TOKENS);
+            inc_budget_exhausted("ag-abc-123", BUDGET_GATE_DAILY_TOKENS);
+            inc_budget_exhausted("ag-abc-123", BUDGET_GATE_TURNS_PER_MINUTE);
+            inc_budget_exhausted_reply("ag-abc-123");
+            inc_budget_exhausted_suppressed("ag-abc-123");
+        });
+        let body = handle.render();
+        // The Prometheus text exposition format renders counters as
+        // `<name>{<labels>} <value>`. We don't care about whitespace,
+        // just that the right name + label + value triple shows up.
+        assert!(
+            body.contains(BUDGET_EXHAUSTED_TOTAL),
+            "missing exhausted counter:\n{body}"
+        );
+        assert!(
+            body.contains("gate=\"daily_tokens\""),
+            "missing gate label:\n{body}"
+        );
+        assert!(
+            body.contains("gate=\"turns_per_minute\""),
+            "missing per-minute gate label:\n{body}"
+        );
+        assert!(
+            body.contains("agent_group_id=\"ag-abc-123\""),
+            "missing agent_group_id label:\n{body}"
+        );
+        assert!(
+            body.contains(BUDGET_EXHAUSTED_REPLIES_TOTAL),
+            "missing replies counter:\n{body}"
+        );
+        assert!(
+            body.contains(BUDGET_EXHAUSTED_SUPPRESSED_TOTAL),
+            "missing suppressed counter:\n{body}"
+        );
     }
 
     #[test]
@@ -460,6 +579,9 @@ mod tests {
             IMAGE_REBUILD_FAILED_TOTAL,
             SECRETS_ROTATED_TOTAL,
             DELIVERY_FAILED_TOTAL,
+            BUDGET_EXHAUSTED_TOTAL,
+            BUDGET_EXHAUSTED_REPLIES_TOTAL,
+            BUDGET_EXHAUSTED_SUPPRESSED_TOTAL,
             LLM_CALL_SECONDS,
             LLM_TOKENS_INPUT,
             LLM_TOKENS_OUTPUT,
@@ -471,6 +593,32 @@ mod tests {
             assert!(
                 name.starts_with("ironclaw_"),
                 "metric name {name:?} does not start with 'ironclaw_'"
+            );
+            assert!(
+                !name.contains("__"),
+                "metric name {name:?} must not contain double underscores"
+            );
+        }
+    }
+
+    #[test]
+    fn counter_metric_names_end_with_total() {
+        let counters = [
+            MESSAGES_INBOUND_TOTAL,
+            MESSAGES_OUTBOUND_TOTAL,
+            CONTAINERS_SPAWNED_TOTAL,
+            CONTAINERS_CRASHED_TOTAL,
+            IMAGE_REBUILD_FAILED_TOTAL,
+            SECRETS_ROTATED_TOTAL,
+            DELIVERY_FAILED_TOTAL,
+            BUDGET_EXHAUSTED_TOTAL,
+            BUDGET_EXHAUSTED_REPLIES_TOTAL,
+            BUDGET_EXHAUSTED_SUPPRESSED_TOTAL,
+        ];
+        for name in counters {
+            assert!(
+                name.ends_with("_total"),
+                "counter {name:?} does not end with '_total'"
             );
         }
     }

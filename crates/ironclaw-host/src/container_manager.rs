@@ -466,6 +466,13 @@ impl ContainerManager {
                 agent_group = %session.agent_group_id.as_uuid(),
                 "daily token budget exhausted; spawn deferred"
             );
+            // Fires once per refusal, before the dedup window check —
+            // operators can alert on the spike independent of how many
+            // reply notices actually went out.
+            ironclaw_metrics::inc_budget_exhausted(
+                &session.agent_group_id.as_uuid().to_string(),
+                ironclaw_metrics::BUDGET_GATE_DAILY_TOKENS,
+            );
             if let Err(err) = self.maybe_post_budget_exhausted(session, &paths) {
                 // Notification failure is non-fatal; the spawn is
                 // still deferred and the warning above is in the log.
@@ -477,11 +484,16 @@ impl ContainerManager {
         // Rate-limit gate. If the group has a per-minute or per-hour
         // LLM-call cap and the trailing window count already meets/exceeds
         // it, refuse to spawn and post a one-per-window in-channel reply.
-        if let Some(msg) = self.rate_limit_message(session)? {
+        if let Some((msg, gate_label)) = self.rate_limit_message(session)? {
             warn!(
                 session = %session.id.as_uuid(),
                 agent_group = %session.agent_group_id.as_uuid(),
+                gate = gate_label,
                 "rate limit reached; spawn deferred"
+            );
+            ironclaw_metrics::inc_budget_exhausted(
+                &session.agent_group_id.as_uuid().to_string(),
+                gate_label,
             );
             if let Err(err) = self.maybe_post_rate_limit_reply(session, &paths, &msg) {
                 warn!(?err, "could not post rate-limit reply");
@@ -648,12 +660,18 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
         )
     }
 
-    /// Returns `Some(notification_text)` when a per-minute or per-hour
-    /// LLM rate cap has been reached, `None` when both caps are clear
-    /// (or unset). Used by the spawn gate to short-circuit before
-    /// calling the runtime and to derive the message for the
-    /// in-channel notification.
-    fn rate_limit_message(&self, session: &Session) -> Result<Option<String>, ManagerError> {
+    /// Returns `Some((notification_text, gate_label))` when a per-minute
+    /// or per-hour LLM rate cap has been reached, `None` when both caps
+    /// are clear (or unset). Used by the spawn gate to short-circuit
+    /// before calling the runtime and to derive the message for the
+    /// in-channel notification. The `gate_label` is one of
+    /// `ironclaw_metrics::BUDGET_GATE_TURNS_PER_MINUTE` or
+    /// `..._TURNS_PER_HOUR`; callers pipe it straight into
+    /// `ironclaw_metrics::inc_budget_exhausted` for the `gate` label.
+    fn rate_limit_message(
+        &self,
+        session: &Session,
+    ) -> Result<Option<(String, &'static str)>, ManagerError> {
         use ironclaw_db::tables::{agent_turns, group_budgets};
         let Some(budget) = group_budgets::get(&self.central, session.agent_group_id)
             .map_err(ManagerError::Db)?
@@ -668,11 +686,14 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
             let count = agent_turns::turns_since(&self.central, &ag_id, since)
                 .map_err(ManagerError::Db)?;
             if count >= cap {
-                return Ok(Some(format!(
-                    "Per-minute LLM rate limit reached for this agent \
-                     ({count} calls in the last minute, cap is {cap}). \
-                     New requests resume within a minute. \
-                     Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> --turns-per-minute N`."
+                return Ok(Some((
+                    format!(
+                        "Per-minute LLM rate limit reached for this agent \
+                         ({count} calls in the last minute, cap is {cap}). \
+                         New requests resume within a minute. \
+                         Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> --turns-per-minute N`."
+                    ),
+                    ironclaw_metrics::BUDGET_GATE_TURNS_PER_MINUTE,
                 )));
             }
         }
@@ -682,11 +703,14 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
             let count = agent_turns::turns_since(&self.central, &ag_id, since)
                 .map_err(ManagerError::Db)?;
             if count >= cap {
-                return Ok(Some(format!(
-                    "Per-hour LLM rate limit reached for this agent \
-                     ({count} calls in the last hour, cap is {cap}). \
-                     New requests resume within the hour. \
-                     Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> --turns-per-hour N`."
+                return Ok(Some((
+                    format!(
+                        "Per-hour LLM rate limit reached for this agent \
+                         ({count} calls in the last hour, cap is {cap}). \
+                         New requests resume within the hour. \
+                         Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> --turns-per-hour N`."
+                    ),
+                    ironclaw_metrics::BUDGET_GATE_TURNS_PER_HOUR,
                 )));
             }
         }
@@ -717,6 +741,12 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
     /// only across the lookup + insert, then writes a Chat-kind
     /// outbound row routed via `session_routing` so the delivery
     /// loop dispatches it through the channel adapter.
+    ///
+    /// Bumps `ironclaw_budget_exhausted_suppressed_total` when the
+    /// dedup window swallows the reply, and
+    /// `ironclaw_budget_exhausted_replies_total` when a reply is
+    /// actually written to outbound. The "no routing target" branch
+    /// does NOT increment the reply counter — nothing was sent.
     #[allow(clippy::unused_self)] // kept as a method so callers can use `self.dispatch_cap_reply(...)`.
     fn post_cap_reply(
         &self,
@@ -729,12 +759,14 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
         window_secs: i64,
         label: &'static str,
     ) -> Result<(), ManagerError> {
+        let ag_id_str = session.agent_group_id.as_uuid().to_string();
         let now = chrono::Utc::now();
         {
             let mut state = dedup.lock().expect("cap-reply dedup mutex poisoned");
             if let Some(prev) = state.get(&session.agent_group_id) {
                 let elapsed = now.signed_duration_since(*prev).num_seconds();
                 if elapsed.abs() < window_secs {
+                    ironclaw_metrics::inc_budget_exhausted_suppressed(&ag_id_str);
                     return Ok(());
                 }
             }
@@ -768,6 +800,7 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
             content: serde_json::json!({ "text": text }),
         };
         ironclaw_db::tables::messages_out::insert(&outbound, &row).map_err(ManagerError::Db)?;
+        ironclaw_metrics::inc_budget_exhausted_reply(&ag_id_str);
         info!(
             session = %session.id.as_uuid(),
             agent_group = %session.agent_group_id.as_uuid(),
@@ -2095,6 +2128,196 @@ mod tests {
         assert_eq!(replies.len(), 1);
     }
 
+    /// Render the Prometheus body for whichever recorder is active.
+    /// Used by the budget-gate metric tests; pair with
+    /// `metrics::with_local_recorder` to get isolated counter state.
+    fn render_prometheus(handle: &metrics_exporter_prometheus::PrometheusHandle) -> String {
+        handle.render()
+    }
+
+    /// End-to-end: drive `maybe_spawn` twice against an over-budget group
+    /// and assert the three budget counters land at the expected totals.
+    /// First call: refusal + reply (no dedup hit). Second call: refusal +
+    /// dedup suppression. Total: 2 refusals, 1 reply, 1 suppression.
+    ///
+    /// Plain `#[test]` (not `#[tokio::test]`) so `with_local_recorder` can
+    /// own the thread for the duration of the inner runtime's `block_on`.
+    /// `#[tokio::test]` would already be driving a runtime on this thread
+    /// and the inner `block_on` would panic.
+    #[test]
+    fn maybe_spawn_emits_budget_counters_for_daily_token_cap() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let body = metrics::with_local_recorder(&recorder, || {
+            // tokio runtime is already active (#[tokio::test]); spawn the
+            // gate work on a fresh blocking task so the local recorder
+            // remains in scope for the metric calls. Easier: use a
+            // single-threaded async block_on inside the closure.
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let db = CentralDb::open_in_memory().unwrap();
+                let mgr = ContainerManager::new(
+                    db.clone(),
+                    std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+                    manager_cfg(tmp.path().to_path_buf()),
+                );
+                let session = fixture_session(&db);
+                let paths =
+                    SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+                paths.ensure_dirs().unwrap();
+                seed_routing(&paths);
+                seed_pending_chat_inbound(&paths);
+                set_daily_cap(&db, session.agent_group_id, 100);
+                record_today_tokens(&db, session.agent_group_id, 150, 50);
+                // Two refusals: the first writes a reply, the second is
+                // dedup-suppressed inside the BUDGET_NOTICE_WINDOW_SECS
+                // window.
+                let _ = mgr.maybe_spawn(&session).await.unwrap();
+                let _ = mgr.maybe_spawn(&session).await.unwrap();
+            });
+            render_prometheus(&handle)
+        });
+
+        // `ironclaw_budget_exhausted_total{gate=daily_tokens, ...} 2`
+        assert!(
+            body.contains(ironclaw_metrics::BUDGET_EXHAUSTED_TOTAL),
+            "exhausted counter missing:\n{body}"
+        );
+        assert!(
+            body.contains("gate=\"daily_tokens\""),
+            "daily_tokens gate label missing:\n{body}"
+        );
+        assert!(
+            find_counter_value(&body, ironclaw_metrics::BUDGET_EXHAUSTED_TOTAL) == Some(2),
+            "expected exhausted_total=2, body:\n{body}"
+        );
+        assert!(
+            find_counter_value(&body, ironclaw_metrics::BUDGET_EXHAUSTED_REPLIES_TOTAL)
+                == Some(1),
+            "expected replies_total=1, body:\n{body}"
+        );
+        assert!(
+            find_counter_value(&body, ironclaw_metrics::BUDGET_EXHAUSTED_SUPPRESSED_TOTAL)
+                == Some(1),
+            "expected suppressed_total=1, body:\n{body}"
+        );
+    }
+
+    /// Per-minute rate-limit gate fires `gate=turns_per_minute`. Plain
+    /// `#[test]` for the same `with_local_recorder` reason as above.
+    #[test]
+    fn maybe_spawn_emits_turns_per_minute_gate_label() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let body = metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let db = CentralDb::open_in_memory().unwrap();
+                let mgr = ContainerManager::new(
+                    db.clone(),
+                    std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+                    manager_cfg(tmp.path().to_path_buf()),
+                );
+                let session = fixture_session(&db);
+                let paths =
+                    SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+                paths.ensure_dirs().unwrap();
+                seed_routing(&paths);
+                seed_pending_chat_inbound(&paths);
+                set_rate_caps(&db, session.agent_group_id, Some(1), None);
+                seed_turns(&db, session.agent_group_id, 1);
+                let _ = mgr.maybe_spawn(&session).await.unwrap();
+            });
+            render_prometheus(&handle)
+        });
+        assert!(
+            body.contains("gate=\"turns_per_minute\""),
+            "turns_per_minute gate label missing:\n{body}"
+        );
+        assert!(
+            find_counter_value(&body, ironclaw_metrics::BUDGET_EXHAUSTED_TOTAL) == Some(1),
+            "expected exhausted_total=1 for per-minute gate, body:\n{body}"
+        );
+    }
+
+    /// Per-hour rate-limit gate fires `gate=turns_per_hour`. Plain
+    /// `#[test]` for the same `with_local_recorder` reason as above.
+    #[test]
+    fn maybe_spawn_emits_turns_per_hour_gate_label() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let body = metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let tmp = tempfile::tempdir().unwrap();
+                let db = CentralDb::open_in_memory().unwrap();
+                let mgr = ContainerManager::new(
+                    db.clone(),
+                    std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+                    manager_cfg(tmp.path().to_path_buf()),
+                );
+                let session = fixture_session(&db);
+                let paths =
+                    SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+                paths.ensure_dirs().unwrap();
+                seed_routing(&paths);
+                seed_pending_chat_inbound(&paths);
+                set_rate_caps(&db, session.agent_group_id, None, Some(1));
+                seed_turns(&db, session.agent_group_id, 1);
+                let _ = mgr.maybe_spawn(&session).await.unwrap();
+            });
+            render_prometheus(&handle)
+        });
+        assert!(
+            body.contains("gate=\"turns_per_hour\""),
+            "turns_per_hour gate label missing:\n{body}"
+        );
+    }
+
+    /// Walk the Prometheus text body and return the integer value of the
+    /// first sample whose name matches `metric_name`. Whitespace tolerant.
+    /// Returns `None` if the metric isn't in the body.
+    fn find_counter_value(body: &str, metric_name: &str) -> Option<u64> {
+        // Prometheus text format: `<name>{<labels>} <value>` or `<name> <value>`.
+        // We sum across all label combinations for the metric.
+        let mut total: u64 = 0;
+        let mut seen = false;
+        for line in body.lines() {
+            let line = line.trim();
+            if line.starts_with('#') || line.is_empty() {
+                continue;
+            }
+            // Match either `name{...}` or `name ` exactly.
+            let name_matches = line
+                .strip_prefix(metric_name)
+                .is_some_and(|rest| rest.starts_with('{') || rest.starts_with(' '));
+            if !name_matches {
+                continue;
+            }
+            // Value is the last whitespace-separated token.
+            if let Some(value) = line.split_whitespace().last() {
+                if let Ok(parsed) = value.parse::<f64>() {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let parsed_u = parsed as u64;
+                    total += parsed_u;
+                    seen = true;
+                }
+            }
+        }
+        if seen { Some(total) } else { None }
+    }
+
     // ---- rate-limit gate (per-minute / per-hour) -------------------------
 
     #[test]
@@ -2116,9 +2339,10 @@ mod tests {
         seed_turns(&db, session.agent_group_id, 2);
         assert!(mgr.rate_limit_message(&session).unwrap().is_none());
         seed_turns(&db, session.agent_group_id, 1);
-        let msg = mgr.rate_limit_message(&session).unwrap().unwrap();
+        let (msg, gate) = mgr.rate_limit_message(&session).unwrap().unwrap();
         assert!(msg.contains("Per-minute"), "{msg}");
         assert!(msg.contains("cap is 3"), "{msg}");
+        assert_eq!(gate, ironclaw_metrics::BUDGET_GATE_TURNS_PER_MINUTE);
     }
 
     #[test]
@@ -2128,9 +2352,10 @@ mod tests {
         let session = fixture_session(&db);
         set_rate_caps(&db, session.agent_group_id, None, Some(5));
         seed_turns(&db, session.agent_group_id, 5);
-        let msg = mgr.rate_limit_message(&session).unwrap().unwrap();
+        let (msg, gate) = mgr.rate_limit_message(&session).unwrap().unwrap();
         assert!(msg.contains("Per-hour"), "{msg}");
         assert!(msg.contains("cap is 5"), "{msg}");
+        assert_eq!(gate, ironclaw_metrics::BUDGET_GATE_TURNS_PER_HOUR);
     }
 
     #[tokio::test]

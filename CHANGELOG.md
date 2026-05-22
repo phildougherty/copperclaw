@@ -59,6 +59,29 @@ adheres to [Semantic Versioning](https://semver.org/).
   three `kind=timeout` mocks (one per retry attempt) and bumped
   `step_timeout_ms` to 10s to accommodate the worst-case retry budget.
 
+### Added (budget-gate Prometheus counters)
+
+- **`ironclaw_budget_exhausted_total{agent_group_id, gate}`** — fired by
+  `ContainerManager::maybe_spawn` every time the budget or rate-limit
+  gate refuses to spawn. `gate` is one of `daily_tokens`,
+  `turns_per_minute`, `turns_per_hour`. Operators can now alert on
+  "budget exhausted spike" with
+  `sum by (agent_group_id, gate) (rate(ironclaw_budget_exhausted_total[15m])) > 0`
+  instead of grepping logs.
+- **`ironclaw_budget_exhausted_replies_total{agent_group_id}`** — fired
+  when the in-channel "budget exhausted" notice is actually written to
+  outbound (i.e. AFTER the per-group dedup window check).
+- **`ironclaw_budget_exhausted_suppressed_total{agent_group_id}`** —
+  fired when a refusal notice is suppressed by the per-group dedup
+  window. Pair with the replies counter to see the user-visible
+  notification rate independent of refusal volume.
+- The three counters land on the existing `IRONCLAW_METRICS_ADDR`
+  endpoint automatically — no new opt-in. `docs/observability.md` and
+  the README counter list were updated. New helpers
+  `ironclaw_metrics::inc_budget_exhausted{,_reply,_suppressed}` and the
+  `BUDGET_GATE_*` label constants are added without changing any
+  existing public symbols in `ironclaw-metrics`.
+
 ### Added (replay-fixture coverage for tool-use loop)
 
 - **`fixtures/cli/tool-use-shell/`** — new replay fixture that drives

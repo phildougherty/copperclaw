@@ -74,6 +74,8 @@ ironclaw-mcp = { workspace = true }
 tokio = { workspace = true }
 wiremock = "=0.6.2"
 regex = "1"
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 
 [lints]
 workspace = true
