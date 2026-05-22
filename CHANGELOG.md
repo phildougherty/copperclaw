@@ -6,6 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (boot: install CreateAgentModule so create_agent action is no longer inert)
+
+- **`crates/ironclaw-host/src/boot.rs`** — `install_modules` now constructs
+  `CreateAgentModule::new(central, data_root, create_agent_always_allow())`
+  and adds it to the install list alongside the legacy unit-struct
+  `AgentToAgentModule`. Before this fix, Team CA's `CreateAgentModule`
+  existed but was never installed; the agent's `create_agent` MCP tool
+  emitted system rows that the delivery loop logged as "no handler;
+  skipping" and silently marked delivered=ok. Caught by the new
+  structural meta-test `every_runner_emit_has_a_host_handler`.
+- **`crates/ironclaw-host/tests/action_handler_coverage.rs`** — also
+  updated to mirror the production module list. Production and test
+  module lists are now in lock-step; the test will fail loudly if
+  either drifts.
+- **TODO**: `create_agent_always_allow()` is the wrong permission gate
+  for production. A `users`-table role lookup should replace it before
+  the tool is reachable from untrusted operators.
+
 ### Added (Test (structural): every runner-emitted action has a handler)
 
 - **`crates/ironclaw-host/tests/action_handler_coverage.rs`** — new

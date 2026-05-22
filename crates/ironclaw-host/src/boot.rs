@@ -21,9 +21,9 @@ use ironclaw_host_delivery::DeliveryService;
 use ironclaw_host_router::Router;
 use ironclaw_host_sweep::{SqliteTaskStore, SweepService};
 use ironclaw_modules::{
-    AgentToAgentModule, ApprovalsModule, InteractiveModule, Module, MountSecurityModule,
-    NewPendingCtx, NewPendingNotifier, PermissionsModule, SchedulingModule, SelfModModule,
-    TypingConfig, TypingModule,
+    create_agent_always_allow, AgentToAgentModule, ApprovalsModule, CreateAgentModule,
+    InteractiveModule, Module, MountSecurityModule, NewPendingCtx, NewPendingNotifier,
+    PermissionsModule, SchedulingModule, SelfModModule, TypingConfig, TypingModule,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -377,7 +377,7 @@ pub fn assemble(
 
 /// Install the built-in module set against `host_ctx`. Each module that
 /// fails to install is logged and skipped.
-pub async fn install_modules(host_ctx: Arc<HostContext>) {
+pub async fn install_modules(host_ctx: Arc<HostContext>, data_root: PathBuf) {
     let modules: Vec<Box<dyn Module>> = vec![
         Box::new(TypingModule::new(TypingConfig::default())),
         Box::new(MountSecurityModule::new()),
@@ -425,7 +425,20 @@ pub async fn install_modules(host_ctx: Arc<HostContext>) {
         Box::new(SchedulingModule::with_store(Arc::new(
             SqliteTaskStore::new(host_ctx.central().clone()),
         ))),
+        // The legacy unit-struct `AgentToAgentModule` registers nothing
+        // (it's an interceptor only). The actual `create_agent` action
+        // handler lives in `CreateAgentModule::new`, which we build here
+        // with the host's central DB + data root so the spawn lands in
+        // the same `agent_groups`/`sessions` tables the container manager
+        // already polls. Permission is currently always-allow; wire this
+        // to a `users`-role lookup before exposing the tool to untrusted
+        // operators.
         Box::new(AgentToAgentModule),
+        Box::new(CreateAgentModule::new(
+            host_ctx.central().clone(),
+            data_root.clone(),
+            create_agent_always_allow(),
+        )),
         Box::new(SelfModModule),
     ];
     for m in modules {
@@ -544,7 +557,7 @@ pub async fn run_host(
 
     // 10. Install modules.
     let host_ctx = HostContext::for_router(Arc::clone(&state.router), Arc::clone(&state.delivery));
-    install_modules(Arc::clone(&host_ctx)).await;
+    install_modules(Arc::clone(&host_ctx), cfg.data_dir.clone()).await;
 
     // 11. Inbound consumer.
     let router_for_consumer = Arc::clone(&state.router);
@@ -1134,7 +1147,7 @@ mod tests {
             Arc::clone(&state.router),
             Arc::clone(&state.delivery),
         );
-        install_modules(ctx).await;
+        install_modules(ctx, cfg.data_dir.clone()).await;
         // At least permissions+approvals install hooks; assert something
         // landed on the router's chain.
         assert!(

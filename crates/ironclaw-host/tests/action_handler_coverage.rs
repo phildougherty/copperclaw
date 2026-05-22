@@ -24,9 +24,9 @@ use std::sync::Arc;
 
 use ironclaw_modules::context::MockModuleContext;
 use ironclaw_modules::{
-    AgentToAgentModule, ApprovalsModule, InteractiveModule, Module, ModuleContext,
-    MountSecurityModule, PermissionsModule, SchedulingModule, SelfModModule, TypingConfig,
-    TypingModule,
+    create_agent_always_allow, AgentToAgentModule, ApprovalsModule, CreateAgentModule,
+    InteractiveModule, Module, ModuleContext, MountSecurityModule, PermissionsModule,
+    SchedulingModule, SelfModModule, TypingConfig, TypingModule,
 };
 
 /// Action names the runner currently emits as `MessageKind::System`
@@ -101,6 +101,16 @@ async fn install_built_in_modules_mock(ctx: Arc<MockModuleContext>) {
         Box::new(InteractiveModule::default()),
         Box::new(SchedulingModule::default()),
         Box::new(AgentToAgentModule),
+        // CreateAgentModule needs a CentralDb + data_root. Use an
+        // in-memory DB and a tempdir to keep the mock-install pure.
+        Box::new(CreateAgentModule::new(
+            ironclaw_db::central::CentralDb::open_in_memory().unwrap(),
+            std::env::temp_dir().join(format!(
+                "ironclaw-action-coverage-{}",
+                uuid::Uuid::new_v4()
+            )),
+            create_agent_always_allow(),
+        )),
         Box::new(SelfModModule),
     ];
     for m in modules {
