@@ -109,16 +109,19 @@ impl ChannelAdapter for MattermostAdapter {
         thread_id: Option<&str>,
         message: &OutboundMessage,
     ) -> Result<Option<String>, AdapterError> {
-        if !message.files.is_empty() {
-            return Err(AdapterError::Unsupported(
-                "mattermost file uploads not implemented yet".into(),
-            ));
-        }
         let content = &message.content;
         let action = content
             .get("action")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("post");
+        // Reject files on actions that don't make sense for them
+        // (edit / reaction) up front; only the post path supports
+        // attachments.
+        if !message.files.is_empty() && action != "post" {
+            return Err(AdapterError::BadRequest(format!(
+                "mattermost action `{action}` does not accept file attachments"
+            )));
+        }
         match action {
             "post" => {
                 let text = content
@@ -127,9 +130,21 @@ impl ChannelAdapter for MattermostAdapter {
                     .ok_or_else(|| {
                         AdapterError::BadRequest("missing `text` in outbound content".into())
                     })?;
+                // Two-step upload: upload each file to /api/v4/files
+                // against the destination channel, collect ids, then
+                // POST the message with `file_ids` attached. Each
+                // upload is independent; one failure cancels the post.
+                let mut file_ids: Vec<String> = Vec::with_capacity(message.files.len());
+                for f in &message.files {
+                    let id = self
+                        .api
+                        .upload_file(platform_id, &f.filename, f.data.clone())
+                        .await?;
+                    file_ids.push(id);
+                }
                 let id = self
                     .api
-                    .create_post(platform_id, text, thread_id)
+                    .create_post_with_files(platform_id, text, thread_id, &file_ids)
                     .await?;
                 Ok(Some(id))
             }
@@ -314,20 +329,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_files_unsupported_for_now() {
+    async fn deliver_post_with_files_uploads_then_attaches_ids() {
+        let mock = MockServer::start().await;
+        // First the multipart upload returns a file id.
+        Mock::given(method("POST"))
+            .and(path("/api/v4/files"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(json!({ "file_infos": [{ "id": "f-1" }] })),
+            )
+            .mount(&mock)
+            .await;
+        // Then the post body must carry that file_id.
+        Mock::given(method("POST"))
+            .and(path("/api/v4/posts"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "p-with-file"})))
+            .mount(&mock)
+            .await;
+        let a = make(&mock, None);
+        let msg = OutboundMessage {
+            kind: MessageKind::Chat,
+            content: json!({"text": "see attached"}),
+            files: vec![ironclaw_types::OutboundFile {
+                filename: "a.txt".into(),
+                data: vec![1, 2, 3],
+            }],
+        };
+        let id = a.deliver("c", None, &msg).await.unwrap();
+        assert_eq!(id.as_deref(), Some("p-with-file"));
+    }
+
+    #[tokio::test]
+    async fn deliver_edit_with_files_is_bad_request() {
         let mock = MockServer::start().await;
         let a = make(&mock, None);
         let msg = OutboundMessage {
             kind: MessageKind::Chat,
-            content: json!({"text":"hi"}),
+            content: json!({"action":"edit","target_id":"p1","text":"x"}),
             files: vec![ironclaw_types::OutboundFile {
                 filename: "a.txt".into(),
-                data: vec![0; 3],
+                data: vec![0; 1],
             }],
         };
         match a.deliver("c", None, &msg).await.unwrap_err() {
-            AdapterError::Unsupported(m) => assert!(m.contains("file uploads")),
-            other => panic!("expected Unsupported, got {other:?}"),
+            AdapterError::BadRequest(m) => assert!(m.contains("edit") && m.contains("file")),
+            other => panic!("expected BadRequest, got {other:?}"),
         }
     }
 

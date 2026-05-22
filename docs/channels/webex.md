@@ -17,7 +17,6 @@ LOW:
 - Reaction endpoint detection is config-driven (`reactions_endpoint`
   field). When unset, reactions silently return Unsupported. Setup
   should warn.
-- Webhook signature uses sha1 hard-coded; Webex has hinted sha256.
 - Multipart file post is one HTTP call per file — not batched.
 
 ## Edge cases tested
@@ -40,9 +39,14 @@ LOW:
 - [x] chat / task / webhook / agent message kinds all route to chat path
 
 ## Fixes in this PR
-None.
+- `SignatureAlgo::Auto` config value: when set, the verifier inspects
+  the incoming X-Spark-Signature length (40 → sha1, 64 → sha256) and
+  validates against the corresponding HMAC. Operators on the Webex
+  sha256 rollout no longer need to flip a config when the upstream
+  switches; `webhook_algo: "auto"` survives the transition. Sha1 and
+  sha256 explicit modes still work as before; `compute_signature`
+  with `Auto` panics (it's verifier-only).
 
 ## Deferred for follow-up
-- Verify sha256 webhook signature when Webex rolls it out.
 - Allow file delivery to person targets.
 - Batch multipart for multiple files.

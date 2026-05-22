@@ -349,6 +349,7 @@ async fn run_one_turn(
         // accidental hangs surface as a test timeout instead of a
         // 60-second stall.
         provider_deadline: Duration::from_millis(5_000),
+        tool_deadline_secs: 30,
     };
     run_loop(deps).await.context("runner one-turn")?;
     Ok(())

@@ -165,15 +165,19 @@ mod tests {
         let ctx = Arc::new(MockToolContext::new());
         let server = build_server(ctx);
         let tools = server.tool_descriptors();
-        // Order is fixed in `build_tool_set` — first and last should
-        // be stable as new tools get appended.
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         assert_eq!(names[0], "send_message");
-        // The 15 messaging/scheduling/agent tools come first, then
-        // the `computer_use` family, then `web_search`, with `explore`
-        // appended as the current tail.
-        assert_eq!(*names.last().unwrap(), "explore");
-        assert_eq!(tools.len(), crate::tools::build_tool_set().len());
+        // Invariant: `tool_descriptors()` must surface the exact sequence
+        // `build_tool_set()` produces — no dropped, reordered, or extra
+        // entries. Pinning the order here catches any drift in `Inner`'s
+        // map/order construction without coupling the test to a specific
+        // tail name.
+        let expected: Vec<String> = crate::tools::build_tool_set()
+            .iter()
+            .map(|t| t.tool.name.to_string())
+            .collect();
+        let actual: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+        assert_eq!(actual, expected);
     }
 
     #[tokio::test]

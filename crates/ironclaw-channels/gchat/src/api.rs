@@ -71,9 +71,84 @@ impl GchatApi {
         space: &str,
         text: &str,
     ) -> Result<MessageResponse, AdapterError> {
-        let body = json!({ "text": text });
+        self.send_text_with_attachments(space, text, &[]).await
+    }
+
+    /// Send a text message with optional `attachment` references
+    /// produced by [`Self::upload_attachment`]. Pass an empty slice
+    /// for a text-only post (same as [`Self::send_text`]).
+    pub async fn send_text_with_attachments(
+        &self,
+        space: &str,
+        text: &str,
+        attachment_refs: &[String],
+    ) -> Result<MessageResponse, AdapterError> {
+        let mut body = json!({ "text": text });
+        if !attachment_refs.is_empty() {
+            let attachments: Vec<Value> = attachment_refs
+                .iter()
+                .map(|name| json!({ "attachmentDataRef": { "resourceName": name } }))
+                .collect();
+            body.as_object_mut().unwrap().insert("attachment".into(), Value::Array(attachments));
+        }
         let url = self.url(&format!("/v1/spaces/{space}/messages"));
         self.do_create(&url, &body, None).await
+    }
+
+    /// `POST /v1/spaces/{space}/attachments:upload` — upload `bytes`
+    /// as a multipart media upload and return the
+    /// `attachmentDataRef.resourceName` Google Chat hands back. The
+    /// resource name is consumed by
+    /// [`Self::send_text_with_attachments`] on the next message.
+    pub async fn upload_attachment(
+        &self,
+        space: &str,
+        filename: &str,
+        bytes: Vec<u8>,
+    ) -> Result<String, AdapterError> {
+        if filename.is_empty() {
+            return Err(AdapterError::BadRequest(
+                "upload_attachment: empty filename".into(),
+            ));
+        }
+        // Multipart media upload: a `metadata` part with the requested
+        // filename (JSON) plus a `data` part with the file bytes. The
+        // request body is sent under `Content-Type: multipart/related`
+        // per Google's media-upload protocol.
+        let metadata = json!({ "filename": filename }).to_string();
+        let meta_part = reqwest::multipart::Part::text(metadata)
+            .mime_str("application/json; charset=UTF-8")
+            .map_err(|e| AdapterError::BadRequest(format!("upload meta mime: {e}")))?;
+        let data_part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename.to_string())
+            .mime_str("application/octet-stream")
+            .map_err(|e| AdapterError::BadRequest(format!("upload data mime: {e}")))?;
+        let form = reqwest::multipart::Form::new()
+            .part("metadata", meta_part)
+            .part("data", data_part);
+        let url = self.url(&format!(
+            "/upload/v1/spaces/{space}/attachments:upload"
+        ));
+        let resp = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.bot_token)
+            .query(&[("uploadType", "multipart")])
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| transport(&e))?;
+        let value = read_gchat_json(resp).await?;
+        let resource = value
+            .pointer("/attachmentDataRef/resourceName")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AdapterError::Transport(
+                    "upload response missing attachmentDataRef.resourceName".into(),
+                )
+            })?
+            .to_string();
+        Ok(resource)
     }
 
     /// Send a threaded reply.

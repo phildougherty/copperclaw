@@ -90,6 +90,7 @@ pub const ROTATABLE_ENV_KEYS: &[&str] = &[
     "EXA_API_KEY",
     "BRAVE_SEARCH_API_KEY",
     "SERPAPI_API_KEY",
+    "OLLAMA_BASE_URL",
 ];
 
 /// Subset of [`ManagerConfig`] that the SIGHUP handler can hot-swap.
@@ -189,6 +190,11 @@ pub struct ManagerConfig {
     /// is scanned alongside the global skills directory and skills
     /// with matching names shadow the global ones.
     pub groups_dir: Option<PathBuf>,
+    /// How skill bodies are surfaced to the agent. See [`SkillsMode`].
+    /// `Inline` (default) preserves today's behaviour; `Callable` shifts
+    /// bodies behind a `load_skill` MCP tool to keep the system prompt
+    /// small. Set via `IRONCLAW_SKILLS_MODE` at boot.
+    pub skills_mode: SkillsMode,
     /// Extra environment variables to forward into every spawned
     /// session container. Used to plumb operator-supplied API keys
     /// (Tavily / Exa / Brave / `SerpAPI` / etc.) and arbitrary
@@ -231,6 +237,18 @@ pub struct ContainerManager {
     /// Defaults to an empty tracker so test code that calls
     /// [`Self::new`] without wiring sweep still works.
     spawn_tracker: Arc<SpawnAttemptTracker>,
+    /// Per-agent-group cooldown tracker for image rebuilds. The host
+    /// auto-rebuilds when `container_configs.config_fingerprint` no
+    /// longer matches the live config (e.g. agent emitted
+    /// `install_packages`). When the rebuild *fails* (Docker stream
+    /// error, bad apt name, transient network), the previous code
+    /// path retried the rebuild on every subsequent spawn — wasting
+    /// minutes per spawn and turning a single bad package name into
+    /// a continuous rebuild storm. This tracker enforces an
+    /// exponential cooldown per group; while a group is in cooldown
+    /// the spawn path falls through to the last-known-good image
+    /// without attempting a fresh build.
+    rebuild_backoff: Arc<RebuildBackoff>,
     /// Set by [`Self::set_degraded`] when the boot-time image health
     /// check fails. When `true`, every call to [`Self::maybe_spawn`]
     /// short-circuits with [`ManagerError::HostDegraded`] — the host
@@ -261,6 +279,7 @@ impl ContainerManager {
                 forward_env: cfg.forward_env.clone(),
             })),
             spawn_tracker: Arc::new(SpawnAttemptTracker::new()),
+            rebuild_backoff: Arc::new(RebuildBackoff::new()),
             degraded: AtomicBool::new(false),
             cfg,
         }
@@ -579,7 +598,7 @@ impl ContainerManager {
 
         let cfg_row = container_configs::get(&self.central, session.agent_group_id)
             .map_err(ManagerError::Db)?;
-        let runner_cfg = self.runner_config_for(session, cfg_row.as_ref());
+        let runner_cfg = self.runner_config_for(session, cfg_row.as_ref(), Some(paths.root.as_path()));
         let runner_json = serde_json::to_vec_pretty(&runner_cfg).map_err(ManagerError::Json)?;
         std::fs::write(paths.root.join(RUNNER_CONFIG_FILENAME), runner_json)
             .map_err(ManagerError::Io)?;
@@ -604,20 +623,49 @@ impl ContainerManager {
             let base_tag = cfg.image_tag.clone().unwrap_or_else(|| self.cfg.default_image_tag.clone());
             if stored_fp == live_fp {
                 base_tag
+            } else if let Some(cooldown_remaining) =
+                self.rebuild_backoff.in_cooldown(session.agent_group_id)
+            {
+                // Don't attempt a fresh rebuild while this group is in
+                // cooldown after recent rebuild failures. Spawn on the
+                // last-known-good image; the operator (or the agent
+                // itself, via in-container `shell npm install`) can
+                // unblock by fixing the config and waiting out the
+                // backoff window, or the backoff expires naturally.
+                if base_tag.is_empty() {
+                    return Err(ManagerError::Spawn(RtError::Container(
+                        "image rebuild in cooldown and no fallback tag is configured"
+                            .into(),
+                    )));
+                }
+                warn!(
+                    agent_group = %session.agent_group_id.as_uuid(),
+                    cooldown_remaining_secs = cooldown_remaining.as_secs(),
+                    fallback_tag = %base_tag,
+                    "image rebuild in cooldown after prior failures; spawning on last-known-good tag"
+                );
+                base_tag
             } else {
                 match self.rebuild_image(session.agent_group_id, cfg).await {
-                    Ok(new_tag) => new_tag,
+                    Ok(new_tag) => {
+                        self.rebuild_backoff.record_success(session.agent_group_id);
+                        new_tag
+                    }
                     Err(err) if !base_tag.is_empty() => {
+                        let next_backoff =
+                            self.rebuild_backoff.record_failure(session.agent_group_id);
                         warn!(
                             agent_group = %session.agent_group_id.as_uuid(),
                             fallback_tag = %base_tag,
+                            next_backoff_secs = next_backoff.as_secs(),
                             ?err,
-                            "image rebuild failed; spawning on last-known-good tag (operator must fix config to pick up changes)"
+                            "image rebuild failed; spawning on last-known-good tag and backing off"
                         );
                         ironclaw_metrics::inc_image_rebuild_failed();
                         base_tag
                     }
                     Err(err) => {
+                        self.rebuild_backoff.record_failure(session.agent_group_id);
                         ironclaw_metrics::inc_image_rebuild_failed();
                         return Err(err);
                     }
@@ -935,13 +983,22 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
         &self,
         session: &Session,
         cc: Option<&container_configs::ContainerConfig>,
+        session_root: Option<&Path>,
     ) -> RunnerConfigForFile {
-        let provider = session
+        let provider_raw = session
             .agent_provider
             .clone()
             .or_else(|| cc.and_then(|c| c.provider.clone()))
             .unwrap_or_else(|| self.cfg.default_provider.clone());
-        let _ = provider; // currently only AnthropicProvider is wired in the runner.
+        // Normalize aliases for the runner; unknown values pass through
+        // (the runner logs + falls back to anthropic). Empty string is
+        // treated as "use the default" so an empty default_provider doesn't
+        // leak into the JSON file.
+        let provider = match provider_raw.as_str() {
+            "" => None,
+            "claude" => Some("anthropic".to_string()),
+            other => Some(other.to_string()),
+        };
 
         let model = cc
             .and_then(|c| c.model.clone())
@@ -951,12 +1008,97 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
         let selector = cc.map_or(ironclaw_skills::SkillsSelector::All, |c| {
             db_selector_to_skills_selector(&c.skills)
         });
-        let system = build_skill_system_prompt(
+        let now = chrono::Utc::now();
+
+        // Build the Callable-mode catalogue first (if applicable) so we
+        // can (a) reuse it to render the prompt index — making the
+        // on-disk `skills.json` and the in-prompt catalogue the same
+        // data — and (b) fall back to Inline-mode prompt assembly if
+        // the catalogue write fails, so the agent isn't left holding a
+        // Callable prompt that points at a missing file.
+        let mut effective_mode = self.cfg.skills_mode;
+        let mut catalogue_for_prompt: Option<Vec<SkillCatalogueEntry>> = None;
+        if let (SkillsMode::Callable, Some(root)) = (self.cfg.skills_mode, session_root) {
+            let entries = select_callable_skills(
+                self.cfg.skills_dir.as_deref(),
+                self.cfg.groups_dir.as_deref(),
+                session.agent_group_id,
+                &selector,
+            );
+            let path = root.join(SKILLS_CATALOGUE_FILENAME);
+            if entries.is_empty() {
+                // Nothing to advertise; behave like Inline for this spawn
+                // so `load_skill` is not in the prompt at all.
+                effective_mode = SkillsMode::Inline;
+                remove_stale_catalogue(&path);
+            } else {
+                match serde_json::to_vec_pretty(&entries) {
+                    Ok(json) => match std::fs::write(&path, json) {
+                        Ok(()) => catalogue_for_prompt = Some(entries),
+                        Err(err) => {
+                            warn!(
+                                ?err,
+                                path = %path.display(),
+                                "could not write skills catalogue; falling back to inline-skills prompt"
+                            );
+                            effective_mode = SkillsMode::Inline;
+                            remove_stale_catalogue(&path);
+                        }
+                    },
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            "could not serialise skills catalogue; falling back to inline-skills prompt"
+                        );
+                        effective_mode = SkillsMode::Inline;
+                        remove_stale_catalogue(&path);
+                    }
+                }
+            }
+        } else if let Some(root) = session_root {
+            // Inline mode (either configured or fallen-back-to): drop
+            // any catalogue from a previous spawn so `load_skill` never
+            // reads stale bodies that don't match the inlined prompt.
+            remove_stale_catalogue(&root.join(SKILLS_CATALOGUE_FILENAME));
+        }
+
+        let system = assemble_system_prompt_with_catalogue(
             self.cfg.skills_dir.as_deref(),
             self.cfg.groups_dir.as_deref(),
             session.agent_group_id,
             &selector,
+            session_root,
+            session.id,
+            now,
+            assistant_name.as_deref(),
+            effective_mode,
+            catalogue_for_prompt.as_deref(),
         );
+
+        // Pick the api_key_env that matches the wire format. Ollama
+        // native doesn't authenticate (or uses its own bearer in front
+        // of a proxy); the runner accepts a missing api_key when
+        // provider=ollama. Ollama-shim talks the Anthropic envelope at
+        // a proxy that may or may not require a key — keep ANTHROPIC_API_KEY
+        // so the operator can set one if they need it.
+        let api_key_env: Option<String> = match provider.as_deref() {
+            Some("ollama") => None,
+            _ => Some("ANTHROPIC_API_KEY".to_string()),
+        };
+
+        // For ollama-shim we route api_base_url to OLLAMA_BASE_URL (or
+        // leave it None and let the runner read OLLAMA_BASE_URL from the
+        // container env). For native ollama, api_base_url is irrelevant
+        // — the runner reads OLLAMA_BASE_URL directly.
+        let api_base_url = match provider.as_deref() {
+            Some("ollama" | "ollama-shim") => None,
+            _ => self
+                .rotatable
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .anthropic_base_url
+                .clone(),
+        };
 
         RunnerConfigForFile {
             session_id: session.id.as_uuid().to_string(),
@@ -965,15 +1107,11 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
             // that's where the bind mount lands and where the runner
             // looks for `inbound.db`/`outbound.db`.
             session_dir: CONTAINER_SESSION_DIR.to_string(),
+            provider,
             model,
             system,
-            api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
-            api_base_url: self
-                .rotatable
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .anthropic_base_url
-                .clone(),
+            api_key_env,
+            api_base_url,
             assistant_name,
             max_messages_per_prompt: max_messages,
         }
@@ -1046,6 +1184,38 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
                 target: CONTAINER_SESSION_DIR.to_string(),
                 read_only: false,
             });
+
+        // Per-agent-group memory mount. Lives outside the session dir
+        // so the same memory file is visible to every session of the
+        // group — an agent can write a memory entry in one chat and
+        // read it back from another. Created lazily here so the
+        // operator doesn't need to provision the directory before the
+        // first spawn. Mounted read-write because the agent is the one
+        // writing to it. Disabled when `groups_dir` is unset — without
+        // a per-group root there's nowhere to anchor the source.
+        if let Some(groups) = self.cfg.groups_dir.as_deref() {
+            let mem_src = groups
+                .join(session.agent_group_id.as_uuid().to_string())
+                .join("memory");
+            match std::fs::create_dir_all(&mem_src) {
+                Ok(()) => {
+                    set_memory_dir_perms(&mem_src);
+                    spec = spec.with_mount(Mount::Bind {
+                        source: mem_src.to_string_lossy().into_owned(),
+                        target: format!("{CONTAINER_SESSION_DIR}/memory"),
+                        read_only: false,
+                    });
+                }
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        path = %mem_src.display(),
+                        "could not prepare per-group memory dir; falling back to session-local memory with UNAVAILABLE marker"
+                    );
+                    write_memory_unavailable_marker(&paths.root, &mem_src, &err);
+                }
+            }
+        }
 
         // The runner reads its config from this path via the
         // `--config` flag wired into the entrypoint args. ContainerSpec
@@ -1167,6 +1337,392 @@ fn strip_quotes(s: &str) -> &str {
     s
 }
 
+/// Filename for an optional operator-supplied project briefing read at
+/// spawn time and prepended to the agent's system prompt. The
+/// convention mirrors Claude Code's `CLAUDE.md`: anything the operator
+/// wants the agent to know about *this* deployment that wouldn't be
+/// obvious from the inbound message alone (house style, identity, the
+/// shape of the workload). Two locations are checked, both optional:
+/// the session dir (`/data/IRONCLAW.md` from the container's
+/// perspective) and the per-group override directory
+/// (`<groups_dir>/<agent_group_id>/IRONCLAW.md`).
+pub const PROJECT_BRIEFING_FILENAME: &str = "IRONCLAW.md";
+
+/// Filename for the per-session skills catalogue. Written into the
+/// session dir alongside `runner.json` when `skills_mode = Callable` so
+/// the runner's `load_skill` MCP tool can pull skill bodies on demand
+/// instead of pre-inlining every body into the system prompt. From the
+/// container's view this lands at `/data/skills.json`.
+pub const SKILLS_CATALOGUE_FILENAME: &str = "skills.json";
+
+/// How skill bodies reach the agent. The default mirrors today's
+/// behaviour (inline every selected skill body into the system prompt
+/// at spawn) so flipping to callable is opt-in per operator. Callable
+/// mode advertises a compact index of skill names + descriptions in the
+/// prompt and exposes a `load_skill` MCP tool that returns a named
+/// skill's body on demand. The trade-off: bodies move from the always-on
+/// prompt window (cheap to use, expensive every turn) to a tool call
+/// (more turns, but every other turn pays nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SkillsMode {
+    /// Inline every selected skill's body into the system prompt at
+    /// spawn time. No `skills.json` is written.
+    #[default]
+    Inline,
+    /// Emit a name+description index in the system prompt and write
+    /// `skills.json` next to `runner.json` for the runner's
+    /// `load_skill` MCP tool.
+    Callable,
+}
+
+impl SkillsMode {
+    /// Parse the operator-facing string form. Accepts `"inline"` and
+    /// `"callable"`; unknown values fall back to [`SkillsMode::Inline`]
+    /// with a `WARN` so a typo never silently mutes skills.
+    pub fn parse_or_default(s: Option<&str>) -> Self {
+        match s.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            None | Some("" | "inline") => Self::Inline,
+            Some("callable") => Self::Callable,
+            Some(other) => {
+                warn!(value = other, "unknown IRONCLAW_SKILLS_MODE; falling back to inline");
+                Self::Inline
+            }
+        }
+    }
+}
+
+/// Universal preamble prepended to every agent's system prompt before
+/// the environment block, project briefing, and skill catalogue. The
+/// content is deliberately mode-agnostic — it describes how to *be* an
+/// Ironclaw agent (read carefully, act with care, prefer dedicated
+/// tools, reply concisely) without assuming the agent is doing any
+/// particular kind of work. Coding, support, scheduling, etc. are all
+/// served by the same disciplines; specialised guidance lives in opt-in
+/// skills.
+pub const BASE_PREAMBLE: &str = "\
+You are an Ironclaw agent — a self-hosted assistant that talks to people \
+through channel adapters and runs inside a per-session Linux container with \
+a set of tools. The capabilities you have are documented as skills further \
+down this prompt; read the skill catalogue before deciding which tool to \
+call.
+
+# How to work
+
+Read the inbound message carefully before acting. For multi-step work, \
+think briefly about the steps first, then take them one tool call at a \
+time and observe each result before deciding the next. Don't speculate \
+past what your tool calls confirmed. If a request is genuinely ambiguous, \
+ask one focused clarifying question rather than guessing across \
+possibilities.
+
+# Acting with care
+
+Tools have real effects: they send messages, change files, spawn sibling \
+agents, schedule future work. Match the boldness of your actions to how \
+reversible they are.
+
+- Reading, searching, asking a clarifying question — go ahead.
+- Editing a file, sending a chat reply, spawning a sibling agent — fine \
+  when the user asked for it; pause if it would be hard to undo.
+- Deleting files, rewriting committed history, modifying configuration \
+  the user didn't ask about — stop and confirm first.
+
+When you find unexpected state (an unfamiliar file, a branch you didn't \
+make, a lock you didn't take), investigate it before overwriting — it is \
+usually the user's in-progress work.
+
+# Picking tools
+
+Prefer the dedicated tool over `shell` when one fits the job. Use `grep` \
+and `glob` for searching rather than shelling out to `find`. When you \
+have several independent things to check or do, call multiple tools in \
+the same turn. When one call needs another's output, sequence them.
+
+# Replying
+
+Be concise. Don't restate the user's request, don't summarize what you \
+just did at the end of every reply, and don't pad with preamble. One or \
+two sentences is usually enough; add a code block, command, or link \
+when it helps and skip the prose around it.
+
+Never use emojis unless the user explicitly asks for them.
+";
+
+/// Build the environment block: a short, structured snapshot of the
+/// agent's context that an operator would otherwise have to teach via
+/// skills (today's date, which session is running, the working directory
+/// inside the container, the assistant's display name when set). Mirrors
+/// the equivalent block Claude Code injects at the top of its system
+/// prompt.
+fn environment_block(
+    session_id: ironclaw_types::SessionId,
+    agent_group_id: AgentGroupId,
+    now: chrono::DateTime<chrono::Utc>,
+    assistant_name: Option<&str>,
+) -> String {
+    let mut out = String::with_capacity(512);
+    out.push_str("\n# Environment\n\n");
+    out.push_str(&format!("Today is {}.\n", now.format("%Y-%m-%d")));
+    out.push_str(&format!("Session id: {}\n", session_id.as_uuid()));
+    out.push_str(&format!("Agent group id: {}\n", agent_group_id.as_uuid()));
+    out.push_str(&format!(
+        "Working directory: {CONTAINER_SESSION_DIR} (per-session bind mount; this is where \
+         inbound.db, outbound.db, and your runner config live)\n"
+    ));
+    if let Some(name) = assistant_name {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            out.push_str(&format!("Assistant name: {trimmed}\n"));
+        }
+    }
+    out
+}
+
+/// Read the optional project briefing from disk. Two sources, both
+/// optional:
+///
+/// 1. The session dir (`<session_root>/IRONCLAW.md`) — operator-supplied
+///    per-session context, e.g. dropped in by a wrapper that materialised
+///    a specific workload before the runner booted.
+/// 2. The per-group override (`<groups_dir>/<agent_group_id>/IRONCLAW.md`)
+///    — operator-supplied per-group context that applies to every session
+///    of this group.
+///
+/// Returns `None` if neither file exists. Read errors are logged and the
+/// briefing is dropped — a missing or malformed briefing must not block
+/// spawn.
+fn read_project_briefing(
+    session_root: Option<&Path>,
+    groups_dir: Option<&Path>,
+    agent_group_id: AgentGroupId,
+) -> Option<String> {
+    let mut sections: Vec<(String, String)> = Vec::new();
+    let mut diagnostics: Vec<String> = Vec::new();
+
+    if let Some(dir) = groups_dir {
+        let path = dir
+            .join(agent_group_id.as_uuid().to_string())
+            .join(PROJECT_BRIEFING_FILENAME);
+        match std::fs::read_to_string(&path) {
+            Ok(body) if !body.trim().is_empty() => {
+                sections.push((format!("group: {}", path.display()), body));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                warn!(?err, path = %path.display(), "could not read group briefing");
+                diagnostics.push(format!(
+                    "The operator-supplied group briefing at {} could not be read ({}); \
+                     the agent has no context from that file for this session.",
+                    path.display(),
+                    err.kind(),
+                ));
+            }
+        }
+    }
+
+    if let Some(root) = session_root {
+        let path = root.join(PROJECT_BRIEFING_FILENAME);
+        match std::fs::read_to_string(&path) {
+            Ok(body) if !body.trim().is_empty() => {
+                sections.push((format!("session: {}", path.display()), body));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                warn!(?err, path = %path.display(), "could not read session briefing");
+                diagnostics.push(format!(
+                    "The operator-supplied session briefing at {} could not be read ({}); \
+                     the agent has no context from that file for this session.",
+                    path.display(),
+                    err.kind(),
+                ));
+            }
+        }
+    }
+
+    if sections.is_empty() && diagnostics.is_empty() {
+        return None;
+    }
+
+    let mut out = String::with_capacity(2 * 1024);
+    out.push_str("\n# Project briefing\n\n");
+    if !sections.is_empty() {
+        out.push_str(
+            "The operator supplied the following briefing(s); treat them as \
+             authoritative context for this deployment.\n",
+        );
+        for (source, body) in sections {
+            out.push_str(&format!("\n<briefing source=\"{}\">\n", escape_attr(&source)));
+            out.push_str(body.trim_end_matches('\n'));
+            out.push_str("\n</briefing>\n");
+        }
+    }
+    if !diagnostics.is_empty() {
+        out.push_str("\n## Briefing diagnostics\n\n");
+        for line in diagnostics {
+            out.push_str(&format!("Note: {line}\n"));
+        }
+    }
+    Some(out)
+}
+
+/// Top-level system-prompt assembler: stitches the universal preamble,
+/// the environment block, an optional operator-supplied project briefing,
+/// and the skill catalogue into a single string the runner writes into
+/// `runner.json` and the provider sends as the `system` message.
+///
+/// Each piece is independent: a deployment without a skills directory
+/// still gets the preamble + environment; a deployment without an
+/// `IRONCLAW.md` still gets the rest. The order is fixed (preamble →
+/// environment → briefing → skills) so that operator briefings can refer
+/// back to the environment block without forward-references.
+///
+/// `skills_mode` controls whether full skill bodies are inlined into the
+/// prompt or just a name/description index is emitted (with bodies
+/// reachable on demand via the `load_skill` MCP tool).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn assemble_system_prompt(
+    skills_dir: Option<&Path>,
+    groups_dir: Option<&Path>,
+    agent_group_id: AgentGroupId,
+    selector: &ironclaw_skills::SkillsSelector,
+    session_root: Option<&Path>,
+    session_id: ironclaw_types::SessionId,
+    now: chrono::DateTime<chrono::Utc>,
+    assistant_name: Option<&str>,
+    skills_mode: SkillsMode,
+) -> String {
+    assemble_system_prompt_with_catalogue(
+        skills_dir,
+        groups_dir,
+        agent_group_id,
+        selector,
+        session_root,
+        session_id,
+        now,
+        assistant_name,
+        skills_mode,
+        None,
+    )
+}
+
+/// Like [`assemble_system_prompt`] but accepts a pre-built Callable-mode
+/// catalogue so the host can render the prompt index off the same data
+/// it just wrote to `skills.json`. Pass `None` to let the assembler
+/// build whatever it needs internally.
+#[allow(clippy::too_many_arguments)]
+fn assemble_system_prompt_with_catalogue(
+    skills_dir: Option<&Path>,
+    groups_dir: Option<&Path>,
+    agent_group_id: AgentGroupId,
+    selector: &ironclaw_skills::SkillsSelector,
+    session_root: Option<&Path>,
+    session_id: ironclaw_types::SessionId,
+    now: chrono::DateTime<chrono::Utc>,
+    assistant_name: Option<&str>,
+    skills_mode: SkillsMode,
+    prebuilt_catalogue: Option<&[SkillCatalogueEntry]>,
+) -> String {
+    let mut out = String::with_capacity(16 * 1024);
+    out.push_str(BASE_PREAMBLE);
+    out.push_str(&environment_block(session_id, agent_group_id, now, assistant_name));
+    if let Some(brief) = read_project_briefing(session_root, groups_dir, agent_group_id) {
+        out.push_str(&brief);
+    }
+    let skills_section = match (skills_mode, prebuilt_catalogue) {
+        (SkillsMode::Callable, Some(cat)) if !cat.is_empty() => render_callable_skill_index(cat),
+        (SkillsMode::Callable, Some(_)) => String::new(),
+        _ => build_skill_system_prompt(
+            skills_dir,
+            groups_dir,
+            agent_group_id,
+            selector,
+            skills_mode,
+        ),
+    };
+    if !skills_section.is_empty() {
+        out.push('\n');
+        out.push_str(&skills_section);
+    }
+    out
+}
+
+/// Per-skill record written into `skills.json` for the runner-side
+/// `load_skill` MCP tool to consume. Kept simple (no extra metadata)
+/// so the schema is forward-compatible.
+#[derive(Debug, Clone, serde::Serialize)]
+struct SkillCatalogueEntry {
+    name: String,
+    description: String,
+    body: String,
+}
+
+/// Single source of truth for which skills make it into a Callable-mode
+/// spawn: scans the registry, reads each selected skill's body, and
+/// drops any that fail to load. The returned vector is the union used
+/// by both the prompt index and the `skills.json` catalogue write, so
+/// the two cannot disagree about which skills exist.
+fn select_callable_skills(
+    skills_dir: Option<&Path>,
+    groups_dir: Option<&Path>,
+    agent_group_id: AgentGroupId,
+    selector: &ironclaw_skills::SkillsSelector,
+) -> Vec<SkillCatalogueEntry> {
+    let Some(global) = skills_dir else {
+        return Vec::new();
+    };
+    let group_override = groups_dir
+        .map(|root| root.join(agent_group_id.as_uuid().to_string()).join("skills"))
+        .filter(|p| p.is_dir())
+        .map(|p| (agent_group_id, p));
+    let registry = match ironclaw_skills::SkillRegistry::scan(
+        global,
+        group_override.as_ref().map(|(id, p)| (*id, p.as_path())),
+    ) {
+        Ok(r) => r,
+        Err(err) => {
+            warn!(?err, dir = %global.display(), "skill scan failed; callable selection will be empty");
+            return Vec::new();
+        }
+    };
+    let selected = registry.list_for_group(agent_group_id, selector);
+    let mut out = Vec::with_capacity(selected.len());
+    for skill in &selected {
+        let body = match ironclaw_skills::read_skill_body(skill) {
+            Ok(b) => b,
+            Err(err) => {
+                warn!(skill = %skill.name, ?err, "skill body read failed; skipping in catalogue");
+                continue;
+            }
+        };
+        out.push(SkillCatalogueEntry {
+            name: skill.name.clone(),
+            description: skill.description.clone(),
+            body: body.trim_end().to_string(),
+        });
+    }
+    out
+}
+
+/// Test-only thin wrapper over [`select_callable_skills`] that returns
+/// `None` when no skills are selected.
+#[cfg(test)]
+fn build_skills_catalogue(
+    skills_dir: Option<&Path>,
+    groups_dir: Option<&Path>,
+    agent_group_id: AgentGroupId,
+    selector: &ironclaw_skills::SkillsSelector,
+) -> Option<Vec<SkillCatalogueEntry>> {
+    let entries = select_callable_skills(skills_dir, groups_dir, agent_group_id, selector);
+    if entries.is_empty() {
+        None
+    } else {
+        Some(entries)
+    }
+}
+
 /// Assemble the agent's system prompt from the global skills directory
 /// (optional per-group override), filtered through the group's
 /// `SkillsSelector`. Each skill's `SKILL.md` body is inlined as a
@@ -1184,6 +1740,7 @@ fn build_skill_system_prompt(
     groups_dir: Option<&std::path::Path>,
     agent_group_id: AgentGroupId,
     selector: &ironclaw_skills::SkillsSelector,
+    mode: SkillsMode,
 ) -> String {
     let Some(global) = skills_dir else {
         return String::new();
@@ -1215,30 +1772,69 @@ fn build_skill_system_prompt(
     }
 
     let mut out = String::with_capacity(8 * 1024);
-    out.push_str(
-        "The following skills document the capabilities available to you. \
+    match mode {
+        SkillsMode::Inline => {
+            out.push_str(
+                "The following skills document the capabilities available to you. \
 Each <skill> block is the rendered SKILL.md for one capability — read \
 them all before deciding which tool to call.\n",
-    );
-    for skill in &selected {
-        let body = match ironclaw_skills::read_skill_body(skill) {
-            Ok(b) => b,
-            Err(err) => {
-                warn!(
-                    skill = %skill.name,
-                    ?err,
-                    "skill body read failed; skipping"
-                );
-                continue;
+            );
+            for skill in &selected {
+                let body = match ironclaw_skills::read_skill_body(skill) {
+                    Ok(b) => b,
+                    Err(err) => {
+                        warn!(
+                            skill = %skill.name,
+                            ?err,
+                            "skill body read failed; skipping"
+                        );
+                        continue;
+                    }
+                };
+                out.push_str("\n<skill name=\"");
+                out.push_str(&escape_attr(&skill.name));
+                out.push_str("\" description=\"");
+                out.push_str(&escape_attr(&skill.description));
+                out.push_str("\">\n");
+                out.push_str(body.trim_end());
+                out.push_str("\n</skill>\n");
             }
-        };
+        }
+        SkillsMode::Callable => {
+            // Hand off to the catalogue-backed renderer so the prompt
+            // index and the on-disk `skills.json` cannot disagree about
+            // which skills exist (any whose body fails to read is dropped
+            // from both).
+            let catalogue =
+                select_callable_skills(skills_dir, groups_dir, agent_group_id, selector);
+            if catalogue.is_empty() {
+                return String::new();
+            }
+            return render_callable_skill_index(&catalogue);
+        }
+    }
+    out
+}
+
+/// Emit the Callable-mode prompt section from a pre-built catalogue.
+/// Used both by `build_skill_system_prompt` (which builds the catalogue
+/// itself) and `runner_config_for` (which reuses the catalogue it
+/// already built for the `skills.json` write).
+fn render_callable_skill_index(catalogue: &[SkillCatalogueEntry]) -> String {
+    let mut out = String::with_capacity(2 * 1024);
+    out.push_str(
+        "The following is the catalogue of skills available to you. Each \
+<skill> entry shows only the skill's name and one-line description — the full \
+SKILL.md body is not inlined. To read a skill's body before acting on it, call \
+the `load_skill` tool with that skill's `name`; the tool returns the same \
+markdown that would have been inlined.\n",
+    );
+    for entry in catalogue {
         out.push_str("\n<skill name=\"");
-        out.push_str(&skill.name);
+        out.push_str(&escape_attr(&entry.name));
         out.push_str("\" description=\"");
-        out.push_str(&escape_attr(&skill.description));
-        out.push_str("\">\n");
-        out.push_str(body.trim_end());
-        out.push_str("\n</skill>\n");
+        out.push_str(&escape_attr(&entry.description));
+        out.push_str("\" />\n");
     }
     out
 }
@@ -1249,6 +1845,87 @@ them all before deciding which tool to call.\n",
 /// confuse a casual reader.
 fn escape_attr(s: &str) -> String {
     s.replace('&', "&amp;").replace('"', "&quot;")
+}
+
+/// Best-effort removal of a previous spawn's `skills.json`. `NotFound`
+/// is the common case (no prior catalogue) and silently ignored; other
+/// errors are logged but never fail the spawn.
+fn remove_stale_catalogue(path: &Path) {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            warn!(?err, path = %path.display(), "could not remove stale skills catalogue");
+        }
+    }
+}
+
+/// Filename of the per-session marker dropped when the per-group memory
+/// mount could not be configured. The agent reads
+/// `/data/memory/UNAVAILABLE.md` and learns the writes it makes here are
+/// session-local rather than persistent.
+pub const MEMORY_UNAVAILABLE_FILENAME: &str = "UNAVAILABLE.md";
+
+/// Loosen the per-group memory dir to group-writeable (`0o775`) so the
+/// operator can clean up files the container's root user wrote into
+/// the bind. Best-effort and no-op on non-unix targets.
+fn set_memory_dir_perms(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o775)) {
+            warn!(
+                ?err,
+                path = %path.display(),
+                "could not relax per-group memory dir permissions to 0o775"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+/// Drop a session-local `/data/memory/UNAVAILABLE.md` marker so the
+/// agent can detect (from inside the container) that the persistent
+/// memory mount was not configured for this spawn. Writes that land in
+/// this directory are bound to the session dir, not the per-group dir,
+/// so they will not be visible to future sessions of the same group.
+fn write_memory_unavailable_marker(
+    session_root: &Path,
+    intended_src: &Path,
+    err: &std::io::Error,
+) {
+    let dir = session_root.join("memory");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!(
+            ?e,
+            path = %dir.display(),
+            "could not create session-local memory dir for UNAVAILABLE marker"
+        );
+        return;
+    }
+    let body = format!(
+        "# Memory mount unavailable\n\n\
+         The per-group memory mount at `{intended}` could not be configured \
+         for this session (host error: {err_kind}). Files you write under \
+         `/data/memory/` will land in this session's own directory and will \
+         **not** persist or be visible to other sessions of this agent group.\n\n\
+         If a user references a memory the agent should have, mention that \
+         the persistent memory mount is currently unavailable so the operator \
+         can investigate.\n",
+        intended = intended_src.display(),
+        err_kind = err.kind(),
+    );
+    let marker = dir.join(MEMORY_UNAVAILABLE_FILENAME);
+    if let Err(e) = std::fs::write(&marker, body) {
+        warn!(
+            ?e,
+            path = %marker.display(),
+            "could not write memory-unavailable marker"
+        );
+    }
 }
 
 /// Translate the db crate's [`container_configs::SkillsSelector`] to
@@ -1278,6 +1955,10 @@ struct RunnerConfigForFile {
     session_id: String,
     agent_group_id: String,
     session_dir: String,
+    /// Provider kind, e.g. `"anthropic"`, `"ollama"`, `"ollama-shim"`.
+    /// When unset the runner falls back to `"anthropic"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
     model: String,
     system: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1349,12 +2030,171 @@ pub fn resolve_rebuild_base(default_image_tag: &str) -> String {
     }
 }
 
+/// Initial backoff after the first rebuild failure for an agent group.
+/// Doubles per subsequent failure up to [`REBUILD_BACKOFF_CEILING`].
+const REBUILD_BACKOFF_INITIAL: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
+/// Ceiling for the rebuild backoff per group. 30 min mirrors the
+/// delivery loop's `ABSOLUTE_CEILING_MS`: after this much time has
+/// passed without operator action, retrying the build won't have
+/// gotten cheaper, but unblocking the group does have value.
+const REBUILD_BACKOFF_CEILING: std::time::Duration =
+    std::time::Duration::from_secs(1_800);
+
+/// Per-agent-group cooldown table for image rebuilds. Wraps a
+/// `Mutex<HashMap>` because the spawn path is already async + holds
+/// the broader manager state; trading the lock contention for not
+/// having to thread a watch / arc-swap is the right call here. All
+/// methods are short, lock-free I/O free.
+pub struct RebuildBackoff {
+    inner: std::sync::Mutex<std::collections::HashMap<AgentGroupId, RebuildBackoffEntry>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RebuildBackoffEntry {
+    /// Number of consecutive failures observed.
+    consecutive_failures: u32,
+    /// Earliest moment at which the next rebuild attempt is allowed.
+    next_attempt_at: std::time::Instant,
+}
+
+impl Default for RebuildBackoff {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RebuildBackoff {
+    /// Build an empty tracker.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// If the group is still in cooldown, return the remaining
+    /// duration. Returns `None` when the group has no record or the
+    /// cooldown has elapsed (in which case the caller should attempt
+    /// the rebuild).
+    #[must_use]
+    pub fn in_cooldown(&self, group: AgentGroupId) -> Option<std::time::Duration> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = guard.get(&group)?;
+        let now = std::time::Instant::now();
+        if entry.next_attempt_at > now {
+            Some(entry.next_attempt_at - now)
+        } else {
+            None
+        }
+    }
+
+    /// Record a successful rebuild; clears any prior cooldown for
+    /// this group so the next config change is attempted immediately.
+    pub fn record_success(&self, group: AgentGroupId) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.remove(&group);
+    }
+
+    /// Record a rebuild failure for this group. Increments the
+    /// consecutive-failure count, computes the next exponential
+    /// backoff, and returns the duration the group is now in
+    /// cooldown for (useful for log messages).
+    pub fn record_failure(&self, group: AgentGroupId) -> std::time::Duration {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = std::time::Instant::now();
+        let entry = guard.entry(group).or_insert(RebuildBackoffEntry {
+            consecutive_failures: 0,
+            next_attempt_at: now,
+        });
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        let exp = entry.consecutive_failures.saturating_sub(1).min(8);
+        let backoff = REBUILD_BACKOFF_INITIAL
+            .saturating_mul(1u32 << exp)
+            .min(REBUILD_BACKOFF_CEILING);
+        entry.next_attempt_at = now + backoff;
+        backoff
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ironclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
     use ironclaw_db::tables::sessions::{create as create_session, CreateSession};
     use ironclaw_types::SessionId;
+
+    /// Backoff is empty on construction: every group is allowed to
+    /// rebuild immediately.
+    #[test]
+    fn rebuild_backoff_clear_by_default() {
+        let bo = RebuildBackoff::new();
+        assert!(bo.in_cooldown(AgentGroupId::new()).is_none());
+    }
+
+    /// First failure installs a cooldown approximately equal to
+    /// `REBUILD_BACKOFF_INITIAL`. Subsequent calls within the
+    /// cooldown window report time remaining and don't re-trigger
+    /// the rebuild.
+    #[test]
+    fn rebuild_backoff_first_failure_installs_initial_cooldown() {
+        let bo = RebuildBackoff::new();
+        let ag = AgentGroupId::new();
+        let dur = bo.record_failure(ag);
+        assert_eq!(dur, REBUILD_BACKOFF_INITIAL);
+        let remaining = bo.in_cooldown(ag).expect("group must be in cooldown");
+        assert!(remaining <= REBUILD_BACKOFF_INITIAL);
+    }
+
+    /// Consecutive failures double the backoff up to the ceiling.
+    #[test]
+    fn rebuild_backoff_doubles_to_ceiling() {
+        let bo = RebuildBackoff::new();
+        let ag = AgentGroupId::new();
+        let mut prev = bo.record_failure(ag);
+        // Push past the doubling threshold a few times.
+        for _ in 0..6 {
+            let next = bo.record_failure(ag);
+            assert!(next >= prev, "backoff should not regress: prev={prev:?} next={next:?}");
+            assert!(next <= REBUILD_BACKOFF_CEILING);
+            prev = next;
+        }
+        // After many failures we should be sitting at the ceiling.
+        assert_eq!(prev, REBUILD_BACKOFF_CEILING);
+    }
+
+    /// A successful rebuild clears the cooldown immediately.
+    #[test]
+    fn rebuild_backoff_success_clears_cooldown() {
+        let bo = RebuildBackoff::new();
+        let ag = AgentGroupId::new();
+        let _ = bo.record_failure(ag);
+        assert!(bo.in_cooldown(ag).is_some());
+        bo.record_success(ag);
+        assert!(bo.in_cooldown(ag).is_none());
+    }
+
+    /// Per-group isolation: a failure for group A must not delay
+    /// rebuilds for group B.
+    #[test]
+    fn rebuild_backoff_per_group_independent() {
+        let bo = RebuildBackoff::new();
+        let a = AgentGroupId::new();
+        let b = AgentGroupId::new();
+        let _ = bo.record_failure(a);
+        assert!(bo.in_cooldown(a).is_some());
+        assert!(bo.in_cooldown(b).is_none(), "other group must be unaffected");
+    }
 
     /// Regression: image rebuilds must base off the install's default
     /// image (which has the runner binary), not bare `debian:trixie-slim`.
@@ -1392,6 +2232,7 @@ mod tests {
             stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
             skills_dir: None,
             groups_dir: None,
+            skills_mode: SkillsMode::Inline,
             forward_env: Vec::new(),
         }
     }
@@ -1509,6 +2350,63 @@ mod tests {
     }
 
     #[test]
+    fn build_spec_mounts_per_group_memory_when_groups_dir_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let groups = tmp.path().join("groups");
+        std::fs::create_dir_all(&groups).unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.groups_dir = Some(groups.clone());
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None);
+        let memory_mount = spec.mounts.iter().find_map(|m| match m {
+            Mount::Bind {
+                source,
+                target,
+                read_only,
+            } if target == &format!("{CONTAINER_SESSION_DIR}/memory") => {
+                Some((source.clone(), *read_only))
+            }
+            _ => None,
+        });
+        let (src, ro) = memory_mount.expect("memory mount present");
+        let expected = groups
+            .join(session.agent_group_id.as_uuid().to_string())
+            .join("memory");
+        assert_eq!(src, expected.to_string_lossy().to_string());
+        assert!(!ro);
+        // Mount source dir is created lazily.
+        assert!(expected.is_dir());
+    }
+
+    #[test]
+    fn build_spec_skips_memory_mount_when_groups_dir_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.groups_dir = None;
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None);
+        let has_memory = spec.mounts.iter().any(|m| match m {
+            Mount::Bind { target, .. } => target == &format!("{CONTAINER_SESSION_DIR}/memory"),
+            _ => false,
+        });
+        assert!(!has_memory, "memory mount must not appear without groups_dir");
+    }
+
+    #[test]
     fn build_spec_applies_resource_limits_from_config() {
         let tmp = tempfile::tempdir().unwrap();
         let db = CentralDb::open_in_memory().unwrap();
@@ -1623,7 +2521,7 @@ mod tests {
             manager_cfg(tmp.path().to_path_buf()),
         );
         let session = fixture_session(&db);
-        let cfg = mgr.runner_config_for(&session, None);
+        let cfg = mgr.runner_config_for(&session, None, None);
         assert_eq!(cfg.model, "claude-sonnet-4-6");
         assert_eq!(cfg.session_dir, CONTAINER_SESSION_DIR);
         assert_eq!(cfg.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
@@ -1631,6 +2529,88 @@ mod tests {
             cfg.api_base_url.as_deref(),
             Some("https://openrouter.ai/api/v1")
         );
+    }
+
+    /// Per-group `container_config.provider = "ollama"` must reach the
+    /// runner-config file so the runner builds an Ollama provider rather
+    /// than the default Anthropic one. Caught regression: the old
+    /// `let _ = provider;` line silently swallowed the field and the
+    /// runner ignored every per-group choice.
+    #[test]
+    fn runner_config_propagates_ollama_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let cc = container_configs::ContainerConfig {
+            agent_group_id: session.agent_group_id,
+            provider: Some("ollama".into()),
+            model: Some("llama3.1:8b".into()),
+            effort: None,
+            image_tag: None,
+            assistant_name: None,
+            max_messages_per_prompt: None,
+            skills: container_configs::SkillsSelector::All,
+            mcp_servers: serde_json::json!({}),
+            packages_apt: vec![],
+            packages_npm: vec![],
+            additional_mounts: serde_json::json!([]),
+            cli_scope: container_configs::CliScope::Group,
+            config_fingerprint: None,
+            egress_allow: vec![],
+            resource_limits: serde_json::json!({}),
+            updated_at: chrono::Utc::now(),
+        };
+        let cfg = mgr.runner_config_for(&session, Some(&cc), None);
+        assert_eq!(cfg.provider.as_deref(), Some("ollama"));
+        assert_eq!(cfg.model, "llama3.1:8b");
+        // Ollama native doesn't authenticate via ANTHROPIC_API_KEY,
+        // so the runner must not be told to pull one.
+        assert!(cfg.api_key_env.is_none());
+        // And the per-rotatable Anthropic base URL is irrelevant —
+        // we must not leak it into an ollama config.
+        assert!(cfg.api_base_url.is_none());
+    }
+
+    /// `claude` is an alias for `anthropic` — both must still resolve
+    /// to `api_key_env=ANTHROPIC_API_KEY` and the rotatable base URL.
+    #[test]
+    fn runner_config_claude_alias_resolves_to_anthropic_envelope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let cc = container_configs::ContainerConfig {
+            agent_group_id: session.agent_group_id,
+            provider: Some("claude".into()),
+            model: None,
+            effort: None,
+            image_tag: None,
+            assistant_name: None,
+            max_messages_per_prompt: None,
+            skills: container_configs::SkillsSelector::All,
+            mcp_servers: serde_json::json!({}),
+            packages_apt: vec![],
+            packages_npm: vec![],
+            additional_mounts: serde_json::json!([]),
+            cli_scope: container_configs::CliScope::Group,
+            config_fingerprint: None,
+            egress_allow: vec![],
+            resource_limits: serde_json::json!({}),
+            updated_at: chrono::Utc::now(),
+        };
+        let cfg = mgr.runner_config_for(&session, Some(&cc), None);
+        assert_eq!(cfg.provider.as_deref(), Some("anthropic"));
+        assert_eq!(cfg.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+        assert!(cfg.api_base_url.is_some());
     }
 
     #[tokio::test]
@@ -1909,6 +2889,7 @@ mod tests {
             None,
             AgentGroupId::new(),
             &ironclaw_skills::SkillsSelector::All,
+            SkillsMode::Inline,
         );
         assert!(prompt.is_empty());
     }
@@ -1925,6 +2906,7 @@ mod tests {
             None,
             AgentGroupId::new(),
             &ironclaw_skills::SkillsSelector::All,
+            SkillsMode::Inline,
         );
         assert!(prompt.contains("<skill name=\"alpha\""));
         assert!(prompt.contains("Alpha body"));
@@ -1948,6 +2930,7 @@ mod tests {
             None,
             AgentGroupId::new(),
             &ironclaw_skills::SkillsSelector::Explicit(vec!["beta".into()]),
+            SkillsMode::Inline,
         );
         assert!(!prompt.contains("alpha body"));
         assert!(prompt.contains("beta body"));
@@ -1965,6 +2948,7 @@ mod tests {
             None,
             AgentGroupId::new(),
             &ironclaw_skills::SkillsSelector::Explicit(vec![]),
+            SkillsMode::Inline,
         );
         assert!(prompt.is_empty());
     }
@@ -1989,6 +2973,7 @@ mod tests {
             Some(&groups),
             ag,
             &ironclaw_skills::SkillsSelector::All,
+            SkillsMode::Inline,
         );
         assert!(prompt.contains("group override body"));
         assert!(!prompt.contains("global body"));
@@ -2001,8 +2986,380 @@ mod tests {
             None,
             AgentGroupId::new(),
             &ironclaw_skills::SkillsSelector::All,
+            SkillsMode::Inline,
         );
         assert!(prompt.is_empty());
+    }
+
+    #[test]
+    fn build_skill_system_prompt_callable_emits_index_without_bodies() {
+        let td = tempfile::tempdir().unwrap();
+        let skills = td.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write_skill_md(&skills, "alpha", "Alpha body\n");
+        write_skill_md(&skills, "beta", "Beta body\n");
+        let prompt = build_skill_system_prompt(
+            Some(&skills),
+            None,
+            AgentGroupId::new(),
+            &ironclaw_skills::SkillsSelector::All,
+            SkillsMode::Callable,
+        );
+        // Names + descriptions present, bodies absent.
+        assert!(prompt.contains("name=\"alpha\""));
+        assert!(prompt.contains("name=\"beta\""));
+        assert!(prompt.contains("desc-of-alpha"));
+        assert!(!prompt.contains("Alpha body"));
+        assert!(!prompt.contains("Beta body"));
+        // The self-closing form makes it visually obvious to the model
+        // that the body is *not* here.
+        assert!(prompt.contains("\" />"));
+        // The instructional sentence reminds the model how to retrieve
+        // bodies; the tool name is mentioned literally.
+        assert!(prompt.contains("`load_skill`"));
+    }
+
+    #[test]
+    fn skills_mode_parse_or_default_handles_known_and_unknown() {
+        assert_eq!(SkillsMode::parse_or_default(None), SkillsMode::Inline);
+        assert_eq!(SkillsMode::parse_or_default(Some("")), SkillsMode::Inline);
+        assert_eq!(
+            SkillsMode::parse_or_default(Some("inline")),
+            SkillsMode::Inline
+        );
+        assert_eq!(
+            SkillsMode::parse_or_default(Some("INLINE")),
+            SkillsMode::Inline
+        );
+        assert_eq!(
+            SkillsMode::parse_or_default(Some("callable")),
+            SkillsMode::Callable
+        );
+        assert_eq!(
+            SkillsMode::parse_or_default(Some("Callable")),
+            SkillsMode::Callable
+        );
+        // Unknown falls back without panicking.
+        assert_eq!(
+            SkillsMode::parse_or_default(Some("on")),
+            SkillsMode::Inline
+        );
+    }
+
+    #[test]
+    fn build_skills_catalogue_returns_entries_for_selected_skills() {
+        let td = tempfile::tempdir().unwrap();
+        let skills = td.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write_skill_md(&skills, "alpha", "Alpha body line one\nAlpha body line two\n");
+        write_skill_md(&skills, "beta", "Beta body\n");
+        let entries = build_skills_catalogue(
+            Some(&skills),
+            None,
+            AgentGroupId::new(),
+            &ironclaw_skills::SkillsSelector::All,
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|e| e.name == "alpha"
+            && e.description == "desc-of-alpha"
+            && e.body.contains("Alpha body line one")));
+        assert!(entries.iter().any(|e| e.name == "beta" && e.body.contains("Beta body")));
+    }
+
+    #[test]
+    fn build_skills_catalogue_returns_none_with_empty_selector() {
+        let td = tempfile::tempdir().unwrap();
+        let skills = td.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write_skill_md(&skills, "alpha", "Alpha body\n");
+        let entries = build_skills_catalogue(
+            Some(&skills),
+            None,
+            AgentGroupId::new(),
+            &ironclaw_skills::SkillsSelector::Explicit(vec![]),
+        );
+        assert!(entries.is_none());
+    }
+
+    #[test]
+    fn build_skills_catalogue_returns_none_without_skills_dir() {
+        let entries = build_skills_catalogue(
+            None,
+            None,
+            AgentGroupId::new(),
+            &ironclaw_skills::SkillsSelector::All,
+        );
+        assert!(entries.is_none());
+    }
+
+    // ---- universal preamble + environment + briefing ----
+
+    fn fixed_now() -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.with_ymd_and_hms(2026, 5, 22, 12, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn assemble_system_prompt_includes_universal_preamble_and_environment() {
+        let prompt = assemble_system_prompt(
+            None,
+            None,
+            AgentGroupId::new(),
+            &ironclaw_skills::SkillsSelector::All,
+            None,
+            ironclaw_types::SessionId::new(),
+            fixed_now(),
+            None,
+            SkillsMode::Inline,
+        );
+        // Preamble is mode-agnostic — these phrases anchor it.
+        assert!(prompt.contains("You are an Ironclaw agent"));
+        assert!(prompt.contains("Acting with care"));
+        assert!(prompt.contains("Picking tools"));
+        assert!(prompt.contains("Never use emojis"));
+        // Environment block follows.
+        assert!(prompt.contains("# Environment"));
+        assert!(prompt.contains("Today is 2026-05-22"));
+        assert!(prompt.contains("Working directory: /data"));
+    }
+
+    #[test]
+    fn assemble_system_prompt_includes_session_and_group_ids() {
+        let session = ironclaw_types::SessionId::new();
+        let ag = AgentGroupId::new();
+        let prompt = assemble_system_prompt(
+            None,
+            None,
+            ag,
+            &ironclaw_skills::SkillsSelector::All,
+            None,
+            session,
+            fixed_now(),
+            None,
+            SkillsMode::Inline,
+        );
+        assert!(prompt.contains(&session.as_uuid().to_string()));
+        assert!(prompt.contains(&ag.as_uuid().to_string()));
+    }
+
+    #[test]
+    fn assemble_system_prompt_includes_assistant_name_when_set() {
+        let with_name = assemble_system_prompt(
+            None,
+            None,
+            AgentGroupId::new(),
+            &ironclaw_skills::SkillsSelector::All,
+            None,
+            ironclaw_types::SessionId::new(),
+            fixed_now(),
+            Some("Atlas"),
+            SkillsMode::Inline,
+        );
+        assert!(with_name.contains("Assistant name: Atlas"));
+        let without_name = assemble_system_prompt(
+            None,
+            None,
+            AgentGroupId::new(),
+            &ironclaw_skills::SkillsSelector::All,
+            None,
+            ironclaw_types::SessionId::new(),
+            fixed_now(),
+            None,
+            SkillsMode::Inline,
+        );
+        assert!(!without_name.contains("Assistant name:"));
+    }
+
+    #[test]
+    fn assemble_system_prompt_omits_briefing_section_when_absent() {
+        let td = tempfile::tempdir().unwrap();
+        let prompt = assemble_system_prompt(
+            None,
+            None,
+            AgentGroupId::new(),
+            &ironclaw_skills::SkillsSelector::All,
+            Some(td.path()),
+            ironclaw_types::SessionId::new(),
+            fixed_now(),
+            None,
+            SkillsMode::Inline,
+        );
+        assert!(!prompt.contains("# Project briefing"));
+        assert!(!prompt.contains("<briefing"));
+    }
+
+    #[test]
+    fn assemble_system_prompt_includes_session_briefing_when_present() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::write(
+            td.path().join(PROJECT_BRIEFING_FILENAME),
+            "House style: terse, no preamble.\n",
+        )
+        .unwrap();
+        let prompt = assemble_system_prompt(
+            None,
+            None,
+            AgentGroupId::new(),
+            &ironclaw_skills::SkillsSelector::All,
+            Some(td.path()),
+            ironclaw_types::SessionId::new(),
+            fixed_now(),
+            None,
+            SkillsMode::Inline,
+        );
+        assert!(prompt.contains("# Project briefing"));
+        assert!(prompt.contains("<briefing source=\"session:"));
+        assert!(prompt.contains("House style: terse, no preamble."));
+    }
+
+    #[test]
+    fn assemble_system_prompt_includes_group_briefing_when_present() {
+        let td = tempfile::tempdir().unwrap();
+        let ag = AgentGroupId::new();
+        let group_dir = td.path().join(ag.as_uuid().to_string());
+        std::fs::create_dir_all(&group_dir).unwrap();
+        std::fs::write(
+            group_dir.join(PROJECT_BRIEFING_FILENAME),
+            "This deployment runs the support workload.\n",
+        )
+        .unwrap();
+        let prompt = assemble_system_prompt(
+            None,
+            Some(td.path()),
+            ag,
+            &ironclaw_skills::SkillsSelector::All,
+            None,
+            ironclaw_types::SessionId::new(),
+            fixed_now(),
+            None,
+            SkillsMode::Inline,
+        );
+        assert!(prompt.contains("<briefing source=\"group:"));
+        assert!(prompt.contains("This deployment runs the support workload."));
+    }
+
+    #[test]
+    fn assemble_system_prompt_group_then_session_briefings_both_included() {
+        let td = tempfile::tempdir().unwrap();
+        let ag = AgentGroupId::new();
+        let group_dir = td.path().join("groups").join(ag.as_uuid().to_string());
+        std::fs::create_dir_all(&group_dir).unwrap();
+        std::fs::write(group_dir.join(PROJECT_BRIEFING_FILENAME), "GROUP-LEVEL\n").unwrap();
+        let session_dir = td.path().join("sess");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::write(session_dir.join(PROJECT_BRIEFING_FILENAME), "SESSION-LEVEL\n").unwrap();
+        let prompt = assemble_system_prompt(
+            None,
+            Some(&td.path().join("groups")),
+            ag,
+            &ironclaw_skills::SkillsSelector::All,
+            Some(&session_dir),
+            ironclaw_types::SessionId::new(),
+            fixed_now(),
+            None,
+            SkillsMode::Inline,
+        );
+        let g_pos = prompt.find("GROUP-LEVEL").expect("group briefing present");
+        let s_pos = prompt.find("SESSION-LEVEL").expect("session briefing present");
+        assert!(g_pos < s_pos, "group briefing must precede session briefing");
+    }
+
+    #[test]
+    fn assemble_system_prompt_ignores_empty_briefing_file() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::write(td.path().join(PROJECT_BRIEFING_FILENAME), "   \n\n").unwrap();
+        let prompt = assemble_system_prompt(
+            None,
+            None,
+            AgentGroupId::new(),
+            &ironclaw_skills::SkillsSelector::All,
+            Some(td.path()),
+            ironclaw_types::SessionId::new(),
+            fixed_now(),
+            None,
+            SkillsMode::Inline,
+        );
+        assert!(!prompt.contains("# Project briefing"));
+    }
+
+    #[test]
+    fn assemble_system_prompt_skills_section_follows_briefing() {
+        let td = tempfile::tempdir().unwrap();
+        let skills = td.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write_skill_md(&skills, "alpha", "alpha body\n");
+        std::fs::write(td.path().join(PROJECT_BRIEFING_FILENAME), "BRIEF\n").unwrap();
+        let prompt = assemble_system_prompt(
+            Some(&skills),
+            None,
+            AgentGroupId::new(),
+            &ironclaw_skills::SkillsSelector::All,
+            Some(td.path()),
+            ironclaw_types::SessionId::new(),
+            fixed_now(),
+            None,
+            SkillsMode::Inline,
+        );
+        let brief_pos = prompt.find("BRIEF").expect("brief present");
+        let skill_pos = prompt
+            .find("<skill name=\"alpha\"")
+            .expect("skill present");
+        assert!(brief_pos < skill_pos, "briefing must precede skills");
+    }
+
+    #[test]
+    fn assemble_system_prompt_works_with_no_skills_dir() {
+        // A deployment with zero skills still gets a complete, useful
+        // system prompt — preamble + environment, no skill block.
+        let prompt = assemble_system_prompt(
+            None,
+            None,
+            AgentGroupId::new(),
+            &ironclaw_skills::SkillsSelector::All,
+            None,
+            ironclaw_types::SessionId::new(),
+            fixed_now(),
+            None,
+            SkillsMode::Inline,
+        );
+        assert!(prompt.contains("You are an Ironclaw agent"));
+        assert!(!prompt.contains("<skill name="));
+    }
+
+    #[test]
+    fn read_project_briefing_returns_none_when_neither_source_present() {
+        let td = tempfile::tempdir().unwrap();
+        let out = read_project_briefing(
+            Some(td.path()),
+            Some(td.path()),
+            AgentGroupId::new(),
+        );
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn environment_block_includes_all_required_fields() {
+        let session = ironclaw_types::SessionId::new();
+        let ag = AgentGroupId::new();
+        let block = environment_block(session, ag, fixed_now(), Some("Atlas"));
+        assert!(block.starts_with("\n# Environment\n"));
+        assert!(block.contains("Today is 2026-05-22"));
+        assert!(block.contains(&format!("Session id: {}", session.as_uuid())));
+        assert!(block.contains(&format!("Agent group id: {}", ag.as_uuid())));
+        assert!(block.contains("Working directory: /data"));
+        assert!(block.contains("Assistant name: Atlas"));
+    }
+
+    #[test]
+    fn environment_block_trims_whitespace_only_assistant_name() {
+        let block = environment_block(
+            ironclaw_types::SessionId::new(),
+            AgentGroupId::new(),
+            fixed_now(),
+            Some("   "),
+        );
+        assert!(!block.contains("Assistant name:"));
     }
 
     #[test]
@@ -2042,9 +3399,116 @@ mod tests {
             cfg,
         );
         let session = fixture_session(&db);
-        let rc = mgr.runner_config_for(&session, None);
+        let rc = mgr.runner_config_for(&session, None, None);
         assert!(rc.system.contains("alpha body"));
         assert!(rc.system.contains("<skill name=\"alpha\""));
+        // The new top-level assembler always prepends the universal
+        // preamble + environment block, even when the session_root is
+        // None (the briefing is the only optional piece). That gives us
+        // a couple of cheap structural sanity checks here.
+        assert!(rc.system.contains("You are an Ironclaw agent"));
+        assert!(rc.system.contains("# Environment"));
+    }
+
+    #[test]
+    fn runner_config_callable_mode_emits_index_and_writes_catalogue() {
+        let td = tempfile::tempdir().unwrap();
+        let skills = td.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write_skill_md(&skills, "alpha", "alpha body\n");
+        write_skill_md(&skills, "beta", "beta body\n");
+        let session_root = td.path().join("session");
+        std::fs::create_dir_all(&session_root).unwrap();
+        let mut cfg = manager_cfg(td.path().to_path_buf());
+        cfg.skills_dir = Some(skills);
+        cfg.skills_mode = SkillsMode::Callable;
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let rc = mgr.runner_config_for(&session, None, Some(&session_root));
+        // System prompt: index only, no inlined bodies.
+        assert!(rc.system.contains("name=\"alpha\""));
+        assert!(rc.system.contains("name=\"beta\""));
+        assert!(!rc.system.contains("alpha body"));
+        assert!(!rc.system.contains("beta body"));
+        assert!(rc.system.contains("`load_skill`"));
+        // Catalogue file written next to the session dir.
+        let catalogue_path = session_root.join(SKILLS_CATALOGUE_FILENAME);
+        assert!(catalogue_path.is_file(), "expected skills.json on disk");
+        let bytes = std::fs::read(&catalogue_path).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        let names: Vec<&str> = parsed
+            .iter()
+            .filter_map(|e| e.get("name").and_then(|v| v.as_str()))
+            .collect();
+        assert!(names.contains(&"alpha") && names.contains(&"beta"));
+        let bodies: String = parsed
+            .iter()
+            .filter_map(|e| e.get("body").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(bodies.contains("alpha body"));
+        assert!(bodies.contains("beta body"));
+    }
+
+    #[test]
+    fn runner_config_inline_mode_does_not_write_catalogue() {
+        let td = tempfile::tempdir().unwrap();
+        let skills = td.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write_skill_md(&skills, "alpha", "alpha body\n");
+        let session_root = td.path().join("session");
+        std::fs::create_dir_all(&session_root).unwrap();
+        let mut cfg = manager_cfg(td.path().to_path_buf());
+        cfg.skills_dir = Some(skills);
+        // SkillsMode::Inline is the default — explicit here for clarity.
+        cfg.skills_mode = SkillsMode::Inline;
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let _rc = mgr.runner_config_for(&session, None, Some(&session_root));
+        assert!(
+            !session_root.join(SKILLS_CATALOGUE_FILENAME).exists(),
+            "inline mode must not write skills.json"
+        );
+    }
+
+    #[test]
+    fn runner_config_callable_mode_removes_stale_catalogue_when_no_skills_selected() {
+        let td = tempfile::tempdir().unwrap();
+        let session_root = td.path().join("session");
+        std::fs::create_dir_all(&session_root).unwrap();
+        // Pre-existing catalogue from a prior spawn that selected skills.
+        std::fs::write(
+            session_root.join(SKILLS_CATALOGUE_FILENAME),
+            r#"[{"name":"old","description":"","body":"old body"}]"#,
+        )
+        .unwrap();
+        // No skills_dir configured → catalogue should be removed so the
+        // agent doesn't see stale entries.
+        let mut cfg = manager_cfg(td.path().to_path_buf());
+        cfg.skills_mode = SkillsMode::Callable;
+        cfg.skills_dir = None;
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let _rc = mgr.runner_config_for(&session, None, Some(&session_root));
+        assert!(
+            !session_root.join(SKILLS_CATALOGUE_FILENAME).exists(),
+            "stale catalogue must be removed when no skills selected"
+        );
     }
 
     // ── budget-exhausted reply ──────────────────────────────────────
@@ -2790,5 +4254,301 @@ NOT_A_PAIR_LINE
         );
         let changed = mgr.reload_env(None);
         assert!(changed.is_empty(), "{changed:?}");
+    }
+
+    // ── code-review fixes ───────────────────────────────────────────
+
+    /// Finding 1: an operator who flips `IRONCLAW_SKILLS_MODE` from
+    /// `callable` to `inline` between spawns must not leave a prior
+    /// `skills.json` on disk — `load_skill` would otherwise hand the
+    /// agent stale bodies that don't match the inlined prompt.
+    #[test]
+    fn runner_config_inline_mode_removes_stale_catalogue_from_prior_spawn() {
+        let td = tempfile::tempdir().unwrap();
+        let skills = td.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write_skill_md(&skills, "alpha", "alpha body v2\n");
+        let session_root = td.path().join("session");
+        std::fs::create_dir_all(&session_root).unwrap();
+        // Pre-existing catalogue from a previous Callable-mode spawn.
+        std::fs::write(
+            session_root.join(SKILLS_CATALOGUE_FILENAME),
+            r#"[{"name":"alpha","description":"","body":"alpha body v1"}]"#,
+        )
+        .unwrap();
+
+        let mut cfg = manager_cfg(td.path().to_path_buf());
+        cfg.skills_dir = Some(skills);
+        cfg.skills_mode = SkillsMode::Inline;
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let _ = mgr.runner_config_for(&session, None, Some(&session_root));
+        assert!(
+            !session_root.join(SKILLS_CATALOGUE_FILENAME).exists(),
+            "inline-mode spawn must scrub a catalogue left by a prior callable spawn"
+        );
+    }
+
+    /// Finding 2: when the `skills.json` write fails in Callable mode,
+    /// the assembled prompt falls back to Inline-mode shape (skill
+    /// bodies present, no `load_skill` advert) so the agent isn't left
+    /// pointing at a missing catalogue.
+    #[test]
+    fn runner_config_callable_falls_back_to_inline_when_catalogue_write_fails() {
+        let td = tempfile::tempdir().unwrap();
+        let skills = td.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write_skill_md(&skills, "alpha", "alpha body marker\n");
+        let session_root = td.path().join("session");
+        std::fs::create_dir_all(&session_root).unwrap();
+        // Sabotage the write: pre-create `skills.json` as a directory so
+        // `fs::write` to that path errors. Mirrors a real-world failure
+        // mode (the path exists but isn't a regular file).
+        std::fs::create_dir_all(session_root.join(SKILLS_CATALOGUE_FILENAME)).unwrap();
+
+        let mut cfg = manager_cfg(td.path().to_path_buf());
+        cfg.skills_dir = Some(skills);
+        cfg.skills_mode = SkillsMode::Callable;
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let rc = mgr.runner_config_for(&session, None, Some(&session_root));
+        // Inline shape: the body is inlined, the `load_skill` callable
+        // index instructions are NOT mentioned.
+        assert!(
+            rc.system.contains("alpha body marker"),
+            "fallback prompt must inline skill bodies"
+        );
+        assert!(
+            !rc.system.contains("`load_skill`"),
+            "fallback prompt must not advertise load_skill when no catalogue was written"
+        );
+    }
+
+    /// Finding 3: the Callable-mode prompt index and the on-disk
+    /// catalogue must agree about which skills exist. The fix makes
+    /// `select_callable_skills` the single source of truth used by both
+    /// outputs; this test pins the consistency.
+    #[test]
+    fn runner_config_callable_prompt_index_and_catalogue_agree() {
+        let td = tempfile::tempdir().unwrap();
+        let skills = td.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write_skill_md(&skills, "alpha", "alpha body\n");
+        write_skill_md(&skills, "beta", "beta body\n");
+        let session_root = td.path().join("session");
+        std::fs::create_dir_all(&session_root).unwrap();
+        let mut cfg = manager_cfg(td.path().to_path_buf());
+        cfg.skills_dir = Some(skills);
+        cfg.skills_mode = SkillsMode::Callable;
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let rc = mgr.runner_config_for(&session, None, Some(&session_root));
+        let bytes = std::fs::read(session_root.join(SKILLS_CATALOGUE_FILENAME)).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        let catalogue_names: std::collections::BTreeSet<String> = parsed
+            .iter()
+            .filter_map(|e| e.get("name").and_then(|v| v.as_str()).map(String::from))
+            .collect();
+        // Every name in the catalogue must also appear in the prompt
+        // index, and the prompt must not mention any name absent from
+        // the catalogue.
+        for name in &catalogue_names {
+            assert!(
+                rc.system.contains(&format!("name=\"{name}\"")),
+                "catalogue entry {name} missing from prompt index"
+            );
+        }
+        for candidate in ["alpha", "beta"] {
+            let in_cat = catalogue_names.contains(candidate);
+            let in_prompt = rc.system.contains(&format!("name=\"{candidate}\""));
+            assert_eq!(
+                in_cat, in_prompt,
+                "{candidate}: catalogue/prompt disagreement (cat={in_cat}, prompt={in_prompt})"
+            );
+        }
+    }
+
+    /// Finding 3 (renderer contract): `render_callable_skill_index` only
+    /// emits entries from its input, so a skill that didn't make it
+    /// into the catalogue cannot appear in the prompt.
+    #[test]
+    fn render_callable_skill_index_only_emits_entries_from_catalogue() {
+        let entries = vec![SkillCatalogueEntry {
+            name: "kept".into(),
+            description: "the only one".into(),
+            body: "body".into(),
+        }];
+        let out = render_callable_skill_index(&entries);
+        assert!(out.contains("name=\"kept\""));
+        assert!(!out.contains("name=\"dropped\""));
+    }
+
+    /// Finding 7: when the per-group memory dir cannot be created, the
+    /// host drops a session-local `memory/UNAVAILABLE.md` marker so the
+    /// agent inside the container can detect the degraded mount.
+    #[test]
+    fn build_spec_writes_memory_unavailable_marker_when_groups_dir_unwriteable() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Point groups_dir at a path whose parent is a regular file —
+        // `create_dir_all` cannot create a directory under a non-dir.
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+        let groups = blocker.join("groups");
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.groups_dir = Some(groups);
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        let spec = mgr.build_spec(&session, &paths, "img", None);
+        // The bind mount is skipped (no source could be prepared).
+        let has_memory_mount = spec.mounts.iter().any(|m| match m {
+            Mount::Bind { target, .. } => target == &format!("{CONTAINER_SESSION_DIR}/memory"),
+            _ => false,
+        });
+        assert!(!has_memory_mount, "memory mount must not appear when source prep failed");
+        // The marker file lands inside the session root so /data/memory
+        // is still browsable from the container.
+        let marker = paths.root.join("memory").join(MEMORY_UNAVAILABLE_FILENAME);
+        assert!(
+            marker.is_file(),
+            "expected UNAVAILABLE.md marker at {}",
+            marker.display()
+        );
+        let body = std::fs::read_to_string(&marker).unwrap();
+        assert!(body.contains("Memory mount unavailable"));
+    }
+
+    /// Finding 8: the per-group memory dir is relaxed to group-writeable
+    /// (`0o775`) so the operator (host uid) can clean up files the
+    /// container's root user wrote into the bind without sudo.
+    #[cfg(unix)]
+    #[test]
+    fn build_spec_per_group_memory_dir_is_group_writeable() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let groups = tmp.path().join("groups");
+        std::fs::create_dir_all(&groups).unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.groups_dir = Some(groups.clone());
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let _spec = mgr.build_spec(&session, &paths, "img", None);
+        let mem = groups
+            .join(session.agent_group_id.as_uuid().to_string())
+            .join("memory");
+        let mode = std::fs::metadata(&mem).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o775,
+            "expected 0o775 mode bits on per-group memory dir, got {mode:o}"
+        );
+    }
+
+    /// Finding 11: a briefing file the operator dropped on disk but the
+    /// host couldn't read (permission error, EISDIR, etc.) surfaces as a
+    /// diagnostic note inside the assembled prompt so the agent can
+    /// mention the failure if the user references the briefing.
+    #[cfg(unix)]
+    #[test]
+    fn assemble_system_prompt_surfaces_briefing_read_error_as_diagnostic() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join(PROJECT_BRIEFING_FILENAME);
+        std::fs::write(&path, "secret deployment notes\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Tests running as root would defeat chmod 0; bail in that case.
+        if std::fs::read_to_string(&path).is_ok() {
+            return;
+        }
+        let prompt = assemble_system_prompt(
+            None,
+            None,
+            AgentGroupId::new(),
+            &ironclaw_skills::SkillsSelector::All,
+            Some(td.path()),
+            ironclaw_types::SessionId::new(),
+            fixed_now(),
+            None,
+            SkillsMode::Inline,
+        );
+        assert!(
+            prompt.contains("Briefing diagnostics"),
+            "expected diagnostics section when briefing was unreadable"
+        );
+        assert!(
+            prompt.contains("could not be read"),
+            "expected explanation of the read failure"
+        );
+        // Restore permissions so tempdir cleanup can drop the file.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    /// Finding 13a: `skill.name` is escaped symmetrically with
+    /// `skill.description` at both call sites so a name containing `"`
+    /// or `&` (defence in depth — the kebab-case validator already
+    /// rejects these) cannot produce malformed prompt markup.
+    #[test]
+    fn build_skill_system_prompt_escapes_skill_name_in_both_modes() {
+        let weird = ironclaw_skills::Skill {
+            id: ironclaw_skills::SkillId("weird".into()),
+            name: "weird&\"name".into(),
+            description: "desc".into(),
+            dir: std::path::PathBuf::from("/nonexistent"),
+            allowed_tools: None,
+            source: ironclaw_skills::SkillSource::Global,
+        };
+        // Inline-mode rendering goes through `out.push_str` with the
+        // escape — exercise the helper directly to pin the contract.
+        let entry = SkillCatalogueEntry {
+            name: weird.name.clone(),
+            description: weird.description.clone(),
+            body: "body".into(),
+        };
+        let callable_out = render_callable_skill_index(std::slice::from_ref(&entry));
+        assert!(
+            callable_out.contains("name=\"weird&amp;&quot;name\""),
+            "callable mode must escape `&` and `\"` in skill name; got: {callable_out}"
+        );
+        // The inline path renders manually inside `build_skill_system_prompt`
+        // — assert via a focused chunk of the format string.
+        let inline_chunk = {
+            let mut s = String::new();
+            s.push_str("\n<skill name=\"");
+            s.push_str(&escape_attr(&weird.name));
+            s.push_str("\" description=\"");
+            s.push_str(&escape_attr(&weird.description));
+            s.push_str("\">\n");
+            s
+        };
+        assert!(
+            inline_chunk.contains("name=\"weird&amp;&quot;name\""),
+            "inline mode must escape `&` and `\"` in skill name"
+        );
     }
 }

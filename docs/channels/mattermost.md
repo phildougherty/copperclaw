@@ -11,11 +11,6 @@
 - open_dm: trait-default None.
 
 ## Gaps
-MED:
-- Files unsupported. Mattermost API supports `/api/v4/files` upload
-  followed by `posts.file_ids`. Not blocking but a common ask.
-  `crates/ironclaw-channels/mattermost/src/adapter.rs:112`
-
 LOW:
 - Reaction fails Unsupported when bot_user_id isn't in the config —
   the user discovers this at first reaction attempt. Setup wizard
@@ -29,12 +24,16 @@ LOW:
 - [x] reaction with bot id
 - [x] reaction without bot id → Unsupported
 - [x] post without text → BadRequest
-- [x] files → Unsupported
+- [x] files → uploaded via `/api/v4/files`, attached via `posts.file_ids`
+- [x] files on edit/reaction → BadRequest
 - [x] unknown action → BadRequest
 
 ## Fixes in this PR
-None.
+- Two-step file upload: `MattermostApi::upload_file` does
+  `POST /api/v4/files` multipart, `create_post_with_files` attaches
+  the returned ids on the post. The adapter wires both together for
+  `action: "post"` outbound messages with `files` set. Edit and
+  reaction actions reject files with BadRequest.
 
 ## Deferred for follow-up
-- Implement file uploads (the two-step `files/upload` + `posts.file_ids`).
 - Surface a setup warning when bot_user_id is missing.

@@ -49,6 +49,10 @@ pub struct RunnerConfigFile {
     pub agent_group_id: Option<String>,
     /// Absolute path to this session's data directory.
     pub session_dir: Option<String>,
+    /// Provider kind to talk to. Recognized values: `"anthropic"`
+    /// (default), `"ollama"`, `"ollama-shim"`. Unknown values fall
+    /// back to `"anthropic"` and a WARN is logged.
+    pub provider: Option<String>,
     /// Provider-native model id.
     pub model: Option<String>,
     /// Tier-of-effort hint.
@@ -83,6 +87,9 @@ pub struct RunnerConfig {
     pub agent_group_id: AgentGroupId,
     /// Absolute path to the session directory.
     pub session_dir: PathBuf,
+    /// Resolved provider kind. One of `"anthropic"`, `"ollama"`,
+    /// `"ollama-shim"`. Defaults to `"anthropic"` when unset / unknown.
+    pub provider: String,
     /// Provider-native model id.
     pub model: String,
     /// Tier-of-effort hint.
@@ -132,10 +139,23 @@ impl RunnerConfig {
         let api_base_url = file
             .api_base_url
             .or_else(|| env.get("ANTHROPIC_BASE_URL"));
+        let provider = match file.provider.as_deref() {
+            None | Some("" | "anthropic" | "claude") => "anthropic".to_string(),
+            Some("ollama") => "ollama".to_string(),
+            Some("ollama-shim") => "ollama-shim".to_string(),
+            Some(other) => {
+                tracing::warn!(
+                    provider = other,
+                    "unknown provider kind in runner config; falling back to anthropic"
+                );
+                "anthropic".to_string()
+            }
+        };
         Ok(Self {
             session_id,
             agent_group_id,
             session_dir,
+            provider,
             model,
             effort: file.effort.unwrap_or(Effort::Medium),
             system,
@@ -223,6 +243,7 @@ mod tests {
             session_id: Some(uuid::Uuid::nil().to_string()),
             agent_group_id: Some(uuid::Uuid::nil().to_string()),
             session_dir: Some("/tmp/ironclaw/session".into()),
+            provider: None,
             model: Some("claude-sonnet-4-6".into()),
             effort: Some(Effort::High),
             system: Some("you are an agent".into()),
@@ -293,6 +314,49 @@ mod tests {
             cfg.api_base_url.as_deref(),
             Some("https://file.example/v1")
         );
+    }
+
+    #[test]
+    fn provider_default_is_anthropic() {
+        let env = MapEnv::default();
+        let cfg = RunnerConfig::from_file_struct(good_file(), &env).unwrap();
+        assert_eq!(cfg.provider, "anthropic");
+    }
+
+    #[test]
+    fn provider_ollama_passes_through() {
+        let mut file = good_file();
+        file.provider = Some("ollama".into());
+        let env = MapEnv::default();
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert_eq!(cfg.provider, "ollama");
+    }
+
+    #[test]
+    fn provider_ollama_shim_passes_through() {
+        let mut file = good_file();
+        file.provider = Some("ollama-shim".into());
+        let env = MapEnv::default();
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert_eq!(cfg.provider, "ollama-shim");
+    }
+
+    #[test]
+    fn provider_claude_alias_maps_to_anthropic() {
+        let mut file = good_file();
+        file.provider = Some("claude".into());
+        let env = MapEnv::default();
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert_eq!(cfg.provider, "anthropic");
+    }
+
+    #[test]
+    fn provider_unknown_falls_back_to_anthropic() {
+        let mut file = good_file();
+        file.provider = Some("bogus".into());
+        let env = MapEnv::default();
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert_eq!(cfg.provider, "anthropic");
     }
 
     #[test]

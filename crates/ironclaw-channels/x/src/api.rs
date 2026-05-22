@@ -172,6 +172,55 @@ impl XApi {
             .map_err(|e| AdapterError::Transport(format!("x media upload decode: {e}")))
     }
 
+    /// `POST {api_base}/2/media/upload` — v2 media upload (multipart).
+    ///
+    /// X's v2 upload endpoint replaces the legacy v1.1 base64 form-field
+    /// flow with a multipart upload that returns
+    /// `{ "data": { "id": "<media_id>" } }`. The returned id is wire-
+    /// compatible with the v1.1 id used by DM `attachments`.
+    pub async fn upload_media_v2(
+        &self,
+        filename: &str,
+        bytes: &[u8],
+        media_category: &str,
+    ) -> Result<UploadMediaResponse, AdapterError> {
+        if filename.is_empty() {
+            return Err(AdapterError::BadRequest(
+                "upload_media_v2: empty filename".into(),
+            ));
+        }
+        let url = self.api_url("/2/media/upload");
+        let media_part = reqwest::multipart::Part::bytes(bytes.to_vec())
+            .file_name(filename.to_string())
+            .mime_str("application/octet-stream")
+            .map_err(|e| AdapterError::BadRequest(format!("upload_media_v2 mime: {e}")))?;
+        let form = reqwest::multipart::Form::new()
+            .part("media", media_part)
+            .text("media_category", media_category.to_owned());
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&self.bearer_token)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| map_send_err(&e))?;
+        let value = read_x_json(resp).await?;
+        // v2 returns the id under `data.id`; map it onto the existing
+        // UploadMediaResponse shape so call sites stay uniform.
+        if let Some(id) = value
+            .pointer("/data/id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        {
+            return Ok(UploadMediaResponse { media_id_string: id });
+        }
+        // Some early v2 responses surface the id at the top level; tolerate.
+        serde_json::from_value(value).map_err(|e| {
+            AdapterError::Transport(format!("x v2 media upload decode: {e}"))
+        })
+    }
+
     /// `GET /2/dm_events?dm_event_types=MessageCreate&...` — fetch the latest
     /// DM events for the authenticated user.
     ///
@@ -513,6 +562,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.media_id_string, "mid-7");
+    }
+
+    #[tokio::test]
+    async fn upload_media_v2_returns_media_id_from_data_id() {
+        let api_srv = MockServer::start().await;
+        let media_srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/2/media/upload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "data": { "id": "v2-mid-9" }
+            })))
+            .mount(&api_srv)
+            .await;
+        let r = split_api(&api_srv.uri(), &media_srv.uri())
+            .upload_media_v2("a.jpg", &[1, 2, 3], "dm_image")
+            .await
+            .unwrap();
+        assert_eq!(r.media_id_string, "v2-mid-9");
+    }
+
+    #[tokio::test]
+    async fn upload_media_v2_tolerates_top_level_media_id_string() {
+        // Some early v2 responses returned the v1.1 shape rather than
+        // wrapping under `data`. The fallback decode path covers that.
+        let api_srv = MockServer::start().await;
+        let media_srv = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/2/media/upload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "media_id_string": "v2-fallback"
+            })))
+            .mount(&api_srv)
+            .await;
+        let r = split_api(&api_srv.uri(), &media_srv.uri())
+            .upload_media_v2("a.jpg", &[1, 2, 3], "dm_image")
+            .await
+            .unwrap();
+        assert_eq!(r.media_id_string, "v2-fallback");
+    }
+
+    #[tokio::test]
+    async fn upload_media_v2_empty_filename_is_bad_request() {
+        let api_srv = MockServer::start().await;
+        let media_srv = MockServer::start().await;
+        match split_api(&api_srv.uri(), &media_srv.uri())
+            .upload_media_v2("", &[1], "dm_image")
+            .await
+            .unwrap_err()
+        {
+            AdapterError::BadRequest(m) => assert!(m.contains("filename")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
     }
 
     #[tokio::test]

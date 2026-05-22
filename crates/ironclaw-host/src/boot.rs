@@ -21,7 +21,7 @@ use ironclaw_host_delivery::DeliveryService;
 use ironclaw_host_router::Router;
 use ironclaw_host_sweep::{SqliteTaskStore, SweepService};
 use ironclaw_modules::{
-    create_agent_always_allow, AgentToAgentModule, ApprovalsModule, CreateAgentModule,
+    create_agent_users_table_check, AgentToAgentModule, ApprovalsModule, CreateAgentModule,
     InteractiveModule, Module, MountSecurityModule, NewPendingCtx, NewPendingNotifier,
     PermissionsModule, SchedulingModule, SelfModModule, TypingConfig, TypingModule,
 };
@@ -430,14 +430,15 @@ pub async fn install_modules(host_ctx: Arc<HostContext>, data_root: PathBuf) {
         // handler lives in `CreateAgentModule::new`, which we build here
         // with the host's central DB + data root so the spawn lands in
         // the same `agent_groups`/`sessions` tables the container manager
-        // already polls. Permission is currently always-allow; wire this
-        // to a `users`-role lookup before exposing the tool to untrusted
-        // operators.
+        // already polls. Permission is gated by `users_table_check`: a
+        // fresh install with no role grants denies every call (safe
+        // default); the operator opens the gate by granting Owner or
+        // Admin to an operator user.
         Box::new(AgentToAgentModule),
         Box::new(CreateAgentModule::new(
             host_ctx.central().clone(),
             data_root.clone(),
-            create_agent_always_allow(),
+            create_agent_users_table_check(host_ctx.central().clone()),
         )),
         Box::new(SelfModModule),
     ];
@@ -796,6 +797,7 @@ fn spawn_container_manager(
         stop_grace_secs: crate::container_manager::DEFAULT_STOP_GRACE_SECS,
         skills_dir: cfg.skills_dir.clone(),
         groups_dir: cfg.groups_dir.clone(),
+        skills_mode: cfg.skills_mode,
         forward_env: collect_forward_env(),
     };
     let manager = Arc::new(

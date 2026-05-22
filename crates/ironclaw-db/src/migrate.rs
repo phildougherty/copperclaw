@@ -54,6 +54,10 @@ const CENTRAL: &[Migration] = &[
         name: "010_tasks",
         sql: include_str!("../migrations/010_tasks.sql"),
     },
+    Migration {
+        name: "011_agent_group_subagent_depth",
+        sql: include_str!("../migrations/011_agent_group_subagent_depth.sql"),
+    },
 ];
 
 const SESSION_INBOUND: &[Migration] = &[Migration {

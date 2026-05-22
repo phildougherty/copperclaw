@@ -16,7 +16,7 @@
 //!   DMs.
 
 use crate::api::XApi;
-use crate::config::XConfig;
+use crate::config::{MediaApiVersion, XConfig};
 use crate::factory::CHANNEL_TYPE_STR;
 use crate::poll::run_poll_loop;
 use async_trait::async_trait;
@@ -148,8 +148,23 @@ impl XAdapter {
         let mut ids = Vec::with_capacity(files.len());
         for file in files {
             let category = media_category_for(&file.filename);
-            let resp = self.api.upload_media(&file.data, category).await?;
-            ids.push(resp.media_id_string);
+            // Dispatch on configured media-upload protocol. v1 is the
+            // legacy default (upload.twitter.com/1.1/media/upload.json
+            // with base64 form field); v2 is the GA-track endpoint at
+            // api.twitter.com/2/media/upload that uses multipart.
+            let media_id = match self.config.media_api_version {
+                MediaApiVersion::V1 => self
+                    .api
+                    .upload_media(&file.data, category)
+                    .await?
+                    .media_id_string,
+                MediaApiVersion::V2 => self
+                    .api
+                    .upload_media_v2(&file.filename, &file.data, category)
+                    .await?
+                    .media_id_string,
+            };
+            ids.push(media_id);
         }
         Ok(ids)
     }
@@ -304,6 +319,7 @@ mod tests {
             user_id: "bot".into(),
             api_base: server_url.to_owned(),
             media_base: server_url.to_owned(),
+            media_api_version: MediaApiVersion::V1,
             since_id_filename: "x_dm_since_id.txt".into(),
             poll_interval_ms: 50_000,
         };

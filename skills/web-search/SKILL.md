@@ -5,16 +5,13 @@ description: Search the open web with the web_search tool — auto-routes to Tav
 
 # web-search
 
-`web_search` finds URLs and snippets for a query. Pair it with
-`web_fetch` to read the page content: search returns a list of
-`{title, url, snippet}` entries, then fetch the URL of whichever one
-looks most relevant.
+`web_search` finds URLs and snippets. Pair with `web_fetch` to read the
+page: search returns `{title, url, snippet}` entries; fetch whichever
+URL looks most relevant.
 
-The tool routes to one of four supported providers based on
-operator configuration. You don't pick — the host auto-detects from
-configured API keys. You **can** force a specific provider per call
-when you have a reason (e.g. you want neural semantic search even
-though Tavily is the default).
+The host auto-routes to one of four providers based on configured API
+keys. You can force a provider per call when you want (e.g. neural
+semantic search even though Tavily is the default).
 
 ## Schema
 
@@ -27,25 +24,23 @@ though Tavily is the default).
 }
 ```
 
-- `query` (required). The search string. Phrasing matters less for
-  neural providers (Exa) and more for keyword providers (Brave).
-- `max_results` (optional). Capped at 25 regardless of the provider's
-  own ceiling. Default 10.
-- `provider` (optional). One of `tavily`, `exa`, `brave`, `serpapi`.
-  Validation error if the chosen provider's API key is not set in
-  the container env.
-- `search_type` (optional). Provider-specific hint, ignored when the
-  provider doesn't recognise it:
+- `query` (required). Phrasing matters less for neural providers
+  (Exa), more for keyword providers (Brave).
+- `max_results` (optional). Capped at 25; default 10.
+- `provider` (optional). Validation error when the chosen provider's
+  API key isn't set in the container env.
+- `search_type` (optional). Provider-specific hint, ignored when not
+  recognised:
   - **Tavily**: `basic` / `advanced` (depth) or `news` / `general` /
     `finance` (topic).
   - **Exa**: `auto` (default) / `neural` / `keyword`.
   - **Brave**: ignored.
-  - **SerpAPI**: the search engine name (`google` default; `bing`,
-    `duckduckgo`, etc. supported).
+  - **SerpAPI**: engine name (`google` default; `bing`, `duckduckgo`,
+    etc.).
 
 ## Output
 
-Every provider's response is normalised to the same shape:
+Every provider's response is normalised:
 
 ```json
 {
@@ -56,7 +51,7 @@ Every provider's response is normalised to the same shape:
     {
       "title": "Tokio — async runtime",
       "url": "https://tokio.rs",
-      "snippet": "Tokio is an asynchronous runtime for the Rust programming language...",
+      "snippet": "Tokio is an asynchronous runtime…",
       "published": "2025-01-15T00:00:00Z",
       "score": 0.92
     }
@@ -66,34 +61,26 @@ Every provider's response is normalised to the same shape:
 
 Snippets are capped at 4 KiB per result with a trailing `…` so a
 verbose provider can't blow your context window. `score` is
-provider-specific and omitted when the backend doesn't surface one
-(Brave omits scores entirely; SerpAPI derives a `1/position` score
-that's only useful for relative ranking).
+provider-specific and omitted when the backend doesn't expose one
+(Brave omits entirely; SerpAPI derives `1/position`).
 
 ## Provider quick reference
 
 | Provider | Best for | API key env var |
 |---|---|---|
 | **Tavily** | Default — agent-tuned snippets | `TAVILY_API_KEY` |
-| **Exa** | Semantic / neural lookups, "find conceptually similar" | `EXA_API_KEY` |
-| **Brave** | Keyword search on an independent index | `BRAVE_SEARCH_API_KEY` |
-| **SerpAPI** | Google/Bing/DDG wrapper; broadest coverage | `SERPAPI_API_KEY` |
+| **Exa** | Semantic / neural lookups | `EXA_API_KEY` |
+| **Brave** | Keyword search, independent index | `BRAVE_SEARCH_API_KEY` |
+| **SerpAPI** | Google/Bing/DDG wrapper | `SERPAPI_API_KEY` |
 
-If multiple keys are present and the operator hasn't set
-`IRONCLAW_WEB_SEARCH_PROVIDER`, the default is the first available
-in the order `tavily, exa, brave, serpapi`. Tavily wins by default
-because it returns the cleanest agent-facing snippets out of the
-box.
+When multiple keys are present and `IRONCLAW_WEB_SEARCH_PROVIDER` is
+unset, default order is `tavily, exa, brave, serpapi`.
 
 ## Examples
-
-Default provider, default count:
 
 ```json
 { "query": "what is the half-life of caffeine in adults" }
 ```
-
-Force a semantic provider for a conceptual query:
 
 ```json
 {
@@ -103,17 +90,9 @@ Force a semantic provider for a conceptual query:
 }
 ```
 
-Recent news (Tavily topic hint):
-
 ```json
-{
-  "query": "claude 4 release notes",
-  "provider": "tavily",
-  "search_type": "news"
-}
+{ "query": "claude 4 release notes", "provider": "tavily", "search_type": "news" }
 ```
-
-Engine-specific via SerpAPI:
 
 ```json
 { "query": "site:reddit.com vim plugins 2025", "provider": "serpapi" }
@@ -121,36 +100,30 @@ Engine-specific via SerpAPI:
 
 ## Pair with `web_fetch`
 
-The intended workflow is two calls per question:
+Two calls per question:
 
 1. `web_search { "query": "..." }` — get a candidate URL.
 2. `web_fetch { "url": "..." }` — read the page.
 
-Tavily and Exa snippets are often enough to answer simple questions
-without the second call. For "what does this page actually say?",
-fetch the URL.
+Tavily / Exa snippets often answer simple questions without the second
+call.
 
 ## When to skip search
 
 - **You already have the URL.** Just `web_fetch`.
-- **The operator has an MCP server with the right access wired up.**
-  Calling a Linear / GitHub / Notion MCP server is almost always
-  better than searching the public web for the same data —
-  authenticated, structured, more reliable.
-- **The user asked a math / reasoning / explanation question.**
-  Reaching for search when you already know the answer wastes the
-  user's time and the operator's budget.
+- **An MCP server has the right access.** Calling a Linear / GitHub /
+  Notion MCP is usually better than searching the public web for the
+  same data — authenticated, structured, reliable.
+- **Math / reasoning / explanation questions.** Don't waste budget on
+  search when you know the answer.
 
 ## Failure modes
 
-- **No API key configured.** Returns a validation error naming the
-  four env vars (`TAVILY_API_KEY`, `EXA_API_KEY`,
-  `BRAVE_SEARCH_API_KEY`, `SERPAPI_API_KEY`). Surface to the user
-  via `send_message` so the operator knows what to set.
-- **Quota / 429 / 5xx from the provider.** Returns an internal
-  error containing the HTTP status and the provider's error
-  message. Consider falling back to a different provider by passing
-  `provider: <other>` on retry — if multiple keys are configured.
-- **Egress allow-list blocks the provider host.** The same connection
-  error you'd see from `web_fetch`. Ask the operator to add the
-  provider's API host to `container_configs.egress_allow`.
+- **No API key configured.** Validation error naming the four env vars
+  (`TAVILY_API_KEY`, `EXA_API_KEY`, `BRAVE_SEARCH_API_KEY`,
+  `SERPAPI_API_KEY`). Surface to the user via `send_message`.
+- **Quota / 429 / 5xx.** Internal error with HTTP status + provider
+  message. Retry with `provider: <other>` when multiple keys exist.
+- **Egress allow-list blocks the host.** Same connection error as
+  `web_fetch`. Ask the operator to add the provider host to
+  `container_configs.egress_allow`.

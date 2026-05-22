@@ -43,6 +43,6 @@ pub use adapter::XAdapter;
 pub use api::XApi;
 pub use config::{
     DEFAULT_API_BASE, DEFAULT_MEDIA_BASE, DEFAULT_POLL_INTERVAL_MS, DEFAULT_SINCE_ID_FILENAME,
-    XConfig,
+    MediaApiVersion, XConfig,
 };
 pub use factory::{CHANNEL_TYPE_STR, XFactory, register};

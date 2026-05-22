@@ -37,10 +37,38 @@ pub struct XConfig {
     pub api_base: String,
     /// v1.1 media upload base URL. Trailing slash trimmed.
     pub media_base: String,
+    /// Which media-upload protocol to use. `"v1"` (default) hits the
+    /// legacy `upload.twitter.com/1.1/media/upload.json` endpoint;
+    /// `"v2"` hits `api.twitter.com/2/media/upload` with multipart.
+    pub media_api_version: MediaApiVersion,
     /// Filename for the persisted `since_id` token.
     pub since_id_filename: String,
     /// Interval between successive `dm_events` polls, in milliseconds.
     pub poll_interval_ms: u64,
+}
+
+/// Which Twitter / X media-upload protocol to use.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum MediaApiVersion {
+    /// `POST upload.twitter.com/1.1/media/upload.json` (base64
+    /// `media_data` form field).
+    V1,
+    /// `POST api.twitter.com/2/media/upload` (multipart with a
+    /// `media` part).
+    V2,
+}
+
+impl MediaApiVersion {
+    /// Parse `"v1"` / `"v2"` (case-insensitive).
+    pub fn parse(s: &str) -> Result<Self, AdapterError> {
+        match s.to_ascii_lowercase().as_str() {
+            "v1" | "1" | "1.1" => Ok(Self::V1),
+            "v2" | "2" => Ok(Self::V2),
+            _ => Err(AdapterError::BadRequest(format!(
+                "x media_api_version must be `v1` or `v2`, got {s:?}"
+            ))),
+        }
+    }
 }
 
 impl XConfig {
@@ -125,11 +153,22 @@ impl XConfig {
             }
         };
 
+        let media_api_version = match obj.get("media_api_version") {
+            None | Some(Value::Null) => MediaApiVersion::V1,
+            Some(Value::String(s)) => MediaApiVersion::parse(s)?,
+            Some(_) => {
+                return Err(AdapterError::BadRequest(
+                    "x media_api_version must be a string".into(),
+                ));
+            }
+        };
+
         Ok(Self {
             bearer_token,
             user_id,
             api_base,
             media_base,
+            media_api_version,
             since_id_filename,
             poll_interval_ms,
         })
@@ -187,6 +226,68 @@ mod tests {
         assert_eq!(cfg.media_base, "https://up.test");
         assert_eq!(cfg.since_id_filename, "sid.txt");
         assert_eq!(cfg.poll_interval_ms, 1234);
+        // Default media-upload protocol is v1.1 (legacy).
+        assert_eq!(cfg.media_api_version, MediaApiVersion::V1);
+    }
+
+    #[test]
+    fn media_api_version_v2_opt_in() {
+        let cfg = XConfig::from_value(&json!({
+            "bearer_token": "tok",
+            "user_id": "1",
+            "media_api_version": "v2"
+        }))
+        .unwrap();
+        assert_eq!(cfg.media_api_version, MediaApiVersion::V2);
+    }
+
+    #[test]
+    fn media_api_version_case_and_alias_accepted() {
+        for s in ["V2", "2"] {
+            let cfg = XConfig::from_value(&json!({
+                "bearer_token": "tok",
+                "user_id": "1",
+                "media_api_version": s,
+            }))
+            .unwrap();
+            assert_eq!(cfg.media_api_version, MediaApiVersion::V2);
+        }
+        for s in ["V1", "1", "1.1"] {
+            let cfg = XConfig::from_value(&json!({
+                "bearer_token": "tok",
+                "user_id": "1",
+                "media_api_version": s,
+            }))
+            .unwrap();
+            assert_eq!(cfg.media_api_version, MediaApiVersion::V1);
+        }
+    }
+
+    #[test]
+    fn media_api_version_unknown_errors() {
+        let err = XConfig::from_value(&json!({
+            "bearer_token": "tok",
+            "user_id": "1",
+            "media_api_version": "v3",
+        }))
+        .unwrap_err();
+        match err {
+            AdapterError::BadRequest(m) => {
+                assert!(m.contains("media_api_version"));
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn media_api_version_wrong_type_errors() {
+        let err = XConfig::from_value(&json!({
+            "bearer_token": "tok",
+            "user_id": "1",
+            "media_api_version": 2,
+        }))
+        .unwrap_err();
+        assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 
     #[test]

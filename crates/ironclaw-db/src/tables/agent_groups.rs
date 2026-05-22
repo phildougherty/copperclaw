@@ -13,6 +13,10 @@ pub struct AgentGroup {
     pub folder: String,
     pub agent_provider: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// Persisted nesting depth for groups spawned via `create_agent`.
+    /// 0 means "not a spawned subagent" (the root agent or any group
+    /// created by setup / an operator).
+    pub subagent_depth: u8,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -36,12 +40,15 @@ fn row_to_agent_group(row: &Row<'_>) -> rusqlite::Result<AgentGroup> {
     let created_at = DateTime::parse_from_rfc3339(&created_at_str)
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
         .with_timezone(&Utc);
+    let depth_i64: i64 = row.get("subagent_depth")?;
+    let subagent_depth = u8::try_from(depth_i64.clamp(0, i64::from(u8::MAX))).unwrap_or(0);
     Ok(AgentGroup {
         id: AgentGroupId(id),
         name: row.get("name")?,
         folder: row.get("folder")?,
         agent_provider: row.get("agent_provider")?,
         created_at,
+        subagent_depth,
     })
 }
 
@@ -50,8 +57,8 @@ pub fn create(db: &CentralDb, req: CreateAgentGroup) -> Result<AgentGroup, DbErr
     let now = Utc::now();
     let conn = db.conn()?;
     conn.execute(
-        "INSERT INTO agent_groups (id, name, folder, agent_provider, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO agent_groups (id, name, folder, agent_provider, created_at, subagent_depth)
+         VALUES (?1, ?2, ?3, ?4, ?5, 0)",
         params![
             id.as_uuid().to_string(),
             req.name,
@@ -66,13 +73,15 @@ pub fn create(db: &CentralDb, req: CreateAgentGroup) -> Result<AgentGroup, DbErr
         folder: req.folder,
         agent_provider: req.agent_provider,
         created_at: now,
+        subagent_depth: 0,
     })
 }
 
 pub fn get(db: &CentralDb, id: AgentGroupId) -> Result<AgentGroup, DbError> {
     let conn = db.conn()?;
     conn.query_row(
-        "SELECT id, name, folder, agent_provider, created_at FROM agent_groups WHERE id = ?1",
+        "SELECT id, name, folder, agent_provider, created_at, subagent_depth
+         FROM agent_groups WHERE id = ?1",
         params![id.as_uuid().to_string()],
         row_to_agent_group,
     )
@@ -84,7 +93,8 @@ pub fn get_by_folder(db: &CentralDb, folder: &str) -> Result<Option<AgentGroup>,
     let conn = db.conn()?;
     Ok(conn
         .query_row(
-            "SELECT id, name, folder, agent_provider, created_at FROM agent_groups WHERE folder = ?1",
+            "SELECT id, name, folder, agent_provider, created_at, subagent_depth
+             FROM agent_groups WHERE folder = ?1",
             params![folder],
             row_to_agent_group,
         )
@@ -94,13 +104,43 @@ pub fn get_by_folder(db: &CentralDb, folder: &str) -> Result<Option<AgentGroup>,
 pub fn list(db: &CentralDb) -> Result<Vec<AgentGroup>, DbError> {
     let conn = db.conn()?;
     let mut stmt = conn.prepare(
-        "SELECT id, name, folder, agent_provider, created_at
+        "SELECT id, name, folder, agent_provider, created_at, subagent_depth
          FROM agent_groups
          ORDER BY created_at",
     )?;
     let rows = stmt.query_map([], row_to_agent_group)?;
     let out: rusqlite::Result<Vec<_>> = rows.collect();
     Ok(out?)
+}
+
+/// Set the persisted `subagent_depth` for an agent group. Called by
+/// `create_agent` immediately after the row is inserted so the value
+/// survives host restarts.
+pub fn set_subagent_depth(db: &CentralDb, id: AgentGroupId, depth: u8) -> Result<(), DbError> {
+    let conn = db.conn()?;
+    let n = conn.execute(
+        "UPDATE agent_groups SET subagent_depth = ?1 WHERE id = ?2",
+        params![i64::from(depth), id.as_uuid().to_string()],
+    )?;
+    if n == 0 {
+        return Err(DbError::NotFound);
+    }
+    Ok(())
+}
+
+/// Fetch just the `subagent_depth` for an agent group. Returns
+/// `Ok(None)` when the group doesn't exist (rather than `NotFound`) so
+/// the depth-gate can treat a missing parent as "no recorded depth".
+pub fn get_subagent_depth(db: &CentralDb, id: AgentGroupId) -> Result<Option<u8>, DbError> {
+    let conn = db.conn()?;
+    let row: Option<i64> = conn
+        .query_row(
+            "SELECT subagent_depth FROM agent_groups WHERE id = ?1",
+            params![id.as_uuid().to_string()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(row.map(|n| u8::try_from(n.clamp(0, i64::from(u8::MAX))).unwrap_or(0)))
 }
 
 pub fn update(db: &CentralDb, id: AgentGroupId, patch: UpdateAgentGroup) -> Result<AgentGroup, DbError> {

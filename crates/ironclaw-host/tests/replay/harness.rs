@@ -478,6 +478,7 @@ impl ReplayHarness {
             stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
             skills_dir: None,
             groups_dir: None,
+            skills_mode: ironclaw_host::SkillsMode::default(),
             forward_env: Vec::new(),
         };
         let runtime: Arc<dyn ContainerRuntime> = Arc::new(HarnessRuntime::default());
@@ -563,6 +564,7 @@ impl ReplayHarness {
             // trips quickly and the retry budget runs to completion
             // inside the per-step `step_timeout_ms` budget.
             provider_deadline: Duration::from_millis(200),
+            tool_deadline_secs: 30,
         };
         run_loop(deps).await.context("runner one-turn")?;
         Ok(())

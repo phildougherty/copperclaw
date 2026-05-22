@@ -114,9 +114,16 @@ impl TeamsAdapter {
             return self.deliver_system_action(target, message).await;
         }
 
-        if !message.files.is_empty() {
+        // Files are supported for channel posts (uploaded into the
+        // channel's SharePoint files folder, then attached by reference).
+        // 1:1 / group chats route via OneDrive which requires delegated
+        // user auth — the bot's app-only token can't reach there. Reject
+        // up-front so the failure mode is visible to the caller.
+        if !message.files.is_empty() && matches!(target, TeamsTarget::Chat { .. }) {
             return Err(AdapterError::Unsupported(
-                "teams adapter does not yet support outbound file attachments".into(),
+                "teams chat (1:1 / group) attachments need delegated OneDrive auth; \
+                 bot app-only auth cannot upload there. Use a channel target."
+                    .into(),
             ));
         }
 
@@ -135,20 +142,80 @@ impl TeamsAdapter {
             TeamsTarget::Channel {
                 team_id,
                 channel_id,
-            } => match thread_id {
-                Some(parent) => {
+            } => {
+                // Channel attachments: resolve the channel's files
+                // folder once, upload each file into it, then attach
+                // by reference on the message.
+                let attachments = if message.files.is_empty() {
+                    Vec::new()
+                } else {
+                    let folder = self
+                        .api
+                        .get_channel_files_folder(team_id, channel_id)
+                        .await?;
+                    let mut out = Vec::with_capacity(message.files.len());
+                    for f in &message.files {
+                        out.push(
+                            self.api
+                                .upload_channel_file(&folder, &f.filename, f.data.clone())
+                                .await?,
+                        );
+                    }
+                    out
+                };
+
+                if attachments.is_empty() {
+                    match thread_id {
+                        Some(parent) => {
+                            self.api
+                                .post_channel_reply(
+                                    team_id,
+                                    channel_id,
+                                    parent,
+                                    content,
+                                    content_type,
+                                )
+                                .await?
+                                .id
+                        }
+                        None => {
+                            self.api
+                                .post_channel_message(
+                                    team_id,
+                                    channel_id,
+                                    content,
+                                    content_type,
+                                )
+                                .await?
+                                .id
+                        }
+                    }
+                } else {
+                    // Reply-in-thread + attachments isn't supported by
+                    // the Graph endpoint we use; warn and post as a
+                    // top-level channel message instead. Threading
+                    // attachments is a known gap in the Graph reply
+                    // surface (post_channel_reply only takes a body,
+                    // not attachments).
+                    if thread_id.is_some() {
+                        tracing::warn!(
+                            "teams: outbound has both thread_id and files; \
+                             attachments posted as top-level channel message \
+                             (Graph reply endpoint does not accept attachments)"
+                        );
+                    }
                     self.api
-                        .post_channel_reply(team_id, channel_id, parent, content, content_type)
+                        .post_channel_message_with_attachments(
+                            team_id,
+                            channel_id,
+                            content,
+                            content_type,
+                            &attachments,
+                        )
                         .await?
                         .id
                 }
-                None => {
-                    self.api
-                        .post_channel_message(team_id, channel_id, content, content_type)
-                        .await?
-                        .id
-                }
-            },
+            }
             TeamsTarget::Chat { chat_id } => {
                 self.api
                     .post_chat_message(chat_id, content, content_type)
@@ -421,19 +488,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_files_returns_unsupported() {
+    async fn deliver_channel_files_upload_and_attach_by_reference() {
         let server = MockServer::start().await;
+        // 1. filesFolder lookup returns drive + folder ids.
+        Mock::given(method("GET"))
+            .and(path("/teams/T1/channels/C1/filesFolder"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "FOLDER1",
+                "parentReference": { "driveId": "DRV1" },
+            })))
+            .mount(&server)
+            .await;
+        // 2. upload returns a driveItem id + webUrl.
+        Mock::given(method("PUT"))
+            .and(path("/drives/DRV1/items/FOLDER1:/a.txt:/content"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({
+                "id": "DI1",
+                "webUrl": "https://contoso.sharepoint.com/sites/team/Shared%20Documents/General/a.txt",
+            })))
+            .mount(&server)
+            .await;
+        // 3. message post with attachments returns the chat-message id.
+        Mock::given(method("POST"))
+            .and(path("/teams/T1/channels/C1/messages"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "M-WITH-ATT"})))
+            .mount(&server)
+            .await;
         let adapter = adapter_for(&server);
         let msg = OutboundMessage {
             kind: MessageKind::Chat,
-            content: json!({"text": "with file"}),
+            content: json!({"text": "see attached"}),
             files: vec![ironclaw_types::OutboundFile {
                 filename: "a.txt".into(),
                 data: vec![1, 2, 3],
             }],
         };
-        match adapter.deliver("team/T1/channel/C1", None, &msg).await {
-            Err(AdapterError::Unsupported(_)) => {}
+        let id = adapter
+            .deliver("team/T1/channel/C1", None, &msg)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("M-WITH-ATT"));
+    }
+
+    #[tokio::test]
+    async fn deliver_chat_files_returns_unsupported_with_explanation() {
+        // 1:1 / group chat attachments need delegated OneDrive auth;
+        // app-only bot auth can't reach a user's OneDrive. The
+        // adapter rejects up-front rather than failing mid-flight at
+        // upload.
+        let server = MockServer::start().await;
+        let adapter = adapter_for(&server);
+        let msg = OutboundMessage {
+            kind: MessageKind::Chat,
+            content: json!({"text": "to chat"}),
+            files: vec![ironclaw_types::OutboundFile {
+                filename: "a.txt".into(),
+                data: vec![1, 2, 3],
+            }],
+        };
+        match adapter.deliver("chat/CHAT1", None, &msg).await {
+            Err(AdapterError::Unsupported(m)) => {
+                assert!(m.contains("OneDrive") || m.contains("delegated"));
+            }
             other => panic!("expected Unsupported, got {other:?}"),
         }
     }

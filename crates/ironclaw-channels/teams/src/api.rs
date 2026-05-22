@@ -24,6 +24,32 @@ pub struct ChatMessageResponse {
     pub id: String,
 }
 
+/// Resolved drive + drive-item pair for a channel's files folder. The
+/// channel's `SharePoint` document library is opaque from the channel
+/// id; Graph returns these once via `GET .../filesFolder` and the
+/// caller passes them back on subsequent uploads.
+#[derive(Debug, Clone)]
+pub struct DriveItemRef {
+    /// Graph drive id (`SharePoint` document library).
+    pub drive_id: String,
+    /// Drive-item id of the *folder* (not the upload target itself).
+    pub item_id: String,
+}
+
+/// Reference-style attachment metadata produced by an upload. Suitable
+/// for inclusion on a Graph chat-message body's `attachments` array.
+#[derive(Debug, Clone)]
+pub struct GraphAttachment {
+    /// driveItem id of the uploaded file (also used as the
+    /// attachment's `id`).
+    pub id: String,
+    /// `webUrl` of the uploaded driveItem; Teams resolves this back
+    /// to the file inline.
+    pub content_url: String,
+    /// Display name for the attachment.
+    pub name: String,
+}
+
 /// Response from `GET /chats/{id}`. We use it to decide `is_group`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatInfoResponse {
@@ -78,12 +104,123 @@ impl TeamsApi {
         content: &str,
         content_type: &str,
     ) -> Result<ChatMessageResponse, AdapterError> {
+        self.post_channel_message_with_attachments(
+            team_id,
+            channel_id,
+            content,
+            content_type,
+            &[],
+        )
+        .await
+    }
+
+    /// `POST /teams/{teamId}/channels/{channelId}/messages` with optional
+    /// `attachments` (reference-style — produced by
+    /// [`Self::upload_channel_file`]).
+    pub async fn post_channel_message_with_attachments(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        content: &str,
+        content_type: &str,
+        attachments: &[GraphAttachment],
+    ) -> Result<ChatMessageResponse, AdapterError> {
         let url = self.url(&format!(
             "teams/{team_id}/channels/{channel_id}/messages"
         ));
-        let body = json!({"body": {"contentType": content_type, "content": content}});
+        let body = build_message_body(content, content_type, attachments);
         let resp = self.send_json(Method::POST, &url, &body).await?;
         decode_message(resp).await
+    }
+
+    /// `GET /teams/{teamId}/channels/{channelId}/filesFolder` — resolve
+    /// the drive + drive-item id of the channel's files folder. Required
+    /// before uploading: the `SharePoint` document library a channel maps
+    /// to isn't predictable from the channel id.
+    pub async fn get_channel_files_folder(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+    ) -> Result<DriveItemRef, AdapterError> {
+        let url = self.url(&format!(
+            "teams/{team_id}/channels/{channel_id}/filesFolder"
+        ));
+        let resp = self.send_empty(Method::GET, &url).await?;
+        let value = consume_json(resp).await?;
+        let drive_id = value
+            .pointer("/parentReference/driveId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AdapterError::Transport(
+                    "filesFolder response missing parentReference.driveId".into(),
+                )
+            })?
+            .to_string();
+        let item_id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                AdapterError::Transport("filesFolder response missing id".into())
+            })?
+            .to_string();
+        Ok(DriveItemRef { drive_id, item_id })
+    }
+
+    /// `PUT /drives/{driveId}/items/{itemId}:/{filename}:/content` — upload
+    /// `bytes` into the channel's files folder. Returns a reference
+    /// suitable for [`Self::post_channel_message_with_attachments`].
+    ///
+    /// Path-style upload tops out at the Graph 4 MB ceiling; larger
+    /// payloads need an upload session, which this helper does not yet
+    /// open. Larger files surface as `BadRequest` from Graph's 4xx with the
+    /// `RequestEntityTooLarge` code; the adapter propagates that.
+    pub async fn upload_channel_file(
+        &self,
+        folder: &DriveItemRef,
+        filename: &str,
+        bytes: Vec<u8>,
+    ) -> Result<GraphAttachment, AdapterError> {
+        if filename.is_empty() {
+            return Err(AdapterError::BadRequest(
+                "upload_channel_file: empty filename".into(),
+            ));
+        }
+        // Graph path-style upload: `…/items/{itemId}:/{filename}:/content`.
+        // The filename segment must be URL-encoded; spaces in particular
+        // are tolerated as `%20`.
+        let encoded = urlencode_segment(filename);
+        let url = self.url(&format!(
+            "drives/{}/items/{}:/{}:/content",
+            folder.drive_id, folder.item_id, encoded
+        ));
+        let resp = self
+            .client
+            .put(&url)
+            .bearer_auth(&self.bot_token)
+            .header(
+                reqwest::header::CONTENT_TYPE,
+                "application/octet-stream",
+            )
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|e| AdapterError::Transport(e.to_string()))?;
+        let value = consume_json(resp).await?;
+        let drive_item_id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AdapterError::Transport("upload response missing id".into()))?
+            .to_string();
+        let web_url = value
+            .get("webUrl")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AdapterError::Transport("upload response missing webUrl".into()))?
+            .to_string();
+        Ok(GraphAttachment {
+            id: drive_item_id,
+            content_url: web_url,
+            name: filename.to_string(),
+        })
     }
 
     /// `POST /teams/{teamId}/channels/{channelId}/messages/{messageId}/replies`
@@ -272,6 +409,89 @@ async fn decode_message(resp: Response) -> Result<ChatMessageResponse, AdapterEr
     let value = consume_json(resp).await?;
     serde_json::from_value(value)
         .map_err(|e| AdapterError::Transport(format!("graph message decode: {e}")))
+}
+
+/// Build the JSON request body for a `messages` create. When
+/// `attachments` is non-empty, the corresponding inline references
+/// (`<attachment id="…"></attachment>`) are appended to the HTML
+/// content so Teams renders the file inline in the message card.
+pub(crate) fn build_message_body(
+    content: &str,
+    content_type: &str,
+    attachments: &[GraphAttachment],
+) -> Value {
+    if attachments.is_empty() {
+        return json!({
+            "body": { "contentType": content_type, "content": content }
+        });
+    }
+    // Graph attachments require an `<attachment id="…">` placeholder
+    // inside the message body (html). If the caller passed text we
+    // upgrade to html so the placeholders render correctly.
+    let mut body_html = if content_type == "html" {
+        content.to_string()
+    } else {
+        // Escape for safety, then convert into html.
+        html_escape(content)
+    };
+    for a in attachments {
+        body_html.push_str(&format!(
+            "<attachment id=\"{}\"></attachment>",
+            xml_attr_escape(&a.id)
+        ));
+    }
+    let attach_json: Vec<Value> = attachments
+        .iter()
+        .map(|a| {
+            json!({
+                "id": a.id,
+                "contentType": "reference",
+                "contentUrl": a.content_url,
+                "name": a.name,
+            })
+        })
+        .collect();
+    json!({
+        "body": { "contentType": "html", "content": body_html },
+        "attachments": attach_json,
+    })
+}
+
+/// Percent-encode characters that aren't safe in a Graph path segment.
+/// Keeps unreserved chars + `.` and `-`; everything else (including
+/// spaces) becomes `%XX`. We don't pull in `urlencoding` for this — the
+/// alphabet of Teams filenames is narrow enough that a hand-rolled
+/// pass is shorter than a new dep.
+pub(crate) fn urlencode_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+    }
+    out
+}
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn xml_attr_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('"', "&quot;")
 }
 
 /// Map an HTTP status (with optional body and retry-after) onto an
@@ -682,5 +902,40 @@ mod tests {
         let _ = api.clone();
         let s = format!("{api:?}");
         assert!(s.contains("tok-1"));
+    }
+
+    #[test]
+    fn build_message_body_without_attachments_is_simple_body() {
+        let v = build_message_body("hi", "text", &[]);
+        assert_eq!(v["body"]["contentType"], "text");
+        assert_eq!(v["body"]["content"], "hi");
+        assert!(v.get("attachments").is_none());
+    }
+
+    #[test]
+    fn build_message_body_with_attachments_promotes_text_to_html_and_inlines_refs() {
+        let attachments = vec![GraphAttachment {
+            id: "DI1".into(),
+            content_url: "https://example/c.txt".into(),
+            name: "c.txt".into(),
+        }];
+        let v = build_message_body("plain & body", "text", &attachments);
+        assert_eq!(v["body"]["contentType"], "html");
+        let html = v["body"]["content"].as_str().unwrap();
+        assert!(html.contains("plain &amp; body"));
+        assert!(html.contains("<attachment id=\"DI1\"></attachment>"));
+        let arr = v["attachments"].as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], "DI1");
+        assert_eq!(arr[0]["contentType"], "reference");
+        assert_eq!(arr[0]["contentUrl"], "https://example/c.txt");
+        assert_eq!(arr[0]["name"], "c.txt");
+    }
+
+    #[test]
+    fn urlencode_segment_keeps_safe_and_escapes_unsafe() {
+        assert_eq!(urlencode_segment("a.txt"), "a.txt");
+        assert_eq!(urlencode_segment("my file.pdf"), "my%20file.pdf");
+        assert_eq!(urlencode_segment("hello/world"), "hello%2Fworld");
     }
 }

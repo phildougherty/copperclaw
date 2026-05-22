@@ -94,18 +94,16 @@ impl ChannelAdapter for GchatAdapter {
         thread_id: Option<&str>,
         message: &OutboundMessage,
     ) -> Result<Option<String>, AdapterError> {
-        // Files are unsupported in v1: Google Chat attachments require the
-        // Drive upload flow which is out of scope.
-        if !message.files.is_empty() {
-            return Err(AdapterError::Unsupported(
-                "gchat attachments require the Drive upload flow (not supported in v1)".into(),
-            ));
-        }
-
         // System actions (edit / reaction) are dispatched from the
         // `content` payload regardless of message kind, mirroring the
-        // contract in `docs/adding-a-channel.md` § 4.
+        // contract in `docs/adding-a-channel.md` § 4. Reject files on
+        // those actions (they have no attachment semantics).
         if let Some(action) = message.content.get("action").and_then(Value::as_str) {
+            if !message.files.is_empty() {
+                return Err(AdapterError::BadRequest(format!(
+                    "gchat action `{action}` does not accept file attachments"
+                )));
+            }
             return self.dispatch_action(action, &message.content).await;
         }
 
@@ -118,6 +116,12 @@ impl ChannelAdapter for GchatAdapter {
             .unwrap_or("default");
 
         if let Some(card) = card {
+            // Card messages don't support attachments either.
+            if !message.files.is_empty() {
+                return Err(AdapterError::BadRequest(
+                    "gchat cards do not accept file attachments".into(),
+                ));
+            }
             let resp = self.api.send_card(space, card_id, card).await?;
             return Ok(Some(resp.name));
         }
@@ -128,6 +132,37 @@ impl ChannelAdapter for GchatAdapter {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_owned();
+
+        // Two-step attachment flow: upload each file via
+        // attachments:upload (returns an opaque resourceName), then
+        // include those names in the `attachment[]` array on the
+        // outgoing message. Google Chat's `messages.create` with
+        // attachments doesn't accept `messageReplyOption`, so a
+        // threaded reply with attachments will be posted top-level
+        // with a warning — symmetric to the Teams behaviour and the
+        // current Graph reply limitation.
+        if !message.files.is_empty() {
+            if thread_id.is_some() {
+                tracing::warn!(
+                    "gchat: outbound has both thread_id and files; \
+                     attachments posted as top-level space message \
+                     (Chat attachments + REPLY_MESSAGE_OR_FAIL not supported)"
+                );
+            }
+            let mut refs = Vec::with_capacity(message.files.len());
+            for f in &message.files {
+                refs.push(
+                    self.api
+                        .upload_attachment(space, &f.filename, f.data.clone())
+                        .await?,
+                );
+            }
+            let resp = self
+                .api
+                .send_text_with_attachments(space, &text, &refs)
+                .await?;
+            return Ok(Some(resp.name));
+        }
 
         let resp = if let Some(thread) = thread_id {
             self.api.send_threaded_text(space, thread, &text).await?
@@ -509,8 +544,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_with_files_is_unsupported() {
+    async fn deliver_with_files_uploads_then_attaches_resource_names() {
         let server = MockServer::start().await;
+        // attachments:upload returns a resourceName.
+        Mock::given(method("POST"))
+            .and(path("/upload/v1/spaces/AAA/attachments:upload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "attachmentDataRef": { "resourceName": "spaces/AAA/attachments/abc" },
+            })))
+            .mount(&server)
+            .await;
+        // messages.create includes the attachment[] array.
+        Mock::given(method("POST"))
+            .and(path("/v1/spaces/AAA/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "spaces/AAA/messages/M-with-att",
+            })))
+            .mount(&server)
+            .await;
         let adapter = adapter_for(&server);
         let msg = OutboundMessage {
             kind: MessageKind::Chat,
@@ -520,9 +571,30 @@ mod tests {
                 data: b"hi".to_vec(),
             }],
         };
+        let id = adapter
+            .deliver("spaces/AAA", None, &msg)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("spaces/AAA/messages/M-with-att"));
+    }
+
+    #[tokio::test]
+    async fn deliver_with_files_and_card_is_bad_request() {
+        let server = MockServer::start().await;
+        let adapter = adapter_for(&server);
+        let msg = OutboundMessage {
+            kind: MessageKind::Chat,
+            content: json!({
+                "card": { "header": { "title": "x" } }
+            }),
+            files: vec![OutboundFile {
+                filename: "x.txt".into(),
+                data: b"hi".to_vec(),
+            }],
+        };
         match adapter.deliver("spaces/AAA", None, &msg).await {
-            Err(AdapterError::Unsupported(m)) => assert!(m.contains("Drive")),
-            other => panic!("expected Unsupported, got {other:?}"),
+            Err(AdapterError::BadRequest(m)) => assert!(m.contains("card")),
+            other => panic!("expected BadRequest, got {other:?}"),
         }
     }
 

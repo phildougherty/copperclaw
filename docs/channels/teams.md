@@ -14,21 +14,24 @@
 - open_dm: trait-default None.
 
 ## Gaps
-MED:
-- Files Unsupported. Graph supports `attachments` with a hosted file
-  reference (uploaded to OneDrive/SharePoint first). Not implemented.
-
 LOW:
 - Reaction emoji map is hard-coded; emojis outside the map return
   Unsupported. List should be expanded to cover the full Teams
   reaction set (currently like/heart/laugh/surprised/sad/angry).
+- Channel reply + attachments collapses to a top-level channel post
+  with a warning, because the Graph `messages/{id}/replies` endpoint
+  doesn't accept `attachments`.
+- Files on 1:1 / group chat targets are explicitly Unsupported (the
+  bot's app-only auth cannot reach a user's OneDrive). Lift requires
+  delegated user auth.
 
 ## Edge cases tested
 - [x] channel message returns id
 - [x] channel with thread → replies endpoint
 - [x] chat uses /chats endpoint
 - [x] html content uses html content-type
-- [x] files → Unsupported
+- [x] files on channel target → uploaded via filesFolder → /drives/.../content, attached by reference
+- [x] files on chat target → Unsupported with explanation
 - [x] malformed platform_id → BadRequest
 - [x] edit channel
 - [x] edit chat
@@ -42,9 +45,16 @@ LOW:
 - [x] auth / rate / transport propagation
 
 ## Fixes in this PR
-None.
+- Channel file attachments via Graph: `get_channel_files_folder`
+  resolves the drive + folder ids, `upload_channel_file` PUTs bytes to
+  `/drives/{drive}/items/{item}:/{filename}:/content`, and
+  `post_channel_message_with_attachments` includes the references on
+  the message. The adapter wires the three calls for channel-target
+  outbounds with `files`. Chat-target attachments are explicitly
+  rejected with an explanation about delegated auth.
 
 ## Deferred for follow-up
-- File attachments via Graph (OneDrive/SharePoint upload + attachment
-  reference).
+- 1:1 / group chat attachments (needs delegated user-OneDrive auth).
+- Path-style upload tops out at the Graph 4 MB ceiling; large files
+  need an upload session.
 - Expand reaction map.

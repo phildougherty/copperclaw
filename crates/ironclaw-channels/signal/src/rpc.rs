@@ -159,6 +159,14 @@ impl std::fmt::Debug for JsonRpcClient {
 }
 
 impl JsonRpcClient {
+    /// True when both reader and writer tasks are still running. False
+    /// when either one has finished, which on the production transport
+    /// indicates the child process closed its stdio (i.e. died).
+    /// Polled by [`SignalSupervisor`] to decide when to respawn.
+    pub fn is_alive(&self) -> bool {
+        !self.writer_task.is_finished() && !self.reader_task.is_finished()
+    }
+
     /// Spawn `bin` with the supplied arguments and wire stdin/stdout/stderr
     /// through the request, response, and stderr tasks.
     ///
@@ -502,6 +510,154 @@ impl RpcTransport for MockTransport {
     }
 }
 
+// ----------------------------------------------------------------------
+// SignalSupervisor — daemon respawn
+// ----------------------------------------------------------------------
+
+/// Initial respawn backoff. Doubles per failed spawn up to
+/// [`RESPAWN_BACKOFF_CEILING`]. Short to keep transient daemon flaps
+/// from causing visible message gaps; long enough to avoid hammering
+/// the executable when it's permanently broken.
+const RESPAWN_BACKOFF_INITIAL_MS: u64 = 500;
+/// Ceiling for the respawn backoff. 30 s mirrors the host's
+/// delivery-loop ceiling — the daemon will eventually catch up
+/// without an operator restart.
+const RESPAWN_BACKOFF_CEILING_MS: u64 = 30_000;
+/// How often the watchdog polls the underlying client's liveness.
+const WATCHDOG_POLL_INTERVAL_MS: u64 = 500;
+
+/// Wraps a [`JsonRpcClient`] and respawns it when the child process
+/// exits. The supervisor implements [`RpcTransport`] by delegating to
+/// the currently-live client; from the adapter's point of view, a
+/// daemon respawn is invisible.
+///
+/// Notifications from each successive child are forwarded through a
+/// shared mpsc so the adapter's already-running notification loop
+/// keeps receiving events without rewiring after a respawn.
+pub struct SignalSupervisor {
+    current: Mutex<Arc<JsonRpcClient>>,
+    bin: String,
+    args: Vec<String>,
+    notif_tx: mpsc::Sender<Notification>,
+    notif_rx_slot: Mutex<Option<mpsc::Receiver<Notification>>>,
+}
+
+impl std::fmt::Debug for SignalSupervisor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignalSupervisor")
+            .field("bin", &self.bin)
+            .field("args", &self.args)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SignalSupervisor {
+    /// Spawn the initial signal-cli daemon, install the watchdog, and
+    /// return the supervisor as an `Arc<dyn RpcTransport>`-ready value.
+    pub async fn spawn(bin: &str, args: &[String]) -> Result<Arc<Self>, AdapterError> {
+        let initial = JsonRpcClient::spawn(bin, args)?;
+        let initial_notif = initial.take_notifications().await;
+        let (notif_tx, notif_rx) = mpsc::channel::<Notification>(NOTIFICATION_CHANNEL_CAPACITY);
+        // Forward the first child's notifications into the shared mpsc.
+        tokio::spawn(forward_notifications(initial_notif, notif_tx.clone()));
+        let me = Arc::new(Self {
+            current: Mutex::new(initial),
+            bin: bin.to_owned(),
+            args: args.to_owned(),
+            notif_tx,
+            notif_rx_slot: Mutex::new(Some(notif_rx)),
+        });
+        tokio::spawn(watchdog_loop(Arc::clone(&me)));
+        Ok(me)
+    }
+}
+
+#[async_trait]
+impl RpcTransport for SignalSupervisor {
+    async fn call(&self, method: &str, params: Value) -> Result<Value, AdapterError> {
+        // Snapshot the current client outside the await so the
+        // mutex isn't held while we wait for the daemon to reply.
+        let client = { self.current.lock().await.clone() };
+        client.call(method, params).await
+    }
+
+    async fn take_notifications(&self) -> mpsc::Receiver<Notification> {
+        let mut slot = self.notif_rx_slot.lock().await;
+        slot.take().unwrap_or_else(|| {
+            let (_, rx) = mpsc::channel::<Notification>(1);
+            rx
+        })
+    }
+}
+
+/// Forward every notification from `src` into `dst` until `src` closes.
+/// One copy per child process — when the child dies, the source mpsc
+/// closes and this task exits; the supervisor's watchdog spawns a fresh
+/// forwarder against the next child.
+async fn forward_notifications(
+    mut src: mpsc::Receiver<Notification>,
+    dst: mpsc::Sender<Notification>,
+) {
+    while let Some(n) = src.recv().await {
+        if dst.send(n).await.is_err() {
+            // Adapter dropped its receiver; supervisor going down.
+            break;
+        }
+    }
+}
+
+/// Background loop that polls the supervised client's liveness; when
+/// the child dies, respawns a fresh daemon with exponential backoff
+/// and swaps it into the supervisor.
+async fn watchdog_loop(supervisor: Arc<SignalSupervisor>) {
+    loop {
+        // Snapshot the current client and wait for it to die.
+        let current = { supervisor.current.lock().await.clone() };
+        while current.is_alive() {
+            // The supervisor itself may be the only owner of `current`
+            // — keep our copy alive until we observe death, then drop.
+            tokio::time::sleep(std::time::Duration::from_millis(
+                WATCHDOG_POLL_INTERVAL_MS,
+            ))
+            .await;
+        }
+        tracing::warn!(
+            "signal: signal-cli daemon exited; respawning with backoff"
+        );
+        drop(current);
+
+        // Respawn with exponential backoff. Tries forever — the
+        // operator's only correct response to a permanently-broken
+        // daemon binary is to fix the config and restart the host;
+        // until then we just keep trying.
+        let mut backoff_ms = RESPAWN_BACKOFF_INITIAL_MS;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            match JsonRpcClient::spawn(&supervisor.bin, &supervisor.args) {
+                Ok(new_client) => {
+                    let new_notif = new_client.take_notifications().await;
+                    tokio::spawn(forward_notifications(
+                        new_notif,
+                        supervisor.notif_tx.clone(),
+                    ));
+                    *supervisor.current.lock().await = new_client;
+                    tracing::info!("signal: daemon respawned");
+                    break;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        backoff_ms,
+                        "signal: respawn attempt failed; backing off"
+                    );
+                    backoff_ms =
+                        (backoff_ms.saturating_mul(2)).min(RESPAWN_BACKOFF_CEILING_MS);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -806,6 +962,35 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, AdapterError::Transport(_)));
+    }
+
+    #[tokio::test]
+    async fn supervisor_spawn_with_missing_binary_returns_transport_error() {
+        // The supervisor delegates to JsonRpcClient::spawn for the
+        // initial spawn; a missing binary surfaces as Transport, same
+        // as the unwrapped path. The watchdog never starts because
+        // we never get past the initial spawn.
+        let err = SignalSupervisor::spawn(
+            "definitely-not-on-path-signal-cli-binary-xyz",
+            &["daemon".to_owned()],
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, AdapterError::Transport(_)));
+    }
+
+    #[tokio::test]
+    async fn jsonrpc_client_is_alive_starts_true() {
+        // A freshly-spawned mock daemon (using `/bin/cat` so the
+        // child stays alive reading stdin) should be `is_alive`. We
+        // can't easily simulate a real signal-cli daemon here, but
+        // `cat` produces a long-lived child with stdin/stdout piped,
+        // which is enough to exercise the liveness check.
+        let client = JsonRpcClient::spawn("/bin/cat", &[]).unwrap();
+        // The reader_loop may exit when EOF is reached on stdout — but
+        // for `cat` stdout stays open as long as stdin does, and we
+        // haven't closed stdin yet.
+        assert!(client.is_alive());
     }
 
     #[test]

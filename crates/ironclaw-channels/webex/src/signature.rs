@@ -19,15 +19,23 @@ pub enum SignatureAlgo {
     Sha1,
     /// HMAC-SHA256 (newer Webex deployments).
     Sha256,
+    /// Accept either algorithm; the concrete one is decided per-request
+    /// by the signature's hex length (40 → sha1, 64 → sha256). Lets an
+    /// operator survive a Webex-side upgrade without re-configuring.
+    Auto,
 }
 
 impl SignatureAlgo {
-    /// Hex digest length for this algorithm.
+    /// Hex digest length for this algorithm. `Auto` has no single
+    /// length; the verifier inspects the supplied signature instead.
     #[must_use]
     pub fn digest_hex_len(self) -> usize {
         match self {
             Self::Sha1 => 40,
-            Self::Sha256 => 64,
+            // `Auto` accepts whichever the request carries; expose
+            // sha256's length as the "max" so a caller using this
+            // for buffer sizing isn't surprised.
+            Self::Sha256 | Self::Auto => 64,
         }
     }
 
@@ -36,6 +44,7 @@ impl SignatureAlgo {
         match s.to_ascii_lowercase().as_str() {
             "sha1" => Ok(Self::Sha1),
             "sha256" => Ok(Self::Sha256),
+            "auto" => Ok(Self::Auto),
             _ => Err(SignatureError::UnknownAlgo(s.to_owned())),
         }
     }
@@ -46,6 +55,7 @@ impl SignatureAlgo {
         match self {
             Self::Sha1 => "sha1",
             Self::Sha256 => "sha256",
+            Self::Auto => "auto",
         }
     }
 }
@@ -68,6 +78,10 @@ pub enum SignatureError {
 }
 
 /// Compute the hex-encoded HMAC of `body` for the chosen algorithm.
+///
+/// Panics if `algo` is [`SignatureAlgo::Auto`] — `Auto` is a
+/// verifier-side selector, not a computable algorithm. The caller
+/// pre-resolves it via the signature's length.
 #[must_use]
 pub fn compute_signature(algo: SignatureAlgo, secret: &[u8], body: &[u8]) -> String {
     match algo {
@@ -83,12 +97,19 @@ pub fn compute_signature(algo: SignatureAlgo, secret: &[u8], body: &[u8]) -> Str
             mac.update(body);
             hex::encode(mac.finalize().into_bytes())
         }
+        SignatureAlgo::Auto => panic!(
+            "compute_signature called with SignatureAlgo::Auto — \
+             resolve to a concrete algorithm via the signature's length first"
+        ),
     }
 }
 
 /// Verify that `provided` matches the expected HMAC for `body`.
 ///
 /// Comparison is constant-time. `provided` may be `None` (missing header).
+/// When `algo` is [`SignatureAlgo::Auto`], the concrete algorithm is
+/// inferred from the signature's hex length (40 → sha1, 64 → sha256)
+/// before verification; any other length is `BadSignatureFormat`.
 pub fn verify_signature(
     algo: SignatureAlgo,
     secret: &[u8],
@@ -96,11 +117,19 @@ pub fn verify_signature(
     provided: Option<&str>,
 ) -> Result<(), SignatureError> {
     let sig = provided.ok_or(SignatureError::MissingSignature)?;
-    if sig.len() != algo.digest_hex_len() {
+    let concrete = match algo {
+        SignatureAlgo::Auto => match sig.len() {
+            40 => SignatureAlgo::Sha1,
+            64 => SignatureAlgo::Sha256,
+            _ => return Err(SignatureError::BadSignatureFormat),
+        },
+        other => other,
+    };
+    if sig.len() != concrete.digest_hex_len() {
         return Err(SignatureError::BadSignatureFormat);
     }
     let provided_bytes = hex::decode(sig).map_err(|_| SignatureError::BadSignatureFormat)?;
-    let expected_hex = compute_signature(algo, secret, body);
+    let expected_hex = compute_signature(concrete, secret, body);
     let expected_bytes =
         hex::decode(&expected_hex).map_err(|_| SignatureError::BadSignatureFormat)?;
     if provided_bytes.ct_eq(&expected_bytes).into() {
@@ -266,5 +295,56 @@ mod tests {
         let s1 = compute_signature(SignatureAlgo::Sha1, SECRET, b"one");
         let s2 = compute_signature(SignatureAlgo::Sha1, SECRET, b"two");
         assert_ne!(s1, s2);
+    }
+
+    #[test]
+    fn algo_parse_accepts_auto() {
+        assert_eq!(SignatureAlgo::parse("auto").unwrap(), SignatureAlgo::Auto);
+        assert_eq!(SignatureAlgo::parse("AUTO").unwrap(), SignatureAlgo::Auto);
+    }
+
+    #[test]
+    fn algo_auto_as_str_is_auto() {
+        assert_eq!(SignatureAlgo::Auto.as_str(), "auto");
+    }
+
+    #[test]
+    fn verify_auto_accepts_sha1_length_signature() {
+        let sig = compute_signature(SignatureAlgo::Sha1, SECRET, BODY);
+        verify_signature(SignatureAlgo::Auto, SECRET, BODY, Some(&sig)).unwrap();
+    }
+
+    #[test]
+    fn verify_auto_accepts_sha256_length_signature() {
+        let sig = compute_signature(SignatureAlgo::Sha256, SECRET, BODY);
+        verify_signature(SignatureAlgo::Auto, SECRET, BODY, Some(&sig)).unwrap();
+    }
+
+    #[test]
+    fn verify_auto_rejects_other_length() {
+        // 48 chars — neither sha1 nor sha256.
+        let bad = "a".repeat(48);
+        let err = verify_signature(SignatureAlgo::Auto, SECRET, BODY, Some(&bad)).unwrap_err();
+        assert_eq!(err, SignatureError::BadSignatureFormat);
+    }
+
+    #[test]
+    fn verify_auto_rejects_wrong_signature_at_sha1_length() {
+        let bad = "0".repeat(40);
+        let err = verify_signature(SignatureAlgo::Auto, SECRET, BODY, Some(&bad)).unwrap_err();
+        assert_eq!(err, SignatureError::Mismatch);
+    }
+
+    #[test]
+    fn verify_auto_rejects_wrong_signature_at_sha256_length() {
+        let bad = "0".repeat(64);
+        let err = verify_signature(SignatureAlgo::Auto, SECRET, BODY, Some(&bad)).unwrap_err();
+        assert_eq!(err, SignatureError::Mismatch);
+    }
+
+    #[test]
+    #[should_panic(expected = "Auto")]
+    fn compute_signature_with_auto_panics() {
+        let _ = compute_signature(SignatureAlgo::Auto, SECRET, BODY);
     }
 }

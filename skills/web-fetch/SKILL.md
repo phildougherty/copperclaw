@@ -5,14 +5,12 @@ description: HTTP GET or POST a URL from inside the container with the web_fetch
 
 # web-fetch
 
-`web_fetch` performs an HTTP GET (or POST) from inside the session
-container and returns the response. It exists so the agent has a
-URL → body pipe without needing to invoke `curl` through `shell`.
+`web_fetch` does an HTTP GET (or POST) from inside the session
+container and returns the response. URL → body pipe without `shell
+curl`.
 
-There is no `web_search` companion (yet) — `web_fetch` requires you
-to already know the URL. To discover URLs, ask the user, consult an
-MCP server (e.g. the `linear` preset for project context), or use
-`shell` with a search tool you've installed via `install_packages`.
+You need the URL already. To discover URLs, use `web_search`, ask the
+user, or consult an MCP server.
 
 ## Schema
 
@@ -26,47 +24,38 @@ MCP server (e.g. the `linear` preset for project context), or use
 }
 ```
 
-- `url` (required). Must include the scheme (`https://...` or
-  `http://...`).
-- `method` (optional). `GET` (default) or `POST`. Other verbs return
-  a validation error — use `shell` with `curl` for PATCH / PUT /
-  DELETE if you really need them.
-- `body` (optional). For `POST`, the request body. Sent as
-  `application/json` content type when the body parses as JSON,
-  otherwise as `text/plain`.
+- `url` (required). Must include scheme (`https://...`).
+- `method` (optional). `GET` (default) or `POST`. Other verbs are a
+  validation error — use `shell curl` for PATCH/PUT/DELETE.
+- `body` (optional, POST). Sent as `application/json` when it parses
+  as JSON, otherwise `text/plain`.
 - `timeout_secs` (optional). Default 30s, ceiling 120s.
-- `raw` (optional). When true, return the response body bytes
-  unmodified even for HTML. Default is `false`, which converts HTML
-  to markdown — see below.
+- `raw` (optional). True returns response body bytes unmodified for
+  HTML. Default false converts HTML→markdown.
 
 ## HTML → markdown by default
 
-When the response Content-Type is `text/html` (or
-`application/xhtml+xml`) the body is automatically converted to
-markdown before being returned. The conversion strips `<script>` and
-`<style>`, preserves links, and formats headings + lists. The result
-is typically 5-10x smaller than the raw HTML, which keeps the model's
-context window for the content rather than the markup.
+When Content-Type is `text/html` / `application/xhtml+xml`, the body
+auto-converts to markdown: strips `<script>`/`<style>`, preserves
+links, formats headings + lists. Typically 5-10x smaller than raw HTML
+— keeps your context window for content, not markup.
 
-The response then includes:
+Response then includes:
 
-- `body`: the markdown text (instead of the raw HTML).
+- `body`: the markdown text.
 - `content_type`: `"text/html → markdown"`.
-- `raw_html_bytes`: the size of the original HTML.
-- `markdown_bytes`: the size of the converted markdown.
+- `raw_html_bytes`: original HTML size.
+- `markdown_bytes`: converted size.
 
-Pass `raw: true` when you need the original HTML — for example, when
-you're scraping `<meta>` tags, parsing embedded JSON, or otherwise
-relying on tag-level structure. JSON, plain text, and other non-HTML
-responses are always returned as-is regardless of `raw`.
+Pass `raw: true` when you need original HTML (scraping `<meta>`,
+parsing embedded JSON, tag-level structure). JSON, plain text, and
+non-HTML responses are returned as-is regardless of `raw`.
 
 ## Output limits
 
-The response body is capped at 256 KiB. Larger responses are
-truncated at a UTF-8 character boundary (binary responses are
-returned base64-encoded; the truncation is still on byte
-boundaries). The result includes `truncated`, `bytes_read`,
-`total_bytes` so you can tell.
+Response body capped at 256 KiB. Larger responses truncate at a UTF-8
+char boundary (binary base64-encoded; truncation still at byte
+boundaries). Result has `truncated`, `bytes_read`, `total_bytes`.
 
 ## Result shape
 
@@ -85,37 +74,28 @@ boundaries). The result includes `truncated`, `bytes_read`,
 
 ## Egress allow-list interaction
 
-Operators can restrict the container's outbound network via
-`container_configs.egress_allow` (see `docs/container-config.md`).
-When set, `web_fetch` calls to hosts outside the allow-list fail
-with a connection error — the tool itself doesn't pre-validate; it
-trusts the runtime's network policy.
+`container_configs.egress_allow` restricts outbound network. Off-list
+hosts fail with a connection error — the tool doesn't pre-validate;
+it trusts the runtime's policy.
 
-If you see a network error on a URL that "should" work, the cause
-is most likely the egress allow-list. Ask the operator to add the
-host or use a different approach (an MCP server with the right
-access already wired up is often the better path).
+Network error on a URL that "should" work → almost always the
+allow-list. Ask the operator to add the host, or use an MCP server
+with the right access wired up.
 
 ## When to prefer other tools
 
-- **Talking to an authenticated API**: an MCP server with the right
-  credentials (`iclaw mcp add linear ...`) is almost always
-  cleaner than threading API keys through the agent.
-- **Fetching the same URL many times**: cache the first result in
-  conversational memory rather than re-fetching.
-- **Downloading a large file**: use `shell` with `curl -o <path>`
-  to stream straight to disk without going through the model's
-  context window.
+- **Authenticated API**: an MCP server (`iclaw mcp add linear ...`)
+  beats threading API keys through the agent.
+- **Same URL many times**: cache the first result in conversational
+  memory.
+- **Large file download**: `shell curl -o <path>` streams to disk
+  without going through context.
 
 ## Common patterns
-
-Fetch JSON and reason over it in the same turn:
 
 ```json
 { "url": "https://api.github.com/repos/anthropics/claude-code/issues?state=open&per_page=5" }
 ```
-
-POST a webhook with a small JSON payload:
 
 ```json
 {

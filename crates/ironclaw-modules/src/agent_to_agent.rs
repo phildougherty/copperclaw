@@ -18,8 +18,10 @@
 //!
 //!    a. Permission-gates via the configured closure (defaults to deny so
 //!       production wiring must opt in).
-//!    b. Refuses if the request originates from a previously-spawned agent
-//!       (max nesting = 1 level).
+//!    b. Refuses if accepting the request would push the new group past the
+//!       configured subagent-depth cap (default [`DEFAULT_MAX_SUBAGENT_DEPTH`]).
+//!       Depth = parent's depth + 1 (or 1 when the parent is itself an
+//!       un-spawned agent, e.g. the initial agent in the install).
 //!    c. INSERTs `agent_groups` + `sessions` (+ optional `messaging_group_agents`).
 //!    d. Writes a `create_agent_result` system row into the *parent* session's
 //!       `inbound.db` so the calling agent sees the real id on its next turn.
@@ -43,12 +45,13 @@ use ironclaw_db::tables::{
     messaging_group_agents::{self, UpsertWiring},
     messaging_groups::{self, UpsertMessagingGroup},
     sessions::{self, CreateSession},
+    user_roles,
 };
 use ironclaw_types::{
     AgentGroupId, ChannelType, EngageMode, MessageId, MessageKind, SessionId, SessionMode,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
@@ -100,13 +103,33 @@ pub fn parse(s: &str) -> Option<AgentRef> {
     })
 }
 
-/// Permission closure consulted before a `create_agent` action runs. Returning
-/// `false` causes the handler to write a `status: "denied"` result row and
-/// abort the central-DB mutation.
+/// Context handed to a [`CreateAgentPermissionCheck`]. Carries enough
+/// state for the check to consult `users` / `user_roles` against the
+/// parent session's scope. New fields can be added at any time — the
+/// struct is not stable API; production code uses the
+/// [`users_table_check`] factory.
+#[derive(Debug, Clone)]
+pub struct CreateAgentPermissionCtx {
+    /// Parent session's agent group, when the action handler could
+    /// resolve one. `None` for orphan invocations (no parent session
+    /// matched) — those represent administrative / scripted calls.
+    pub parent_agent_group_id: Option<AgentGroupId>,
+    /// Parent session id, when available.
+    pub parent_session_id: Option<SessionId>,
+    /// `create_agent` payload's requested name. Surfaced for audit
+    /// purposes; the default check ignores it.
+    pub requested_name: String,
+}
+
+/// Permission closure consulted before a `create_agent` action runs.
+/// Returning `false` causes the handler to write a `status: "denied"`
+/// result row and abort the central-DB mutation.
 ///
 /// In production the host wires this to a check against the `users` /
-/// `user_roles` table (Admins may, Members + Guests may not).
-pub type CreateAgentPermissionCheck = Arc<dyn Fn() -> bool + Send + Sync>;
+/// `user_roles` table via [`users_table_check`]. Tests can use
+/// [`always_allow`] / [`always_deny`].
+pub type CreateAgentPermissionCheck =
+    Arc<dyn Fn(&CreateAgentPermissionCtx) -> bool + Send + Sync>;
 
 /// Module wraps the helpers above and registers a message interceptor that
 /// tags outbound messages whose destination resolves to an agent. Kept as a
@@ -128,14 +151,33 @@ pub struct CreateAgentModule {
     deps: HandlerDeps,
 }
 
+/// Default cap on `create_agent` nesting depth. A parent at depth N can
+/// spawn a child at depth N+1; the spawn is rejected once N+1 exceeds
+/// this cap. 3 lets a top-level agent delegate to a sibling that
+/// delegates to a focused sub-sibling — useful for layered
+/// investigations — without permitting an unbounded fork-bomb.
+pub const DEFAULT_MAX_SUBAGENT_DEPTH: u8 = 3;
+
+/// Hard ceiling on operator-configured subagent depth caps. Deeper
+/// chains than this are misconfiguration: they invite the saturation
+/// collapse `checked_add` guards against, and they have no real-world
+/// use case beyond fork-bombs.
+pub const MAX_SUBAGENT_DEPTH_CEILING: u8 = 16;
+
 #[derive(Clone)]
 struct HandlerDeps {
     central: CentralDb,
     data_root: PathBuf,
     permission_check: CreateAgentPermissionCheck,
-    // Agent groups that were themselves spawned by `create_agent`. Used to
-    // refuse nested spawns (max depth = 1).
-    spawned: Arc<Mutex<HashSet<AgentGroupId>>>,
+    /// In-memory `(agent_group_id → depth)` cache. Persisted ground
+    /// truth lives in `agent_groups.subagent_depth`; the cache is a
+    /// write-through accelerator that avoids hitting the DB twice per
+    /// `create_agent` and serves as the synchronisation point for the
+    /// re-check-on-insert that prevents the depth-cap TOCTOU race.
+    spawned: Arc<Mutex<HashMap<AgentGroupId, u8>>>,
+    /// Hard cap on subagent depth — see [`DEFAULT_MAX_SUBAGENT_DEPTH`].
+    /// `1` reproduces the historical "no nested spawns at all" rule.
+    max_depth: u8,
 }
 
 impl Default for AgentToAgentModule {
@@ -163,9 +205,30 @@ impl CreateAgentModule {
                 central,
                 data_root: data_root.into(),
                 permission_check,
-                spawned: Arc::new(Mutex::new(HashSet::new())),
+                spawned: Arc::new(Mutex::new(HashMap::new())),
+                max_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
             },
         }
+    }
+
+    /// Override the subagent-depth cap. Values < 1 are clamped to 1 so
+    /// the gate never accidentally rejects every spawn; values above
+    /// [`MAX_SUBAGENT_DEPTH_CEILING`] are clamped down with a warn,
+    /// because deeper chains both invite u8 saturation collapse and
+    /// have no plausible legitimate use case.
+    #[must_use]
+    pub fn with_max_depth(mut self, depth: u8) -> Self {
+        let clamped = depth.clamp(1, MAX_SUBAGENT_DEPTH_CEILING);
+        if clamped != depth {
+            warn!(
+                requested = depth,
+                clamped,
+                ceiling = MAX_SUBAGENT_DEPTH_CEILING,
+                "with_max_depth: clamped subagent depth cap to ceiling",
+            );
+        }
+        self.deps.max_depth = clamped;
+        self
     }
 
     /// Test-only helper: borrow the deps so a test can assert against the
@@ -179,12 +242,64 @@ impl CreateAgentModule {
 /// Convenience permission closure that always allows. Useful for tests and
 /// non-multi-user deployments where every agent is trusted.
 pub fn always_allow() -> CreateAgentPermissionCheck {
-    Arc::new(|| true)
+    Arc::new(|_ctx: &CreateAgentPermissionCtx| true)
 }
 
 /// Convenience permission closure that always denies.
 pub fn always_deny() -> CreateAgentPermissionCheck {
-    Arc::new(|| false)
+    Arc::new(|_ctx: &CreateAgentPermissionCtx| false)
+}
+
+/// Production permission check: allow `create_agent` only when the
+/// install has at least one user granted [`user_roles::Role::Owner`] or
+/// [`user_roles::Role::Admin`] (either globally or scoped to the parent
+/// agent group). This is the bootstrap form of the role check — it
+/// requires an operator to deliberately grant a privileged role before
+/// any agent can spawn new agents, but does not yet bind the action to
+/// a specific user identity (the system action carries no user
+/// context; binding to a user requires per-turn provenance which the
+/// schema does not currently track).
+///
+/// Operationally:
+/// * Fresh install with no role grants → deny (safe default).
+/// * Operator runs `iclaw users grant <id> admin` or `owner` → allow.
+/// * Database read errors → deny (fail-closed).
+///
+/// The check consults the database on every call so role revocations
+/// take effect immediately; a stale cache would extend privilege past
+/// the operator's intent.
+pub fn users_table_check(central: CentralDb) -> CreateAgentPermissionCheck {
+    Arc::new(move |ctx: &CreateAgentPermissionCtx| {
+        // Global owner/admin: grants the privilege for every parent.
+        let has_global = matches!(
+            user_roles::list_for_scope(&central, None, user_roles::Role::Owner),
+            Ok(v) if !v.is_empty()
+        ) || matches!(
+            user_roles::list_for_scope(&central, None, user_roles::Role::Admin),
+            Ok(v) if !v.is_empty()
+        );
+        if has_global {
+            return true;
+        }
+        // Group-scoped owner/admin: grants the privilege only when the
+        // parent session resolves to that scope. Orphan calls (no
+        // parent) fall through to deny since there's nothing to scope
+        // against.
+        if let Some(parent_ag) = ctx.parent_agent_group_id {
+            let group_owner = matches!(
+                user_roles::list_for_scope(&central, Some(parent_ag), user_roles::Role::Owner),
+                Ok(v) if !v.is_empty()
+            );
+            let group_admin = matches!(
+                user_roles::list_for_scope(&central, Some(parent_ag), user_roles::Role::Admin),
+                Ok(v) if !v.is_empty()
+            );
+            if group_owner || group_admin {
+                return true;
+            }
+        }
+        false
+    })
 }
 
 #[async_trait]
@@ -319,6 +434,7 @@ impl CreateAgentPayload {
 }
 
 impl DeliveryActionHandler for CreateAgentHandler {
+    #[allow(clippy::too_many_lines)] // single linear flow; splitting hurts clarity.
     fn handle(
         &self,
         input: DeliveryActionInput,
@@ -343,14 +459,19 @@ impl DeliveryActionHandler for CreateAgentHandler {
 
         // 2. Permission gate. Denied requests are surfaced back as a system
         //    row so the parent agent can adjust its behavior.
-        if !(self.deps.permission_check)() {
+        let parent_for_check = self.resolve_parent(&input);
+        let perm_ctx = CreateAgentPermissionCtx {
+            parent_agent_group_id: parent_for_check.as_ref().map(|p| p.agent_group_id),
+            parent_session_id: parent_for_check.as_ref().map(|p| p.session_id),
+            requested_name: payload.name.clone(),
+        };
+        if !(self.deps.permission_check)(&perm_ctx) {
             warn!(
                 name = %payload.name,
                 "create_agent denied: permissions.create_agent not granted",
             );
-            let parent = self.resolve_parent(&input);
             self.write_parent_result(
-                parent.as_ref(),
+                parent_for_check.as_ref(),
                 ResultStatus::Denied,
                 None,
                 None,
@@ -359,35 +480,113 @@ impl DeliveryActionHandler for CreateAgentHandler {
             return Ok(DeliveryActionOutput::default());
         }
 
-        // 3. Nesting gate. If the request originated from an agent group that
-        //    is itself in `spawned`, refuse — max depth is 1 to prevent agent
-        //    fork-bombs.
-        let parent_session = self.resolve_parent(&input);
-        if let Some(parent) = &parent_session {
-            let nested = {
-                let s = self.deps.spawned.lock().unwrap();
-                s.contains(&parent.agent_group_id)
-            };
-            if nested {
+        // 3. Nesting gate (soft check). Compute the depth a new child
+        //    would land at: parent's recorded depth + 1, or 1 when the
+        //    parent isn't a previously-spawned agent. Reject up-front
+        //    when the cap is already obviously exceeded so we skip the
+        //    DB writes. The authoritative re-check happens under the
+        //    `spawned` lock at insert time (step 4) to close the
+        //    TOCTOU race between concurrent calls from the same
+        //    parent. Parent depth is read from the central DB so the
+        //    gate survives host restarts; the in-memory cache is a
+        //    write-through accelerator.
+        let parent_session = parent_for_check;
+        let parent_depth = self.lookup_parent_depth(parent_session.as_ref());
+        let Some(new_depth) = parent_depth.unwrap_or(0).checked_add(1) else {
+            warn!(
+                parent_agent_group = ?parent_session.as_ref().map(|p| p.agent_group_id.as_uuid()),
+                parent_depth = parent_depth.unwrap_or(0),
+                max_depth = self.deps.max_depth,
+                name = %payload.name,
+                "create_agent rejected: parent depth at u8::MAX, child would overflow",
+            );
+            self.write_parent_result(
+                parent_session.as_ref(),
+                ResultStatus::Rejected,
+                None,
+                None,
+                Some("nested create_agent (parent depth saturated)"),
+            );
+            return Ok(DeliveryActionOutput::default());
+        };
+        if new_depth > self.deps.max_depth {
+            warn!(
+                parent_agent_group = ?parent_session.as_ref().map(|p| p.agent_group_id.as_uuid()),
+                parent_depth = parent_depth.unwrap_or(0),
+                max_depth = self.deps.max_depth,
+                name = %payload.name,
+                "create_agent rejected: would exceed subagent depth cap",
+            );
+            self.write_parent_result(
+                parent_session.as_ref(),
+                ResultStatus::Rejected,
+                None,
+                None,
+                Some(&format!(
+                    "nested create_agent (max depth = {})",
+                    self.deps.max_depth
+                )),
+            );
+            return Ok(DeliveryActionOutput::default());
+        }
+
+        // 4. Hard depth gate, re-checked under the `spawned` lock to
+        //    close the TOCTOU window: two concurrent calls from the
+        //    same parent both observe step-3's soft check passing,
+        //    both compute new_depth=N+1, both try to insert. We
+        //    re-read the parent's depth here while holding the lock
+        //    and bail if a concurrent winner has already pushed the
+        //    parent deeper. The lock guards only the in-memory cache,
+        //    so it isn't held across the DB writes that follow.
+        let central = &self.deps.central;
+        {
+            let spawned = self
+                .deps
+                .spawned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let live_parent_depth = parent_session
+                .as_ref()
+                .and_then(|p| spawned.get(&p.agent_group_id).copied())
+                .or(parent_depth);
+            let Some(live_new_depth) = live_parent_depth.unwrap_or(0).checked_add(1) else {
+                drop(spawned);
                 warn!(
-                    parent_agent_group = %parent.agent_group_id.as_uuid(),
-                    name = %payload.name,
-                    "create_agent rejected: parent was itself spawned",
+                    parent_depth = live_parent_depth.unwrap_or(0),
+                    "create_agent rejected on lock re-check: parent depth saturated",
                 );
                 self.write_parent_result(
-                    Some(parent),
+                    parent_session.as_ref(),
                     ResultStatus::Rejected,
                     None,
                     None,
-                    Some("nested create_agent (max depth = 1)"),
+                    Some("nested create_agent (parent depth saturated)"),
+                );
+                return Ok(DeliveryActionOutput::default());
+            };
+            if live_new_depth > self.deps.max_depth {
+                drop(spawned);
+                warn!(
+                    live_parent_depth = live_parent_depth.unwrap_or(0),
+                    max_depth = self.deps.max_depth,
+                    "create_agent rejected on lock re-check: concurrent spawn won",
+                );
+                self.write_parent_result(
+                    parent_session.as_ref(),
+                    ResultStatus::Rejected,
+                    None,
+                    None,
+                    Some(&format!(
+                        "nested create_agent (max depth = {})",
+                        self.deps.max_depth
+                    )),
                 );
                 return Ok(DeliveryActionOutput::default());
             }
         }
 
-        // 4. Central DB mutations: agent_groups → sessions → (optional)
+        // 5. Central DB mutations: agent_groups → sessions → (optional)
         //    messaging_group_agents wiring.
-        let central = &self.deps.central;
         let group = agent_groups::create(
             central,
             CreateAgentGroup {
@@ -397,6 +596,18 @@ impl DeliveryActionHandler for CreateAgentHandler {
             },
         )
         .map_err(|e| ModuleError::other("agent_to_agent", format!("agent_groups::create: {e}")))?;
+
+        // Persist the new group's nesting depth so it survives host
+        // restarts. The in-memory cache is also written so subsequent
+        // gate checks within this process hit the cache.
+        if let Err(err) = agent_groups::set_subagent_depth(central, group.id, new_depth) {
+            warn!(
+                agent_group = %group.id.as_uuid(),
+                new_depth,
+                ?err,
+                "create_agent: set_subagent_depth failed; cap will not survive restart",
+            );
+        }
 
         // The instructions are not stored as a column on `agent_groups` —
         // production hosts persist them as `container_configs` or skill
@@ -415,8 +626,11 @@ impl DeliveryActionHandler for CreateAgentHandler {
         )
         .map_err(|e| ModuleError::other("agent_to_agent", format!("sessions::create: {e}")))?;
 
-        // Track the new agent group so it can't itself spawn children.
-        self.deps.spawned.lock().unwrap().insert(group.id);
+        self.deps
+            .spawned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(group.id, new_depth);
 
         if let Some(channel) = payload.channel.as_deref() {
             if let Err(err) = self.create_wiring(group.id, channel, &payload.name) {
@@ -459,6 +673,34 @@ struct ParentSession {
 }
 
 impl CreateAgentHandler {
+    /// Read the parent's recorded subagent depth. Tries the in-memory
+    /// cache first, falls back to the persisted column. `None` means
+    /// "no parent" or "parent has no recorded depth" (depth=0 root).
+    fn lookup_parent_depth(&self, parent: Option<&ParentSession>) -> Option<u8> {
+        let parent = parent?;
+        {
+            let spawned = self
+                .deps
+                .spawned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(d) = spawned.get(&parent.agent_group_id).copied() {
+                return Some(d);
+            }
+        }
+        match agent_groups::get_subagent_depth(&self.deps.central, parent.agent_group_id) {
+            Ok(Some(d)) if d > 0 => {
+                self.deps
+                    .spawned
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(parent.agent_group_id, d);
+                Some(d)
+            }
+            _ => None,
+        }
+    }
+
     /// Find the originating session from the dispatch target's routing.
     /// Tries, in order: `agent_group_id` (only set for `MessageKind::Agent`,
     /// not normally populated for system rows), then a lookup by
@@ -984,17 +1226,24 @@ mod tests {
     }
 
     #[test]
-    fn create_agent_refuses_nesting() {
+    fn create_agent_refuses_when_max_depth_exceeded() {
+        // Default cap is DEFAULT_MAX_SUBAGENT_DEPTH (3); a parent
+        // already at depth 3 spawning would land the child at depth 4,
+        // which exceeds the cap.
         let (handler, central, tmp, parent, target) = make_handler(always_allow());
-        // Mark the parent as itself a previously-spawned agent.
-        handler.deps.spawned.lock().unwrap().insert(parent.agent_group_id);
+        handler
+            .deps
+            .spawned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(parent.agent_group_id, DEFAULT_MAX_SUBAGENT_DEPTH);
         let before = agent_groups::list(&central).unwrap().len();
         handler
             .handle(DeliveryActionInput {
                 action: "create_agent".into(),
                 payload: serde_json::json!({
-                    "name": "grandchild",
-                    "instructions": "would be 2 levels deep",
+                    "name": "great-grandchild",
+                    "instructions": "would exceed depth cap",
                 }),
                 target,
                 session_id: None,
@@ -1005,6 +1254,95 @@ mod tests {
         let results = read_inbound_create_results(tmp.path(), parent);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["create_agent_result"]["status"], "rejected");
+        // The rejection message references the current cap so the
+        // model can self-correct without guessing.
+        let detail = results[0]["create_agent_result"]["detail"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            detail.contains(&format!("max depth = {DEFAULT_MAX_SUBAGENT_DEPTH}")),
+            "expected cap mention in detail, got: {detail}"
+        );
+    }
+
+    #[test]
+    fn create_agent_allows_intermediate_depths_under_default_cap() {
+        // Parent at depth 2 (still under the default cap of 3) spawning
+        // is allowed; the new group is recorded at depth 3.
+        let (handler, central, _tmp, parent, target) = make_handler(always_allow());
+        handler
+            .deps
+            .spawned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(parent.agent_group_id, 2);
+        let before = agent_groups::list(&central).unwrap().len();
+        handler
+            .handle(DeliveryActionInput {
+                action: "create_agent".into(),
+                payload: serde_json::json!({
+                    "name": "depth-three-child",
+                    "instructions": "depth 3 is fine",
+                }),
+                target,
+                session_id: None,
+            })
+            .unwrap();
+        let after = agent_groups::list(&central).unwrap().len();
+        assert_eq!(after, before + 1, "depth-3 spawn must create the group");
+        // The new group should be tracked at depth 3 so a further spawn
+        // from it would be the one that fails.
+        let depths: Vec<u8> = handler
+            .deps
+            .spawned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .copied()
+            .collect();
+        assert!(depths.contains(&3));
+    }
+
+    #[test]
+    fn create_agent_with_max_depth_one_reproduces_historical_behaviour() {
+        // Pin `max_depth = 1` on the handler. Then a parent recorded at
+        // depth 1 spawning would land the child at depth 2 — rejected.
+        let (mut handler, central, tmp, parent, target) = make_handler(always_allow());
+        handler.deps.max_depth = 1;
+        handler
+            .deps
+            .spawned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(parent.agent_group_id, 1);
+        let before = agent_groups::list(&central).unwrap().len();
+        handler
+            .handle(DeliveryActionInput {
+                action: "create_agent".into(),
+                payload: serde_json::json!({
+                    "name": "grandchild",
+                    "instructions": "would be depth 2",
+                }),
+                target,
+                session_id: None,
+            })
+            .unwrap();
+        let after = agent_groups::list(&central).unwrap().len();
+        assert_eq!(after, before, "max_depth=1 must reject depth-2 children");
+        let results = read_inbound_create_results(tmp.path(), parent);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["create_agent_result"]["status"], "rejected");
+    }
+
+    #[test]
+    fn with_max_depth_clamps_zero_to_one() {
+        // `with_max_depth(0)` would otherwise reject every spawn; the
+        // builder clamps to 1 so the gate stays useful.
+        let central = CentralDb::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let module = CreateAgentModule::new(central, tmp.path().to_path_buf(), always_allow())
+            .with_max_depth(0);
+        assert_eq!(module.deps().max_depth, 1);
     }
 
     #[test]
@@ -1024,5 +1362,368 @@ mod tests {
         let results = read_inbound_create_results(tmp.path(), parent);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["create_agent_result"]["status"], "invalid");
+    }
+
+    /// `users_table_check` denies when the install has no roles
+    /// granted. This is the bootstrap-safe default — without it any
+    /// untrusted operator could spawn agents the moment the host
+    /// boots.
+    #[test]
+    fn users_table_check_denies_on_empty_install() {
+        use ironclaw_db::tables::users::{self, UpsertUser};
+        let central = CentralDb::open_in_memory().unwrap();
+        // Even with users present, no roles means deny.
+        users::upsert(
+            &central,
+            UpsertUser {
+                kind: "telegram".into(),
+                identity: "1".into(),
+                display_name: Some("op".into()),
+            },
+        )
+        .unwrap();
+        let check = users_table_check(central);
+        let ctx = CreateAgentPermissionCtx {
+            parent_agent_group_id: None,
+            parent_session_id: None,
+            requested_name: "x".into(),
+        };
+        assert!(!check(&ctx), "no roles granted → deny");
+    }
+
+    /// Granting global Owner opens the gate for every parent.
+    #[test]
+    fn users_table_check_allows_when_global_owner_exists() {
+        use ironclaw_db::tables::users::{self, UpsertUser};
+        let central = CentralDb::open_in_memory().unwrap();
+        let user = users::upsert(
+            &central,
+            UpsertUser {
+                kind: "telegram".into(),
+                identity: "1".into(),
+                display_name: Some("op".into()),
+            },
+        )
+        .unwrap();
+        user_roles::grant(&central, user.id, user_roles::Role::Owner, None, None).unwrap();
+        let check = users_table_check(central);
+        let ctx = CreateAgentPermissionCtx {
+            parent_agent_group_id: Some(AgentGroupId::new()),
+            parent_session_id: None,
+            requested_name: "x".into(),
+        };
+        assert!(check(&ctx), "global Owner → allow");
+    }
+
+    /// Group-scoped Admin opens the gate only for that scope.
+    #[test]
+    fn users_table_check_allows_only_for_scoped_admin_when_no_global() {
+        use ironclaw_db::tables::users::{self, UpsertUser};
+        let central = CentralDb::open_in_memory().unwrap();
+        let user = users::upsert(
+            &central,
+            UpsertUser {
+                kind: "telegram".into(),
+                identity: "2".into(),
+                display_name: Some("scoped-op".into()),
+            },
+        )
+        .unwrap();
+        let scoped_group = agent_groups::create(
+            &central,
+            CreateAgentGroup {
+                name: "scoped".into(),
+                folder: "scoped".into(),
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        let scoped_ag = scoped_group.id;
+        user_roles::grant(
+            &central,
+            user.id,
+            user_roles::Role::Admin,
+            Some(scoped_ag),
+            None,
+        )
+        .unwrap();
+        let check = users_table_check(central);
+        // In-scope: allow.
+        let in_scope = CreateAgentPermissionCtx {
+            parent_agent_group_id: Some(scoped_ag),
+            parent_session_id: None,
+            requested_name: "x".into(),
+        };
+        assert!(check(&in_scope), "scoped Admin within own group → allow");
+        // Out-of-scope: deny.
+        let out_of_scope = CreateAgentPermissionCtx {
+            parent_agent_group_id: Some(AgentGroupId::new()),
+            parent_session_id: None,
+            requested_name: "x".into(),
+        };
+        assert!(
+            !check(&out_of_scope),
+            "scoped Admin must not leak to other groups"
+        );
+        // Orphan parent (no scope to match): deny.
+        let orphan = CreateAgentPermissionCtx {
+            parent_agent_group_id: None,
+            parent_session_id: None,
+            requested_name: "x".into(),
+        };
+        assert!(!check(&orphan), "no parent scope → cannot match scoped grant");
+    }
+
+    // -----------------------------------------------------------------------
+    // Code-review fixes — depth-cap TOCTOU, restart persistence,
+    // saturation, poison handling, orphan-warn.
+    // -----------------------------------------------------------------------
+
+    /// Finding 4 (TOCTOU): cap is re-checked under the `spawned` lock.
+    #[test]
+    fn create_agent_depth_recheck_under_lock_catches_concurrent_winner() {
+        let (mut handler, central, tmp, parent, target) = make_handler(always_allow());
+        handler.deps.max_depth = 2;
+        // Soft check sees parent at depth 1 -> new_depth = 2 -> allowed.
+        handler
+            .deps
+            .spawned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(parent.agent_group_id, 1);
+        // Simulate a concurrent winner: persist parent at depth 2 in
+        // the DB. The hard re-check pulls from the cache first, so we
+        // mutate the cache too. We can't actually race threads here,
+        // so we model the cache-state the loser would observe at lock
+        // acquire time.
+        agent_groups::set_subagent_depth(&central, parent.agent_group_id, 2).unwrap();
+        handler
+            .deps
+            .spawned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(parent.agent_group_id, 2);
+
+        let before = agent_groups::list(&central).unwrap().len();
+        handler
+            .handle(DeliveryActionInput {
+                action: "create_agent".into(),
+                payload: serde_json::json!({
+                    "name": "loser",
+                    "instructions": "raced for the slot",
+                }),
+                target,
+                session_id: None,
+            })
+            .unwrap();
+        let after = agent_groups::list(&central).unwrap().len();
+        assert_eq!(
+            after, before,
+            "racing loser must not create rows once cache shows the winner"
+        );
+        let results = read_inbound_create_results(tmp.path(), parent);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["create_agent_result"]["status"], "rejected");
+    }
+
+    /// Finding 5 (persistence): depth cap survives module reconstruction.
+    #[test]
+    fn depth_cap_survives_module_reconstruction() {
+        let (handler, central, tmp, parent, target) = make_handler(always_allow());
+        // Persist parent at the cap directly via the DB (no cache).
+        agent_groups::set_subagent_depth(
+            &central,
+            parent.agent_group_id,
+            DEFAULT_MAX_SUBAGENT_DEPTH,
+        )
+        .unwrap();
+
+        // "Restart": new module, fresh in-memory cache.
+        let module = CreateAgentModule::new(
+            central.clone(),
+            tmp.path().to_path_buf(),
+            always_allow(),
+        );
+        let fresh = CreateAgentHandler {
+            deps: module.deps().clone(),
+        };
+        assert!(
+            fresh
+                .deps
+                .spawned
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "freshly constructed handler must start with empty cache",
+        );
+        let _ = handler; // silence unused warning; kept for setup symmetry.
+
+        let before = agent_groups::list(&central).unwrap().len();
+        fresh
+            .handle(DeliveryActionInput {
+                action: "create_agent".into(),
+                payload: serde_json::json!({
+                    "name": "post-restart-child",
+                    "instructions": "must be rejected",
+                }),
+                target,
+                session_id: None,
+            })
+            .unwrap();
+        let after = agent_groups::list(&central).unwrap().len();
+        assert_eq!(
+            after, before,
+            "persisted parent depth must still gate after restart",
+        );
+        let results = read_inbound_create_results(tmp.path(), parent);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["create_agent_result"]["status"], "rejected");
+    }
+
+    /// Finding 9 (saturation): `with_max_depth` clamps at the ceiling.
+    #[test]
+    fn with_max_depth_clamps_above_ceiling() {
+        let central = CentralDb::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let module = CreateAgentModule::new(central, tmp.path().to_path_buf(), always_allow())
+            .with_max_depth(u8::MAX);
+        assert_eq!(module.deps().max_depth, MAX_SUBAGENT_DEPTH_CEILING);
+    }
+
+    /// Finding 9 (saturation): boundary check at `max_depth` rejects.
+    #[test]
+    fn create_agent_rejects_at_max_depth_boundary() {
+        let (mut handler, central, tmp, parent, target) = make_handler(always_allow());
+        handler.deps.max_depth = MAX_SUBAGENT_DEPTH_CEILING;
+        handler
+            .deps
+            .spawned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(parent.agent_group_id, MAX_SUBAGENT_DEPTH_CEILING);
+        let before = agent_groups::list(&central).unwrap().len();
+        handler
+            .handle(DeliveryActionInput {
+                action: "create_agent".into(),
+                payload: serde_json::json!({
+                    "name": "boundary-child",
+                    "instructions": "at the cap, child would exceed",
+                }),
+                target,
+                session_id: None,
+            })
+            .unwrap();
+        let after = agent_groups::list(&central).unwrap().len();
+        assert_eq!(after, before);
+        let results = read_inbound_create_results(tmp.path(), parent);
+        assert_eq!(results[0]["create_agent_result"]["status"], "rejected");
+    }
+
+    /// Finding 9 (saturation): `checked_add` rejection at `u8::MAX` parent.
+    #[test]
+    fn create_agent_rejects_when_checked_add_overflows() {
+        let (mut handler, central, tmp, parent, target) = make_handler(always_allow());
+        handler.deps.max_depth = u8::MAX;
+        handler
+            .deps
+            .spawned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(parent.agent_group_id, u8::MAX);
+        let before = agent_groups::list(&central).unwrap().len();
+        handler
+            .handle(DeliveryActionInput {
+                action: "create_agent".into(),
+                payload: serde_json::json!({
+                    "name": "would-saturate",
+                    "instructions": "parent at u8::MAX",
+                }),
+                target,
+                session_id: None,
+            })
+            .unwrap();
+        let after = agent_groups::list(&central).unwrap().len();
+        assert_eq!(after, before, "saturated-parent spawn must be rejected");
+        let results = read_inbound_create_results(tmp.path(), parent);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["create_agent_result"]["status"], "rejected");
+        let detail = results[0]["create_agent_result"]["detail"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            detail.contains("saturated"),
+            "expected saturation explanation, got: {detail}"
+        );
+    }
+
+    /// Finding 12 (orphan-warn): orphan depth-cap rejection still emits a warn.
+    #[test]
+    fn orphan_depth_cap_rejection_emits_warn() {
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct CaptureWriter(Arc<StdMutex<Vec<u8>>>);
+        impl std::io::Write for CaptureWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for CaptureWriter {
+            type Writer = CaptureWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf: Arc<StdMutex<Vec<u8>>> = Arc::new(StdMutex::new(Vec::new()));
+        let writer = CaptureWriter(buf.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(writer)
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        // Pin max_depth=0 + unresolvable target so the orphan branch
+        // of the depth gate fires.
+        let (mut handler, _central, _tmp, _parent, _target) = make_handler(always_allow());
+        handler.deps.max_depth = 0;
+        let orphan_target = DispatchTarget::channel(
+            ChannelType::new("nonexistent"),
+            "no-such-platform".into(),
+            None,
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            handler
+                .handle(DeliveryActionInput {
+                    action: "create_agent".into(),
+                    payload: serde_json::json!({
+                        "name": "orphan",
+                        "instructions": "no parent resolvable",
+                    }),
+                    target: orphan_target,
+                    session_id: None,
+                })
+                .unwrap();
+        });
+
+        let captured = String::from_utf8(
+            buf.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .expect("captured warn output is utf-8");
+        assert!(
+            captured.contains("create_agent rejected"),
+            "expected a warn line on orphan depth-cap rejection, got: {captured}",
+        );
     }
 }

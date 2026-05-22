@@ -6,6 +6,344 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (container_manager.rs — seven code-review findings)
+
+- **`crates/ironclaw-host/src/container_manager.rs`** (runner_config_for)
+  — Finding 1: switching `IRONCLAW_SKILLS_MODE` from `callable` to
+  `inline` between spawns no longer leaves a stale `skills.json` on
+  disk for `load_skill` to read.
+- **`crates/ironclaw-host/src/container_manager.rs`** (runner_config_for)
+  — Finding 2: when the Callable-mode catalogue write fails, the
+  prompt now falls back to Inline shape so the agent never sees a
+  `load_skill` advert pointing at a missing file.
+- **`crates/ironclaw-host/src/container_manager.rs`** (select_callable_skills,
+  render_callable_skill_index) — Finding 3: new helper is the single
+  source of truth shared by the in-prompt index and the on-disk
+  catalogue, so the two cannot disagree about which skills exist.
+- **`crates/ironclaw-host/src/container_manager.rs`** (build_spec memory
+  mount) — Finding 7: when the per-group memory dir can't be created,
+  a session-local `memory/UNAVAILABLE.md` marker is dropped so the
+  agent inside the container learns its writes won't persist.
+- **`crates/ironclaw-host/src/container_manager.rs`** (set_memory_dir_perms)
+  — Finding 8: per-group memory dir is relaxed to `0o775` after
+  creation so the operator can `rm` files the container's root user
+  wrote into the bind without sudo.
+- **`crates/ironclaw-host/src/container_manager.rs`** (read_project_briefing)
+  — Finding 11: non-`NotFound` errors reading `IRONCLAW.md` now surface
+  as a `Briefing diagnostics` section in the assembled prompt, so the
+  agent can mention the failure if asked.
+- **`crates/ironclaw-host/src/container_manager.rs`** (build_skill_system_prompt,
+  render_callable_skill_index) — Finding 13a: `skill.name` is now
+  passed through `escape_attr` symmetrically with `skill.description`
+  at both call sites; defence in depth against an unescaped `&` or `"`.
+
+### Fixed (`create_agent` depth-cap correctness, persistence, poison handling)
+
+- **`crates/ironclaw-modules/src/agent_to_agent.rs`** (~L475/~L536) —
+  Finding 4: closed the TOCTOU race where two concurrent
+  `create_agent` calls from the same parent could both pass the cap
+  check and double-spawn at depth N+1. Hard cap is now re-checked
+  under the `spawned` lock just before the cache insert.
+- **`crates/ironclaw-modules/src/agent_to_agent.rs`** + new
+  **`crates/ironclaw-db/migrations/011_agent_group_subagent_depth.sql`**
+  — Finding 5: in-memory depth map reset on host restart, letting a
+  depth-3 grandchild re-spawn fresh depth-1 children. Added
+  `agent_groups.subagent_depth`; gate reads from DB on cache miss,
+  writes through to DB on success.
+- **`crates/ironclaw-modules/src/agent_to_agent.rs`** (~L478) —
+  Finding 9: replaced `saturating_add(1)` with `checked_add(1)` so a
+  parent at `u8::MAX` cannot keep passing the gate. Added a
+  `MAX_SUBAGENT_DEPTH_CEILING = 16` clamp in `with_max_depth`.
+- **`crates/ironclaw-modules/src/agent_to_agent.rs`** (~L475/~L536) —
+  Finding 10: replaced inconsistent `.lock().unwrap()` on the
+  `spawned` Mutex with `.lock().unwrap_or_else(std::sync::PoisonError::into_inner)`
+  to match the workspace convention.
+- **`crates/ironclaw-modules/src/agent_to_agent.rs`** (~L481) —
+  Finding 12: orphan rejection path (depth-cap exceeded with no
+  resolvable parent) previously returned silently. `warn!` is now
+  unconditional so the failure is always auditable.
+
+### Fixed (todo store: atomic writes + recovery from a corrupt file)
+
+- **`crates/ironclaw-mcp/src/tools/todo.rs`** (`read_all` / `write_all`,
+  ~line 102 onward) — `write_all` now writes to a sibling `<path>.tmp`
+  and `rename`s into place, so a runner panic or SIGKILL mid-write
+  leaves either the old or new file intact instead of a truncated
+  half. `read_all` no longer hard-errors on a malformed file: it logs
+  a warning, quarantines the file as `<path>.corrupt-<unix-nanos>`,
+  and returns an empty store so the next mutator starts fresh. Four
+  new tests cover the atomic-rename, quarantine, truncated-JSON, and
+  add-after-recovery paths.
+
+### Fixed (load_skill rendering + server test brittleness)
+
+- **`crates/ironclaw-mcp/src/tools/load_skill.rs`** (render at ~L180,
+  empty-catalogue branch at ~L150) and
+  **`crates/ironclaw-mcp/src/server.rs`** (`lists_all_in_process_tools`
+  test at ~L163) — extracted an `escape_attr` helper so the rendered
+  `<skill name="...">` attribute is entity-encoded symmetrically with
+  `description`; added a fast path that returns a clear "catalogue is
+  empty" validation error instead of the misleading `(known: )` tail;
+  replaced the brittle tail-name assertion with an equality check
+  against `build_tool_set()`'s exact name sequence. Two new tests.
+
+### Changed (subagent depth cap raised from 1 to configurable, default 3)
+
+- **`crates/ironclaw-modules/src/agent_to_agent.rs`** — `create_agent`'s
+  nesting gate now tracks per-group *depth* rather than a binary
+  spawned-or-not flag. `HandlerDeps.spawned` is now
+  `HashMap<AgentGroupId, u8>` and the gate computes the new child's
+  depth as `parent_depth + 1`, rejecting when that would exceed the
+  configured cap. New const `DEFAULT_MAX_SUBAGENT_DEPTH = 3` permits
+  layered investigations (A delegates to B which delegates to C)
+  without permitting unbounded fork-bombs. New `with_max_depth(u8)`
+  builder on `CreateAgentModule` clamps values < 1 to 1. Three updated
+  tests (depth-cap rejection at the new cap, intermediate-depth
+  acceptance, historical depth=1 behaviour reproducible via
+  `with_max_depth(1)`), plus a clamp test.
+
+### Added (opt-in coding skill bundle)
+
+- **`skills/coding-task/SKILL.md`** — disciplines for editing files,
+  running tests, deciding when to comment, when to stop. The Ironclaw
+  analog of Claude Code's "doing tasks" section, scoped to coding work.
+- **`skills/git-commit/SKILL.md`** — staging, commit-message style, and
+  the things to never do (amend pushed commits, `--no-verify`, force-
+  push, `reset --hard` over uncommitted work).
+- **`skills/code-review/SKILL.md`** — reading a diff, what to flag,
+  what to ignore, how to summarise. Built on top of the existing
+  `git_diff` tool.
+- **`skills/testing/SKILL.md`** — finding the suite, interpreting
+  failures, deciding when to add a test and when not to.
+
+These are pure markdown files — they activate only when an operator
+explicitly selects them via `SkillsSelector::Explicit(...)` on a
+group's `container_config.skills`. The default messaging agent's
+prompt is unchanged.
+
+### Added (per-agent-group persistent memory mount)
+
+- **`crates/ironclaw-host/src/container_manager.rs`** — `build_spec`
+  now adds a second bind mount at `/data/memory/` backed by
+  `<groups_dir>/<agent_group_id>/memory/` (created lazily). The mount
+  is shared across every session of the same agent group, so memory
+  files an agent writes in one chat are visible in the next. Disabled
+  when `groups_dir` is unset. Two tests pin the present / absent
+  cases.
+- **`skills/agent-memory/SKILL.md`** — the auto-memory protocol from
+  Claude Code adapted for Ironclaw: four entry types (user, feedback,
+  project, reference), a `MEMORY.md` index, kebab-case slugs, and
+  `[[name]]` cross-links. Agents read/write via the existing
+  `read_file` / `write_file` tools — no new tool. Universal: every
+  agent benefits from being able to remember the user across
+  conversations.
+
+### Added (todo tracker: per-session self-planning scratchpad)
+
+- **`crates/ironclaw-mcp/src/tools/todo.rs`** — four new MCP tools
+  (`todo_add`, `todo_list`, `todo_update`, `todo_delete`) backed by
+  `/data/agent_todos.json` in the session dir. Universal (not coding-
+  specific) — any agent juggling multi-step work can use the scratchpad
+  to remember which steps are done, in-progress, or still pending.
+  Items survive runner restarts within the same session but never bleed
+  across sessions. Ten unit tests cover happy path, monotonic ids,
+  empty-text/unknown-id validation, status transitions, and the
+  unused-id error message shape.
+- **`skills/todo-tracker/SKILL.md`** — documents the convention: one
+  item per step, only one `in_progress` at a time, mark `completed`
+  immediately, delete dead items rather than carrying them forward.
+  Explicitly *not* a user-facing reminder system (that's `schedule_task`).
+
+### Added (callable skills loader: index in prompt, bodies on demand)
+
+- **`crates/ironclaw-host/src/container_manager.rs`** — new
+  `SkillsMode` enum (`Inline` | `Callable`) on `ManagerConfig`.
+  `Inline` (default) preserves today's behaviour — every selected
+  skill's full SKILL.md body is dumped into the system prompt at spawn
+  time. `Callable` emits only a compact `<skill name=… description=… />`
+  index in the prompt and writes a per-session `skills.json` (one
+  `{name, description, body}` per selected skill) next to `runner.json`.
+- **`crates/ironclaw-host/src/config.rs`** — `HostConfig.skills_mode`
+  parsed from `IRONCLAW_SKILLS_MODE`. Unknown values fall back to
+  `Inline` with a `WARN` so a typo never silently mutes skills.
+- **`crates/ironclaw-mcp/src/tools/load_skill.rs`** — new `load_skill`
+  MCP tool. Reads `/data/skills.json` and returns the named skill's
+  body wrapped in the same `<skill>` envelope the inline-mode prompt
+  uses, so the agent's experience is consistent across modes. Errors
+  with an explanatory message when the catalogue is absent (i.e. the
+  host is in inline mode and the bodies are already in the prompt).
+- New tests:
+  - 9 unit tests in `load_skill.rs` covering happy-path body
+    retrieval, name-not-found errors with a known-skills hint, missing
+    catalogue, malformed JSON, empty-name validation, description
+    escaping.
+  - 3 new manager-level tests pinning the callable-mode prompt shape,
+    `skills.json` contents, the inline-mode no-write guarantee, and
+    stale-catalogue cleanup when no skills are selected.
+  - 3 config tests for `IRONCLAW_SKILLS_MODE` default / parse / unknown.
+- **Workspace tool inventory test** in `crates/ironclaw-mcp/src/server.rs`
+  updated to expect `load_skill` as the new tail of the tool list.
+
+### Added (universal system prompt: preamble, environment, project briefing)
+
+- **`crates/ironclaw-host/src/container_manager.rs`** — every agent now
+  receives a structured system prompt with three new sections prepended
+  to the existing skill catalogue:
+  1. A mode-agnostic `BASE_PREAMBLE` that establishes Ironclaw-agent
+     identity, planning discipline, reversibility-aware action-taking,
+     tool-selection preferences, and reply conciseness (incl. no-emojis).
+     The text is deliberately *not* coding-specific so it applies to
+     messaging, support, and any other workload equally.
+  2. An `environment_block` carrying today's date, the session id, the
+     agent-group id, the in-container working directory, and the
+     assistant's display name when set.
+  3. An optional project briefing read from `IRONCLAW.md`. Two sources
+     are checked, both optional: `<groups_dir>/<id>/IRONCLAW.md` (per-
+     group) and `<session_root>/IRONCLAW.md` (per-session). When both
+     exist the group briefing precedes the session briefing.
+- **`runner_config_for`** now accepts an optional `session_root` and
+  delegates prompt assembly to a new top-level `assemble_system_prompt`
+  that stitches preamble → environment → briefing → skills.
+- 13 new unit tests pin the preamble/env/briefing structure, ordering,
+  empty-briefing behaviour, and the assistant-name codepath. The
+  existing `runner_config_uses_skill_dir_when_configured` test now also
+  asserts the preamble appears so a regression that strips it would
+  surface immediately.
+
+### Added (runner provider factory: native Ollama wiring)
+
+- **`crates/ironclaw-runner/src/main.rs`** — replaced the hard-coded
+  `AnthropicProvider::new(api_key)` with a `build_provider(&cfg, &env)`
+  dispatch on `cfg.provider`. Recognises `"anthropic"` (default),
+  `"ollama"` (native `/api/chat` NDJSON via `OllamaProvider::new`),
+  `"ollama-shim"` (legacy Anthropic-shaped proxy via
+  `OllamaProvider::shim`). Ollama paths read `OLLAMA_BASE_URL` from
+  the container env (defaults to `http://localhost:11434`).
+- **`crates/ironclaw-runner/src/config.rs`** — new `provider` field on
+  `RunnerConfigFile` / `RunnerConfig` with `"claude"` alias for
+  `"anthropic"` and a graceful fallback when the value is unknown.
+  Five new unit tests pin the alias / fallback semantics.
+- **`crates/ironclaw-host/src/container_manager.rs`** — the host's
+  `runner_config_for` now emits `provider`, `api_key_env`, and
+  `api_base_url` consistent with the chosen provider (Ollama native
+  doesn't get `ANTHROPIC_API_KEY` injected; the rotatable
+  `anthropic_base_url` doesn't leak into an Ollama runner). Two new
+  meta-tests pin the per-provider config shape.
+- **Forwarded env**: `OLLAMA_BASE_URL` joins the rotatable set so
+  operators can configure it via the host `.env` and rotate via
+  SIGHUP without restarting.
+
+### Fixed (CreateAgent permission gate replaces always-allow)
+
+- **`crates/ironclaw-modules/src/agent_to_agent.rs`** — type signature
+  of `CreateAgentPermissionCheck` changed from `Fn() -> bool` to
+  `Fn(&CreateAgentPermissionCtx) -> bool` so the check sees the
+  parent's agent-group id, session id, and requested name. New
+  `users_table_check(CentralDb)` factory denies by default and allows
+  when (a) any user has been granted global `Role::Owner`/`Admin` in
+  `user_roles`, or (b) the parent's scope has a granted Owner/Admin.
+  DB read errors fail closed. Three new unit tests pin the deny /
+  global-allow / scoped-allow paths.
+- **`crates/ironclaw-host/src/boot.rs`** — `install_modules` now wires
+  `create_agent_users_table_check(central)` in place of the
+  `always_allow()` stub used during initial integration. A fresh
+  install with no role grants denies every `create_agent` call until
+  the operator grants Owner/Admin.
+
+### Changed (skill body cap tightened to 4 KiB)
+
+- **`crates/ironclaw-skills/tests/coverage.rs`** — `MAX_SKILL_BODY_BYTES`
+  drops from 8 KiB to 4 KiB after a prose-cull pass on the nine
+  previously-oversize skills (`explore`, `web-search`, `add-mcp-server`,
+  `git`, `error-handling`, `web-fetch`, `messaging-context`,
+  `customize`, `install-packages`). Adding back content that pushes a
+  skill over the cap now means trimming elsewhere in that file, not
+  raising the constant. All skills are under the new ceiling; the
+  `skill_bodies_under_size_cap` test continues to pin it.
+
+### Fixed (iMessage empty-body silent drop)
+
+- **`crates/ironclaw-channels/imessage/src/adapter.rs`** — the
+  `deliver` path used to return `Ok(None)` when the outbound message
+  carried no text and no files, which the host's delivery loop
+  interpreted as delivered-ok. Replaced with
+  `Err(BadRequest("imessage deliver: empty body (no text, no files)"))`
+  so the row lands in `dropped_messages` with a visible reason. The
+  prior `deliver_empty_text_is_a_noop_when_no_files` test was renamed
+  to `deliver_empty_body_is_bad_request_not_silent_drop` and now
+  asserts the failure path.
+
+### Added (Mattermost file uploads — two-step `/api/v4/files` + `posts.file_ids`)
+
+- **`crates/ironclaw-channels/mattermost/src/api.rs`** — new
+  `upload_file(channel_id, filename, bytes)` (multipart against
+  `/api/v4/files`, returns the file id) and
+  `create_post_with_files(...)` (POST `/api/v4/posts` with `file_ids`).
+  `create_post` is now a thin wrapper.
+- **`crates/ironclaw-channels/mattermost/src/adapter.rs`** — the
+  `post` action now uploads files into the destination channel and
+  attaches their ids on the message. Edit / reaction actions
+  reject files with `BadRequest`. Three new tests cover the upload
+  flow, the bad-request shape, and the empty `file_infos` path.
+
+### Added (Teams + Google Chat attachments)
+
+- **`crates/ironclaw-channels/teams/src/api.rs`** — `get_channel_files_folder`
+  resolves the channel's SharePoint drive + folder ids;
+  `upload_channel_file` PUTs bytes to
+  `/drives/{drive}/items/{item}:/{filename}:/content`;
+  `post_channel_message_with_attachments` includes the references on
+  the new message and inlines `<attachment id="…">` markers in the
+  HTML body. Chat (1:1 / group) attachments are explicitly rejected
+  with `Unsupported` because Graph DM file upload requires delegated
+  user-OneDrive auth that the bot's app-only token cannot reach. New
+  unit tests cover both the happy-path channel upload and the chat
+  rejection.
+- **`crates/ironclaw-channels/gchat/src/api.rs`** — new
+  `upload_attachment(space, filename, bytes)` (multipart against
+  `/upload/v1/spaces/{space}/attachments:upload`, returns the
+  `attachmentDataRef.resourceName`) and `send_text_with_attachments`
+  (POSTs the message with `attachment[]` containing those names).
+  Cards / edits / reactions reject files with `BadRequest`. The
+  threaded-reply + attachments combination falls back to a top-level
+  post with a `WARN` log because Chat's `messageReplyOption` doesn't
+  accept attachments.
+
+### Added (Signal daemon respawn)
+
+- **`crates/ironclaw-channels/signal/src/rpc.rs`** — new
+  `SignalSupervisor` wraps `Arc<JsonRpcClient>` behind a poll-based
+  watchdog. When the underlying `signal-cli daemon` exits (writer or
+  reader task finishes), the supervisor respawns the process with
+  exponential backoff (500 ms → 30 s ceiling) and forwards
+  notifications from each successive child through a shared mpsc so
+  the adapter's notification loop sees the respawn as transparent.
+  Adapter-facing trait surface (`RpcTransport`) is unchanged.
+- **`crates/ironclaw-channels/signal/src/factory.rs`** — `init` now
+  builds a `SignalSupervisor` instead of a bare `JsonRpcClient`.
+
+### Added (Webex sha256 webhook signature with `SignatureAlgo::Auto`)
+
+- **`crates/ironclaw-channels/webex/src/signature.rs`** — new
+  `SignatureAlgo::Auto` variant. When configured, the verifier picks
+  the concrete algorithm from the incoming signature's hex length
+  (40 → sha1, 64 → sha256) before constant-time comparing. Lets
+  operators on the Webex sha256 rollout configure `webhook_algo:
+  "auto"` and survive the upstream transition without re-configuring.
+  `compute_signature` with `Auto` panics (verifier-only).
+
+### Added (X v2 media upload, opt-in)
+
+- **`crates/ironclaw-channels/x/src/api.rs`** — `upload_media_v2`
+  posts a multipart upload to `{api_base}/2/media/upload` and reads
+  the media id from `data.id` (with a tolerant fallback to the
+  top-level `media_id_string` shape some early v2 responses used).
+- **`crates/ironclaw-channels/x/src/config.rs`** — new
+  `media_api_version` field (`"v1"` default; `"v2"` opts in to the
+  new endpoint). `XConfig::from_value` parses `v1`/`v2` (with
+  `1`/`2`/`1.1` aliases) case-insensitively. `XAdapter::upload_files`
+  dispatches on the configured version.
+
 ### Fixed (boot: install CreateAgentModule so create_agent action is no longer inert)
 
 - **`crates/ironclaw-host/src/boot.rs`** — `install_modules` now constructs
@@ -20,9 +358,9 @@ adheres to [Semantic Versioning](https://semver.org/).
   updated to mirror the production module list. Production and test
   module lists are now in lock-step; the test will fail loudly if
   either drifts.
-- **TODO**: `create_agent_always_allow()` is the wrong permission gate
-  for production. A `users`-table role lookup should replace it before
-  the tool is reachable from untrusted operators.
+- Follow-up (now landed): the `always_allow()` stub has been replaced
+  with `create_agent_users_table_check(central)`. See the
+  "CreateAgent permission gate replaces always-allow" entry above.
 
 ### Added (Test (structural): every runner-emitted action has a handler)
 

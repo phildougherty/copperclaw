@@ -124,6 +124,18 @@ impl ChannelAdapter for IMessageAdapter {
             .unwrap_or("")
             .to_owned();
 
+        // Reject empty bodies up front. Letting them through silently
+        // produced the "agent thought it sent, user saw nothing" bug
+        // class — there is no AppleScript invocation to make, so the
+        // host's delivery loop would mark the row delivered=ok with no
+        // platform side effect. A BadRequest surfaces to
+        // `dropped_messages` with an explanatory reason instead.
+        if text.is_empty() && message.files.is_empty() {
+            return Err(AdapterError::BadRequest(
+                "imessage deliver: empty body (no text, no files)".into(),
+            ));
+        }
+
         // Send the text body first (if any).
         if !text.is_empty() {
             let script = render_text_script(&self.config.service_name, &target, &text)?;
@@ -142,11 +154,6 @@ impl ChannelAdapter for IMessageAdapter {
             }
         }
 
-        if text.is_empty() && message.files.is_empty() {
-            // Nothing to do — but the host shouldn't have called us with an
-            // empty body. Treat it as a no-op rather than an error.
-            return Ok(None);
-        }
         Ok(None)
     }
 
@@ -494,7 +501,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_empty_text_is_a_noop_when_no_files() {
+    async fn deliver_empty_body_is_bad_request_not_silent_drop() {
+        // Regression: the original implementation returned Ok(None)
+        // here, which the host's delivery loop interpreted as
+        // delivered-ok. The agent thought it sent a message but the
+        // user saw nothing. Surface it as BadRequest so the row lands
+        // in `dropped_messages` with a visible reason.
         let m = Arc::new(MockBridge::always_applescript_ok(""));
         let (a, _rx, _d) = make_adapter(m.clone(), polling_off());
         let msg = OutboundMessage {
@@ -502,8 +514,11 @@ mod tests {
             content: json!({}),
             files: vec![],
         };
-        let r = a.deliver("handle:+1", None, &msg).await.unwrap();
-        assert!(r.is_none());
+        let err = a.deliver("handle:+1", None, &msg).await.unwrap_err();
+        match err {
+            AdapterError::BadRequest(s) => assert!(s.contains("empty body")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
         assert_eq!(m.applescript_call_count(), 0);
     }
 

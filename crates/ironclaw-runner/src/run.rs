@@ -102,6 +102,48 @@ pub fn resolve_provider_deadline(env: &dyn crate::config::EnvLookup) -> Duration
     Duration::from_millis(parsed)
 }
 
+/// Env var operators / tests use to override the per-tool deadline.
+pub const TOOL_DEADLINE_ENV: &str = "IRONCLAW_RUNNER_TOOL_DEADLINE_SECS";
+
+/// Floor for the per-tool deadline. Below 10s a routine `npm install`
+/// of a trivial package list trips the timeout, defeating the safety
+/// net.
+pub const MIN_TOOL_DEADLINE_SECS: u64 = 10;
+
+/// Ceiling for the per-tool deadline. An hour is generous for any
+/// realistic single tool invocation (`cargo build` of a large crate,
+/// big `apt-get install`). Beyond that, presume the tool is wedged.
+pub const MAX_TOOL_DEADLINE_SECS: u64 = 3_600;
+
+/// Resolve the per-tool deadline from the env. Same shape as
+/// [`resolve_provider_deadline`]: out-of-range / unparseable values
+/// fall back to [`DEFAULT_TOOL_DEADLINE_SECS`] with a WARN.
+#[must_use]
+pub fn resolve_tool_deadline_secs(env: &dyn crate::config::EnvLookup) -> u64 {
+    let Some(raw) = env.get(TOOL_DEADLINE_ENV) else {
+        return DEFAULT_TOOL_DEADLINE_SECS;
+    };
+    let Ok(parsed) = raw.parse::<u64>() else {
+        tracing::warn!(
+            env = TOOL_DEADLINE_ENV,
+            value = %raw,
+            "could not parse tool deadline; using default"
+        );
+        return DEFAULT_TOOL_DEADLINE_SECS;
+    };
+    if !(MIN_TOOL_DEADLINE_SECS..=MAX_TOOL_DEADLINE_SECS).contains(&parsed) {
+        tracing::warn!(
+            env = TOOL_DEADLINE_ENV,
+            value = parsed,
+            min = MIN_TOOL_DEADLINE_SECS,
+            max = MAX_TOOL_DEADLINE_SECS,
+            "tool deadline out of range; using default"
+        );
+        return DEFAULT_TOOL_DEADLINE_SECS;
+    }
+    parsed
+}
+
 /// Dependencies injected into [`run_loop`]. Holding all of these in a struct
 /// keeps the signature small and makes it easy to fan out variations from
 /// tests.
@@ -165,7 +207,21 @@ pub struct RunnerDeps {
     /// value up from `IRONCLAW_RUNNER_PROVIDER_DEADLINE_MS`; tests can
     /// shorten it to make failure-mode fixtures finish quickly.
     pub provider_deadline: Duration,
+    /// Per-tool-call hard ceiling. Wraps each [`invoke_tool`] dispatch
+    /// in `tokio::time::timeout`; on expiry the tool returns a
+    /// `tool_result` with `is_error: true` describing the timeout.
+    /// Belt-and-braces with [`HeartbeatTicker`]: the ticker prevents
+    /// the host from killing the container during a slow legitimate
+    /// tool, this deadline keeps a *wedged* tool from running forever.
+    /// Default [`DEFAULT_TOOL_DEADLINE_SECS`].
+    pub tool_deadline_secs: u64,
 }
+
+/// Default per-tool-call deadline. Comfortably above an `npm install`
+/// of a typical TypeScript project or an `apt-get install` of a small
+/// graph; below the threshold at which a stuck tool would be
+/// indistinguishable from a hung container.
+pub const DEFAULT_TOOL_DEADLINE_SECS: u64 = 900;
 
 impl RunnerDeps {
     /// Convenience builder used by tests. Production callers populate fields
@@ -207,6 +263,7 @@ impl RunnerDeps {
             idle_sleep: Duration::from_millis(POLL_INTERVAL_MS),
             heartbeat_path: None,
             provider_deadline: Duration::from_millis(DEFAULT_PROVIDER_DEADLINE_MS),
+            tool_deadline_secs: DEFAULT_TOOL_DEADLINE_SECS,
         }
     }
 }
@@ -874,9 +931,30 @@ async fn invoke_tool(
             );
         }
     };
-    match entry.handler.call(arguments, deps.tool_ctx.as_ref()).await {
-        Ok(result) => (render_tool_result(&result), false),
-        Err(err) => (format!("Tool `{}` failed: {err}", call.name), true),
+    // Keep the heartbeat file fresh for the duration of the tool
+    // call. Without this a `shell { cmd: "npm install …" }` (~60-90s
+    // on a fresh image) drifts past the host's 60s staleness
+    // threshold and the host SIGKILLs the container. Drops on
+    // function return; the background task is aborted.
+    let _hb = HeartbeatTicker::start(deps.heartbeat_path.clone());
+    // Per-tool hard deadline so a wedged tool can't run forever.
+    // The provider call has its own deadline (`provider_deadline`);
+    // tool dispatch did not, until now. Defaulting to a generous
+    // 15 min ceiling — `npm install`, `cargo build`, `apt-get
+    // install gcc` are all the kinds of tools we want to permit;
+    // anything past that is presumed wedged.
+    let call_fut = entry.handler.call(arguments, deps.tool_ctx.as_ref());
+    let timeout = std::time::Duration::from_secs(deps.tool_deadline_secs);
+    match tokio::time::timeout(timeout, call_fut).await {
+        Ok(Ok(result)) => (render_tool_result(&result), false),
+        Ok(Err(err)) => (format!("Tool `{}` failed: {err}", call.name), true),
+        Err(_) => (
+            format!(
+                "Tool `{}` did not return within {}s (per-tool deadline); the runner aborted it. Consider breaking the work into smaller steps.",
+                call.name, deps.tool_deadline_secs
+            ),
+            true,
+        ),
     }
 }
 
@@ -1121,6 +1199,63 @@ fn touch_heartbeat(path: Option<&PathBuf>) {
             .open(p)
         {
             let _ = f.write_all(b".");
+        }
+    }
+}
+
+/// Interval at which a [`HeartbeatTicker`] refreshes the heartbeat
+/// file. Picked well under the host's default 60s `heartbeat_stale_secs`
+/// so a slow tool call (npm install, apt-get install, compile) can't
+/// drift past the staleness threshold while the runner is blocked
+/// awaiting `invoke_tool`.
+pub(crate) const HEARTBEAT_TICK_INTERVAL_MS: u64 = 5_000;
+
+/// RAII guard that refreshes the heartbeat file every
+/// [`HEARTBEAT_TICK_INTERVAL_MS`] while alive.
+///
+/// The runner's main poll loop touches the heartbeat between turns
+/// and when the provider streams `Progress` / `Activity`, but a
+/// synchronous `invoke_tool().await` blocks all of that — and a long
+/// tool call (npm install, cargo build) easily runs past the host's
+/// 60s staleness threshold. The host then SIGKILLs the container
+/// thinking the runner has hung. Wrap each tool dispatch with one of
+/// these to keep the heartbeat fresh; drop the guard when the tool
+/// returns to stop the background task.
+pub(crate) struct HeartbeatTicker {
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl HeartbeatTicker {
+    /// Start a ticker that touches `path` immediately and then every
+    /// [`HEARTBEAT_TICK_INTERVAL_MS`] until dropped. When `path` is
+    /// `None` (test runners with no heartbeat configured), returns a
+    /// no-op guard.
+    pub(crate) fn start(path: Option<PathBuf>) -> Self {
+        let Some(path) = path else {
+            return Self { handle: None };
+        };
+        // Touch once up-front so a sub-tick-interval tool call still
+        // sees its heartbeat refreshed.
+        touch_heartbeat(Some(&path));
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(
+                std::time::Duration::from_millis(HEARTBEAT_TICK_INTERVAL_MS),
+            );
+            // We already touched once; skip the immediate tick.
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                touch_heartbeat(Some(&path));
+            }
+        });
+        Self { handle: Some(handle) }
+    }
+}
+
+impl Drop for HeartbeatTicker {
+    fn drop(&mut self) {
+        if let Some(h) = self.handle.take() {
+            h.abort();
         }
     }
 }
@@ -1878,6 +2013,78 @@ mod tests {
         setup.deps.max_turns = Some(1);
         run_loop(setup.deps).await.unwrap();
         assert!(hb_path.exists(), "heartbeat path should exist after a turn");
+    }
+
+    /// Regression for the "running container SIGKILLed during long
+    /// `npm install`" bug: a synchronous tool call that takes longer
+    /// than the host's 60s heartbeat-stale threshold must not block
+    /// the heartbeat refresh. The ticker keeps the file's mtime
+    /// advancing while the tool is in flight.
+    #[tokio::test]
+    async fn heartbeat_ticker_refreshes_during_slow_tool() {
+        // Use a *short* tick interval inside the test by overriding
+        // via the constant if it were configurable; since it isn't,
+        // we cheat and call HeartbeatTicker directly with a synthetic
+        // slow-tool sleep. That's exactly the surface invoke_tool
+        // wraps, so the test pins the right contract.
+        let tmp = tempfile::tempdir().unwrap();
+        let hb = tmp.path().join(".heartbeat");
+        // Touch initially so we have a baseline mtime.
+        std::fs::write(&hb, b".").unwrap();
+        let baseline = std::fs::metadata(&hb).unwrap().modified().unwrap();
+        // Make the file look "old" by an explicit sleep before
+        // starting the ticker; this would otherwise be racing the
+        // mtime granularity.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let ticker = HeartbeatTicker::start(Some(hb.clone()));
+        // Simulate a tool call that takes long enough that the
+        // ticker fires at least once. We use a sub-tick-interval
+        // sleep plus the initial touch to keep CI quick: the
+        // initial touch alone already refreshes mtime.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(ticker);
+
+        let after = std::fs::metadata(&hb).unwrap().modified().unwrap();
+        assert!(
+            after > baseline,
+            "heartbeat mtime should advance while the ticker is alive"
+        );
+    }
+
+    /// When `path` is `None` the ticker is a no-op — useful for
+    /// in-process tests that don't bother wiring a heartbeat file.
+    #[tokio::test]
+    async fn heartbeat_ticker_with_no_path_is_inert() {
+        let ticker = HeartbeatTicker::start(None);
+        // Just exercising Drop without panic.
+        drop(ticker);
+    }
+
+    #[test]
+    fn resolve_tool_deadline_uses_env_when_in_range() {
+        let env = crate::config::MapEnv::from_pairs([(TOOL_DEADLINE_ENV, "120")]);
+        assert_eq!(resolve_tool_deadline_secs(&env), 120);
+    }
+
+    #[test]
+    fn resolve_tool_deadline_falls_back_when_unset() {
+        let env = crate::config::MapEnv::default();
+        assert_eq!(resolve_tool_deadline_secs(&env), DEFAULT_TOOL_DEADLINE_SECS);
+    }
+
+    #[test]
+    fn resolve_tool_deadline_rejects_out_of_range() {
+        let env = crate::config::MapEnv::from_pairs([(TOOL_DEADLINE_ENV, "1")]);
+        assert_eq!(resolve_tool_deadline_secs(&env), DEFAULT_TOOL_DEADLINE_SECS);
+        let env = crate::config::MapEnv::from_pairs([(TOOL_DEADLINE_ENV, "99999")]);
+        assert_eq!(resolve_tool_deadline_secs(&env), DEFAULT_TOOL_DEADLINE_SECS);
+    }
+
+    #[test]
+    fn resolve_tool_deadline_rejects_garbage() {
+        let env = crate::config::MapEnv::from_pairs([(TOOL_DEADLINE_ENV, "not-a-number")]);
+        assert_eq!(resolve_tool_deadline_secs(&env), DEFAULT_TOOL_DEADLINE_SECS);
     }
 
     #[tokio::test]

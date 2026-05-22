@@ -155,16 +155,15 @@ const NON_TOOL_TOKEN_ALLOWLIST: &[&str] = &[
     "write_all",
 ];
 
-/// TODO(team-skl): The spec called for 4 KiB per skill body. Nine of the
-/// current skills (e.g. `explore`, `web-search`, `add-mcp-server`) are
-/// already 4-5.5 KiB; chopping them to fit a 4 KiB limit would gut the
-/// "when to reach for X" prose that the rest of these tests are
-/// pinning. Going with 8 KiB as the working ceiling — still small
-/// enough that the union of all skill bodies stays well under the
-/// system-prompt budget, but doesn't force a content cull right now.
-/// Revisit when someone has the bandwidth to compress the long-form
-/// skills.
-const MAX_SKILL_BODY_BYTES: u64 = 8 * 1024;
+/// Skill body cap. Every container spawn loads every skill into the
+/// system prompt; a runaway skill bloats every session uniformly. The
+/// spec called for 4 KiB; this is now enforced after a prose-cull pass
+/// across the previously-oversize skills (`explore`, `web-search`,
+/// `add-mcp-server`, `git`, `error-handling`, `web-fetch`,
+/// `messaging-context`, `customize`, `install-packages`). Adding back
+/// content that pushes a skill over the cap means trimming elsewhere
+/// in that file, not raising this number.
+const MAX_SKILL_BODY_BYTES: u64 = 4 * 1024;
 
 // -----------------------------------------------------------------------
 // Filesystem helpers

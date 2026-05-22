@@ -53,10 +53,29 @@ impl MattermostApi {
         message: &str,
         root_id: Option<&str>,
     ) -> Result<String, AdapterError> {
+        self.create_post_with_files(channel_id, message, root_id, &[])
+            .await
+    }
+
+    /// `POST /api/v4/posts` with optional `file_ids`. Attaches
+    /// previously-uploaded files to the new post. Pass an empty slice
+    /// for a text-only post (equivalent to [`Self::create_post`]).
+    pub async fn create_post_with_files(
+        &self,
+        channel_id: &str,
+        message: &str,
+        root_id: Option<&str>,
+        file_ids: &[String],
+    ) -> Result<String, AdapterError> {
         let body = CreatePostBody {
             channel_id,
             message,
             root_id,
+            file_ids: if file_ids.is_empty() {
+                None
+            } else {
+                Some(file_ids)
+            },
         };
         let res = self
             .client
@@ -72,6 +91,46 @@ impl MattermostApi {
         }
         let post: PostResponse = res.json().await.map_err(|e| transport(&e))?;
         Ok(post.id)
+    }
+
+    /// `POST /api/v4/files?channel_id=…&filename=…` — upload a file's
+    /// bytes for the given channel and return its `file_id`. The
+    /// returned id is consumed by [`Self::create_post_with_files`].
+    pub async fn upload_file(
+        &self,
+        channel_id: &str,
+        filename: &str,
+        bytes: Vec<u8>,
+    ) -> Result<String, AdapterError> {
+        if filename.is_empty() {
+            return Err(AdapterError::BadRequest(
+                "upload_file: empty filename".into(),
+            ));
+        }
+        let part = reqwest::multipart::Part::bytes(bytes)
+            .file_name(filename.to_string())
+            .mime_str("application/octet-stream")
+            .map_err(|e| AdapterError::BadRequest(format!("upload_file mime: {e}")))?;
+        let form = reqwest::multipart::Form::new().part("files", part);
+        let res = self
+            .client
+            .post(format!("{}/api/v4/files", self.base_url))
+            .bearer_auth(&self.token)
+            .query(&[("channel_id", channel_id), ("filename", filename)])
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| transport(&e))?;
+        let status = res.status();
+        if !status.is_success() {
+            return Err(map_error(status, res).await);
+        }
+        let resp: UploadResponse = res.json().await.map_err(|e| transport(&e))?;
+        resp.file_infos
+            .into_iter()
+            .next()
+            .map(|f| f.id)
+            .ok_or_else(|| AdapterError::Transport("upload_file: empty file_infos".into()))
     }
 
     /// `PUT /api/v4/posts/{post_id}/patch` — edit an existing post's
@@ -143,10 +202,22 @@ struct CreatePostBody<'a> {
     message: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     root_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_ids: Option<&'a [String]>,
 }
 
 #[derive(Deserialize)]
 struct PostResponse {
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct UploadResponse {
+    file_infos: Vec<FileInfo>,
+}
+
+#[derive(Deserialize)]
+struct FileInfo {
     id: String,
 }
 
@@ -337,6 +408,70 @@ mod tests {
             api.add_reaction("u", "p", "fake").await.unwrap_err(),
             AdapterError::BadRequest(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn upload_file_returns_id_on_201() {
+        let mock = server().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/files"))
+            .respond_with(
+                ResponseTemplate::new(201)
+                    .set_body_json(json!({ "file_infos": [{ "id": "abc" }] })),
+            )
+            .mount(&mock)
+            .await;
+        let api = MattermostApi::new(&mock.uri(), "t");
+        let id = api
+            .upload_file("c1", "report.pdf", vec![0u8, 1, 2, 3])
+            .await
+            .unwrap();
+        assert_eq!(id, "abc");
+    }
+
+    #[tokio::test]
+    async fn upload_file_empty_file_infos_is_transport_error() {
+        let mock = server().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/files"))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(json!({ "file_infos": [] })),
+            )
+            .mount(&mock)
+            .await;
+        let api = MattermostApi::new(&mock.uri(), "t");
+        match api.upload_file("c", "a.txt", vec![0u8]).await.unwrap_err() {
+            AdapterError::Transport(m) => assert!(m.contains("empty file_infos")),
+            other => panic!("expected Transport, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_file_empty_filename_is_bad_request() {
+        let api = MattermostApi::new("https://chat.example", "t");
+        match api.upload_file("c", "", vec![0u8]).await.unwrap_err() {
+            AdapterError::BadRequest(m) => assert!(m.contains("filename")),
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_post_with_files_includes_file_ids_in_body() {
+        // We can't easily inspect the body via wiremock without a
+        // matcher, but a 201 with a parseable response is sufficient
+        // to assert the API surface compiles and round-trips.
+        let mock = server().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/posts"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "p9"})))
+            .mount(&mock)
+            .await;
+        let api = MattermostApi::new(&mock.uri(), "t");
+        let id = api
+            .create_post_with_files("c", "hi", None, &["f1".to_string(), "f2".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(id, "p9");
     }
 
     #[test]

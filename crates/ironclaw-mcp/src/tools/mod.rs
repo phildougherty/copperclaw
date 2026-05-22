@@ -31,8 +31,10 @@ pub mod git_status;
 pub mod glob;
 pub mod grep;
 pub mod interactive;
+pub mod load_skill;
 pub mod scheduling;
 pub mod self_mod;
+pub mod todo;
 pub mod web_search;
 
 /// A registered tool: its schema plus a type-erased async handler.
@@ -91,6 +93,11 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         grep::entry(),
         web_search::entry(),
         explore::entry(),
+        load_skill::entry(),
+        todo::add::entry(),
+        todo::list::entry(),
+        todo::update::entry(),
+        todo::delete::entry(),
     ]
 }
 
@@ -185,6 +192,11 @@ mod tests {
             "grep",
             "web_search",
             "explore",
+            "load_skill",
+            "todo_add",
+            "todo_list",
+            "todo_update",
+            "todo_delete",
         ];
         assert_eq!(set.len(), expected.len());
         for tool in &expected {

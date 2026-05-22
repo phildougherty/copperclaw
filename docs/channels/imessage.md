@@ -13,17 +13,16 @@
 - open_dm: trait-default None.
 
 ## Gaps
-MED:
-- Empty body (no text + no files) returns `Ok(None)` silently. Should
-  be `BadRequest`. The current behavior is enshrined in
-  `deliver_empty_text_is_a_noop_when_no_files` so changing it requires
-  also updating that test (which is outside this audit's scope per
-  the "don't modify existing tests" rule).
-  `crates/ironclaw-channels/imessage/src/adapter.rs:145`
-
 LOW:
 - AppleScript escape failures map to BadRequest, which is correct, but
   the escape function rejects control chars rather than encoding them.
+
+## Fixed (was MED)
+- Empty body (no text + no files) no longer silently drops to
+  `Ok(None)`; it returns `BadRequest("imessage deliver: empty body
+  (no text, no files)")` so the host records a visible
+  `dropped_messages` row instead of marking delivered=ok. Replaced
+  test: `deliver_empty_body_is_bad_request_not_silent_drop`.
 
 ## Edge cases tested
 - [x] handle: target sends buddy_send_script
@@ -33,16 +32,16 @@ LOW:
 - [x] bad platform_id → BadRequest
 - [x] system edit / reaction / unknown → Unsupported
 - [x] auth / transport bridge errors
-- [x] empty text + no files → Ok(None) (NOTED: should be BadRequest)
+- [x] empty text + no files → BadRequest (regression-pinned)
 - [x] file writes to outgoing dir + sends POSIX file
 - [x] file with dirty filename → BadRequest
 - [x] file with empty basename → BadRequest
 - [x] two files invokes bridge twice
 
 ## Fixes in this PR
-None — the empty-body bug is documented but unfixed (would break the
-existing test).
+- Empty body returns `BadRequest` instead of `Ok(None)`. The previous
+  test was renamed to `deliver_empty_body_is_bad_request_not_silent_drop`
+  and now asserts the failure path.
 
 ## Deferred for follow-up
-- Convert empty-body to BadRequest (requires updating the existing
-  test in a follow-up PR; that's the only test that would break).
+- None.

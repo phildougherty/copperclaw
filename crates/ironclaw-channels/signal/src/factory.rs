@@ -19,7 +19,7 @@ use ironclaw_types::ChannelType;
 
 use crate::adapter::SignalAdapter;
 use crate::config::SignalConfig;
-use crate::rpc::JsonRpcClient;
+use crate::rpc::SignalSupervisor;
 
 /// Channel-type string used by this channel (`"signal"`).
 pub const CHANNEL_TYPE_STR: &str = "signal";
@@ -62,7 +62,11 @@ impl ChannelFactory for SignalFactory {
     async fn init(&self, setup: ChannelSetup) -> Result<Arc<dyn ChannelAdapter>, AdapterError> {
         let config = SignalConfig::from_value(&setup.config)?;
         let args = build_signal_cli_args(&config);
-        let transport = JsonRpcClient::spawn(&config.signal_cli_bin, &args)?;
+        // SignalSupervisor wraps a JsonRpcClient and respawns it
+        // (with exponential backoff) when the underlying signal-cli
+        // daemon dies. Inbound + outbound paths see this as a single
+        // `Arc<dyn RpcTransport>` and the respawn is transparent.
+        let transport = SignalSupervisor::spawn(&config.signal_cli_bin, &args).await?;
         let adapter =
             SignalAdapter::with_transport(transport, setup.inbound_tx, setup.data_dir).await;
         Ok(Arc::new(adapter) as Arc<dyn ChannelAdapter>)

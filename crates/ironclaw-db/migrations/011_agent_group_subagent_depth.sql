@@ -1,0 +1,12 @@
+-- Persisted nesting depth for agent groups spawned via `create_agent`.
+--
+-- The `agent_to_agent` module's depth cap was previously enforced via an
+-- in-memory `HashMap<AgentGroupId, u8>` that reset on every host restart;
+-- a grandchild at depth 3 would, after a restart, look like a fresh root
+-- and could spawn unbounded children. Persisting the depth as a column
+-- makes the gate survive restarts.
+--
+-- Default 0 means "not spawned by create_agent" — i.e. the root agent or
+-- any agent created by setup / an operator. A `create_agent`-spawned
+-- group is written with `parent_depth + 1`.
+ALTER TABLE agent_groups ADD COLUMN subagent_depth INTEGER NOT NULL DEFAULT 0;

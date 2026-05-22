@@ -13,8 +13,6 @@
 
 ## Gaps
 LOW:
-- Media upload uses the v1.1 endpoint. v2 media upload is on the
-  roadmap but not yet GA. Long-term migration needed.
 - One DM per file means N HTTP calls for N attachments; X doesn't
   batch but the polling cost amplifies latency.
 - Since-id file is per-adapter; if the file is removed the next poll
@@ -34,9 +32,14 @@ LOW:
 - [x] subscribe default returns Ok
 
 ## Fixes in this PR
-None — adapter healthy.
+- v2 media upload path: `XApi::upload_media_v2` posts to
+  `{api_base}/2/media/upload` as multipart and returns the media id
+  from `data.id` (with a tolerant fallback for early v2 responses
+  that surfaced `media_id_string` at the top level). Selected via
+  the new `media_api_version: "v2"` config field (default `"v1"`
+  keeps legacy behaviour). The adapter's `upload_files` dispatches
+  on the configured version.
 
 ## Deferred for follow-up
-- Migrate to v2 media upload when GA.
 - Backup since-id to the central DB so the file lost case still
   doesn't double-deliver.

@@ -12,10 +12,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use ironclaw_db::session::{open_inbound_rw_no_mmap, open_outbound, SessionPaths};
-use ironclaw_providers::AnthropicProvider;
+use ironclaw_providers::{AnthropicProvider, OllamaProvider};
 use ironclaw_runner::{
-    compaction::CompactionCfg, resolve_provider_deadline, run_loop, RunnerConfig, RunnerDeps,
-    RunnerToolCtx, SubagentRunnerDeps,
+    compaction::CompactionCfg, resolve_provider_deadline, resolve_tool_deadline_secs, run_loop,
+    RunnerConfig, RunnerDeps, RunnerToolCtx, SubagentRunnerDeps,
 };
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
@@ -63,15 +63,8 @@ async fn main() -> Result<()> {
     let inbound = Arc::new(Mutex::new(inbound));
     let outbound = Arc::new(Mutex::new(outbound));
 
-    let api_key = cfg
-        .api_key
-        .clone()
-        .context("provider api key not set; configure `api_key_env`")?;
     let provider: Arc<dyn ironclaw_providers::AgentProvider> =
-        Arc::new(match cfg.api_base_url.as_deref() {
-            Some(base) => AnthropicProvider::with_base_url(api_key, base),
-            None => AnthropicProvider::new(api_key),
-        });
+        build_provider(&cfg, &env).context("build provider")?;
 
     let compaction = CompactionCfg {
         model_input_window: cfg.model_input_window,
@@ -156,13 +149,56 @@ async fn main() -> Result<()> {
         tool_map,
         max_tool_turns: 20,
         provider_deadline,
+        tool_deadline_secs: resolve_tool_deadline_secs(&env),
     };
 
     tracing::info!(
         session_id = %cfg.session_id,
         agent_group_id = %cfg.agent_group_id,
+        provider = %cfg.provider,
         model = %cfg.model,
         "ironclaw-runner starting"
     );
     run_loop(deps).await
+}
+
+/// Build the [`ironclaw_providers::AgentProvider`] dictated by
+/// `cfg.provider`. Anthropic uses `cfg.api_key` + optional
+/// `cfg.api_base_url`. Ollama (native) reads `OLLAMA_BASE_URL` from the
+/// container env (defaults to `http://localhost:11434` — only useful if
+/// the operator binds the host's Ollama into the container; the more
+/// common deployment is to set `OLLAMA_BASE_URL` to a reachable URL).
+/// `ollama-shim` keeps the historical Anthropic-shaped proxy flow.
+fn build_provider(
+    cfg: &RunnerConfig,
+    env: &dyn ironclaw_runner::config::EnvLookup,
+) -> Result<Arc<dyn ironclaw_providers::AgentProvider>> {
+    match cfg.provider.as_str() {
+        "ollama" => {
+            let base_url = env
+                .get("OLLAMA_BASE_URL")
+                .unwrap_or_else(|| "http://localhost:11434".to_string());
+            let model = if cfg.model.is_empty() { None } else { Some(cfg.model.clone()) };
+            Ok(Arc::new(OllamaProvider::new(base_url, model)))
+        }
+        "ollama-shim" => {
+            let base_url = cfg
+                .api_base_url
+                .clone()
+                .or_else(|| env.get("OLLAMA_BASE_URL"))
+                .context("ollama-shim requires api_base_url or OLLAMA_BASE_URL pointing at the Anthropic-shaped proxy")?;
+            let model = if cfg.model.is_empty() { None } else { Some(cfg.model.clone()) };
+            Ok(Arc::new(OllamaProvider::shim(base_url, model)))
+        }
+        _ => {
+            let api_key = cfg
+                .api_key
+                .clone()
+                .context("provider api key not set; configure `api_key_env`")?;
+            Ok(Arc::new(match cfg.api_base_url.as_deref() {
+                Some(base) => AnthropicProvider::with_base_url(api_key, base),
+                None => AnthropicProvider::new(api_key),
+            }))
+        }
+    }
 }

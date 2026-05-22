@@ -13,13 +13,15 @@
 
 ## Gaps
 MED:
-- Files Unsupported — Google Chat attachments require the Drive upload
-  flow (uploadAttachment → Drive file → attachment reference). Documented.
 - Card content passes through opaquely — malformed cards surface as a
   remote 400 rather than local BadRequest.
 
 LOW:
 - Emoji map covers ~30 shortcodes; broader coverage would be useful.
+- Threaded replies + attachments fall back to top-level posting with a
+  warning, because the Chat `attachment[]` array isn't supported alongside
+  `messageReplyOption=REPLY_MESSAGE_OR_FAIL`. Track if the API gains
+  that combination.
 
 ## Edge cases tested
 - [x] text → send_text
@@ -34,14 +36,21 @@ LOW:
 - [x] reaction with unknown emoji → Unsupported
 - [x] reaction missing message_name / emoji → BadRequest
 - [x] unknown action → Unsupported
-- [x] files → Unsupported
+- [x] files → uploaded via attachments:upload, attached via attachment[]
+- [x] files + card → BadRequest
+- [x] files + edit/reaction → BadRequest
 - [x] bad platform_id → BadRequest
 - [x] auth / rate / transport / 404 propagation
 
 ## Fixes in this PR
-None.
+- Two-step attachment flow: `GchatApi::upload_attachment` posts the
+  bytes to `POST /upload/v1/spaces/{space}/attachments:upload`
+  (multipart media upload), and `send_text_with_attachments`
+  includes the returned `resourceName` in the message's
+  `attachment[]` array. The adapter wires both for text outbounds
+  with `files`. Cards / edits / reactions reject files with
+  BadRequest.
 
 ## Deferred for follow-up
-- Implement Drive-based attachment upload.
 - Validate card schema at deliver time.
 - Expand emoji shortcode map.

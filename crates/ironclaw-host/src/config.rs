@@ -22,6 +22,7 @@
 //! | `IRONCLAW_CLI_LOG` | `<install_root>/chat.log` | Append-only log the cli channel writes outbound replies to; `iclaw chat` tails it. Same default-resolution rules as `IRONCLAW_CLI_FIFO`. |
 //! | `IRONCLAW_SKILLS_DIR` | unset | Directory of `SKILL.md` skill bundles auto-loaded into the agent system prompt. |
 //! | `IRONCLAW_GROUPS_DIR` | unset | Directory under which per-group `<ag_id>/skills/` overrides live. |
+//! | `IRONCLAW_SKILLS_MODE` | `inline` | How skill bodies reach the agent: `inline` (full bodies in the system prompt — today's behaviour) or `callable` (compact name+description index in the prompt, bodies retrieved on demand via the `load_skill` MCP tool). |
 //! | `IRONCLAW_METRICS_ADDR` | unset | Enable the Prometheus `/metrics` endpoint. Accepts `host:port` or a bare port (auto-prefixed to `127.0.0.1:`). Off by default per the conservative-defaults tenet. |
 //! | `IRONCLAW_LOG_DIR` | unset | When set, fan tracing output to `<dir>/host.log.<date>` via `tracing-appender::rolling::daily` in addition to stderr. Default off keeps the legacy stderr-only behaviour. |
 //! | `IRONCLAW_DEFAULT_IMAGE_TAG` | unset | sha-pinned default image tag for sessions when the per-group `container_configs.image_tag` is unset. Written by `ironclaw-setup` after building the image. |
@@ -105,6 +106,13 @@ pub struct HostConfig {
     /// with the same name. Optional; absent groups fall back to the
     /// global skills directory.
     pub groups_dir: Option<PathBuf>,
+    /// How skill bodies are surfaced to the agent. `Inline` (default)
+    /// matches today's behaviour — every selected skill's full
+    /// `SKILL.md` body lives in the system prompt. `Callable` emits
+    /// only a name+description index in the prompt and writes a
+    /// per-session `skills.json` that the `load_skill` MCP tool reads
+    /// on demand. Set via `IRONCLAW_SKILLS_MODE=inline|callable`.
+    pub skills_mode: crate::container_manager::SkillsMode,
     /// Channels to initialize at boot.
     pub channels: Vec<ChannelInit>,
 }
@@ -152,6 +160,9 @@ impl HostConfig {
             .cloned()
             .filter(|s| !s.is_empty())
             .map(PathBuf::from);
+        let skills_mode = crate::container_manager::SkillsMode::parse_or_default(
+            map.get("IRONCLAW_SKILLS_MODE").map(String::as_str),
+        );
 
         let channels_list = map
             .get("IRONCLAW_CHANNELS")
@@ -223,6 +234,7 @@ impl HostConfig {
             default_image_tag,
             skills_dir,
             groups_dir,
+            skills_mode,
             channels,
         })
     }
@@ -547,6 +559,33 @@ mod tests {
         assert_eq!(
             cfg.groups_dir.as_deref(),
             Some(Path::new("/opt/ironclaw/groups"))
+        );
+    }
+
+    #[test]
+    fn skills_mode_defaults_to_inline() {
+        let cfg = HostConfig::from_map(&m(&[])).unwrap();
+        assert_eq!(
+            cfg.skills_mode,
+            crate::container_manager::SkillsMode::Inline
+        );
+    }
+
+    #[test]
+    fn skills_mode_parses_callable() {
+        let cfg = HostConfig::from_map(&m(&[("IRONCLAW_SKILLS_MODE", "callable")])).unwrap();
+        assert_eq!(
+            cfg.skills_mode,
+            crate::container_manager::SkillsMode::Callable
+        );
+    }
+
+    #[test]
+    fn skills_mode_unknown_value_falls_back_to_inline() {
+        let cfg = HostConfig::from_map(&m(&[("IRONCLAW_SKILLS_MODE", "bogus")])).unwrap();
+        assert_eq!(
+            cfg.skills_mode,
+            crate::container_manager::SkillsMode::Inline
         );
     }
 

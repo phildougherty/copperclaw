@@ -12,8 +12,6 @@
 
 ## Gaps
 LOW:
-- Adapter relies on a long-lived signal-cli daemon; if the daemon
-  dies it only logs and waits for restart. No automatic respawn.
 - `target_author` field is required for reactions (Signal needs the
   message author's identity to address the reaction); the test for
   missing-author exists but the field name is undocumented.
@@ -37,8 +35,12 @@ LOW:
 - [x] set_typing bad platform_id → BadRequest
 
 ## Fixes in this PR
-None — adapter healthy.
+- `SignalSupervisor` (in `rpc.rs`) wraps the `JsonRpcClient` and
+  polls liveness; when the underlying signal-cli daemon's stdio
+  closes (child exit), it respawns the process with exponential
+  backoff (500 ms → 30 s) and forwards notifications through a
+  shared mpsc so the adapter sees the respawn as transparent.
+  Factory wires the supervisor in place of a bare `JsonRpcClient`.
 
 ## Deferred for follow-up
-- Daemon respawn watchdog.
 - Document the `target_author` field name on the action shape.

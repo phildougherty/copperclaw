@@ -1,23 +1,20 @@
 ---
 name: git
-description: Inspect a git repository — branch state, commit history, diffs, and per-line blame — via the structured `git_status`, `git_log`, `git_diff`, and `git_blame` tools. Invoke when the user asks "what changed", "who wrote this", "is the working tree clean", "show me the last few commits", or anything that previously would have meant shelling out to `git`.
+description: Inspect a git repository — branch state, commit history, diffs, and per-line blame — via the structured `git_status`, `git_log`, `git_diff`, and `git_blame` tools. Invoke when the user asks "what changed", "who wrote this", "is the working tree clean", "show me the last few commits", or anything that previously meant shelling out to `git`.
 ---
 
 # git
 
-Four read-only tools backed by libgit2. They return structured JSON,
-not text the model has to parse. Use them in preference to
-`shell git ...` — the output is stable, the errors are friendly, and
-there's no pager to fight.
+Four read-only tools backed by libgit2. Structured JSON, not text the
+model has to parse. Prefer over `shell git ...` — stable output,
+friendly errors, no pager.
 
-All four accept an optional `path` argument. Default is the current
-working directory; the tool walks upward to find the repo. You can
-also pass any path *inside* a repo (a file, a subdirectory) and the
-tool will resolve to the enclosing `.git`.
+All four take an optional `path` (default cwd). The tool walks upward
+to the `.git`; any path *inside* a repo works.
 
-These tools do not commit, push, branch, or modify anything. If the
-user wants a mutation — hand the exact `git ...` command to the
-operator and stop. Don't try to `shell` your way around it.
+These tools never commit, push, branch, or modify. For mutations: hand
+the exact `git ...` command to the operator and stop. Do not `shell`
+around it.
 
 ## When to use each
 
@@ -26,91 +23,73 @@ operator and stop. Don't try to `shell` your way around it.
 > "Is the working tree clean?" / "what's modified?" / "did I leave
 > something uncommitted?"
 
-Returns the branch name, ahead/behind counts vs upstream, and the
-list of staged / unstaged / untracked files. Cheap; call it first
-before doing anything that depends on a clean state.
+Branch name, ahead/behind vs upstream, staged / unstaged / untracked
+lists. Cheap; call first before anything that needs a clean state.
 
 ### `git_log`
 
-> "What changed in the last hour?" / "show me the last 10 commits"
-> / "who's been touching `src/auth/`?"
+> "What changed in the last hour?" / "show the last 10 commits" /
+> "who's touching `src/auth/`?"
 
-Walks commits reachable from a ref (default `HEAD`) and returns one
-JSON object per commit with sha / short_sha / author / email /
-RFC3339 date / subject / body / files_changed. Supports:
+Walks from a ref (default `HEAD`); one JSON object per commit with
+sha / short_sha / author / email / RFC3339 date / subject / body /
+files_changed.
 
 - `max_count` (default 20, cap 200).
-- `since` filter (ISO date `2026-05-01` or full RFC 3339).
-- `files` filter — restricts the result to commits that touch any
-  of the listed paths.
+- `since` (ISO date `2026-05-01` or full RFC 3339).
+- `files` — restrict to commits touching any listed path.
 
 ### `git_diff`
 
-> "What's the diff between `HEAD~1` and `HEAD`?" / "what
-> uncommitted changes do I have?" / "show me what changed in
-> `src/foo.rs` last commit"
+> "Diff between `HEAD~1` and `HEAD`?" / "what uncommitted changes
+> do I have?" / "what changed in `src/foo.rs` last commit?"
 
-Unified diff plus a per-file additions/deletions summary.
+Unified diff plus per-file additions/deletions summary.
 
-- Omit both `from` and `to` for the working-tree diff (equivalent
-  to plain `git diff`).
-- Set `from` and `to` for ref-to-ref diffs.
-- `files` narrows to a pathspec.
-- `context` controls unified-diff context lines (default 3).
-- `max_bytes` caps the patch text (default 200 KiB, hard cap 1
-  MiB). Truncated responses set `truncated: true` so you know to
-  narrow the scope.
+- Omit both `from` and `to` → working-tree diff.
+- Set both → ref-to-ref diff.
+- `files` narrows by pathspec.
+- `context` controls unified-diff context (default 3).
+- `max_bytes` caps the patch (default 200 KiB, hard cap 1 MiB).
+  Truncated responses set `truncated: true`.
 
 ### `git_blame`
 
 > "Who wrote this function?" / "when was line 42 last touched?"
 
-Per-line blame for a file. Each row carries the short SHA, author
-name, RFC 3339 date, and the line text. Range with `from_line` /
-`to_line` (defaults 1 → end-of-file). Out-of-range bounds are
-clamped to the file's actual size; inverted ranges return empty.
+Per-line blame: short SHA, author, RFC 3339 date, line text.
+`from_line` / `to_line` range (defaults 1 → EOF). OOB bounds clamp to
+file size; inverted ranges return empty.
 
 ## Common patterns
 
-- **"What did I just change?"** → `git_status` first (see if it's
-  unstaged or staged), then `git_diff` with no `from`/`to` for the
-  working-tree patch.
-- **"What changed in the last hour?"** → `git_log` with
-  `since: "<one-hour-ago RFC3339>"`. For each commit you care
-  about, follow up with `git_diff { from: <sha>~1, to: <sha> }`.
-- **"Why is this line here?"** → `git_blame` for the offending
-  line range. The blame row's SHA is your jumping-off point for a
-  `git_log` (filter by `files: ["<that-file>"]`) to see the wider
-  context.
-- **"Is it safe to edit?"** → `git_status` — if `clean: false`,
-  warn the user before you do anything that could conflict with
-  their uncommitted work.
+- **"What did I just change?"** → `git_status` first, then `git_diff`
+  with no `from`/`to`.
+- **"What changed in the last hour?"** → `git_log { since: "<RFC3339>" }`,
+  then `git_diff { from: <sha>~1, to: <sha> }` per commit.
+- **"Why is this line here?"** → `git_blame` for the range; the
+  blame SHA seeds a `git_log { files: ["<file>"] }`.
+- **"Safe to edit?"** → `git_status`; if `clean: false`, warn the
+  user before editing.
 
 ## Triggers
 
-- "git status" / "what's the state of the repo"
+- "git status" / "state of the repo"
 - "git log" / "recent commits" / "what changed lately"
-- "git diff" / "show me the diff" / "what changed in `<ref>`"
+- "git diff" / "show the diff" / "what changed in `<ref>`"
 - "git blame" / "who wrote this" / "when was this added"
 - "is the working tree clean"
-- Anything where the user previously would have asked you to
-  `shell git ...` — reach for these first.
+- Anything the user would have framed as `shell git ...`.
 
 ## Do NOT
 
-- **Do not commit, push, branch, tag, reset, stash, or check out
-  via these tools.** They're read-only by design. Hand mutations
-  back to the operator with the exact `git` command.
-- **Do not** parse text output from `shell git ...` if one of
-  these tools could answer the question. Structured JSON is more
-  reliable.
-- **Do not** call `git_blame` on a huge file without narrowing
-  the line range — it will return a validation error past 5,000
-  lines. Use `from_line` / `to_line`.
-- **Do not** treat `truncated: true` from `git_diff` as the full
-  answer. Either raise `max_bytes` (up to 1 MiB) or narrow the
-  scope with `files` / a tighter `from`..`to`.
-- **Do not** assume HEAD exists. A freshly `git init`-ed repo has
-  no commits — `git_log` returns `{"commits": []}` and
-  `git_status` reports `branch: "(unborn)"`. Treat both as
-  successful, not as errors.
+- Commit, push, branch, tag, reset, stash, or check out. Hand back
+  the exact `git` command to the operator.
+- Parse text from `shell git ...` when these tools answer it.
+- `git_blame` a huge file without `from_line` / `to_line` — past
+  5,000 lines returns a validation error.
+- Treat `truncated: true` as the full answer — raise `max_bytes`
+  (up to 1 MiB) or narrow with `files` / tighter `from`..`to`.
+- Assume HEAD exists. Freshly `git init`-ed: `git_log` returns
+  `{"commits": []}`; `git_status` reports `branch: "(unborn)"`.
+  Both are success, not errors.

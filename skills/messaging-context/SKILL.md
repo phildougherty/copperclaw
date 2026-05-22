@@ -5,29 +5,28 @@ description: Read inbound messages — kinds, sender identity, mention vs DM, th
 
 # messaging-context
 
-Every turn, the runner reads pending rows from `inbound.db.messages_in`,
-formats them, and hands the batch to the provider. The body of each
-row carries everything you need to react correctly. This skill explains
-how to read it.
+Every turn, the runner reads pending rows from
+`inbound.db.messages_in`, formats them, and hands the batch to the
+provider. Each row carries everything you need to react correctly.
 
 ## Message kinds
 
-The `kind` field on every inbound row is one of:
+The `kind` field is one of:
 
 | Kind | Source | Treat as |
 |---|---|---|
-| `chat`    | a user typed on a channel | conversational message |
-| `task`    | a scheduled task fired   | self-issued prompt |
-| `webhook` | external service POSTed  | event you must process |
-| `system`  | host-internal synthetic  | admin / CLI / ack payload |
-| `agent`   | another agent sent you   | inter-agent message |
+| `chat`    | user typed on a channel | conversational |
+| `task`    | scheduled task fired   | self-issued prompt |
+| `webhook` | external service POSTed  | event to process |
+| `system`  | host-internal synthetic  | admin / CLI / ack |
+| `agent`   | another agent sent you   | inter-agent |
 
-The on-disk `kind` is a lowercase string (`"chat"`, `"task"`, etc.).
-Always branch on it before assuming the row is conversational.
+`kind` is a lowercase string. Branch on it before assuming the row is
+conversational.
 
 ## Sender identity
 
-Chat rows carry a sender block in `content`:
+Chat rows carry a sender block:
 
 ```json
 {
@@ -40,77 +39,68 @@ Chat rows carry a sender block in `content`:
 }
 ```
 
-- `channel_type` + `identity` is the unique platform user key. The
-  host resolves it to a `UserId` (UUIDv5 deterministic) before storing
-  in central DB.
-- `display_name` is best-effort — channels may not provide one.
-- Inter-agent messages carry no human sender; instead they include the
-  source `session_id` in the row's `source_session_id` field.
+- `channel_type` + `identity` = unique platform user key. The host
+  resolves to a `UserId` (UUIDv5 deterministic) before storing.
+- `display_name` is best-effort.
+- Inter-agent messages have no human sender; the source `session_id`
+  is on the row's `source_session_id`.
 
 ## Mentions vs DMs vs group chat
 
-Each row has two booleans:
+Each row has:
 
-- `is_mention` — true when the inbound platform message explicitly
-  addressed your agent (the channel adapter computed this; for
-  Slack, `<@U…>`; for Telegram, `@yourbot`; for Discord, a role or
-  user mention).
-- `is_group` — true when the message arrived in a group / channel
-  rather than a 1-1 DM.
+- `is_mention` — platform message explicitly addressed your agent
+  (`<@U…>` for Slack, `@yourbot` for Telegram, role/user mention for
+  Discord).
+- `is_group` — arrived in a group/channel rather than 1-1 DM.
 
-Decision matrix:
-
-| is_group | is_mention | Likely meaning |
+| is_group | is_mention | Meaning |
 |---|---|---|
 | `false` | n/a | DM. Always respond. |
 | `true`  | `true`  | Group ping. Respond. |
-| `true`  | `false` | Background group chatter. Respect the wiring's `engage` mode (pattern, mention, mention-sticky). |
+| `true`  | `false` | Background chatter. Respect wiring's `engage` (pattern, mention, mention-sticky). |
 
-If the wiring's engage mode is `mention-sticky`, once you have replied
-in a thread the host treats the next non-mention messages there as
-addressed to you until the thread idles. Trust the row's `is_mention`
-unless you have a strong reason to override.
+`mention-sticky`: once you reply in a thread, the host treats next
+non-mention messages there as addressed to you until idle. Trust the
+row's `is_mention` unless you have strong reason to override.
 
 ## Threading
 
-`thread_id` is set when the platform exposes threads (Slack threads,
-Telegram topic groups, Discord threads). It is `None` for:
+`thread_id` set when the platform exposes threads (Slack, Telegram
+topic groups, Discord threads). `None` for:
 
 - Channels without thread support.
-- Top-level messages in a channel that does support threads.
+- Top-level messages in a thread-capable channel.
 
-When replying with `send_message`, omit `to` and the runner copies the
+When replying with `send_message`, omit `to`; the runner copies the
 inbound `thread_id` into the outbound row, keeping the conversation
 in-thread.
 
 ## `content` shape per kind
 
-- `chat`: `{ "text": "...", "sender": { ... } }` plus any
-  attachments under `files`.
-- `task`: the prompt you registered with `schedule_task`. Also
-  includes `recurrence` (so you can recognise "this is a scheduled
-  fire") and `series_id` (correlates fires of the same task).
-- `webhook`: the verbatim JSON the external service POSTed,
-  namespaced under `body`.
-- `system`: `{ "kind": "<sub-kind>", ... }`. Sub-kinds include
-  `cli_request`, `cli_response`, and ack payloads.
+- `chat`: `{ "text": "...", "sender": {...} }` + optional `files`.
+- `task`: the prompt you registered with `schedule_task` + `recurrence`
+  (so you recognise the scheduled fire) + `series_id` (correlates
+  fires).
+- `webhook`: the verbatim JSON the external service POSTed, under
+  `body`.
+- `system`: `{ "kind": "<sub-kind>", ... }`. Sub-kinds:
+  `cli_request`, `cli_response`, ack payloads.
 - `agent`: same shape as `chat` but with `source_session_id` set and
   no `sender.channel_type`.
 
-## Reading attachments
+## Attachments
 
-When a chat row carries files, they are extracted to
-`inbox/<msg_id>/<filename>`. The path is mounted into the container
-read-only. Read with normal filesystem APIs; do not try to fetch them
+Files extract to `inbox/<msg_id>/<filename>`. The path mounts into the
+container read-only. Read with normal filesystem APIs; do not fetch
 from the platform.
 
-The runner runs `safe_attachment_name()` on every file before
-extraction. Files with `..`, `/`, leading dots, or length > 255 are
-dropped before they reach you.
+The runner runs `safe_attachment_name()` before extraction. Files
+with `..`, `/`, leading dots, or length > 255 are dropped.
 
 ## Worked example
 
-A Slack mention in a thread looks like:
+A Slack mention in a thread:
 
 ```json
 {
@@ -128,6 +118,6 @@ A Slack mention in a thread looks like:
 }
 ```
 
-Reply by calling `send_message({"text": "On it."})` with no `to` —
-the runner fills in `(slack, C01XYZ, 1714578122.000200)` from
+Reply with `send_message({"text": "On it."})` and no `to` — the
+runner fills in `(slack, C01XYZ, 1714578122.000200)` from
 `session_routing`.

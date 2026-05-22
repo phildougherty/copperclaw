@@ -22,7 +22,7 @@ pub mod sessions;
 pub mod socket;
 
 pub use boot::{run_host, BootError};
-pub use container_manager::{ContainerManager, ManagerConfig};
+pub use container_manager::{ContainerManager, ManagerConfig, SkillsMode};
 pub use config::{ChannelInit, HostConfig, HostConfigError};
 pub use context::HostContext;
 pub use sessions::FsSessionRoot;
