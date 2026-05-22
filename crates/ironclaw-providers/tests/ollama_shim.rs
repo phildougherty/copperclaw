@@ -1,7 +1,7 @@
-//! Integration tests for `OllamaProvider`. Since Ollama exposes an
-//! Anthropic-compatible facade, the wire format is the same SSE stream as
-//! `AnthropicProvider`; these tests just verify the facade plumbs the base
-//! URL, the model fallback, and the error mappings correctly.
+//! Integration tests for `OllamaProvider` in *shim* mode — i.e. against an
+//! Anthropic-compatible proxy in front of Ollama (`LiteLLM`, etc.). These
+//! tests exist to keep the legacy facade behaviour pinned. The native
+//! `/api/chat` path is covered in `ollama_conformance.rs`.
 
 use ironclaw_providers::{
     AgentProvider, HistoryMessage, OllamaProvider, ProviderError, QueryInput,
@@ -72,7 +72,7 @@ async fn ollama_happy_path() {
         .mount(&server)
         .await;
 
-    let p = OllamaProvider::new(server.uri(), Some("qwen2:7b".into()));
+    let p = OllamaProvider::shim(server.uri(), Some("qwen2:7b".into()));
     let mut q = p.query(basic_input()).await.expect("query starts");
     let first = q.next_event().await.expect("init");
     match first {
@@ -114,7 +114,7 @@ async fn ollama_default_model_substituted_on_empty() {
         .mount(&server)
         .await;
 
-    let p = OllamaProvider::new(server.uri(), None);
+    let p = OllamaProvider::shim(server.uri(), None);
     let mut q = p.query(basic_input()).await.expect("query starts");
     let _init = q.next_event().await.unwrap();
     let result = q.next_event().await.unwrap();
@@ -145,7 +145,7 @@ async fn ollama_explicit_model_passed_through() {
         .mount(&server)
         .await;
 
-    let p = OllamaProvider::new(server.uri(), Some("custom:override".into()));
+    let p = OllamaProvider::shim(server.uri(), Some("custom:override".into()));
     let mut q = QueryInput::new("s", "mistral:7b");
     q.history.push(HistoryMessage::User { content: "hi".into() });
     let mut handle = p.query(q).await.expect("query starts");
@@ -162,7 +162,7 @@ async fn ollama_error_mapping_is_inherited() {
         .respond_with(ResponseTemplate::new(500).set_body_string("backend dead"))
         .mount(&server)
         .await;
-    let p = OllamaProvider::new(server.uri(), None);
+    let p = OllamaProvider::shim(server.uri(), None);
     let err = expect_query_err(p.query(basic_input()).await);
     match err {
         ProviderError::Api { status, message } => {
@@ -176,7 +176,7 @@ async fn ollama_error_mapping_is_inherited() {
 #[tokio::test]
 async fn ollama_provider_name() {
     let server = MockServer::start().await;
-    let p = OllamaProvider::new(server.uri(), None);
+    let p = OllamaProvider::shim(server.uri(), None);
     assert_eq!(p.name(), "ollama");
     assert!(!p.supports_native_slash_commands());
 }
