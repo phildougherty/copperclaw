@@ -7,7 +7,7 @@ use crate::dispatch::{AdapterResolver, HostDispatcher};
 use crate::error::DeliveryError;
 use crate::system_actions::parse_system_content;
 use dashmap::DashMap;
-use ironclaw_channels_core::ChannelAdapter;
+use ironclaw_channels_core::{AdapterError, ChannelAdapter};
 use ironclaw_db::central::CentralDb;
 use ironclaw_db::session::{open_inbound, open_outbound, SessionPaths};
 use ironclaw_db::tables::{delivered, messages_out, session_routing};
@@ -700,16 +700,69 @@ impl DeliveryService {
 
 /// Wrap an adapter `deliver` call so the `?` operator at the call sites can
 /// surface the error as `DeliveryError::Adapter(_)`.
+///
+/// When the adapter rejects the message with a [`AdapterError::BadRequest`]
+/// whose body matches a known formatting-error signature
+/// (`is_formatting_bad_request`), we ask the adapter for a
+/// plain-text fallback via [`ChannelAdapter::plain_text_fallback`] and
+/// re-issue the delivery. If the fallback succeeds, the original failure
+/// is swallowed and the fallback metric
+/// (`ironclaw_delivery_formatting_fallback_total{channel_type}`) is
+/// incremented. If the adapter has no fallback (default impl) or the
+/// fallback itself fails, the ORIGINAL error is returned so the caller's
+/// failure-handling stays unchanged.
 async fn call_adapter(
     adapter: &dyn ChannelAdapter,
     platform_id: &str,
     thread_id: Option<&str>,
     message: &OutboundMessage,
 ) -> Result<Option<String>, DeliveryError> {
-    adapter
-        .deliver(platform_id, thread_id, message)
-        .await
-        .map_err(DeliveryError::Adapter)
+    match adapter.deliver(platform_id, thread_id, message).await {
+        Ok(id) => Ok(id),
+        Err(AdapterError::BadRequest(msg)) if is_formatting_bad_request(&msg) => {
+            let original = AdapterError::BadRequest(msg);
+            let Some(fallback_msg) = adapter.plain_text_fallback(message) else {
+                return Err(DeliveryError::Adapter(original));
+            };
+            match adapter
+                .deliver(platform_id, thread_id, &fallback_msg)
+                .await
+            {
+                Ok(id) => {
+                    let ct = adapter.channel_type().as_str();
+                    info!(channel = ct, "delivered with reduced formatting");
+                    ironclaw_metrics::inc_delivery_formatting_fallback(ct);
+                    Ok(id)
+                }
+                Err(_) => Err(DeliveryError::Adapter(original)),
+            }
+        }
+        Err(other) => Err(DeliveryError::Adapter(other)),
+    }
+}
+
+/// Return `true` when the `BadRequest` message text matches a known
+/// formatting-validation signature. The delivery loop uses this to gate
+/// the plain-text retry: only formatting rejections fall back, everything
+/// else (e.g. "`chat_id` required") fails fast.
+///
+/// Patterns covered (case-insensitive):
+/// - `parse entities` — Telegram `MarkdownV2` / Markdown / HTML.
+/// - `rich text` / `blocks` / `block_kit` / `block kit` — Slack.
+/// - `embed` / `embeds` — Discord.
+/// - `format` / `formatting` — generic fallback for adapters that surface
+///   a less specific error message.
+pub(crate) fn is_formatting_bad_request(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("parse entities")
+        || m.contains("rich text")
+        || m.contains("blocks")
+        || m.contains("block_kit")
+        || m.contains("block kit")
+        || m.contains("embed")
+        || m.contains("embeds")
+        || m.contains("format")
+        || m.contains("formatting")
 }
 
 /// Helper used by tests / the sweep loop to filter on container status.
@@ -1449,6 +1502,157 @@ mod tests {
         write_row(&out_pool, &row);
         let rpt = service.process_session_once(&sess).await.unwrap();
         assert_eq!(rpt.failed, 1);
+    }
+
+    /// Drive a full `process_session_once` pass under a local Prometheus
+    /// recorder so the test can assert against the fallback metric. Plain
+    /// `#[test]` (not `#[tokio::test]`) because `with_local_recorder`
+    /// installs the recorder via a thread-local that must stay alive for
+    /// the duration of the inner `block_on` — a `#[tokio::test]` would
+    /// already own the runtime on this thread and the inner `block_on`
+    /// would panic.
+    #[test]
+    fn delivery_retries_with_plain_text_on_parse_entities_error() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let body = metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (service, _root, sess, mock) = make_service().await;
+                mock.enable_plain_text_fallback(true);
+                let out_pool = service
+                    .session_paths
+                    .outbound_pool(&sess.agent_group_id, &sess.id)
+                    .unwrap();
+                let row = make_row(
+                    MessageKind::Chat,
+                    json!({"text": "Hey!", "parse_mode": "MarkdownV2"}),
+                );
+                write_row(&out_pool, &row);
+
+                // First call fails with a Telegram-style parse-entities
+                // error; the queued-failure list is FIFO, so the *second*
+                // deliver (the fallback retry) is not preloaded with a
+                // failure and therefore succeeds.
+                mock.fail_next_deliver(AdapterError::BadRequest(
+                    "Bad Request: can't parse entities: Character '!' is reserved".into(),
+                ));
+
+                let rpt = service.process_session_once(&sess).await.unwrap();
+                assert_eq!(rpt.delivered, 1);
+                assert_eq!(rpt.failed, 0);
+
+                // The mock records the fallback delivery — the original
+                // failing call never entered the deliveries log.
+                let deliveries = mock.deliveries();
+                assert_eq!(deliveries.len(), 1);
+                let content = &deliveries[0].message.content;
+                assert!(content.get("parse_mode").is_none());
+                assert!(
+                    content["text"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("[reduced formatting]"),
+                    "expected downgraded text, got {content:?}",
+                );
+
+                // Row marked delivered with status "ok".
+                let in_pool = service
+                    .session_paths
+                    .inbound_pool(&sess.agent_group_id, &sess.id)
+                    .unwrap();
+                let in_conn = in_pool.connect().unwrap();
+                let listed = delivered::list(&in_conn).unwrap();
+                assert_eq!(listed.len(), 1);
+                assert_eq!(listed[0].status, "ok");
+            });
+            handle.render()
+        });
+
+        assert!(
+            body.contains(ironclaw_metrics::DELIVERY_FORMATTING_FALLBACK_TOTAL),
+            "expected fallback metric in scrape body:\n{body}",
+        );
+        assert!(
+            body.contains("channel_type=\"mock\""),
+            "expected channel_type label in body:\n{body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn delivery_marks_failed_when_plain_text_fallback_also_rejected() {
+        let (service, _root, sess, mock) = make_service().await;
+        mock.enable_plain_text_fallback(true);
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let row = make_row(
+            MessageKind::Chat,
+            json!({"text": "Hey!", "parse_mode": "MarkdownV2"}),
+        );
+        write_row(&out_pool, &row);
+
+        // BOTH the original and the fallback retry fail with a
+        // formatting-style BadRequest. The original error is non-retryable,
+        // so the row should be marked failed immediately on the same pass.
+        mock.fail_next_deliver(AdapterError::BadRequest(
+            "Bad Request: can't parse entities: Character '!' is reserved".into(),
+        ));
+        mock.fail_next_deliver(AdapterError::BadRequest(
+            "Bad Request: can't parse entities: still bad".into(),
+        ));
+
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.failed, 1);
+        assert_eq!(rpt.delivered, 0);
+        // No successful delivery was ever recorded — both attempts errored.
+        assert!(mock.deliveries().is_empty());
+
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let in_conn = in_pool.connect().unwrap();
+        let listed = delivered::list(&in_conn).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, "failed");
+    }
+
+    #[tokio::test]
+    async fn delivery_does_not_retry_on_other_bad_request() {
+        let (service, _root, sess, mock) = make_service().await;
+        // Enable fallback so we'd notice an erroneous retry — if the
+        // delivery loop wrongly retried, it would land a fallback delivery.
+        mock.enable_plain_text_fallback(true);
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let row = make_row(MessageKind::Chat, json!({"text": "hi"}));
+        write_row(&out_pool, &row);
+
+        // A non-formatting BadRequest must fail fast — no fallback retry.
+        mock.fail_next_deliver(AdapterError::BadRequest("chat_id required".into()));
+
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.failed, 1);
+        assert_eq!(rpt.delivered, 0);
+        // No successful delivery was attempted (the only call errored, no
+        // retry was issued).
+        assert!(mock.deliveries().is_empty());
+
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let in_conn = in_pool.connect().unwrap();
+        let listed = delivered::list(&in_conn).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, "failed");
     }
 
     #[tokio::test]

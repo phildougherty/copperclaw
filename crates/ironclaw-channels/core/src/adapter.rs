@@ -61,6 +61,29 @@ pub trait ChannelAdapter: Send + Sync {
     async fn open_dm(&self, _user_id: &str) -> Result<Option<DmHandle>, AdapterError> {
         Ok(None)
     }
+
+    /// Strip channel-specific formatting from an outbound message body,
+    /// returning a plain-text fallback the channel will accept even when
+    /// the original failed a formatting validation.
+    ///
+    /// The delivery loop calls this when a `deliver` call returned
+    /// `AdapterError::BadRequest(_)` with a known formatting-error signature
+    /// (e.g. Telegram's "can't parse entities", Slack's block-kit errors,
+    /// Discord's embed errors). The returned message must be safe to feed
+    /// directly back through `deliver`.
+    ///
+    /// Default impl returns `None` — adapters without a known plain-text
+    /// recovery should fail fast instead of degrading silently. Channels that
+    /// know how to strip formatting metadata (parse_mode for Telegram,
+    /// `blocks` for Slack, `embeds` for Discord) override this.
+    ///
+    /// The text body itself is preserved (emoji, unicode included) — only
+    /// formatting metadata is removed. Implementations are expected to
+    /// prepend a "[reduced formatting] " marker to the text so the user
+    /// knows the message arrived in a downgraded shape.
+    fn plain_text_fallback(&self, _msg: &OutboundMessage) -> Option<OutboundMessage> {
+        None
+    }
 }
 
 /// A factory builds a `ChannelAdapter` for a particular channel kind.
