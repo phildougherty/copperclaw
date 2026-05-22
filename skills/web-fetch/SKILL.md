@@ -21,7 +21,8 @@ MCP server (e.g. the `linear` preset for project context), or use
   "url": "string, non-empty",
   "method": "string (optional, GET or POST, default GET)",
   "body": "string (optional, only for POST)",
-  "timeout_secs": "integer (optional, max 120)"
+  "timeout_secs": "integer (optional, max 120)",
+  "raw": "boolean (optional, default false)"
 }
 ```
 
@@ -34,6 +35,30 @@ MCP server (e.g. the `linear` preset for project context), or use
   `application/json` content type when the body parses as JSON,
   otherwise as `text/plain`.
 - `timeout_secs` (optional). Default 30s, ceiling 120s.
+- `raw` (optional). When true, return the response body bytes
+  unmodified even for HTML. Default is `false`, which converts HTML
+  to markdown — see below.
+
+## HTML → markdown by default
+
+When the response Content-Type is `text/html` (or
+`application/xhtml+xml`) the body is automatically converted to
+markdown before being returned. The conversion strips `<script>` and
+`<style>`, preserves links, and formats headings + lists. The result
+is typically 5-10x smaller than the raw HTML, which keeps the model's
+context window for the content rather than the markup.
+
+The response then includes:
+
+- `body`: the markdown text (instead of the raw HTML).
+- `content_type`: `"text/html → markdown"`.
+- `raw_html_bytes`: the size of the original HTML.
+- `markdown_bytes`: the size of the converted markdown.
+
+Pass `raw: true` when you need the original HTML — for example, when
+you're scraping `<meta>` tags, parsing embedded JSON, or otherwise
+relying on tag-level structure. JSON, plain text, and other non-HTML
+responses are always returned as-is regardless of `raw`.
 
 ## Output limits
 

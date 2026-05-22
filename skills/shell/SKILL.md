@@ -17,7 +17,8 @@ persists beyond the session's container lifetime.
 {
   "command": "string, non-empty",
   "cwd": "string (optional)",
-  "timeout_secs": "integer (optional, max 600)"
+  "timeout_secs": "integer (optional, max 600)",
+  "reset": "boolean (optional, default false)"
 }
 ```
 
@@ -27,6 +28,29 @@ persists beyond the session's container lifetime.
   runner started in (typically `/`).
 - `timeout_secs` (optional). Soft cap on wall time. Default 60s,
   ceiling 600s. The model cannot disable timeouts.
+- `reset` (optional). When true, wipe the persistent shell state
+  file before running. Discards prior `cd` and exported env vars.
+
+## Persistent state across calls
+
+Within a single session the shell carries state forward between
+calls. Specifically:
+
+- The working directory: `cd /repo` in one call, then `pwd` in the
+  next call prints `/repo`. No need to thread `cwd` through every
+  call.
+- Exported environment variables: `export FOO=bar` then `echo $FOO`
+  in the next call prints `bar`.
+
+State is per-session — different sessions never share, and nothing
+survives container restart. To start clean mid-session pass
+`reset: true` on the call you want to begin from.
+
+Secret hygiene: variables whose name ends in `_TOKEN`, `_KEY`, or
+`_SECRET`, or starts with `ANTHROPIC_`, are dropped from the
+persisted snapshot. They're visible *within* the call that exported
+them, but the next call sees them empty — re-export explicitly if
+you need them across calls (and only if it's safe to do so).
 
 ## Output limits
 

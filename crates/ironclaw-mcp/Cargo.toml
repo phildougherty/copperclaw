@@ -17,6 +17,7 @@ thiserror = { workspace = true }
 chrono = { workspace = true }
 rmcp = { workspace = true, features = ["client", "server", "transport-child-process", "transport-sse-client", "reqwest"] }
 reqwest = { workspace = true }
+htmd = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true }
