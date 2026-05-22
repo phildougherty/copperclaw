@@ -10,7 +10,7 @@ use dashmap::DashMap;
 use ironclaw_channels_core::{AdapterError, ChannelAdapter};
 use ironclaw_db::central::CentralDb;
 use ironclaw_db::session::{open_inbound, open_outbound, SessionPaths};
-use ironclaw_db::tables::{delivered, messages_out, session_routing};
+use ironclaw_db::tables::{delivered, messages_in, messages_out, session_routing};
 use ironclaw_modules::{
     DeliveryActionHandler, DeliveryActionInput, DeliveryDispatcher, DispatchTarget,
 };
@@ -19,9 +19,10 @@ use ironclaw_types::{
     OutboundMessage, Session, SessionId, SessionStatus,
 };
 use rusqlite::{Connection, OptionalExtension};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// Active loop poll interval (milliseconds). Loops only running sessions.
 pub const ACTIVE_POLL_MS: u64 = 1_000;
@@ -209,6 +210,14 @@ pub struct DeliveryService {
     inflight: DashMap<DeliveryKey, Instant>,
     retries: DashMap<DeliveryKey, RetryState>,
     dispatcher: Arc<dyn DeliveryDispatcher>,
+    /// When `true`, a failed `install_packages` / `add_mcp_server`
+    /// apply is surfaced as a `DeliveryError::SystemAction` so the
+    /// outer loop records the row as failed (and the existing retry
+    /// path can have another go) rather than recording the failure
+    /// in-line. Initialised from `IRONCLAW_SELFMOD_HARD_FAIL` at
+    /// construct time; an `AtomicBool` so tests can flip it without
+    /// touching the process env. Default off.
+    selfmod_hard_fail: AtomicBool,
 }
 
 impl DeliveryService {
@@ -240,6 +249,7 @@ impl DeliveryService {
             inflight: DashMap::new(),
             retries: DashMap::new(),
             dispatcher,
+            selfmod_hard_fail: AtomicBool::new(selfmod_hard_fail_from_env()),
         })
     }
 
@@ -277,6 +287,7 @@ impl DeliveryService {
             inflight: DashMap::new(),
             retries: DashMap::new(),
             dispatcher,
+            selfmod_hard_fail: AtomicBool::new(selfmod_hard_fail_from_env()),
         })
     }
 
@@ -308,6 +319,19 @@ impl DeliveryService {
     /// Number of rows the service currently considers in-flight.
     pub fn inflight_len(&self) -> usize {
         self.inflight.len()
+    }
+
+    /// Whether the service was started with `IRONCLAW_SELFMOD_HARD_FAIL`
+    /// enabled. Exposed for tests and for `iclaw doctor` to report.
+    pub fn selfmod_hard_fail(&self) -> bool {
+        self.selfmod_hard_fail.load(Ordering::Relaxed)
+    }
+
+    /// Override the `selfmod_hard_fail` flag after construction. Used
+    /// by tests to flip the mode without touching the process env.
+    #[doc(hidden)]
+    pub fn set_selfmod_hard_fail(&self, on: bool) {
+        self.selfmod_hard_fail.store(on, Ordering::Relaxed);
     }
 
     /// Read-only view of the central DB. Useful for tests.
@@ -522,33 +546,13 @@ impl DeliveryService {
         // ensures the container_configs fingerprint diff machinery in
         // the container manager picks up the change on the next spawn.
         if action.name == "install_packages" {
-            if let Err(err) =
-                apply_install_packages(&self.central, sess.agent_group_id, &action.payload)
-            {
-                warn!(
-                    session = %sess.id.as_uuid(),
-                    agent_group = %sess.agent_group_id.as_uuid(),
-                    ?err,
-                    "install_packages: failed to update container_configs; dropping"
-                );
-            }
-            let in_conn = inbound_pool.connect()?;
-            delivered::insert(&in_conn, row.id, None, "ok")?;
+            let apply = apply_install_packages(&self.central, sess.agent_group_id, &action.payload);
+            self.finish_self_mod("install_packages", sess, row, inbound_pool, apply)?;
             return Ok(());
         }
         if action.name == "add_mcp_server" {
-            if let Err(err) =
-                apply_add_mcp_server(&self.central, sess.agent_group_id, &action.payload)
-            {
-                warn!(
-                    session = %sess.id.as_uuid(),
-                    agent_group = %sess.agent_group_id.as_uuid(),
-                    ?err,
-                    "add_mcp_server: failed to update container_configs; dropping"
-                );
-            }
-            let in_conn = inbound_pool.connect()?;
-            delivered::insert(&in_conn, row.id, None, "ok")?;
+            let apply = apply_add_mcp_server(&self.central, sess.agent_group_id, &action.payload);
+            self.finish_self_mod("add_mcp_server", sess, row, inbound_pool, apply)?;
             return Ok(());
         }
 
@@ -760,6 +764,50 @@ impl DeliveryService {
                 Ok(ActionAdapterOutcome::FallThrough)
             }
             Err(other) => Err(DeliveryError::Adapter(other)),
+        }
+    }
+
+    /// Resolve an `install_packages` / `add_mcp_server` apply result
+    /// into the right side effects:
+    /// - on success → `delivered.status = "ok"` + success counter;
+    /// - on failure with hard-fail off → `record_self_mod_failure`
+    ///   writes a `failed` delivery row + a `system` inbound row + bumps
+    ///   the failure counter;
+    /// - on failure with hard-fail on → return `DeliveryError::SystemAction`
+    ///   so the outer loop records the row in `dropped-messages` and
+    ///   leaves the existing retry path in charge.
+    fn finish_self_mod(
+        &self,
+        action: &'static str,
+        sess: &Session,
+        row: &MessageOutRow,
+        inbound_pool: &SessionPool,
+        apply: Result<(), ironclaw_db::DbError>,
+    ) -> Result<(), DeliveryError> {
+        match apply {
+            Ok(()) => {
+                ironclaw_metrics::inc_self_mod_succeeded(action);
+                let in_conn = inbound_pool.connect()?;
+                delivered::insert(&in_conn, row.id, None, "ok")?;
+                Ok(())
+            }
+            Err(err) => {
+                if self.selfmod_hard_fail.load(Ordering::Relaxed) {
+                    ironclaw_metrics::inc_self_mod_failed(action);
+                    error!(
+                        session = %sess.id.as_uuid(),
+                        agent_group = %sess.agent_group_id.as_uuid(),
+                        action,
+                        ?err,
+                        "self-mod hard-fail; surfacing as DeliveryError",
+                    );
+                    return Err(DeliveryError::SystemAction(format!(
+                        "{action}: {err}"
+                    )));
+                }
+                record_self_mod_failure(sess, row, inbound_pool, action, &err)?;
+                Ok(())
+            }
         }
     }
 
@@ -1071,6 +1119,92 @@ fn record_usage_report(
     if let Err(err) = agent_turns::insert(central, &turn) {
         warn!(?err, "agent_turns insert failed; dropping usage report");
     }
+}
+
+/// Read the `IRONCLAW_SELFMOD_HARD_FAIL` env var once at boot. When
+/// set to `1` / `true` / `yes` / `on` (case-insensitive), a failed
+/// self-mod apply is surfaced as a [`DeliveryError::SystemAction`]
+/// from `handle_system` rather than being recorded as a failed
+/// delivery, so the existing retry path can have another go. Default
+/// is off — see the per-block recovery in
+/// [`DeliveryService::handle_system`].
+fn selfmod_hard_fail_from_env() -> bool {
+    matches!(
+        std::env::var("IRONCLAW_SELFMOD_HARD_FAIL")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// On `install_packages` / `add_mcp_server` apply failure:
+/// - logs at `error!` (operator-visible);
+/// - increments `ironclaw_self_mod_failed_total{action}`;
+/// - marks the outbound row as `delivered.status = "failed"` with the
+///   error message in the payload so it surfaces in
+///   `iclaw dropped-messages outbound-list`;
+/// - writes a `MessageKind::System` row to the session's `inbound.db`
+///   carrying a `self_mod_error` envelope so the agent can react on
+///   its next turn (without this, the runner thinks the install
+///   succeeded and loops).
+fn record_self_mod_failure(
+    sess: &Session,
+    row: &MessageOutRow,
+    inbound_pool: &SessionPool,
+    action: &str,
+    err: &ironclaw_db::DbError,
+) -> Result<(), DeliveryError> {
+    let err_text = err.to_string();
+    error!(
+        session = %sess.id.as_uuid(),
+        agent_group = %sess.agent_group_id.as_uuid(),
+        action,
+        error = %err_text,
+        "self-mod action failed to apply"
+    );
+    ironclaw_metrics::inc_self_mod_failed(action);
+
+    let in_conn = inbound_pool.connect()?;
+    delivered::insert(&in_conn, row.id, Some(&err_text), "failed")?;
+
+    // Best-effort: surface the failure to the agent. A second write
+    // error here would be confusing (the delivery row is already
+    // marked failed) — log and move on so we don't poison the loop.
+    let inbound_row = messages_in::WriteInbound {
+        id: MessageId::new(),
+        kind: MessageKind::System,
+        timestamp: chrono::Utc::now(),
+        content: serde_json::json!({
+            "kind": "system",
+            "content": {
+                "self_mod_error": {
+                    "action": action,
+                    "error": err_text,
+                    "guidance": "The package install was rejected. Inspect the error and either retry with corrected names or proceed without it.",
+                }
+            }
+        }),
+        trigger: false,
+        on_wake: false,
+        process_after: None,
+        recurrence: None,
+        series_id: None,
+        platform_id: None,
+        channel_type: None,
+        thread_id: None,
+        source_session_id: None,
+    };
+    if let Err(insert_err) = messages_in::insert(&in_conn, &inbound_row) {
+        warn!(
+            session = %sess.id.as_uuid(),
+            ?insert_err,
+            "self_mod_error inbound write failed; agent will not see the failure"
+        );
+    }
+    Ok(())
 }
 
 /// Ensure a `container_configs` row exists for `agent_group_id`,
@@ -2317,6 +2451,140 @@ mod tests {
         );
     }
 
+    // ── self-mod (install_packages / add_mcp_server) error surfacing ──────
+
+    /// Build a `Session` whose `agent_group_id` is NOT registered in
+    /// `service.central()` so that `apply_install_packages` /
+    /// `apply_add_mcp_server` fail with an FK-constraint error from
+    /// the `container_configs` upsert (FKs are enabled on the central
+    /// DB; see `central.rs`). Returns the cooked session.
+    fn ghost_session(template: &Session) -> Session {
+        Session {
+            id: template.id,
+            agent_group_id: AgentGroupId::new(),
+            messaging_group_id: template.messaging_group_id,
+            thread_id: template.thread_id.clone(),
+            agent_provider: template.agent_provider.clone(),
+            status: template.status,
+            container_status: template.container_status,
+            last_active: template.last_active,
+            created_at: template.created_at,
+        }
+    }
+
+    /// Inbound system rows live in `messages_in` — there's no top-level
+    /// helper for "give me all the system rows", so query directly.
+    fn list_inbound_system_rows(pool: &SessionPool) -> Vec<serde_json::Value> {
+        let conn = pool.connect().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT content FROM messages_in WHERE kind = 'system'")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                let s: String = r.get(0)?;
+                Ok(serde_json::from_str::<serde_json::Value>(&s).unwrap())
+            })
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    #[tokio::test]
+    async fn install_packages_failure_writes_self_mod_error_to_inbound() {
+        let (service, _root, sess, _mock) = make_service().await;
+        let ghost = ghost_session(&sess);
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&ghost.agent_group_id, &ghost.id)
+            .unwrap();
+        let row = make_row(
+            MessageKind::System,
+            json!({ "install_packages": {"apt": ["jq"]} }),
+        );
+        write_row(&out_pool, &row);
+
+        let _ = service.process_session_once(&ghost).await.unwrap();
+
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&ghost.agent_group_id, &ghost.id)
+            .unwrap();
+        let sys_rows = list_inbound_system_rows(&in_pool);
+        assert_eq!(sys_rows.len(), 1, "expected one system row, got {sys_rows:?}");
+        let envelope = &sys_rows[0];
+        let err_obj = &envelope["content"]["self_mod_error"];
+        assert_eq!(err_obj["action"], "install_packages");
+        assert!(
+            err_obj["error"].as_str().is_some(),
+            "expected error string: {envelope}",
+        );
+        assert!(
+            err_obj["guidance"].as_str().is_some(),
+            "expected guidance string: {envelope}",
+        );
+    }
+
+    #[tokio::test]
+    async fn install_packages_failure_marks_row_failed() {
+        let (service, _root, sess, _mock) = make_service().await;
+        let ghost = ghost_session(&sess);
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&ghost.agent_group_id, &ghost.id)
+            .unwrap();
+        let row = make_row(
+            MessageKind::System,
+            json!({ "install_packages": {"apt": ["jq"]} }),
+        );
+        write_row(&out_pool, &row);
+
+        let _ = service.process_session_once(&ghost).await.unwrap();
+
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&ghost.agent_group_id, &ghost.id)
+            .unwrap();
+        let in_conn = in_pool.connect().unwrap();
+        let listed = delivered::list(&in_conn).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, "failed");
+    }
+
+    #[test]
+    fn install_packages_failure_increments_metric() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let body = metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (service, _root, sess, _mock) = make_service().await;
+                let ghost = ghost_session(&sess);
+                let out_pool = service
+                    .session_paths
+                    .outbound_pool(&ghost.agent_group_id, &ghost.id)
+                    .unwrap();
+                let row = make_row(
+                    MessageKind::System,
+                    json!({ "install_packages": {"apt": ["jq"]} }),
+                );
+                write_row(&out_pool, &row);
+                let _ = service.process_session_once(&ghost).await.unwrap();
+            });
+            handle.render()
+        });
+
+        assert!(
+            body.contains(ironclaw_metrics::SELF_MOD_FAILED_TOTAL),
+            "expected self-mod failure metric in scrape body:\n{body}",
+        );
+        assert!(
+            body.contains("action=\"install_packages\""),
+            "expected install_packages action label in body:\n{body}",
+        );
+    }
+
     #[test]
     fn message_id_for_seq_round_trips() {
         // Pure helper-level coverage so we don't have to spin up the full
@@ -2361,6 +2629,137 @@ mod tests {
         // Failed deliveries don't expose an external_id to subsequent
         // edits/reactions — the row is logically absent.
         assert!(platform_message_id_for(&conn, id).unwrap().is_none());
+    }
+
+    #[test]
+    fn install_packages_success_increments_succeeded_metric() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let body = metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (service, _root, sess, _mock) = make_service().await;
+                let out_pool = service
+                    .session_paths
+                    .outbound_pool(&sess.agent_group_id, &sess.id)
+                    .unwrap();
+                let row = make_row(
+                    MessageKind::System,
+                    json!({ "install_packages": {"apt": ["ripgrep"]} }),
+                );
+                write_row(&out_pool, &row);
+                let rpt = service.process_session_once(&sess).await.unwrap();
+                assert_eq!(rpt.delivered, 1);
+            });
+            handle.render()
+        });
+
+        assert!(
+            body.contains(ironclaw_metrics::SELF_MOD_SUCCEEDED_TOTAL),
+            "expected self-mod success metric in scrape body:\n{body}",
+        );
+        assert!(
+            body.contains("action=\"install_packages\""),
+            "expected install_packages action label in body:\n{body}",
+        );
+    }
+
+    #[tokio::test]
+    async fn add_mcp_server_failure_writes_self_mod_error_to_inbound() {
+        let (service, _root, sess, _mock) = make_service().await;
+        let ghost = ghost_session(&sess);
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&ghost.agent_group_id, &ghost.id)
+            .unwrap();
+        let row = make_row(
+            MessageKind::System,
+            json!({ "add_mcp_server": {"name": "linear", "transport": {"command": "npx"}} }),
+        );
+        write_row(&out_pool, &row);
+
+        let _ = service.process_session_once(&ghost).await.unwrap();
+
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&ghost.agent_group_id, &ghost.id)
+            .unwrap();
+        let sys_rows = list_inbound_system_rows(&in_pool);
+        assert_eq!(sys_rows.len(), 1);
+        let envelope = &sys_rows[0];
+        assert_eq!(
+            envelope["content"]["self_mod_error"]["action"],
+            "add_mcp_server"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_mcp_server_failure_marks_row_failed() {
+        let (service, _root, sess, _mock) = make_service().await;
+        let ghost = ghost_session(&sess);
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&ghost.agent_group_id, &ghost.id)
+            .unwrap();
+        let row = make_row(
+            MessageKind::System,
+            json!({ "add_mcp_server": {"name": "linear", "transport": {"command": "npx"}} }),
+        );
+        write_row(&out_pool, &row);
+
+        let _ = service.process_session_once(&ghost).await.unwrap();
+
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&ghost.agent_group_id, &ghost.id)
+            .unwrap();
+        let in_conn = in_pool.connect().unwrap();
+        let listed = delivered::list(&in_conn).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, "failed");
+    }
+
+    /// `IRONCLAW_SELFMOD_HARD_FAIL=1` flips the failure into a returned
+    /// `DeliveryError`, so the row is recorded as failed via the
+    /// outer loop's `SystemAction` arm (rather than being recorded
+    /// inline by `record_self_mod_failure`). The env var is read at
+    /// boot and stored on the service; tests flip it via
+    /// `set_selfmod_hard_fail` to avoid the Rust 2024 unsafe
+    /// requirement on `std::env::set_var`.
+    // TODO(team-ip): if operators want to flip this without restart,
+    // wire `SIGHUP` to re-read `IRONCLAW_SELFMOD_HARD_FAIL`.
+    #[tokio::test]
+    async fn selfmod_hard_fail_env_propagates_error() {
+        let (service, _root, sess, _mock) = make_service().await;
+        assert!(
+            !service.selfmod_hard_fail(),
+            "hard-fail must default to off",
+        );
+        service.set_selfmod_hard_fail(true);
+        let ghost = ghost_session(&sess);
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&ghost.agent_group_id, &ghost.id)
+            .unwrap();
+        let row = make_row(
+            MessageKind::System,
+            json!({ "install_packages": {"apt": ["jq"]} }),
+        );
+        write_row(&out_pool, &row);
+
+        let rpt = service.process_session_once(&ghost).await.unwrap();
+        // The hard-fail path returns a `SystemAction` error from
+        // `handle_system`. `process_row` propagates it; the outer
+        // loop classifies it as a non-retryable failure and records
+        // the delivery row as failed in the same pass (see
+        // `process_session_once`'s `Err(DeliveryError::SystemAction(_))`
+        // arm). The agent-visible inbound row is NOT written in this
+        // mode — the row stays in dropped-messages and the operator
+        // is expected to investigate.
+        assert_eq!(rpt.failed, 1, "expected one failed row on hard-fail");
     }
 
     #[test]

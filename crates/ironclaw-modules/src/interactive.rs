@@ -596,6 +596,7 @@ mod tests {
                     thread_id: None,
                     agent_group_id: None,
                 },
+                session_id: None,
             })
             .unwrap();
         let dispatch = out.dispatch.expect("dispatch target");
@@ -626,6 +627,7 @@ mod tests {
                     thread_id: Some("100.0".into()),
                     agent_group_id: None,
                 },
+                session_id: None,
             })
             .unwrap();
         let dispatch = out.dispatch.expect("dispatch target");
@@ -662,6 +664,7 @@ mod tests {
                     thread_id: None,
                     agent_group_id: None,
                 },
+                session_id: None,
             })
             .unwrap();
         let msg = out.message.expect("fallback message");
@@ -693,6 +696,7 @@ mod tests {
                     thread_id: None,
                     agent_group_id: None,
                 },
+                session_id: None,
             })
             .unwrap_err();
         assert!(format!("{err}").contains("text"));
@@ -715,6 +719,7 @@ mod tests {
                     thread_id: None,
                     agent_group_id: None,
                 },
+                session_id: None,
             })
             .unwrap_err();
         assert!(format!("{err}").contains("emoji"));

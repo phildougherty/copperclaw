@@ -135,6 +135,35 @@ adheres to [Semantic Versioning](https://semver.org/).
   thing; other adapters (CLI, webhooks, etc.) get the fallback chat
   message automatically via the `Unsupported` default.
 
+### Fixed (delivery: surface install_packages / add_mcp_server apply failures)
+
+- **`crates/ironclaw-host-delivery/src/service.rs`** — the
+  `install_packages` and `add_mcp_server` system-action handlers no
+  longer mark a row `delivered.status="ok"` after the underlying
+  `container_configs` update failed. On apply error the row is now
+  recorded as `delivered.status="failed"` with the error message in
+  the payload (so it surfaces in `iclaw dropped-messages outbound-list`),
+  the failure is logged at `error!` (not `warn!`), and a
+  `MessageKind::System` row carrying a `self_mod_error` envelope is
+  written to the session's `inbound.db` so the agent learns its tool
+  call failed and can adapt on the next turn. Without this, the
+  agent would loop thinking its install succeeded while the next
+  container spawn silently lacked the package.
+- New metric counters
+  `ironclaw_self_mod_failed_total{action}` and
+  `ironclaw_self_mod_succeeded_total{action}` (`action` ∈
+  `{install_packages, add_mcp_server}`) — fired on every self-mod
+  apply outcome so operators can chart the failure rate.
+- New env var `IRONCLAW_SELFMOD_HARD_FAIL=1` flips failed applies
+  into a non-retryable `DeliveryError::SystemAction` so the outer
+  delivery loop records the row in `dropped-messages` instead of
+  handling the failure inline. Default off; useful for tests + paranoid
+  operators that want the message in the failed-deliveries view.
+- **`crates/ironclaw-metrics/src/lib.rs`** — new
+  `inc_self_mod_failed(action)` / `inc_self_mod_succeeded(action)`
+  helpers + `SELF_MOD_FAILED_TOTAL` / `SELF_MOD_SUCCEEDED_TOTAL`
+  name constants, following the existing pattern.
+
 ### Fixed (runner: route chat outbounds back to the originating channel)
 
 - **`crates/ironclaw-runner/src/tools.rs`** and

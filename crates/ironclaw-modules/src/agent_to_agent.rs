@@ -891,6 +891,7 @@ mod tests {
                     "instructions": "Investigate things",
                 }),
                 target,
+                session_id: None,
             })
             .unwrap();
         assert!(out.message.is_none(), "create_agent has no chat reply");
@@ -921,6 +922,7 @@ mod tests {
                     "instructions": "do work",
                 }),
                 target,
+                session_id: None,
             })
             .unwrap();
         let results = read_inbound_create_results(tmp.path(), parent);
@@ -943,6 +945,7 @@ mod tests {
                     "channel": "cli",
                 }),
                 target,
+                session_id: None,
             })
             .unwrap();
         let groups = agent_groups::list(&central).unwrap();
@@ -970,6 +973,7 @@ mod tests {
                     "instructions": "should not exist",
                 }),
                 target,
+                session_id: None,
             })
             .unwrap();
         let after = agent_groups::list(&central).unwrap().len();
@@ -993,6 +997,7 @@ mod tests {
                     "instructions": "would be 2 levels deep",
                 }),
                 target,
+                session_id: None,
             })
             .unwrap();
         let after = agent_groups::list(&central).unwrap().len();
@@ -1011,6 +1016,7 @@ mod tests {
                 action: "create_agent".into(),
                 payload: serde_json::json!({"name": "no-instructions"}),
                 target,
+                session_id: None,
             })
             .unwrap();
         let after = agent_groups::list(&central).unwrap().len();
