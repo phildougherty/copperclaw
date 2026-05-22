@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (setup: telegram channel now ships fully wired)
+
+- **`crates/ironclaw-setup/src/steps/quickstart_group.rs`** —
+  `quickstart_group` now handles `first_channel = telegram` (previously
+  only `cli`).  Closes the live gap I hit on this box: after the
+  channel step persisted `TELEGRAM_BOT_TOKEN`, I still had to manually
+  (a) add `IRONCLAW_CHANNELS=cli,telegram` to `.env`, (b) add
+  `IRONCLAW_CHANNELS_CONFIG='{"telegram":{"bot_token":"...","mode":"long_poll"}}'`
+  (single-quoted so dotenvy parses it), (c) `iclaw messaging-groups
+  create --channel-type telegram --platform-id <chat_id>`, (d)
+  `iclaw wirings create --mg ... --ag ... --engage pattern --pattern '.*'`,
+  and (e) `iclaw approvals approve --channel telegram --identity <chat_id>`.
+  All five now happen automatically when setup completes.
+- New helper `bootstrap_telegram_install(db, cfg, name)` writes the
+  channel-enable env vars + creates an agent group + (when the channel
+  step captured `TELEGRAM_CHAT_ID`) creates the messaging-group,
+  wiring, and sender approval. When no chat_id was captured the agent
+  group + env vars still land so the runtime
+  `unregistered_senders` flow can complete the wiring on first inbound.
+- Three new tests:
+  `bootstrap_telegram_install_writes_env_vars_and_db_rows_with_chat_id`
+  pins the full-wire path; `..._without_chat_id_still_enables_channel`
+  pins the minimal path; `..._errors_without_token` pins the
+  channel-step-must-run-first contract.
+
 ### Fixed (runner: retry on transient stream errors)
 
 - **`crates/ironclaw-providers/src/anthropic.rs`** — SSE
