@@ -9,7 +9,7 @@ use crate::error::ModuleError;
 use async_trait::async_trait;
 use ironclaw_types::{
     AgentGroupId, ChannelType, InboundEvent, MessagingGroupId, OutboundMessage, SenderIdentity,
-    UserId,
+    SessionId, UserId,
 };
 use std::sync::Arc;
 
@@ -244,6 +244,10 @@ pub struct DeliveryActionInput {
     /// Target the host resolved for this action; the action handler may
     /// override the dispatch target via [`DeliveryActionOutput::dispatch`].
     pub target: DispatchTarget,
+    /// Identifier of the session whose outbound row produced this action.
+    /// Populated by the host's delivery service when invoking the handler;
+    /// `None` in some tests that construct `DeliveryActionInput` directly.
+    pub session_id: Option<SessionId>,
 }
 
 /// What a delivery action wants the host to do.
@@ -257,7 +261,7 @@ pub struct DeliveryActionOutput {
 }
 
 /// Where an outbound message goes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DispatchTarget {
     pub channel_type: Option<ChannelType>,
     pub platform_id: Option<String>,

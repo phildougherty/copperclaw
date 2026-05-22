@@ -42,6 +42,10 @@ pub use error::ModuleError;
 pub use interactive::{InteractiveModule, PendingQuestion, QuestionId};
 pub use mount_security::{MountError, MountSecurityModule, validate_mount_target};
 pub use permissions::{PermissionOp, PermissionsModule, Role, check as permissions_check};
-pub use scheduling::{ScheduleError, SchedulingModule, When, compute_next_fire, parse_when};
+pub use scheduling::{
+    compute_next_fire, parse_when, CreateTaskSpec, InMemoryTaskStore, ScheduleError,
+    ScheduleHandler, SchedulingModule, TaskRecord, TaskStatus as ScheduledTaskStatus, TaskStore,
+    UpdateTaskFields, When,
+};
 pub use self_mod::{ChangeRequest, PackageError, PackageManager, SelfModModule};
 pub use typing::{TypingConfig, TypingModule};

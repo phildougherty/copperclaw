@@ -19,7 +19,7 @@ use ironclaw_db::migrate::{
 };
 use ironclaw_host_delivery::DeliveryService;
 use ironclaw_host_router::Router;
-use ironclaw_host_sweep::SweepService;
+use ironclaw_host_sweep::{SqliteTaskStore, SweepService};
 use ironclaw_modules::{
     AgentToAgentModule, ApprovalsModule, InteractiveModule, Module, MountSecurityModule,
     NewPendingCtx, NewPendingNotifier, PermissionsModule, SchedulingModule, SelfModModule,
@@ -419,7 +419,12 @@ pub async fn install_modules(host_ctx: Arc<HostContext>) {
             .with_new_pending_notifier(build_pending_notifier(host_ctx.central().clone())),
         ),
         Box::new(InteractiveModule::default()),
-        Box::new(SchedulingModule),
+        // TODO(team-sc): wire sqlite-backed TaskStore so scheduled
+        // tasks created via the agent's `schedule_task` MCP tool
+        // persist and the sweep loop can fire them.
+        Box::new(SchedulingModule::with_store(Arc::new(
+            SqliteTaskStore::new(host_ctx.central().clone()),
+        ))),
         Box::new(AgentToAgentModule),
         Box::new(SelfModModule),
     ];

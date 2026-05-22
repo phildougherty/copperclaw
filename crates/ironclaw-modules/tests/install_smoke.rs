@@ -18,7 +18,7 @@ async fn every_module_installs_and_registers_expected_hooks() {
         Box::new(PermissionsModule::deny_all()),
         Box::new(ApprovalsModule::new()),
         Box::new(InteractiveModule::default()),
-        Box::new(SchedulingModule),
+        Box::new(SchedulingModule::default()),
         Box::new(AgentToAgentModule),
         Box::new(SelfModModule),
     ];
@@ -44,7 +44,10 @@ async fn every_module_installs_and_registers_expected_hooks() {
     // registers ask_user_question + send_card.
     let mut actions = ctx.delivery_actions();
     actions.sort();
-    assert_eq!(actions, vec!["approval_card", "ask_user_question", "send_card"]);
+    assert_eq!(
+        actions,
+        vec!["approval_card", "ask_user_question", "schedule", "send_card"]
+    );
     // Names are all unique and stable.
     let names: Vec<&'static str> = modules.iter().map(|m| m.name()).collect();
     let mut sorted = names.clone();

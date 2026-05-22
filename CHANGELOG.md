@@ -6,6 +6,50 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (scheduling: persist tasks and fire due ones from the sweep loop)
+
+- **`crates/ironclaw-modules/src/scheduling.rs`** — `SchedulingModule::install`
+  now registers a real `"schedule"` delivery action against the host's
+  module context. Previously the module's `install` was a literal no-op,
+  so every `schedule_task` / `list_tasks` / `cancel_task` / `pause_task` /
+  `resume_task` / `update_task` call from the agent produced an outbound
+  system row that the delivery loop logged as
+  `"no handler for system action; skipping name=schedule"` and dropped
+  on the floor. **Live-caught**: the agent reported it had scheduled a
+  daily 9am dashboard for the user — and nothing was scheduled. The new
+  `ScheduleHandler` drives a `TaskStore` trait (in-memory store for
+  tests; the host wires a sqlite-backed `SqliteTaskStore`) and dispatches
+  on the payload's `op` field.
+- **`crates/ironclaw-db/migrations/010_tasks.sql`** — new `tasks` table
+  on the central DB. Columns: `id` (server-generated `task_<uuid>`),
+  `agent_group_id`, `session_id`, `name`, `prompt`, `when_spec`,
+  `recurrence`, `next_fire`, `status`
+  (`active`/`paused`/`cancelled`/`completed`), `created_at`, `updated_at`.
+- **`crates/ironclaw-db/src/tables/tasks.rs`** — CRUD module for the
+  new table: `insert`, `get`, `list_for_session`, `list_due`,
+  `set_status`, `set_next_fire`, `update`.
+- **`crates/ironclaw-host-sweep/src/checks/scheduling.rs`** — new sweep
+  check called once per pass. For every `active` task with
+  `next_fire <= now`, the check synthesises a `kind: task`, `on_wake: true`
+  inbound row into the originating session's `inbound.db` and either
+  re-arms (recurring tasks bump `next_fire` to the next occurrence) or
+  transitions to `completed` (one-shot tasks clear `next_fire`). The
+  existing `wake.rs` check then picks up the new pending row and walks
+  the container back to `running`.
+- **`crates/ironclaw-host-sweep/src/task_store.rs`** — the sqlite-backed
+  `SqliteTaskStore` impl of `TaskStore`. Lives in the sweep crate so the
+  modules crate stays decoupled from `ironclaw-db`.
+- **`crates/ironclaw-host/src/boot.rs`** — boot now constructs
+  `SqliteTaskStore::new(host_ctx.central().clone())` and passes it
+  through `SchedulingModule::with_store(...)` so created tasks land in
+  the same `tasks` table the sweep scans.
+- **`crates/ironclaw-modules/src/context.rs`** — `DeliveryActionInput`
+  gains `session_id: Option<SessionId>` and `DispatchTarget` derives
+  `Default`. The host's delivery service populates both for system
+  actions so the `ScheduleHandler` can identify the originating session.
+  Existing handlers (`approval_card`, `ask_user_question`, `send_card`)
+  ignore the new field.
+
 ### Fixed (runner: route chat outbounds back to the originating channel)
 
 - **`crates/ironclaw-runner/src/tools.rs`** and

@@ -453,10 +453,13 @@ impl DeliveryService {
                 // that handler the row is recorded as delivered with status
                 // "ok" — there is no external channel to invoke.
                 if let Some(handler) = self.actions.get("agent_dispatch").map(|r| r.clone()) {
+                    // TODO(team-sc): session_id wired through for the
+                    // scheduling action handler; other handlers ignore.
                     let input = DeliveryActionInput {
                         action: "agent_dispatch".into(),
                         payload: row.content.clone(),
                         target: target.clone(),
+                        session_id: Some(sess.id),
                     };
                     let _ = handler
                         .handle(input)
@@ -546,10 +549,18 @@ impl DeliveryService {
             return Ok(());
         };
 
+        // TODO(team-sc): wire session_id + agent_group_id through to the
+        // delivery action handler so the scheduling module can identify
+        // which session a `schedule` op targets. Other handlers ignore.
+        let mut handler_target = target.clone();
+        if handler_target.agent_group_id.is_none() {
+            handler_target.agent_group_id = Some(sess.agent_group_id);
+        }
         let input = DeliveryActionInput {
             action: action.name,
             payload: action.payload,
-            target: target.clone(),
+            target: handler_target,
+            session_id: Some(sess.id),
         };
         let output = handler
             .handle(input)

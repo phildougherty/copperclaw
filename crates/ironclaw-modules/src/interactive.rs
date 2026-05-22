@@ -398,6 +398,7 @@ mod tests {
                     thread_id: None,
                     agent_group_id: None,
                 },
+                session_id: None,
             })
             .unwrap();
         let dispatch = out.dispatch.unwrap();
@@ -426,6 +427,7 @@ mod tests {
                 thread_id: None,
                 agent_group_id: None,
             },
+            session_id: None,
         });
         assert!(bad.is_err());
         let bad = handler.handle(DeliveryActionInput {
@@ -437,6 +439,7 @@ mod tests {
                 thread_id: None,
                 agent_group_id: None,
             },
+            session_id: None,
         });
         assert!(bad.is_err());
         let bad = handler.handle(DeliveryActionInput {
@@ -448,6 +451,7 @@ mod tests {
                 thread_id: None,
                 agent_group_id: None,
             },
+            session_id: None,
         });
         assert!(bad.is_err());
     }
@@ -471,6 +475,7 @@ mod tests {
                     thread_id: None,
                     agent_group_id: None,
                 },
+                session_id: None,
             })
             .unwrap();
         let msg = out.message.unwrap();
@@ -493,6 +498,7 @@ mod tests {
                 thread_id: None,
                 agent_group_id: None,
             },
+            session_id: None,
         });
         assert!(out.is_err());
     }

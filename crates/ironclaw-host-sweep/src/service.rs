@@ -2,7 +2,7 @@
 //! [`crate::SWEEP_POLL_MS`] tick and produces a [`SweepReport`] describing
 //! sessions that need host attention.
 
-use crate::checks::{apology, heartbeat, processing, recurrence, stuck, wake};
+use crate::checks::{apology, heartbeat, processing, recurrence, scheduling, stuck, wake};
 use crate::checks::apology::ApologyEmit;
 use crate::clock::{Clock, SystemClock};
 use crate::error::SweepError;
@@ -278,11 +278,25 @@ impl SweepService {
     /// Errors during one session's check are logged and skipped — the pass
     /// continues with the next session — except for failures reading the
     /// central session list, which abort the pass with `Err`.
+    #[allow(clippy::too_many_lines)]
     pub fn run_once(&self) -> Result<SweepReport, SweepError> {
         let now = self.clock.now();
         let sessions = ironclaw_db::tables::sessions::list_active(&self.central)?;
 
         let mut report = SweepReport::default();
+
+        // Global: scan the central `tasks` table for due scheduled
+        // tasks, synthesise wake inbounds, and re-arm / mark completed.
+        // Errors here are logged and swallowed so per-session checks
+        // still run; a single sqlite hiccup must not abort the pass.
+        match scheduling::check(&self.central, self.session_paths.as_ref(), now) {
+            Ok(mut fan) => report.recurrences_fired.append(&mut fan),
+            Err(e) => tracing::warn!(
+                target: "ironclaw_host_sweep",
+                error = %e,
+                "scheduled-task fan-out failed",
+            ),
+        }
 
         for session in sessions {
             // Heartbeat is checked even for non-running containers because
