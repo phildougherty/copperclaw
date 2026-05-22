@@ -55,6 +55,27 @@ pub enum ProviderEvent {
         input_tokens: u32,
         output_tokens: u32,
     },
+    /// The provider finished reassembling a `tool_use` block but the
+    /// concatenated `input_json_delta` chunks did not parse as JSON.
+    /// Rather than treating this as a terminal stream error (which
+    /// would leave the user without a reply), the runner converts this
+    /// into a synthetic `tool_result` with `is_error: true` and feeds
+    /// it back into the next turn so the model can self-correct. See
+    /// `ironclaw-runner::run::pump_events` for the recovery path.
+    ToolInputParseError {
+        /// Provider-side tool-use id the model assigned to this block.
+        /// Must echo back as the matching `tool_result.tool_use_id`.
+        tool_use_id: String,
+        /// Tool the model was trying to invoke.
+        tool_name: String,
+        /// Raw concatenated `input_json_delta` payload that failed to
+        /// parse. Captured for audit / debugging; the runner does not
+        /// attempt to repair it.
+        raw_input: String,
+        /// The underlying `serde_json` error rendered as a string (e.g.
+        /// "EOF while parsing an object at line 1 column 37").
+        parse_error: String,
+    },
 }
 
 /// Provider config materialized into the container at spawn time. Stored in

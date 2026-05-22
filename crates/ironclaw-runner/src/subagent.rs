@@ -248,6 +248,28 @@ pub async fn run_inner_loop(
                 ProviderEvent::ToolCall { id, name, input } => {
                     pending_calls.push(PendingCall { id, name, input });
                 }
+                ProviderEvent::ToolInputParseError {
+                    tool_use_id,
+                    tool_name,
+                    parse_error,
+                    ..
+                } => {
+                    // Subagent doesn't get the parse-error feedback
+                    // loop the main runner has — keep behaviour
+                    // conservative and abort the explore so the
+                    // parent agent can see the failure summary. The
+                    // top-level runner is where self-correction
+                    // happens; subagent turns are bounded and
+                    // single-shot.
+                    tracing::warn!(
+                        tool_use_id = %tool_use_id,
+                        tool_name = %tool_name,
+                        parse_error = %parse_error,
+                        "subagent: tool_use input JSON parse failure; bailing turn"
+                    );
+                    failed = true;
+                    break;
+                }
             }
         }
         query.abort().await;

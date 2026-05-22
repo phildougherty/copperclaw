@@ -470,15 +470,22 @@ async fn handle_sse_event(
                     match serde_json::from_str::<Value>(&acc.input_json) {
                         Ok(v) => v,
                         Err(e) => {
+                            // Surface this as a recoverable event rather
+                            // than a terminal Error: the runner will hand
+                            // the parse error back to the model as a
+                            // tool_result with is_error=true so it can
+                            // self-correct on the next turn. See
+                            // `ironclaw-runner::run::pump_events` for the
+                            // matching recovery path.
                             let _ = tx
-                                .send(ProviderEvent::Error {
-                                    message: format!(
-                                        "tool_use input json parse failed for {}: {e}",
-                                        acc.name
-                                    ),
-                                    retryable: false,
+                                .send(ProviderEvent::ToolInputParseError {
+                                    tool_use_id: acc.id,
+                                    tool_name: acc.name,
+                                    raw_input: acc.input_json,
+                                    parse_error: e.to_string(),
                                 })
                                 .await;
+                            let _ = tx.send(ProviderEvent::ToolEnd).await;
                             return false;
                         }
                     }
