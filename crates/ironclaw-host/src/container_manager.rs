@@ -900,7 +900,22 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
         agent_group_id: AgentGroupId,
         cfg: &container_configs::ContainerConfig,
     ) -> Result<String, ManagerError> {
-        let mut build_spec = ImageBuildSpec::new("ironclaw/session", "debian:trixie-slim");
+        // Base the per-group rebuild on the install's default image
+        // (which has `/usr/local/bin/ironclaw-runner` baked in at setup
+        // time), NOT on bare `debian:trixie-slim`. The rebuild's
+        // Dockerfile only adds layers (apt / npm / labels) — it does
+        // not COPY the runner binary, so building from a runnerless
+        // base produces a runnerless image and every subsequent
+        // `runc create` fails with "stat /usr/local/bin/ironclaw-runner:
+        // no such file or directory". Caught live: an agent emitted
+        // `install_packages` → host auto-rebuilt → container_configs
+        // got pinned to a 413MB runnerless image → all subsequent
+        // spawns wedged. Falling back to a hard-coded slim base when
+        // `default_image_tag` is empty (shouldn't happen in a
+        // setup-completed install, but the fallback keeps tests that
+        // run with `HostConfig::default()` working).
+        let base = resolve_rebuild_base(&self.cfg.default_image_tag);
+        let mut build_spec = ImageBuildSpec::new("ironclaw/session", &base);
         build_spec.apt_packages.clone_from(&cfg.packages_apt);
         build_spec.npm_packages.clone_from(&cfg.packages_npm);
         let tag = self.runtime.build_image(build_spec).await.map_err(ManagerError::Spawn)?;
@@ -1222,12 +1237,50 @@ pub enum ManagerError {
     Spawn(#[source] RtError),
 }
 
+/// Choose the base image for a per-group rebuild. Returns the install's
+/// `default_image_tag` (which has `/usr/local/bin/ironclaw-runner`
+/// baked in at setup time) when set; falls back to `debian:trixie-slim`
+/// otherwise (only reachable from tests that construct a `HostConfig`
+/// without going through setup). The rebuild Dockerfile only adds layers
+/// on top — it doesn't COPY the runner — so basing on a runnerless image
+/// produces an unspawnable container.
+#[must_use]
+pub fn resolve_rebuild_base(default_image_tag: &str) -> String {
+    if default_image_tag.is_empty() {
+        "debian:trixie-slim".to_string()
+    } else {
+        default_image_tag.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ironclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
     use ironclaw_db::tables::sessions::{create as create_session, CreateSession};
     use ironclaw_types::SessionId;
+
+    /// Regression: image rebuilds must base off the install's default
+    /// image (which has the runner binary), not bare `debian:trixie-slim`.
+    /// Caught live: agent emitted `install_packages` → host rebuilt
+    /// against debian-slim → resulting image had apt packages but no
+    /// `/usr/local/bin/ironclaw-runner` → every `runc create` failed.
+    #[test]
+    fn rebuild_base_prefers_default_image_tag() {
+        assert_eq!(
+            resolve_rebuild_base("ironclaw/session:sha256-abc123"),
+            "ironclaw/session:sha256-abc123"
+        );
+    }
+
+    #[test]
+    fn rebuild_base_falls_back_when_default_unset() {
+        // Only reachable from tests constructing HostConfig::default()
+        // — a setup-completed install always has the env var. The
+        // fallback keeps unit tests working without producing an
+        // empty `FROM` directive in the Dockerfile.
+        assert_eq!(resolve_rebuild_base(""), "debian:trixie-slim");
+    }
 
     fn manager_cfg(data_dir: PathBuf) -> ManagerConfig {
         ManagerConfig {

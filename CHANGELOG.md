@@ -6,6 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (container rebuild: preserve runner binary)
+
+- **`crates/ironclaw-host/src/container_manager.rs`** —
+  `rebuild_image` now bases per-group image rebuilds on the install's
+  `default_image_tag` (which has `/usr/local/bin/ironclaw-runner`
+  baked in at setup time) instead of bare `debian:trixie-slim`. The
+  rebuild Dockerfile only adds layers (apt / npm / labels); it never
+  re-COPIES the runner binary. Caught live: agent on this box
+  emitted `install_packages` for `git`/`nodejs`/`npm`, the host's
+  M13 auto-apply flow triggered a rebuild against debian-slim, the
+  resulting image had apt packages but no runner, and every
+  subsequent `runc create` failed with `stat
+  /usr/local/bin/ironclaw-runner: no such file or directory`. New
+  `resolve_rebuild_base()` helper picks the default tag when set,
+  falls back to `debian:trixie-slim` only when default is empty
+  (tests). Two regression tests:
+  `rebuild_base_prefers_default_image_tag` and
+  `rebuild_base_falls_back_when_default_unset`.
+
+### Added (skill: agent identity)
+
+- **`skills/identity/SKILL.md`** — auto-loads into every agent's
+  system prompt and teaches the agent that it's an Ironclaw agent.
+  Previously the agent answered "who are you?" with the model's
+  generic Claude-or-AI-assistant intro, denying any connection to
+  Ironclaw (caught live: agent told a user "I'm not Ironclaw — I'm
+  an AI assistant"). The skill names the system, describes the
+  per-session container runtime + channel brokering, and includes
+  three example phrasings to anchor the answer.
+
 ### Fixed (setup: telegram channel now ships fully wired)
 
 - **`crates/ironclaw-setup/src/steps/quickstart_group.rs`** —
