@@ -92,6 +92,9 @@ mod smoke {
                 "update_task",
                 serde_json::json!({"id": "task_1", "prompt": "p"}),
             ),
+            // git_* smoke covered in each tool's own test module — they
+            // need a real on-disk repo, which the smoke harness doesn't
+            // set up. Skipping here is intentional.
         ];
 
         for (name, body) in inputs {
