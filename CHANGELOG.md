@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (dev loop: skills now actually load)
+
+- **`rebuild.sh`** — symlinks `<install_root>/data/skills` at the
+  repo's `skills/` directory so dev edits to `SKILL.md` files land
+  in the next session spawn without manual copying. Caught live:
+  `IRONCLAW_SKILLS_DIR` defaults to `<install_root>/data/skills`
+  but setup never copied the repo's skills into that path. Result:
+  the running session had an EMPTY system prompt (verified:
+  `runner.json:system` was `""`), every skill we'd authored was
+  invisible to the agent, and the identity skill in particular
+  didn't fire when the user asked "what is Ironclaw?" — the model
+  pulled from training data and described a tabletop RPG.
+- **`CLAUDE.md`** — documents the symlink + the gotcha for the
+  next contributor.
+
 ### Fixed (container rebuild: preserve runner binary)
 
 - **`crates/ironclaw-host/src/container_manager.rs`** —

@@ -30,6 +30,18 @@ direct `cargo install` for one-off experiments.
 For a brand-new box, use `install.sh` instead (downloads prebuilt tarballs
 from GitHub Releases, falls back to `cargo install --git`, runs setup).
 
+### Skills loading (the dev gotcha)
+
+The host reads `IRONCLAW_SKILLS_DIR` (defaulted by setup to
+`<install_root>/data/skills`). Setup-time copy doesn't sync repo edits
+into the install, so `rebuild.sh` symlinks `<install_root>/data/skills`
+at the repo's `skills/` dir on every run. Edits to `skills/<name>/SKILL.md`
+in the repo land in the next session spawn — no rebuild needed.
+
+If `data/skills` is a real directory (not a symlink — e.g. an old install
+predating this loop), `rebuild.sh` warns and refuses to clobber it.
+Move it aside (`mv data/skills data/skills.bak`) and re-run.
+
 ## Checking the code is healthy
 
 Before declaring any change done:

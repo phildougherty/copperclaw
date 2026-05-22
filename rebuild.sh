@@ -93,6 +93,30 @@ if [ "$do_clean" = 1 ]; then
     fi
 fi
 
+# ── Step 2b: link the install's skills/ + groups/ at the repo ────────
+# Dev-loop ergonomic: skills are pure markdown, and we want edits in
+# the repo to land in the running host without a rebuild. The host
+# reads IRONCLAW_SKILLS_DIR (defaulted by setup to
+# <install_root>/data/skills) — symlink that at the repo's skills/ so
+# every running session sees current-tree skills on its next spawn.
+# A missing groups/ dir blocks per-agent-group overrides from being
+# picked up, so we mkdir an empty one if needed.
+if [ "$do_clean" = 1 ] && [ -d "$INSTALL_ROOT" ]; then
+    install_skills="$DATA_DIR/skills"
+    install_groups="$DATA_DIR/groups"
+    repo_skills="$REPO_ROOT/skills"
+    if [ -d "$repo_skills" ] && [ ! -e "$install_skills" ]; then
+        say "symlinking $install_skills -> $repo_skills (dev skill loop)"
+        mkdir -p "$(dirname "$install_skills")"
+        ln -sfn "$repo_skills" "$install_skills"
+    elif [ -d "$install_skills" ] && [ ! -L "$install_skills" ]; then
+        warn "$install_skills is a real directory; skills edits in the repo won't reach the running host. Move it aside and re-run if you want the dev loop."
+    fi
+    if [ ! -d "$install_groups" ]; then
+        mkdir -p "$install_groups"
+    fi
+fi
+
 # ── Step 3: build + install ───────────────────────────────────────────
 say "building + installing binaries ($build_mode) to $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
