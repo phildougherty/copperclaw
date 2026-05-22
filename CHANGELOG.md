@@ -6,6 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (runner: retry on transient stream errors)
+
+- **`crates/ironclaw-providers/src/anthropic.rs`** — SSE
+  transport/decode failures are now tagged `retryable: true` (was
+  `false`). These almost always represent a dropped connection or
+  malformed chunk mid-stream, not a fundamental upstream problem.
+- **`crates/ironclaw-runner/src/run.rs`** — `run_llm_turn` now wraps
+  `query + pump_events` in a second retry layer (in addition to the
+  query-level retry Team Q added). When `pump_events` returns a
+  failure tagged `retryable_failure=true` and there are attempts
+  left, the whole call is re-issued with the same 250ms / 500ms / 1s
+  exponential backoff and the same `MAX_PROVIDER_ATTEMPTS=3` cap.
+  Closes the gap caught live with a Telegram message ("Where are you
+  running") that produced a `usage_report` with `status=error`,
+  `input_tokens=0`, and a `failed` inbound after OpenRouter dropped
+  the SSE stream once. With the retry in place the second attempt
+  succeeds and the agent replies. Two new tests:
+  `retryable_stream_error_retries_then_succeeds` pins the new path;
+  the existing `error_event_marks_inbound_failed` continues to cover
+  the non-retryable terminal case.
+- **`LlmTurnOutput.retryable_failure`** — new bool field carrying the
+  classification through pump_events back to the caller.
+
 ### Fixed (telegram: plain-text default for outbound)
 
 - **`crates/ironclaw-channels/telegram/src/adapter.rs`** — `DEFAULT_PARSE_MODE`

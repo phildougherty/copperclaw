@@ -311,6 +311,11 @@ struct LlmTurnOutput {
     tool_calls: Vec<PendingToolCall>,
     /// True if the provider emitted a terminal Error event.
     failed: bool,
+    /// When `failed` is true and the provider's `Error` event carried
+    /// `retryable: true`, this is set so `run_llm_turn` can re-issue
+    /// the whole query rather than terminating the inbound. Surfaces the
+    /// transport/SSE-decode classification the provider already does.
+    retryable_failure: bool,
 }
 
 /// Drive one inbound through to a final assistant response. Loops
@@ -423,29 +428,61 @@ async fn run_llm_turn(
         display_name: None,
     };
     let turn_started_at = chrono::Utc::now();
-    let mut query = match query_with_retry(deps, input).await {
-        Ok(q) => q,
-        Err(err) => {
-            // All retries exhausted (or the failure was non-retryable).
-            // Mark this turn as a terminal failure so the caller flips
-            // the inbound to `failed` and emits a usage_report with
-            // status=error. Do NOT bubble — the runner must stay up.
-            tracing::error!(
-                error = %err,
-                provider = deps.provider.name(),
-                "provider query failed terminally; marking turn as failed"
-            );
-            let out = LlmTurnOutput {
-                failed: true,
-                ..LlmTurnOutput::default()
-            };
-            emit_usage_report(deps, 0, 0, turn_started_at, &TurnOutcome::Failed).await;
-            return Ok(out);
-        }
-    };
 
-    let (out, input_tokens, output_tokens) = pump_events(deps, query.as_mut()).await?;
-    query.abort().await;
+    // Two layers of retry surround the stream:
+    //   1. `query_with_retry` retries the initial HTTP call when it
+    //      fails before the stream starts (covers connect / TLS / 5xx /
+    //      timeout on the request).
+    //   2. The loop below retries the WHOLE (query + pump) pair when the
+    //      stream itself errors mid-way and the provider tagged the
+    //      `ProviderEvent::Error` as retryable. This catches transient
+    //      SSE-decode / dropped-connection cases that the initial query
+    //      can't see because the HTTP response already returned 200.
+    // Both layers cap at the same `MAX_PROVIDER_ATTEMPTS` budget so the
+    // worst-case wall time stays bounded.
+    let mut stream_attempts: u32 = 0;
+    let (out, input_tokens, output_tokens) = loop {
+        stream_attempts += 1;
+        let mut query = match query_with_retry(deps, input.clone()).await {
+            Ok(q) => q,
+            Err(err) => {
+                // All retries exhausted (or the failure was non-retryable).
+                // Mark this turn as a terminal failure so the caller flips
+                // the inbound to `failed` and emits a usage_report with
+                // status=error. Do NOT bubble — the runner must stay up.
+                tracing::error!(
+                    error = %err,
+                    provider = deps.provider.name(),
+                    "provider query failed terminally; marking turn as failed"
+                );
+                let out = LlmTurnOutput {
+                    failed: true,
+                    ..LlmTurnOutput::default()
+                };
+                emit_usage_report(deps, 0, 0, turn_started_at, &TurnOutcome::Failed).await;
+                return Ok(out);
+            }
+        };
+
+        let pumped = pump_events(deps, query.as_mut()).await?;
+        query.abort().await;
+
+        // Retry only if the failure was tagged retryable AND we have
+        // budget left. Use the same backoff schedule as query_with_retry
+        // for consistency.
+        if pumped.0.failed && pumped.0.retryable_failure && stream_attempts < MAX_PROVIDER_ATTEMPTS {
+            tracing::warn!(
+                attempt = stream_attempts,
+                max = MAX_PROVIDER_ATTEMPTS,
+                provider = deps.provider.name(),
+                "retryable stream failure; backing off and retrying"
+            );
+            ironclaw_metrics::inc_provider_retry(deps.provider.name());
+            backoff_for_attempt(stream_attempts).await;
+            continue;
+        }
+        break pumped;
+    };
     let outcome = if out.failed {
         TurnOutcome::Failed
     } else {
@@ -506,9 +543,14 @@ async fn pump_events(
                 }
                 break;
             }
-            ProviderEvent::Error { message, .. } => {
-                tracing::warn!(error = %message, "provider returned an error event");
+            ProviderEvent::Error { message, retryable } => {
+                tracing::warn!(
+                    error = %message,
+                    retryable,
+                    "provider returned an error event"
+                );
                 out.failed = true;
+                out.retryable_failure = retryable;
                 break;
             }
             ProviderEvent::ToolStart {
@@ -1065,6 +1107,69 @@ mod tests {
         assert!(!st.history.is_empty());
     }
 
+    /// Regression: a single retryable stream error must NOT terminally
+    /// fail the inbound. The runner's `run_llm_turn` should re-open the
+    /// query (up to `MAX_PROVIDER_ATTEMPTS`) and let the next attempt
+    /// produce a real `Result`. Caught live: OpenRouter's SSE stream
+    /// dropped a chunk mid-flight for one Telegram message, the
+    /// `pump_events` path marked it failed, and the user's question
+    /// went unanswered. With this loop in place the second attempt
+    /// completes normally and the agent replies.
+    #[tokio::test]
+    async fn retryable_stream_error_retries_then_succeeds() {
+        // First scripted turn: stream produces an Error with retryable=true
+        // (mirrors anthropic.rs's SSE-decode path). Second turn: clean
+        // Result with text. The retry loop must consume both and emit
+        // the assistant text on the second pass.
+        let mut setup = build_setup(vec![
+            vec![ProviderEvent::Error {
+                message: "sse decode: transient".into(),
+                retryable: true,
+            }],
+            vec![ProviderEvent::Result {
+                text: Some("hello after retry".into()),
+            }],
+        ]);
+        let id = {
+            let g = setup.deps.inbound.lock().await;
+            insert_pending(&g, "hi")
+        };
+        setup.deps.max_turns = Some(1);
+        run_loop(setup.deps).await.unwrap();
+
+        let inbound = open_inbound(&setup.paths).unwrap();
+        let status: String = inbound
+            .query_row(
+                "SELECT status FROM messages_in WHERE id = ?1",
+                rusqlite::params![id.as_uuid().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "completed",
+            "retryable stream error must not terminally fail the inbound"
+        );
+
+        // The assistant text from the second turn must reach
+        // messages_out as a chat row.
+        let outbound = open_outbound(&setup.paths).unwrap();
+        let text: String = outbound
+            .query_row(
+                "SELECT content FROM messages_out WHERE kind = 'chat' ORDER BY seq DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            text.contains("hello after retry"),
+            "expected the retried-turn text in outbound: {text:?}"
+        );
+    }
+
+    /// Regression: a non-retryable Error event (e.g. authentication
+    /// failure) must terminate the inbound after the same retry budget
+    /// applied at the query layer — i.e. NOT loop forever. This pins
+    /// `pump_events`'s `retryable: false` short-circuit.
     #[tokio::test]
     async fn error_event_marks_inbound_failed() {
         let mut setup = build_setup(vec![vec![ProviderEvent::Error {

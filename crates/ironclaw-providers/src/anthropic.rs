@@ -345,10 +345,17 @@ where
                 }
             }
             Err(e) => {
+                // SSE transport/decode failures are almost always
+                // transient: the upstream connection got reset mid-stream
+                // or a chunk arrived malformed. Mark retryable so the
+                // runner's `drive_turn` loop re-opens the query rather
+                // than terminally failing the inbound. Verified live
+                // against OpenRouter: a single dropped SSE chunk would
+                // otherwise lose the user's message permanently.
                 let _ = tx
                     .send(ProviderEvent::Error {
                         message: format!("sse decode: {e}"),
-                        retryable: false,
+                        retryable: true,
                     })
                     .await;
                 return;
