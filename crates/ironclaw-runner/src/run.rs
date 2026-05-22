@@ -886,6 +886,71 @@ async fn finalize_messages(
             processing_ack::update_status(conn, row.id, ack_status)?;
         }
     }
+    // On terminal failure, surface a brief apology to the user via the
+    // same channel the inbound came in on. Without this the user just
+    // sees the typing indicator clear with no reply — caught live on
+    // Telegram when the model emitted a malformed tool_use JSON, the
+    // runner classified the stream as failed, marked the inbound
+    // status='failed', and emitted nothing for the delivery loop to
+    // route back. The apology message is one row per inbound so the
+    // user still gets feedback per question if several failed in a
+    // batch. Routing fields (`channel_type` / `platform_id` /
+    // `thread_id`) are copied from the inbound so the delivery loop
+    // dispatches the apology back to the originating chat.
+    if let TurnOutcome::Failed = outcome {
+        if let Err(err) = emit_terminal_failure_apologies(deps, rows).await {
+            tracing::warn!(?err, "could not emit terminal-failure apology");
+        }
+    }
+    Ok(())
+}
+
+/// One short chat outbound per failed inbound, routed back to the
+/// channel the inbound came in on. Idempotent at the per-row level
+/// because each inbound has a stable id that flows into `in_reply_to`.
+async fn emit_terminal_failure_apologies(
+    deps: &RunnerDeps,
+    rows: &[MessageInRow],
+) -> Result<()> {
+    use ironclaw_db::tables::messages_out::{insert as insert_out, WriteOutbound};
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let outbound = deps.outbound.lock().await;
+    let conn: &rusqlite::Connection = &outbound;
+    for row in rows {
+        // Only emit for chat inbounds — system / task / wake events
+        // don't have a user on the other end to apologize to.
+        if !matches!(row.kind, ironclaw_types::MessageKind::Chat) {
+            continue;
+        }
+        // Skip if the inbound has no channel info (e.g. test fixtures
+        // that route through a bare router). Without routing the
+        // delivery loop can't dispatch the apology anyway.
+        let Some(channel_type) = &row.channel_type else {
+            continue;
+        };
+        let Some(platform_id) = &row.platform_id else {
+            continue;
+        };
+        let apology = WriteOutbound {
+            id: ironclaw_types::MessageId::new(),
+            in_reply_to: Some(row.id),
+            timestamp: chrono::Utc::now(),
+            deliver_after: None,
+            recurrence: None,
+            kind: ironclaw_types::MessageKind::Chat,
+            channel_type: Some(channel_type.clone()),
+            platform_id: Some(platform_id.clone()),
+            thread_id: row.thread_id.clone(),
+            content: serde_json::json!({
+                "text": "I hit a snag processing your message and couldn't finish a reply. Could you try rephrasing or sending a smaller request? (Operator: see runner stderr for the exact error.)",
+            }),
+        };
+        if let Err(err) = insert_out(conn, &apology) {
+            tracing::warn!(?err, "apology insert failed");
+        }
+    }
     Ok(())
 }
 
@@ -1170,6 +1235,86 @@ mod tests {
     /// failure) must terminate the inbound after the same retry budget
     /// applied at the query layer — i.e. NOT loop forever. This pins
     /// `pump_events`'s `retryable: false` short-circuit.
+    /// Regression: a terminal turn failure must emit a user-visible
+    /// apology chat row routed back to the originating channel.
+    /// Caught live on Telegram: model emitted a malformed `send_file`
+    /// tool_use, runner classified the stream as failed, marked the
+    /// inbound `status=failed`, and emitted nothing — user was left
+    /// staring at a stale typing indicator with no reply.
+    #[tokio::test]
+    async fn terminal_failure_emits_apology_to_originating_channel() {
+        let mut setup = build_setup(vec![vec![ProviderEvent::Error {
+            message: "tool_use input json parse failed for send_file".into(),
+            retryable: false,
+        }]]);
+        // Insert an inbound that carries channel routing fields, like
+        // a real telegram message would.
+        let id = {
+            let g = setup.deps.inbound.lock().await;
+            let id = MessageId::new();
+            let msg = WriteInbound {
+                id,
+                kind: MessageKind::Chat,
+                timestamp: Utc::now(),
+                content: serde_json::json!({"text": "do something cool"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("8929393356".into()),
+                channel_type: Some(ChannelType::new("telegram")),
+                thread_id: None,
+                source_session_id: None,
+            };
+            insert_in(&g, &msg).unwrap();
+            id
+        };
+        setup.deps.max_turns = Some(1);
+        run_loop(setup.deps).await.unwrap();
+
+        // The inbound must be marked failed.
+        let inbound = open_inbound(&setup.paths).unwrap();
+        let status: String = inbound
+            .query_row(
+                "SELECT status FROM messages_in WHERE id = ?1",
+                rusqlite::params![id.as_uuid().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "failed");
+
+        // The outbound must include exactly one Chat apology routed at
+        // (telegram, 8929393356) with the inbound id in `in_reply_to`.
+        let outbound = open_outbound(&setup.paths).unwrap();
+        let rows = messages_out::list_due(&outbound).unwrap();
+        let apologies: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == MessageKind::Chat)
+            .collect();
+        assert_eq!(
+            apologies.len(),
+            1,
+            "expected exactly one apology row, got: {rows:?}"
+        );
+        let apology = apologies[0];
+        assert_eq!(
+            apology.channel_type.as_ref().map(ironclaw_types::ChannelType::as_str),
+            Some("telegram")
+        );
+        assert_eq!(apology.platform_id.as_deref(), Some("8929393356"));
+        assert_eq!(apology.in_reply_to.map(|m| m.as_uuid()), Some(id.as_uuid()));
+        let text = apology
+            .content
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        assert!(
+            text.contains("snag") || text.contains("couldn't finish"),
+            "apology text should be user-facing: {text:?}"
+        );
+    }
+
     #[tokio::test]
     async fn error_event_marks_inbound_failed() {
         let mut setup = build_setup(vec![vec![ProviderEvent::Error {

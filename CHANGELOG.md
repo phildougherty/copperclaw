@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (runner: surface a reply when a turn fails terminally)
+
+- **`crates/ironclaw-runner/src/run.rs`** — `finalize_messages` now
+  emits a one-line chat outbound to the originating channel when an
+  inbound is marked `failed`. Previously the user just saw the typing
+  indicator clear with no reply, because all the host-side delivery
+  code routes from `messages_out` rows and the runner emitted none on
+  failure. Caught live on Telegram: model produced a malformed
+  `send_file` tool_use JSON (`EOF while parsing an object at line 1
+  column 37`), runner classified it terminal, inbound went to
+  `status=failed`, and the user was left staring at silence.
+  `emit_terminal_failure_apologies()` copies the inbound's routing
+  (`channel_type` / `platform_id` / `thread_id`) into a Chat row with
+  `in_reply_to = inbound.id` so the delivery loop dispatches the
+  apology back through the same channel adapter. System / task / wake
+  inbounds are skipped (no user on the other end). Pinned by
+  `terminal_failure_emits_apology_to_originating_channel` —
+  `fixtures/cli/provider-timeout` was updated to expect the new
+  outbound row.
+
 ### Fixed (dev loop: skills now actually load)
 
 - **`rebuild.sh`** — symlinks `<install_root>/data/skills` at the
