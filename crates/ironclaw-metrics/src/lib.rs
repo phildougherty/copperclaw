@@ -43,6 +43,7 @@
 //! | Histogram | `ironclaw_container_spawn_seconds` | —              |
 //! | Counter   | `ironclaw_provider_deadline_total` | `provider`     |
 //! | Counter   | `ironclaw_provider_retry_total`    | `provider`     |
+//! | Counter   | `ironclaw_stuck_inbound_apology_total` | `agent_group_id`, `reason` |
 
 use metrics::{counter, histogram};
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -70,6 +71,19 @@ pub const LLM_TOKENS_OUTPUT: &str = "ironclaw_llm_tokens_output";
 pub const CONTAINER_SPAWN_SECONDS: &str = "ironclaw_container_spawn_seconds";
 pub const PROVIDER_DEADLINE_TOTAL: &str = "ironclaw_provider_deadline_total";
 pub const PROVIDER_RETRY_TOTAL: &str = "ironclaw_provider_retry_total";
+pub const STUCK_INBOUND_APOLOGY_TOTAL: &str = "ironclaw_stuck_inbound_apology_total";
+
+// ── Reason label values for the `reason` label of
+// `ironclaw_stuck_inbound_apology_total`. Use these constants instead of
+// stringly-typed literals at call sites so a typo is a compile error.
+
+/// The inbound message sat in `messages_in.status='pending'` longer
+/// than the apology threshold (default 5 min) without progress.
+pub const STUCK_REASON_PENDING_TOO_LONG: &str = "pending_too_long";
+
+/// The session's `container_status='stopped'` with a pending inbound
+/// and the container manager has exhausted its spawn-retry budget.
+pub const STUCK_REASON_CONTAINER_SPAWN_FAILED: &str = "container_spawn_failed";
 
 // ── Budget-gate label values for the `gate` label of
 // `ironclaw_budget_exhausted_total`. Use these constants instead of
@@ -170,6 +184,24 @@ pub fn inc_budget_exhausted_suppressed(agent_group_id: &str) {
     counter!(
         BUDGET_EXHAUSTED_SUPPRESSED_TOTAL,
         "agent_group_id" => agent_group_id.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Increment `ironclaw_stuck_inbound_apology_total{agent_group_id, reason}`.
+/// Fired by the host sweep loop each time it emits a user-visible apology
+/// for an inbound that's been sitting in `pending` longer than the apology
+/// threshold (or whose session can't even spawn a container).
+///
+/// `reason` should be one of [`STUCK_REASON_PENDING_TOO_LONG`] or
+/// [`STUCK_REASON_CONTAINER_SPAWN_FAILED`]. Pairs with the inbound's
+/// `tries=99` dedupe marker — exactly one apology per stuck inbound, so
+/// this counter is also the per-stuck-message-emit count.
+pub fn inc_stuck_inbound_apology(agent_group_id: &str, reason: &str) {
+    counter!(
+        STUCK_INBOUND_APOLOGY_TOTAL,
+        "agent_group_id" => agent_group_id.to_owned(),
+        "reason" => reason.to_owned(),
     )
     .increment(1);
 }
@@ -494,6 +526,8 @@ mod tests {
         inc_budget_exhausted("ag-test", BUDGET_GATE_TURNS_PER_HOUR);
         inc_budget_exhausted_reply("ag-test");
         inc_budget_exhausted_suppressed("ag-test");
+        inc_stuck_inbound_apology("ag-test", STUCK_REASON_PENDING_TOO_LONG);
+        inc_stuck_inbound_apology("ag-test", STUCK_REASON_CONTAINER_SPAWN_FAILED);
     }
 
     #[test]
@@ -588,6 +622,7 @@ mod tests {
             CONTAINER_SPAWN_SECONDS,
             PROVIDER_DEADLINE_TOTAL,
             PROVIDER_RETRY_TOTAL,
+            STUCK_INBOUND_APOLOGY_TOTAL,
         ];
         for name in names {
             assert!(
@@ -614,6 +649,7 @@ mod tests {
             BUDGET_EXHAUSTED_TOTAL,
             BUDGET_EXHAUSTED_REPLIES_TOTAL,
             BUDGET_EXHAUSTED_SUPPRESSED_TOTAL,
+            STUCK_INBOUND_APOLOGY_TOTAL,
         ];
         for name in counters {
             assert!(
@@ -621,5 +657,33 @@ mod tests {
                 "counter {name:?} does not end with '_total'"
             );
         }
+    }
+
+    #[test]
+    fn stuck_inbound_apology_counter_renders_with_labels() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            inc_stuck_inbound_apology("ag-stuck-1", STUCK_REASON_PENDING_TOO_LONG);
+            inc_stuck_inbound_apology("ag-stuck-1", STUCK_REASON_CONTAINER_SPAWN_FAILED);
+            inc_stuck_inbound_apology("ag-stuck-1", STUCK_REASON_PENDING_TOO_LONG);
+        });
+        let body = handle.render();
+        assert!(
+            body.contains(STUCK_INBOUND_APOLOGY_TOTAL),
+            "missing stuck-apology counter:\n{body}"
+        );
+        assert!(
+            body.contains("reason=\"pending_too_long\""),
+            "missing pending_too_long reason label:\n{body}"
+        );
+        assert!(
+            body.contains("reason=\"container_spawn_failed\""),
+            "missing container_spawn_failed reason label:\n{body}"
+        );
+        assert!(
+            body.contains("agent_group_id=\"ag-stuck-1\""),
+            "missing agent_group_id label:\n{body}"
+        );
     }
 }

@@ -2,9 +2,11 @@
 //! [`crate::SWEEP_POLL_MS`] tick and produces a [`SweepReport`] describing
 //! sessions that need host attention.
 
-use crate::checks::{heartbeat, processing, recurrence, stuck, wake};
+use crate::checks::{apology, heartbeat, processing, recurrence, stuck, wake};
+use crate::checks::apology::ApologyEmit;
 use crate::clock::{Clock, SystemClock};
 use crate::error::SweepError;
+use crate::spawn_tracker::SpawnAttemptTracker;
 use chrono::{DateTime, Utc};
 use ironclaw_db::central::CentralDb;
 use ironclaw_types::{AgentGroupId, MessageId, SessionId};
@@ -137,6 +139,10 @@ pub struct SweepReport {
     pub processing_acks_reset: Vec<MessageReset>,
     pub woken_sessions: Vec<SessionId>,
     pub heartbeat_stale: Vec<SessionId>,
+    /// One entry per stuck-inbound apology written by the apology
+    /// check during this pass. Empty in the common case where every
+    /// session is healthy.
+    pub apologies_emitted: Vec<ApologyEmit>,
 }
 
 impl SweepReport {
@@ -147,6 +153,7 @@ impl SweepReport {
             && self.processing_acks_reset.is_empty()
             && self.woken_sessions.is_empty()
             && self.heartbeat_stale.is_empty()
+            && self.apologies_emitted.is_empty()
     }
 
     /// Total number of items across all check categories.
@@ -156,6 +163,7 @@ impl SweepReport {
             + self.processing_acks_reset.len()
             + self.woken_sessions.len()
             + self.heartbeat_stale.len()
+            + self.apologies_emitted.len()
     }
 }
 
@@ -164,6 +172,12 @@ pub struct SweepService {
     central: CentralDb,
     session_paths: Arc<dyn SessionRoot>,
     clock: Arc<dyn Clock>,
+    /// Shared with the host's container manager (when wired through
+    /// `with_spawn_tracker`). The manager bumps this on every failed
+    /// `runtime.spawn` call; the apology check reads it to gate the
+    /// `container_spawn_failed` reason. A default-empty tracker keeps
+    /// the test path simple.
+    spawn_tracker: Arc<SpawnAttemptTracker>,
 }
 
 impl SweepService {
@@ -173,6 +187,7 @@ impl SweepService {
             central,
             session_paths,
             clock: Arc::new(SystemClock),
+            spawn_tracker: Arc::new(SpawnAttemptTracker::new()),
         }
     }
 
@@ -187,7 +202,17 @@ impl SweepService {
             central,
             session_paths,
             clock,
+            spawn_tracker: Arc::new(SpawnAttemptTracker::new()),
         }
+    }
+
+    /// Replace the in-memory spawn-attempt tracker with one shared
+    /// between the sweep and the container manager. Builders return
+    /// `self` so this composes with [`Self::new`] / [`Self::with_clock`].
+    #[must_use]
+    pub fn with_spawn_tracker(mut self, tracker: Arc<SpawnAttemptTracker>) -> Self {
+        self.spawn_tracker = tracker;
+        self
     }
 
     /// Access the configured clock (mostly for tests).
@@ -203,6 +228,13 @@ impl SweepService {
     /// Access the central DB handle.
     pub fn central(&self) -> &CentralDb {
         &self.central
+    }
+
+    /// Access the shared spawn-attempt tracker. The host's container
+    /// manager calls `record_failure` / `record_success` on this; the
+    /// sweep's apology check reads it.
+    pub fn spawn_tracker(&self) -> &Arc<SpawnAttemptTracker> {
+        &self.spawn_tracker
     }
 
     /// Tick `run_once` every [`crate::SWEEP_POLL_MS`] until `shutdown` is
@@ -223,6 +255,7 @@ impl SweepService {
                                     acks_reset = report.processing_acks_reset.len(),
                                     woken = report.woken_sessions.len(),
                                     heartbeat_stale = report.heartbeat_stale.len(),
+                                    apologies = report.apologies_emitted.len(),
                                     "sweep pass produced report",
                                 );
                             }
@@ -330,6 +363,21 @@ impl SweepService {
                     session = %session.id,
                     error = %e,
                     "due-message wake check failed",
+                ),
+            }
+
+            match apology::check(
+                self.session_paths.as_ref(),
+                self.spawn_tracker.as_ref(),
+                &session,
+                now,
+            ) {
+                Ok(mut emits) => report.apologies_emitted.append(&mut emits),
+                Err(e) => tracing::warn!(
+                    target: "ironclaw_host_sweep",
+                    session = %session.id,
+                    error = %e,
+                    "stuck-inbound apology check failed",
                 ),
             }
         }

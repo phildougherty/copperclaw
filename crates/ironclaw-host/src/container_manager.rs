@@ -38,6 +38,7 @@ use ironclaw_container_rt::{ContainerRuntime, ContainerSpec, ImageBuildSpec, Mou
 use ironclaw_db::central::CentralDb;
 use ironclaw_db::session::{open_inbound, open_outbound, SessionPaths};
 use ironclaw_db::tables::{container_configs, messages_in, sessions};
+use ironclaw_host_sweep::SpawnAttemptTracker;
 use ironclaw_types::{AgentGroupId, ContainerStatus, Session, SessionStatus};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -222,6 +223,13 @@ pub struct ContainerManager {
     /// during `build_spec` / `runner_config_for` take a short-lived
     /// read-lock so the spawn path stays fast.
     rotatable: Arc<RwLock<RotatableConfig>>,
+    /// Per-session counter of consecutive failed `runtime.spawn`
+    /// calls. Shared with the host's sweep service so its apology
+    /// check can detect "container never came up" and emit a
+    /// user-visible note. A successful spawn resets the counter.
+    /// Defaults to an empty tracker so test code that calls
+    /// [`Self::new`] without wiring sweep still works.
+    spawn_tracker: Arc<SpawnAttemptTracker>,
 }
 
 impl ContainerManager {
@@ -242,8 +250,26 @@ impl ContainerManager {
                 anthropic_base_url: cfg.anthropic_base_url.clone(),
                 forward_env: cfg.forward_env.clone(),
             })),
+            spawn_tracker: Arc::new(SpawnAttemptTracker::new()),
             cfg,
         }
+    }
+
+    /// Wire a shared spawn-attempt tracker (typically owned by
+    /// [`ironclaw_host_sweep::SweepService`]) into the manager.
+    /// Mutates `self` so the boot sequence can hand the same tracker to
+    /// both halves.
+    #[must_use]
+    pub fn with_spawn_tracker(mut self, tracker: Arc<SpawnAttemptTracker>) -> Self {
+        self.spawn_tracker = tracker;
+        self
+    }
+
+    /// Access the shared spawn-attempt tracker. Exposed so callers
+    /// composing the manager can also pass the same handle to the
+    /// sweep service.
+    pub fn spawn_tracker(&self) -> &Arc<SpawnAttemptTracker> {
+        &self.spawn_tracker
     }
 
     /// Re-read the `.env` file at `env_file` (or use no file when
@@ -439,6 +465,7 @@ impl ContainerManager {
     /// a container was actually spawned (i.e. pending work was found
     /// and the runtime call succeeded), `Ok(false)` when there was
     /// nothing pending, and `Err(...)` for real failures.
+    #[allow(clippy::too_many_lines)] // spawn flow has several gates that are clearer inline
     async fn maybe_spawn(&self, session: &Session) -> Result<bool, ManagerError> {
         let paths = SessionPaths::new(
             &self.cfg.data_dir,
@@ -565,12 +592,27 @@ impl ContainerManager {
         // its first heartbeat.
         let _ = std::fs::remove_file(&paths.heartbeat);
         let spawn_started = std::time::Instant::now();
-        let handle = self
-            .runtime
-            .spawn(spec)
-            .await
-            .map_err(ManagerError::Spawn)?;
+        let handle = match self.runtime.spawn(spec).await {
+            Ok(h) => h,
+            Err(err) => {
+                // Bump the spawn-attempt tracker so the sweep's apology
+                // check can decide whether to notify the user that the
+                // container can't come up. The tracker is process-local
+                // and cleared on a successful spawn below.
+                let attempts = self.spawn_tracker.record_failure(session.id);
+                warn!(
+                    session = %session.id.as_uuid(),
+                    attempts,
+                    ?err,
+                    "runtime spawn failed; bumped spawn-attempt counter",
+                );
+                return Err(ManagerError::Spawn(err));
+            }
+        };
         let spawn_elapsed = spawn_started.elapsed().as_secs_f64();
+        // Successful spawn: clear any prior failure record so a future
+        // crash doesn't immediately trip the apology threshold.
+        self.spawn_tracker.record_success(session.id);
         sessions::mark_container_running(&self.central, session.id).map_err(ManagerError::Db)?;
         ironclaw_metrics::inc_containers_spawned();
         ironclaw_metrics::observe_container_spawn_seconds(spawn_elapsed);

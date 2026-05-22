@@ -563,6 +563,7 @@ pub async fn run_host(
         state.central.clone(),
         Arc::clone(&runtime),
         shutdown.clone(),
+        Arc::clone(state.sweep.spawn_tracker()),
     );
     let (manager_task, manager_handle): (
         Option<tokio::task::JoinHandle<()>>,
@@ -718,6 +719,7 @@ fn spawn_container_manager(
     central: ironclaw_db::central::CentralDb,
     runtime: Arc<dyn ContainerRuntime>,
     shutdown: CancellationToken,
+    spawn_tracker: Arc<ironclaw_host_sweep::SpawnAttemptTracker>,
 ) -> Option<SpawnedManager> {
     let Some(image_tag) = cfg.default_image_tag.clone() else {
         warn!(
@@ -752,11 +754,10 @@ fn spawn_container_manager(
         groups_dir: cfg.groups_dir.clone(),
         forward_env: collect_forward_env(),
     };
-    let manager = Arc::new(crate::container_manager::ContainerManager::new(
-        central,
-        runtime,
-        manager_cfg,
-    ));
+    let manager = Arc::new(
+        crate::container_manager::ContainerManager::new(central, runtime, manager_cfg)
+            .with_spawn_tracker(spawn_tracker),
+    );
     let task = tokio::spawn(Arc::clone(&manager).run_loop(shutdown));
     Some((task, manager))
 }

@@ -10,15 +10,24 @@ pub mod checks;
 pub mod clock;
 pub mod error;
 pub mod service;
+pub mod spawn_tracker;
 
 #[cfg(test)]
 mod test_support;
 
+pub use checks::apology::{ApologyEmit, ApologyReason, APOLOGY_TRIES_MARKER};
 pub use clock::{Clock, SystemClock};
 pub use error::SweepError;
 pub use service::{
     MessageReset, SeriesFanout, SessionPool, SessionRoot, SweepReport, SweepService,
 };
+pub use spawn_tracker::{SpawnAttemptTracker, SPAWN_FAIL_THRESHOLD};
+
+/// Wall-clock age threshold for a pending chat inbound before the
+/// sweep emits a user-visible apology. Matches the container
+/// manager's default idle timeout (5 minutes) — anything pending
+/// past this is genuinely stuck.
+pub const APOLOGY_AFTER_SECS: u32 = 300;
 
 /// How often `run_loop` calls `run_once`.
 pub const SWEEP_POLL_MS: u64 = 60_000;
@@ -67,5 +76,10 @@ mod constant_tests {
     #[test]
     fn max_tries_is_five() {
         assert_eq!(MAX_TRIES, 5);
+    }
+
+    #[test]
+    fn apology_after_matches_five_minutes() {
+        assert_eq!(APOLOGY_AFTER_SECS, 300);
     }
 }

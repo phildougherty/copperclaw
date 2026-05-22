@@ -6,6 +6,59 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (sweep: user-visible apology when an inbound is stuck)
+
+- **`crates/ironclaw-host-sweep/src/checks/apology.rs`** — new sweep
+  responsibility. On every 60s pass the sweep scans each active session's
+  `inbound.db` for chat rows with `status='pending'` and `kind='chat'`
+  whose `(now - timestamp) > APOLOGY_AFTER_SECS` (5 min, hard-coded), and
+  writes a single user-visible apology chat row to the session's
+  `outbound.db` so the delivery loop dispatches it back through the
+  channel the inbound arrived on. Routes via the inbound's
+  `(channel_type, platform_id, thread_id)` and stamps `in_reply_to` so
+  the user sees the apology in the right place. The runner's own
+  `emit_terminal_failure_apologies` path is unchanged — this fills the
+  gap when the runner never even ran (container spawn broken, runner
+  panic before any DB write, heartbeat stale with no recovery).
+- **Dedupe via `tries=99` sentinel** — to avoid adding a new DB column,
+  the check writes `tries=APOLOGY_TRIES_MARKER (=99)` on the inbound row
+  after a successful apology emit. The host's regular retry path tops
+  out at `MAX_TRIES=5`, so 99 is safely out-of-band. The query filter is
+  `tries < 99`, so a second sweep skips the row.
+- **`crates/ironclaw-host-sweep/src/spawn_tracker.rs`** — new in-memory
+  `SpawnAttemptTracker` shared between the host's container manager and
+  the sweep. The manager calls `record_failure(session_id)` on every
+  failed `runtime.spawn(...)` and `record_success(session_id)` on a
+  successful spawn. The sweep's apology check reads
+  `is_exhausted(session_id)` (>= `SPAWN_FAIL_THRESHOLD = 3` attempts)
+  combined with `container_status='stopped'` to fire the
+  `reason=container_spawn_failed` branch — which emits the apology even
+  for inbounds under the 5-min age threshold, because if the container
+  can't come up at all the user shouldn't have to wait 5 min.
+- **`crates/ironclaw-metrics/src/lib.rs`** — new counter
+  `ironclaw_stuck_inbound_apology_total{agent_group_id, reason}` with
+  reason ∈ {`pending_too_long`, `container_spawn_failed`}. Operators
+  can alert on it spiking to detect a container that flat-out won't
+  start (image corruption, OCI error, OOM at launch).
+- **`crates/ironclaw-host/src/container_manager.rs`** — `maybe_spawn`
+  now bumps the spawn-attempt tracker on every `runtime.spawn` failure
+  and clears it on success. The shared `Arc<SpawnAttemptTracker>` is
+  threaded through `with_spawn_tracker(...)` from `boot.rs`, where the
+  same tracker is also handed to the sweep service.
+- **`crates/ironclaw-host-sweep/src/lib.rs`** — exposes
+  `APOLOGY_AFTER_SECS` (=300) and re-exports the new types
+  (`ApologyEmit`, `ApologyReason`, `SpawnAttemptTracker`).
+- **Tests** — five spec tests in `apology.rs`:
+  `stuck_inbound_apology_emits_after_5min`,
+  `apology_not_emitted_below_threshold`,
+  `apology_only_emitted_once`,
+  `container_spawn_failure_emits_apology`,
+  `apology_routing_preserves_channel_fields`. Plus unit coverage of
+  `SpawnAttemptTracker` and the missing-routing dedupe path.
+- The sweep cadence stays at 60s; no new timer or DB schema change.
+  Stuck-inbound scan is bounded to 50 rows per session per pass so a
+  large outage backlog can't choke the loop.
+
 ### Fixed (rebuild.sh: rebake session image so new runner reaches the agent)
 
 - **`rebuild.sh`** — now also rebuilds the session container image
