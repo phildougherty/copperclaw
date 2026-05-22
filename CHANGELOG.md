@@ -6,6 +6,71 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (delivery: plain-text fallback retry for formatting BadRequests)
+
+- **`crates/ironclaw-channels/core/src/adapter.rs`** — new
+  `ChannelAdapter::plain_text_fallback(&self, msg) -> Option<OutboundMessage>`
+  trait method with a default impl that returns `None`. Adapters whose
+  upstream platform has a known formatting-validation failure mode
+  (Telegram `MarkdownV2`, Slack block-kit, Discord embeds) override this
+  to return a downgraded copy of the outbound message — formatting
+  metadata stripped, text body preserved and prepended with
+  `"[reduced formatting] "` — that the channel will accept as plain
+  text. Default-`None` means "no clean fallback known; fail fast", which
+  preserves the previous behaviour for adapters that don't opt in
+  (matrix, webhooks, github, etc.).
+- **`crates/ironclaw-host-delivery/src/service.rs`** — `call_adapter` now
+  inspects `AdapterError::BadRequest(msg)` for a formatting-error
+  signature (`parse entities`, `rich text`, `blocks`, `block_kit`,
+  `block kit`, `embed`, `embeds`, `format`, `formatting`; case-
+  insensitive) via `is_formatting_bad_request`. When matched it calls
+  `adapter.plain_text_fallback(message)` and re-issues `deliver` with
+  the result. If the fallback succeeds the row is recorded as
+  delivered, an info-level "delivered with reduced formatting" log
+  line fires, and the new metric
+  `ironclaw_delivery_formatting_fallback_total{channel_type}` is
+  incremented. If the fallback fails (or the adapter has no
+  fallback), the ORIGINAL `BadRequest` is surfaced and the existing
+  terminal-failure path takes over — non-formatting BadRequests
+  (e.g. "chat_id required") fail fast without a retry.
+- **Per-channel `plain_text_fallback` impls** in:
+  - `crates/ironclaw-channels/telegram/src/adapter.rs` — strips
+    `parse_mode`, keeps `text`. Fixes the regression where the agent
+    opting into `parse_mode=MarkdownV2` and emitting natural-language
+    text with bare `!` / `.` / `-` / `(` / `)` / `[` / `]` would hit
+    Telegram's 400 "can't parse entities" and the user got nothing.
+  - `crates/ironclaw-channels/slack/src/adapter.rs` — strips
+    `blocks`, keeps the `text` fallback string Slack already requires
+    on `chat.postMessage`.
+  - `crates/ironclaw-channels/discord/src/adapter.rs` — strips
+    `embeds`, keeps `text`.
+- **`crates/ironclaw-metrics/src/lib.rs`** — adds
+  `DELIVERY_FORMATTING_FALLBACK_TOTAL` constant and
+  `inc_delivery_formatting_fallback(channel_type)` helper, alongside
+  the existing `inc_delivery_failed`. Surfaced in the metric-name
+  prefix / ends-with-`_total` invariants so an operator scraping
+  `/metrics` can alert on "delivered but downgraded".
+- **`crates/ironclaw-channels/core/src/testing.rs`** — `MockAdapter`
+  gains `enable_plain_text_fallback(bool)` and (under the hood) a
+  FIFO queue for `fail_next_deliver` so a single test can preload
+  multiple consecutive failures — required to exercise both the
+  primary deliver AND the fallback retry failing on the same pass.
+- Seven new tests pin the behaviour:
+  - `plain_text_fallback_strips_parse_mode_for_telegram` /
+    `plain_text_fallback_strips_blocks_for_slack` /
+    `plain_text_fallback_strips_embeds_for_discord` — per-channel
+    unit coverage of the stripping rules.
+  - `plain_text_fallback_returns_none_when_already_plain` (telegram)
+    — no formatting fields means no fallback.
+  - `delivery_retries_with_plain_text_on_parse_entities_error` —
+    row delivered after retry, fallback metric incremented.
+  - `delivery_marks_failed_when_plain_text_fallback_also_rejected`
+    — when both attempts fail, the original terminal-failure path
+    runs.
+  - `delivery_does_not_retry_on_other_bad_request` — a non-
+    formatting BadRequest ("chat_id required") fails fast with no
+    fallback attempt.
+
 ### Fixed (rebuild.sh: rebake session image so new runner reaches the agent)
 
 - **`rebuild.sh`** — now also rebuilds the session container image

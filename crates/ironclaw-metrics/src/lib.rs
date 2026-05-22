@@ -34,6 +34,7 @@
 //! | Counter   | `ironclaw_containers_spawned_total`| —              |
 //! | Counter   | `ironclaw_containers_crashed_total`| —              |
 //! | Counter   | `ironclaw_delivery_failed_total`   | `channel_type` |
+//! | Counter   | `ironclaw_delivery_formatting_fallback_total` | `channel_type` |
 //! | Counter   | `ironclaw_budget_exhausted_total`  | `agent_group_id`, `gate` |
 //! | Counter   | `ironclaw_budget_exhausted_replies_total` | `agent_group_id` |
 //! | Counter   | `ironclaw_budget_exhausted_suppressed_total` | `agent_group_id` |
@@ -61,6 +62,8 @@ pub const CONTAINERS_CRASHED_TOTAL: &str = "ironclaw_containers_crashed_total";
 pub const IMAGE_REBUILD_FAILED_TOTAL: &str = "ironclaw_image_rebuild_failed_total";
 pub const SECRETS_ROTATED_TOTAL: &str = "ironclaw_secrets_rotated_total";
 pub const DELIVERY_FAILED_TOTAL: &str = "ironclaw_delivery_failed_total";
+pub const DELIVERY_FORMATTING_FALLBACK_TOTAL: &str =
+    "ironclaw_delivery_formatting_fallback_total";
 pub const BUDGET_EXHAUSTED_TOTAL: &str = "ironclaw_budget_exhausted_total";
 pub const BUDGET_EXHAUSTED_REPLIES_TOTAL: &str = "ironclaw_budget_exhausted_replies_total";
 pub const BUDGET_EXHAUSTED_SUPPRESSED_TOTAL: &str = "ironclaw_budget_exhausted_suppressed_total";
@@ -119,6 +122,19 @@ pub fn inc_secrets_rotated() {
 /// Increment `ironclaw_delivery_failed_total{channel_type=<ct>}`.
 pub fn inc_delivery_failed(channel_type: &str) {
     counter!(DELIVERY_FAILED_TOTAL, "channel_type" => channel_type.to_owned()).increment(1);
+}
+
+/// Increment `ironclaw_delivery_formatting_fallback_total{channel_type=<ct>}`.
+/// Fired by the delivery loop when an adapter rejected a delivery with a
+/// formatting-related `BadRequest` (e.g. Telegram's "can't parse entities")
+/// AND the channel's `plain_text_fallback` retry then succeeded. Measures
+/// downgraded deliveries — the user got the message but in a less rich shape.
+pub fn inc_delivery_formatting_fallback(channel_type: &str) {
+    counter!(
+        DELIVERY_FORMATTING_FALLBACK_TOTAL,
+        "channel_type" => channel_type.to_owned(),
+    )
+    .increment(1);
 }
 
 /// Increment `ironclaw_provider_deadline_total{provider=<p>}`. Fired by
@@ -485,6 +501,7 @@ mod tests {
         inc_containers_spawned();
         inc_containers_crashed();
         inc_delivery_failed("slack");
+        inc_delivery_formatting_fallback("telegram");
         inc_image_rebuild_failed();
         inc_secrets_rotated();
         inc_provider_deadline("anthropic");
@@ -579,6 +596,7 @@ mod tests {
             IMAGE_REBUILD_FAILED_TOTAL,
             SECRETS_ROTATED_TOTAL,
             DELIVERY_FAILED_TOTAL,
+            DELIVERY_FORMATTING_FALLBACK_TOTAL,
             BUDGET_EXHAUSTED_TOTAL,
             BUDGET_EXHAUSTED_REPLIES_TOTAL,
             BUDGET_EXHAUSTED_SUPPRESSED_TOTAL,
@@ -611,6 +629,7 @@ mod tests {
             IMAGE_REBUILD_FAILED_TOTAL,
             SECRETS_ROTATED_TOTAL,
             DELIVERY_FAILED_TOTAL,
+            DELIVERY_FORMATTING_FALLBACK_TOTAL,
             BUDGET_EXHAUSTED_TOTAL,
             BUDGET_EXHAUSTED_REPLIES_TOTAL,
             BUDGET_EXHAUSTED_SUPPRESSED_TOTAL,

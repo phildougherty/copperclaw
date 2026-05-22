@@ -172,6 +172,34 @@ impl ChannelAdapter for SlackAdapter {
         // pre-resolve DMs.
         Ok(None)
     }
+
+    /// Slack-specific plain-text fallback used by the delivery loop when
+    /// `chat.postMessage` rejected the original payload with a block-kit
+    /// validation error. Drops the `blocks` field — Slack then renders just
+    /// the `text` fallback string — and prepends `"[reduced formatting] "`
+    /// so the recipient knows the layout was simplified. Returns `None`
+    /// when there are no `blocks` to strip (nothing to fall back to).
+    fn plain_text_fallback(&self, msg: &OutboundMessage) -> Option<OutboundMessage> {
+        let obj = msg.content.as_object()?;
+        if !obj.contains_key("blocks") {
+            return None;
+        }
+        let text = obj
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let mut new_obj = obj.clone();
+        new_obj.remove("blocks");
+        new_obj.insert(
+            "text".to_owned(),
+            Value::String(format!("[reduced formatting] {text}")),
+        );
+        Some(OutboundMessage {
+            kind: msg.kind,
+            content: Value::Object(new_obj),
+            files: msg.files.clone(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -567,6 +595,31 @@ mod tests {
             Err(AdapterError::Transport(_)) => {}
             other => panic!("expected Transport, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn plain_text_fallback_strips_blocks_for_slack() {
+        let server = MockServer::start().await;
+        let adapter = adapter_for(&server);
+        let msg = OutboundMessage {
+            kind: MessageKind::Chat,
+            content: json!({
+                "text": "hello",
+                "blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "*hi*"}}]
+            }),
+            files: vec![],
+        };
+        let fallback = adapter
+            .plain_text_fallback(&msg)
+            .expect("slack fallback");
+        // blocks must be removed entirely.
+        assert!(fallback.content.get("blocks").is_none());
+        // text is preserved and prepended with the reduced-formatting marker.
+        assert_eq!(
+            fallback.content["text"].as_str().unwrap(),
+            "[reduced formatting] hello"
+        );
+        assert_eq!(fallback.kind, MessageKind::Chat);
     }
 
     #[tokio::test]

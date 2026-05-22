@@ -10,6 +10,7 @@ use crate::error::AdapterError;
 use crate::setup::ChannelSetup;
 use async_trait::async_trait;
 use ironclaw_types::{ChannelType, OutboundMessage};
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 /// Captured `deliver` call.
@@ -27,8 +28,15 @@ pub struct MockAdapter {
     supports_threads: bool,
     deliveries: Mutex<Vec<DeliveredMessage>>,
     delivery_id_prefix: String,
-    deliver_should_error: Mutex<Option<AdapterError>>,
+    deliver_should_error: Mutex<VecDeque<AdapterError>>,
     open_dm_result: Mutex<Option<DmHandle>>,
+    /// When set, [`ChannelAdapter::plain_text_fallback`] returns a downgraded
+    /// version of the input message: any `parse_mode`, `blocks`, `embeds`
+    /// fields are stripped and the `text` field is prepended with
+    /// `"[reduced formatting] "`. Lets the delivery-loop tests simulate an
+    /// adapter that owns a real fallback path without depending on a
+    /// concrete channel crate.
+    plain_text_fallback_enabled: Mutex<bool>,
 }
 
 impl MockAdapter {
@@ -41,8 +49,9 @@ impl MockAdapter {
             channel_type: ChannelType::new(ct),
             supports_threads: false,
             deliveries: Mutex::new(vec![]),
-            deliver_should_error: Mutex::new(None),
+            deliver_should_error: Mutex::new(VecDeque::new()),
             open_dm_result: Mutex::new(None),
+            plain_text_fallback_enabled: Mutex::new(false),
         }
     }
 
@@ -59,8 +68,23 @@ impl MockAdapter {
     }
 
     /// Cause the next call to `deliver` to fail with `err`. Cleared on use.
+    /// Calling this multiple times queues the failures FIFO — useful for
+    /// the delivery-loop tests that exercise the formatting-fallback retry,
+    /// which expects both the primary call AND the retry to fail.
     pub fn fail_next_deliver(&self, err: AdapterError) {
-        *self.deliver_should_error.lock().expect("poisoned") = Some(err);
+        self.deliver_should_error
+            .lock()
+            .expect("poisoned")
+            .push_back(err);
+    }
+
+    /// Enable / disable the [`ChannelAdapter::plain_text_fallback`] hook
+    /// for this mock. Defaults to disabled (`None`). When enabled, the
+    /// fallback returns the input message with any `parse_mode`, `blocks`,
+    /// `embeds` keys stripped and the `text` field prepended with
+    /// `"[reduced formatting] "`.
+    pub fn enable_plain_text_fallback(&self, on: bool) {
+        *self.plain_text_fallback_enabled.lock().expect("poisoned") = on;
     }
 
     /// Make `open_dm` return this handle.
@@ -85,7 +109,12 @@ impl ChannelAdapter for MockAdapter {
         thread_id: Option<&str>,
         message: &OutboundMessage,
     ) -> Result<Option<String>, AdapterError> {
-        if let Some(err) = self.deliver_should_error.lock().expect("poisoned").take() {
+        if let Some(err) = self
+            .deliver_should_error
+            .lock()
+            .expect("poisoned")
+            .pop_front()
+        {
             return Err(err);
         }
         let mut guard = self.deliveries.lock().expect("poisoned");
@@ -103,6 +132,34 @@ impl ChannelAdapter for MockAdapter {
 
     async fn open_dm(&self, _user_id: &str) -> Result<Option<DmHandle>, AdapterError> {
         Ok(self.open_dm_result.lock().expect("poisoned").clone())
+    }
+
+    fn plain_text_fallback(&self, msg: &OutboundMessage) -> Option<OutboundMessage> {
+        if !*self.plain_text_fallback_enabled.lock().expect("poisoned") {
+            return None;
+        }
+        let mut content = msg.content.clone();
+        if let Some(obj) = content.as_object_mut() {
+            obj.remove("parse_mode");
+            obj.remove("blocks");
+            obj.remove("embeds");
+            // Prepend the downgrade marker to the text body.
+            let text = obj
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned();
+            let downgraded = format!("[reduced formatting] {text}");
+            obj.insert(
+                "text".to_owned(),
+                serde_json::Value::String(downgraded),
+            );
+        }
+        Some(OutboundMessage {
+            kind: msg.kind,
+            content,
+            files: msg.files.clone(),
+        })
     }
 }
 

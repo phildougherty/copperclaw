@@ -356,6 +356,35 @@ impl ChannelAdapter for DiscordAdapter {
             channel_type: self.channel_type.clone(),
         }))
     }
+
+    /// Discord-specific plain-text fallback used by the delivery loop when
+    /// `POST /channels/:id/messages` rejected the original payload with an
+    /// embed-validation error. Drops the `embeds` field — Discord then
+    /// renders just the message content — and prepends
+    /// `"[reduced formatting] "` so the recipient knows the rich layout
+    /// was dropped. Returns `None` when there are no `embeds` to strip
+    /// (nothing to fall back to).
+    fn plain_text_fallback(&self, msg: &OutboundMessage) -> Option<OutboundMessage> {
+        let obj = msg.content.as_object()?;
+        if !obj.contains_key("embeds") {
+            return None;
+        }
+        let text = obj
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let mut new_obj = obj.clone();
+        new_obj.remove("embeds");
+        new_obj.insert(
+            "text".to_owned(),
+            serde_json::Value::String(format!("[reduced formatting] {text}")),
+        );
+        Some(OutboundMessage {
+            kind: msg.kind,
+            content: serde_json::Value::Object(new_obj),
+            files: msg.files.clone(),
+        })
+    }
 }
 
 /// Render an `OutboundMessage` to a plain string suitable for Discord's
@@ -676,6 +705,29 @@ mod tests {
         let f = GatewayExit::Fatal(4004);
         assert!(format!("{t:?}").contains("Transient"));
         assert!(format!("{f:?}").contains("4004"));
+    }
+
+    #[tokio::test]
+    async fn plain_text_fallback_strips_embeds_for_discord() {
+        let server = MockServer::start().await;
+        let (a, _rx) = build_adapter(&server);
+        let msg = OutboundMessage {
+            kind: MessageKind::Chat,
+            content: json!({
+                "text": "rich title",
+                "embeds": [{"title": "T", "description": "D"}]
+            }),
+            files: vec![],
+        };
+        let fallback = a
+            .plain_text_fallback(&msg)
+            .expect("discord fallback");
+        assert!(fallback.content.get("embeds").is_none());
+        assert_eq!(
+            fallback.content["text"].as_str().unwrap(),
+            "[reduced formatting] rich title"
+        );
+        assert_eq!(fallback.kind, MessageKind::Chat);
     }
 
     #[tokio::test]

@@ -255,6 +255,37 @@ impl ChannelAdapter for TelegramAdapter {
             channel_type: self.channel_type.clone(),
         }))
     }
+
+    /// Telegram-specific plain-text fallback used by the delivery loop when
+    /// `sendMessage` rejected the original payload with a "can't parse
+    /// entities" error (or similar formatting validation). Removes any
+    /// `parse_mode` field — the adapter then sends the text without
+    /// MarkdownV2 / HTML / Markdown escaping requirements — and prepends
+    /// `"[reduced formatting] "` so the recipient knows the message arrived
+    /// in a downgraded shape. Returns `None` if there is no `text` AND no
+    /// `parse_mode` to strip (nothing to fall back to).
+    fn plain_text_fallback(&self, msg: &OutboundMessage) -> Option<OutboundMessage> {
+        let obj = msg.content.as_object()?;
+        let text = obj
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let has_parse_mode = obj.contains_key("parse_mode");
+        if !has_parse_mode {
+            return None;
+        }
+        let mut new_obj = obj.clone();
+        new_obj.remove("parse_mode");
+        new_obj.insert(
+            "text".to_owned(),
+            serde_json::Value::String(format!("[reduced formatting] {text}")),
+        );
+        Some(OutboundMessage {
+            kind: msg.kind,
+            content: serde_json::Value::Object(new_obj),
+            files: msg.files.clone(),
+        })
+    }
 }
 
 fn extract_text(value: &serde_json::Value) -> String {
@@ -712,6 +743,70 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AdapterError::Transport(_)));
+    }
+
+    #[tokio::test]
+    async fn plain_text_fallback_strips_parse_mode_for_telegram() {
+        let s = MockServer::start().await;
+        empty_get_updates(&s).await;
+        let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
+        let dir = temp_dir();
+        let adapter = TelegramAdapter::start(
+            lp_config(&s.uri()),
+            None,
+            tx,
+            dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+
+        let msg = OutboundMessage {
+            kind: MessageKind::Chat,
+            content: json!({
+                "text": "Hey! Yes, I'm here!",
+                "parse_mode": "MarkdownV2"
+            }),
+            files: vec![],
+        };
+        let fallback = adapter
+            .plain_text_fallback(&msg)
+            .expect("telegram fallback");
+        // parse_mode must be removed entirely.
+        assert!(fallback.content.get("parse_mode").is_none());
+        // text is prepended with the reduced-formatting marker.
+        assert_eq!(
+            fallback.content["text"].as_str().unwrap(),
+            "[reduced formatting] Hey! Yes, I'm here!"
+        );
+        // Kind and files are preserved.
+        assert_eq!(fallback.kind, MessageKind::Chat);
+        assert!(fallback.files.is_empty());
+
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn plain_text_fallback_returns_none_when_already_plain() {
+        let s = MockServer::start().await;
+        empty_get_updates(&s).await;
+        let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
+        let dir = temp_dir();
+        let adapter = TelegramAdapter::start(
+            lp_config(&s.uri()),
+            None,
+            tx,
+            dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+
+        let msg = OutboundMessage {
+            kind: MessageKind::Chat,
+            content: json!({ "text": "Hello" }),
+            files: vec![],
+        };
+        assert!(adapter.plain_text_fallback(&msg).is_none());
+        adapter.shutdown().await;
     }
 
     #[test]

@@ -1997,6 +1997,8 @@ dependencies = [
  "ironclaw-metrics",
  "ironclaw-modules",
  "ironclaw-types",
+ "metrics",
+ "metrics-exporter-prometheus",
  "rusqlite",
  "serde_json",
  "tempfile",
