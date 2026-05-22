@@ -6,6 +6,44 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (recover from malformed tool_use JSON by feeding the parse error back to the model)
+
+- **`crates/ironclaw-types/src/provider.rs`** — new
+  `ProviderEvent::ToolInputParseError { tool_use_id, tool_name, raw_input, parse_error }`
+  variant. Emitted by the provider when a `tool_use` content block's
+  reassembled `input_json_delta` chunks fail to parse as JSON. Carries
+  enough metadata for the runner to synthesise a corrective
+  `tool_result` keyed by `tool_use_id`.
+- **`crates/ironclaw-providers/src/anthropic.rs`** — on a `tool_use`
+  input JSON parse failure (the live-caught `send_file` "EOF while
+  parsing an object at line 1 column 37" case), the SSE pump now
+  emits `ProviderEvent::ToolInputParseError` followed by
+  `ProviderEvent::ToolEnd` instead of a terminal
+  `ProviderEvent::Error`. The previous behaviour terminated the
+  inbound with only the generic apology row reaching the user.
+- **`crates/ironclaw-runner/src/run.rs`** — `pump_events` converts
+  the new event into a synthetic `PendingToolCall` tagged with the
+  parse error. `drive_turn` recognises these, skips the real tool
+  invocation, and pushes a `HistoryMessage::Tool { is_error: true,
+  content: "Your tool_use input JSON could not be parsed: <err>.
+  Please re-issue this exact tool call with valid JSON." }` so the
+  model self-corrects on the next turn (the Anthropic SDK's standard
+  pattern). Hard-capped at 3 consecutive parse-error turns per
+  inbound; on exhaustion the runner falls through to the existing
+  terminal-failure / apology path. Real tool calls emitted in the
+  same turn (e.g. a clean `shell` alongside a malformed `send_file`)
+  still execute normally.
+- **`crates/ironclaw-runner/src/subagent.rs`** — exhaustive-match arm
+  added for the new variant. Subagent turns are single-shot, so the
+  parse-error path bails the subagent turn (the parent runner is
+  where the self-correction loop lives).
+- **Tests** — four new tests in `crates/ironclaw-runner/src/run.rs`:
+  `malformed_tool_use_recovers_after_one_retry`,
+  `malformed_tool_use_gives_up_after_three_attempts`,
+  `malformed_tool_use_other_tools_still_work`, and
+  `tool_input_parse_error_event_serialization`. Workspace total goes
+  from 4,898 → 4,902 passing.
+
 ### Fixed (rebuild.sh: rebake session image so new runner reaches the agent)
 
 - **`rebuild.sh`** — now also rebuilds the session container image

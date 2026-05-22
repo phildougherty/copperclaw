@@ -296,6 +296,12 @@ struct PendingToolCall {
     id: String,
     name: String,
     input: serde_json::Value,
+    /// `Some` when the provider couldn't parse the model's `tool_use`
+    /// input JSON. The runner skips real tool invocation for this
+    /// call and instead feeds the parse error back to the model as a
+    /// `tool_result { is_error: true }` so it can self-correct on the
+    /// next turn. The `input` field is `Value::Null` in this case.
+    parse_error: Option<String>,
 }
 
 /// What one LLM round-trip produced.
@@ -318,6 +324,16 @@ struct LlmTurnOutput {
     retryable_failure: bool,
 }
 
+/// Hard cap on consecutive turns where the model emitted at least one
+/// `tool_use` block whose input JSON failed to parse. The runner feeds
+/// the parse error back as a `tool_result { is_error: true }` so the
+/// model can self-correct, but if it can't fix it after this many
+/// attempts we fall through to the existing terminal-failure path so
+/// the user at least sees the apology row. See
+/// `malformed_tool_use_gives_up_after_three_attempts` for the
+/// regression pin.
+const MAX_TOOL_PARSE_ERROR_ATTEMPTS: u32 = 3;
+
 /// Drive one inbound through to a final assistant response. Loops
 /// LLM-turn → execute-tools → LLM-turn until the model produces a
 /// turn with no `tool_use` blocks (or we hit `max_tool_turns`).
@@ -327,6 +343,12 @@ async fn drive_turn(
     previous_continuation: Option<&str>,
 ) -> Result<TurnResult> {
     let mut continuation: Option<String> = previous_continuation.map(str::to_string);
+    // Counts consecutive turns whose output included any
+    // parse-error-tagged tool call. Reset when a turn produces a
+    // parse-error-free output. Bounded by
+    // `MAX_TOOL_PARSE_ERROR_ATTEMPTS` so a stuck model can't loop us
+    // forever.
+    let mut consecutive_parse_error_turns: u32 = 0;
 
     for tool_turn in 0..deps.max_tool_turns.max(1) {
         let output = run_llm_turn(deps, history, continuation.as_deref()).await?;
@@ -377,6 +399,22 @@ async fn drive_turn(
             });
         }
 
+        // Track whether THIS turn included any synthetic
+        // parse-error tool calls. We bump the counter now but defer
+        // the cap check until after pushing tool_results into history
+        // so the audit trail captures all attempts (the model never
+        // sees the third turn's results, but the persisted history
+        // shows three full parse-error cycles for ops review).
+        let turn_had_parse_error = output
+            .tool_calls
+            .iter()
+            .any(|c| c.parse_error.is_some());
+        if turn_had_parse_error {
+            consecutive_parse_error_turns += 1;
+        } else {
+            consecutive_parse_error_turns = 0;
+        }
+
         // Tools requested → execute each, push the result as a
         // user-role tool_result history entry, and loop into
         // another LLM turn.
@@ -386,11 +424,39 @@ async fn drive_turn(
             "executing tool calls"
         );
         for call in &output.tool_calls {
-            let (content, is_error) = invoke_tool(deps, call).await;
+            let (content, is_error) = if let Some(parse_err) = call.parse_error.as_deref() {
+                // Synthetic call from `ProviderEvent::ToolInputParseError`:
+                // we never actually invoke the tool — instead we hand the
+                // model a tool_result describing what went wrong so it
+                // can re-emit the call with valid JSON next turn.
+                (
+                    format!(
+                        "Your tool_use input JSON could not be parsed: {parse_err}. Please re-issue this exact tool call with valid JSON.",
+                    ),
+                    true,
+                )
+            } else {
+                invoke_tool(deps, call).await
+            };
             history.push(HistoryMessage::Tool {
                 tool_use_id: call.id.clone(),
                 content,
                 is_error,
+            });
+        }
+
+        // After pushing the tool_results, enforce the parse-error cap.
+        // Three consecutive turns of malformed tool_use JSON means
+        // the model is stuck — fall through to the existing terminal
+        // failure path so the user sees the apology row.
+        if consecutive_parse_error_turns >= MAX_TOOL_PARSE_ERROR_ATTEMPTS {
+            tracing::error!(
+                attempts = consecutive_parse_error_turns,
+                "{MAX_TOOL_PARSE_ERROR_ATTEMPTS} consecutive tool_use parse failures; bailing",
+            );
+            return Ok(TurnResult {
+                continuation,
+                outcome: TurnOutcome::Failed,
             });
         }
     }
@@ -566,7 +632,40 @@ async fn pump_events(
                 // PendingToolCall either way so the model sees a
                 // matching `tool_result` on the next turn.
                 let _ = is_disallowed(&name);
-                out.tool_calls.push(PendingToolCall { id, name, input });
+                out.tool_calls.push(PendingToolCall {
+                    id,
+                    name,
+                    input,
+                    parse_error: None,
+                });
+            }
+            ProviderEvent::ToolInputParseError {
+                tool_use_id,
+                tool_name,
+                raw_input,
+                parse_error,
+            } => {
+                // The provider couldn't parse the tool_use input JSON
+                // the model emitted. Rather than terminating the turn
+                // (which would leave the user with no reply, only the
+                // generic apology), we synthesise a PendingToolCall
+                // tagged with `parse_error`. `drive_turn` recognises
+                // these and feeds a `tool_result { is_error: true }`
+                // back into the next turn so the model self-corrects.
+                tracing::warn!(
+                    tool_use_id = %tool_use_id,
+                    tool_name = %tool_name,
+                    raw_input_bytes = raw_input.len(),
+                    parse_error = %parse_error,
+                    "tool_use input JSON did not parse; feeding error back to model"
+                );
+                ironclaw_metrics::inc_provider_retry(deps.provider.name());
+                out.tool_calls.push(PendingToolCall {
+                    id: tool_use_id,
+                    name: tool_name,
+                    input: serde_json::Value::Null,
+                    parse_error: Some(parse_error),
+                });
             }
             ProviderEvent::ToolEnd => {
                 clear_current_tool(deps).await?;
@@ -1313,6 +1412,294 @@ mod tests {
             text.contains("snag") || text.contains("couldn't finish"),
             "apology text should be user-facing: {text:?}"
         );
+    }
+
+    /// Recoverable path: a malformed `tool_use` JSON on the first turn
+    /// must NOT terminate the inbound. The runner synthesises a
+    /// `tool_result { is_error: true }` describing the parse failure,
+    /// feeds it back into the next turn, and the model self-corrects
+    /// with a clean `Result`. The inbound flips to `completed`, the
+    /// final assistant text reaches the channel as a chat row, and no
+    /// apology row is emitted.
+    #[tokio::test]
+    async fn malformed_tool_use_recovers_after_one_retry() {
+        let mut setup = build_setup(vec![
+            vec![ProviderEvent::ToolInputParseError {
+                tool_use_id: "tu_bad_1".into(),
+                tool_name: "send_file".into(),
+                raw_input: "{\"path\":".into(),
+                parse_error: "EOF while parsing an object at line 1 column 37".into(),
+            }],
+            vec![ProviderEvent::Result {
+                text: Some("ok done".into()),
+            }],
+        ]);
+        let id = {
+            let g = setup.deps.inbound.lock().await;
+            insert_pending(&g, "send me the file")
+        };
+        setup.deps.max_turns = Some(1);
+        run_loop(setup.deps).await.unwrap();
+
+        let inbound = open_inbound(&setup.paths).unwrap();
+        let status: String = inbound
+            .query_row(
+                "SELECT status FROM messages_in WHERE id = ?1",
+                rusqlite::params![id.as_uuid().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "completed",
+            "parse-error recovery must not terminally fail the inbound"
+        );
+
+        // Exactly one Chat outbound row, carrying the second turn's text.
+        let outbound = open_outbound(&setup.paths).unwrap();
+        let rows = messages_out::list_due(&outbound).unwrap();
+        let chat_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == ironclaw_types::MessageKind::Chat)
+            .collect();
+        assert_eq!(
+            chat_rows.len(),
+            1,
+            "expected one chat outbound (the recovered reply), got: {chat_rows:?}"
+        );
+        assert_eq!(chat_rows[0].content["text"], "ok done");
+
+        // History should contain the synthetic Tool result tagged
+        // is_error=true with the parse-error feedback message.
+        let st = load_state(&outbound).unwrap();
+        assert!(
+            st.history.iter().any(|m| matches!(
+                m,
+                HistoryMessage::Tool { tool_use_id, content, is_error: true }
+                    if tool_use_id == "tu_bad_1"
+                        && content.contains("could not be parsed")
+                        && content.contains("EOF while parsing")
+            )),
+            "expected synthetic parse-error tool_result in history, got: {:?}",
+            st.history
+        );
+    }
+
+    /// Cap path: three consecutive turns each emit a
+    /// `ToolInputParseError` for `send_file`. The fourth scripted turn
+    /// is never reached because `drive_turn` bails after the third
+    /// retry. The inbound is marked `failed` and the apology row is
+    /// emitted.
+    #[tokio::test]
+    async fn malformed_tool_use_gives_up_after_three_attempts() {
+        let parse_err = || ProviderEvent::ToolInputParseError {
+            tool_use_id: "tu_bad_1".into(),
+            tool_name: "send_file".into(),
+            raw_input: "{\"path\":".into(),
+            parse_error: "EOF while parsing an object at line 1 column 37".into(),
+        };
+        // Four scripted turns: the runner should consume the first
+        // three and then bail without ever calling `query()` for the
+        // fourth.
+        let mut setup = build_setup(vec![
+            vec![parse_err()],
+            vec![parse_err()],
+            vec![parse_err()],
+            vec![ProviderEvent::Result {
+                text: Some("should never be seen".into()),
+            }],
+        ]);
+        let id = {
+            let g = setup.deps.inbound.lock().await;
+            insert_pending(&g, "send me the file")
+        };
+        setup.deps.max_turns = Some(1);
+        run_loop(setup.deps).await.unwrap();
+
+        let inbound = open_inbound(&setup.paths).unwrap();
+        let status: String = inbound
+            .query_row(
+                "SELECT status FROM messages_in WHERE id = ?1",
+                rusqlite::params![id.as_uuid().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "failed",
+            "three consecutive parse failures must terminally fail the inbound"
+        );
+
+        // The "should never be seen" turn must not have been emitted.
+        let outbound = open_outbound(&setup.paths).unwrap();
+        let rows = messages_out::list_due(&outbound).unwrap();
+        let chat_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == ironclaw_types::MessageKind::Chat)
+            .collect();
+        // Exactly one chat row — the apology — and it must NOT contain
+        // the never-reached fourth-turn text.
+        assert_eq!(
+            chat_rows.len(),
+            1,
+            "expected exactly one apology chat row, got: {chat_rows:?}"
+        );
+        let apology_text = chat_rows[0]
+            .content
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        assert!(
+            !apology_text.contains("should never be seen"),
+            "fourth turn must not have been consumed: {apology_text:?}"
+        );
+        assert!(
+            apology_text.contains("snag") || apology_text.contains("couldn't finish"),
+            "apology text should be user-facing: {apology_text:?}"
+        );
+
+        // The history should carry three synthetic Tool error
+        // results, one per consumed turn — matches the
+        // "3 consecutive tool_use parse failures" audit narrative.
+        let st = load_state(&outbound).unwrap();
+        let parse_error_results = st
+            .history
+            .iter()
+            .filter(|m| {
+                matches!(
+                    m,
+                    HistoryMessage::Tool { content, is_error: true, .. }
+                        if content.contains("could not be parsed")
+                )
+            })
+            .count();
+        assert_eq!(
+            parse_error_results, 3,
+            "expected 3 synthetic parse-error tool_results in history, got {parse_error_results}"
+        );
+    }
+
+    /// Mixed-batch path: when one turn emits both a clean ToolCall
+    /// (`shell`) and a malformed `send_file`, the real tool path
+    /// still runs for `shell` and the synthetic-error path runs for
+    /// `send_file`. The next turn sees both `tool_result` rows.
+    #[tokio::test]
+    async fn malformed_tool_use_other_tools_still_work() {
+        let mut setup = build_setup(vec![
+            vec![
+                ProviderEvent::ToolCall {
+                    id: "tu_shell_1".into(),
+                    name: "shell".into(),
+                    input: serde_json::json!({"cmd": "echo hi"}),
+                },
+                ProviderEvent::ToolInputParseError {
+                    tool_use_id: "tu_send_bad".into(),
+                    tool_name: "send_file".into(),
+                    raw_input: "{\"path\":".into(),
+                    parse_error: "EOF while parsing an object at line 1 column 37".into(),
+                },
+            ],
+            vec![ProviderEvent::Result {
+                text: Some("both handled".into()),
+            }],
+        ]);
+        let id = {
+            let g = setup.deps.inbound.lock().await;
+            insert_pending(&g, "do two things")
+        };
+        setup.deps.max_turns = Some(1);
+        run_loop(setup.deps).await.unwrap();
+
+        let inbound = open_inbound(&setup.paths).unwrap();
+        let status: String = inbound
+            .query_row(
+                "SELECT status FROM messages_in WHERE id = ?1",
+                rusqlite::params![id.as_uuid().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
+
+        let outbound = open_outbound(&setup.paths).unwrap();
+        let st = load_state(&outbound).unwrap();
+
+        // The shell tool_result is real: the test tool_map is empty so
+        // `invoke_tool` returns the "Unknown tool" refusal, but
+        // crucially it is NOT the synthetic "could not be parsed"
+        // text — that path is reserved for parse-error calls.
+        let shell_result = st.history.iter().find_map(|m| {
+            if let HistoryMessage::Tool { tool_use_id, content, is_error } = m {
+                if tool_use_id == "tu_shell_1" {
+                    return Some((content.clone(), *is_error));
+                }
+            }
+            None
+        });
+        let (shell_content, shell_is_error) =
+            shell_result.expect("expected a tool_result for tu_shell_1");
+        assert!(
+            !shell_content.contains("could not be parsed"),
+            "shell tool_result must come from invoke_tool, not the synthetic parse-error path: {shell_content:?}"
+        );
+        assert!(shell_is_error, "unknown-tool returns is_error=true");
+
+        // The send_file tool_result is the synthetic parse-error
+        // message tagged is_error=true.
+        let send_result = st.history.iter().find_map(|m| {
+            if let HistoryMessage::Tool { tool_use_id, content, is_error } = m {
+                if tool_use_id == "tu_send_bad" {
+                    return Some((content.clone(), *is_error));
+                }
+            }
+            None
+        });
+        let (send_content, send_is_error) =
+            send_result.expect("expected a tool_result for tu_send_bad");
+        assert!(
+            send_content.contains("could not be parsed"),
+            "send_file tool_result must be the synthetic parse-error message: {send_content:?}"
+        );
+        assert!(send_is_error);
+
+        // And the second turn's final text reached the channel.
+        let _ = id;
+        let chat_rows: Vec<_> = messages_out::list_due(&outbound)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == ironclaw_types::MessageKind::Chat)
+            .collect();
+        assert_eq!(chat_rows.len(), 1);
+        assert_eq!(chat_rows[0].content["text"], "both handled");
+    }
+
+    /// Serde round-trip pin for the new `ToolInputParseError` variant.
+    #[test]
+    fn tool_input_parse_error_event_serialization() {
+        let ev = ProviderEvent::ToolInputParseError {
+            tool_use_id: "tu_42".into(),
+            tool_name: "send_file".into(),
+            raw_input: "{\"path\":".into(),
+            parse_error: "EOF while parsing an object at line 1 column 37".into(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains("\"type\":\"tool_input_parse_error\""));
+        assert!(json.contains("\"tool_use_id\":\"tu_42\""));
+        assert!(json.contains("\"tool_name\":\"send_file\""));
+        assert!(json.contains("EOF while parsing"));
+
+        let back: ProviderEvent = serde_json::from_str(&json).unwrap();
+        match back {
+            ProviderEvent::ToolInputParseError {
+                tool_use_id,
+                tool_name,
+                raw_input,
+                parse_error,
+            } => {
+                assert_eq!(tool_use_id, "tu_42");
+                assert_eq!(tool_name, "send_file");
+                assert_eq!(raw_input, "{\"path\":");
+                assert!(parse_error.contains("EOF while parsing"));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[tokio::test]
