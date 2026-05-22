@@ -526,6 +526,17 @@ pub async fn run_host(
         }
     }
 
+    // 9c. Boot-time image health check. Reads the configured default
+    // image tag and verifies it (a) exists locally, (b) carries an
+    // executable runner binary at the expected path, and (c)
+    // optionally that its `ironclaw.fingerprint` label matches the
+    // host's runner. Failure does NOT abort the boot — instead, the
+    // host enters "degraded" mode: the admin socket stays reachable,
+    // each session with pending inbound gets a one-time apology row,
+    // and the container manager refuses to spawn new sessions.
+    let health_outcome: Option<crate::image_health::HealthDegradedReason> =
+        run_boot_image_health_check(&cfg, &state.central).await;
+
     // 10. Install modules.
     let host_ctx = HostContext::for_router(Arc::clone(&state.router), Arc::clone(&state.delivery));
     install_modules(Arc::clone(&host_ctx)).await;
@@ -571,6 +582,21 @@ pub async fn run_host(
         Some((task, mgr)) => (Some(task), Some(mgr)),
         None => (None, None),
     };
+
+    // 13c. If the boot-time image health check flagged the host as
+    // degraded, flip the manager into refuse-spawn mode now so the
+    // poll loop never tries to spawn against the stale image.
+    if let (Some(reason), Some(mgr)) = (health_outcome.as_ref(), manager_handle.as_ref()) {
+        mgr.set_degraded();
+        // The metric + apology fan-out already fired inside
+        // `enter_degraded_mode` — this is just the manager-side
+        // bookkeeping. Re-warn so a quick log-tail surfaces the
+        // sticky degraded state right before the ready banner.
+        warn!(
+            reason = %reason,
+            "container manager started in degraded mode; will refuse new spawns"
+        );
+    }
 
     // 14. Spawn socket server.
     let socket_path = cfg.ncl_socket_path.clone();
@@ -759,6 +785,54 @@ fn spawn_container_manager(
     ));
     let task = tokio::spawn(Arc::clone(&manager).run_loop(shutdown));
     Some((task, manager))
+}
+
+/// Run the boot-time image health check against
+/// `cfg.default_image_tag`. Returns `Some(reason)` when the host
+/// should enter degraded mode (and writes the apology rows + sets
+/// the metric gauge as a side effect); returns `None` on success
+/// (image is healthy or check was skipped because no tag is
+/// configured).
+///
+/// Lives outside [`run_host`] so the call surface is unit-testable
+/// (see `crates/ironclaw-host/src/image_health.rs::tests`).
+async fn run_boot_image_health_check(
+    cfg: &HostConfig,
+    central: &ironclaw_db::central::CentralDb,
+) -> Option<crate::image_health::HealthDegradedReason> {
+    let Some(image_tag) = cfg.default_image_tag.as_deref() else {
+        // No configured tag → container manager is already disabled,
+        // separate warning is emitted from spawn_container_manager.
+        // No need to run the health check in that case.
+        return None;
+    };
+    let probe = crate::image_health::DockerImageProbe;
+    let host_fp = crate::image_health::host_runner_fingerprint(
+        crate::image_health::default_host_runner_path().as_deref(),
+    );
+    match crate::image_health::check_image_health(&probe, image_tag, host_fp.as_deref()).await {
+        Ok(()) => {
+            info!(image_tag = %image_tag, "boot image health check passed");
+            None
+        }
+        Err(reason) => {
+            // Side-effects of degraded mode (metric + apology
+            // fan-out) live in `enter_degraded_mode`. Calling it from
+            // here keeps boot.rs lean.
+            let notified = crate::image_health::enter_degraded_mode(
+                central,
+                cfg.data_dir(),
+                &reason,
+            );
+            warn!(
+                image_tag = %image_tag,
+                reason = %reason,
+                notified,
+                "boot image health check failed; entering degraded mode"
+            );
+            Some(reason)
+        }
+    }
 }
 
 /// Collect operator-supplied env vars that should be forwarded into

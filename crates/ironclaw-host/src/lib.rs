@@ -16,6 +16,7 @@ pub mod container_manager;
 pub mod context;
 pub mod daemon;
 pub mod handlers;
+pub mod image_health;
 pub mod orphans;
 pub mod sessions;
 pub mod socket;

@@ -6,6 +6,57 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (boot-time image health check + host degraded mode)
+
+- **`crates/ironclaw-host/src/image_health.rs`** — new module that
+  inspects the configured `IRONCLAW_DEFAULT_IMAGE_TAG` at boot
+  before the container manager starts. Three checks:
+  1. **Image exists locally** — `docker image inspect <tag>`. A
+     missing image is what happens when an operator runs the host
+     binaries (e.g. via systemd) without first running
+     `./rebuild.sh` to refresh the session image. This is the
+     bug-class the change closes.
+  2. **Runner binary present + executable** — one-shot
+     `docker run --rm --entrypoint /bin/ls <tag> -l /usr/local/bin/ironclaw-runner`
+     bounded by a 5 s per-call timeout and `kill_on_drop(true)` so
+     a wedged daemon can't monopolise boot.
+  3. **Fingerprint compare** — reads the image's
+     `ironclaw.fingerprint` label (set by `ironclaw-setup`) and
+     compares it to the sha256 of the host's runner binary. A
+     mismatch is a WARN, **not** a degrade — fingerprints can
+     legitimately differ across architectures and build flavours,
+     so we only flag the suspicion.
+  The whole pipeline is bounded by an outer 10 s `tokio::time::timeout`.
+- **`crates/ironclaw-host/src/boot.rs::run_boot_image_health_check`**
+  wires the check into `run_host` between migrations and the
+  container-manager spawn. On failure the host enters degraded mode
+  via `image_health::enter_degraded_mode`: the metric gauge is set,
+  a one-time `"The agent is temporarily degraded — the container
+  image is missing or out of date. The operator has been notified."`
+  apology row is written to every active session's `outbound.db`
+  routed back through its most recent pending chat inbound's channel,
+  and the container manager is flipped into refuse-spawn mode via
+  the new `ContainerManager::set_degraded()`. The startup log line
+  starts with `HOST DEGRADED:` so a quick log tail surfaces it.
+- **`crates/ironclaw-host/src/container_manager.rs`** — new
+  `ManagerError::HostDegraded` variant; `maybe_spawn` short-circuits
+  with it when degraded; the reconcile loop swallows the error so
+  the host log isn't spammed every tick.
+- **`crates/ironclaw-metrics/src/lib.rs`** — new
+  `ironclaw_degraded_state{reason}` Prometheus gauge with five label
+  values: `image_not_found`, `runner_binary_missing`,
+  `runner_binary_not_executable`, `health_check_timeout`,
+  `health_check_failed`. Exposed via `set_degraded_state` /
+  `clear_degraded_state` helpers.
+- **Tests**: `image_health_passes_when_image_has_runner`,
+  `image_health_fails_when_image_missing`,
+  `image_health_fails_when_runner_binary_absent`,
+  `image_health_warns_on_fingerprint_mismatch`,
+  `degraded_mode_refuses_spawn`,
+  `degraded_mode_emits_apology_to_pending_inbounds`, plus six more
+  defensive cases (label-skip path, transport-error fallback,
+  fingerprint-helper edge cases). Workspace tests: 4 898 → 4 910.
+
 ### Fixed (rebuild.sh: rebake session image so new runner reaches the agent)
 
 - **`rebuild.sh`** — now also rebuilds the session container image
