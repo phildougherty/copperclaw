@@ -21,6 +21,7 @@ use crate::error::ToolError;
 pub mod agents;
 pub mod computer_use;
 pub mod core;
+pub mod edit_file;
 pub mod interactive;
 pub mod scheduling;
 pub mod self_mod;
@@ -68,6 +69,7 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         scheduling::resume_task::entry(),
         scheduling::update_task::entry(),
         computer_use::shell::entry(),
+        edit_file::entry(),
         computer_use::read_file::entry(),
         computer_use::write_file::entry(),
         computer_use::web_fetch::entry(),
@@ -154,6 +156,7 @@ mod tests {
             "resume_task",
             "update_task",
             "shell",
+            "edit_file",
             "read_file",
             "write_file",
             "web_fetch",
