@@ -5,7 +5,7 @@
 
 use crate::dispatch::{AdapterResolver, HostDispatcher};
 use crate::error::DeliveryError;
-use crate::system_actions::parse_system_content;
+use crate::system_actions::{parse_system_content, ParsedAction};
 use dashmap::DashMap;
 use ironclaw_channels_core::{AdapterError, ChannelAdapter};
 use ironclaw_db::central::CentralDb;
@@ -18,7 +18,7 @@ use ironclaw_types::{
     AgentGroupId, ChannelType, ContainerStatus, MessageId, MessageKind, MessageOutRow,
     OutboundMessage, Session, SessionId, SessionStatus,
 };
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
@@ -169,6 +169,17 @@ struct RetryState {
     tries: u32,
     /// `Instant` after which the row may be retried.
     not_before: Instant,
+}
+
+/// Outcome of [`DeliveryService::try_action_via_adapter`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionAdapterOutcome {
+    /// Adapter call succeeded; caller marks the row delivered.
+    Done,
+    /// Adapter could not service the request (Unsupported / missing
+    /// `external_id` / missing payload field); caller falls through to the
+    /// registered-handler path so a fallback chat message can be emitted.
+    FallThrough,
 }
 
 /// Decision the host wants for a not-yet-delivered row.
@@ -538,6 +549,18 @@ impl DeliveryService {
             return Ok(());
         }
 
+        // "edit" / "reaction" go through the channel adapter's typed APIs.
+        // Both fall through to the registered-handler path when the adapter
+        // reports `Unsupported` (CLI / webhooks / etc.) OR when the original
+        // row's platform message id is missing — the handler is expected to
+        // return a fallback `OutboundMessage` we then dispatch normally.
+        if let Some(()) = self
+            .maybe_handle_edit_or_reaction(sess, row, &action, target, inbound_pool)
+            .await?
+        {
+            return Ok(());
+        }
+
         let handler = self.actions.get(&action.name).map(|r| r.clone());
         let Some(handler) = handler else {
             info!(name = %action.name, "no handler for system action; skipping");
@@ -588,6 +611,145 @@ impl DeliveryService {
             delivered::insert(&in_conn, row.id, None, "ok")?;
         }
         Ok(())
+    }
+
+    /// Top-level dispatch for `edit` / `reaction` system actions. Returns
+    /// `Some(())` to signal "row processed, caller may return immediately",
+    /// `None` to signal "this isn't an edit/reaction action; continue down
+    /// the regular registered-handler path", and propagates errors as-is.
+    async fn maybe_handle_edit_or_reaction(
+        &self,
+        sess: &Session,
+        row: &MessageOutRow,
+        action: &ParsedAction,
+        target: &DispatchTarget,
+        inbound_pool: &SessionPool,
+    ) -> Result<Option<()>, DeliveryError> {
+        if action.name != "edit" && action.name != "reaction" {
+            return Ok(None);
+        }
+        let outbound_pool = self
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)?;
+        let outcome = self
+            .try_action_via_adapter(
+                &action.name,
+                &action.payload,
+                target,
+                inbound_pool,
+                &outbound_pool,
+            )
+            .await?;
+        match outcome {
+            ActionAdapterOutcome::Done => {
+                let in_conn = inbound_pool.connect()?;
+                delivered::insert(&in_conn, row.id, None, "ok")?;
+                Ok(Some(()))
+            }
+            ActionAdapterOutcome::FallThrough => Ok(None),
+        }
+    }
+
+    /// Try to dispatch an `edit` / `reaction` system action through the
+    /// channel adapter's typed API. Returns:
+    /// - `Done` when the adapter call succeeded (the caller marks the row as
+    ///   delivered).
+    /// - `FallThrough` when the adapter reported `Unsupported`, the original
+    ///   row's `external_id` couldn't be located, or any precondition (target,
+    ///   adapter, payload shape) is missing. The caller continues into the
+    ///   registered-handler path so a fallback chat message can be emitted.
+    ///
+    /// `Err` is reserved for hard failures (adapter returned a non-Unsupported
+    /// error, or a DB read blew up) — the caller propagates and the row goes
+    /// down the retry/fail path.
+    async fn try_action_via_adapter(
+        &self,
+        action_name: &str,
+        payload: &serde_json::Value,
+        target: &DispatchTarget,
+        inbound_pool: &SessionPool,
+        outbound_pool: &SessionPool,
+    ) -> Result<ActionAdapterOutcome, DeliveryError> {
+        let Some(seq) = payload.get("seq").and_then(serde_json::Value::as_i64) else {
+            warn!(action = action_name, "edit/reaction payload missing seq; falling back");
+            return Ok(ActionAdapterOutcome::FallThrough);
+        };
+        // Need a target with channel_type + platform_id; otherwise fall back.
+        let (Some(channel_type), Some(platform_id)) =
+            (target.channel_type.clone(), target.platform_id.clone())
+        else {
+            return Ok(ActionAdapterOutcome::FallThrough);
+        };
+        let Some(adapter) = self.adapters.get(&channel_type).map(|r| r.clone()) else {
+            return Err(DeliveryError::NoAdapter(channel_type));
+        };
+
+        // Resolve the row's platform_message_id by:
+        //   1. Looking up the messages_out row whose seq = `seq` (outbound DB).
+        //   2. Reading delivered.platform_message_id for that id (inbound DB).
+        // The row identified by `seq` MUST already be delivered for an edit /
+        // reaction to make sense; if it isn't (or the platform never gave us
+        // an id) we fall back to a synthetic chat message.
+        let original_id = {
+            let out_conn = outbound_pool.connect()?;
+            message_id_for_seq(&out_conn, seq)?
+        };
+        let Some(original_id) = original_id else {
+            warn!(
+                action = action_name,
+                seq, "no outbound row with this seq; falling back"
+            );
+            return Ok(ActionAdapterOutcome::FallThrough);
+        };
+        let external_id = {
+            let in_conn = inbound_pool.connect()?;
+            platform_message_id_for(&in_conn, original_id)?
+        };
+        let Some(external_id) = external_id else {
+            warn!(
+                action = action_name,
+                seq, "no platform_message_id recorded for seq; falling back"
+            );
+            return Ok(ActionAdapterOutcome::FallThrough);
+        };
+
+        let call_result = match action_name {
+            "edit" => {
+                let Some(text) = payload.get("text").and_then(serde_json::Value::as_str) else {
+                    warn!("edit payload missing text; falling back");
+                    return Ok(ActionAdapterOutcome::FallThrough);
+                };
+                adapter
+                    .edit_message(&platform_id, target.thread_id.as_deref(), &external_id, text)
+                    .await
+            }
+            "reaction" => {
+                let Some(emoji) = payload.get("emoji").and_then(serde_json::Value::as_str) else {
+                    warn!("reaction payload missing emoji; falling back");
+                    return Ok(ActionAdapterOutcome::FallThrough);
+                };
+                adapter
+                    .add_reaction(
+                        &platform_id,
+                        target.thread_id.as_deref(),
+                        &external_id,
+                        emoji,
+                    )
+                    .await
+            }
+            // TODO(team-er): adding a new edit/reaction-shaped action would
+            // require a third arm here.
+            _ => return Ok(ActionAdapterOutcome::FallThrough),
+        };
+
+        match call_result {
+            Ok(()) => Ok(ActionAdapterOutcome::Done),
+            Err(AdapterError::Unsupported(reason)) => {
+                info!(action = action_name, reason, "adapter unsupported; falling back");
+                Ok(ActionAdapterOutcome::FallThrough)
+            }
+            Err(other) => Err(DeliveryError::Adapter(other)),
+        }
     }
 
     async fn dispatch_chat(
@@ -773,6 +935,53 @@ pub(crate) fn is_container_running(s: &Session) -> bool {
 /// Helper used by tests / the sweep loop to filter on session status.
 pub(crate) fn is_session_active(s: &Session) -> bool {
     s.status == SessionStatus::Active
+}
+
+/// Look up an outbound row's `MessageId` by its monotonic `seq` value.
+/// Returns `Ok(None)` when no row with that seq exists. Pulled out of
+/// [`DeliveryService::try_action_via_adapter`] so the SELECT lives in one
+/// place and can be unit-tested directly.
+fn message_id_for_seq(
+    out_conn: &Connection,
+    seq: i64,
+) -> Result<Option<MessageId>, DeliveryError> {
+    let mut stmt = out_conn
+        .prepare("SELECT id FROM messages_out WHERE seq = ?1")
+        .map_err(ironclaw_db::DbError::from)?;
+    let row: Option<String> = stmt
+        .query_row([seq], |r| r.get::<_, String>(0))
+        .optional()
+        .map_err(ironclaw_db::DbError::from)?;
+    let Some(id_str) = row else {
+        return Ok(None);
+    };
+    let uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
+        DeliveryError::SystemAction(format!("invalid outbound row uuid: {e}"))
+    })?;
+    Ok(Some(MessageId(uuid)))
+}
+
+/// Look up the platform-side message id recorded against an outbound row
+/// in the inbound `delivered` table. Returns `Ok(None)` when the row was
+/// either never delivered or the platform didn't expose an id (e.g. CLI).
+fn platform_message_id_for(
+    in_conn: &Connection,
+    message_out_id: MessageId,
+) -> Result<Option<String>, DeliveryError> {
+    let mut stmt = in_conn
+        .prepare(
+            "SELECT platform_message_id FROM delivered
+             WHERE message_out_id = ?1 AND status = 'ok'",
+        )
+        .map_err(ironclaw_db::DbError::from)?;
+    let row: Option<Option<String>> = stmt
+        .query_row(
+            [message_out_id.as_uuid().to_string()],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(ironclaw_db::DbError::from)?;
+    Ok(row.flatten())
 }
 
 /// Translate a `usage_report` system payload into an `agent_turns`
@@ -1897,6 +2106,250 @@ mod tests {
         apply_add_mcp_server(&db, ag, &payload).unwrap();
         let servers = container_configs::get_mcp_servers(&db, ag).unwrap();
         assert_eq!(servers["linear"]["command"], "new");
+    }
+
+    /// `edit` system action with a recorded `platform_message_id` invokes
+    /// `ChannelAdapter::edit_message` and marks the row delivered. Verifies
+    /// the seq → message id → external_id resolution chain end to end.
+    #[tokio::test]
+    async fn edit_system_action_routes_through_adapter() {
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        // First, write a chat row and pre-record it as delivered with an
+        // external platform id ("p-7"). The runner then emits an "edit"
+        // system row referencing the same `seq`.
+        let chat = make_row(MessageKind::Chat, json!({"text": "hello"}));
+        write_row(&out_pool, &chat);
+        let chat_seq = {
+            let conn = out_pool.connect().unwrap();
+            messages_out::get(&conn, chat.id).unwrap().seq
+        };
+        {
+            let in_conn = in_pool.connect().unwrap();
+            delivered::insert(&in_conn, chat.id, Some("p-7"), "ok").unwrap();
+        }
+
+        let edit = make_row(
+            MessageKind::System,
+            json!({"edit": {"seq": chat_seq, "text": "edited body"}}),
+        );
+        write_row(&out_pool, &edit);
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        // Only the edit row is processed this pass (chat was already delivered).
+        assert_eq!(rpt.delivered, 1);
+        let edits = mock.edits();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].platform_id, "plat-1");
+        assert_eq!(edits[0].external_id, "p-7");
+        assert_eq!(edits[0].new_text, "edited body");
+        // No new chat delivery — the fallback was not invoked.
+        assert!(mock.deliveries().is_empty());
+    }
+
+    /// `reaction` system action routes through `ChannelAdapter::add_reaction`.
+    #[tokio::test]
+    async fn reaction_system_action_routes_through_adapter() {
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let chat = make_row(MessageKind::Chat, json!({"text": "hi"}));
+        write_row(&out_pool, &chat);
+        let chat_seq = {
+            let conn = out_pool.connect().unwrap();
+            messages_out::get(&conn, chat.id).unwrap().seq
+        };
+        {
+            let in_conn = in_pool.connect().unwrap();
+            delivered::insert(&in_conn, chat.id, Some("p-9"), "ok").unwrap();
+        }
+        let react = make_row(
+            MessageKind::System,
+            json!({"reaction": {"seq": chat_seq, "emoji": "thumbsup"}}),
+        );
+        write_row(&out_pool, &react);
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.delivered, 1);
+        let reactions = mock.reactions();
+        assert_eq!(reactions.len(), 1);
+        assert_eq!(reactions[0].external_id, "p-9");
+        assert_eq!(reactions[0].emoji, "thumbsup");
+    }
+
+    /// When the adapter returns `Unsupported`, the service invokes the
+    /// registered handler whose fallback is a synthetic chat message. Tests
+    /// the registered-handler hand-off described in `try_action_via_adapter`.
+    #[tokio::test]
+    async fn unsupported_fallback_sends_new_message() {
+        struct Fallback;
+        impl DeliveryActionHandler for Fallback {
+            fn handle(
+                &self,
+                input: DeliveryActionInput,
+            ) -> Result<DeliveryActionOutput, ModuleError> {
+                let text = input
+                    .payload
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                Ok(DeliveryActionOutput {
+                    dispatch: Some(input.target.clone()),
+                    message: Some(OutboundMessage {
+                        kind: MessageKind::Chat,
+                        content: json!({ "text": format!("(edit) {text}") }),
+                        files: vec![],
+                    }),
+                })
+            }
+        }
+        let (service, _root, sess, mock) = make_service().await;
+        service.register_action("edit", Arc::new(Fallback));
+        // Tell the adapter to refuse edits — drives the fallback path.
+        mock.set_edit_unsupported(true);
+
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let chat = make_row(MessageKind::Chat, json!({"text": "hello"}));
+        write_row(&out_pool, &chat);
+        let chat_seq = {
+            let conn = out_pool.connect().unwrap();
+            messages_out::get(&conn, chat.id).unwrap().seq
+        };
+        {
+            let in_conn = in_pool.connect().unwrap();
+            delivered::insert(&in_conn, chat.id, Some("p-1"), "ok").unwrap();
+        }
+        let edit = make_row(
+            MessageKind::System,
+            json!({"edit": {"seq": chat_seq, "text": "fallback text"}}),
+        );
+        write_row(&out_pool, &edit);
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.delivered, 1);
+        // No edit_message call landed (it returned Unsupported); a new chat
+        // delivery was emitted with the "(edit) ..." marker.
+        assert!(mock.edits().is_empty());
+        let deliveries = mock.deliveries();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(
+            deliveries[0].message.content["text"].as_str().unwrap(),
+            "(edit) fallback text"
+        );
+    }
+
+    /// When the row referenced by `seq` was never delivered (no
+    /// `platform_message_id` recorded), the service falls back to invoking
+    /// the registered handler.
+    #[tokio::test]
+    async fn edit_handler_falls_back_when_external_id_missing() {
+        struct Fallback;
+        impl DeliveryActionHandler for Fallback {
+            fn handle(
+                &self,
+                input: DeliveryActionInput,
+            ) -> Result<DeliveryActionOutput, ModuleError> {
+                let text = input
+                    .payload
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                Ok(DeliveryActionOutput {
+                    dispatch: Some(input.target.clone()),
+                    message: Some(OutboundMessage {
+                        kind: MessageKind::Chat,
+                        content: json!({ "text": format!("(edit) {text}") }),
+                        files: vec![],
+                    }),
+                })
+            }
+        }
+        let (service, _root, sess, mock) = make_service().await;
+        service.register_action("edit", Arc::new(Fallback));
+
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        // Emit the edit BEFORE any chat row exists — seq won't match.
+        let edit = make_row(
+            MessageKind::System,
+            json!({"edit": {"seq": 999, "text": "no anchor"}}),
+        );
+        write_row(&out_pool, &edit);
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.delivered, 1);
+        // Adapter edit never invoked; fallback dispatched a new chat row.
+        assert!(mock.edits().is_empty());
+        let deliveries = mock.deliveries();
+        assert_eq!(deliveries.len(), 1);
+        assert_eq!(
+            deliveries[0].message.content["text"].as_str().unwrap(),
+            "(edit) no anchor"
+        );
+    }
+
+    #[test]
+    fn message_id_for_seq_round_trips() {
+        // Pure helper-level coverage so we don't have to spin up the full
+        // service to verify the SQL.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ironclaw_db::session::SessionPaths::new(
+            tmp.path(),
+            AgentGroupId::new(),
+            SessionId::new(),
+        );
+        let conn = ironclaw_db::session::open_outbound(&paths).unwrap();
+        let msg = ironclaw_db::tables::messages_out::WriteOutbound {
+            id: MessageId::new(),
+            in_reply_to: None,
+            timestamp: Utc::now(),
+            deliver_after: None,
+            recurrence: None,
+            kind: MessageKind::Chat,
+            platform_id: Some("plat".into()),
+            channel_type: Some(ChannelType::new("mock")),
+            thread_id: None,
+            content: json!({"text": "hi"}),
+        };
+        let seq = messages_out::insert(&conn, &msg).unwrap();
+        let got = message_id_for_seq(&conn, seq).unwrap();
+        assert_eq!(got, Some(msg.id));
+        let missing = message_id_for_seq(&conn, seq + 100).unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn platform_message_id_for_returns_none_when_status_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = ironclaw_db::session::SessionPaths::new(
+            tmp.path(),
+            AgentGroupId::new(),
+            SessionId::new(),
+        );
+        let conn = ironclaw_db::session::open_inbound(&paths).unwrap();
+        let id = MessageId::new();
+        delivered::insert(&conn, id, Some("p-x"), "failed").unwrap();
+        // Failed deliveries don't expose an external_id to subsequent
+        // edits/reactions — the row is logically absent.
+        assert!(platform_message_id_for(&conn, id).unwrap().is_none());
     }
 
     #[test]

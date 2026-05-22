@@ -62,6 +62,41 @@ pub trait ChannelAdapter: Send + Sync {
         Ok(None)
     }
 
+    /// Edit an existing message. `external_id` is the platform's id for
+    /// the original message (Telegram's `message_id`, Slack's `ts`,
+    /// Discord's message id, etc.).
+    ///
+    /// Default impl returns `Err(AdapterError::Unsupported(_))` so adapters
+    /// that don't expose an edit API fall through cleanly to a
+    /// "fallback: send a new message" path in the host's delivery service.
+    async fn edit_message(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        external_id: &str,
+        new_text: &str,
+    ) -> Result<(), AdapterError> {
+        let _ = (platform_id, thread_id, external_id, new_text);
+        Err(AdapterError::Unsupported("edit_message".into()))
+    }
+
+    /// React to a message with an emoji. `external_id` is the platform's
+    /// id for the target message (same shape as [`Self::edit_message`]).
+    ///
+    /// Default impl returns `Err(AdapterError::Unsupported(_))` so adapters
+    /// that don't expose a reaction API fall through cleanly to a
+    /// "fallback: send a new message" path in the host's delivery service.
+    async fn add_reaction(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        external_id: &str,
+        emoji: &str,
+    ) -> Result<(), AdapterError> {
+        let _ = (platform_id, thread_id, external_id, emoji);
+        Err(AdapterError::Unsupported("add_reaction".into()))
+    }
+
     /// Strip channel-specific formatting from an outbound message body,
     /// returning a plain-text fallback the channel will accept even when
     /// the original failed a formatting validation.
@@ -147,6 +182,52 @@ mod tests {
         let a = MockAdapter::new("x");
         let res = a.open_dm("u").await.unwrap();
         assert!(res.is_none());
+    }
+
+    /// Adapter that only implements the mandatory `channel_type` /
+    /// `deliver` methods — used to verify the trait-level defaults for
+    /// `edit_message` and `add_reaction` return `Unsupported`.
+    struct MinimalAdapter {
+        channel_type: ChannelType,
+    }
+
+    #[async_trait]
+    impl ChannelAdapter for MinimalAdapter {
+        fn channel_type(&self) -> &ChannelType {
+            &self.channel_type
+        }
+        async fn deliver(
+            &self,
+            _platform_id: &str,
+            _thread_id: Option<&str>,
+            _message: &OutboundMessage,
+        ) -> Result<Option<String>, AdapterError> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn default_edit_message_returns_unsupported() {
+        let a = MinimalAdapter {
+            channel_type: ChannelType::new("minimal"),
+        };
+        let err = a
+            .edit_message("p", None, "ext-1", "new text")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AdapterError::Unsupported(ref s) if s == "edit_message"));
+    }
+
+    #[tokio::test]
+    async fn default_add_reaction_returns_unsupported() {
+        let a = MinimalAdapter {
+            channel_type: ChannelType::new("minimal"),
+        };
+        let err = a
+            .add_reaction("p", None, "ext-1", "thumbsup")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AdapterError::Unsupported(ref s) if s == "add_reaction"));
     }
 
     #[tokio::test]

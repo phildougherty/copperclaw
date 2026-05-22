@@ -6,6 +6,49 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (wire up agent `edit_message` / `add_reaction` end-to-end)
+
+- **`crates/ironclaw-channels/core/src/adapter.rs`** — `ChannelAdapter`
+  gains two default-`Unsupported` trait methods, `edit_message` and
+  `add_reaction`, so adapters that don't expose those APIs fall
+  through cleanly to the host's fallback path.
+- **`crates/ironclaw-channels/telegram/src/adapter.rs`** plus
+  **`crates/ironclaw-channels/telegram/src/api.rs`** — implements the
+  trait against Telegram's `editMessageText` and `setMessageReaction`
+  endpoints.
+- **`crates/ironclaw-channels/slack/src/adapter.rs`** — implements the
+  trait against Slack's `chat.update` and `reactions.add` (strips
+  surrounding `:` from the emoji name before forwarding).
+- **`crates/ironclaw-channels/discord/src/adapter.rs`** — implements
+  the trait against Discord's `PATCH /channels/{id}/messages/{msg}`
+  and `PUT /channels/{id}/messages/{msg}/reactions/{emoji}/@me`.
+- **`crates/ironclaw-channels/core/src/testing.rs`** — `MockAdapter`
+  records `edit_message` / `add_reaction` calls and exposes
+  `set_edit_unsupported` / `set_reaction_unsupported` knobs so tests
+  can drive the host's fallback path.
+- **`crates/ironclaw-modules/src/interactive.rs`** — `InteractiveModule`
+  now registers `edit` and `reaction` delivery-action handlers. They
+  emit a synthetic chat message of the form `"(edit) <text>"` /
+  `"(reaction: <emoji>)"`; the host invokes them only when the
+  adapter call falls through.
+- **`crates/ironclaw-host-delivery/src/service.rs`** — the
+  registered-handler path now intercepts `action.name == "edit"` and
+  `"reaction"`, resolves the original message's `platform_message_id`
+  via the inbound `delivered` table (joined to `messages_out` by
+  seq), and calls the typed adapter API. On `Unsupported`, missing
+  external id, or malformed payload, the code falls through to the
+  registered handler so the synthetic chat fallback gets dispatched
+  through the normal delivery path. The existing hard-coded
+  `usage_report` / `install_packages` / `add_mcp_server` paths are
+  unchanged.
+- **Why this fix matters:** before this change the runner emitted
+  `system` rows with `{"edit": ...}` / `{"reaction": ...}` content
+  but no handler existed, so the host logged "no handler; skipping"
+  and the agent's "(edit / reaction)" tool calls were silent on the
+  user-facing channel. Telegram, Slack, and Discord now do the right
+  thing; other adapters (CLI, webhooks, etc.) get the fallback chat
+  message automatically via the `Unsupported` default.
+
 ### Fixed (runner: route chat outbounds back to the originating channel)
 
 - **`crates/ironclaw-runner/src/tools.rs`** and

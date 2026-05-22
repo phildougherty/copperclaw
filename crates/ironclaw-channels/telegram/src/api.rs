@@ -253,6 +253,72 @@ impl TelegramApi {
         })
     }
 
+    /// `editMessageText` — replace the text body of an existing message.
+    ///
+    /// Returns `()` on success; the Telegram API returns the edited message
+    /// envelope but we don't surface it because the platform `message_id` is
+    /// preserved and the host already has it.
+    pub async fn edit_message_text(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        text: &str,
+    ) -> Result<(), AdapterError> {
+        let url = self.endpoint("editMessageText");
+        let mut body = serde_json::Map::new();
+        body.insert("chat_id".into(), Value::from(chat_id));
+        // Telegram message_id is numeric; we try to parse, falling back to
+        // the original string so non-numeric ids (shouldn't happen on
+        // Telegram, but safe) still round-trip.
+        if let Ok(n) = message_id.parse::<i64>() {
+            body.insert("message_id".into(), Value::from(n));
+        } else {
+            body.insert("message_id".into(), Value::from(message_id));
+        }
+        body.insert("text".into(), Value::from(text));
+
+        let resp = self
+            .http
+            .post(&url)
+            .json(&Value::Object(body))
+            .send()
+            .await
+            .map_err(|e| map_send_err(&e))?;
+        let raw = read_body(resp).await?;
+        decode_envelope::<Value>(raw).map(|_| ())
+    }
+
+    /// `setMessageReaction` — react to a message with a single emoji.
+    pub async fn set_message_reaction(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> Result<(), AdapterError> {
+        let url = self.endpoint("setMessageReaction");
+        let mut body = serde_json::Map::new();
+        body.insert("chat_id".into(), Value::from(chat_id));
+        if let Ok(n) = message_id.parse::<i64>() {
+            body.insert("message_id".into(), Value::from(n));
+        } else {
+            body.insert("message_id".into(), Value::from(message_id));
+        }
+        body.insert(
+            "reaction".into(),
+            Value::Array(vec![serde_json::json!({"type": "emoji", "emoji": emoji})]),
+        );
+
+        let resp = self
+            .http
+            .post(&url)
+            .json(&Value::Object(body))
+            .send()
+            .await
+            .map_err(|e| map_send_err(&e))?;
+        let raw = read_body(resp).await?;
+        decode_envelope::<Value>(raw).map(|_| ())
+    }
+
     /// `sendChatAction` — fire-and-forget. Returns `()` on success.
     pub async fn send_chat_action(
         &self,

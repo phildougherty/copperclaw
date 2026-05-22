@@ -348,6 +348,30 @@ impl ChannelAdapter for DiscordAdapter {
         Ok(Some(id))
     }
 
+    async fn edit_message(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        external_id: &str,
+        new_text: &str,
+    ) -> Result<(), AdapterError> {
+        self.rest
+            .patch_message(platform_id, external_id, new_text)
+            .await
+    }
+
+    async fn add_reaction(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        external_id: &str,
+        emoji: &str,
+    ) -> Result<(), AdapterError> {
+        self.rest
+            .put_reaction(platform_id, external_id, emoji)
+            .await
+    }
+
     async fn open_dm(&self, user_id: &str) -> Result<Option<CoreDmHandle>, AdapterError> {
         let platform_id = self.rest.open_dm(user_id).await?;
         Ok(Some(CoreDmHandle {
@@ -728,6 +752,46 @@ mod tests {
             "[reduced formatting] rich title"
         );
         assert_eq!(fallback.kind, MessageKind::Chat);
+    }
+
+    #[tokio::test]
+    async fn discord_edit_message_patches_channel() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/channels/c1/messages/m9"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        let (a, _rx) = build_adapter(&server);
+        a.edit_message("c1", None, "m9", "updated body")
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        let req = reqs
+            .iter()
+            .find(|r| {
+                r.method.as_str().eq_ignore_ascii_case("PATCH")
+                    && r.url.path() == "/channels/c1/messages/m9"
+            })
+            .expect("PATCH /channels/c1/messages/m9");
+        let body: serde_json::Value =
+            serde_json::from_slice(&req.body).expect("json body");
+        assert_eq!(body["content"], "updated body");
+    }
+
+    #[tokio::test]
+    async fn discord_add_reaction_puts_reaction() {
+        let server = MockServer::start().await;
+        // Smiley face emoji "\u{1F600}" -> %F0%9F%98%80
+        Mock::given(method("PUT"))
+            .and(path("/channels/c1/messages/m9/reactions/%F0%9F%98%80/@me"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let (a, _rx) = build_adapter(&server);
+        a.add_reaction("c1", None, "m9", "\u{1F600}")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

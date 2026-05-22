@@ -41,10 +41,19 @@ async fn every_module_installs_and_registers_expected_hooks() {
         );
     }
     // Approvals registers a delivery action named approval_card; interactive
-    // registers ask_user_question + send_card.
+    // registers ask_user_question + send_card + edit + reaction.
     let mut actions = ctx.delivery_actions();
     actions.sort();
-    assert_eq!(actions, vec!["approval_card", "ask_user_question", "send_card"]);
+    assert_eq!(
+        actions,
+        vec![
+            "approval_card",
+            "ask_user_question",
+            "edit",
+            "reaction",
+            "send_card",
+        ]
+    );
     // Names are all unique and stable.
     let names: Vec<&'static str> = modules.iter().map(|m| m.name()).collect();
     let mut sorted = names.clone();
