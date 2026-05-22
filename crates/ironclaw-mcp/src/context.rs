@@ -387,6 +387,26 @@ pub trait ToolContext: Send + Sync {
             "subagent not supported in this context".into(),
         ))
     }
+
+    /// Stash channel-routing fields copied from the inbound that
+    /// triggered the current turn. Implementations that write
+    /// `messages_out` rows should populate `channel_type` /
+    /// `platform_id` / `thread_id` from this when the tool caller
+    /// didn't pass an explicit `to`.
+    ///
+    /// Default no-op so contexts that don't need routing (mocks,
+    /// subagent adapters) continue to compile unchanged. The
+    /// runner's `RunnerToolCtx` overrides this with the real
+    /// implementation.
+    fn set_originating(&self, channel_type: Option<&str>, platform_id: Option<&str>, thread_id: Option<&str>, in_reply_to: Option<&str>) {
+        let _ = (channel_type, platform_id, thread_id, in_reply_to);
+    }
+
+    /// Clear the originating-routing stash. Called by the runner
+    /// after the turn completes so a subsequent emit on this ctx
+    /// (e.g. a host-side apology write) doesn't inherit stale
+    /// routing.
+    fn clear_originating(&self) {}
 }
 
 /// In-memory recording implementation used by tests.

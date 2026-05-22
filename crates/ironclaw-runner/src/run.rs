@@ -245,6 +245,32 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
         ack_picked_up(&deps, &pending).await?;
         let formatted = format_messages(pending);
 
+        // Plumb the originating inbound's routing into the tool ctx
+        // so any chat-kind outbound the turn produces (the model's
+        // final assistant text or an explicit send_message /
+        // send_file) carries the channel_type / platform_id /
+        // thread_id columns. Without this the delivery loop has no
+        // routing to dispatch by and the user sees nothing. We pick
+        // the first chat-kind row's routing — same channel for all
+        // inbounds in a batch is the overwhelming case (a single
+        // user dropping multiple messages in the same window).
+        let origin_row = formatted
+            .rows
+            .iter()
+            .find(|r| r.kind == ironclaw_types::MessageKind::Chat)
+            .or_else(|| formatted.rows.first());
+        if let Some(r) = origin_row {
+            let in_reply_to = r.id.as_uuid().to_string();
+            deps.tool_ctx.set_originating(
+                r.channel_type.as_ref().map(ironclaw_types::ChannelType::as_str),
+                r.platform_id.as_deref(),
+                r.thread_id.as_deref(),
+                Some(in_reply_to.as_str()),
+            );
+        } else {
+            deps.tool_ctx.set_originating(None, None, None, None);
+        }
+
         state
             .history
             .push(HistoryMessage::User { content: formatted.prompt });
@@ -264,6 +290,10 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
         state.continuation = turn.continuation.or(state.continuation);
 
         finalize_messages(&deps, &formatted.rows, turn.outcome).await?;
+        // Clear the originating routing so the next iteration's
+        // emit-outbound calls don't accidentally inherit a stale
+        // channel (e.g. a system-kind row written by save_state).
+        deps.tool_ctx.clear_originating();
 
         {
             let g = deps.outbound.lock().await;

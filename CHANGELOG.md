@@ -6,6 +6,32 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (runner: route chat outbounds back to the originating channel)
+
+- **`crates/ironclaw-runner/src/tools.rs`** and
+  **`crates/ironclaw-runner/src/run.rs`** — when the model emits a
+  reply (final assistant text or an explicit `send_message` /
+  `send_file` with `to: None`), the `messages_out` row's
+  `channel_type` / `platform_id` / `thread_id` / `in_reply_to`
+  columns now carry the originating inbound's routing. Before this
+  fix those columns were always written as `NULL`, so the host's
+  delivery loop had nothing to dispatch by — the model replied
+  correctly but the user saw silence. **Live-caught on Telegram**:
+  every successful turn produced a chat outbound with empty routing
+  and the user got nothing.
+- **`crates/ironclaw-mcp/src/context.rs`** — the `ToolContext`
+  trait gains `set_originating(...)` / `clear_originating()`
+  methods with no-op default impls. The runner's `RunnerToolCtx`
+  implements the real plumbing via a `Mutex<OriginatingRouting>`
+  field that `run_loop` sets before each turn and clears after.
+  Mock contexts and the subagent adapter inherit the no-op default.
+- **`fixtures/{cli,discord,github,matrix,slack,telegram,webhooks}/*/expected/messages-out.jsonl`** —
+  ten replay fixtures' chat-kind outbound rows updated to expect the
+  populated routing columns (previously they pinned the bug by
+  asserting `channel_type: null`). The `cli/budget-exhausted` fixture
+  keeps `in_reply_to: null` because that reply is host-side, not
+  runner-side.
+
 ### Fixed (rebuild.sh: don't let `ironclaw-setup --headless` wipe channel config from .env)
 
 - **`rebuild.sh`** — the image-rebake step invokes the full

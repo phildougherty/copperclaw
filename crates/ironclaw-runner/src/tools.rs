@@ -99,6 +99,22 @@ pub struct SubagentRunnerDeps {
 /// runner binary builds the ctx in `main.rs`; tests / minimal builds
 /// can skip the wiring and rely on the trait default (returns
 /// `ToolError::Context("subagent not supported in this context")`).
+/// Routing copied from the inbound message that triggered the current
+/// turn. The runner's main loop sets this on [`RunnerToolCtx`] before
+/// driving each turn so that `send_message` / `send_file` calls with
+/// `to: None` ("reply on the originating channel") actually carry the
+/// channel routing on the resulting `messages_out` row. Without it the
+/// row's `channel_type` / `platform_id` columns end up empty and the
+/// host's delivery loop has nowhere to send the reply — the bug live-
+/// caught when the model replied normally but the user saw silence.
+#[derive(Debug, Clone, Default)]
+pub struct OriginatingRouting {
+    pub channel_type: Option<String>,
+    pub platform_id: Option<String>,
+    pub thread_id: Option<String>,
+    pub in_reply_to: Option<MessageId>,
+}
+
 pub struct RunnerToolCtx {
     outbound: SharedOutbound,
     outbox_root: PathBuf,
@@ -108,6 +124,12 @@ pub struct RunnerToolCtx {
     /// fires. Bumped on entry to `spawn_subagent` and checked on
     /// re-entry.
     in_subagent: Arc<std::sync::atomic::AtomicBool>,
+    /// Routing of the inbound currently being processed. Set by
+    /// `run_loop` before `drive_turn`, cleared after. Read by
+    /// `apply_send_message` / `apply_send_file` to fill the outbound
+    /// row's `channel_type` / `platform_id` columns when the model
+    /// didn't pass an explicit `to` recipient.
+    originating: Arc<std::sync::Mutex<OriginatingRouting>>,
 }
 
 impl RunnerToolCtx {
@@ -120,7 +142,36 @@ impl RunnerToolCtx {
             outbox_root: outbox_root.into(),
             subagent: None,
             in_subagent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            originating: Arc::new(std::sync::Mutex::new(OriginatingRouting::default())),
         }
+    }
+
+    /// Set the originating-inbound routing so subsequent
+    /// `send_message` / `send_file` effects on this ctx auto-fill
+    /// the outbound row's channel columns. Called by `run_loop`
+    /// at the start of each turn.
+    pub fn set_originating(&self, routing: OriginatingRouting) {
+        if let Ok(mut guard) = self.originating.lock() {
+            *guard = routing;
+        }
+    }
+
+    /// Clear the originating-inbound routing. Called by `run_loop`
+    /// after the turn finalises so a subsequent emit (e.g. the
+    /// terminal-failure apology written by the host-side
+    /// `emit_terminal_failure_apologies`) doesn't accidentally
+    /// pick up routing from a previous turn.
+    pub fn clear_originating(&self) {
+        if let Ok(mut guard) = self.originating.lock() {
+            *guard = OriginatingRouting::default();
+        }
+    }
+
+    fn current_originating(&self) -> OriginatingRouting {
+        self.originating
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default()
     }
 
     /// Attach the subagent dependencies so the `explore` tool's
@@ -144,10 +195,11 @@ impl ToolContext for RunnerToolCtx {
         effect: OutboundToolEffect,
     ) -> Result<ToolEffectAck, ToolError> {
         let outbox = self.outbox_root.clone();
+        let origin = self.current_originating();
         // Take the lock for the entire DB write.
         let mut guard = self.outbound.lock().await;
         let conn: &mut Connection = &mut guard;
-        let ack = apply_effect(conn, &outbox, effect).map_err(to_tool_error)?;
+        let ack = apply_effect(conn, &outbox, effect, &origin).map_err(to_tool_error)?;
         Ok(ack)
     }
 
@@ -157,6 +209,28 @@ impl ToolContext for RunnerToolCtx {
         // message and await the host's response via `messages_in`. Until
         // that flow exists we surface an empty list.
         Ok(Vec::new())
+    }
+
+    fn set_originating(
+        &self,
+        channel_type: Option<&str>,
+        platform_id: Option<&str>,
+        thread_id: Option<&str>,
+        in_reply_to: Option<&str>,
+    ) {
+        let routing = OriginatingRouting {
+            channel_type: channel_type.map(str::to_string),
+            platform_id: platform_id.map(str::to_string),
+            thread_id: thread_id.map(str::to_string),
+            in_reply_to: in_reply_to.and_then(|s| {
+                Uuid::parse_str(s).ok().map(MessageId::from)
+            }),
+        };
+        Self::set_originating(self, routing);
+    }
+
+    fn clear_originating(&self) {
+        Self::clear_originating(self);
     }
 
     async fn spawn_subagent(
@@ -250,7 +324,12 @@ impl ToolContext for SubagentCtxAdapter {
         let outbox = self.outbox_root.clone();
         let mut guard = self.inner.lock().await;
         let conn: &mut Connection = &mut guard;
-        apply_effect(conn, &outbox, effect).map_err(to_tool_error)
+        // Subagents do not own an originating-inbound concept (they
+        // run on behalf of the parent turn), so we pass an empty
+        // routing and let the parent's own emit-outbound handle the
+        // user-facing reply.
+        let origin = OriginatingRouting::default();
+        apply_effect(conn, &outbox, effect, &origin).map_err(to_tool_error)
     }
     async fn list_tasks(&self) -> Result<Vec<TaskSummary>, ToolError> {
         Ok(Vec::new())
@@ -298,10 +377,11 @@ fn apply_effect(
     conn: &mut Connection,
     outbox_root: &Path,
     effect: OutboundToolEffect,
+    origin: &OriginatingRouting,
 ) -> Result<ToolEffectAck, ToolApplyError> {
     match effect {
-        OutboundToolEffect::SendMessage(spec) => apply_send_message(conn, spec),
-        OutboundToolEffect::SendFile(spec) => apply_send_file(conn, outbox_root, spec),
+        OutboundToolEffect::SendMessage(spec) => apply_send_message(conn, spec, origin),
+        OutboundToolEffect::SendFile(spec) => apply_send_file(conn, outbox_root, spec, origin),
         OutboundToolEffect::EditMessage(spec) => apply_edit_message(conn, spec),
         OutboundToolEffect::AddReaction(spec) => apply_add_reaction(conn, spec),
         OutboundToolEffect::AskUserQuestion(spec) => apply_ask_question(conn, spec),
@@ -322,14 +402,26 @@ fn apply_effect(
 fn apply_send_message(
     conn: &mut Connection,
     spec: SendMessageSpec,
+    origin: &OriginatingRouting,
 ) -> Result<ToolEffectAck, ToolApplyError> {
     let SendMessageSpec { to, text } = spec;
+    let to_present = to.is_some();
     let mut body = serde_json::Map::new();
     body.insert("text".into(), serde_json::Value::String(text));
     if let Some(t) = to {
         body.insert("to".into(), serde_json::to_value(t).unwrap_or_default());
     }
-    let seq = insert_row(conn, MessageKind::Chat, serde_json::Value::Object(body))?;
+    let routing = if to_present {
+        // Model specified an explicit recipient — for now we still
+        // populate routing columns from the originating inbound (the
+        // delivery loop has no canonical way to parse arbitrary `to`
+        // ids yet). The `to` field is preserved in the body for any
+        // downstream consumer that wants to inspect the override.
+        origin
+    } else {
+        origin
+    };
+    let seq = insert_chat_row(conn, serde_json::Value::Object(body), routing)?;
     Ok(ToolEffectAck::Message { seq })
 }
 
@@ -338,6 +430,7 @@ fn apply_send_file(
     conn: &mut Connection,
     outbox_root: &Path,
     spec: SendFileSpec,
+    origin: &OriginatingRouting,
 ) -> Result<ToolEffectAck, ToolApplyError> {
     let SendFileSpec {
         to,
@@ -365,11 +458,11 @@ fn apply_send_file(
         "files".into(),
         serde_json::json!([{ "filename": filename }]),
     );
-    let seq = insert_row_with_id(
+    let seq = insert_chat_row_with_id(
         conn,
         msg_id,
-        MessageKind::Chat,
         serde_json::Value::Object(body),
+        origin,
     )?;
     Ok(ToolEffectAck::Message { seq })
 }
@@ -575,6 +668,44 @@ fn insert_row_with_id(
         platform_id: None,
         channel_type: None,
         thread_id: None,
+        content,
+    };
+    let seq = messages_out::insert(conn, &row)?;
+    Ok(seq)
+}
+
+/// Chat-row insert that honours the originating inbound's routing.
+/// Without this, the row's `channel_type` / `platform_id` columns are
+/// empty and the delivery loop has no idea where to send the reply —
+/// the user-visible silence the live-caught bug produced.
+fn insert_chat_row(
+    conn: &mut Connection,
+    content: serde_json::Value,
+    origin: &OriginatingRouting,
+) -> Result<i64, ToolApplyError> {
+    let id = MessageId::new();
+    insert_chat_row_with_id(conn, id, content, origin)
+}
+
+fn insert_chat_row_with_id(
+    conn: &mut Connection,
+    id: MessageId,
+    content: serde_json::Value,
+    origin: &OriginatingRouting,
+) -> Result<i64, ToolApplyError> {
+    let row = WriteOutbound {
+        id,
+        in_reply_to: origin.in_reply_to,
+        timestamp: Utc::now(),
+        deliver_after: None,
+        recurrence: None,
+        kind: MessageKind::Chat,
+        platform_id: origin.platform_id.clone(),
+        channel_type: origin
+            .channel_type
+            .as_ref()
+            .map(|s| ironclaw_types::ChannelType::new(s.as_str())),
+        thread_id: origin.thread_id.clone(),
         content,
     };
     let seq = messages_out::insert(conn, &row)?;
