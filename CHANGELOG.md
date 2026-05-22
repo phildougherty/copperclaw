@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (telegram: plain-text default for outbound)
+
+- **`crates/ironclaw-channels/telegram/src/adapter.rs`** — `DEFAULT_PARSE_MODE`
+  flipped from `"MarkdownV2"` to `""`. The previous default unconditionally
+  told Telegram to parse outbound text as MarkdownV2, but the agent generates
+  natural-language replies that contain bare `!`, `.`, `-`, `(`, `)`, `[`,
+  `]` etc. — every one of those is reserved in MarkdownV2 and Telegram
+  rejects the send with HTTP 400 ("can't parse entities") unless the agent
+  backslash-escapes them. Plain text now round-trips literally; the agent
+  can still opt into a specific mode by setting `content.parse_mode =
+  "MarkdownV2"` (or `Markdown` / `HTML`) on the outbound row. New regression
+  test `deliver_text_omits_parse_mode_by_default` pins the contract.
+
 ### Removed (dead `pending_sender_approvals` module)
 
 - **`crates/ironclaw-db/src/tables/pending_sender_approvals.rs`** and

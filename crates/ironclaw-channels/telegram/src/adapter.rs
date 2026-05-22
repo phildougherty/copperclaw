@@ -21,8 +21,18 @@ use tokio_util::sync::CancellationToken;
 pub const CHANNEL_TYPE_STR: &str = "telegram";
 
 /// `parse_mode` used by `sendMessage` when none is supplied in the outbound
-/// payload. Telegram's `MarkdownV2` is the modern variant.
-pub const DEFAULT_PARSE_MODE: &str = "MarkdownV2";
+/// payload. Empty string means "no parse mode" — plain text passes through
+/// unmodified. The agent can opt into a specific mode by setting
+/// `content.parse_mode = "MarkdownV2"` (or `Markdown` / `HTML`) on the
+/// outbound row; that path requires the agent to escape Telegram's reserved
+/// characters itself.
+///
+/// Why plain text by default: the agent generates natural-language replies
+/// that contain bare `!`, `.`, `-`, `(`, `)`, `[`, `]` etc.  In `MarkdownV2`
+/// every one of those is reserved and Telegram rejects the send with HTTP
+/// 400 ("can't parse entities") unless the agent backslash-escapes them.
+/// Plain text round-trips literally and lets the agent be Telegram-agnostic.
+pub const DEFAULT_PARSE_MODE: &str = "";
 
 /// Telegram channel adapter.
 pub struct TelegramAdapter {
@@ -216,14 +226,21 @@ impl ChannelAdapter for TelegramAdapter {
                 "telegram deliver requires `text` or files".into(),
             ));
         }
+        // Use the agent-supplied parse_mode if any; otherwise fall back to
+        // DEFAULT_PARSE_MODE — empty string means "send as plain text" so
+        // we omit the field entirely from the API call rather than passing
+        // an empty `parse_mode` that Telegram would reject.
+        let effective_mode = parse_mode
+            .as_deref()
+            .unwrap_or(DEFAULT_PARSE_MODE);
+        let mode_for_api = if effective_mode.is_empty() {
+            None
+        } else {
+            Some(effective_mode)
+        };
         let m = self
             .api
-            .send_message(
-                platform_id,
-                thread_id,
-                &text,
-                Some(parse_mode.as_deref().unwrap_or(DEFAULT_PARSE_MODE)),
-            )
+            .send_message(platform_id, thread_id, &text, mode_for_api)
             .await?;
         Ok(Some(m.message_id.to_string()))
     }
@@ -714,7 +731,64 @@ mod tests {
     #[test]
     fn channel_type_str_constant() {
         assert_eq!(CHANNEL_TYPE_STR, "telegram");
-        assert_eq!(DEFAULT_PARSE_MODE, "MarkdownV2");
+        // Empty string = plain text (no parse_mode field on the API call).
+        // The agent opts into MarkdownV2 / HTML / Markdown by setting
+        // `content.parse_mode` on the outbound row.
+        assert_eq!(DEFAULT_PARSE_MODE, "");
+    }
+
+    #[tokio::test]
+    async fn deliver_text_omits_parse_mode_by_default() {
+        // Regression: telegram bot API rejects un-escaped `!` / `.` /
+        // `-` / `(` / `)` / `[` / `]` etc. when parse_mode=MarkdownV2.
+        // The default must NOT set parse_mode so the agent's natural-
+        // language replies round-trip literally.
+        let s = MockServer::start().await;
+        empty_get_updates(&s).await;
+        Mock::given(method("POST"))
+            .and(path("/bottok/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": { "message_id": 777 }
+            })))
+            .mount(&s)
+            .await;
+        let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
+        let dir = temp_dir();
+        let adapter = TelegramAdapter::start(
+            lp_config(&s.uri()),
+            None,
+            tx,
+            dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        let id = adapter
+            .deliver(
+                "100",
+                None,
+                &OutboundMessage {
+                    kind: MessageKind::Chat,
+                    content: json!({ "text": "hey! yes!" }),
+                    files: vec![],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("777"));
+        // Belt and braces: scan the recorded requests for an absent
+        // parse_mode field. wiremock's body_string_contains alone is
+        // necessary-but-not-sufficient — confirm the field is missing.
+        let reqs = s.received_requests().await.unwrap();
+        let send_msg_req = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/sendMessage"))
+            .expect("sendMessage request");
+        let body = String::from_utf8_lossy(&send_msg_req.body);
+        assert!(
+            !body.contains("parse_mode"),
+            "default deliver must omit parse_mode but body was: {body:?}"
+        );
+        adapter.shutdown().await;
     }
 
 }
