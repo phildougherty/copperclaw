@@ -62,6 +62,34 @@ adheres to [Semantic Versioning](https://semver.org/).
   clears, `ANTHROPIC_*` filter, `_TOKEN`/`_KEY`/`_SECRET` filter,
   and the wrapped-command shape.
 
+### Added (agent tool: `edit_file` for string-replacement edits)
+
+- **`crates/ironclaw-mcp/src/tools/edit_file.rs`** — new in-process
+  MCP tool that swaps an exact substring inside an existing file.
+  Mirrors Claude Code's `Edit` semantics: `old_string` must appear
+  exactly once unless `replace_all` is set, `old_string` must
+  differ from `new_string`, and the path must already exist as a
+  regular file. Writes go through a sibling temp file in the same
+  directory with `fsync` + `rename(2)` so a crash mid-write leaves
+  the original intact; the file's mode is restored onto the temp
+  before the rename so permissions survive. Removes the token tax
+  the agent was paying by re-emitting whole files via `write_file`
+  for one-line tweaks.
+- **`crates/ironclaw-mcp/src/tools/mod.rs`** — registers
+  `edit_file` in `build_tool_set` (alphabetically within the
+  computer-use group, before `read_file`). Tool count is now 21;
+  the `tool_set_lists_every_in_process_tool` inventory test was
+  updated to match.
+- **`skills/edit-file/SKILL.md`** — tells the model to prefer
+  `edit_file` over `write_file` for modifications, to `read_file`
+  first to capture enough surrounding context for a unique match,
+  and to reach for `replace_all` only on renames / refactors.
+  (Directory uses kebab-case `edit-file` to match the skill
+  registry's `[a-z0-9][a-z0-9-]{0,63}` rule; the underlying MCP
+  tool is `edit_file`, snake_case like its peers.)
+- **`README.md`** — bumps the "20 tools" copy to 21 and lists
+  `edit_file` under computer-use.
+
 ### Fixed (runner: surface a reply when a turn fails terminally)
 
 - **`crates/ironclaw-runner/src/run.rs`** — `finalize_messages` now
