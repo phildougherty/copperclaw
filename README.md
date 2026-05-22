@@ -54,7 +54,9 @@ agent> Boxes hold the world,
   tool use and automatic compaction), Anthropic-compatible
   gateways (OpenRouter, internal proxies — set
   `ANTHROPIC_BASE_URL`), subprocess-bridged Codex / OpenCode, and
-  Ollama via the Anthropic shim.
+  and Ollama (native `/api/chat` NDJSON by default;
+  `OllamaProvider::shim(...)` available for Anthropic-compatible
+  proxies in front of Ollama like LiteLLM).
 - **Operations built in.** Per-group token budgets and turn-rate
   caps, persistent sender approvals with in-channel prompts,
   dead-letter inspection and replay, audit logs of every host

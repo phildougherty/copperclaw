@@ -40,6 +40,45 @@ adheres to [Semantic Versioning](https://semver.org/).
   workflows that need to touch both sides (adding a new skill,
   renaming/deleting an MCP tool).
 
+### Fixed (providers: native Ollama support that actually talks `/api/chat`)
+
+- **`crates/ironclaw-providers/src/ollama.rs`** — replaced the
+  Anthropic-Messages shim with a native `/api/chat` NDJSON adapter.
+  The previous implementation always hit `<base_url>/v1/messages`, which
+  vanilla `ollama serve` does not expose (`404`), so the path only
+  worked against a LiteLLM-style proxy fronting Ollama. The native
+  adapter now: streams `POST /api/chat` NDJSON frame-by-frame; emits
+  `Activity` per content frame for liveness; reassembles
+  `message.tool_calls[]` into `ToolStart` + `ToolCall` + `ToolEnd`;
+  serialises tools in OpenAI's `{type:"function", function:{...}}`
+  envelope; surfaces tool results as `tool` role messages with
+  `tool_call_id`; maps `prompt_eval_count`/`eval_count` onto
+  `ProviderEvent::Usage`. The shim path remains reachable via the new
+  `OllamaProvider::shim(...)` constructor for operators with a
+  proxy front-end.
+- **`crates/ironclaw-providers/tests/ollama_conformance.rs`** — new,
+  12 wiremock conformance tests covering every `ProviderEvent`
+  emission path on the native code path (text, tool round-trip,
+  streaming heartbeats, abort, usage, model passthrough, tool schema
+  translation, tool-result history translation, system prompt
+  placement, error classification, empty body, malformed JSON
+  recovery).
+- **`crates/ironclaw-providers/tests/ollama_live.rs`** — new,
+  `#[ignore]`d live test against a real Ollama server. Reads
+  `OLLAMA_HOST` (default `http://localhost:11434`) and `OLLAMA_MODEL`
+  (default `llama3.1:8b`); run with
+  `cargo test --ignored ollama_live -p ironclaw-providers`.
+- **`crates/ironclaw-providers/tests/ollama_shim.rs`** — renamed from
+  `ollama_sse.rs` and converted to drive `OllamaProvider::shim(...)` so
+  the legacy facade path stays pinned against regressions.
+- **`docs/providers/ollama.md`** — new audit document covering the
+  gap matrix, wire-format notes, and follow-ups
+  (`OllamaProvider` is not yet wired into the runner config —
+  separate runner-side ticket).
+- **`README.md`** — Ollama bullet under "Multiple providers" updated:
+  native `/api/chat` is the default; the Anthropic shim remains
+  available for proxy-fronted deployments.
+
 ### Fixed (scheduling: persist tasks and fire due ones from the sweep loop)
 
 - **`crates/ironclaw-modules/src/scheduling.rs`** — `SchedulingModule::install`
