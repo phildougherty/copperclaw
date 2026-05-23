@@ -6,6 +6,44 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (`Some("")` crashed DB row parsers; reconciler hot-looped forever)
+
+The session reconciler in `container_manager` started spinning at one
+ERROR-per-second per session with `FromSqlConversionFailure(0, Text,
+ParseError(TooShort))` after a session had run for a while.
+
+Root cause: several DB row decoders use the pattern
+
+```rust
+let opt: Option<String> = row.get(col)?;
+opt.as_deref().map(|s| Parse::parse(s)).transpose()?
+```
+
+which treats `Some("")` as a parse target. Adapters and runner code
+sometimes write empty strings into optional UUID / datetime columns
+instead of NULL (the worst offender observed live: `container_state.
+tool_started_at = ''` left over from an aborted tool turn), and the
+chrono / uuid parsers both return `ParseError(TooShort)` on the empty
+string. The reconciler then read the row every tick, failed to parse,
+retried, and never made progress — wedging the session until the
+operator intervened.
+
+Fix: every optional UUID / datetime column decoder now treats `Some("")`
+identically to `None`. Touched:
+
+- `crates/ironclaw-db/src/tables/container_state.rs` —
+  `tool_started_at`, `updated_at` (and `current_tool` collapsed via
+  `Option::filter`).
+- `crates/ironclaw-db/src/tables/messages_in.rs` — `process_after`
+  via the shared `parse_dt_opt` helper.
+- `crates/ironclaw-db/src/tables/messages_out.rs` — `deliver_after`.
+- `crates/ironclaw-db/src/tables/tasks.rs` — `next_fire`.
+- `crates/ironclaw-db/src/tables/sessions.rs` — `messaging_group_id`,
+  `source_session_id`.
+
+Each site got a short comment naming the actual failure mode so the
+next reader doesn't undo the defence thinking it's redundant.
+
 ### Fixed (rebuild.sh left existing groups pinned to the old image)
 
 Caught when a fresh rebuild visibly shipped the new runner binary at

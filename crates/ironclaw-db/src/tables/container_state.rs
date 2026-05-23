@@ -63,25 +63,40 @@ pub fn clear_tool(conn: &Connection) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Empty-string-tolerant `RFC3339` timestamp parse. `SQLite` columns
+/// that should be NULL sometimes end up as the empty string when an
+/// adapter writes `Some("")` instead of `None`. Real failure mode
+/// observed live: a stuck `tool_started_at = ''` crashed the session
+/// reconciler in a hot-loop with chrono's `ParseError(TooShort)`.
+/// Treat empty as missing rather than propagating the error — by the
+/// time it surfaces, the only visible symptom is a wedged session.
+fn parse_dt_opt_empty_is_none(s: Option<&str>) -> rusqlite::Result<Option<DateTime<Utc>>> {
+    match s {
+        None | Some("") => Ok(None),
+        Some(ts) => DateTime::parse_from_rfc3339(ts)
+            .map(|d| Some(d.with_timezone(&Utc)))
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            }),
+    }
+}
+
 fn row_to_state(row: &Row<'_>) -> rusqlite::Result<ContainerState> {
-    let tool_started_at: Option<String> = row.get("tool_started_at")?;
-    let tool_started_at = tool_started_at
-        .as_deref()
-        .map(|s| DateTime::parse_from_rfc3339(s).map(|d| d.with_timezone(&Utc)))
-        .transpose()
-        .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
-        })?;
-    let updated_at: Option<String> = row.get("updated_at")?;
-    let updated_at = updated_at
-        .as_deref()
-        .map(|s| DateTime::parse_from_rfc3339(s).map(|d| d.with_timezone(&Utc)))
-        .transpose()
-        .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
-        })?;
+    let tool_started_at_str: Option<String> = row.get("tool_started_at")?;
+    let tool_started_at = parse_dt_opt_empty_is_none(tool_started_at_str.as_deref())?;
+    let updated_at_str: Option<String> = row.get("updated_at")?;
+    let updated_at = parse_dt_opt_empty_is_none(updated_at_str.as_deref())?;
+    let current_tool: Option<String> = row.get("current_tool")?;
+    // Collapse the same empty-string-as-None mistake on `current_tool`:
+    // observed sitting next to a NULL `tool_started_at` after the
+    // runner crashed mid-tool. Nothing downstream wants `Some("")`.
+    let current_tool = current_tool.filter(|s| !s.is_empty());
     Ok(ContainerState {
-        current_tool: row.get("current_tool")?,
+        current_tool,
         tool_declared_timeout_ms: row.get("tool_declared_timeout_ms")?,
         tool_started_at,
         updated_at,

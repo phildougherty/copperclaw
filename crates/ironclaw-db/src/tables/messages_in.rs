@@ -217,10 +217,15 @@ fn parse_dt(row: &Row<'_>, col: &str) -> rusqlite::Result<DateTime<Utc>> {
 }
 
 fn parse_dt_opt(row: &Row<'_>, col: &str) -> rusqlite::Result<Option<DateTime<Utc>>> {
+    // Empty string is treated as missing. Adapters occasionally write
+    // `Some("")` instead of `None` for optional timestamp columns; the
+    // chrono parser returns `ParseError(TooShort)` on `""`, which used
+    // to wedge the host's session reconciler in a hot-loop. Coalesce
+    // to None and move on. Real RFC3339 strings still parse normally.
     let s: Option<String> = row.get(col)?;
-    match s {
-        None => Ok(None),
-        Some(s) => DateTime::parse_from_rfc3339(&s)
+    match s.as_deref() {
+        None | Some("") => Ok(None),
+        Some(ts) => DateTime::parse_from_rfc3339(ts)
             .map(|d| Some(d.with_timezone(&Utc)))
             .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))),
     }

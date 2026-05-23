@@ -100,11 +100,13 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
             rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
         })?
         .with_timezone(&Utc);
+    // Empty-string-as-Some defence: a `next_fire = ''` row would
+    // otherwise crash the parser with chrono's `TooShort`.
     let next_fire_str: Option<String> = row.get("next_fire")?;
-    let next_fire = next_fire_str
-        .as_deref()
-        .map(|s| {
-            DateTime::parse_from_rfc3339(s)
+    let next_fire = match next_fire_str.as_deref() {
+        None | Some("") => None,
+        Some(ts) => Some(
+            DateTime::parse_from_rfc3339(ts)
                 .map(|d| d.with_timezone(&Utc))
                 .map_err(|e| {
                     rusqlite::Error::FromSqlConversionFailure(
@@ -112,9 +114,9 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
                         rusqlite::types::Type::Text,
                         Box::new(e),
                     )
-                })
-        })
-        .transpose()?;
+                })?,
+        ),
+    };
     Ok(Task {
         id: row.get("id")?,
         agent_group_id: AgentGroupId(ag_uuid),

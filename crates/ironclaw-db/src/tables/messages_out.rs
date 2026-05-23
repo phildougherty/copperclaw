@@ -120,12 +120,18 @@ fn row_to_message_out(row: &Row<'_>) -> rusqlite::Result<MessageOutRow> {
         .map(|d| d.with_timezone(&Utc))
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
 
+    // Same empty-string-as-Some pitfall as messages_in::parse_dt_opt:
+    // a row written with `deliver_after=''` would crash the parser with
+    // chrono's `TooShort`. Coalesce to None.
     let deliver_after: Option<String> = row.get("deliver_after")?;
-    let deliver_after = deliver_after
-        .as_deref()
-        .map(|s| DateTime::parse_from_rfc3339(s).map(|d| d.with_timezone(&Utc)))
-        .transpose()
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let deliver_after = match deliver_after.as_deref() {
+        None | Some("") => None,
+        Some(ts) => Some(
+            DateTime::parse_from_rfc3339(ts)
+                .map(|d| d.with_timezone(&Utc))
+                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?,
+        ),
+    };
 
     let content_str: String = row.get("content")?;
     let content: serde_json::Value = serde_json::from_str(&content_str)

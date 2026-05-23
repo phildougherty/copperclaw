@@ -50,13 +50,14 @@ fn row_to_session(row: &Row<'_>) -> rusqlite::Result<Session> {
     let ag_str: String = row.get("agent_group_id")?;
     let ag = uuid::Uuid::parse_str(&ag_str)
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    // Empty-string-as-Some defence (see `source_session_id` below).
     let mg_opt: Option<String> = row.get("messaging_group_id")?;
-    let mg = mg_opt
-        .as_deref()
-        .map(uuid::Uuid::parse_str)
-        .transpose()
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
-        .map(MessagingGroupId);
+    let mg = match mg_opt.as_deref() {
+        None | Some("") => None,
+        Some(uuid_str) => Some(MessagingGroupId(uuid::Uuid::parse_str(uuid_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?)),
+    };
 
     let status: String = row.get("status")?;
     let container_status: String = row.get("container_status")?;
@@ -72,13 +73,17 @@ fn row_to_session(row: &Row<'_>) -> rusqlite::Result<Session> {
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
         .with_timezone(&Utc);
 
+    // Empty-string-as-Some defence: a `source_session_id = ''` row
+    // (legacy from before the column had a clean NULL writer) would
+    // otherwise crash the parser with uuid's `TooShort` — observed
+    // hot-looping the session reconciler in prod.
     let source_session_opt: Option<String> = row.get("source_session_id")?;
-    let source_session_id = source_session_opt
-        .as_deref()
-        .map(uuid::Uuid::parse_str)
-        .transpose()
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
-        .map(SessionId);
+    let source_session_id = match source_session_opt.as_deref() {
+        None | Some("") => None,
+        Some(uuid_str) => Some(SessionId(uuid::Uuid::parse_str(uuid_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?)),
+    };
 
     Ok(Session {
         id: SessionId(id),
