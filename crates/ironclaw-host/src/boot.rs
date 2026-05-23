@@ -596,6 +596,17 @@ pub async fn run_host(
     // 13. Sweep loop.
     let sweep_loop = tokio::spawn(Arc::clone(&state.sweep).run_loop(shutdown.clone()));
 
+    // 13b. Typing ticker. Keeps the channel's "agent is working"
+    // indicator visible every 4 sec for any session with an active
+    // container — fills the gap where `TypingModule` only fires on
+    // inbound traffic, so users see a continuous bubble during long
+    // tool loops rather than a 5-second flash then silence.
+    let typing_ticker = Arc::new(crate::typing_ticker::TypingTicker::new(
+        state.central.clone(),
+        state.delivery.dispatcher(),
+    ));
+    let typing_task = tokio::spawn(Arc::clone(&typing_ticker).run_loop(shutdown.clone()));
+
     let spawned = spawn_container_manager(
         &cfg,
         state.central.clone(),
@@ -652,6 +663,7 @@ pub async fn run_host(
         let _ = active.await;
         let _ = sweep_delivery.await;
         let _ = sweep_loop.await;
+        let _ = typing_task.await;
         if let Some(t) = manager_task {
             let _ = t.await;
         }
