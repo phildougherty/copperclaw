@@ -1,5 +1,18 @@
 //! Runner poll loop. Module name is `run` because `loop` is a reserved
 //! keyword in Rust 2024.
+//!
+//! The module is split into focused files: the per-turn orchestrator in
+//! [`drive_turn`], the provider-call layer (retry + deadline + stream
+//! pump) in [`provider_call`], the per-tool dispatcher in
+//! [`tool_dispatch`], and the formatting seam in [`formatting`]. This
+//! file holds the [`RunnerDeps`] struct, [`run_loop`] itself, and the
+//! small DB-side helpers that need a `&RunnerDeps` and a mutex lock on
+//! the inbound/outbound connections.
+
+pub(super) mod drive_turn;
+pub(super) mod formatting;
+pub(super) mod provider_call;
+pub(super) mod tool_dispatch;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,19 +24,21 @@ use ironclaw_db::tables::{
     container_state, messages_in, processing_ack,
 };
 use ironclaw_mcp::{ToolContext, ToolEntry};
-use ironclaw_providers::{AgentProvider, AgentQuery, HistoryMessage, ProviderError, QueryInput, ToolDef};
+use ironclaw_providers::{AgentProvider, HistoryMessage, ToolDef};
 #[cfg_attr(not(test), allow(unused_imports))]
 use ironclaw_types::MessageId;
-use ironclaw_types::{Effort, MessageInRow, ProviderEvent};
+use ironclaw_types::{Effort, MessageInRow};
 use std::collections::HashMap;
 use rusqlite::Connection;
 use tokio::sync::Mutex;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 
 use crate::compaction::{compact, estimate_tokens, CompactionCfg};
-use crate::disallowed::is_disallowed;
 use crate::formatter::format_messages;
 use crate::state::{load_state, save_state};
+
+use self::drive_turn::{drive_turn, TurnOutcome};
+use self::provider_call::touch_heartbeat;
 
 /// Default poll interval (ms) while the loop is idle.
 pub const POLL_INTERVAL_MS: u64 = 1000;
@@ -57,17 +72,6 @@ pub const MIN_PROVIDER_DEADLINE_MS: u64 = 30_000;
 /// reqwest's own client timeout is 600s and 3 attempts past that would
 /// hang the runner for 25 minutes.
 pub const MAX_PROVIDER_DEADLINE_MS: u64 = 300_000;
-
-/// Maximum number of `provider.query()` attempts (including the first)
-/// before the runner gives up and marks the inbound failed. Hard-coded
-/// rather than configurable: 3 strikes is the standard SRE default for
-/// idempotent retries and we don't want to give operators a footgun for
-/// "infinite retry on a flapping API".
-const MAX_PROVIDER_ATTEMPTS: u32 = 3;
-
-/// Initial backoff between retries; doubles each attempt:
-/// 250ms → 500ms → 1s.
-const INITIAL_PROVIDER_BACKOFF: Duration = Duration::from_millis(250);
 
 /// Resolve the per-call provider deadline from the env. Out-of-range or
 /// unparseable values fall back to [`DEFAULT_PROVIDER_DEADLINE_MS`]
@@ -200,17 +204,17 @@ pub struct RunnerDeps {
     /// Per-LLM-call deadline. Wraps each `provider.query()` attempt in
     /// `tokio::time::timeout`. On expiry the attempt is treated as a
     /// retryable failure and reissued (with backoff) up to
-    /// [`MAX_PROVIDER_ATTEMPTS`] times before terminal failure.
+    /// [`provider_call::MAX_PROVIDER_ATTEMPTS`] times before terminal failure.
     ///
     /// Default in [`RunnerDeps::minimal`] is
     /// [`DEFAULT_PROVIDER_DEADLINE_MS`]. The runner binary picks the
     /// value up from `IRONCLAW_RUNNER_PROVIDER_DEADLINE_MS`; tests can
     /// shorten it to make failure-mode fixtures finish quickly.
     pub provider_deadline: Duration,
-    /// Per-tool-call hard ceiling. Wraps each [`invoke_tool`] dispatch
-    /// in `tokio::time::timeout`; on expiry the tool returns a
+    /// Per-tool-call hard ceiling. Wraps each [`tool_dispatch::invoke_tool`]
+    /// dispatch in `tokio::time::timeout`; on expiry the tool returns a
     /// `tool_result` with `is_error: true` describing the timeout.
-    /// Belt-and-braces with [`HeartbeatTicker`]: the ticker prevents
+    /// Belt-and-braces with [`provider_call::HeartbeatTicker`]: the ticker prevents
     /// the host from killing the container during a slow legitimate
     /// tool, this deadline keeps a *wedged* tool from running forever.
     /// Default [`DEFAULT_TOOL_DEADLINE_SECS`].
@@ -359,652 +363,11 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
     }
 }
 
-#[derive(Debug, Clone)]
-struct TurnResult {
-    continuation: Option<String>,
-    outcome: TurnOutcome,
-}
-
-#[derive(Debug, Clone)]
-enum TurnOutcome {
-    /// Model produced a final response.
-    Done,
-    /// Provider returned an error event.
-    Failed,
-}
-
-/// One pending tool call extracted from a streamed turn.
-#[derive(Debug, Clone)]
-struct PendingToolCall {
-    id: String,
-    name: String,
-    input: serde_json::Value,
-    /// `Some` when the provider couldn't parse the model's `tool_use`
-    /// input JSON. The runner skips real tool invocation for this
-    /// call and instead feeds the parse error back to the model as a
-    /// `tool_result { is_error: true }` so it can self-correct on the
-    /// next turn. The `input` field is `Value::Null` in this case.
-    parse_error: Option<String>,
-}
-
-/// What one LLM round-trip produced.
-#[derive(Debug, Clone, Default)]
-struct LlmTurnOutput {
-    continuation: Option<String>,
-    /// Final assistant text accumulated during the stream. May be
-    /// empty when the model produced only `tool_use` blocks.
-    text: String,
-    /// Tool calls the model requested. When non-empty the caller
-    /// must execute them and run another LLM turn before treating
-    /// the message as answered.
-    tool_calls: Vec<PendingToolCall>,
-    /// True if the provider emitted a terminal Error event.
-    failed: bool,
-    /// When `failed` is true and the provider's `Error` event carried
-    /// `retryable: true`, this is set so `run_llm_turn` can re-issue
-    /// the whole query rather than terminating the inbound. Surfaces the
-    /// transport/SSE-decode classification the provider already does.
-    retryable_failure: bool,
-}
-
-/// Hard cap on consecutive turns where the model emitted at least one
-/// `tool_use` block whose input JSON failed to parse. The runner feeds
-/// the parse error back as a `tool_result { is_error: true }` so the
-/// model can self-correct, but if it can't fix it after this many
-/// attempts we fall through to the existing terminal-failure path so
-/// the user at least sees the apology row. See
-/// `malformed_tool_use_gives_up_after_three_attempts` for the
-/// regression pin.
-const MAX_TOOL_PARSE_ERROR_ATTEMPTS: u32 = 3;
-
-/// Drive one inbound through to a final assistant response. Loops
-/// LLM-turn → execute-tools → LLM-turn until the model produces a
-/// turn with no `tool_use` blocks (or we hit `max_tool_turns`).
-async fn drive_turn(
-    deps: &RunnerDeps,
-    history: &mut Vec<HistoryMessage>,
-    previous_continuation: Option<&str>,
-) -> Result<TurnResult> {
-    let mut continuation: Option<String> = previous_continuation.map(str::to_string);
-    // Counts consecutive turns whose output included any
-    // parse-error-tagged tool call. Reset when a turn produces a
-    // parse-error-free output. Bounded by
-    // `MAX_TOOL_PARSE_ERROR_ATTEMPTS` so a stuck model can't loop us
-    // forever.
-    let mut consecutive_parse_error_turns: u32 = 0;
-
-    for tool_turn in 0..deps.max_tool_turns.max(1) {
-        let output = run_llm_turn(deps, history, continuation.as_deref()).await?;
-        continuation = output.continuation.or(continuation);
-
-        if output.failed {
-            return Ok(TurnResult {
-                continuation,
-                outcome: TurnOutcome::Failed,
-            });
-        }
-
-        // Append the model's assistant turn (text + tool_use blocks)
-        // to history before deciding what to do next. Anthropic's
-        // serializer coalesces consecutive same-role entries, so
-        // Assistant{text} + ToolUse{...} round-trip as one
-        // multi-block assistant message.
-        if !output.text.is_empty() {
-            history.push(HistoryMessage::Assistant {
-                content: output.text.clone(),
-            });
-        }
-        for call in &output.tool_calls {
-            history.push(HistoryMessage::ToolUse {
-                id: call.id.clone(),
-                name: call.name.clone(),
-                input: call.input.clone(),
-            });
-        }
-
-        // No tools requested → this is the final answer for the
-        // inbound. Surface the text to the channel and return.
-        if output.tool_calls.is_empty() {
-            if !output.text.is_empty() {
-                let spec = ironclaw_mcp::SendMessageSpec {
-                    to: None,
-                    text: output.text,
-                };
-                let _ack = deps
-                    .tool_ctx
-                    .emit_outbound(ironclaw_mcp::OutboundToolEffect::SendMessage(spec))
-                    .await
-                    .map_err(|e| anyhow::anyhow!("send_message failed: {e}"))?;
-            }
-            return Ok(TurnResult {
-                continuation,
-                outcome: TurnOutcome::Done,
-            });
-        }
-
-        // Track whether THIS turn included any synthetic
-        // parse-error tool calls. We bump the counter now but defer
-        // the cap check until after pushing tool_results into history
-        // so the audit trail captures all attempts (the model never
-        // sees the third turn's results, but the persisted history
-        // shows three full parse-error cycles for ops review).
-        let turn_had_parse_error = output
-            .tool_calls
-            .iter()
-            .any(|c| c.parse_error.is_some());
-        if turn_had_parse_error {
-            consecutive_parse_error_turns += 1;
-        } else {
-            consecutive_parse_error_turns = 0;
-        }
-
-        // Tools requested → execute each, push the result as a
-        // user-role tool_result history entry, and loop into
-        // another LLM turn.
-        tracing::info!(
-            tool_turn,
-            n = output.tool_calls.len(),
-            "executing tool calls"
-        );
-        for call in &output.tool_calls {
-            let (content, is_error) = if let Some(parse_err) = call.parse_error.as_deref() {
-                // Synthetic call from `ProviderEvent::ToolInputParseError`:
-                // we never actually invoke the tool — instead we hand the
-                // model a tool_result describing what went wrong so it
-                // can re-emit the call with valid JSON next turn.
-                (
-                    format!(
-                        "Your tool_use input JSON could not be parsed: {parse_err}. Please re-issue this exact tool call with valid JSON.",
-                    ),
-                    true,
-                )
-            } else {
-                invoke_tool(deps, call).await
-            };
-            history.push(HistoryMessage::Tool {
-                tool_use_id: call.id.clone(),
-                content,
-                is_error,
-            });
-        }
-
-        // After pushing the tool_results, enforce the parse-error cap.
-        // Three consecutive turns of malformed tool_use JSON means
-        // the model is stuck — fall through to the existing terminal
-        // failure path so the user sees the apology row.
-        if consecutive_parse_error_turns >= MAX_TOOL_PARSE_ERROR_ATTEMPTS {
-            tracing::error!(
-                attempts = consecutive_parse_error_turns,
-                "{MAX_TOOL_PARSE_ERROR_ATTEMPTS} consecutive tool_use parse failures; bailing",
-            );
-            return Ok(TurnResult {
-                continuation,
-                outcome: TurnOutcome::Failed,
-            });
-        }
-    }
-
-    // Exhausted the cap. Push a synthetic system message so the
-    // model can see what happened on the next inbound, return
-    // Failed so finalize_messages marks the inbound that way too.
-    tracing::warn!(
-        max = deps.max_tool_turns,
-        "tool-use cycle exceeded max turns; bailing"
-    );
-    Ok(TurnResult {
-        continuation,
-        outcome: TurnOutcome::Failed,
-    })
-}
-
-/// Make one LLM call. Pumps the streamed provider events into
-/// per-turn buffers and returns when the stream ends.
-async fn run_llm_turn(
-    deps: &RunnerDeps,
-    history: &[HistoryMessage],
-    previous_continuation: Option<&str>,
-) -> Result<LlmTurnOutput> {
-    let input = QueryInput {
-        system: deps.system.clone(),
-        model: deps.model.clone(),
-        effort: deps.effort,
-        previous_continuation: previous_continuation.map(str::to_string),
-        history: history.to_vec(),
-        tools: deps.tools.clone(),
-        max_tokens: deps.max_tokens,
-        temperature: deps.temperature,
-        assistant_name: deps.assistant_name.clone(),
-        display_name: None,
-    };
-    let turn_started_at = chrono::Utc::now();
-
-    // Two layers of retry surround the stream:
-    //   1. `query_with_retry` retries the initial HTTP call when it
-    //      fails before the stream starts (covers connect / TLS / 5xx /
-    //      timeout on the request).
-    //   2. The loop below retries the WHOLE (query + pump) pair when the
-    //      stream itself errors mid-way and the provider tagged the
-    //      `ProviderEvent::Error` as retryable. This catches transient
-    //      SSE-decode / dropped-connection cases that the initial query
-    //      can't see because the HTTP response already returned 200.
-    // Both layers cap at the same `MAX_PROVIDER_ATTEMPTS` budget so the
-    // worst-case wall time stays bounded.
-    let mut stream_attempts: u32 = 0;
-    let (out, input_tokens, output_tokens) = loop {
-        stream_attempts += 1;
-        let mut query = match query_with_retry(deps, input.clone()).await {
-            Ok(q) => q,
-            Err(err) => {
-                // All retries exhausted (or the failure was non-retryable).
-                // Mark this turn as a terminal failure so the caller flips
-                // the inbound to `failed` and emits a usage_report with
-                // status=error. Do NOT bubble — the runner must stay up.
-                tracing::error!(
-                    error = %err,
-                    provider = deps.provider.name(),
-                    "provider query failed terminally; marking turn as failed"
-                );
-                let out = LlmTurnOutput {
-                    failed: true,
-                    ..LlmTurnOutput::default()
-                };
-                emit_usage_report(deps, 0, 0, turn_started_at, &TurnOutcome::Failed).await;
-                return Ok(out);
-            }
-        };
-
-        let pumped = pump_events(deps, query.as_mut()).await?;
-        query.abort().await;
-
-        // Retry only if the failure was tagged retryable AND we have
-        // budget left. Use the same backoff schedule as query_with_retry
-        // for consistency.
-        if pumped.0.failed && pumped.0.retryable_failure && stream_attempts < MAX_PROVIDER_ATTEMPTS {
-            tracing::warn!(
-                attempt = stream_attempts,
-                max = MAX_PROVIDER_ATTEMPTS,
-                provider = deps.provider.name(),
-                "retryable stream failure; backing off and retrying"
-            );
-            ironclaw_metrics::inc_provider_retry(deps.provider.name());
-            backoff_for_attempt(stream_attempts).await;
-            continue;
-        }
-        break pumped;
-    };
-    let outcome = if out.failed {
-        TurnOutcome::Failed
-    } else {
-        TurnOutcome::Done
-    };
-
-    // Emit Prometheus metrics for this LLM call.
-    let elapsed_ms = (chrono::Utc::now() - turn_started_at)
-        .num_milliseconds()
-        .max(0);
-    // i64 -> f64 loses precision for large values (> 2^53 ms = ~285 years);
-    // acceptable here since we're measuring LLM call durations in seconds.
-    #[allow(clippy::cast_precision_loss)]
-    let elapsed_secs = elapsed_ms as f64 / 1000.0;
-    ironclaw_metrics::observe_llm_call_seconds(elapsed_secs.max(0.0));
-    if input_tokens > 0 {
-        ironclaw_metrics::observe_llm_tokens_input(input_tokens);
-    }
-    if output_tokens > 0 {
-        ironclaw_metrics::observe_llm_tokens_output(output_tokens);
-    }
-
-    emit_usage_report(deps, input_tokens, output_tokens, turn_started_at, &outcome).await;
-    Ok(out)
-}
-
-/// Pump events off a live [`AgentQuery`] until the stream ends or
-/// emits a terminal event ([`ProviderEvent::Result`] /
-/// [`ProviderEvent::Error`]). Returns the accumulated turn output plus
-/// the latest seen `(input_tokens, output_tokens)` counts.
-async fn pump_events(
-    deps: &RunnerDeps,
-    query: &mut dyn AgentQuery,
-) -> Result<(LlmTurnOutput, u32, u32)> {
-    let mut out = LlmTurnOutput::default();
-    let mut input_tokens: u32 = 0;
-    let mut output_tokens: u32 = 0;
-
-    while let Some(event) = query.next_event().await {
-        match event {
-            ProviderEvent::Init { continuation: c } => {
-                out.continuation = Some(c);
-            }
-            ProviderEvent::Usage {
-                input_tokens: it,
-                output_tokens: ot,
-            } => {
-                if it > 0 {
-                    input_tokens = it;
-                }
-                if ot > 0 {
-                    output_tokens = ot;
-                }
-            }
-            ProviderEvent::Result { text } => {
-                if let Some(t) = text {
-                    out.text = t;
-                }
-                break;
-            }
-            ProviderEvent::Error { message, retryable } => {
-                tracing::warn!(
-                    error = %message,
-                    retryable,
-                    "provider returned an error event"
-                );
-                out.failed = true;
-                out.retryable_failure = retryable;
-                break;
-            }
-            ProviderEvent::ToolStart {
-                name,
-                declared_timeout_ms,
-            } => {
-                set_current_tool(deps, &name, declared_timeout_ms).await?;
-            }
-            ProviderEvent::ToolCall { id, name, input } => {
-                // `is_disallowed` is checked here AND inside
-                // `invoke_tool`; the second check is the one that
-                // synthesises the refusal text. We still push the
-                // PendingToolCall either way so the model sees a
-                // matching `tool_result` on the next turn.
-                let _ = is_disallowed(&name);
-                out.tool_calls.push(PendingToolCall {
-                    id,
-                    name,
-                    input,
-                    parse_error: None,
-                });
-            }
-            ProviderEvent::ToolInputParseError {
-                tool_use_id,
-                tool_name,
-                raw_input,
-                parse_error,
-            } => {
-                // The provider couldn't parse the tool_use input JSON
-                // the model emitted. Rather than terminating the turn
-                // (which would leave the user with no reply, only the
-                // generic apology), we synthesise a PendingToolCall
-                // tagged with `parse_error`. `drive_turn` recognises
-                // these and feeds a `tool_result { is_error: true }`
-                // back into the next turn so the model self-corrects.
-                tracing::warn!(
-                    tool_use_id = %tool_use_id,
-                    tool_name = %tool_name,
-                    raw_input_bytes = raw_input.len(),
-                    parse_error = %parse_error,
-                    "tool_use input JSON did not parse; feeding error back to model"
-                );
-                ironclaw_metrics::inc_provider_retry(deps.provider.name());
-                out.tool_calls.push(PendingToolCall {
-                    id: tool_use_id,
-                    name: tool_name,
-                    input: serde_json::Value::Null,
-                    parse_error: Some(parse_error),
-                });
-            }
-            ProviderEvent::ToolEnd => {
-                clear_current_tool(deps).await?;
-            }
-            ProviderEvent::Progress { message } => {
-                tracing::debug!(message = %message, "provider progress");
-                touch_heartbeat(deps.heartbeat_path.as_ref());
-            }
-            ProviderEvent::Activity => {
-                touch_heartbeat(deps.heartbeat_path.as_ref());
-            }
-        }
-    }
-    Ok((out, input_tokens, output_tokens))
-}
-
-/// Call `provider.query()` with a per-attempt deadline and exponential
-/// backoff. Returns the live [`AgentQuery`] once a call succeeds, or a
-/// terminal [`ProviderError`] once retries are exhausted (or the failure
-/// was non-retryable).
-///
-/// Behaviour:
-/// - Each attempt is wrapped in [`tokio::time::timeout`] with
-///   `deps.provider_deadline`.
-/// - A timeout is treated as a retryable failure — counts toward the
-///   attempt cap just like a 5xx.
-/// - Retryable [`ProviderError`]s (`is_retryable() == true`) trigger
-///   exponential backoff (250ms → 500ms → 1s) and another attempt.
-/// - Non-retryable errors fail-fast on attempt 1.
-/// - Final attempt's timeout is converted to
-///   [`ProviderError::DeadlineExceeded`].
-///
-/// All retries fire a `ironclaw_provider_retry_total` counter so the
-/// operator dashboard can spot flapping upstreams. Timeout-final fires
-/// `ironclaw_provider_deadline_total`.
-async fn query_with_retry(
-    deps: &RunnerDeps,
-    input: QueryInput,
-) -> std::result::Result<Box<dyn AgentQuery>, ProviderError> {
-    let mut attempt: u32 = 0;
-    loop {
-        attempt += 1;
-        let attempt_started = std::time::Instant::now();
-        // Clone the input for this attempt; the previous attempt may
-        // have consumed it on a successful call but we never reach
-        // here once query() returns Ok, so the borrow checker is fine
-        // with a fresh clone per loop iteration.
-        //
-        // Heartbeat coverage: local-model providers (Ollama) can take
-        // 60-180s of prefill before the first token streams back; the
-        // host's heartbeat-stale threshold (default 60s) would otherwise
-        // kill the container mid-prefill. Holding a HeartbeatTicker for
-        // the duration of each provider attempt keeps the file fresh
-        // while we wait. The Ticker is RAII-dropped at the end of the
-        // attempt — backoff sleeps between attempts are short enough
-        // (≤1s) that they don't need their own coverage.
-        let _hb = HeartbeatTicker::start(deps.heartbeat_path.clone());
-        let result = timeout(deps.provider_deadline, deps.provider.query(input.clone())).await;
-
-        let err: ProviderError = match result {
-            Ok(Ok(query)) => return Ok(query),
-            Ok(Err(err)) => err,
-            Err(_elapsed) => {
-                // Per-call deadline tripped.
-                tracing::warn!(
-                    attempt,
-                    max = MAX_PROVIDER_ATTEMPTS,
-                    deadline_ms = u64_from_dur(deps.provider_deadline),
-                    elapsed_ms = u64_from_dur(attempt_started.elapsed()),
-                    provider = deps.provider.name(),
-                    "provider query deadline exceeded"
-                );
-                if attempt >= MAX_PROVIDER_ATTEMPTS {
-                    ironclaw_metrics::inc_provider_deadline(deps.provider.name());
-                    tracing::error!(
-                        attempt,
-                        max = MAX_PROVIDER_ATTEMPTS,
-                        deadline_ms = u64_from_dur(deps.provider_deadline),
-                        provider = deps.provider.name(),
-                        "provider deadline exceeded after {ms}ms (attempt {attempt}/{max})",
-                        ms = u64_from_dur(deps.provider_deadline),
-                        attempt = attempt,
-                        max = MAX_PROVIDER_ATTEMPTS,
-                    );
-                    return Err(ProviderError::DeadlineExceeded {
-                        deadline_ms: u64_from_dur(deps.provider_deadline),
-                        attempts: attempt,
-                    });
-                }
-                // Treat as retryable; fall through to backoff.
-                ironclaw_metrics::inc_provider_retry(deps.provider.name());
-                backoff_for_attempt(attempt).await;
-                continue;
-            }
-        };
-
-        // We have a ProviderError. Decide whether to retry.
-        if err.is_retryable() && attempt < MAX_PROVIDER_ATTEMPTS {
-            tracing::warn!(
-                attempt,
-                max = MAX_PROVIDER_ATTEMPTS,
-                provider = deps.provider.name(),
-                error = %err,
-                "provider query failed; retrying after backoff"
-            );
-            ironclaw_metrics::inc_provider_retry(deps.provider.name());
-            backoff_for_attempt(attempt).await;
-            continue;
-        }
-
-        // Terminal: either non-retryable, or we've exhausted attempts.
-        if err.is_retryable() {
-            tracing::error!(
-                attempt,
-                max = MAX_PROVIDER_ATTEMPTS,
-                provider = deps.provider.name(),
-                error = %err,
-                "provider query failed; retry budget exhausted"
-            );
-        } else {
-            tracing::error!(
-                attempt,
-                provider = deps.provider.name(),
-                error = %err,
-                "provider query failed with non-retryable error"
-            );
-        }
-        return Err(err);
-    }
-}
-
-/// Compute the backoff delay for the *next* attempt given the current
-/// attempt number. With [`INITIAL_PROVIDER_BACKOFF`] = 250ms:
-/// - after attempt 1 → 250ms (before attempt 2)
-/// - after attempt 2 → 500ms (before attempt 3)
-async fn backoff_for_attempt(attempt: u32) {
-    let exp = attempt.saturating_sub(1).min(16); // cap shift just in case
-    let delay = INITIAL_PROVIDER_BACKOFF
-        .checked_mul(1u32 << exp)
-        .unwrap_or(Duration::from_secs(60));
-    sleep(delay).await;
-}
-
-/// Saturating `Duration::as_millis()` → `u64`. The standard
-/// `as_millis()` returns `u128`; for tracing fields and the
-/// `DeadlineExceeded` variant we want a plain `u64`.
-fn u64_from_dur(d: Duration) -> u64 {
-    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
-}
-
-/// Execute one tool call against the runner's tool map. Returns the
-/// `(content, is_error)` pair for the `HistoryMessage::Tool` row the
-/// model sees on the next turn.
-async fn invoke_tool(
-    deps: &RunnerDeps,
-    call: &PendingToolCall,
-) -> (String, bool) {
-    if is_disallowed(&call.name) {
-        return (
-            format!(
-                "Tool `{}` is disallowed inside the ironclaw container.",
-                call.name
-            ),
-            true,
-        );
-    }
-    let Some(entry) = deps.tool_map.get(&call.name) else {
-        return (
-            format!("Unknown tool `{}` — no handler registered.", call.name),
-            true,
-        );
-    };
-    // ToolHandler::call wants `Option<JsonObject>`; convert from the
-    // Value we got off the wire.
-    let arguments = match &call.input {
-        serde_json::Value::Object(map) => Some(map.clone()),
-        serde_json::Value::Null => None,
-        _ => {
-            return (
-                format!(
-                    "Tool `{}` input must be a JSON object, got {}",
-                    call.name,
-                    short_type(&call.input)
-                ),
-                true,
-            );
-        }
-    };
-    // Keep the heartbeat file fresh for the duration of the tool
-    // call. Without this a `shell { cmd: "npm install …" }` (~60-90s
-    // on a fresh image) drifts past the host's 60s staleness
-    // threshold and the host SIGKILLs the container. Drops on
-    // function return; the background task is aborted.
-    let _hb = HeartbeatTicker::start(deps.heartbeat_path.clone());
-    // Per-tool hard deadline so a wedged tool can't run forever.
-    // The provider call has its own deadline (`provider_deadline`);
-    // tool dispatch did not, until now. Defaulting to a generous
-    // 15 min ceiling — `npm install`, `cargo build`, `apt-get
-    // install gcc` are all the kinds of tools we want to permit;
-    // anything past that is presumed wedged.
-    let call_fut = entry.handler.call(arguments, deps.tool_ctx.as_ref());
-    let timeout = std::time::Duration::from_secs(deps.tool_deadline_secs);
-    match tokio::time::timeout(timeout, call_fut).await {
-        Ok(Ok(result)) => (render_tool_result(&result), false),
-        Ok(Err(err)) => (format!("Tool `{}` failed: {err}", call.name), true),
-        Err(_) => (
-            format!(
-                "Tool `{}` did not return within {}s (per-tool deadline); the runner aborted it. Consider breaking the work into smaller steps.",
-                call.name, deps.tool_deadline_secs
-            ),
-            true,
-        ),
-    }
-}
-
-/// Pluck the textual content out of a `CallToolResult`. Multiple
-/// blocks get joined with double newlines; non-text blocks
-/// (resources, images) are rendered as their type tag so the model
-/// at least sees they happened.
-fn render_tool_result(result: &rmcp::model::CallToolResult) -> String {
-    let mut out = String::new();
-    for block in &result.content {
-        if !out.is_empty() {
-            out.push_str("\n\n");
-        }
-        let raw = &block.raw;
-        match raw {
-            rmcp::model::RawContent::Text(t) => out.push_str(&t.text),
-            rmcp::model::RawContent::Image(_) => out.push_str("<image>"),
-            rmcp::model::RawContent::Audio(_) => out.push_str("<audio>"),
-            rmcp::model::RawContent::Resource(_) => out.push_str("<resource>"),
-        }
-    }
-    if out.is_empty() {
-        "(tool produced no output)".to_string()
-    } else {
-        out
-    }
-}
-
-fn short_type(v: &serde_json::Value) -> &'static str {
-    match v {
-        serde_json::Value::Null => "null",
-        serde_json::Value::Bool(_) => "bool",
-        serde_json::Value::Number(_) => "number",
-        serde_json::Value::String(_) => "string",
-        serde_json::Value::Array(_) => "array",
-        serde_json::Value::Object(_) => "object",
-    }
-}
-
 /// Append a `usage_report` system row to `outbound.db`. The host's
 /// delivery service intercepts this kind of system action (instead of
 /// dispatching it to a channel adapter) and writes the corresponding
 /// `agent_turns` row.
-async fn emit_usage_report(
+pub(in crate::run) async fn emit_usage_report(
     deps: &RunnerDeps,
     input_tokens: u32,
     output_tokens: u32,
@@ -1167,7 +530,7 @@ async fn emit_terminal_failure_apologies(
     Ok(())
 }
 
-async fn set_current_tool(
+pub(in crate::run) async fn set_current_tool(
     deps: &RunnerDeps,
     name: &str,
     declared_timeout_ms: Option<u64>,
@@ -1184,98 +547,23 @@ async fn set_current_tool(
     Ok(())
 }
 
-async fn clear_current_tool(deps: &RunnerDeps) -> Result<()> {
+pub(in crate::run) async fn clear_current_tool(deps: &RunnerDeps) -> Result<()> {
     let g = deps.outbound.lock().await;
     container_state::clear_tool(&g)?;
     Ok(())
 }
 
-/// Refresh the heartbeat file's mtime so the host's container
-/// manager knows the runner is alive. Just opening the file is *not*
-/// enough — Linux only updates mtime on actual writes, so the file
-/// would look frozen at first-create. Truncate to 0 then write one
-/// byte; that's the minimum change that bumps mtime portably.
-fn touch_heartbeat(path: Option<&PathBuf>) {
-    use std::io::Write;
-    if let Some(p) = path {
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(p)
-        {
-            let _ = f.write_all(b".");
-        }
-    }
-}
-
-/// Interval at which a [`HeartbeatTicker`] refreshes the heartbeat
-/// file. Picked well under the host's default 60s `heartbeat_stale_secs`
-/// so a slow tool call (npm install, apt-get install, compile) can't
-/// drift past the staleness threshold while the runner is blocked
-/// awaiting `invoke_tool`.
-pub(crate) const HEARTBEAT_TICK_INTERVAL_MS: u64 = 5_000;
-
-/// RAII guard that refreshes the heartbeat file every
-/// [`HEARTBEAT_TICK_INTERVAL_MS`] while alive.
-///
-/// The runner's main poll loop touches the heartbeat between turns
-/// and when the provider streams `Progress` / `Activity`, but a
-/// synchronous `invoke_tool().await` blocks all of that — and a long
-/// tool call (npm install, cargo build) easily runs past the host's
-/// 60s staleness threshold. The host then SIGKILLs the container
-/// thinking the runner has hung. Wrap each tool dispatch with one of
-/// these to keep the heartbeat fresh; drop the guard when the tool
-/// returns to stop the background task.
-pub(crate) struct HeartbeatTicker {
-    handle: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl HeartbeatTicker {
-    /// Start a ticker that touches `path` immediately and then every
-    /// [`HEARTBEAT_TICK_INTERVAL_MS`] until dropped. When `path` is
-    /// `None` (test runners with no heartbeat configured), returns a
-    /// no-op guard.
-    pub(crate) fn start(path: Option<PathBuf>) -> Self {
-        let Some(path) = path else {
-            return Self { handle: None };
-        };
-        // Touch once up-front so a sub-tick-interval tool call still
-        // sees its heartbeat refreshed.
-        touch_heartbeat(Some(&path));
-        let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(
-                std::time::Duration::from_millis(HEARTBEAT_TICK_INTERVAL_MS),
-            );
-            // We already touched once; skip the immediate tick.
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                touch_heartbeat(Some(&path));
-            }
-        });
-        Self { handle: Some(handle) }
-    }
-}
-
-impl Drop for HeartbeatTicker {
-    fn drop(&mut self) {
-        if let Some(h) = self.handle.take() {
-            h.abort();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::provider_call::{query_with_retry, backoff_for_attempt, HeartbeatTicker, MAX_PROVIDER_ATTEMPTS};
     use crate::tools::RunnerToolCtx;
     use async_trait::async_trait;
     use ironclaw_db::session::{open_inbound, open_outbound, SessionPaths};
     use ironclaw_db::tables::messages_in::{insert as insert_in, WriteInbound};
     use ironclaw_db::tables::messages_out;
-    use ironclaw_providers::{AgentProvider, AgentQuery, ProviderError};
-    use ironclaw_types::{AgentGroupId, ChannelType, MessageKind, SessionId};
+    use ironclaw_providers::{AgentProvider, AgentQuery, ProviderError, QueryInput};
+    use ironclaw_types::{AgentGroupId, ChannelType, MessageKind, ProviderEvent, SessionId};
     use std::sync::Mutex as StdMutex;
 
     /// Provider that yields a pre-baked sequence of events for each turn.
