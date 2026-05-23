@@ -323,6 +323,20 @@ struct ToolUseAccumulator {
     input_json: String,
 }
 
+/// Tracks an in-flight `thinking` (or `redacted_thinking`) content block.
+/// Reasoning models (Anthropic extended thinking, `Kimi K2.6`, `Qwen QwQ`,
+/// `DeepSeek R1`, etc.) stream chain-of-thought as `thinking_delta` events
+/// interleaved with `signature_delta` events that authenticate the block
+/// for re-submission. We accumulate but do NOT surface the thinking text
+/// to the user — only the final `text` content block reaches the agent's
+/// reply. The signature is captured for future use (history re-submission
+/// requires it for some providers); presently dropped at stop.
+#[derive(Debug, Default)]
+struct ThinkingAccumulator {
+    text: String,
+    signature: String,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct ApiError {
     #[serde(rename = "type", default)]
@@ -374,6 +388,11 @@ struct SseState {
     /// multiple `input_json_delta` events under a single
     /// `content_block_start` → `content_block_stop` envelope.
     tool_use: Option<ToolUseAccumulator>,
+    /// Set while we're inside a `thinking` or `redacted_thinking`
+    /// content block. `None` otherwise. Reasoning models emit one or
+    /// more thinking blocks before any visible text; we absorb them
+    /// silently and keep the user-facing reply unaffected.
+    thinking: Option<ThinkingAccumulator>,
     saw_init: bool,
 }
 
@@ -425,23 +444,37 @@ async fn handle_sse_event(
         }
         "content_block_start" => {
             if let Some(block) = env.content_block {
-                if block.block_type == "tool_use" {
-                    let name = block.name.unwrap_or_default();
-                    let id = block.id.unwrap_or_default();
-                    state.tool_use = Some(ToolUseAccumulator {
-                        id,
-                        name: name.clone(),
-                        input_json: String::new(),
-                    });
-                    if tx
-                        .send(ProviderEvent::ToolStart {
-                            name,
-                            declared_timeout_ms: None,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return false;
+                match block.block_type.as_str() {
+                    "tool_use" => {
+                        let name = block.name.unwrap_or_default();
+                        let id = block.id.unwrap_or_default();
+                        state.tool_use = Some(ToolUseAccumulator {
+                            id,
+                            name: name.clone(),
+                            input_json: String::new(),
+                        });
+                        if tx
+                            .send(ProviderEvent::ToolStart {
+                                name,
+                                declared_timeout_ms: None,
+                            })
+                            .await
+                            .is_err()
+                        {
+                            return false;
+                        }
+                    }
+                    "thinking" | "redacted_thinking" => {
+                        // Reasoning model is entering its chain-of-thought.
+                        // Surface Activity so the runner's drive loop sees
+                        // liveness — thinking phases can run 30-90s before
+                        // any user-visible text appears.
+                        state.thinking = Some(ThinkingAccumulator::default());
+                        let _ = tx.send(ProviderEvent::Activity).await;
+                    }
+                    _ => {
+                        // Unknown content-block type — keep streaming;
+                        // future-proof against new variants.
                     }
                 }
             }
@@ -459,9 +492,33 @@ async fn handle_sse_event(
                         acc.input_json.push_str(chunk);
                     }
                 }
+                // `thinking_delta` carries one chunk of the model's
+                // reasoning. Accumulate but don't expose to the agent's
+                // reply. Emit Activity so the runner sees progress.
+                if let Some(thought) = delta.get("thinking").and_then(Value::as_str) {
+                    if let Some(acc) = state.thinking.as_mut() {
+                        acc.text.push_str(thought);
+                    }
+                    let _ = tx.send(ProviderEvent::Activity).await;
+                }
+                // `signature_delta` authenticates a thinking block for
+                // re-submission. Captured for future history-passthrough;
+                // dropped on `content_block_stop` for now since we don't
+                // yet re-submit thinking content across turns.
+                if let Some(sig) = delta.get("signature").and_then(Value::as_str) {
+                    if let Some(acc) = state.thinking.as_mut() {
+                        acc.signature.push_str(sig);
+                    }
+                }
             }
         }
         "content_block_stop" => {
+            // Close any in-flight thinking block first — thinking and
+            // tool_use are mutually exclusive within a single index, but
+            // closing it here keeps the state machine simple.
+            if state.thinking.take().is_some() {
+                let _ = tx.send(ProviderEvent::Activity).await;
+            }
             if let Some(acc) = state.tool_use.take() {
                 // Empty input is the typical zero-arg call.
                 let input = if acc.input_json.is_empty() {
@@ -648,6 +705,110 @@ mod tests {
         assert_eq!(user_blocks.len(), 1);
         assert_eq!(user_blocks[0]["type"], "tool_result");
         assert_eq!(user_blocks[0]["is_error"], false);
+    }
+
+    /// Build an `eventsource_stream::Event` from a JSON payload for
+    /// the SSE-pump unit tests. The `event` name field is not used by
+    /// the pump (we read `data.type`) so it stays default.
+    fn sse(data: &str) -> eventsource_stream::Event {
+        eventsource_stream::Event {
+            data: data.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn drain<T>(rx: &mut mpsc::Receiver<T>) -> Vec<T> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn thinking_blocks_emit_activity_and_do_not_pollute_text() {
+        // Reproduces a Kimi K2.6 / Claude-extended-thinking stream: the
+        // model opens a `thinking` content block, streams thinking_delta
+        // and signature_delta events, closes it, then opens a normal
+        // `text` content block with the user-facing reply. The bug this
+        // pins: thinking content must NOT leak into buffered_text, and
+        // the runner must see Activity events while the thinking phase
+        // is in flight (so it doesn't perceive a silent hang).
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut state = SseState::default();
+
+        for ev in [
+            sse(r#"{"type":"message_start","message":{"id":"gen_1","usage":{"input_tokens":10,"output_tokens":0}}}"#),
+            sse(r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#),
+            sse(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"The user said hi."}}"#),
+            sse(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":" I should reply briefly."}}"#),
+            sse(r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-xyz"}}"#),
+            sse(r#"{"type":"content_block_stop","index":0}"#),
+            sse(r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#),
+            sse(r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hi!"}}"#),
+            sse(r#"{"type":"content_block_stop","index":1}"#),
+            sse(r#"{"type":"message_stop"}"#),
+        ] {
+            handle_sse_event(&ev, &tx, &mut state).await;
+        }
+
+        let events = drain(&mut rx);
+        let names: Vec<&'static str> = events
+            .iter()
+            .map(|e| match e {
+                ProviderEvent::Init { .. } => "init",
+                ProviderEvent::Activity => "activity",
+                ProviderEvent::Result { .. } => "result",
+                ProviderEvent::Usage { .. } => "usage",
+                ProviderEvent::ToolStart { .. } => "tool_start",
+                ProviderEvent::ToolEnd => "tool_end",
+                ProviderEvent::ToolCall { .. } => "tool_call",
+                _ => "other",
+            })
+            .collect();
+        // Must contain init, at least one activity (thinking liveness),
+        // and a terminal result.
+        assert!(names.contains(&"init"), "got: {names:?}");
+        assert!(
+            names.iter().filter(|n| **n == "activity").count() >= 2,
+            "expected ≥2 activity events during thinking, got: {names:?}"
+        );
+        let result_text: Option<String> = events.iter().find_map(|e| match e {
+            ProviderEvent::Result { text } => Some(text.clone().unwrap_or_default()),
+            _ => None,
+        });
+        assert_eq!(
+            result_text.as_deref(),
+            Some("Hi!"),
+            "user-facing text must equal the text block; thinking deltas must not leak in"
+        );
+    }
+
+    #[tokio::test]
+    async fn redacted_thinking_block_does_not_hang_or_leak() {
+        // `redacted_thinking` is the model's encoded reasoning that the
+        // user cannot see but that providers require be acknowledged.
+        // Treat it like a `thinking` block: enter, emit Activity, exit,
+        // never let it pollute the text buffer.
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut state = SseState::default();
+        for ev in [
+            sse(r#"{"type":"message_start","message":{"id":"gen_2"}}"#),
+            sse(r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque-blob"}}"#),
+            sse(r#"{"type":"content_block_stop","index":0}"#),
+            sse(r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#),
+            sse(r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"ok"}}"#),
+            sse(r#"{"type":"content_block_stop","index":1}"#),
+            sse(r#"{"type":"message_stop"}"#),
+        ] {
+            handle_sse_event(&ev, &tx, &mut state).await;
+        }
+        let events = drain(&mut rx);
+        let final_text = events.iter().find_map(|e| match e {
+            ProviderEvent::Result { text } => text.clone(),
+            _ => None,
+        });
+        assert_eq!(final_text.as_deref(), Some("ok"));
     }
 
     #[test]

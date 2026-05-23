@@ -254,6 +254,7 @@ impl RunnerDeps {
             compaction: CompactionCfg {
                 model_input_window: 200_000,
                 safety_margin_tokens: 8_000,
+                output_reserve_tokens: 4_096,
                 summary_model: "claude-sonnet-4-6".into(),
                 summary_effort: Effort::Low,
                 summary_max_tokens: 1024,
@@ -332,12 +333,7 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
             .history
             .push(HistoryMessage::User { content: formatted.prompt });
 
-        if estimate_tokens(&state.history)
-            > deps
-                .compaction
-                .model_input_window
-                .saturating_sub(deps.compaction.safety_margin_tokens)
-        {
+        if deps.compaction.should_compact(estimate_tokens(&state.history)) {
             state.history = compact(state.history, deps.provider.as_ref(), &deps.compaction)
                 .await
                 .context("compaction failed")?;

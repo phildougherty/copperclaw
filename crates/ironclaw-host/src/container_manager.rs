@@ -1248,6 +1248,20 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
                 read_only: false,
             });
 
+        // Run the container as the host operator's UID:GID so anything
+        // the agent writes through the bind mount (session_state,
+        // skills.json, agent_todos.json, /data/memory/*) lands on the
+        // host as files the operator can read, edit, and remove without
+        // sudo. Previously the container ran as the image's USER
+        // (typically root); every file required root to clean up,
+        // surfaced as `Error: stepping, attempt to write a readonly
+        // database` when iclaw tried to mutate outbound.db, and silent
+        // EACCES on cleanup commands. Detection reads /proc/self
+        // (Linux-only — matches the deployment target).
+        if let Some((uid, gid)) = host_uid_gid() {
+            spec = spec.with_user(format!("{uid}:{gid}"));
+        }
+
         // Per-agent-group memory mount. Lives outside the session dir
         // so the same memory file is visible to every session of the
         // group — an agent can write a memory entry in one chat and
@@ -1339,6 +1353,19 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
 
 /// Container name format. Uses the session id (which is a UUID) so
 /// names are globally unique and DNS-safe.
+/// Resolve the host process's effective UID/GID for the container's
+/// `--user` flag. Reads `/proc/self`'s ownership via the standard
+/// `MetadataExt` interface so we avoid the `unsafe` `libc::geteuid`
+/// call (the workspace forbids unsafe). Linux-only — returns `None` on
+/// systems without `/proc`, in which case the caller falls back to the
+/// image's default USER and the operator gets the legacy root-owned
+/// bind-mount behaviour.
+fn host_uid_gid() -> Option<(u32, u32)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata("/proc/self").ok()?;
+    Some((meta.uid(), meta.gid()))
+}
+
 fn container_name(_agent: AgentGroupId, session: ironclaw_types::SessionId) -> String {
     format!("ironclaw-{}", session.as_uuid())
 }
@@ -2414,6 +2441,35 @@ mod tests {
         assert_eq!(spec.labels.get("ironclaw.install").map(String::as_str), Some("test"));
         assert!(spec.labels.contains_key("ironclaw.session"));
         assert!(spec.labels.contains_key("ironclaw.agent_group"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn build_spec_runs_container_as_host_user() {
+        use std::os::unix::fs::MetadataExt;
+        // Regression: containers used to inherit the image's default
+        // USER (root), so every file the agent wrote via the bind mount
+        // landed on the host as root-owned. iclaw could not modify
+        // outbound.db without sudo. Now build_spec sets `--user
+        // <uid>:<gid>` matching the host process so files are operator-
+        // owned.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None);
+        let user = spec.user.as_deref().expect("spec.user should be set");
+        let (uid_str, gid_str) = user.split_once(':').expect("user is uid:gid");
+        let uid: u32 = uid_str.parse().expect("uid is numeric");
+        let gid: u32 = gid_str.parse().expect("gid is numeric");
+        let meta = std::fs::metadata("/proc/self").unwrap();
+        assert_eq!(uid, meta.uid());
+        assert_eq!(gid, meta.gid());
     }
 
     #[test]

@@ -332,6 +332,7 @@ async fn run_one_turn(
         compaction: CompactionCfg {
             model_input_window: 200_000,
             safety_margin_tokens: 8_000,
+            output_reserve_tokens: 4_096,
             summary_model: "claude-sonnet-4-6".into(),
             summary_effort: Effort::Low,
             summary_max_tokens: 1024,

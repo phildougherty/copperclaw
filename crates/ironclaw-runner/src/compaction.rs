@@ -20,8 +20,19 @@ use ironclaw_types::{Effort, ProviderEvent};
 
 /// Default conservative window we plan against (Claude Sonnet 4.5 / 4.7).
 pub const DEFAULT_INPUT_WINDOW: usize = 200_000;
-/// Default safety margin in tokens before we trigger compaction.
-pub const DEFAULT_SAFETY_MARGIN: usize = 8_000;
+/// Default safety margin in tokens before we trigger compaction. Sized to
+/// absorb the static request overhead the naive `estimate_tokens` doesn't
+/// count: the system prompt, tool-schema JSON, and the per-turn
+/// `max_tokens` output reservation. Bumped from 8K → 16K after the
+/// runner shipped a 124KB inlined-skills prompt that ate the old margin
+/// in one bite. Operators on much-larger windows can shrink this back
+/// down via `RunnerConfigFile.safety_margin_tokens`.
+pub const DEFAULT_SAFETY_MARGIN: usize = 16_000;
+/// Default per-turn output reservation. Compaction subtracts this from
+/// the window in addition to `safety_margin_tokens` so the API doesn't
+/// reject the request for `input + max_tokens > window`. Matches the
+/// runner's default `max_tokens` so the two move together.
+pub const DEFAULT_OUTPUT_RESERVE: usize = 4_096;
 /// System prompt the runner sends to the provider when asking for a summary.
 pub const SUMMARY_SYSTEM_PROMPT: &str =
     "Summarize the following conversation succinctly. Preserve any decisions, \
@@ -33,8 +44,13 @@ pub struct CompactionCfg {
     /// Total input window of the target model in tokens.
     pub model_input_window: usize,
     /// How much headroom to keep below the window. Compaction fires when the
-    /// estimated transcript size exceeds `window - margin`.
+    /// estimated transcript size exceeds `window - margin - output_reserve`.
     pub safety_margin_tokens: usize,
+    /// Tokens reserved for the model's response (matches the runner's
+    /// per-turn `max_tokens`). Subtracted from the window so the request
+    /// never violates `input + max_tokens > window` — the failure mode
+    /// that surfaced as a hard 400 on Haiku 4.5 with a long transcript.
+    pub output_reserve_tokens: usize,
     /// Provider model name to use for the summarisation turn.
     pub summary_model: String,
     /// Effort hint for the summarisation turn.
@@ -47,10 +63,19 @@ pub struct CompactionCfg {
 }
 
 impl CompactionCfg {
-    /// True iff `estimated_tokens` has crossed the threshold.
+    /// True iff `estimated_tokens` has crossed the threshold. The
+    /// threshold subtracts both `safety_margin_tokens` (to cover the
+    /// static request overhead the estimator doesn't count — system
+    /// prompt, tool schemas, formatting) and `output_reserve_tokens`
+    /// (the per-turn output budget the provider enforces as part of
+    /// the total window).
     #[must_use]
     pub fn should_compact(&self, estimated_tokens: usize) -> bool {
-        estimated_tokens > self.model_input_window.saturating_sub(self.safety_margin_tokens)
+        let threshold = self
+            .model_input_window
+            .saturating_sub(self.safety_margin_tokens)
+            .saturating_sub(self.output_reserve_tokens);
+        estimated_tokens > threshold
     }
 }
 
@@ -209,7 +234,8 @@ mod tests {
     fn cfg_with_dir(dir: PathBuf) -> CompactionCfg {
         CompactionCfg {
             model_input_window: 200_000,
-            safety_margin_tokens: 8_000,
+            safety_margin_tokens: 16_000,
+            output_reserve_tokens: 4_096,
             summary_model: "claude-sonnet-4-6".into(),
             summary_effort: Effort::Low,
             summary_max_tokens: 1024,
@@ -219,10 +245,11 @@ mod tests {
 
     #[test]
     fn should_compact_threshold() {
+        // 200_000 - 16_000 (margin) - 4_096 (output reserve) = 179_904
         let cfg = cfg_with_dir(PathBuf::from("/tmp/x"));
         assert!(!cfg.should_compact(100));
-        assert!(!cfg.should_compact(192_000));
-        assert!(cfg.should_compact(192_001));
+        assert!(!cfg.should_compact(179_904));
+        assert!(cfg.should_compact(179_905));
         assert!(cfg.should_compact(1_000_000));
     }
 
@@ -231,10 +258,36 @@ mod tests {
         let cfg = CompactionCfg {
             model_input_window: 100,
             safety_margin_tokens: 500,
+            output_reserve_tokens: 0,
             ..cfg_with_dir(PathBuf::from("/tmp"))
         };
         // saturating_sub keeps threshold at 0; any positive estimate compacts.
         assert!(cfg.should_compact(1));
+    }
+
+    #[test]
+    fn should_compact_accounts_for_output_reserve() {
+        // Regression for the live Haiku-4.5 200K-window overflow: with
+        // an 8K safety margin and a 4K output reserve, the model rejects
+        // requests where `input + max_tokens > window`. The threshold
+        // must subtract BOTH so the API never sees that combination.
+        let cfg = CompactionCfg {
+            model_input_window: 200_000,
+            safety_margin_tokens: 8_000,
+            output_reserve_tokens: 4_096,
+            ..cfg_with_dir(PathBuf::from("/tmp"))
+        };
+        // 200_000 - 8_000 - 4_096 = 187_904
+        assert!(!cfg.should_compact(187_904));
+        assert!(cfg.should_compact(187_905));
+        // The pre-fix bug: estimated_tokens=195_000 would NOT have
+        // triggered compaction under the old `input - margin` rule
+        // (195_000 < 192_000 was false — but `195_000 > 192_000` was
+        // true, so OLD code did compact at this point. The new failure
+        // path was around `input=190_000` with `max_tokens=4_096`:
+        // old rule: 190K < 192K → no compact → 194K total → fail.
+        // New rule: 190K > 187_904 → compact → safe.
+        assert!(cfg.should_compact(190_000));
     }
 
     #[test]

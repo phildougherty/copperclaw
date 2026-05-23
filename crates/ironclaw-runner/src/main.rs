@@ -69,6 +69,11 @@ async fn main() -> Result<()> {
     let compaction = CompactionCfg {
         model_input_window: cfg.model_input_window,
         safety_margin_tokens: cfg.safety_margin_tokens,
+        // Reserve the per-turn output budget so the threshold check
+        // never lets `input + max_tokens > window` slip through to the
+        // provider (the exact failure mode that crashed Haiku-4.5 with
+        // a long transcript).
+        output_reserve_tokens: cfg.max_tokens as usize,
         summary_model: cfg.model.clone(),
         summary_effort: ironclaw_types::Effort::Low,
         summary_max_tokens: 1024,
