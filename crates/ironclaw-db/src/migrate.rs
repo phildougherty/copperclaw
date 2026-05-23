@@ -62,6 +62,10 @@ const CENTRAL: &[Migration] = &[
         name: "012_container_config_coding_enabled",
         sql: include_str!("../migrations/012_container_config_coding_enabled.sql"),
     },
+    Migration {
+        name: "013_sessions_source_session",
+        sql: include_str!("../migrations/013_sessions_source_session.sql"),
+    },
 ];
 
 const SESSION_INBOUND: &[Migration] = &[Migration {

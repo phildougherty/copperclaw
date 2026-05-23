@@ -84,6 +84,13 @@ pub struct RunnerConfigFile {
     /// path). Only consulted when `provider == "codex"`. Falls back
     /// to `IRONCLAW_CODEX_ARGS` (comma-separated), then `["--json"]`.
     pub codex_args: Option<Vec<String>>,
+    /// Session id of the parent agent that spawned this one, written
+    /// by the host's `CreateAgentHandler`. When set, the runner's
+    /// `send_message` defaults `to: None` calls to "report up to the
+    /// parent" (emit a `MessageKind::Agent` row whose body carries
+    /// the parent session id), rather than dumping into the user
+    /// channel inherited from the parent's MG.
+    pub source_session_id: Option<String>,
 }
 
 /// Fully-resolved runner config.
@@ -130,6 +137,10 @@ pub struct RunnerConfig {
     /// `codex_args` in the JSON file, falling back to a
     /// comma-separated `IRONCLAW_CODEX_ARGS`, then `["--json"]`.
     pub codex_args: Option<Vec<String>>,
+    /// Parent session that spawned this one. `Some(_)` for child
+    /// sessions created via `create_agent`; `None` for sessions
+    /// kicked off by a real user channel.
+    pub source_session_id: Option<SessionId>,
 }
 
 impl RunnerConfig {
@@ -171,6 +182,11 @@ impl RunnerConfig {
                 "anthropic".to_string()
             }
         };
+        let source_session_id = file
+            .source_session_id
+            .as_deref()
+            .map(|s| parse_uuid::<SessionId>(Some(s), "source_session_id"))
+            .transpose()?;
         Ok(Self {
             session_id,
             agent_group_id,
@@ -192,6 +208,7 @@ impl RunnerConfig {
             temperature: file.temperature,
             codex_binary: file.codex_binary,
             codex_args: file.codex_args,
+            source_session_id,
         })
     }
 
@@ -278,6 +295,7 @@ mod tests {
             temperature: Some(0.7),
             codex_binary: None,
             codex_args: None,
+            source_session_id: None,
         }
     }
 

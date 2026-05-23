@@ -81,6 +81,7 @@ pub async fn make_service() -> (
             messaging_group_id: None,
             thread_id: None,
             agent_provider: None,
+            source_session_id: None,
         },
     )
     .unwrap();
@@ -105,6 +106,7 @@ pub async fn make_service() -> (
         messaging_group_id: sess_row.messaging_group_id,
         thread_id: sess_row.thread_id.clone(),
         agent_provider: sess_row.agent_provider.clone(),
+        source_session_id: None,
         status: SessionStatus::Active,
         container_status: ContainerStatus::Stopped,
         last_active: sess_row.last_active,
@@ -139,6 +141,7 @@ pub fn make_session() -> Session {
         messaging_group_id: None,
         thread_id: None,
         agent_provider: None,
+        source_session_id: None,
         status: SessionStatus::Active,
         container_status: ContainerStatus::Stopped,
         last_active: Utc::now(),

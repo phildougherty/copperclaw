@@ -33,8 +33,9 @@ pub mod typing;
 
 pub use agent_to_agent::{
     always_allow as create_agent_always_allow, always_deny as create_agent_always_deny,
-    users_table_check as create_agent_users_table_check, AgentRef, AgentToAgentModule,
-    CreateAgentHandler, CreateAgentModule, CreateAgentPermissionCheck, CreateAgentPermissionCtx,
+    users_table_check as create_agent_users_table_check, AgentDispatchModule, AgentRef,
+    AgentToAgentModule, CreateAgentHandler, CreateAgentModule, CreateAgentPermissionCheck,
+    CreateAgentPermissionCtx,
 };
 pub use approvals::{ApprovalsModule, ApprovalSummary, NewPendingCtx, NewPendingNotifier};
 pub use context::{

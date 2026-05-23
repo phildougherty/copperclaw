@@ -417,6 +417,7 @@ impl Router {
             messaging_group_id: search_mg,
             thread_id: search_thread,
             agent_provider: None,
+            source_session_id: None,
         };
         let created = create_session(&self.central, req)
             .map_err(|e| RouterError::session_create(format!("create session: {e}")))?;

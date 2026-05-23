@@ -6,6 +6,83 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (subagent routing: children now report up to the parent by default)
+
+The big one. Routing of child agents' replies is now architectural —
+the runtime decides where they go based on `sessions.source_session_id`,
+not a prompt instruction the model has to follow. See
+[`docs/plans/agent-to-agent-routing.md`](docs/plans/agent-to-agent-routing.md).
+
+**Before:** the kicker prompt told each spawned child to use
+`send_message(to: "agent:<parent_name>", text: ...)`. The `agent:` parser
+existed but had no production callers — every child's reply went through
+the inherited messaging-group routing and landed in the user's chat, not
+the parent's inbound. Result: disjointed-voices UX where N spawned
+children dumped N independent messages on the operator instead of one
+consolidated parent report.
+
+**After:** the child's session row carries a `source_session_id`
+pointing at the parent. The runner sees this on startup and the routing
+helper (`resolve_outbound_routing`) defaults `send_message(to: None)`
+to a `MessageKind::Agent` outbound row addressed to the parent. The
+host's new `agent_dispatch` handler reads the row's body, opens the
+target session's `inbound.db`, and writes a chat row with the
+originating session id in `source_session_id`. Explicit
+`Recipient::Channel { ... }` recipients keep working unchanged.
+
+Migrations + code touched:
+
+- **`crates/ironclaw-db/migrations/013_sessions_source_session.sql`** —
+  new `sessions.source_session_id TEXT REFERENCES sessions(id) ON DELETE
+  SET NULL` column + `idx_sessions_source` index. Registered in
+  `crates/ironclaw-db/src/migrate.rs`.
+- **`crates/ironclaw-types/src/session.rs`** + **`crates/ironclaw-db/src/tables/sessions.rs`** —
+  `Session` and `CreateSession` carry the new column; every SELECT /
+  INSERT updated via a `SESSION_SELECT_COLS` constant so column order
+  stays in sync across the half-dozen reads. Roundtrip test pinned.
+- **`crates/ironclaw-modules/src/agent_to_agent/create_agent.rs`** —
+  `CreateAgentHandler` now sets `source_session_id =
+  parent.session_id` when creating the child session. New test
+  `child_session_records_source_session_id_pointing_at_parent` pins
+  the behaviour.
+- **`crates/ironclaw-runner/src/config.rs`** — `RunnerConfigFile` /
+  `RunnerConfig` gain `source_session_id`. **`crates/ironclaw-runner/src/main.rs`** —
+  threads it onto `RunnerToolCtx`. **`crates/ironclaw-host/src/container_manager/runner_config.rs`** —
+  host writes the field into `runner.json` so it reaches the container.
+- **`crates/ironclaw-runner/src/tools.rs`** — `OriginatingRouting`
+  carries `source_session_id`; new `RunnerToolCtx::with_source_session_id`
+  builder; new `resolve_outbound_routing` helper decides
+  `MessageKind::Agent` vs `MessageKind::Chat` based on the recipient
+  and the parent-id; `insert_outbound_row` replaces the older
+  `insert_chat_row` and elides channel columns for Agent-kind rows.
+  Two new tests:
+  `child_send_message_with_no_to_routes_to_parent` and
+  `child_send_message_with_explicit_channel_still_works`.
+- **`crates/ironclaw-modules/src/agent_to_agent/dispatch.rs`** — new
+  `AgentDispatchModule` + handler. Implements the `agent_dispatch`
+  delivery action the host's delivery service was already calling
+  into (but had no real implementation for outside test fakes).
+  Reads `payload.to.session_id`, resolves the target session, writes
+  a `MessageKind::Chat` row into its `inbound.db` with
+  `source_session_id` set to the originating session. Four
+  unit tests cover the happy path, missing-target, malformed-payload,
+  and parser cases.
+- **`crates/ironclaw-host/src/boot.rs`** — installs
+  `AgentDispatchModule` alongside `CreateAgentModule` so the delivery
+  loop's `agent_dispatch` action handler is no longer a no-op.
+- **`crates/ironclaw-modules/src/agent_to_agent/inbound_seed.rs`** —
+  the kicker prompt no longer tells the child to use
+  `to: "agent:<parent>"`. The new prelude just says "your replies
+  route back to the parent by default; consolidate, send once."
+- **`skills/create-agent/SKILL.md`** — updated the "Consolidating
+  subagent results" section to describe the architectural routing
+  (no more `agent:<name>` magic).
+
+Verification: `cargo test --workspace --no-fail-fast` = 5210 passed,
+0 failed (one pre-existing flake in `ironclaw-mcp::tools::compact_now`
+under parallel-test load — passes alone, unrelated to this change).
+Clippy clean.
+
 ### Added (install.sh detects Apple Container on macOS — 2026-05-23)
 
 - **`install.sh`** — `check_container_runtime` now also accepts the

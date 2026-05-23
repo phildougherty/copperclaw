@@ -53,6 +53,13 @@ pub(crate) struct RunnerConfigForFile {
     /// default when unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) codex_args: Option<Vec<String>>,
+    /// Parent session id for child agents created via `create_agent`.
+    /// Threads `sessions.source_session_id` (set by
+    /// `CreateAgentHandler`) into the runner so its `send_message`
+    /// default routes back to the parent's inbound rather than the
+    /// inherited messaging-group channel.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source_session_id: Option<String>,
 }
 
 impl ContainerManager {
@@ -269,6 +276,9 @@ impl ContainerManager {
             max_messages_per_prompt: max_messages,
             codex_binary,
             codex_args,
+            source_session_id: session
+                .source_session_id
+                .map(|s| s.as_uuid().to_string()),
         }
     }
 }
@@ -324,6 +334,7 @@ mod tests {
                 messaging_group_id: None,
                 thread_id: None,
                 agent_provider: None,
+                source_session_id: None,
             },
         )
         .unwrap()

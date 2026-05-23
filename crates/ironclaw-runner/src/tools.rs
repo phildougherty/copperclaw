@@ -49,9 +49,9 @@ use ironclaw_db::tables::messages_out::{self, WriteOutbound};
 use ironclaw_db::DbError;
 use ironclaw_mcp::{
     AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec, EditMessageSpec,
-    InstallSpec, OutboundToolEffect, ScheduleSpec, SendCardSpec, SendFileSpec, SendMessageSpec,
-    SubagentRequest, SubagentResult, TaskSummary, ToolContext, ToolEffectAck, ToolEntry,
-    ToolError, UpdateTaskSpec,
+    InstallSpec, OutboundToolEffect, Recipient, ScheduleSpec, SendCardSpec, SendFileSpec,
+    SendMessageSpec, SubagentRequest, SubagentResult, TaskSummary, ToolContext, ToolEffectAck,
+    ToolEntry, ToolError, UpdateTaskSpec,
 };
 use ironclaw_providers::AgentProvider;
 use ironclaw_types::{Effort, MessageId, MessageKind};
@@ -125,6 +125,12 @@ pub struct OriginatingRouting {
     pub platform_id: Option<String>,
     pub thread_id: Option<String>,
     pub in_reply_to: Option<MessageId>,
+    /// Parent session id when this runner is a spawned child (host
+    /// writes this through from `RunnerConfig::source_session_id`).
+    /// When set, `apply_send_message` / `apply_send_file` default
+    /// `to: None` to "report up to the parent" instead of the
+    /// inherited messaging-group channel.
+    pub source_session_id: Option<ironclaw_types::SessionId>,
 }
 
 pub struct RunnerToolCtx {
@@ -142,6 +148,12 @@ pub struct RunnerToolCtx {
     /// row's `channel_type` / `platform_id` columns when the model
     /// didn't pass an explicit `to` recipient.
     originating: Arc<std::sync::Mutex<OriginatingRouting>>,
+    /// Parent session id, for child agents created via `create_agent`.
+    /// Immutable for the lifetime of the runner (it's a property of
+    /// the session, not the inbound). When set, `apply_send_message`
+    /// routes `to: None` outbound rows up to the parent's inbound
+    /// instead of dumping into the inherited messaging-group channel.
+    source_session_id: Option<ironclaw_types::SessionId>,
 }
 
 impl RunnerToolCtx {
@@ -155,7 +167,23 @@ impl RunnerToolCtx {
             subagent: None,
             in_subagent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             originating: Arc::new(std::sync::Mutex::new(OriginatingRouting::default())),
+            source_session_id: None,
         }
+    }
+
+    /// Stash the parent session id on the context so `apply_send_message`
+    /// can route the child's default `to: None` calls to the parent's
+    /// inbound instead of the inherited messaging-group channel.
+    #[must_use]
+    pub fn with_source_session_id(mut self, parent: ironclaw_types::SessionId) -> Self {
+        self.source_session_id = Some(parent);
+        self
+    }
+
+    /// Accessor for the parent session id (None when this is a root session).
+    #[must_use]
+    pub fn source_session_id(&self) -> Option<ironclaw_types::SessionId> {
+        self.source_session_id
     }
 
     /// Set the originating-inbound routing so subsequent
@@ -256,6 +284,7 @@ impl ToolContext for RunnerToolCtx {
             in_reply_to: in_reply_to.and_then(|s| {
                 Uuid::parse_str(s).ok().map(MessageId::from)
             }),
+            source_session_id: self.source_session_id,
         };
         Self::set_originating(self, routing);
     }
@@ -436,23 +465,13 @@ fn apply_send_message(
     origin: &OriginatingRouting,
 ) -> Result<ToolEffectAck, ToolApplyError> {
     let SendMessageSpec { to, text } = spec;
-    let to_present = to.is_some();
+    let routed = resolve_outbound_routing(to, origin);
     let mut body = serde_json::Map::new();
     body.insert("text".into(), serde_json::Value::String(text));
-    if let Some(t) = to {
-        body.insert("to".into(), serde_json::to_value(t).unwrap_or_default());
+    if let Some(r) = &routed.body_to {
+        body.insert("to".into(), serde_json::to_value(r).unwrap_or_default());
     }
-    let routing = if to_present {
-        // Model specified an explicit recipient — for now we still
-        // populate routing columns from the originating inbound (the
-        // delivery loop has no canonical way to parse arbitrary `to`
-        // ids yet). The `to` field is preserved in the body for any
-        // downstream consumer that wants to inspect the override.
-        origin
-    } else {
-        origin
-    };
-    let seq = insert_chat_row(conn, serde_json::Value::Object(body), routing)?;
+    let seq = insert_outbound_row(conn, MessageId::new(), serde_json::Value::Object(body), &routed)?;
     Ok(ToolEffectAck::Message { seq })
 }
 
@@ -478,22 +497,23 @@ fn apply_send_file(
     let target = target_dir.join(&filename);
     std::fs::write(&target, &data)?;
 
+    let routed = resolve_outbound_routing(to, origin);
     let mut body = serde_json::Map::new();
     if let Some(t) = text {
         body.insert("text".into(), serde_json::Value::String(t));
     }
-    if let Some(t) = to {
-        body.insert("to".into(), serde_json::to_value(t).unwrap_or_default());
+    if let Some(r) = &routed.body_to {
+        body.insert("to".into(), serde_json::to_value(r).unwrap_or_default());
     }
     body.insert(
         "files".into(),
         serde_json::json!([{ "filename": filename }]),
     );
-    let seq = insert_chat_row_with_id(
+    let seq = insert_outbound_row(
         conn,
         msg_id,
         serde_json::Value::Object(body),
-        origin,
+        &routed,
     )?;
     Ok(ToolEffectAck::Message { seq })
 }
@@ -711,38 +731,110 @@ fn insert_row_with_id(
     Ok(seq)
 }
 
-/// Chat-row insert that honours the originating inbound's routing.
-/// Without this, the row's `channel_type` / `platform_id` columns are
-/// empty and the delivery loop has no idea where to send the reply —
-/// the user-visible silence the live-caught bug produced.
-fn insert_chat_row(
-    conn: &mut Connection,
-    content: serde_json::Value,
-    origin: &OriginatingRouting,
-) -> Result<i64, ToolApplyError> {
-    let id = MessageId::new();
-    insert_chat_row_with_id(conn, id, content, origin)
+/// Routing decision for an outbound `send_message` / `send_file` row.
+/// Combines the explicit `to:` recipient (if any) with the originating
+/// inbound's channel routing and the runner's `source_session_id`
+/// (parent agent for child sessions) to pick the right `MessageKind`
+/// and the right columns on the outbound row.
+struct OutboundRouting {
+    kind: MessageKind,
+    /// The `Recipient` form that gets serialised into the row body's
+    /// `to` field. Some when the caller passed an explicit `to:` or
+    /// when we synthesised one from `source_session_id`. None when
+    /// routing is implicit (no parent + no explicit `to`) — the
+    /// delivery loop falls back to the channel columns.
+    body_to: Option<Recipient>,
+    /// Channel routing for `MessageKind::Chat` rows. Pulled from the
+    /// originating inbound. Ignored for `MessageKind::Agent` rows.
+    channel_type: Option<String>,
+    platform_id: Option<String>,
+    thread_id: Option<String>,
+    in_reply_to: Option<MessageId>,
 }
 
-fn insert_chat_row_with_id(
+/// Decide where this outbound row should land.
+///
+/// Rules (in order):
+/// 1. Caller passed `to: Recipient::Agent { session_id }` → kind Agent.
+/// 2. Caller passed any other explicit `to:` → kind Chat with the
+///    explicit recipient preserved in the body; the channel routing
+///    still falls back to the originating inbound (the delivery loop
+///    doesn't yet route arbitrary channel ids on its own).
+/// 3. Caller passed no `to:` AND the session has a `source_session_id`
+///    (i.e. this is a child agent) → kind Agent, synthesise the
+///    recipient pointing at the parent. **This is the headline routing
+///    change in `docs/plans/agent-to-agent-routing.md` Phase 2.**
+/// 4. Otherwise → kind Chat, channel routing from the inbound. The
+///    root-session "reply to user" default.
+fn resolve_outbound_routing(
+    to: Option<Recipient>,
+    origin: &OriginatingRouting,
+) -> OutboundRouting {
+    use ironclaw_mcp::Recipient as R;
+    let kind = match &to {
+        Some(R::Agent { .. }) => MessageKind::Agent,
+        Some(_) => MessageKind::Chat,
+        None => {
+            if origin.source_session_id.is_some() {
+                MessageKind::Agent
+            } else {
+                MessageKind::Chat
+            }
+        }
+    };
+    let body_to = match to {
+        Some(r) => Some(r),
+        None => origin
+            .source_session_id
+            .map(|sid| R::Agent { session_id: sid.as_uuid().to_string() }),
+    };
+    OutboundRouting {
+        kind,
+        body_to,
+        channel_type: origin.channel_type.clone(),
+        platform_id: origin.platform_id.clone(),
+        thread_id: origin.thread_id.clone(),
+        in_reply_to: origin.in_reply_to,
+    }
+}
+
+/// Insert an outbound chat / agent row honouring [`OutboundRouting`].
+/// Replaces the older `insert_chat_row` which only knew about chat-kind
+/// rows backed by the inbound channel routing.
+fn insert_outbound_row(
     conn: &mut Connection,
     id: MessageId,
     content: serde_json::Value,
-    origin: &OriginatingRouting,
+    routed: &OutboundRouting,
 ) -> Result<i64, ToolApplyError> {
     let row = WriteOutbound {
         id,
-        in_reply_to: origin.in_reply_to,
+        in_reply_to: routed.in_reply_to,
         timestamp: Utc::now(),
         deliver_after: None,
         recurrence: None,
-        kind: MessageKind::Chat,
-        platform_id: origin.platform_id.clone(),
-        channel_type: origin
-            .channel_type
-            .as_ref()
-            .map(|s| ironclaw_types::ChannelType::new(s.as_str())),
-        thread_id: origin.thread_id.clone(),
+        kind: routed.kind,
+        // Agent-kind rows don't need channel routing on the row
+        // itself — the delivery loop dispatches via the `Recipient`
+        // in the body. Keeping them None makes that intent explicit.
+        platform_id: if matches!(routed.kind, MessageKind::Agent) {
+            None
+        } else {
+            routed.platform_id.clone()
+        },
+        channel_type: if matches!(routed.kind, MessageKind::Agent) {
+            None
+        } else {
+            routed
+                .channel_type
+                .as_ref()
+                .map(|s| ironclaw_types::ChannelType::new(s.as_str()))
+        },
+        thread_id: if matches!(routed.kind, MessageKind::Agent) {
+            None
+        } else {
+            routed.thread_id.clone()
+        },
         content,
     };
     let seq = messages_out::insert(conn, &row)?;
@@ -790,6 +882,87 @@ mod tests {
         assert_eq!(row.kind, MessageKind::Chat);
         assert_eq!(row.content["text"], "hello");
         assert!(row.content.get("to").is_some());
+    }
+
+    #[tokio::test]
+    async fn child_send_message_with_no_to_routes_to_parent() {
+        // Phase 2 of docs/plans/agent-to-agent-routing.md: when the
+        // runner has a `source_session_id` (i.e. this is a child agent
+        // spawned via `create_agent`), `send_message(to: None)` should
+        // emit a MessageKind::Agent row whose body points at the
+        // parent — NOT a chat-kind row dumped into the inherited
+        // user channel.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let parent_session = SessionId::new();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
+            .with_source_session_id(parent_session);
+        // Simulate a parent inbound that the child is processing —
+        // inheriting the user's channel routing.
+        ctx.set_originating(OriginatingRouting {
+            channel_type: Some("telegram".into()),
+            platform_id: Some("chat-1".into()),
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: Some(parent_session),
+        });
+        ctx.emit_outbound(OutboundToolEffect::SendMessage(SendMessageSpec {
+            to: None,
+            text: "ran scout".into(),
+        }))
+        .await
+        .unwrap();
+        let row = last_row(&ctx).await;
+        assert_eq!(
+            row.kind,
+            MessageKind::Agent,
+            "child default routing must produce an Agent-kind row, not Chat",
+        );
+        assert!(
+            row.channel_type.is_none() && row.platform_id.is_none(),
+            "Agent-kind rows must not carry channel routing — that's how the \
+             delivery loop knows to dispatch via agent_dispatch instead of a \
+             channel adapter",
+        );
+        assert_eq!(
+            row.content["to"]["kind"], "agent",
+            "body.to must be the tagged Agent recipient form",
+        );
+        assert_eq!(
+            row.content["to"]["session_id"],
+            parent_session.as_uuid().to_string(),
+            "child must address its reply to the parent session",
+        );
+    }
+
+    #[tokio::test]
+    async fn child_send_message_with_explicit_channel_still_works() {
+        // The new routing only flips the default. If the child agent
+        // explicitly addresses a channel (e.g. crossposting to a sibling
+        // chat), that should still produce a Chat-kind row.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
+            .with_source_session_id(SessionId::new());
+        ctx.set_originating(OriginatingRouting {
+            channel_type: Some("telegram".into()),
+            platform_id: Some("chat-1".into()),
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: ctx.source_session_id(),
+        });
+        ctx.emit_outbound(OutboundToolEffect::SendMessage(SendMessageSpec {
+            to: Some(Recipient::Channel {
+                id: "telegram:other".into(),
+            }),
+            text: "cross-post".into(),
+        }))
+        .await
+        .unwrap();
+        let row = last_row(&ctx).await;
+        assert_eq!(row.kind, MessageKind::Chat);
     }
 
     #[tokio::test]

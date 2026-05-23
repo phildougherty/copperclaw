@@ -517,6 +517,7 @@ mod tests {
                 messaging_group_id: None,
                 thread_id: Some("t1".into()),
                 agent_provider: None,
+                source_session_id: None,
             },
         )
         .unwrap();
@@ -527,6 +528,7 @@ mod tests {
                 messaging_group_id: None,
                 thread_id: Some("t2".into()),
                 agent_provider: None,
+                source_session_id: None,
             },
         )
         .unwrap();
@@ -564,6 +566,7 @@ mod tests {
                 messaging_group_id: None,
                 thread_id: None,
                 agent_provider: None,
+                source_session_id: None,
             },
         )
         .unwrap();
@@ -574,6 +577,7 @@ mod tests {
                 messaging_group_id: None,
                 thread_id: None,
                 agent_provider: None,
+                source_session_id: None,
             },
         )
         .unwrap();

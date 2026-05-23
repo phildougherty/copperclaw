@@ -431,6 +431,11 @@ impl DeliveryActionHandler for CreateAgentHandler {
                     .map(|s| (s.messaging_group_id, s.thread_id))
             })
             .unwrap_or((None, None));
+        // Persist the parent → child link so the runtime can route the
+        // child's default `send_message` (no explicit `to:`) back into the
+        // parent's `inbound.db` instead of dumping it into the user's chat.
+        // See docs/plans/agent-to-agent-routing.md Phase 1.
+        let source_session_id = parent_session.as_ref().map(|p| p.session_id);
         let session = sessions::create(
             central,
             CreateSession {
@@ -438,6 +443,7 @@ impl DeliveryActionHandler for CreateAgentHandler {
                 messaging_group_id: parent_messaging_group,
                 thread_id: parent_thread,
                 agent_provider: None,
+                source_session_id,
             },
         )
         .map_err(|e| ModuleError::other("agent_to_agent", format!("sessions::create: {e}")))?;
@@ -743,6 +749,7 @@ mod tests {
                 messaging_group_id: Some(mg.id),
                 thread_id: None,
                 agent_provider: None,
+                source_session_id: None,
             },
         )
         .unwrap();
@@ -978,6 +985,40 @@ mod tests {
         assert_eq!(
             new_session.thread_id, parent_session.thread_id,
             "child must inherit parent's thread_id"
+        );
+    }
+
+    #[test]
+    fn child_session_records_source_session_id_pointing_at_parent() {
+        // Phase 1 of docs/plans/agent-to-agent-routing.md: child
+        // sessions must persist a back-reference to the spawning
+        // session so the runtime can route default `send_message`
+        // calls up to the parent instead of the user's chat.
+        let (handler, central, _tmp, parent, target) = make_handler(always_allow());
+        let before_sessions: std::collections::HashSet<SessionId> =
+            sessions::list_active(&central).unwrap().iter().map(|s| s.id).collect();
+        handler
+            .handle(DeliveryActionInput {
+                action: "create_agent".into(),
+                payload: serde_json::json!({
+                    "name": "scout",
+                    "instructions": "go look",
+                }),
+                target,
+                session_id: None,
+            })
+            .unwrap();
+        let new_session = sessions::list_active(&central)
+            .unwrap()
+            .into_iter()
+            .find(|s| !before_sessions.contains(&s.id))
+            .expect("a new session was created");
+        assert_eq!(
+            new_session.source_session_id,
+            Some(parent.session_id),
+            "child must record the spawning parent's session id so default \
+             `send_message` routes back up to the parent's inbound, not the \
+             user's chat",
         );
     }
 

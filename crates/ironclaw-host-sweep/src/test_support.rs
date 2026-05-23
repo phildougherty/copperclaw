@@ -132,6 +132,7 @@ pub fn seed_running_session(central: &CentralDb) -> Session {
             messaging_group_id: None,
             thread_id: None,
             agent_provider: None,
+            source_session_id: None,
         },
     )
     .unwrap();

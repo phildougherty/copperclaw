@@ -144,34 +144,29 @@ impl CreateAgentHandler {
         parent_name: Option<&str>,
         instructions: &str,
     ) {
-        // When the parent's name is known (the normal case), tell the
-        // child explicitly to address its reports back to that parent
-        // for consolidation. Without this instruction the child's
-        // default `send_message` goes through the inherited channel
-        // routing and dumps directly into the user's chat — the
-        // operator gets N independent voices in their inbox instead of
-        // one consolidated report from the parent. This is the
-        // prompt-side half of the agent-to-agent routing plan (see
-        // docs/plans/agent-to-agent-routing.md); the proper fix is a
-        // runner-level routing default backed by `source_session_id`,
-        // which needs a migration. For now we lean on the model
-        // following the instruction.
+        // Routing is now architectural (see Phase 2 of
+        // docs/plans/agent-to-agent-routing.md): the runner's
+        // `apply_send_message` checks `source_session_id` (threaded
+        // through from `sessions.source_session_id`) and routes the
+        // child's default `send_message(to: None)` calls back to the
+        // parent's inbound automatically. The kicker no longer has to
+        // tell the child about the parent's name — the runtime does
+        // the work. We still mention who spawned us so the child has
+        // context, but the wire-level routing is no longer the model's
+        // problem.
         let prelude = match parent_name {
             Some(p) => format!(
                 "You are agent `{name}`, spawned by parent agent `{p}` for \
-                 the task below. Work through it autonomously, then return \
-                 a SINGLE consolidated reply by calling \
-                 `send_message(to: \"agent:{p}\", text: ...)`. Do NOT call \
-                 `send_message` without an explicit `to:` field — the \
-                 default routing would deliver your message directly to the \
-                 end user, which bypasses the parent's consolidation step \
-                 and makes the operator see disjointed voices instead of \
-                 one coherent answer.\n\nTask:\n\n"
+                 the task below. Work through it autonomously, then call \
+                 `send_message` to deliver a single consolidated report. \
+                 Your replies route back to the parent by default; the \
+                 parent will summarise across siblings (if any) before \
+                 surfacing anything to the end user.\n\nTask:\n\n"
             ),
             None => format!(
-                "You are agent `{name}`, spawned by a parent agent for the \
-                 task below. Work through it autonomously, then call \
-                 `send_message` to deliver your findings.\n\nTask:\n\n"
+                "You are agent `{name}`, spawned for the task below. Work \
+                 through it autonomously, then call `send_message` to \
+                 deliver your findings.\n\nTask:\n\n"
             ),
         };
         let text = format!("{prelude}{instructions}");

@@ -12,7 +12,18 @@ pub struct CreateSession {
     pub messaging_group_id: Option<MessagingGroupId>,
     pub thread_id: Option<String>,
     pub agent_provider: Option<String>,
+    /// Session id of the parent agent that spawned this one (via
+    /// `create_agent`). `None` for root sessions kicked off by a real
+    /// user channel.
+    pub source_session_id: Option<SessionId>,
 }
+
+/// `SELECT` column list used by every `row_to_session` callsite. Kept
+/// as a constant so the column order stays in sync across the half-
+/// dozen reads in this file.
+const SESSION_SELECT_COLS: &str =
+    "id, agent_group_id, messaging_group_id, thread_id, agent_provider,
+     status, container_status, last_active, created_at, source_session_id";
 
 fn parse_status(s: &str) -> SessionStatus {
     match s {
@@ -61,6 +72,14 @@ fn row_to_session(row: &Row<'_>) -> rusqlite::Result<Session> {
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
         .with_timezone(&Utc);
 
+    let source_session_opt: Option<String> = row.get("source_session_id")?;
+    let source_session_id = source_session_opt
+        .as_deref()
+        .map(uuid::Uuid::parse_str)
+        .transpose()
+        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
+        .map(SessionId);
+
     Ok(Session {
         id: SessionId(id),
         agent_group_id: AgentGroupId(ag),
@@ -71,6 +90,7 @@ fn row_to_session(row: &Row<'_>) -> rusqlite::Result<Session> {
         container_status: parse_container_status(&container_status),
         last_active: last_active_parsed,
         created_at: created_at_parsed,
+        source_session_id,
     })
 }
 
@@ -81,8 +101,8 @@ pub fn create(db: &CentralDb, req: CreateSession) -> Result<Session, DbError> {
     conn.execute(
         "INSERT INTO sessions
            (id, agent_group_id, messaging_group_id, thread_id, agent_provider,
-            status, container_status, last_active, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 'active', 'stopped', ?6, ?6)",
+            status, container_status, last_active, created_at, source_session_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'active', 'stopped', ?6, ?6, ?7)",
         params![
             id.as_uuid().to_string(),
             req.agent_group_id.as_uuid().to_string(),
@@ -90,6 +110,7 @@ pub fn create(db: &CentralDb, req: CreateSession) -> Result<Session, DbError> {
             req.thread_id,
             req.agent_provider,
             now.to_rfc3339(),
+            req.source_session_id.map(|s| s.as_uuid().to_string()),
         ],
     )?;
     Ok(Session {
@@ -102,15 +123,14 @@ pub fn create(db: &CentralDb, req: CreateSession) -> Result<Session, DbError> {
         container_status: ContainerStatus::Stopped,
         last_active: now,
         created_at: now,
+        source_session_id: req.source_session_id,
     })
 }
 
 pub fn get(db: &CentralDb, id: SessionId) -> Result<Session, DbError> {
     let conn = db.conn()?;
     conn.query_row(
-        "SELECT id, agent_group_id, messaging_group_id, thread_id, agent_provider,
-                status, container_status, last_active, created_at
-         FROM sessions WHERE id = ?1",
+        &format!("SELECT {SESSION_SELECT_COLS} FROM sessions WHERE id = ?1"),
         params![id.as_uuid().to_string()],
         row_to_session,
     )
@@ -130,14 +150,15 @@ pub fn find_for_agent(
     // SQLite treats NULL != NULL, so we use IS comparison.
     let row = conn
         .query_row(
-            "SELECT id, agent_group_id, messaging_group_id, thread_id, agent_provider,
-                    status, container_status, last_active, created_at
-             FROM sessions
-             WHERE agent_group_id = ?1
-               AND messaging_group_id IS ?2
-               AND thread_id IS ?3
-             ORDER BY created_at DESC
-             LIMIT 1",
+            &format!(
+                "SELECT {SESSION_SELECT_COLS}
+                 FROM sessions
+                 WHERE agent_group_id = ?1
+                   AND messaging_group_id IS ?2
+                   AND thread_id IS ?3
+                 ORDER BY created_at DESC
+                 LIMIT 1"
+            ),
             params![agent.as_uuid().to_string(), mg_str, thread],
             row_to_session,
         )
@@ -149,12 +170,13 @@ pub fn find_by_agent_group(db: &CentralDb, agent: AgentGroupId) -> Result<Option
     let conn = db.conn()?;
     let row = conn
         .query_row(
-            "SELECT id, agent_group_id, messaging_group_id, thread_id, agent_provider,
-                    status, container_status, last_active, created_at
-             FROM sessions
-             WHERE agent_group_id = ?1
-             ORDER BY created_at DESC
-             LIMIT 1",
+            &format!(
+                "SELECT {SESSION_SELECT_COLS}
+                 FROM sessions
+                 WHERE agent_group_id = ?1
+                 ORDER BY created_at DESC
+                 LIMIT 1"
+            ),
             params![agent.as_uuid().to_string()],
             row_to_session,
         )
@@ -198,11 +220,12 @@ pub fn touch_last_active(db: &CentralDb, id: SessionId) -> Result<(), DbError> {
 pub fn list_active(db: &CentralDb) -> Result<Vec<Session>, DbError> {
     let conn = db.conn()?;
     let mut stmt = conn.prepare(
-        "SELECT id, agent_group_id, messaging_group_id, thread_id, agent_provider,
-                status, container_status, last_active, created_at
-         FROM sessions
-         WHERE status = 'active'
-         ORDER BY last_active DESC",
+        &format!(
+            "SELECT {SESSION_SELECT_COLS}
+             FROM sessions
+             WHERE status = 'active'
+             ORDER BY last_active DESC"
+        ),
     )?;
     let rows = stmt.query_map([], row_to_session)?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -214,11 +237,12 @@ pub fn list_for_agent_group(
 ) -> Result<Vec<Session>, DbError> {
     let conn = db.conn()?;
     let mut stmt = conn.prepare(
-        "SELECT id, agent_group_id, messaging_group_id, thread_id, agent_provider,
-                status, container_status, last_active, created_at
-         FROM sessions
-         WHERE agent_group_id = ?1
-         ORDER BY last_active DESC",
+        &format!(
+            "SELECT {SESSION_SELECT_COLS}
+             FROM sessions
+             WHERE agent_group_id = ?1
+             ORDER BY last_active DESC"
+        ),
     )?;
     let rows = stmt.query_map(
         params![agent.as_uuid().to_string()],
@@ -230,10 +254,11 @@ pub fn list_for_agent_group(
 pub fn list_running(db: &CentralDb) -> Result<Vec<Session>, DbError> {
     let conn = db.conn()?;
     let mut stmt = conn.prepare(
-        "SELECT id, agent_group_id, messaging_group_id, thread_id, agent_provider,
-                status, container_status, last_active, created_at
-         FROM sessions
-         WHERE container_status = 'running'",
+        &format!(
+            "SELECT {SESSION_SELECT_COLS}
+             FROM sessions
+             WHERE container_status = 'running'"
+        ),
     )?;
     let rows = stmt.query_map([], row_to_session)?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -268,6 +293,7 @@ mod tests {
                 messaging_group_id: None,
                 thread_id: None,
                 agent_provider: Some("claude".into()),
+                source_session_id: None,
             },
         )
         .unwrap();
@@ -287,6 +313,7 @@ mod tests {
                 messaging_group_id: None,
                 thread_id: None,
                 agent_provider: None,
+                source_session_id: None,
             },
         )
         .unwrap();
@@ -304,6 +331,7 @@ mod tests {
                 messaging_group_id: None,
                 thread_id: Some("t1".into()),
                 agent_provider: None,
+                source_session_id: None,
             },
         )
         .unwrap();
@@ -314,6 +342,7 @@ mod tests {
                 messaging_group_id: None,
                 thread_id: Some("t2".into()),
                 agent_provider: None,
+                source_session_id: None,
             },
         )
         .unwrap();
@@ -331,6 +360,7 @@ mod tests {
                 messaging_group_id: None,
                 thread_id: None,
                 agent_provider: None,
+                source_session_id: None,
             },
         )
         .unwrap();
@@ -352,6 +382,7 @@ mod tests {
                 messaging_group_id: None,
                 thread_id: Some("t1".into()),
                 agent_provider: None,
+                source_session_id: None,
             },
         )
         .unwrap();
@@ -362,6 +393,7 @@ mod tests {
                 messaging_group_id: None,
                 thread_id: Some("t2".into()),
                 agent_provider: None,
+                source_session_id: None,
             },
         )
         .unwrap();
@@ -381,6 +413,7 @@ mod tests {
                 messaging_group_id: None,
                 thread_id: None,
                 agent_provider: None,
+                source_session_id: None,
             },
         )
         .unwrap();
@@ -417,6 +450,7 @@ mod tests {
                 messaging_group_id: None,
                 thread_id: Some("t1".into()),
                 agent_provider: None,
+                source_session_id: None,
             },
         )
         .unwrap();
@@ -427,6 +461,7 @@ mod tests {
                 messaging_group_id: None,
                 thread_id: Some("t2".into()),
                 agent_provider: None,
+                source_session_id: None,
             },
         )
         .unwrap();
@@ -437,6 +472,7 @@ mod tests {
                 messaging_group_id: None,
                 thread_id: None,
                 agent_provider: None,
+                source_session_id: None,
             },
         )
         .unwrap();
@@ -468,6 +504,7 @@ mod tests {
                 messaging_group_id: None,
                 thread_id: None,
                 agent_provider: None,
+                source_session_id: None,
             },
         )
         .unwrap();

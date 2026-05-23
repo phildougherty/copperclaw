@@ -125,10 +125,12 @@ async fn main() -> Result<()> {
         assistant_name: cfg.assistant_name.clone(),
         provider_deadline,
     };
-    let tool_ctx: Arc<dyn ironclaw_mcp::ToolContext> = Arc::new(
-        RunnerToolCtx::new(outbound.clone(), paths.outbox.clone())
-            .with_subagent(subagent_deps),
-    );
+    let mut tool_ctx_inner = RunnerToolCtx::new(outbound.clone(), paths.outbox.clone())
+        .with_subagent(subagent_deps);
+    if let Some(parent) = cfg.source_session_id {
+        tool_ctx_inner = tool_ctx_inner.with_source_session_id(parent);
+    }
+    let tool_ctx: Arc<dyn ironclaw_mcp::ToolContext> = Arc::new(tool_ctx_inner);
 
     let deps = RunnerDeps {
         provider,
@@ -258,6 +260,7 @@ mod build_provider_tests {
             temperature: None,
             codex_binary: None,
             codex_args: None,
+            source_session_id: None,
         }
     }
 

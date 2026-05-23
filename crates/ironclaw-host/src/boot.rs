@@ -21,7 +21,8 @@ use ironclaw_host_delivery::DeliveryService;
 use ironclaw_host_router::Router;
 use ironclaw_host_sweep::{SqliteTaskStore, SweepService};
 use ironclaw_modules::{
-    create_agent_users_table_check, AgentToAgentModule, ApprovalsModule, CreateAgentModule,
+    create_agent_users_table_check, AgentDispatchModule, AgentToAgentModule, ApprovalsModule,
+    CreateAgentModule,
     InteractiveModule, Module, MountSecurityModule, NewPendingCtx, NewPendingNotifier,
     PermissionsModule, SchedulingModule, SelfModModule, TypingConfig, TypingModule,
 };
@@ -436,6 +437,16 @@ pub async fn install_modules(host_ctx: Arc<HostContext>, data_root: PathBuf) {
             host_ctx.central().clone(),
             data_root.clone(),
             create_agent_users_table_check(host_ctx.central().clone()),
+        )),
+        // Handles `MessageKind::Agent` outbound rows — writes them into
+        // the target session's inbound.db. Without this, children's
+        // default `send_message` calls (which Phase 2 routes via Agent-
+        // kind rows pointing at the parent) get silently dropped by the
+        // delivery loop's no-op `agent_dispatch` fallback. See
+        // docs/plans/agent-to-agent-routing.md.
+        Box::new(AgentDispatchModule::new(
+            host_ctx.central().clone(),
+            data_root.clone(),
         )),
         Box::new(SelfModModule),
     ];

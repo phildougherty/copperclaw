@@ -65,6 +65,13 @@ pub struct Session {
     pub container_status: ContainerStatus,
     pub last_active: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+    /// Session id of the agent that spawned this one (via `create_agent`).
+    /// `None` for root sessions (a real user channel kicked them off).
+    /// Used by the runtime to route a child's default `send_message`
+    /// (`to: None`) back to the parent's `inbound.db` instead of the
+    /// user's chat — see `docs/plans/agent-to-agent-routing.md`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_session_id: Option<SessionId>,
 }
 
 #[cfg(test)]
@@ -94,10 +101,31 @@ mod tests {
             container_status: ContainerStatus::Idle,
             last_active: Utc::now(),
             created_at: Utc::now(),
+            source_session_id: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Session = serde_json::from_str(&json).unwrap();
         assert_eq!(s.id, back.id);
         assert_eq!(s.status, back.status);
+    }
+
+    #[test]
+    fn session_with_source_id_roundtrip() {
+        let parent_id = SessionId::new();
+        let s = Session {
+            id: SessionId::new(),
+            agent_group_id: AgentGroupId::new(),
+            messaging_group_id: None,
+            thread_id: None,
+            agent_provider: Some("claude".into()),
+            status: SessionStatus::Active,
+            container_status: ContainerStatus::Idle,
+            last_active: Utc::now(),
+            created_at: Utc::now(),
+            source_session_id: Some(parent_id),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.source_session_id, Some(parent_id));
     }
 }

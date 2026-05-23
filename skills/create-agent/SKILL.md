@@ -70,10 +70,13 @@ agent later:
 
 When you spawn subagents to do parallel work (research fan-out,
 multi-step build, etc.), the children's replies arrive in **your**
-`messages_in` queue as new chat messages addressed to `agent:<your-
-name>`, not in the end user's chat. The host automatically tells each
-child to address replies back to you for consolidation. Your job is
-to:
+`messages_in` queue as new chat messages, not in the end user's chat.
+Routing is automatic: the host's `agent_dispatch` handler walks each
+child's `source_session_id` (set when the child was created) and writes
+the reply directly into your inbound. You don't have to tell the
+children "send to agent:<your-name>" — the runtime does it.
+
+Your job is to:
 
 1. **Wait** for the subagent results to arrive (subsequent turns).
 2. **Consolidate** the per-child reports into a single coherent

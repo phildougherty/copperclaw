@@ -2473,6 +2473,7 @@ mod tests {
             container_status: template.container_status,
             last_active: template.last_active,
             created_at: template.created_at,
+            source_session_id: template.source_session_id,
         }
     }
 

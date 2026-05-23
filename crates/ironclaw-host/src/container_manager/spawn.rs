@@ -699,6 +699,7 @@ mod tests {
                 messaging_group_id: None,
                 thread_id: None,
                 agent_provider: None,
+                source_session_id: None,
             },
         )
         .unwrap()

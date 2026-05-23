@@ -32,6 +32,7 @@
 
 mod create_agent;
 mod depth;
+mod dispatch;
 mod inbound_seed;
 mod permissions;
 
@@ -44,6 +45,7 @@ use std::sync::Arc;
 
 pub use create_agent::{CreateAgentHandler, CreateAgentModule};
 pub use depth::{DEFAULT_MAX_SUBAGENT_DEPTH, MAX_SUBAGENT_DEPTH_CEILING};
+pub use dispatch::AgentDispatchModule;
 pub use permissions::{
     always_allow, always_deny, users_table_check, CreateAgentPermissionCheck,
     CreateAgentPermissionCtx,

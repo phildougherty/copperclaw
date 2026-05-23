@@ -129,30 +129,6 @@ operators write the file by hand.
 
 ## Large
 
-### Architectural fix: `sessions.source_session_id` for child→parent routing
-
-Currently spawned children route their replies back to their parent
-via a prompt-engineered instruction (the kicker tells the child to
-`send_message(to: "agent:<parent>", text: ...)`). This works while
-the model follows the prompt; it fails when the model decides not
-to.
-
-Root-cause fix lives in
-[`docs/plans/agent-to-agent-routing.md`](agent-to-agent-routing.md)
-— add `sessions.source_session_id` column, propagate through
-`CreateSession`, and have the runner default `send_message`'s
-recipient to the source session when no `to:` is specified.
-
-- **Phase 1** (migration + column plumbing): half-day.
-- **Phase 2** (runner default-routing logic): half-day.
-- **Phase 3** (drop the kicker's instruction, replace with a one-
-  line context note): half-day.
-- **Phase 4** (delete the `agent:<name>` prompt-engineering work
-  from `inbound_seed.rs`): half-day.
-
-Total ~2 days. Gate behind a feature flag for a few releases so
-existing deployments don't surprise on upgrade.
-
 ### Replay-fixture coverage for the remaining 14 channels
 
 7 channels (cli, telegram, slack, discord, matrix, github,
