@@ -6,6 +6,33 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (typing ticker was always-on; agent self-introducing on tasks)
+
+Two issues caught in the Sonnet retest:
+
+- **Typing indicator stayed pinned forever** after the first user
+  message. The old ticker fired for any session with
+  `container_status = Running`, but Running lasts for the full
+  idle-timeout window between user turns — so the bubble pulsed
+  continuously even when the agent was idle waiting for input.
+  Fixed by gating each tick on `messages_in::count_due() > 0` for
+  the session's inbound.db. Typing now only appears when the agent
+  actually has work to process (pending inbound) or is mid-turn.
+  `TypingTicker::new` gained a `data_root` parameter; new
+  `tick_skips_idle_running_session_without_pending_work` test pins
+  the new behaviour.
+- **Bot recited a self-introduction when the user gave a task.**
+  User: "Build me a clone of one of the top apps in the App Store."
+  Bot: "I'm the Ironclaw agent — a self-hosted AI assistant
+  running inside a per-session Linux container. Here's a quick
+  overview of what I am..." — ignoring the actual task and ending
+  with "What can I help you with?". The `identity` skill says only
+  introduce when asked; Sonnet ignored the conditional. Added a
+  hard rule to `BASE_PREAMBLE`: "Do NOT introduce yourself unless
+  the user explicitly asks" + "No preamble or postamble on
+  substantive replies." Identity introductions are reserved for
+  "who are you?" / "what is Ironclaw?" messages.
+
 ### Changed (anti-fabrication on coding-task completion)
 
 Live testing surfaced a worse cousin of the news-roundup

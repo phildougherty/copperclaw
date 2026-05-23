@@ -604,6 +604,7 @@ pub async fn run_host(
     let typing_ticker = Arc::new(crate::typing_ticker::TypingTicker::new(
         state.central.clone(),
         state.delivery.dispatcher(),
+        cfg.data_dir.clone(),
     ));
     let typing_task = tokio::spawn(Arc::clone(&typing_ticker).run_loop(shutdown.clone()));
 

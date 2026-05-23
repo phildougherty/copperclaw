@@ -18,8 +18,10 @@
 //! are the source of truth.
 
 use ironclaw_db::central::CentralDb;
-use ironclaw_db::tables::{messaging_groups, sessions};
+use ironclaw_db::session::{open_inbound_ro_no_mmap, SessionPaths};
+use ironclaw_db::tables::{messages_in, messaging_groups, sessions};
 use ironclaw_modules::{DeliveryDispatcher, DispatchTarget};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -35,14 +37,20 @@ pub const TICK_INTERVAL: Duration = Duration::from_secs(4);
 pub struct TypingTicker {
     central: CentralDb,
     dispatcher: Arc<dyn DeliveryDispatcher>,
+    data_root: PathBuf,
     interval: Duration,
 }
 
 impl TypingTicker {
-    pub fn new(central: CentralDb, dispatcher: Arc<dyn DeliveryDispatcher>) -> Self {
+    pub fn new(
+        central: CentralDb,
+        dispatcher: Arc<dyn DeliveryDispatcher>,
+        data_root: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             central,
             dispatcher,
+            data_root: data_root.into(),
             interval: TICK_INTERVAL,
         }
     }
@@ -72,6 +80,17 @@ impl TypingTicker {
             let Some(mg_id) = s.messaging_group_id else {
                 continue;
             };
+            // Gate on actual work-in-flight, not just container=Running:
+            // a session that's been Running for the whole idle-timeout
+            // window between user turns should NOT pulse typing
+            // continuously. Open the session's inbound.db read-only,
+            // count rows where status='pending'. If > 0, the agent
+            // has work it's about to process (or is processing); fire
+            // typing. If 0, the agent is idle waiting for the next
+            // user message; stay quiet.
+            if !has_pending_inbound(&self.data_root, s.agent_group_id, s.id) {
+                continue;
+            }
             let mg = match messaging_groups::get(&self.central, mg_id) {
                 Ok(m) => m,
                 Err(err) => {
@@ -90,6 +109,25 @@ impl TypingTicker {
         fired
     }
 
+}
+
+/// Cheaply check whether a session has unprocessed inbound rows. The
+/// host writes to inbound.db so a read-only handle here is safe. We
+/// only need a count; the runner picks up the rows on its next poll
+/// and the ticker just needs the boolean.
+fn has_pending_inbound(
+    data_root: &std::path::Path,
+    agent_group_id: ironclaw_types::AgentGroupId,
+    session_id: ironclaw_types::SessionId,
+) -> bool {
+    let paths = SessionPaths::new(data_root, agent_group_id, session_id);
+    let Ok(conn) = open_inbound_ro_no_mmap(&paths) else {
+        return false;
+    };
+    messages_in::count_due(&conn).map(|n| n > 0).unwrap_or(false)
+}
+
+impl TypingTicker {
     /// Loop until `shutdown` is cancelled, firing one [`tick`] per
     /// `interval`. The shutdown branch wins — when the cancel token
     /// fires mid-sleep the loop drops out promptly.
@@ -145,7 +183,16 @@ mod tests {
         (tmp, db)
     }
 
-    fn make_running_session(central: &CentralDb, ch: &str) -> ironclaw_types::SessionId {
+    /// Build a running session AND seed its inbound.db with one pending
+    /// chat row so `has_pending_inbound` returns true (the ticker now
+    /// gates on actual work-in-flight). `data_root` should be the
+    /// tempdir from `fresh_central()` so the session-dir layout matches
+    /// production.
+    fn make_running_session_with_pending(
+        central: &CentralDb,
+        data_root: &std::path::Path,
+        ch: &str,
+    ) -> ironclaw_types::SessionId {
         let g = agent_groups::create(
             central,
             CreateAgentGroup {
@@ -178,22 +225,47 @@ mod tests {
         )
         .unwrap();
         sessions::mark_container_running(central, s.id).unwrap();
+        // Seed a pending inbound row so the work-in-flight gate
+        // returns true.
+        let paths = ironclaw_db::session::SessionPaths::new(data_root, g.id, s.id);
+        paths.ensure_dirs().unwrap();
+        let conn = ironclaw_db::session::open_inbound(&paths).unwrap();
+        ironclaw_db::tables::messages_in::insert(
+            &conn,
+            &ironclaw_db::tables::messages_in::WriteInbound {
+                id: ironclaw_types::MessageId::new(),
+                kind: ironclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({ "text": "hi" }),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: None,
+                channel_type: None,
+                thread_id: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
         s.id
     }
 
     #[test]
-    fn tick_fires_set_typing_for_each_running_session() {
-        let (_tmp, central) = fresh_central();
-        let _s1 = make_running_session(&central, "telegram");
-        let _s2 = make_running_session(&central, "slack");
+    fn tick_fires_set_typing_for_each_running_session_with_pending_work() {
+        let (tmp, central) = fresh_central();
+        let _s1 = make_running_session_with_pending(&central, tmp.path(), "telegram");
+        let _s2 = make_running_session_with_pending(&central, tmp.path(), "slack");
 
         let mock = StdArc::new(MockDispatcher::default());
         let ticker = TypingTicker::new(
             central,
             StdArc::clone(&mock) as Arc<dyn DeliveryDispatcher>,
+            tmp.path(),
         );
         let fired = ticker.tick();
-        assert_eq!(fired, 2, "both running sessions should fire");
+        assert_eq!(fired, 2, "both running sessions with pending work should fire");
         let calls = mock.typing_calls.lock().unwrap();
         let kinds: Vec<&str> = calls
             .iter()
@@ -204,26 +276,75 @@ mod tests {
     }
 
     #[test]
-    fn tick_skips_idle_sessions() {
-        let (_tmp, central) = fresh_central();
-        let s = make_running_session(&central, "telegram");
-        // Flip to idle: the ticker should NOT fire for this session
-        // anymore — typing while idle is a lie.
+    fn tick_skips_idle_running_session_without_pending_work() {
+        // A session whose container is `Running` but has no pending
+        // inbound rows is between turns — typing here would be a lie.
+        let (tmp, central) = fresh_central();
+        // Build a session WITHOUT seeding a pending inbound row.
+        let g = agent_groups::create(
+            &central,
+            CreateAgentGroup {
+                name: "idle".into(),
+                folder: "idle".into(),
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        let mg = messaging_groups::upsert(
+            &central,
+            UpsertMessagingGroup {
+                channel_type: ChannelType::new("telegram"),
+                platform_id: "chat-idle".into(),
+                name: Some("idle".into()),
+                is_group: false,
+                unknown_sender_policy: "strict".into(),
+            },
+        )
+        .unwrap();
+        let s = sessions::create(
+            &central,
+            CreateSession {
+                agent_group_id: g.id,
+                messaging_group_id: Some(mg.id),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        sessions::mark_container_running(&central, s.id).unwrap();
+
+        let mock = StdArc::new(MockDispatcher::default());
+        let ticker = TypingTicker::new(
+            central,
+            StdArc::clone(&mock) as Arc<dyn DeliveryDispatcher>,
+            tmp.path(),
+        );
+        assert_eq!(
+            ticker.tick(),
+            0,
+            "Running session without pending inbound must NOT pulse typing",
+        );
+    }
+
+    #[test]
+    fn tick_skips_container_idle_sessions() {
+        // Even with pending work, a session whose container_status is
+        // not `Running` is excluded (the runner isn't on to process it).
+        let (tmp, central) = fresh_central();
+        let s = make_running_session_with_pending(&central, tmp.path(), "telegram");
         sessions::mark_container_idle(&central, s).unwrap();
 
         let mock = StdArc::new(MockDispatcher::default());
         let ticker = TypingTicker::new(
             central,
             StdArc::clone(&mock) as Arc<dyn DeliveryDispatcher>,
+            tmp.path(),
         );
-        let fired = ticker.tick();
-        assert_eq!(fired, 0);
+        assert_eq!(ticker.tick(), 0);
     }
 
     #[test]
     fn tick_skips_sessions_without_messaging_group() {
-        let (_tmp, central) = fresh_central();
-        // Session with NO messaging_group_id (e.g. an unrouted agent).
+        let (tmp, central) = fresh_central();
         let g = agent_groups::create(
             &central,
             CreateAgentGroup {
@@ -248,20 +369,22 @@ mod tests {
         let ticker = TypingTicker::new(
             central,
             StdArc::clone(&mock) as Arc<dyn DeliveryDispatcher>,
+            tmp.path(),
         );
         assert_eq!(ticker.tick(), 0);
     }
 
     #[tokio::test]
     async fn run_loop_fires_repeatedly_until_shutdown() {
-        let (_tmp, central) = fresh_central();
-        let _s = make_running_session(&central, "telegram");
+        let (tmp, central) = fresh_central();
+        let _s = make_running_session_with_pending(&central, tmp.path(), "telegram");
 
         let mock = StdArc::new(MockDispatcher::default());
         let ticker = Arc::new(
             TypingTicker::new(
                 central,
                 StdArc::clone(&mock) as Arc<dyn DeliveryDispatcher>,
+                tmp.path(),
             )
             .with_interval(Duration::from_millis(20)),
         );
