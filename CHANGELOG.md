@@ -6,6 +6,135 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (subagent routing follow-up: 15 code-review findings)
+
+Follow-up to the subagent-routing PR (`466b1ed`). An extra-high-effort
+multi-angle review surfaced 15 defects — all addressed here. Highlights:
+
+- **Silent loss in `agent_dispatch` (finding #1, severity: critical).**
+  `AgentDispatchHandler` used to swallow `messages_in::insert` /
+  `open_inbound` failures with a `warn!` and return Ok, then the delivery
+  loop marked the outbound row delivered=ok — permanent loss with no
+  retry. Now: transient failures (insert, open_inbound) return
+  `ModuleError`, which the delivery loop's retry/backoff handles
+  normally. Permanent failures (malformed payload, target deleted /
+  archived) still return Ok so retries don't churn.
+- **`send_file` orphaning bytes (#2).** A child agent's
+  `send_file(to: None)` previously emitted an Agent-kind row whose body
+  carried a `files: [{filename}]` field, but the `agent_dispatch`
+  handler only forwarded `body.text` — the on-disk bytes under
+  `outbox/<msg_id>/<filename>` were never copied to the parent. Now
+  `apply_send_file` overrides Agent-kind back to Chat for the
+  inherited-channel routing, so bytes reach the user channel. (The
+  long-term fix — real cross-session attachment relay — stays on the
+  follow-up list.)
+- **Migration 013 FK enforcement (#3).** The migration's `ON DELETE SET
+  NULL` IS enforced (the central DB runs `PRAGMA foreign_keys=ON`),
+  contradicting the original "soft reference" comment. Updated the
+  migration comment to acknowledge enforcement and document the
+  `UPDATE sessions SET status='archived'` retirement pattern that keeps
+  child pointers intact.
+- **Subagent emit lost routing (#4).** `SubagentCtxAdapter::emit_outbound`
+  built `OriginatingRouting::default()` (empty everything) for the
+  subagent's tool calls. For any operator-widened `tools_allowed` that
+  included a message-emitting tool, a subagent emission landed with
+  empty channel columns → `DeliveryError::NoRoute`. Now the subagent
+  inherits the parent's current originating routing AND
+  `source_session_id`.
+- **User→child siphon to parent (#5).** Old default routing said "if
+  `source_session_id` is set, route up." That accidentally hijacked
+  user messages that landed directly on a child session (per-thread
+  wirings, operator-added wirings). Now the rule is "route up only when
+  the inbound itself has no channel routing (i.e. came from
+  `agent_dispatch`)." User-channel inbounds always reply via channel.
+- **Apology cascade (#6).** Both apology paths (in-runner emit, sweep)
+  used to require `inbound.channel_type` AND `platform_id` before
+  emitting — but agent-dispatched inbounds have neither. Now: if
+  channel routing is absent but `source_session_id` is set, emit an
+  Agent-kind apology UP the chain so the parent agent learns the
+  child failed and can surface it to the user.
+- **`in_reply_to` dangling (#7).** `insert_outbound_row` used to copy
+  `origin.in_reply_to` into Agent-kind rows, but that id lives in the
+  source session's `messages_in` — a dangling reference once the row
+  crossed into the target session's space. Now elided for Agent-kind.
+- **No parent-status check (#8).** `AgentDispatchHandler` now refuses
+  to dead-letter into a non-`Active` target session. Logs and returns
+  Ok (permanent — retry won't help). New `sessions::set_status` helper
+  in `ironclaw-db` powers the test that pins this.
+- **Retry duplicates (#10).** A successful handler call followed by a
+  failed `delivered::insert` previously caused the loop to re-run the
+  handler with a fresh `MessageId`, writing the parent's inbound twice.
+  Now: the handler uses the source outbound row's `MessageId` (passed
+  through new `DeliveryActionInput.row_id`) as the parent inbound's
+  id, plus new `messages_in::insert_idempotent` (`INSERT OR IGNORE`).
+  A retry is a no-op.
+- **`thread_id` stripped (#11).** `agent_dispatch` used to write parent
+  inbound rows with `thread_id: None`, dropping the user-thread
+  context. Runner now copies origin's `thread_id` into the Agent body;
+  handler reads it back and stores it on the inbound write.
+- **Loose `parse_target_session` (#12).** Removed the bare-string
+  `to: "<uuid>"` fallback that let any UUID-shaped payload route into
+  the matching session. Now requires the tagged
+  `{ kind: "agent", session_id: ... }` form. Two new tests pin the
+  rejection.
+- **Explicit `Recipient::Channel` columns (#12 / #8 in review).** Now
+  documented behavior: explicit Channel keeps the row's column routing
+  inherited (delivery loop doesn't parse channel-id strings yet). The
+  body's `to` is preserved so future versions can override.
+- **Replay harness wired (#13).** `crates/ironclaw-host/tests/replay/harness.rs`
+  now threads `source_session_id` onto the runner ctx the same way
+  production's `main.rs` does, so replay fixtures actually exercise
+  the new Agent-kind routing path.
+- **`unwrap_or_default` on Recipient serialization (#15).** Replaced
+  with `.expect("Recipient is always serialisable")` so a future
+  serialization regression surfaces loudly instead of silently
+  producing `to: null`.
+
+Service-level integration test gap (#14 — make_service tests register
+a Failer mock for `agent_dispatch` instead of the real handler) is
+not addressed here because pulling `ironclaw-modules` into
+`ironclaw-host-delivery`'s dev-deps would create a circular concern.
+The dispatch.rs in-module tests (10 passing) cover the handler
+end-to-end; this gap is logged in `docs/plans/vaporware-followups.md`.
+
+Migrations + new code:
+
+- **`crates/ironclaw-db/migrations/013_sessions_source_session.sql`** —
+  comment rewritten; migration body unchanged.
+- **`crates/ironclaw-db/src/tables/messages_in.rs`** — new
+  `insert_idempotent` variant.
+- **`crates/ironclaw-db/src/tables/sessions.rs`** — new
+  `set_status(db, id, status)` helper.
+- **`crates/ironclaw-types/src/session.rs`** —
+  `SessionStatus::as_str()` impl (mirrors `ContainerStatus`).
+- **`crates/ironclaw-modules/src/context.rs`** —
+  `DeliveryActionInput.row_id: Option<MessageId>`.
+- **`crates/ironclaw-modules/src/agent_to_agent/dispatch.rs`** — full
+  handler rewrite covering findings #1, #8, #10, #11, #12. Five new
+  unit tests for the new behaviors.
+- **`crates/ironclaw-host-delivery/src/service.rs`** — passes
+  `row_id` into `DeliveryActionInput`; Agent-kind arm dropped the
+  swallow-error `let _ =` pattern in favour of propagating the handler's
+  Err.
+- **`crates/ironclaw-runner/src/tools.rs`** — `resolve_outbound_routing`
+  rewritten: routes up to parent only when inbound has no channel info,
+  elides `in_reply_to` for Agent-kind, propagates `thread_id` into
+  body. `apply_send_file` falls back to Chat-kind when routing
+  resolved to Agent. `SubagentCtxAdapter` inherits the parent's
+  originating routing. Replaced silent `unwrap_or_default` with
+  `expect`. Four new tests pin the routing rules.
+- **`crates/ironclaw-host-sweep/src/checks/apology.rs`** — apology
+  cascade walks `source_session_id` for inbounds without channel
+  routing.
+- **`crates/ironclaw-runner/src/run/mod.rs`** — same cascade for the
+  in-runner terminal-failure apology emit.
+- **`crates/ironclaw-host/tests/replay/harness.rs`** — replay
+  threads `source_session_id` onto `RunnerToolCtx`.
+
+Verification: cargo test --workspace --no-fail-fast = 5219 passed, 0
+failed (was 5210); cargo clippy --workspace --all-targets -- -D warnings
+clean.
+
 ### Fixed (subagent routing: children now report up to the parent by default)
 
 The big one. Routing of child agents' replies is now architectural —

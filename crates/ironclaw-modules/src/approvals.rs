@@ -462,6 +462,7 @@ mod tests {
                 agent_group_id: None,
             },
             session_id: None,
+            row_id: None,
         };
         let out = handler.handle(input).unwrap();
         let dispatch = out.dispatch.unwrap();
@@ -490,6 +491,7 @@ mod tests {
                 agent_group_id: None,
             },
             session_id: None,
+            row_id: None,
         };
         let err = handler.handle(input).unwrap_err();
         assert!(err.to_string().contains("approval_id"));
@@ -510,6 +512,7 @@ mod tests {
                 agent_group_id: None,
             },
             session_id: None,
+            row_id: None,
         };
         let out = handler.handle(input).unwrap();
         assert!(out.dispatch.is_none());

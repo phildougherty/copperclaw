@@ -470,6 +470,7 @@ mod tests {
                     agent_group_id: None,
                 },
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         let dispatch = out.dispatch.unwrap();
@@ -499,6 +500,7 @@ mod tests {
                 agent_group_id: None,
             },
             session_id: None,
+            row_id: None,
         });
         assert!(bad.is_err());
         let bad = handler.handle(DeliveryActionInput {
@@ -511,6 +513,7 @@ mod tests {
                 agent_group_id: None,
             },
             session_id: None,
+            row_id: None,
         });
         assert!(bad.is_err());
         let bad = handler.handle(DeliveryActionInput {
@@ -523,6 +526,7 @@ mod tests {
                 agent_group_id: None,
             },
             session_id: None,
+            row_id: None,
         });
         assert!(bad.is_err());
     }
@@ -547,6 +551,7 @@ mod tests {
                     agent_group_id: None,
                 },
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         let msg = out.message.unwrap();
@@ -570,6 +575,7 @@ mod tests {
                 agent_group_id: None,
             },
             session_id: None,
+            row_id: None,
         });
         assert!(out.is_err());
     }
@@ -597,6 +603,7 @@ mod tests {
                     agent_group_id: None,
                 },
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         let dispatch = out.dispatch.expect("dispatch target");
@@ -628,6 +635,7 @@ mod tests {
                     agent_group_id: None,
                 },
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         let dispatch = out.dispatch.expect("dispatch target");
@@ -665,6 +673,7 @@ mod tests {
                     agent_group_id: None,
                 },
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         let msg = out.message.expect("fallback message");
@@ -697,6 +706,7 @@ mod tests {
                     agent_group_id: None,
                 },
                 session_id: None,
+                row_id: None,
             })
             .unwrap_err();
         assert!(format!("{err}").contains("text"));
@@ -720,6 +730,7 @@ mod tests {
                     agent_group_id: None,
                 },
                 session_id: None,
+                row_id: None,
             })
             .unwrap_err();
         assert!(format!("{err}").contains("emoji"));

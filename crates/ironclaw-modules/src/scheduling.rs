@@ -945,6 +945,7 @@ mod tests {
                 agent_group_id: Some(agent_group_id),
             },
             session_id: Some(session_id),
+            row_id: None,
         }
     }
 

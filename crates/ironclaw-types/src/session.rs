@@ -54,6 +54,16 @@ pub enum SessionStatus {
     Archived,
 }
 
+impl SessionStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Stopped => "stopped",
+            Self::Archived => "archived",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: SessionId,

@@ -483,20 +483,30 @@ impl DeliveryService {
                 self.handle_system(sess, row, &target, inbound_pool).await?;
             }
             MessageKind::Agent => {
-                // Agent-to-agent delivery: the agent_to_agent module owns the
-                // implementation via the action registry. In the absence of
-                // that handler the row is recorded as delivered with status
-                // "ok" — there is no external channel to invoke.
+                // Agent-to-agent delivery: the `agent_to_agent::AgentDispatchModule`
+                // owns the implementation via the action registry. Its handler
+                // writes the message into the target session's inbound.db.
+                //
+                // If the handler returns Err, propagate as `SystemAction` so the
+                // delivery loop's retry/backoff kicks in (transient SQLite
+                // contention is the common cause). If the handler returns Ok,
+                // we record the row delivered=ok — but ONLY THEN. Previously
+                // this path always recorded delivered=ok even on swallowed
+                // errors, which silently lost the parent inbound write.
+                //
+                // Tests that don't register a real `agent_dispatch` handler hit
+                // the "no handler" branch which records delivered=ok with a
+                // null platform_message_id — same as before for compatibility
+                // with the existing service-level tests.
                 if let Some(handler) = self.actions.get("agent_dispatch").map(|r| r.clone()) {
-                    // TODO(team-sc): session_id wired through for the
-                    // scheduling action handler; other handlers ignore.
                     let input = DeliveryActionInput {
                         action: "agent_dispatch".into(),
                         payload: row.content.clone(),
                         target: target.clone(),
                         session_id: Some(sess.id),
+                        row_id: Some(row.id),
                     };
-                    let _ = handler
+                    handler
                         .handle(input)
                         .map_err(|err| DeliveryError::SystemAction(err.to_string()))?;
                 }
@@ -589,6 +599,7 @@ impl DeliveryService {
             payload: action.payload,
             target: handler_target,
             session_id: Some(sess.id),
+            row_id: Some(row.id),
         };
         let output = handler
             .handle(input)

@@ -196,6 +196,25 @@ pub fn mark_container_stopped(db: &CentralDb, id: SessionId) -> Result<(), DbErr
     set_container_status(db, id, ContainerStatus::Stopped)
 }
 
+/// Set the session's lifecycle `status` (Active / Archived / Stopped).
+/// Used by retire / cleanup flows, and by the `agent_dispatch` test
+/// that pins the "don't dead-letter into archived parents" behaviour.
+pub fn set_status(
+    db: &CentralDb,
+    id: SessionId,
+    status: ironclaw_types::SessionStatus,
+) -> Result<(), DbError> {
+    let conn = db.conn()?;
+    let n = conn.execute(
+        "UPDATE sessions SET status = ?1 WHERE id = ?2",
+        params![status.as_str(), id.as_uuid().to_string()],
+    )?;
+    if n == 0 {
+        return Err(DbError::NotFound);
+    }
+    Ok(())
+}
+
 fn set_container_status(db: &CentralDb, id: SessionId, status: ContainerStatus) -> Result<(), DbError> {
     let conn = db.conn()?;
     let n = conn.execute(

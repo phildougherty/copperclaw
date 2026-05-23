@@ -504,10 +504,18 @@ impl ReplayHarness {
             "harness-key",
             self.anthropic_server.uri(),
         ));
-        let tool_ctx: Arc<dyn ironclaw_mcp::ToolContext> = Arc::new(RunnerToolCtx::new(
-            outbound.clone(),
-            paths.outbox.clone(),
-        ));
+        // If the session row records a parent, thread it into the
+        // runner ctx the same way production's `main.rs` does — without
+        // this, replay fixtures that exercise child sessions would
+        // bypass the Phase-2 routing change (Agent-kind default for
+        // `to: None`) and silently exercise the legacy path instead.
+        let mut tool_ctx_inner = RunnerToolCtx::new(outbound.clone(), paths.outbox.clone());
+        if let Ok(s) = ironclaw_db::tables::sessions::get(&self.central, sess) {
+            if let Some(parent) = s.source_session_id {
+                tool_ctx_inner = tool_ctx_inner.with_source_session_id(parent);
+            }
+        }
+        let tool_ctx: Arc<dyn ironclaw_mcp::ToolContext> = Arc::new(tool_ctx_inner);
 
         let tool_set = ironclaw_mcp::build_tool_set();
         let tool_defs: Vec<ironclaw_providers::ToolDef> = tool_set

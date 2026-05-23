@@ -30,13 +30,41 @@ pub struct WriteInbound {
 /// only needs to pick the next even value. Concurrent host writers are
 /// disallowed by design, so we don't worry about contention.
 pub fn insert(conn: &Connection, msg: &WriteInbound) -> Result<i64, DbError> {
+    insert_impl(conn, msg, false)
+}
+
+/// Same as [`insert`], but uses `INSERT OR IGNORE` so a row with the same
+/// `id` already present is a no-op rather than a constraint violation.
+///
+/// Used by `agent_dispatch` to make cross-session inbound writes idempotent
+/// under delivery-loop retry: the parent's inbound row reuses the source
+/// outbound row's [`MessageId`], so a retry of the dispatch (between the
+/// handler succeeding and `delivered::insert` succeeding) is dedup'd at
+/// the `SQLite` layer rather than duplicating the parent's inbound.
+///
+/// Returns `Ok(0)` when the insert was ignored (row already present),
+/// `Ok(seq)` with the new sequence number when the row was inserted.
+pub fn insert_idempotent(conn: &Connection, msg: &WriteInbound) -> Result<i64, DbError> {
+    insert_impl(conn, msg, true)
+}
+
+fn insert_impl(conn: &Connection, msg: &WriteInbound, idempotent: bool) -> Result<i64, DbError> {
     let seq = next_even_seq(conn)?;
-    conn.execute(
+    let sql = if idempotent {
+        "INSERT OR IGNORE INTO messages_in
+           (id, seq, kind, timestamp, status, process_after, recurrence,
+            series_id, tries, trigger, platform_id, channel_type, thread_id,
+            content, source_session_id, on_wake)
+         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+    } else {
         "INSERT INTO messages_in
            (id, seq, kind, timestamp, status, process_after, recurrence,
             series_id, tries, trigger, platform_id, channel_type, thread_id,
             content, source_session_id, on_wake)
-         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+    };
+    let rows = conn.execute(
+        sql,
         params![
             msg.id.as_uuid().to_string(),
             seq,
@@ -54,7 +82,11 @@ pub fn insert(conn: &Connection, msg: &WriteInbound) -> Result<i64, DbError> {
             i32::from(msg.on_wake),
         ],
     )?;
-    Ok(seq)
+    if rows == 0 {
+        Ok(0)
+    } else {
+        Ok(seq)
+    }
 }
 
 fn next_even_seq(conn: &Connection) -> Result<i64, DbError> {

@@ -85,17 +85,22 @@ impl DeliveryActionHandler for AgentDispatchHandler {
         let DeliveryActionInput {
             payload,
             session_id: source_session_id,
+            row_id,
             ..
         } = input;
 
+        // 1. Parse the target. Permanent failure (return Ok) — no retry
+        //    will rescue a malformed payload.
         let Some(target_session_id) = parse_target_session(&payload) else {
             warn!(
                 payload = %payload,
-                "agent_dispatch: payload missing `to.session_id`; dropping",
+                "agent_dispatch: payload missing tagged `to: {{kind: 'agent', session_id: ...}}`; dropping",
             );
             return Ok(DeliveryActionOutput::default());
         };
 
+        // 2. Resolve the target session. NotFound is permanent (target was
+        //    deleted before this row was dispatched) — log and Ok.
         let target = match sessions::get(&self.deps.central, target_session_id) {
             Ok(s) => s,
             Err(err) => {
@@ -108,32 +113,64 @@ impl DeliveryActionHandler for AgentDispatchHandler {
             }
         };
 
+        // 3. Refuse to dead-letter into a non-Active parent. The row
+        //    would land in an inbound.db nobody is reading. Permanent
+        //    (the parent's status won't flip back to Active for us).
+        if !matches!(target.status, ironclaw_types::SessionStatus::Active) {
+            warn!(
+                target_session_id = %target.id.as_uuid(),
+                status = ?target.status,
+                "agent_dispatch: target session is not Active; dropping (dead letter)",
+            );
+            return Ok(DeliveryActionOutput::default());
+        }
+
+        // 4. Open the target inbound. Filesystem-level errors are
+        //    transient (FS hiccup, permissions race during a chmod) so
+        //    propagate as ModuleError to trigger the delivery loop's
+        //    retry/backoff.
         let paths = SessionPaths::new(
             &self.deps.data_root,
             target.agent_group_id,
             target.id,
         );
-        let conn = match open_inbound(&paths) {
-            Ok(c) => c,
-            Err(err) => {
-                warn!(
-                    ?err,
-                    target_session_id = %target.id.as_uuid(),
-                    "agent_dispatch: open_inbound failed; dropping",
-                );
-                return Ok(DeliveryActionOutput::default());
-            }
-        };
+        let conn = open_inbound(&paths).map_err(|err| {
+            warn!(
+                ?err,
+                target_session_id = %target.id.as_uuid(),
+                "agent_dispatch: open_inbound failed; will retry",
+            );
+            ModuleError::other(
+                "agent_dispatch",
+                format!("open_inbound for {}: {err}", target.id.as_uuid()),
+            )
+        })?;
 
+        // 5. Build the body. Propagate text and thread_id from the
+        //    source payload so thread-aware features on the parent side
+        //    can correlate child reports back to the user's thread.
         let text = payload
             .get("text")
             .and_then(|t| t.as_str())
             .unwrap_or("")
             .to_owned();
+        let thread_id = payload
+            .get("thread_id")
+            .and_then(|t| t.as_str())
+            .map(str::to_owned);
         let content = serde_json::json!({ "text": text });
 
+        // 6. Use the source outbound row's MessageId as the parent
+        //    inbound row's id. Combined with `INSERT OR IGNORE`, this
+        //    makes the dispatch idempotent under retry: if the handler
+        //    succeeded but `delivered::insert` failed on the caller side,
+        //    the next retry re-runs us — and the duplicate insert is a
+        //    no-op rather than a second row. Falls back to a fresh
+        //    MessageId for the test-construction case where row_id is
+        //    absent (the test_support handler-only paths).
+        let inbound_id = row_id.unwrap_or_else(MessageId::new);
         let msg = WriteInbound {
-            id: MessageId::new(),
+            id: inbound_id,
             kind: MessageKind::Chat,
             timestamp: chrono::Utc::now(),
             content,
@@ -144,35 +181,39 @@ impl DeliveryActionHandler for AgentDispatchHandler {
             series_id: None,
             platform_id: None,
             channel_type: None,
-            thread_id: None,
+            thread_id,
             source_session_id: source_session_id.map(|s| s.as_uuid().to_string()),
         };
-        if let Err(err) = messages_in::insert(&conn, &msg) {
+        // 7. INSERT OR IGNORE on a constraint conflict. Transient SQLite
+        //    errors (busy_timeout exceeded, disk full) are propagated as
+        //    ModuleError so the delivery loop retries with backoff.
+        messages_in::insert_idempotent(&conn, &msg).map_err(|err| {
             warn!(
                 ?err,
                 target_session_id = %target.id.as_uuid(),
-                "agent_dispatch: messages_in::insert failed",
+                "agent_dispatch: messages_in::insert_idempotent failed; will retry",
             );
-        }
+            ModuleError::other(
+                "agent_dispatch",
+                format!("messages_in::insert for {}: {err}", target.id.as_uuid()),
+            )
+        })?;
         Ok(DeliveryActionOutput::default())
     }
 }
 
 fn parse_target_session(payload: &serde_json::Value) -> Option<SessionId> {
     let to = payload.get("to")?;
-    // Accept both the tagged Recipient::Agent form `{ "kind": "agent",
-    // "session_id": "..." }` and a bare-string `{ "to": "<uuid>" }`
-    // shape that some pre-Phase-2 callers might still emit. The latter
-    // is best-effort — newer callers always use the tagged form.
-    if let Some(kind) = to.get("kind").and_then(|k| k.as_str()) {
-        if kind != "agent" {
-            return None;
-        }
+    // Require the tagged `Recipient::Agent` form. The looser bare-string
+    // fallback that previously existed allowed any `to: "<uuid>"` shape to
+    // route into the matching session — a cross-routing risk if a
+    // different recipient variant ever happened to serialise with a
+    // session-id-shaped string.
+    let kind = to.get("kind").and_then(|k| k.as_str())?;
+    if kind != "agent" {
+        return None;
     }
-    let id_str = to
-        .get("session_id")
-        .and_then(|s| s.as_str())
-        .or_else(|| to.as_str())?;
+    let id_str = to.get("session_id").and_then(|s| s.as_str())?;
     let parsed = uuid::Uuid::parse_str(id_str).ok()?;
     Some(SessionId(parsed))
 }
@@ -241,6 +282,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_target_rejects_untagged_uuid_string() {
+        // A bare-string `to: "<uuid>"` (no `{kind: 'agent'}` wrapper)
+        // must NOT route as an agent target. The old permissive parser
+        // accepted this and could cross-route into any session.
+        let payload = serde_json::json!({
+            "to": "00000000-0000-0000-0000-000000000001"
+        });
+        assert!(parse_target_session(&payload).is_none());
+    }
+
+    #[test]
+    fn parse_target_rejects_untagged_object_with_session_id() {
+        // Object missing the `kind: "agent"` discriminator also must
+        // not match — without the tag we cannot tell whether the row
+        // was actually intended as an Agent recipient.
+        let payload = serde_json::json!({
+            "to": { "session_id": "00000000-0000-0000-0000-000000000001" }
+        });
+        assert!(parse_target_session(&payload).is_none());
+    }
+
+    #[test]
     fn dispatch_writes_into_target_inbound() {
         let (tmp, central) = fresh_central();
         let parent = fresh_session(&central, "parent");
@@ -261,6 +324,7 @@ mod tests {
                 payload,
                 target: crate::context::DispatchTarget::default(),
                 session_id: Some(child.id),
+                row_id: None,
             })
             .unwrap();
         assert!(out.message.is_none());
@@ -301,8 +365,124 @@ mod tests {
                 payload,
                 target: crate::context::DispatchTarget::default(),
                 session_id: Some(child.id),
+                row_id: None,
             })
             .unwrap();
         assert!(out.message.is_none());
+    }
+
+    #[test]
+    fn dispatch_is_idempotent_under_retry() {
+        // Two dispatch calls with the same row_id must produce ONE
+        // parent inbound row, not two. Without `INSERT OR IGNORE` the
+        // delivery loop's retry path (transient `delivered::insert`
+        // failure after handler success) would create duplicates.
+        let (tmp, central) = fresh_central();
+        let parent = fresh_session(&central, "parent");
+        let child = fresh_session(&central, "child");
+
+        let module = AgentDispatchModule::new(central.clone(), tmp.path());
+        let handler = AgentDispatchHandler {
+            deps: module.deps.clone(),
+        };
+        let row_id = MessageId::new();
+        let payload = serde_json::json!({
+            "text": "report",
+            "to": { "kind": "agent", "session_id": parent.id.as_uuid().to_string() }
+        });
+        for _ in 0..2 {
+            handler
+                .handle(DeliveryActionInput {
+                    action: "agent_dispatch".into(),
+                    payload: payload.clone(),
+                    target: crate::context::DispatchTarget::default(),
+                    session_id: Some(child.id),
+                    row_id: Some(row_id),
+                })
+                .unwrap();
+        }
+        let parent_paths = SessionPaths::new(tmp.path(), parent.agent_group_id, parent.id);
+        let in_conn = open_inbound(&parent_paths).unwrap();
+        let pending = messages_in::get_pending(&in_conn, true, 10).unwrap();
+        assert_eq!(pending.len(), 1, "retry must dedup via INSERT OR IGNORE");
+    }
+
+    #[test]
+    fn dispatch_propagates_thread_id_from_payload() {
+        // Thread context must survive the cross-session write so
+        // thread-aware features on the parent side (per-thread mute,
+        // summarise-thread, scope-tools-to-thread) can correlate the
+        // child's reply with the originating user thread.
+        let (tmp, central) = fresh_central();
+        let parent = fresh_session(&central, "parent");
+        let child = fresh_session(&central, "child");
+
+        let module = AgentDispatchModule::new(central.clone(), tmp.path());
+        let handler = AgentDispatchHandler {
+            deps: module.deps.clone(),
+        };
+        let payload = serde_json::json!({
+            "text": "in-thread reply",
+            "thread_id": "thread-abc",
+            "to": { "kind": "agent", "session_id": parent.id.as_uuid().to_string() }
+        });
+        handler
+            .handle(DeliveryActionInput {
+                action: "agent_dispatch".into(),
+                payload,
+                target: crate::context::DispatchTarget::default(),
+                session_id: Some(child.id),
+                row_id: Some(MessageId::new()),
+            })
+            .unwrap();
+        let parent_paths = SessionPaths::new(tmp.path(), parent.agent_group_id, parent.id);
+        let in_conn = open_inbound(&parent_paths).unwrap();
+        let pending = messages_in::get_pending(&in_conn, true, 10).unwrap();
+        assert_eq!(pending[0].thread_id.as_deref(), Some("thread-abc"));
+    }
+
+    #[test]
+    fn dispatch_refuses_archived_target() {
+        // A target session that is not Active must not be written into
+        // — no runner is reading that inbound.db. The handler must log
+        // and return Ok (permanent — retry won't help) rather than
+        // dead-lettering.
+        let (tmp, central) = fresh_central();
+        let parent = fresh_session(&central, "parent");
+        // Archive the parent.
+        archive_session(&central, parent.id);
+        let child = fresh_session(&central, "child");
+
+        let module = AgentDispatchModule::new(central, tmp.path());
+        let handler = AgentDispatchHandler {
+            deps: module.deps.clone(),
+        };
+        let payload = serde_json::json!({
+            "text": "into the void",
+            "to": { "kind": "agent", "session_id": parent.id.as_uuid().to_string() }
+        });
+        handler
+            .handle(DeliveryActionInput {
+                action: "agent_dispatch".into(),
+                payload,
+                target: crate::context::DispatchTarget::default(),
+                session_id: Some(child.id),
+                row_id: Some(MessageId::new()),
+            })
+            .unwrap();
+        let parent_paths = SessionPaths::new(tmp.path(), parent.agent_group_id, parent.id);
+        // open_inbound might still create the file; we just verify no
+        // row was inserted into messages_in.
+        if let Ok(in_conn) = open_inbound(&parent_paths) {
+            let pending = messages_in::get_pending(&in_conn, true, 10).unwrap();
+            assert!(
+                pending.is_empty(),
+                "dispatch must not write into an archived session"
+            );
+        }
+    }
+
+    fn archive_session(central: &ironclaw_db::central::CentralDb, id: SessionId) {
+        sessions::set_status(central, id, ironclaw_types::SessionStatus::Archived).unwrap();
     }
 }

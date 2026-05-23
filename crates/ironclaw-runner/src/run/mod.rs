@@ -510,6 +510,8 @@ async fn finalize_messages(
 /// One short chat outbound per failed inbound, routed back to the
 /// channel the inbound came in on. Idempotent at the per-row level
 /// because each inbound has a stable id that flows into `in_reply_to`.
+const APOLOGY_TEXT: &str = "I hit a snag processing your message and couldn't finish a reply. Could you try rephrasing or sending a smaller request? (Operator: see runner stderr for the exact error.)";
+
 async fn emit_terminal_failure_apologies(
     deps: &RunnerDeps,
     rows: &[MessageInRow],
@@ -526,28 +528,47 @@ async fn emit_terminal_failure_apologies(
         if !matches!(row.kind, ironclaw_types::MessageKind::Chat) {
             continue;
         }
-        // Skip if the inbound has no channel info (e.g. test fixtures
-        // that route through a bare router). Without routing the
-        // delivery loop can't dispatch the apology anyway.
-        let Some(channel_type) = &row.channel_type else {
+        // Pick the apology shape. Three cases mirror the sweep
+        // (`ironclaw-host-sweep/src/checks/apology.rs`):
+        //   (a) Inbound has channel routing — chat-kind apology back
+        //       through the same channel.
+        //   (b) Inbound has NO channel routing but has source_session_id
+        //       — Agent-kind apology UP to the source so the parent
+        //       agent learns the child failed.
+        //   (c) Neither — silently skip (no recipient to apologize to).
+        let apology = if let (Some(channel_type), Some(platform_id)) =
+            (row.channel_type.as_ref(), row.platform_id.as_ref())
+        {
+            WriteOutbound {
+                id: ironclaw_types::MessageId::new(),
+                in_reply_to: Some(row.id),
+                timestamp: chrono::Utc::now(),
+                deliver_after: None,
+                recurrence: None,
+                kind: ironclaw_types::MessageKind::Chat,
+                channel_type: Some(channel_type.clone()),
+                platform_id: Some(platform_id.clone()),
+                thread_id: row.thread_id.clone(),
+                content: serde_json::json!({ "text": APOLOGY_TEXT }),
+            }
+        } else if let Some(source) = row.source_session_id.as_deref() {
+            WriteOutbound {
+                id: ironclaw_types::MessageId::new(),
+                in_reply_to: None,
+                timestamp: chrono::Utc::now(),
+                deliver_after: None,
+                recurrence: None,
+                kind: ironclaw_types::MessageKind::Agent,
+                channel_type: None,
+                platform_id: None,
+                thread_id: None,
+                content: serde_json::json!({
+                    "text": APOLOGY_TEXT,
+                    "to": { "kind": "agent", "session_id": source },
+                }),
+            }
+        } else {
             continue;
-        };
-        let Some(platform_id) = &row.platform_id else {
-            continue;
-        };
-        let apology = WriteOutbound {
-            id: ironclaw_types::MessageId::new(),
-            in_reply_to: Some(row.id),
-            timestamp: chrono::Utc::now(),
-            deliver_after: None,
-            recurrence: None,
-            kind: ironclaw_types::MessageKind::Chat,
-            channel_type: Some(channel_type.clone()),
-            platform_id: Some(platform_id.clone()),
-            thread_id: row.thread_id.clone(),
-            content: serde_json::json!({
-                "text": "I hit a snag processing your message and couldn't finish a reply. Could you try rephrasing or sending a smaller request? (Operator: see runner stderr for the exact error.)",
-            }),
         };
         if let Err(err) = insert_out(conn, &apology) {
             tracing::warn!(?err, "apology insert failed");

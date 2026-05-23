@@ -812,6 +812,7 @@ mod tests {
                 }),
                 target,
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         assert!(out.message.is_none(), "create_agent has no chat reply");
@@ -851,6 +852,7 @@ mod tests {
                 }),
                 target,
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         // Locate the newly-created child and read its inbound.db.
@@ -925,6 +927,7 @@ mod tests {
                 }),
                 target,
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         let child_session = sessions::list_active(&central)
@@ -964,6 +967,7 @@ mod tests {
                 }),
                 target,
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         let new_session = sessions::list_active(&central)
@@ -1006,6 +1010,7 @@ mod tests {
                 }),
                 target,
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         let new_session = sessions::list_active(&central)
@@ -1034,6 +1039,7 @@ mod tests {
                 }),
                 target,
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         let results = read_inbound_create_results(tmp.path(), parent);
@@ -1057,6 +1063,7 @@ mod tests {
                 }),
                 target,
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         let groups = agent_groups::list(&central).unwrap();
@@ -1085,6 +1092,7 @@ mod tests {
                 }),
                 target,
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         let after = agent_groups::list(&central).unwrap().len();
@@ -1116,6 +1124,7 @@ mod tests {
                 }),
                 target,
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         let after = agent_groups::list(&central).unwrap().len();
@@ -1155,6 +1164,7 @@ mod tests {
                 }),
                 target,
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         let after = agent_groups::list(&central).unwrap().len();
@@ -1194,6 +1204,7 @@ mod tests {
                 }),
                 target,
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         let after = agent_groups::list(&central).unwrap().len();
@@ -1224,6 +1235,7 @@ mod tests {
                 payload: serde_json::json!({"name": "no-instructions"}),
                 target,
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         let after = agent_groups::list(&central).unwrap().len();
@@ -1273,6 +1285,7 @@ mod tests {
                 }),
                 target,
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         let after = agent_groups::list(&central).unwrap().len();
@@ -1327,6 +1340,7 @@ mod tests {
                 }),
                 target,
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         let after = agent_groups::list(&central).unwrap().len();
@@ -1370,6 +1384,7 @@ mod tests {
                 }),
                 target,
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         let after = agent_groups::list(&central).unwrap().len();
@@ -1399,6 +1414,7 @@ mod tests {
                 }),
                 target,
                 session_id: None,
+                row_id: None,
             })
             .unwrap();
         let after = agent_groups::list(&central).unwrap().len();
@@ -1470,6 +1486,7 @@ mod tests {
                     }),
                     target: orphan_target,
                     session_id: None,
+                    row_id: None,
                 })
                 .unwrap();
         });

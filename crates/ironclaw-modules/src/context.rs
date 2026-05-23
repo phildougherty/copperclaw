@@ -8,8 +8,8 @@
 use crate::error::ModuleError;
 use async_trait::async_trait;
 use ironclaw_types::{
-    AgentGroupId, ChannelType, InboundEvent, MessagingGroupId, OutboundMessage, SenderIdentity,
-    SessionId, UserId,
+    AgentGroupId, ChannelType, InboundEvent, MessageId, MessagingGroupId, OutboundMessage,
+    SenderIdentity, SessionId, UserId,
 };
 use std::sync::Arc;
 
@@ -248,6 +248,14 @@ pub struct DeliveryActionInput {
     /// Populated by the host's delivery service when invoking the handler;
     /// `None` in some tests that construct `DeliveryActionInput` directly.
     pub session_id: Option<SessionId>,
+    /// The outbound row's `MessageId`, threaded through so handlers can
+    /// derive deterministic inbound ids for idempotent cross-session
+    /// writes (used by `agent_dispatch` to dedup retries: the parent's
+    /// inbound row reuses this id, and `INSERT OR IGNORE` semantics in
+    /// `messages_in::insert_idempotent` make a retry a no-op).
+    /// `None` in tests that construct `DeliveryActionInput` directly
+    /// without a real outbound row.
+    pub row_id: Option<MessageId>,
 }
 
 /// What a delivery action wants the host to do.

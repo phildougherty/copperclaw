@@ -70,6 +70,11 @@ struct StuckInboundRow {
     channel_type: Option<ChannelType>,
     platform_id: Option<String>,
     thread_id: Option<String>,
+    /// Set when the inbound was written by `agent_dispatch` (a child
+    /// reporting up to its parent). When channel routing is absent,
+    /// the apology cascade walks this UUID via an Agent-kind outbound
+    /// so the parent agent learns the child failed.
+    source_session_id: Option<String>,
 }
 
 /// Result of one apology emit. Returned so the sweep can count them
@@ -159,35 +164,59 @@ pub fn check(
             continue;
         };
 
-        // Skip rows that have no usable routing. Without channel_type
-        // and platform_id the delivery loop can't dispatch the apology
-        // back to the right place. Still mark tries=99 so we don't keep
-        // re-evaluating on every sweep — the user will never see
-        // anything anyway.
-        let (Some(channel_type), Some(platform_id)) =
+        // Pick the apology shape. Three cases:
+        //   (a) Inbound has channel_type + platform_id — chat-kind
+        //       apology back through the same channel (root sessions
+        //       and child sessions wired directly to a user channel).
+        //   (b) Inbound has NO channel routing but has `source_session_id`
+        //       — Agent-kind apology back UP the chain, so the parent
+        //       (or whoever owns the source session) sees a system
+        //       message that we failed. Lets the parent surface the
+        //       failure to the user instead of silently swallowing it.
+        //   (c) Neither — give up, mark tries=99 to stop re-evaluating.
+        let apology = if let (Some(channel_type), Some(platform_id)) =
             (row.channel_type.clone(), row.platform_id.clone())
-        else {
+        {
+            WriteOutbound {
+                id: MessageId::new(),
+                in_reply_to: Some(row.id),
+                timestamp: now,
+                deliver_after: None,
+                recurrence: None,
+                kind: MessageKind::Chat,
+                channel_type: Some(channel_type),
+                platform_id: Some(platform_id),
+                thread_id: row.thread_id,
+                content: serde_json::json!({ "text": APOLOGY_TEXT }),
+            }
+        } else if let Some(source) = row.source_session_id.as_deref() {
+            // Build an Agent-kind apology targeted at the source
+            // session. The host's `agent_dispatch` handler writes it
+            // into that session's inbound on the next delivery sweep.
+            WriteOutbound {
+                id: MessageId::new(),
+                in_reply_to: None,
+                timestamp: now,
+                deliver_after: None,
+                recurrence: None,
+                kind: MessageKind::Agent,
+                channel_type: None,
+                platform_id: None,
+                thread_id: None,
+                content: serde_json::json!({
+                    "text": APOLOGY_TEXT,
+                    "to": { "kind": "agent", "session_id": source },
+                }),
+            }
+        } else {
             mark_tries_apology_sent(inbound_pool.conn_mut(), row.id)?;
             tracing::debug!(
                 target: "ironclaw_host_sweep",
                 session = %session.id,
                 message = %row.id,
-                "apology skipped: inbound has no channel routing",
+                "apology skipped: inbound has no channel routing and no source_session_id",
             );
             continue;
-        };
-
-        let apology = WriteOutbound {
-            id: MessageId::new(),
-            in_reply_to: Some(row.id),
-            timestamp: now,
-            deliver_after: None,
-            recurrence: None,
-            kind: MessageKind::Chat,
-            channel_type: Some(channel_type),
-            platform_id: Some(platform_id),
-            thread_id: row.thread_id,
-            content: serde_json::json!({ "text": APOLOGY_TEXT }),
         };
 
         if let Err(err) = insert_out(outbound_pool.conn_mut(), &apology) {
@@ -236,7 +265,7 @@ fn scan_stuck_inbounds(
 ) -> Result<Vec<StuckInboundRow>, SweepError> {
     let pool = root.inbound_pool(&session.agent_group_id, &session.id)?;
     let mut stmt = pool.conn().prepare(
-        "SELECT id, timestamp, channel_type, platform_id, thread_id
+        "SELECT id, timestamp, channel_type, platform_id, thread_id, source_session_id
          FROM messages_in
          WHERE status = 'pending'
            AND kind = 'chat'
@@ -271,6 +300,7 @@ fn scan_stuck_inbounds(
                 channel_type: channel_type.map(ChannelType::from),
                 platform_id: row.get("platform_id")?,
                 thread_id: row.get("thread_id")?,
+                source_session_id: row.get("source_session_id")?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;

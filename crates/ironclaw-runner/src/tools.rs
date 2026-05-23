@@ -330,9 +330,19 @@ impl ToolContext for RunnerToolCtx {
         // the `tools_allowed` allowlist (defaults to read-only) is
         // what prevents that. The two are intentionally redundant.
         let provider = deps.provider.clone();
+        // The subagent inherits the parent's originating routing AND
+        // `source_session_id` so that any allowlisted message-emitting
+        // tool (operator-widened tools_allowed) lands its row through
+        // the same routing rules as a tool call from the parent's main
+        // turn — same channel for root sessions, same parent for
+        // child agents. Without this the subagent would emit rows with
+        // empty channel routing and `MessageKind::Chat`, which the
+        // delivery loop rejects with `NoRoute`.
+        let inherited_origin = self.current_originating();
         let tool_ctx: Arc<dyn ToolContext> = Arc::new(SubagentCtxAdapter {
             inner: self.outbound.clone(),
             outbox_root: self.outbox_root.clone(),
+            origin: inherited_origin,
         });
         let sub_deps = SubagentDeps {
             provider: &provider,
@@ -373,6 +383,12 @@ impl ToolContext for RunnerToolCtx {
 struct SubagentCtxAdapter {
     inner: SharedOutbound,
     outbox_root: PathBuf,
+    /// Snapshot of the parent's routing at the time the subagent was
+    /// spawned. Inherited so subagent-emitted rows route through the
+    /// same MG / parent path as the parent's own emissions. Without
+    /// this every subagent emission landed with empty channel columns
+    /// and hit `NoRoute`.
+    origin: OriginatingRouting,
 }
 
 #[async_trait]
@@ -384,12 +400,7 @@ impl ToolContext for SubagentCtxAdapter {
         let outbox = self.outbox_root.clone();
         let mut guard = self.inner.lock().await;
         let conn: &mut Connection = &mut guard;
-        // Subagents do not own an originating-inbound concept (they
-        // run on behalf of the parent turn), so we pass an empty
-        // routing and let the parent's own emit-outbound handle the
-        // user-facing reply.
-        let origin = OriginatingRouting::default();
-        apply_effect(conn, &outbox, effect, &origin).map_err(to_tool_error)
+        apply_effect(conn, &outbox, effect, &self.origin).map_err(to_tool_error)
     }
     async fn list_tasks(&self) -> Result<Vec<TaskSummary>, ToolError> {
         Ok(Vec::new())
@@ -469,7 +480,23 @@ fn apply_send_message(
     let mut body = serde_json::Map::new();
     body.insert("text".into(), serde_json::Value::String(text));
     if let Some(r) = &routed.body_to {
-        body.insert("to".into(), serde_json::to_value(r).unwrap_or_default());
+        // `Recipient` is a tagged enum with simple owned fields — its
+        // `Serialize` impl cannot fail. `.expect` makes the assumption
+        // explicit so a future regression on `Recipient` surfaces
+        // loudly instead of silently producing `to: null`.
+        body.insert(
+            "to".into(),
+            serde_json::to_value(r).expect("Recipient is always serialisable"),
+        );
+    }
+    // Agent-kind rows go to `agent_dispatch` which writes into the
+    // target session's inbound. Carry the inbound's `thread_id` into
+    // the body so the dispatcher can preserve thread context on the
+    // parent's inbound row.
+    if matches!(routed.kind, MessageKind::Agent) {
+        if let Some(thread) = &routed.thread_id {
+            body.insert("thread_id".into(), serde_json::Value::String(thread.clone()));
+        }
     }
     let seq = insert_outbound_row(conn, MessageId::new(), serde_json::Value::Object(body), &routed)?;
     Ok(ToolEffectAck::Message { seq })
@@ -497,13 +524,36 @@ fn apply_send_file(
     let target = target_dir.join(&filename);
     std::fs::write(&target, &data)?;
 
-    let routed = resolve_outbound_routing(to, origin);
+    let mut routed = resolve_outbound_routing(to, origin);
+    // `send_file` cannot use the Agent-kind dispatch path: the
+    // `agent_dispatch` handler only forwards the body's text into the
+    // parent's inbound — it has no mechanism to copy the file bytes
+    // from the child's outbox to the parent's session. If routing
+    // resolved to Agent (e.g. a child agent's default `send_file(to:
+    // None)`), force-fall-back to Chat with the inherited channel
+    // routing so the bytes actually reach the user's channel. The
+    // tradeoff: files always go through the inherited MG, never up to
+    // the parent's inbound. Document via the changelog; long-term
+    // answer is a real cross-session attachment-relay in `agent_dispatch`.
+    if matches!(routed.kind, MessageKind::Agent) {
+        routed.kind = MessageKind::Chat;
+        // Drop the synthesised parent-as-recipient — there's no
+        // useful body.to for a Chat-kind row that goes through the
+        // inherited MG.
+        routed.body_to = None;
+        // Restore in_reply_to for the chat path (resolve_outbound_routing
+        // elided it for Agent-kind rows).
+        routed.in_reply_to = origin.in_reply_to;
+    }
     let mut body = serde_json::Map::new();
     if let Some(t) = text {
         body.insert("text".into(), serde_json::Value::String(t));
     }
     if let Some(r) = &routed.body_to {
-        body.insert("to".into(), serde_json::to_value(r).unwrap_or_default());
+        body.insert(
+            "to".into(),
+            serde_json::to_value(r).expect("Recipient is always serialisable"),
+        );
     }
     body.insert(
         "files".into(),
@@ -755,27 +805,40 @@ struct OutboundRouting {
 /// Decide where this outbound row should land.
 ///
 /// Rules (in order):
-/// 1. Caller passed `to: Recipient::Agent { session_id }` → kind Agent.
-/// 2. Caller passed any other explicit `to:` → kind Chat with the
-///    explicit recipient preserved in the body; the channel routing
-///    still falls back to the originating inbound (the delivery loop
-///    doesn't yet route arbitrary channel ids on its own).
-/// 3. Caller passed no `to:` AND the session has a `source_session_id`
-///    (i.e. this is a child agent) → kind Agent, synthesise the
-///    recipient pointing at the parent. **This is the headline routing
-///    change in `docs/plans/agent-to-agent-routing.md` Phase 2.**
-/// 4. Otherwise → kind Chat, channel routing from the inbound. The
-///    root-session "reply to user" default.
+/// 1. Caller passed `to: Recipient::Agent { session_id }` → kind Agent
+///    addressed to that session. Channel columns on the row are elided
+///    (Agent-kind dispatches via the body's `to`, not the row's
+///    channel routing).
+/// 2. Caller passed `to: Recipient::Channel { .. }` → kind Chat. The
+///    explicit recipient is preserved in the body for any downstream
+///    consumer that wants to inspect the override. Channel routing on
+///    the row stays inherited from the originating inbound: today's
+///    delivery loop doesn't parse arbitrary channel id strings on its
+///    own, so the row inherits routing for now.
+/// 3. Caller passed no `to:` AND the runner has a `source_session_id`
+///    AND the originating inbound had no channel routing (i.e. this is
+///    truly an internal child→parent reply, not a direct user message
+///    to a child session via inherited MG) → kind Agent, synthesise
+///    the recipient pointing at the parent.
+/// 4. Otherwise → kind Chat, channel routing from the inbound. Covers
+///    root-session "reply to user" AND the edge case where the child
+///    session has been wired directly to a user channel and a user
+///    message landed on it (per-thread wirings, operator-added wiring
+///    pointing at the child's `agent_group`). In those cases the user
+///    expects a reply, not silent siphoning up to the parent.
 fn resolve_outbound_routing(
     to: Option<Recipient>,
     origin: &OriginatingRouting,
 ) -> OutboundRouting {
     use ironclaw_mcp::Recipient as R;
+    let inbound_came_from_parent = origin.channel_type.is_none()
+        && origin.platform_id.is_none()
+        && origin.source_session_id.is_some();
     let kind = match &to {
         Some(R::Agent { .. }) => MessageKind::Agent,
         Some(_) => MessageKind::Chat,
         None => {
-            if origin.source_session_id.is_some() {
+            if inbound_came_from_parent {
                 MessageKind::Agent
             } else {
                 MessageKind::Chat
@@ -784,17 +847,33 @@ fn resolve_outbound_routing(
     };
     let body_to = match to {
         Some(r) => Some(r),
-        None => origin
+        None if inbound_came_from_parent => origin
             .source_session_id
             .map(|sid| R::Agent { session_id: sid.as_uuid().to_string() }),
+        None => None,
     };
+    // For Agent-kind rows, the dispatcher receives channel routing
+    // through the body's `to` payload (and we propagate thread_id into
+    // the body so the parent's inbound row can carry it). For Chat-kind
+    // rows the row's channel columns drive delivery.
+    let inherit_thread = matches!(kind, MessageKind::Agent | MessageKind::Chat);
+    let _ = inherit_thread; // suppressed; reads as documentation here.
     OutboundRouting {
         kind,
         body_to,
         channel_type: origin.channel_type.clone(),
         platform_id: origin.platform_id.clone(),
         thread_id: origin.thread_id.clone(),
-        in_reply_to: origin.in_reply_to,
+        // Agent-kind rows MUST NOT carry an `in_reply_to` pointing at
+        // the originating session's `messages_in.id` — that id is
+        // session-local and would be a dangling reference inside the
+        // target's session. Chat-kind rows keep the back-reference for
+        // the apology-lookup / telemetry threading paths.
+        in_reply_to: if matches!(kind, MessageKind::Agent) {
+            None
+        } else {
+            origin.in_reply_to
+        },
     }
 }
 
@@ -887,22 +966,21 @@ mod tests {
     #[tokio::test]
     async fn child_send_message_with_no_to_routes_to_parent() {
         // Phase 2 of docs/plans/agent-to-agent-routing.md: when the
-        // runner has a `source_session_id` (i.e. this is a child agent
-        // spawned via `create_agent`), `send_message(to: None)` should
-        // emit a MessageKind::Agent row whose body points at the
-        // parent — NOT a chat-kind row dumped into the inherited
-        // user channel.
+        // runner has a `source_session_id` AND the inbound was a
+        // child-routed (no channel columns) row written by the
+        // `agent_dispatch` handler, `send_message(to: None)` should
+        // route UP to the parent — emit a MessageKind::Agent row.
         let tmp = tempfile::tempdir().unwrap();
         let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
         let conn = open_outbound(&paths).unwrap();
         let parent_session = SessionId::new();
         let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
             .with_source_session_id(parent_session);
-        // Simulate a parent inbound that the child is processing —
-        // inheriting the user's channel routing.
+        // Simulate the inbound being processed: kickoff from the
+        // parent, channel columns empty (agent_dispatch elides them).
         ctx.set_originating(OriginatingRouting {
-            channel_type: Some("telegram".into()),
-            platform_id: Some("chat-1".into()),
+            channel_type: None,
+            platform_id: None,
             thread_id: None,
             in_reply_to: None,
             source_session_id: Some(parent_session),
@@ -917,7 +995,8 @@ mod tests {
         assert_eq!(
             row.kind,
             MessageKind::Agent,
-            "child default routing must produce an Agent-kind row, not Chat",
+            "child default routing on a parent-routed inbound must produce \
+             an Agent-kind row, not Chat",
         );
         assert!(
             row.channel_type.is_none() && row.platform_id.is_none(),
@@ -933,6 +1012,112 @@ mod tests {
             row.content["to"]["session_id"],
             parent_session.as_uuid().to_string(),
             "child must address its reply to the parent session",
+        );
+    }
+
+    #[tokio::test]
+    async fn child_send_message_to_none_with_user_channel_inbound_replies_to_user() {
+        // The new guard: if the inbound being processed CAME FROM a
+        // user channel (channel_type/platform_id Some) — e.g. a
+        // per-thread wiring landed it directly on the child session —
+        // then `send_message(to: None)` should reply back to the user,
+        // NOT siphon up to the parent. Otherwise children wired to
+        // user channels would silently swallow user messages.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let parent_session = SessionId::new();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
+            .with_source_session_id(parent_session);
+        ctx.set_originating(OriginatingRouting {
+            channel_type: Some("telegram".into()),
+            platform_id: Some("chat-1".into()),
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: Some(parent_session),
+        });
+        ctx.emit_outbound(OutboundToolEffect::SendMessage(SendMessageSpec {
+            to: None,
+            text: "hi user".into(),
+        }))
+        .await
+        .unwrap();
+        let row = last_row(&ctx).await;
+        assert_eq!(
+            row.kind,
+            MessageKind::Chat,
+            "user-channel inbound on a child session must reply via channel, \
+             not siphon to the parent",
+        );
+        assert_eq!(row.platform_id.as_deref(), Some("chat-1"));
+    }
+
+    #[tokio::test]
+    async fn child_send_file_to_none_routes_via_channel_not_parent() {
+        // The `agent_dispatch` handler can't relay file bytes between
+        // sessions, so `send_file(to: None)` from a child must fall
+        // back to the inherited channel routing (Chat-kind). Bytes go
+        // to the user; the alternative is silent file loss.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
+            .with_source_session_id(SessionId::new());
+        ctx.set_originating(OriginatingRouting {
+            channel_type: None,
+            platform_id: None,
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: ctx.source_session_id(),
+        });
+        ctx.emit_outbound(OutboundToolEffect::SendFile(SendFileSpec {
+            to: None,
+            filename: "report.pdf".into(),
+            data: b"bytes".to_vec(),
+            text: Some("see attached".into()),
+        }))
+        .await
+        .unwrap();
+        let row = last_row(&ctx).await;
+        assert_eq!(
+            row.kind,
+            MessageKind::Chat,
+            "send_file must NOT use Agent-kind dispatch (it can't carry bytes \
+             across session boundaries) — fall back to Chat so the inherited \
+             channel actually delivers the file",
+        );
+    }
+
+    #[tokio::test]
+    async fn child_send_message_no_to_propagates_thread_id_to_body() {
+        // Thread context must reach the parent's inbound row. The
+        // runner copies origin.thread_id into the Agent body so
+        // `agent_dispatch` can write it onto the parent's inbound.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let parent_session = SessionId::new();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
+            .with_source_session_id(parent_session);
+        ctx.set_originating(OriginatingRouting {
+            channel_type: None,
+            platform_id: None,
+            thread_id: Some("user-thread-1".into()),
+            in_reply_to: None,
+            source_session_id: Some(parent_session),
+        });
+        ctx.emit_outbound(OutboundToolEffect::SendMessage(SendMessageSpec {
+            to: None,
+            text: "in-thread reply".into(),
+        }))
+        .await
+        .unwrap();
+        let row = last_row(&ctx).await;
+        assert_eq!(row.kind, MessageKind::Agent);
+        assert_eq!(
+            row.content["thread_id"], "user-thread-1",
+            "thread_id must be preserved on the Agent-kind body so \
+             agent_dispatch can carry it onto the parent's inbound",
         );
     }
 
