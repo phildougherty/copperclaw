@@ -661,6 +661,23 @@ impl DeliveryActionHandler for CreateAgentHandler {
             }
         }
 
+        // Copy the parent's `session_routing` (channel_type +
+        // platform_id + thread_id) into the child's inbound.db. The
+        // delivery service uses this record — not `sessions.messaging_
+        // group_id` — to resolve where to send outbound chat messages,
+        // so without it the child's `send_message` calls fail with
+        // `NoRoute` and the user never sees the reply. The router
+        // normally writes session_routing on inbound arrival; spawned
+        // sessions have no inbound event so we mirror it here.
+        if let Some(parent) = parent_session.as_ref() {
+            self.copy_parent_session_routing(
+                parent.agent_group_id,
+                parent.session_id,
+                group.id,
+                session.id,
+            );
+        }
+
         // Seed the child's inbound.db with the operator's instructions
         // as the first user-side chat message. Without this kicker the
         // child has zero pending inbound, the container manager never
@@ -877,6 +894,61 @@ impl CreateAgentHandler {
             body.insert("detail".into(), serde_json::json!(d));
         }
         serde_json::json!({ "create_agent_result": body })
+    }
+
+    /// Mirror the parent session's `session_routing` record into the
+    /// child's `inbound.db`. The delivery service uses this row — not
+    /// `sessions.messaging_group_id` — to resolve where outbound chat
+    /// messages should be sent; without it the child's first
+    /// `send_message` call fails with `NoRoute` and the operator never
+    /// sees the reply. Logs on failure; non-fatal (the operator can
+    /// hand-write the row later if it really matters).
+    fn copy_parent_session_routing(
+        &self,
+        parent_agent_group: AgentGroupId,
+        parent_session: SessionId,
+        child_agent_group: AgentGroupId,
+        child_session: SessionId,
+    ) {
+        let parent_paths =
+            SessionPaths::new(&self.deps.data_root, parent_agent_group, parent_session);
+        let parent_conn = match ironclaw_db::session::open_inbound(&parent_paths) {
+            Ok(c) => c,
+            Err(err) => {
+                warn!(?err, "create_agent: open parent inbound for routing copy failed");
+                return;
+            }
+        };
+        let routing = match ironclaw_db::tables::session_routing::read(&parent_conn) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                warn!(
+                    parent_session = %parent_session.as_uuid(),
+                    "create_agent: parent has no session_routing — child outbound will fail until one is written",
+                );
+                return;
+            }
+            Err(err) => {
+                warn!(?err, "create_agent: read parent session_routing failed");
+                return;
+            }
+        };
+        let child_paths =
+            SessionPaths::new(&self.deps.data_root, child_agent_group, child_session);
+        let child_conn = match ironclaw_db::session::open_inbound(&child_paths) {
+            Ok(c) => c,
+            Err(err) => {
+                warn!(?err, "create_agent: open child inbound for routing write failed");
+                return;
+            }
+        };
+        if let Err(err) = ironclaw_db::tables::session_routing::write(&child_conn, &routing) {
+            warn!(
+                ?err,
+                child_session = %child_session.as_uuid(),
+                "create_agent: write child session_routing failed; outbound will NoRoute",
+            );
+        }
     }
 
     /// Seed a newly-spawned child agent's `inbound.db` with its initial
@@ -1305,6 +1377,64 @@ mod tests {
             text.contains("research-bot") && text.contains("AI safety papers"),
             "kicker must name the agent and quote the instructions, got: {text}"
         );
+    }
+
+    #[test]
+    fn child_inherits_parent_session_routing_so_outbound_can_deliver() {
+        // Regression: child sessions had no `session_routing` record,
+        // so even with the parent's messaging_group_id inherited, the
+        // delivery service marked every outbound `chat` row failed with
+        // NoRoute. The router writes session_routing on inbound arrival,
+        // but spawned sessions have no inbound event — create_agent now
+        // copies the parent's routing record into the child's inbound.db.
+        use ironclaw_db::tables::session_routing;
+        let (handler, central, tmp, parent, target) = make_handler(always_allow());
+        // Seed parent's session_routing — the production code path
+        // writes this on inbound arrival; the test fixture doesn't go
+        // through that path, so we write it directly.
+        let parent_paths = SessionPaths::new(
+            tmp.path(),
+            parent.agent_group_id,
+            parent.session_id,
+        );
+        let parent_conn = ironclaw_db::session::open_inbound(&parent_paths).unwrap();
+        let parent_routing = ironclaw_types::routing::SessionRouting {
+            channel_type: Some(ChannelType::new("telegram")),
+            platform_id: Some("bot-123".into()),
+            thread_id: Some("chat-456".into()),
+        };
+        session_routing::write(&parent_conn, &parent_routing).unwrap();
+        // Spawn the child.
+        let before_sessions: std::collections::HashSet<SessionId> =
+            sessions::list_active(&central).unwrap().iter().map(|s| s.id).collect();
+        handler
+            .handle(DeliveryActionInput {
+                action: "create_agent".into(),
+                payload: serde_json::json!({
+                    "name": "scout",
+                    "instructions": "go look",
+                }),
+                target,
+                session_id: None,
+            })
+            .unwrap();
+        let child_session = sessions::list_active(&central)
+            .unwrap()
+            .into_iter()
+            .find(|s| !before_sessions.contains(&s.id))
+            .expect("child created");
+        let child_paths = SessionPaths::new(
+            tmp.path(),
+            child_session.agent_group_id,
+            child_session.id,
+        );
+        let child_conn = ironclaw_db::session::open_inbound(&child_paths).unwrap();
+        let child_routing = session_routing::read(&child_conn)
+            .unwrap()
+            .expect("child must have routing copied from parent");
+        assert_eq!(child_routing.channel_type, parent_routing.channel_type);
+        assert_eq!(child_routing.platform_id, parent_routing.platform_id);
+        assert_eq!(child_routing.thread_id, parent_routing.thread_id);
     }
 
     #[test]
