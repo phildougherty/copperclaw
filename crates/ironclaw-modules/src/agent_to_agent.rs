@@ -661,6 +661,22 @@ impl DeliveryActionHandler for CreateAgentHandler {
             }
         }
 
+        // Seed the child's inbound.db with the operator's instructions
+        // as the first user-side chat message. Without this kicker the
+        // child has zero pending inbound, the container manager never
+        // spawns it, and the spawned agent sits inert forever. Surfaced
+        // live as "I created three research agents and none of them
+        // ever reported back" — the agents existed in the central DB
+        // but their containers were never started because the
+        // `payload.instructions` text was returned to the parent in the
+        // create_agent_result row and lost from there.
+        self.seed_child_inbound(
+            group.id,
+            session.id,
+            &payload.name,
+            &payload.instructions,
+        );
+
         info!(
             agent_group = %group.id.as_uuid(),
             session = %session.id.as_uuid(),
@@ -827,18 +843,22 @@ impl CreateAgentHandler {
             );
             return;
         };
-        let paths = SessionPaths::new(
-            &self.deps.data_root,
+        self.write_inbound_payload(
             parent.agent_group_id,
             parent.session_id,
+            MessageKind::System,
+            Self::build_result_content(status, session_id, agent_group_id, detail),
+            false,
         );
-        let conn = match ironclaw_db::session::open_inbound(&paths) {
-            Ok(c) => c,
-            Err(err) => {
-                warn!(?err, "create_agent_result: open_inbound failed; skipping");
-                return;
-            }
-        };
+    }
+
+    /// Compose the JSON payload for a `create_agent_result` inbound row.
+    fn build_result_content(
+        status: ResultStatus,
+        session_id: Option<SessionId>,
+        agent_group_id: Option<AgentGroupId>,
+        detail: Option<&str>,
+    ) -> serde_json::Value {
         let mut body = serde_json::Map::new();
         body.insert("status".into(), serde_json::json!(status.as_str()));
         if let Some(sid) = session_id {
@@ -856,13 +876,72 @@ impl CreateAgentHandler {
         if let Some(d) = detail {
             body.insert("detail".into(), serde_json::json!(d));
         }
-        let content = serde_json::json!({ "create_agent_result": body });
+        serde_json::json!({ "create_agent_result": body })
+    }
+
+    /// Seed a newly-spawned child agent's `inbound.db` with its initial
+    /// instructions, written as a `kind=Chat` message with `trigger=true`
+    /// so the container manager spawns the child on its next reconcile
+    /// tick. Without this the child has zero pending inbound, the manager
+    /// considers it idle, and it never starts — the `payload.instructions`
+    /// is otherwise only stashed in the parent's `create_agent_result`
+    /// row and lost from there. Failures are logged but non-fatal: the
+    /// `agent_groups` + `sessions` rows are already committed, so the
+    /// operator can still drive the child manually via `iclaw chat`.
+    fn seed_child_inbound(
+        &self,
+        agent_group_id: AgentGroupId,
+        session_id: SessionId,
+        name: &str,
+        instructions: &str,
+    ) {
+        let prelude = format!(
+            "You are agent `{name}`, spawned by a parent agent with the \
+             following task. Work through it autonomously using your \
+             available tools (search, file ops, etc.), then call \
+             `send_message` to deliver your findings — the wiring will \
+             route your reply back to the conversation that spawned you. \
+             Task:\n\n"
+        );
+        let text = format!("{prelude}{instructions}");
+        self.write_inbound_payload(
+            agent_group_id,
+            session_id,
+            MessageKind::Chat,
+            serde_json::json!({ "text": text }),
+            true,
+        );
+    }
+
+    /// Shared insert helper for the two `messages_in::insert` call sites
+    /// in this module (parent-result notify + child-kicker seed). Logs
+    /// on failure; never panics.
+    fn write_inbound_payload(
+        &self,
+        agent_group_id: AgentGroupId,
+        session_id: SessionId,
+        kind: MessageKind,
+        content: serde_json::Value,
+        trigger: bool,
+    ) {
+        let paths = SessionPaths::new(&self.deps.data_root, agent_group_id, session_id);
+        let conn = match ironclaw_db::session::open_inbound(&paths) {
+            Ok(c) => c,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    session = %session_id.as_uuid(),
+                    "create_agent: open_inbound failed; skipping inbound write",
+                );
+                return;
+            }
+        };
         let msg = WriteInbound {
             id: MessageId::new(),
-            kind: MessageKind::System,
+            kind,
             timestamp: Utc::now(),
             content,
-            trigger: false,
+            trigger,
             on_wake: false,
             process_after: None,
             recurrence: None,
@@ -874,9 +953,9 @@ impl CreateAgentHandler {
         };
         if let Err(err) = messages_in::insert(&conn, &msg) {
             warn!(
-                parent_session = %parent.session_id.as_uuid(),
+                session = %session_id.as_uuid(),
                 ?err,
-                "create_agent_result: messages_in::insert failed; agent will not see result",
+                "create_agent: messages_in::insert failed",
             );
         }
     }
@@ -1168,6 +1247,63 @@ mod tests {
             new_group.folder.starts_with("research-bot-"),
             "folder slug derived from name (got {})",
             new_group.folder,
+        );
+    }
+
+    #[test]
+    fn child_inbound_is_seeded_with_instructions_so_container_spawns() {
+        // Regression for the "spawned 3 research agents and none ever
+        // reported back" failure mode. Before this fix the child agent
+        // existed in the DB but had no pending inbound — the container
+        // manager spawns sessions only when there's queued work, so
+        // children sat inert forever. Now create_agent writes the
+        // operator's `instructions` as the child's first chat message
+        // with `trigger=true` so the manager picks it up on the next
+        // reconcile.
+        let (handler, central, tmp, _parent, target) = make_handler(always_allow());
+        handler
+            .handle(DeliveryActionInput {
+                action: "create_agent".into(),
+                payload: serde_json::json!({
+                    "name": "research-bot",
+                    "instructions": "Search for the latest AI safety papers and summarise."
+                }),
+                target,
+                session_id: None,
+            })
+            .unwrap();
+        // Locate the newly-created child and read its inbound.db.
+        let child_session = sessions::list_active(&central)
+            .unwrap()
+            .into_iter()
+            .find(|s| {
+                agent_groups::get(&central, s.agent_group_id)
+                    .map(|g| g.name == "research-bot")
+                    .unwrap_or(false)
+            })
+            .expect("child session exists");
+        let paths = SessionPaths::new(
+            tmp.path(),
+            child_session.agent_group_id,
+            child_session.id,
+        );
+        let conn = ironclaw_db::session::open_inbound(&paths).unwrap();
+        let pending = messages_in_read::get_pending(&conn, true, 10).unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "child must have exactly one seeded inbound (the instructions)"
+        );
+        let row = &pending[0];
+        assert_eq!(row.kind, MessageKind::Chat, "kicker is a chat-kind message");
+        let text = row
+            .content
+            .get("text")
+            .and_then(|v| v.as_str())
+            .expect("content.text present");
+        assert!(
+            text.contains("research-bot") && text.contains("AI safety papers"),
+            "kicker must name the agent and quote the instructions, got: {text}"
         );
     }
 
