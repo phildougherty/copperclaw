@@ -220,6 +220,24 @@ PY
             fi
             say "pinned IRONCLAW_DEFAULT_IMAGE_TAG=$new_tag"
         fi
+
+        # Repoint every existing agent group at the new image. The .env
+        # default only applies to *new* groups; existing rows in
+        # container_configs keep their previously-pinned tag and silently
+        # run yesterday's runner binary forever otherwise. Caught live
+        # when a fresh runner with new apology text shipped but the
+        # running session kept emitting the old apology because its
+        # container_configs row still pointed at the old image.
+        central_db="$DATA_DIR/ironclaw.db"
+        if [ -n "$new_tag" ] && [ -f "$central_db" ] && command -v sqlite3 >/dev/null 2>&1; then
+            stale_count="$(sqlite3 "$central_db" \
+                "select count(*) from container_configs where coalesce(image_tag,'') != '$new_tag';" 2>/dev/null || echo 0)"
+            if [ "$stale_count" -gt 0 ]; then
+                sqlite3 "$central_db" \
+                    "update container_configs set image_tag='$new_tag', updated_at=datetime('now') where coalesce(image_tag,'') != '$new_tag';"
+                say "repointed $stale_count agent group(s) to $new_tag"
+            fi
+        fi
     fi
 fi
 

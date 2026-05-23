@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (rebuild.sh left existing groups pinned to the old image)
+
+Caught when a fresh rebuild visibly shipped the new runner binary at
+`~/.local/bin/ironclaw-runner`, the host log confirmed a new image was
+baked, and `IRONCLAW_DEFAULT_IMAGE_TAG` in `.env` was repointed — yet
+the running session container kept spawning with the old image hash and
+the agent kept emitting the old "I hit a snag … see runner stderr"
+apology that the new runner code no longer contains.
+
+Root cause: `container_configs.image_tag` (central DB) is pinned
+per-agent-group. `.env`'s `IRONCLAW_DEFAULT_IMAGE_TAG` is only consulted
+when *creating* a new group; existing rows retain whatever image tag
+was pinned at first spawn. So `rebuild.sh` was leaving every existing
+agent group running the previous baked image forever.
+
+Fix: extended `rebuild.sh`'s pin step to also `UPDATE
+container_configs SET image_tag = <new>` for any row whose pinned tag
+differs from the freshly baked one. Reports the number repointed.
+Gated on `sqlite3` being available; silent no-op otherwise.
+
 ### Fixed (breadcrumbs, turn-cap, opaque apology) — three issues caught in the same Telegram session
 
 A "Build me a clone of an App Store app" run surfaced three independent
