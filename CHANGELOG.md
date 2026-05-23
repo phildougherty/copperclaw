@@ -6,6 +6,86 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (code-review followup — 15 findings)
+
+Extra-high-effort code review on this session's commits surfaced 15 real
+issues; this batch fixes all of them. Grouped by file:
+
+`rebuild.sh`:
+- **Critical**: the new image-tag-repoint UPDATE wrote
+  `updated_at=datetime('now')` (sqlite default format, no T separator,
+  no timezone). `DateTime::parse_from_rfc3339` requires both — chrono
+  returns `premature end of input`. Confirmed live: `iclaw groups
+  config get` was already erroring against the post-rebuild DB.
+  Replaced with `strftime('%Y-%m-%dT%H:%M:%fZ','now')` and added a
+  comment naming the bug shape.
+- `stale_count` now validated against `^[0-9]+$` before the bash
+  arithmetic; a non-numeric stdout no longer aborts the rebuild under
+  `set -euo pipefail`.
+- `$new_tag` validated against `^[A-Za-z0-9._:/-]+$` before the SQL
+  interpolation — guards against future tag schemes containing quote
+  chars that would silently break the UPDATE.
+- When `sqlite3` is missing, the repoint now emits a `warn` telling
+  the operator to install sqlite3 or run `iclaw groups config update
+  <id> image_tag <tag>` manually, instead of silently no-op'ing.
+
+`crates/ironclaw-runner/src/run/{mod,drive_turn,provider_call}.rs`:
+- `compact_now` sentinel branch now runs `compact()` BEFORE removing
+  the sentinel file, so a transient provider failure during
+  summarisation doesn't silently drop the user's compaction request.
+- `compact_now` branch resets `state.continuation = None` to match the
+  `clear_history` branch — a provider continuation handle anchored to
+  the pre-compact history is incompatible with the new (shorter)
+  history.
+- When BOTH `.history_clear_pending` and `.compact_now_pending` exist,
+  the clear branch now also removes the compact sentinel (previously
+  it leaked, causing a no-op LLM compaction call on the next iteration).
+- Apology emitter now uses two distinct texts: a human-style message
+  for end-user channels (Chat-kind) and a terse machine-actionable
+  message for parent-agent reports (Agent-kind). Previously the parent
+  LLM received "Try rephrasing... operator can check the runner log"
+  which it couldn't act on.
+- `resolve_max_tool_turns` warns once per process via `OnceLock`
+  instead of once per misconfigured spawn, eliminating log flooding
+  from a sticky `IRONCLAW_MAX_TOOL_TURNS=6o`-style typo.
+- `apology_text` trims trailing `.`/`?`/`!` from the reason before
+  splicing so future contributors writing natural-English reasons
+  ending in punctuation don't produce visible double-punctuation.
+- `LlmTurnOutput` grew a `failure_reason: String` field. `provider_call`
+  now emits specific reasons at the two failure sites ("provider
+  rejected the query before streaming started" vs "provider stream
+  ended with an error event") instead of a blank-string sentinel that
+  was structurally indistinguishable from a real-but-empty reason.
+  `drive_turn` preserves the inner reason in `TurnOutcome::Failed`
+  when non-empty.
+
+`crates/ironclaw-host/src/typing_ticker.rs` +
+`crates/ironclaw-db/src/tables/messages_in.rs`:
+- New `messages_in::count_pending_for_typing` — no `trigger = 1`
+  filter, so the ticker now pulses typing during turns processing
+  agent-dispatch, Task-wake, or system inbounds (the original
+  `count_due` had the trigger filter and stayed dark during those
+  turns).
+- `row_to_message_in` coalesces `source_session_id = Some("")` to
+  `None`, completing the empty-string defence pass from the previous
+  commit (sessions.rs was fixed; the matching messages_in path was
+  missed — would have caused the parent-agent apology to silently
+  drop on legacy rows).
+- `TypingTicker` gained a per-instance `last_seen_pending` cache that
+  short-circuits inbound.db reopens within a 2x-tick window for
+  continuously-busy sessions; idle sessions are evicted on the next
+  count-zero. Drops steady-state sqlite open churn from O(sessions)
+  per tick to O(idle-transitions) per tick.
+- Transient inbound.db open errors are now logged at `debug!` (with
+  session id + error) instead of silently swallowed; the return-false
+  fallback is unchanged.
+
+Replay fixture `fixtures/cli/provider-timeout/expected/*.jsonl` updated
+to match the new specific-reason apology text.
+
+Verification: cargo test --workspace --no-fail-fast = 5266 passed (8
+new tests across the three fixes); clippy clean.
+
 ### Fixed (`Some("")` crashed DB row parsers; reconciler hot-looped forever)
 
 The session reconciler in `container_manager` started spinning at one

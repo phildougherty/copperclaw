@@ -111,6 +111,30 @@ pub fn count_due(conn: &Connection) -> Result<i64, DbError> {
     Ok(count)
 }
 
+/// Count any pending row whose `process_after` is null or due, *without*
+/// the `trigger = 1` filter that [`count_due`] applies.
+///
+/// Why this exists: the typing-ticker needs to decide whether to keep
+/// pulsing the "agent is working" indicator. The runner's first-poll
+/// pass picks up non-trigger rows (agent-to-agent dispatch, scheduled
+/// Task/wake messages, system messages) too, so filtering them out
+/// here would make the ticker conclude "no work" during those turns
+/// and the typing bubble would fade. Keep [`count_due`] as-is for the
+/// existing callers that rely on its precise trigger=1 semantics; this
+/// function is the right answer for "is there *any* work the runner
+/// will pick up on its next poll".
+pub fn count_pending_for_typing(conn: &Connection) -> Result<i64, DbError> {
+    let now = Utc::now().to_rfc3339();
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM messages_in
+         WHERE status = 'pending'
+           AND (process_after IS NULL OR process_after <= ?1)",
+        params![now],
+        |r| r.get(0),
+    )?;
+    Ok(count)
+}
+
 pub fn mark_completed(conn: &Connection, id: MessageId) -> Result<(), DbError> {
     let n = conn.execute(
         "UPDATE messages_in SET status = 'completed' WHERE id = ?1",
@@ -179,6 +203,15 @@ fn row_to_message_in(row: &Row<'_>) -> rusqlite::Result<MessageInRow> {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })?;
     let channel_type: Option<String> = row.get("channel_type")?;
+    // Empty-string-as-Some defence (parallel to the SessionId branch in
+    // `sessions.rs::row_to_session`): a legacy row with
+    // `source_session_id = ''` would read as `Some("")` and propagate
+    // into downstream code — the runner's apology emitter consumes it
+    // as the literal empty session_id on the Agent-kind branch and
+    // silently drops the message. Coalesce the empty string to `None`
+    // here so every reader sees the same well-formed value.
+    let source_session_id: Option<String> = row.get("source_session_id")?;
+    let source_session_id = source_session_id.filter(|s| !s.is_empty());
 
     Ok(MessageInRow {
         id: MessageId(id),
@@ -201,7 +234,7 @@ fn row_to_message_in(row: &Row<'_>) -> rusqlite::Result<MessageInRow> {
         channel_type: channel_type.map(ChannelType::from),
         thread_id: row.get("thread_id")?,
         content,
-        source_session_id: row.get("source_session_id")?,
+        source_session_id,
         on_wake: {
             let v: i64 = row.get("on_wake")?;
             v != 0
@@ -342,5 +375,61 @@ mod tests {
         let (_tmp, conn) = fresh_inbound();
         let err = mark_completed(&conn, MessageId::new()).unwrap_err();
         assert!(matches!(err, DbError::NotFound));
+    }
+
+    #[test]
+    fn count_pending_for_typing_includes_non_trigger() {
+        // The typing-ticker uses `count_pending_for_typing` instead of
+        // `count_due` so non-trigger rows (agent-to-agent dispatch,
+        // Task/wake from the scheduler, system messages) still keep
+        // the typing indicator alive while the runner processes them.
+        let (_tmp, conn) = fresh_inbound();
+        let mut m = make_msg();
+        m.trigger = false;
+        insert(&conn, &m).unwrap();
+        assert_eq!(
+            count_due(&conn).unwrap(),
+            0,
+            "count_due must keep its trigger=1 semantics",
+        );
+        assert_eq!(
+            count_pending_for_typing(&conn).unwrap(),
+            1,
+            "count_pending_for_typing must include trigger=0 rows",
+        );
+    }
+
+    #[test]
+    fn count_pending_for_typing_respects_process_after() {
+        let (_tmp, conn) = fresh_inbound();
+        let mut m = make_msg();
+        m.process_after = Some(Utc::now() + chrono::Duration::seconds(60));
+        insert(&conn, &m).unwrap();
+        assert_eq!(count_pending_for_typing(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn row_to_message_in_coalesces_empty_source_session_id() {
+        // A row written by a legacy code path with `source_session_id = ''`
+        // (instead of NULL) must read back as `None` so the runner's
+        // apology emitter on the Agent-kind branch doesn't consume the
+        // empty string as a literal session_id and silently drop the
+        // message.
+        let (_tmp, conn) = fresh_inbound();
+        let msg = make_msg();
+        insert(&conn, &msg).unwrap();
+        // Forcibly stamp the row's source_session_id to '' to simulate
+        // the legacy shape.
+        conn.execute(
+            "UPDATE messages_in SET source_session_id = '' WHERE id = ?1",
+            params![msg.id.as_uuid().to_string()],
+        )
+        .unwrap();
+        let rows = get_pending(&conn, true, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].source_session_id, None,
+            "Some(\"\") must coalesce to None at the row-parsing boundary",
+        );
     }
 }

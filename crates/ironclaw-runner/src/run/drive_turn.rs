@@ -60,6 +60,15 @@ pub(super) struct LlmTurnOutput {
     /// the whole query rather than terminating the inbound. Surfaces the
     /// transport/SSE-decode classification the provider already does.
     pub(super) retryable_failure: bool,
+    /// Short, site-specific reason describing why this turn failed
+    /// ("provider rejected the query before streaming started",
+    /// "provider stream ended with an error event"). When non-empty
+    /// `drive_turn` preserves it on the resulting
+    /// `TurnOutcome::Failed`; empty falls back to the generic
+    /// "did not return a complete response" wording. Decouples
+    /// failure-site identification from the empty-string sentinel
+    /// the old code used (#12 in code-review notes).
+    pub(super) failure_reason: String,
 }
 
 /// Hard cap on consecutive turns where the model emitted at least one
@@ -93,11 +102,18 @@ pub(super) async fn drive_turn(
         continuation = output.continuation.or(continuation);
 
         if output.failed {
+            // Preserve the site-specific reason from provider_call if
+            // it filled one in; otherwise fall back to the generic
+            // wording. Only the generic path reaches the user-visible
+            // apology when no inner detail was available.
+            let reason = if output.failure_reason.is_empty() {
+                "the model's provider call did not return a complete response".into()
+            } else {
+                output.failure_reason
+            };
             return Ok(TurnResult {
                 continuation,
-                outcome: TurnOutcome::Failed(
-                    "the model's provider call did not return a complete response".into(),
-                ),
+                outcome: TurnOutcome::Failed(reason),
             });
         }
 

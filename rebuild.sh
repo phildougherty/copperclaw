@@ -228,14 +228,32 @@ PY
         # when a fresh runner with new apology text shipped but the
         # running session kept emitting the old apology because its
         # container_configs row still pointed at the old image.
+        #
+        # Invariants enforced below:
+        #   - $new_tag is interpolated directly into SQL, so we validate
+        #     it against a conservative OCI-tag charset (no quotes, no
+        #     spaces) before running UPDATE. Tags today are sha256 hex,
+        #     but the regex documents and enforces the assumption.
+        #   - updated_at uses strftime('%Y-%m-%dT%H:%M:%fZ','now') — must
+        #     be RFC3339 because chrono's parse_from_rfc3339 rejects
+        #     sqlite's default space-separated datetime('now') output
+        #     ("2026-05-23 21:51:53") with "premature end of input".
         central_db="$DATA_DIR/ironclaw.db"
-        if [ -n "$new_tag" ] && [ -f "$central_db" ] && command -v sqlite3 >/dev/null 2>&1; then
-            stale_count="$(sqlite3 "$central_db" \
-                "select count(*) from container_configs where coalesce(image_tag,'') != '$new_tag';" 2>/dev/null || echo 0)"
-            if [ "$stale_count" -gt 0 ]; then
-                sqlite3 "$central_db" \
-                    "update container_configs set image_tag='$new_tag', updated_at=datetime('now') where coalesce(image_tag,'') != '$new_tag';"
-                say "repointed $stale_count agent group(s) to $new_tag"
+        if [ -n "$new_tag" ] && [ -f "$central_db" ]; then
+            if ! command -v sqlite3 >/dev/null 2>&1; then
+                warn "sqlite3 not installed; skipping container_configs repoint. Install sqlite3 or run 'iclaw groups config update <id> image_tag $new_tag' manually for each existing group."
+            elif [[ ! "$new_tag" =~ ^[A-Za-z0-9._:/-]+$ ]]; then
+                warn "refusing to repoint container_configs: image_tag '$new_tag' contains characters outside [A-Za-z0-9._:/-]; rerun setup or repoint manually with 'iclaw groups config update'."
+            else
+                stale_count="$(sqlite3 "$central_db" \
+                    "select count(*) from container_configs where coalesce(image_tag,'') != '$new_tag';" 2>/dev/null || echo 0)"
+                if [[ ! "$stale_count" =~ ^[0-9]+$ ]]; then
+                    warn "sqlite3 returned non-numeric count ('$stale_count') for container_configs; skipping repoint."
+                elif [ "$stale_count" -gt 0 ]; then
+                    sqlite3 "$central_db" \
+                        "update container_configs set image_tag='$new_tag', updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') where coalesce(image_tag,'') != '$new_tag';"
+                    say "repointed $stale_count agent group(s) to $new_tag"
+                fi
             fi
         fi
     fi

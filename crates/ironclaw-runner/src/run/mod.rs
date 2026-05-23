@@ -141,27 +141,39 @@ pub const MIN_MAX_TOOL_TURNS: usize = 5;
 pub const MAX_MAX_TOOL_TURNS: usize = 500;
 
 /// Resolve `max_tool_turns` from the env. Out-of-range / unparseable
-/// values fall back to [`DEFAULT_MAX_TOOL_TURNS`] with a WARN.
+/// values fall back to [`DEFAULT_MAX_TOOL_TURNS`] with a one-shot WARN.
+///
+/// The misconfig warn fires exactly once per process via a
+/// `OnceLock<()>` guard. Each runner spawn is a fresh process inside a
+/// container, so the dedupe is *within-process* — a long-lived runner
+/// that hits this function across many turns won't re-warn. (Per-spawn
+/// dedupe across containers would need host-side state we don't keep
+/// here.)
 #[must_use]
 pub fn resolve_max_tool_turns(env: &dyn crate::config::EnvLookup) -> usize {
+    static MISCONFIG_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    let warn_once = |line: &str, raw: &str| {
+        MISCONFIG_WARNED.get_or_init(|| {
+            tracing::warn!(
+                env = MAX_TOOL_TURNS_ENV,
+                value = %raw,
+                "{line} (using default {DEFAULT_MAX_TOOL_TURNS}; suppressing further warnings this process)",
+            );
+        });
+    };
     let Some(raw) = env.get(MAX_TOOL_TURNS_ENV) else {
         return DEFAULT_MAX_TOOL_TURNS;
     };
     let Ok(parsed) = raw.parse::<usize>() else {
-        tracing::warn!(
-            env = MAX_TOOL_TURNS_ENV,
-            value = %raw,
-            "could not parse max tool turns; using default"
-        );
+        warn_once("max tool turns is not a valid integer", &raw);
         return DEFAULT_MAX_TOOL_TURNS;
     };
     if !(MIN_MAX_TOOL_TURNS..=MAX_MAX_TOOL_TURNS).contains(&parsed) {
-        tracing::warn!(
-            env = MAX_TOOL_TURNS_ENV,
-            value = parsed,
-            min = MIN_MAX_TOOL_TURNS,
-            max = MAX_MAX_TOOL_TURNS,
-            "max tool turns out of range; using default"
+        warn_once(
+            &format!(
+                "max tool turns out of range [{MIN_MAX_TOOL_TURNS}, {MAX_MAX_TOOL_TURNS}]"
+            ),
+            &raw,
         );
         return DEFAULT_MAX_TOOL_TURNS;
     }
@@ -399,12 +411,25 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
             state.history.clear();
             state.continuation = None;
             let _ = tokio::fs::remove_file(&clear_pending).await;
+            // Clear wins over compact when both sentinels are pending:
+            // remove the compact sentinel too so it doesn't fire a no-op
+            // compaction on the next iteration (best-effort, ignore errors).
+            if compact_pending.exists() {
+                let _ = tokio::fs::remove_file(&compact_pending).await;
+            }
             tracing::info!("history cleared (sentinel consumed)");
         } else if compact_pending.exists() {
-            let _ = tokio::fs::remove_file(&compact_pending).await;
+            // Run compact FIRST. The sentinel is removed AFTER compact
+            // succeeds so a transient provider error (429/timeout) doesn't
+            // silently lose the user's compact request — the next runner
+            // spawn will retry it. Mirror clear's continuation reset: a
+            // post-compact history is incompatible with a continuation
+            // handle anchored to the pre-compact prefix.
             state.history = compact(state.history, deps.provider.as_ref(), &deps.compaction)
                 .await
                 .context("compact_now failed")?;
+            state.continuation = None;
+            let _ = tokio::fs::remove_file(&compact_pending).await;
             tracing::info!("history compacted (sentinel consumed)");
         }
 
@@ -575,10 +600,35 @@ fn apology_text(reason: &str) -> String {
          runner log for the exact error."
             .into()
     } else {
+        // Trim trailing sentence-ending punctuation from the reason so
+        // we don't get double-punctuation when the upstream phrase
+        // already ends in `.`/`?`/`!`.
+        let trimmed = reason.trim_end_matches(['.', '?', '!']);
         format!(
-            "I couldn't finish a reply on that message — {reason}. \
+            "I couldn't finish a reply on that message — {trimmed}. \
              Try rephrasing or sending a smaller request, and the \
              operator can check the runner log for details."
+        )
+    }
+}
+
+/// Apology text for a parent-agent recipient (Agent-kind outbound).
+/// The parent's LLM, not a human, reads this — so the human "try
+/// rephrasing" guidance is wrong from its position. Keep it terse and
+/// machine-actionable: name the failure, and make it clear that the
+/// child session is gone and cannot be re-tried with the same prompt,
+/// so the parent should surface the failure upstream rather than retry.
+fn agent_apology_text(reason: &str) -> String {
+    let trimmed = reason.trim_end_matches(['.', '?', '!']);
+    if trimmed.is_empty() {
+        "sub-task failed: child session terminated and cannot continue this request. \
+         Report the failure upstream rather than retrying with the same prompt."
+            .into()
+    } else {
+        format!(
+            "sub-task failed: {trimmed}. The child session terminated and cannot \
+             continue this request. Report the failure upstream rather than \
+             retrying with the same prompt."
         )
     }
 }
@@ -592,7 +642,11 @@ async fn emit_terminal_failure_apologies(
     if rows.is_empty() {
         return Ok(());
     }
-    let text = apology_text(reason);
+    // Two flavors of apology: human-readable for end-user channels,
+    // terse + machine-actionable for parent-agent recipients (the
+    // reader is another LLM, not a person).
+    let user_text = apology_text(reason);
+    let agent_text = agent_apology_text(reason);
     let outbound = deps.outbound.lock().await;
     let conn: &rusqlite::Connection = &outbound;
     for row in rows {
@@ -604,10 +658,10 @@ async fn emit_terminal_failure_apologies(
         // Pick the apology shape. Three cases mirror the sweep
         // (`ironclaw-host-sweep/src/checks/apology.rs`):
         //   (a) Inbound has channel routing — chat-kind apology back
-        //       through the same channel.
+        //       through the same channel (human reader).
         //   (b) Inbound has NO channel routing but has source_session_id
         //       — Agent-kind apology UP to the source so the parent
-        //       agent learns the child failed.
+        //       agent learns the child failed (LLM reader).
         //   (c) Neither — silently skip (no recipient to apologize to).
         let apology = if let (Some(channel_type), Some(platform_id)) =
             (row.channel_type.as_ref(), row.platform_id.as_ref())
@@ -622,7 +676,7 @@ async fn emit_terminal_failure_apologies(
                 channel_type: Some(channel_type.clone()),
                 platform_id: Some(platform_id.clone()),
                 thread_id: row.thread_id.clone(),
-                content: serde_json::json!({ "text": text }),
+                content: serde_json::json!({ "text": user_text }),
             }
         } else if let Some(source) = row.source_session_id.as_deref() {
             WriteOutbound {
@@ -636,7 +690,7 @@ async fn emit_terminal_failure_apologies(
                 platform_id: None,
                 thread_id: None,
                 content: serde_json::json!({
-                    "text": text,
+                    "text": agent_text,
                     "to": { "kind": "agent", "session_id": source },
                 }),
             }
@@ -1473,6 +1527,65 @@ mod tests {
         let ticker = HeartbeatTicker::start(None);
         // Just exercising Drop without panic.
         drop(ticker);
+    }
+
+    #[test]
+    fn apology_text_trims_trailing_sentence_punctuation() {
+        // Reason ending in '.' must not produce double-punctuation.
+        let s = apology_text("the agent ran out of turns.");
+        assert!(
+            s.contains("— the agent ran out of turns. Try"),
+            "expected single '.' between reason and 'Try': {s}"
+        );
+        assert!(
+            !s.contains("turns.. Try"),
+            "double-period must be trimmed: {s}"
+        );
+
+        // '?' and '!' get the same treatment.
+        let q = apology_text("did it really fail?");
+        assert!(q.contains("— did it really fail. Try"), "got: {q}");
+        let bang = apology_text("boom!");
+        assert!(bang.contains("— boom. Try"), "got: {bang}");
+
+        // No trailing punctuation → unchanged splice.
+        let plain = apology_text("provider returned 503");
+        assert!(plain.contains("— provider returned 503. Try"), "got: {plain}");
+
+        // Empty reason still falls through the fallback branch.
+        let empty = apology_text("");
+        assert!(empty.contains("couldn't finish a reply"), "got: {empty}");
+    }
+
+    #[test]
+    fn agent_apology_text_is_terse_and_actionable() {
+        // Agent-targeted text must NOT contain the human-style
+        // "Try rephrasing or sending a smaller request" guidance.
+        let s = agent_apology_text("provider returned 503");
+        assert!(s.contains("sub-task failed"), "got: {s}");
+        assert!(
+            s.contains("Report the failure upstream"),
+            "agent apology should tell parent to surface, not retry: {s}"
+        );
+        assert!(
+            !s.contains("Try rephrasing"),
+            "agent apology must not carry human-channel guidance: {s}"
+        );
+        assert!(
+            !s.contains("smaller request"),
+            "agent apology must not carry human-channel guidance: {s}"
+        );
+
+        // Trailing punctuation gets trimmed here too.
+        let dotted = agent_apology_text("ran out of turns.");
+        assert!(
+            dotted.contains("sub-task failed: ran out of turns. The"),
+            "got: {dotted}"
+        );
+
+        // Empty reason still produces a usable message.
+        let empty = agent_apology_text("");
+        assert!(empty.contains("sub-task failed"), "got: {empty}");
     }
 
     #[test]

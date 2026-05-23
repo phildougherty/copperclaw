@@ -75,14 +75,24 @@ pub(super) async fn run_llm_turn(
                 );
                 let out = LlmTurnOutput {
                     failed: true,
+                    failure_reason:
+                        "provider rejected the query before streaming started".into(),
                     ..LlmTurnOutput::default()
                 };
+                // Emit a SPECIFIC reason on the usage report so the
+                // failure mode is greppable in the audit log instead of
+                // being conflated with the post-stream failure path
+                // below. `drive_turn` will preserve this reason verbatim
+                // when wrapping the per-turn output for the run loop
+                // (see #12 in code-review notes).
                 emit_usage_report(
                     deps,
                     0,
                     0,
                     turn_started_at,
-                    &TurnOutcome::Failed(String::new()),
+                    &TurnOutcome::Failed(
+                        "provider rejected the query before streaming started".into(),
+                    ),
                 )
                 .await;
                 return Ok(out);
@@ -109,11 +119,12 @@ pub(super) async fn run_llm_turn(
         break pumped;
     };
     let outcome = if out.failed {
-        // Empty reason here — `drive_turn` will wrap this output in
-        // its own `TurnOutcome::Failed(reason)` before returning to
-        // the run loop. The reason on the per-turn usage report is
-        // not user-facing.
-        TurnOutcome::Failed(String::new())
+        // Specific reason for the usage report so the audit log shows
+        // *where* the failure happened (stream-time vs query-time —
+        // see the matching reason in the query_with_retry branch
+        // above). `drive_turn` overwrites this with a higher-level
+        // reason for the user-visible apology unless empty.
+        TurnOutcome::Failed("provider stream ended with an error event".into())
     } else {
         TurnOutcome::Done
     };
@@ -180,6 +191,14 @@ pub(super) async fn pump_events(
                 );
                 out.failed = true;
                 out.retryable_failure = retryable;
+                // Site-specific reason so drive_turn can preserve it
+                // instead of falling back to the generic "did not
+                // return a complete response" wording. Empty-string
+                // sentinel is reserved for "no reason captured".
+                if out.failure_reason.is_empty() {
+                    out.failure_reason =
+                        "provider stream ended with an error event".into();
+                }
                 break;
             }
             ProviderEvent::ToolStart {
