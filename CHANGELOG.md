@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (iclaw subcommand `--help` text — 2026-05-23)
+
+- **`crates/ironclaw-iclaw/src/commands.rs`** — added `///`
+  doc-comments to every variant and every `#[arg(long)]` field on
+  `MessagingGroupsCmd`, `WiringsCmd`, `UsersCmd`, `RolesCmd`,
+  `MembersCmd`, `DestinationsCmd`, `SessionsCmd`, `UserDmsCmd`, and
+  `ApprovalsCmd`. Operators running `iclaw <foo> <bar> --help` now
+  see a description of every command and flag instead of a bare
+  usage line. The `ApprovalsCmd::Approve` variant also notes the
+  scope limitation (sender-only — see
+  `docs/plans/vaporware-followups.md` for the generic approve/deny
+  follow-up).
+
 ### Changed (doc-vs-reality reconciliation pass — 2026-05-23)
 
 Wide audit + reconciliation of the in-tree docs against the actual

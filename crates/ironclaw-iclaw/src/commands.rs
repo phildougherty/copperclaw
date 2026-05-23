@@ -480,28 +480,44 @@ pub struct PackageFlag {
 
 #[derive(Debug, Subcommand)]
 pub enum MessagingGroupsCmd {
+    /// List configured messaging groups (channel + platform-id pairs).
     List,
+    /// Show one messaging group by id.
     Get {
+        /// Messaging-group id (UUID).
         id: String,
     },
+    /// Create a new messaging group — the channel + platform-id row that
+    /// `wirings` then attach to an agent group.
     Create {
+        /// Channel kind: `cli`, `telegram`, `slack`, `discord`, `matrix`, ...
         #[arg(long = "channel-type")]
         channel_type: String,
+        /// Channel-native id for the conversation (Slack channel id, Discord
+        /// guild id, Telegram chat id, ...).
         #[arg(long = "platform-id")]
         platform_id: String,
+        /// Display name for the dashboard (`iclaw messaging-groups list`).
         #[arg(long)]
         name: Option<String>,
+        /// Mark as a group conversation (vs. a DM) for sender-scope logic.
         #[arg(long = "is-group")]
         is_group: bool,
     },
+    /// Update a messaging group's name or group/DM flag.
     Update {
+        /// Messaging-group id.
         id: String,
+        /// New display name.
         #[arg(long)]
         name: Option<String>,
+        /// New group/DM flag.
         #[arg(long = "is-group")]
         is_group: Option<bool>,
     },
+    /// Delete a messaging group. Wirings that reference it are deleted too.
     Delete {
+        /// Messaging-group id.
         id: String,
     },
 }
@@ -559,40 +575,62 @@ impl SessionModeArg {
 
 #[derive(Debug, Subcommand)]
 pub enum WiringsCmd {
+    /// List all wirings (messaging-group → agent-group bindings).
     List,
+    /// Show one wiring by id.
     Get {
+        /// Wiring id.
         id: String,
     },
+    /// Create a wiring: route messages from a messaging group to an agent
+    /// group, with rules for when to engage and how to session messages.
     Create {
+        /// Messaging-group id (the source side).
         #[arg(long = "mg")]
         mg: String,
+        /// Agent-group id (the destination side).
         #[arg(long = "ag")]
         ag: String,
+        /// Engage rule: `all` / `mention` / `mention-sticky` / `pattern`.
         #[arg(long)]
         engage: EngageArg,
+        /// Regex applied to message text when `engage=pattern`.
         #[arg(long)]
         pattern: Option<String>,
+        /// Sender scope: `all` (default — everyone) or `known` (registered users only).
         #[arg(long = "sender-scope")]
         sender_scope: Option<SenderScopeArg>,
+        /// Session mode: `shared` (default), `per-thread`, or `agent-shared`.
         #[arg(long = "session-mode")]
         session_mode: Option<SessionModeArg>,
+        /// Sort priority when multiple wirings match (higher fires first).
         #[arg(long)]
         priority: Option<i64>,
     },
+    /// Update one or more fields on an existing wiring.
     Update {
+        /// Wiring id.
         id: String,
+        /// New engage rule.
         #[arg(long)]
         engage: Option<EngageArg>,
+        /// New pattern (only valid when engage=pattern).
         #[arg(long)]
         pattern: Option<String>,
+        /// New sender scope.
         #[arg(long = "sender-scope")]
         sender_scope: Option<SenderScopeArg>,
+        /// New session mode.
         #[arg(long = "session-mode")]
         session_mode: Option<SessionModeArg>,
+        /// New sort priority.
         #[arg(long)]
         priority: Option<i64>,
     },
+    /// Delete a wiring. Sessions already routed through it stay; no new
+    /// messages will be routed via this wiring after deletion.
     Delete {
+        /// Wiring id.
         id: String,
     },
 }
@@ -601,18 +639,28 @@ pub enum WiringsCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum UsersCmd {
+    /// List known user records (approved senders + admin-created users).
     List,
+    /// Show one user by id.
     Get {
+        /// User id (UUID).
         id: String,
     },
+    /// Create a user record directly (skips the sender-approval flow).
     Create {
+        /// Identity string — `<channel_type>:<platform_id>`, e.g.
+        /// `telegram:12345` or `slack:U01ABCDEF`.
         #[arg(long)]
         identity: String,
+        /// Optional display name shown in dashboards.
         #[arg(long = "display-name")]
         display_name: Option<String>,
     },
+    /// Update a user's display name.
     Update {
+        /// User id.
         id: String,
+        /// New display name.
         #[arg(long = "display-name")]
         display_name: Option<String>,
     },
@@ -622,16 +670,25 @@ pub enum UsersCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum RolesCmd {
+    /// List role assignments across all users / agent groups.
     List,
+    /// Grant a role to a user, optionally scoped to one agent group.
     Grant {
+        /// User id.
         user: String,
+        /// Role name (e.g. `admin`, `member`).
         role: String,
+        /// Scope the grant to one agent group; omit for an install-wide grant.
         #[arg(long = "agent-group")]
         agent_group: Option<String>,
     },
+    /// Revoke a previously-granted role.
     Revoke {
+        /// User id.
         user: String,
+        /// Role name to revoke.
         role: String,
+        /// Agent group the grant was scoped to (must match the grant).
         #[arg(long = "agent-group")]
         agent_group: Option<String>,
     },
@@ -641,9 +698,25 @@ pub enum RolesCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum MembersCmd {
-    List { agent_group: String },
-    Add { agent_group: String, user: String },
-    Remove { agent_group: String, user: String },
+    /// List users who are members of an agent group.
+    List {
+        /// Agent-group id.
+        agent_group: String,
+    },
+    /// Add a user as a member of an agent group.
+    Add {
+        /// Agent-group id.
+        agent_group: String,
+        /// User id.
+        user: String,
+    },
+    /// Remove a user from an agent group's membership.
+    Remove {
+        /// Agent-group id.
+        agent_group: String,
+        /// User id.
+        user: String,
+    },
 }
 
 // --- destinations ----------------------------------------------------------
@@ -665,26 +738,40 @@ impl DestinationKind {
 
 #[derive(Debug, Subcommand)]
 pub enum DestinationsCmd {
+    /// List the named outbound destinations configured for an agent group.
     List {
+        /// Agent-group id.
         agent_group: String,
     },
+    /// Add a named outbound destination that the agent can `send_message` to
+    /// by name (vs. having to know the channel/platform-id pair).
     Add {
+        /// Agent-group id that owns this destination.
         agent_group: String,
+        /// Friendly name the agent uses (e.g. `releases`, `boss-dm`).
         #[arg(long)]
         name: String,
+        /// Destination kind: `channel` (external chat) or `agent` (sibling agent).
         #[arg(long = "type")]
         kind: DestinationKind,
+        /// Optional display name for dashboards.
         #[arg(long = "display-name")]
         display_name: Option<String>,
+        /// For `--type channel`: the channel kind (e.g. `slack`, `discord`).
         #[arg(long = "channel-type")]
         channel_type: Option<String>,
+        /// For `--type channel`: the channel-native platform id.
         #[arg(long = "platform-id")]
         platform_id: Option<String>,
+        /// For `--type agent`: the destination agent-group id.
         #[arg(long = "target-agent-group")]
         target_agent_group: Option<String>,
     },
+    /// Remove a named destination by name.
     Remove {
+        /// Agent-group id that owns the destination.
         agent_group: String,
+        /// Destination name to remove.
         #[arg(long)]
         name: String,
     },
@@ -694,13 +781,19 @@ pub enum DestinationsCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum SessionsCmd {
+    /// List sessions, optionally filtered by agent group and / or status.
     List {
+        /// Agent-group id to filter by.
         #[arg(long = "agent-group")]
         agent_group: Option<String>,
+        /// Status filter: `active`, `idle`, `stopped`, `crashed`.
         #[arg(long)]
         status: Option<String>,
     },
+    /// Show one session by id (state, last-active, container status,
+    /// last few inbound / outbound rows).
     Get {
+        /// Session id (UUID).
         id: String,
     },
 }
@@ -709,6 +802,7 @@ pub enum SessionsCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum UserDmsCmd {
+    /// List opened DM channels keyed by `(user, channel_type)`.
     List,
 }
 
@@ -747,17 +841,28 @@ pub enum DroppedMessagesCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum ApprovalsCmd {
+    /// List pending approvals across all families (sender, channel,
+    /// `install_packages`, `add_mcp_server`).
     List,
-    Get { id: String },
+    /// Show one approval by id.
+    Get {
+        /// Approval id.
+        id: String,
+    },
     /// Approve a sender by `(channel_type, identity)`. Persists a
     /// `users` row keyed on that pair; the host's sender-scope
     /// gate consults `users` on every inbound, so the approval
     /// takes effect on the next message without a host restart.
+    /// (Channel / install / MCP approvals don't have a generic CLI
+    /// write surface yet — see docs/plans/vaporware-followups.md.)
     Approve {
+        /// Channel kind the sender uses (e.g. `telegram`, `slack`).
         #[arg(long)]
         channel: String,
+        /// Sender's platform-native id.
         #[arg(long)]
         identity: String,
+        /// Optional display name to attach to the new `users` row.
         #[arg(long)]
         display_name: Option<String>,
     },
