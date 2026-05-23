@@ -160,6 +160,21 @@ impl ContainerManager {
         // loop hook.
         if let Some(root) = session_root {
             super::tasks_snapshot::write_tasks_snapshot(&self.central, session.id, root);
+            // Drop a `.host_path` file at the session root containing the
+            // absolute host path of the bind-mount source. The
+            // `artifact_path` MCP tool reads it so the agent can tell the
+            // operator where to find files it wrote under /data. Without
+            // this, every "I built X" turn dead-ends because the user
+            // can't actually reach the artifacts.
+            let host_path_marker = root.join(".host_path");
+            if let Err(err) = std::fs::write(&host_path_marker, root.to_string_lossy().as_bytes())
+            {
+                warn!(
+                    ?err,
+                    path = %host_path_marker.display(),
+                    "could not write .host_path discovery file; artifact_path tool will error"
+                );
+            }
         }
 
         let system = assemble_system_prompt_with_catalogue(

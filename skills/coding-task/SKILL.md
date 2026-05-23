@@ -1,76 +1,87 @@
 ---
 name: coding-task
-description: Disciplines for doing real coding work — editing files, running tests, deciding when to add comments, when to stop. Opt-in via `SkillsSelector::Explicit` on the agent group; non-coding agents should not enable this.
+description: Disciplines for doing real coding work — editing files, running tests, verifying that what you built actually works, and delivering the artifacts so the operator can use them. Opt-in via `SkillsSelector::Explicit` on the agent group; non-coding agents should not enable this.
 ---
 
 # coding-task
 
-How to do coding work as an Ironclaw agent. This skill captures the
-behaviour the operator wants when an agent is asked to write or change
-code — distinct from messaging, scheduling, or support agents who would
-not have this skill enabled.
+How to do coding work as an Ironclaw agent. The base session image
+ships with `python3`, `pip`, `node`, `npm`, `git`, `curl`, `wget`,
+`jq`, and `build-essential` available via `shell`. Use them.
 
 ## Doing the task
 
-**Read before you write.** Open the file you're about to change with
-`read_file` first. Skim the surrounding code so the change matches the
-style already there.
+- **Read before you write.** Open files with `read_file` first.
+  Match the surrounding style.
+- **Prefer editing existing files.** Don't create a new file unless
+  the task needs one.
+- **Don't add features the user didn't ask for.** No surrounding
+  cleanup, no speculative helpers, no future-proofing.
+- **Don't add error handling for impossible cases.** Trust internal
+  guarantees. Validate at system boundaries only.
+- **Comments only when the *why* is non-obvious.** Restating the
+  code is noise.
 
-**Prefer editing existing files.** Don't create a new file unless the
-task genuinely needs one. The repository's existing structure is almost
-always the right place for new code.
+## Verifying the change works (NOT OPTIONAL)
 
-**Don't add features the user didn't ask for.** A bug fix doesn't need
-surrounding cleanup. A one-shot operation doesn't need a helper. Don't
-design for hypothetical future requirements.
+**You do not claim "done" until you ran the code.** "Production-
+ready", "complete", "working" — those are claims about evidence,
+not vibes. If you have no evidence, you don't have the claim.
 
-**Don't add error handling for impossible cases.** Trust internal code
-and framework guarantees. Validate at system boundaries (user input,
-external APIs) — not at every internal boundary.
+Concrete verification recipes:
 
-**Don't add comments unless they pay rent.** Most comments restate what
-the code already says. Write a comment only when the *why* is
-non-obvious: a hidden constraint, a workaround for a specific bug,
-behaviour that would surprise a reader. If removing the comment
-wouldn't confuse a future reader, don't write it.
+- **Python script** — `python3 path/to/file.py` (or with a sample
+  input). Confirm exit 0 and the expected output.
+- **Python module** — `python3 -c 'import path.to.module; print("ok")'`
+  to catch import-time errors at minimum.
+- **Node app** — `node path/to/file.js`. For an Express/HTTP server,
+  also: spawn it on a port, `curl http://localhost:<port>/`, and
+  confirm a real response before declaring it works.
+- **HTML page** — `head` the file to confirm structure;
+  `python3 -m http.server` in the dir and `curl` your test page
+  to verify it serves; visually you can't preview from the
+  container, but at least confirm the file is syntactically valid
+  HTML and the assets it references exist.
+- **Any script** — if there's a test command (`pytest`, `npm test`),
+  run it. The bar is higher than "it compiles."
 
-## Verifying the change works
+If the verification fails or you can't run it, **say so in your
+reply**. "I wrote X but couldn't run it because Y" is honest.
+"Production-ready" without evidence is not.
 
-**Run the tests before declaring done.** If the project has tests for
-the area you touched, run them. If your change should have a test and
-doesn't, add one — but stay focused; don't expand the test plan beyond
-the change.
+## Delivering artifacts to the operator
 
-**Type-check and lint pass.** A change isn't done if `cargo check`,
-`tsc`, `mypy`, or `clippy` complains about it. Fix the warnings, don't
-suppress them, unless the suppression is the genuinely-right answer
-(in which case write a brief comment explaining why).
+Files you write under `/data/` are invisible to the operator unless
+you do one of these. Pick one for every artifact you produce:
 
-**Don't claim a UI works without running it.** Type-checking and tests
-verify correctness, not feature behaviour. If the change is visible to
-a human, exercise it — start the dev server, click the thing, watch
-for regressions. If you can't, say so explicitly rather than claiming
-success.
+1. **`send_file`** — pushes the file through the channel adapter
+   (Telegram shows it as an attachment, etc.). Good for small
+   deliverables the operator wants on their phone.
+2. **`artifact_path`** — returns the host-side filesystem path
+   corresponding to `/data`. Include that path verbatim in your
+   reply so the operator can `cd` to it. Good for many-file
+   projects (entire repo, build output, etc.).
+
+Without either, you've effectively built nothing the operator can
+use. Saying "the files are at `/data/foo.html`" is wrong — `/data`
+is the *container*'s path, not the operator's.
+
+## Don't fabricate
+
+If you used `web_search` and got 12 results, your report says "12
+results." Never invent "238K user complaints reviewed" or "$12M ARR
+projection" or research stats you didn't actually compute. If the
+data isn't real, don't pretend it is.
 
 ## Knowing when to stop
 
-**Match the change to what was asked.** A one-line fix gets a one-line
-diff. Don't refactor adjacent code, rename variables, or "improve"
-formatting because you were in the file.
-
-**Don't half-finish.** If you can't complete the task in a single pass,
-stop, summarise where you are, and ask. Leaving an in-flight refactor
-in the tree is worse than not starting.
-
-**Stop after the substantive change.** Don't write a summary paragraph
-restating what you did — the diff already says that. Cross-reference
-[[todo-tracker]] for step-tracking and [[agent-memory]] for things the
-user wants you to remember next time.
+- **Match the change to what was asked.** No drive-by refactors.
+- **Don't half-finish.** If you can't complete in one pass, stop
+  and ask.
+- **Stop after the substantive change.** No "here's what I built"
+  prose restating the diff.
 
 ## Related skills
 
-- [[git-commit]] — once the work is done, how to stage and commit it.
-- [[code-review]] — reading a diff someone else wrote.
-- [[testing]] — finding the suite, interpreting failures.
-- [[planning]] (via [[todo-tracker]]) — breaking multi-step work into
-  trackable items.
+- [[git-commit]], [[code-review]], [[testing]], [[todo-tracker]],
+  [[agent-memory]]

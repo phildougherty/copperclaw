@@ -146,6 +146,14 @@ pub const RUNNER_PATH_IN_IMAGE: &str = "/usr/local/bin/ironclaw-runner";
 /// than producing a broken image.
 pub fn default_spec() -> Result<ImageBuildSpec, StepError> {
     let mut spec = ImageBuildSpec::new(DEFAULT_REPO, DEFAULT_BASE_IMAGE);
+    // Baseline runtime layer: every session agent can run Python or
+    // Node code it writes, hit HTTP endpoints, and clone repos out of
+    // the box. Without these the agent confabulates "production-ready"
+    // because it has no way to actually exercise what it produced —
+    // there's no python3, no node, no curl, no git. Adds ~500MB to
+    // the image but the alternative is per-spawn `install_packages`
+    // churn that takes minutes per cold start.
+    spec.apt_packages = DEFAULT_BASE_APT_PACKAGES.iter().copied().map(String::from).collect();
     let runner_path = locate_runner_binary()?;
     let bytes = std::fs::read(&runner_path).map_err(|e| {
         StepError::Other(format!(
@@ -158,6 +166,40 @@ pub fn default_spec() -> Result<ImageBuildSpec, StepError> {
     );
     Ok(spec)
 }
+
+/// Apt packages installed in every session image by default. The list
+/// is deliberately conservative: language runtimes the agent will
+/// reach for, plus the network + build tools they need to be useful.
+/// Operators can extend per-group via `iclaw groups config
+/// add-package`. Heavyweight things (clang, rustc, postgres-client,
+/// docker.io) intentionally NOT included — those belong in per-group
+/// add-ons.
+pub const DEFAULT_BASE_APT_PACKAGES: &[&str] = &[
+    // Network + cert basics.
+    "ca-certificates",
+    "curl",
+    "wget",
+    // Source control.
+    "git",
+    // Python runtime + package management + venv support for safe
+    // per-session installs without polluting the system-wide site.
+    "python3",
+    "python3-pip",
+    "python3-venv",
+    // Node runtime + npm. Pre-installed so the agent doesn't reach
+    // for `install_packages` and trigger a full image rebuild before
+    // it can `node app.js`.
+    "nodejs",
+    "npm",
+    // GNU build chain — required by many pip installs that compile
+    // C extensions on first use. Heavier than the rest but ubiquitous.
+    "build-essential",
+    // Useful diagnostic / inspection tools the agent reaches for when
+    // troubleshooting its own output.
+    "jq",
+    "less",
+    "procps",
+];
 
 /// Find the `ironclaw-runner` binary that should be baked into the
 /// session image.

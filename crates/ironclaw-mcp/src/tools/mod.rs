@@ -30,6 +30,7 @@ pub mod git_log;
 pub mod git_status;
 pub mod glob;
 pub mod grep;
+pub mod artifact_path;
 pub mod clear_history;
 pub mod compact_now;
 pub mod interactive;
@@ -103,6 +104,7 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         todo::delete::entry(),
         compact_now::entry(),
         clear_history::entry(),
+        artifact_path::entry(),
     ]
 }
 
@@ -204,6 +206,7 @@ mod tests {
             "todo_delete",
             "compact_now",
             "clear_history",
+            "artifact_path",
         ];
         assert_eq!(set.len(), expected.len());
         for tool in &expected {
