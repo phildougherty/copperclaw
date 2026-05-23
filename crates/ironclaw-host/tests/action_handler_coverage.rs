@@ -174,8 +174,13 @@ async fn every_runner_emit_has_a_host_handler() {
 fn runner_emit_set_matches_source() {
     let tools_src = std::fs::read_to_string(runner_path("tools.rs"))
         .expect("read crates/ironclaw-runner/src/tools.rs");
-    let run_src = std::fs::read_to_string(runner_path("run.rs"))
-        .expect("read crates/ironclaw-runner/src/run.rs");
+    // `run.rs` was split into a directory module (`run/mod.rs` plus
+    // focused sub-files) in the runner refactor. `emit_usage_report`
+    // stayed in `mod.rs` alongside the main loop because it locks the
+    // outbound `Connection`; the regex scan only needs the file that
+    // contains its body.
+    let run_src = std::fs::read_to_string(runner_path("run/mod.rs"))
+        .expect("read crates/ironclaw-runner/src/run/mod.rs");
 
     // Match `serde_json::json!({ "<name>": ...` where <name> is the
     // first key inside the top-level object. This is the pattern every
