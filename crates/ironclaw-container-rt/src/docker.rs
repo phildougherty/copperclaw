@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bollard::container::{
-    Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions, StopContainerOptions,
+    Config, CreateContainerOptions, ListContainersOptions, LogsOptions, RemoveContainerOptions,
+    StopContainerOptions,
 };
 use bollard::image::BuildImageOptions;
 use bollard::models::{DeviceRequest, HostConfig, Mount as DockerMount, MountTypeEnum};
@@ -190,6 +191,35 @@ impl ContainerRuntime for DockerRuntime {
             }) => Ok(false),
             Err(e) => Err(RtError::Container(format!("inspect image {tag}: {e}"))),
         }
+    }
+
+    async fn logs(&self, name: &str, tail: u32) -> Result<String, RtError> {
+        // bollard streams `LogOutput` chunks for both stdout and stderr.
+        // We want the tail of the combined stream as plain UTF-8 — the
+        // host writes the result to a `crash-<utc>.log` file, so any
+        // non-UTF-8 bytes are best lossy-decoded rather than dropped.
+        let opts = LogsOptions::<String> {
+            stdout: true,
+            stderr: true,
+            tail: tail.to_string(),
+            follow: false,
+            ..Default::default()
+        };
+        let mut stream = self.docker.logs(name, Some(opts));
+        let mut buf = String::new();
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(chunk) => {
+                    buf.push_str(&String::from_utf8_lossy(chunk.as_ref()));
+                }
+                Err(e) => {
+                    return Err(RtError::Container(format!(
+                        "fetch logs {name}: {e}"
+                    )));
+                }
+            }
+        }
+        Ok(buf)
     }
 }
 

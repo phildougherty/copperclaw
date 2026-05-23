@@ -46,6 +46,12 @@ ironclaw-modules       = { workspace = true }
 ironclaw-skills        = { workspace = true }
 ironclaw-onecli        = { workspace = true }
 ironclaw-metrics       = { workspace = true }
+# Used at startup to compute the runner's effective provider
+# deadline (honouring `IRONCLAW_RUNNER_PROVIDER_DEADLINE_MS`) so the
+# boot-time heartbeat-vs-deadline alignment check warns against the
+# value the runner will actually be configured with. Read-only — no
+# runtime coupling to the runner's poll loop.
+ironclaw-runner        = { workspace = true }
 ironclaw-iclaw           = { path = "../ironclaw-iclaw" }
 tokio                  = { workspace = true }
 tokio-util             = "0.7"

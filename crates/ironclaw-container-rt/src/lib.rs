@@ -93,6 +93,20 @@ pub trait ContainerRuntime: Send + Sync {
         let _ = tag;
         Ok(false)
     }
+
+    /// Capture up to `tail` lines from the named container's combined
+    /// stdout/stderr stream. Used by the host's crash-restart path to
+    /// archive the last words of a dying runner before its container is
+    /// removed.
+    ///
+    /// Default impl returns an empty string — backends that don't
+    /// support log capture (`AppleContainerRuntime` today, in-process
+    /// test stubs) silently degrade. Concrete runtimes (Docker)
+    /// override.
+    async fn logs(&self, name: &str, tail: u32) -> Result<String, RtError> {
+        let _ = (name, tail);
+        Ok(String::new())
+    }
 }
 
 /// Picker for [`detect`] / explicit selection.

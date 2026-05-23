@@ -52,6 +52,23 @@ pub const ACTIVE_POLL_INTERVAL_MS: u64 = 500;
 /// (~1.75s).
 ///
 /// Overridable per-process via `IRONCLAW_RUNNER_PROVIDER_DEADLINE_MS`.
+///
+/// # Coupled with the host's heartbeat-staleness threshold
+///
+/// The host's `DEFAULT_HEARTBEAT_STALE_SECS` (in
+/// `ironclaw-host/src/container_manager/spawn.rs`) MUST stay at least
+/// `2 * (DEFAULT_PROVIDER_DEADLINE_MS / 1000)`. If they're equal, the
+/// host can race the runner and SIGKILL the container at the exact
+/// moment a slow provider call returns `DeadlineExceeded`, losing the
+/// in-flight turn and triggering a respawn loop. The host enforces
+/// this with a startup check
+/// (`check_heartbeat_deadline_alignment`) that emits a `warn!` when
+/// the relationship is violated — see that function for the rationale.
+///
+/// If you raise this default, also raise the heartbeat threshold to
+/// keep the 2x margin. If you lower it (e.g. tightening to 30s for a
+/// faster-fail UX), the existing 120s heartbeat default already
+/// covers the new value with margin to spare.
 pub const DEFAULT_PROVIDER_DEADLINE_MS: u64 = 60_000;
 
 /// Environment variable read at runner startup to override
@@ -433,14 +450,31 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
             tracing::info!("history compacted (sentinel consumed)");
         }
 
-        state
-            .history
-            .push(HistoryMessage::User { content: formatted.prompt });
-
         if deps.compaction.should_compact(estimate_tokens(&state.history)) {
             state.history = compact(state.history, deps.provider.as_ref(), &deps.compaction)
                 .await
                 .context("compaction failed")?;
+        }
+
+        // Resume-after-crash guard. If the prior runner persisted a
+        // mid-message history (per-turn save_state in drive_turn) and
+        // then crashed before finalize_messages ran, the inbound will
+        // be re-picked-up here with state.history already ending in
+        // the matching User message. Pushing again would feed the
+        // model two consecutive identical user turns, which confuses
+        // it ("the user just asked twice?"). Only check the LAST
+        // entry — cheap and the only place a duplicate could land,
+        // since prior turns appended assistant/tool entries on top.
+        let already_pushed = matches!(
+            state.history.last(),
+            Some(HistoryMessage::User { content }) if content == &formatted.prompt
+        );
+        if already_pushed {
+            tracing::debug!("resuming mid-message — skipping duplicate user push");
+        } else {
+            state
+                .history
+                .push(HistoryMessage::User { content: formatted.prompt });
         }
 
         let turn = drive_turn(&deps, &mut state.history, state.continuation.as_deref()).await?;
@@ -2154,5 +2188,203 @@ mod tests {
             )
             .unwrap();
         assert_eq!(status, "failed");
+    }
+
+    /// Mid-message persistence: after the FIRST inner iteration of
+    /// drive_turn's tool-turn loop, the assistant tool_use and the
+    /// tool_result must already be in `runner.history` on disk. If the
+    /// runner crashed mid-message before the end-of-inbound save_state,
+    /// the respawned runner needs to see the work the prior attempt
+    /// did so it doesn't replay every tool call.
+    #[tokio::test]
+    async fn save_state_per_turn_persists_intermediate_tool_results() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // Custom provider that snapshots persisted runner state at the
+        // start of each `query()` call. Turn 1: emit a ToolCall. Turn
+        // 2: emit a final Result. We assert that the snapshot captured
+        // at the START of turn 2 already includes the User + ToolUse +
+        // Tool(result) entries — meaning the mid-message save_state
+        // fired between the two turns.
+        struct SnapshotProvider {
+            outbound: Arc<Mutex<Connection>>,
+            calls: AtomicU32,
+            snapshot_at_turn2: StdMutex<Option<Vec<HistoryMessage>>>,
+        }
+        #[async_trait]
+        impl AgentProvider for SnapshotProvider {
+            fn name(&self) -> &'static str {
+                "snapshot"
+            }
+            async fn query(
+                &self,
+                _input: QueryInput,
+            ) -> Result<Box<dyn AgentQuery>, ProviderError> {
+                let n = self.calls.fetch_add(1, Ordering::Relaxed);
+                let events = if n == 0 {
+                    // First turn: one tool call, then end of stream.
+                    vec![
+                        ProviderEvent::ToolCall {
+                            id: "tu_mid_1".into(),
+                            name: "shell".into(),
+                            input: serde_json::json!({"cmd": "echo mid"}),
+                        },
+                        ProviderEvent::Result { text: None },
+                    ]
+                } else {
+                    // Capture what the runner persisted between turn 1
+                    // and turn 2 — that's the mid-message save_state.
+                    if n == 1 {
+                        let g = self.outbound.lock().await;
+                        let st = crate::state::load_state(&g).unwrap();
+                        *self.snapshot_at_turn2.lock().unwrap() = Some(st.history);
+                    }
+                    vec![ProviderEvent::Result {
+                        text: Some("all done".into()),
+                    }]
+                };
+                Ok(Box::new(ScriptedQuery {
+                    events: StdMutex::new(events),
+                }))
+            }
+            fn is_session_invalid(&self, _err: &ProviderError) -> bool {
+                false
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let inbound = Arc::new(Mutex::new(open_inbound(&paths).unwrap()));
+        let outbound = Arc::new(Mutex::new(open_outbound(&paths).unwrap()));
+        let provider = Arc::new(SnapshotProvider {
+            outbound: outbound.clone(),
+            calls: AtomicU32::new(0),
+            snapshot_at_turn2: StdMutex::new(None),
+        });
+        let tool_ctx: Arc<dyn ToolContext> =
+            Arc::new(RunnerToolCtx::new(outbound.clone(), paths.outbox.clone()));
+        let mut deps = RunnerDeps::minimal(
+            provider.clone(),
+            tool_ctx,
+            inbound.clone(),
+            outbound.clone(),
+            paths.outbox.join("_compactions"),
+        );
+        deps.max_turns = Some(1);
+        deps.idle_sleep = Duration::from_millis(1);
+
+        {
+            let g = inbound.lock().await;
+            insert_pending(&g, "do a tool then finish");
+        }
+        run_loop(deps).await.unwrap();
+
+        let snapshot = provider
+            .snapshot_at_turn2
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("expected a mid-message snapshot at start of turn 2");
+
+        // Must contain: User prompt + ToolUse(shell) + Tool(result) at minimum.
+        let has_user = snapshot
+            .iter()
+            .any(|m| matches!(m, HistoryMessage::User { content } if content.contains("do a tool then finish")));
+        let has_tool_use = snapshot.iter().any(|m| matches!(
+            m,
+            HistoryMessage::ToolUse { id, name, .. } if id == "tu_mid_1" && name == "shell"
+        ));
+        let has_tool_result = snapshot.iter().any(|m| matches!(
+            m,
+            HistoryMessage::Tool { tool_use_id, .. } if tool_use_id == "tu_mid_1"
+        ));
+        assert!(
+            has_user,
+            "mid-message snapshot missing the User entry: {snapshot:?}"
+        );
+        assert!(
+            has_tool_use,
+            "mid-message snapshot missing the ToolUse entry: {snapshot:?}"
+        );
+        assert!(
+            has_tool_result,
+            "mid-message snapshot missing the Tool result entry: {snapshot:?}"
+        );
+    }
+
+    /// Resume-after-crash dedup: if the persisted history already ends
+    /// with a User message matching the freshly-formatted prompt, the
+    /// runner must NOT push a second copy. Two consecutive identical
+    /// User entries confuse the model ("did the user really ask
+    /// twice?"). Caught by inspection during the lost-progress fix:
+    /// the per-turn save_state lands history mid-message, and a crash
+    /// before finalize_messages leaves the inbound pending — the next
+    /// runner spawn re-picks it and would otherwise duplicate the push.
+    #[tokio::test]
+    async fn resume_with_matching_user_message_skips_duplicate_push() {
+        let mut setup = build_setup(vec![vec![ProviderEvent::Result {
+            text: Some("resumed".into()),
+        }]]);
+        // Insert one pending inbound with text "ping". format_messages
+        // wraps it in a `[chat …] ping` envelope; that's what the
+        // dedup check compares against, so we pre-format the history
+        // entry the same way by lifting format_messages's output.
+        let id = {
+            let g = setup.deps.inbound.lock().await;
+            insert_pending(&g, "ping")
+        };
+        // Capture the formatted prompt the runner will produce so we
+        // can pre-seed history with a matching User entry. Reuse the
+        // same code path the run loop uses.
+        let formatted_prompt = {
+            let g = setup.deps.inbound.lock().await;
+            let pending = messages_in::get_pending(&g, true, 10).unwrap();
+            crate::formatter::format_messages(pending).prompt
+        };
+        // Pre-seed history as if a prior runner had pushed the user
+        // message and crashed before finalize_messages.
+        {
+            let g = setup.deps.outbound.lock().await;
+            crate::state::save_state(
+                &g,
+                &[HistoryMessage::User {
+                    content: formatted_prompt.clone(),
+                }],
+                None,
+            )
+            .unwrap();
+        }
+        setup.deps.max_turns = Some(1);
+        run_loop(setup.deps).await.unwrap();
+
+        let outbound = open_outbound(&setup.paths).unwrap();
+        let st = load_state(&outbound).unwrap();
+        // No two consecutive User entries with identical content.
+        let mut prev_user: Option<&str> = None;
+        for m in &st.history {
+            if let HistoryMessage::User { content } = m {
+                if let Some(prev) = prev_user {
+                    assert!(
+                        prev != content,
+                        "duplicate consecutive User entries with same content: {:?}",
+                        st.history
+                    );
+                }
+                prev_user = Some(content.as_str());
+            } else {
+                prev_user = None;
+            }
+        }
+        // And only one User entry total matches the formatted prompt.
+        let user_matches = st
+            .history
+            .iter()
+            .filter(|m| matches!(m, HistoryMessage::User { content } if content == &formatted_prompt))
+            .count();
+        assert_eq!(
+            user_matches, 1,
+            "expected exactly one User entry matching the prompt, got: {:?}",
+            st.history
+        );
+        let _ = id;
     }
 }

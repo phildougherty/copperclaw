@@ -43,11 +43,67 @@ pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 /// `.heartbeat` file's mtime every ~1s as part of the poll loop; if
 /// the host hasn't seen a refresh for this long, the runner is
 /// presumed dead and the container is reset for respawn.
-pub const DEFAULT_HEARTBEAT_STALE_SECS: u64 = 60;
+///
+/// **Must stay ≥ 2× the runner's `DEFAULT_PROVIDER_DEADLINE_MS / 1000`**
+/// (see `ironclaw-runner/src/run/mod.rs::DEFAULT_PROVIDER_DEADLINE_MS`).
+/// Rationale: the runner's `HeartbeatTicker` only fires every 5s, and a
+/// provider call that blocks for the full 60s deadline can leave the
+/// last touch ~5s in the past by the time the deadline trips. If this
+/// threshold equals the deadline, the host can mark the container stale
+/// and SIGKILL it the same instant the provider call would have returned
+/// `Err(DeadlineExceeded)` — losing the work and triggering a respawn
+/// loop on slow models. 120s gives the runner room to fail a 60s
+/// provider call cleanly (emit `usage_report`, finalise the inbound) before
+/// being declared dead. The startup check in
+/// [`check_heartbeat_deadline_alignment`] warns operators who tighten one
+/// side without the other.
+pub const DEFAULT_HEARTBEAT_STALE_SECS: u64 = 120;
 
 /// Grace period passed to `runtime.stop` on idle / crash transitions.
 /// 5s is enough for the runner to flush an in-flight HTTP call.
 pub const DEFAULT_STOP_GRACE_SECS: u64 = 5;
+
+/// Verify that the host's `heartbeat_stale_secs` leaves the runner room
+/// to fail a provider call before being declared dead. The runner's
+/// `HeartbeatTicker` fires every 5s and a provider attempt can block
+/// for the full `provider_deadline_ms` — if the stale threshold equals
+/// the deadline, the host can race the runner and SIGKILL the
+/// container the same moment the provider call returns
+/// `DeadlineExceeded`. We require `heartbeat_stale_secs >= 2 *
+/// (provider_deadline_ms / 1000)` so the runner has its full provider
+/// budget plus a turn-worth of margin to land the failure cleanly.
+///
+/// Returns `Ok(())` when the relationship holds. Returns a human-
+/// readable warning string otherwise; callers should log it at `warn!`
+/// rather than panic — an operator may have set both sides
+/// deliberately. Called from `boot.rs::spawn_container_manager` at
+/// startup so the warning lands once in the host log with both
+/// values visible.
+///
+/// # Errors
+///
+/// Returns `Err(String)` describing the misconfiguration when the
+/// safety relationship does not hold; the returned message names both
+/// values and the required relationship so the operator can act
+/// without spelunking the source.
+pub fn check_heartbeat_deadline_alignment(
+    heartbeat_stale_secs: u64,
+    provider_deadline_ms: u64,
+) -> Result<(), String> {
+    // Integer-divide ceilingly so a deadline of e.g. 60_500ms reads as
+    // 61s, not 60s — the operator is asking for "just over a minute",
+    // and the safety margin should reflect that.
+    let deadline_secs = provider_deadline_ms.div_ceil(1_000);
+    let required = deadline_secs.saturating_mul(2);
+    if heartbeat_stale_secs >= required {
+        return Ok(());
+    }
+    Err(format!(
+        "heartbeat_stale_secs ({heartbeat_stale_secs}s) < 2 x provider_deadline ({deadline_secs}s = {provider_deadline_ms}ms); \
+         the host may declare a container stale and SIGKILL it before a slow provider call completes — \
+         raise heartbeat_stale_secs to at least {required}s or lower the provider deadline"
+    ))
+}
 
 impl ContainerManager {
     /// Try to spawn a container for `session`. Returns `Ok(true)` when
@@ -1252,6 +1308,80 @@ mod tests {
         );
         let changed = mgr.reload_env(None);
         assert!(changed.is_empty(), "{changed:?}");
+    }
+
+    /// The defaults shipped in this module must already satisfy the
+    /// startup alignment check — otherwise every host boot would emit
+    /// the warn line. If a future contributor lowers the heartbeat
+    /// threshold or raises the provider deadline default without
+    /// updating the other, this test catches it before the operator
+    /// does.
+    #[test]
+    fn defaults_satisfy_heartbeat_deadline_alignment() {
+        // Reach across crates here intentionally: the runner crate
+        // owns the provider-deadline default, the host crate owns the
+        // heartbeat threshold, and the safety check is the load-
+        // bearing contract between them.
+        let runner_default = ironclaw_runner::DEFAULT_PROVIDER_DEADLINE_MS;
+        check_heartbeat_deadline_alignment(DEFAULT_HEARTBEAT_STALE_SECS, runner_default)
+            .expect("shipped defaults must already align");
+    }
+
+    /// The boundary case — heartbeat exactly equal to `2 * deadline` —
+    /// is the minimum acceptable configuration and must pass without
+    /// a warn.
+    #[test]
+    fn alignment_check_passes_at_exact_2x_boundary() {
+        // 30s deadline → require 60s heartbeat.
+        assert!(check_heartbeat_deadline_alignment(60, 30_000).is_ok());
+        // 60s deadline → require 120s heartbeat (matches the new
+        // shipped defaults).
+        assert!(check_heartbeat_deadline_alignment(120, 60_000).is_ok());
+    }
+
+    /// The misconfigured case fires an Err containing both values so
+    /// the operator can act on the warn line without reading source.
+    /// This is the regression guard for the original race: a 60s
+    /// heartbeat against a 60s provider deadline.
+    #[test]
+    fn alignment_check_warns_when_heartbeat_lt_2x_deadline() {
+        // Original (pre-fix) configuration: same value on both sides.
+        let err = check_heartbeat_deadline_alignment(60, 60_000)
+            .expect_err("60s heartbeat vs 60s deadline must trip the check");
+        assert!(err.contains("60s"), "warning must show heartbeat value: {err}");
+        assert!(
+            err.contains("60000ms") || err.contains("60_000"),
+            "warning must show deadline ms value: {err}"
+        );
+        assert!(
+            err.contains("120"),
+            "warning must name the required minimum (2x = 120s): {err}"
+        );
+    }
+
+    /// A sub-second deadline (only reachable in tests today, but the
+    /// check should still be sensible) ceils to 1s so the required
+    /// minimum is 2s, not 0.
+    #[test]
+    fn alignment_check_ceils_sub_second_deadlines() {
+        // 500ms deadline → div_ceil to 1s → require 2s heartbeat.
+        assert!(check_heartbeat_deadline_alignment(2, 500).is_ok());
+        assert!(check_heartbeat_deadline_alignment(1, 500).is_err());
+    }
+
+    /// Operator-supplied extreme values must not panic the check.
+    /// The `saturating_mul` guards against u64 overflow when the
+    /// operator pins the deadline at the upper validator bound and
+    /// the heartbeat at some other large number.
+    #[test]
+    fn alignment_check_does_not_overflow_on_large_values() {
+        // u64::MAX deadline would overflow without saturating_mul.
+        // Heartbeat is also u64::MAX so the relationship holds at
+        // saturation.
+        assert!(check_heartbeat_deadline_alignment(u64::MAX, u64::MAX).is_ok());
+        // A more realistic extreme: the validator-capped 300s
+        // deadline against a tiny heartbeat — must Err, not panic.
+        assert!(check_heartbeat_deadline_alignment(10, 300_000).is_err());
     }
 
 }

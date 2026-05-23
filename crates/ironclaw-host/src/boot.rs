@@ -835,6 +835,37 @@ fn spawn_container_manager(
         gpu_passthrough: parse_truthy_env("IRONCLAW_CONTAINER_GPU"),
         forward_env: collect_forward_env(),
     };
+
+    // Startup safety check: the host's heartbeat-staleness threshold
+    // must leave the runner enough room to fail a provider call
+    // cleanly before being declared dead. If an operator pinned
+    // IRONCLAW_RUNNER_PROVIDER_DEADLINE_MS at a value that's too close
+    // to (or larger than) `heartbeat_stale_secs / 2`, the host can
+    // race the runner and SIGKILL the container the same instant the
+    // provider call returns `DeadlineExceeded`. We warn rather than
+    // panic — an operator may have set both deliberately (e.g. a
+    // local Ollama setup with both numbers cranked) — but the log
+    // line names both values so it's actionable. See
+    // `container_manager::spawn::check_heartbeat_deadline_alignment`
+    // for the rationale. Reads the same env var the runner reads at
+    // spawn so the comparison reflects the value the runner will
+    // actually be configured with.
+    {
+        let env_for_check = ironclaw_runner::config::SystemEnv;
+        let provider_deadline = ironclaw_runner::resolve_provider_deadline(&env_for_check);
+        let provider_deadline_ms = u64::try_from(provider_deadline.as_millis())
+            .unwrap_or(u64::MAX);
+        if let Err(msg) = crate::container_manager::spawn::check_heartbeat_deadline_alignment(
+            manager_cfg.heartbeat_stale_secs,
+            provider_deadline_ms,
+        ) {
+            warn!(
+                heartbeat_stale_secs = manager_cfg.heartbeat_stale_secs,
+                provider_deadline_ms,
+                "{msg}"
+            );
+        }
+    }
     let manager = Arc::new(
         crate::container_manager::ContainerManager::new(central, runtime, manager_cfg)
             .with_spawn_tracker(spawn_tracker),

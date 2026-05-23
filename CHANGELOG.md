@@ -6,6 +6,122 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (root-cause batch: silent crash + lost progress on restart)
+
+A Telegram retest showed the agent building a CapCut clone, then going
+silent mid-build, then forgetting everything on respawn. Three
+independent architectural bugs combined:
+
+1. **Container heartbeat went stale → host removed the container →
+   no chat apology for 5 minutes** (until `host_sweep::apology`
+   PendingTooLong fired). From the user's view: typing indicator, then
+   silence, then a generic "I'm having trouble" five minutes later.
+2. **Runner crashed mid-message → all in-memory tool turns lost.**
+   `save_state` only persisted history + continuation ONCE per
+   inbound, AFTER `drive_turn` returned. A long multi-tool message
+   (11 tool turns + 5 file writes in this case) kept everything in
+   memory; the crash erased it. Respawned runner saw only the
+   pre-message history and replied "Nothing went wrong — I'm just
+   waiting on your pick".
+3. **No diagnostic capture before container removal.** The
+   `CrashRestart` path called `runtime.remove(...)` before reading the
+   container's logs — by the time we wanted to debug, the evidence was
+   gone.
+
+Three parallel fixes, each on disjoint file scope:
+
+- **`crates/ironclaw-host/src/container_manager/classify.rs`**: the
+  `CrashRestart` action now (a) captures the last 200 lines of the
+  container's stdout/stderr to `<session_root>/crash-<rfc3339>.log`
+  BEFORE removing the container, (b) scans `processing_ack` for
+  in-flight `Processing` claims and emits a chat apology
+  ("Hit a snag mid-task and need to restart the agent container.
+  Some progress may have been lost. I'll pick back up — try sending
+  a follow-up if I don't continue on my own.") per row with chat
+  routing, (c) marks each emitted claim `Failed` and the corresponding
+  inbound `tries = APOLOGY_TRIES_MARKER (99)` so the host-sweep paths
+  don't double-fire. Idempotent across reconciler ticks. New trait
+  method `ContainerRuntime::logs(name, tail) -> Result<String>` with
+  a default empty-string impl; only `DockerRuntime` overrides it
+  (bollard `LogsOptions{tail, stdout, stderr}`). 3 new unit tests.
+- **`crates/ironclaw-runner/src/run/{mod,drive_turn}.rs`**: `drive_turn`
+  now calls `save_state` AFTER each tool-turn iteration (not just at
+  end of message) via a `persist_mid_message` helper. A mid-message
+  crash now preserves the assistant + tool_use + tool_result history
+  on disk. The run-loop additionally guards against duplicate user
+  pushes on resume — if `state.history.last()` is already a User
+  message with the same content as `formatted.prompt`, it logs a
+  debug line ("resuming mid-message — skipping duplicate user push")
+  and skips the push. Two regression tests cover both halves.
+- **`crates/ironclaw-host/src/container_manager/spawn.rs` +
+  `boot.rs`**: raised `DEFAULT_HEARTBEAT_STALE_SECS` 60 → 120, added
+  startup safety check `check_heartbeat_deadline_alignment` (warns
+  when `heartbeat_stale_secs < 2 * provider_deadline_secs`), cross-
+  referenced the constants. See the "Changed
+  (heartbeat-vs-provider-deadline race hardening)" entry below for
+  details. (Promoted `ironclaw-runner` from dev-dep to runtime dep
+  in `crates/ironclaw-host/Cargo.toml` to read the runner's effective
+  provider deadline from `resolve_provider_deadline(&SystemEnv)` at
+  boot.)
+
+Verification: cargo test --workspace --no-fail-fast = 5276 passed (10
+new tests); clippy clean. Live retest pending.
+
+### Changed (heartbeat-vs-provider-deadline race hardening)
+
+The host's `DEFAULT_HEARTBEAT_STALE_SECS` and the runner's
+`DEFAULT_PROVIDER_DEADLINE_MS` previously defaulted to the same 60s
+value, which exposed a small but real race: when the runner's
+`HeartbeatTicker` had any latency dropping its last touch (it fires
+every 5s; a fully-blocked provider attempt can let mtime drift
+~5s in the past), the host could mark the container stale and
+SIGKILL it the same instant `provider.query()` returned
+`Err(DeadlineExceeded)` — losing the work and triggering a respawn
+loop on slow Sonnet calls.
+
+- `crates/ironclaw-host/src/container_manager/spawn.rs`:
+  `DEFAULT_HEARTBEAT_STALE_SECS` raised from `60` → `120` so the host
+  always gives the runner at least the full provider budget plus a
+  turn-worth of margin to fail cleanly before declaring the container
+  dead. Doc comment now cross-references the runner-side default.
+- `crates/ironclaw-host/src/container_manager/spawn.rs`: new free
+  function `check_heartbeat_deadline_alignment(heartbeat_stale_secs,
+  provider_deadline_ms)` returns `Err(String)` when the host's stale
+  threshold is `< 2 * (provider_deadline / 1000)`. Boundary cases
+  (sub-second deadlines, `u64::MAX` extremes) are handled via
+  `div_ceil` + `saturating_mul`. Called from
+  `boot.rs::spawn_container_manager` once at host startup; on misalignment
+  the boot path emits a `warn!` line naming both values and the
+  required minimum, then continues. Operators can still pin a tighter
+  pair deliberately — the check warns, it does not panic.
+- `crates/ironclaw-host/src/boot.rs`: startup safety check reads the
+  operator-supplied `IRONCLAW_RUNNER_PROVIDER_DEADLINE_MS` via
+  `ironclaw_runner::resolve_provider_deadline` so the warn line
+  reflects the value the runner will actually be configured with at
+  spawn (not just the compiled-in default).
+- `crates/ironclaw-host/Cargo.toml`: `ironclaw-runner` promoted from
+  `dev-dependencies` to `dependencies`. Used only at boot to resolve
+  the configured provider deadline — no runtime coupling to the
+  poll loop.
+- `crates/ironclaw-runner/src/run/mod.rs`: doc comment on
+  `DEFAULT_PROVIDER_DEADLINE_MS` now explains the 2x relationship
+  with the host's stale threshold and points future contributors at
+  the host-side check.
+- `crates/ironclaw-host/src/container_manager/classify.rs`: the
+  `classify_running_with_stale_heartbeat_is_crash_restart` test
+  backdates the heartbeat by 240s (was 120s) so it sits comfortably
+  past the new 120s default with margin for test wall-clock jitter
+  instead of right on the boundary. Updated a related comment to
+  show the new "120s crash, 300s idle" defaults.
+
+Tests: 5 new tests in `container_manager::spawn::tests` —
+`defaults_satisfy_heartbeat_deadline_alignment` (shipped defaults
+satisfy the check), `alignment_check_passes_at_exact_2x_boundary`,
+`alignment_check_warns_when_heartbeat_lt_2x_deadline` (regression
+guard for the original 60s/60s misconfiguration),
+`alignment_check_ceils_sub_second_deadlines`,
+`alignment_check_does_not_overflow_on_large_values`.
+
 ### Fixed (code-review followup — 15 findings)
 
 Extra-high-effort code review on this session's commits surfaced 15 real

@@ -8,6 +8,7 @@ use ironclaw_providers::HistoryMessage;
 use super::provider_call::run_llm_turn;
 use super::tool_dispatch::invoke_tool;
 use super::RunnerDeps;
+use crate::state::save_state;
 
 #[derive(Debug, Clone)]
 pub(super) struct TurnResult {
@@ -69,6 +70,27 @@ pub(super) struct LlmTurnOutput {
     /// failure-site identification from the empty-string sentinel
     /// the old code used (#12 in code-review notes).
     pub(super) failure_reason: String,
+}
+
+/// Persist `history` + `continuation` to `outbound` mid-message so a
+/// crash between tool turns doesn't lose the prior work. Errors are
+/// logged at WARN and swallowed — the next iteration (or the
+/// end-of-message save in `run_loop`) will retry, and we'd rather make
+/// forward progress than abort the turn on a transient `SQLite` hiccup.
+async fn persist_mid_message(
+    deps: &RunnerDeps,
+    history: &[HistoryMessage],
+    continuation: Option<&str>,
+    tool_turn: usize,
+) {
+    let g = deps.outbound.lock().await;
+    if let Err(err) = save_state(&g, history, continuation) {
+        tracing::warn!(
+            ?err,
+            tool_turn,
+            "mid-message save_state failed; continuing (next turn will retry)"
+        );
+    }
 }
 
 /// Hard cap on consecutive turns where the model emitted at least one
@@ -200,6 +222,14 @@ pub(super) async fn drive_turn(
                 is_error,
             });
         }
+
+        // Persisted mid-message so a crash here (OOM, panic, container
+        // kill) doesn't lose the prior tool turns: without this the
+        // respawned runner would re-pick the same inbound and start
+        // from the pre-message history, repeating every tool call.
+        // Failure to save is warn-and-continue — the next iteration or
+        // the end-of-message save_state in run_loop will retry.
+        persist_mid_message(deps, history, continuation.as_deref(), tool_turn).await;
 
         // After pushing the tool_results, enforce the parse-error cap.
         // Three consecutive turns of malformed tool_use JSON means
