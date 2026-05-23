@@ -154,6 +154,12 @@ pub struct RunnerToolCtx {
     /// routes `to: None` outbound rows up to the parent's inbound
     /// instead of dumping into the inherited messaging-group channel.
     source_session_id: Option<ironclaw_types::SessionId>,
+    /// When true, the runner emits a brief `[tool] tool_name` chat
+    /// message to the originating channel at the start of every
+    /// "visible" tool call (`shell` / `web_search` / `write_file` /
+    /// `explore` / etc.). Off by default; enabled via the
+    /// `IRONCLAW_TOOL_BREADCRUMBS` env var.
+    breadcrumbs_enabled: bool,
 }
 
 impl RunnerToolCtx {
@@ -168,7 +174,60 @@ impl RunnerToolCtx {
             in_subagent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             originating: Arc::new(std::sync::Mutex::new(OriginatingRouting::default())),
             source_session_id: None,
+            breadcrumbs_enabled: false,
         }
+    }
+
+    /// Enable `[tool] name` chat breadcrumbs for visible tools. Reads
+    /// the `IRONCLAW_TOOL_BREADCRUMBS` env var (1/true/yes/on = on);
+    /// any other value keeps it disabled. Called at runner startup
+    /// from `main.rs`.
+    #[must_use]
+    pub fn with_breadcrumbs_from_env(mut self) -> Self {
+        self.breadcrumbs_enabled = matches!(
+            std::env::var("IRONCLAW_TOOL_BREADCRUMBS").ok().as_deref(),
+            Some("1" | "true" | "yes" | "on")
+        );
+        self
+    }
+
+    /// Emit a brief `[tool_name]` chat message via the originating
+    /// channel routing so the user sees what the agent is working on.
+    /// No-op when breadcrumbs are disabled, the tool isn't on the
+    /// "visible" allowlist, or there's no channel routing to send to
+    /// (e.g. agent-to-agent rows where the destination is the parent).
+    ///
+    /// Errors are swallowed: breadcrumbs are best-effort UX
+    /// observability, NOT load-bearing — a failed write shouldn't
+    /// abort the turn or surface to the user.
+    pub async fn emit_breadcrumb(&self, tool_name: &str) {
+        if !self.breadcrumbs_enabled {
+            return;
+        }
+        if !is_visible_breadcrumb_tool(tool_name) {
+            return;
+        }
+        let origin = self.current_originating();
+        // Only emit when there's a real user channel to send to.
+        // Child agents that route to parent via Agent-kind won't
+        // benefit from a breadcrumb (the parent doesn't need to be
+        // told what its own children are doing).
+        if origin.channel_type.is_none() || origin.platform_id.is_none() {
+            return;
+        }
+        let text = format!("[{tool_name}]");
+        let body = serde_json::json!({ "text": text });
+        let routed = OutboundRouting {
+            kind: MessageKind::Chat,
+            body_to: None,
+            channel_type: origin.channel_type.clone(),
+            platform_id: origin.platform_id.clone(),
+            thread_id: origin.thread_id.clone(),
+            in_reply_to: None,
+        };
+        let mut guard = self.outbound.lock().await;
+        let conn: &mut Connection = &mut guard;
+        let _ = insert_outbound_row(conn, MessageId::new(), body, &routed);
     }
 
     /// Stash the parent session id on the context so `apply_send_message`
@@ -291,6 +350,10 @@ impl ToolContext for RunnerToolCtx {
 
     fn clear_originating(&self) {
         Self::clear_originating(self);
+    }
+
+    async fn emit_breadcrumb(&self, tool_name: &str) {
+        Self::emit_breadcrumb(self, tool_name).await;
     }
 
     async fn spawn_subagent(
@@ -485,6 +548,25 @@ fn apply_effect(
 /// verbatim so we never accidentally swallow large chunks of
 /// legitimate prose. Case-insensitive open/close tags, multi-line
 /// content, leaves the surrounding text intact.
+/// Allow-list of tool names that get a chat breadcrumb when
+/// `IRONCLAW_TOOL_BREADCRUMBS=1`. Limited to tools that (a) take
+/// long enough that the user wants to know about them and (b)
+/// aren't already user-visible via their own outbound emission.
+fn is_visible_breadcrumb_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "shell"
+            | "web_search"
+            | "web_fetch"
+            | "explore"
+            | "write_file"
+            | "edit_file"
+            | "create_agent"
+            | "install_packages"
+            | "add_mcp_server"
+    )
+}
+
 fn strip_reasoning_blocks(text: &str) -> String {
     // Hand-rolled scan instead of pulling in `regex` just for this.
     // Looking for `<thinking>` followed by anything up to `</thinking>`,

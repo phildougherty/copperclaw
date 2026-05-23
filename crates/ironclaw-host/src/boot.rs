@@ -607,6 +607,18 @@ pub async fn run_host(
     ));
     let typing_task = tokio::spawn(Arc::clone(&typing_ticker).run_loop(shutdown.clone()));
 
+    // 13c. Todo watcher. Polls each running session's
+    // `agent_todos.json` and emits chat notifications when a new plan
+    // appears or items complete. Gated by `IRONCLAW_TODO_NOTIFICATIONS`
+    // env var (default off — opt-in for operators who want the
+    // step-by-step progress signal in chat).
+    let todo_watcher = Arc::new(crate::todo_watcher::TodoWatcher::new(
+        state.central.clone(),
+        state.delivery.dispatcher(),
+        cfg.data_dir.clone(),
+    ));
+    let todo_task = tokio::spawn(Arc::clone(&todo_watcher).run_loop(shutdown.clone()));
+
     let spawned = spawn_container_manager(
         &cfg,
         state.central.clone(),
@@ -664,6 +676,7 @@ pub async fn run_host(
         let _ = sweep_delivery.await;
         let _ = sweep_loop.await;
         let _ = typing_task.await;
+        let _ = todo_task.await;
         if let Some(t) = manager_task {
             let _ = t.await;
         }

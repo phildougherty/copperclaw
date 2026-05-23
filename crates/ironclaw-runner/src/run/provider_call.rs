@@ -176,6 +176,12 @@ pub(super) async fn pump_events(
                 declared_timeout_ms,
             } => {
                 set_current_tool(deps, &name, declared_timeout_ms).await?;
+                // Optional `[tool]` chat breadcrumb for user-visible
+                // observability during long agent turns. Default
+                // no-op via the trait; the RunnerToolCtx impl gates
+                // on `IRONCLAW_TOOL_BREADCRUMBS=1` and a tool
+                // allowlist.
+                deps.tool_ctx.emit_breadcrumb(&name).await;
             }
             ProviderEvent::ToolCall { id, name, input } => {
                 // `is_disallowed` is checked here AND inside

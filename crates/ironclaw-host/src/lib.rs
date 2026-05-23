@@ -20,6 +20,7 @@ pub mod image_health;
 pub mod orphans;
 pub mod sessions;
 pub mod socket;
+pub mod todo_watcher;
 pub mod typing_ticker;
 
 pub use boot::{run_host, BootError};

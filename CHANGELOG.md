@@ -6,6 +6,61 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (UX feedback layer for long agent turns)
+
+Live Telegram testing exposed a real UX gap: complex tasks (e.g.
+"research App Store apps, decide what to build, scaffold the
+project, start coding") take 1-5 minutes and the user has zero
+visibility into what the agent is doing between turns. Three new
+host- and runner-side feedback mechanisms:
+
+- **`crates/ironclaw-host/src/typing_ticker.rs`** (always on).
+  Background tokio task wired into `boot::run_host` alongside the
+  delivery + sweep loops. Every 4 seconds, iterates
+  `sessions::list_running` and fires `HostDispatcher::set_typing`
+  for each running session that has a channel-bound messaging
+  group. Closes the gap where Telegram's `sendChatAction` indicator
+  fades after ~5 seconds but `TypingModule` only re-fires on
+  inbound events — long agent turns between inbounds left the
+  bubble silent. Telegram/Slack/Discord/Teams benefit; channels
+  without typing get a quiet no-op. Four unit tests pin behaviour
+  (fires per running session, skips idle, skips no-MG sessions,
+  loops until shutdown).
+
+- **`crates/ironclaw-host/src/todo_watcher.rs`** (gated by
+  `IRONCLAW_TODO_NOTIFICATIONS=1`, default off). Background task
+  that polls each running session's `agent_todos.json` every 5
+  seconds, diffs against the last snapshot, and emits chat
+  notifications via the dispatcher when:
+    1. Todos first appear (one "📋 Plan (N steps): ..." message
+       with the full list);
+    2. Items transition to `completed` (one rollup "Step(s)
+       complete: ..." per tick, multiple completions in the same
+       tick collapsed to one message);
+    3. New items are added mid-run (one "Plan grew (+N steps): ..."
+       per tick).
+  Deletes are silent; status-unchanged items don't re-emit.
+  Eight unit tests pin the delta logic.
+
+- **`crates/ironclaw-runner/src/tools.rs`** + **`run/provider_call.rs`**
+  (gated by `IRONCLAW_TOOL_BREADCRUMBS=1`, default off). New
+  `ToolContext::emit_breadcrumb` trait method (default no-op) +
+  `RunnerToolCtx::emit_breadcrumb` impl that writes a short
+  `[tool_name]` chat row at the start of every "visible" tool
+  call. Visible tools: `shell`, `web_search`, `web_fetch`,
+  `explore`, `write_file`, `edit_file`, `create_agent`,
+  `install_packages`, `add_mcp_server`. Other tools (read_file,
+  grep, glob, todo_*, etc.) are excluded to keep the chat from
+  drowning. Only fires when there's real channel routing — child
+  agents reporting up to a parent don't spam the parent with
+  their own breadcrumbs.
+
+Operator wiring: the env vars are read at host boot
+(`IRONCLAW_TODO_NOTIFICATIONS`) and runner startup
+(`IRONCLAW_TOOL_BREADCRUMBS`) respectively. Set both to `1` in
+`.env` for the live-testing experience the user requested in the
+session that drove this work.
+
 ### Fixed (strip leaked `<thinking>` blocks from outbound chat text)
 
 Live Telegram testing (Haiku 4.5) caught the model emitting its

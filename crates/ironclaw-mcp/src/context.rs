@@ -407,6 +407,19 @@ pub trait ToolContext: Send + Sync {
     /// (e.g. a host-side apology write) doesn't inherit stale
     /// routing.
     fn clear_originating(&self) {}
+
+    /// Optional UX-observability hook: emit a brief `[tool_name]`
+    /// chat message to the originating channel right before a tool
+    /// call fires, so users see what the agent is working on during
+    /// long turns. Default no-op so most contexts opt-out. The
+    /// runner's `RunnerToolCtx` enables this when the
+    /// `IRONCLAW_TOOL_BREADCRUMBS` env var is set; the
+    /// implementation filters by a hard-coded allowlist of "visible"
+    /// tools (shell, web_search, write_file, etc.) and only emits
+    /// when there's a real channel routing to send to.
+    async fn emit_breadcrumb(&self, tool_name: &str) {
+        let _ = tool_name;
+    }
 }
 
 /// In-memory recording implementation used by tests.

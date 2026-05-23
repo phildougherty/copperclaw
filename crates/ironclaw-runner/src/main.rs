@@ -126,7 +126,8 @@ async fn main() -> Result<()> {
         provider_deadline,
     };
     let mut tool_ctx_inner = RunnerToolCtx::new(outbound.clone(), paths.outbox.clone())
-        .with_subagent(subagent_deps);
+        .with_subagent(subagent_deps)
+        .with_breadcrumbs_from_env();
     if let Some(parent) = cfg.source_session_id {
         tool_ctx_inner = tool_ctx_inner.with_source_session_id(parent);
     }
