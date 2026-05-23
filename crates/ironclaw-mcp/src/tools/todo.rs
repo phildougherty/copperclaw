@@ -312,23 +312,61 @@ pub mod update {
         text: Option<String>,
         #[serde(default)]
         status: Option<TodoStatus>,
+        /// Concrete proof of completion when flipping to `completed`.
+        /// Required only for `status: "completed"`. Should reference
+        /// files you wrote, commands you ran, or outputs you saw —
+        /// not aspirational prose. See [`is_acceptable_evidence`] for
+        /// the rejection criteria (too short, generic phrases, etc.).
+        #[serde(default)]
+        evidence: Option<String>,
     }
 
     pub fn schema() -> super::Tool {
         make_tool(
             "todo_update",
-            "Update a todo's text and/or status by id. Pass only the fields you want to change; the others stay as-is. Use this to flip a `pending` item to `in_progress` when you start it, then to `completed` when it's done. Errors if no todo has the given id.",
+            "Update a todo's text and/or status by id. Pass only the fields you want to change; the others stay as-is. Use this to flip a `pending` item to `in_progress` when you start it, then to `completed` when it's done. **When setting `status` to `\"completed\"`, you MUST also provide an `evidence` field** naming the specific files you wrote, commands you ran, or outputs that prove the work is done — generic phrases like \"done\" / \"finished\" / \"all set\" are rejected. This is an anti-fabrication guard: if you can't cite concrete evidence, leave the todo `in_progress`. Errors if no todo has the given id.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["id"],
                 "properties": {
-                    "id":     { "type": "integer", "minimum": 0 },
-                    "text":   { "type": ["string", "null"], "minLength": 1 },
-                    "status": { "type": ["string", "null"], "enum": ["pending", "in_progress", "completed", null] }
+                    "id":       { "type": "integer", "minimum": 0 },
+                    "text":     { "type": ["string", "null"], "minLength": 1 },
+                    "status":   { "type": ["string", "null"], "enum": ["pending", "in_progress", "completed", null] },
+                    "evidence": { "type": ["string", "null"], "minLength": 1 }
                 }
             }),
         )
+    }
+
+    /// Reject obvious non-evidence strings — generic affirmations,
+    /// too-short blurbs that can't possibly cite a file path or
+    /// command output. The goal isn't perfect detection but a
+    /// force-function that makes the agent stop and think before
+    /// declaring a task complete.
+    const FORBIDDEN_GENERIC: &[&str] = &[
+        "done",
+        "complete",
+        "completed",
+        "finished",
+        "all set",
+        "all done",
+        "good to go",
+        "ready",
+        "yes",
+        "ok",
+        "okay",
+    ];
+
+    pub(crate) fn is_acceptable_evidence(text: &str) -> bool {
+        let trimmed = text.trim();
+        if trimmed.len() < 20 {
+            // Real evidence ("wrote backend/server.rs and ran cargo
+            // test") doesn't fit in 20 chars.
+            return false;
+        }
+        let lowered = trimmed.to_ascii_lowercase();
+        !FORBIDDEN_GENERIC.iter().any(|g| lowered == *g)
     }
 
     pub async fn handle(
@@ -346,6 +384,21 @@ pub mod update {
             .iter()
             .position(|i| i.id == input.id)
             .ok_or_else(|| ToolError::Validation(format!("no todo with id {}", input.id)))?;
+        // Anti-fabrication guard: when marking a todo `completed`,
+        // require concrete evidence. Runs AFTER the id lookup so
+        // unknown-id errors still surface first (more useful diag).
+        if matches!(input.status, Some(TodoStatus::Completed)) {
+            let Some(ev) = input.evidence.as_deref() else {
+                return Err(ToolError::Validation(
+                    "must provide `evidence` when setting status to `completed` — cite the files you wrote, commands you ran, or specific outputs that prove the work is done; generic phrases like \"done\" are rejected".into(),
+                ));
+            };
+            if !is_acceptable_evidence(ev) {
+                return Err(ToolError::Validation(
+                    "`evidence` must be a substantive citation (>= 20 chars, not just \"done\" / \"finished\" / etc.) — name the specific files, commands, or outputs that prove the work is complete".into(),
+                ));
+            }
+        }
         if let Some(text) = input.text {
             let trimmed = text.trim();
             if trimmed.is_empty() {
@@ -568,6 +621,94 @@ mod tests {
         let created = updated["created_at"].as_str().unwrap();
         let updated_at = updated["updated_at"].as_str().unwrap();
         assert!(updated_at >= created);
+    }
+
+    #[tokio::test]
+    async fn update_completed_without_evidence_is_rejected() {
+        // The anti-fabrication guard: status="completed" requires
+        // a substantive `evidence` field.
+        let _g = TodoGuard::new();
+        let ctx = MockToolContext::new();
+        let added = body_json(
+            &add::handle(obj(json!({"text": "build backend"})), &ctx).await.unwrap(),
+        );
+        let id = added["id"].as_u64().unwrap();
+        let err = update::handle(
+            obj(json!({"id": id, "status": "completed"})),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        match err {
+            ToolError::Validation(msg) => assert!(
+                msg.contains("evidence"),
+                "expected evidence-required error, got: {msg}"
+            ),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn update_completed_with_generic_evidence_is_rejected() {
+        let _g = TodoGuard::new();
+        let ctx = MockToolContext::new();
+        let added = body_json(
+            &add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap(),
+        );
+        let id = added["id"].as_u64().unwrap();
+        for generic in &["done", "complete", "finished", "all set", "ok"] {
+            let err = update::handle(
+                obj(json!({"id": id, "status": "completed", "evidence": generic})),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(err, ToolError::Validation(msg) if msg.contains("substantive")),
+                "expected rejection for generic evidence {generic:?}",
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_completed_with_substantive_evidence_succeeds() {
+        let _g = TodoGuard::new();
+        let ctx = MockToolContext::new();
+        let added = body_json(
+            &add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap(),
+        );
+        let id = added["id"].as_u64().unwrap();
+        let updated = body_json(
+            &update::handle(
+                obj(json!({
+                    "id": id,
+                    "status": "completed",
+                    "evidence": "wrote backend/server.rs and ran cargo test (all 14 pass)"
+                })),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(updated["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn update_in_progress_doesnt_need_evidence() {
+        // Only completed status gates on evidence — in_progress /
+        // pending updates are uninhibited.
+        let _g = TodoGuard::new();
+        let ctx = MockToolContext::new();
+        let added = body_json(
+            &add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap(),
+        );
+        let id = added["id"].as_u64().unwrap();
+        update::handle(
+            obj(json!({"id": id, "status": "in_progress"})),
+            &ctx,
+        )
+        .await
+        .unwrap();
     }
 
     #[tokio::test]

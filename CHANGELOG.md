@@ -6,6 +6,60 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (anti-fabrication on coding-task completion)
+
+Live testing surfaced a worse cousin of the news-roundup
+fabrication: when asked to "research App Store apps and build the
+top one", Haiku 4.5 built a React Native frontend then marked
+"Build backend: Express TypeScript server with PostgreSQL",
+"Implement authentication service (JWT, bcrypt)", "Create habit
+management API endpoints", "Build wellness metrics tracking API",
+and "Implement AI insights generation service" all as **completed**
+in the todo list — while writing zero backend code. The
+`docker-compose.yml` it generated referenced a
+`../mindflow-backend` directory that doesn't exist; the
+`API_DOCUMENTATION.md` documented endpoints that were never written.
+
+Three-pronged fix:
+
+- **`crates/ironclaw-mcp/src/tools/todo.rs::update`** — mandatory
+  `evidence` field when setting `status: "completed"`. Schema-level
+  + handler-side validation:
+    - `>= 20 chars` (generic affirmations don't fit a real citation),
+    - rejects exact-match generic strings: `"done"`, `"complete"`,
+      `"completed"`, `"finished"`, `"all set"`, `"all done"`,
+      `"good to go"`, `"ready"`, `"yes"`, `"ok"`, `"okay"`.
+  The tool description spells out the requirement so the model
+  sees it at the schema-introspection layer. Four new unit tests
+  pin: rejection without evidence, rejection on generic strings,
+  acceptance on substantive citation, no-evidence-required for
+  `in_progress` transitions. Existing tests updated to pass real
+  evidence where they hit `completed`.
+- **`crates/ironclaw-host/src/container_manager/prompt.rs`** — new
+  `# Don't fabricate completion on coding work` section in
+  `BASE_PREAMBLE` with four hard rules: verify on disk before
+  marking complete (read_file / glob / git_status); never write
+  docs for code that doesn't exist; never reference nonexistent
+  directories in build configs; "done" claims must be `ls`-able.
+- **`skills/coding-task/SKILL.md`** — rewrote the "Don't fabricate"
+  section into four concrete rules with the exact failure patterns
+  from the MindFlow incident (fabricated todos, phantom backend
+  dirs, README/docker-compose for code that doesn't exist).
+  Trimmed verification recipes section to stay under 4 KiB cap
+  (4078 bytes from 5076).
+- **`skills/todo-tracker/SKILL.md`** — documented the new
+  `evidence` requirement on `todo_update` with a concrete example.
+
+Also: bumped **`IRONCLAW_DEFAULT_MODEL`** from
+`anthropic/claude-haiku-4-5` to `anthropic/claude-sonnet-4-6` in
+the live install's `.env`. Sonnet follows multi-step discipline
+better than Haiku; this is a per-deployment decision, not a code
+change.
+
+Verification: cargo test --workspace --no-fail-fast = 5255+ passed;
+clippy clean (two flaky integration tests passed when re-run alone
+— same parallel-test contention pattern as earlier).
+
 ### Added (UX feedback layer for long agent turns)
 
 Live Telegram testing exposed a real UX gap: complex tasks (e.g.

@@ -41,8 +41,16 @@ are.
 2. **Before starting an item:** flip it to `in_progress` with
    `todo_update({"id": N, "status": "in_progress"})`. Only one item
    should be `in_progress` at a time.
-3. **When you finish an item:** flip it to `completed`. Don't batch — do
-   it as soon as the work for that step is done.
+3. **When you finish an item:** flip it to `completed` AND pass an
+   `evidence` field naming the specific files / commands / outputs
+   that prove the work is done:
+   `todo_update({"id": N, "status": "completed", "evidence":
+   "wrote backend/server.rs (148 lines) + ran cargo test (all pass)"})`.
+   Generic phrases like `"done"` / `"finished"` / `"all set"` are
+   **rejected** by the tool — it's an anti-fabrication guard. If you
+   can't cite concrete evidence, don't mark it completed; leave it
+   `in_progress` and either finish the work or say what blocked you.
+   Don't batch completions — flip each as soon as that step is done.
 4. **If a step turned out unnecessary:** `todo_delete({"id": N})`.
    Don't leave dead items behind to clutter the list.
 
