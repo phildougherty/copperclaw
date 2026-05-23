@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (anti-fabrication prompt + sharper schedule-task description)
+
+- **`crates/ironclaw-host/src/container_manager/prompt.rs`** — added a
+  "Don't fabricate capabilities" section to `BASE_PREAMBLE`. The agent
+  was inventing fictional capabilities like a "Real-Time News Monitor"
+  with "persistent loops," then backtracking when asked to verify.
+  The new section tells the agent: the skill catalogue is authoritative,
+  for recurring work use `schedule_task` (the scheduler IS the loop),
+  never invent agent types or tools, and if unsure call `load_skill`.
+- **`skills/schedule-task/SKILL.md`** — rewrote the frontmatter
+  `description` (the only thing the agent sees in callable-mode skill
+  index) from dry/procedural to imperative: leads with "USE THIS for
+  anything periodic or recurring" and lists the trigger phrases. The
+  previous wording let the agent miss the skill and fabricate a
+  background-loop pattern instead. Quoted the cron expression as plain
+  text (no backticks/colons inside YAML) so the frontmatter parses.
+- **`crates/ironclaw-host/src/container_manager/runner_config.rs`**
+  (`runner_config_callable_falls_back_to_inline_when_catalogue_write_fails`
+  test) — relaxed the inline-fallback assertion from `!contains("\`load_skill\`")`
+  to `!contains("catalogue of skills available to you")`. The base
+  preamble now legitimately mentions `load_skill` as a tool name; the
+  thing that must stay absent in inline fallback is the callable-mode
+  catalogue header sentence.
+
 ### Added (per-group coding-skills toggle)
 
 - **`crates/ironclaw-db/migrations/012_container_config_coding_enabled.sql`**

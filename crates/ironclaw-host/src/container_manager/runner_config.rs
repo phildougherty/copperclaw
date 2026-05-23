@@ -858,15 +858,19 @@ mod tests {
         );
         let session = fixture_session(&db);
         let rc = mgr.runner_config_for(&session, None, Some(&session_root));
-        // Inline shape: the body is inlined, the `load_skill` callable
-        // index instructions are NOT mentioned.
+        // Inline shape: bodies are inlined and the callable-mode catalogue
+        // header (which instructs the agent to call load_skill to fetch
+        // bodies) is absent. The base preamble is allowed to mention
+        // load_skill in passing; what must not appear is the catalogue
+        // index instruction sentence.
         assert!(
             rc.system.contains("alpha body marker"),
             "fallback prompt must inline skill bodies"
         );
         assert!(
-            !rc.system.contains("`load_skill`"),
-            "fallback prompt must not advertise load_skill when no catalogue was written"
+            !rc.system
+                .contains("catalogue of skills available to you"),
+            "fallback prompt must not include the callable-mode skill catalogue header"
         );
     }
 

@@ -1,6 +1,6 @@
 ---
 name: schedule-task
-description: Schedule, list, pause, resume, cancel, and update recurring or one-shot prompts with the scheduling MCP tools.
+description: USE THIS for anything periodic or recurring — every N minutes, every N hours, daily, hourly, regular monitoring, future-dated one-shots, any "do this on a schedule" pattern. The schedule_task tool enqueues a prompt with a cron recurrence (use the string */30 * * * * for every 30 minutes) and the host re-invokes the agent when the task fires — there is no need for a persistent loop or background agent; the scheduler IS the loop. Companions list_tasks, cancel_task, pause_task, resume_task, update_task.
 ---
 
 # schedule-task and friends
