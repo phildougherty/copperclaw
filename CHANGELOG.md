@@ -6,6 +6,34 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (clear-history sentinel silently swallowed the next user message)
+
+Caught while debugging "agent says 'I'm ready to help' instead of doing
+the task." Sequence:
+
+1. Runner polls inbound, pushes the user's chat message into
+   `state.history`.
+2. Then checks for the `.history_clear_pending` sentinel.
+3. If found, it clears the **entire** history — including the user
+   message that was just pushed one statement earlier — then calls
+   the model with an empty context.
+
+The model received: system prompt + tool schemas + zero user content.
+With nothing to respond to it fell back to its training prior ("I'm
+ready to help. What would you like to work on?"), which looked
+identical to a bot ignoring the task. Both operator-dropped sentinels
+and tool-triggered clears hit this path; the inline comment claimed
+the user message had to be dropped to "avoid surprising the operator,"
+but in practice that just made the next inbound silently disappear.
+
+Fix in `crates/ironclaw-runner/src/run/mod.rs`: process the clear /
+compact sentinels **before** pushing the user message, so the incoming
+inbound always reaches the model against the requested baseline (cleared
+or compacted) rather than being thrown out alongside it. Also updated
+the `clear_history` tool docstring in
+`crates/ironclaw-mcp/src/tools/clear_history.rs` to reflect the
+corrected semantics ("drops everything prior to the next inbound").
+
 ### Fixed (typing ticker was always-on; agent self-introducing on tasks)
 
 Two issues caught in the Sonnet retest:

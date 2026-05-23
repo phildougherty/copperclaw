@@ -333,35 +333,35 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
             deps.tool_ctx.set_originating(None, None, None, None);
         }
 
-        state
-            .history
-            .push(HistoryMessage::User { content: formatted.prompt });
-
-        // Honor agent-requested history actions BEFORE auto-compaction
-        // runs. The compact_now / clear_history tools drop sentinel files
-        // in /data; consume them here so a single tool call this turn
-        // takes effect at the start of next turn. Clear wins over
-        // compact when both are pending — the agent presumably wanted a
-        // full reset.
+        // Honor pending history actions BEFORE pushing the incoming
+        // user message, so the user's request is processed against the
+        // requested baseline (cleared or compacted) rather than being
+        // silently dropped alongside it. Two sources drop these
+        // sentinels: the `clear_history` / `compact_now` MCP tools (the
+        // agent asks for it mid-turn, sentinel survives into the next
+        // poll), and the operator (manually placing the file under
+        // `<session>/` to reset a stuck session). Both produce the
+        // same outcome here: wipe/compact prior history, then keep
+        // processing this turn's inbound. Clear wins over compact when
+        // both are pending — the caller presumably wanted a full reset.
         let clear_pending = ironclaw_mcp::clear_history_pending_path();
         let compact_pending = ironclaw_mcp::compact_now_pending_path();
         if clear_pending.exists() {
             state.history.clear();
             state.continuation = None;
             let _ = tokio::fs::remove_file(&clear_pending).await;
-            // Drop the just-pushed user message too — clear means clear.
-            // The user's next inbound will start the conversation fresh.
-            // (We could keep it, but "clear" without dropping the
-            // triggering message would surprise an operator: their next
-            // message would still see the message that asked to clear.)
-            tracing::info!("history cleared by agent request");
+            tracing::info!("history cleared (sentinel consumed)");
         } else if compact_pending.exists() {
             let _ = tokio::fs::remove_file(&compact_pending).await;
             state.history = compact(state.history, deps.provider.as_ref(), &deps.compaction)
                 .await
                 .context("compact_now failed")?;
-            tracing::info!("history compacted by agent request");
+            tracing::info!("history compacted (sentinel consumed)");
         }
+
+        state
+            .history
+            .push(HistoryMessage::User { content: formatted.prompt });
 
         if deps.compaction.should_compact(estimate_tokens(&state.history)) {
             state.history = compact(state.history, deps.provider.as_ref(), &deps.compaction)

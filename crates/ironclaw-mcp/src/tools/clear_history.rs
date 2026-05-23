@@ -3,8 +3,9 @@
 //!
 //! Same sentinel-file pattern as `compact_now`, different mode of
 //! erasure: `compact_now` keeps a summary, this drops everything
-//! including the message that asked to clear. Mechanism: see
-//! `crate::tools::sentinel`.
+//! prior to the next inbound. The next user message arrives against
+//! an empty history — it is itself preserved and answered. Mechanism:
+//! see `crate::tools::sentinel`.
 
 use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
 use serde_json::json;
