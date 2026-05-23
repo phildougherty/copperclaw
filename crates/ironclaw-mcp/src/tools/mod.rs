@@ -34,6 +34,7 @@ pub mod clear_history;
 pub mod compact_now;
 pub mod interactive;
 pub mod load_skill;
+pub mod sentinel;
 pub mod scheduling;
 pub mod self_mod;
 pub mod todo;
