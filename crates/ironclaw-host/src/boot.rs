@@ -875,6 +875,13 @@ fn collect_forward_env() -> Vec<(String, String)> {
         // ultimate fallback).
         "IRONCLAW_CODEX_BINARY",
         "IRONCLAW_CODEX_ARGS",
+        // Ollama native provider base URL. Without this, the runner
+        // inside the container falls back to `http://localhost:11434`
+        // — which inside Docker resolves to the container itself,
+        // never the host's Ollama. Forwarding it lets the operator
+        // set `OLLAMA_BASE_URL=http://172.17.0.1:11434` (or
+        // `host.docker.internal`) in the install's .env.
+        "OLLAMA_BASE_URL",
     ];
     let mut out = Vec::with_capacity(FORWARDED.len());
     for key in FORWARDED {

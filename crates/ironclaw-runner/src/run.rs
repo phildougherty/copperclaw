@@ -800,6 +800,16 @@ async fn query_with_retry(
         // have consumed it on a successful call but we never reach
         // here once query() returns Ok, so the borrow checker is fine
         // with a fresh clone per loop iteration.
+        //
+        // Heartbeat coverage: local-model providers (Ollama) can take
+        // 60-180s of prefill before the first token streams back; the
+        // host's heartbeat-stale threshold (default 60s) would otherwise
+        // kill the container mid-prefill. Holding a HeartbeatTicker for
+        // the duration of each provider attempt keeps the file fresh
+        // while we wait. The Ticker is RAII-dropped at the end of the
+        // attempt — backoff sleeps between attempts are short enough
+        // (≤1s) that they don't need their own coverage.
+        let _hb = HeartbeatTicker::start(deps.heartbeat_path.clone());
         let result = timeout(deps.provider_deadline, deps.provider.query(input.clone())).await;
 
         let err: ProviderError = match result {
