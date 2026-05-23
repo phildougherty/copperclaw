@@ -70,20 +70,6 @@ endpoint for the reverse proxy.
   Existing deployments rely on the dynamic behaviour. Probably
   not worth churning unless someone reports it as a footgun.
 
-### Sparse `--help` on multi-subcommand iclaw families
-
-`iclaw messaging-groups`, `wirings`, `users`, `roles`, `members`,
-`destinations`, `sessions`, `user-dms`, `approvals list`,
-`approvals get` all have empty help strings. Several arg flags
-have no description either (`--mg`, `--ag`, `--platform-id`,
-`--display-name`, `--name`, `--identity`).
-
-- **What it takes:** add a `///` doc-comment on each enum variant
-  and each `#[arg(long)]` field in
-  `crates/ironclaw-iclaw/src/commands.rs`. ~half-day, no tests
-  needed (clap surfaces the strings into `--help`).
-- **Load-bearing question:** none — pure polish.
-
 ---
 
 ## Medium
@@ -182,21 +168,6 @@ The other 14 channels rely on per-adapter unit tests.
   pipeline interactions? RPC-only channels (signal, deltachat,
   emacs, imessage) might gain less from this than HTTP webhook
   channels.
-
-### Apple Container support in `install.sh`
-
-The wizard's `env_check` step already detects `container` (Apple's
-container runtime), but `install.sh:189-207` only checks for
-Docker / Podman. macOS users on the new Apple Container runtime
-see an unnecessary "install Docker" prompt.
-
-- **What it takes:** add the `container` binary to the list of
-  acceptable runtimes in `install.sh`. ~hour including a test
-  case under `tests/install/`.
-- **Load-bearing question:** does Apple Container's CLI surface
-  match enough of Docker's that the rest of the install path
-  works without changes? (Setup's `image` step probably needs a
-  similar branch.)
 
 ---
 
