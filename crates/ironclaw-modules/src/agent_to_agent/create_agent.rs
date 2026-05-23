@@ -1,142 +1,49 @@
-//! Resolves outbound destinations of the form `agent:<name>` and handles the
-//! `create_agent` system-action.
+//! The `create_agent` delivery action and its handler.
 //!
-//! Two responsibilities live in this module:
+//! When an agent calls the `create_agent` MCP tool, the runner writes a
+//! `kind=system` outbound row with content `{"create_agent": {"name":
+//! "...", "instructions": "...", "channel": "..."}}`. The host's
+//! delivery loop parses the action name and dispatches to
+//! [`CreateAgentHandler::handle`], which:
 //!
-//! 1. **Destination parsing** — when an agent calls
-//!    `send_message(to: "agent:helper")` the runner serializes the destination
-//!    string verbatim. The host's delivery loop calls into this module's
-//!    [`parse`] / [`is_agent_destination`] helpers to decide whether to route
-//!    through a channel adapter or fan the message into another agent's
-//!    `messages_in`.
+//! a. Permission-gates via the configured closure (defaults to deny so
+//!    production wiring must opt in).
+//! b. Refuses if accepting the request would push the new group past
+//!    the configured subagent-depth cap (default
+//!    [`DEFAULT_MAX_SUBAGENT_DEPTH`]). Depth = parent's depth + 1 (or 1
+//!    when the parent is itself an un-spawned agent, e.g. the initial
+//!    agent in the install).
+//! c. INSERTs `agent_groups` + `sessions` (+ optional
+//!    `messaging_group_agents`).
+//! d. Writes a `create_agent_result` system row into the *parent*
+//!    session's `inbound.db` so the calling agent sees the real id on
+//!    its next turn (see [`super::inbound_seed`] for the inbound write
+//!    helpers).
 //!
-//! 2. **`create_agent` delivery action** — when an agent calls the
-//!    `create_agent` MCP tool, the runner writes a `kind=system` outbound row
-//!    with content `{"create_agent": {"name": "...", "instructions": "...",
-//!    "channel": "..."}}`. The host's delivery loop parses the action name
-//!    and dispatches to [`CreateAgentHandler::handle`], which:
-//!
-//!    a. Permission-gates via the configured closure (defaults to deny so
-//!       production wiring must opt in).
-//!    b. Refuses if accepting the request would push the new group past the
-//!       configured subagent-depth cap (default [`DEFAULT_MAX_SUBAGENT_DEPTH`]).
-//!       Depth = parent's depth + 1 (or 1 when the parent is itself an
-//!       un-spawned agent, e.g. the initial agent in the install).
-//!    c. INSERTs `agent_groups` + `sessions` (+ optional `messaging_group_agents`).
-//!    d. Writes a `create_agent_result` system row into the *parent* session's
-//!       `inbound.db` so the calling agent sees the real id on its next turn.
-//!
-//! The container manager's reconcile loop polls the `sessions` table on a
-//! short timer, so the new agent's container will spawn on its next tick
-//! without any explicit notification from the handler.
+//! The container manager's reconcile loop polls the `sessions` table on
+//! a short timer, so the new agent's container will spawn on its next
+//! tick without any explicit notification from the handler.
 
+use super::depth::{DEFAULT_MAX_SUBAGENT_DEPTH, MAX_SUBAGENT_DEPTH_CEILING};
+use super::permissions::{CreateAgentPermissionCheck, CreateAgentPermissionCtx};
+use super::SPAWN_PLATFORM_PREFIX;
 use crate::context::{
-    DeliveryActionHandler, DeliveryActionInput, DeliveryActionOutput, InterceptorCtx,
-    InterceptorDecision, Module, ModuleContext,
+    DeliveryActionHandler, DeliveryActionInput, DeliveryActionOutput, Module, ModuleContext,
 };
 use crate::error::ModuleError;
 use async_trait::async_trait;
-use chrono::Utc;
 use ironclaw_db::central::CentralDb;
-use ironclaw_db::session::SessionPaths;
 use ironclaw_db::tables::{
     agent_groups::{self, CreateAgentGroup},
-    messages_in::{self, WriteInbound},
     messaging_group_agents::{self, UpsertWiring},
     messaging_groups::{self, UpsertMessagingGroup},
     sessions::{self, CreateSession},
-    user_roles,
 };
-use ironclaw_types::{
-    AgentGroupId, ChannelType, EngageMode, MessageId, MessageKind, SessionId, SessionMode,
-};
-use serde::{Deserialize, Serialize};
+use ironclaw_types::{AgentGroupId, ChannelType, EngageMode, SessionId, SessionMode};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
-
-/// The `agent:` URL prefix.
-pub const AGENT_PREFIX: &str = "agent:";
-
-/// Default channel a `create_agent` call binds to when the payload omits one.
-pub const DEFAULT_CREATE_AGENT_CHANNEL: &str = "cli";
-
-/// Platform identifier used for synthetic messaging-groups created via
-/// `create_agent`. The spawned agent has no real channel platform — it's
-/// addressable only by other agents — so we use a stable "agent-spawn"
-/// placeholder so the wiring is unique per-agent.
-const SPAWN_PLATFORM_PREFIX: &str = "agent-spawn:";
-
-/// Parsed agent destination.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentRef {
-    /// Bare agent name (folder slug or display name as configured in the
-    /// destinations table).
-    pub name: String,
-}
-
-/// `true` if `s` looks like an agent destination (`agent:<...>` or
-/// `agent://<...>`).
-pub fn is_agent_destination(s: &str) -> bool {
-    parse(s).is_some()
-}
-
-/// Parse `agent:<name>` or `agent://<name>` strings.
-pub fn parse(s: &str) -> Option<AgentRef> {
-    let s = s.trim();
-    let after = s
-        .strip_prefix("agent://")
-        .or_else(|| s.strip_prefix(AGENT_PREFIX))?;
-    let name = after.trim();
-    if name.is_empty() {
-        return None;
-    }
-    if !name
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    {
-        return None;
-    }
-    Some(AgentRef {
-        name: name.to_owned(),
-    })
-}
-
-/// Context handed to a [`CreateAgentPermissionCheck`]. Carries enough
-/// state for the check to consult `users` / `user_roles` against the
-/// parent session's scope. New fields can be added at any time — the
-/// struct is not stable API; production code uses the
-/// [`users_table_check`] factory.
-#[derive(Debug, Clone)]
-pub struct CreateAgentPermissionCtx {
-    /// Parent session's agent group, when the action handler could
-    /// resolve one. `None` for orphan invocations (no parent session
-    /// matched) — those represent administrative / scripted calls.
-    pub parent_agent_group_id: Option<AgentGroupId>,
-    /// Parent session id, when available.
-    pub parent_session_id: Option<SessionId>,
-    /// `create_agent` payload's requested name. Surfaced for audit
-    /// purposes; the default check ignores it.
-    pub requested_name: String,
-}
-
-/// Permission closure consulted before a `create_agent` action runs.
-/// Returning `false` causes the handler to write a `status: "denied"`
-/// result row and abort the central-DB mutation.
-///
-/// In production the host wires this to a check against the `users` /
-/// `user_roles` table via [`users_table_check`]. Tests can use
-/// [`always_allow`] / [`always_deny`].
-pub type CreateAgentPermissionCheck =
-    Arc<dyn Fn(&CreateAgentPermissionCtx) -> bool + Send + Sync>;
-
-/// Module wraps the helpers above and registers a message interceptor that
-/// tags outbound messages whose destination resolves to an agent. Kept as a
-/// unit struct so existing call sites (`Box::new(AgentToAgentModule)`) keep
-/// compiling; the `create_agent` delivery action is registered separately
-/// by [`CreateAgentModule`].
-pub struct AgentToAgentModule;
 
 /// Companion module that registers the `create_agent` delivery action. The
 /// handler runs in-process against the central DB, so this module is the
@@ -148,42 +55,23 @@ pub struct AgentToAgentModule;
 /// that want the `create_agent` action working must construct this companion
 /// module themselves and install it alongside `AgentToAgentModule`.
 pub struct CreateAgentModule {
-    deps: HandlerDeps,
+    pub(super) deps: HandlerDeps,
 }
 
-/// Default cap on `create_agent` nesting depth. A parent at depth N can
-/// spawn a child at depth N+1; the spawn is rejected once N+1 exceeds
-/// this cap. 3 lets a top-level agent delegate to a sibling that
-/// delegates to a focused sub-sibling — useful for layered
-/// investigations — without permitting an unbounded fork-bomb.
-pub const DEFAULT_MAX_SUBAGENT_DEPTH: u8 = 3;
-
-/// Hard ceiling on operator-configured subagent depth caps. Deeper
-/// chains than this are misconfiguration: they invite the saturation
-/// collapse `checked_add` guards against, and they have no real-world
-/// use case beyond fork-bombs.
-pub const MAX_SUBAGENT_DEPTH_CEILING: u8 = 16;
-
 #[derive(Clone)]
-struct HandlerDeps {
-    central: CentralDb,
-    data_root: PathBuf,
-    permission_check: CreateAgentPermissionCheck,
+pub(super) struct HandlerDeps {
+    pub(super) central: CentralDb,
+    pub(super) data_root: PathBuf,
+    pub(super) permission_check: CreateAgentPermissionCheck,
     /// In-memory `(agent_group_id → depth)` cache. Persisted ground
     /// truth lives in `agent_groups.subagent_depth`; the cache is a
     /// write-through accelerator that avoids hitting the DB twice per
     /// `create_agent` and serves as the synchronisation point for the
     /// re-check-on-insert that prevents the depth-cap TOCTOU race.
-    spawned: Arc<Mutex<HashMap<AgentGroupId, u8>>>,
+    pub(super) spawned: Arc<Mutex<HashMap<AgentGroupId, u8>>>,
     /// Hard cap on subagent depth — see [`DEFAULT_MAX_SUBAGENT_DEPTH`].
     /// `1` reproduces the historical "no nested spawns at all" rule.
-    max_depth: u8,
-}
-
-impl Default for AgentToAgentModule {
-    fn default() -> Self {
-        Self
-    }
+    pub(super) max_depth: u8,
 }
 
 impl CreateAgentModule {
@@ -194,7 +82,8 @@ impl CreateAgentModule {
     /// `SessionPaths::new` walks to find each session's `inbound.db`.
     ///
     /// `permission_check` is consulted at every `handle()` call. Pass
-    /// [`always_allow`] for tests and a `users`-table lookup in production.
+    /// [`super::always_allow`] for tests and a `users`-table lookup in
+    /// production.
     pub fn new(
         central: CentralDb,
         data_root: impl Into<PathBuf>,
@@ -234,98 +123,8 @@ impl CreateAgentModule {
     /// Test-only helper: borrow the deps so a test can assert against the
     /// internal `spawned` set or central DB.
     #[cfg(test)]
-    fn deps(&self) -> &HandlerDeps {
+    pub(super) fn deps(&self) -> &HandlerDeps {
         &self.deps
-    }
-}
-
-/// Convenience permission closure that always allows. Useful for tests and
-/// non-multi-user deployments where every agent is trusted.
-pub fn always_allow() -> CreateAgentPermissionCheck {
-    Arc::new(|_ctx: &CreateAgentPermissionCtx| true)
-}
-
-/// Convenience permission closure that always denies.
-pub fn always_deny() -> CreateAgentPermissionCheck {
-    Arc::new(|_ctx: &CreateAgentPermissionCtx| false)
-}
-
-/// Production permission check: allow `create_agent` only when the
-/// install has at least one user granted [`user_roles::Role::Owner`] or
-/// [`user_roles::Role::Admin`] (either globally or scoped to the parent
-/// agent group). This is the bootstrap form of the role check — it
-/// requires an operator to deliberately grant a privileged role before
-/// any agent can spawn new agents, but does not yet bind the action to
-/// a specific user identity (the system action carries no user
-/// context; binding to a user requires per-turn provenance which the
-/// schema does not currently track).
-///
-/// Operationally:
-/// * Fresh install with no role grants → deny (safe default).
-/// * Operator runs `iclaw users grant <id> admin` or `owner` → allow.
-/// * Database read errors → deny (fail-closed).
-///
-/// The check consults the database on every call so role revocations
-/// take effect immediately; a stale cache would extend privilege past
-/// the operator's intent.
-pub fn users_table_check(central: CentralDb) -> CreateAgentPermissionCheck {
-    Arc::new(move |ctx: &CreateAgentPermissionCtx| {
-        // Global owner/admin: grants the privilege for every parent.
-        let has_global = matches!(
-            user_roles::list_for_scope(&central, None, user_roles::Role::Owner),
-            Ok(v) if !v.is_empty()
-        ) || matches!(
-            user_roles::list_for_scope(&central, None, user_roles::Role::Admin),
-            Ok(v) if !v.is_empty()
-        );
-        if has_global {
-            return true;
-        }
-        // Group-scoped owner/admin: grants the privilege only when the
-        // parent session resolves to that scope. Orphan calls (no
-        // parent) fall through to deny since there's nothing to scope
-        // against.
-        if let Some(parent_ag) = ctx.parent_agent_group_id {
-            let group_owner = matches!(
-                user_roles::list_for_scope(&central, Some(parent_ag), user_roles::Role::Owner),
-                Ok(v) if !v.is_empty()
-            );
-            let group_admin = matches!(
-                user_roles::list_for_scope(&central, Some(parent_ag), user_roles::Role::Admin),
-                Ok(v) if !v.is_empty()
-            );
-            if group_owner || group_admin {
-                return true;
-            }
-        }
-        false
-    })
-}
-
-#[async_trait]
-impl Module for AgentToAgentModule {
-    fn name(&self) -> &'static str {
-        "agent_to_agent"
-    }
-
-    async fn install(&self, ctx: Arc<dyn ModuleContext>) -> Result<(), ModuleError> {
-        ctx.set_message_interceptor(Arc::new(|i: InterceptorCtx| {
-            // If the outbound destination's channel_type is `agent`, the host's
-            // delivery loop already routes by `agent_group_id`. We pass it
-            // through unchanged. The interceptor exists so the host has a hook
-            // to log or rewrite agent-bound messages.
-            if i
-                .channel_type
-                .as_ref()
-                .is_some_and(|c| c.as_str() == ChannelType::AGENT)
-            {
-                return InterceptorDecision::Passthrough;
-            }
-            // For non-agent destinations, also a pass-through — the module's
-            // raison d'être is the helper functions, not interception.
-            InterceptorDecision::Passthrough
-        }));
-        Ok(())
     }
 }
 
@@ -348,14 +147,14 @@ impl Module for CreateAgentModule {
 
 /// Delivery-action handler for the runner's `create_agent` system message.
 pub struct CreateAgentHandler {
-    deps: HandlerDeps,
+    pub(super) deps: HandlerDeps,
 }
 
 /// Outcome of a single `create_agent` invocation. The handler writes a JSON
 /// rendering of this back to the parent session's inbound.db as a `system`
 /// row so the parent agent can see the real ids on its next turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResultStatus {
+pub(super) enum ResultStatus {
     Created,
     Denied,
     Rejected,
@@ -363,7 +162,7 @@ enum ResultStatus {
 }
 
 impl ResultStatus {
-    fn as_str(self) -> &'static str {
+    pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Created => "created",
             Self::Denied => "denied",
@@ -374,14 +173,14 @@ impl ResultStatus {
 }
 
 #[derive(Debug, Clone)]
-struct CreateAgentPayload {
-    name: String,
-    instructions: String,
-    channel: Option<String>,
+pub(super) struct CreateAgentPayload {
+    pub(super) name: String,
+    pub(super) instructions: String,
+    pub(super) channel: Option<String>,
 }
 
 impl CreateAgentPayload {
-    fn parse(v: &serde_json::Value) -> Result<Self, String> {
+    pub(super) fn parse(v: &serde_json::Value) -> Result<Self, String> {
         let name = v
             .get("name")
             .and_then(|x| x.as_str())
@@ -413,7 +212,7 @@ impl CreateAgentPayload {
     }
 
     /// Folder slug — lower-case alphanumerics, dashes only.
-    fn folder(&self) -> String {
+    pub(super) fn folder(&self) -> String {
         let mut s = String::with_capacity(self.name.len());
         for c in self.name.chars() {
             if c.is_ascii_alphanumeric() {
@@ -718,16 +517,16 @@ impl DeliveryActionHandler for CreateAgentHandler {
 /// handler entry by matching the dispatch target's routing. Carrying both
 /// ids lets `write_parent_result` open the right inbound.db.
 #[derive(Debug, Clone, Copy)]
-struct ParentSession {
-    session_id: SessionId,
-    agent_group_id: AgentGroupId,
+pub(super) struct ParentSession {
+    pub(super) session_id: SessionId,
+    pub(super) agent_group_id: AgentGroupId,
 }
 
 impl CreateAgentHandler {
     /// Read the parent's recorded subagent depth. Tries the in-memory
     /// cache first, falls back to the persisted column. `None` means
     /// "no parent" or "parent has no recorded depth" (depth=0 root).
-    fn lookup_parent_depth(&self, parent: Option<&ParentSession>) -> Option<u8> {
+    pub(super) fn lookup_parent_depth(&self, parent: Option<&ParentSession>) -> Option<u8> {
         let parent = parent?;
         {
             let spawned = self
@@ -761,7 +560,7 @@ impl CreateAgentHandler {
     /// TODO(team-ca): once `DeliveryActionInput` grows a `source_session_id`
     /// field (Team IP's domain — host-delivery service.rs), drop this
     /// best-effort lookup in favor of the direct id.
-    fn resolve_parent(&self, input: &DeliveryActionInput) -> Option<ParentSession> {
+    pub(super) fn resolve_parent(&self, input: &DeliveryActionInput) -> Option<ParentSession> {
         if let Some(ag) = input.target.agent_group_id {
             if let Ok(Some(sess)) = sessions::find_by_agent_group(&self.deps.central, ag) {
                 return Some(ParentSession {
@@ -802,7 +601,7 @@ impl CreateAgentHandler {
 
     /// Upsert a synthetic messaging-group + wiring so the new agent has a
     /// destination on the requested channel.
-    fn create_wiring(
+    pub(super) fn create_wiring(
         &self,
         agent_group_id: AgentGroupId,
         channel: &str,
@@ -840,270 +639,17 @@ impl CreateAgentHandler {
         .map_err(|e| e.to_string())?;
         Ok(())
     }
-
-    /// Append a `create_agent_result` system row to the parent session's
-    /// inbound.db. The runner's `format_messages` will render this into the
-    /// next turn's prompt as a `system:` line so the calling agent learns
-    /// the real session / agent-group ids.
-    fn write_parent_result(
-        &self,
-        parent: Option<&ParentSession>,
-        status: ResultStatus,
-        session_id: Option<SessionId>,
-        agent_group_id: Option<AgentGroupId>,
-        detail: Option<&str>,
-    ) {
-        let Some(parent) = parent else {
-            info!(
-                ?status,
-                "create_agent_result: no parent session resolvable; skipping inbound notice",
-            );
-            return;
-        };
-        self.write_inbound_payload(
-            parent.agent_group_id,
-            parent.session_id,
-            MessageKind::System,
-            Self::build_result_content(status, session_id, agent_group_id, detail),
-            false,
-        );
-    }
-
-    /// Compose the JSON payload for a `create_agent_result` inbound row.
-    fn build_result_content(
-        status: ResultStatus,
-        session_id: Option<SessionId>,
-        agent_group_id: Option<AgentGroupId>,
-        detail: Option<&str>,
-    ) -> serde_json::Value {
-        let mut body = serde_json::Map::new();
-        body.insert("status".into(), serde_json::json!(status.as_str()));
-        if let Some(sid) = session_id {
-            body.insert(
-                "session_id".into(),
-                serde_json::json!(sid.as_uuid().to_string()),
-            );
-        }
-        if let Some(agid) = agent_group_id {
-            body.insert(
-                "agent_group_id".into(),
-                serde_json::json!(agid.as_uuid().to_string()),
-            );
-        }
-        if let Some(d) = detail {
-            body.insert("detail".into(), serde_json::json!(d));
-        }
-        serde_json::json!({ "create_agent_result": body })
-    }
-
-    /// Mirror the parent session's `session_routing` record into the
-    /// child's `inbound.db`. The delivery service uses this row — not
-    /// `sessions.messaging_group_id` — to resolve where outbound chat
-    /// messages should be sent; without it the child's first
-    /// `send_message` call fails with `NoRoute` and the operator never
-    /// sees the reply. Logs on failure; non-fatal (the operator can
-    /// hand-write the row later if it really matters).
-    fn copy_parent_session_routing(
-        &self,
-        parent_agent_group: AgentGroupId,
-        parent_session: SessionId,
-        child_agent_group: AgentGroupId,
-        child_session: SessionId,
-    ) {
-        let parent_paths =
-            SessionPaths::new(&self.deps.data_root, parent_agent_group, parent_session);
-        let parent_conn = match ironclaw_db::session::open_inbound(&parent_paths) {
-            Ok(c) => c,
-            Err(err) => {
-                warn!(?err, "create_agent: open parent inbound for routing copy failed");
-                return;
-            }
-        };
-        let routing = match ironclaw_db::tables::session_routing::read(&parent_conn) {
-            Ok(Some(r)) => r,
-            Ok(None) => {
-                warn!(
-                    parent_session = %parent_session.as_uuid(),
-                    "create_agent: parent has no session_routing — child outbound will fail until one is written",
-                );
-                return;
-            }
-            Err(err) => {
-                warn!(?err, "create_agent: read parent session_routing failed");
-                return;
-            }
-        };
-        let child_paths =
-            SessionPaths::new(&self.deps.data_root, child_agent_group, child_session);
-        let child_conn = match ironclaw_db::session::open_inbound(&child_paths) {
-            Ok(c) => c,
-            Err(err) => {
-                warn!(?err, "create_agent: open child inbound for routing write failed");
-                return;
-            }
-        };
-        if let Err(err) = ironclaw_db::tables::session_routing::write(&child_conn, &routing) {
-            warn!(
-                ?err,
-                child_session = %child_session.as_uuid(),
-                "create_agent: write child session_routing failed; outbound will NoRoute",
-            );
-        }
-    }
-
-    /// Seed a newly-spawned child agent's `inbound.db` with its initial
-    /// instructions, written as a `kind=Chat` message with `trigger=true`
-    /// so the container manager spawns the child on its next reconcile
-    /// tick. Without this the child has zero pending inbound, the manager
-    /// considers it idle, and it never starts — the `payload.instructions`
-    /// is otherwise only stashed in the parent's `create_agent_result`
-    /// row and lost from there. Failures are logged but non-fatal: the
-    /// `agent_groups` + `sessions` rows are already committed, so the
-    /// operator can still drive the child manually via `iclaw chat`.
-    fn seed_child_inbound(
-        &self,
-        agent_group_id: AgentGroupId,
-        session_id: SessionId,
-        name: &str,
-        instructions: &str,
-    ) {
-        let prelude = format!(
-            "You are agent `{name}`, spawned by a parent agent with the \
-             following task. Work through it autonomously using your \
-             available tools (search, file ops, etc.), then call \
-             `send_message` to deliver your findings — the wiring will \
-             route your reply back to the conversation that spawned you. \
-             Task:\n\n"
-        );
-        let text = format!("{prelude}{instructions}");
-        self.write_inbound_payload(
-            agent_group_id,
-            session_id,
-            MessageKind::Chat,
-            serde_json::json!({ "text": text }),
-            true,
-        );
-    }
-
-    /// Shared insert helper for the two `messages_in::insert` call sites
-    /// in this module (parent-result notify + child-kicker seed). Logs
-    /// on failure; never panics.
-    fn write_inbound_payload(
-        &self,
-        agent_group_id: AgentGroupId,
-        session_id: SessionId,
-        kind: MessageKind,
-        content: serde_json::Value,
-        trigger: bool,
-    ) {
-        let paths = SessionPaths::new(&self.deps.data_root, agent_group_id, session_id);
-        let conn = match ironclaw_db::session::open_inbound(&paths) {
-            Ok(c) => c,
-            Err(err) => {
-                warn!(
-                    ?err,
-                    session = %session_id.as_uuid(),
-                    "create_agent: open_inbound failed; skipping inbound write",
-                );
-                return;
-            }
-        };
-        let msg = WriteInbound {
-            id: MessageId::new(),
-            kind,
-            timestamp: Utc::now(),
-            content,
-            trigger,
-            on_wake: false,
-            process_after: None,
-            recurrence: None,
-            series_id: None,
-            platform_id: None,
-            channel_type: None,
-            thread_id: None,
-            source_session_id: None,
-        };
-        if let Err(err) = messages_in::insert(&conn, &msg) {
-            warn!(
-                session = %session_id.as_uuid(),
-                ?err,
-                "create_agent: messages_in::insert failed",
-            );
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::permissions::{always_allow, always_deny};
     use super::*;
     use crate::context::{DispatchTarget, MockModuleContext};
     use ironclaw_db::central::CentralDb;
     use ironclaw_db::session::SessionPaths;
     use ironclaw_db::tables::messages_in as messages_in_read;
-    use ironclaw_types::{AgentGroupId, MessageKind, OutboundMessage};
-
-    #[test]
-    fn parses_simple_agent_name() {
-        let r = parse("agent:helper").unwrap();
-        assert_eq!(r.name, "helper");
-        assert!(is_agent_destination("agent:helper"));
-    }
-
-    #[test]
-    fn parses_url_form() {
-        let r = parse("agent://my.bot").unwrap();
-        assert_eq!(r.name, "my.bot");
-    }
-
-    #[test]
-    fn allows_dash_underscore_dot_in_name() {
-        assert_eq!(parse("agent:foo-bar_baz.42").unwrap().name, "foo-bar_baz.42");
-    }
-
-    #[test]
-    fn rejects_empty_name() {
-        assert!(parse("agent:").is_none());
-        assert!(parse("agent://").is_none());
-    }
-
-    #[test]
-    fn rejects_invalid_chars() {
-        assert!(parse("agent:hello world").is_none());
-        assert!(parse("agent:hello/etc").is_none());
-        assert!(parse("agent:hello!").is_none());
-    }
-
-    #[test]
-    fn rejects_non_agent_strings() {
-        assert!(parse("telegram:chat-1").is_none());
-        assert!(parse("helper").is_none());
-        assert!(parse("").is_none());
-        assert!(!is_agent_destination("https://example.com"));
-    }
-
-    #[test]
-    fn parses_trimmed_input() {
-        let r = parse("  agent:helper  ").unwrap();
-        assert_eq!(r.name, "helper");
-    }
-
-    #[test]
-    fn agent_ref_serde_roundtrip() {
-        let r = AgentRef {
-            name: "helper".into(),
-        };
-        let s = serde_json::to_string(&r).unwrap();
-        let back: AgentRef = serde_json::from_str(&s).unwrap();
-        assert_eq!(r, back);
-    }
-
-    #[tokio::test]
-    async fn install_registers_interceptor() {
-        let m = AgentToAgentModule;
-        let ctx = MockModuleContext::new();
-        m.install(ctx.clone()).await.unwrap();
-        assert_eq!(ctx.registered(), vec!["message_interceptor"]);
-    }
+    use ironclaw_types::{MessageKind, SessionId};
 
     #[tokio::test]
     async fn create_agent_module_registers_action() {
@@ -1116,67 +662,12 @@ mod tests {
         assert_eq!(actions, vec!["create_agent"]);
     }
 
-    #[tokio::test]
-    async fn interceptor_is_passthrough_for_agent_channel() {
-        let m = AgentToAgentModule;
-        let ctx = MockModuleContext::new();
-        m.install(ctx.clone()).await.unwrap();
-        let hook = ctx.interceptors.lock().unwrap()[0].clone();
-        let dec = hook(InterceptorCtx {
-            message: OutboundMessage {
-                kind: MessageKind::Agent,
-                content: serde_json::json!({}),
-                files: vec![],
-            },
-            channel_type: Some(ChannelType::new(ChannelType::AGENT)),
-            platform_id: None,
-            thread_id: None,
-            agent_group_id: AgentGroupId::new(),
-        });
-        assert!(dec.is_passthrough());
-    }
-
-    #[tokio::test]
-    async fn interceptor_is_passthrough_for_non_agent() {
-        let m = AgentToAgentModule;
-        let ctx = MockModuleContext::new();
-        m.install(ctx.clone()).await.unwrap();
-        let hook = ctx.interceptors.lock().unwrap()[0].clone();
-        let dec = hook(InterceptorCtx {
-            message: OutboundMessage {
-                kind: MessageKind::Chat,
-                content: serde_json::json!({}),
-                files: vec![],
-            },
-            channel_type: Some(ChannelType::new("telegram")),
-            platform_id: Some("C1".into()),
-            thread_id: None,
-            agent_group_id: AgentGroupId::new(),
-        });
-        assert!(dec.is_passthrough());
-    }
-
-    #[test]
-    fn name_is_stable() {
-        assert_eq!(AgentToAgentModule.name(), "agent_to_agent");
-    }
-
     #[test]
     fn create_agent_module_name_is_stable() {
         let central = CentralDb::open_in_memory().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let m = CreateAgentModule::new(central, tmp.path().to_path_buf(), always_allow());
         assert_eq!(m.name(), "create_agent");
-    }
-
-    // Compile-time use of DispatchTarget::agent to keep its tests honest.
-    #[test]
-    fn dispatch_target_agent_used() {
-        let t = DispatchTarget::agent(AgentGroupId::new());
-        assert_eq!(
-            t.channel_type.as_ref().map(ChannelType::as_str),
-            Some(ChannelType::AGENT)
-        );
     }
 
     // -----------------------------------------------------------------------
@@ -1186,7 +677,7 @@ mod tests {
     /// Build a handler + parent session that the handler can resolve via the
     /// dispatch target's `(channel_type, platform_id)`. Returns the handler,
     /// the central DB, the data-root tempdir, and the parent session ids.
-    fn make_handler(
+    pub(super) fn make_handler(
         permission: CreateAgentPermissionCheck,
     ) -> (
         CreateAgentHandler,
@@ -1268,7 +759,7 @@ mod tests {
         (handler, central, tmp, parent, target)
     }
 
-    fn read_inbound_create_results(
+    pub(super) fn read_inbound_create_results(
         data_root: &std::path::Path,
         parent: ParentSession,
     ) -> Vec<serde_json::Value> {
@@ -1688,116 +1179,6 @@ mod tests {
         let results = read_inbound_create_results(tmp.path(), parent);
         assert_eq!(results.len(), 1);
         assert_eq!(results[0]["create_agent_result"]["status"], "invalid");
-    }
-
-    /// `users_table_check` denies when the install has no roles
-    /// granted. This is the bootstrap-safe default — without it any
-    /// untrusted operator could spawn agents the moment the host
-    /// boots.
-    #[test]
-    fn users_table_check_denies_on_empty_install() {
-        use ironclaw_db::tables::users::{self, UpsertUser};
-        let central = CentralDb::open_in_memory().unwrap();
-        // Even with users present, no roles means deny.
-        users::upsert(
-            &central,
-            UpsertUser {
-                kind: "telegram".into(),
-                identity: "1".into(),
-                display_name: Some("op".into()),
-            },
-        )
-        .unwrap();
-        let check = users_table_check(central);
-        let ctx = CreateAgentPermissionCtx {
-            parent_agent_group_id: None,
-            parent_session_id: None,
-            requested_name: "x".into(),
-        };
-        assert!(!check(&ctx), "no roles granted → deny");
-    }
-
-    /// Granting global Owner opens the gate for every parent.
-    #[test]
-    fn users_table_check_allows_when_global_owner_exists() {
-        use ironclaw_db::tables::users::{self, UpsertUser};
-        let central = CentralDb::open_in_memory().unwrap();
-        let user = users::upsert(
-            &central,
-            UpsertUser {
-                kind: "telegram".into(),
-                identity: "1".into(),
-                display_name: Some("op".into()),
-            },
-        )
-        .unwrap();
-        user_roles::grant(&central, user.id, user_roles::Role::Owner, None, None).unwrap();
-        let check = users_table_check(central);
-        let ctx = CreateAgentPermissionCtx {
-            parent_agent_group_id: Some(AgentGroupId::new()),
-            parent_session_id: None,
-            requested_name: "x".into(),
-        };
-        assert!(check(&ctx), "global Owner → allow");
-    }
-
-    /// Group-scoped Admin opens the gate only for that scope.
-    #[test]
-    fn users_table_check_allows_only_for_scoped_admin_when_no_global() {
-        use ironclaw_db::tables::users::{self, UpsertUser};
-        let central = CentralDb::open_in_memory().unwrap();
-        let user = users::upsert(
-            &central,
-            UpsertUser {
-                kind: "telegram".into(),
-                identity: "2".into(),
-                display_name: Some("scoped-op".into()),
-            },
-        )
-        .unwrap();
-        let scoped_group = agent_groups::create(
-            &central,
-            CreateAgentGroup {
-                name: "scoped".into(),
-                folder: "scoped".into(),
-                agent_provider: None,
-            },
-        )
-        .unwrap();
-        let scoped_ag = scoped_group.id;
-        user_roles::grant(
-            &central,
-            user.id,
-            user_roles::Role::Admin,
-            Some(scoped_ag),
-            None,
-        )
-        .unwrap();
-        let check = users_table_check(central);
-        // In-scope: allow.
-        let in_scope = CreateAgentPermissionCtx {
-            parent_agent_group_id: Some(scoped_ag),
-            parent_session_id: None,
-            requested_name: "x".into(),
-        };
-        assert!(check(&in_scope), "scoped Admin within own group → allow");
-        // Out-of-scope: deny.
-        let out_of_scope = CreateAgentPermissionCtx {
-            parent_agent_group_id: Some(AgentGroupId::new()),
-            parent_session_id: None,
-            requested_name: "x".into(),
-        };
-        assert!(
-            !check(&out_of_scope),
-            "scoped Admin must not leak to other groups"
-        );
-        // Orphan parent (no scope to match): deny.
-        let orphan = CreateAgentPermissionCtx {
-            parent_agent_group_id: None,
-            parent_session_id: None,
-            requested_name: "x".into(),
-        };
-        assert!(!check(&orphan), "no parent scope → cannot match scoped grant");
     }
 
     // -----------------------------------------------------------------------
