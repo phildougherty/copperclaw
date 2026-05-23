@@ -926,6 +926,16 @@ fn collect_forward_env() -> Vec<(String, String)> {
         // set `OLLAMA_BASE_URL=http://172.17.0.1:11434` (or
         // `host.docker.internal`) in the install's .env.
         "OLLAMA_BASE_URL",
+        // UX visibility flags read by the runner inside the container.
+        // The runner's `RunnerToolCtx::with_breadcrumbs_from_env()`
+        // checks `IRONCLAW_TOOL_BREADCRUMBS`; without forwarding the
+        // operator's `.env` value never reaches the container and the
+        // flag silently no-ops.
+        "IRONCLAW_TOOL_BREADCRUMBS",
+        // Per-session turn cap override. The runner main reads this
+        // to size `max_tool_turns` (default 60); operators bump it for
+        // long build/research sessions that would otherwise bail mid-flight.
+        "IRONCLAW_MAX_TOOL_TURNS",
     ];
     let mut out = Vec::with_capacity(FORWARDED.len());
     for key in FORWARDED {

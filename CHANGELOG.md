@@ -6,6 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (breadcrumbs, turn-cap, opaque apology) — three issues caught in the same Telegram session
+
+A "Build me a clone of an App Store app" run surfaced three independent
+papercuts in one shot:
+
+- **`IRONCLAW_TOOL_BREADCRUMBS=1` silently no-op'd.** The runner inside
+  the container reads the env var via `std::env::var`, but the host's
+  `collect_forward_env` in `crates/ironclaw-host/src/boot.rs` only
+  forwarded provider keys + Ollama base URL. The operator's `.env`
+  setting never reached the container; the runner saw it unset and
+  treated breadcrumbs as off. Added `IRONCLAW_TOOL_BREADCRUMBS` (and
+  `IRONCLAW_MAX_TOOL_TURNS`, for symmetry with the cap change below)
+  to the `FORWARDED` list.
+- **`max_tool_turns` hard-coded at 20 was too low for build/research
+  tasks.** Live session bailed after exactly 20 turns with the agent
+  mid-flight on a real "research apps then scaffold a TypeScript
+  clone" workload. Bumped the default to 60 in
+  `crates/ironclaw-runner/src/run/mod.rs` (new
+  `DEFAULT_MAX_TOOL_TURNS` + bounds + `resolve_max_tool_turns(env)`
+  helper). Operators can override via `IRONCLAW_MAX_TOOL_TURNS`
+  (clamped to [5, 500]).
+- **Apology said "I hit a snag … see runner stderr" — useless to the
+  user.** When a turn failed (provider error, 3-strikes parse-error
+  bailout, or hitting the cap above), the user saw a generic message
+  with no hint why. Extended `TurnOutcome::Failed` to carry a short
+  human-readable reason string ("the agent ran out of turns after 60
+  tool calls without finishing the task", "the model's provider call
+  did not return a complete response", "model produced malformed
+  tool-call JSON 3 turns in a row"), and reshaped the apology to
+  splice it in: "I couldn't finish a reply on that message — &lt;reason&gt;.
+  Try rephrasing or sending a smaller request, and the operator can
+  check the runner log for details." `cli_provider_timeout` replay
+  fixture updated to match.
+
 ### Fixed (clear-history sentinel silently swallowed the next user message)
 
 Caught while debugging "agent says 'I'm ready to help' instead of doing

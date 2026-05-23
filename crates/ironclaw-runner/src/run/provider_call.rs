@@ -77,7 +77,14 @@ pub(super) async fn run_llm_turn(
                     failed: true,
                     ..LlmTurnOutput::default()
                 };
-                emit_usage_report(deps, 0, 0, turn_started_at, &TurnOutcome::Failed).await;
+                emit_usage_report(
+                    deps,
+                    0,
+                    0,
+                    turn_started_at,
+                    &TurnOutcome::Failed(String::new()),
+                )
+                .await;
                 return Ok(out);
             }
         };
@@ -102,7 +109,11 @@ pub(super) async fn run_llm_turn(
         break pumped;
     };
     let outcome = if out.failed {
-        TurnOutcome::Failed
+        // Empty reason here — `drive_turn` will wrap this output in
+        // its own `TurnOutcome::Failed(reason)` before returning to
+        // the run loop. The reason on the per-turn usage report is
+        // not user-facing.
+        TurnOutcome::Failed(String::new())
     } else {
         TurnOutcome::Done
     };

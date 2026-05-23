@@ -19,8 +19,13 @@ pub(super) struct TurnResult {
 pub(super) enum TurnOutcome {
     /// Model produced a final response.
     Done,
-    /// Provider returned an error event.
-    Failed,
+    /// Turn could not complete. The wrapped string is a short
+    /// human-readable reason ("provider error: …", "exceeded
+    /// 60-turn cap", "model emitted malformed JSON 3 turns in a
+    /// row") that the apology emitter surfaces to the user instead
+    /// of the old generic "I hit a snag". Keep it under ~80 chars —
+    /// it's spliced into a single chat sentence.
+    Failed(String),
 }
 
 /// One pending tool call extracted from a streamed turn.
@@ -90,7 +95,9 @@ pub(super) async fn drive_turn(
         if output.failed {
             return Ok(TurnResult {
                 continuation,
-                outcome: TurnOutcome::Failed,
+                outcome: TurnOutcome::Failed(
+                    "the model's provider call did not return a complete response".into(),
+                ),
             });
         }
 
@@ -189,7 +196,9 @@ pub(super) async fn drive_turn(
             );
             return Ok(TurnResult {
                 continuation,
-                outcome: TurnOutcome::Failed,
+                outcome: TurnOutcome::Failed(format!(
+                    "model produced malformed tool-call JSON {consecutive_parse_error_turns} turns in a row"
+                )),
             });
         }
     }
@@ -197,12 +206,12 @@ pub(super) async fn drive_turn(
     // Exhausted the cap. Push a synthetic system message so the
     // model can see what happened on the next inbound, return
     // Failed so finalize_messages marks the inbound that way too.
-    tracing::warn!(
-        max = deps.max_tool_turns,
-        "tool-use cycle exceeded max turns; bailing"
-    );
+    let cap = deps.max_tool_turns;
+    tracing::warn!(max = cap, "tool-use cycle exceeded max turns; bailing");
     Ok(TurnResult {
         continuation,
-        outcome: TurnOutcome::Failed,
+        outcome: TurnOutcome::Failed(format!(
+            "the agent ran out of turns after {cap} tool calls without finishing the task"
+        )),
     })
 }

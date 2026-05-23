@@ -119,6 +119,55 @@ pub const MIN_TOOL_DEADLINE_SECS: u64 = 10;
 /// big `apt-get install`). Beyond that, presume the tool is wedged.
 pub const MAX_TOOL_DEADLINE_SECS: u64 = 3_600;
 
+/// Env var operators use to override how many tool-use cycles a single
+/// inbound is allowed to run before the runner bails. Build/research
+/// tasks routinely exceed the original cap of 20 (e.g. researching App
+/// Store apps + scaffolding a TypeScript project requires ~40 tool
+/// calls). Operators can crank this up for long autonomous sessions or
+/// dial it down for cheap conversational agents.
+pub const MAX_TOOL_TURNS_ENV: &str = "IRONCLAW_MAX_TOOL_TURNS";
+
+/// Default tool-use cycles per inbound. Sized for autonomous build/
+/// research tasks rather than chat — short conversations finish well
+/// inside this, while a single research+plan+build user request can
+/// burn 30-50 turns before producing the final reply.
+pub const DEFAULT_MAX_TOOL_TURNS: usize = 60;
+
+/// Floor — below this even simple multi-tool chains bail mid-flight.
+pub const MIN_MAX_TOOL_TURNS: usize = 5;
+
+/// Ceiling — beyond this a runaway tool loop is more likely than a
+/// legitimate need.
+pub const MAX_MAX_TOOL_TURNS: usize = 500;
+
+/// Resolve `max_tool_turns` from the env. Out-of-range / unparseable
+/// values fall back to [`DEFAULT_MAX_TOOL_TURNS`] with a WARN.
+#[must_use]
+pub fn resolve_max_tool_turns(env: &dyn crate::config::EnvLookup) -> usize {
+    let Some(raw) = env.get(MAX_TOOL_TURNS_ENV) else {
+        return DEFAULT_MAX_TOOL_TURNS;
+    };
+    let Ok(parsed) = raw.parse::<usize>() else {
+        tracing::warn!(
+            env = MAX_TOOL_TURNS_ENV,
+            value = %raw,
+            "could not parse max tool turns; using default"
+        );
+        return DEFAULT_MAX_TOOL_TURNS;
+    };
+    if !(MIN_MAX_TOOL_TURNS..=MAX_MAX_TOOL_TURNS).contains(&parsed) {
+        tracing::warn!(
+            env = MAX_TOOL_TURNS_ENV,
+            value = parsed,
+            min = MIN_MAX_TOOL_TURNS,
+            max = MAX_MAX_TOOL_TURNS,
+            "max tool turns out of range; using default"
+        );
+        return DEFAULT_MAX_TOOL_TURNS;
+    }
+    parsed
+}
+
 /// Resolve the per-tool deadline from the env. Same shape as
 /// [`resolve_provider_deadline`]: out-of-range / unparseable values
 /// fall back to [`DEFAULT_TOOL_DEADLINE_SECS`] with a WARN.
@@ -254,7 +303,7 @@ impl RunnerDeps {
             agent_group_id: ironclaw_types::AgentGroupId(uuid::Uuid::nil()),
             turn_seq: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             tool_map: Arc::new(HashMap::new()),
-            max_tool_turns: 20,
+            max_tool_turns: DEFAULT_MAX_TOOL_TURNS,
             compaction: CompactionCfg {
                 model_input_window: 200_000,
                 safety_margin_tokens: 8_000,
@@ -414,7 +463,7 @@ pub(in crate::run) async fn emit_usage_report(
             "ended_at": chrono::Utc::now().to_rfc3339(),
             "status": match outcome {
                 TurnOutcome::Done => "ok",
-                TurnOutcome::Failed => "error",
+                TurnOutcome::Failed(_) => "error",
             },
         }
     });
@@ -463,11 +512,10 @@ async fn finalize_messages(
     rows: &[MessageInRow],
     outcome: TurnOutcome,
 ) -> Result<()> {
-    let (in_status, ack_status) = match outcome {
-        TurnOutcome::Done => ("completed", processing_ack::ProcessingStatus::Done),
-        TurnOutcome::Failed => ("failed", processing_ack::ProcessingStatus::Failed),
+    let ack_status = match outcome {
+        TurnOutcome::Done => processing_ack::ProcessingStatus::Done,
+        TurnOutcome::Failed(_) => processing_ack::ProcessingStatus::Failed,
     };
-    let _ = in_status;
     {
         let inbound = deps.inbound.lock().await;
         for row in rows {
@@ -475,7 +523,7 @@ async fn finalize_messages(
                 TurnOutcome::Done => {
                     let _ = messages_in::mark_completed(&inbound, row.id);
                 }
-                TurnOutcome::Failed => {
+                TurnOutcome::Failed(_) => {
                     let _ = messages_in::mark_failed(&inbound, row.id);
                 }
             }
@@ -499,8 +547,8 @@ async fn finalize_messages(
     // batch. Routing fields (`channel_type` / `platform_id` /
     // `thread_id`) are copied from the inbound so the delivery loop
     // dispatches the apology back to the originating chat.
-    if let TurnOutcome::Failed = outcome {
-        if let Err(err) = emit_terminal_failure_apologies(deps, rows).await {
+    if let TurnOutcome::Failed(reason) = &outcome {
+        if let Err(err) = emit_terminal_failure_apologies(deps, rows, reason).await {
             tracing::warn!(?err, "could not emit terminal-failure apology");
         }
     }
@@ -510,16 +558,41 @@ async fn finalize_messages(
 /// One short chat outbound per failed inbound, routed back to the
 /// channel the inbound came in on. Idempotent at the per-row level
 /// because each inbound has a stable id that flows into `in_reply_to`.
-const APOLOGY_TEXT: &str = "I hit a snag processing your message and couldn't finish a reply. Could you try rephrasing or sending a smaller request? (Operator: see runner stderr for the exact error.)";
+///
+/// `reason` is a short phrase from `TurnOutcome::Failed` ("the agent
+/// ran out of turns after 60 tool calls without finishing the task",
+/// "the model's provider call did not return a complete response",
+/// etc.) which we splice into the apology so the user knows
+/// *which* snag instead of being told to "see runner stderr".
+fn apology_text(reason: &str) -> String {
+    if reason.is_empty() {
+        // Fallback: emitter didn't supply a reason. Should be rare —
+        // every `TurnOutcome::Failed` site in drive_turn.rs sets one.
+        // Operators can still find the underlying cause in runner
+        // stderr.
+        "I couldn't finish a reply on that message. Try rephrasing, \
+         or send a smaller request — and the operator can check the \
+         runner log for the exact error."
+            .into()
+    } else {
+        format!(
+            "I couldn't finish a reply on that message — {reason}. \
+             Try rephrasing or sending a smaller request, and the \
+             operator can check the runner log for details."
+        )
+    }
+}
 
 async fn emit_terminal_failure_apologies(
     deps: &RunnerDeps,
     rows: &[MessageInRow],
+    reason: &str,
 ) -> Result<()> {
     use ironclaw_db::tables::messages_out::{insert as insert_out, WriteOutbound};
     if rows.is_empty() {
         return Ok(());
     }
+    let text = apology_text(reason);
     let outbound = deps.outbound.lock().await;
     let conn: &rusqlite::Connection = &outbound;
     for row in rows {
@@ -549,7 +622,7 @@ async fn emit_terminal_failure_apologies(
                 channel_type: Some(channel_type.clone()),
                 platform_id: Some(platform_id.clone()),
                 thread_id: row.thread_id.clone(),
-                content: serde_json::json!({ "text": APOLOGY_TEXT }),
+                content: serde_json::json!({ "text": text }),
             }
         } else if let Some(source) = row.source_session_id.as_deref() {
             WriteOutbound {
@@ -563,7 +636,7 @@ async fn emit_terminal_failure_apologies(
                 platform_id: None,
                 thread_id: None,
                 content: serde_json::json!({
-                    "text": APOLOGY_TEXT,
+                    "text": text,
                     "to": { "kind": "agent", "session_id": source },
                 }),
             }

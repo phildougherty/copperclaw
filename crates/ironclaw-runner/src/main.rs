@@ -14,7 +14,8 @@ use clap::Parser;
 use ironclaw_db::session::{open_inbound_rw_no_mmap, open_outbound, SessionPaths};
 use ironclaw_providers::{AnthropicProvider, CodexProvider, OllamaProvider};
 use ironclaw_runner::{
-    compaction::CompactionCfg, resolve_provider_deadline, resolve_tool_deadline_secs, run_loop,
+    compaction::CompactionCfg, resolve_max_tool_turns, resolve_provider_deadline,
+    resolve_tool_deadline_secs, run_loop,
     RunnerConfig, RunnerDeps, RunnerToolCtx, SubagentRunnerDeps,
 };
 use tokio::sync::Mutex;
@@ -155,7 +156,7 @@ async fn main() -> Result<()> {
         agent_group_id: cfg.agent_group_id,
         turn_seq: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         tool_map,
-        max_tool_turns: 20,
+        max_tool_turns: resolve_max_tool_turns(&env),
         provider_deadline,
         tool_deadline_secs: resolve_tool_deadline_secs(&env),
     };

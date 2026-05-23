@@ -28,9 +28,10 @@ pub use destinations::{resolve_recipient, ResolvedRoute};
 pub use disallowed::{is_disallowed, DISALLOWED_TOOLS};
 pub use formatter::{format_messages, FormattedTurn};
 pub use run::{
-    resolve_provider_deadline, resolve_tool_deadline_secs, run_loop, RunnerDeps,
-    ACTIVE_POLL_INTERVAL_MS, DEFAULT_PROVIDER_DEADLINE_MS, DEFAULT_TOOL_DEADLINE_SECS,
-    MAX_PROVIDER_DEADLINE_MS, MAX_TOOL_DEADLINE_SECS, MIN_PROVIDER_DEADLINE_MS,
+    resolve_max_tool_turns, resolve_provider_deadline, resolve_tool_deadline_secs, run_loop,
+    RunnerDeps, ACTIVE_POLL_INTERVAL_MS, DEFAULT_MAX_TOOL_TURNS, DEFAULT_PROVIDER_DEADLINE_MS,
+    DEFAULT_TOOL_DEADLINE_SECS, MAX_MAX_TOOL_TURNS, MAX_PROVIDER_DEADLINE_MS,
+    MAX_TOOL_DEADLINE_SECS, MAX_TOOL_TURNS_ENV, MIN_MAX_TOOL_TURNS, MIN_PROVIDER_DEADLINE_MS,
     MIN_TOOL_DEADLINE_SECS, POLL_INTERVAL_MS, PROVIDER_DEADLINE_ENV, TOOL_DEADLINE_ENV,
 };
 pub use state::{load_state, save_state, PersistedState};
