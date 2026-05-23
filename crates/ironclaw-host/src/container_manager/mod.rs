@@ -40,9 +40,11 @@ pub mod config;
 pub mod prompt;
 pub mod runner_config;
 pub mod spawn;
+pub mod tasks_snapshot;
 
 pub use config::{ManagerConfig, RotatableConfig, SkillsMode, ROTATABLE_ENV_KEYS};
 pub use prompt::{BASE_PREAMBLE, MEMORY_UNAVAILABLE_FILENAME, PROJECT_BRIEFING_FILENAME, SKILLS_CATALOGUE_FILENAME};
+pub use tasks_snapshot::TASKS_SNAPSHOT_FILENAME;
 pub use spawn::{
     resolve_rebuild_base, RebuildBackoff, CODING_SKILL_NAMES, CONTAINER_RUNNER_PATH,
     CONTAINER_SESSION_DIR, DEFAULT_HEARTBEAT_STALE_SECS, DEFAULT_IDLE_TIMEOUT_SECS,
@@ -291,6 +293,27 @@ impl ContainerManager {
         for session in sessions {
             if !matches!(session.status, SessionStatus::Active) {
                 continue;
+            }
+            // Refresh the tasks snapshot for any session whose container
+            // is up so a long-running agent calling `list_tasks` sees the
+            // current state of the scheduler. Cheap (a single SELECT +
+            // ~1 KB JSON write per running session per tick); only fires
+            // on Running because Stopped/Idle sessions don't have a
+            // runner that could observe the file.
+            if matches!(
+                session.container_status,
+                ironclaw_types::ContainerStatus::Running
+            ) {
+                let paths = ironclaw_db::session::SessionPaths::new(
+                    &self.cfg.data_dir,
+                    session.agent_group_id,
+                    session.id,
+                );
+                tasks_snapshot::write_tasks_snapshot(
+                    &self.central,
+                    session.id,
+                    &paths.root,
+                );
             }
             let action = self.classify(&session);
             if let Err(err) = self.apply(&session, action).await {

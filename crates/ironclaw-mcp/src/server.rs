@@ -171,7 +171,7 @@ mod tests {
         // `build_tool_set()` produces — no dropped, reordered, or extra
         // entries. Pinning the order here catches any drift in `Inner`'s
         // map/order construction without coupling the test to a specific
-        // tail name.
+        // tail name. (Latest tools appended: compact_now, clear_history.)
         let expected: Vec<String> = crate::tools::build_tool_set()
             .iter()
             .map(|t| t.tool.name.to_string())

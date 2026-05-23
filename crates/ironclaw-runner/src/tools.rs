@@ -30,6 +30,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Path inside the container where the host writes the per-session tasks
+/// snapshot for the `list_tasks` MCP tool. Mirrors
+/// `ironclaw_host::container_manager::TASKS_SNAPSHOT_FILENAME` under the
+/// `/data` bind. Test-overridable via the env var below.
+const TASKS_SNAPSHOT_DEFAULT_PATH: &str = "/data/tasks.json";
+const TASKS_SNAPSHOT_ENV_OVERRIDE: &str = "IRONCLAW_TASKS_SNAPSHOT_FILE";
+
+fn tasks_snapshot_path() -> PathBuf {
+    std::env::var_os(TASKS_SNAPSHOT_ENV_OVERRIDE)
+        .map_or_else(|| PathBuf::from(TASKS_SNAPSHOT_DEFAULT_PATH), PathBuf::from)
+}
+
 use async_trait::async_trait;
 use chrono::Utc;
 use ironclaw_db::attachments::safe_attachment_name;
@@ -204,11 +216,30 @@ impl ToolContext for RunnerToolCtx {
     }
 
     async fn list_tasks(&self) -> Result<Vec<TaskSummary>, ToolError> {
-        // Task state lives on the host; the runner has no local view of it.
-        // The expectation is that callers schedule a `list_tasks` system
-        // message and await the host's response via `messages_in`. Until
-        // that flow exists we surface an empty list.
-        Ok(Vec::new())
+        // Task state lives on the host; the runner can't reach the
+        // central DB from inside its container. Read the snapshot the
+        // host writes into the session dir on every spawn + tick. NotFound
+        // means the host hasn't written one yet (fresh deployment / first
+        // tick) — return an empty list rather than erroring so the agent
+        // sees "no tasks" rather than a tool failure.
+        let path = tasks_snapshot_path();
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(err) => {
+                return Err(ToolError::Internal(format!(
+                    "list_tasks: read {}: {err}",
+                    path.display()
+                )));
+            }
+        };
+        let tasks: Vec<TaskSummary> = serde_json::from_slice(&bytes).map_err(|err| {
+            ToolError::Internal(format!(
+                "list_tasks: parse {}: {err}",
+                path.display()
+            ))
+        })?;
+        Ok(tasks)
     }
 
     fn set_originating(

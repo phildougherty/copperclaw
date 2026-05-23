@@ -152,6 +152,16 @@ impl ContainerManager {
             remove_stale_catalogue(&root.join(SKILLS_CATALOGUE_FILENAME));
         }
 
+        // Snapshot the central DB's tasks for this session into
+        // `<session_root>/tasks.json`. The runner can't reach the central
+        // DB from inside its container, so this snapshot is the host-side
+        // half of the `list_tasks` MCP tool. Refreshed on every spawn;
+        // for live updates within a long-running session see the sweep
+        // loop hook.
+        if let Some(root) = session_root {
+            super::tasks_snapshot::write_tasks_snapshot(&self.central, session.id, root);
+        }
+
         let system = assemble_system_prompt_with_catalogue(
             self.cfg.skills_dir.as_deref(),
             self.cfg.groups_dir.as_deref(),

@@ -33,6 +33,14 @@ pub use context::{
     SUBAGENT_MAX_TURNS_LIMIT, SUBAGENT_WALL_CLOCK_SECS,
 };
 pub use error::{McpError, ToolError};
+
+/// Sentinel file the `compact_now` tool drops to ask the runner to
+/// compact history at the start of its next turn. Re-exported so the
+/// runner can `use ironclaw_mcp::compact_now_pending_path()` to find it.
+pub use tools::compact_now::pending_path as compact_now_pending_path;
+/// Sentinel file the `clear_history` tool drops to ask the runner to
+/// wipe history at the start of its next turn.
+pub use tools::clear_history::pending_path as clear_history_pending_path;
 pub use server::{build_server, IronclawServer};
 pub use tools::{build_tool_map, build_tool_set, ToolEntry, ToolHandler};
 
