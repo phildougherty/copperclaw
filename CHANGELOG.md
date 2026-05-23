@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (strip leaked `<thinking>` blocks from outbound chat text)
+
+Live Telegram testing (Haiku 4.5) caught the model emitting its
+reasoning as literal `<thinking>...</thinking>` markup inside regular
+`send_message` text — not via the Anthropic API's private-reasoning
+content blocks. End users saw a wall of "the model talking to
+itself" before the actual reply. The provider-side
+`thinking`/`redacted_thinking` block handling can't catch this case
+because the markup is content, not metadata.
+
+- **`crates/ironclaw-runner/src/tools.rs`** — new
+  `strip_reasoning_blocks(text)` helper that drops every closed
+  `<thinking>...</thinking>` pair (case-insensitive tag, multi-line
+  content), collapses the blank-line runs left behind, and
+  preserves text containing an unterminated open tag verbatim (so
+  we never silently swallow large prose chunks).
+  `apply_send_message` and `apply_send_file` both run their text
+  through it before writing the row. Six unit tests cover
+  open/close pair removal, multi-block, unterminated tag
+  preservation, case insensitivity, plain-text passthrough, and an
+  end-to-end via `emit_outbound`.
+
 ### Added
 
 - **`iclaw sessions delete <id> [--force]`.** Closes the operator gap
