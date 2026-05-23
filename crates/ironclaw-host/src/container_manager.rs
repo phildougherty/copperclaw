@@ -464,7 +464,21 @@ impl ContainerManager {
                     .unwrap_or(false)
                 {
                     ReconcileAction::CrashRestart
-                } else if Self::session_idle(session, self.cfg.idle_timeout_secs) {
+                } else if Self::session_idle(session, self.cfg.idle_timeout_secs)
+                    && Self::heartbeat_stale(&paths, self.cfg.idle_timeout_secs)
+                        .unwrap_or(false)
+                {
+                    // Only idle when BOTH the session shows no recent
+                    // inbound activity AND the runner's heartbeat says
+                    // it's done working. Without the second clause,
+                    // long-running tool loops (e.g. a research agent
+                    // chaining 10+ web_search + read_file calls past
+                    // 5 minutes) get killed mid-flight even though the
+                    // runner is actively producing — the prior check
+                    // measured time since the LAST INBOUND, not time
+                    // since the runner did anything. Surfaced live as
+                    // "spawned three research agents and the host
+                    // killed them just before they could reply."
                     ReconcileAction::IdleStop
                 } else {
                     ReconcileAction::Noop
@@ -3165,13 +3179,14 @@ mod tests {
     }
 
     #[test]
-    fn classify_running_with_quiet_session_is_idle_stop() {
+    fn classify_running_with_quiet_session_and_quiet_runner_is_idle_stop() {
+        // Both signals quiet: no recent inbound AND the runner stopped
+        // touching its heartbeat. This is the genuine "idle" case.
         let tmp = tempfile::tempdir().unwrap();
-        let (mgr, db) = make_mgr(&tmp);
+        let (_mgr, db) = make_mgr(&tmp);
         let mut session = fixture_session(&db);
         sessions::mark_container_running(&db, session.id).unwrap();
         session.container_status = ContainerStatus::Running;
-        // last_active is set to "now" at session create; backdate it.
         session.last_active = chrono::Utc::now()
             - chrono::Duration::seconds(
                 i64::try_from(DEFAULT_IDLE_TIMEOUT_SECS).unwrap() + 10,
@@ -3179,7 +3194,57 @@ mod tests {
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
         paths.ensure_dirs().unwrap();
         std::fs::write(&paths.heartbeat, b"").unwrap();
-        assert_eq!(mgr.classify(&session), ReconcileAction::IdleStop);
+        // Backdate heartbeat past the idle window AND past the
+        // crash-stale threshold's mid-zone — we want "idle, not
+        // crashed," i.e. older than idle_timeout_secs but younger than
+        // some fictional crash window. With defaults (60s crash, 300s
+        // idle), an idle heartbeat would be ≥300s old but… in practice
+        // anything older than idle_secs is also stale-as-crash. To
+        // disambiguate we test a config where they're set apart:
+        // crash=ridiculously long, idle=10s.
+        let mut wide_cfg = manager_cfg(tmp.path().to_path_buf());
+        wide_cfg.idle_timeout_secs = 10;
+        wide_cfg.heartbeat_stale_secs = 86_400;
+        let mgr_wide = ContainerManager::new(
+            ironclaw_db::central::CentralDb::open_in_memory().unwrap(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            wide_cfg,
+        );
+        let backdated =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        filetime::set_file_mtime(
+            &paths.heartbeat,
+            filetime::FileTime::from_system_time(backdated),
+        )
+        .unwrap();
+        assert_eq!(mgr_wide.classify(&session), ReconcileAction::IdleStop);
+    }
+
+    #[test]
+    fn classify_running_with_quiet_session_but_active_runner_is_noop() {
+        // Regression: the manager used to idle-stop any session whose
+        // last_active was older than idle_timeout_secs, even if the
+        // runner was actively producing work. Long-running tool loops
+        // (research agents chaining 10+ web_search calls past 5 min)
+        // got killed mid-flight because last_active is bumped by
+        // inbound arrival, not by runner activity. The fix gates
+        // IdleStop on heartbeat freshness AS WELL — if the runner is
+        // ticking, it's not idle.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let mut session = fixture_session(&db);
+        sessions::mark_container_running(&db, session.id).unwrap();
+        session.container_status = ContainerStatus::Running;
+        // No recent inbound: backdate last_active past the idle window.
+        session.last_active = chrono::Utc::now()
+            - chrono::Duration::seconds(
+                i64::try_from(DEFAULT_IDLE_TIMEOUT_SECS).unwrap() + 10,
+            );
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        std::fs::write(&paths.heartbeat, b"").unwrap();
+        // Heartbeat is fresh: runner is actively working.
+        assert_eq!(mgr.classify(&session), ReconcileAction::Noop);
     }
 
     #[test]
