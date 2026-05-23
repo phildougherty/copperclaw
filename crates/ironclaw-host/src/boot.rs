@@ -419,9 +419,6 @@ pub async fn install_modules(host_ctx: Arc<HostContext>, data_root: PathBuf) {
             .with_new_pending_notifier(build_pending_notifier(host_ctx.central().clone())),
         ),
         Box::new(InteractiveModule::default()),
-        // TODO(team-sc): wire sqlite-backed TaskStore so scheduled
-        // tasks created via the agent's `schedule_task` MCP tool
-        // persist and the sweep loop can fire them.
         Box::new(SchedulingModule::with_store(Arc::new(
             SqliteTaskStore::new(host_ctx.central().clone()),
         ))),

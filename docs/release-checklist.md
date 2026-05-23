@@ -81,8 +81,8 @@ for each release; "0.1.0" below is illustrative.
       - `target/release/iclaw` (admin client)
       - `target/release/ironclaw-setup` (setup helper)
 - [ ] Binaries `--version` strings include the release version.
-- [ ] `ironclaw run --check` exits 0 against a fresh empty data
-      directory.
+- [ ] `iclaw schema-version` reports `ok` against a fresh empty data
+      directory after `ironclaw migrate`.
 - [ ] `iclaw groups list` against a host with one group returns one
       row.
 

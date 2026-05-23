@@ -41,7 +41,7 @@ in-flight.
    - Telegram: unset the webhook (`POST /deleteWebhook`).
    - Slack: pause the events subscription URL.
    - Discord: leave the gateway disconnected (kill the bot session).
-   - Webex / GitHub / Linear / Teams / Webex / Matrix / Resend:
+   - Webex / GitHub / Linear / Teams / Matrix / Resend:
      disable the webhook at the platform side.
    - Long-poll channels (Telegram long-poll, Matrix sync, X DM poll):
      stop the predecessor and they stop polling.
@@ -65,7 +65,7 @@ Run the data-directory migrator. This is idempotent — running it
 twice on the same destination is safe.
 
 ```
-ironclaw setup --migrate-from /var/lib/ironclaw-old \
+ironclaw-setup --migrate-from /var/lib/ironclaw-old \
                --data-dir /var/lib/ironclaw
 ```
 
@@ -75,9 +75,11 @@ The migrator:
 - Calls `CentralDb::open`, which runs every central migration in
   `crates/ironclaw-db/migrations/` against the copy. Migrations are
   recorded in `schema_migrations`; re-running is a no-op.
-- Leaves per-session DBs in place. Session DBs are migrated lazily
-  the first time the new host opens them, via the
-  `SessionInbound` / `SessionOutbound` migration sets.
+- Does NOT touch per-session DBs. If you want session history
+  preserved, separately `rsync -a <source>/data/sessions/
+  <dest>/data/sessions/` while the predecessor is stopped. Session
+  DBs the new host then opens are migrated lazily via the
+  `SessionInbound` / `SessionOutbound` migration sets on first open.
 
 If the migrator reports `copied_db: false` and you expected a copy,
 re-check the `--migrate-from` path — it should point at the
@@ -89,17 +91,18 @@ Do not start the channel ingress yet. Run a read-only verification
 pass first.
 
 ```
-# Sanity: the host can boot and exit cleanly.
-ironclaw run --once --check
+# Sanity: schema is at the expected version (any pending → run `ironclaw migrate`).
+iclaw schema-version
+
+# Apply pending migrations (idempotent — no-op when already current).
+ironclaw migrate
 
 # Schema introspection via iclaw on an idle host.
-ironclaw run &
-HOST_PID=$!
+ironclaw start
 iclaw groups list
 iclaw sessions list --status active
 iclaw approvals list
-kill $HOST_PID
-wait $HOST_PID
+ironclaw stop
 ```
 
 What you are looking for:

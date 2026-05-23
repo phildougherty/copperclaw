@@ -7,8 +7,10 @@ description: Inventory the MCP tools available to this agent, introspect their s
 
 The agent's tool list is the union of:
 
-- The 15 built-in tools served by the in-process MCP server
-  (`ironclaw-mcp`).
+- The built-in tools served by the in-process MCP server
+  (`ironclaw-mcp`). The registry is built in
+  `crates/ironclaw-mcp/src/tools/mod.rs::build_tool_set` — that's
+  the canonical inventory. Always-on, no admin step.
 - External MCP servers configured via `container_configs.mcp_servers`
   (which an admin or the agent itself registered through
   `add_mcp_server`).
@@ -16,30 +18,31 @@ The agent's tool list is the union of:
 This skill explains how to enumerate the live set and read each
 tool's JSON schema.
 
-## Built-in tools
+## Built-in tools (categories)
 
-The in-process MCP server exposes these 15 tools (see PLAN.md § 7 for
-the canonical inventory):
+The in-process MCP server exposes around three dozen built-in tools,
+grouped roughly:
 
-| Tool | Module | One-line purpose |
-|---|---|---|
-| `send_message`      | core         | reply or cross-post text |
-| `send_file`         | core         | reply with a file attachment |
-| `edit_message`      | core         | replace the body of a sent message |
-| `add_reaction`      | core         | react to a sent message |
-| `ask_user_question` | interactive  | constrained multiple-choice |
-| `send_card`         | interactive  | platform-specific structured UI |
-| `create_agent`      | agents       | spin up a sibling agent |
-| `install_packages`  | self-mod     | request apt/npm installs |
-| `add_mcp_server`    | self-mod     | request a new MCP server |
-| `schedule_task`     | scheduling   | enqueue a one-shot or recurring prompt |
-| `list_tasks`        | scheduling   | inventory scheduled tasks |
-| `cancel_task`       | scheduling   | remove a task |
-| `pause_task`        | scheduling   | stop firing |
-| `resume_task`       | scheduling   | re-arm a paused task |
-| `update_task`       | scheduling   | edit a task in place |
+- **Messaging core** — `send_message`, `send_file`, `edit_message`,
+  `add_reaction`.
+- **Interactive UI** — `ask_user_question`, `send_card`.
+- **Agent lifecycle** — `create_agent`.
+- **Self-modification (gated)** — `install_packages`, `add_mcp_server`.
+- **Scheduling** — `schedule_task`, `list_tasks`, `cancel_task`,
+  `pause_task`, `resume_task`, `update_task`.
+- **Computer use** — `shell`, `read_file`, `write_file`, `edit_file`,
+  `web_fetch`, `artifact_path`.
+- **Code navigation** — `grep`, `glob`, `git_status`, `git_diff`,
+  `git_log`, `git_blame`.
+- **Research** — `web_search`, `explore` (read-only subagent).
+- **Skill catalogue** — `load_skill`.
+- **Planning scratchpad** — `todo_add`, `todo_list`, `todo_update`,
+  `todo_delete`.
+- **Session control** — `compact_now`, `clear_history`.
 
-These are always present. They never require an admin to enable.
+For the authoritative list at any moment, call `tools/list` (the
+runner proxies it). The names above are stable; the count drifts as
+new tools land — don't trust a hard number quoted in a doc.
 
 ## External tools
 
@@ -68,50 +71,24 @@ spawn a test runner to see the live `tools/list` output.
 ## Reading a tool's schema
 
 Every built-in tool's schema is declared verbatim in
-`crates/ironclaw-mcp/src/tools/*.rs`. The shape always looks like:
+`crates/ironclaw-mcp/src/tools/*.rs`. Standard shape:
+`additionalProperties: false`, an explicit `required` list, and
+`minLength: 1` on string fields meaning "non-empty". External tool
+schemas come from the upstream MCP server; treat as advisory.
 
-```json
-{
-  "type": "object",
-  "additionalProperties": false,
-  "required": [ ... ],
-  "properties": {
-    "field": { "type": "...", "minLength": 1 }
-  }
-}
-```
+## Suppressed names
 
-You can rely on:
+Some upstream Claude-SDK / MCP names are deliberately not exposed
+(use the local analogue instead):
 
-- `required` listing the mandatory fields.
-- `additionalProperties: false` — passing extra fields is a
-  validation error.
-- `minLength: 1` on string fields meaning "non-empty".
-
-For external tools, the schema lives in the upstream MCP server's
-code; treat it as advisory and handle validation errors at runtime.
-
-## Disallowed built-ins (do not expect them)
-
-A few tool names exist in upstream MCP definitions but are
-**deliberately not** exposed by ironclaw's runner — the host owns
-the underlying functionality:
-
-- `CronCreate`, `CronDelete`, `CronList` — use `schedule_task`,
-  `list_tasks`, `cancel_task` instead.
-- `ScheduleWakeup` — same path, via `schedule_task`.
-- `AskUserQuestion` (the upstream variant) — use the local
-  `ask_user_question`.
-- `EnterPlanMode`, `ExitPlanMode`, `EnterWorktree`, `ExitWorktree`
-  — these are upstream Claude SDK concepts; the host does not
-  surface them.
-
-If you see one of these listed in `tools/list`, something is
-misconfigured.
+- `CronCreate` / `CronDelete` / `CronList` / `ScheduleWakeup` →
+  use `schedule_task` & friends.
+- upstream `AskUserQuestion` → use the local `ask_user_question`.
+- `EnterPlanMode` / `ExitPlanMode` / `EnterWorktree` / `ExitWorktree`
+  → not surfaced.
 
 ## Practical pattern
 
-Begin every fresh session by calling `tools/list` (the provider's
-SDK does this automatically) and trusting that list. Do not
-hard-code tool names from training data — the actual set is the
-one the runner reports.
+Begin every fresh session by trusting `tools/list` (the provider's
+SDK calls it automatically). Don't hard-code names from training
+data — the actual set is what the runner reports.

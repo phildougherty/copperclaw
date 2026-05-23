@@ -16,9 +16,6 @@
 LOW:
 - `chat.update` discards thread_id; correct for Slack but means an
   edit on a non-existent ts surfaces as a generic BadRequest.
-- File uploads issue one v2 upload per file, but `completeUploadExternal`
-  batches multiple in one call. We could merge to one round-trip per
-  deliver but it's not user-visible.
 
 ## Edge cases tested
 - [x] empty body — falls through to API which would reject; we
@@ -38,7 +35,5 @@ LOW:
 None — adapter healthy.
 
 ## Deferred for follow-up
-- Batch `completeUploadExternal` across multiple files (single round
-  trip).
 - Surface a per-file upload error rather than aborting the whole
   deliver on the first failure.

@@ -63,10 +63,14 @@ fire time and `recurrence` controls everything after that.
 `list_tasks` returns a JSON array of `TaskSummary` values:
 
 ```json
-[ { "id": "task_8a", "name": "hourly-poll",
+[ { "id": "task_018f9c2d-7e1a-7b4d-a2f6-1d2c3e4f5061",
+    "name": "hourly-poll",
     "status": "active", "when": null,
     "recurrence": "0 * * * *" } ]
 ```
+
+Task ids are `task_<uuidv7>` (always the full UUID — don't shorten them
+when passing back to `cancel_task` / `pause_task` / etc.).
 
 `status` is one of `active` / `paused`. Use the `id` in
 `pause_task` / `resume_task` / `cancel_task` / `update_task`.

@@ -14,18 +14,17 @@ decision.
 This skill covers the four kinds of approval an agent will encounter
 and how a human resolves them via `iclaw`.
 
-## The four approval kinds
+## The approval families
 
-| Kind | Triggered by | Row table |
+| Family | Triggered by | Row table |
 |---|---|---|
 | `Sender`           | unknown platform user sending into a wired channel | `unregistered_senders` |
 | `Channel`          | first message arriving on a channel + platform id not yet known | `pending_channel_approvals` |
 | `InstallPackages`  | `install_packages` MCP tool                          | `pending_approvals` |
 | `AddMcpServer`     | `add_mcp_server` MCP tool                            | `pending_approvals` |
-| `OneCli`           | first OneCLI device link                             | `pending_approvals` |
 
-`pending_approvals` carries a typed `kind` and a `payload` JSON blob
-describing the request. The other tables exist because senders and
+`pending_approvals` carries an `action` string and a `payload` JSON
+blob describing the request. The other tables exist because senders and
 channels need a richer per-row state (last-seen times, denial flags)
 than a generic payload can carry.
 
@@ -54,54 +53,40 @@ session id, the agent group, the request payload, and a timestamp.
 
 ## How an admin resolves an approval
 
-Today, `iclaw` exposes the read side:
+`iclaw` exposes read everywhere, write only for sender approvals:
 
 ```bash
-iclaw approvals list                # list all pending
-iclaw approvals get <approval-id>   # show one
+iclaw approvals list                                       # list pending (all families)
+iclaw approvals get <approval-id>                          # show one
+iclaw approvals approve --channel <ct> --identity <id> [--display-name "Name"]
+                                                           # approves a Sender row
 ```
 
-The write side (approve / deny) is driven through the central DB
-update functions exposed in `ironclaw-db::pending_approvals` and
-the related per-kind tables. In a real deployment, the admin uses
-a higher-level CLI (`iclaw approvals approve <id>` / `deny <id>`)
-that translates to the appropriate table update.
+There is no generic `iclaw approvals approve <id>` / `deny <id>` today.
+Channel / InstallPackages / AddMcpServer approvals are resolved by the
+operator either via the underlying CRUD on the central DB
+(`ironclaw-db::pending_approvals` and the per-kind tables) or by
+re-running the action through whatever workflow registered the row.
 
-When the admin approves:
-
-- For sender approvals: a `users` row is created (or attached);
-  any future inbound from that sender flows.
-- For channel approvals: a `messaging_groups` row is created;
-  wirings can be added.
-- For install / MCP approvals: the `container_configs` row is
-  updated and the container is queued for rebuild.
-
-When the admin denies:
-
-- Sender approvals: the row is marked denied; future sends from
-  that identity land in `dropped_messages`.
-- Channel approvals: same — the channel is parked.
-- Install / MCP approvals: the request is dropped; the agent
-  may try again with a better reason.
+Approve → sender becomes a `users` row / channel becomes a
+`messaging_groups` row / install or MCP request is applied and the
+container is queued for rebuild. Deny → sender or channel rows are
+marked denied (future sends from that identity land in
+`dropped_messages`); install / MCP requests are dropped (the agent
+may retry with a better reason).
 
 ## What the agent sees
 
-The agent does not directly see approval rows. It learns about
-them only through:
+The agent does not directly see approval rows. It learns about them
+through the absence of an action it expected (an install that didn't
+take effect at the next boot) or a `kind: system` message the host
+writes when the admin acts — that's the right cue for "my install is
+finally live."
 
-- The absence of an action it expected (`install_packages` did
-  not lead to a new package on the next boot — admin hasn't
-  approved yet).
-- A system message of kind `system` containing an approval
-  outcome, written by the host when the admin acts. This is
-  the right place to detect "my install is finally live."
+## Tips
 
-## Practical tips
-
-- Always include a `reason` that helps the admin decide quickly.
-- After requesting an install or MCP server, do not call
-  `install_packages` again in a tight loop — wait for the next
-  boot or for a system message acknowledgement.
-- For high-stakes operations, schedule a follow-up
-  (`schedule_task`) to check whether the approval ever
-  landed; if not, surface the situation to a user.
+- Always include a clear `reason` so the admin can decide quickly.
+- Don't re-call `install_packages` / `add_mcp_server` in a tight loop
+  — wait for the next boot or the system-message ack.
+- For high-stakes requests, `schedule_task` a follow-up to verify the
+  approval ever landed and surface the result to a user if not.

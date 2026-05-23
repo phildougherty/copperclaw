@@ -57,7 +57,7 @@ cargo test --workspace --no-fail-fast
 ```
 
 The workspace forbids `unsafe_code` and treats clippy warnings as errors.
-Current baseline: ~5,160 passing tests. Don't break that.
+Current baseline: ~5,200 passing tests. Don't break that.
 
 ## Where things live on the local install
 
@@ -96,7 +96,7 @@ In order of cost:
 2. `iclaw dropped-messages outbound-list --since 1h` — delivery failures with reason.
 3. `iclaw audit list --since 1h` — was a recent mutation declined?
 4. `iclaw usage --since 24h` + `iclaw budgets list` — did you hit the daily-token cap?
-5. `ironclaw logs --tail 200` — host stderr; look for ERROR / WARN.
+5. `ironclaw logs -n 200` — host stderr; look for ERROR / WARN. (Use `ironclaw logs -f` to follow.)
 6. Per-session DBs under `data/sessions/<ag>/<sess>/`:
      - `inbound.db`'s `messages_in` table — did the router record your message?
      - `outbound.db`'s `messages_out` table — did the runner emit a reply?

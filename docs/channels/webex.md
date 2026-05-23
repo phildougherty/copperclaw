@@ -7,16 +7,19 @@
 - subscribe: trait-default Ok (webhook ingress; firehose model).
 - set_typing: trait-default Ok (no public typing API).
 - edit_message: action="edit" → PUT.
-- add_reaction: action="reaction" — only works when reaction endpoint
-  is present; otherwise Unsupported.
+- add_reaction: action="reaction" — POSTs to `<api_base>/reactions`.
+  A 404 or 501 from the server is mapped to `AdapterError::Unsupported`
+  so a Webex deployment that hasn't enabled the reactions API
+  degrades cleanly.
 - plain_text_fallback: trait-default None.
 - open_dm: synthesises a `person:<user_id>` DmHandle.
 
 ## Gaps
 LOW:
-- Reaction endpoint detection is config-driven (`reactions_endpoint`
-  field). When unset, reactions silently return Unsupported. Setup
-  should warn.
+- Reaction endpoint discovery is via HTTP-status fallback (404/501 from
+  POST `/reactions` → `AdapterError::Unsupported`). No config knob —
+  Webex deployments without the reactions API degrade cleanly but
+  operators only learn about the limit at first reaction attempt.
 - Multipart file post is one HTTP call per file — not batched.
 
 ## Edge cases tested
@@ -33,7 +36,7 @@ LOW:
 - [x] person + file → Unsupported (Webex DMs don't take files via this
       adapter shape)
 - [x] edit / delete / reaction
-- [x] reaction without endpoint → Unsupported
+- [x] reaction 404 / 501 from `/reactions` → Unsupported
 - [x] system unknown action → BadRequest
 - [x] system to person → Unsupported
 - [x] chat / task / webhook / agent message kinds all route to chat path

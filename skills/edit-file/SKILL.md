@@ -3,15 +3,6 @@ name: edit-file
 description: Modify an existing file by replacing a unique substring with the edit_file tool. Cheaper and safer than rewriting the whole file with write_file when you only need to change a few lines.
 ---
 
-<!-- TODO(team-u): Team U spec called for `skills/edit_file/`, but the
-     skill registry (crates/ironclaw-skills/src/name.rs) only accepts
-     kebab-case names matching `[a-z0-9][a-z0-9-]{0,63}` and requires
-     the frontmatter name to equal the directory name. Going with
-     `edit-file` to match every other skill (`read-file`, `write-file`,
-     `edit-message`, ...) and let the loader actually load this. The
-     underlying MCP tool is still `edit_file` (snake_case, matching
-     `read_file` / `write_file`). -->
-
 # edit-file
 
 `edit_file` swaps an exact substring inside an existing file. Always

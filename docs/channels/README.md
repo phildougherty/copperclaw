@@ -19,11 +19,11 @@ tree" — was checked against each adapter's `deliver()`, `subscribe()`,
 | 7 | `github` | COMPLETE | 0 | text comment + action-edit + action-reaction. Files explicitly Unsupported (GitHub API limit). |
 | 8 | `linear` | COMPLETE | 0 | text + action-edit + action-reaction. Files explicitly Unsupported. |
 | 9 | `resend` | COMPLETE (outbound-only) | 0 | Email — no inbound by design. Subject/text/html/attachments + thread headers. |
-| 10 | `mattermost` | COMPLETE | 0 | text + action-edit + action-reaction. Files explicitly Unsupported with marker. |
-| 11 | `teams` | COMPLETE | 0 | channel + chat + action-edit + action-reaction. Files explicitly Unsupported. |
-| 12 | `gchat` | COMPLETE | 0 | text + threaded + card + action-edit/delete/reaction. Files Unsupported (Drive flow not modelled). |
+| 10 | `mattermost` | COMPLETE | 0 | text + files (two-step `/api/v4/files` upload + `posts.file_ids`) + action-edit + action-reaction. |
+| 11 | `teams` | COMPLETE | 0 | channel + chat + action-edit + action-reaction. Channel-target files supported (Graph filesFolder + drive upload + attachment-by-reference); chat-target files Unsupported (delegated-auth limit). |
+| 12 | `gchat` | COMPLETE | 0 | text + threaded + card + action-edit/delete/reaction + files (two-step `attachments:upload` then `attachment[]`). |
 | 13 | `webex` | COMPLETE | 0 | text + markdown + files + cards + action-edit/delete/reaction. |
-| 14 | `line` | PARTIAL | 1 | text via reply-or-push. NO edit, NO reaction, NO files. All explicitly Unsupported. |
+| 14 | `line` | PARTIAL | 1 | text via reply-or-push. Files Unsupported. Edit + reaction not handled (non-`post` action returns BadRequest, no edit_message / add_reaction override). |
 | 15 | `imessage` | COMPLETE | 0 | text + files (one AppleScript per file). System actions all Unsupported (AppleScript can't reach tapbacks reliably). |
 | 16 | `signal` | COMPLETE | 0 | text + files + action-edit + action-reaction + action-delete. |
 | 17 | `deltachat` | COMPLETE | 0 | text + files (with caption) + action-reaction + action-delete. Edit explicitly Unsupported (DC protocol limit). |
@@ -34,8 +34,7 @@ tree" — was checked against each adapter's `deliver()`, `subscribe()`,
 
 **Summary**: 21 audited, 20 complete (one with documented partial scope:
 `line`). Zero adapters had `todo!()` / `unimplemented!()` in the
-production deliver path. One adapter (`imessage`) has a documented
-silent no-op when the message body is empty; flagged MED below.
+production deliver path.
 
 ## High-severity gaps (HIGH)
 
@@ -50,21 +49,17 @@ fall into one of these documented buckets:
 1. **Platform limit** (genuinely can't be done): wechat edit/reaction,
    whatsapp edit, deltachat edit, emacs files, github files.
 2. **Out-of-scope-in-v1** (intentional deferral with marker text):
-   gchat files (needs Drive), mattermost files, teams files,
+   teams chat-target files (needs delegated user-OneDrive auth),
    line files / edit / reaction.
 3. **Inbound-only by design**: webhooks.
 4. **Outbound-only by design**: resend.
 
 ## Medium-severity gaps (MED)
 
-- **`imessage`**: empty body (no text, no files) returns `Ok(None)`
-  instead of `BadRequest`. This is currently enshrined in a test
-  (`deliver_empty_text_is_a_noop_when_no_files`). Risk: an agent that
-  emits an empty reply will look like a successful delivery in the
-  outbound DB; the user sees nothing. Recommend converting to
-  `BadRequest` and updating the host's delivery loop to drop the
-  empty message upstream. Not changed in this audit because the
-  test would break. — `crates/ironclaw-channels/imessage/src/adapter.rs:145`
+None outstanding. (The previously-documented `imessage` empty-body
+silent-drop was fixed: empty body now returns `BadRequest` at
+`crates/ironclaw-channels/imessage/src/adapter.rs:133-137`, pinned by
+`deliver_empty_body_is_bad_request_not_silent_drop`.)
 
 ## Low-severity gaps (LOW)
 
@@ -96,9 +91,9 @@ fall into one of these documented buckets:
 | github | yes (comment) | NO | action | action (slug) | no-op | webhook |
 | linear | yes (comment) | NO | action | action | no-op | webhook |
 | resend | yes (email) | yes (base64) | NO | NO | no-op | NO (by design) |
-| mattermost | yes | NO | action | action | no-op | router |
-| teams | yes (text/html) | NO | action | action | no-op | webhook |
-| gchat | yes (+card) | NO | action | action | no-op | webhook |
+| mattermost | yes | yes (multipart upload + post) | action | action | no-op | router |
+| teams | yes (text/html) | yes (channel only; chat target → Unsupported) | action | action | no-op | webhook |
+| gchat | yes (+card) | yes (upload+attachment[]) | action | action | no-op | webhook |
 | webex | yes (+markdown+card) | yes (multipart) | action | action | no-op | webhook |
 | line | yes (reply/push) | NO | NO | NO | no-op | router |
 | imessage | yes | yes (per-file script) | NO (AppleScript limit) | NO | no-op | poll |
@@ -114,15 +109,11 @@ fall into one of these documented buckets:
 See per-channel docs in this directory for line-level findings. Top
 items the next sweep should tackle:
 
-1. `mattermost` file uploads (Mattermost API supports `files/upload` →
-   `posts.file_ids`). Not blocking but a frequent agent use case.
-2. `line` edit + reaction support (LINE Messaging API does not expose
+1. `line` edit + reaction support (LINE Messaging API does not expose
    either — needs Bot SDK trait change). Document on the README.
-3. `imessage` empty-body should fail BadRequest after updating the
-   test that pins the current behavior.
-4. `gchat` attachment support (requires the Drive upload flow).
-5. `teams` file attachments (Microsoft Graph supports `attachments`
-   with a hosted file reference). Documented as v2 in the adapter.
+2. `teams` chat-target file attachments (requires delegated user
+   auth so the bot can write to the user's OneDrive — channel-target
+   files already work via the bot's app-only auth).
 
 ## Methodology
 

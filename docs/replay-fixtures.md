@@ -24,61 +24,56 @@ A fixture is a directory:
 
 ```
 fixtures/<channel>/<scenario>/
-├── manifest.toml              # fixture metadata + replay plan
-├── config.json                # channel config (secrets redacted)
-├── central.sql                # central-DB seed (groups, users, wirings)
+├── manifest.json             # fixture metadata + replay plan
+├── central.sql               # central-DB seed (groups, users, wirings)
 ├── inbound/
-│   ├── 001-webhook.http        # raw HTTP request body + headers
-│   ├── 002-callback.json       # gateway frame, or follow-up call
+│   ├── 001-message.json      # adapter-shaped inbound payload
 │   └── ...
 ├── claude/
-│   ├── 001-turn.json           # mock Claude response (or full SSE)
+│   ├── 001-turn.json         # mock Claude response (or full SSE)
 │   └── ...
 └── expected/
-    ├── inbound-events.jsonl    # one InboundEvent per line
-    ├── messages-in.jsonl       # rows the router should have written
-    ├── messages-out.jsonl      # rows the container should write
-    └── delivered.jsonl         # outbound platform calls
+    ├── inbound-events.jsonl  # one InboundEvent per line
+    ├── messages-in.jsonl     # rows the router should have written
+    ├── messages-out.jsonl    # rows the container should write
+    └── delivered.jsonl       # outbound platform calls
 ```
 
-### `manifest.toml`
+The harness lives in `crates/ironclaw-host/tests/replay/`; the loader
+is `fixture.rs::load`.
 
-```toml
-name = "telegram-text-reply"
-channel = "telegram"
-description = "Plain-text DM, single Claude turn, no attachments."
-schema = 1
+### `manifest.json`
 
-[replay]
-# How to drive inbound events.
-mode = "webhook"           # webhook | gateway | poll | rpc
-# The host is held at the head of each script step until it acks
-# (writes a messages_in row, completes a delivery, etc.).
-step_timeout_ms = 5000
-
-# Names of fixture files to expect identical bytes for. Empty means
-# everything under expected/ is compared.
-diff = []
-
-# Substitutions to apply to recorded payloads — useful for purging
-# timestamps and bot ids that vary across recordings.
-[substitutions]
-"\"timestamp\":\"[^\"]+\"" = "\"timestamp\":\"<TS>\""
-"\"message_id\":[0-9]+"     = "\"message_id\":<MID>"
+```json
+{
+  "name": "telegram-inbound-text-message",
+  "channel": "telegram",
+  "description": "Plain-text DM, single Claude turn, no attachments.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\""
+  }
+}
 ```
 
-### `inbound/NNN-*.http`
+`replay.mode` is `direct` for the current harness — inbound payloads
+are handed to the adapter's `MockAdapter::inject` rather than through
+a webhook listener / gateway / poll / rpc front-door. (The
+webhook / gateway / poll / rpc modes named in earlier design docs are
+not implemented; the `manifest.toml` story was deferred behind an
+unused dep, hence the `.json` filename.)
 
-A `requests`-style raw HTTP payload:
+### `inbound/NNN-*.json`
 
-```
-POST /telegram/webhook HTTP/1.1
-Host: ironclaw.local
-Content-Type: application/json
-X-Telegram-Bot-Api-Secret-Token: REDACTED
-
-{"update_id":12345,...}
-```
+Adapter-shaped inbound payload — the bytes the adapter would see
+after its parser has lifted the raw HTTP / gateway frame into the
+adapter's `InboundEvent` (or equivalent) struct. Fixtures hand this
+directly to the adapter's mock instead of replaying transport.
 
 The replay harness:
 
@@ -166,10 +161,12 @@ replay suite:
    layer will tee writes. The directory ends up with the same shape
    as a hand-authored fixture.
 2. **Redact.** `target/fixture-capture/...` will contain bearer
-   tokens, signing secrets, and personal text. Run
-   `ironclaw fixture redact <dir>` to apply the project's redaction
-   pass (see `crates/ironclaw-host/src/fixture/redact.rs`). Manual
-   review is still required.
+   tokens, signing secrets, and personal text. The redaction pass
+   lives at `crates/ironclaw-host/src/fixture/redact.rs` but is not
+   wired to a CLI subcommand — write a small one-shot Rust binary
+   or shell script that walks the capture dir and feeds each file
+   through `redact::redact_bytes` (see the unit tests in that file
+   for usage). Manual review is still required.
 3. **Stabilise.** Add substitutions to `manifest.toml` for any
    field that varies between recordings (timestamps, generated
    ids, server-side message ids).

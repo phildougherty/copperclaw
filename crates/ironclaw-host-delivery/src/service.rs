@@ -576,9 +576,10 @@ impl DeliveryService {
             return Ok(());
         };
 
-        // TODO(team-sc): wire session_id + agent_group_id through to the
-        // delivery action handler so the scheduling module can identify
-        // which session a `schedule` op targets. Other handlers ignore.
+        // `session_id` (set below) and a defaulted `agent_group_id` are
+        // both threaded into `DeliveryActionInput` so the scheduling
+        // handler can identify which session a `schedule` op targets.
+        // Other handlers ignore the extra context.
         let mut handler_target = target.clone();
         if handler_target.agent_group_id.is_none() {
             handler_target.agent_group_id = Some(sess.agent_group_id);

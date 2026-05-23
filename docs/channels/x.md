@@ -3,7 +3,7 @@
 ## Implemented
 - deliver: COMPLETE — text + files (one DM per file; first carries the
   text, subsequent use the filename as the required-non-empty body).
-  `crates/ironclaw-channels/x/src/adapter.rs:201`
+  `crates/ironclaw-channels/x/src/adapter.rs:216`
 - subscribe: trait-default Ok (poll loop hits /2/dm_events).
 - set_typing: trait-default Ok (no public typing API in v2).
 - edit_message: any system action → Unsupported.

@@ -30,20 +30,12 @@ implement.
 #[async_trait]
 pub trait ChannelAdapter: Send + Sync {
     fn channel_type(&self) -> &ChannelType;
-
     fn supports_threads(&self) -> bool { false }
 
-    async fn subscribe(
-        &self,
-        platform_id: &str,
-        thread_id: Option<&str>,
-    ) -> Result<(), AdapterError> { Ok(()) }
-
-    async fn set_typing(
-        &self,
-        platform_id: &str,
-        thread_id: Option<&str>,
-    ) -> Result<(), AdapterError> { Ok(()) }
+    async fn subscribe(&self, platform_id: &str, thread_id: Option<&str>)
+        -> Result<(), AdapterError> { Ok(()) }
+    async fn set_typing(&self, platform_id: &str, thread_id: Option<&str>)
+        -> Result<(), AdapterError> { Ok(()) }
 
     async fn deliver(
         &self,
@@ -52,14 +44,46 @@ pub trait ChannelAdapter: Send + Sync {
         message: &OutboundMessage,
     ) -> Result<Option<String>, AdapterError>;
 
-    async fn open_dm(&self, user_id: &str) -> Result<Option<DmHandle>, AdapterError> {
-        Ok(None)
-    }
+    async fn open_dm(&self, user_id: &str)
+        -> Result<Option<DmHandle>, AdapterError> { Ok(None) }
+
+    /// Edit a previously-sent message. `external_id` is the platform's
+    /// id for the original message (Telegram `message_id`, Slack `ts`,
+    /// Discord message id, ...). Default impl returns
+    /// `Err(AdapterError::Unsupported(_))`.
+    async fn edit_message(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        external_id: &str,
+        new_text: &str,
+    ) -> Result<(), AdapterError> { /* default Unsupported */ }
+
+    /// React to a sent message. Default impl returns Unsupported.
+    async fn add_reaction(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        external_id: &str,
+        emoji: &str,
+    ) -> Result<(), AdapterError> { /* default Unsupported */ }
+
+    /// Strip channel-specific formatting from `msg` so it can be
+    /// resent after a formatting-error rejection. Default `None`.
+    fn plain_text_fallback(&self, msg: &OutboundMessage)
+        -> Option<OutboundMessage> { None }
 }
 ```
 
-The only required method is `deliver`. Override the others if your
-platform supports them.
+The only required method is `deliver`. Everything else has a default —
+override only what your platform supports. `edit_message` and
+`add_reaction` are first-class trait methods (not action-shaped JSON
+inside `deliver`); the delivery loop dispatches to them directly and
+falls back to "send a new message" when an adapter returns
+`Unsupported`. `plain_text_fallback` is the host's escape hatch when
+`deliver` returns `AdapterError::BadRequest` for a known formatting
+error (Telegram parse_mode, Slack blocks, Discord embeds) — return a
+formatting-stripped copy of the message and the host retries.
 
 ### `ChannelFactory`
 
@@ -278,18 +302,31 @@ the agent's intent reaches the user even imperfectly.
 
 ### System actions: edit and reaction
 
-The host also calls `deliver` for outbound rows whose `kind` is
-`System` and whose content describes an action:
+The host dispatches edit / reaction work through the dedicated
+`edit_message` and `add_reaction` trait methods (NOT through a
+`System`-kind `deliver` call with action JSON). Override either when
+your platform exposes an API for it — Telegram, Slack, Discord all
+do. If the platform doesn't support edits or reactions, leave the
+default impl in place: it returns `AdapterError::Unsupported(_)` and
+the delivery loop falls back to "send a new message" for an edit, or
+quietly skips the reaction.
 
-```json
-{ "action": "edit", "target_seq": 7, "text": "new body" }
-{ "action": "reaction", "target_seq": 7, "emoji": "thumbsup" }
-```
+A handful of older channels (matrix, mattermost, teams, gchat,
+github, linear, signal) instead model edit / reaction as system-kind
+outbound rows whose `content` carries an `action` field and dispatch
+inside their own `deliver`. That pattern still works — the host
+treats either trait override OR action-shaped `deliver` as a valid
+implementation — but new channels should prefer the dedicated trait
+methods so the dispatch matches the rest of the codebase.
 
-You translate `edit` to the platform's edit-message API and
-`reaction` to the platform's reaction API. If the platform does not
-support either, return `AdapterError::Unsupported(String)` so the
-delivery loop can stop retrying.
+### Plain-text fallback
+
+If your `deliver` can return `AdapterError::BadRequest(_)` for
+formatting errors (Telegram parse_mode, Slack `blocks`, Discord
+embeds), implement `plain_text_fallback`: strip the formatting
+metadata and return the body with a `[reduced formatting] ` prefix so
+the user knows the message landed downgraded. The host retries the
+fallback automatically.
 
 ### Return value
 

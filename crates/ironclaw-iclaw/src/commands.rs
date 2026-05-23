@@ -171,12 +171,7 @@ pub enum TopCommand {
     ///
     /// Returns a non-zero exit when any check is in FAIL state so CI
     /// and pre-flight scripts can branch on it.
-    Doctor {
-        /// Skip the live LLM provider ping (saves a round-trip + a
-        /// token when you only want local checks).
-        #[arg(long)]
-        no_ping: bool,
-    },
+    Doctor,
     /// Per-group daily budget caps.
     Budgets {
         #[command(subcommand)]
@@ -866,9 +861,7 @@ impl TopCommand {
             Self::Mcp { action } => action.to_call(),
             Self::Status => ParsedCall::new("composite.status", json!({})),
             Self::Health => ParsedCall::new("composite.health", json!({})),
-            Self::Doctor { no_ping } => {
-                ParsedCall::new("composite.doctor", json!({ "no_ping": no_ping }))
-            }
+            Self::Doctor => ParsedCall::new("composite.doctor", json!({})),
             Self::Usage { since } => {
                 ParsedCall::new("usage.rollup", json!({"since": since}))
             }

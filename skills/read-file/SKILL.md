@@ -39,17 +39,17 @@ If you need a tail or a specific section of a large file, use
 ```json
 {
   "path": "/data/notes.txt",
-  "content": "...",
-  "bytes_read": 14021,
-  "total_bytes": 14021,
-  "truncated": false
+  "size_bytes": 14021,
+  "truncated": false,
+  "content": "..."
 }
 ```
 
 ## Errors
 
-- Non-UTF-8 bytes return a validation error. Decode explicitly with
-  `shell` (`iconv`, `base64`, etc.).
+- Non-UTF-8 bytes are returned via `String::from_utf8_lossy` — invalid
+  sequences appear as the U+FFFD replacement character. For exact bytes,
+  decode explicitly with `shell` (`iconv`, `base64`, etc.).
 - Missing path returns `Internal`. Check with
   `shell { "command": "test -f <path>" }` first if the file's
   existence is uncertain.

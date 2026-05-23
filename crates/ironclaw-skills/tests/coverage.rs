@@ -69,6 +69,14 @@ const REGISTRY_TOOLS: &[&str] = &[
     "grep",
     "web_search",
     "explore",
+    "load_skill",
+    "todo_add",
+    "todo_list",
+    "todo_update",
+    "todo_delete",
+    "compact_now",
+    "clear_history",
+    "artifact_path",
 ];
 
 /// Tools that are *deliberately* not mentioned in any skill (e.g. because

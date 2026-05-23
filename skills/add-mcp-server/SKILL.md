@@ -109,8 +109,9 @@ can call the new tools directly.
 ## Result
 
 Returns an `Accepted` ack. Re-attempt the operation that needed it
-after the next container boot. `iclaw groups config get-mcp-servers
-<ag>` confirms the merge.
+after the next container boot. `iclaw groups config get <ag>` renders
+the merged container config (including the `mcp_servers` map) so the
+operator can confirm the merge.
 
 ## Failure modes
 

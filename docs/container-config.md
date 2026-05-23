@@ -136,13 +136,14 @@ to fix it.
 
 ## Inspecting a group
 
-There is no top-level `iclaw groups config show` command yet — for
-now, read the row directly:
+Read the current container config row as JSON:
 
 ```
-sqlite3 /srv/ironclaw/data/ironclaw.db \
-  "SELECT * FROM container_configs WHERE agent_group_id = '<id>'"
+iclaw groups config get <agent-group-id>
 ```
+
+(Raw SQL fallback for forensic / read-only-disk situations:
+`sqlite3 /srv/ironclaw/data/ironclaw.db "SELECT * FROM container_configs WHERE agent_group_id = '<id>'"`.)
 
 The audit log captures every mutation:
 

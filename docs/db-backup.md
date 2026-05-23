@@ -98,10 +98,12 @@ The correct procedure is **offline restore**:
 # 1. Stop the host. systemd:
 sudo systemctl stop ironclaw
 
-# Or, manual:
-kill "$(cat /var/run/ironclaw.pid)"   # or whatever launcher you use
-# Then wait until `ironclaw run` has exited — the iclaw.sock file
-# should be gone.
+# Or, manual (preferred — handles SIGTERM grace + SIGKILL fallback):
+ironclaw stop
+# Or if you have to do it by PID:
+kill "$(cat <data_dir>/ironclaw.pid)"
+# Wait until `ironclaw status` reports stopped and the iclaw.sock
+# file is gone.
 
 # 2. Copy the backup over the live file.
 sudo cp /var/backups/ironclaw-2026-05-21.db /srv/ironclaw/data/ironclaw.db
@@ -121,11 +123,12 @@ sudo systemctl start ironclaw
 The central DB is the only thing `iclaw db backup` captures. To restore
 a complete install you also need:
 
-- `<data_dir>/sessions/` — per-session inbound.db / outbound.db files.
-  These are typically transient (each session's history fits inside
-  the compaction window), but if you want fully reproducible state,
-  back them up with the standard filesystem tools.
-- `<data_dir>/inbox/` and `<data_dir>/outbox/` — attachment payloads.
+- `<data_dir>/sessions/` — per-session `inbound.db` / `outbound.db`
+  files plus each session's `inbox/` and `outbox/` directories (the
+  attachment payload bind-mounts). These are typically transient
+  (each session's history fits inside the compaction window), but if
+  you want fully reproducible state, back them up with the standard
+  filesystem tools.
 - `.env` — the API key + paths. Treated as a secret; back up
   separately using your normal secret-store flow.
 - Container images. The session image is rebuilt from

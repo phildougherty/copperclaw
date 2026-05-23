@@ -709,7 +709,7 @@ async fn run_doctor<T>(
 where
     T: CallTransport + ?Sized,
 {
-    let _no_ping = args.get("no_ping").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    let _ = args; // doctor takes no arguments at present
     let mut checks: Vec<Check> = Vec::new();
 
     // 1. Host reachable + central DB readable.

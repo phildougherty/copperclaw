@@ -49,11 +49,10 @@ use tracing::{info, warn};
 /// handler runs in-process against the central DB, so this module is the
 /// natural place to plumb DB handles into the host's hook surface.
 ///
-/// TODO(team-ca): the host's `boot::install_modules` currently constructs
-/// `Box::new(AgentToAgentModule)` (a unit struct) and the file is outside
-/// this team's scope to modify. Until the wiring is added in boot.rs, hosts
-/// that want the `create_agent` action working must construct this companion
-/// module themselves and install it alongside `AgentToAgentModule`.
+/// Installed alongside `AgentToAgentModule` in `boot::install_modules` —
+/// the two modules are intentionally separate: the unit-struct
+/// `AgentToAgentModule` is an interceptor only, this one carries the DB
+/// state needed by the `create_agent` handler.
 pub struct CreateAgentModule {
     pub(super) deps: HandlerDeps,
 }

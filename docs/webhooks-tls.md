@@ -167,32 +167,41 @@ a reverse proxy that validates the upstream connection. Exposing port
 8081 directly on a public IP without TLS or signature verification is
 insecure.**
 
-All webhook channels perform HMAC signature verification on every inbound
-request (using the shared secret configured with the upstream service).
-The signature check happens before any routing, so an attacker who can
-reach the port but does not know the secret cannot inject messages.
-Verify your channel's HMAC is enabled before binding on `0.0.0.0`.
+Most webhook channels perform HMAC signature verification on every
+inbound request (slack, github, linear, webex, whatsapp-cloud, line,
+gchat, telegram, and the generic `webhooks` channel). A few use
+shared-secret models instead: **teams** uses a constant-time
+`clientState` compare, **mattermost** uses a `webhook_token` shared
+secret on the query string / header. Verify your channel's specific
+scheme — and that it's enabled — before binding on `0.0.0.0`.
 
 ## Per-channel default ports and paths
 
+These are the constants in each `crates/ironclaw-channels/<name>/src/config.rs`
+as of the current tree. **Note that telegram and slack default to
+`0.0.0.0`** (they're typically fronted by a public proxy); every other
+HTTP-listening channel defaults to `127.0.0.1` for a reverse-proxy
+deployment.
+
 | Channel | Default host | Default port | Default path |
 |---------|-------------|-------------|--------------|
-| telegram (webhook mode) | `127.0.0.1` | dynamic (OS-assigned) | `/telegram/webhook` |
-| slack | `127.0.0.1` | dynamic | `/slack/events` |
-| github | `127.0.0.1` | dynamic | `/github/webhook` |
-| linear | `127.0.0.1` | dynamic | `/linear/webhook` |
-| gchat | `127.0.0.1` | dynamic | `/gchat/webhook` |
-| line | `127.0.0.1` | dynamic | `/line/webhook` |
-| mattermost | `127.0.0.1` | dynamic | `/mattermost/webhook` |
-| matrix | n/a (HTTP push from Synapse) | dynamic | varies |
-| slack | `127.0.0.1` | dynamic | `/slack/events` |
-| teams | `127.0.0.1` | dynamic | varies |
-| webex | `127.0.0.1` | dynamic | `/webex/webhook` |
-| whatsapp-cloud | `127.0.0.1` | dynamic | `/whatsapp-cloud/webhook` |
-| webhooks (generic) | `127.0.0.1` | dynamic | `/webhooks` |
+| telegram (webhook mode) | `0.0.0.0` | `8081` | `/telegram` |
+| slack | `0.0.0.0` | `8082` | `/slack/events` |
+| github | `127.0.0.1` | `8082` | `/github/webhook` |
+| linear | `127.0.0.1` | `8083` | `/linear/webhook` |
+| webex | `127.0.0.1` | `8084` | `/webex/webhook` |
+| teams | `127.0.0.1` | `8085` | `/teams/webhook` |
+| gchat | `127.0.0.1` | `8086` | `/gchat/webhook` |
+| whatsapp-cloud | `127.0.0.1` | `8087` | `/whatsapp-cloud/webhook` |
+| line | dynamic (port 0, OS-assigned) | dynamic | `/line/webhook` |
+| mattermost | dynamic | dynamic | `/mattermost/webhook` |
+| matrix | n/a (host issues `/sync` long-poll against Synapse) | n/a | n/a |
+| webhooks (generic) | dynamic | dynamic | `/webhooks` |
 
-Dynamic ports default to `0` (OS-assigned). Set an explicit `port` in the
-channel config for a stable value that matches your proxy rule.
+Ports are stable defaults — override `port` in the channel config when
+your reverse-proxy rule needs something else. Telegram + slack
+defaulting to `0.0.0.0` is a property the deployment-time
+config should override (or accept) consciously.
 
 ## Summary
 

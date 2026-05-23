@@ -26,9 +26,6 @@ expired credential, and the user's answer narrows the search.
   been sending — failures are downstream.
 - `shell` to scan any session-scoped log files
   (`/data/*.log` if present).
-  <!-- TODO(team-h): if Team B starts routing host-side logs into
-       the session dir, document the exact path here so we can
-       `read_file` directly. -->
 
 Host-side data is **not** reachable from `read_file`. The host log
 lives at `<data_dir>/logs/ironclaw.out.log` (and `.err.log`) and
@@ -41,14 +38,13 @@ Print these commands and ask the operator to paste the results
 back:
 
 ```
-iclaw health                                   # structured health probe
+iclaw doctor                                   # composite first-run / ongoing diagnostic; FAIL rows include `fix:` hints
+iclaw health                                   # structured health probe (sessions + audit + drops snapshot)
 iclaw status                                   # wiring digest
 iclaw audit list --since 1h                    # recent mutations
 iclaw dropped-messages list --since 1h         # delivery failures
 iclaw sessions get <session_id>                # this session's state
 ```
-
-(There is no `iclaw doctor` — `iclaw health` is the equivalent.)
 
 The host log is at `<data_dir>/logs/ironclaw.out.log` and
 `<data_dir>/logs/ironclaw.err.log`. Ask the operator to grep for

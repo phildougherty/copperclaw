@@ -27,8 +27,9 @@ user, or consult an MCP server.
 - `url` (required). Must include scheme (`https://...`).
 - `method` (optional). `GET` (default) or `POST`. Other verbs are a
   validation error — use `shell curl` for PATCH/PUT/DELETE.
-- `body` (optional, POST). Sent as `application/json` when it parses
-  as JSON, otherwise `text/plain`.
+- `body` (optional, POST). Sent as the request body as-is; no
+  Content-Type is set automatically. If the server requires one (most
+  JSON APIs do), set `Content-Type` yourself via `headers`.
 - `timeout_secs` (optional). Default 30s, ceiling 120s.
 - `raw` (optional). True returns response body bytes unmodified for
   HTML. Default false converts HTML→markdown.
@@ -54,8 +55,7 @@ non-HTML responses are returned as-is regardless of `raw`.
 ## Output limits
 
 Response body capped at 256 KiB. Larger responses truncate at a UTF-8
-char boundary (binary base64-encoded; truncation still at byte
-boundaries). Result has `truncated`, `bytes_read`, `total_bytes`.
+char boundary. Result has `truncated`, `size_bytes`.
 
 ## Result shape
 
@@ -65,10 +65,9 @@ boundaries). Result has `truncated`, `bytes_read`, `total_bytes`.
   "status": 200,
   "headers": { "content-type": "application/json", "...": "..." },
   "body": "...",
-  "bytes_read": 1421,
-  "total_bytes": 1421,
+  "size_bytes": 1421,
   "truncated": false,
-  "elapsed_secs": 0.31
+  "elapsed_ms": 310
 }
 ```
 

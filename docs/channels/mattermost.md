@@ -1,7 +1,7 @@
 # mattermost channel audit
 
 ## Implemented
-- deliver: COMPLETE for text + edit + reaction; files Unsupported.
+- deliver: COMPLETE for text + files + edit + reaction.
   `crates/ironclaw-channels/mattermost/src/adapter.rs:106`
 - subscribe: trait-default Ok (router handles all incoming webhooks).
 - set_typing: trait-default Ok.

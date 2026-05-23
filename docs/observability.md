@@ -68,7 +68,7 @@ and the endpoint stays off; the rest of the host runs normally.
   — an agent group is repeatedly hitting a budget or rate-limit gate.
   Refusals come in three flavours via the `gate` label: `daily_tokens`
   (the daily-token cap), `turns_per_minute`, and `turns_per_hour`. The
-  fix is operator-side: raise the cap with `iclaw groups budget set` or
+  fix is operator-side: raise the cap with `iclaw budgets set --agent-group-id <id> --daily-tokens <n>` (also `--turns-per-minute` / `--turns-per-hour`) or
   investigate why the group is burning tokens / turns so fast. Pair
   with `ironclaw_budget_exhausted_replies_total` (notices that actually
   went to the user) and `ironclaw_budget_exhausted_suppressed_total`

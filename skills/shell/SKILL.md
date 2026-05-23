@@ -1,6 +1,6 @@
 ---
 name: shell
-description: Run a bash command inside the agent container with the shell tool — stdout, stderr, exit code, and an 8-byte output cap.
+description: Run a bash command inside the agent container with the shell tool — stdout, stderr, exit code, and a 64 KiB output cap.
 ---
 
 # shell
@@ -70,7 +70,7 @@ the output reaches the tool boundary:
   "stdout": "...",
   "stderr": "...",
   "exit_code": 0,
-  "elapsed_secs": 0.42,
+  "elapsed_ms": 420,
   "timed_out": false
 }
 ```

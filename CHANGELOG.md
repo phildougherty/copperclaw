@@ -6,6 +6,152 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (doc-vs-reality reconciliation pass — 2026-05-23)
+
+Wide audit + reconciliation of the in-tree docs against the actual
+code, motivated by the agent fabricating capabilities that didn't
+exist. Highlights:
+
+- **`README.md`** — rewrite. Drops the "no half-finished adapters in
+  the tree" / "surprises don't ship here" framing in favour of an
+  honest pre-1.0 stance. New `## What's rough` section enumerating
+  shipped-but-unpolished surfaces. Fixed the in-tree tool count
+  (`33` → `36`), test count (`~5160` → `~5200`), the `ICLAW_SOCKET`
+  env-key row (now `IRONCLAW_ICLAW_SOCKET` for the host with a note
+  about the client-side `ICLAW_SOCKET`), and added rows for
+  `IRONCLAW_CONTAINER_GPU` and the new session-control tools
+  (`compact_now`, `clear_history`, `artifact_path`). Operator
+  cheatsheet now includes `users` / `roles` / `members` /
+  `schema-version` / `quickstart cli`. Removed the duplicated `cli`
+  channel in the headline channel list. The `Status` and `Tenets`
+  sections collapsed into a single more-honest `Status` block.
+- **`docs/channels/README.md`** — fixed stale rows:
+  `gchat` files now correctly listed as supported (two-step
+  `attachments:upload`); `mattermost` files supported (two-step
+  `/api/v4/files`); `teams` channel-target files supported, chat-
+  target files Unsupported (delegated-auth limit); `imessage`
+  empty-body Med-severity flag removed (already fixed in code);
+  `line` row clarified (non-`post` action returns BadRequest, not
+  Unsupported); deferred punch-list trimmed of items shipped since
+  the original audit.
+- **`docs/channels/mattermost.md`** + **`docs/channels/teams.md`** +
+  **`docs/channels/webex.md`** — fixed the intros to match what the
+  adapters actually do. Removed the fictional
+  `webex` `reactions_endpoint` config field (no such field exists;
+  the adapter does HTTP-status fallback on 404/501 from `/reactions`).
+- **`docs/channels/slack.md`** + **`docs/channels/x.md`** — removed a
+  stale "deferred follow-up" already shipped; fixed an `x` `deliver`
+  line-number anchor.
+- **`docs/adding-a-channel.md`** — rewrote the `ChannelAdapter` trait
+  snippet to include `edit_message`, `add_reaction`, and
+  `plain_text_fallback` (the trait grew these as first-class methods;
+  the doc still described an action-shaped `deliver` dispatch). Added
+  a `Plain-text fallback` section.
+- **`docs/webhooks-tls.md`** — rewrote the per-channel port table from
+  the actual `DEFAULT_HOST` / `DEFAULT_PORT` / `DEFAULT_PATH`
+  constants. Telegram + Slack default to `0.0.0.0` (not `127.0.0.1`
+  as the table claimed). Most webhook channels have stable
+  static ports (8081–8087), not dynamic OS-assigned ports.
+  Softened the "all webhook channels perform HMAC verification"
+  claim — Teams uses `clientState`, Mattermost uses
+  `webhook_token`, gchat uses a query-string client_token.
+- **`docs/db-backup.md`** — replaced `/var/run/ironclaw.pid` example
+  with `<data_dir>/ironclaw.pid` (or `ironclaw stop`). Corrected the
+  "not in the backup" list — per-session `inbox/` and `outbox/` live
+  inside each session's dir under `<data_dir>/sessions/`, not at the
+  data root.
+- **`docs/observability.md`** — `iclaw groups budget set` (does not
+  exist) → `iclaw budgets set --agent-group-id <id> --daily-tokens <n>`.
+- **`docs/cutover.md`** — removed `ironclaw run --once --check` (no
+  such flag combo) — replaced with `iclaw schema-version` + `ironclaw
+  migrate`. `ironclaw setup` → `ironclaw-setup` (binary name). Fixed
+  the migrator description: the migrator only copies the central DB,
+  not per-session DBs; operators must rsync `data/sessions/` separately.
+  Dedup'd the `Webex` entry in the channel-disable bullet list.
+- **`docs/release-checklist.md`** — replaced fictional
+  `ironclaw run --check` with `iclaw schema-version` + `ironclaw
+  migrate`.
+- **`docs/replay-fixtures.md`** — rewrote the fixture-shape section
+  to match the real on-disk layout (`manifest.json`, not
+  `manifest.toml`; `inbound/NNN-*.json`, not `.http`; `mode: "direct"`,
+  not `webhook|gateway|poll|rpc`). Acknowledged that the
+  capture-and-redact pipeline (`IRONCLAW_FIXTURE_CAPTURE` env,
+  `ironclaw fixture redact <dir>` subcommand,
+  `crates/ironclaw-host/src/fixture/redact.rs`) is design-only.
+- **`docs/container-config.md`** — replaced the "no top-level `iclaw
+  groups config show` command yet" sqlite3 workaround with the actual
+  shipped `iclaw groups config get <id>`.
+- **`CLAUDE.md`** — `ironclaw logs --tail` (does not exist) → `-n` /
+  `--lines`. Bumped test baseline (`~5,160` → `~5,200`).
+
+### Changed (skill bodies match real tool behaviour — 2026-05-23)
+
+- **`skills/debug/SKILL.md`** — removed the false claim "There is no
+  `iclaw doctor` — `iclaw health` is the equivalent." (Doctor IS
+  implemented at `crates/ironclaw-iclaw/src/lib.rs:703`.) Added
+  `iclaw doctor` to the operator-side command list. Dropped an
+  HTML-comment `TODO(team-h)` body marker.
+- **`skills/read-file/SKILL.md`** — result shape now uses
+  `size_bytes` (not the fictional `bytes_read` / `total_bytes`). The
+  "non-UTF-8 returns validation error" claim was wrong — the tool
+  uses `String::from_utf8_lossy`; doc updated to match.
+- **`skills/shell/SKILL.md`** — frontmatter typo `8-byte output cap`
+  → `64 KiB`. Result-shape field `elapsed_secs` → `elapsed_ms` (the
+  tool emits milliseconds).
+- **`skills/web-fetch/SKILL.md`** — dropped the fictional "JSON vs
+  text/plain Content-Type heuristic" (the tool does no
+  Content-Type detection; if the server requires one, callers set
+  it via `headers`). Result-shape fields fixed to match what the
+  tool actually emits (`size_bytes` + `elapsed_ms`, not
+  `bytes_read` / `total_bytes` / `elapsed_secs`).
+- **`skills/add-mcp-server/SKILL.md`** — `iclaw groups config
+  get-mcp-servers <ag>` (does not exist) → `iclaw groups config
+  get <ag>`.
+- **`skills/approvals/SKILL.md`** — `pending_approvals` schema uses
+  an `action` string column, not a typed `kind` enum. Removed the
+  fictional `OneCli` approval kind. Replaced the aspirational
+  `iclaw approvals approve <id>` / `deny <id>` generic CLI with the
+  actual sender-only surface. Trimmed body to stay under the
+  4 KiB skill-body cap.
+- **`skills/schedule-task/SKILL.md`** — example task id changed to
+  the actual `task_<uuidv7>` shape (was `task_8a` — short suffixes
+  do not exist).
+- **`skills/discovering-tools/SKILL.md`** — the "15 built-in tools"
+  table was wildly out of date (registry has 36). Replaced the
+  hand-counted enumeration with a category-grouped index that names
+  every tool currently in the registry. Trimmed body to stay under
+  the 4 KiB cap.
+- **`skills/edit-file/SKILL.md`** — removed a stale HTML-comment
+  `TODO(team-u)` from the body (the work it described shipped).
+- **`crates/ironclaw-skills/tests/coverage.rs`** — synced the
+  hardcoded `REGISTRY_TOOLS` list to the real
+  `ironclaw_mcp::tools::build_tool_set` inventory (27 → 36 entries).
+  The `every_registry_tool_appears_in_some_skill` test was silently
+  undercovering by 9 tools (`load_skill`, `compact_now`,
+  `clear_history`, `artifact_path`, plus the four `todo_*` tools).
+
+### Changed (code cleanup — dropped vapor surfaces, stale TODOs)
+
+- **`crates/ironclaw-iclaw/src/commands.rs`** + **`lib.rs`** — dropped
+  the dead `iclaw doctor --no-ping` flag. The flag was wired into
+  the CLI parser but read into `_no_ping` and never used; no LLM
+  ping is performed by `run_doctor`. The help text claimed otherwise,
+  so the flag was a small lie.
+- **`crates/ironclaw-host/src/boot.rs`**,
+  **`crates/ironclaw-modules/src/agent_to_agent/create_agent.rs`**,
+  **`crates/ironclaw-host-delivery/src/service.rs`** — removed three
+  stale `TODO(team-…)` comments whose work has already shipped
+  (`SqliteTaskStore` installed at boot, `CreateAgentModule` installed
+  at boot, `session_id` plumbed through `DeliveryActionInput`).
+
+### Added (vaporware-followups punch list)
+
+- **`docs/plans/vaporware-followups.md`** — open punch list of items
+  the docs or operator surface reference that don't fully exist in
+  code yet. Sized small / medium / large with a load-bearing
+  question per item so future contributors know what to decide
+  before writing code. Sweep done 2026-05-23.
+
 ### Changed (anti-fabrication prompt + sharper schedule-task description)
 
 - **`crates/ironclaw-host/src/container_manager/prompt.rs`** — added a
