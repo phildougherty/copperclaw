@@ -66,6 +66,25 @@ agent later:
   "text": "Welcome, here's your first job." }
 ```
 
+## Consolidating subagent results (important)
+
+When you spawn subagents to do parallel work (research fan-out,
+multi-step build, etc.), the children's replies arrive in **your**
+`messages_in` queue as new chat messages addressed to `agent:<your-
+name>`, not in the end user's chat. The host automatically tells each
+child to address replies back to you for consolidation. Your job is
+to:
+
+1. **Wait** for the subagent results to arrive (subsequent turns).
+2. **Consolidate** the per-child reports into a single coherent
+   answer.
+3. **Send the consolidated answer** to the end user with a normal
+   `send_message` (no `to:`).
+
+Do NOT forward each subagent's raw output directly to the user as
+separate messages — that recreates the disjointed-voices UX the
+consolidation step is meant to prevent.
+
 ## Notes
 
 - The new agent shares the calling agent's container image, MCP

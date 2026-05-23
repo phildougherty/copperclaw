@@ -141,16 +141,39 @@ impl CreateAgentHandler {
         agent_group_id: AgentGroupId,
         session_id: SessionId,
         name: &str,
+        parent_name: Option<&str>,
         instructions: &str,
     ) {
-        let prelude = format!(
-            "You are agent `{name}`, spawned by a parent agent with the \
-             following task. Work through it autonomously using your \
-             available tools (search, file ops, etc.), then call \
-             `send_message` to deliver your findings — the wiring will \
-             route your reply back to the conversation that spawned you. \
-             Task:\n\n"
-        );
+        // When the parent's name is known (the normal case), tell the
+        // child explicitly to address its reports back to that parent
+        // for consolidation. Without this instruction the child's
+        // default `send_message` goes through the inherited channel
+        // routing and dumps directly into the user's chat — the
+        // operator gets N independent voices in their inbox instead of
+        // one consolidated report from the parent. This is the
+        // prompt-side half of the agent-to-agent routing plan (see
+        // docs/plans/agent-to-agent-routing.md); the proper fix is a
+        // runner-level routing default backed by `source_session_id`,
+        // which needs a migration. For now we lean on the model
+        // following the instruction.
+        let prelude = match parent_name {
+            Some(p) => format!(
+                "You are agent `{name}`, spawned by parent agent `{p}` for \
+                 the task below. Work through it autonomously, then return \
+                 a SINGLE consolidated reply by calling \
+                 `send_message(to: \"agent:{p}\", text: ...)`. Do NOT call \
+                 `send_message` without an explicit `to:` field — the \
+                 default routing would deliver your message directly to the \
+                 end user, which bypasses the parent's consolidation step \
+                 and makes the operator see disjointed voices instead of \
+                 one coherent answer.\n\nTask:\n\n"
+            ),
+            None => format!(
+                "You are agent `{name}`, spawned by a parent agent for the \
+                 task below. Work through it autonomously, then call \
+                 `send_message` to deliver your findings.\n\nTask:\n\n"
+            ),
+        };
         let text = format!("{prelude}{instructions}");
         self.write_inbound_payload(
             agent_group_id,

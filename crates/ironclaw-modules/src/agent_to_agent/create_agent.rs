@@ -486,10 +486,22 @@ impl DeliveryActionHandler for CreateAgentHandler {
         // but their containers were never started because the
         // `payload.instructions` text was returned to the parent in the
         // create_agent_result row and lost from there.
+        // Look up the parent agent group's display name so we can tell
+        // the child how to address replies back to its parent for
+        // consolidation, rather than dumping findings directly into the
+        // user's chat. None if the parent's row isn't resolvable
+        // (administrative invocations) — in that case the child gets a
+        // softer "wiring will route your reply back" instruction.
+        let parent_name = parent_session.as_ref().and_then(|p| {
+            agent_groups::get(central, p.agent_group_id)
+                .ok()
+                .map(|g| g.name)
+        });
         self.seed_child_inbound(
             group.id,
             session.id,
             &payload.name,
+            parent_name.as_deref(),
             &payload.instructions,
         );
 
