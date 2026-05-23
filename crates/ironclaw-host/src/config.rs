@@ -33,6 +33,8 @@
 //! | `EXA_API_KEY` | unset | Exa.ai search API key (semantic / neural search). |
 //! | `BRAVE_SEARCH_API_KEY` | unset | Brave Search API key (keyword search). |
 //! | `SERPAPI_API_KEY` | unset | `SerpAPI` key (Google/Bing/etc. wrapper). |
+//! | `IRONCLAW_CODEX_BINARY` | `/usr/local/bin/codex` (runner default) | Absolute path to the Codex CLI inside the container. Consulted by the runner only when `provider == "codex"`. Forwarded into every spawn so the operator can swap binaries via `.env` + SIGHUP. |
+//! | `IRONCLAW_CODEX_ARGS` | `--json` (runner default) | Comma-separated extra args appended to every Codex spawn (e.g. `--json,--no-color`). Consulted by the runner only when `provider == "codex"`. |
 //!
 //! The `cli` channel is always implicitly known but is only initialized if it
 //! appears in `IRONCLAW_CHANNELS`. Unknown channel names log a warning and

@@ -56,6 +56,7 @@ pub const HOST_ONLY_COMMANDS: &[&str] = &[
     "groups.config.remove-package",
     "groups.config.set-egress-allow",
     "groups.config.set-resource-limits",
+    "groups.config.set-coding-enabled",
     "messaging-groups.create",
     "messaging-groups.update",
     "messaging-groups.delete",

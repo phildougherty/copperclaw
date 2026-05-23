@@ -1,0 +1,15 @@
+-- Per-group toggle for whether the four coding-bundle skills load.
+--
+-- Phase E added `skills/coding-task`, `skills/git-commit`,
+-- `skills/code-review`, `skills/testing` and they shipped enabled in
+-- every group's default `SkillsSelector::All`. That was wrong — most
+-- agents are not coding agents. This column makes the bundle opt-in
+-- without disturbing the existing selector semantics: when 0, the
+-- container manager filters the four names out of whatever the
+-- selector resolved to (so `All` stops including them by default).
+-- When 1, the four skills are visible like any other.
+--
+-- Default 0 means existing installs stop loading the coding bundle
+-- the first time they upgrade past this migration — operators who
+-- want the old behaviour run `iclaw groups enable-coding <id>`.
+ALTER TABLE container_configs ADD COLUMN coding_enabled INTEGER NOT NULL DEFAULT 0;

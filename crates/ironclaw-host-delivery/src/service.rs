@@ -1238,6 +1238,7 @@ fn ensure_config_row(
             config_fingerprint: None,
             egress_allow: vec![],
             resource_limits: serde_json::json!({}),
+            coding_enabled: false,
         },
     )?;
     Ok(())
@@ -2206,6 +2207,7 @@ mod tests {
                 config_fingerprint: None,
                 egress_allow: vec![],
                 resource_limits: json!({}),
+                coding_enabled: false,
             },
         )
         .unwrap();
@@ -2241,6 +2243,7 @@ mod tests {
                 config_fingerprint: None,
                 egress_allow: vec![],
                 resource_limits: json!({}),
+                coding_enabled: false,
             },
         )
         .unwrap();

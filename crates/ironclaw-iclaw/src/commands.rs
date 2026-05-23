@@ -346,6 +346,14 @@ pub enum GroupsCmd {
     List,
     /// Fetch a single agent group by id.
     Get { id: String },
+    /// Enable the bundled coding skills (`coding-task`, `git-commit`,
+    /// `code-review`, `testing`) for this group.
+    #[command(name = "enable-coding")]
+    EnableCoding { id: String },
+    /// Disable the bundled coding skills for this group (the default
+    /// for new groups).
+    #[command(name = "disable-coding")]
+    DisableCoding { id: String },
     /// Create a new agent group.
     ///
     /// `--folder` is the on-disk slug under `<data>/groups/`; defaults
@@ -1006,6 +1014,14 @@ impl GroupsCmd {
             }
             Self::Delete { id } => ParsedCall::new("groups.delete", json!({"id": id})),
             Self::Restart { id } => ParsedCall::new("groups.restart", json!({"id": id})),
+            Self::EnableCoding { id } => ParsedCall::new(
+                "groups.config.set-coding-enabled",
+                json!({"id": id, "enabled": true}),
+            ),
+            Self::DisableCoding { id } => ParsedCall::new(
+                "groups.config.set-coding-enabled",
+                json!({"id": id, "enabled": false}),
+            ),
             Self::Config { action } => action.to_call(),
         }
     }
@@ -1414,6 +1430,7 @@ pub const ALL_COMMANDS: &[&str] = &[
     "groups.config.remove-package",
     "groups.config.set-egress-allow",
     "groups.config.set-resource-limits",
+    "groups.config.set-coding-enabled",
     "messaging-groups.list",
     "messaging-groups.get",
     "messaging-groups.create",
@@ -1761,6 +1778,22 @@ mod tests {
         ]);
         assert_eq!(p.command, "groups.config.set-resource-limits");
         assert_eq!(p.args, json!({"id": "id1", "limits": {}}));
+    }
+
+    // --- groups enable-coding / disable-coding -----------------------------
+
+    #[test]
+    fn groups_enable_coding_dispatches_set_coding_enabled_true() {
+        let p = parse(&["iclaw", "groups", "enable-coding", "ag_1"]);
+        assert_eq!(p.command, "groups.config.set-coding-enabled");
+        assert_eq!(p.args, json!({"id": "ag_1", "enabled": true}));
+    }
+
+    #[test]
+    fn groups_disable_coding_dispatches_set_coding_enabled_false() {
+        let p = parse(&["iclaw", "groups", "disable-coding", "ag_1"]);
+        assert_eq!(p.command, "groups.config.set-coding-enabled");
+        assert_eq!(p.args, json!({"id": "ag_1", "enabled": false}));
     }
 
     // --- messaging-groups --------------------------------------------------
@@ -2201,6 +2234,8 @@ mod tests {
             ],
             &["iclaw", "groups", "config", "set-egress-allow", "x"],
             &["iclaw", "groups", "config", "set-resource-limits", "x"],
+            &["iclaw", "groups", "enable-coding", "x"],
+            &["iclaw", "groups", "disable-coding", "x"],
             &["iclaw", "messaging-groups", "list"],
             &["iclaw", "messaging-groups", "get", "x"],
             &[

@@ -57,7 +57,7 @@ cargo test --workspace --no-fail-fast
 ```
 
 The workspace forbids `unsafe_code` and treats clippy warnings as errors.
-Current baseline: ~4,800 passing tests. Don't break that.
+Current baseline: ~5,160 passing tests. Don't break that.
 
 ## Where things live on the local install
 

@@ -64,6 +64,14 @@ pub const RUNNER_CONFIG_FILENAME: &str = "runner.json";
 /// match the path baked into the session image at build time.
 pub const CONTAINER_RUNNER_PATH: &str = "/usr/local/bin/ironclaw-runner";
 
+/// Skill names belonging to the Phase E coding bundle. Filtered out
+/// of the resolved skill set when `container_configs.coding_enabled`
+/// is false. Acts as a cap on `SkillsSelector::All`; explicit
+/// selector lists are honoured as-is (the operator picked the names
+/// deliberately).
+pub const CODING_SKILL_NAMES: &[&str] =
+    &["coding-task", "git-commit", "code-review", "testing"];
+
 /// Default idle window before the manager stops a running container.
 /// 300s (5 min) matches the OpenBSD-of-claw-agents "conservative
 /// defaults" tenet — long enough to avoid thrashing on quiet groups,
@@ -91,6 +99,8 @@ pub const ROTATABLE_ENV_KEYS: &[&str] = &[
     "BRAVE_SEARCH_API_KEY",
     "SERPAPI_API_KEY",
     "OLLAMA_BASE_URL",
+    "IRONCLAW_CODEX_BINARY",
+    "IRONCLAW_CODEX_ARGS",
 ];
 
 /// Subset of [`ManagerConfig`] that the SIGHUP handler can hot-swap.
@@ -979,6 +989,7 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
         elapsed.num_seconds() > i64::try_from(idle_window_secs).unwrap_or(i64::MAX)
     }
 
+    #[allow(clippy::too_many_lines)] // single linear assembly; provider/skills branches read more clearly inline
     fn runner_config_for(
         &self,
         session: &Session,
@@ -1008,6 +1019,17 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
         let selector = cc.map_or(ironclaw_skills::SkillsSelector::All, |c| {
             db_selector_to_skills_selector(&c.skills)
         });
+        // The coding-skills cap. When the per-group `coding_enabled`
+        // flag is false (the default) AND the selector is the catch-all
+        // `All`, the four coding bundle skills are filtered from the
+        // resolved set. Explicit selector lists are honoured as-is —
+        // an operator who listed a coding skill by name picked it
+        // deliberately. New groups (`cc == None`) get the same default
+        // "off" behaviour.
+        let coding_enabled = cc.is_some_and(|c| c.coding_enabled);
+        let exclude_coding =
+            !coding_enabled && matches!(selector, ironclaw_skills::SkillsSelector::All);
+        let exclude_names: &[&str] = if exclude_coding { CODING_SKILL_NAMES } else { &[] };
         let now = chrono::Utc::now();
 
         // Build the Callable-mode catalogue first (if applicable) so we
@@ -1024,6 +1046,7 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
                 self.cfg.groups_dir.as_deref(),
                 session.agent_group_id,
                 &selector,
+                exclude_names,
             );
             let path = root.join(SKILLS_CATALOGUE_FILENAME);
             if entries.is_empty() {
@@ -1073,31 +1096,69 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
             assistant_name.as_deref(),
             effective_mode,
             catalogue_for_prompt.as_deref(),
+            exclude_names,
         );
 
         // Pick the api_key_env that matches the wire format. Ollama
         // native doesn't authenticate (or uses its own bearer in front
         // of a proxy); the runner accepts a missing api_key when
-        // provider=ollama. Ollama-shim talks the Anthropic envelope at
-        // a proxy that may or may not require a key — keep ANTHROPIC_API_KEY
-        // so the operator can set one if they need it.
+        // provider=ollama. Codex talks to a local CLI subprocess that
+        // brokers its own auth (the operator pre-authenticates the
+        // binary outside Ironclaw), so it also doesn't need
+        // ANTHROPIC_API_KEY. Ollama-shim talks the Anthropic envelope
+        // at a proxy that may or may not require a key — keep
+        // ANTHROPIC_API_KEY so the operator can set one if they need it.
         let api_key_env: Option<String> = match provider.as_deref() {
-            Some("ollama") => None,
+            Some("ollama" | "codex") => None,
             _ => Some("ANTHROPIC_API_KEY".to_string()),
         };
 
         // For ollama-shim we route api_base_url to OLLAMA_BASE_URL (or
         // leave it None and let the runner read OLLAMA_BASE_URL from the
         // container env). For native ollama, api_base_url is irrelevant
-        // — the runner reads OLLAMA_BASE_URL directly.
+        // — the runner reads OLLAMA_BASE_URL directly. Codex spawns a
+        // subprocess and has no HTTP base URL at all.
         let api_base_url = match provider.as_deref() {
-            Some("ollama" | "ollama-shim") => None,
+            Some("ollama" | "ollama-shim" | "codex") => None,
             _ => self
                 .rotatable
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .anthropic_base_url
                 .clone(),
+        };
+
+        // Codex binary + args. Sourced from the rotatable forward_env
+        // map so an operator can edit `.env` + SIGHUP to swap binaries
+        // without restarting the host. Per-group `container_config`
+        // columns are a future enhancement; the env-var override is
+        // intentionally global for this slice. When neither field is
+        // set the runner falls back to its `/usr/local/bin/codex` /
+        // `["--json"]` defaults.
+        let (codex_binary, codex_args) = if provider.as_deref() == Some("codex") {
+            let rotatable = self
+                .rotatable
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let codex_binary = rotatable
+                .forward_env
+                .iter()
+                .find(|(k, _)| k == "IRONCLAW_CODEX_BINARY")
+                .map(|(_, v)| v.clone());
+            let codex_args = rotatable
+                .forward_env
+                .iter()
+                .find(|(k, _)| k == "IRONCLAW_CODEX_ARGS")
+                .map(|(_, v)| {
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                });
+            (codex_binary, codex_args)
+        } else {
+            (None, None)
         };
 
         RunnerConfigForFile {
@@ -1114,6 +1175,8 @@ Operators can raise the cap with `iclaw groups budget set --agent-group-id <id> 
             api_base_url,
             assistant_name,
             max_messages_per_prompt: max_messages,
+            codex_binary,
+            codex_args,
         }
     }
 
@@ -1605,6 +1668,7 @@ fn assemble_system_prompt(
         assistant_name,
         skills_mode,
         None,
+        &[],
     )
 }
 
@@ -1612,6 +1676,11 @@ fn assemble_system_prompt(
 /// catalogue so the host can render the prompt index off the same data
 /// it just wrote to `skills.json`. Pass `None` to let the assembler
 /// build whatever it needs internally.
+///
+/// `exclude_names` is forwarded to [`build_skill_system_prompt`] so the
+/// Inline-mode fallback (no prebuilt catalogue) honours the same filter
+/// as the Callable path. When a prebuilt catalogue is supplied the
+/// caller is expected to have already applied any filtering.
 #[allow(clippy::too_many_arguments)]
 fn assemble_system_prompt_with_catalogue(
     skills_dir: Option<&Path>,
@@ -1624,6 +1693,7 @@ fn assemble_system_prompt_with_catalogue(
     assistant_name: Option<&str>,
     skills_mode: SkillsMode,
     prebuilt_catalogue: Option<&[SkillCatalogueEntry]>,
+    exclude_names: &[&str],
 ) -> String {
     let mut out = String::with_capacity(16 * 1024);
     out.push_str(BASE_PREAMBLE);
@@ -1640,6 +1710,7 @@ fn assemble_system_prompt_with_catalogue(
             agent_group_id,
             selector,
             skills_mode,
+            exclude_names,
         ),
     };
     if !skills_section.is_empty() {
@@ -1664,11 +1735,17 @@ struct SkillCatalogueEntry {
 /// drops any that fail to load. The returned vector is the union used
 /// by both the prompt index and the `skills.json` catalogue write, so
 /// the two cannot disagree about which skills exist.
+///
+/// `exclude_names` is a post-resolution filter applied after the
+/// registry's selector logic: any skill whose `name` matches is dropped.
+/// Used by the `coding_enabled = false` path to cap `SkillsSelector::All`
+/// without disturbing explicit selector semantics.
 fn select_callable_skills(
     skills_dir: Option<&Path>,
     groups_dir: Option<&Path>,
     agent_group_id: AgentGroupId,
     selector: &ironclaw_skills::SkillsSelector,
+    exclude_names: &[&str],
 ) -> Vec<SkillCatalogueEntry> {
     let Some(global) = skills_dir else {
         return Vec::new();
@@ -1690,6 +1767,9 @@ fn select_callable_skills(
     let selected = registry.list_for_group(agent_group_id, selector);
     let mut out = Vec::with_capacity(selected.len());
     for skill in &selected {
+        if exclude_names.contains(&skill.name.as_str()) {
+            continue;
+        }
         let body = match ironclaw_skills::read_skill_body(skill) {
             Ok(b) => b,
             Err(err) => {
@@ -1715,7 +1795,8 @@ fn build_skills_catalogue(
     agent_group_id: AgentGroupId,
     selector: &ironclaw_skills::SkillsSelector,
 ) -> Option<Vec<SkillCatalogueEntry>> {
-    let entries = select_callable_skills(skills_dir, groups_dir, agent_group_id, selector);
+    let entries =
+        select_callable_skills(skills_dir, groups_dir, agent_group_id, selector, &[]);
     if entries.is_empty() {
         None
     } else {
@@ -1741,6 +1822,7 @@ fn build_skill_system_prompt(
     agent_group_id: AgentGroupId,
     selector: &ironclaw_skills::SkillsSelector,
     mode: SkillsMode,
+    exclude_names: &[&str],
 ) -> String {
     let Some(global) = skills_dir else {
         return String::new();
@@ -1779,7 +1861,11 @@ fn build_skill_system_prompt(
 Each <skill> block is the rendered SKILL.md for one capability — read \
 them all before deciding which tool to call.\n",
             );
+            let mut emitted = 0usize;
             for skill in &selected {
+                if exclude_names.contains(&skill.name.as_str()) {
+                    continue;
+                }
                 let body = match ironclaw_skills::read_skill_body(skill) {
                     Ok(b) => b,
                     Err(err) => {
@@ -1798,6 +1884,12 @@ them all before deciding which tool to call.\n",
                 out.push_str("\">\n");
                 out.push_str(body.trim_end());
                 out.push_str("\n</skill>\n");
+                emitted += 1;
+            }
+            // If every entry was filtered out, return empty so the caller
+            // doesn't emit a header with nothing under it.
+            if emitted == 0 {
+                return String::new();
             }
         }
         SkillsMode::Callable => {
@@ -1805,8 +1897,13 @@ them all before deciding which tool to call.\n",
             // index and the on-disk `skills.json` cannot disagree about
             // which skills exist (any whose body fails to read is dropped
             // from both).
-            let catalogue =
-                select_callable_skills(skills_dir, groups_dir, agent_group_id, selector);
+            let catalogue = select_callable_skills(
+                skills_dir,
+                groups_dir,
+                agent_group_id,
+                selector,
+                exclude_names,
+            );
             if catalogue.is_empty() {
                 return String::new();
             }
@@ -1955,8 +2052,8 @@ struct RunnerConfigForFile {
     session_id: String,
     agent_group_id: String,
     session_dir: String,
-    /// Provider kind, e.g. `"anthropic"`, `"ollama"`, `"ollama-shim"`.
-    /// When unset the runner falls back to `"anthropic"`.
+    /// Provider kind, e.g. `"anthropic"`, `"ollama"`, `"ollama-shim"`,
+    /// `"codex"`. When unset the runner falls back to `"anthropic"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<String>,
     model: String,
@@ -1969,6 +2066,20 @@ struct RunnerConfigForFile {
     assistant_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_messages_per_prompt: Option<u32>,
+    /// Absolute path to the Codex CLI binary inside the container.
+    /// Only set when `provider == "codex"`; sourced from the
+    /// `IRONCLAW_CODEX_BINARY` rotatable env var (no per-group
+    /// override column yet — that's intentional for this slice).
+    /// Falls back to the runner's `/usr/local/bin/codex` default
+    /// when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codex_binary: Option<String>,
+    /// Extra args appended to every Codex spawn. Only set when
+    /// `provider == "codex"`; sourced from `IRONCLAW_CODEX_ARGS`
+    /// (comma-separated). Falls back to the runner's `["--json"]`
+    /// default when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    codex_args: Option<Vec<String>>,
 }
 
 /// What the reconcile loop wants to do with a session this tick.
@@ -2435,6 +2546,7 @@ mod tests {
             config_fingerprint: None,
             egress_allow: vec![],
             resource_limits: serde_json::json!({"cpus": "1.5", "memory_mb": 512u64}),
+            coding_enabled: false,
             updated_at: chrono::Utc::now(),
         };
         let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg));
@@ -2471,6 +2583,7 @@ mod tests {
             config_fingerprint: None,
             egress_allow: vec!["api.example.com:443".into(), "db.local:5432".into()],
             resource_limits: serde_json::json!({}),
+            coding_enabled: false,
             updated_at: chrono::Utc::now(),
         };
         let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg));
@@ -2505,6 +2618,7 @@ mod tests {
             config_fingerprint: None,
             egress_allow: vec![],
             resource_limits: serde_json::json!({}),
+            coding_enabled: false,
             updated_at: chrono::Utc::now(),
         };
         let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg));
@@ -2563,6 +2677,7 @@ mod tests {
             config_fingerprint: None,
             egress_allow: vec![],
             resource_limits: serde_json::json!({}),
+            coding_enabled: false,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -2574,6 +2689,106 @@ mod tests {
         // And the per-rotatable Anthropic base URL is irrelevant —
         // we must not leak it into an ollama config.
         assert!(cfg.api_base_url.is_none());
+    }
+
+    /// Per-group `container_config.provider = "codex"` must reach the
+    /// runner-config file so the runner spawns the Codex CLI rather
+    /// than the default Anthropic provider. Asserts the no-HTTP shape:
+    /// no `api_key_env`, no `api_base_url`, and that the runner's
+    /// `IRONCLAW_CODEX_BINARY` / `IRONCLAW_CODEX_ARGS` overrides reach
+    /// the file when set on the rotatable env.
+    #[test]
+    fn runner_config_propagates_codex_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut mc = manager_cfg(tmp.path().to_path_buf());
+        mc.forward_env.push((
+            "IRONCLAW_CODEX_BINARY".into(),
+            "/opt/codex/bin/codex".into(),
+        ));
+        mc.forward_env.push((
+            "IRONCLAW_CODEX_ARGS".into(),
+            "--json,--quiet".into(),
+        ));
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            mc,
+        );
+        let session = fixture_session(&db);
+        let cc = container_configs::ContainerConfig {
+            agent_group_id: session.agent_group_id,
+            provider: Some("codex".into()),
+            model: Some("codex-default".into()),
+            effort: None,
+            image_tag: None,
+            assistant_name: None,
+            max_messages_per_prompt: None,
+            skills: container_configs::SkillsSelector::All,
+            mcp_servers: serde_json::json!({}),
+            packages_apt: vec![],
+            packages_npm: vec![],
+            additional_mounts: serde_json::json!([]),
+            cli_scope: container_configs::CliScope::Group,
+            config_fingerprint: None,
+            egress_allow: vec![],
+            resource_limits: serde_json::json!({}),
+            coding_enabled: false,
+            updated_at: chrono::Utc::now(),
+        };
+        let cfg = mgr.runner_config_for(&session, Some(&cc), None);
+        assert_eq!(cfg.provider.as_deref(), Some("codex"));
+        // Subprocess provider does not use ANTHROPIC_API_KEY.
+        assert!(cfg.api_key_env.is_none());
+        // No HTTP base URL — Codex is a local subprocess.
+        assert!(cfg.api_base_url.is_none());
+        // Env-supplied codex overrides land in the JSON file.
+        assert_eq!(cfg.codex_binary.as_deref(), Some("/opt/codex/bin/codex"));
+        assert_eq!(
+            cfg.codex_args.as_deref(),
+            Some(&["--json".to_string(), "--quiet".to_string()][..])
+        );
+    }
+
+    /// When `IRONCLAW_CODEX_BINARY` / `IRONCLAW_CODEX_ARGS` are unset,
+    /// the host writes `None` for both fields and the runner picks up
+    /// its hard-coded defaults (`/usr/local/bin/codex`, `["--json"]`).
+    #[test]
+    fn runner_config_codex_omits_overrides_when_env_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let cc = container_configs::ContainerConfig {
+            agent_group_id: session.agent_group_id,
+            provider: Some("codex".into()),
+            model: Some("codex-default".into()),
+            effort: None,
+            image_tag: None,
+            assistant_name: None,
+            max_messages_per_prompt: None,
+            skills: container_configs::SkillsSelector::All,
+            mcp_servers: serde_json::json!({}),
+            packages_apt: vec![],
+            packages_npm: vec![],
+            additional_mounts: serde_json::json!([]),
+            cli_scope: container_configs::CliScope::Group,
+            config_fingerprint: None,
+            egress_allow: vec![],
+            resource_limits: serde_json::json!({}),
+            coding_enabled: false,
+            updated_at: chrono::Utc::now(),
+        };
+        let cfg = mgr.runner_config_for(&session, Some(&cc), None);
+        assert_eq!(cfg.provider.as_deref(), Some("codex"));
+        assert!(cfg.api_key_env.is_none());
+        assert!(cfg.api_base_url.is_none());
+        assert!(cfg.codex_binary.is_none());
+        assert!(cfg.codex_args.is_none());
     }
 
     /// `claude` is an alias for `anthropic` — both must still resolve
@@ -2605,12 +2820,138 @@ mod tests {
             config_fingerprint: None,
             egress_allow: vec![],
             resource_limits: serde_json::json!({}),
+            coding_enabled: false,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
         assert_eq!(cfg.provider.as_deref(), Some("anthropic"));
         assert_eq!(cfg.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
         assert!(cfg.api_base_url.is_some());
+    }
+
+    /// Helper: build a `ContainerConfig` populated with the four coding
+    /// skill names available, the `coding_enabled` flag set as requested,
+    /// and an otherwise-default shape. Used by the three filter tests below.
+    fn cc_with_coding_flag(
+        agent_group_id: AgentGroupId,
+        coding_enabled: bool,
+    ) -> container_configs::ContainerConfig {
+        container_configs::ContainerConfig {
+            agent_group_id,
+            provider: None,
+            model: None,
+            effort: None,
+            image_tag: None,
+            assistant_name: None,
+            max_messages_per_prompt: None,
+            skills: container_configs::SkillsSelector::All,
+            mcp_servers: serde_json::json!({}),
+            packages_apt: vec![],
+            packages_npm: vec![],
+            additional_mounts: serde_json::json!([]),
+            cli_scope: container_configs::CliScope::Group,
+            config_fingerprint: None,
+            egress_allow: vec![],
+            resource_limits: serde_json::json!({}),
+            coding_enabled,
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    /// Writes the four coding-bundle skill stubs plus one non-coding
+    /// `alpha` skill into `<root>` so the registry sees them.
+    fn write_coding_bundle_plus_alpha(skills_root: &std::path::Path) {
+        std::fs::create_dir_all(skills_root).unwrap();
+        for name in CODING_SKILL_NAMES {
+            write_skill_md(skills_root, name, &format!("body-of-{name}\n"));
+        }
+        write_skill_md(skills_root, "alpha", "alpha body\n");
+    }
+
+    #[test]
+    fn runner_config_filters_coding_skills_when_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_root = tmp.path().join("skills");
+        write_coding_bundle_plus_alpha(&skills_root);
+
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut mgr_cfg = manager_cfg(tmp.path().to_path_buf());
+        mgr_cfg.skills_dir = Some(skills_root);
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            mgr_cfg,
+        );
+        let session = fixture_session(&db);
+        let cc = cc_with_coding_flag(session.agent_group_id, false);
+        let cfg = mgr.runner_config_for(&session, Some(&cc), None);
+        for name in CODING_SKILL_NAMES {
+            assert!(
+                !cfg.system.contains(&format!("name=\"{name}\"")),
+                "coding skill `{name}` must not appear when coding_enabled=false; system was:\n{}",
+                cfg.system,
+            );
+        }
+        // The non-coding skill still appears.
+        assert!(
+            cfg.system.contains("name=\"alpha\""),
+            "non-coding skill `alpha` must still appear; system was:\n{}",
+            cfg.system,
+        );
+    }
+
+    #[test]
+    fn runner_config_includes_coding_skills_when_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_root = tmp.path().join("skills");
+        write_coding_bundle_plus_alpha(&skills_root);
+
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut mgr_cfg = manager_cfg(tmp.path().to_path_buf());
+        mgr_cfg.skills_dir = Some(skills_root);
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            mgr_cfg,
+        );
+        let session = fixture_session(&db);
+        let cc = cc_with_coding_flag(session.agent_group_id, true);
+        let cfg = mgr.runner_config_for(&session, Some(&cc), None);
+        for name in CODING_SKILL_NAMES {
+            assert!(
+                cfg.system.contains(&format!("name=\"{name}\"")),
+                "coding skill `{name}` must appear when coding_enabled=true; system was:\n{}",
+                cfg.system,
+            );
+        }
+    }
+
+    /// An explicit selector that lists a coding skill must keep that
+    /// skill even when `coding_enabled=false`. The flag is a cap on the
+    /// `All` default, not an override of operator-picked allowlists.
+    #[test]
+    fn runner_config_respects_explicit_selector_even_when_coding_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills_root = tmp.path().join("skills");
+        write_coding_bundle_plus_alpha(&skills_root);
+
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut mgr_cfg = manager_cfg(tmp.path().to_path_buf());
+        mgr_cfg.skills_dir = Some(skills_root);
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            mgr_cfg,
+        );
+        let session = fixture_session(&db);
+        let mut cc = cc_with_coding_flag(session.agent_group_id, false);
+        cc.skills = container_configs::SkillsSelector::Explicit(vec!["coding-task".into()]);
+        let cfg = mgr.runner_config_for(&session, Some(&cc), None);
+        assert!(
+            cfg.system.contains("name=\"coding-task\""),
+            "explicit selector must honour `coding-task` even when coding_enabled=false; system was:\n{}",
+            cfg.system,
+        );
     }
 
     #[tokio::test]
@@ -2890,6 +3231,7 @@ mod tests {
             AgentGroupId::new(),
             &ironclaw_skills::SkillsSelector::All,
             SkillsMode::Inline,
+            &[],
         );
         assert!(prompt.is_empty());
     }
@@ -2907,6 +3249,7 @@ mod tests {
             AgentGroupId::new(),
             &ironclaw_skills::SkillsSelector::All,
             SkillsMode::Inline,
+            &[],
         );
         assert!(prompt.contains("<skill name=\"alpha\""));
         assert!(prompt.contains("Alpha body"));
@@ -2931,6 +3274,7 @@ mod tests {
             AgentGroupId::new(),
             &ironclaw_skills::SkillsSelector::Explicit(vec!["beta".into()]),
             SkillsMode::Inline,
+            &[],
         );
         assert!(!prompt.contains("alpha body"));
         assert!(prompt.contains("beta body"));
@@ -2949,6 +3293,7 @@ mod tests {
             AgentGroupId::new(),
             &ironclaw_skills::SkillsSelector::Explicit(vec![]),
             SkillsMode::Inline,
+            &[],
         );
         assert!(prompt.is_empty());
     }
@@ -2974,6 +3319,7 @@ mod tests {
             ag,
             &ironclaw_skills::SkillsSelector::All,
             SkillsMode::Inline,
+            &[],
         );
         assert!(prompt.contains("group override body"));
         assert!(!prompt.contains("global body"));
@@ -2987,6 +3333,7 @@ mod tests {
             AgentGroupId::new(),
             &ironclaw_skills::SkillsSelector::All,
             SkillsMode::Inline,
+            &[],
         );
         assert!(prompt.is_empty());
     }
@@ -3004,6 +3351,7 @@ mod tests {
             AgentGroupId::new(),
             &ironclaw_skills::SkillsSelector::All,
             SkillsMode::Callable,
+            &[],
         );
         // Names + descriptions present, bodies absent.
         assert!(prompt.contains("name=\"alpha\""));

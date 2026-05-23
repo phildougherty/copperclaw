@@ -50,8 +50,8 @@ pub struct RunnerConfigFile {
     /// Absolute path to this session's data directory.
     pub session_dir: Option<String>,
     /// Provider kind to talk to. Recognized values: `"anthropic"`
-    /// (default), `"ollama"`, `"ollama-shim"`. Unknown values fall
-    /// back to `"anthropic"` and a WARN is logged.
+    /// (default), `"ollama"`, `"ollama-shim"`, `"codex"`. Unknown
+    /// values fall back to `"anthropic"` and a WARN is logged.
     pub provider: Option<String>,
     /// Provider-native model id.
     pub model: Option<String>,
@@ -76,6 +76,14 @@ pub struct RunnerConfigFile {
     pub assistant_name: Option<String>,
     /// Sampling temperature.
     pub temperature: Option<f32>,
+    /// Absolute path to the Codex binary inside the container. Only
+    /// consulted when `provider == "codex"`. Falls back to the
+    /// `IRONCLAW_CODEX_BINARY` env var, then `/usr/local/bin/codex`.
+    pub codex_binary: Option<String>,
+    /// Extra args appended to every Codex spawn (after the binary
+    /// path). Only consulted when `provider == "codex"`. Falls back
+    /// to `IRONCLAW_CODEX_ARGS` (comma-separated), then `["--json"]`.
+    pub codex_args: Option<Vec<String>>,
 }
 
 /// Fully-resolved runner config.
@@ -88,7 +96,8 @@ pub struct RunnerConfig {
     /// Absolute path to the session directory.
     pub session_dir: PathBuf,
     /// Resolved provider kind. One of `"anthropic"`, `"ollama"`,
-    /// `"ollama-shim"`. Defaults to `"anthropic"` when unset / unknown.
+    /// `"ollama-shim"`, `"codex"`. Defaults to `"anthropic"` when
+    /// unset / unknown.
     pub provider: String,
     /// Provider-native model id.
     pub model: String,
@@ -111,6 +120,16 @@ pub struct RunnerConfig {
     pub assistant_name: Option<String>,
     /// Sampling temperature.
     pub temperature: Option<f32>,
+    /// Absolute path to the Codex binary inside the container. Only
+    /// meaningful when `provider == "codex"`; ignored otherwise.
+    /// Sourced from `codex_binary` in the JSON file, falling back to
+    /// `IRONCLAW_CODEX_BINARY` and finally `/usr/local/bin/codex`.
+    pub codex_binary: Option<String>,
+    /// Extra args passed on every Codex spawn (after the binary path).
+    /// Only meaningful when `provider == "codex"`. Sourced from
+    /// `codex_args` in the JSON file, falling back to a
+    /// comma-separated `IRONCLAW_CODEX_ARGS`, then `["--json"]`.
+    pub codex_args: Option<Vec<String>>,
 }
 
 impl RunnerConfig {
@@ -143,6 +162,7 @@ impl RunnerConfig {
             None | Some("" | "anthropic" | "claude") => "anthropic".to_string(),
             Some("ollama") => "ollama".to_string(),
             Some("ollama-shim") => "ollama-shim".to_string(),
+            Some("codex") => "codex".to_string(),
             Some(other) => {
                 tracing::warn!(
                     provider = other,
@@ -170,6 +190,8 @@ impl RunnerConfig {
             max_tokens: file.max_tokens.unwrap_or(4096),
             assistant_name: file.assistant_name,
             temperature: file.temperature,
+            codex_binary: file.codex_binary,
+            codex_args: file.codex_args,
         })
     }
 
@@ -254,6 +276,8 @@ mod tests {
             max_tokens: Some(4096),
             assistant_name: Some("Claude".into()),
             temperature: Some(0.7),
+            codex_binary: None,
+            codex_args: None,
         }
     }
 
@@ -339,6 +363,49 @@ mod tests {
         let env = MapEnv::default();
         let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
         assert_eq!(cfg.provider, "ollama-shim");
+    }
+
+    #[test]
+    fn provider_codex_passes_through() {
+        let mut file = good_file();
+        file.provider = Some("codex".into());
+        let env = MapEnv::default();
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert_eq!(cfg.provider, "codex");
+    }
+
+    #[test]
+    fn codex_binary_and_args_default_to_none() {
+        let env = MapEnv::default();
+        let cfg = RunnerConfig::from_file_struct(good_file(), &env).unwrap();
+        assert!(cfg.codex_binary.is_none());
+        assert!(cfg.codex_args.is_none());
+    }
+
+    #[test]
+    fn codex_binary_and_args_pass_through_from_file() {
+        let mut file = good_file();
+        file.provider = Some("codex".into());
+        file.codex_binary = Some("/opt/codex/bin/codex".into());
+        file.codex_args = Some(vec!["--json".into(), "--no-color".into()]);
+        let env = MapEnv::default();
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert_eq!(cfg.provider, "codex");
+        assert_eq!(cfg.codex_binary.as_deref(), Some("/opt/codex/bin/codex"));
+        assert_eq!(
+            cfg.codex_args.as_deref(),
+            Some(&["--json".to_string(), "--no-color".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn codex_empty_args_round_trip() {
+        let mut file = good_file();
+        file.provider = Some("codex".into());
+        file.codex_args = Some(Vec::new());
+        let env = MapEnv::default();
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert_eq!(cfg.codex_args.as_deref(), Some(&[][..]));
     }
 
     #[test]

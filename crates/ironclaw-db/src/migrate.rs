@@ -58,6 +58,10 @@ const CENTRAL: &[Migration] = &[
         name: "011_agent_group_subagent_depth",
         sql: include_str!("../migrations/011_agent_group_subagent_depth.sql"),
     },
+    Migration {
+        name: "012_container_config_coding_enabled",
+        sql: include_str!("../migrations/012_container_config_coding_enabled.sql"),
+    },
 ];
 
 const SESSION_INBOUND: &[Migration] = &[Migration {

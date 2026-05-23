@@ -6,6 +6,93 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (per-group coding-skills toggle)
+
+- **`crates/ironclaw-db/migrations/012_container_config_coding_enabled.sql`**
+  — new `container_configs.coding_enabled INTEGER NOT NULL DEFAULT 0`
+  column. Registered in `crates/ironclaw-db/src/migrate.rs`.
+- **`crates/ironclaw-db/src/tables/container_configs.rs`** — added
+  `ContainerConfig.coding_enabled: bool` and matching field on
+  `UpsertContainerConfig`; `get` / `upsert` paths now read and write
+  the new column. New narrow setter `set_coding_enabled(central, id, enabled)`
+  does a single-column UPDATE.
+- **`crates/ironclaw-host/src/container_manager.rs`** — new public
+  constant `CODING_SKILL_NAMES = &["coding-task", "git-commit",
+  "code-review", "testing"]`. `runner_config_for` builds an
+  `exclude_names` filter that drops those four skills from the
+  assembled prompt and `skills.json` catalogue when
+  `coding_enabled == false`. The filter is plumbed through
+  `select_callable_skills`, `build_skill_system_prompt`, and
+  `assemble_system_prompt_with_catalogue`. Explicit selector lists
+  are honoured as-is; the flag only caps the `SkillsSelector::All`
+  default.
+- **`crates/ironclaw-host/src/handlers/groups.rs`** — new
+  `config_set_coding_enabled` handler bound to the
+  `groups.config.set-coding-enabled` host-only socket method, plus
+  `coding_enabled` surfaced in `container_config_to_json`.
+- **`crates/ironclaw-host/src/handlers/mod.rs`**,
+  **`crates/ironclaw-host/src/socket.rs`** — host-only entry and
+  dispatch wiring for the new command.
+- **`crates/ironclaw-iclaw/src/commands.rs`** — two new
+  subcommands `iclaw groups enable-coding <id>` and
+  `iclaw groups disable-coding <id>` that dispatch to
+  `groups.config.set-coding-enabled` with `enabled: true|false`.
+- **`crates/ironclaw-iclaw/src/lib.rs`** (`render_config_toml`) —
+  current value is shown as a `# read-only: coding_enabled = …`
+  line in the `iclaw groups config edit` buffer so operators can
+  see the state when they open the TOML, with a hint pointing at
+  the dedicated subcommands.
+- **`README.md`** — replaced the "Per-group skill selection …
+  is not yet exposed" paragraph with the new toggle instructions.
+
+### Changed (default coding-skill loading)
+
+- **Behaviour change for existing installs:** the four coding
+  skills (`coding-task`, `git-commit`, `code-review`, `testing`)
+  no longer load into every agent group automatically. After
+  migration 012 applies, every existing group's `coding_enabled`
+  defaults to 0, so coding skills stop loading by default. To
+  restore the prior behaviour for a specific group, run
+  `iclaw groups enable-coding <id>`.
+
+### Added (Codex subprocess provider routed by build_provider)
+
+- **`crates/ironclaw-runner/src/main.rs`** (`build_provider`) — added a
+  `"codex"` arm that constructs a `CodexProvider` via
+  `CodexProvider::new(binary_path, extra_args)`. Binary path resolves
+  from `RunnerConfig::codex_binary`, then the runner's
+  `IRONCLAW_CODEX_BINARY` env var, then `/usr/local/bin/codex`. Args
+  resolve from `RunnerConfig::codex_args`, then a comma-separated
+  `IRONCLAW_CODEX_ARGS`, then `["--json"]`. The function is now
+  `pub(crate)` so the new `build_provider_tests` module can exercise
+  it directly.
+- **`crates/ironclaw-runner/src/config.rs`** — `RunnerConfigFile` and
+  `RunnerConfig` grew `codex_binary: Option<String>` and
+  `codex_args: Option<Vec<String>>`. `from_file_struct` carries them
+  through; `provider` recognises `"codex"` as a known value (no more
+  WARN-and-fall-back-to-anthropic). New unit tests:
+  `provider_codex_passes_through`, `codex_binary_and_args_default_to_none`,
+  `codex_binary_and_args_pass_through_from_file`,
+  `codex_empty_args_round_trip`.
+- **`crates/ironclaw-host/src/container_manager.rs`** —
+  `RunnerConfigForFile` mirrors the new fields. `runner_config_for`
+  sources them from the rotatable `forward_env` so an operator can
+  edit `.env` + SIGHUP to swap binaries without restarting the host.
+  `provider == "codex"` now also routes to the "no API key, no base
+  URL" arm so the runner doesn't try to pull `ANTHROPIC_API_KEY` for
+  a Codex session. `ROTATABLE_ENV_KEYS` learned the new keys so SIGHUP
+  picks them up. New unit tests:
+  `runner_config_propagates_codex_provider`,
+  `runner_config_codex_omits_overrides_when_env_unset`.
+- **`crates/ironclaw-host/src/boot.rs`** (`collect_forward_env`) —
+  forwards `IRONCLAW_CODEX_BINARY` and `IRONCLAW_CODEX_ARGS` into the
+  manager's initial `forward_env` at boot.
+- **`crates/ironclaw-host/src/config.rs`** — env-var table in the
+  module docstring lists the two new keys.
+- **`README.md`** — Multiple-providers bullet now advertises the Codex
+  subprocess bridge instead of disclaiming it. Configuration table
+  lists `IRONCLAW_CODEX_BINARY` and `IRONCLAW_CODEX_ARGS`.
+
 ### Fixed (container_manager.rs — seven code-review findings)
 
 - **`crates/ironclaw-host/src/container_manager.rs`** (runner_config_for)

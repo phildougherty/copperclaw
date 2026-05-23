@@ -869,6 +869,12 @@ fn collect_forward_env() -> Vec<(String, String)> {
         "EXA_API_KEY",
         "BRAVE_SEARCH_API_KEY",
         "SERPAPI_API_KEY",
+        // Codex subprocess provider configuration. The runner's
+        // codex arm sources its binary path + args from these (with
+        // hard-coded `/usr/local/bin/codex` + `["--json"]` as the
+        // ultimate fallback).
+        "IRONCLAW_CODEX_BINARY",
+        "IRONCLAW_CODEX_ARGS",
     ];
     let mut out = Vec::with_capacity(FORWARDED.len());
     for key in FORWARDED {

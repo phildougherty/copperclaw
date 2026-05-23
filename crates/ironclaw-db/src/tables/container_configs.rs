@@ -119,6 +119,12 @@ pub struct ContainerConfig {
     /// Per-group resource caps forwarded to the container runtime.  The
     /// recognised JSON keys are `"cpus"`, `"memory_mb"`, `"pids_limit"`.
     pub resource_limits: serde_json::Value,
+    /// When false (the default), the four coding-bundle skills
+    /// (`coding-task`, `git-commit`, `code-review`, `testing`) are
+    /// filtered out by the container manager before prompt assembly.
+    /// Acts as a cap on `SkillsSelector::All`; explicit selector lists
+    /// are honoured as-is.
+    pub coding_enabled: bool,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -140,6 +146,7 @@ pub struct UpsertContainerConfig {
     pub config_fingerprint: Option<String>,
     pub egress_allow: Vec<String>,
     pub resource_limits: serde_json::Value,
+    pub coding_enabled: bool,
 }
 
 fn effort_as_str(e: Effort) -> &'static str {
@@ -205,6 +212,8 @@ fn row_to_container_config(row: &Row<'_>) -> rusqlite::Result<ContainerConfig> {
     let resource_limits_str: String = row.get("resource_limits")?;
     let resource_limits: serde_json::Value = serde_json::from_str(&resource_limits_str)
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let coding_enabled_int: i64 = row.get("coding_enabled")?;
+    let coding_enabled = coding_enabled_int != 0;
     let updated_at_str: String = row.get("updated_at")?;
     let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
@@ -226,6 +235,7 @@ fn row_to_container_config(row: &Row<'_>) -> rusqlite::Result<ContainerConfig> {
         config_fingerprint,
         egress_allow,
         resource_limits,
+        coding_enabled,
         updated_at,
     })
 }
@@ -237,7 +247,8 @@ pub fn get(db: &CentralDb, agent_group_id: AgentGroupId) -> Result<Option<Contai
             "SELECT agent_group_id, provider, model, effort, image_tag, assistant_name,
                     max_messages_per_prompt, skills, mcp_servers, packages_apt,
                     packages_npm, additional_mounts, cli_scope,
-                    config_fingerprint, egress_allow, resource_limits, updated_at
+                    config_fingerprint, egress_allow, resource_limits,
+                    coding_enabled, updated_at
              FROM container_configs
              WHERE agent_group_id = ?1",
             params![agent_group_id.as_uuid().to_string()],
@@ -261,8 +272,9 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
            (agent_group_id, provider, model, effort, image_tag, assistant_name,
             max_messages_per_prompt, skills, mcp_servers, packages_apt,
             packages_npm, additional_mounts, cli_scope,
-            config_fingerprint, egress_allow, resource_limits, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            config_fingerprint, egress_allow, resource_limits,
+            coding_enabled, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
          ON CONFLICT(agent_group_id) DO UPDATE SET
              provider = excluded.provider,
              model = excluded.model,
@@ -279,6 +291,7 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
              config_fingerprint = excluded.config_fingerprint,
              egress_allow = excluded.egress_allow,
              resource_limits = excluded.resource_limits,
+             coding_enabled = excluded.coding_enabled,
              updated_at = excluded.updated_at",
         params![
             req.agent_group_id.as_uuid().to_string(),
@@ -297,6 +310,7 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
             req.config_fingerprint,
             egress_allow_json,
             resource_limits_json,
+            i64::from(req.coding_enabled),
             now.to_rfc3339(),
         ],
     )?;
@@ -317,6 +331,7 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
         config_fingerprint: req.config_fingerprint,
         egress_allow: req.egress_allow,
         resource_limits: req.resource_limits,
+        coding_enabled: req.coding_enabled,
         updated_at: now,
     })
 }
@@ -585,6 +600,36 @@ pub fn get_resource_limits(
     Ok(serde_json::from_str(&raw)?)
 }
 
+/// Narrow setter for the per-group `coding_enabled` flag.
+///
+/// Toggles whether the four coding-bundle skills (`coding-task`,
+/// `git-commit`, `code-review`, `testing`) are visible to this group's
+/// agent. The container manager treats the flag as a cap on
+/// `SkillsSelector::All` — when off, the coding names are filtered out
+/// of the assembled prompt and `skills.json`. Explicit selector lists
+/// are honoured as-is regardless of this flag.
+pub fn set_coding_enabled(
+    db: &CentralDb,
+    agent_group_id: AgentGroupId,
+    enabled: bool,
+) -> Result<(), DbError> {
+    let conn = db.conn()?;
+    let n = conn.execute(
+        "UPDATE container_configs
+         SET coding_enabled = ?1, updated_at = ?2
+         WHERE agent_group_id = ?3",
+        params![
+            i64::from(enabled),
+            Utc::now().to_rfc3339(),
+            agent_group_id.as_uuid().to_string()
+        ],
+    )?;
+    if n == 0 {
+        return Err(DbError::NotFound);
+    }
+    Ok(())
+}
+
 /// Overwrite the resource limits JSON for an agent group.
 ///
 /// Accepted keys: `"cpus"` (string), `"memory_mb"` (integer),
@@ -650,6 +695,7 @@ mod tests {
             config_fingerprint: None,
             egress_allow: vec![],
             resource_limits: json!({}),
+            coding_enabled: false,
         }
     }
 
@@ -724,6 +770,7 @@ mod tests {
             config_fingerprint: Some("abc123".into()),
             egress_allow: vec!["api.example.com:443".into()],
             resource_limits: json!({"cpus": "1.5", "memory_mb": 512}),
+            coding_enabled: true,
         };
         let saved = upsert(&db, req.clone()).unwrap();
         let fetched = get(&db, ag).unwrap().unwrap();
@@ -744,6 +791,7 @@ mod tests {
         assert_eq!(fetched.egress_allow, vec!["api.example.com:443".to_string()]);
         assert_eq!(fetched.resource_limits["cpus"], "1.5");
         assert_eq!(fetched.resource_limits["memory_mb"], 512);
+        assert!(fetched.coding_enabled);
     }
 
     #[test]
@@ -1011,6 +1059,7 @@ mod tests {
         assert!(cfg.config_fingerprint.is_none());
         assert!(cfg.egress_allow.is_empty());
         assert_eq!(cfg.resource_limits, json!({}));
+        assert!(!cfg.coding_enabled);
     }
 
     #[test]
@@ -1132,5 +1181,42 @@ mod tests {
         let db = db();
         let err = set_resource_limits(&db, AgentGroupId::new(), &json!({})).unwrap_err();
         assert!(matches!(err, DbError::NotFound));
+    }
+
+    #[test]
+    fn set_coding_enabled_roundtrips_true_then_false() {
+        let db = db();
+        let ag = make_agent_group(&db, "g");
+        upsert(&db, minimal_req(ag)).unwrap();
+        // Default from minimal_req is false.
+        assert!(!get(&db, ag).unwrap().unwrap().coding_enabled);
+        set_coding_enabled(&db, ag, true).unwrap();
+        assert!(get(&db, ag).unwrap().unwrap().coding_enabled);
+        set_coding_enabled(&db, ag, false).unwrap();
+        assert!(!get(&db, ag).unwrap().unwrap().coding_enabled);
+    }
+
+    #[test]
+    fn set_coding_enabled_not_found_when_no_row() {
+        let db = db();
+        let err = set_coding_enabled(&db, AgentGroupId::new(), true).unwrap_err();
+        assert!(matches!(err, DbError::NotFound));
+    }
+
+    #[test]
+    fn coding_enabled_defaults_to_false_via_sql_default() {
+        // Inserting with only required columns must yield coding_enabled = false.
+        let db = db();
+        let ag = make_agent_group(&db, "g");
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "INSERT INTO container_configs (agent_group_id, updated_at)
+             VALUES (?1, ?2)",
+            params![ag.as_uuid().to_string(), Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        drop(conn);
+        let cfg = get(&db, ag).unwrap().unwrap();
+        assert!(!cfg.coding_enabled);
     }
 }

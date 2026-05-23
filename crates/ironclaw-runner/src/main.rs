@@ -12,7 +12,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use ironclaw_db::session::{open_inbound_rw_no_mmap, open_outbound, SessionPaths};
-use ironclaw_providers::{AnthropicProvider, OllamaProvider};
+use ironclaw_providers::{AnthropicProvider, CodexProvider, OllamaProvider};
 use ironclaw_runner::{
     compaction::CompactionCfg, resolve_provider_deadline, resolve_tool_deadline_secs, run_loop,
     RunnerConfig, RunnerDeps, RunnerToolCtx, SubagentRunnerDeps,
@@ -169,7 +169,13 @@ async fn main() -> Result<()> {
 /// the operator binds the host's Ollama into the container; the more
 /// common deployment is to set `OLLAMA_BASE_URL` to a reachable URL).
 /// `ollama-shim` keeps the historical Anthropic-shaped proxy flow.
-fn build_provider(
+/// `codex` spawns the configured Codex CLI binary as a one-turn-per-spawn
+/// subprocess. The binary path and extra args are sourced (in order)
+/// from `cfg.codex_binary` / `cfg.codex_args`, then the
+/// `IRONCLAW_CODEX_BINARY` / `IRONCLAW_CODEX_ARGS` env vars, then the
+/// `/usr/local/bin/codex` / `--json` defaults.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn build_provider(
     cfg: &RunnerConfig,
     env: &dyn ironclaw_runner::config::EnvLookup,
 ) -> Result<Arc<dyn ironclaw_providers::AgentProvider>> {
@@ -190,6 +196,26 @@ fn build_provider(
             let model = if cfg.model.is_empty() { None } else { Some(cfg.model.clone()) };
             Ok(Arc::new(OllamaProvider::shim(base_url, model)))
         }
+        "codex" => {
+            let binary = cfg
+                .codex_binary
+                .clone()
+                .or_else(|| env.get("IRONCLAW_CODEX_BINARY"))
+                .unwrap_or_else(|| "/usr/local/bin/codex".to_string());
+            let args = cfg.codex_args.clone().unwrap_or_else(|| match env.get("IRONCLAW_CODEX_ARGS") {
+                Some(raw) => raw
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+                None => vec!["--json".to_string()],
+            });
+            Ok(Arc::new(CodexProvider::new(
+                std::path::PathBuf::from(binary),
+                args,
+            )))
+        }
         _ => {
             let api_key = cfg
                 .api_key
@@ -200,5 +226,75 @@ fn build_provider(
                 None => AnthropicProvider::new(api_key),
             }))
         }
+    }
+}
+
+#[cfg(test)]
+mod build_provider_tests {
+    use super::*;
+    use ironclaw_runner::config::MapEnv;
+    use ironclaw_types::{AgentGroupId, Effort, SessionId};
+
+    fn base_cfg(provider: &str) -> RunnerConfig {
+        RunnerConfig {
+            session_id: SessionId(uuid::Uuid::nil()),
+            agent_group_id: AgentGroupId::new(),
+            session_dir: std::path::PathBuf::from("/tmp/ironclaw/test"),
+            provider: provider.to_string(),
+            model: "test-model".to_string(),
+            effort: Effort::Medium,
+            system: String::new(),
+            api_key: None,
+            api_base_url: None,
+            model_input_window: 200_000,
+            safety_margin_tokens: 8_000,
+            max_tokens: 4096,
+            assistant_name: None,
+            temperature: None,
+            codex_binary: None,
+            codex_args: None,
+        }
+    }
+
+    #[test]
+    fn codex_uses_explicit_config_fields() {
+        let mut cfg = base_cfg("codex");
+        cfg.codex_binary = Some("/explicit/codex".into());
+        cfg.codex_args = Some(vec!["--json".into(), "--quiet".into()]);
+        let env = MapEnv::default();
+        let p = build_provider(&cfg, &env).unwrap();
+        assert_eq!(p.name(), "codex");
+    }
+
+    #[test]
+    fn codex_falls_back_to_env_vars() {
+        let cfg = base_cfg("codex");
+        let env = MapEnv::from_pairs([
+            ("IRONCLAW_CODEX_BINARY", "/env/codex"),
+            ("IRONCLAW_CODEX_ARGS", "--json,--no-color"),
+        ]);
+        let p = build_provider(&cfg, &env).unwrap();
+        assert_eq!(p.name(), "codex");
+    }
+
+    #[test]
+    fn codex_falls_back_to_defaults() {
+        let cfg = base_cfg("codex");
+        let env = MapEnv::default();
+        let p = build_provider(&cfg, &env).unwrap();
+        // No binary configured anywhere => provider still constructed
+        // with the hard-coded default path. Name confirms the arm took.
+        assert_eq!(p.name(), "codex");
+    }
+
+    #[test]
+    fn anthropic_requires_api_key() {
+        let cfg = base_cfg("anthropic");
+        let env = MapEnv::default();
+        // `Arc<dyn AgentProvider>` doesn't implement Debug, so we can't
+        // use `.unwrap_err()`; collapse to a Debug-able String first.
+        let result = build_provider(&cfg, &env).map(|_| "ok").map_err(|e| e.to_string());
+        let err = result.unwrap_err();
+        assert!(err.contains("api key"));
     }
 }

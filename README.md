@@ -37,26 +37,32 @@ agent> Boxes hold the world,
   `outbound.db` (container writes, host reads) — plus a central
   identity / wiring database. The single-writer rule is enforced
   by code, not convention.
-- **First-class agent tools.** 28 in-tree tools the model can call:
+- **First-class agent tools.** 33 in-tree tools the model can call:
   send / edit / react / file / card / question, schedule and
   manage recurring tasks, install packages, register MCP servers,
-  spawn sibling agents, seven computer-use tools (`shell`,
-  `edit_file`, `read_file`, `write_file`, `web_fetch`, `grep`,
-  `glob`) backed by structured `{path, line, text}` rows and
-  `.gitignore`-aware traversal, four read-only git inspection
+  spawn sibling agents (up to a configurable depth cap, default
+  3, persisted across host restarts), seven computer-use tools
+  (`shell`, `edit_file`, `read_file`, `write_file`, `web_fetch`,
+  `grep`, `glob`) backed by structured `{path, line, text}` rows
+  and `.gitignore`-aware traversal, four read-only git inspection
   tools (`git_status`, `git_log`, `git_diff`, `git_blame`) backed
   by libgit2 with structured JSON output, a multi-provider
   `web_search` tool that auto-routes to Tavily / Exa / Brave /
-  SerpAPI based on which API key is configured, and `explore` —
-  a lightweight in-process subagent for "go look at these files
-  and tell me what's there" without spawning a whole new container.
+  SerpAPI based on which API key is configured, `explore` — a
+  lightweight in-process subagent for "go look at these files
+  and tell me what's there" without spawning a whole new
+  container — `load_skill` for on-demand skill bodies in callable
+  mode, and a per-session todo tracker (`todo_add` / `todo_list`
+  / `todo_update` / `todo_delete`).
 - **Multiple providers.** Anthropic native (HTTP streaming with
   tool use and automatic compaction), Anthropic-compatible
   gateways (OpenRouter, internal proxies — set
-  `ANTHROPIC_BASE_URL`), subprocess-bridged Codex / OpenCode, and
-  and Ollama (native `/api/chat` NDJSON by default;
-  `OllamaProvider::shim(...)` available for Anthropic-compatible
-  proxies in front of Ollama like LiteLLM).
+  `ANTHROPIC_BASE_URL`), and Ollama (native `/api/chat` NDJSON
+  by default; `OllamaProvider::shim(...)` available for
+  Anthropic-compatible proxies in front of Ollama like LiteLLM).
+  Codex via subprocess bridge (set `IRONCLAW_DEFAULT_PROVIDER=codex`
+  or pin per group; configure the binary path via
+  `IRONCLAW_CODEX_BINARY`).
 - **Operations built in.** Per-group token budgets and turn-rate
   caps, persistent sender approvals with in-channel prompts,
   dead-letter inspection and replay, audit logs of every host
@@ -72,7 +78,7 @@ agent> Boxes hold the world,
   hours. Retry cap of three. Webhook channels bind `127.0.0.1` by
   default. Opt-in budgets, opt-in metrics endpoint, opt-in log
   rotation. Surprises cost money; surprises don't ship here.
-- **Tested.** ~4634 passing tests, 0 failing.
+- **Tested.** ~5160 passing tests, 0 failing.
   `cargo clippy --workspace --all-targets -- -D warnings` clean.
   CI runs fmt + clippy + test on Linux and macOS with an 85%
   coverage gate. Differential replay-fixture harness covers the
@@ -81,6 +87,13 @@ agent> Boxes hold the world,
 ---
 
 ## Install
+
+> **Pre-1.0 status.** No tagged releases have been cut yet, so the
+> install script currently falls through to building from source.
+> You need the Rust toolchain (1.85+) installed before the one-liner
+> below will work end-to-end. Prebuilt binary tarballs land with the
+> first `v0.x.y` tag — see [`docs/release-checklist.md`](docs/release-checklist.md)
+> and the [Status](#status) section.
 
 One command, on Linux or macOS:
 
@@ -94,9 +107,12 @@ What it does:
 2. Checks for Docker or Podman (won't install one for you — too
    invasive — but tells you exactly what to install).
 3. Installs `ironclaw`, `iclaw`, and `ironclaw-setup` to `~/.local/bin`.
-   Prefers a prebuilt release tarball; falls back to `cargo install
-   --git` (needs the Rust toolchain) or, from a checkout, `cargo
-   install --path`.
+   The script tries three strategies in order: (a) a prebuilt
+   release tarball from GitHub Releases — currently 404s because no
+   release has been cut yet; (b) `cargo install --git` — requires
+   the Rust toolchain; this is the path that works today; (c) from
+   inside a checkout, `cargo install --path` — same Rust
+   requirement but uses your local source.
 4. Launches `ironclaw-setup` to walk provider credentials, the data
    directory, and the first channel.
 
@@ -140,17 +156,19 @@ The three binaries land in `target/release/`. Add them to your PATH
 or run `./install.sh` from the checkout — it'll detect the local
 build and install to `~/.local/bin`.
 
-Tagged releases also ship prebuilt binary tarballs (Linux x86_64 /
-aarch64, macOS arm64 / x86_64) on the GitHub Releases page — one
-`.tar.gz` per target, plus a `SHA256SUMS` manifest:
+Once the first tag lands, releases will also ship prebuilt binary
+tarballs (Linux x86_64 / aarch64, macOS arm64 / x86_64) on the
+GitHub Releases page — one `.tar.gz` per target, plus a `SHA256SUMS`
+manifest:
 
 ```
 https://github.com/phildougherty/ironclaw/releases/download/<TAG>/ironclaw-<TARGET>.tar.gz
 ```
 
-`install.sh` resolves the right tarball for your platform
+`install.sh` will resolve the right tarball for your platform
 automatically; downloading by hand is only useful for air-gapped or
-mirrored installs.
+mirrored installs. Until then the script falls through to the
+`cargo install` paths above.
 
 ### Testing install.sh
 
@@ -252,12 +270,12 @@ defer a step. See the per-prompt table below.
 
 ### Choosing a provider
 
-At the provider-URL prompt, type `openrouter` (or `or`) to use
-OpenRouter, leave blank or type `anthropic` for the upstream API,
-or paste any Anthropic-compatible base URL verbatim — a trailing
-`/v1` is stripped automatically. The provider key is then
-forwarded into every session container via
-`ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL`.
+At the provider-URL prompt, type `openrouter` to use OpenRouter,
+leave blank or type `anthropic` for the upstream API, or paste
+any Anthropic-compatible base URL verbatim — a trailing `/v1` is
+stripped automatically. The provider key is then forwarded into
+every session container via `ANTHROPIC_API_KEY` and
+`ANTHROPIC_BASE_URL`.
 
 ### Wire your first channel
 
@@ -322,7 +340,7 @@ template.
 
 ## Agent tools
 
-The runner inside each container exposes 28 tools to the model:
+The runner inside each container exposes 33 tools to the model:
 
 **Messaging.** `send_message`, `send_file`, `edit_message`,
 `add_reaction`, `ask_user_question`, `send_card`.
@@ -373,11 +391,47 @@ calls are refused. Useful when an answer needs 3+ file reads or
 2+ search queries; for trivial one-file lookups, use `read_file`
 directly. See `skills/explore/SKILL.md`.
 
+**Skill loader.** `load_skill` returns a named skill's `SKILL.md`
+body on demand when the host is configured with
+`IRONCLAW_SKILLS_MODE=callable`. In that mode the system prompt
+only carries a compact `<skill name=… description=… />` index;
+bodies live in a per-session `skills.json` that this tool reads.
+The default mode is `inline` (every selected body inlined into
+the prompt at spawn) and is still preferred for small skill
+catalogues; flip to `callable` when prompt-token cost starts to
+matter.
+
+**Per-session todos.** `todo_add`, `todo_list`, `todo_update`,
+`todo_delete` back a JSON scratchpad at `/data/agent_todos.json`.
+Universal — useful for any agent juggling multi-step work, not
+coding-specific. Items survive runner restarts within the same
+session but never bleed across sessions. See
+`skills/todo-tracker/SKILL.md`.
+
+**Persistent memory (opt-in via `IRONCLAW_GROUPS_DIR`).** When the
+host is configured with a groups dir, each agent group also gets
+`<groups_dir>/<id>/memory/` bind-mounted at `/data/memory/`.
+Agents read and write memory files via the existing `read_file`
+/ `write_file` tools — no new tool required. See
+`skills/agent-memory/SKILL.md` for the user / feedback / project
+/ reference protocol that mirrors Claude Code's auto-memory.
+
+Every agent also receives a universal base preamble + an
+`# Environment` block (today's date, session id, agent group id,
+working directory, assistant name) at the top of its system
+prompt, plus an optional operator-supplied `IRONCLAW.md` briefing
+from either the session dir or
+`<groups_dir>/<id>/IRONCLAW.md`. These ground the agent without
+any per-deployment configuration.
+
 Per-skill SKILL.md prose is auto-inlined into the runner's system
-prompt at spawn so the model knows *when* to reach for each tool,
-not just what each tool's schema looks like. 28 skill bundles are
-authored under `skills/` (the `git` bundle covers all four
-inspection tools at once).
+prompt at spawn (default `inline` mode) so the model knows *when*
+to reach for each tool, not just what each tool's schema looks
+like. 36 skill bundles are authored under `skills/` (the `git`
+bundle covers all four inspection tools at once). Switch to
+`IRONCLAW_SKILLS_MODE=callable` to swap inlined bodies for a
+name+description index and have the agent retrieve bodies on
+demand via `load_skill`.
 
 ---
 
@@ -499,13 +553,16 @@ populated copy; production overrides go in your service unit.
 | `ANTHROPIC_BASE_URL` | Optional Anthropic-compatible base URL (OpenRouter, internal proxy). Trailing `/v1` stripped automatically. |
 | `IRONCLAW_DATA_DIR` | Host data root. Setup writes per-platform install path; defaults to `./data` when unset. |
 | `ICLAW_SOCKET` | Override socket path; otherwise resolved per-platform. |
-| `IRONCLAW_SKILLS_DIR` | Skills directory whose `SKILL.md` bodies get auto-inlined into the runner's system prompt at spawn. |
-| `IRONCLAW_GROUPS_DIR` | Per-agent-group skill overrides under `<groups_dir>/<ag_uuid>/skills/`. |
+| `IRONCLAW_SKILLS_DIR` | Skills directory whose `SKILL.md` bodies get auto-inlined into the runner's system prompt at spawn (in `inline` mode) or advertised as a name+description index (in `callable` mode). |
+| `IRONCLAW_GROUPS_DIR` | Per-agent-group override root. `<groups_dir>/<id>/skills/` shadows global skills with matching names. `<groups_dir>/<id>/memory/` is bind-mounted at `/data/memory/` so per-group memory persists across sessions. `<groups_dir>/<id>/IRONCLAW.md` is read as an operator-supplied briefing into every spawn's system prompt. |
+| `IRONCLAW_SKILLS_MODE` | `inline` (default) or `callable`. Inline puts every selected skill body in the prompt at spawn. Callable emits only an index and writes a per-session `skills.json` for the `load_skill` MCP tool. |
 | `IRONCLAW_METRICS_ADDR` | Bind address for the Prometheus endpoint (e.g. `127.0.0.1:9090`). Off when unset. |
 | `IRONCLAW_LOG_DIR` | Enable daily-rotating file appender alongside stderr. Off when unset. |
 | `IRONCLAW_DEFAULT_PROVIDER` | Provider name for sessions whose group hasn't pinned one. |
 | `IRONCLAW_DEFAULT_IMAGE_TAG` | Default container image tag when no `container_configs` row pins one. |
 | `TAVILY_API_KEY` / `EXA_API_KEY` / `BRAVE_SEARCH_API_KEY` / `SERPAPI_API_KEY` | Forwarded into the container so `web_search` auto-selects a backend. |
+| `IRONCLAW_CODEX_BINARY` | Absolute path to the Codex CLI inside the container. Read by the runner only when `provider == "codex"`. Defaults to `/usr/local/bin/codex`. |
+| `IRONCLAW_CODEX_ARGS` | Comma-separated extra args appended to every Codex spawn (e.g. `--json,--no-color`). Defaults to `--json`. |
 
 A SIGHUP on the host re-reads the `.env` file, updates the
 forwarded keys, and increments the `ironclaw_secrets_rotated_total`
@@ -592,10 +649,13 @@ config-management tool without going through the full wizard.
 ## Agent skills
 
 Skills under `skills/` are markdown bundles auto-discovered by
-`ironclaw-skills` and inlined into the running agent's system
-prompt. Capability docs (`send-message`, `install-packages`, …)
-describe the in-tree MCP tools; guided-flow skills describe a
-multi-turn interaction the agent runs with the user:
+`ironclaw-skills` and either inlined into the running agent's
+system prompt (default `inline` mode) or advertised as a compact
+name+description index and served on demand via the `load_skill`
+tool (`IRONCLAW_SKILLS_MODE=callable`). Capability docs
+(`send-message`, `install-packages`, …) describe the in-tree MCP
+tools; guided-flow skills describe a multi-turn interaction the
+agent runs with the user:
 
 - `skills/customize/` — change the model, install a package or
   MCP server, edit the per-group behavior prompt, raise/lower the
@@ -605,6 +665,21 @@ multi-turn interaction the agent runs with the user:
   report: pull what's reachable from inside the container, then
   hand `iclaw health`, `iclaw audit list`, and
   `iclaw dropped-messages list` to the operator.
+- `skills/todo-tracker/`, `skills/agent-memory/` — universal
+  scratchpad and persistent-memory disciplines for any agent.
+- `skills/coding-task/`, `skills/git-commit/`,
+  `skills/code-review/`, `skills/testing/` — bundle for agents
+  doing coding work. Off by default — flip on per agent group
+  with `iclaw groups enable-coding <id>`, off again with
+  `iclaw groups disable-coding <id>`. Under the hood the toggle
+  sets `container_configs.coding_enabled`; when off the
+  container manager filters the four names out of the resolved
+  skill set before assembling the system prompt and writing
+  `skills.json`. Operator-picked explicit selectors are honoured
+  as-is — the flag is a cap on the `SkillsSelector::All` default,
+  not an override of allowlists. Operators who want every skill
+  loaded everywhere (the pre-Phase E behaviour) re-enable the
+  bundle per group.
 
 Drop a new directory with a `SKILL.md` (YAML frontmatter +
 markdown body) into `skills/` and the next container boot picks

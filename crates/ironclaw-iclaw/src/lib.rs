@@ -1829,6 +1829,17 @@ fn render_config_toml(obj: &serde_json::Map<String, serde_json::Value>) -> Strin
         let v = obj.get(*key).cloned().unwrap_or(serde_json::Value::Null);
         out.push_str(&render_scalar_line(key, &v));
     }
+    // Read-only display of the per-group coding-skills toggle so the
+    // operator can see the current state when they `iclaw groups
+    // config edit`. Toggled via `iclaw groups enable-coding <id>` /
+    // `disable-coding <id>` — not through this buffer.
+    let coding_enabled = obj
+        .get("coding_enabled")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    out.push_str(&format!(
+        "# read-only: coding_enabled = {coding_enabled}   # toggle via `iclaw groups enable-coding <id>` / `disable-coding <id>`\n"
+    ));
     out.push('\n');
 
     // Packages — render as arrays of strings.

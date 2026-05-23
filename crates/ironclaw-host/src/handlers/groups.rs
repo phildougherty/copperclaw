@@ -163,6 +163,7 @@ pub fn config_update(args: &Value, central: &CentralDb) -> Result<Value, ErrorPa
             config_fingerprint: existing.config_fingerprint,
             egress_allow: existing.egress_allow,
             resource_limits: existing.resource_limits,
+            coding_enabled: existing.coding_enabled,
         },
     )
     .map_err(db_err)?;
@@ -272,6 +273,19 @@ pub fn config_set_egress_allow(args: &Value, central: &CentralDb) -> Result<Valu
     Ok(serde_json::json!({"egress_allow": allow}))
 }
 
+/// `groups.config.set-coding-enabled` — narrow toggle for the coding
+/// skills bundle.
+pub fn config_set_coding_enabled(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
+    let id = parse_agent_group_id(args, "id")?;
+    let enabled = args
+        .get("enabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| ErrorPayload::new("bad_request", "missing boolean `enabled`"))?;
+    ensure_config_row(central, id)?;
+    container_configs::set_coding_enabled(central, id, enabled).map_err(db_err)?;
+    Ok(serde_json::json!({"coding_enabled": enabled}))
+}
+
 /// `groups.config.set-resource-limits`
 pub fn config_set_resource_limits(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     let id = parse_agent_group_id(args, "id")?;
@@ -332,6 +346,7 @@ fn default_config(id: AgentGroupId) -> container_configs::ContainerConfig {
         config_fingerprint: None,
         egress_allow: Vec::new(),
         resource_limits: Value::Object(serde_json::Map::new()),
+        coding_enabled: false,
         updated_at: chrono::Utc::now(),
     }
 }
@@ -358,6 +373,7 @@ fn ensure_config_row(central: &CentralDb, id: AgentGroupId) -> Result<(), ErrorP
                 config_fingerprint: row.config_fingerprint,
                 egress_allow: row.egress_allow,
                 resource_limits: row.resource_limits,
+                coding_enabled: row.coding_enabled,
             },
         )
         .map_err(db_err)?;
@@ -392,6 +408,7 @@ fn container_config_to_json(c: &container_configs::ContainerConfig) -> Value {
         "config_fingerprint": c.config_fingerprint,
         "egress_allow": c.egress_allow,
         "resource_limits": c.resource_limits,
+        "coding_enabled": c.coding_enabled,
         "updated_at": c.updated_at.to_rfc3339(),
     })
 }
@@ -894,6 +911,53 @@ mod tests {
         let g = make_group(&db, "g");
         let err = config_set_resource_limits(
             &json!({"id": g.id.as_uuid().to_string()}),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+    }
+
+    #[test]
+    fn config_set_coding_enabled_true_then_false_roundtrip() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let v = config_set_coding_enabled(
+            &json!({"id": g.id.as_uuid().to_string(), "enabled": true}),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["coding_enabled"], true);
+        let cfg = config_get(&json!({"id": g.id.as_uuid().to_string()}), &db).unwrap();
+        assert_eq!(cfg["coding_enabled"], true);
+
+        let v = config_set_coding_enabled(
+            &json!({"id": g.id.as_uuid().to_string(), "enabled": false}),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["coding_enabled"], false);
+        let cfg = config_get(&json!({"id": g.id.as_uuid().to_string()}), &db).unwrap();
+        assert_eq!(cfg["coding_enabled"], false);
+    }
+
+    #[test]
+    fn config_set_coding_enabled_requires_enabled_key() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let err = config_set_coding_enabled(
+            &json!({"id": g.id.as_uuid().to_string()}),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+    }
+
+    #[test]
+    fn config_set_coding_enabled_rejects_non_bool_enabled() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let err = config_set_coding_enabled(
+            &json!({"id": g.id.as_uuid().to_string(), "enabled": "yes"}),
             &db,
         )
         .unwrap_err();
