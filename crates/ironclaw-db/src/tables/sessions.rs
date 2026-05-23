@@ -283,6 +283,67 @@ pub fn list_running(db: &CentralDb) -> Result<Vec<Session>, DbError> {
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
+/// Delete one session and every central-DB row that references it.
+///
+/// Cleanup is atomic (single transaction) and covers:
+/// - `agent_turns` rows for this session (no FK; manual filter).
+/// - `tasks` rows for this session (no FK; manual filter).
+/// - `pending_questions` rows for this session (FK NOT NULL; `SQLite`
+///   would otherwise refuse the delete with `FOREIGN KEY constraint
+///   failed`).
+/// - `pending_approvals` rows for this session (FK nullable; same
+///   reason).
+/// - Finally, the `sessions` row itself.
+///
+/// `sessions.source_session_id` already has `ON DELETE SET NULL`, so
+/// child sessions retain their other state.
+///
+/// The on-disk session directory (`<data_dir>/sessions/<ag>/<sess>/`)
+/// is NOT removed here — that's the caller's responsibility because
+/// `ironclaw-db` deliberately knows nothing about the filesystem
+/// layout. The host's `sessions.delete` handler does the rmtree.
+///
+/// Returns `DbError::NotFound` if the session doesn't exist.
+pub fn delete(db: &CentralDb, id: SessionId) -> Result<(), DbError> {
+    let mut conn = db.conn()?;
+    let tx = conn.transaction()?;
+    let id_str = id.as_uuid().to_string();
+    // Pre-check existence so the caller gets a clean NotFound rather
+    // than a silently-empty cascade.
+    let exists: Option<i64> = tx
+        .query_row(
+            "SELECT 1 FROM sessions WHERE id = ?1",
+            params![id_str],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if exists.is_none() {
+        return Err(DbError::NotFound);
+    }
+    tx.execute(
+        "DELETE FROM agent_turns WHERE session_id = ?1",
+        params![id_str],
+    )?;
+    tx.execute(
+        "DELETE FROM tasks WHERE session_id = ?1",
+        params![id_str],
+    )?;
+    tx.execute(
+        "DELETE FROM pending_questions WHERE session_id = ?1",
+        params![id_str],
+    )?;
+    tx.execute(
+        "DELETE FROM pending_approvals WHERE session_id = ?1",
+        params![id_str],
+    )?;
+    tx.execute(
+        "DELETE FROM sessions WHERE id = ?1",
+        params![id_str],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,6 +572,203 @@ mod tests {
         let (db, ag) = db_with_agent();
         let v = list_for_agent_group(&db, ag).unwrap();
         assert!(v.is_empty());
+    }
+
+    #[test]
+    fn delete_removes_session_row() {
+        let (db, ag) = db_with_agent();
+        let s = create(
+            &db,
+            CreateSession {
+                agent_group_id: ag,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
+        delete(&db, s.id).unwrap();
+        let err = get(&db, s.id).unwrap_err();
+        assert!(matches!(err, DbError::NotFound));
+    }
+
+    #[test]
+    fn delete_missing_session_is_not_found() {
+        let db = CentralDb::open_in_memory().unwrap();
+        let err = delete(&db, SessionId::new()).unwrap_err();
+        assert!(matches!(err, DbError::NotFound));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn delete_cascades_agent_turns_and_tasks() {
+        use crate::tables::agent_turns::{insert as insert_turn, NewAgentTurn};
+        use crate::tables::tasks::{insert as insert_task, NewTask};
+        let (db, ag) = db_with_agent();
+        let s = create(
+            &db,
+            CreateSession {
+                agent_group_id: ag,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
+        // Three agent_turns and one task for this session.
+        for seq in 0..3 {
+            let now = Utc::now();
+            insert_turn(
+                &db,
+                &NewAgentTurn {
+                    session_id: s.id.as_uuid().to_string(),
+                    agent_group_id: ag.as_uuid().to_string(),
+                    seq,
+                    model: "test".into(),
+                    provider: "test".into(),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    started_at: now,
+                    ended_at: now,
+                    status: "ok".into(),
+                    error: None,
+                },
+            )
+            .unwrap();
+        }
+        insert_task(
+            &db,
+            NewTask {
+                id: "task-1".into(),
+                agent_group_id: ag,
+                session_id: s.id,
+                name: Some("t".into()),
+                prompt: "p".into(),
+                when_spec: "now".into(),
+                recurrence: None,
+                next_fire: None,
+            },
+        )
+        .unwrap();
+        // Another session in the same group — its rows must survive.
+        let other = create(
+            &db,
+            CreateSession {
+                agent_group_id: ag,
+                messaging_group_id: None,
+                thread_id: Some("other".into()),
+                agent_provider: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
+        let now = Utc::now();
+        insert_turn(
+            &db,
+            &NewAgentTurn {
+                session_id: other.id.as_uuid().to_string(),
+                agent_group_id: ag.as_uuid().to_string(),
+                seq: 0,
+                model: "test".into(),
+                provider: "test".into(),
+                input_tokens: 1,
+                output_tokens: 1,
+                started_at: now,
+                ended_at: now,
+                status: "ok".into(),
+                error: None,
+            },
+        )
+        .unwrap();
+
+        delete(&db, s.id).unwrap();
+
+        // Session gone.
+        assert!(matches!(get(&db, s.id), Err(DbError::NotFound)));
+        // Cleanup happened for the deleted session, and the other
+        // session's rows survived. Counts are pulled in a scoped
+        // block so the pooled connection is released before the
+        // closing `get` call (the in-memory test DB has a pool of 1).
+        let (turn_count, task_count, other_turns) = {
+            let conn = db.conn().unwrap();
+            let t: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_turns WHERE session_id = ?1",
+                    params![s.id.as_uuid().to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let k: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE session_id = ?1",
+                    params![s.id.as_uuid().to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let o: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM agent_turns WHERE session_id = ?1",
+                    params![other.id.as_uuid().to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            (t, k, o)
+        };
+        assert_eq!(turn_count, 0);
+        assert_eq!(task_count, 0);
+        assert_eq!(other_turns, 1);
+        // And the other session itself is intact.
+        assert!(get(&db, other.id).is_ok());
+    }
+
+    #[test]
+    fn delete_clears_session_referenced_pending_approvals() {
+        use rusqlite::params;
+        let (db, ag) = db_with_agent();
+        let s = create(
+            &db,
+            CreateSession {
+                agent_group_id: ag,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
+        // Insert a pending_approvals row that points at this session;
+        // without the cascade the FK would refuse the parent delete.
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "INSERT INTO pending_approvals
+                   (approval_id, session_id, request_id, action, payload,
+                    created_at, status, title)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', '')",
+                params![
+                    "appr-1",
+                    s.id.as_uuid().to_string(),
+                    "req-1",
+                    "install_packages",
+                    "{}",
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
+        }
+        delete(&db, s.id).unwrap();
+        // Approval went with the session.
+        let conn = db.conn().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_approvals WHERE approval_id = 'appr-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]

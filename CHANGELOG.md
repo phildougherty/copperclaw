@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **`iclaw sessions delete <id> [--force]`.** Closes the operator gap
+  that forced raw `sqlite3` cleanup when a session row needed to go
+  away (e.g. so `iclaw groups delete <id>` would stop failing with
+  `FOREIGN KEY constraint failed`). The new subcommand deletes the
+  central `sessions` row plus every per-session row that referenced
+  it — `agent_turns`, `tasks`, `pending_questions`,
+  `pending_approvals` — in a single transaction, then removes the
+  on-disk session tree at `<data_dir>/sessions/<agent>/<session>/`.
+  Refuses by default if the session's container is not in `stopped`
+  state so the operator runs `iclaw groups restart <ag>` first; pass
+  `--force` to override. Filesystem removal is best-effort: a warn
+  is logged but the command still succeeds when the central rows
+  are already gone. New table function:
+  `ironclaw_db::tables::sessions::delete`. New handler:
+  `ironclaw_host::handlers::sessions::delete` (registered as a
+  host-only mutation, so every call lands in `audit_log`).
+
 ### Fixed (subagent routing follow-up: 15 code-review findings)
 
 Follow-up to the subagent-routing PR (`466b1ed`). An extra-high-effort

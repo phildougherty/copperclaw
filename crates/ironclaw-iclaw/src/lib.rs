@@ -2706,6 +2706,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sessions_delete_round_trips_through_transport() {
+        // Integration coverage for `iclaw sessions delete <id>`:
+        // drive the CLI front-end against an in-process stub transport
+        // and verify the parsed command/args reach the wire layer
+        // unchanged.
+        let t = StubTransport::ok(json!({
+            "deleted": "00000000-0000-0000-0000-000000000001",
+            "agent_group_id": "00000000-0000-0000-0000-0000000000aa",
+            "directory_removed": true,
+        }));
+        let out = run_cli(
+            ["iclaw", "sessions", "delete", "00000000-0000-0000-0000-000000000001"],
+            &t,
+        )
+        .await;
+        assert!(out.stderr.is_empty(), "stderr={:?}", out.stderr);
+        let captured = t.last_call.lock().unwrap();
+        let (cmd, args, _caller) = captured.as_ref().unwrap();
+        assert_eq!(cmd, "sessions.delete");
+        assert_eq!(
+            args,
+            &json!({"id": "00000000-0000-0000-0000-000000000001", "force": false}),
+        );
+    }
+
+    #[tokio::test]
+    async fn sessions_delete_force_flag_carries_through() {
+        let t = StubTransport::ok(json!({"deleted": "x"}));
+        let out = run_cli(
+            ["iclaw", "sessions", "delete", "sess-1", "--force"],
+            &t,
+        )
+        .await;
+        assert!(out.stderr.is_empty(), "stderr={:?}", out.stderr);
+        let captured = t.last_call.lock().unwrap();
+        let (cmd, args, _caller) = captured.as_ref().unwrap();
+        assert_eq!(cmd, "sessions.delete");
+        assert_eq!(args["force"], json!(true));
+    }
+
+    #[tokio::test]
     async fn dashboard_unreachable_host_returns_friendly_error() {
         // Use a transport that returns an IO NotFound for every call.
         struct DeadTransport;

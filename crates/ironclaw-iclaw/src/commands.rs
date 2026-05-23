@@ -796,6 +796,21 @@ pub enum SessionsCmd {
         /// Session id (UUID).
         id: String,
     },
+    /// Delete a session: remove its central-DB row plus every per-session
+    /// row that references it (`agent_turns`, `tasks`, `pending_questions`,
+    /// `pending_approvals`) and its on-disk directory under
+    /// `<data_dir>/sessions/<agent_group>/<session>/`.
+    ///
+    /// Refuses by default when the session's container is still Running;
+    /// pass `--force` to delete anyway (the container will be orphaned
+    /// until the next restart of the host).
+    Delete {
+        /// Session id (UUID).
+        id: String,
+        /// Delete even if the session's container is not Stopped.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 // --- user-dms --------------------------------------------------------------
@@ -1416,6 +1431,10 @@ impl SessionsCmd {
                 ParsedCall::new("sessions.list", Value::Object(o))
             }
             Self::Get { id } => ParsedCall::new("sessions.get", json!({"id": id})),
+            Self::Delete { id, force } => ParsedCall::new(
+                "sessions.delete",
+                json!({"id": id, "force": *force}),
+            ),
         }
     }
 }
@@ -1554,6 +1573,7 @@ pub const ALL_COMMANDS: &[&str] = &[
     "destinations.remove",
     "sessions.list",
     "sessions.get",
+    "sessions.delete",
     "user-dms.list",
     "dropped-messages.list",
     "dropped-messages.outbound-list",
@@ -2244,6 +2264,20 @@ mod tests {
         assert_eq!(p.command, "sessions.get");
     }
 
+    #[test]
+    fn sessions_delete_default_force_false() {
+        let p = parse(&["iclaw", "sessions", "delete", "s1"]);
+        assert_eq!(p.command, "sessions.delete");
+        assert_eq!(p.args, json!({"id": "s1", "force": false}));
+    }
+
+    #[test]
+    fn sessions_delete_with_force_flag() {
+        let p = parse(&["iclaw", "sessions", "delete", "s1", "--force"]);
+        assert_eq!(p.command, "sessions.delete");
+        assert_eq!(p.args, json!({"id": "s1", "force": true}));
+    }
+
     // --- user-dms / dropped-messages / approvals ---------------------------
 
     #[test]
@@ -2378,6 +2412,7 @@ mod tests {
             &["iclaw", "destinations", "remove", "ag", "--name", "n"],
             &["iclaw", "sessions", "list"],
             &["iclaw", "sessions", "get", "x"],
+            &["iclaw", "sessions", "delete", "x"],
             &["iclaw", "user-dms", "list"],
             &["iclaw", "dropped-messages", "list"],
             &["iclaw", "dropped-messages", "outbound-list"],

@@ -231,6 +231,7 @@ pub fn build_dispatch_table() -> DispatchTable {
 
     ins!("sessions.list", handlers::sessions::list, false);
     ins!("sessions.get", handlers::sessions::get, false);
+    ins_ctx!("sessions.delete", handlers::sessions::delete, true);
 
     ins!("user-dms.list", handlers::user_dms::list, false);
     ins!("dropped-messages.list", handlers::dropped_messages::list, false);
@@ -732,6 +733,78 @@ mod tests {
         };
         let r = dispatch_request(&table, &ctx, &req);
         assert!(matches!(r, Response::Ok { .. }));
+    }
+
+    #[test]
+    fn dispatch_sessions_delete_removes_central_row() {
+        use ironclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+        use ironclaw_db::tables::sessions::{create as create_session, CreateSession};
+        let db = central();
+        let ag = create_ag(
+            &db,
+            CreateAgentGroup {
+                name: "g".into(),
+                folder: "g".into(),
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        let s = create_session(
+            &db,
+            CreateSession {
+                agent_group_id: ag.id,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = HandlerCtx::with_data_dir(db.clone(), tmp.path().to_path_buf());
+        let table = build_dispatch_table();
+        let req = Request::Call {
+            id: "1".into(),
+            command: "sessions.delete".into(),
+            args: json!({"id": s.id.as_uuid().to_string()}),
+            caller: Caller::Host,
+        };
+        let r = dispatch_request(&table, &ctx, &req);
+        match r {
+            Response::Ok { data, .. } => {
+                assert_eq!(data["deleted"], s.id.as_uuid().to_string());
+            }
+            Response::Err { error, .. } => panic!("unexpected error: {error:?}"),
+        }
+        // Audit row recorded — sessions.delete is host-only.
+        let audit_rows = ironclaw_db::tables::audit_log::list_recent(
+            &db,
+            chrono::Utc::now() - chrono::Duration::hours(1),
+            50,
+        )
+        .unwrap();
+        assert!(audit_rows.iter().any(|r| r.command == "sessions.delete"));
+    }
+
+    #[test]
+    fn dispatch_sessions_delete_agent_caller_blocked() {
+        let table = build_dispatch_table();
+        let ctx = HandlerCtx::new(central());
+        let req = Request::Call {
+            id: "1".into(),
+            command: "sessions.delete".into(),
+            args: json!({"id": uuid::Uuid::now_v7().to_string()}),
+            caller: Caller::Agent {
+                session_id: SessionId::nil(),
+                agent_group_id: AgentGroupId::nil(),
+                messaging_group_id: None,
+            },
+        };
+        let r = dispatch_request(&table, &ctx, &req);
+        match r {
+            Response::Err { error, .. } => assert_eq!(error.code, "permission_denied"),
+            Response::Ok { .. } => panic!("unexpected Ok"),
+        }
     }
 
     #[tokio::test]
