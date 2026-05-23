@@ -166,8 +166,8 @@ rebuilds are automatic on config change.
 
 Requires Rust 1.85+ (pinned by `rust-toolchain.toml`) and a container
 runtime (Docker on Linux, Docker / Podman / Apple Container on
-macOS — the wizard detects all three, `install.sh` only currently
-detects Docker / Podman).
+macOS — `install.sh` and the wizard's `env_check` step detect all
+three).
 
 ```bash
 git clone https://github.com/phildougherty/ironclaw

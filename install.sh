@@ -202,17 +202,24 @@ check_container_runtime() {
             warn "  run 'podman machine start' (macOS) or check 'systemctl --user status podman' (Linux)"
             exit 1
         fi
+    elif [ "$PLATFORM_OS" = "macos" ] && command -v container >/dev/null 2>&1; then
+        # Apple Container (the new macOS-native container runtime). Detected
+        # by ironclaw-setup's env_check step as well; included here so a
+        # fresh mac user with only Apple Container installed doesn't get a
+        # misleading "install Docker" prompt.
+        found="apple-container"
     fi
 
     if [ -z "$found" ]; then
-        err "no container runtime found (looked for docker, podman)."
+        err "no container runtime found (looked for docker, podman, container)."
         case "$PLATFORM_OS" in
             linux)
                 err "  install Docker: https://docs.docker.com/engine/install/"
                 err "  or Podman:      sudo apt-get install podman   # or your distro's package manager" ;;
             macos)
                 err "  install Docker Desktop: https://docs.docker.com/desktop/install/mac-install/"
-                err "  or Podman:              brew install podman && podman machine init && podman machine start" ;;
+                err "  or Podman:              brew install podman && podman machine init && podman machine start"
+                err "  or Apple Container:     https://github.com/apple/container (macOS 15+)" ;;
         esac
         exit 1
     fi

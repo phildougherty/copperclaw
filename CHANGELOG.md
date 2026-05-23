@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (install.sh detects Apple Container on macOS — 2026-05-23)
+
+- **`install.sh`** — `check_container_runtime` now also accepts the
+  Apple Container runtime (`container` binary) on macOS, in addition
+  to Docker / Podman. Brings the installer in line with the wizard's
+  `env_check` step (`crates/ironclaw-setup/src/steps/env_check.rs`),
+  which already detected it. A fresh macOS user with only Apple
+  Container installed no longer sees a misleading "install Docker"
+  prompt. Also added the Apple Container install link to the
+  no-runtime-found error message on macOS.
+- **`README.md`** — Manual Install section now correctly lists
+  Apple Container alongside Docker / Podman as detected by
+  `install.sh`.
+
 ### Changed (iclaw subcommand `--help` text — 2026-05-23)
 
 - **`crates/ironclaw-iclaw/src/commands.rs`** — added `///`
