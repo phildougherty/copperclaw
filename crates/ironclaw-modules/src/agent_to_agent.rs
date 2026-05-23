@@ -615,12 +615,30 @@ impl DeliveryActionHandler for CreateAgentHandler {
         // once the central schema lands a system_prompt column. For now we
         // surface them via the result row so the parent agent / operator
         // can hand-roll persistence.
+        // Inherit the parent session's routing so the spawned agent
+        // can reply into the same chat the parent is talking to. Without
+        // this the child session lands with `messaging_group_id = NULL`
+        // and its `send_message` calls have nowhere to deliver — the
+        // failure mode that surfaced as "research agents I created
+        // never reported back" on a live Telegram chat. The parent
+        // wiring stays intact (parent still receives the user's
+        // messages); we just copy the addressing onto the new session.
+        // Falls back to None when there's no resolvable parent
+        // (administrative / scripted `create_agent` calls).
+        let (parent_messaging_group, parent_thread) = parent_session
+            .as_ref()
+            .and_then(|p| {
+                sessions::get(central, p.session_id)
+                    .ok()
+                    .map(|s| (s.messaging_group_id, s.thread_id))
+            })
+            .unwrap_or((None, None));
         let session = sessions::create(
             central,
             CreateSession {
                 agent_group_id: group.id,
-                messaging_group_id: None,
-                thread_id: None,
+                messaging_group_id: parent_messaging_group,
+                thread_id: parent_thread,
                 agent_provider: None,
             },
         )
@@ -1150,6 +1168,48 @@ mod tests {
             new_group.folder.starts_with("research-bot-"),
             "folder slug derived from name (got {})",
             new_group.folder,
+        );
+    }
+
+    #[test]
+    fn child_session_inherits_parent_messaging_group() {
+        // Regression for the live Telegram failure: child sessions used
+        // to land with `messaging_group_id = NULL`, so `send_message`
+        // from the child had no return path. Now create_agent copies
+        // the parent session's routing onto the new session.
+        let (handler, central, _tmp, parent, target) = make_handler(always_allow());
+        let before_sessions: std::collections::HashSet<SessionId> =
+            sessions::list_active(&central).unwrap().iter().map(|s| s.id).collect();
+        handler
+            .handle(DeliveryActionInput {
+                action: "create_agent".into(),
+                payload: serde_json::json!({
+                    "name": "scout",
+                    "instructions": "go look",
+                }),
+                target,
+                session_id: None,
+            })
+            .unwrap();
+        let new_session = sessions::list_active(&central)
+            .unwrap()
+            .into_iter()
+            .find(|s| !before_sessions.contains(&s.id))
+            .expect("a new session was created");
+        let parent_session = sessions::get(&central, parent.session_id).unwrap();
+        assert!(
+            parent_session.messaging_group_id.is_some(),
+            "test parent must have a wired messaging group"
+        );
+        assert_eq!(
+            new_session.messaging_group_id, parent_session.messaging_group_id,
+            "child must inherit parent's messaging_group_id, not land with NULL"
+        );
+        // thread_id propagates too (None in this test fixture; the
+        // important behaviour is that they match the parent).
+        assert_eq!(
+            new_session.thread_id, parent_session.thread_id,
+            "child must inherit parent's thread_id"
         );
     }
 
