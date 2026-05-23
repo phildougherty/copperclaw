@@ -469,6 +469,56 @@ fn apply_effect(
     }
 }
 
+/// Strip model-emitted reasoning blocks from outbound chat text.
+///
+/// Some models (notably Haiku 4.5 in our live testing) ignore the
+/// "private reasoning" convention of the Anthropic API's
+/// `thinking` content blocks and instead emit literal
+/// `<thinking>...</thinking>` markup as part of regular text output.
+/// That markup leaks to end users — they see the model "talking to
+/// itself" in the chat. Strip it here, before the row hits
+/// `messages_out`, so no future-channel-adapter has to worry about
+/// the same payload.
+///
+/// Conservative: only strip closed `<thinking>...</thinking>` pairs.
+/// An unterminated `<thinking>` without a closing tag is preserved
+/// verbatim so we never accidentally swallow large chunks of
+/// legitimate prose. Case-insensitive open/close tags, multi-line
+/// content, leaves the surrounding text intact.
+fn strip_reasoning_blocks(text: &str) -> String {
+    // Hand-rolled scan instead of pulling in `regex` just for this.
+    // Looking for `<thinking>` followed by anything up to `</thinking>`,
+    // case-insensitive on the tag names only.
+    const OPEN: &str = "<thinking>";
+    const CLOSE: &str = "</thinking>";
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    let lower = text.to_ascii_lowercase();
+    while cursor < text.len() {
+        let Some(open_off) = lower[cursor..].find(OPEN) else {
+            out.push_str(&text[cursor..]);
+            break;
+        };
+        let open_abs = cursor + open_off;
+        let after_open = open_abs + OPEN.len();
+        let Some(close_off) = lower[after_open..].find(CLOSE) else {
+            // No closing tag — preserve the rest as-is.
+            out.push_str(&text[cursor..]);
+            break;
+        };
+        let close_abs = after_open + close_off;
+        let after_close = close_abs + CLOSE.len();
+        // Emit everything before the open tag; skip the open..close span.
+        out.push_str(&text[cursor..open_abs]);
+        cursor = after_close;
+    }
+    // Collapse blank-line runs left behind by the strip so we don't
+    // ship messages that start with multiple empty lines where the
+    // reasoning used to be.
+    out.trim_start_matches([' ', '\n', '\r'])
+        .replace("\n\n\n", "\n\n")
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn apply_send_message(
     conn: &mut Connection,
@@ -476,6 +526,7 @@ fn apply_send_message(
     origin: &OriginatingRouting,
 ) -> Result<ToolEffectAck, ToolApplyError> {
     let SendMessageSpec { to, text } = spec;
+    let text = strip_reasoning_blocks(&text);
     let routed = resolve_outbound_routing(to, origin);
     let mut body = serde_json::Map::new();
     body.insert("text".into(), serde_json::Value::String(text));
@@ -515,6 +566,7 @@ fn apply_send_file(
         data,
         text,
     } = spec;
+    let text = text.map(|t| strip_reasoning_blocks(&t));
     safe_attachment_name(&filename)
         .map_err(|e| ToolApplyError::Validation(e.to_string()))?;
     let msg_id = MessageId::new();
@@ -939,6 +991,66 @@ mod tests {
         let guard = ctx.outbound.lock().await;
         let rows = ironclaw_db::tables::messages_out::list_due(&guard).unwrap();
         rows.into_iter().next_back().unwrap()
+    }
+
+    #[test]
+    fn strip_reasoning_drops_thinking_blocks() {
+        let raw = "<thinking>\nThe user wants X.\nI should do Y.\n</thinking>\n\nHere is the answer.";
+        assert_eq!(strip_reasoning_blocks(raw), "Here is the answer.");
+    }
+
+    #[test]
+    fn strip_reasoning_handles_multiple_blocks() {
+        let raw = "<thinking>step 1</thinking>\nFirst.\n<thinking>step 2</thinking>\nSecond.";
+        let out = strip_reasoning_blocks(raw);
+        assert!(!out.contains("step"), "got: {out:?}");
+        assert!(out.contains("First.") && out.contains("Second."));
+    }
+
+    #[test]
+    fn strip_reasoning_preserves_unterminated_tag() {
+        // If the model emits an open tag with no close, leave the text
+        // alone — we'd rather ship a tagged message than silently
+        // swallow the entire reply.
+        let raw = "<thinking>\nThis never closes — keep the body.";
+        assert_eq!(strip_reasoning_blocks(raw), raw);
+    }
+
+    #[test]
+    fn strip_reasoning_is_case_insensitive_on_tag() {
+        let raw = "<Thinking>reason</THINKING>\nReply.";
+        assert_eq!(strip_reasoning_blocks(raw), "Reply.");
+    }
+
+    #[test]
+    fn strip_reasoning_leaves_plain_text_alone() {
+        let raw = "Plain reply with no reasoning tags.";
+        assert_eq!(strip_reasoning_blocks(raw), raw);
+    }
+
+    #[tokio::test]
+    async fn send_message_strips_thinking_block_from_chat_text() {
+        let (_tmp, ctx) = fresh_ctx();
+        ctx.emit_outbound(OutboundToolEffect::SendMessage(SendMessageSpec {
+            to: Some(Recipient::Channel {
+                id: "telegram:chat-1".into(),
+            }),
+            text: "<thinking>\nThe user said hi.\nI should greet them.\n</thinking>\n\nHi there!"
+                .into(),
+        }))
+        .await
+        .unwrap();
+        let row = last_row(&ctx).await;
+        let text = row.content["text"].as_str().unwrap();
+        assert!(
+            !text.contains("<thinking>") && !text.contains("</thinking>"),
+            "thinking tags leaked into outbound text: {text:?}"
+        );
+        assert!(text.contains("Hi there!"));
+        assert!(
+            !text.contains("I should greet"),
+            "reasoning content leaked: {text:?}"
+        );
     }
 
     #[tokio::test]
