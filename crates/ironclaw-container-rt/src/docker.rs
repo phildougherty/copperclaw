@@ -19,7 +19,7 @@ use bollard::container::{
     Config, CreateContainerOptions, ListContainersOptions, RemoveContainerOptions, StopContainerOptions,
 };
 use bollard::image::BuildImageOptions;
-use bollard::models::{HostConfig, Mount as DockerMount, MountTypeEnum};
+use bollard::models::{DeviceRequest, HostConfig, Mount as DockerMount, MountTypeEnum};
 use bollard::Docker;
 use bytes::Bytes;
 use futures::stream::StreamExt;
@@ -218,7 +218,7 @@ pub(crate) fn container_config(spec: &ContainerSpec) -> Config<String> {
         .map(|(host, ip)| format!("{host}:{ip}"))
         .collect();
 
-    let host_config = host_config_with_limits(&spec.resource_limits, mounts, extra_hosts);
+    let host_config = host_config_with_limits(&spec.resource_limits, mounts, extra_hosts, spec.gpu_passthrough);
 
     Config {
         image: Some(spec.image.clone()),
@@ -240,6 +240,7 @@ pub(crate) fn host_config_with_limits(
     limits: &ResourceLimits,
     mounts: Vec<DockerMount>,
     extra_hosts: Vec<String>,
+    gpu_passthrough: bool,
 ) -> HostConfig {
     // Docker's CPU quota is in nano-CPUs (1 CPU = 1_000_000_000 nano-CPUs).
     // The f64->i64 truncation is intentional: fractional nano-CPUs are meaningless.
@@ -256,12 +257,27 @@ pub(crate) fn host_config_with_limits(
     #[allow(clippy::cast_possible_wrap)]
     let pids_limit = limits.pids_limit.map(|p| p as i64);
 
+    // `--gpus all` equivalent. `count=-1` means "every device the
+    // driver enumerates" — Nvidia's runtime hooks resolve this at
+    // container start. Requires `nvidia-container-toolkit` on the host.
+    let device_requests = if gpu_passthrough {
+        Some(vec![DeviceRequest {
+            driver: Some("nvidia".to_string()),
+            count: Some(-1),
+            capabilities: Some(vec![vec!["gpu".to_string()]]),
+            ..Default::default()
+        }])
+    } else {
+        None
+    };
+
     HostConfig {
         mounts: Some(mounts),
         extra_hosts: Some(extra_hosts),
         nano_cpus,
         memory,
         pids_limit,
+        device_requests,
         ..Default::default()
     }
 }

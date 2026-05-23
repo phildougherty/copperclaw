@@ -798,6 +798,7 @@ fn spawn_container_manager(
         skills_dir: cfg.skills_dir.clone(),
         groups_dir: cfg.groups_dir.clone(),
         skills_mode: cfg.skills_mode,
+        gpu_passthrough: parse_truthy_env("IRONCLAW_CONTAINER_GPU"),
         forward_env: collect_forward_env(),
     };
     let manager = Arc::new(
@@ -861,6 +862,15 @@ async fn run_boot_image_health_check(
 /// provider keys + the explicit provider override; the list is kept
 /// here (rather than spread across the modules that need them) so
 /// the host has one place to audit what leaks into the container.
+/// Parse a boolean-ish env var. Truthy: `1`, `true`, `yes`, `on`, `all`
+/// (case-insensitive). Anything else (incl. unset, empty) is false.
+fn parse_truthy_env(name: &str) -> bool {
+    matches!(
+        std::env::var(name).ok().as_deref(),
+        Some("1" | "true" | "True" | "TRUE" | "yes" | "Yes" | "YES" | "on" | "On" | "ON" | "all" | "All" | "ALL")
+    )
+}
+
 fn collect_forward_env() -> Vec<(String, String)> {
     const FORWARDED: &[&str] = &[
         // Web-search providers (web_search tool).

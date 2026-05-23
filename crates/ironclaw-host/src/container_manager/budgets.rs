@@ -266,6 +266,7 @@ mod tests {
             skills_dir: None,
             groups_dir: None,
             skills_mode: SkillsMode::Inline,
+            gpu_passthrough: false,
             forward_env: Vec::new(),
         }
     }

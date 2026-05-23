@@ -157,6 +157,15 @@ pub struct ContainerSpec {
     pub extra_hosts: Vec<(String, String)>,
     /// Per-group resource caps applied at spawn time.
     pub resource_limits: ResourceLimits,
+    /// When `true`, expose every Nvidia GPU on the host to the
+    /// container (`docker run --gpus all` equivalent — wires a
+    /// `DeviceRequest { driver: "nvidia", count: -1, capabilities:
+    /// [["gpu"]] }` into the bollard `HostConfig`). Requires the
+    /// `nvidia-container-toolkit` package on the host. Default off
+    /// because most agent sessions don't need GPU access and a
+    /// device-request against a host without the toolkit fails the
+    /// spawn outright.
+    pub gpu_passthrough: bool,
     /// Egress allow-list.  Empty means allow-all.  Non-empty restricts
     /// outbound traffic to the listed `"host:port"` pairs.  Docker:
     /// enforced via iptables inside the container network namespace.
@@ -220,6 +229,14 @@ impl ContainerSpec {
     #[must_use]
     pub fn with_resource_limits(mut self, limits: ResourceLimits) -> Self {
         self.resource_limits = limits;
+        self
+    }
+
+    /// Expose all Nvidia GPUs on the host to the container. Requires
+    /// `nvidia-container-toolkit` on the host. See [`Self::gpu_passthrough`].
+    #[must_use]
+    pub fn with_gpu_passthrough(mut self, on: bool) -> Self {
+        self.gpu_passthrough = on;
         self
     }
 

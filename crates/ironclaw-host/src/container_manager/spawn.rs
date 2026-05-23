@@ -419,6 +419,16 @@ impl ContainerManager {
             }
         }
 
+        // Host-wide Nvidia GPU passthrough. Gated by `IRONCLAW_CONTAINER_GPU`
+        // at boot so a default install never asks Docker for a device the
+        // host doesn't have. When the host has `nvidia-container-toolkit`
+        // installed, the agent sees the host's GPUs via `nvidia-smi`
+        // inside the container and can run CUDA/Ollama workloads
+        // directly.
+        if self.cfg.gpu_passthrough {
+            spec = spec.with_gpu_passthrough(true);
+        }
+
         spec
     }
 }
@@ -667,6 +677,7 @@ mod tests {
             skills_dir: None,
             groups_dir: None,
             skills_mode: SkillsMode::Inline,
+            gpu_passthrough: false,
             forward_env: Vec::new(),
         }
     }

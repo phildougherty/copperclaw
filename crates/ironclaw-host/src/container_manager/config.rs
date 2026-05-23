@@ -120,6 +120,11 @@ pub struct ManagerConfig {
     /// bodies behind a `load_skill` MCP tool to keep the system prompt
     /// small. Set via `IRONCLAW_SKILLS_MODE` at boot.
     pub skills_mode: SkillsMode,
+    /// Expose host Nvidia GPUs to every spawned container (`docker run
+    /// --gpus all` equivalent). Default off because the device request
+    /// fails the spawn outright on hosts without `nvidia-container-
+    /// toolkit`. Set via `IRONCLAW_CONTAINER_GPU=1` (or `all`, `true`).
+    pub gpu_passthrough: bool,
     /// Extra environment variables to forward into every spawned
     /// session container. Used to plumb operator-supplied API keys
     /// (Tavily / Exa / Brave / `SerpAPI` / etc.) and arbitrary
