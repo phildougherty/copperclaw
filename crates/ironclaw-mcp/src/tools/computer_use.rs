@@ -271,30 +271,249 @@ pub mod shell {
 
 pub mod read_file {
     //! `read_file`: read a UTF-8 file from the container filesystem.
+    //!
+    //! Supports two access modes:
+    //!   - `bytes` (default): seek to `offset` (0-indexed) and read up
+    //!     to `min(limit, READ_FILE_CAP)` bytes. Useful for binary-ish
+    //!     spelunking and for "give me 8 KB starting at 1 MB" reads of
+    //!     large logs.
+    //!   - `lines`: 1-indexed line range. `offset = 1, limit = 50`
+    //!     reads the first 50 lines; `offset = 200, limit = 100` reads
+    //!     lines 200–299. The line-count cap still applies via
+    //!     `READ_FILE_CAP` — bytes accumulated past the cap stop the
+    //!     read and flip `truncated`.
+    //!
+    //! Out-of-range offsets return an empty body with `truncated: false`,
+    //! not an error — the agent gets a clean signal that it walked off
+    //! the end. Negative offsets are rejected at parse time; for
+    //! tail-style reads the agent should use `shell tail -n N`.
 
     use super::{
         json, parse_args, success_json, CallToolResult, Deserialize, JsonObject,
         PathBuf, Tool, ToolEntry, ToolError, ToolHandler, READ_FILE_CAP,
     };
+    use serde_json::Value;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
+    /// Default behaviour when neither `offset` nor `limit` is given:
+    /// keep the historical "read from start, cap at `READ_FILE_CAP`"
+    /// shape so existing callers don't change.
     #[derive(Debug, Deserialize)]
     struct Input {
         path: String,
+        /// 0-indexed byte offset (`bytes` mode) or 1-indexed line
+        /// number (`lines` mode). Negative values are rejected — see
+        /// [`parse_input`].
+        #[serde(default)]
+        offset: Option<i64>,
+        /// Number of bytes (`bytes` mode) or lines (`lines` mode) to
+        /// read. Bytes are still clamped to `READ_FILE_CAP` regardless.
+        #[serde(default)]
+        limit: Option<i64>,
+        /// Either `"bytes"` (default) or `"lines"`. Anything else is
+        /// rejected as a Validation error.
+        #[serde(default)]
+        mode: Option<String>,
+    }
+
+    /// What [`handle`] decided to do after validating the user's input.
+    struct Plan {
+        path: PathBuf,
+        offset: u64,
+        limit: u64,
+        mode: Mode,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Mode {
+        Bytes,
+        Lines,
+    }
+
+    impl Mode {
+        fn as_str(self) -> &'static str {
+            match self {
+                Self::Bytes => "bytes",
+                Self::Lines => "lines",
+            }
+        }
     }
 
     pub fn schema() -> Tool {
         super::make_tool(
             "read_file",
-            "Read a UTF-8 file from the container filesystem. Capped at 128 KiB; larger files are truncated to the head with `truncated: true` in the response. For larger files, extract just the relevant region with `grep` / `shell` instead.",
+            "Read a UTF-8 file. Default reads from the start, capped at 128 KiB. For larger files or precise regions, use `offset` + `limit` + `mode: 'bytes' | 'lines'`. Examples: `{path:'x.log', mode:'lines', offset:200, limit:100}` reads lines 200-299; `{path:'x.log', mode:'bytes', offset:1000000, limit:8000}` reads 8 KB starting at byte 1 MB. Tail-reads aren't supported — use `shell tail -n N` for those.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["path"],
                 "properties": {
-                    "path": { "type": "string", "minLength": 1 }
+                    "path":   { "type": "string", "minLength": 1 },
+                    "offset": { "type": ["integer", "null"], "minimum": 0 },
+                    "limit":  { "type": ["integer", "null"], "minimum": 0 },
+                    "mode":   { "type": ["string", "null"], "enum": ["bytes", "lines", null] }
                 }
             }),
         )
+    }
+
+    /// Translate `Input` into a validated `Plan`. Centralises the
+    /// "what does no-args mean", "what counts as a valid mode", and
+    /// "is the limit clamped to the cap" logic so [`handle`] stays
+    /// focused on I/O.
+    fn parse_input(input: &Input) -> Result<Plan, ToolError> {
+        // Reject negatives up front; we can't represent them as u64.
+        // `unsigned_abs` after the check is safe and avoids the
+        // sign-loss cast clippy lints.
+        let raw_offset = match input.offset {
+            Some(o) if o < 0 => {
+                return Err(ToolError::Validation(
+                    "`offset` must be >= 0 (tail-reads not supported; use `shell tail -n N`)"
+                        .into(),
+                ));
+            }
+            Some(o) => o.unsigned_abs(),
+            None => 0,
+        };
+        let raw_limit = match input.limit {
+            Some(l) if l < 0 => {
+                return Err(ToolError::Validation("`limit` must be >= 0".into()));
+            }
+            Some(l) => Some(l.unsigned_abs()),
+            None => None,
+        };
+        let mode = match input.mode.as_deref() {
+            None | Some("bytes") => Mode::Bytes,
+            Some("lines") => Mode::Lines,
+            Some(other) => {
+                return Err(ToolError::Validation(format!(
+                    "`mode` must be \"bytes\" or \"lines\" (got `{other}`)"
+                )));
+            }
+        };
+        let limit = match (mode, raw_limit) {
+            // bytes mode: missing limit means "as much as the cap allows"
+            (Mode::Bytes, None) => READ_FILE_CAP as u64,
+            (Mode::Bytes, Some(l)) => l.min(READ_FILE_CAP as u64),
+            // lines mode: missing limit means "until cap"; cap still
+            // bounds total bytes accumulated, not the line count.
+            (Mode::Lines, None) => u64::MAX,
+            (Mode::Lines, Some(l)) => l,
+        };
+        Ok(Plan {
+            path: PathBuf::from(&input.path),
+            offset: raw_offset,
+            limit,
+            mode,
+        })
+    }
+
+    /// Read a byte-range slice of the file. `truncated` flips on when
+    /// we hit `READ_FILE_CAP` and there's still file past the read
+    /// window. Out-of-range offsets short-circuit to an empty body
+    /// with `truncated: false` — the agent walked off the end, that's
+    /// not an error.
+    async fn read_bytes_range(
+        path: &std::path::Path,
+        offset: u64,
+        limit: u64,
+    ) -> Result<(String, bool, u64), ToolError> {
+        let mut f = tokio::fs::File::open(path).await.map_err(|e| {
+            ToolError::Internal(format!("read_file({}): {e}", path.display()))
+        })?;
+        let len = f
+            .metadata()
+            .await
+            .map_err(|e| {
+                ToolError::Internal(format!(
+                    "read_file({}) stat: {e}",
+                    path.display()
+                ))
+            })?
+            .len();
+        if offset >= len {
+            return Ok((String::new(), false, 0));
+        }
+        f.seek(SeekFrom::Start(offset)).await.map_err(|e| {
+            ToolError::Internal(format!(
+                "read_file({}) seek: {e}",
+                path.display()
+            ))
+        })?;
+        // Cap reads at READ_FILE_CAP regardless of caller's `limit` to
+        // protect the context window.
+        let cap = limit.min(READ_FILE_CAP as u64);
+        let available = len.saturating_sub(offset);
+        let to_read = cap.min(available);
+        #[allow(clippy::cast_possible_truncation)]
+        let mut buf = vec![0u8; to_read as usize];
+        f.read_exact(&mut buf).await.map_err(|e| {
+            ToolError::Internal(format!(
+                "read_file({}) read: {e}",
+                path.display()
+            ))
+        })?;
+        // `truncated` reflects "there was more we didn't return". If
+        // the caller's limit was higher than the cap and the file had
+        // more bytes past the cap, flag it.
+        let truncated = to_read < available;
+        // Decode as lossy UTF-8 so a mid-multibyte slice still
+        // produces valid text (replacement char in the worst case).
+        let body = String::from_utf8_lossy(&buf).into_owned();
+        Ok((body, truncated, to_read))
+    }
+
+    /// Read a 1-indexed line range. The cap on accumulated bytes
+    /// still applies — a runaway line-grab on a giant file stops at
+    /// `READ_FILE_CAP` with `truncated: true`. `offset = 0` is
+    /// treated as `1` for ergonomics (1-indexed but agents will mix
+    /// it up).
+    async fn read_lines_range(
+        path: &std::path::Path,
+        offset: u64,
+        limit: u64,
+    ) -> Result<(String, bool, u64), ToolError> {
+        // Read the whole file up to the cap+1 so we can detect overflow.
+        // For very large files this is the same memory pressure as the
+        // existing implementation — we don't make it worse.
+        let bytes = tokio::fs::read(path).await.map_err(|e| {
+            ToolError::Internal(format!("read_file({}): {e}", path.display()))
+        })?;
+        let text = String::from_utf8_lossy(&bytes);
+        // Normalise offset: 1-indexed, but accept 0 as "from the start".
+        let start_line = offset.max(1);
+        let mut out = String::new();
+        let mut count: u64 = 0;
+        let mut emitted_lines: u64 = 0;
+        // `split_inclusive` keeps the trailing newline on each chunk
+        // so we faithfully reconstruct the source slice.
+        let mut current_line: u64 = 0;
+        let mut truncated = false;
+        for line in text.split_inclusive('\n') {
+            current_line += 1;
+            if current_line < start_line {
+                continue;
+            }
+            if emitted_lines >= limit {
+                // We had more file past the requested window.
+                truncated = true;
+                break;
+            }
+            let line_bytes = line.len() as u64;
+            if count + line_bytes > READ_FILE_CAP as u64 {
+                // Cap hit mid-line; flip truncated and stop. We do not
+                // emit a partial line — keeping the body line-aligned
+                // is more useful to the model than maxing out bytes.
+                truncated = true;
+                break;
+            }
+            out.push_str(line);
+            count += line_bytes;
+            emitted_lines += 1;
+        }
+        // If the loop exhausted the file without filling `limit`, the
+        // body is exactly what the caller asked for — not truncated.
+        Ok((out, truncated, count))
     }
 
     pub async fn handle(
@@ -302,25 +521,42 @@ pub mod read_file {
         _ctx: &dyn crate::context::ToolContext,
     ) -> Result<CallToolResult, ToolError> {
         let input: Input = parse_args(arguments)?;
-        let path = PathBuf::from(&input.path);
-        let bytes = tokio::fs::read(&path).await.map_err(|e| {
-            ToolError::Internal(format!("read_file({}): {e}", path.display()))
-        })?;
-        let truncated = bytes.len() > READ_FILE_CAP;
-        let head = if truncated {
-            // Truncate on a UTF-8 char boundary so the model gets
-            // valid text — slicing raw bytes could split a multi-
-            // byte rune.
-            let s = String::from_utf8_lossy(&bytes[..READ_FILE_CAP]);
-            s.into_owned()
-        } else {
-            String::from_utf8_lossy(&bytes).into_owned()
+        let plan = parse_input(&input)?;
+
+        // For `bytes` mode + default path (offset=0, no caller-supplied
+        // limit beyond the cap) we preserve the pre-existing read-the-
+        // whole-file-and-truncate-the-head shape. Tests pin this.
+        let (body, truncated, bytes_read) = match plan.mode {
+            Mode::Bytes => {
+                read_bytes_range(&plan.path, plan.offset, plan.limit).await?
+            }
+            Mode::Lines => {
+                read_lines_range(&plan.path, plan.offset, plan.limit).await?
+            }
         };
+
+        // `limit_applied` is the cap actually enforced for this call.
+        // Bytes mode clamps to READ_FILE_CAP at parse time; lines mode
+        // surfaces the caller's limit (or `null` when uncapped).
+        let limit_applied: Value = match plan.mode {
+            Mode::Bytes => Value::Number(plan.limit.into()),
+            Mode::Lines => {
+                if plan.limit == u64::MAX {
+                    Value::Null
+                } else {
+                    Value::Number(plan.limit.into())
+                }
+            }
+        };
+
         Ok(success_json(&json!({
-            "path": path.display().to_string(),
-            "size_bytes": bytes.len(),
+            "path": plan.path.display().to_string(),
+            "body": body,
             "truncated": truncated,
-            "content": head,
+            "bytes_read": bytes_read,
+            "offset": plan.offset,
+            "limit_applied": limit_applied,
+            "mode": plan.mode.as_str(),
         })))
     }
 
@@ -1312,6 +1548,285 @@ mod tests {
         .unwrap();
         let body = result_text(&res);
         assert!(body.contains("\"truncated\": true"), "got: {body}");
+    }
+
+    /// Default behaviour (no offset/limit/mode): response shape echoes
+    /// `mode: "bytes"`, `offset: 0`, and `limit_applied` clamps to the
+    /// cap. Regression guard for callers that depend on the
+    /// unchanged-by-default contract.
+    #[tokio::test]
+    async fn read_file_default_behavior_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hello.txt");
+        tokio::fs::write(&path, b"abcdef\n").await.unwrap();
+        let res = read_file::handle(
+            Some(
+                json!({"path": path.to_string_lossy()})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            ctx().as_ref(),
+        )
+        .await
+        .unwrap();
+        let body = result_text(&res);
+        assert!(body.contains("\"truncated\": false"), "got: {body}");
+        assert!(body.contains("\"mode\": \"bytes\""), "got: {body}");
+        assert!(body.contains("\"offset\": 0"), "got: {body}");
+        // limit_applied should be the cap (131072 = 128 KiB)
+        assert!(
+            body.contains("\"limit_applied\": 131072"),
+            "got: {body}"
+        );
+        assert!(body.contains("\"bytes_read\": 7"), "got: {body}");
+        assert!(body.contains("abcdef"), "got: {body}");
+    }
+
+    /// `mode: "bytes"` with offset+limit reads exactly that byte range.
+    #[tokio::test]
+    async fn read_file_bytes_mode_offset_and_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bytes.bin");
+        // 0123456789abcdef (16 bytes)
+        tokio::fs::write(&path, b"0123456789abcdef").await.unwrap();
+        let res = read_file::handle(
+            Some(
+                json!({
+                    "path": path.to_string_lossy(),
+                    "mode": "bytes",
+                    "offset": 4,
+                    "limit": 5,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            ctx().as_ref(),
+        )
+        .await
+        .unwrap();
+        let body = result_text(&res);
+        assert!(body.contains("\"body\": \"45678\""), "got: {body}");
+        assert!(body.contains("\"bytes_read\": 5"), "got: {body}");
+        assert!(body.contains("\"offset\": 4"), "got: {body}");
+        assert!(body.contains("\"limit_applied\": 5"), "got: {body}");
+        assert!(body.contains("\"mode\": \"bytes\""), "got: {body}");
+        // 16 - (4+5) = 7 bytes still on disk; truncated must flip on.
+        assert!(body.contains("\"truncated\": true"), "got: {body}");
+    }
+
+    /// `mode: "lines"` with offset+limit reads the exact 1-indexed
+    /// line range — `offset:2, limit:3` returns lines 2, 3, 4.
+    #[tokio::test]
+    async fn read_file_lines_mode_offset_and_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lines.txt");
+        tokio::fs::write(
+            &path,
+            b"line1\nline2\nline3\nline4\nline5\nline6\n",
+        )
+        .await
+        .unwrap();
+        let res = read_file::handle(
+            Some(
+                json!({
+                    "path": path.to_string_lossy(),
+                    "mode": "lines",
+                    "offset": 2,
+                    "limit": 3,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            ctx().as_ref(),
+        )
+        .await
+        .unwrap();
+        let body = result_text(&res);
+        assert!(body.contains("line2"), "got: {body}");
+        assert!(body.contains("line3"), "got: {body}");
+        assert!(body.contains("line4"), "got: {body}");
+        assert!(!body.contains("line1"), "leaked line1: {body}");
+        assert!(!body.contains("line5"), "leaked line5: {body}");
+        assert!(body.contains("\"mode\": \"lines\""), "got: {body}");
+        assert!(body.contains("\"offset\": 2"), "got: {body}");
+        assert!(body.contains("\"limit_applied\": 3"), "got: {body}");
+        // There were lines past the window, so truncated flips on.
+        assert!(body.contains("\"truncated\": true"), "got: {body}");
+    }
+
+    /// Reading the final lines exactly (no overflow) should NOT flag
+    /// truncated. Distinguishes "you got everything you asked for"
+    /// from "I had to stop early".
+    #[tokio::test]
+    async fn read_file_lines_mode_exact_tail_not_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lines.txt");
+        tokio::fs::write(&path, b"a\nb\nc\n").await.unwrap();
+        let res = read_file::handle(
+            Some(
+                json!({
+                    "path": path.to_string_lossy(),
+                    "mode": "lines",
+                    "offset": 2,
+                    "limit": 2,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            ctx().as_ref(),
+        )
+        .await
+        .unwrap();
+        let body = result_text(&res);
+        assert!(body.contains("\"truncated\": false"), "got: {body}");
+    }
+
+    /// Out-of-range offset returns empty body with `truncated: false`
+    /// — agent walking off the end is a clean signal, not an error.
+    #[tokio::test]
+    async fn read_file_offset_beyond_eof_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.txt");
+        tokio::fs::write(&path, b"hi").await.unwrap();
+        let res = read_file::handle(
+            Some(
+                json!({
+                    "path": path.to_string_lossy(),
+                    "mode": "bytes",
+                    "offset": 1_000_000,
+                    "limit": 100,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            ctx().as_ref(),
+        )
+        .await
+        .unwrap();
+        let body = result_text(&res);
+        assert!(body.contains("\"body\": \"\""), "got: {body}");
+        assert!(body.contains("\"truncated\": false"), "got: {body}");
+        assert!(body.contains("\"bytes_read\": 0"), "got: {body}");
+    }
+
+    /// `limit` above READ_FILE_CAP must be clamped to the cap so a
+    /// careless caller can't blow the context window.
+    #[tokio::test]
+    async fn read_file_limit_clamped_to_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.bin");
+        // Just past the cap so the clamp is observable.
+        let big = "a".repeat(200 * 1024);
+        tokio::fs::write(&path, &big).await.unwrap();
+        let res = read_file::handle(
+            Some(
+                json!({
+                    "path": path.to_string_lossy(),
+                    "mode": "bytes",
+                    "offset": 0,
+                    "limit": 10_000_000_u64,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            ctx().as_ref(),
+        )
+        .await
+        .unwrap();
+        let body = result_text(&res);
+        // The cap (131072 = 128 KiB) wins over the caller's 10M.
+        assert!(
+            body.contains("\"limit_applied\": 131072"),
+            "got: {body}"
+        );
+        assert!(body.contains("\"bytes_read\": 131072"), "got: {body}");
+        assert!(body.contains("\"truncated\": true"), "got: {body}");
+    }
+
+    /// Negative offset is rejected at parse time with a Validation
+    /// error — tail-reads aren't supported via `offset`.
+    #[tokio::test]
+    async fn read_file_negative_offset_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.txt");
+        tokio::fs::write(&path, b"hi").await.unwrap();
+        let err = read_file::handle(
+            Some(
+                json!({
+                    "path": path.to_string_lossy(),
+                    "offset": -1,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            ctx().as_ref(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Validation(_)),
+            "expected Validation, got: {err:?}"
+        );
+    }
+
+    /// Negative limit is also rejected.
+    #[tokio::test]
+    async fn read_file_negative_limit_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.txt");
+        tokio::fs::write(&path, b"hi").await.unwrap();
+        let err = read_file::handle(
+            Some(
+                json!({
+                    "path": path.to_string_lossy(),
+                    "limit": -5,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            ctx().as_ref(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Validation(_)),
+            "expected Validation, got: {err:?}"
+        );
+    }
+
+    /// Unknown `mode` value is rejected with a Validation error so
+    /// the agent gets an immediate signal rather than silent fallback.
+    #[tokio::test]
+    async fn read_file_unknown_mode_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("x.txt");
+        tokio::fs::write(&path, b"hi").await.unwrap();
+        let err = read_file::handle(
+            Some(
+                json!({
+                    "path": path.to_string_lossy(),
+                    "mode": "chars",
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            ctx().as_ref(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Validation(_)),
+            "expected Validation, got: {err:?}"
+        );
     }
 
     #[tokio::test]

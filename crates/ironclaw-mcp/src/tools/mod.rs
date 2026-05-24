@@ -19,10 +19,13 @@ use crate::context::{ToolContext, ToolEffectAck};
 use crate::error::ToolError;
 
 pub mod agents;
+pub mod apply_patch;
 pub mod computer_use;
+pub mod copy_file;
 pub mod core;
 pub mod edit_file;
 pub mod explore;
+pub mod multi_edit;
 pub(crate) mod git_common;
 pub mod git_blame;
 pub mod git_diff;
@@ -84,6 +87,9 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         scheduling::update_task::entry(),
         computer_use::shell::entry(),
         edit_file::entry(),
+        multi_edit::entry(),
+        apply_patch::entry(),
+        copy_file::entry(),
         computer_use::read_file::entry(),
         computer_use::write_file::entry(),
         computer_use::web_fetch::entry(),
@@ -188,6 +194,9 @@ mod tests {
             "update_task",
             "shell",
             "edit_file",
+            "multi_edit",
+            "apply_patch",
+            "copy_file",
             "read_file",
             "write_file",
             "web_fetch",

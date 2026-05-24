@@ -572,6 +572,9 @@ fn is_visible_breadcrumb_tool(name: &str) -> bool {
             | "read_file"
             | "write_file"
             | "edit_file"
+            | "multi_edit"
+            | "apply_patch"
+            | "copy_file"
             | "grep"
             | "glob"
             | "create_agent"
@@ -598,7 +601,20 @@ fn breadcrumb_detail(name: &str, input: &serde_json::Value) -> Option<String> {
         "shell" => field("command"),
         "web_search" | "explore" => field("query"),
         "web_fetch" => field("url"),
-        "read_file" | "write_file" | "edit_file" => field("path"),
+        "read_file" | "write_file" | "edit_file" | "multi_edit" | "apply_patch" => {
+            field("path")
+        }
+        "copy_file" => {
+            // Show "src → dst" so the user sees both ends of the copy
+            // in one glance.
+            let src = field("src");
+            let dst = field("dst");
+            match (src, dst) {
+                (Some(s), Some(d)) => Some(format!("{s} → {d}")),
+                (Some(s), None) | (None, Some(s)) => Some(s),
+                _ => None,
+            }
+        }
         "grep" | "glob" => field("pattern"),
         "create_agent" => field("name").or_else(|| field("prompt")),
         "add_mcp_server" => field("name"),

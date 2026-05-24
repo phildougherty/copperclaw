@@ -6,6 +6,47 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (4 new tools to reduce LLM round-trips for common patterns)
+
+Profiling the live failure modes (CapCut, base64 loop) surfaced the same
+underlying issue across many places: the model is doing work the host
+could do directly, burning tokens and round-trips. These four tools
+close the biggest gaps:
+
+- **`multi_edit`** (`crates/ironclaw-mcp/src/tools/multi_edit.rs`): apply
+  N find-replaces to one file in a single call. Replaces the pattern
+  of 5 sequential `edit_file` calls, each re-emitting overlapping
+  surrounding context as `old_string`. Atomic — if any edit fails, the
+  whole call rolls back. 50-edit hard cap. Later edits see earlier
+  edits applied. 5-10× reduction on multi-edit refactor sessions.
+- **`apply_patch`** (`crates/ironclaw-mcp/src/tools/apply_patch.rs`):
+  apply a unified diff to one file. For multi-region edits this is
+  3-10× more compact than the equivalent `edit_file` sequence — the
+  model writes a small diff instead of repeating overlapping
+  `old_string` context. Hand-rolled parser (no new crate deps).
+  Exact-context required, atomic on any hunk mismatch.
+- **`copy_file`** (`crates/ironclaw-mcp/src/tools/copy_file.rs`):
+  filesystem-level copy that doesn't round-trip the bytes through the
+  LLM. Replaces the `read_file(src)` + `write_file(dst, content=...)`
+  pattern that previously moved every byte through the model's
+  context twice. 32 MB hard ceiling. Optional `create_parents` and
+  `overwrite` flags. Binary-safe.
+- **`read_file` extended with `offset` / `limit` / `mode`**
+  (`crates/ironclaw-mcp/src/tools/computer_use.rs`): the existing
+  `read_file` tool now accepts a byte or line range. Lets the model
+  read precise regions of large files instead of pulling the whole
+  thing (or getting the truncated head). `mode: "lines"` is 1-indexed;
+  `mode: "bytes"` is 0-indexed. Out-of-range offsets return empty
+  body, not an error. Backward-compatible — calls without
+  offset/limit behave exactly as before.
+
+Tool-breadcrumb detail extractors extended to cover the new tools
+(`[multi_edit] src/main.rs`, `[apply_patch] src/lib.rs`,
+`[copy_file] src/template.html → src/page.html`).
+
+48 new tests across the four tools. Workspace: 5334 passing; clippy
+clean.
+
 ### Added (tool breadcrumbs now include input details)
 
 Previously the user-visible chat breadcrumbs were just `[tool_name]`
