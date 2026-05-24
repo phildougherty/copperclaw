@@ -91,7 +91,7 @@ pub mod shell {
     pub fn schema() -> Tool {
         super::make_tool(
             "shell",
-            "Run a bash command inside the container. Returns stdout, stderr, and exit code. Output is capped at 32 KiB per stream — if you expect more, narrow it first with `tail -n 200`, `head -n 200`, or `grep`. Working directory and exported environment variables persist across calls within a session; pass `reset: true` to wipe that state.",
+            "Run a bash command inside the container. Returns stdout, stderr, and exit code. Output is capped at 32 KiB per stream — if you expect more, narrow it first with `tail -n 200`, `head -n 200`, or `grep`. Working directory and exported environment variables persist across calls within a session; pass `reset: true` to wipe that state.\n\nDO NOT use `shell` to create or edit files. Use the dedicated tools instead: `write_file` for new files, `edit_file` / `multi_edit` / `apply_patch` for changes, `copy_file` to duplicate. Heredoc patterns like `cat > foo << 'EOF' ... EOF` and `echo \"content\" > foo` waste tokens twice: the file body travels through history as the shell `command` string, AND the tool result. The dedicated tools take the body as a clean `content` field and don't echo it back. Heredoc-style file writes are REJECTED here with a redirect message.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -106,6 +106,46 @@ pub mod shell {
         )
     }
 
+    /// Detect the obvious "write a file via shell" anti-patterns:
+    ///
+    /// - `cat > path << 'TAG'` / `cat >> path << TAG` (heredoc into file)
+    /// - `tee path << TAG` and `tee -a path << TAG`
+    /// - `cat <<TAG > path` (heredoc before redirect)
+    ///
+    /// Returns the matched pattern as a hint for the redirect message.
+    ///
+    /// We deliberately do NOT block `echo "..." > foo` even though it's
+    /// the same anti-pattern — `echo` redirects are often legitimate
+    /// short writes (1-2 lines of config) and false-positives would
+    /// hurt more than the leak. The heredoc form is the dominant cost.
+    pub(crate) fn detect_file_write_anti_pattern(cmd: &str) -> Option<&'static str> {
+        // Cheap: collapse whitespace and lower-case to make matching less
+        // brittle. We only need to recognise the shape, not parse bash.
+        let lower = cmd.to_ascii_lowercase();
+        let normalised: String = lower.split_whitespace().collect::<Vec<_>>().join(" ");
+        if normalised.contains("cat > ") && normalised.contains("<<") {
+            return Some("cat > FILE << EOF");
+        }
+        if normalised.contains("cat >> ") && normalised.contains("<<") {
+            return Some("cat >> FILE << EOF");
+        }
+        // `tee FILE << EOF` writes the heredoc body to FILE (with or
+        // without `-a` for append, with or without an intermediate
+        // pipe `> /dev/null` to suppress the echo). The pattern we
+        // want is "tee, then heredoc, regardless of redirect" — `tee`
+        // by definition writes to whatever filename follows it on the
+        // command line.
+        if (normalised.contains("tee ") || normalised.starts_with("tee "))
+            && normalised.contains("<<")
+        {
+            return Some("tee FILE << EOF");
+        }
+        if normalised.contains("cat <<") && normalised.contains("> ") {
+            return Some("cat <<EOF > FILE");
+        }
+        None
+    }
+
     pub async fn handle(
         arguments: Option<JsonObject>,
         _ctx: &dyn crate::context::ToolContext,
@@ -113,6 +153,21 @@ pub mod shell {
         let input: Input = parse_args(arguments)?;
         if input.command.trim().is_empty() {
             return Err(ToolError::Validation("`command` must be non-empty".into()));
+        }
+        if let Some(pattern) = detect_file_write_anti_pattern(&input.command) {
+            // Reject the heredoc-file-write pattern with a precise redirect
+            // so the next turn picks the right tool. The body of these
+            // commands is usually multiple KB of file content that would
+            // otherwise live in history as a shell command string. The
+            // dedicated tools (write_file / edit_file / etc.) take it as
+            // a clean `content` field that doesn't get echoed back in
+            // the tool result.
+            return Err(ToolError::Validation(format!(
+                "rejected: `{pattern}` writes a file through the shell command string, \
+                 which is captured into conversation history twice. Use `write_file` for a new file, \
+                 `edit_file` or `multi_edit` or `apply_patch` to modify, or `copy_file` to duplicate. \
+                 Re-issue with one of those tools instead of the heredoc pattern."
+            )));
         }
         let timeout = Duration::from_secs(
             input
@@ -1243,6 +1298,60 @@ mod tests {
         assert!(!content.contains("AWS_SECRET"), "AWS_SECRET leaked: {content}");
         assert!(!content.contains("STRIPE_KEY"), "STRIPE_KEY leaked: {content}");
         assert!(content.contains("SAFE_VAR"), "SAFE_VAR missing: {content}");
+    }
+
+    #[test]
+    fn shell_detects_cat_heredoc_file_write() {
+        let cases = [
+            "cat > /data/app.css << 'CSSEOF'\nbody{}\nCSSEOF",
+            "cat > /data/x.txt <<EOF\nhi\nEOF",
+            "cat >> /data/log <<TAG\nappend\nTAG",
+            "tee /tmp/foo <<'END'\nhi\nEND",
+            "tee -a /tmp/foo << END\nhi\nEND",
+            "cat <<EOF > /data/x.css\n/*style*/\nEOF",
+        ];
+        for cmd in cases {
+            assert!(
+                shell::detect_file_write_anti_pattern(cmd).is_some(),
+                "expected detection on: {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_does_not_flag_legitimate_uses() {
+        let cases = [
+            "ls -la /data",
+            "cat /data/app.css",                       // reading, no redirect
+            "echo hello > /tmp/x",                      // echo redirect — intentionally not blocked
+            "grep -r foo .",
+            "tar -czf out.tgz /data",
+            "diff -u a.txt b.txt",
+            "find . -name '*.rs' -exec wc -l {} \\;",   // contains '>' but inside -exec
+        ];
+        for cmd in cases {
+            assert!(
+                shell::detect_file_write_anti_pattern(cmd).is_none(),
+                "false positive on: {cmd:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_rejects_cat_heredoc_with_redirect_message() {
+        use rmcp::model::JsonObject;
+        let mut args = JsonObject::new();
+        args.insert(
+            "command".into(),
+            serde_json::Value::String(
+                "cat > /data/style.css << 'EOF'\nbody{color:red}\nEOF".into(),
+            ),
+        );
+        let ctx = crate::context::MockToolContext::new();
+        let err = shell::handle(Some(args), &ctx).await.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("write_file"), "must redirect to write_file: {msg}");
+        assert!(msg.contains("cat > FILE"), "must name the pattern: {msg}");
     }
 
     #[test]
