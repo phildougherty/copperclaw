@@ -26,6 +26,30 @@ pub(super) const MAX_PROVIDER_ATTEMPTS: u32 = 3;
 /// 250ms → 500ms → 1s.
 const INITIAL_PROVIDER_BACKOFF: Duration = Duration::from_millis(250);
 
+/// Cap on the `failure_reason` we splice into the user-visible apology.
+/// The apology format is `"I couldn't finish a reply on that message — {reason}. Try ..."`,
+/// so a 200-char reason keeps the whole message under ~300 chars even
+/// on the cli channel.
+const FAILURE_REASON_CAP: usize = 200;
+
+/// Build a concise, user-visible failure reason from a `ProviderError`.
+/// Includes the underlying error message (which carries the HTTP
+/// status and the API's response body for the `Api` variant, the
+/// transport detail for `Transport`, etc.) so the apology actually
+/// tells the user what went wrong instead of a bare "rejected the
+/// query".
+fn format_provider_failure_reason(err: &ProviderError) -> String {
+    let raw = format!("provider rejected the query before streaming started ({err})");
+    // Trim at a char boundary, append `…` if we truncated. Cheaper
+    // than pulling unicode-segmentation; correct because `chars()`
+    // returns codepoints.
+    if raw.chars().count() <= FAILURE_REASON_CAP {
+        return raw;
+    }
+    let prefix: String = raw.chars().take(FAILURE_REASON_CAP.saturating_sub(1)).collect();
+    format!("{prefix}…")
+}
+
 /// Make one LLM call. Pumps the streamed provider events into
 /// per-turn buffers and returns when the stream ends.
 pub(super) async fn run_llm_turn(
@@ -73,26 +97,33 @@ pub(super) async fn run_llm_turn(
                     provider = deps.provider.name(),
                     "provider query failed terminally; marking turn as failed"
                 );
+                // Include the underlying provider error in the
+                // failure_reason so the user-visible apology actually
+                // says WHY (e.g. "api error 400: prompt is too long:
+                // 250000 tokens, max 200000" instead of the bare
+                // "provider rejected the query"). Cap at 200 chars so
+                // a giant 4xx body doesn't overflow the apology.
+                // `ProviderError` derives Display via thiserror so
+                // `to_string()` gives a structured message ("api
+                // error 400: …", "transport error: …", etc.).
+                let reason = format_provider_failure_reason(&err);
                 let out = LlmTurnOutput {
                     failed: true,
-                    failure_reason:
-                        "provider rejected the query before streaming started".into(),
+                    failure_reason: reason.clone(),
                     ..LlmTurnOutput::default()
                 };
-                // Emit a SPECIFIC reason on the usage report so the
-                // failure mode is greppable in the audit log instead of
-                // being conflated with the post-stream failure path
-                // below. `drive_turn` will preserve this reason verbatim
-                // when wrapping the per-turn output for the run loop
-                // (see #12 in code-review notes).
+                // Same SPECIFIC reason on the usage_report so the
+                // failure mode is greppable in the audit log instead
+                // of being conflated with the post-stream failure
+                // path below. `drive_turn` will preserve this reason
+                // verbatim when wrapping the per-turn output for the
+                // run loop (see #12 in code-review notes).
                 emit_usage_report(
                     deps,
                     0,
                     0,
                     turn_started_at,
-                    &TurnOutcome::Failed(
-                        "provider rejected the query before streaming started".into(),
-                    ),
+                    &TurnOutcome::Failed(reason),
                 )
                 .await;
                 return Ok(out);
@@ -153,6 +184,7 @@ pub(super) async fn run_llm_turn(
 /// emits a terminal event ([`ProviderEvent::Result`] /
 /// [`ProviderEvent::Error`]). Returns the accumulated turn output plus
 /// the latest seen `(input_tokens, output_tokens)` counts.
+#[allow(clippy::too_many_lines)]
 pub(super) async fn pump_events(
     deps: &RunnerDeps,
     query: &mut dyn AgentQuery,
@@ -196,8 +228,23 @@ pub(super) async fn pump_events(
                 // return a complete response" wording. Empty-string
                 // sentinel is reserved for "no reason captured".
                 if out.failure_reason.is_empty() {
-                    out.failure_reason =
-                        "provider stream ended with an error event".into();
+                    // Splice the actual provider message in (capped)
+                    // so the apology says what happened, not just
+                    // "ended with an error event". The `message`
+                    // field on ProviderEvent::Error carries whatever
+                    // the provider streamed back as the error body.
+                    let trimmed: String = message
+                        .chars()
+                        .take(FAILURE_REASON_CAP.saturating_sub(60))
+                        .collect();
+                    let suffix = if message.chars().count() > FAILURE_REASON_CAP - 60 {
+                        "…"
+                    } else {
+                        ""
+                    };
+                    out.failure_reason = format!(
+                        "provider stream ended with an error event ({trimmed}{suffix})"
+                    );
                 }
                 break;
             }
