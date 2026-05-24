@@ -7,7 +7,7 @@ use crate::dispatch::{AdapterResolver, HostDispatcher};
 use crate::error::DeliveryError;
 use crate::system_actions::{parse_system_content, ParsedAction};
 use dashmap::DashMap;
-use ironclaw_channels_core::{AdapterError, ChannelAdapter};
+use ironclaw_channels_core::{AdapterError, Card, ChannelAdapter};
 use ironclaw_db::central::CentralDb;
 use ironclaw_db::session::{open_inbound, open_outbound, SessionPaths};
 use ironclaw_db::tables::{delivered, messages_in, messages_out, session_routing};
@@ -516,6 +516,20 @@ impl DeliveryService {
             MessageKind::Chat | MessageKind::Task | MessageKind::Webhook => {
                 self.dispatch_chat(row, &target, inbound_pool).await?;
             }
+            // Wave 2 of the cards rollout: deserialize the canonical
+            // Card from `content.card` and call the adapter's
+            // `deliver_card` hook so channels with native card support
+            // (Telegram inline keyboards, Slack Block Kit, …) render
+            // the structure. Belt-and-braces: if the adapter explicitly
+            // returns `Unsupported`, fall back to a plain `deliver`
+            // call with the text rendering. (The trait's default impl
+            // ALREADY converts to text via `deliver`, so most adapters
+            // will never surface Unsupported — this branch only fires
+            // for adapters that deliberately overrode `deliver_card` to
+            // opt out of cards entirely.)
+            MessageKind::Card => {
+                self.dispatch_card(row, &target, inbound_pool).await?;
+            }
         }
         Ok(())
     }
@@ -863,6 +877,117 @@ impl DeliveryService {
             &outbound,
         )
         .await?;
+        let in_conn = inbound_pool.connect()?;
+        delivered::insert(&in_conn, row.id, platform_message_id.as_deref(), "ok")?;
+        Ok(())
+    }
+
+    /// Dispatch a `MessageKind::Card` row.
+    ///
+    /// Row content shape (written by the runner's `apply_send_card`):
+    ///
+    /// ```json
+    /// { "card": { ...canonical Card... }, "to": { ...Recipient... } }
+    /// ```
+    ///
+    /// `to` is optional — present only when the model passed an explicit
+    /// `to:` to `send_card`. We forward it to the adapter as a routing
+    /// hint so wave-2 native renderers can use it for DM-open flows.
+    ///
+    /// Belt-and-braces: if the adapter returns
+    /// `Err(AdapterError::Unsupported(_))`, we treat that as "this
+    /// adapter has explicitly opted out of cards" and fall back to a
+    /// plain `deliver` call with the text rendering. (The trait's
+    /// default `deliver_card` impl already routes to `deliver` with the
+    /// text fallback, so most adapters never get here — this branch only
+    /// fires for adapters that deliberately overrode `deliver_card` to
+    /// return Unsupported.)
+    async fn dispatch_card(
+        &self,
+        row: &MessageOutRow,
+        target: &DispatchTarget,
+        inbound_pool: &SessionPool,
+    ) -> Result<(), DeliveryError> {
+        let channel_type = target
+            .channel_type
+            .clone()
+            .ok_or(DeliveryError::NoRoute(SessionId::nil()))?;
+        let platform_id = target
+            .platform_id
+            .clone()
+            .ok_or(DeliveryError::NoRoute(SessionId::nil()))?;
+        let adapter = self
+            .adapters
+            .get(&channel_type)
+            .map(|r| r.clone())
+            .ok_or_else(|| DeliveryError::NoAdapter(channel_type.clone()))?;
+
+        // Deserialize the canonical Card. The runner's apply path went
+        // through `Card::validate` at the MCP boundary, so a parse
+        // failure here is a host bug (e.g. corrupted row) rather than
+        // bad input — surface it as SystemAction so the retry loop
+        // doesn't keep banging on a row that will never parse.
+        let card: Card = match row.content.get("card") {
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                DeliveryError::SystemAction(format!(
+                    "card row content.card failed to deserialise into Card: {e}"
+                ))
+            })?,
+            None => {
+                return Err(DeliveryError::SystemAction(
+                    "card row missing content.card".into(),
+                ));
+            }
+        };
+        // Optional `to` hint — pulled out of the row body without
+        // committing to a typed Recipient at this layer (the adapter
+        // only needs a string for its DM-open / lookup flow).
+        let to_hint = row
+            .content
+            .get("to")
+            .and_then(|v| v.get("id"))
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                row.content
+                    .get("to")
+                    .and_then(|v| v.get("session_id"))
+                    .and_then(|v| v.as_str())
+            });
+
+        // Typing indicator — best-effort. Same as the chat path.
+        if let Err(err) = adapter
+            .set_typing(&platform_id, target.thread_id.as_deref())
+            .await
+        {
+            debug!(?err, "set_typing failed (ignored)");
+        }
+
+        let platform_message_id = match adapter
+            .deliver_card(&platform_id, target.thread_id.as_deref(), &card, to_hint)
+            .await
+        {
+            Ok(id) => id,
+            Err(AdapterError::Unsupported(reason)) => {
+                info!(
+                    channel = adapter.channel_type().as_str(),
+                    reason,
+                    "deliver_card unsupported; falling back to text deliver"
+                );
+                let outbound = OutboundMessage {
+                    kind: MessageKind::Chat,
+                    content: serde_json::json!({ "text": card.to_text_fallback() }),
+                    files: vec![],
+                };
+                call_adapter(
+                    adapter.as_ref(),
+                    &platform_id,
+                    target.thread_id.as_deref(),
+                    &outbound,
+                )
+                .await?
+            }
+            Err(other) => return Err(DeliveryError::Adapter(other)),
+        };
         let in_conn = inbound_pool.connect()?;
         delivered::insert(&in_conn, row.id, platform_message_id.as_deref(), "ok")?;
         Ok(())
@@ -2789,5 +2914,154 @@ mod tests {
             || ironclaw_db::tables::container_configs::get_mcp_servers(&db, ag)
                 .map(|v| v.as_object().is_some_and(serde_json::Map::is_empty))
                 .unwrap_or(false));
+    }
+
+    /// Card-kind row flows through the new `dispatch_card` path: the
+    /// canonical Card is pulled out of `content.card` and the adapter
+    /// gets a `deliver_card` call. The MockAdapter doesn't override
+    /// `deliver_card`, so it gets the trait-level default which routes
+    /// to `deliver` with the text fallback — proving the structure
+    /// reached the adapter and was rendered. End-to-end with native
+    /// renderers is covered by per-channel adapter crates in wave 2b.
+    #[tokio::test]
+    async fn card_kind_row_invokes_deliver_card_path() {
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        // Build a representative card and serialise it the way the
+        // runner does: `content.card` carries the full Card JSON.
+        let card = ironclaw_channels_core::Card {
+            title: Some("Order #42".into()),
+            body: Some("Confirm?".into()),
+            ..ironclaw_channels_core::Card::default()
+        };
+        let content = json!({
+            "card": serde_json::to_value(&card).unwrap(),
+        });
+        write_row(&out_pool, &make_row(MessageKind::Card, content));
+
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.delivered, 1);
+        assert_eq!(rpt.failed, 0);
+        // The MockAdapter records every `deliver` call. The default
+        // `deliver_card` impl on `ChannelAdapter` converts to text and
+        // routes through `deliver`, so the delivery counter ticks once
+        // with the text-fallback rendering.
+        let deliveries = mock.deliveries();
+        assert_eq!(deliveries.len(), 1);
+        let text = deliveries[0]
+            .message
+            .content
+            .get("text")
+            .and_then(|v| v.as_str())
+            .expect("text-fallback rendering must land on the `text` field");
+        assert!(text.contains("**Order #42**"));
+        assert!(text.contains("Confirm?"));
+    }
+
+    /// Adapters that explicitly override `deliver_card` to return
+    /// `Err(AdapterError::Unsupported)` get the host's belt-and-braces
+    /// fallback: a `deliver` call with the text rendering wrapped in a
+    /// Chat-kind `OutboundMessage`. Most adapters never trigger this
+    /// (the trait-level default already does the text-fallback), but
+    /// adapters that want to *refuse* cards outright can.
+    #[tokio::test]
+    async fn card_kind_row_falls_back_when_adapter_reports_unsupported() {
+        // Bespoke adapter that explicitly returns Unsupported from
+        // `deliver_card`. The host should fall back to `deliver` with
+        // the text rendering.
+        use ironclaw_channels_core::AdapterError as AE;
+        struct RefusingCardAdapter {
+            channel_type: ChannelType,
+            text_deliveries: StdMutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl ChannelAdapter for RefusingCardAdapter {
+            fn channel_type(&self) -> &ChannelType {
+                &self.channel_type
+            }
+            async fn deliver(
+                &self,
+                _platform_id: &str,
+                _thread_id: Option<&str>,
+                message: &OutboundMessage,
+            ) -> Result<Option<String>, AE> {
+                let text = message
+                    .content
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                self.text_deliveries.lock().unwrap().push(text);
+                Ok(Some("plat-id-1".into()))
+            }
+            async fn deliver_card(
+                &self,
+                _platform_id: &str,
+                _thread_id: Option<&str>,
+                _card: &ironclaw_channels_core::Card,
+                _to: Option<&str>,
+            ) -> Result<Option<String>, AE> {
+                Err(AE::Unsupported("this adapter rejects cards".into()))
+            }
+        }
+        let refusing = Arc::new(RefusingCardAdapter {
+            channel_type: ChannelType::new("mock"),
+            text_deliveries: StdMutex::new(vec![]),
+        });
+
+        let (service, _root, sess, _mock) = make_service().await;
+        // Replace the registered MockAdapter on channel "mock" with our
+        // refusing one.
+        service.register_adapter(
+            ChannelType::new("mock"),
+            refusing.clone() as Arc<dyn ChannelAdapter>,
+        );
+
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let card = ironclaw_channels_core::Card {
+            title: Some("Hi".into()),
+            ..ironclaw_channels_core::Card::default()
+        };
+        let content = json!({ "card": serde_json::to_value(&card).unwrap() });
+        write_row(&out_pool, &make_row(MessageKind::Card, content));
+
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.delivered, 1);
+        // The refusing adapter's `deliver` was invoked once with the
+        // text fallback — proves the host did the belt-and-braces
+        // fallback after Unsupported.
+        let texts = refusing.text_deliveries.lock().unwrap().clone();
+        assert_eq!(texts.len(), 1, "expected exactly one fallback deliver");
+        assert!(texts[0].contains("**Hi**"), "got: {:?}", texts[0]);
+    }
+
+    /// A Card-kind row whose `content.card` is malformed JSON (or
+    /// missing) is a host-level bug, not a user-recoverable transient
+    /// — record `failed` and don't keep retrying. The runner's MCP
+    /// boundary validates Cards on the way in, so reaching this branch
+    /// means the row was corrupted in flight.
+    #[tokio::test]
+    async fn card_kind_row_with_malformed_card_marks_failed() {
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        // No `card` key at all.
+        write_row(
+            &out_pool,
+            &make_row(MessageKind::Card, json!({"unrelated": "junk"})),
+        );
+
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.failed, 1);
+        assert_eq!(rpt.delivered, 0);
+        assert!(mock.deliveries().is_empty());
     }
 }

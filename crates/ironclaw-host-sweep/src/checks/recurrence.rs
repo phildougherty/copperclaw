@@ -187,6 +187,7 @@ fn parse_kind(s: &str) -> Result<MessageKind, SweepError> {
         "webhook" => MessageKind::Webhook,
         "system" => MessageKind::System,
         "agent" => MessageKind::Agent,
+        "card" => MessageKind::Card,
         other => return Err(SweepError::ScheduleParse(format!("unknown kind `{other}`"))),
     })
 }

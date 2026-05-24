@@ -305,7 +305,12 @@ impl ChannelAdapter for WebexAdapter {
             MessageKind::Chat
             | MessageKind::Task
             | MessageKind::Webhook
-            | MessageKind::Agent => self.deliver_chat(&target, thread_id, message).await,
+            | MessageKind::Agent
+            // Card-kind rows arrive here only when the host routes a card
+            // through the legacy `deliver` path (e.g. unit-test fixtures).
+            // Treat as chat delivery — wave 2 wires up `deliver_card`
+            // properly and routes card-kind rows away from this match.
+            | MessageKind::Card => self.deliver_chat(&target, thread_id, message).await,
             MessageKind::System => self.deliver_system(&target, message).await,
         }
     }

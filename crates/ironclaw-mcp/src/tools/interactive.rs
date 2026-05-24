@@ -97,13 +97,23 @@ pub mod ask_user_question {
 }
 
 pub mod send_card {
-    //! `send_card`: send a structured card. The card body is opaque to this
-    //! crate — the channel adapter validates the payload.
+    //! `send_card`: send a canonical, portable card that every channel
+    //! adapter knows how to render.
+    //!
+    //! The card schema lives in `ironclaw-channels-core::Card`. Channels
+    //! with native card support (Telegram inline keyboards, Slack Block
+    //! Kit, Discord embeds, Google Chat cards v2, etc.) render the
+    //! structure directly via their `deliver_card` override. Channels
+    //! without native support fall back automatically to a deterministic
+    //! text rendering via the trait-level default — so calling
+    //! `send_card` from any agent on any channel produces a usable
+    //! result.
 
     use super::{validate_to, RecipientInput};
     use crate::context::{OutboundToolEffect, SendCardSpec, ToolContext};
     use crate::error::ToolError;
     use crate::tools::{ack_to_result, make_tool, parse_args, ToolEntry, ToolHandler};
+    use ironclaw_channels_core::Card;
     use rmcp::model::{CallToolResult, JsonObject, Tool};
     use serde::Deserialize;
 
@@ -111,20 +121,90 @@ pub mod send_card {
     struct Input {
         #[serde(default)]
         to: Option<RecipientInput>,
-        card: serde_json::Value,
+        /// Canonical card payload — parsed directly into [`Card`] so the
+        /// MCP boundary catches malformed input before the runner ever
+        /// sees it.
+        card: Card,
     }
 
     pub fn schema() -> Tool {
         make_tool(
             "send_card",
-            "Send a structured card payload understood by the destination channel adapter.",
+            // The description is what the model sees — keep it grounded
+            // in the portability story so the agent reaches for cards
+            // when it has structured content, regardless of channel.
+            "Portable card schema — works on every channel. Channels with native \
+             card support (Telegram, Slack, etc.) render the structure; channels \
+             without it fall back to formatted text. Provide title/body/fields/\
+             buttons/image_url. Buttons each have either `value` (for callback) \
+             or `url` (for link).",
             serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["card"],
                 "properties": {
                     "to": { "type": ["string", "object", "null"] },
-                    "card": { "type": "object" }
+                    "card": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "description": "Canonical card. At least one of title, body, fields, or image_url must be present.",
+                        "properties": {
+                            "title": {
+                                "type": "string",
+                                "description": "Headline. Rendered bold on text-only channels; embed title on Discord; etc."
+                            },
+                            "body": {
+                                "type": "string",
+                                "description": "Body paragraph. Markdown or plain text — adapters handle channel-specific escaping."
+                            },
+                            "fields": {
+                                "type": "array",
+                                "description": "Key/value rows. Rendered as a small table where the channel supports it.",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["label", "value"],
+                                    "properties": {
+                                        "label": { "type": "string" },
+                                        "value": { "type": "string" },
+                                        "inline": {
+                                            "type": "boolean",
+                                            "description": "Hint: render side-by-side with the next field when the channel supports it."
+                                        }
+                                    }
+                                }
+                            },
+                            "buttons": {
+                                "type": "array",
+                                "description": "Interactive buttons. Each button must set EITHER `value` (callback payload sent back as an inbound chat message) OR `url` (opens a link). Set exactly one — both is rejected.",
+                                "items": {
+                                    "type": "object",
+                                    "additionalProperties": false,
+                                    "required": ["label"],
+                                    "properties": {
+                                        "label": { "type": "string" },
+                                        "value": {
+                                            "type": "string",
+                                            "description": "Callback payload. ≤ 64 bytes."
+                                        },
+                                        "url": {
+                                            "type": "string",
+                                            "description": "http(s) URL to open."
+                                        },
+                                        "style": {
+                                            "type": "string",
+                                            "description": "primary | danger | secondary. Adapters that don't support styles ignore this.",
+                                            "enum": ["primary", "danger", "secondary"]
+                                        }
+                                    }
+                                }
+                            },
+                            "image_url": {
+                                "type": "string",
+                                "description": "http(s) image URL. Rendered inline where supported."
+                            }
+                        }
+                    }
                 }
             }),
         )
@@ -135,9 +215,13 @@ pub mod send_card {
         ctx: &dyn ToolContext,
     ) -> Result<CallToolResult, ToolError> {
         let input: Input = parse_args(arguments)?;
-        if !input.card.is_object() {
-            return Err(ToolError::Validation("`card` must be an object".into()));
-        }
+        // Run the canonical schema validator at the MCP boundary so the
+        // model gets a precise error message and the runner never
+        // touches an invalid card.
+        input
+            .card
+            .validate()
+            .map_err(|e| ToolError::Validation(e.to_string()))?;
         let to = validate_to(input.to)?;
         let spec = SendCardSpec {
             to,
@@ -237,22 +321,94 @@ mod tests {
     #[tokio::test]
     async fn send_card_happy() {
         let ctx = MockToolContext::new();
+        // Full canonical card — title, body, one field, one button, one image.
         send_card::handle(
-            args_from(serde_json::json!({"card": {"title": "Hi"}})),
+            args_from(serde_json::json!({
+                "card": {
+                    "title": "Order #42",
+                    "body": "Confirm?",
+                    "fields": [{"label": "Item", "value": "Espresso"}],
+                    "buttons": [{"label": "Confirm", "value": "confirm:42"}],
+                    "image_url": "https://example.com/x.png"
+                }
+            })),
             &ctx,
         )
         .await
         .unwrap();
         match &ctx.calls()[0] {
             OutboundToolEffect::SendCard(s) => {
-                assert_eq!(s.card["title"], "Hi");
+                assert_eq!(s.card.title.as_deref(), Some("Order #42"));
+                assert_eq!(s.card.body.as_deref(), Some("Confirm?"));
+                assert_eq!(s.card.fields.len(), 1);
+                assert_eq!(s.card.fields[0].label, "Item");
+                assert_eq!(s.card.buttons.len(), 1);
+                assert_eq!(s.card.buttons[0].value.as_deref(), Some("confirm:42"));
+                assert_eq!(
+                    s.card.image_url.as_deref(),
+                    Some("https://example.com/x.png")
+                );
             }
             other => panic!("unexpected: {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn send_card_validation_not_object() {
+    async fn send_card_rejects_empty_card() {
+        // An empty `{}` card has no title / body / fields / image — the
+        // canonical validator rejects it as `CardError::Empty`.
+        let ctx = MockToolContext::new();
+        let err = send_card::handle(args_from(serde_json::json!({"card": {}})), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn send_card_rejects_button_without_target() {
+        // A button with neither `value` nor `url` is rejected.
+        let ctx = MockToolContext::new();
+        let err = send_card::handle(
+            args_from(serde_json::json!({
+                "card": {
+                    "title": "Hi",
+                    "buttons": [{"label": "Click"}]
+                }
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        let msg = match err {
+            ToolError::Validation(m) => m,
+            other => panic!("expected Validation, got {other:?}"),
+        };
+        assert!(msg.contains("value") || msg.contains("url"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn send_card_rejects_button_with_bad_url_scheme() {
+        // `javascript:` URLs are rejected by the canonical validator —
+        // proves the schema check actually runs at the MCP boundary.
+        let ctx = MockToolContext::new();
+        let err = send_card::handle(
+            args_from(serde_json::json!({
+                "card": {
+                    "title": "Hi",
+                    "buttons": [{"label": "Click", "url": "javascript:alert(1)"}]
+                }
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ToolError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn send_card_rejects_card_not_object() {
+        // Card field must deserialise into a Card struct — passing an
+        // array fails at the serde stage.
         let ctx = MockToolContext::new();
         let err = send_card::handle(args_from(serde_json::json!({"card": [1, 2]})), &ctx)
             .await
@@ -278,5 +434,13 @@ mod tests {
         let s = send_card::schema();
         let v: serde_json::Value = serde_json::to_value(&*s.input_schema).unwrap();
         assert_eq!(v["required"], serde_json::json!(["card"]));
+        // The card sub-schema enumerates the canonical fields so the model
+        // gets type-level hints without reading the docstring.
+        let props = &v["properties"]["card"]["properties"];
+        assert!(props.get("title").is_some());
+        assert!(props.get("body").is_some());
+        assert!(props.get("fields").is_some());
+        assert!(props.get("buttons").is_some());
+        assert!(props.get("image_url").is_some());
     }
 }

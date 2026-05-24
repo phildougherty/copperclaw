@@ -5,7 +5,7 @@ pub mod webhook;
 
 use crate::api::TelegramApi;
 use crate::types::{
-    Audio, Document, Message, PhotoSize, Sticker, Update, Video, VideoNote, Voice,
+    Audio, CallbackQuery, Document, Message, PhotoSize, Sticker, Update, Video, VideoNote, Voice,
 };
 use chrono::{DateTime, TimeZone, Utc};
 use ironclaw_channels_core::AdapterError;
@@ -53,6 +53,17 @@ struct AttachmentDescriptor {
 /// Convert a Telegram [`Update`] into zero or one [`InboundEvent`]s,
 /// downloading any attachment via `api` when the settings allow it.
 ///
+/// Two shapes are handled today:
+///
+/// - `update.message`: regular chat / attachment messages → routed through
+///   [`message_to_event`].
+/// - `update.callback_query`: a user tapped an inline-keyboard button on
+///   a card the agent sent. The button's `data` (i.e. the
+///   [`ironclaw_channels_core::CardButton::value`]) is surfaced to the
+///   agent as a plain chat event so the agent can react as if the user
+///   had typed the value. The callback is acked via `answerCallbackQuery`
+///   so the user's client stops showing the loading spinner.
+///
 /// Returns `Ok(Vec)` rather than streaming so callers (long-poll, webhook)
 /// can `await` it once and then push the results.
 pub async fn updates_to_events(
@@ -66,7 +77,96 @@ pub async fn updates_to_events(
             out.push(evt);
         }
     }
+    if let Some(cb) = update.callback_query.as_ref() {
+        if let Some(evt) = callback_query_to_event(cb, api).await {
+            out.push(evt);
+        }
+    }
     out
+}
+
+/// Synthesise an inbound chat event from a `callback_query` update and
+/// fire the (fire-and-forget) `answerCallbackQuery` ack so the user's
+/// client stops showing the spinner.
+///
+/// The event payload mimics a plain chat message:
+///
+/// - `kind = MessageKind::Chat`
+/// - `content = { "text": callback_data }` — the agent receives the
+///   button's `value` verbatim so it can branch on it.
+/// - `channel_type = "telegram"`, `platform_id = chat_id` so the host
+///   routes it back through the same wiring as a normal user message.
+///
+/// Returns `None` when the callback is unroutable — no `data` field,
+/// or no chat id to route by. The ack is still attempted in those
+/// cases so Telegram's spinner clears.
+async fn callback_query_to_event(
+    cb: &CallbackQuery,
+    api: &TelegramApi,
+) -> Option<InboundEvent> {
+    // Best-effort ack — never block the event on it. Pass `None` so no
+    // toast pops up over the chat input (the value is already arriving
+    // as a normal chat message; an extra toast would be noise).
+    if let Err(err) = api.answer_callback_query(&cb.id, None).await {
+        tracing::warn!(
+            error = %err,
+            callback_id = cb.id.as_str(),
+            "telegram answerCallbackQuery failed; surfacing event anyway",
+        );
+    }
+
+    let data = cb.data.as_deref()?;
+    // Prefer the chat the message lives in. Fall back to the user's own id
+    // when the message envelope is absent (Telegram drops it for callbacks
+    // on messages older than ~48h).
+    let (platform_id, thread_id, is_group, original_message_id, ts) =
+        if let Some(msg) = cb.message.as_ref() {
+            (
+                msg.chat.id.to_string(),
+                msg.message_thread_id.map(|t| t.to_string()),
+                matches!(msg.chat.kind.as_str(), "group" | "supergroup"),
+                msg.message_id,
+                ts_to_datetime(msg.date),
+            )
+        } else {
+            (cb.from.id.to_string(), None, false, 0, Utc::now())
+        };
+
+    let channel_type = ChannelType::new(crate::CHANNEL_TYPE_STR);
+    Some(InboundEvent {
+        channel_type: channel_type.clone(),
+        platform_id,
+        thread_id,
+        message: InboundMessage {
+            // The callback id is unique; reuse it as the platform-side
+            // message id so dedupe in the router still works.
+            id: cb.id.clone(),
+            kind: MessageKind::Chat,
+            content: json!({
+                "text": data,
+                // Tag the event so handlers can tell a button-tap apart
+                // from a typed message when the distinction matters.
+                "callback": {
+                    "id": cb.id,
+                    "data": data,
+                    "original_message_id": original_message_id,
+                },
+            }),
+            timestamp: ts,
+            is_mention: None,
+            is_group: Some(is_group),
+        },
+        reply_to: None,
+        sender: Some(SenderIdentity {
+            channel_type,
+            identity: cb.from.id.to_string(),
+            display_name: cb
+                .from
+                .username
+                .clone()
+                .or_else(|| cb.from.first_name.clone()),
+        }),
+    })
 }
 
 async fn message_to_event(
@@ -594,6 +694,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let dir = TempDir::new().unwrap();
         let (api, _s) = dummy_api().await;
@@ -628,6 +729,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let dir = TempDir::new().unwrap();
         let (api, _s) = dummy_api().await;
@@ -652,6 +754,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+            callback_query: None,
             },
             &api,
             &default_settings(dir.path()),
@@ -672,6 +775,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+            callback_query: None,
             },
             &api,
             &default_settings(dir.path()),
@@ -692,6 +796,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+            callback_query: None,
             },
             &api,
             &default_settings(dir.path()),
@@ -707,6 +812,7 @@ mod tests {
             message: None,
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let dir = TempDir::new().unwrap();
         let (api, _s) = dummy_api().await;
@@ -728,6 +834,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+            callback_query: None,
             },
             &api,
             &default_settings(dir.path()),
@@ -755,6 +862,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+            callback_query: None,
             },
             &api,
             &settings,
@@ -782,6 +890,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+            callback_query: None,
             },
             &api,
             &settings,
@@ -815,6 +924,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+            callback_query: None,
             },
             &api,
             &settings,
@@ -842,6 +952,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+            callback_query: None,
             },
             &api,
             &settings,
@@ -861,6 +972,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+            callback_query: None,
             },
             &api,
             &default_settings(dir.path()),
@@ -888,6 +1000,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+            callback_query: None,
             },
             &api,
             &settings,
@@ -936,6 +1049,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+            callback_query: None,
             },
             &api,
             &default_settings(dir.path()),
@@ -999,6 +1113,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
         assert_eq!(evts.len(), 1);
@@ -1027,6 +1142,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
         assert_eq!(evts.len(), 1);
@@ -1052,6 +1168,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
         assert_eq!(evts[0].message.kind, Mk::System);
@@ -1073,6 +1190,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
         assert_eq!(evts[0].message.kind, Mk::System);
@@ -1098,6 +1216,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
         let e = &evts[0];
@@ -1125,6 +1244,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
         assert_eq!(evts[0].message.kind, Mk::System);
@@ -1151,6 +1271,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
         assert_eq!(evts[0].message.kind, Mk::System);
@@ -1196,6 +1317,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
         let e = &evts[0];
@@ -1233,6 +1355,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
         let att = &evts[0].message.content["attachment"];
@@ -1266,6 +1389,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
         let att = &evts[0].message.content["attachment"];
@@ -1297,6 +1421,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
         let att = &evts[0].message.content["attachment"];
@@ -1326,6 +1451,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
         let att = &evts[0].message.content["attachment"];
@@ -1361,6 +1487,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
         let att = &evts[0].message.content["attachment"];
@@ -1395,6 +1522,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
         let att = &evts[0].message.content["attachment"];
@@ -1428,6 +1556,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
         let att = &evts[0].message.content["attachment"];
@@ -1458,6 +1587,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
         assert_eq!(evts[0].message.content["text"], "see attached");
@@ -1477,6 +1607,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
         let att = &evts[0].message.content["attachment"];
@@ -1499,6 +1630,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
         let att = &evts[0].message.content["attachment"];
@@ -1540,5 +1672,171 @@ mod tests {
         assert_eq!(v["file_name"], "a.txt");
         assert_eq!(v["mime_type"], "text/plain");
         assert_eq!(v["file_size"], 7);
+    }
+
+    // ---------------------------------------------------------------
+    // Wave 2b: callback_query → InboundEvent.
+    // ---------------------------------------------------------------
+
+    async fn mount_ack(server: &MockServer) {
+        Mock::given(method("POST"))
+            .and(path("/bottok/answerCallbackQuery"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": true
+            })))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn callback_query_routes_via_chat_id_and_tags_payload() {
+        let server = MockServer::start().await;
+        mount_ack(&server).await;
+        let api = TelegramApi::new(server.uri(), "tok");
+        let dir = TempDir::new().unwrap();
+
+        let update = Update {
+            update_id: 99,
+            message: None,
+            edited_message: None,
+            channel_post: None,
+            callback_query: Some(CallbackQuery {
+                id: "cb-1".into(),
+                from: User {
+                    id: 7,
+                    is_bot: false,
+                    first_name: Some("Bob".into()),
+                    last_name: None,
+                    username: Some("bob".into()),
+                },
+                message: Some(text_msg("ignored")),
+                data: Some("approve:42".into()),
+            }),
+        };
+        let evts =
+            updates_to_events(&update, &api, &default_settings(dir.path())).await;
+        assert_eq!(evts.len(), 1);
+        let e = &evts[0];
+        assert_eq!(e.channel_type.as_str(), "telegram");
+        // text_msg uses chat.id = 100.
+        assert_eq!(e.platform_id, "100");
+        assert_eq!(e.message.kind, Mk::Chat);
+        assert_eq!(e.message.content["text"], "approve:42");
+        assert_eq!(e.message.content["callback"]["id"], "cb-1");
+        assert_eq!(e.message.content["callback"]["data"], "approve:42");
+        // Sender carries the user who tapped, not the user from the
+        // original message.
+        let s = e.sender.as_ref().unwrap();
+        assert_eq!(s.identity, "7");
+        assert_eq!(s.display_name.as_deref(), Some("bob"));
+    }
+
+    #[tokio::test]
+    async fn callback_query_falls_back_to_user_id_when_message_missing() {
+        let server = MockServer::start().await;
+        mount_ack(&server).await;
+        let api = TelegramApi::new(server.uri(), "tok");
+        let dir = TempDir::new().unwrap();
+
+        let update = Update {
+            update_id: 1,
+            message: None,
+            edited_message: None,
+            channel_post: None,
+            callback_query: Some(CallbackQuery {
+                id: "cb-2".into(),
+                from: User {
+                    id: 555,
+                    is_bot: false,
+                    first_name: Some("X".into()),
+                    last_name: None,
+                    username: None,
+                },
+                message: None,
+                data: Some("x".into()),
+            }),
+        };
+        let evts =
+            updates_to_events(&update, &api, &default_settings(dir.path())).await;
+        assert_eq!(evts.len(), 1);
+        // Platform id falls back to the user id.
+        assert_eq!(evts[0].platform_id, "555");
+        assert_eq!(evts[0].message.content["text"], "x");
+        assert_eq!(evts[0].message.content["callback"]["original_message_id"], 0);
+    }
+
+    #[tokio::test]
+    async fn callback_query_without_data_yields_no_event_but_still_acks() {
+        let server = MockServer::start().await;
+        mount_ack(&server).await;
+        let api = TelegramApi::new(server.uri(), "tok");
+        let dir = TempDir::new().unwrap();
+
+        let update = Update {
+            update_id: 1,
+            message: None,
+            edited_message: None,
+            channel_post: None,
+            callback_query: Some(CallbackQuery {
+                id: "cb-3".into(),
+                from: User {
+                    id: 1,
+                    is_bot: false,
+                    first_name: None,
+                    last_name: None,
+                    username: None,
+                },
+                message: Some(text_msg("x")),
+                data: None,
+            }),
+        };
+        let evts =
+            updates_to_events(&update, &api, &default_settings(dir.path())).await;
+        assert!(evts.is_empty());
+        // The ack endpoint must still have been hit.
+        let reqs = server.received_requests().await.unwrap();
+        assert!(
+            reqs.iter()
+                .any(|r| r.url.path().ends_with("/answerCallbackQuery")),
+            "expected an answerCallbackQuery request"
+        );
+    }
+
+    #[tokio::test]
+    async fn callback_query_event_emitted_even_when_ack_fails() {
+        // Resilience: the ack failing should not swallow the inbound event.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/bottok/answerCallbackQuery"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "ok": false, "error_code": 400, "description": "expired"
+            })))
+            .mount(&server)
+            .await;
+        let api = TelegramApi::new(server.uri(), "tok");
+        let dir = TempDir::new().unwrap();
+
+        let update = Update {
+            update_id: 1,
+            message: None,
+            edited_message: None,
+            channel_post: None,
+            callback_query: Some(CallbackQuery {
+                id: "cb-4".into(),
+                from: User {
+                    id: 2,
+                    is_bot: false,
+                    first_name: None,
+                    last_name: None,
+                    username: Some("u".into()),
+                },
+                message: Some(text_msg("y")),
+                data: Some("payload".into()),
+            }),
+        };
+        let evts =
+            updates_to_events(&update, &api, &default_settings(dir.path())).await;
+        assert_eq!(evts.len(), 1);
+        assert_eq!(evts[0].message.content["text"], "payload");
     }
 }

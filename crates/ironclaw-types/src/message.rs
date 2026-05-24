@@ -19,6 +19,17 @@ pub enum MessageKind {
     System,
     /// Inter-agent message (delivery routes via the host, not a channel adapter).
     Agent,
+    /// Structured card payload. Routed through the same delivery path as
+    /// `Chat`, but the host/delivery service hands the card body to the
+    /// adapter's `deliver_card` hook so adapters with native card support
+    /// (Telegram inline keyboards, Slack Block Kit, Discord embeds,
+    /// Google Chat cards v2, …) can render it structurally. Adapters
+    /// without a native renderer fall back to a text rendering for free
+    /// via the default `deliver_card` impl on `ChannelAdapter`.
+    ///
+    /// Wave 2 of the cards rollout starts writing rows with this kind
+    /// from the runner / MCP `send_card` tool.
+    Card,
 }
 
 impl MessageKind {
@@ -29,7 +40,23 @@ impl MessageKind {
             Self::Webhook => "webhook",
             Self::System => "system",
             Self::Agent => "agent",
+            Self::Card => "card",
         }
+    }
+
+    /// Parse a column-stored kind string back into the enum. Returns
+    /// `None` for unknown strings so callers can decide how to surface
+    /// the error (the database tables return a custom rusqlite error).
+    pub fn parse_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "chat" => Self::Chat,
+            "task" => Self::Task,
+            "webhook" => Self::Webhook,
+            "system" => Self::System,
+            "agent" => Self::Agent,
+            "card" => Self::Card,
+            _ => return None,
+        })
     }
 }
 
@@ -196,11 +223,35 @@ mod tests {
             MessageKind::Webhook,
             MessageKind::System,
             MessageKind::Agent,
+            MessageKind::Card,
         ] {
             let json = serde_json::to_string(&kind).unwrap();
             let back: MessageKind = serde_json::from_str(&json).unwrap();
             assert_eq!(kind, back, "roundtrip failed for {kind:?}");
         }
+    }
+
+    #[test]
+    fn message_kind_as_str_and_parse_str_roundtrip() {
+        for kind in [
+            MessageKind::Chat,
+            MessageKind::Task,
+            MessageKind::Webhook,
+            MessageKind::System,
+            MessageKind::Agent,
+            MessageKind::Card,
+        ] {
+            let s = kind.as_str();
+            assert_eq!(MessageKind::parse_str(s), Some(kind));
+        }
+        assert_eq!(MessageKind::parse_str("nonsense"), None);
+    }
+
+    #[test]
+    fn message_kind_card_is_lowercase_card_in_json() {
+        let s = serde_json::to_string(&MessageKind::Card).unwrap();
+        assert_eq!(s, r#""card""#);
+        assert_eq!(MessageKind::Card.as_str(), "card");
     }
 
     #[test]

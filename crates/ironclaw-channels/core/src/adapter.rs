@@ -1,11 +1,12 @@
 //! Channel adapter and factory traits.
 
+use crate::card::Card;
 use crate::container::ContainerContribution;
 use crate::dm::DmHandle;
 use crate::error::AdapterError;
 use crate::setup::ChannelSetup;
 use async_trait::async_trait;
-use ironclaw_types::{ChannelType, OutboundMessage};
+use ironclaw_types::{ChannelType, MessageKind, OutboundMessage};
 use std::sync::Arc;
 
 /// A channel adapter speaks to one external platform (Telegram, Slack, …).
@@ -55,6 +56,41 @@ pub trait ChannelAdapter: Send + Sync {
         thread_id: Option<&str>,
         message: &OutboundMessage,
     ) -> Result<Option<String>, AdapterError>;
+
+    /// Render and deliver a portable [`Card`].
+    ///
+    /// The default implementation converts the card to the plain-text
+    /// rendering from [`Card::to_text_fallback`] and routes it through
+    /// [`Self::deliver`] as a `MessageKind::Chat` outbound message — so
+    /// every adapter gets a usable card rendering for free, even before
+    /// it provides a native implementation.
+    ///
+    /// Adapters with rich card support (Telegram inline keyboards, Slack
+    /// Block Kit, Discord embeds, Google Chat cards v2, etc.) should
+    /// override this to render the card structurally. Wave 2 of the cards
+    /// rollout will implement those overrides — see the doc comment at
+    /// the top of `card.rs` for the schema contract.
+    ///
+    /// `to` is a routing hint the host pulls from `SendCardSpec::to`. It
+    /// is currently unused by the default impl (which uses `platform_id`)
+    /// but is part of the signature so wave 2's native renderers can pass
+    /// it through to platform DM-open flows.
+    async fn deliver_card(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        card: &Card,
+        to: Option<&str>,
+    ) -> Result<Option<String>, AdapterError> {
+        let _ = to;
+        let text = card.to_text_fallback();
+        let outbound = OutboundMessage {
+            kind: MessageKind::Chat,
+            content: serde_json::json!({ "text": text }),
+            files: vec![],
+        };
+        self.deliver(platform_id, thread_id, &outbound).await
+    }
 
     /// Open a direct-message thread with the given user. Defaults to
     /// `Ok(None)` — channels that don't support DMs leave it alone.
@@ -263,5 +299,48 @@ mod tests {
     fn factory_default_container_contribution_is_empty() {
         let f = MockFactory::new("mock");
         assert!(f.container_contribution().is_empty());
+    }
+
+    #[tokio::test]
+    async fn default_deliver_card_falls_back_to_text_deliver() {
+        // Cards with no native renderer get the trait-level fallback:
+        // convert to text via `Card::to_text_fallback` and call `deliver`.
+        let a = MockAdapter::new("ch");
+        let card = crate::card::Card {
+            title: Some("Hello".into()),
+            body: Some("World".into()),
+            ..crate::card::Card::default()
+        };
+        let id = a
+            .deliver_card("plat-1", None, &card, None)
+            .await
+            .unwrap();
+        assert!(id.is_some());
+        let calls = a.deliveries();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].message.kind, MessageKind::Chat);
+        let text = calls[0]
+            .message
+            .content
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert!(text.contains("**Hello**"));
+        assert!(text.contains("World"));
+    }
+
+    #[tokio::test]
+    async fn default_deliver_card_propagates_routing_args() {
+        let a = MockAdapter::new("ch");
+        let card = crate::card::Card {
+            title: Some("Hi".into()),
+            ..crate::card::Card::default()
+        };
+        a.deliver_card("plat-9", Some("thread-7"), &card, Some("user-1"))
+            .await
+            .unwrap();
+        let calls = a.deliveries();
+        assert_eq!(calls[0].platform_id, "plat-9");
+        assert_eq!(calls[0].thread_id.as_deref(), Some("thread-7"));
     }
 }

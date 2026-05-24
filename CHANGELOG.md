@@ -6,6 +6,104 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (portable `send_card` — works on every channel)
+
+The user-visible goal: `send_card` works on every channel. The mechanism:
+one canonical Card schema (`title`/`body`/`fields`/`buttons`/`image_url`),
+rendered natively where the adapter has card support and degraded to
+formatted text everywhere else — so no channel gets left behind.
+
+Shipped in three waves, all in this batch:
+
+- **Wave 1 — foundation** (`crates/ironclaw-channels/core/src/card.rs`):
+  canonical `Card`, `CardField`, `CardButton`, `CardError` types with
+  `Card::validate()` + `to_text_fallback()`. New `MessageKind::Card`
+  variant. New trait method `ChannelAdapter::deliver_card()` with a
+  default impl that renders to text and dispatches through `deliver()`
+  — every existing adapter gets a working `send_card` for free.
+- **Wave 2a — production path**: see the dedicated entry below.
+- **Wave 2b — Telegram native**: full `deliver_card` override using
+  MarkdownV2 + `reply_markup.inline_keyboard`. `value` buttons produce
+  `callback_data`; URL buttons open links. Image cards send via
+  `sendPhoto` (caption + keyboard); long captions split to
+  photo + follow-up text+keyboard. Inbound `callback_query` handling
+  synthesises a chat event whose text is the button's `value` and ACKs
+  the callback so the spinner stops — the agent receives the tap as if
+  the user typed the value. Buttons wrap at 3 per row to avoid label
+  truncation on phones. 27 new tests.
+- **Wave 2c — skill docs** (`skills/send-card/SKILL.md`): rewritten
+  honestly. Previous version claimed per-channel shapes that didn't
+  exist; new version describes the canonical schema, validation rules,
+  callback flow, and per-channel rendering table.
+
+Status by channel after this batch:
+- **Telegram**: native (inline_keyboard + callbacks).
+- **20 other channels**: text fallback via the trait default impl. Native
+  impls (Slack Block Kit, Discord embeds, Teams adaptive cards, etc.)
+  can land as follow-ups without touching anything else — the foundation
+  is in place.
+
+Workspace: 5400 passing; clippy clean.
+
+### Changed (cards rollout wave 2a — production path)
+
+Wave 1 added the canonical portable `Card` schema in
+`ironclaw-channels-core`, the `MessageKind::Card` variant, and the
+trait-level `ChannelAdapter::deliver_card()` with a text-fallback
+default impl. Wave 2a wires the production path:
+
+- `send_card` MCP tool (`crates/ironclaw-mcp/src/tools/interactive.rs`)
+  rewritten to accept the canonical `Card` schema directly. JSON
+  schema now documents `title`/`body`/`fields`/`buttons`/`image_url`
+  with the right types; `Card::validate()` runs at the MCP boundary
+  so the model gets a precise error and the runner never touches an
+  invalid card. Tool description updated to explain the portability
+  story ("Portable card schema — works on every channel. Channels
+  with native card support render the structure; channels without it
+  fall back to formatted text.").
+- `SendCardSpec` (`crates/ironclaw-mcp/src/context.rs`) now carries a
+  typed `ironclaw_channels_core::Card` instead of an opaque
+  `serde_json::Value`. Cards travel through the runner with their
+  schema preserved.
+- `apply_send_card` (`crates/ironclaw-runner/src/tools.rs`) now writes
+  a `MessageKind::Card` row to `messages_out` (NOT a `MessageKind::System`
+  action). Row content shape: `{ "card": <Card JSON>, "to": <Recipient> }`
+  with `to` present only when the caller passed an explicit recipient.
+  Channel routing (`channel_type` / `platform_id` / `thread_id`) is
+  inherited from the originating inbound exactly the way `send_message`
+  does. The old System-routing-and-action-handler indirection
+  (`"send_card"` action key on a System row) is gone — the previous
+  flow only wrapped the opaque blob and forwarded it, so removing it
+  doesn't change any channel adapter's contract.
+- Host delivery service (`crates/ironclaw-host-delivery/src/service.rs`)
+  picks up `MessageKind::Card` rows in a dedicated `dispatch_card`
+  branch: deserialise `content.card` back into `Card`, pull the
+  optional `content.to` hint, call `adapter.deliver_card(platform_id,
+  thread_id, &card, to)`. If the adapter explicitly returns
+  `AdapterError::Unsupported`, the host falls back to a plain
+  `deliver` call with the text rendering. (The trait-level default
+  already does the text fallback, so this only fires for adapters
+  that deliberately overrode `deliver_card` to refuse cards entirely.)
+  Malformed `content.card` JSON is treated as a host-level bug and
+  recorded `failed` rather than retried.
+- `"card"` added to the kind-string `parse_str` arms in
+  `messages_in.rs`, `messages_out.rs`, `outbound_dropped_messages.rs`,
+  and `recurrence.rs`. Card rows now read back correctly from every
+  per-session DB and central dropped-message table.
+- `runner_emit_set()` in
+  `crates/ironclaw-host/tests/action_handler_coverage.rs` updated:
+  `send_card` removed from the System-action set (the runner no
+  longer emits it as a System action; the structural test would
+  have failed otherwise).
+
+Tests: 3 new tests on the runner side (Card-kind row contents,
+explicit-`to` propagation), 4 new tests on the MCP-tool side (canonical
+schema validation), 3 new tests on the host-delivery side (deliver_card
+invocation, Unsupported fallback, malformed-card guard). Existing
+opaque-card test in `send_card_writes_system_row` rewritten as
+`send_card_writes_card_kind_row` to assert the new contract. Wave 1's
+17 unit tests on the `Card` schema continue to pass.
+
 ### Added (4 new tools to reduce LLM round-trips for common patterns)
 
 Profiling the live failure modes (CapCut, base64 loop) surfaced the same

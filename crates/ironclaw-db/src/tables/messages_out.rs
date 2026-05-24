@@ -106,6 +106,7 @@ fn row_to_message_out(row: &Row<'_>) -> rusqlite::Result<MessageOutRow> {
         "webhook" => MessageKind::Webhook,
         "system" => MessageKind::System,
         "agent" => MessageKind::Agent,
+        "card" => MessageKind::Card,
         other => {
             return Err(rusqlite::Error::FromSqlConversionFailure(
                 0,

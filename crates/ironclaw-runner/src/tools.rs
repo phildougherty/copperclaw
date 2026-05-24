@@ -14,7 +14,6 @@
 //! { "edit":          { "seq": 7, "text": "..." } }
 //! { "reaction":      { "seq": 7, "emoji": "..." } }
 //! { "ask_user_question": { "id": "q_<uuid>", "title": "...", "options": [...], "to": {...} } }
-//! { "send_card":          { "to": {...}, "card": {...} } }
 //! { "create_agent":  { "name": "...", "instructions": "...", "channel": "..." } }
 //! { "install_packages": { "apt": [...], "npm": [...], "reason": "..." } }
 //! { "add_mcp_server":   { "name": "...", "transport": {...}, "reason": "..." } }
@@ -24,6 +23,19 @@
 //! `SendFile` writes the bytes to `outbox/<msg_id>/<filename>` and emits a
 //! `chat`-kind row whose `content` includes a `files` array pointing at the
 //! filename.
+//!
+//! `SendCard` emits a `card`-kind row (NOT a system row) whose `content` is:
+//!
+//! ```json
+//! { "card": { "title": "...", "body": "...", "fields": [...], "buttons": [...], "image_url": "..." },
+//!   "to":   { "kind": "channel" | "agent" | "user", ... }  // optional, only when caller passed `to:`
+//! }
+//! ```
+//!
+//! The host-delivery service deserialises `content.card` back into
+//! [`ironclaw_channels_core::Card`] and hands it to the adapter's
+//! `deliver_card` hook. Channels with native card support render the
+//! structure; the trait-level default converts to a text fallback.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -529,7 +541,7 @@ fn apply_effect(
         OutboundToolEffect::EditMessage(spec) => apply_edit_message(conn, spec),
         OutboundToolEffect::AddReaction(spec) => apply_add_reaction(conn, spec),
         OutboundToolEffect::AskUserQuestion(spec) => apply_ask_question(conn, spec),
-        OutboundToolEffect::SendCard(spec) => apply_send_card(conn, spec),
+        OutboundToolEffect::SendCard(spec) => apply_send_card(conn, spec, origin),
         OutboundToolEffect::CreateAgent(spec) => apply_create_agent(conn, spec),
         OutboundToolEffect::InstallPackages(spec) => apply_install_packages(conn, spec),
         OutboundToolEffect::AddMcpServer(spec) => apply_add_mcp_server(conn, spec),
@@ -844,16 +856,48 @@ fn apply_ask_question(
 fn apply_send_card(
     conn: &mut Connection,
     spec: SendCardSpec,
+    origin: &OriginatingRouting,
 ) -> Result<ToolEffectAck, ToolApplyError> {
-    let mut body = serde_json::Map::new();
-    if let Some(t) = spec.to {
-        body.insert("to".into(), serde_json::to_value(t).unwrap_or_default());
+    let SendCardSpec { to, card } = spec;
+    // Reuse the existing chat-routing resolver so Card-kind rows
+    // inherit the originating inbound's channel / platform / thread
+    // exactly the way Chat rows do. After it returns we override the
+    // kind to Card — the Agent-routing branch is irrelevant for cards
+    // (the model picks `send_message`/`send_file` for cross-agent
+    // hand-offs, not `send_card`), but if `resolve_outbound_routing`
+    // does flip to Agent (e.g. a child agent with no explicit `to`),
+    // force the kind back to Card and drop the synthesised parent
+    // recipient: a Card-kind row addressed at a parent session can't
+    // be rendered by any adapter, so we fall back to Chat-style
+    // delivery on the inherited channel routing. This mirrors the
+    // belt-and-braces logic in `apply_send_file`.
+    let mut routed = resolve_outbound_routing(to.clone(), origin);
+    if matches!(routed.kind, MessageKind::Agent) {
+        routed.body_to = None;
+        routed.in_reply_to = origin.in_reply_to;
     }
-    body.insert("card".into(), spec.card);
-    // Action name must match what `InteractiveModule::install` registers
-    // (`send_card`). Previously emitted as `"card"` which fell through.
-    let payload = serde_json::json!({ "send_card": body });
-    let seq = insert_row(conn, MessageKind::System, payload)?;
+    routed.kind = MessageKind::Card;
+
+    let mut body = serde_json::Map::new();
+    // The canonical Card serialises cleanly via its derived Serialize —
+    // expect is justified because Card has no failable serialisation
+    // paths and the MCP layer already validated the payload.
+    body.insert(
+        "card".into(),
+        serde_json::to_value(&card).expect("Card is always serialisable"),
+    );
+    if let Some(r) = &routed.body_to {
+        body.insert(
+            "to".into(),
+            serde_json::to_value(r).expect("Recipient is always serialisable"),
+        );
+    }
+    let seq = insert_outbound_row(
+        conn,
+        MessageId::new(),
+        serde_json::Value::Object(body),
+        &routed,
+    )?;
     Ok(ToolEffectAck::Message { seq })
 }
 
@@ -1585,17 +1629,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_card_writes_system_row() {
+    async fn send_card_writes_card_kind_row() {
+        // Wave 2 contract: `send_card` writes a `MessageKind::Card` row to
+        // messages_out with the canonical Card serialised under
+        // `content.card`. The host-delivery service deserialises it back
+        // into `ironclaw_channels_core::Card` and hands it to the
+        // adapter's `deliver_card` hook.
         let (_tmp, ctx) = fresh_ctx();
+        let card = ironclaw_channels_core::Card {
+            title: Some("Order #42".into()),
+            body: Some("Confirm?".into()),
+            fields: vec![ironclaw_channels_core::CardField {
+                label: "Item".into(),
+                value: "Espresso".into(),
+                inline: false,
+            }],
+            buttons: vec![ironclaw_channels_core::CardButton {
+                label: "Confirm".into(),
+                value: Some("confirm:42".into()),
+                url: None,
+                style: Some("primary".into()),
+            }],
+            image_url: Some("https://example.com/x.png".into()),
+        };
         ctx.emit_outbound(OutboundToolEffect::SendCard(SendCardSpec {
             to: None,
-            card: serde_json::json!({"hi": 1}),
+            card: card.clone(),
         }))
         .await
         .unwrap();
         let row = last_row(&ctx).await;
-        assert_eq!(row.kind, MessageKind::System);
-        assert_eq!(row.content["send_card"]["card"]["hi"], 1);
+        // Kind is Card (not System / not Chat).
+        assert_eq!(row.kind, MessageKind::Card);
+        // Content carries the canonical Card payload under `card` and
+        // round-trips through serde back into the same struct.
+        let parsed: ironclaw_channels_core::Card =
+            serde_json::from_value(row.content["card"].clone()).unwrap();
+        assert_eq!(parsed, card);
+        // No `to` field on the row when the caller didn't pass one.
+        assert!(row.content.get("to").is_none());
+    }
+
+    #[tokio::test]
+    async fn send_card_carries_explicit_to_in_content() {
+        // When the caller supplies an explicit `to:`, it is preserved in
+        // `content.to` so sibling agents / DM-opening adapters can read
+        // the routing override from the row.
+        let (_tmp, ctx) = fresh_ctx();
+        let card = ironclaw_channels_core::Card {
+            title: Some("Hi".into()),
+            ..Default::default()
+        };
+        ctx.emit_outbound(OutboundToolEffect::SendCard(SendCardSpec {
+            to: Some(Recipient::User { id: "u-1".into() }),
+            card,
+        }))
+        .await
+        .unwrap();
+        let row = last_row(&ctx).await;
+        assert_eq!(row.kind, MessageKind::Card);
+        assert_eq!(row.content["to"]["kind"], "user");
+        assert_eq!(row.content["to"]["id"], "u-1");
     }
 
     #[tokio::test]

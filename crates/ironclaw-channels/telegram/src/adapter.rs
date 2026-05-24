@@ -3,11 +3,11 @@
 //! Owns the [`TelegramApi`] client, the cancellation token used to stop
 //! background tasks, and the resolved [`TelegramConfig`].
 
-use crate::api::TelegramApi;
+use crate::api::{InlineKeyboardButton, TelegramApi, escape_markdown_v2};
 use crate::config::{IngressMode, TelegramConfig};
 use crate::ingress::{IngressSettings, long_poll, webhook};
 use async_trait::async_trait;
-use ironclaw_channels_core::{AdapterError, ChannelAdapter, DmHandle};
+use ironclaw_channels_core::{AdapterError, Card, ChannelAdapter, DmHandle};
 use ironclaw_types::{ChannelType, InboundEvent, OutboundMessage};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -259,6 +259,115 @@ impl ChannelAdapter for TelegramAdapter {
             .await
     }
 
+    /// Render a [`Card`] natively as a MarkdownV2 message with an
+    /// `inline_keyboard` reply_markup. The card's `image_url` is attached
+    /// via `sendPhoto`; if the photo caption would exceed Telegram's
+    /// `MAX_PHOTO_CAPTION_CHARS` budget, the body is sent as a follow-up
+    /// `sendMessage` (still carrying the keyboard) — see
+    /// [`MAX_PHOTO_CAPTION_CHARS`].
+    async fn deliver_card(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        card: &Card,
+        _to: Option<&str>,
+    ) -> Result<Option<String>, AdapterError> {
+        let body = render_card_markdown_v2(card);
+        let keyboard = build_inline_keyboard(card);
+        let parse_mode = Some("MarkdownV2");
+
+        match card.image_url.as_deref() {
+            Some(image_url) => {
+                let caption_fits = body.chars().count() <= MAX_PHOTO_CAPTION_CHARS;
+                if caption_fits {
+                    // Photo + caption + keyboard all in one message.
+                    let caption = if body.is_empty() { None } else { Some(body.as_str()) };
+                    let keyboard_ref = if keyboard.is_empty() {
+                        None
+                    } else {
+                        Some(keyboard.as_slice())
+                    };
+                    let m = self
+                        .api
+                        .send_photo_with_caption_and_keyboard(
+                            platform_id,
+                            thread_id,
+                            image_url,
+                            caption,
+                            if caption.is_some() { parse_mode } else { None },
+                            keyboard_ref,
+                        )
+                        .await?;
+                    Ok(Some(m.message_id.to_string()))
+                } else {
+                    // Caption too long: send a truncated caption with the
+                    // photo, then a follow-up message carrying the full
+                    // body and the keyboard.
+                    let truncated = truncate_for_photo_caption(&body);
+                    let truncated_for_send = if truncated.is_empty() {
+                        None
+                    } else {
+                        Some(truncated.as_str())
+                    };
+                    let photo = self
+                        .api
+                        .send_photo_with_caption_and_keyboard(
+                            platform_id,
+                            thread_id,
+                            image_url,
+                            truncated_for_send,
+                            if truncated_for_send.is_some() {
+                                parse_mode
+                            } else {
+                                None
+                            },
+                            None,
+                        )
+                        .await?;
+                    let _follow = self
+                        .api
+                        .send_message_with_inline_keyboard(
+                            platform_id,
+                            thread_id,
+                            &body,
+                            parse_mode,
+                            &keyboard,
+                        )
+                        .await?;
+                    // Return the photo's id — it's the first message in
+                    // the pair the user sees and the most useful anchor
+                    // for downstream replies/edits.
+                    Ok(Some(photo.message_id.to_string()))
+                }
+            }
+            None => {
+                // Text-only card. If there are buttons, use the
+                // inline-keyboard sender; otherwise fall through to plain
+                // `sendMessage` so we don't put an empty `reply_markup`
+                // on the wire.
+                if keyboard.is_empty() {
+                    let m = self
+                        .api
+                        .send_message(platform_id, thread_id, &body, parse_mode)
+                        .await?;
+                    Ok(Some(m.message_id.to_string()))
+                } else {
+                    let m = self
+                        .api
+                        .send_message_with_inline_keyboard(
+                            platform_id,
+                            thread_id,
+                            &body,
+                            parse_mode,
+                            &keyboard,
+                        )
+                        .await?;
+                    Ok(Some(m.message_id.to_string()))
+                }
+            }
+        }
+    }
+
     async fn add_reaction(
         &self,
         platform_id: &str,
@@ -312,6 +421,136 @@ impl ChannelAdapter for TelegramAdapter {
             files: msg.files.clone(),
         })
     }
+}
+
+/// Maximum characters Telegram accepts in a `sendPhoto` caption.
+/// Spec is 1024; we leave headroom for the "see message below" suffix
+/// we append when the body is too long for a single caption.
+pub const MAX_PHOTO_CAPTION_CHARS: usize = 900;
+
+/// Maximum inline-keyboard buttons per row before we wrap to a new row.
+/// Telegram allows up to 8 per row, but readability on phones drops fast
+/// past 3 — see the canonical-card schema notes at
+/// [`ironclaw_channels_core::Card`].
+pub const MAX_BUTTONS_PER_ROW: usize = 3;
+
+/// Suffix appended to a truncated photo caption when the full body is
+/// being sent as a separate follow-up message.
+const CAPTION_OVERFLOW_SUFFIX: &str = "(see message below)";
+
+/// Render a [`Card`] into the `MarkdownV2` body Telegram expects from
+/// `sendMessage(parse_mode="MarkdownV2")`. The shape is:
+///
+/// ```text
+/// *Title*
+///
+/// Body text
+///
+/// *Label:* value
+/// *Other:* value
+/// ```
+///
+/// Every user-supplied substring is run through
+/// [`escape_markdown_v2`] so reserved punctuation cannot break the
+/// parser. Markdown markers we add ourselves (`*` for bold) are emitted
+/// outside the escaped segments so they remain functional.
+fn render_card_markdown_v2(card: &Card) -> String {
+    let mut out = String::new();
+
+    if let Some(title) = card.title.as_deref() {
+        let t = title.trim();
+        if !t.is_empty() {
+            out.push('*');
+            out.push_str(&escape_markdown_v2(t));
+            out.push('*');
+            out.push('\n');
+        }
+    }
+
+    if let Some(body) = card.body.as_deref() {
+        let b = body.trim();
+        if !b.is_empty() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&escape_markdown_v2(b));
+            out.push('\n');
+        }
+    }
+
+    if !card.fields.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        for f in &card.fields {
+            out.push('*');
+            out.push_str(&escape_markdown_v2(&f.label));
+            // The colon is reserved-adjacent but `:` itself is not in
+            // the MarkdownV2 reserved set; we still escape the label
+            // contents to be safe.
+            out.push_str(":*");
+            out.push(' ');
+            out.push_str(&escape_markdown_v2(&f.value));
+            out.push('\n');
+        }
+    }
+
+    // Trim trailing newline so the renderer composes cleanly with a
+    // photo caption (where trailing whitespace is ugly).
+    while out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Build the row-major [`InlineKeyboardButton`] layout Telegram expects
+/// for the `reply_markup.inline_keyboard` field. Buttons with `value`
+/// become `callback_data` buttons; buttons with `url` become URL
+/// buttons. Rows wrap at [`MAX_BUTTONS_PER_ROW`].
+fn build_inline_keyboard(card: &Card) -> Vec<Vec<InlineKeyboardButton>> {
+    let mut rows: Vec<Vec<InlineKeyboardButton>> = Vec::new();
+    let mut current: Vec<InlineKeyboardButton> = Vec::new();
+    for btn in &card.buttons {
+        let row_button = match (btn.value.as_deref(), btn.url.as_deref()) {
+            (Some(value), _) => InlineKeyboardButton::callback(btn.label.clone(), value),
+            (None, Some(url)) => InlineKeyboardButton::url(btn.label.clone(), url),
+            // The card validator rejects buttons missing both — but we
+            // defensively skip rather than panic if a bad card slips
+            // through.
+            (None, None) => continue,
+        };
+        current.push(row_button);
+        if current.len() >= MAX_BUTTONS_PER_ROW {
+            rows.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        rows.push(current);
+    }
+    rows
+}
+
+/// Truncate `body` so it fits in [`MAX_PHOTO_CAPTION_CHARS`] characters
+/// once the "(see message below)" suffix is appended. The suffix is
+/// `MarkdownV2`-escaped to survive `parse_mode=MarkdownV2`.
+fn truncate_for_photo_caption(body: &str) -> String {
+    let escaped_suffix = escape_markdown_v2(CAPTION_OVERFLOW_SUFFIX);
+    // We measure in chars, not bytes — MarkdownV2 supports multi-byte
+    // codepoints and Telegram counts them as 1.
+    let suffix_chars = escaped_suffix.chars().count();
+    // Leave room for the suffix plus a separator newline.
+    let budget = MAX_PHOTO_CAPTION_CHARS.saturating_sub(suffix_chars + 1);
+    let mut out: String = body.chars().take(budget).collect();
+    // Avoid leaving a dangling backslash that would escape a
+    // non-existent next character and confuse the MarkdownV2 parser.
+    while out.ends_with('\\') {
+        out.pop();
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(&escaped_suffix);
+    out
 }
 
 fn extract_text(value: &serde_json::Value) -> String {
@@ -1111,6 +1350,594 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
+        adapter.shutdown().await;
+    }
+
+    // ---------------------------------------------------------------
+    // Wave 2b: `deliver_card` native rendering + callback_query inbound.
+    // ---------------------------------------------------------------
+
+    use ironclaw_channels_core::{Card, CardButton, CardField};
+
+    /// Mount a `sendMessage` mock that records the body and replies with
+    /// `message_id = 1001`. Returns the server so the test can inspect
+    /// `received_requests` for the captured payload.
+    async fn mount_send_message(server: &MockServer, id: i64) {
+        Mock::given(method("POST"))
+            .and(path("/bottok/sendMessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": { "message_id": id }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_send_photo(server: &MockServer, id: i64) {
+        Mock::given(method("POST"))
+            .and(path("/bottok/sendPhoto"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": { "message_id": id }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    async fn build_adapter(s: &MockServer) -> Arc<TelegramAdapter> {
+        let (tx, _rx) = mpsc::channel::<InboundEvent>(8);
+        let dir = temp_dir();
+        let adapter = TelegramAdapter::start(
+            lp_config(&s.uri()),
+            None,
+            tx,
+            dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        // Leak the tempdir so it lives as long as the adapter — the
+        // returned Arc owns the path reference indirectly via
+        // `data_dir`.
+        std::mem::forget(dir);
+        adapter
+    }
+
+    fn confirm_card_with_buttons() -> Card {
+        Card {
+            title: Some("Order #42".into()),
+            body: Some("Ready to confirm?".into()),
+            fields: vec![
+                CardField {
+                    label: "Item".into(),
+                    value: "Espresso".into(),
+                    inline: true,
+                },
+                CardField {
+                    label: "Price".into(),
+                    value: "$4.50".into(),
+                    inline: true,
+                },
+            ],
+            buttons: vec![
+                CardButton {
+                    label: "Confirm".into(),
+                    value: Some("confirm:42".into()),
+                    url: None,
+                    style: Some("primary".into()),
+                },
+                CardButton {
+                    label: "Cancel".into(),
+                    value: Some("cancel:42".into()),
+                    url: None,
+                    style: None,
+                },
+                CardButton {
+                    label: "Details".into(),
+                    value: None,
+                    url: Some("https://example.com/o/42".into()),
+                    style: None,
+                },
+            ],
+            image_url: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn deliver_card_with_buttons_sends_inline_keyboard() {
+        let s = MockServer::start().await;
+        empty_get_updates(&s).await;
+        mount_send_message(&s, 5001).await;
+        let adapter = build_adapter(&s).await;
+
+        let card = confirm_card_with_buttons();
+        let id = adapter
+            .deliver_card("100", None, &card, None)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("5001"));
+
+        let reqs = s.received_requests().await.unwrap();
+        let req = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/sendMessage"))
+            .expect("sendMessage request");
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(body["chat_id"], "100");
+        // MarkdownV2 parse_mode is set.
+        assert_eq!(body["parse_mode"], "MarkdownV2");
+        // Body contains the bold title (with `#` escaped) and the body.
+        let text = body["text"].as_str().unwrap();
+        assert!(text.contains("*Order \\#42*"), "got `{text}`");
+        assert!(text.contains("Ready to confirm"), "got `{text}`");
+        // Fields use `*Label:*` MarkdownV2 bold around the label.
+        assert!(text.contains("*Item:*"), "got `{text}`");
+        assert!(text.contains("Espresso"), "got `{text}`");
+
+        // Inline keyboard: three buttons → 1 row of 3 (fits within MAX_BUTTONS_PER_ROW=3).
+        let kb = body["reply_markup"]["inline_keyboard"]
+            .as_array()
+            .unwrap();
+        assert_eq!(kb.len(), 1);
+        let row = kb[0].as_array().unwrap();
+        assert_eq!(row.len(), 3);
+        assert_eq!(row[0]["text"], "Confirm");
+        assert_eq!(row[0]["callback_data"], "confirm:42");
+        assert!(row[0].get("url").is_none() || row[0]["url"].is_null());
+        assert_eq!(row[2]["text"], "Details");
+        assert_eq!(row[2]["url"], "https://example.com/o/42");
+        assert!(row[2].get("callback_data").is_none() || row[2]["callback_data"].is_null());
+
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_card_text_only_falls_through_to_send_message() {
+        let s = MockServer::start().await;
+        empty_get_updates(&s).await;
+        mount_send_message(&s, 99).await;
+        let adapter = build_adapter(&s).await;
+
+        let card = Card {
+            title: Some("Just a heading".into()),
+            body: Some("Nothing to click here.".into()),
+            ..Card::default()
+        };
+        let id = adapter
+            .deliver_card("c-1", None, &card, None)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("99"));
+
+        let reqs = s.received_requests().await.unwrap();
+        let req = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/sendMessage"))
+            .expect("sendMessage request");
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        // No buttons → no reply_markup field.
+        assert!(
+            body.get("reply_markup").is_none(),
+            "expected no reply_markup, got `{body}`"
+        );
+        assert_eq!(body["parse_mode"], "MarkdownV2");
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_card_with_image_sends_photo_with_caption_and_keyboard() {
+        let s = MockServer::start().await;
+        empty_get_updates(&s).await;
+        mount_send_photo(&s, 222).await;
+        let adapter = build_adapter(&s).await;
+
+        let card = Card {
+            title: Some("Latte".into()),
+            body: Some("Want one?".into()),
+            buttons: vec![CardButton {
+                label: "Yes".into(),
+                value: Some("yes".into()),
+                url: None,
+                style: None,
+            }],
+            image_url: Some("https://example.com/latte.png".into()),
+            ..Card::default()
+        };
+        let id = adapter.deliver_card("c-1", None, &card, None).await.unwrap();
+        assert_eq!(id.as_deref(), Some("222"));
+
+        let reqs = s.received_requests().await.unwrap();
+        let req = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/sendPhoto"))
+            .expect("sendPhoto request");
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(body["photo"], "https://example.com/latte.png");
+        assert!(body["caption"].as_str().unwrap().contains("*Latte*"));
+        assert_eq!(body["parse_mode"], "MarkdownV2");
+        // Keyboard rides on the photo message in the single-call path.
+        let kb = body["reply_markup"]["inline_keyboard"]
+            .as_array()
+            .unwrap();
+        assert_eq!(kb.len(), 1);
+        assert_eq!(kb[0][0]["callback_data"], "yes");
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_card_long_caption_splits_to_photo_plus_message() {
+        let s = MockServer::start().await;
+        empty_get_updates(&s).await;
+        mount_send_photo(&s, 1).await;
+        mount_send_message(&s, 2).await;
+        let adapter = build_adapter(&s).await;
+
+        // 2000 chars of body → after escaping (no reserved chars in `a`)
+        // still 2000 chars, well above MAX_PHOTO_CAPTION_CHARS=900.
+        let big_body = "a".repeat(2000);
+        let card = Card {
+            body: Some(big_body),
+            buttons: vec![CardButton {
+                label: "Ok".into(),
+                value: Some("ok".into()),
+                url: None,
+                style: None,
+            }],
+            image_url: Some("https://example.com/x.png".into()),
+            ..Card::default()
+        };
+        let id = adapter.deliver_card("c-1", None, &card, None).await.unwrap();
+        assert_eq!(id.as_deref(), Some("1")); // photo id returned, not follow-up
+
+        let reqs = s.received_requests().await.unwrap();
+        let photo_req = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/sendPhoto"))
+            .expect("sendPhoto request");
+        let photo_body: serde_json::Value =
+            serde_json::from_slice(&photo_req.body).unwrap();
+        // Caption is truncated and ends with the (escaped) overflow suffix.
+        let caption = photo_body["caption"].as_str().unwrap();
+        assert!(caption.chars().count() <= MAX_PHOTO_CAPTION_CHARS);
+        assert!(caption.contains("see message below"), "got `{caption}`");
+        // No reply_markup on the photo when the body splits.
+        assert!(
+            photo_body.get("reply_markup").is_none(),
+            "expected no reply_markup on photo when body split"
+        );
+
+        let msg_req = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/sendMessage"))
+            .expect("follow-up sendMessage request");
+        let msg_body: serde_json::Value = serde_json::from_slice(&msg_req.body).unwrap();
+        // Full body lands in the follow-up message and carries the keyboard.
+        assert!(msg_body["text"].as_str().unwrap().contains("aaaa"));
+        let kb = msg_body["reply_markup"]["inline_keyboard"]
+            .as_array()
+            .unwrap();
+        assert_eq!(kb[0][0]["callback_data"], "ok");
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_card_many_buttons_wrap_into_rows() {
+        // 8 buttons → 3 + 3 + 2 layout.
+        let s = MockServer::start().await;
+        empty_get_updates(&s).await;
+        mount_send_message(&s, 1).await;
+        let adapter = build_adapter(&s).await;
+
+        let buttons: Vec<CardButton> = (0..8)
+            .map(|i| CardButton {
+                label: format!("B{i}"),
+                value: Some(format!("v{i}")),
+                url: None,
+                style: None,
+            })
+            .collect();
+        let card = Card {
+            title: Some("Pick one".into()),
+            buttons,
+            ..Card::default()
+        };
+        adapter.deliver_card("c", None, &card, None).await.unwrap();
+
+        let reqs = s.received_requests().await.unwrap();
+        let req = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/sendMessage"))
+            .expect("sendMessage request");
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        let kb = body["reply_markup"]["inline_keyboard"]
+            .as_array()
+            .unwrap();
+        assert_eq!(kb.len(), 3, "expected 3 rows, got {}", kb.len());
+        assert_eq!(kb[0].as_array().unwrap().len(), 3);
+        assert_eq!(kb[1].as_array().unwrap().len(), 3);
+        assert_eq!(kb[2].as_array().unwrap().len(), 2);
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_card_propagates_thread_id_to_send_message() {
+        let s = MockServer::start().await;
+        empty_get_updates(&s).await;
+        mount_send_message(&s, 1).await;
+        let adapter = build_adapter(&s).await;
+
+        let card = Card {
+            title: Some("Hi".into()),
+            buttons: vec![CardButton {
+                label: "Ok".into(),
+                value: Some("ok".into()),
+                url: None,
+                style: None,
+            }],
+            ..Card::default()
+        };
+        adapter
+            .deliver_card("c-1", Some("17"), &card, None)
+            .await
+            .unwrap();
+        let reqs = s.received_requests().await.unwrap();
+        let req = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/sendMessage"))
+            .expect("sendMessage request");
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+        assert_eq!(body["message_thread_id"], 17);
+        adapter.shutdown().await;
+    }
+
+    #[test]
+    fn markdown_v2_escapes_special_chars() {
+        // Every reserved char per the Bot API spec must be backslash-prefixed.
+        let escaped = escape_markdown_v2("Title v1.2 (beta)!");
+        assert_eq!(escaped, "Title v1\\.2 \\(beta\\)\\!");
+
+        // Underscores + stars + brackets all escaped.
+        let escaped = escape_markdown_v2("a_b *c* [d] `e` >f #g +h -i =j |k {l} ~m");
+        assert!(escaped.contains("a\\_b"));
+        assert!(escaped.contains("\\*c\\*"));
+        assert!(escaped.contains("\\[d\\]"));
+        assert!(escaped.contains("\\`e\\`"));
+        assert!(escaped.contains("\\>f"));
+        assert!(escaped.contains("\\#g"));
+        assert!(escaped.contains("\\+h"));
+        assert!(escaped.contains("\\-i"));
+        assert!(escaped.contains("\\=j"));
+        assert!(escaped.contains("\\|k"));
+        assert!(escaped.contains("\\{l\\}"));
+        assert!(escaped.contains("\\~m"));
+
+        // Non-reserved chars passed through unchanged.
+        assert_eq!(escape_markdown_v2("hello world"), "hello world");
+        assert_eq!(escape_markdown_v2(""), "");
+
+        // Backslashes themselves are escaped so they cannot smuggle
+        // through additional escape semantics.
+        assert_eq!(escape_markdown_v2("\\foo"), "\\\\foo");
+    }
+
+    #[test]
+    fn render_card_markdown_v2_full_card_layout() {
+        let c = confirm_card_with_buttons();
+        let out = render_card_markdown_v2(&c);
+        // Title bolded with `#` and `.` escaped.
+        assert!(out.starts_with("*Order \\#42*"), "got `{out}`");
+        // Body present (unescaped chars survive).
+        assert!(out.contains("Ready to confirm"));
+        // Fields rendered as *Label:* value.
+        assert!(out.contains("*Item:* Espresso"));
+        // `$` is not reserved in MarkdownV2; `.` and `4.50` is escaped.
+        assert!(out.contains("$4\\.50"), "got `{out}`");
+        // No trailing newline.
+        assert!(!out.ends_with('\n'));
+    }
+
+    #[test]
+    fn build_inline_keyboard_wraps_at_three() {
+        let mut card = Card {
+            title: Some("t".into()),
+            ..Card::default()
+        };
+        card.buttons = (0..5)
+            .map(|i| CardButton {
+                label: format!("B{i}"),
+                value: Some(format!("v{i}")),
+                url: None,
+                style: None,
+            })
+            .collect();
+        let rows = build_inline_keyboard(&card);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].len(), 3);
+        assert_eq!(rows[1].len(), 2);
+        assert_eq!(rows[0][0].callback_data.as_deref(), Some("v0"));
+        assert!(rows[0][0].url.is_none());
+    }
+
+    #[test]
+    fn build_inline_keyboard_skips_buttons_with_neither_value_nor_url() {
+        // Validator catches these at the runner, but the adapter must
+        // not panic if a bad card sneaks through (defence in depth).
+        let card = Card {
+            title: Some("t".into()),
+            buttons: vec![CardButton {
+                label: "B".into(),
+                value: None,
+                url: None,
+                style: None,
+            }],
+            ..Card::default()
+        };
+        assert!(build_inline_keyboard(&card).is_empty());
+    }
+
+    #[test]
+    fn render_card_markdown_v2_title_only() {
+        let c = Card {
+            title: Some("hi".into()),
+            ..Card::default()
+        };
+        assert_eq!(render_card_markdown_v2(&c), "*hi*");
+    }
+
+    #[test]
+    fn render_card_markdown_v2_omits_blank_sections() {
+        // Whitespace-only title / body must not produce empty headings.
+        let c = Card {
+            title: Some("  ".into()),
+            body: Some("real body".into()),
+            ..Card::default()
+        };
+        let out = render_card_markdown_v2(&c);
+        assert_eq!(out, "real body");
+    }
+
+    #[test]
+    fn truncate_for_photo_caption_appends_suffix_under_budget() {
+        let body = "a".repeat(2000);
+        let out = truncate_for_photo_caption(&body);
+        assert!(out.chars().count() <= MAX_PHOTO_CAPTION_CHARS);
+        assert!(out.ends_with("\\(see message below\\)"), "got `{out}`");
+    }
+
+    #[test]
+    fn truncate_for_photo_caption_drops_dangling_backslash() {
+        // Construct an escaped body whose truncation lands mid-escape.
+        let body: String = "\\.".repeat(1000); // each pair is 2 chars
+        let out = truncate_for_photo_caption(&body);
+        // The truncation point must not leave a stray `\` immediately
+        // before the suffix newline.
+        let pre_suffix: String = out
+            .chars()
+            .take(out.chars().count() - "\\(see message below\\)".chars().count() - 1)
+            .collect();
+        assert!(!pre_suffix.ends_with('\\'), "stray backslash in `{pre_suffix}`");
+    }
+
+    // ---------------------------------------------------------------
+    // Inbound: callback_query path.
+    // ---------------------------------------------------------------
+
+    /// Mount the long-poll endpoint so it returns a single `callback_query`
+    /// update on the first call and then idle empty responses.
+    async fn mount_callback_query_long_poll(server: &MockServer, data: &str) {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cc = counter.clone();
+        let data = data.to_owned();
+        Mock::given(method("POST"))
+            .and(path("/bottok/getUpdates"))
+            .respond_with(move |_req: &wiremock::Request| {
+                let n = cc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    ResponseTemplate::new(200).set_body_json(json!({
+                        "ok": true,
+                        "result": [{
+                            "update_id": 11,
+                            "callback_query": {
+                                "id": "cb-xyz",
+                                "from": { "id": 200, "is_bot": false, "username": "alice" },
+                                "message": {
+                                    "message_id": 99,
+                                    "date": 1_700_000_000,
+                                    "chat": { "id": 100, "type": "private" }
+                                },
+                                "data": data,
+                            }
+                        }]
+                    }))
+                } else {
+                    ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": []}))
+                }
+            })
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn callback_query_inbound_becomes_chat_event() {
+        let s = MockServer::start().await;
+        mount_callback_query_long_poll(&s, "confirm:42").await;
+        // answerCallbackQuery is called eagerly — mount so it does not fail.
+        Mock::given(method("POST"))
+            .and(path("/bottok/answerCallbackQuery"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": true
+            })))
+            .mount(&s)
+            .await;
+
+        let (tx, mut rx) = mpsc::channel::<InboundEvent>(8);
+        let dir = temp_dir();
+        let adapter = TelegramAdapter::start(
+            lp_config(&s.uri()),
+            None,
+            tx,
+            dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+
+        let evt = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(evt.channel_type.as_str(), "telegram");
+        assert_eq!(evt.platform_id, "100");
+        assert_eq!(evt.message.kind, MessageKind::Chat);
+        assert_eq!(evt.message.content["text"], "confirm:42");
+        // Tagged so handlers can distinguish a callback from a typed message.
+        assert_eq!(evt.message.content["callback"]["id"], "cb-xyz");
+        assert_eq!(evt.message.content["callback"]["data"], "confirm:42");
+        assert_eq!(evt.message.content["callback"]["original_message_id"], 99);
+        let sender = evt.sender.as_ref().expect("sender");
+        assert_eq!(sender.identity, "200");
+        assert_eq!(sender.display_name.as_deref(), Some("alice"));
+        assert_eq!(sender.channel_type.as_str(), "telegram");
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn callback_query_acks_the_query() {
+        let s = MockServer::start().await;
+        mount_callback_query_long_poll(&s, "noop").await;
+        Mock::given(method("POST"))
+            .and(path("/bottok/answerCallbackQuery"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": true
+            })))
+            .mount(&s)
+            .await;
+
+        let (tx, mut rx) = mpsc::channel::<InboundEvent>(8);
+        let dir = temp_dir();
+        let adapter = TelegramAdapter::start(
+            lp_config(&s.uri()),
+            None,
+            tx,
+            dir.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+
+        // Wait for the inbound event so we know the loop has processed
+        // the callback and (per our ordering) already called the ack.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // Give the long-poll a moment to finish flushing the ack.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let reqs = s.received_requests().await.unwrap();
+        let ack = reqs
+            .iter()
+            .find(|r| r.url.path().ends_with("/answerCallbackQuery"))
+            .expect("answerCallbackQuery request");
+        let body: serde_json::Value = serde_json::from_slice(&ack.body).unwrap();
+        assert_eq!(body["callback_query_id"], "cb-xyz");
+        // We pass `None` text so no toast pops up.
+        assert!(body.get("text").is_none(), "expected no text, got `{body}`");
         adapter.shutdown().await;
     }
 }

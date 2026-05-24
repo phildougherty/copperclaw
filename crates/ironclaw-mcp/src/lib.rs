@@ -73,7 +73,14 @@ mod smoke {
                 "ask_user_question",
                 serde_json::json!({"title": "t", "options": ["a"]}),
             ),
-            ("send_card", serde_json::json!({"card": {}})),
+            // Wave 2 of the cards rollout switched `send_card` to the
+            // canonical `Card` schema; an empty `{}` card fails the
+            // non-emptiness validator, so we send a minimal-but-valid
+            // card with a title.
+            (
+                "send_card",
+                serde_json::json!({"card": {"title": "hi"}}),
+            ),
             (
                 "create_agent",
                 serde_json::json!({"name": "n", "instructions": "i"}),

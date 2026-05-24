@@ -233,7 +233,8 @@ pub struct Message {
     pub sticker: Option<Sticker>,
 }
 
-/// A Telegram `Update`. The adapter only handles message-bearing updates.
+/// A Telegram `Update`. The adapter handles message- and `callback_query`-
+/// bearing updates.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Update {
     pub update_id: i64,
@@ -243,6 +244,37 @@ pub struct Update {
     pub edited_message: Option<Message>,
     #[serde(default)]
     pub channel_post: Option<Message>,
+    /// Update payload sent when a user taps an `inline_keyboard` button on
+    /// a message produced by [`crate::adapter::TelegramAdapter::deliver_card`].
+    /// The `data` field carries the button's `value` from the canonical
+    /// [`ironclaw_channels_core::Card`] schema.
+    #[serde(default)]
+    pub callback_query: Option<CallbackQuery>,
+}
+
+/// Telegram `CallbackQuery` — emitted when a user taps an `inline_keyboard`
+/// button with a `callback_data` payload.
+///
+/// Only the fields the adapter needs to synthesise an [`crate::InboundEvent`]
+/// and ack via `answerCallbackQuery` are declared; unknown fields are
+/// ignored so the struct survives Telegram adding new attributes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallbackQuery {
+    /// Opaque callback id — required for `answerCallbackQuery` to stop the
+    /// button's loading spinner.
+    pub id: String,
+    /// The user who tapped the button.
+    pub from: User,
+    /// The message the button was attached to. `None` when the original
+    /// message is too old to be referenced — we still emit an event so the
+    /// agent can react, but routing falls back to the `from.id` chat id.
+    #[serde(default)]
+    pub message: Option<Message>,
+    /// Payload from the button's `callback_data` field. This is exactly
+    /// the [`ironclaw_channels_core::CardButton::value`] string the agent
+    /// supplied when constructing the card.
+    #[serde(default)]
+    pub data: Option<String>,
 }
 
 /// Return shape of `sendMessage` and `sendDocument`.
@@ -411,6 +443,7 @@ mod tests {
             }),
             edited_message: None,
             channel_post: None,
+            callback_query: None,
         };
         let json = serde_json::to_string(&u).unwrap();
         let back: Update = serde_json::from_str(&json).unwrap();

@@ -44,9 +44,12 @@ fn runner_emit_set() -> HashSet<&'static str> {
         // Message lifecycle actions (apply_edit_message, apply_add_reaction).
         "edit",
         "reaction",
-        // Interactive UI (apply_ask_question, apply_send_card).
+        // Interactive UI (apply_ask_question). `send_card` was removed
+        // from this list in wave 2 of the cards rollout: `apply_send_card`
+        // now writes a `MessageKind::Card` row (NOT a System action) and
+        // goes through the delivery service's `dispatch_card` path, not
+        // the module action registry.
         "ask_user_question",
-        "send_card",
         // Agent-to-agent fan-out (apply_create_agent).
         "create_agent",
         // Self-modification (apply_install_packages, apply_add_mcp_server).

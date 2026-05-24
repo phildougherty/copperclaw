@@ -81,6 +81,7 @@ fn row_to_record(row: &Row<'_>) -> rusqlite::Result<OutboundDroppedMessage> {
         "webhook" => MessageKind::Webhook,
         "system" => MessageKind::System,
         "agent" => MessageKind::Agent,
+        "card" => MessageKind::Card,
         other => {
             return Err(rusqlite::Error::FromSqlConversionFailure(
                 0,

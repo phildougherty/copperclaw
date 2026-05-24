@@ -181,13 +181,19 @@ pub struct AskUserQuestionSpec {
     pub to: Option<Recipient>,
 }
 
-/// Spec for `send_card` — a structured platform-specific UI element.
+/// Spec for `send_card` — the canonical portable card schema defined in
+/// `ironclaw-channels-core`. The runner serialises this directly into a
+/// `MessageKind::Card` outbound row; the delivery service deserialises it
+/// back into [`ironclaw_channels_core::Card`] and hands it to the
+/// adapter's `deliver_card` hook.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendCardSpec {
     /// Recipient; `None` means "reply on origin channel".
     pub to: Option<Recipient>,
-    /// Opaque card payload; validated by the channel adapter.
-    pub card: serde_json::Value,
+    /// Canonical card. Validated against the schema at construction time
+    /// by the `send_card` MCP tool — anything that reaches the runner is
+    /// guaranteed to pass [`ironclaw_channels_core::Card::validate`].
+    pub card: ironclaw_channels_core::Card,
 }
 
 /// The sum type of every side effect a tool may emit.
@@ -725,7 +731,10 @@ mod tests {
             (
                 OutboundToolEffect::SendCard(SendCardSpec {
                     to: None,
-                    card: serde_json::json!({}),
+                    card: ironclaw_channels_core::Card {
+                        title: Some("t".into()),
+                        ..ironclaw_channels_core::Card::default()
+                    },
                 }),
                 "send_card",
             ),
