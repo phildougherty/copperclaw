@@ -651,6 +651,31 @@ pub(crate) mod bytes_b64 {
     }
 }
 
+/// Same as `bytes_b64`, but for `Option<Vec<u8>>` fields where the
+/// model may omit the data entirely (e.g. `send_file` when using
+/// `path` instead). Delegates to `bytes_b64` for the actual decode
+/// when present.
+pub(crate) mod bytes_b64_optional {
+    use super::bytes_b64;
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        d: D,
+    ) -> Result<Option<Vec<u8>>, D::Error> {
+        let opt = Option::<String>::deserialize(d)?;
+        match opt {
+            None => Ok(None),
+            Some(s) if s.is_empty() => Ok(None),
+            Some(s) => {
+                // Funnel through bytes_b64's deserializer via a small
+                // adapter so we don't duplicate the alphabet table.
+                let de = serde::de::value::StrDeserializer::<D::Error>::new(&s);
+                bytes_b64::deserialize(de).map(Some)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -132,13 +132,33 @@ pub mod send_file {
     use rmcp::model::{CallToolResult, JsonObject, Tool};
     use serde::Deserialize;
 
+    /// Hard ceiling on bytes a single `send_file` will read from disk.
+    /// Channel adapters cap separately (Telegram is 50 MB) — this is a
+    /// runner-side guard so a malicious model can't tie up the host
+    /// trying to upload a 4 GB log file. Pick comfortably above the
+    /// largest payload any sane attachment uses.
+    const SEND_FILE_PATH_MAX_BYTES: usize = 32 * 1024 * 1024; // 32 MB
+
     #[derive(Debug, Deserialize)]
     struct Input {
         #[serde(default)]
         to: Option<RecipientInput>,
-        filename: String,
-        #[serde(with = "crate::context::bytes_b64")]
-        data: Vec<u8>,
+        #[serde(default)]
+        filename: Option<String>,
+        /// **Preferred** for any file already on disk inside the
+        /// container (typical case: the agent just wrote it with
+        /// `write_file` or a build step generated it). The handler
+        /// reads the file directly — no base64 dance in the model's
+        /// output. Mutually exclusive with `data`.
+        #[serde(default)]
+        path: Option<String>,
+        /// Use only for bytes the model has actually generated
+        /// in-memory and cannot save to disk first. Base64-encoded
+        /// strings over a few KB are an anti-pattern here — they
+        /// blow past `max_tokens` mid-tool-call. Mutually exclusive
+        /// with `path`.
+        #[serde(default, with = "crate::context::bytes_b64_optional")]
+        data: Option<Vec<u8>>,
         #[serde(default)]
         text: Option<String>,
     }
@@ -146,16 +166,22 @@ pub mod send_file {
     pub fn schema() -> Tool {
         make_tool(
             "send_file",
-            "Send a file (base64-encoded bytes). `text` is an optional caption.",
+            "Send a file. Provide EITHER `path` (preferred; the host reads the file from disk \
+             — use this for anything you wrote with `write_file` or a build artifact) OR \
+             `data` (base64-encoded bytes; only use for bytes generated in-memory that you \
+             can't save first). DO NOT base64-encode a file on disk and pass it as `data` — \
+             that overflows the model's max_tokens. `filename` is required when using `data`, \
+             optional when using `path` (defaults to the basename). `text` is an optional \
+             caption.",
             serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["filename", "data"],
                 "properties": {
-                    "to": { "type": ["string", "object", "null"] },
-                    "filename": { "type": "string", "minLength": 1 },
-                    "data": { "type": "string", "contentEncoding": "base64" },
-                    "text": { "type": ["string", "null"] }
+                    "to":       { "type": ["string", "object", "null"] },
+                    "path":     { "type": ["string", "null"], "description": "Filesystem path inside the container. Preferred for files on disk." },
+                    "filename": { "type": ["string", "null"], "description": "Display name for the recipient. Required with `data`; defaults to path basename when using `path`." },
+                    "data":     { "type": ["string", "null"], "contentEncoding": "base64", "description": "Base64 bytes. Avoid for files on disk — use `path` instead." },
+                    "text":     { "type": ["string", "null"] }
                 }
             }),
         )
@@ -166,17 +192,66 @@ pub mod send_file {
         ctx: &dyn ToolContext,
     ) -> Result<CallToolResult, ToolError> {
         let input: Input = parse_args(arguments)?;
-        if input.filename.trim().is_empty() {
+        let to = validate_to(input.to)?;
+
+        // Resolve to (filename, bytes). Exactly one of `path` / `data`
+        // must be supplied. The path branch is the recommended way
+        // for any file the agent already has on disk; the data
+        // branch is the legacy in-memory-bytes path.
+        let (filename, data) = match (input.path.as_deref(), input.data) {
+            (Some(_), Some(_)) => {
+                return Err(ToolError::Validation(
+                    "send_file: provide either `path` or `data`, not both".into(),
+                ))
+            }
+            (None, None) => {
+                return Err(ToolError::Validation(
+                    "send_file: must provide either `path` (preferred) or `data`".into(),
+                ))
+            }
+            (Some(path), None) => {
+                let metadata = std::fs::metadata(path).map_err(|e| {
+                    ToolError::Validation(format!("send_file: stat `{path}` failed: {e}"))
+                })?;
+                let len = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+                if len > SEND_FILE_PATH_MAX_BYTES {
+                    return Err(ToolError::Validation(format!(
+                        "send_file: `{path}` is {len} bytes; max is {SEND_FILE_PATH_MAX_BYTES}"
+                    )));
+                }
+                let bytes = std::fs::read(path).map_err(|e| {
+                    ToolError::Validation(format!("send_file: read `{path}` failed: {e}"))
+                })?;
+                let fname = input.filename.unwrap_or_else(|| {
+                    std::path::Path::new(path)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("file")
+                        .to_string()
+                });
+                (fname, bytes)
+            }
+            (None, Some(bytes)) => {
+                let fname = input.filename.ok_or_else(|| {
+                    ToolError::Validation(
+                        "send_file: `filename` is required when using `data`".into(),
+                    )
+                })?;
+                (fname, bytes)
+            }
+        };
+
+        if filename.trim().is_empty() {
             return Err(ToolError::Validation("`filename` must be non-empty".into()));
         }
-        if input.data.is_empty() {
-            return Err(ToolError::Validation("`data` must be non-empty".into()));
+        if data.is_empty() {
+            return Err(ToolError::Validation("file is empty (zero bytes)".into()));
         }
-        let to = validate_to(input.to)?;
+
         let spec = SendFileSpec {
             to,
-            filename: input.filename,
-            data: input.data,
+            filename,
+            data,
             text: input.text,
         };
         let ack = ctx.emit_outbound(OutboundToolEffect::SendFile(spec)).await?;
@@ -605,7 +680,18 @@ mod tests {
 
         let s = send_file::schema();
         let schema: serde_json::Value = serde_json::to_value(&*s.input_schema).unwrap();
-        assert_eq!(schema["required"], serde_json::json!(["filename", "data"]));
+        // send_file uses runtime cross-validation (exactly one of
+        // `path` or `data`) instead of schema `required` — the
+        // either-or rule isn't easily expressible in JSON Schema's
+        // top-level `required` array.
+        assert_eq!(schema["required"], serde_json::Value::Null);
+        let props = schema["properties"].as_object().expect("properties object");
+        for key in ["path", "data", "filename", "text", "to"] {
+            assert!(
+                props.contains_key(key),
+                "send_file schema should advertise property {key}: got {props:?}"
+            );
+        }
 
         let s = edit_message::schema();
         let schema: serde_json::Value = serde_json::to_value(&*s.input_schema).unwrap();
