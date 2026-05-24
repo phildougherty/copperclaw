@@ -200,7 +200,7 @@ impl RunnerToolCtx {
     /// Errors are swallowed: breadcrumbs are best-effort UX
     /// observability, NOT load-bearing — a failed write shouldn't
     /// abort the turn or surface to the user.
-    pub async fn emit_breadcrumb(&self, tool_name: &str) {
+    pub async fn emit_breadcrumb(&self, tool_name: &str, input: Option<&serde_json::Value>) {
         if !self.breadcrumbs_enabled {
             return;
         }
@@ -215,7 +215,17 @@ impl RunnerToolCtx {
         if origin.channel_type.is_none() || origin.platform_id.is_none() {
             return;
         }
-        let text = format!("[{tool_name}]");
+        // Add per-tool detail when we have the input — shell command,
+        // search query, file path, etc. — so the user can see at a
+        // glance what the agent is doing, not just which tool it's
+        // running. Format: `[name] detail` when we have detail,
+        // `[name]` when we don't (e.g. detail extraction failed or
+        // the tool has no useful arg to surface).
+        let detail = input.and_then(|v| breadcrumb_detail(tool_name, v));
+        let text = match detail {
+            Some(d) => format!("[{tool_name}] {d}"),
+            None => format!("[{tool_name}]"),
+        };
         let body = serde_json::json!({ "text": text });
         let routed = OutboundRouting {
             kind: MessageKind::Chat,
@@ -352,8 +362,8 @@ impl ToolContext for RunnerToolCtx {
         Self::clear_originating(self);
     }
 
-    async fn emit_breadcrumb(&self, tool_name: &str) {
-        Self::emit_breadcrumb(self, tool_name).await;
+    async fn emit_breadcrumb(&self, tool_name: &str, input: Option<&serde_json::Value>) {
+        Self::emit_breadcrumb(self, tool_name, input).await;
     }
 
     async fn spawn_subagent(
@@ -559,12 +569,70 @@ fn is_visible_breadcrumb_tool(name: &str) -> bool {
             | "web_search"
             | "web_fetch"
             | "explore"
+            | "read_file"
             | "write_file"
             | "edit_file"
+            | "grep"
+            | "glob"
             | "create_agent"
             | "install_packages"
             | "add_mcp_server"
     )
+}
+
+/// Per-tool detail extractor: given a tool name and the model's input
+/// JSON, return a short string (≤80 chars) for the user-visible
+/// breadcrumb. Returns `None` when the tool has no useful arg to
+/// surface or the input doesn't match the expected shape — caller
+/// falls back to just `[tool_name]`.
+///
+/// Caps are deliberately tight: the breadcrumb is a UX cue, not the
+/// full request. Long commands / paths / queries get truncated with
+/// an ellipsis so the chat line stays readable on mobile.
+fn breadcrumb_detail(name: &str, input: &serde_json::Value) -> Option<String> {
+    const MAX_LEN: usize = 80;
+    let field = |key: &str| -> Option<String> {
+        input.get(key).and_then(|v| v.as_str()).map(str::to_owned)
+    };
+    let raw = match name {
+        "shell" => field("command"),
+        "web_search" | "explore" => field("query"),
+        "web_fetch" => field("url"),
+        "read_file" | "write_file" | "edit_file" => field("path"),
+        "grep" | "glob" => field("pattern"),
+        "create_agent" => field("name").or_else(|| field("prompt")),
+        "add_mcp_server" => field("name"),
+        "install_packages" => {
+            // Two parallel arrays in this tool's input. Show the names
+            // joined with commas (apt first, then npm).
+            let mut parts: Vec<String> = Vec::new();
+            for key in ["apt", "npm"] {
+                if let Some(arr) = input.get(key).and_then(|v| v.as_array()) {
+                    for v in arr {
+                        if let Some(s) = v.as_str() {
+                            parts.push(s.to_owned());
+                        }
+                    }
+                }
+            }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(", "))
+            }
+        }
+        _ => None,
+    }?;
+    // Collapse any internal newlines so the breadcrumb is one line;
+    // the model may emit multi-line shell commands and the chat
+    // adapter treats `\n` as message boundaries on some channels.
+    let collapsed = raw.replace(['\n', '\r'], " ");
+    if collapsed.chars().count() <= MAX_LEN {
+        Some(collapsed)
+    } else {
+        let truncated: String = collapsed.chars().take(MAX_LEN.saturating_sub(1)).collect();
+        Some(format!("{truncated}…"))
+    }
 }
 
 fn strip_reasoning_blocks(text: &str) -> String {
@@ -1060,6 +1128,73 @@ mod tests {
     use ironclaw_db::session::{open_outbound, SessionPaths};
     use ironclaw_mcp::Recipient;
     use ironclaw_types::{AgentGroupId, SessionId};
+
+    #[test]
+    fn breadcrumb_detail_shell_includes_command() {
+        let input = serde_json::json!({"command": "cargo test --workspace"});
+        assert_eq!(
+            breadcrumb_detail("shell", &input).as_deref(),
+            Some("cargo test --workspace")
+        );
+    }
+
+    #[test]
+    fn breadcrumb_detail_web_search_includes_query() {
+        let input = serde_json::json!({"query": "rust async runtime comparison"});
+        assert_eq!(
+            breadcrumb_detail("web_search", &input).as_deref(),
+            Some("rust async runtime comparison")
+        );
+    }
+
+    #[test]
+    fn breadcrumb_detail_write_file_includes_path() {
+        let input = serde_json::json!({"path": "/data/src/main.rs", "content": "fn main(){}"});
+        assert_eq!(
+            breadcrumb_detail("write_file", &input).as_deref(),
+            Some("/data/src/main.rs")
+        );
+    }
+
+    #[test]
+    fn breadcrumb_detail_truncates_long_commands_with_ellipsis() {
+        let long_cmd = "a".repeat(200);
+        let input = serde_json::json!({"command": long_cmd});
+        let got = breadcrumb_detail("shell", &input).unwrap();
+        // Cap is 80; truncated form is 79 chars + '…'.
+        assert_eq!(got.chars().count(), 80);
+        assert!(got.ends_with('…'));
+    }
+
+    #[test]
+    fn breadcrumb_detail_collapses_newlines_in_multiline_commands() {
+        let input = serde_json::json!({"command": "set -e\necho hi\nls -la"});
+        let got = breadcrumb_detail("shell", &input).unwrap();
+        assert!(!got.contains('\n'), "newlines must be collapsed: {got:?}");
+        assert_eq!(got, "set -e echo hi ls -la");
+    }
+
+    #[test]
+    fn breadcrumb_detail_install_packages_joins_apt_and_npm() {
+        let input = serde_json::json!({
+            "apt": ["jq", "ripgrep"],
+            "npm": ["typescript"],
+        });
+        let got = breadcrumb_detail("install_packages", &input).unwrap();
+        assert_eq!(got, "jq, ripgrep, typescript");
+    }
+
+    #[test]
+    fn breadcrumb_detail_returns_none_for_unknown_tool() {
+        let input = serde_json::json!({"anything": "here"});
+        assert!(breadcrumb_detail("not_a_known_tool", &input).is_none());
+    }
+
+    #[test]
+    fn breadcrumb_detail_returns_none_when_expected_field_missing() {
+        let input = serde_json::json!({"wrong_field": "value"});
+        assert!(breadcrumb_detail("shell", &input).is_none());
+    }
 
     fn fresh_ctx() -> (tempfile::TempDir, RunnerToolCtx) {
         let tmp = tempfile::tempdir().unwrap();

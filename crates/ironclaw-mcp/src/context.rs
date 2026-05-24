@@ -408,17 +408,20 @@ pub trait ToolContext: Send + Sync {
     /// routing.
     fn clear_originating(&self) {}
 
-    /// Optional UX-observability hook: emit a brief `[tool_name]`
-    /// chat message to the originating channel right before a tool
-    /// call fires, so users see what the agent is working on during
-    /// long turns. Default no-op so most contexts opt-out. The
-    /// runner's `RunnerToolCtx` enables this when the
-    /// `IRONCLAW_TOOL_BREADCRUMBS` env var is set; the
-    /// implementation filters by a hard-coded allowlist of "visible"
-    /// tools (shell, web_search, write_file, etc.) and only emits
-    /// when there's a real channel routing to send to.
-    async fn emit_breadcrumb(&self, tool_name: &str) {
-        let _ = tool_name;
+    /// Optional UX-observability hook: emit a brief
+    /// `[tool_name detail]` chat message to the originating channel
+    /// right before a tool call fires, so users see what the agent
+    /// is working on during long turns. `input` is the model's full
+    /// tool-call argument JSON (when available) — the runner-side
+    /// implementation pulls per-tool detail strings out of it
+    /// (command for `shell`, query for `web_search`, path for
+    /// `write_file`, etc.) and appends them. Default no-op so most
+    /// contexts opt-out. The runner's `RunnerToolCtx` enables this
+    /// when `IRONCLAW_TOOL_BREADCRUMBS` is set; the implementation
+    /// filters by a hard-coded allowlist of "visible" tools and
+    /// only emits when there's real channel routing.
+    async fn emit_breadcrumb(&self, tool_name: &str, input: Option<&serde_json::Value>) {
+        let _ = (tool_name, input);
     }
 }
 

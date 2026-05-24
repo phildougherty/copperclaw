@@ -6,6 +6,51 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (tool breadcrumbs now include input details)
+
+Previously the user-visible chat breadcrumbs were just `[tool_name]`
+("[shell]", "[web_search]") — enough to know the agent was working
+but useless for "what's it actually doing?". Now they include a short
+per-tool detail extracted from the model's input JSON:
+
+- `[shell] cargo test --workspace`
+- `[web_search] AI biotech news May 2026`
+- `[web_fetch] https://apps.apple.com/charts`
+- `[write_file] src/main.rs`
+- `[read_file] /data/Cargo.toml`
+- `[grep] use\s+anyhow`
+- `[install_packages] jq, ripgrep, typescript`
+- `[create_agent] Biotech News Researcher`
+
+Implementation in `crates/ironclaw-runner/src/tools.rs`:
+
+- New `breadcrumb_detail(name, input) -> Option<String>` formatter.
+  Per-tool field extraction (`command` for shell, `query` for
+  web_search/explore, `url` for web_fetch, `path` for file ops,
+  `pattern` for grep/glob, etc.). Strings are capped at 80 chars
+  with an ellipsis suffix and newlines collapsed to single spaces
+  so the breadcrumb stays one line on mobile clients. Returns
+  `None` for unknown tools or missing fields — caller falls back
+  to the old bare `[tool_name]` form.
+- Allowlist (`is_visible_breadcrumb_tool`) expanded to include
+  `read_file`, `grep`, `glob` alongside the existing shell /
+  web_search / web_fetch / file-write / etc. set.
+
+Plumbing in `crates/ironclaw-mcp/src/context.rs` +
+`crates/ironclaw-runner/src/run/provider_call.rs`:
+
+- `ToolContext::emit_breadcrumb` signature gained an
+  `input: Option<&serde_json::Value>` parameter. Default trait
+  impl stays a no-op.
+- Breadcrumb emission moved from `ProviderEvent::ToolStart` (no
+  input available yet — the streamed deltas haven't been
+  reassembled) to `ProviderEvent::ToolCall` (full input ready
+  to dispatch). Tiny timing change (≤500ms) but worth it for the
+  much richer UX.
+
+8 new unit tests covering each tool's detail format, truncation,
+newline collapsing, and the missing-field fallback.
+
 ### Changed (tool-result efficiency — search + fetch + shell + read_file)
 
 Profiling the live failure mode showed one `web_fetch` of

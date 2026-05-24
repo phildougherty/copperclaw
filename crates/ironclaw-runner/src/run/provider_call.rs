@@ -206,12 +206,11 @@ pub(super) async fn pump_events(
                 declared_timeout_ms,
             } => {
                 set_current_tool(deps, &name, declared_timeout_ms).await?;
-                // Optional `[tool]` chat breadcrumb for user-visible
-                // observability during long agent turns. Default
-                // no-op via the trait; the RunnerToolCtx impl gates
-                // on `IRONCLAW_TOOL_BREADCRUMBS=1` and a tool
-                // allowlist.
-                deps.tool_ctx.emit_breadcrumb(&name).await;
+                // Breadcrumb emit moved to ToolCall below — by that
+                // point we have the full input JSON and can include
+                // the command / query / path in the breadcrumb. The
+                // ToolStart timing was the wrong place: the input
+                // hasn't been reassembled from streaming deltas yet.
             }
             ProviderEvent::ToolCall { id, name, input } => {
                 // `is_disallowed` is checked here AND inside
@@ -220,6 +219,14 @@ pub(super) async fn pump_events(
                 // PendingToolCall either way so the model sees a
                 // matching `tool_result` on the next turn.
                 let _ = is_disallowed(&name);
+                // Optional `[tool detail]` chat breadcrumb for
+                // user-visible observability during long agent turns.
+                // Default no-op via the trait; the RunnerToolCtx impl
+                // gates on `IRONCLAW_TOOL_BREADCRUMBS=1`, the tool
+                // allowlist, and extracts a per-tool detail (command
+                // for shell, query for web_search, path for
+                // write_file, etc.) from the input.
+                deps.tool_ctx.emit_breadcrumb(&name, Some(&input)).await;
                 out.tool_calls.push(PendingToolCall {
                     id,
                     name,
