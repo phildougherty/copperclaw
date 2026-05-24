@@ -6,6 +6,59 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (tool-result efficiency — search + fetch + shell + read_file)
+
+Profiling the live failure mode showed one `web_fetch` of
+apps.apple.com/charts dumped 344KB into conversation history (88% of
+the 391KB total). The bloat made Sonnet emit malformed JSON, which
+hit the 3-strikes parse cap, which crashed the runner via a separate
+processing_ack bug — see the runner-death fix below.
+
+Root issue: tool results live in conversation history forever until
+compaction fires (at ~180k tokens). One verbose tool call can push
+the agent into context pressure where models start producing
+truncated JSON. Aggressive caps are correctness, not just
+optimization.
+
+Two parallel agents on disjoint file scopes:
+
+- **`crates/ironclaw-mcp/src/tools/web_search.rs`**:
+  - `DEFAULT_MAX_RESULTS` 10 → 5. Models can still ask for more via
+    the `max_results` arg (ceiling stays 25).
+  - `SNIPPET_CAP_BYTES` 4096 → 400. A 400-char snippet is enough to
+    judge relevance and decide whether to pivot to `web_fetch`.
+  - Net: a typical 4-search session drops from ~35 KB → ~8 KB of
+    snippet bloat.
+
+- **`crates/ironclaw-mcp/src/tools/computer_use.rs`** (web_fetch /
+  shell / read_file all live here):
+  - `WEB_FETCH_CAP` 256 KB → 32 KB. Markdown-extracted content of
+    a typical page fits in 32 KB; pages that need more depth are
+    better served by a second targeted fetch.
+  - `web_fetch` response: dropped the entire `headers` map. Apple's
+    CSP header alone was 30+ KB and the model rarely needs response
+    headers. `content_type` is now a top-level scalar (sourced from
+    the original `Content-Type` header) alongside `status` and
+    `size_bytes`. If a future user wants headers they can `shell`
+    `curl -I`.
+  - `SHELL_OUTPUT_CAP` 64 KB → 32 KB per stream. The truncation hint
+    now reads "narrow with tail/head/grep before re-running" so the
+    model knows the next move.
+  - `READ_FILE_CAP` 1 MB → 128 KB. Most source files fit; larger
+    reads should use offset/limit.
+  - New regression tests:
+    `web_fetch_omits_headers_map_and_surfaces_content_type_scalar`
+    and `web_fetch_caps_body_at_32k`.
+
+For the specific failure mode we just debugged: the same 344 KB
+fetch would now produce ~32 KB (10.5× reduction). Four similar
+fetches in a session would stay under 130 KB — well under the
+threshold where Sonnet starts emitting malformed JSON.
+
+Verification: cargo test --workspace --no-fail-fast = 5277 passed
+(4 new tests); clippy clean. One pre-existing parallel-test flake
+(ETXTBSY on editor.sh) — unrelated and tracked separately.
+
 ### Fixed (the actual runner-death root cause: processing_ack NotFound aborted the runner mid-cleanup)
 
 The new `crash-<rfc3339>.log` capture from the previous commit paid off

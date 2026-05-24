@@ -21,22 +21,41 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// Max bytes of stdout/stderr we'll surface back to the model from
-/// `shell`. Tuned so a noisy build can still report status without
-/// blowing the context window — most things the agent cares about
-/// are at the head or tail of output anyway.
-const SHELL_OUTPUT_CAP: usize = 64 * 1024;
+/// Max bytes of stdout/stderr (PER STREAM) we'll surface back to the
+/// model from `shell`. Tuned so a noisy build can still report status
+/// without blowing the context window — most things the agent cares
+/// about are at the head or tail of output anyway. If the agent needs
+/// more, it should re-run with `tail -n 200` / `head -n 200` / `grep`
+/// to narrow the output before invoking `shell`.
+///
+/// Tool results live in conversation history forever until compaction;
+/// size is the dominant cost. Aggressive caps are correctness, not
+/// just optimization — Sonnet produces malformed JSON at high context.
+const SHELL_OUTPUT_CAP: usize = 32 * 1024;
 /// Default timeout for `shell` if the caller doesn't override.
 const SHELL_DEFAULT_TIMEOUT_SECS: u64 = 60;
 /// Hard ceiling — the model can't disable timeouts entirely.
 const SHELL_MAX_TIMEOUT_SECS: u64 = 600;
 /// Max bytes `read_file` will return. Beyond this we return a
-/// truncated head + a hint to the model.
-const READ_FILE_CAP: usize = 1024 * 1024;
+/// truncated head + a hint to the model. Most source files are well
+/// under this cap; for larger files the model should use `grep` /
+/// `shell` to extract just the relevant region.
+///
+/// Tool results live in conversation history forever until compaction;
+/// size is the dominant cost. Aggressive caps are correctness, not
+/// just optimization — Sonnet produces malformed JSON at high context.
+const READ_FILE_CAP: usize = 128 * 1024;
 /// Default timeout for `web_fetch`.
 const WEB_FETCH_DEFAULT_TIMEOUT_SECS: u64 = 30;
-/// Max body bytes `web_fetch` will surface to the model.
-const WEB_FETCH_CAP: usize = 256 * 1024;
+/// Max body bytes `web_fetch` will surface to the model. 32 KiB of
+/// markdown-extracted text is enough context for the model to
+/// understand a page; if it needs more, it can `web_fetch` again with
+/// a different URL or strategy.
+///
+/// Tool results live in conversation history forever until compaction;
+/// size is the dominant cost. Aggressive caps are correctness, not
+/// just optimization — Sonnet produces malformed JSON at high context.
+const WEB_FETCH_CAP: usize = 32 * 1024;
 /// Default path of the per-session shell state file. The container
 /// runtime bind-mounts the session's host directory at `/data`, so
 /// the state file is automatically scoped to a single session — no
@@ -72,7 +91,7 @@ pub mod shell {
     pub fn schema() -> Tool {
         super::make_tool(
             "shell",
-            "Run a bash command inside the container. Returns stdout, stderr, and exit code. Output is capped at 64 KiB. Working directory and exported environment variables persist across calls within a session; pass `reset: true` to wipe that state.",
+            "Run a bash command inside the container. Returns stdout, stderr, and exit code. Output is capped at 32 KiB per stream — if you expect more, narrow it first with `tail -n 200`, `head -n 200`, or `grep`. Working directory and exported environment variables persist across calls within a session; pass `reset: true` to wipe that state.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -266,7 +285,7 @@ pub mod read_file {
     pub fn schema() -> Tool {
         super::make_tool(
             "read_file",
-            "Read a UTF-8 file from the container filesystem. Capped at 1 MiB; larger files are truncated to the head with `truncated: true` in the response.",
+            "Read a UTF-8 file from the container filesystem. Capped at 128 KiB; larger files are truncated to the head with `truncated: true` in the response. For larger files, extract just the relevant region with `grep` / `shell` instead.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -464,7 +483,7 @@ pub mod web_fetch {
     pub fn schema() -> Tool {
         super::make_tool(
             "web_fetch",
-            "Fetch an HTTP(S) URL. Defaults to GET; pass `method: POST` and `body` for posts. HTML responses are automatically converted to markdown to save context — pass `raw: true` to receive the original bytes. Response body is capped at 256 KiB.",
+            "Fetch an HTTP(S) URL. Defaults to GET; pass `method: POST` and `body` for posts. HTML responses are automatically converted to markdown to save context — pass `raw: true` to receive the original bytes. Response body is capped at 32 KiB. Returns `status`, `content_type`, `size_bytes`, and `body`; full response headers are not surfaced — if you need them, use `shell` with `curl -I`.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -517,20 +536,12 @@ pub mod web_fetch {
             ToolError::Internal(format!("web_fetch({}): {e}", input.url))
         })?;
         let status = resp.status().as_u16();
-        let headers: serde_json::Map<String, serde_json::Value> = resp
-            .headers()
-            .iter()
-            .map(|(k, v)| {
-                (
-                    k.as_str().to_string(),
-                    serde_json::Value::String(
-                        v.to_str().unwrap_or("<binary>").to_string(),
-                    ),
-                )
-            })
-            .collect();
         // Pull Content-Type before consuming the body — once we call
-        // `bytes()` the response is moved.
+        // `bytes()` the response is moved. We intentionally do NOT
+        // surface the full response headers map: tool results live in
+        // history forever and a single CSP / Set-Cookie header can be
+        // tens of KiB. The model cares about status + content-type;
+        // anything more should go through `shell` with `curl -I`.
         let content_type_header = resp
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -551,7 +562,7 @@ pub mod web_fetch {
             "url": input.url,
             "method": method,
             "status": status,
-            "headers": headers,
+            "content_type": content_type_header,
             "size_bytes": raw_bytes,
             "truncated": truncated,
             "body": body,
@@ -559,6 +570,9 @@ pub mod web_fetch {
         });
         if let Some(md_len) = conversion.markdown_bytes {
             if let Some(map) = out.as_object_mut() {
+                // Overwrite the raw Content-Type with the conversion
+                // marker so callers can see at a glance that the body
+                // was transformed.
                 map.insert(
                     "content_type".into(),
                     serde_json::Value::String("text/html → markdown".into()),
@@ -704,7 +718,9 @@ fn shell_state_path() -> PathBuf {
 }
 
 /// Cap a string to `max` bytes on a char boundary. Returns
-/// `(capped_string, truncated_flag)`.
+/// `(capped_string, truncated_flag)`. The trailing hint nudges the
+/// model toward narrowing the source (`tail -n 200`, `head -n 200`,
+/// `grep`) rather than re-running the same overflowing command.
 fn cap_output(s: &str, max: usize) -> (String, bool) {
     if s.len() <= max {
         return (s.to_string(), false);
@@ -713,7 +729,13 @@ fn cap_output(s: &str, max: usize) -> (String, bool) {
     while !s.is_char_boundary(cap) {
         cap -= 1;
     }
-    (format!("{}…[truncated]", &s[..cap]), true)
+    (
+        format!(
+            "{}…[truncated; narrow with tail/head/grep before re-running]",
+            &s[..cap]
+        ),
+        true,
+    )
 }
 
 #[cfg(test)]
@@ -1108,6 +1130,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn web_fetch_omits_headers_map_and_surfaces_content_type_scalar() {
+        // Regression guard for the response-shape audit: a single CSP
+        // header can be tens of KiB, so the full headers map must NOT
+        // appear in the tool output. Status + content_type as scalars
+        // are the supported surface area.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/api"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("x-custom-bloat", "a".repeat(2048))
+                    .set_body_raw(b"{\"ok\":true}".as_ref(), "application/json"),
+            )
+            .mount(&server)
+            .await;
+        let res = web_fetch::handle(
+            Some(
+                json!({"url": format!("{}/api", server.uri())})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            ctx().as_ref(),
+        )
+        .await
+        .unwrap();
+        let body = result_text(&res);
+        // The headers map (and our 2 KiB bloat header) must not leak.
+        assert!(!body.contains("\"headers\""), "headers leaked: {body}");
+        assert!(!body.contains("x-custom-bloat"), "header bloat leaked: {body}");
+        // But the scalar content_type must be present.
+        assert!(
+            body.contains("\"content_type\": \"application/json\""),
+            "missing content_type: {body}"
+        );
+        // And status must remain.
+        assert!(body.contains("\"status\": 200"), "missing status: {body}");
+    }
+
+    #[tokio::test]
+    async fn web_fetch_caps_body_at_32k() {
+        // Regression guard: the cap is 32 KiB, not 256 KiB. A 64 KiB
+        // JSON payload must come back truncated.
+        let server = wiremock::MockServer::start().await;
+        let big = "x".repeat(64 * 1024);
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/big"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(big.as_bytes(), "text/plain"),
+            )
+            .mount(&server)
+            .await;
+        let res = web_fetch::handle(
+            Some(
+                json!({"url": format!("{}/big", server.uri())})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            ctx().as_ref(),
+        )
+        .await
+        .unwrap();
+        let body = result_text(&res);
+        assert!(body.contains("\"truncated\": true"), "got: {body}");
+        // The raw size header should still report the full 64 KiB.
+        assert!(body.contains("\"size_bytes\": 65536"), "got: {body}");
+    }
+
+    #[tokio::test]
     async fn web_fetch_html_with_charset_param_triggers_conversion() {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -1248,7 +1341,13 @@ mod tests {
         let s = "héllo".repeat(100);
         let (got, truncated) = cap_output(&s, 10);
         assert!(truncated);
-        assert!(got.ends_with("…[truncated]"));
+        // The trailing hint must mention a narrowing tool so the model
+        // knows the recovery path.
+        assert!(got.contains("truncated"), "got: {got}");
+        assert!(
+            got.contains("tail") || got.contains("head") || got.contains("grep"),
+            "missing narrowing hint: {got}"
+        );
         // The truncated prefix must still be valid UTF-8 (the function
         // guarantees we backed up to a char boundary).
         assert!(got.is_char_boundary(0));

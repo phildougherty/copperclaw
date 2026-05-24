@@ -50,15 +50,31 @@ use serde_json::json;
 use std::time::{Duration, Instant};
 
 /// Default cap on per-call result count.
-const DEFAULT_MAX_RESULTS: u32 = 10;
+///
+/// Kept small because tool results live in conversation history forever
+/// until compaction; the model should pivot to `web_fetch` for any result
+/// that needs more depth than the snippet provides. Live failure mode
+/// that motivated this: one `web_fetch` returned 344KB; four `web_search`
+/// calls at the old 10-result cap would have added another ~35KB on top.
+/// Callers can still raise this per-call via the `max_results` arg up to
+/// [`MAX_RESULTS_CEILING`].
+const DEFAULT_MAX_RESULTS: u32 = 5;
 /// Ceiling on per-call result count (regardless of provider's own cap).
 const MAX_RESULTS_CEILING: u32 = 25;
 /// HTTP timeout per call. Search APIs typically respond in under 2s;
 /// we leave headroom for the slowest provider (`SerpAPI` cold cache).
 const DEFAULT_TIMEOUT_SECS: u64 = 15;
-/// Cap on individual snippet length so a verbose provider doesn't
-/// blow the model's context. Truncated on a UTF-8 boundary.
-const SNIPPET_CAP_BYTES: usize = 4 * 1024;
+/// Cap on individual snippet length so a verbose provider doesn't blow
+/// the model's context. Truncated on a UTF-8 boundary.
+///
+/// Kept small because tool results live in conversation history forever
+/// until compaction; the model should pivot to `web_fetch` for any result
+/// that needs more depth than the snippet provides. Live failure mode
+/// that motivated this: one `web_fetch` returned 344KB; four `web_search`
+/// calls at the old 4KB cap would have added another ~35KB on top. 400
+/// bytes is enough to judge relevance and decide whether to fetch the
+/// full page.
+const SNIPPET_CAP_BYTES: usize = 400;
 
 /// Default base URLs. Tests inject alternative URLs via the lower-
 /// level `search_with_*` fns so wiremock can stand in for the real
