@@ -550,17 +550,32 @@ async fn ack_picked_up(deps: &RunnerDeps, rows: &[MessageInRow]) -> Result<()> {
     let mut g = deps.outbound.lock().await;
     let conn: &mut Connection = &mut g;
     for row in rows {
-        // `insert` errors on duplicate; tolerate retries by switching to update.
+        // `insert` errors on duplicate; tolerate retries by switching
+        // to update. Both paths are best-effort housekeeping — a
+        // missing-or-broken processing_ack row must NOT abort the
+        // runner; the actual inbound processing is what matters.
         match processing_ack::insert(conn, row.id, processing_ack::ProcessingStatus::Processing) {
             Ok(()) => {}
             Err(ironclaw_db::DbError::Sqlite(_)) => {
-                processing_ack::update_status(
+                if let Err(err) = processing_ack::update_status(
                     conn,
                     row.id,
                     processing_ack::ProcessingStatus::Processing,
-                )?;
+                ) {
+                    tracing::warn!(
+                        ?err,
+                        row_id = %row.id.as_uuid(),
+                        "processing_ack ack_picked_up update failed; continuing"
+                    );
+                }
             }
-            Err(e) => return Err(e.into()),
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    row_id = %row.id.as_uuid(),
+                    "processing_ack ack_picked_up insert failed; continuing"
+                );
+            }
         }
     }
     Ok(())
@@ -592,7 +607,27 @@ async fn finalize_messages(
         let mut outbound = deps.outbound.lock().await;
         let conn: &mut Connection = &mut outbound;
         for row in rows {
-            processing_ack::update_status(conn, row.id, ack_status)?;
+            // Don't bubble NotFound out of finalize_messages — it just
+            // means the host's processing-reset sweep already cleared
+            // the ack row between when the runner picked the inbound up
+            // and now. Caught live: the parse-error cap fired
+            // (TurnOutcome::Failed), finalize_messages reached this
+            // line, the ack was missing, `?` propagated NotFound to
+            // main(), the runner exited, the container died, the user
+            // got silence. The mark_failed on messages_in above is
+            // tolerated the same way (it's already let _ = ...). The
+            // apology emit below is what the user actually sees; we
+            // must not gate it on this housekeeping update.
+            match processing_ack::update_status(conn, row.id, ack_status) {
+                Ok(()) | Err(ironclaw_db::DbError::NotFound) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        ?err,
+                        row_id = %row.id.as_uuid(),
+                        "processing_ack::update_status failed in finalize; continuing"
+                    );
+                }
+            }
         }
     }
     // On terminal failure, surface a brief apology to the user via the

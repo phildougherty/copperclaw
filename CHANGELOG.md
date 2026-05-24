@@ -6,6 +6,51 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (the actual runner-death root cause: processing_ack NotFound aborted the runner mid-cleanup)
+
+The new `crash-<rfc3339>.log` capture from the previous commit paid off
+on the very first crash and revealed the real death mechanism:
+
+```
+2026-05-23T23:54:54  ERROR 3 consecutive tool_use parse failures; bailing attempts=3
+Error: not found
+```
+
+Sequence:
+1. The model emitted malformed `write_file` JSON three turns in a
+   row (38-byte truncated input each time — model degradation at
+   high context).
+2. The 3-strikes parse-error cap correctly fired
+   `TurnOutcome::Failed`.
+3. `finalize_messages` ran. `mark_failed` on the inbound succeeded.
+4. `processing_ack::update_status(row.id, Failed)` returned
+   `DbError::NotFound` because the host's
+   `host_sweep::checks::processing` had already cleared the ack row
+   (its CLAIM_STUCK_MS reset deletes the ack as part of the reset
+   path).
+5. The `?` propagated up out of `finalize_messages` → out of
+   `run_loop` → out of `main()`. The runner process exited
+   with `Error: not found`. The container died. The user got
+   nothing — the apology emit that lives BELOW the ack update never
+   ran.
+
+Fix in `crates/ironclaw-runner/src/run/mod.rs`:
+
+- `finalize_messages`: tolerate `DbError::NotFound` from
+  `processing_ack::update_status` (the row legitimately disappeared
+  between pickup and finalize when the host swept it). Other errors
+  are demoted from `?` to `tracing::warn!`. The terminal-failure
+  apology path now runs unconditionally regardless of ack
+  housekeeping.
+- `ack_picked_up`: same treatment — a missing-or-broken
+  `processing_ack` row at pickup time logs a `warn!` and continues
+  rather than aborting the runner. The actual inbound processing is
+  what matters; ack tracking is best-effort housekeeping.
+
+This is the bug that produced the symptom the user was debugging:
+silent runner death mid-message, no apology, no chat update, just
+heartbeat-stale 7 minutes later.
+
 ### Fixed (root-cause batch: silent crash + lost progress on restart)
 
 A Telegram retest showed the agent building a CapCut clone, then going
