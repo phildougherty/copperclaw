@@ -189,6 +189,11 @@ impl Step for ServiceUnitStep {
         "Generate, install, and enable the host service unit"
     }
 
+    // The `run` body sequences scope selection, unit generation,
+    // idempotency check, wrapper write (launchd), and optional
+    // enable+start. Splitting further would push the locals into a
+    // struct with no readability win.
+    #[allow(clippy::too_many_lines)]
     fn run(
         &self,
         cfg: &mut SetupConfig,
@@ -250,6 +255,35 @@ impl Step for ServiceUnitStep {
 
         write_unit(&out, &body)?;
         cfg.service_unit_path.clone_from(&out);
+
+        // For launchd we also need a wrapper shell script that sources
+        // the `.env` and execs ironclaw — launchd has no native env-file
+        // mechanism. The plist's `ProgramArguments` already points at this
+        // wrapper path (see `crates/ironclaw-setup/src/units.rs::render_launchd`).
+        // Without the wrapper, the host boots on macOS without
+        // `ANTHROPIC_API_KEY` and every turn fails. Best-effort: log on
+        // failure but don't abort install — the operator can still write
+        // the wrapper by hand if filesystem permissions intervene.
+        if kind == UnitKind::Launchd {
+            match crate::units::write_launchd_wrapper(&ctx) {
+                Ok(Some(p)) => {
+                    eprintln!("  wrote launchd wrapper script: {}", p.display());
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "  WARN: skipping launchd wrapper — exec path has no parent dir; \
+                         the plist will fail to load env vars from {}",
+                        cfg.env_file.display()
+                    );
+                }
+                Err(err) => {
+                    eprintln!(
+                        "  WARN: failed to write launchd wrapper ({err}); \
+                         host will boot without `.env` values until you create it manually"
+                    );
+                }
+            }
+        }
 
         if scope == ServiceScope::Print {
             let hint = manual_enable_hint(kind, &out);

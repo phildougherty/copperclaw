@@ -1,5 +1,23 @@
 # signal channel audit
 
+## Native UI capabilities
+
+| Capability | Native | Notes |
+|---|---|---|
+| Chat (text) | yes | `signal-cli` JSON-RPC `send` |
+| Auto-split long messages | no | no `max_message_chars()` override; Signal cap is large enough to skip splitting |
+| Honour `Retry-After` | yes | `AdapterError::Rate { retry_after }` from `api.rs`; delivery loop reads it |
+| Typing indicator | yes | `send_typing(stop=false)` (adapter.rs:287) |
+| Native cards (buttons/sections) | no | Signal protocol has no card primitive; falls back via trait-default text render |
+| Native breadcrumbs (tool chips) | fallback | trait-default `[tool]` text line |
+| Inbound reply_to context | yes | `dataMessage.quote.id` → `InboundEvent.reply_to` (parse.rs:124); quote `id` is the ms timestamp, which matches our `message.id` format |
+| Inbound group vs DM distinction | yes | `group_id.is_some()` (parse.rs:73) |
+| Edit messages | yes (via action) | `content.action = "edit"` → `send_edit`. Trait-level `edit_message` NOT overridden |
+| Reactions | yes (via action) | `content.action = "reaction"` → `send_reaction` with `remove` flag. Trait-level `add_reaction` NOT overridden |
+| Files / attachments | yes | staged on disk then passed by path to `send_with_attachments` |
+| Threading | no | `supports_threads() = false` (adapter.rs:272) |
+| Webhook secret verification | n/a (RPC) | inbound rides the `signal-cli` JSON-RPC stdio; no HTTP webhook |
+
 ## Implemented
 - deliver: COMPLETE — text + files, plus action-shape edit / reaction /
   delete. `crates/ironclaw-channels/signal/src/adapter.rs:296`

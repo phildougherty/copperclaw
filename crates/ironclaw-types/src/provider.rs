@@ -76,6 +76,26 @@ pub enum ProviderEvent {
         /// "EOF while parsing an object at line 1 column 37").
         parse_error: String,
     },
+    /// One completed thinking (or `redacted_thinking`) content block.
+    /// Reasoning-capable providers (Anthropic extended thinking,
+    /// `Kimi K2.6`, `Qwen QwQ`, `DeepSeek R1`) stream the chain-of-thought
+    /// as `thinking_delta` events interleaved with `signature_delta`
+    /// events; the provider accumulates them and emits this event
+    /// once at the `content_block_stop` boundary so the runner can
+    /// (a) record the reasoning into `agent_turns` for audit and
+    /// (b) surface it to the user as a [`MessageKind::Thinking`] row
+    /// when the per-group `surface_thinking` config knob is on.
+    ///
+    /// `text` is the accumulated thinking prose (empty when
+    /// `redacted == true`); `redacted` mirrors the upstream
+    /// `redacted_thinking` block type — the user must NOT see the
+    /// raw blob, only a placeholder.
+    Thinking {
+        /// Accumulated thinking text. Empty for redacted blocks.
+        text: String,
+        /// `true` when the upstream block was `redacted_thinking`.
+        redacted: bool,
+    },
 }
 
 /// Provider config materialized into the container at spawn time. Stored in

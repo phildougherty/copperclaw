@@ -58,6 +58,12 @@ fn runner_emit_set() -> HashSet<&'static str> {
         // Scheduling — every op (create / list / cancel / pause / resume /
         // update) emits the same top-level "schedule" key with an inner `op`.
         "schedule",
+        // Tool-progress chip finalisation. `emit_breadcrumb_finish` in
+        // tools.rs writes a System row carrying this action; the host's
+        // delivery service intercepts it inline (see
+        // `inline_handler_set`) and drives an in-place edit of the
+        // prior chip via `deliver_breadcrumb(..., existing_message_id)`.
+        "update_breadcrumb",
     ]
     .into_iter()
     .collect()
@@ -72,6 +78,12 @@ fn inline_handler_set() -> HashSet<&'static str> {
         "usage_report",
         "install_packages",
         "add_mcp_server",
+        // `update_breadcrumb` is the finalisation half of the runner's
+        // tool-progress chip pipeline. Intercepted inline (rather than
+        // via the module registry) so the host can resolve the prior
+        // chip's platform message id and drive an in-place edit via
+        // the adapter's `deliver_breadcrumb` hook.
+        "update_breadcrumb",
         // `edit` and `reaction` go through the typed adapter API
         // (`maybe_handle_edit_or_reaction`). They also fall through to
         // the module-registered handler when the adapter is `Unsupported`.
@@ -197,7 +209,18 @@ fn runner_emit_set_matches_source() {
 
     let mut derived: HashSet<String> = HashSet::new();
     for src in [&tools_src, &run_src] {
-        for fn_body in extract_fn_bodies(src, &["fn apply_", "fn emit_usage_report"]) {
+        for fn_body in extract_fn_bodies(
+            src,
+            &[
+                "fn apply_",
+                "fn emit_usage_report",
+                // Trailing `(` pins this to the function definition,
+                // not the unit-test names like
+                // `fn emit_breadcrumb_finish_writes_update_system_row`
+                // that would otherwise share the prefix.
+                "fn emit_breadcrumb_finish(",
+            ],
+        ) {
             for cap in re.captures_iter(&fn_body) {
                 derived.insert(cap[1].to_string());
             }

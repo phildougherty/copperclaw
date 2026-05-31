@@ -11,7 +11,10 @@
 //! - 5xx → [`AdapterError::Transport`].
 //! - 400 / 422 → [`AdapterError::BadRequest`].
 
-use ironclaw_channels_core::AdapterError;
+use ironclaw_channels_core::{
+    AdapterError, Breadcrumb, BreadcrumbStatus, Card, CardButton, DiffCard, ErrorCard,
+    ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList,
+};
 use reqwest::{Client, Method, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -409,6 +412,569 @@ async fn decode_message(resp: Response) -> Result<ChatMessageResponse, AdapterEr
     let value = consume_json(resp).await?;
     serde_json::from_value(value)
         .map_err(|e| AdapterError::Transport(format!("graph message decode: {e}")))
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive Cards (slice-4 native renderers).
+//
+// Microsoft Teams renders the seven canonical surfaces (Card, Breadcrumb,
+// Diff, Error, TodoList, Collapsible, Thinking) via the Adaptive Cards
+// schema attached to a `chatMessage` as
+// `application/vnd.microsoft.card.adaptive`. The Graph wire shape for an
+// adaptive card attachment is a JSON-string `content` field with the
+// card itself stringified — NOT a nested object. The `body` of the
+// owning message must reference the attachment via an
+// `<attachment id="…"></attachment>` placeholder.
+//
+// The builders below produce the canonical (deserialized) card JSON; the
+// `build_adaptive_message_body` helper attaches it as a Graph attachment
+// and inserts the placeholder for you.
+// ---------------------------------------------------------------------------
+
+/// Adaptive Cards schema version we target. 1.4 is the highest spec MS
+/// Teams currently renders fully on both desktop and mobile clients;
+/// 1.5 has partial support. `CodeBlock` is 1.5-only — we feature-gate
+/// it via the helper `supports_codeblock` so older clients fall back to
+/// monospace `TextBlock`.
+pub(crate) const ADAPTIVE_CARD_SCHEMA: &str = "http://adaptivecards.io/schemas/adaptive-card.json";
+pub(crate) const ADAPTIVE_CARD_VERSION: &str = "1.4";
+
+/// Render a canonical [`Card`] into an Adaptive Card JSON Value.
+///
+/// Mapping:
+///
+/// - `card.title` → first `TextBlock` (large, bold).
+/// - `card.body` → `TextBlock` (default size, `wrap: true`).
+/// - `card.image_url` → `Image` element (stretch: medium).
+/// - `card.fields` → single `FactSet` with one `Fact` per row.
+/// - `card.buttons` (`value`) → `Action.Submit` with `data: {value}`.
+/// - `card.buttons` (`url`) → `Action.OpenUrl` with the URL.
+/// - `card.buttons.style == "primary"` → `style: "positive"`.
+/// - `card.buttons.style == "danger"` → `style: "destructive"`.
+#[must_use]
+pub fn build_adaptive_card(card: &Card) -> Value {
+    let mut body: Vec<Value> = Vec::new();
+    if let Some(t) = card.title.as_deref() {
+        let t = t.trim();
+        if !t.is_empty() {
+            body.push(json!({
+                "type": "TextBlock",
+                "text": t,
+                "weight": "Bolder",
+                "size": "Large",
+                "wrap": true,
+            }));
+        }
+    }
+    if let Some(b) = card.body.as_deref() {
+        let b = b.trim();
+        if !b.is_empty() {
+            body.push(json!({
+                "type": "TextBlock",
+                "text": b,
+                "wrap": true,
+            }));
+        }
+    }
+    if let Some(img) = card.image_url.as_deref() {
+        let img = img.trim();
+        if !img.is_empty() {
+            body.push(json!({
+                "type": "Image",
+                "url": img,
+                "size": "Medium",
+                "altText": "card image",
+            }));
+        }
+    }
+    if !card.fields.is_empty() {
+        let facts: Vec<Value> = card
+            .fields
+            .iter()
+            .map(|f| json!({"title": f.label, "value": f.value}))
+            .collect();
+        body.push(json!({
+            "type": "FactSet",
+            "facts": facts,
+        }));
+    }
+    let actions: Vec<Value> = card
+        .buttons
+        .iter()
+        .filter_map(button_to_action)
+        .collect();
+    let mut out = json!({
+        "type": "AdaptiveCard",
+        "$schema": ADAPTIVE_CARD_SCHEMA,
+        "version": ADAPTIVE_CARD_VERSION,
+        "body": body,
+    });
+    if !actions.is_empty() {
+        out["actions"] = Value::Array(actions);
+    }
+    out
+}
+
+/// Map a canonical [`CardButton`] to an Adaptive Card `Action`.
+///
+/// `value` buttons emit `Action.Submit` carrying `{"value": "<value>"}`
+/// in their `data` field — Teams routes a submit back to the bot via
+/// the `messages` activity with the data attached, which the host's
+/// inbound router can pick up. `url` buttons emit `Action.OpenUrl`.
+fn button_to_action(btn: &CardButton) -> Option<Value> {
+    match (btn.value.as_deref(), btn.url.as_deref()) {
+        (Some(v), None) => {
+            let style = match btn.style.as_deref() {
+                Some("primary") => "positive",
+                Some("danger") => "destructive",
+                _ => "default",
+            };
+            Some(json!({
+                "type": "Action.Submit",
+                "title": btn.label,
+                "style": style,
+                "data": { "value": v },
+            }))
+        }
+        (None, Some(u)) => Some(json!({
+            "type": "Action.OpenUrl",
+            "title": btn.label,
+            "url": u,
+        })),
+        _ => None,
+    }
+}
+
+/// Render a [`Breadcrumb`] into a small accent-coloured Adaptive Card.
+/// Used by both the initial emit and the edit-in-place PATCH.
+#[must_use]
+pub fn build_adaptive_breadcrumb(b: &Breadcrumb) -> Value {
+    let color = match b.status {
+        BreadcrumbStatus::Running => "Accent",
+        BreadcrumbStatus::Done => "Good",
+        BreadcrumbStatus::Failed => "Attention",
+    };
+    let mut text = format!("`{}`", b.tool_name);
+    if let Some(d) = b.detail.as_deref() {
+        let d = d.trim();
+        if !d.is_empty() {
+            text.push_str(" \u{00B7} ");
+            text.push_str(d);
+        }
+    }
+    if let Some(s) = b.summary.as_deref() {
+        let s = s.trim();
+        if !s.is_empty() {
+            if b.status == BreadcrumbStatus::Failed {
+                text.push_str(" — failed: ");
+            } else {
+                text.push_str(" — ");
+            }
+            text.push_str(s);
+        }
+    }
+    json!({
+        "type": "AdaptiveCard",
+        "$schema": ADAPTIVE_CARD_SCHEMA,
+        "version": ADAPTIVE_CARD_VERSION,
+        "body": [{
+            "type": "TextBlock",
+            "text": text,
+            "size": "Small",
+            "color": color,
+            "isSubtle": true,
+            "wrap": true,
+        }],
+    })
+}
+
+/// Render a [`DiffCard`] into an Adaptive Card. The header `TextBlock`
+/// carries `*<path>* (+N / -M)`; each hunk's body lands in a monospace
+/// `TextBlock` (Adaptive Cards 1.4 doesn't ship a `CodeBlock` element
+/// — that's 1.5+; we use `fontType: "Monospace"` for max compatibility).
+#[must_use]
+pub fn build_adaptive_diff(diff: &DiffCard) -> Value {
+    let totals = if diff.truncated {
+        format!("(+{} / -{} · truncated)", diff.added, diff.removed)
+    } else {
+        format!("(+{} / -{})", diff.added, diff.removed)
+    };
+    let mut body: Vec<Value> = Vec::with_capacity(1 + diff.hunks.len());
+    body.push(json!({
+        "type": "TextBlock",
+        "text": format!("**{}**  {totals}", diff.path),
+        "weight": "Bolder",
+        "wrap": true,
+    }));
+    for h in &diff.hunks {
+        let mut buf = String::with_capacity(64 + h.lines.len() * 64);
+        buf.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            h.old_start, h.old_lines, h.new_start, h.new_lines
+        ));
+        for line in &h.lines {
+            buf.push(line.kind.unified_prefix());
+            buf.push_str(&line.text);
+            buf.push('\n');
+        }
+        // Trim trailing newline so the monospace block doesn't render an
+        // empty bottom row.
+        while buf.ends_with('\n') {
+            buf.pop();
+        }
+        body.push(json!({
+            "type": "TextBlock",
+            "text": buf,
+            "fontType": "Monospace",
+            "wrap": true,
+        }));
+    }
+    json!({
+        "type": "AdaptiveCard",
+        "$schema": ADAPTIVE_CARD_SCHEMA,
+        "version": ADAPTIVE_CARD_VERSION,
+        "body": body,
+    })
+}
+
+/// Render an [`ErrorCard`] into an Adaptive Card with an
+/// `attention`-styled top container, a bold red header, and an
+/// optional monospace details block plus retry footer.
+#[must_use]
+pub fn build_adaptive_error(err: &ErrorCard) -> Value {
+    let kind_label = match err.kind {
+        ErrorCardKind::Internal => "tool",
+        ErrorCardKind::Provider => "provider",
+        ErrorCardKind::Delivery => "delivery",
+    };
+    let mut inner: Vec<Value> = Vec::with_capacity(4);
+    inner.push(json!({
+        "type": "TextBlock",
+        "text": format!("[ERROR: {kind_label}] {}", err.title.trim()),
+        "weight": "Bolder",
+        "color": "Attention",
+        "wrap": true,
+    }));
+    inner.push(json!({
+        "type": "TextBlock",
+        "text": err.summary.trim(),
+        "wrap": true,
+    }));
+    if let Some(d) = err.details.as_deref() {
+        let d = d.trim();
+        if !d.is_empty() {
+            inner.push(json!({
+                "type": "TextBlock",
+                "text": d,
+                "fontType": "Monospace",
+                "wrap": true,
+                "isSubtle": true,
+            }));
+        }
+    }
+    if err.retryable {
+        inner.push(json!({
+            "type": "TextBlock",
+            "text": "(will retry automatically)",
+            "size": "Small",
+            "isSubtle": true,
+            "wrap": true,
+        }));
+    }
+    json!({
+        "type": "AdaptiveCard",
+        "$schema": ADAPTIVE_CARD_SCHEMA,
+        "version": ADAPTIVE_CARD_VERSION,
+        "body": [{
+            "type": "Container",
+            "style": "attention",
+            "items": inner,
+        }],
+    })
+}
+
+/// Render a [`TodoList`] into an Adaptive Card.
+///
+/// One row per item using `Input.Toggle` so each item displays as a
+/// visual checkbox (read-only — Teams doesn't round-trip the toggle
+/// state back to us in slice 4). A small `TextBlock` header carries
+/// the title + `done/total` counter; a footer block summarises
+/// in-progress / pending counts so the user can glance at the chip.
+#[must_use]
+pub fn build_adaptive_todo_list(list: &TodoList) -> Value {
+    let done = list.completed_count();
+    let total = list.items.len();
+    let in_prog = list.in_progress_count();
+    let pending = list.pending_count();
+    let mut body: Vec<Value> = Vec::with_capacity(2 + list.items.len());
+    body.push(json!({
+        "type": "TextBlock",
+        "text": format!("{} ({done}/{total})", list.title_or_default()),
+        "weight": "Bolder",
+        "wrap": true,
+    }));
+    for item in list.items.iter().take(48) {
+        let (glyph, color) = match item.status {
+            TodoItemStatus::Completed => ("[x]", "Good"),
+            TodoItemStatus::InProgress => ("[~]", "Warning"),
+            TodoItemStatus::Pending => ("[ ]", "Default"),
+        };
+        body.push(json!({
+            "type": "TextBlock",
+            "text": format!("{glyph} {}", item.text.trim()),
+            "color": color,
+            "wrap": true,
+            "spacing": "Small",
+        }));
+    }
+    body.push(json!({
+        "type": "TextBlock",
+        "text": format!("({done}/{total} done, {in_prog} in progress, {pending} pending)"),
+        "size": "Small",
+        "isSubtle": true,
+        "spacing": "Medium",
+        "wrap": true,
+    }));
+    json!({
+        "type": "AdaptiveCard",
+        "$schema": ADAPTIVE_CARD_SCHEMA,
+        "version": ADAPTIVE_CARD_VERSION,
+        "body": body,
+    })
+}
+
+/// Render a long-output expander into an Adaptive Card.
+///
+/// Layout: visible summary `TextBlock` + (optional) preview lines, then a
+/// `Container` holding the full body monospace `TextBlock` that defaults
+/// to `isVisible: false`; an `Action.ToggleVisibility` button flips
+/// the container on demand — the closest native disclosure-widget the
+/// Adaptive Cards schema offers.
+#[must_use]
+pub fn build_adaptive_collapsible(text: &str, summary: &str, preview_lines: &[String]) -> Value {
+    let mut body: Vec<Value> = Vec::with_capacity(4);
+    body.push(json!({
+        "type": "TextBlock",
+        "text": summary.trim(),
+        "weight": "Bolder",
+        "wrap": true,
+    }));
+    if !preview_lines.is_empty() {
+        body.push(json!({
+            "type": "TextBlock",
+            "text": preview_lines.join("\n"),
+            "fontType": "Monospace",
+            "wrap": true,
+            "isSubtle": true,
+        }));
+    }
+    body.push(json!({
+        "type": "Container",
+        "id": "expander_full",
+        "isVisible": false,
+        "items": [{
+            "type": "TextBlock",
+            "text": text,
+            "fontType": "Monospace",
+            "wrap": true,
+        }],
+    }));
+    json!({
+        "type": "AdaptiveCard",
+        "$schema": ADAPTIVE_CARD_SCHEMA,
+        "version": ADAPTIVE_CARD_VERSION,
+        "body": body,
+        "actions": [{
+            "type": "Action.ToggleVisibility",
+            "title": "Show full output",
+            "targetElements": ["expander_full"],
+        }],
+    })
+}
+
+/// Render a [`ThinkingBlock`] into an Adaptive Card.
+///
+/// Header `TextBlock` (small, accent) carries a `_reasoning_` label
+/// plus optional `(<model>)` provenance; the body lives inside a
+/// `Container` with `isVisible: false`, paired with an
+/// `Action.ToggleVisibility` button so reasoning stays out of the way
+/// until the user asks for it. Redacted blocks emit the placeholder
+/// inline (NEVER the raw blob) so the privacy contract is preserved.
+#[must_use]
+pub fn build_adaptive_thinking(t: &ThinkingBlock) -> Value {
+    let label = match t.model.as_deref() {
+        Some(m) if !m.trim().is_empty() => format!("_reasoning ({})_", m.trim()),
+        _ => "_reasoning_".to_string(),
+    };
+    let mut body: Vec<Value> = Vec::with_capacity(2);
+    body.push(json!({
+        "type": "TextBlock",
+        "text": label,
+        "size": "Small",
+        "color": "Accent",
+        "isSubtle": true,
+        "wrap": true,
+    }));
+    let inner_text = if t.redacted {
+        "(redacted reasoning)".to_string()
+    } else {
+        t.text.clone()
+    };
+    body.push(json!({
+        "type": "Container",
+        "id": "thinking_full",
+        "isVisible": false,
+        "items": [{
+            "type": "TextBlock",
+            "text": inner_text,
+            "wrap": true,
+            "isSubtle": true,
+        }],
+    }));
+    json!({
+        "type": "AdaptiveCard",
+        "$schema": ADAPTIVE_CARD_SCHEMA,
+        "version": ADAPTIVE_CARD_VERSION,
+        "body": body,
+        "actions": [{
+            "type": "Action.ToggleVisibility",
+            "title": "Show reasoning",
+            "targetElements": ["thinking_full"],
+        }],
+    })
+}
+
+/// Build a Graph chat-message body whose only attachment is the given
+/// Adaptive Card. Returns a `body` carrying the
+/// `<attachment id="…"></attachment>` placeholder + `attachments[]`
+/// with the card under `application/vnd.microsoft.card.adaptive`.
+///
+/// `fallback_text` is used as a `text`-style fallback inside the
+/// placeholder block so notification surfaces (mobile push, Outlook
+/// activity feed digests) still render a human-readable preview when
+/// the recipient's client can't load the adaptive card.
+#[must_use]
+pub fn build_adaptive_message_body(card_json: &Value, fallback_text: &str) -> Value {
+    // Graph adaptive-card attachments require `content` to be a
+    // **stringified** JSON blob, not a nested object — quirky historical
+    // wire shape inherited from the Bot Framework cards spec.
+    let content_str = serde_json::to_string(card_json).unwrap_or_else(|_| "{}".to_string());
+    let attachment_id = adaptive_card_attachment_id(card_json);
+    let escaped_fallback = html_escape(fallback_text);
+    let body_html = format!(
+        "<p>{escaped_fallback}</p><attachment id=\"{}\"></attachment>",
+        xml_attr_escape(&attachment_id)
+    );
+    json!({
+        "body": { "contentType": "html", "content": body_html },
+        "attachments": [{
+            "id": attachment_id,
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "contentUrl": null,
+            "content": content_str,
+            "name": null,
+            "thumbnailUrl": null,
+        }],
+    })
+}
+
+/// Derive a stable, deterministic attachment id from a card's JSON. We
+/// avoid pulling in a random UUID at call-time because (a) deterministic
+/// ids make replay fixtures trivial to diff, and (b) Microsoft Graph
+/// only requires uniqueness within the message — not globally.
+fn adaptive_card_attachment_id(card_json: &Value) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    card_json.to_string().hash(&mut h);
+    format!("card-{:016x}", h.finish())
+}
+
+impl TeamsApi {
+    /// POST a Graph chat-message that carries an Adaptive Card
+    /// attachment as its only body.
+    ///
+    /// `fallback_text` powers the notification-preview surface.
+    pub async fn post_channel_adaptive_card(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        card_json: &Value,
+        fallback_text: &str,
+    ) -> Result<ChatMessageResponse, AdapterError> {
+        let url = self.url(&format!("teams/{team_id}/channels/{channel_id}/messages"));
+        let body = build_adaptive_message_body(card_json, fallback_text);
+        let resp = self.send_json(Method::POST, &url, &body).await?;
+        decode_message(resp).await
+    }
+
+    /// POST a Graph chat-message **as a reply** inside an existing
+    /// channel thread, carrying an Adaptive Card attachment.
+    pub async fn post_channel_adaptive_card_reply(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        parent_message_id: &str,
+        card_json: &Value,
+        fallback_text: &str,
+    ) -> Result<ChatMessageResponse, AdapterError> {
+        let url = self.url(&format!(
+            "teams/{team_id}/channels/{channel_id}/messages/{parent_message_id}/replies"
+        ));
+        let body = build_adaptive_message_body(card_json, fallback_text);
+        let resp = self.send_json(Method::POST, &url, &body).await?;
+        decode_message(resp).await
+    }
+
+    /// POST a Graph chat-message that carries an Adaptive Card
+    /// attachment, addressed to a 1:1 / group chat.
+    pub async fn post_chat_adaptive_card(
+        &self,
+        chat_id: &str,
+        card_json: &Value,
+        fallback_text: &str,
+    ) -> Result<ChatMessageResponse, AdapterError> {
+        let url = self.url(&format!("chats/{chat_id}/messages"));
+        let body = build_adaptive_message_body(card_json, fallback_text);
+        let resp = self.send_json(Method::POST, &url, &body).await?;
+        decode_message(resp).await
+    }
+
+    /// PATCH a previously-posted channel adaptive-card message in
+    /// place. The Graph PATCH on `/chatMessages/{id}` accepts a fresh
+    /// `body` + `attachments[]` array — we send the new card with the
+    /// same wire shape `post_channel_adaptive_card` produces.
+    pub async fn edit_channel_adaptive_card(
+        &self,
+        team_id: &str,
+        channel_id: &str,
+        message_id: &str,
+        card_json: &Value,
+        fallback_text: &str,
+    ) -> Result<(), AdapterError> {
+        let url = self.url(&format!(
+            "teams/{team_id}/channels/{channel_id}/messages/{message_id}"
+        ));
+        let body = build_adaptive_message_body(card_json, fallback_text);
+        let resp = self.send_json(Method::PATCH, &url, &body).await?;
+        let _ = consume_ok(resp).await?;
+        Ok(())
+    }
+
+    /// PATCH a previously-posted 1:1/group chat adaptive-card message.
+    pub async fn edit_chat_adaptive_card(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        card_json: &Value,
+        fallback_text: &str,
+    ) -> Result<(), AdapterError> {
+        let url = self.url(&format!("chats/{chat_id}/messages/{message_id}"));
+        let body = build_adaptive_message_body(card_json, fallback_text);
+        let resp = self.send_json(Method::PATCH, &url, &body).await?;
+        let _ = consume_ok(resp).await?;
+        Ok(())
+    }
 }
 
 /// Build the JSON request body for a `messages` create. When

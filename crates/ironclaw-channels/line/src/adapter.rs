@@ -126,6 +126,11 @@ impl ChannelAdapter for LineAdapter {
         &self.channel_type
     }
 
+    /// LINE `Messaging API` text messages cap at 5 000 chars.
+    fn max_message_chars(&self) -> Option<usize> {
+        Some(5000)
+    }
+
     async fn deliver(
         &self,
         platform_id: &str,

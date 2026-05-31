@@ -182,91 +182,92 @@ pub fn get(db: &CentralDb, id: ApprovalId) -> Result<PendingApproval, DbError> {
     .ok_or(DbError::NotFound)
 }
 
+/// Insert a new pending approval, or update the existing pending row
+/// for the same `(request_id, action)` in place.
+///
+/// Implemented as a single atomic `INSERT ... ON CONFLICT DO UPDATE`
+/// against the partial unique index
+/// `pending_approvals_request_action_uq` (migration
+/// `016_pending_approvals_unique.sql`, scoped to `status = 'pending'`).
+/// The previous SELECT-then-INSERT/UPDATE shape raced on a pooled
+/// writer — two concurrent upserts for the same key could both miss
+/// the SELECT and both INSERT, producing silent duplicate pending
+/// rows. The atomic form collapses the race.
+///
+/// The conflict scope is `status = 'pending'` so already-terminal
+/// rows (denied / approved / expired) remain in place as historical
+/// receipts even if the same `(request_id, action)` is re-asked
+/// later — the re-ask gets a fresh pending row, the old terminal
+/// row is preserved.
 pub fn upsert(db: &CentralDb, req: UpsertPendingApproval) -> Result<PendingApproval, DbError> {
+    // Destructure once so SQL bindings are obvious moves, satisfying
+    // clippy's `needless_pass_by_value` while keeping the public API.
+    let UpsertPendingApproval {
+        session_id,
+        request_id,
+        action,
+        payload,
+        agent_group_id,
+        channel_type,
+        platform_id,
+        platform_message_id,
+        expires_at,
+        title,
+        options,
+    } = req;
     let conn = db.conn()?;
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT approval_id FROM pending_approvals WHERE request_id = ?1 AND action = ?2",
-            params![req.request_id, req.action],
-            |r| r.get(0),
-        )
-        .optional()?;
-
-    let payload_str = req.payload.to_string();
-    let options_json = serde_json::to_string(&req.options)?;
-
-    if let Some(id_str) = existing {
-        conn.execute(
-            "UPDATE pending_approvals
-             SET session_id = ?1,
-                 payload = ?2,
-                 agent_group_id = ?3,
-                 channel_type = ?4,
-                 platform_id = ?5,
-                 platform_message_id = ?6,
-                 expires_at = ?7,
-                 title = ?8,
-                 options_json = ?9
-             WHERE approval_id = ?10",
-            params![
-                req.session_id.map(|s| s.as_uuid().to_string()),
-                payload_str,
-                req.agent_group_id.map(|a| a.as_uuid().to_string()),
-                req.channel_type.as_ref().map(ChannelType::as_str),
-                req.platform_id,
-                req.platform_message_id,
-                req.expires_at.map(|t| t.to_rfc3339()),
-                req.title,
-                options_json,
-                id_str,
-            ],
-        )?;
-        let id = uuid::Uuid::parse_str(&id_str)
-            .map_err(|e| DbError::Invariant(format!("invalid uuid in pending_approvals.approval_id: {e}")))?;
-        drop(conn);
-        return get(db, ApprovalId(id));
-    }
-
+    let payload_str = payload.to_string();
+    let options_json = serde_json::to_string(&options)?;
     let id = ApprovalId::new();
     let now = Utc::now();
+
     conn.execute(
         "INSERT INTO pending_approvals
            (approval_id, session_id, request_id, action, payload, created_at,
             agent_group_id, channel_type, platform_id, platform_message_id,
             expires_at, status, title, options_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12, ?13)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'pending', ?12, ?13)
+         ON CONFLICT(request_id, action) WHERE status = 'pending' DO UPDATE SET
+           session_id          = excluded.session_id,
+           payload             = excluded.payload,
+           agent_group_id      = excluded.agent_group_id,
+           channel_type        = excluded.channel_type,
+           platform_id         = excluded.platform_id,
+           platform_message_id = excluded.platform_message_id,
+           expires_at          = excluded.expires_at,
+           title               = excluded.title,
+           options_json        = excluded.options_json",
         params![
             id.as_uuid().to_string(),
-            req.session_id.map(|s| s.as_uuid().to_string()),
-            req.request_id,
-            req.action,
+            session_id.map(|s| s.as_uuid().to_string()),
+            request_id,
+            action,
             payload_str,
             now.to_rfc3339(),
-            req.agent_group_id.map(|a| a.as_uuid().to_string()),
-            req.channel_type.as_ref().map(ChannelType::as_str),
-            req.platform_id,
-            req.platform_message_id,
-            req.expires_at.map(|t| t.to_rfc3339()),
-            req.title,
+            agent_group_id.map(|a| a.as_uuid().to_string()),
+            channel_type.as_ref().map(ChannelType::as_str),
+            platform_id,
+            platform_message_id,
+            expires_at.map(|t| t.to_rfc3339()),
+            title,
             options_json,
         ],
     )?;
-    Ok(PendingApproval {
-        approval_id: id,
-        session_id: req.session_id,
-        request_id: req.request_id,
-        action: req.action,
-        payload: req.payload,
-        created_at: now,
-        agent_group_id: req.agent_group_id,
-        channel_type: req.channel_type,
-        platform_id: req.platform_id,
-        platform_message_id: req.platform_message_id,
-        expires_at: req.expires_at,
-        status: ApprovalStatus::Pending,
-        title: req.title,
-        options: req.options,
-    })
+
+    // Reload by the natural key (request_id, action) restricted to the
+    // pending row — that's the row we just touched, regardless of
+    // whether the INSERT or the DO UPDATE branch fired. Reusing the
+    // existing row parser keeps the field marshalling consistent.
+    let id_str: String = conn.query_row(
+        "SELECT approval_id FROM pending_approvals
+         WHERE request_id = ?1 AND action = ?2 AND status = 'pending'",
+        params![request_id, action],
+        |r| r.get(0),
+    )?;
+    let parsed = uuid::Uuid::parse_str(&id_str)
+        .map_err(|e| DbError::Invariant(format!("invalid uuid in pending_approvals.approval_id: {e}")))?;
+    drop(conn);
+    get(db, ApprovalId(parsed))
 }
 
 pub fn update_status(db: &CentralDb, id: ApprovalId, status: ApprovalStatus) -> Result<(), DbError> {
@@ -444,5 +445,65 @@ mod tests {
         let db = db();
         let err = delete(&db, ApprovalId::new()).unwrap_err();
         assert!(matches!(err, DbError::NotFound));
+    }
+
+    #[test]
+    fn upsert_after_denial_creates_fresh_pending_row() {
+        // The partial unique index is scoped to `status = 'pending'`,
+        // so a terminal row (denied / approved / expired) is preserved
+        // as a historical receipt and the next upsert for the same
+        // `(request_id, action)` produces a fresh pending row beside
+        // it. Pins the contract for the
+        // `016_pending_approvals_unique` migration.
+        let db = db();
+        let first = upsert(&db, sample("r1")).unwrap();
+        update_status(&db, first.approval_id, ApprovalStatus::Denied).unwrap();
+        let second = upsert(&db, sample("r1")).unwrap();
+        assert_ne!(first.approval_id, second.approval_id);
+        assert_eq!(second.status, ApprovalStatus::Pending);
+        let denied = list(&db, None, Some(ApprovalStatus::Denied)).unwrap();
+        assert_eq!(denied.len(), 1, "old denied row stays in place");
+        let pending = list(&db, None, Some(ApprovalStatus::Pending)).unwrap();
+        assert_eq!(pending.len(), 1, "exactly one pending row exists");
+    }
+
+    /// Race regression: 16 concurrent upserts against the same
+    /// `(request_id, action)` against a real file-backed pool must
+    /// collapse to one pending row, no panics, no UNIQUE violations.
+    /// Pre-fix the SELECT-then-INSERT shape produced silent duplicate
+    /// pending rows under contention.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn upsert_is_atomic_under_concurrent_writers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ironclaw.db");
+        let db = CentralDb::open(&path).unwrap();
+
+        let mut handles = Vec::new();
+        for i in 0..16 {
+            let db = db.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                let mut req = sample("shared-request");
+                // Vary the title so an UPDATE branch firing is observable
+                // if we want to dig — the key invariant under test is
+                // pending-row count, not which writer "wins".
+                req.title = format!("racer-{i}");
+                upsert(&db, req)
+            }));
+        }
+
+        for h in handles {
+            h.await
+                .expect("spawn_blocking task panicked")
+                .expect("upsert returned a DB error under contention");
+        }
+
+        let pending = list(&db, None, Some(ApprovalStatus::Pending)).unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "exactly one pending row should exist after 16 concurrent upserts"
+        );
+        assert_eq!(pending[0].request_id, "shared-request");
+        assert_eq!(pending[0].action, "send_message");
     }
 }

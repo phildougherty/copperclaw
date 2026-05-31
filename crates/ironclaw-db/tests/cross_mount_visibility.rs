@@ -35,6 +35,8 @@ fn write_msg(paths: &SessionPaths) -> MessageId {
             channel_type: Some(ChannelType::new("cli")),
             thread_id: None,
             source_session_id: None,
+            reply_to: None,
+            is_group: None,
         },
     )
     .unwrap();

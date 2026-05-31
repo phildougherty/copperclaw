@@ -1,13 +1,14 @@
 ---
 name: send-card
-description: Emit a portable structured Card — rendered natively on Telegram (inline_keyboard) and as formatted text fallback on every other channel.
+description: Emit a portable structured Card — rendered natively on Telegram (inline_keyboard), Slack (Block Kit), and Discord (embeds + components), with formatted-text fallback on every other channel.
 ---
 
 # send-card
 
 `send_card` emits ONE portable Card. The host renders it natively where
-the adapter supports it (Telegram today) and falls back to deterministic
-formatted text elsewhere — the same card works on every channel.
+the adapter supports it (Telegram, Slack, Discord today) and falls back
+to deterministic formatted text elsewhere — the same card works on every
+channel.
 
 ## Schema
 
@@ -40,8 +41,13 @@ The validator names the offending field.
 
 | Channel | Rendering |
 |---------|-----------|
-| Telegram | Native: MarkdownV2 + `inline_keyboard`. `value` buttons route taps back as inbound chat. `url` buttons open the link. `image_url` uses `sendPhoto` with body as caption. |
-| All others | Text fallback: bold title, body, `Label: value` rows, then `[Label] -> callback:value` / `-> url` lines. Native renderers landing channel-by-channel. |
+| Telegram | Native: MarkdownV2 + `inline_keyboard`. `image_url` rides as `sendPhoto` caption. |
+| Slack | Native Block Kit: `header` / `section` / `image` / `actions`. `value` buttons honour `style: primary | danger`. |
+| Discord | Native embed + `ActionRow`s of `Button`s (chunked at 5/row). `value` styles map primary→1, success→3, danger→4, else→2; URL→5. |
+| All others | Text fallback: bold title, body, `Label: value` rows, then `[Label] -> callback:value` / `-> url` lines. |
+
+On Telegram, Slack, and Discord, `value` buttons round-trip taps back as
+inbound chat (see Callback flow). `url` buttons always open the link.
 
 ## Callback flow
 
@@ -83,9 +89,7 @@ Status with fields and image:
     "body":  "All checks passed in 4m 12s.",
     "fields": [
       { "label": "Branch", "value": "main",    "inline": true },
-      { "label": "Commit", "value": "a1b2c3d", "inline": true },
-      { "label": "Tests",  "value": "5214 ok", "inline": true },
-      { "label": "Clippy", "value": "clean",   "inline": true }
+      { "label": "Tests",  "value": "5214 ok", "inline": true }
     ],
     "image_url": "https://ci.example.com/1042.png"
 } }

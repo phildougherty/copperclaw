@@ -34,6 +34,11 @@ pub use run::{
     MAX_TOOL_DEADLINE_SECS, MAX_TOOL_TURNS_ENV, MIN_MAX_TOOL_TURNS, MIN_PROVIDER_DEADLINE_MS,
     MIN_TOOL_DEADLINE_SECS, POLL_INTERVAL_MS, PROVIDER_DEADLINE_ENV, TOOL_DEADLINE_ENV,
 };
+// Production wiring for the typing-indicator-keepalive path: the
+// runner binary constructs a HeartbeatPinger so each LLM stream
+// refreshes the heartbeat file (and thus the host's typing-ticker
+// stays willing to fire) across long provider calls.
+pub use run::provider_call::{HeartbeatPinger, NoopPinger, ProviderActivityPinger};
 pub use state::{load_state, save_state, PersistedState};
 pub use subagent::{
     build_subagent_system, run_inner_loop, SubagentDeps, SubagentInputs, SUBAGENT_PREAMBLE,

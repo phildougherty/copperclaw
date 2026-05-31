@@ -10,6 +10,7 @@ ironclaw-types = { workspace = true }
 ironclaw-db = { workspace = true }
 ironclaw-modules = { workspace = true }
 ironclaw-metrics = { workspace = true }
+ironclaw-channels-core = { workspace = true }
 tokio = { workspace = true }
 tokio-util = "0.7"
 tracing = { workspace = true }

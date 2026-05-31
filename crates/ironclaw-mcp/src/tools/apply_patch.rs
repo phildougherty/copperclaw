@@ -41,6 +41,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::error::ToolError;
+use crate::tools::diff_util::{build_blob_card, build_diff_card, over_blob_cutoff};
 use crate::tools::{make_tool, parse_args, success_json, ToolEntry, ToolHandler};
 
 #[derive(Debug, Deserialize)]
@@ -75,7 +76,7 @@ pub fn schema() -> Tool {
 
 pub async fn handle(
     arguments: Option<JsonObject>,
-    _ctx: &dyn crate::context::ToolContext,
+    ctx: &dyn crate::context::ToolContext,
 ) -> Result<CallToolResult, ToolError> {
     let input: Input = parse_args(arguments)?;
 
@@ -91,6 +92,16 @@ pub async fn handle(
         .await
         .map_err(|e| ToolError::Internal(format!("apply_patch({display}) join: {e}")))??;
 
+    // Best-effort diff card — same pattern as `edit_file`.
+    let before_size = result.before.len() as u64;
+    let after_size = result.after.len() as u64;
+    if over_blob_cutoff(before_size, after_size) {
+        ctx.emit_diff(build_blob_card(&result.path, before_size, after_size))
+            .await;
+    } else if let Some(card) = build_diff_card(&result.path, &result.before, &result.after) {
+        ctx.emit_diff(card).await;
+    }
+
     Ok(success_json(&json!({
         "path": result.path,
         "hunks_applied": result.hunks_applied,
@@ -104,6 +115,12 @@ struct ApplyOutcome {
     hunks_applied: usize,
     lines_added: usize,
     lines_removed: usize,
+    /// Pre-edit content snapshot, kept so we can build a `DiffCard`
+    /// after the atomic write succeeds.
+    before: String,
+    /// Post-edit content (the bytes the atomic rename just landed
+    /// on disk).
+    after: String,
 }
 
 /// One parsed hunk. `old_start` is 1-based (matching unified diff
@@ -423,6 +440,8 @@ fn do_apply(path: &Path, patch: &str) -> Result<ApplyOutcome, ToolError> {
         hunks_applied: hunks.len(),
         lines_added,
         lines_removed,
+        before: original,
+        after: new_content,
     })
 }
 

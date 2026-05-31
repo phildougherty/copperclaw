@@ -39,6 +39,17 @@ pub enum DeliveryError {
 }
 
 impl DeliveryError {
+    /// When the underlying error is an [`AdapterError::Rate`] carrying a
+    /// `retry_after` hint (seconds), return it. Otherwise `None`. Used by
+    /// the delivery loop to honour platform-supplied backoff windows in
+    /// place of the fixed exponential schedule.
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            Self::Adapter(AdapterError::Rate { retry_after }) => *retry_after,
+            _ => None,
+        }
+    }
+
     /// True when this error is worth retrying (transport blip, rate limit).
     pub fn is_retryable(&self) -> bool {
         match self {

@@ -8,7 +8,7 @@ use crate::config::HostConfig;
 use crate::context::HostContext;
 use crate::orphans::cleanup_orphans;
 use crate::sessions::FsSessionRoot;
-use crate::socket::run_server;
+use crate::socket::{bind_listener, serve_listener};
 use anyhow::Result;
 use dashmap::DashMap;
 use ironclaw_channels_core::ChannelAdapter;
@@ -650,12 +650,17 @@ pub async fn run_host(
         );
     }
 
-    // 14. Spawn socket server.
+    // 14. Spawn socket server. Bind synchronously first so a bind
+    // failure (stale non-socket file at the path, parent dir unwritable,
+    // EADDRINUSE, etc.) surfaces as `BootError::Socket` rather than
+    // being swallowed by the spawned task's discarded JoinHandle. The
+    // accept loop then runs on the spawned task as before.
     let socket_path = cfg.ncl_socket_path.clone();
     let socket_central = state.central.clone();
     let socket_cancel = shutdown.clone();
+    let listener = bind_listener(&socket_path).map_err(BootError::Socket)?;
     let socket_task = tokio::spawn(async move {
-        run_server(socket_path, socket_central, socket_cancel).await
+        serve_listener(listener, socket_path, socket_central, socket_cancel).await
     });
 
     print_ready_banner(&cfg, &initialized);
@@ -824,6 +829,7 @@ fn spawn_container_manager(
             .default_model
             .clone()
             .unwrap_or_else(|| "claude-sonnet-4-6".into()),
+        default_effort: parse_effort_env(),
         anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
         anthropic_base_url: std::env::var("ANTHROPIC_BASE_URL").ok(),
         idle_timeout_secs: crate::container_manager::DEFAULT_IDLE_TIMEOUT_SECS,
@@ -934,6 +940,28 @@ fn parse_truthy_env(name: &str) -> bool {
         std::env::var(name).ok().as_deref(),
         Some("1" | "true" | "True" | "TRUE" | "yes" | "Yes" | "YES" | "on" | "On" | "ON" | "all" | "All" | "ALL")
     )
+}
+
+/// Parse `IRONCLAW_DEFAULT_EFFORT` env var into an `Effort` tier.
+/// Recognised values (case-insensitive): `low`, `medium`, `high`.
+/// `None` (unset, empty, or unrecognised) means "use the model's
+/// default" — no `reasoning.effort` field is emitted on the wire.
+/// Unrecognised values log a one-time warning at boot.
+fn parse_effort_env() -> Option<ironclaw_types::Effort> {
+    let raw = std::env::var("IRONCLAW_DEFAULT_EFFORT").ok()?;
+    match raw.to_ascii_lowercase().as_str() {
+        "" => None,
+        "low" => Some(ironclaw_types::Effort::Low),
+        "medium" | "med" => Some(ironclaw_types::Effort::Medium),
+        "high" => Some(ironclaw_types::Effort::High),
+        other => {
+            tracing::warn!(
+                value = %other,
+                "IRONCLAW_DEFAULT_EFFORT must be one of low|medium|high; ignoring"
+            );
+            None
+        }
+    }
 }
 
 fn collect_forward_env() -> Vec<(String, String)> {
@@ -1296,6 +1324,32 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_host_returns_socket_error_on_bad_socket_path() {
+        // The socket sits inside a regular file masquerading as the
+        // parent directory — `bind_listener` cannot create the
+        // parent dir on top of a real file, so the bind step has to
+        // error out. The test asserts the error is surfaced as
+        // `BootError::Socket` rather than being swallowed by the
+        // spawned-task discard the old `run_server` used.
+        let tmp = tempfile::tempdir().unwrap();
+        let parent_as_file = tmp.path().join("not_a_dir");
+        std::fs::write(&parent_as_file, b"this is a file, not a dir").unwrap();
+        let cfg = HostConfig {
+            data_dir: tmp.path().to_path_buf(),
+            ncl_socket_path: parent_as_file.join("iclaw.sock"),
+            channels: Vec::new(),
+            ..HostConfig::default()
+        };
+        let shutdown = CancellationToken::new();
+        let rt: Box<dyn ContainerRuntime> = Box::new(crate::tests::NoopRuntime::default());
+        let err = run_host(cfg, Some(rt), shutdown, None).await.unwrap_err();
+        assert!(
+            matches!(err, BootError::Socket(_)),
+            "expected BootError::Socket, got {err:?}",
+        );
     }
 
     #[tokio::test]

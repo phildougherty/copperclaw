@@ -61,9 +61,9 @@ use ironclaw_db::tables::messages_out::{self, WriteOutbound};
 use ironclaw_db::DbError;
 use ironclaw_mcp::{
     AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec, EditMessageSpec,
-    InstallSpec, OutboundToolEffect, Recipient, ScheduleSpec, SendCardSpec, SendFileSpec,
-    SendMessageSpec, SubagentRequest, SubagentResult, TaskSummary, ToolContext, ToolEffectAck,
-    ToolEntry, ToolError, UpdateTaskSpec,
+    EmitTodoListSpec, InstallSpec, OutboundToolEffect, Recipient, ScheduleSpec, SendCardSpec,
+    SendFileSpec, SendMessageSpec, SubagentRequest, SubagentResult, TaskSummary, ToolContext,
+    ToolEffectAck, ToolEntry, ToolError, UpdateTaskSpec,
 };
 use ironclaw_providers::AgentProvider;
 use ironclaw_types::{Effort, MessageId, MessageKind};
@@ -172,6 +172,21 @@ pub struct RunnerToolCtx {
     /// `explore` / etc.). Off by default; enabled via the
     /// `IRONCLAW_TOOL_BREADCRUMBS` env var.
     breadcrumbs_enabled: bool,
+    /// One-shot gate for child agents (sessions with
+    /// [`source_session_id`] set). Flipped to `true` the first time the
+    /// child emits a `send_message` effect. The runner's main loop
+    /// checks this after each turn and exits cleanly when set —
+    /// turning every child into a one-shot agent that delivers ONE
+    /// reply and stops, even if the LLM tries to send follow-ups.
+    ///
+    /// Required because soft prompt rules ("EXACTLY ONE `send_message`")
+    /// don't reliably constrain free / open-weight models. Lived
+    /// through on 2026-05-24 with `openrouter/owl-alpha` sending a
+    /// report + "report delivered" summary as two separate messages.
+    ///
+    /// Stays `false` forever for root sessions (no `source_session_id`),
+    /// so the gate is a no-op for the top-level conversation.
+    parent_reply_sent: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RunnerToolCtx {
@@ -187,27 +202,68 @@ impl RunnerToolCtx {
             originating: Arc::new(std::sync::Mutex::new(OriginatingRouting::default())),
             source_session_id: None,
             breadcrumbs_enabled: false,
+            parent_reply_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
-    /// Enable `[tool] name` chat breadcrumbs for visible tools. Reads
-    /// the `IRONCLAW_TOOL_BREADCRUMBS` env var (1/true/yes/on = on);
-    /// any other value keeps it disabled. Called at runner startup
-    /// from `main.rs`.
+    /// True when this session is a child of another session (was
+    /// spawned via `create_agent`) AND has already emitted its first
+    /// `send_message`. Used by the runner's main loop to exit cleanly
+    /// after a child delivers its one-shot reply.
+    pub fn parent_reply_sent(&self) -> bool {
+        self.source_session_id.is_some()
+            && self
+                .parent_reply_sent
+                .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Enable native tool-progress breadcrumb chips for visible tools.
+    /// **Default: ON.** Reads the `IRONCLAW_TOOL_BREADCRUMBS` env var
+    /// to allow an operator to OPT OUT (`0`/`false`/`no`/`off`); any
+    /// other value (including unset) leaves the default on. Called at
+    /// runner startup from `main.rs`.
+    ///
+    /// The default flip (off → on) shipped alongside the slice-2
+    /// `deliver_breadcrumb` native renderers — there's no UX payoff if
+    /// the surface is gated behind an env var nobody knows to set.
+    /// The opt-out exists for noisy / low-bandwidth deployments where
+    /// the operator doesn't want chip churn in chat.
     #[must_use]
     pub fn with_breadcrumbs_from_env(mut self) -> Self {
-        self.breadcrumbs_enabled = matches!(
+        self.breadcrumbs_enabled = !matches!(
             std::env::var("IRONCLAW_TOOL_BREADCRUMBS").ok().as_deref(),
-            Some("1" | "true" | "yes" | "on")
+            Some("0" | "false" | "no" | "off")
         );
         self
     }
 
-    /// Emit a brief `[tool_name]` chat message via the originating
-    /// channel routing so the user sees what the agent is working on.
+    /// Force-enable breadcrumbs. Used by tests so we don't depend on
+    /// process-level env vars in concurrent test runs.
+    #[must_use]
+    pub fn with_breadcrumbs_enabled(mut self, enabled: bool) -> Self {
+        self.breadcrumbs_enabled = enabled;
+        self
+    }
+
+    /// Emit a [`MessageKind::Breadcrumb`] outbound row capturing the
+    /// agent's tool invocation as a `Running` chip on the originating
+    /// channel. The host's delivery loop hands the row to the
+    /// adapter's `deliver_breadcrumb` hook, which renders a compact
+    /// native chip (Telegram HTML `<code>`, Slack Block Kit `context`,
+    /// Discord embed footer, Google Chat cards v2, Matrix `m.notice`
+    /// with `<code>`) — or falls back to the legacy `[tool] detail`
+    /// text line on adapters without a native renderer.
+    ///
     /// No-op when breadcrumbs are disabled, the tool isn't on the
     /// "visible" allowlist, or there's no channel routing to send to
     /// (e.g. agent-to-agent rows where the destination is the parent).
+    ///
+    /// We also stash a row-id → seq mapping (via the
+    /// `_breadcrumb_seq` field on the row body) so a subsequent
+    /// [`Self::emit_breadcrumb_finish`] can reference the original
+    /// chip when emitting the update — adapters with an in-place edit
+    /// API use this to replace the chip's contents rather than emit a
+    /// fresh row.
     ///
     /// Errors are swallowed: breadcrumbs are best-effort UX
     /// observability, NOT load-bearing — a failed write shouldn't
@@ -219,25 +275,265 @@ impl RunnerToolCtx {
         if !is_visible_breadcrumb_tool(tool_name) {
             return;
         }
-        let origin = self.current_originating();
-        // Only emit when there's a real user channel to send to.
-        // Child agents that route to parent via Agent-kind won't
-        // benefit from a breadcrumb (the parent doesn't need to be
-        // told what its own children are doing).
-        if origin.channel_type.is_none() || origin.platform_id.is_none() {
+        // Skip for child sessions only (their recipient is another
+        // LLM, not a user). Origin's channel routing may be None —
+        // delivery's session_routing wiring fallback resolves it.
+        // See [`should_skip_user_facing_emit`] for the 2026-05-24
+        // incident that motivated this relaxation.
+        if self.should_skip_user_facing_emit() {
             return;
         }
-        // Add per-tool detail when we have the input — shell command,
-        // search query, file path, etc. — so the user can see at a
-        // glance what the agent is doing, not just which tool it's
-        // running. Format: `[name] detail` when we have detail,
-        // `[name]` when we don't (e.g. detail extraction failed or
-        // the tool has no useful arg to surface).
+        let origin = self.current_originating();
+        // Per-tool detail: shell command, search query, file path…
+        // Falls back to None when extraction fails so the renderer
+        // shows just `[tool_name]`.
         let detail = input.and_then(|v| breadcrumb_detail(tool_name, v));
-        let text = match detail {
-            Some(d) => format!("[{tool_name}] {d}"),
-            None => format!("[{tool_name}]"),
+        let breadcrumb = ironclaw_channels_core::Breadcrumb {
+            tool_name: tool_name.to_owned(),
+            detail,
+            status: ironclaw_channels_core::BreadcrumbStatus::Running,
+            summary: None,
         };
+        // `breadcrumb.validate()` is best-effort: a too-long detail
+        // would just cap the renderer's display. Skip validation here
+        // (the runner already truncates detail strings to 80 chars).
+        let body = serde_json::json!({
+            "breadcrumb": breadcrumb,
+        });
+        let routed = OutboundRouting {
+            kind: MessageKind::Breadcrumb,
+            body_to: None,
+            channel_type: origin.channel_type.clone(),
+            platform_id: origin.platform_id.clone(),
+            thread_id: origin.thread_id.clone(),
+            in_reply_to: None,
+        };
+        let mut guard = self.outbound.lock().await;
+        let conn: &mut Connection = &mut guard;
+        let _ = insert_outbound_row(conn, MessageId::new(), body, &routed);
+    }
+
+    /// Finalisation half of [`Self::emit_breadcrumb`]. Writes a
+    /// `MessageKind::System` row carrying an `update_breadcrumb`
+    /// action; the host's delivery loop looks up the most recent
+    /// Breadcrumb-kind row for this tool/origin and, on adapters with
+    /// an edit API, edits the original chip in place. Adapters
+    /// without an edit API surface a fresh chip with the completion
+    /// blurb (visible but harmless).
+    ///
+    /// Best-effort: swallows errors and is a no-op when breadcrumbs
+    /// are disabled, the tool isn't on the visible allowlist, or the
+    /// originating routing was cleared.
+    pub async fn emit_breadcrumb_finish(
+        &self,
+        tool_name: &str,
+        input: Option<&serde_json::Value>,
+        ok: bool,
+        summary: Option<&str>,
+    ) {
+        if !self.breadcrumbs_enabled {
+            return;
+        }
+        if !is_visible_breadcrumb_tool(tool_name) {
+            return;
+        }
+        // Mirror `emit_breadcrumb`'s relaxation — skip only for child
+        // sessions, not when origin lacks channel routing.
+        if self.should_skip_user_facing_emit() {
+            return;
+        }
+        let origin = self.current_originating();
+        let detail = input.and_then(|v| breadcrumb_detail(tool_name, v));
+        let status = if ok {
+            ironclaw_channels_core::BreadcrumbStatus::Done
+        } else {
+            ironclaw_channels_core::BreadcrumbStatus::Failed
+        };
+        let breadcrumb = ironclaw_channels_core::Breadcrumb {
+            tool_name: tool_name.to_owned(),
+            detail,
+            status,
+            summary: summary.map(str::to_owned),
+        };
+        let payload = serde_json::json!({
+            "update_breadcrumb": {
+                "tool_name": tool_name,
+                "breadcrumb": breadcrumb,
+            }
+        });
+        // Update rows ride the System path so the delivery loop's
+        // existing system-action dispatch handles them — we register
+        // the handler in `ironclaw-host-delivery`. The row inherits
+        // the originating inbound's channel routing so the adapter
+        // can look up the prior chip's platform message id.
+        let routed = OutboundRouting {
+            kind: MessageKind::System,
+            body_to: None,
+            channel_type: origin.channel_type.clone(),
+            platform_id: origin.platform_id.clone(),
+            thread_id: origin.thread_id.clone(),
+            in_reply_to: None,
+        };
+        let mut guard = self.outbound.lock().await;
+        let conn: &mut Connection = &mut guard;
+        let _ = insert_outbound_row(conn, MessageId::new(), payload, &routed);
+    }
+
+    /// Slice-3.5 opt-in emit path. Persists a structured
+    /// `MessageKind::Thinking` outbound row carrying the canonical
+    /// `ThinkingBlock` payload so the host delivery service can render
+    /// it as a collapsed native UI primitive (Telegram `<blockquote
+    /// expandable>`, Slack `context` block, Discord muted-grey embed,
+    /// Google Chat `collapsibleSection`, Matrix `<details>`).
+    ///
+    /// `text` is the accumulated thinking prose (empty for redacted
+    /// blocks); `redacted == true` flags the upstream
+    /// `redacted_thinking` variant — adapters render a placeholder
+    /// rather than the raw blob. `model` is optional provenance.
+    ///
+    /// The opt-in privacy gate is enforced UPSTREAM in
+    /// `run::provider_call::pump_events` — this method runs only after
+    /// the runner has verified the per-group `surface_thinking` flag
+    /// is on. Errors are swallowed; thinking is best-effort UX
+    /// observability, not load-bearing.
+    pub async fn emit_thinking(
+        &self,
+        text: &str,
+        redacted: bool,
+        model: Option<&str>,
+    ) {
+        // Mirror `emit_status`'s relaxation — see
+        // [`should_skip_user_facing_emit`] for rationale.
+        if self.should_skip_user_facing_emit() {
+            return;
+        }
+        let origin = self.current_originating();
+        // Cap `text` at the schema's max — Anthropic streams can produce
+        // very long reasoning blocks for `effort=high`, and we don't
+        // want to overflow the renderer's tight on-screen budget. The
+        // canonical fallback wraps everything in quoted lines on
+        // text-only channels so length matters.
+        let mut capped_text = String::from(text);
+        let max = ironclaw_channels_core::MAX_THINKING_CHARS;
+        if capped_text.chars().count() > max {
+            capped_text = capped_text.chars().take(max).collect();
+        }
+        let block = ironclaw_channels_core::ThinkingBlock {
+            text: capped_text,
+            redacted,
+            model: model.map(|m| {
+                let model_len = m.chars().count();
+                let model_max = ironclaw_channels_core::MAX_THINKING_MODEL_CHARS;
+                if model_len > model_max {
+                    m.chars().take(model_max).collect()
+                } else {
+                    m.to_owned()
+                }
+            }),
+        };
+        let body = serde_json::json!({ "thinking": block });
+        let routed = OutboundRouting {
+            kind: MessageKind::Thinking,
+            body_to: None,
+            channel_type: origin.channel_type.clone(),
+            platform_id: origin.platform_id.clone(),
+            thread_id: origin.thread_id.clone(),
+            in_reply_to: None,
+        };
+        let mut guard = self.outbound.lock().await;
+        let conn: &mut Connection = &mut guard;
+        let _ = insert_outbound_row(conn, MessageId::new(), body, &routed);
+    }
+
+    /// Slice-3.1 emit path. Persists a structured `MessageKind::Diff`
+    /// outbound row carrying the canonical `DiffCard` payload so the
+    /// host delivery service can render it as a native diff (Telegram
+    /// `MarkdownV2` ` ```diff ``` `, Slack Block Kit
+    /// `rich_text_preformatted`, Discord embed + color, Google Chat
+    /// Cards v2 `decoratedText`, Matrix `<pre><code
+    /// class="language-diff">…</code></pre>`).
+    ///
+    /// Emitted *alongside* the existing tool breadcrumb — breadcrumb
+    /// says "what tool ran", diff card says "what changed". Routes to
+    /// the originating inbound channel so the user sees the diff in
+    /// the same conversation they triggered the edit from.
+    ///
+    /// Errors are swallowed: diff cards are best-effort UX, NOT
+    /// load-bearing — a failed write must not abort the file edit.
+    /// Same no-route guard as `emit_breadcrumb`: skip when there's no
+    /// human channel on the receiving end (agent-to-agent rows).
+    pub async fn emit_diff(&self, diff: ironclaw_channels_core::DiffCard) {
+        // Mirror `emit_status`'s relaxation — see
+        // [`should_skip_user_facing_emit`] for rationale.
+        if self.should_skip_user_facing_emit() {
+            return;
+        }
+        let origin = self.current_originating();
+        let body = serde_json::json!({ "diff": diff });
+        let routed = OutboundRouting {
+            kind: MessageKind::Diff,
+            body_to: None,
+            channel_type: origin.channel_type.clone(),
+            platform_id: origin.platform_id.clone(),
+            thread_id: origin.thread_id.clone(),
+            in_reply_to: None,
+        };
+        let mut guard = self.outbound.lock().await;
+        let conn: &mut Connection = &mut guard;
+        let _ = insert_outbound_row(conn, MessageId::new(), body, &routed);
+    }
+
+    /// Returns true when status / breadcrumb / diff / thinking emits
+    /// should be skipped because the recipient isn't a human user.
+    ///
+    /// The ONLY skip condition is "this runner is a child session"
+    /// (its [`source_session_id`] was wired in by the host's
+    /// `create_agent` path). Child sessions report up to their parent
+    /// LLM, not to a human channel, so UX-observability chatter would
+    /// just bloat the parent's history.
+    ///
+    /// We DO NOT skip merely because the originating inbound lacks
+    /// `channel_type` / `platform_id`. Agent-dispatched inbounds
+    /// (child reports forwarded into a root session's inbound) carry
+    /// NULL channel routing on the row but the messaging-group
+    /// wiring's `session_routing` fallback fills in the user channel
+    /// at delivery time. Lived through on 2026-05-24: a Telegram run
+    /// spawned 3 children, the parent picked up the third child's
+    /// forwarded report (NULL routing, `source_session_id` set on the
+    /// row), spent 5+ minutes silently synthesising a prototype, and
+    /// the user saw no heartbeat — the old gate over-strictly
+    /// skipped because origin had no channel, even though normal
+    /// `send_message` calls in the same scenario reach the user just
+    /// fine via the wiring fallback.
+    fn should_skip_user_facing_emit(&self) -> bool {
+        self.source_session_id.is_some()
+    }
+
+    /// Emit a "still working" status row to the originating channel.
+    /// Triggered from `drive_turn` after a configurable silent stretch
+    /// (default 60s) so users see a heartbeat-shaped chat message when
+    /// a tool-heavy turn (or a long silent reasoning pass) would
+    /// otherwise look like the agent has hung.
+    ///
+    /// Routing rules:
+    ///   - Skipped for child sessions
+    ///     (see [`should_skip_user_facing_emit`] for rationale).
+    ///   - Writes a `MessageKind::Chat` row direct to outbound,
+    ///     bypassing the `emit_outbound` one-shot gate. Status
+    ///     messages are not "the reply" and must not consume the
+    ///     child-reply budget.
+    ///   - Channel routing on the row may be `None` (agent-dispatched
+    ///     inbounds carry NULL routing). Delivery's `session_routing`
+    ///     fallback (`crates/ironclaw-host-delivery/src/service.rs`,
+    ///     `resolve_target`) fills in the user channel from the
+    ///     messaging-group wiring before dispatch.
+    ///
+    /// Errors are swallowed: status is best-effort UX, not load-bearing.
+    pub async fn emit_status(&self, text: &str) {
+        if self.should_skip_user_facing_emit() {
+            return;
+        }
+        let origin = self.current_originating();
         let body = serde_json::json!({ "text": text });
         let routed = OutboundRouting {
             kind: MessageKind::Chat,
@@ -245,7 +541,7 @@ impl RunnerToolCtx {
             channel_type: origin.channel_type.clone(),
             platform_id: origin.platform_id.clone(),
             thread_id: origin.thread_id.clone(),
-            in_reply_to: None,
+            in_reply_to: origin.in_reply_to,
         };
         let mut guard = self.outbound.lock().await;
         let conn: &mut Connection = &mut guard;
@@ -317,10 +613,36 @@ impl ToolContext for RunnerToolCtx {
     ) -> Result<ToolEffectAck, ToolError> {
         let outbox = self.outbox_root.clone();
         let origin = self.current_originating();
+        // One-shot gate for child agents: refuse second send_message.
+        // The flag is only set for children (`source_session_id` set)
+        // AFTER their first successful send_message — so root sessions
+        // and pre-first-send children pass through untouched.
+        if self.source_session_id.is_some()
+            && matches!(effect, OutboundToolEffect::SendMessage(_))
+            && self
+                .parent_reply_sent
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ToolError::Internal(
+                "child agent has already delivered its one-shot reply; \
+                 a child session may emit only one `send_message`. The \
+                 prior send was accepted; this duplicate is refused."
+                    .to_string(),
+            ));
+        }
+        let is_child_send_message = self.source_session_id.is_some()
+            && matches!(effect, OutboundToolEffect::SendMessage(_));
         // Take the lock for the entire DB write.
         let mut guard = self.outbound.lock().await;
         let conn: &mut Connection = &mut guard;
         let ack = apply_effect(conn, &outbox, effect, &origin).map_err(to_tool_error)?;
+        // Flip the gate after the first successful child-send. The
+        // runner's main loop checks `parent_reply_sent()` after each
+        // turn and exits when set.
+        if is_child_send_message {
+            self.parent_reply_sent
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         Ok(ack)
     }
 
@@ -374,8 +696,39 @@ impl ToolContext for RunnerToolCtx {
         Self::clear_originating(self);
     }
 
+    fn parent_reply_sent(&self) -> bool {
+        Self::parent_reply_sent(self)
+    }
+
     async fn emit_breadcrumb(&self, tool_name: &str, input: Option<&serde_json::Value>) {
         Self::emit_breadcrumb(self, tool_name, input).await;
+    }
+
+    async fn emit_breadcrumb_finish(
+        &self,
+        tool_name: &str,
+        input: Option<&serde_json::Value>,
+        ok: bool,
+        summary: Option<&str>,
+    ) {
+        Self::emit_breadcrumb_finish(self, tool_name, input, ok, summary).await;
+    }
+
+    async fn emit_thinking(
+        &self,
+        text: &str,
+        redacted: bool,
+        model: Option<&str>,
+    ) {
+        Self::emit_thinking(self, text, redacted, model).await;
+    }
+
+    async fn emit_status(&self, text: &str) {
+        Self::emit_status(self, text).await;
+    }
+
+    async fn emit_diff(&self, diff: ironclaw_channels_core::DiffCard) {
+        Self::emit_diff(self, diff).await;
     }
 
     async fn spawn_subagent(
@@ -542,6 +895,7 @@ fn apply_effect(
         OutboundToolEffect::AddReaction(spec) => apply_add_reaction(conn, spec),
         OutboundToolEffect::AskUserQuestion(spec) => apply_ask_question(conn, spec),
         OutboundToolEffect::SendCard(spec) => apply_send_card(conn, spec, origin),
+        OutboundToolEffect::EmitTodoList(spec) => apply_emit_todo_list(conn, spec, origin),
         OutboundToolEffect::CreateAgent(spec) => apply_create_agent(conn, spec),
         OutboundToolEffect::InstallPackages(spec) => apply_install_packages(conn, spec),
         OutboundToolEffect::AddMcpServer(spec) => apply_add_mcp_server(conn, spec),
@@ -697,6 +1051,73 @@ fn strip_reasoning_blocks(text: &str) -> String {
         .replace("\n\n\n", "\n\n")
 }
 
+/// Threshold for triggering the slice-3.4 long-output expander
+/// decorator: lines count.
+pub(crate) const EXPANDER_LINE_THRESHOLD: usize = 30;
+/// Threshold for triggering the long-output expander decorator: byte
+/// length of the body. Set well above the largest splitter
+/// `max_message_chars()` (Slack's 40 000 is the ceiling among shipped
+/// channels) so a single agent message that's "just over the platform
+/// cap" goes through the splitter unwrapped, not folded into an
+/// expander chip. Long *tool output* (the use case this surface is
+/// for) — pages of shell stdout, a 30-line `cat` — easily exceeds
+/// 64 KB.
+pub(crate) const EXPANDER_BYTE_THRESHOLD: usize = 64 * 1024;
+/// How many leading lines we capture into the preview ("teaser") when
+/// attaching an expander decorator. Six lines fits the average mobile
+/// viewport without scroll while still giving a meaningful look at
+/// what the user will get when they expand.
+pub(crate) const EXPANDER_PREVIEW_LINES: usize = 6;
+
+/// Build the long-output expander decorator (slice 3.4) when `text`
+/// exceeds the line OR byte threshold. Returns `None` if the text is
+/// short enough that no decoration is warranted — the chat row goes
+/// through the default `dispatch_chat` path unchanged.
+///
+/// The returned JSON has the shape:
+///
+/// ```json
+/// {
+///   "summary": "<short host-generated one-liner>",
+///   "summary_kind": "lines" | "bytes",
+///   "preview_lines": ["<line 1>", "<line 2>", …]
+/// }
+/// ```
+///
+/// `dispatch_chat` (host-delivery) checks for `content.expander` and
+/// routes such rows to `ChannelAdapter::deliver_collapsible` instead
+/// of `deliver`. The full body still rides as `content.text` — the
+/// decorator only carries the metadata an adapter needs to render the
+/// "summary + disclosure" treatment.
+pub(crate) fn build_expander_decorator(text: &str) -> Option<serde_json::Value> {
+    let bytes = text.len();
+    let line_count = text.lines().count();
+    let exceeds_lines = line_count > EXPANDER_LINE_THRESHOLD;
+    let exceeds_bytes = bytes > EXPANDER_BYTE_THRESHOLD;
+    if !exceeds_lines && !exceeds_bytes {
+        return None;
+    }
+    // Prefer the line trigger when both fire — line count is the more
+    // human-meaningful unit ("30 lines" is more legible than "8 KB"
+    // when both are true of the same buffer).
+    let summary_kind = if exceeds_lines { "lines" } else { "bytes" };
+    let summary = if exceeds_lines {
+        format!("long output: {line_count} lines ({bytes} B)")
+    } else {
+        format!("long output: {bytes} bytes ({line_count} lines)")
+    };
+    let preview_lines: Vec<String> = text
+        .lines()
+        .take(EXPANDER_PREVIEW_LINES)
+        .map(str::to_owned)
+        .collect();
+    Some(serde_json::json!({
+        "summary": summary,
+        "summary_kind": summary_kind,
+        "preview_lines": preview_lines,
+    }))
+}
+
 #[allow(clippy::needless_pass_by_value)]
 fn apply_send_message(
     conn: &mut Connection,
@@ -707,7 +1128,21 @@ fn apply_send_message(
     let text = strip_reasoning_blocks(&text);
     let routed = resolve_outbound_routing(to, origin);
     let mut body = serde_json::Map::new();
+    // Slice 3.4: attach the long-output expander decorator BEFORE we
+    // move `text` into the body. Only attaches on Chat-kind rows
+    // (Agent-kind rows are runner-to-runner traffic; the adapter
+    // expander surface doesn't apply there). The decorator just adds
+    // a `content.expander` sibling to `content.text`; the full text
+    // still rides in the row for the renderer to use.
+    let expander = if matches!(routed.kind, MessageKind::Chat) {
+        build_expander_decorator(&text)
+    } else {
+        None
+    };
     body.insert("text".into(), serde_json::Value::String(text));
+    if let Some(e) = expander {
+        body.insert("expander".into(), e);
+    }
     if let Some(r) = &routed.body_to {
         // `Recipient` is a tagged enum with simple owned fields — its
         // `Serialize` impl cannot fail. `.expect` makes the assumption
@@ -776,8 +1211,19 @@ fn apply_send_file(
         routed.in_reply_to = origin.in_reply_to;
     }
     let mut body = serde_json::Map::new();
+    // Slice 3.4: same as `apply_send_message`, attach the long-output
+    // expander decorator if the file's accompanying caption text is
+    // long. Files themselves are rendered platform-native so the
+    // decorator only governs the `text` body (the caption).
+    let expander = match (&text, matches!(routed.kind, MessageKind::Chat)) {
+        (Some(t), true) => build_expander_decorator(t),
+        _ => None,
+    };
     if let Some(t) = text {
         body.insert("text".into(), serde_json::Value::String(t));
+    }
+    if let Some(e) = expander {
+        body.insert("expander".into(), e);
     }
     if let Some(r) = &routed.body_to {
         body.insert(
@@ -892,6 +1338,64 @@ fn apply_send_card(
             serde_json::to_value(r).expect("Recipient is always serialisable"),
         );
     }
+    let seq = insert_outbound_row(
+        conn,
+        MessageId::new(),
+        serde_json::Value::Object(body),
+        &routed,
+    )?;
+    Ok(ToolEffectAck::Message { seq })
+}
+
+/// Apply an [`EmitTodoListSpec`]: write a `MessageKind::TodoList`
+/// outbound row carrying the canonical `TodoList` in `content.todo_list`,
+/// routed to the originating inbound's channel exactly the way Card-kind
+/// rows are. Mirrors `apply_send_card`'s body shape — just the typed key
+/// differs.
+///
+/// Emitted by every mutating `todo_*` MCP-tool handler (`todo_add`,
+/// `todo_update`, `todo_delete`) at the END of the mutation. The host
+/// delivery service's `dispatch_todo_list` path looks up the prior
+/// list's platform message id and threads it through to the adapter's
+/// `deliver_todo_list` hook so the chip is edited in place rather than
+/// emitted as a fresh row on every mutation. There is no model-facing
+/// `emit_todo_list` tool — the spec is constructed implicitly by the
+/// runner-side todo handlers; the model continues to call the existing
+/// `todo_add` / `todo_update` / `todo_delete` tools unchanged.
+#[allow(clippy::needless_pass_by_value)]
+fn apply_emit_todo_list(
+    conn: &mut Connection,
+    spec: EmitTodoListSpec,
+    origin: &OriginatingRouting,
+) -> Result<ToolEffectAck, ToolApplyError> {
+    let EmitTodoListSpec { list } = spec;
+    // Inherit the originating inbound's channel routing the same way
+    // Card / Chat rows do. We force the kind to TodoList AFTER the
+    // resolver returns; the Agent-routing branch is irrelevant here
+    // (a TodoList sent cross-agent makes no sense — the parent
+    // doesn't care about its child's plan) but if the resolver does
+    // flip to Agent (no explicit `to`, no inbound channel), force
+    // the kind back and drop the body_to so we don't try to render
+    // an inter-agent TodoList. Mirrors `apply_send_card`'s
+    // belt-and-braces logic.
+    let mut routed = resolve_outbound_routing(None, origin);
+    if matches!(routed.kind, MessageKind::Agent) {
+        routed.body_to = None;
+        routed.in_reply_to = origin.in_reply_to;
+    }
+    routed.kind = MessageKind::TodoList;
+
+    // Build the body via `Map::new()` + `.insert()` rather than the
+    // `json!({...})` macro so the runner-emit-set coverage test (which
+    // regex-greps for `json!({"<action>":`) doesn't mistake `"todo_list"`
+    // for a System-action name. TodoList rows are a typed `MessageKind`
+    // and go through `dispatch_todo_list`, not the System handler.
+    // Mirrors the same dodge in `apply_send_card`.
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "todo_list".into(),
+        serde_json::to_value(&list).expect("TodoList is always serialisable"),
+    );
     let seq = insert_outbound_row(
         conn,
         MessageId::new(),
@@ -1256,6 +1760,197 @@ mod tests {
         assert!(breadcrumb_detail("shell", &input).is_none());
     }
 
+    #[tokio::test]
+    async fn emit_breadcrumb_writes_breadcrumb_kind_row() {
+        // The runner used to write a Chat-kind row; this verifies the
+        // switch to MessageKind::Breadcrumb with the canonical
+        // `Breadcrumb` payload under `content.breadcrumb`. The
+        // host's delivery loop dispatches on the kind so it can call
+        // the adapter's `deliver_breadcrumb` hook (native chip
+        // rendering) instead of plain `deliver`.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
+            .with_breadcrumbs_enabled(true);
+        ctx.set_originating(OriginatingRouting {
+            channel_type: Some("telegram".into()),
+            platform_id: Some("chat-1".into()),
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: None,
+        });
+        ctx.emit_breadcrumb(
+            "shell",
+            Some(&serde_json::json!({"command": "cargo check"})),
+        )
+        .await;
+        let row = last_row(&ctx).await;
+        assert_eq!(row.kind, MessageKind::Breadcrumb);
+        let bc: ironclaw_channels_core::Breadcrumb =
+            serde_json::from_value(row.content["breadcrumb"].clone()).unwrap();
+        assert_eq!(bc.tool_name, "shell");
+        assert_eq!(bc.detail.as_deref(), Some("cargo check"));
+        assert_eq!(
+            bc.status,
+            ironclaw_channels_core::BreadcrumbStatus::Running
+        );
+        assert!(bc.summary.is_none());
+        // Channel routing is inherited from the originating inbound so
+        // the delivery loop has a target to dispatch to.
+        assert_eq!(row.platform_id.as_deref(), Some("chat-1"));
+    }
+
+    #[tokio::test]
+    async fn emit_breadcrumb_writes_even_without_channel_routing_for_root_session() {
+        // 2026-05-24 fix: the gate used to skip when origin had NULL
+        // channel routing. Lived through with a parent runner processing
+        // an agent-dispatched inbound (child report up to parent): the
+        // inbound row carries NULL channel_type/platform_id but
+        // delivery's session_routing wiring fallback fills in the user
+        // channel before dispatch. The old gate over-skipped, so the
+        // user saw no breadcrumb chips during multi-minute synthesis.
+        // The new gate skips ONLY for child sessions (source_session_id
+        // set on the runner ctx); root sessions emit regardless.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
+            .with_breadcrumbs_enabled(true);
+        // No originating set → no channel info, but THIS IS A ROOT
+        // session (no source_session_id) so the emit must fire.
+        ctx.emit_breadcrumb("shell", Some(&serde_json::json!({"command": "ls"})))
+            .await;
+        let guard = ctx.outbound.lock().await;
+        let rows = ironclaw_db::tables::messages_out::list_due(&guard).unwrap();
+        assert_eq!(rows.len(), 1, "root-session breadcrumb must land even with NULL routing");
+        assert_eq!(rows[0].kind, MessageKind::Breadcrumb);
+        // Routing fields on the row stay NULL; delivery's
+        // session_routing fallback resolves them at dispatch time.
+        assert!(rows[0].channel_type.is_none());
+        assert!(rows[0].platform_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn emit_breadcrumb_skips_for_child_session() {
+        // Child sessions (source_session_id set on the runner) report
+        // up to a parent LLM, not a user — breadcrumb chatter would
+        // just bloat the parent's history.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let parent_session = SessionId::new();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
+            .with_breadcrumbs_enabled(true)
+            .with_source_session_id(parent_session);
+        ctx.set_originating(OriginatingRouting {
+            channel_type: Some("telegram".into()),
+            platform_id: Some("chat-1".into()),
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: Some(parent_session),
+        });
+        ctx.emit_breadcrumb("shell", Some(&serde_json::json!({"command": "ls"})))
+            .await;
+        let guard = ctx.outbound.lock().await;
+        let rows = ironclaw_db::tables::messages_out::list_due(&guard).unwrap();
+        assert!(rows.is_empty(), "child-session breadcrumb must skip");
+    }
+
+    #[tokio::test]
+    async fn emit_breadcrumb_skips_when_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone());
+        // breadcrumbs_enabled defaults to false.
+        ctx.set_originating(OriginatingRouting {
+            channel_type: Some("telegram".into()),
+            platform_id: Some("chat-1".into()),
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: None,
+        });
+        ctx.emit_breadcrumb("shell", Some(&serde_json::json!({"command": "ls"})))
+            .await;
+        let guard = ctx.outbound.lock().await;
+        let rows = ironclaw_db::tables::messages_out::list_due(&guard).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn emit_breadcrumb_finish_writes_update_system_row() {
+        // The finish hook writes a MessageKind::System row carrying
+        // an `update_breadcrumb` action. The host-delivery service's
+        // system-action dispatcher (see `update_breadcrumb`
+        // registration in ironclaw-host-delivery) translates this
+        // into an in-place edit of the original chip.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
+            .with_breadcrumbs_enabled(true);
+        ctx.set_originating(OriginatingRouting {
+            channel_type: Some("slack".into()),
+            platform_id: Some("C123".into()),
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: None,
+        });
+        ctx.emit_breadcrumb_finish(
+            "shell",
+            Some(&serde_json::json!({"command": "cargo check"})),
+            true,
+            Some("passed (0.4s)"),
+        )
+        .await;
+        let row = last_row(&ctx).await;
+        assert_eq!(row.kind, MessageKind::System);
+        let bc: ironclaw_channels_core::Breadcrumb = serde_json::from_value(
+            row.content["update_breadcrumb"]["breadcrumb"].clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            bc.status,
+            ironclaw_channels_core::BreadcrumbStatus::Done
+        );
+        assert_eq!(bc.summary.as_deref(), Some("passed (0.4s)"));
+        assert_eq!(
+            row.content["update_breadcrumb"]["tool_name"], "shell",
+            "tool_name is duplicated at the action level so the host's \
+             dispatcher can look up the prior chip without deserialising \
+             the full Breadcrumb",
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_breadcrumb_finish_marks_failed_when_not_ok() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
+            .with_breadcrumbs_enabled(true);
+        ctx.set_originating(OriginatingRouting {
+            channel_type: Some("slack".into()),
+            platform_id: Some("C123".into()),
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: None,
+        });
+        ctx.emit_breadcrumb_finish("shell", None, false, Some("ENOENT"))
+            .await;
+        let row = last_row(&ctx).await;
+        let bc: ironclaw_channels_core::Breadcrumb = serde_json::from_value(
+            row.content["update_breadcrumb"]["breadcrumb"].clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            bc.status,
+            ironclaw_channels_core::BreadcrumbStatus::Failed
+        );
+        assert_eq!(bc.summary.as_deref(), Some("ENOENT"));
+    }
+
     fn fresh_ctx() -> (tempfile::TempDir, RunnerToolCtx) {
         let tmp = tempfile::tempdir().unwrap();
         let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
@@ -1264,10 +1959,462 @@ mod tests {
         (tmp, ctx)
     }
 
+    #[tokio::test]
+    async fn child_agent_first_send_message_flips_parent_reply_sent() {
+        // The one-shot gate fires on the FIRST `send_message` emitted
+        // by a child session (one with `source_session_id` set). After
+        // that, `parent_reply_sent()` returns true and the runner's
+        // main loop exits cleanly.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let parent = SessionId::new();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
+            .with_source_session_id(parent);
+        // Origin: inbound came from the parent (no channel routing,
+        // source_session_id set). `send_message(to: None)` routes
+        // back as `MessageKind::Agent` via `resolve_outbound_routing`.
+        ctx.set_originating(OriginatingRouting {
+            channel_type: None,
+            platform_id: None,
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: Some(parent),
+        });
+        assert!(!ctx.parent_reply_sent(), "fresh child has not replied yet");
+        let spec = ironclaw_mcp::SendMessageSpec {
+            to: None,
+            text: "here is my one-shot report".into(),
+        };
+        ctx.emit_outbound(OutboundToolEffect::SendMessage(spec))
+            .await
+            .expect("first send_message accepted");
+        assert!(
+            ctx.parent_reply_sent(),
+            "gate flips after first child-send"
+        );
+    }
+
+    #[tokio::test]
+    async fn child_agent_second_send_message_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let parent = SessionId::new();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
+            .with_source_session_id(parent);
+        ctx.set_originating(OriginatingRouting {
+            channel_type: None,
+            platform_id: None,
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: Some(parent),
+        });
+        // First send: accepted.
+        ctx.emit_outbound(OutboundToolEffect::SendMessage(
+            ironclaw_mcp::SendMessageSpec {
+                to: None,
+                text: "report".into(),
+            },
+        ))
+        .await
+        .expect("first send accepted");
+        // Second send: refused with a clear error.
+        let err = ctx
+            .emit_outbound(OutboundToolEffect::SendMessage(
+                ironclaw_mcp::SendMessageSpec {
+                    to: None,
+                    text: "follow-up the model wants to send anyway".into(),
+                },
+            ))
+            .await
+            .expect_err("second send refused");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("one-shot") || msg.contains("already delivered"),
+            "error should explain the gate: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn root_session_send_message_does_not_flip_gate() {
+        // Root sessions (no `source_session_id`) are unaffected by
+        // the one-shot gate — they can send as many messages as the
+        // model produces.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone());
+        ctx.set_originating(OriginatingRouting {
+            channel_type: Some("telegram".into()),
+            platform_id: Some("chat-1".into()),
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: None,
+        });
+        for i in 0..3 {
+            ctx.emit_outbound(OutboundToolEffect::SendMessage(
+                ironclaw_mcp::SendMessageSpec {
+                    to: None,
+                    text: format!("msg {i}"),
+                },
+            ))
+            .await
+            .expect("root sessions can send multiple messages");
+        }
+        assert!(!ctx.parent_reply_sent(), "root never flips the gate");
+    }
+
+    #[tokio::test]
+    async fn emit_diff_writes_diff_kind_row_with_canonical_payload() {
+        // The runner persists a `MessageKind::Diff` outbound row with
+        // the canonical `DiffCard` under `content.diff`. The
+        // host-delivery service's `dispatch_diff` arm pulls it out and
+        // hands it to the adapter's `deliver_diff` hook.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone());
+        ctx.set_originating(OriginatingRouting {
+            channel_type: Some("telegram".into()),
+            platform_id: Some("chat-1".into()),
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: None,
+        });
+        let card = ironclaw_channels_core::DiffCard {
+            path: "src/main.rs".into(),
+            language: Some("rust".into()),
+            hunks: vec![ironclaw_channels_core::DiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![
+                    ironclaw_channels_core::DiffLine {
+                        kind: ironclaw_channels_core::DiffLineKind::Remove,
+                        text: "old".into(),
+                    },
+                    ironclaw_channels_core::DiffLine {
+                        kind: ironclaw_channels_core::DiffLineKind::Add,
+                        text: "new".into(),
+                    },
+                ],
+            }],
+            added: 1,
+            removed: 1,
+            truncated: false,
+        };
+        ctx.emit_diff(card.clone()).await;
+        let row = last_row(&ctx).await;
+        assert_eq!(row.kind, MessageKind::Diff);
+        let back: ironclaw_channels_core::DiffCard =
+            serde_json::from_value(row.content["diff"].clone()).unwrap();
+        assert_eq!(back, card);
+        // Channel routing inherits from the originating inbound so the
+        // delivery loop has a target.
+        assert_eq!(row.platform_id.as_deref(), Some("chat-1"));
+        assert_eq!(
+            row.channel_type.as_ref().map(|c| c.as_str().to_owned()),
+            Some("telegram".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn emit_diff_writes_even_without_channel_routing_for_root_session() {
+        // Mirror of emit_breadcrumb's same-gate test — 2026-05-24 fix.
+        // Root sessions emit even when origin lacks channel routing;
+        // delivery's session_routing wiring fallback fills in the user
+        // channel at dispatch time.
+        let (_tmp, ctx) = fresh_ctx();
+        let card = ironclaw_channels_core::DiffCard {
+            path: "x.rs".into(),
+            language: None,
+            hunks: vec![],
+            added: 0,
+            removed: 0,
+            truncated: false,
+        };
+        ctx.emit_diff(card).await;
+        let guard = ctx.outbound.lock().await;
+        let rows = ironclaw_db::tables::messages_out::list_due(&guard).unwrap();
+        assert_eq!(rows.len(), 1, "root-session diff must land");
+        assert_eq!(rows[0].kind, MessageKind::Diff);
+    }
+
+    #[tokio::test]
+    async fn emit_diff_skips_for_child_session() {
+        // Child sessions report up to another LLM, not a user.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let parent_session = SessionId::new();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
+            .with_source_session_id(parent_session);
+        ctx.set_originating(OriginatingRouting {
+            channel_type: Some("telegram".into()),
+            platform_id: Some("chat-1".into()),
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: Some(parent_session),
+        });
+        let card = ironclaw_channels_core::DiffCard {
+            path: "x.rs".into(),
+            language: None,
+            hunks: vec![],
+            added: 0,
+            removed: 0,
+            truncated: false,
+        };
+        ctx.emit_diff(card).await;
+        let guard = ctx.outbound.lock().await;
+        let rows = ironclaw_db::tables::messages_out::list_due(&guard).unwrap();
+        assert!(rows.is_empty(), "child-session diff must skip");
+    }
+
+    #[tokio::test]
+    async fn emit_status_writes_for_root_session_with_null_routing() {
+        // Direct regression on the specific incident: parent runner
+        // processing an agent-dispatched inbound (NULL channel routing
+        // on the row) must still produce a heartbeat status row.
+        let (_tmp, ctx) = fresh_ctx();
+        ctx.set_originating(OriginatingRouting {
+            channel_type: None,
+            platform_id: None,
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: None,
+        });
+        ctx.emit_status("Still working on this — 60s in").await;
+        let guard = ctx.outbound.lock().await;
+        let rows = ironclaw_db::tables::messages_out::list_due(&guard).unwrap();
+        assert_eq!(rows.len(), 1, "root-session status must land");
+        assert_eq!(rows[0].kind, MessageKind::Chat);
+        // Routing fields NULL — delivery's session_routing fallback
+        // fills them at dispatch.
+        assert!(rows[0].channel_type.is_none());
+        assert!(rows[0].platform_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn emit_status_skips_for_child_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let conn = open_outbound(&paths).unwrap();
+        let parent_session = SessionId::new();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
+            .with_source_session_id(parent_session);
+        ctx.set_originating(OriginatingRouting {
+            channel_type: Some("telegram".into()),
+            platform_id: Some("chat-1".into()),
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: Some(parent_session),
+        });
+        ctx.emit_status("Still working — should not fire for child").await;
+        let guard = ctx.outbound.lock().await;
+        let rows = ironclaw_db::tables::messages_out::list_due(&guard).unwrap();
+        assert!(rows.is_empty(), "child-session status must skip");
+    }
+
     async fn last_row(ctx: &RunnerToolCtx) -> ironclaw_types::MessageOutRow {
         let guard = ctx.outbound.lock().await;
         let rows = ironclaw_db::tables::messages_out::list_due(&guard).unwrap();
         rows.into_iter().next_back().unwrap()
+    }
+
+    // ---------------------------------------------------------------
+    // Slice 3.4 — long-output expander decorator tests.
+    //
+    // `build_expander_decorator` is the runner-side hot path: every
+    // `apply_send_message` / `apply_send_file` call passes the chat
+    // body through it before writing the outbound row. We verify the
+    // line-vs-byte trigger, the summary shape, the preview cap, and
+    // the round-trip into a row's `content.expander`.
+    // ---------------------------------------------------------------
+    #[test]
+    fn expander_short_text_returns_none() {
+        // Plain ten-line reply is well under both thresholds; no
+        // decorator should be attached.
+        let text = "alpha\nbeta\ngamma\ndelta\nepsilon";
+        assert!(build_expander_decorator(text).is_none());
+    }
+
+    #[test]
+    fn expander_empty_text_returns_none() {
+        assert!(build_expander_decorator("").is_none());
+    }
+
+    #[test]
+    fn expander_triggers_on_line_count_alone() {
+        // 31 short lines — under the byte cap but over the line cap.
+        let text = (0..31).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n");
+        assert!(text.len() < EXPANDER_BYTE_THRESHOLD);
+        let v = build_expander_decorator(&text).expect("31 lines must trigger");
+        assert_eq!(v["summary_kind"], "lines");
+        let summary = v["summary"].as_str().unwrap();
+        assert!(summary.contains("31 lines"), "got: {summary}");
+        let preview = v["preview_lines"].as_array().unwrap();
+        // Preview cap is 6 lines; even if more are available we only
+        // surface six.
+        assert_eq!(preview.len(), EXPANDER_PREVIEW_LINES);
+        assert_eq!(preview[0], "l0");
+        assert_eq!(preview[5], "l5");
+    }
+
+    #[test]
+    fn expander_triggers_on_byte_count_alone() {
+        // One huge single line — under the line cap but well over the
+        // byte cap.
+        let text = "x".repeat(EXPANDER_BYTE_THRESHOLD + 1);
+        let v = build_expander_decorator(&text).expect("oversized text must trigger");
+        assert_eq!(v["summary_kind"], "bytes");
+        let summary = v["summary"].as_str().unwrap();
+        assert!(summary.contains("bytes"), "got: {summary}");
+        // Preview captures the single line (it's all one line).
+        let preview = v["preview_lines"].as_array().unwrap();
+        assert_eq!(preview.len(), 1);
+    }
+
+    #[test]
+    fn expander_prefers_lines_when_both_triggers_fire() {
+        // Long enough lines and enough of them to exceed BOTH the byte
+        // and line thresholds — tie-break is `lines` because it's the
+        // more human-meaningful unit. Sized at 1000 × 80-char lines so
+        // the byte total clears any future bump of `EXPANDER_BYTE_THRESHOLD`
+        // up to ~80 KB.
+        let line: String = "x".repeat(80);
+        let text = (0..1000).map(|_| line.clone()).collect::<Vec<_>>().join("\n");
+        assert!(text.len() > EXPANDER_BYTE_THRESHOLD);
+        assert!(text.lines().count() > EXPANDER_LINE_THRESHOLD);
+        let v = build_expander_decorator(&text).expect("both triggers fire");
+        assert_eq!(v["summary_kind"], "lines");
+    }
+
+    #[test]
+    fn expander_below_threshold_byte_boundary() {
+        // Single line, exactly at the byte threshold (not >). Must
+        // NOT trigger — threshold is `> 4 KB`, not `>= 4 KB`.
+        let text = "x".repeat(EXPANDER_BYTE_THRESHOLD);
+        assert!(build_expander_decorator(&text).is_none());
+    }
+
+    #[test]
+    fn expander_at_line_threshold_does_not_trigger() {
+        // Exactly 30 lines must NOT trigger — threshold is `> 30`.
+        let text = (0..EXPANDER_LINE_THRESHOLD)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(build_expander_decorator(&text).is_none());
+    }
+
+    #[test]
+    fn expander_decorator_shape_validates() {
+        // The decorator payload MUST have `summary` (string),
+        // `summary_kind` (string), and `preview_lines` (array of
+        // strings) so the host-delivery service can read it back
+        // without a defensive decode loop.
+        let text = (0..40).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        let v = build_expander_decorator(&text).unwrap();
+        assert!(v.get("summary").and_then(|s| s.as_str()).is_some());
+        assert!(v.get("summary_kind").and_then(|s| s.as_str()).is_some());
+        let preview = v.get("preview_lines").and_then(|p| p.as_array()).unwrap();
+        for entry in preview {
+            assert!(entry.is_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn send_message_attaches_expander_when_long() {
+        // End-to-end: an `apply_send_message` call with a long body
+        // writes a Chat-kind row with both `content.text` (the full
+        // body) AND `content.expander` (the decorator). The decorator
+        // is what tells the host-delivery service to route through
+        // `deliver_collapsible`.
+        let (_tmp, ctx) = fresh_ctx();
+        ctx.set_originating(OriginatingRouting {
+            channel_type: Some("telegram".into()),
+            platform_id: Some("chat-1".into()),
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: None,
+        });
+        let long_text = (0..50)
+            .map(|i| format!("output line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ctx.emit_outbound(OutboundToolEffect::SendMessage(SendMessageSpec {
+            to: None,
+            text: long_text.clone(),
+        }))
+        .await
+        .unwrap();
+        let row = last_row(&ctx).await;
+        assert_eq!(row.kind, MessageKind::Chat);
+        // Full body preserved on `content.text`.
+        assert_eq!(row.content["text"].as_str().unwrap(), long_text);
+        // Decorator attached on `content.expander`.
+        let exp = &row.content["expander"];
+        assert_eq!(exp["summary_kind"], "lines");
+        assert!(exp["summary"].as_str().unwrap().contains("50 lines"));
+        let preview = exp["preview_lines"].as_array().unwrap();
+        assert_eq!(preview.len(), EXPANDER_PREVIEW_LINES);
+    }
+
+    #[tokio::test]
+    async fn send_message_skips_expander_when_short() {
+        // Short messages must NOT carry an `expander` field — keeps
+        // the wire payload minimal and the host-delivery service's
+        // hot path identical to today's behaviour for normal chats.
+        let (_tmp, ctx) = fresh_ctx();
+        ctx.set_originating(OriginatingRouting {
+            channel_type: Some("telegram".into()),
+            platform_id: Some("chat-1".into()),
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: None,
+        });
+        ctx.emit_outbound(OutboundToolEffect::SendMessage(SendMessageSpec {
+            to: None,
+            text: "short reply.".into(),
+        }))
+        .await
+        .unwrap();
+        let row = last_row(&ctx).await;
+        assert!(row.content.get("expander").is_none(), "got: {:?}", row.content);
+    }
+
+    #[tokio::test]
+    async fn send_file_attaches_expander_when_caption_is_long() {
+        // `send_file` may carry a caption alongside the bytes; we
+        // mirror the message-side decoration so long captions still
+        // get the disclosure treatment.
+        let (_tmp, ctx) = fresh_ctx();
+        ctx.set_originating(OriginatingRouting {
+            channel_type: Some("telegram".into()),
+            platform_id: Some("chat-1".into()),
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: None,
+        });
+        let long_caption: String = (0..40)
+            .map(|i| format!("notes line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        ctx.emit_outbound(OutboundToolEffect::SendFile(SendFileSpec {
+            to: None,
+            filename: "report.txt".into(),
+            data: b"placeholder".to_vec(),
+            text: Some(long_caption.clone()),
+        }))
+        .await
+        .unwrap();
+        let row = last_row(&ctx).await;
+        assert_eq!(row.kind, MessageKind::Chat);
+        assert!(row.content.get("expander").is_some());
+        let exp = &row.content["expander"];
+        assert!(exp["summary"].as_str().unwrap().contains("40 lines"));
     }
 
     #[test]

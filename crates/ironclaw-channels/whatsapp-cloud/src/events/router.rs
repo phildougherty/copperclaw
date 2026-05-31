@@ -34,7 +34,7 @@ use axum::{
     routing::get,
 };
 use chrono::{TimeZone, Utc};
-use ironclaw_types::{ChannelType, InboundEvent, InboundMessage, MessageKind, SenderIdentity};
+use ironclaw_types::{ChannelType, InboundEvent, InboundMessage, MessageKind, ReplyTo, SenderIdentity};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -139,8 +139,18 @@ async fn handle_verify(
     if mode != "subscribe" {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if token.as_str() != state.verify_token.as_str() {
-        return StatusCode::FORBIDDEN.into_response();
+    // Constant-time compare on the verify token. Meta's docs treat the
+    // verify token as a shared secret; a plain `!=` would leak the token
+    // one char at a time via response timing.
+    {
+        use subtle::ConstantTimeEq;
+        if !bool::from(
+            token
+                .as_bytes()
+                .ct_eq(state.verify_token.as_bytes()),
+        ) {
+            return StatusCode::FORBIDDEN.into_response();
+        }
     }
     (StatusCode::OK, challenge).into_response()
 }
@@ -266,6 +276,19 @@ async fn convert_message(
     let platform_id = format!("{phone_number_id}:{from}");
     let sender = lookup_sender(state, contacts, &from);
 
+    // WhatsApp Cloud surfaces "this message replies to <parent>" via
+    // `context.message_id`. The parent lives in the same chat, so we route
+    // the reply back through the same `platform_id` we just built.
+    let reply_to = msg
+        .get("context")
+        .and_then(|c| c.get("message_id"))
+        .and_then(Value::as_str)
+        .map(|parent_id| ReplyTo {
+            channel_type: state.channel_type.clone(),
+            platform_id: platform_id.clone(),
+            thread_id: Some(parent_id.to_owned()),
+        });
+
     Some(InboundEvent {
         channel_type: state.channel_type.clone(),
         platform_id,
@@ -278,7 +301,7 @@ async fn convert_message(
             is_mention: None,
             is_group: Some(false),
         },
-        reply_to: None,
+        reply_to,
         sender: Some(sender),
     })
 }
@@ -916,6 +939,54 @@ mod tests {
     #[test]
     fn signature_header_constant() {
         assert_eq!(SIGNATURE_HEADER, "X-Hub-Signature-256");
+    }
+
+    #[tokio::test]
+    async fn message_with_context_populates_reply_to() {
+        let (state, mut rx) = make_state();
+        let app = build_events_router("/wh", state.clone());
+        let env = make_envelope(
+            &json!([{
+                "from":"15551234",
+                "id":"wamid.REPLY",
+                "timestamp":"1700000020",
+                "type":"text",
+                "text":{"body":"yeah, that one"},
+                "context":{"message_id":"wamid.PARENT","from":"15559999"}
+            }]),
+            &json!([]),
+            "PNID",
+        );
+        let body = serde_json::to_vec(&env).unwrap();
+        let req = signed_post(&state, "/wh", &body);
+        let _ = app.oneshot(req).await.unwrap();
+        let evt = rx.recv().await.unwrap();
+        let rt = evt.reply_to.expect("reply_to populated from context.message_id");
+        assert_eq!(rt.channel_type.as_str(), "whatsapp-cloud");
+        assert_eq!(rt.platform_id, "PNID:15551234");
+        assert_eq!(rt.thread_id.as_deref(), Some("wamid.PARENT"));
+    }
+
+    #[tokio::test]
+    async fn message_without_context_leaves_reply_to_none() {
+        let (state, mut rx) = make_state();
+        let app = build_events_router("/wh", state.clone());
+        let env = make_envelope(
+            &json!([{
+                "from":"15551234",
+                "id":"wamid.PLAIN",
+                "timestamp":"1700000021",
+                "type":"text",
+                "text":{"body":"fresh thought"}
+            }]),
+            &json!([]),
+            "PNID",
+        );
+        let body = serde_json::to_vec(&env).unwrap();
+        let req = signed_post(&state, "/wh", &body);
+        let _ = app.oneshot(req).await.unwrap();
+        let evt = rx.recv().await.unwrap();
+        assert!(evt.reply_to.is_none());
     }
 
     #[tokio::test]

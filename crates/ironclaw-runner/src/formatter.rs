@@ -98,6 +98,8 @@ mod tests {
             content,
             source_session_id: None,
             on_wake: false,
+            reply_to: None,
+            is_group: None,
         }
     }
 

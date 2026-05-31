@@ -125,6 +125,26 @@ pub struct ContainerConfig {
     /// Acts as a cap on `SkillsSelector::All`; explicit selector lists
     /// are honoured as-is.
     pub coding_enabled: bool,
+    /// When `false` (the default), the runner drops the provider's
+    /// `thinking` / `redacted_thinking` content blocks on the floor —
+    /// matching the historical behaviour. When `true`, the runner
+    /// persists each completed reasoning block as a
+    /// `MessageKind::Thinking` row carrying a canonical `ThinkingBlock`
+    /// payload, and the host's delivery service renders it as a
+    /// collapsed native primitive (Telegram `<blockquote expandable>`,
+    /// Slack `context` block, Discord muted-grey embed, Google Chat
+    /// `collapsibleSection`, Matrix `<details>`).
+    ///
+    /// Default off — surfacing model chain-of-thought has privacy
+    /// implications (mid-thought speculation about the user, debugging
+    /// notes the model didn't intend the user to see, etc.). Operators
+    /// opt in per-group via `iclaw groups config edit <id>`.
+    ///
+    /// Orthogonal to `strip_reasoning_blocks` (the sanitiser that
+    /// removes inline `<thinking>` markup from `Chat` rows): that path
+    /// scrubs prose contamination from the chat reply; this flag gates
+    /// the structured-reasoning surface.
+    pub surface_thinking: bool,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -147,6 +167,7 @@ pub struct UpsertContainerConfig {
     pub egress_allow: Vec<String>,
     pub resource_limits: serde_json::Value,
     pub coding_enabled: bool,
+    pub surface_thinking: bool,
 }
 
 fn effort_as_str(e: Effort) -> &'static str {
@@ -214,6 +235,8 @@ fn row_to_container_config(row: &Row<'_>) -> rusqlite::Result<ContainerConfig> {
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
     let coding_enabled_int: i64 = row.get("coding_enabled")?;
     let coding_enabled = coding_enabled_int != 0;
+    let surface_thinking_int: i64 = row.get("surface_thinking")?;
+    let surface_thinking = surface_thinking_int != 0;
     let updated_at_str: String = row.get("updated_at")?;
     let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
@@ -236,6 +259,7 @@ fn row_to_container_config(row: &Row<'_>) -> rusqlite::Result<ContainerConfig> {
         egress_allow,
         resource_limits,
         coding_enabled,
+        surface_thinking,
         updated_at,
     })
 }
@@ -248,7 +272,7 @@ pub fn get(db: &CentralDb, agent_group_id: AgentGroupId) -> Result<Option<Contai
                     max_messages_per_prompt, skills, mcp_servers, packages_apt,
                     packages_npm, additional_mounts, cli_scope,
                     config_fingerprint, egress_allow, resource_limits,
-                    coding_enabled, updated_at
+                    coding_enabled, surface_thinking, updated_at
              FROM container_configs
              WHERE agent_group_id = ?1",
             params![agent_group_id.as_uuid().to_string()],
@@ -273,8 +297,8 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
             max_messages_per_prompt, skills, mcp_servers, packages_apt,
             packages_npm, additional_mounts, cli_scope,
             config_fingerprint, egress_allow, resource_limits,
-            coding_enabled, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+            coding_enabled, surface_thinking, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
          ON CONFLICT(agent_group_id) DO UPDATE SET
              provider = excluded.provider,
              model = excluded.model,
@@ -292,6 +316,7 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
              egress_allow = excluded.egress_allow,
              resource_limits = excluded.resource_limits,
              coding_enabled = excluded.coding_enabled,
+             surface_thinking = excluded.surface_thinking,
              updated_at = excluded.updated_at",
         params![
             req.agent_group_id.as_uuid().to_string(),
@@ -311,6 +336,7 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
             egress_allow_json,
             resource_limits_json,
             i64::from(req.coding_enabled),
+            i64::from(req.surface_thinking),
             now.to_rfc3339(),
         ],
     )?;
@@ -332,6 +358,7 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
         egress_allow: req.egress_allow,
         resource_limits: req.resource_limits,
         coding_enabled: req.coding_enabled,
+        surface_thinking: req.surface_thinking,
         updated_at: now,
     })
 }
@@ -630,6 +657,40 @@ pub fn set_coding_enabled(
     Ok(())
 }
 
+/// Narrow setter for the per-group `surface_thinking` flag.
+///
+/// When `false` (the default), the runner drops the provider's
+/// `thinking` / `redacted_thinking` content blocks on the floor —
+/// matching the historical behaviour. When `true`, each completed
+/// reasoning block is persisted as a `MessageKind::Thinking` row and
+/// rendered by the host's delivery service as a collapsed native
+/// primitive on adapters that support one.
+///
+/// Default off — surfacing model chain-of-thought has privacy
+/// implications. Operators flip this per-group when they want to give
+/// users visibility into the model's reasoning.
+pub fn set_surface_thinking(
+    db: &CentralDb,
+    agent_group_id: AgentGroupId,
+    enabled: bool,
+) -> Result<(), DbError> {
+    let conn = db.conn()?;
+    let n = conn.execute(
+        "UPDATE container_configs
+         SET surface_thinking = ?1, updated_at = ?2
+         WHERE agent_group_id = ?3",
+        params![
+            i64::from(enabled),
+            Utc::now().to_rfc3339(),
+            agent_group_id.as_uuid().to_string()
+        ],
+    )?;
+    if n == 0 {
+        return Err(DbError::NotFound);
+    }
+    Ok(())
+}
+
 /// Overwrite the resource limits JSON for an agent group.
 ///
 /// Accepted keys: `"cpus"` (string), `"memory_mb"` (integer),
@@ -696,6 +757,7 @@ mod tests {
             egress_allow: vec![],
             resource_limits: json!({}),
             coding_enabled: false,
+            surface_thinking: false,
         }
     }
 
@@ -771,6 +833,7 @@ mod tests {
             egress_allow: vec!["api.example.com:443".into()],
             resource_limits: json!({"cpus": "1.5", "memory_mb": 512}),
             coding_enabled: true,
+            surface_thinking: true,
         };
         let saved = upsert(&db, req.clone()).unwrap();
         let fetched = get(&db, ag).unwrap().unwrap();
@@ -792,6 +855,7 @@ mod tests {
         assert_eq!(fetched.resource_limits["cpus"], "1.5");
         assert_eq!(fetched.resource_limits["memory_mb"], 512);
         assert!(fetched.coding_enabled);
+        assert!(fetched.surface_thinking);
     }
 
     #[test]
@@ -1060,6 +1124,8 @@ mod tests {
         assert!(cfg.egress_allow.is_empty());
         assert_eq!(cfg.resource_limits, json!({}));
         assert!(!cfg.coding_enabled);
+        // Slice-3.5 surface defaults to off — secure-by-default tenet.
+        assert!(!cfg.surface_thinking);
     }
 
     #[test]
@@ -1218,5 +1284,47 @@ mod tests {
         drop(conn);
         let cfg = get(&db, ag).unwrap().unwrap();
         assert!(!cfg.coding_enabled);
+    }
+
+    #[test]
+    fn set_surface_thinking_roundtrips_true_then_false() {
+        // Pins the opt-in toggle for the slice-3.5 thinking-block
+        // surface. Default-off invariant is asserted by the
+        // `default_values_apply_when_only_required_columns_set` test
+        // above; this one covers the explicit setter.
+        let db = db();
+        let ag = make_agent_group(&db, "g");
+        upsert(&db, minimal_req(ag)).unwrap();
+        assert!(!get(&db, ag).unwrap().unwrap().surface_thinking);
+        set_surface_thinking(&db, ag, true).unwrap();
+        assert!(get(&db, ag).unwrap().unwrap().surface_thinking);
+        set_surface_thinking(&db, ag, false).unwrap();
+        assert!(!get(&db, ag).unwrap().unwrap().surface_thinking);
+    }
+
+    #[test]
+    fn set_surface_thinking_not_found_when_no_row() {
+        let db = db();
+        let err = set_surface_thinking(&db, AgentGroupId::new(), true).unwrap_err();
+        assert!(matches!(err, DbError::NotFound));
+    }
+
+    #[test]
+    fn surface_thinking_defaults_to_false_via_sql_default() {
+        // Existing installs that upgrade past migration 014 must default
+        // to `surface_thinking = false` — privacy-default tenet. Pins
+        // the SQL `DEFAULT 0` in `014_container_config_surface_thinking`.
+        let db = db();
+        let ag = make_agent_group(&db, "g");
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "INSERT INTO container_configs (agent_group_id, updated_at)
+             VALUES (?1, ?2)",
+            params![ag.as_uuid().to_string(), Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        drop(conn);
+        let cfg = get(&db, ag).unwrap().unwrap();
+        assert!(!cfg.surface_thinking);
     }
 }

@@ -11,6 +11,7 @@
 
 pub(super) mod drive_turn;
 pub(super) mod formatting;
+pub(super) mod prompt;
 pub(super) mod provider_call;
 pub(super) mod tool_dispatch;
 
@@ -297,6 +298,31 @@ pub struct RunnerDeps {
     /// tool, this deadline keeps a *wedged* tool from running forever.
     /// Default [`DEFAULT_TOOL_DEADLINE_SECS`].
     pub tool_deadline_secs: u64,
+    /// Receives "the provider call is still working" signals while a
+    /// `run_llm_turn` is in flight (per ~3s tick via
+    /// [`provider_call::ProviderActivityTicker`] plus one ping per
+    /// useful SSE chunk). The default in [`RunnerDeps::minimal`] is a
+    /// no-op [`provider_call::NoopPinger`] because tests don't depend
+    /// on the signal; the production runner wires
+    /// [`provider_call::HeartbeatPinger`] so each ping refreshes the
+    /// heartbeat file and the host's typing-indicator path stays alive
+    /// across long LLM streams.
+    pub activity_pinger: Arc<dyn provider_call::ProviderActivityPinger>,
+    /// Slice-3.5 opt-in: when `true`, the runner persists each
+    /// completed `thinking` / `redacted_thinking` content block the
+    /// provider streams as a [`ironclaw_types::MessageKind::Thinking`]
+    /// row, and the host delivery service renders it as a collapsed
+    /// native UI primitive (Telegram `<blockquote expandable>`, Slack
+    /// `context` block, Discord muted-grey embed, Google Chat
+    /// `collapsibleSection`, Matrix `<details>`).
+    ///
+    /// Default `false` — surfacing model chain-of-thought has privacy
+    /// implications (mid-thought speculation about the user, debugging
+    /// notes the model didn't intend the user to see, etc.). Operators
+    /// flip per-group via `iclaw groups config edit <id>`; the value
+    /// is plumbed in from `container_configs.surface_thinking` by the
+    /// host's container manager into the runner's JSON config file.
+    pub surface_thinking: bool,
 }
 
 /// Default per-tool-call deadline. Comfortably above an `npm install`
@@ -347,13 +373,52 @@ impl RunnerDeps {
             heartbeat_path: None,
             provider_deadline: Duration::from_millis(DEFAULT_PROVIDER_DEADLINE_MS),
             tool_deadline_secs: DEFAULT_TOOL_DEADLINE_SECS,
+            activity_pinger: Arc::new(provider_call::NoopPinger),
+            // Privacy-default: thinking blocks are dropped on the
+            // floor unless the operator explicitly opts the group in
+            // via `container_configs.surface_thinking`.
+            surface_thinking: false,
         }
     }
+}
+
+/// How many entries back from the tail of `state.history` the
+/// resume-after-crash dedup check scans for a matching `User` entry.
+/// The window has to cover the worst case where the prior runner had
+/// completed one full tool turn before crashing — that leaves history
+/// ending in `Tool { ... }` with `[User, Assistant, ToolUse, Tool]`
+/// before it. Ten entries comfortably absorbs a couple of nested tool
+/// turns (`User, Assistant, ToolUse, Tool, ToolUse, Tool, ...`)
+/// without paying for a full-history walk on every poll.
+const RESUME_DEDUP_LOOKBACK: usize = 10;
+
+/// Returns true iff the most-recent `User` entry within the last
+/// [`RESUME_DEDUP_LOOKBACK`] history entries has the same content as
+/// `prompt`. Used by `run_loop` to skip a duplicate push when the
+/// inbound was already enqueued by a prior runner that crashed
+/// mid-message. Walks backwards and STOPS at the first `User` entry —
+/// older `User` entries are not relevant to the resume guard.
+fn is_prompt_already_in_history(history: &[HistoryMessage], prompt: &str) -> bool {
+    history
+        .iter()
+        .rev()
+        .take(RESUME_DEDUP_LOOKBACK)
+        .find_map(|m| match m {
+            HistoryMessage::User { content } => Some(content == prompt),
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 /// Drive the poll loop until `max_turns` turns have been executed (or
 /// forever, if `max_turns` is `None`). The function is `async` and may be
 /// awaited from any tokio runtime.
+//
+// The body sequences ack → format → slash-command intercept → history
+// reconciliation → context-block build → drive_turn → finalize. Splitting
+// further would push the per-iteration locals into a struct without
+// readability win.
+#[allow(clippy::too_many_lines)]
 pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
     // Bring the persisted message history into memory once at startup.
     let mut state = {
@@ -368,6 +433,22 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
             if turns_run >= limit {
                 return Ok(());
             }
+        }
+        // One-shot gate for child agents (`source_session_id` set in
+        // `runner.json`). Once the child has emitted its first
+        // `send_message` back to the parent, exit cleanly — even if
+        // the LLM tries to push follow-up turns. This is the runtime
+        // backstop for the "child agents sent duplicate report +
+        // 'report delivered' summary" bug surfaced on 2026-05-24 with
+        // `openrouter/owl-alpha`. Soft prompt rules ("EXACTLY ONE
+        // send_message") don't reliably constrain free models, so the
+        // runtime enforces the invariant.
+        if deps.tool_ctx.parent_reply_sent() {
+            tracing::info!(
+                target: "ironclaw_runner",
+                "child agent delivered its one-shot reply; exiting run_loop"
+            );
+            return Ok(());
         }
         touch_heartbeat(deps.heartbeat_path.as_ref());
 
@@ -384,6 +465,24 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
 
         ack_picked_up(&deps, &pending).await?;
         let formatted = format_messages(pending);
+
+        // Chat slash-command detection. When the user types `/clear`,
+        // `/reset`, or `/compact` as their entire message (no other
+        // text, no other rows in this batch), we handle it
+        // synchronously here — wipe / compact history, write a
+        // confirmation chat row, mark the inbound completed, skip the
+        // LLM turn. This is the user-side counterpart to the agent's
+        // `clear_history` / `compact_now` MCP tools (which fire from
+        // INSIDE a turn via sentinel files); the chat command short-
+        // circuits the turn entirely so a runaway session can be
+        // reset even when the model is too confused / broken to
+        // honour the request itself.
+        if let Some(cmd) = detect_slash_command_batch(&formatted) {
+            handle_slash_command(&deps, &mut state, &formatted, cmd).await?;
+            // Bypass the rest of the loop body — the command's
+            // confirmation is the entire reply for this turn.
+            continue;
+        }
 
         // Plumb the originating inbound's routing into the tool ctx
         // so any chat-kind outbound the turn produces (the model's
@@ -410,6 +509,20 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
         } else {
             deps.tool_ctx.set_originating(None, None, None, None);
         }
+
+        // Surface child-agent failure notices to the user channel
+        // BEFORE the parent's LLM picks them up. Without this the
+        // parent can spend minutes silently digesting the failure +
+        // reworking — the user has no signal that the parent received
+        // a "sub-task failed" from a child and is still on the case.
+        // Lived through on 2026-05-24: a `golf-research-market` child
+        // failed at 16:33:27, the parent went silent until 16:36:59
+        // while it processed the failure and built a fallback
+        // prototype — five minutes that read as "stuck" to the user.
+        // Routing rules match `emit_status`: gated inside the runner's
+        // `RunnerToolCtx` to channels with real user routing, so child-
+        // agent contexts skip cleanly.
+        emit_failure_notice_toasts(&deps, &formatted.rows).await;
 
         // Honor pending history actions BEFORE pushing the incoming
         // user message, so the user's request is processed against the
@@ -456,19 +569,13 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
                 .context("compaction failed")?;
         }
 
-        // Resume-after-crash guard. If the prior runner persisted a
-        // mid-message history (per-turn save_state in drive_turn) and
-        // then crashed before finalize_messages ran, the inbound will
-        // be re-picked-up here with state.history already ending in
-        // the matching User message. Pushing again would feed the
-        // model two consecutive identical user turns, which confuses
-        // it ("the user just asked twice?"). Only check the LAST
-        // entry — cheap and the only place a duplicate could land,
-        // since prior turns appended assistant/tool entries on top.
-        let already_pushed = matches!(
-            state.history.last(),
-            Some(HistoryMessage::User { content }) if content == &formatted.prompt
-        );
+        // Resume-after-crash guard — see `is_prompt_already_in_history`.
+        let already_pushed = is_prompt_already_in_history(&state.history, &formatted.prompt);
+        // Render the per-inbound conversation-context block from the
+        // current history depth + the freshly-picked-up rows; see the
+        // helper for the prior-vs-current entry-count semantics.
+        let context_block =
+            build_inbound_context_block(&state.history, &formatted.rows, already_pushed);
         if already_pushed {
             tracing::debug!("resuming mid-message — skipping duplicate user push");
         } else {
@@ -477,7 +584,13 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
                 .push(HistoryMessage::User { content: formatted.prompt });
         }
 
-        let turn = drive_turn(&deps, &mut state.history, state.continuation.as_deref()).await?;
+        let turn = drive_turn(
+            &deps,
+            &mut state.history,
+            state.continuation.as_deref(),
+            context_block.as_deref(),
+        )
+        .await?;
         state.continuation = turn.continuation.or(state.continuation);
 
         finalize_messages(&deps, &formatted.rows, turn.outcome).await?;
@@ -495,6 +608,36 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
         // Active path: poll faster when traffic is flowing.
         sleep(Duration::from_millis(ACTIVE_POLL_INTERVAL_MS)).await;
     }
+}
+
+/// Render the per-inbound "Conversation context" block (or `None` when
+/// the batch yields nothing useful). Splits the work out of
+/// [`run_loop`] so the poll body stays under clippy's per-function
+/// line cap and so the depth-snapshot rule is documented once in one
+/// place.
+///
+/// `already_pushed` is the resume-after-crash flag: when the runner is
+/// re-picking-up an inbound it already pushed onto history before a
+/// crash, the trailing User entry IS the current message and must be
+/// excluded from the "prior history" depth the block reports.
+fn build_inbound_context_block(
+    history: &[HistoryMessage],
+    rows: &[ironclaw_types::MessageInRow],
+    already_pushed: bool,
+) -> Option<String> {
+    // Snapshot the prior-history depth BEFORE pushing the current
+    // user turn so the rendered block counts entries from earlier
+    // exchanges in this session, not the about-to-be-pushed message
+    // we're currently replying to. When we're resuming a mid-message
+    // crash recovery (already_pushed=true), the User entry is already
+    // at the tail of history; back off by one to mirror the
+    // not-yet-pushed semantics.
+    let depth = if already_pushed {
+        history.len().saturating_sub(1)
+    } else {
+        history.len()
+    };
+    self::prompt::render_conversation_context(rows, depth)
 }
 
 /// Append a `usage_report` system row to `outbound.db`. The host's
@@ -546,6 +689,53 @@ pub(in crate::run) async fn emit_usage_report(
     deps.turn_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Prefix the runner's `agent_apology_text` emits when a child agent
+/// terminates with failure. Used here to spot the inbound copy of that
+/// apology on the parent's side so we can surface a brief user-facing
+/// toast.
+const SUB_TASK_FAILED_PREFIX: &str = "sub-task failed:";
+
+/// When any pending Agent-kind inbound carries the
+/// [`SUB_TASK_FAILED_PREFIX`] sentinel, write a brief Chat-kind row to
+/// the originating user channel so the user knows the parent received
+/// a failure notice and is working on it. No-op when:
+///   - none of the rows match (the common case),
+///   - the originating routing has no user channel (parent is itself a
+///     child agent — `emit_status` gates inside `RunnerToolCtx`),
+///   - the apology text is missing / malformed.
+///
+/// Each batch emits at most one toast even when multiple failures
+/// arrive together — repeated "sub-task failed" rows in one poll are
+/// usually the same sweep of dying children; one heads-up is enough.
+async fn emit_failure_notice_toasts(deps: &RunnerDeps, rows: &[MessageInRow]) {
+    let any_failure = rows.iter().any(|r| {
+        matches!(r.kind, ironclaw_types::MessageKind::Agent)
+            && r.content
+                .get("text")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| s.trim_start().starts_with(SUB_TASK_FAILED_PREFIX))
+    });
+    if !any_failure {
+        return;
+    }
+    let count = rows
+        .iter()
+        .filter(|r| {
+            matches!(r.kind, ironclaw_types::MessageKind::Agent)
+                && r.content
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| s.trim_start().starts_with(SUB_TASK_FAILED_PREFIX))
+        })
+        .count();
+    let body = if count == 1 {
+        "Heads up — a sub-task reported failure. Handling it now.".to_string()
+    } else {
+        format!("Heads up — {count} sub-tasks reported failure. Handling them now.")
+    };
+    deps.tool_ctx.emit_status(&body).await;
+}
+
 async fn ack_picked_up(deps: &RunnerDeps, rows: &[MessageInRow]) -> Result<()> {
     let mut g = deps.outbound.lock().await;
     let conn: &mut Connection = &mut g;
@@ -578,6 +768,161 @@ async fn ack_picked_up(deps: &RunnerDeps, rows: &[MessageInRow]) -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+/// Recognised user-side slash commands. Detected in the inbound text
+/// BEFORE the message is pushed onto history or sent to the LLM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlashCommand {
+    /// Wipe conversation history + continuation. Starts the next turn
+    /// from a clean slate.
+    Clear,
+    /// Run the compaction pass on history (summarise + truncate).
+    Compact,
+    /// Show the list of supported commands.
+    Help,
+}
+
+impl SlashCommand {
+    fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "/clear" | "/reset" | "/new" => Some(Self::Clear),
+            "/compact" => Some(Self::Compact),
+            "/help" | "/?" | "/commands" => Some(Self::Help),
+            _ => None,
+        }
+    }
+}
+
+/// Inspect a freshly-formatted inbound batch and decide whether it's a
+/// pure slash command. Returns `Some(cmd)` only when:
+/// - the batch is a single chat row (no other rows queued), AND
+/// - that row's `content.text` is exactly a recognised slash command.
+///
+/// Mixed batches (e.g. `/clear` followed by a real question) fall
+/// through to the LLM unchanged — the model can decide what to do.
+fn detect_slash_command_batch(formatted: &crate::formatter::FormattedTurn) -> Option<SlashCommand> {
+    if formatted.rows.len() != 1 {
+        return None;
+    }
+    let row = &formatted.rows[0];
+    if row.kind != ironclaw_types::MessageKind::Chat {
+        return None;
+    }
+    let text = row.content.get("text").and_then(|v| v.as_str())?;
+    SlashCommand::parse(text)
+}
+
+/// Execute a slash command synchronously. Writes a confirmation chat
+/// row through the configured tool context (so it routes to the
+/// originating channel), marks all batch inbounds as completed, and
+/// persists the new state. The caller `continue`s the run loop after
+/// this returns — no LLM turn fires for the command itself.
+async fn handle_slash_command(
+    deps: &RunnerDeps,
+    state: &mut crate::state::PersistedState,
+    formatted: &crate::formatter::FormattedTurn,
+    cmd: SlashCommand,
+) -> Result<()> {
+    let confirmation = match cmd {
+        SlashCommand::Clear => {
+            let prior = state.history.len();
+            state.history.clear();
+            state.continuation = None;
+            // Also wipe the todo store. Without this, `/clear` leaves
+            // the prior session's plan in `/data/agent_todos.json`,
+            // the next prompt's model picks it up, appends new items
+            // on top, and the user sees a Frankenstein "13/26 done"
+            // plan with items from three unrelated tasks. Errors are
+            // best-effort: a locked / missing store must not abort
+            // the clear confirmation.
+            let todo_removed = match ironclaw_mcp::clear_todo_store().await {
+                Ok(removed) => removed,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "ironclaw_runner",
+                        ?err,
+                        "/clear: could not wipe todo store; continuing"
+                    );
+                    false
+                }
+            };
+            tracing::info!(
+                target: "ironclaw_runner",
+                prior_entries = prior,
+                todo_removed,
+                "/clear: wiped conversation history + todo store"
+            );
+            let todo_note = if todo_removed {
+                " The plan/todo list was also cleared."
+            } else {
+                ""
+            };
+            format!(
+                "Cleared conversation history ({prior} prior entries removed).{todo_note} \
+                 Starting fresh — send your next message and I'll have no \
+                 memory of earlier turns."
+            )
+        }
+        SlashCommand::Compact => {
+            let prior = state.history.len();
+            state.history = compact(
+                std::mem::take(&mut state.history),
+                deps.provider.as_ref(),
+                &deps.compaction,
+            )
+            .await
+            .context("/compact failed")?;
+            state.continuation = None;
+            let after = state.history.len();
+            tracing::info!(
+                target: "ironclaw_runner",
+                prior_entries = prior,
+                after_entries = after,
+                "/compact: summarised history"
+            );
+            format!(
+                "Compacted conversation history ({prior} entries → {after}). \
+                 Older context summarised; recent turns kept verbatim."
+            )
+        }
+        SlashCommand::Help => {
+            "Available commands:\n\
+             - /clear (or /reset, /new) — wipe conversation history and start fresh\n\
+             - /compact — summarise older history to free token budget\n\
+             - /help (or /?, /commands) — show this list\n\
+             \n\
+             Anything else is sent to the model as a normal message."
+                .to_string()
+        }
+    };
+
+    // Persist the cleared / compacted state before the confirmation
+    // hits the wire — that way a crash between the emit and the next
+    // poll doesn't leave the user with confirmation + un-cleared
+    // history.
+    {
+        let guard = deps.outbound.lock().await;
+        save_state(&guard, &state.history, state.continuation.as_deref())
+            .context("persist state after slash command")?;
+    }
+
+    // Emit the confirmation through the standard send_message path so
+    // it picks up the originating channel routing set above.
+    let spec = ironclaw_mcp::SendMessageSpec {
+        to: None,
+        text: confirmation,
+    };
+    deps.tool_ctx
+        .emit_outbound(ironclaw_mcp::OutboundToolEffect::SendMessage(spec))
+        .await
+        .map_err(|e| anyhow::anyhow!("/{cmd:?}: confirmation send failed: {e}"))?;
+
+    // Mark the batch's inbound rows as completed so the host doesn't
+    // re-deliver them, then update the processing_ack rows.
+    finalize_messages(deps, &formatted.rows, TurnOutcome::Done).await?;
+    deps.tool_ctx.clear_originating();
     Ok(())
 }
 
@@ -684,20 +1029,30 @@ fn apology_text(reason: &str) -> String {
 /// Apology text for a parent-agent recipient (Agent-kind outbound).
 /// The parent's LLM, not a human, reads this — so the human "try
 /// rephrasing" guidance is wrong from its position. Keep it terse and
-/// machine-actionable: name the failure, and make it clear that the
-/// child session is gone and cannot be re-tried with the same prompt,
-/// so the parent should surface the failure upstream rather than retry.
+/// machine-actionable: name the failure, name the dead child, and tell
+/// the parent it MAY retry by calling `create_agent` again with the
+/// same instructions. Most terminal failures here are transient
+/// (parse-error cap, brief provider hiccup, container crash) and the
+/// parent often has the cheapest path to a fix because it knows what
+/// the task was. Pure-host auto-retry is deferred (see CHANGELOG note);
+/// this prompt-side nudge is the smallest change that turns
+/// "report failure" into "try once more, then report".
 fn agent_apology_text(reason: &str) -> String {
     let trimmed = reason.trim_end_matches(['.', '?', '!']);
     if trimmed.is_empty() {
-        "sub-task failed: child session terminated and cannot continue this request. \
-         Report the failure upstream rather than retrying with the same prompt."
+        "sub-task failed: child session terminated. You may retry by calling \
+         create_agent again with the same name + instructions — these failures \
+         are often transient (parse-error cap, brief provider hiccup, container \
+         crash). If a second attempt also fails, report the failure upstream so \
+         the user can intervene."
             .into()
     } else {
         format!(
-            "sub-task failed: {trimmed}. The child session terminated and cannot \
-             continue this request. Report the failure upstream rather than \
-             retrying with the same prompt."
+            "sub-task failed: {trimmed}. The child session terminated. You may \
+             retry by calling create_agent again with the same name + \
+             instructions — these failures are often transient (parse-error \
+             cap, brief provider hiccup, container crash). If a second attempt \
+             also fails, report the failure upstream so the user can intervene."
         )
     }
 }
@@ -711,10 +1066,17 @@ async fn emit_terminal_failure_apologies(
     if rows.is_empty() {
         return Ok(());
     }
-    // Two flavors of apology: human-readable for end-user channels,
-    // terse + machine-actionable for parent-agent recipients (the
-    // reader is another LLM, not a person).
-    let user_text = apology_text(reason);
+    // Two flavors of apology:
+    //   - End-user channels: a `MessageKind::Error` card (slice-3.3 —
+    //     visually-distinct receipt, rendered red where the platform
+    //     supports it, bold + `[ERROR]` prefix everywhere else). The
+    //     human-readable apology prose lives in the card's `summary`.
+    //   - Parent-agent recipients: plain Agent-kind chat — the reader
+    //     is another LLM, not a person, and giving an LLM a structured
+    //     ErrorCard hands it a side-channel signal that's harder to
+    //     handle than a sentence. Keep the existing prose.
+    let user_summary = apology_text(reason);
+    let user_card = build_terminal_failure_error_card(&user_summary, reason);
     let agent_text = agent_apology_text(reason);
     let outbound = deps.outbound.lock().await;
     let conn: &rusqlite::Connection = &outbound;
@@ -726,11 +1088,11 @@ async fn emit_terminal_failure_apologies(
         }
         // Pick the apology shape. Three cases mirror the sweep
         // (`ironclaw-host-sweep/src/checks/apology.rs`):
-        //   (a) Inbound has channel routing — chat-kind apology back
+        //   (a) Inbound has channel routing — Error-kind card back
         //       through the same channel (human reader).
         //   (b) Inbound has NO channel routing but has source_session_id
-        //       — Agent-kind apology UP to the source so the parent
-        //       agent learns the child failed (LLM reader).
+        //       — Agent-kind plain-prose apology UP to the source so
+        //       the parent agent learns the child failed (LLM reader).
         //   (c) Neither — silently skip (no recipient to apologize to).
         let apology = if let (Some(channel_type), Some(platform_id)) =
             (row.channel_type.as_ref(), row.platform_id.as_ref())
@@ -741,11 +1103,11 @@ async fn emit_terminal_failure_apologies(
                 timestamp: chrono::Utc::now(),
                 deliver_after: None,
                 recurrence: None,
-                kind: ironclaw_types::MessageKind::Chat,
+                kind: ironclaw_types::MessageKind::Error,
                 channel_type: Some(channel_type.clone()),
                 platform_id: Some(platform_id.clone()),
                 thread_id: row.thread_id.clone(),
-                content: serde_json::json!({ "text": user_text }),
+                content: serde_json::json!({ "error": user_card }),
             }
         } else if let Some(source) = row.source_session_id.as_deref() {
             WriteOutbound {
@@ -773,6 +1135,46 @@ async fn emit_terminal_failure_apologies(
     Ok(())
 }
 
+/// Build the `ErrorCard` used for the terminal-failure apology
+/// surface. Separated out so tests can pin the card's shape (kind,
+/// title, summary, retryable flag) directly without poking at
+/// outbound rows.
+///
+/// - `kind = Provider`: terminal turn failures are virtually always
+///   provider-shaped (retry-exhausted streams, malformed `tool_use`
+///   JSON the model couldn't recover from, etc.). The host's
+///   delivery-retry-exhaustion path uses `ErrorCardKind::Delivery`;
+///   internal-tool errors would use `ErrorCardKind::Internal`. Keep
+///   `Provider` here so per-channel renderers can theme distinctly
+///   in the future.
+/// - `retryable = false`: terminal means terminal — the runner
+///   already exhausted its budget by the time we reach
+///   `emit_terminal_failure_apologies`. Telling the user "will retry
+///   automatically" here would be a lie.
+/// - `details = Some(reason)` when reason is non-empty: the raw
+///   `failure_reason` string from `TurnOutcome::Failed` makes it
+///   into the card's monospace details block so operators (and
+///   curious users) can see what went wrong without scraping logs.
+fn build_terminal_failure_error_card(
+    summary: &str,
+    reason: &str,
+) -> ironclaw_channels_core::ErrorCard {
+    use ironclaw_channels_core::{ErrorCard, ErrorCardKind};
+    let mut card = ErrorCard::new(ErrorCardKind::Provider, summary)
+        .with_title("I couldn't finish that reply");
+    let trimmed = reason.trim();
+    if !trimmed.is_empty() {
+        // Cap to fit within the schema's details cap so a long
+        // provider trace doesn't fail validation.
+        let capped: String = trimmed
+            .chars()
+            .take(ironclaw_channels_core::MAX_ERROR_DETAILS_CHARS)
+            .collect();
+        card = card.with_details(capped);
+    }
+    card
+}
+
 pub(in crate::run) async fn set_current_tool(
     deps: &RunnerDeps,
     name: &str,
@@ -794,6 +1196,47 @@ pub(in crate::run) async fn clear_current_tool(deps: &RunnerDeps) -> Result<()> 
     let g = deps.outbound.lock().await;
     container_state::clear_tool(&g)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod slash_command_tests {
+    use super::SlashCommand;
+
+    #[test]
+    fn clear_aliases() {
+        assert_eq!(SlashCommand::parse("/clear"), Some(SlashCommand::Clear));
+        assert_eq!(SlashCommand::parse("/reset"), Some(SlashCommand::Clear));
+        assert_eq!(SlashCommand::parse("/new"), Some(SlashCommand::Clear));
+        // Case-insensitive.
+        assert_eq!(SlashCommand::parse("/CLEAR"), Some(SlashCommand::Clear));
+        // Whitespace trimmed.
+        assert_eq!(SlashCommand::parse("  /reset  "), Some(SlashCommand::Clear));
+    }
+
+    #[test]
+    fn compact_alias() {
+        assert_eq!(SlashCommand::parse("/compact"), Some(SlashCommand::Compact));
+    }
+
+    #[test]
+    fn help_aliases() {
+        assert_eq!(SlashCommand::parse("/help"), Some(SlashCommand::Help));
+        assert_eq!(SlashCommand::parse("/?"), Some(SlashCommand::Help));
+        assert_eq!(
+            SlashCommand::parse("/commands"),
+            Some(SlashCommand::Help)
+        );
+    }
+
+    #[test]
+    fn unrecognised_returns_none() {
+        // Anything else falls through to the LLM.
+        assert_eq!(SlashCommand::parse("what is 2+2"), None);
+        assert_eq!(SlashCommand::parse("/unknown"), None);
+        // Slash command with trailing text is NOT a pure command (the
+        // model should handle it). We don't try to strip args here.
+        assert_eq!(SlashCommand::parse("/clear and also..."), None);
+    }
 }
 
 #[cfg(test)]
@@ -912,6 +1355,8 @@ mod tests {
             channel_type: Some(ChannelType::new("cli")),
             thread_id: None,
             source_session_id: None,
+            reply_to: None,
+            is_group: None,
         };
         insert_in(inbound, &msg).unwrap();
         id
@@ -1067,6 +1512,8 @@ mod tests {
                 channel_type: Some(ChannelType::new("telegram")),
                 thread_id: None,
                 source_session_id: None,
+                reply_to: None,
+                is_group: None,
             };
             insert_in(&g, &msg).unwrap();
             id
@@ -1085,18 +1532,21 @@ mod tests {
             .unwrap();
         assert_eq!(status, "failed");
 
-        // The outbound must include exactly one Chat apology routed at
-        // (telegram, 8929393356) with the inbound id in `in_reply_to`.
+        // Slice-3.3: the apology is now an Error-kind row carrying a
+        // canonical ErrorCard in `content.error` (rather than a plain
+        // Chat row with `content.text`). The card's `summary` field
+        // holds the user-facing apology text the original test
+        // asserted on.
         let outbound = open_outbound(&setup.paths).unwrap();
         let rows = messages_out::list_due(&outbound).unwrap();
         let apologies: Vec<_> = rows
             .iter()
-            .filter(|r| r.kind == MessageKind::Chat)
+            .filter(|r| r.kind == MessageKind::Error)
             .collect();
         assert_eq!(
             apologies.len(),
             1,
-            "expected exactly one apology row, got: {rows:?}"
+            "expected exactly one Error apology row, got: {rows:?}"
         );
         let apology = apologies[0];
         assert_eq!(
@@ -1105,15 +1555,25 @@ mod tests {
         );
         assert_eq!(apology.platform_id.as_deref(), Some("8929393356"));
         assert_eq!(apology.in_reply_to.map(|m| m.as_uuid()), Some(id.as_uuid()));
-        let text = apology
+        let card_value = apology
             .content
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
+            .get("error")
+            .expect("Error-kind apology row must carry content.error");
+        let card: ironclaw_channels_core::ErrorCard =
+            serde_json::from_value(card_value.clone()).unwrap();
+        // Provider-kind because terminal turn failures are virtually
+        // always provider-shaped (retry-exhausted streams, malformed
+        // tool_use JSON, …).
+        assert_eq!(card.kind, ironclaw_channels_core::ErrorCardKind::Provider);
+        // The summary carries the same user-facing prose the
+        // pre-slice-3.3 plain-text apology used to carry.
         assert!(
-            text.contains("snag") || text.contains("couldn't finish"),
-            "apology text should be user-facing: {text:?}"
+            card.summary.contains("snag") || card.summary.contains("couldn't finish"),
+            "card summary should be user-facing: {:?}",
+            card.summary
         );
+        // Terminal failures are NOT retryable — we just gave up.
+        assert!(!card.retryable);
     }
 
     /// Recoverable path: a malformed `tool_use` JSON on the first turn
@@ -1231,24 +1691,34 @@ mod tests {
         );
 
         // The "should never be seen" turn must not have been emitted.
+        // Slice-3.3: apology now lands as an Error-kind row carrying a
+        // canonical ErrorCard (not a plain Chat row).
         let outbound = open_outbound(&setup.paths).unwrap();
         let rows = messages_out::list_due(&outbound).unwrap();
         let chat_rows: Vec<_> = rows
             .iter()
             .filter(|r| r.kind == ironclaw_types::MessageKind::Chat)
             .collect();
-        // Exactly one chat row — the apology — and it must NOT contain
-        // the never-reached fourth-turn text.
-        assert_eq!(
-            chat_rows.len(),
-            1,
-            "expected exactly one apology chat row, got: {chat_rows:?}"
+        assert!(
+            chat_rows.is_empty(),
+            "no Chat outbound expected — apology rides Error kind now: {chat_rows:?}"
         );
-        let apology_text = chat_rows[0]
+        let error_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == ironclaw_types::MessageKind::Error)
+            .collect();
+        assert_eq!(
+            error_rows.len(),
+            1,
+            "expected exactly one Error apology row, got: {error_rows:?}"
+        );
+        let card_value = error_rows[0]
             .content
-            .get("text")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
+            .get("error")
+            .expect("Error apology row must carry content.error");
+        let card: ironclaw_channels_core::ErrorCard =
+            serde_json::from_value(card_value.clone()).unwrap();
+        let apology_text = card.summary.as_str();
         assert!(
             !apology_text.contains("should never be seen"),
             "fourth turn must not have been consumed: {apology_text:?}"
@@ -1632,9 +2102,16 @@ mod tests {
         // "Try rephrasing or sending a smaller request" guidance.
         let s = agent_apology_text("provider returned 503");
         assert!(s.contains("sub-task failed"), "got: {s}");
+        // Parent should be nudged toward retry-once-then-surface.
+        // Slice-3.5 flip from "Report the failure upstream rather
+        // than retrying" to "You may retry … then report upstream".
         assert!(
-            s.contains("Report the failure upstream"),
-            "agent apology should tell parent to surface, not retry: {s}"
+            s.contains("retry") && s.contains("create_agent"),
+            "agent apology should encourage retry via create_agent: {s}"
+        );
+        assert!(
+            s.contains("report the failure upstream"),
+            "agent apology should still fall back to surfacing if retry fails: {s}"
         );
         assert!(
             !s.contains("Try rephrasing"),
@@ -1746,6 +2223,8 @@ mod tests {
             content: serde_json::json!({}),
             source_session_id: None,
             on_wake: false,
+            reply_to: None,
+            is_group: None,
         };
         ack_picked_up(&d, &[row]).await.unwrap();
         let g = outbound.lock().await;
@@ -2419,6 +2898,81 @@ mod tests {
             user_matches, 1,
             "expected exactly one User entry matching the prompt, got: {:?}",
             st.history
+        );
+        let _ = id;
+    }
+
+    /// Resume-after-crash dedup, mid-tool-loop variant. When the prior
+    /// runner crashed AFTER `persist_mid_message` saved history past
+    /// the first tool turn, the persisted history ends in `Tool { ...
+    /// }` (the tool result), with the originating User entry several
+    /// positions back. The original dedup check only looked at
+    /// `history.last()` and so missed the duplicate, re-pushing the
+    /// user prompt and ending up with `[..., User(p), Assistant,
+    /// ToolUse, Tool, User(p)]` — the model either re-answered or got
+    /// confused. The lookback scan must walk past intervening
+    /// `Assistant` / `ToolUse` / `Tool` entries and dedup when the
+    /// most-recent `User` matches the current prompt.
+    #[tokio::test]
+    async fn resume_mid_tool_loop_skips_duplicate_push() {
+        let mut setup = build_setup(vec![vec![ProviderEvent::Result {
+            text: Some("resumed-mid-tool".into()),
+        }]]);
+        // Insert the same pending inbound the prior runner had been
+        // processing.
+        let id = {
+            let g = setup.deps.inbound.lock().await;
+            insert_pending(&g, "do the thing")
+        };
+        let formatted_prompt = {
+            let g = setup.deps.inbound.lock().await;
+            let pending = messages_in::get_pending(&g, true, 10).unwrap();
+            crate::formatter::format_messages(pending).prompt
+        };
+        // Pre-seed history as if the prior runner had pushed the user
+        // prompt, run one assistant turn that invoked a tool, persisted
+        // mid-message AFTER the tool result, then crashed before
+        // finalize_messages. History therefore ENDS in `Tool { ... }`
+        // — the failure mode `history.last()`-only dedup missed.
+        {
+            let g = setup.deps.outbound.lock().await;
+            crate::state::save_state(
+                &g,
+                &[
+                    HistoryMessage::User { content: formatted_prompt.clone() },
+                    HistoryMessage::Assistant { content: String::new() },
+                    HistoryMessage::ToolUse {
+                        id: "tu_resume_1".into(),
+                        name: "shell".into(),
+                        input: serde_json::json!({"command": "ls"}),
+                    },
+                    HistoryMessage::Tool {
+                        tool_use_id: "tu_resume_1".into(),
+                        content: "ok".into(),
+                        is_error: false,
+                    },
+                ],
+                None,
+            )
+            .unwrap();
+        }
+        setup.deps.max_turns = Some(1);
+        run_loop(setup.deps).await.unwrap();
+
+        let outbound = open_outbound(&setup.paths).unwrap();
+        let st = load_state(&outbound).unwrap();
+        // Exactly one User entry matching the current prompt — the
+        // pre-seeded one. A buggy dedup would have pushed a second
+        // copy, taking the count to 2.
+        let user_matches = st
+            .history
+            .iter()
+            .filter(|m| matches!(m, HistoryMessage::User { content } if content == &formatted_prompt))
+            .count();
+        assert_eq!(
+            user_matches, 1,
+            "expected exactly one User entry matching the prompt after mid-tool-loop resume, got: {:?}",
+            st.history,
         );
         let _ = id;
     }

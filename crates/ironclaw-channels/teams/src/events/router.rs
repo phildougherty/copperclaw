@@ -26,7 +26,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use ironclaw_types::{
-    ChannelType, InboundEvent, InboundMessage, MessageKind, SenderIdentity,
+    ChannelType, InboundEvent, InboundMessage, MessageKind, ReplyTo, SenderIdentity,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -347,6 +347,18 @@ fn build_event(
     is_mention: Option<bool>,
     is_group: Option<bool>,
 ) -> InboundEvent {
+    // `replyToId` on the Graph payload is the message this reply targets.
+    // The historical `thread_id` mirror is kept (callers rely on it to
+    // stitch a Teams "reply chain" together); `reply_to` is the cleaner
+    // semantic so we surface it explicitly too.
+    let reply_to = raw
+        .get("replyToId")
+        .and_then(Value::as_str)
+        .map(|parent| ReplyTo {
+            channel_type: state.channel_type.clone(),
+            platform_id: platform_id.clone(),
+            thread_id: Some(parent.to_owned()),
+        });
     let html = raw
         .get("body")
         .and_then(|b| b.get("content"))
@@ -390,7 +402,7 @@ fn build_event(
             is_mention,
             is_group,
         },
-        reply_to: None,
+        reply_to,
         sender,
     }
 }
@@ -1156,6 +1168,68 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
         let evt = rx.recv().await.unwrap();
         assert_eq!(evt.message.id, "MX");
+    }
+
+    #[tokio::test]
+    async fn reply_to_id_populates_reply_to_field() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/teams/T1/channels/C1/messages/MR"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "MR",
+                "replyToId": "PARENT-77",
+                "body": {"contentType":"html","content":"+1"},
+                "from": {"user": {"id": "U-USER"}}
+            })))
+            .mount(&server)
+            .await;
+        let (state, mut rx) = make_state(&server, None);
+        let app = build_webhook_router("/teams/webhook", state.clone());
+        let body = serde_json::to_vec(&json!({
+            "value": [{
+                "subscriptionId": "S1",
+                "clientState": "shared-secret",
+                "resource": "teams/T1/channels/C1/messages/MR",
+                "resourceData": {"id":"MR"}
+            }]
+        }))
+        .unwrap();
+        let req = json_request("/teams/webhook", &body);
+        let _ = app.oneshot(req).await.unwrap();
+        let evt = rx.recv().await.unwrap();
+        let rt = evt.reply_to.expect("reply_to populated from replyToId");
+        assert_eq!(rt.channel_type.as_str(), "teams");
+        assert_eq!(rt.platform_id, "team/T1/channel/C1");
+        assert_eq!(rt.thread_id.as_deref(), Some("PARENT-77"));
+    }
+
+    #[tokio::test]
+    async fn message_without_reply_to_id_leaves_reply_to_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/teams/T1/channels/C1/messages/MR2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "MR2",
+                "body": {"contentType":"html","content":"fresh"},
+                "from": {"user": {"id": "U-USER"}}
+            })))
+            .mount(&server)
+            .await;
+        let (state, mut rx) = make_state(&server, None);
+        let app = build_webhook_router("/teams/webhook", state.clone());
+        let body = serde_json::to_vec(&json!({
+            "value": [{
+                "subscriptionId": "S1",
+                "clientState": "shared-secret",
+                "resource": "teams/T1/channels/C1/messages/MR2",
+                "resourceData": {"id":"MR2"}
+            }]
+        }))
+        .unwrap();
+        let req = json_request("/teams/webhook", &body);
+        let _ = app.oneshot(req).await.unwrap();
+        let evt = rx.recv().await.unwrap();
+        assert!(evt.reply_to.is_none());
     }
 
     #[tokio::test]

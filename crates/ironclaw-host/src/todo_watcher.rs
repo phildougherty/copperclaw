@@ -229,7 +229,7 @@ pub(crate) fn diff_to_notifications(
             .map(|t| format!("  • {}", t.text))
             .collect();
         out.push(format!(
-            "📋 Plan ({} steps):\n{}",
+            "[todo] Plan ({} steps):\n{}",
             current.len(),
             lines.join("\n"),
         ));
@@ -248,7 +248,7 @@ pub(crate) fn diff_to_notifications(
     if !completed.is_empty() {
         let lines: Vec<String> = completed
             .iter()
-            .map(|t| format!("  ✅ {}", t.text))
+            .map(|t| format!("  [done] {}", t.text))
             .collect();
         out.push(format!(
             "Step{} complete:\n{}",
@@ -303,9 +303,70 @@ mod tests {
             &[t(1, "Research", "pending"), t(2, "Build", "pending")],
         );
         assert_eq!(out.len(), 1);
-        assert!(out[0].starts_with("📋 Plan (2 steps):"));
+        assert!(out[0].starts_with("[todo] Plan (2 steps):"));
         assert!(out[0].contains("Research"));
         assert!(out[0].contains("Build"));
+    }
+
+    /// Returns true if `c` falls inside one of the Unicode emoji
+    /// blocks. Used by the no-emoji-in-notifications test to enforce
+    /// the project's "no emojis" rule on watcher output without false-
+    /// flagging existing non-ASCII typography (e.g. bullets, em dashes)
+    /// that are not emoji.
+    fn is_emoji_codepoint(c: char) -> bool {
+        let n = c as u32;
+        // Miscellaneous Symbols and Pictographs (includes the
+        // historical 📋 clipboard at U+1F4CB).
+        (0x1F300..=0x1F5FF).contains(&n)
+        // Emoticons.
+        || (0x1F600..=0x1F64F).contains(&n)
+        // Transport and Map Symbols.
+        || (0x1F680..=0x1F6FF).contains(&n)
+        // Supplemental Symbols and Pictographs.
+        || (0x1F900..=0x1F9FF).contains(&n)
+        // Symbols and Pictographs Extended-A.
+        || (0x1FA70..=0x1FAFF).contains(&n)
+        // Miscellaneous Symbols (includes U+2705 white-check ✅).
+        || (0x2600..=0x27BF).contains(&n)
+        // Regional indicator (flag) symbols.
+        || (0x1F1E6..=0x1F1FF).contains(&n)
+    }
+
+    #[test]
+    fn notifications_contain_no_emoji() {
+        // Every notification body the watcher might emit must be free
+        // of emoji per the project-wide "no emojis" rule (CLAUDE.md).
+        // Exercises all three code paths in `diff_to_notifications`:
+        //   1. first-time plan rollup,
+        //   2. completion announcement,
+        //   3. "plan grew" line.
+        let cases: Vec<(Vec<TodoItem>, Vec<TodoItem>)> = vec![
+            // 1. First-time plan.
+            (vec![], vec![t(1, "Research", "pending"), t(2, "Build", "pending")]),
+            // 2. Completion.
+            (
+                vec![t(1, "Research", "in_progress")],
+                vec![t(1, "Research", "completed")],
+            ),
+            // 3. Plan grew.
+            (
+                vec![t(1, "First", "pending")],
+                vec![t(1, "First", "pending"), t(2, "Second", "pending")],
+            ),
+        ];
+        for (prev, curr) in cases {
+            let out = diff_to_notifications(&prev, &curr);
+            assert!(!out.is_empty(), "case produced no notification");
+            for s in &out {
+                for c in s.chars() {
+                    assert!(
+                        !is_emoji_codepoint(c),
+                        "emoji char {c:?} (U+{:04X}) leaked into todo notification: {s:?}",
+                        c as u32,
+                    );
+                }
+            }
+        }
     }
 
     #[test]

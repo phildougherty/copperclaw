@@ -38,6 +38,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::error::ToolError;
+use crate::tools::diff_util::{build_blob_card, build_diff_card, over_blob_cutoff};
 use crate::tools::{make_tool, parse_args, success_json, ToolEntry, ToolHandler};
 
 #[derive(Debug, Deserialize)]
@@ -69,7 +70,7 @@ pub fn schema() -> Tool {
 
 pub async fn handle(
     arguments: Option<JsonObject>,
-    _ctx: &dyn crate::context::ToolContext,
+    ctx: &dyn crate::context::ToolContext,
 ) -> Result<CallToolResult, ToolError> {
     let input: Input = parse_args(arguments)?;
 
@@ -96,6 +97,14 @@ pub async fn handle(
     .await
     .map_err(|e| ToolError::Internal(format!("edit_file({display}) join: {e}")))??;
 
+    // Best-effort: compute a DiffCard from the pre/post snapshots and
+    // hand it to the runner's emit_diff hook. The hook is a no-op on
+    // contexts that don't surface diff cards (mock / subagent / etc).
+    // We pass the `before_size` / `after_size` through `over_blob_cutoff`
+    // first — a 4 MB file overwrite shouldn't try to compute a real
+    // diff. See `slice-3-native-ui.md` § Surface 1 for the rationale.
+    emit_diff_card(ctx, &result).await;
+
     Ok(success_json(&json!({
         "path": result.path,
         "replacements": result.replacements,
@@ -107,6 +116,25 @@ struct EditOutcome {
     path: String,
     replacements: usize,
     bytes_written: usize,
+    /// Pre-edit content (kept so the handler can compute a `DiffCard`
+    /// after the atomic write succeeds). Always populated.
+    before: String,
+    /// Post-edit content (the bytes the atomic rename just landed on
+    /// disk). Always populated.
+    after: String,
+}
+
+async fn emit_diff_card(ctx: &dyn crate::context::ToolContext, r: &EditOutcome) {
+    let before_size = r.before.len() as u64;
+    let after_size = r.after.len() as u64;
+    if over_blob_cutoff(before_size, after_size) {
+        ctx.emit_diff(build_blob_card(&r.path, before_size, after_size))
+            .await;
+        return;
+    }
+    if let Some(card) = build_diff_card(&r.path, &r.before, &r.after) {
+        ctx.emit_diff(card).await;
+    }
 }
 
 fn do_edit(
@@ -176,6 +204,8 @@ fn do_edit(
         path: path.display().to_string(),
         replacements,
         bytes_written: new_content.len(),
+        before: original,
+        after: new_content,
     })
 }
 
@@ -595,5 +625,64 @@ mod tests {
         assert!(body.contains("old_string"));
         assert!(body.contains("new_string"));
         assert!(body.contains("replace_all"));
+    }
+
+    /// After a successful single edit the tool must emit one
+    /// `DiffCard` via `ctx.emit_diff` carrying the structured diff.
+    /// This is the slice-3.1 wiring contract: tests for the
+    /// per-channel native renderers downstream rely on this card
+    /// reaching the runner.
+    #[test]
+    fn successful_edit_emits_diff_card_via_ctx() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn main() {\n    println!(\"old\");\n}\n").unwrap();
+
+        let mock = Arc::new(crate::context::MockToolContext::new());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let args = json!({
+            "path": path.to_string_lossy(),
+            "old_string": "    println!(\"old\");",
+            "new_string": "    println!(\"new\");",
+        });
+        let map = args.as_object().unwrap().clone();
+        let ctx_ref: &dyn crate::context::ToolContext = mock.as_ref();
+        rt.block_on(handle(Some(map), ctx_ref)).unwrap();
+
+        let diffs = mock.diff_calls();
+        assert_eq!(diffs.len(), 1, "exactly one diff card per successful edit");
+        let card = &diffs[0];
+        assert_eq!(card.path, path.display().to_string());
+        assert_eq!(card.added, 1);
+        assert_eq!(card.removed, 1);
+        assert_eq!(card.language.as_deref(), Some("rust"));
+    }
+
+    /// Failed edits (no match, ambiguous match) must NOT emit a diff
+    /// card — the file wasn't touched, there's nothing to surface.
+    #[test]
+    fn failed_edit_does_not_emit_diff_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "hello world\n").unwrap();
+
+        let mock = Arc::new(crate::context::MockToolContext::new());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let args = json!({
+            "path": path.to_string_lossy(),
+            "old_string": "nope",
+            "new_string": "x",
+        });
+        let map = args.as_object().unwrap().clone();
+        let ctx_ref: &dyn crate::context::ToolContext = mock.as_ref();
+        let res = rt.block_on(handle(Some(map), ctx_ref));
+        assert!(res.is_err());
+        assert!(mock.diff_calls().is_empty());
     }
 }

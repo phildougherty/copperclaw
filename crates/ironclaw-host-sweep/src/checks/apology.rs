@@ -37,6 +37,7 @@ use crate::spawn_tracker::SpawnAttemptTracker;
 use crate::APOLOGY_AFTER_SECS;
 use chrono::{DateTime, Utc};
 use ironclaw_db::tables::messages_out::{insert as insert_out, WriteOutbound};
+use ironclaw_channels_core::{ErrorCard, ErrorCardKind};
 use ironclaw_types::{ChannelType, ContainerStatus, MessageId, MessageKind, Session};
 use rusqlite::params;
 #[cfg(test)]
@@ -120,6 +121,12 @@ impl ApologyReason {
 /// 2. If the session is also in `container_status=Stopped` AND the
 ///    spawn tracker has exhausted its budget, reason → `ContainerSpawnFailed`;
 ///    otherwise reason → `PendingTooLong`.
+//
+// `check` carries the three-branch apology builder (channel-routed
+// ErrorCard, agent-routed plain text, give-up marker) inline. Splitting
+// to silence `too_many_lines` would just push the per-row locals into
+// a struct for no readability win.
+#[allow(clippy::too_many_lines)]
 pub fn check(
     root: &dyn SessionRoot,
     spawn_tracker: &SpawnAttemptTracker,
@@ -153,6 +160,8 @@ pub fn check(
         root.outbound_pool(&session.agent_group_id, &session.id)?;
     let agent_group_id_str = session.agent_group_id.as_uuid().to_string();
 
+    let container_is_running = matches!(session.container_status, ContainerStatus::Running);
+
     for row in rows {
         let reason = if spawn_failed {
             ApologyReason::ContainerSpawnFailed
@@ -163,6 +172,38 @@ pub fn check(
             // declared spawn-failed — skip.
             continue;
         };
+
+        // Liveness gate. The pending-too-long branch fires on message
+        // AGE alone, which previously produced false positives during
+        // legitimate long work: a model spending 6 minutes building a
+        // prototype writes a fresh heartbeat each tick and bumps a
+        // `processing_ack` row to `processing`, but the inbound stays
+        // `status=pending` until finalize_messages flips it at the
+        // very end. The age-only check therefore saw a "stuck" row
+        // even though the runner was actively making forward
+        // progress. Lived through on 2026-05-24 with a Telegram
+        // session that got a false "I'm having trouble" toast 5
+        // minutes into a multi-file build (heartbeat 1s old, golfflow
+        // dir modified just now, ~30 rapid usage_report rows in
+        // outbound).
+        //
+        // The gate: if the container is Running AND the row's
+        // processing_ack is `processing`, the runner is on it.
+        // Skip the apology. The spawn-failed branch is exempt
+        // because by definition the container is Stopped there.
+        if matches!(reason, ApologyReason::PendingTooLong)
+            && container_is_running
+            && inbound_is_being_processed(outbound_pool.conn(), row.id)?
+        {
+            tracing::debug!(
+                target: "ironclaw_host_sweep",
+                session = %session.id,
+                message = %row.id,
+                age_secs = row.age_secs,
+                "stuck-inbound apology suppressed: runner is actively processing",
+            );
+            continue;
+        }
 
         // Pick the apology shape. Three cases:
         //   (a) Inbound has channel_type + platform_id — chat-kind
@@ -177,17 +218,36 @@ pub fn check(
         let apology = if let (Some(channel_type), Some(platform_id)) =
             (row.channel_type.clone(), row.platform_id.clone())
         {
+            // Mirror the runner's terminal-failure apology shape
+            // (slice-3.3 ErrorCard) so a user whose container went
+            // unresponsive sees the same red error chip as one whose
+            // provider call timed out. The two failure modes are
+            // operationally distinct but user-cosmetically identical.
+            let card = ErrorCard {
+                title: "I couldn't process your message".to_string(),
+                summary: APOLOGY_TEXT.to_string(),
+                kind: ErrorCardKind::Internal,
+                details: Some(
+                    "agent container unresponsive (heartbeat stale or never spawned); \
+                     operator notified via log + metrics"
+                        .to_string(),
+                ),
+                retryable: true,
+            };
             WriteOutbound {
                 id: MessageId::new(),
                 in_reply_to: Some(row.id),
                 timestamp: now,
                 deliver_after: None,
                 recurrence: None,
-                kind: MessageKind::Chat,
+                kind: MessageKind::Error,
                 channel_type: Some(channel_type),
                 platform_id: Some(platform_id),
                 thread_id: row.thread_id,
-                content: serde_json::json!({ "text": APOLOGY_TEXT }),
+                content: serde_json::json!({
+                    "error": serde_json::to_value(&card)
+                        .expect("ErrorCard is always serialisable"),
+                }),
             }
         } else if let Some(source) = row.source_session_id.as_deref() {
             // Build an Agent-kind apology targeted at the source
@@ -307,6 +367,41 @@ fn scan_stuck_inbounds(
     Ok(rows)
 }
 
+/// Liveness gate for the pending-too-long apology branch. Returns
+/// `true` when the runner has acked the inbound and is still working
+/// on it (its `processing_ack` row carries `status='processing'`).
+/// The sweep uses this to suppress the false-positive "I'm having
+/// trouble" toast that the age-only check produced during legitimate
+/// long work (multi-minute model turns + tool sequences).
+///
+/// `None` from `processing_ack::get` means the runner hasn't seen
+/// the row yet (truly unacknowledged) — that IS suspicious past the
+/// time threshold, so we fall through to the normal apology path.
+/// Done/Failed ack states also fall through — by then the runner is
+/// off the row entirely and the inbound shouldn't still be
+/// `status=pending`; if it is, something else is wrong and the
+/// apology is appropriate.
+///
+/// DB errors are surfaced as `SweepError::Db` rather than swallowed —
+/// a broken outbound DB is a real problem and squashing it here would
+/// hide it. The cost of bubbling is one extra `Result` return at this
+/// site; the upside is the caller's `?` matches the rest of the
+/// scan/emit chain.
+fn inbound_is_being_processed(
+    outbound_conn: &rusqlite::Connection,
+    message_id: MessageId,
+) -> Result<bool, SweepError> {
+    use ironclaw_db::tables::processing_ack;
+    match processing_ack::get(outbound_conn, message_id) {
+        Ok(Some(claim)) => Ok(matches!(
+            claim.status,
+            processing_ack::ProcessingStatus::Processing,
+        )),
+        Ok(None) => Ok(false),
+        Err(err) => Err(SweepError::from(err)),
+    }
+}
+
 /// Stamp `tries = APOLOGY_TRIES_MARKER` on a single inbound to dedupe
 /// subsequent apology emits. The row is left at `status=pending` so the
 /// runner can still pick it up if the container ever recovers — the
@@ -391,6 +486,8 @@ mod tests {
             channel_type: Some(ChannelType::new(channel_type)),
             thread_id: thread_id.map(str::to_string),
             source_session_id: None,
+            reply_to: None,
+            is_group: None,
         };
         let mut pool = root.inbound_pool(&session.agent_group_id, &session.id).unwrap();
         insert_in(pool.conn_mut(), &msg).unwrap();
@@ -432,8 +529,8 @@ mod tests {
         let rows = messages_out::list_due(outbound.conn()).unwrap();
         let apology = rows
             .iter()
-            .find(|r| r.kind == MessageKind::Chat)
-            .expect("expected an apology chat row");
+            .find(|r| r.kind == MessageKind::Error)
+            .expect("expected an apology error row");
         assert_eq!(
             apology.channel_type.as_ref().map(ChannelType::as_str),
             Some("telegram")
@@ -441,15 +538,16 @@ mod tests {
         assert_eq!(apology.platform_id.as_deref(), Some("tg-123"));
         assert_eq!(apology.in_reply_to, Some(id));
 
-        // User-facing text is the spec text, not jargon.
-        let text = apology
+        // User-facing text lives on the ErrorCard's `summary` field.
+        let summary = apology
             .content
-            .get("text")
+            .get("error")
+            .and_then(|e| e.get("summary"))
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
         assert!(
-            text.contains("trouble") && text.contains("operator"),
-            "apology text should be user-facing: {text:?}"
+            summary.contains("trouble") && summary.contains("operator"),
+            "apology summary should be user-facing: {summary:?}"
         );
 
         // Dedupe marker present so subsequent passes skip the row.
@@ -474,11 +572,11 @@ mod tests {
         let emits = check(&root, &tracker, &sess, now).unwrap();
         assert!(emits.is_empty(), "no apology expected below 5 min");
 
-        // And no chat row landed in outbound.
+        // And no error apology row landed in outbound.
         let outbound = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
         let rows = messages_out::list_due(outbound.conn()).unwrap();
-        let chat_rows: Vec<_> = rows.iter().filter(|r| r.kind == MessageKind::Chat).collect();
-        assert!(chat_rows.is_empty(), "no chat outbound expected, got {chat_rows:?}");
+        let err_rows: Vec<_> = rows.iter().filter(|r| r.kind == MessageKind::Error).collect();
+        assert!(err_rows.is_empty(), "no error outbound expected, got {err_rows:?}");
     }
 
     /// Spec test #3: a stuck inbound across two consecutive sweep
@@ -504,7 +602,7 @@ mod tests {
 
         let outbound = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
         let rows = messages_out::list_due(outbound.conn()).unwrap();
-        let apologies: Vec<_> = rows.iter().filter(|r| r.kind == MessageKind::Chat).collect();
+        let apologies: Vec<_> = rows.iter().filter(|r| r.kind == MessageKind::Error).collect();
         assert_eq!(apologies.len(), 1, "expected exactly one apology row");
     }
 
@@ -531,8 +629,8 @@ mod tests {
         let rows = messages_out::list_due(outbound.conn()).unwrap();
         let apology = rows
             .iter()
-            .find(|r| r.kind == MessageKind::Chat)
-            .expect("expected an apology chat row");
+            .find(|r| r.kind == MessageKind::Error)
+            .expect("expected an apology error row");
         assert_eq!(
             apology.channel_type.as_ref().map(ChannelType::as_str),
             Some("telegram"),
@@ -568,6 +666,8 @@ mod tests {
             channel_type: Some(ChannelType::new("cli")),
             thread_id: None,
             source_session_id: None,
+            reply_to: None,
+            is_group: None,
         };
         insert_in(pool.conn_mut(), &msg).unwrap();
         drop(pool);
@@ -664,6 +764,8 @@ mod tests {
             channel_type: None,
             thread_id: None,
             source_session_id: None,
+            reply_to: None,
+            is_group: None,
         };
         insert_in(pool.conn_mut(), &msg).unwrap();
         drop(pool);
@@ -672,5 +774,176 @@ mod tests {
         assert!(emits.is_empty());
         let inbound = root.inbound_pool(&sess.agent_group_id, &sess.id).unwrap();
         assert!(apology_marker_present(inbound.conn(), id).unwrap());
+    }
+
+    // ── Liveness gate (false-positive apology suppression) ────────
+
+    /// A long-running model turn writes a fresh heartbeat and acks
+    /// the inbound as `processing` while the inbound's `status`
+    /// column stays `pending` (the runner only flips that at
+    /// finalize). The age-only branch used to fire here; the gate
+    /// added on 2026-05-24 must suppress the apology so the user
+    /// doesn't get a false "I'm having trouble" toast during
+    /// legitimate work.
+    #[test]
+    fn apology_suppressed_when_runner_actively_processing() {
+        use ironclaw_db::tables::processing_ack;
+
+        let (_c, root, sess, now, tracker) = fixture();
+        let id = insert_stuck_chat(
+            &root,
+            &sess,
+            ChDuration::minutes(7),
+            "tg-1",
+            "telegram",
+            None,
+            now,
+        );
+
+        // Runner has acked the inbound and is still chewing on it.
+        let mut outbound_pool = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
+        processing_ack::insert(
+            outbound_pool.conn_mut(),
+            id,
+            processing_ack::ProcessingStatus::Processing,
+        )
+        .unwrap();
+        drop(outbound_pool);
+
+        let emits = check(&root, &tracker, &sess, now).unwrap();
+        assert!(
+            emits.is_empty(),
+            "apology should be suppressed when ack=processing + container Running, got: {emits:?}",
+        );
+
+        let outbound = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
+        let rows = messages_out::list_due(outbound.conn()).unwrap();
+        assert!(
+            rows.iter().all(|r| r.kind != MessageKind::Error),
+            "no Error apology should land in outbound when suppressed",
+        );
+
+        // The dedupe marker must NOT be stamped — the row may still
+        // genuinely become stuck later (e.g. the runner crashes
+        // after the gate's snapshot), and we want the next sweep
+        // pass to re-evaluate from scratch.
+        let inbound = root.inbound_pool(&sess.agent_group_id, &sess.id).unwrap();
+        assert!(
+            !apology_marker_present(inbound.conn(), id).unwrap(),
+            "tries marker must not be stamped on suppressed rows",
+        );
+    }
+
+    /// Container is Stopped (crashed mid-process). Even with
+    /// `processing_ack=processing` on the row, the gate must not
+    /// suppress — the runner is dead and the user deserves the
+    /// apology. The age-only branch should fire normally.
+    #[test]
+    fn apology_still_fires_when_ack_processing_but_container_stopped() {
+        use ironclaw_db::tables::processing_ack;
+
+        let (central, root, mut sess, now, tracker) = fixture();
+        let id = insert_stuck_chat(
+            &root,
+            &sess,
+            ChDuration::minutes(7),
+            "tg-1",
+            "telegram",
+            None,
+            now,
+        );
+
+        // Ack is stale-processing — runner picked it up then crashed.
+        let mut outbound_pool = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
+        processing_ack::insert(
+            outbound_pool.conn_mut(),
+            id,
+            processing_ack::ProcessingStatus::Processing,
+        )
+        .unwrap();
+        drop(outbound_pool);
+
+        // Now mark the container stopped.
+        sessions_tbl::mark_container_stopped(&central, sess.id).unwrap();
+        sess = sessions_tbl::get(&central, sess.id).unwrap();
+
+        let emits = check(&root, &tracker, &sess, now).unwrap();
+        assert_eq!(emits.len(), 1, "apology must fire when container is stopped");
+        assert_eq!(emits[0].message_id, id);
+        assert_eq!(emits[0].reason, ApologyReason::PendingTooLong);
+    }
+
+    /// Done/Failed acks do NOT suppress: the runner is off the row,
+    /// and if the inbound is still `status=pending` something else is
+    /// wrong (the runner exited without flipping it). Better to
+    /// surface the apology than silently swallow.
+    #[test]
+    fn apology_fires_when_ack_is_done_or_failed() {
+        use ironclaw_db::tables::processing_ack;
+
+        for terminal in [
+            processing_ack::ProcessingStatus::Done,
+            processing_ack::ProcessingStatus::Failed,
+        ] {
+            let (_c, root, sess, now, tracker) = fixture();
+            let id = insert_stuck_chat(
+                &root,
+                &sess,
+                ChDuration::minutes(7),
+                "tg-1",
+                "telegram",
+                None,
+                now,
+            );
+
+            let mut outbound_pool = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
+            processing_ack::insert(outbound_pool.conn_mut(), id, terminal).unwrap();
+            drop(outbound_pool);
+
+            let emits = check(&root, &tracker, &sess, now).unwrap();
+            assert_eq!(
+                emits.len(),
+                1,
+                "ack={terminal:?} should NOT suppress apology",
+            );
+        }
+    }
+
+    /// Direct unit coverage on the helper — sanity that the truth
+    /// table matches: only `Some(Processing)` returns true.
+    #[test]
+    fn inbound_is_being_processed_truth_table() {
+        use ironclaw_db::tables::processing_ack;
+
+        let (_c, root, sess, _now, _tracker) = fixture();
+        let id_unacked = MessageId::new();
+        let id_running = MessageId::new();
+        let id_finished = MessageId::new();
+        let id_errored = MessageId::new();
+
+        let mut outbound_pool = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
+        processing_ack::insert(
+            outbound_pool.conn_mut(),
+            id_running,
+            processing_ack::ProcessingStatus::Processing,
+        )
+        .unwrap();
+        processing_ack::insert(
+            outbound_pool.conn_mut(),
+            id_finished,
+            processing_ack::ProcessingStatus::Done,
+        )
+        .unwrap();
+        processing_ack::insert(
+            outbound_pool.conn_mut(),
+            id_errored,
+            processing_ack::ProcessingStatus::Failed,
+        )
+        .unwrap();
+
+        assert!(!inbound_is_being_processed(outbound_pool.conn(), id_unacked).unwrap());
+        assert!(inbound_is_being_processed(outbound_pool.conn(), id_running).unwrap());
+        assert!(!inbound_is_being_processed(outbound_pool.conn(), id_finished).unwrap());
+        assert!(!inbound_is_being_processed(outbound_pool.conn(), id_errored).unwrap());
     }
 }

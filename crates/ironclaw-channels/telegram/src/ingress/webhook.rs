@@ -60,7 +60,16 @@ async fn handle_update(
         let provided = headers
             .get(SECRET_TOKEN_HEADER)
             .and_then(|v| v.to_str().ok());
-        if provided != Some(expected) {
+        // Constant-time compare so a network attacker can't probe the
+        // secret one char at a time via the response-time side channel.
+        let ok = match provided {
+            Some(p) => {
+                use subtle::ConstantTimeEq;
+                p.as_bytes().ct_eq(expected.as_bytes()).into()
+            }
+            None => false,
+        };
+        if !ok {
             tracing::warn!("telegram webhook rejected: secret token mismatch");
             return StatusCode::UNAUTHORIZED;
         }

@@ -53,25 +53,26 @@ fn parse_since(s: &str) -> Result<DateTime<chrono::Utc>, ErrorPayload> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Ok(dt.with_timezone(&chrono::Utc));
     }
-    // Relative shorthand: <N>(s|m|h|d)
-    let (digits, unit) = s.split_at(s.len().saturating_sub(1));
-    let n: i64 = digits.parse().map_err(|_| {
+    // Relative shorthand: <N>(s|m|h|d). Use char iteration rather than
+    // byte-index split_at so multi-byte UTF-8 inputs like "é" or "5🦀"
+    // surface as a parse error instead of panicking inside split_at.
+    let bad = || {
         ErrorPayload::new(
             "bad_request",
             format!("invalid `since` value `{s}`; use an ISO-8601 timestamp or a shorthand like `24h`, `30m`, `7d`"),
         )
-    })?;
-    let duration = match unit {
-        "s" => chrono::Duration::seconds(n),
-        "m" => chrono::Duration::minutes(n),
-        "h" => chrono::Duration::hours(n),
-        "d" => chrono::Duration::days(n),
-        _ => {
-            return Err(ErrorPayload::new(
-                "bad_request",
-                format!("invalid `since` value `{s}`; use an ISO-8601 timestamp or a shorthand like `24h`, `30m`, `7d`"),
-            ));
-        }
+    };
+    let unit_char = s.chars().next_back().ok_or_else(bad)?;
+    // The digits portion is everything up to the last char.
+    let digits_end = s.len() - unit_char.len_utf8();
+    let digits = &s[..digits_end];
+    let n: i64 = digits.parse().map_err(|_| bad())?;
+    let duration = match unit_char {
+        's' => chrono::Duration::seconds(n),
+        'm' => chrono::Duration::minutes(n),
+        'h' => chrono::Duration::hours(n),
+        'd' => chrono::Duration::days(n),
+        _ => return Err(bad()),
     };
     Ok(chrono::Utc::now() - duration)
 }
@@ -240,6 +241,43 @@ mod tests {
     fn list_bad_since_errors() {
         let db = db();
         let err = list(&json!({"since": "not-a-ts"}), &db).unwrap_err();
+        assert_eq!(err.code, "bad_request");
+    }
+
+    #[test]
+    fn parse_since_rejects_multibyte_inputs_without_panicking() {
+        // Inputs that exercise the previous byte-index split_at bug:
+        // - "é" is 2 bytes, single char; split_at(len-1) lands on the
+        //   middle of the e-acute and panics.
+        // - "5🦀" has a 4-byte trailing crab; split_at(len-1) lands
+        //   inside the crab bytes and panics.
+        // - "hello" has no recognised unit suffix.
+        // - "" is empty and must not panic.
+        for bad in ["é", "5🦀", "hello", "", "🦀"] {
+            let err = parse_since(bad);
+            assert!(
+                err.is_err(),
+                "parse_since({bad:?}) should error, got {err:?}",
+            );
+            assert_eq!(err.unwrap_err().code, "bad_request");
+        }
+    }
+
+    #[test]
+    fn parse_since_accepts_valid_shorthand() {
+        assert!(parse_since("24h").is_ok());
+        assert!(parse_since("30m").is_ok());
+        assert!(parse_since("7d").is_ok());
+        assert!(parse_since("90s").is_ok());
+    }
+
+    #[test]
+    fn outbound_list_with_multibyte_since_errors_cleanly() {
+        // End-to-end: feeding the handler a multi-byte `since` value
+        // returns a bad_request error rather than panicking the host
+        // task.
+        let db = db();
+        let err = outbound_list(&json!({"since": "5🦀"}), &db).unwrap_err();
         assert_eq!(err.code, "bad_request");
     }
 }

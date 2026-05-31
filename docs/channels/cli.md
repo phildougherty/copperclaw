@@ -2,6 +2,24 @@
 
 Reference adapter. Drives the `iclaw chat` REPL via stdio + FIFO.
 
+## Native UI capabilities
+
+| Capability | Native | Notes |
+|---|---|---|
+| Chat (text) | yes | always supported via stdio / FIFO write |
+| Auto-split long messages | no | no `max_message_chars()` override; terminal has no hard cap |
+| Honour `Retry-After` | yes | shared via delivery loop (no platform to rate-limit but the path is the same) |
+| Typing indicator | no | trait default no-op; no terminal concept |
+| Native cards (buttons/sections) | no | trait-default text fallback writes the rendered card |
+| Native breadcrumbs (tool chips) | fallback | trait-default writes `[tool] detail` lines |
+| Inbound reply_to context | no | `is_group: None`, `reply_to: None` on every event (lib.rs:381) |
+| Inbound group vs DM distinction | no | reference adapter has no concept of either |
+| Edit messages | no | trait-default Unsupported |
+| Reactions | no | trait-default Unsupported |
+| Files / attachments | yes | rendered as `[files: ...]` listing in chat output |
+| Threading | no | `supports_threads() = false` (trait default) |
+| Webhook secret verification | n/a | local process, no network surface |
+
 ## Implemented
 - deliver: COMPLETE (`crates/ironclaw-channels/cli/src/lib.rs:438`)
 - subscribe: noop (no platform concept)

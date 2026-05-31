@@ -68,6 +68,7 @@ pub const SECRETS_ROTATED_TOTAL: &str = "ironclaw_secrets_rotated_total";
 pub const DELIVERY_FAILED_TOTAL: &str = "ironclaw_delivery_failed_total";
 pub const DELIVERY_FORMATTING_FALLBACK_TOTAL: &str =
     "ironclaw_delivery_formatting_fallback_total";
+pub const DELIVERY_CHAT_SPLIT_TOTAL: &str = "ironclaw_delivery_chat_split_total";
 pub const SELF_MOD_FAILED_TOTAL: &str = "ironclaw_self_mod_failed_total";
 pub const SELF_MOD_SUCCEEDED_TOTAL: &str = "ironclaw_self_mod_succeeded_total";
 pub const BUDGET_EXHAUSTED_TOTAL: &str = "ironclaw_budget_exhausted_total";
@@ -177,6 +178,18 @@ pub fn inc_self_mod_succeeded(action: &str) {
 pub fn inc_delivery_formatting_fallback(channel_type: &str) {
     counter!(
         DELIVERY_FORMATTING_FALLBACK_TOTAL,
+        "channel_type" => channel_type.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Increment `ironclaw_delivery_chat_split_total{channel_type=<ct>}`. Fired
+/// by the delivery loop when an outbound chat row's text exceeded the
+/// adapter's `max_message_chars()` cap and was split into multiple parts
+/// before send. One increment per split row (not per resulting part).
+pub fn inc_delivery_chat_split(channel_type: &str) {
+    counter!(
+        DELIVERY_CHAT_SPLIT_TOTAL,
         "channel_type" => channel_type.to_owned(),
     )
     .increment(1);

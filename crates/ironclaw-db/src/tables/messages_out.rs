@@ -100,21 +100,13 @@ fn row_to_message_out(row: &Row<'_>) -> rusqlite::Result<MessageOutRow> {
         .map(MessageId);
 
     let kind: String = row.get("kind")?;
-    let kind = match kind.as_str() {
-        "chat" => MessageKind::Chat,
-        "task" => MessageKind::Task,
-        "webhook" => MessageKind::Webhook,
-        "system" => MessageKind::System,
-        "agent" => MessageKind::Agent,
-        "card" => MessageKind::Card,
-        other => {
-            return Err(rusqlite::Error::FromSqlConversionFailure(
-                0,
-                rusqlite::types::Type::Text,
-                format!("unknown kind {other}").into(),
-            ))
-        }
-    };
+    let kind = MessageKind::parse_str(&kind).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            format!("unknown kind {kind}").into(),
+        )
+    })?;
 
     let timestamp_str: String = row.get("timestamp")?;
     let timestamp = DateTime::parse_from_rfc3339(&timestamp_str)

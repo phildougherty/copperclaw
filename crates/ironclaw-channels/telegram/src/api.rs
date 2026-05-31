@@ -107,6 +107,7 @@ fn empty_message(message_id: i64) -> Message {
         voice: None,
         video_note: None,
         sticker: None,
+        reply_to_message: None,
     }
 }
 
@@ -447,6 +448,19 @@ impl TelegramApi {
         message_id: &str,
         text: &str,
     ) -> Result<(), AdapterError> {
+        self.edit_message_text_with_mode(chat_id, message_id, text, None).await
+    }
+
+    /// As [`edit_message_text`] but lets the caller pass a `parse_mode`
+    /// so chip-style edits (used by `deliver_breadcrumb`) preserve
+    /// their HTML / `MarkdownV2` formatting on update.
+    pub async fn edit_message_text_with_mode(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+        text: &str,
+        parse_mode: Option<&str>,
+    ) -> Result<(), AdapterError> {
         let url = self.endpoint("editMessageText");
         let mut body = serde_json::Map::new();
         body.insert("chat_id".into(), Value::from(chat_id));
@@ -459,6 +473,9 @@ impl TelegramApi {
             body.insert("message_id".into(), Value::from(message_id));
         }
         body.insert("text".into(), Value::from(text));
+        if let Some(mode) = parse_mode {
+            body.insert("parse_mode".into(), Value::from(mode));
+        }
 
         let resp = self
             .http
@@ -526,6 +543,64 @@ impl TelegramApi {
             .map_err(|e| map_send_err(&e))?;
         let raw = read_body(resp).await?;
         // Result type is `true` per Telegram docs; we only care about the envelope.
+        decode_envelope::<Value>(raw).map(|_| ())
+    }
+
+    /// `pinChatMessage` — pin a message in a chat. Used by
+    /// [`crate::adapter::TelegramAdapter::deliver_todo_list`] on the
+    /// first emit so the todo chip stays visible above the timeline.
+    /// `disable_notification` is `true` because the agent pinning its
+    /// own plan shouldn't ping every group member.
+    pub async fn pin_chat_message(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+    ) -> Result<(), AdapterError> {
+        let url = self.endpoint("pinChatMessage");
+        let mut body = serde_json::Map::new();
+        body.insert("chat_id".into(), Value::from(chat_id));
+        if let Ok(n) = message_id.parse::<i64>() {
+            body.insert("message_id".into(), Value::from(n));
+        } else {
+            body.insert("message_id".into(), Value::from(message_id));
+        }
+        body.insert("disable_notification".into(), Value::from(true));
+        let resp = self
+            .http
+            .post(&url)
+            .json(&Value::Object(body))
+            .send()
+            .await
+            .map_err(|e| map_send_err(&e))?;
+        let raw = read_body(resp).await?;
+        decode_envelope::<Value>(raw).map(|_| ())
+    }
+
+    /// `unpinChatMessage` — unpin a previously pinned message. Called
+    /// when a [`TodoList`](ironclaw_channels_core::TodoList) transitions
+    /// to fully-completed so the chat header isn't permanently occupied
+    /// by a finished plan.
+    pub async fn unpin_chat_message(
+        &self,
+        chat_id: &str,
+        message_id: &str,
+    ) -> Result<(), AdapterError> {
+        let url = self.endpoint("unpinChatMessage");
+        let mut body = serde_json::Map::new();
+        body.insert("chat_id".into(), Value::from(chat_id));
+        if let Ok(n) = message_id.parse::<i64>() {
+            body.insert("message_id".into(), Value::from(n));
+        } else {
+            body.insert("message_id".into(), Value::from(message_id));
+        }
+        let resp = self
+            .http
+            .post(&url)
+            .json(&Value::Object(body))
+            .send()
+            .await
+            .map_err(|e| map_send_err(&e))?;
+        let raw = read_body(resp).await?;
         decode_envelope::<Value>(raw).map(|_| ())
     }
 }

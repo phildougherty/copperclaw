@@ -21,9 +21,9 @@
 //! shape with channel-specific adapters.
 
 use crate::prompt::Prompt;
+use crate::state::write_secret_file;
 use crate::steps::StepError;
 use serde::Deserialize;
-use std::io::Write as _;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -263,8 +263,10 @@ pub fn poll_for_chat_id_blocking(
 /// Append (or replace) `KEY=value` in the `.env` at `path`.
 ///
 /// Creates the file if missing. If `key` already appears, the existing
-/// line is replaced in place so re-runs are idempotent. Preserves
-/// `0o600` permissions on Unix.
+/// line is replaced in place so re-runs are idempotent. On Unix the
+/// file is opened with mode `0o600` from the start — closing the
+/// TOCTOU window where a chmod-after-write left the bot token
+/// world-readable for a moment during initial install.
 pub fn append_env_var(path: &Path, key: &str, value: &str) -> Result<(), StepError> {
     let new_line = format!("{key}={value}\n");
     let prefix = format!("{key}=");
@@ -295,28 +297,7 @@ pub fn append_env_var(path: &Path, key: &str, value: &str) -> Result<(), StepErr
             std::fs::create_dir_all(parent)?;
         }
     }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path)?;
-    file.write_all(rebuilt.as_bytes())?;
-    drop(file);
-    restrict_permissions(path)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn restrict_permissions(path: &Path) -> Result<(), StepError> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(path, perms)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> Result<(), StepError> {
+    write_secret_file(path, rebuilt.as_bytes())?;
     Ok(())
 }
 
@@ -387,6 +368,12 @@ fn capture_token(
     prompt: &dyn Prompt,
     out: &mut Vec<String>,
 ) -> Result<Option<String>, StepError> {
+    // Track the previous invalid response so we can detect a headless
+    // (`EnvBacked`) prompt that keeps returning the same malformed
+    // value on every iteration. Without this guard, a malformed
+    // `IRONCLAW_SETUP_TELEGRAM_BOT_TOKEN` would spin the loop forever
+    // because env-backed `secret()` is purely deterministic.
+    let mut prev_invalid: Option<String> = None;
     loop {
         let raw = prompt.secret(HEADLESS_TOKEN_KEY, "Paste the token here (or type `skip`)")?;
         let trimmed = raw.trim();
@@ -400,6 +387,18 @@ fn capture_token(
             ));
             return Ok(Some(trimmed.to_string()));
         }
+        // Headless-loop guard: if we already saw this exact invalid
+        // value once, a second identical response means the prompt
+        // can't yield anything different (env-backed) — bail with a
+        // clear error rather than spin forever.
+        if prev_invalid.as_deref() == Some(trimmed) {
+            return Err(StepError::Other(format!(
+                "IRONCLAW_SETUP_{HEADLESS_TOKEN_KEY} failed bot-token validation; \
+                 expected format `<bot_id>:<token>` (got {})",
+                redact_token(trimmed)
+            )));
+        }
+        prev_invalid = Some(trimmed.to_string());
         out.push(
             "That doesn't look like a BotFather token (expected `<digits>:<chars>`). Try again."
                 .to_string(),
@@ -772,6 +771,59 @@ mod tests {
         let res = run_pairing(&prompt, "http://127.0.0.1:1", &mut out).unwrap();
         assert!(res.is_none());
         assert!(out.iter().any(|m| m.contains("doesn't look like")));
+    }
+
+    #[test]
+    fn pairing_headless_malformed_token_bails_instead_of_looping() {
+        // Regression: `EnvBacked` returns the same value on every
+        // `secret()` call. Before this fix, a malformed
+        // `IRONCLAW_SETUP_TELEGRAM_BOT_TOKEN` would spin the loop
+        // forever. Now the second identical-invalid response surfaces
+        // a clear error.
+        let mut env = HashMap::new();
+        env.insert(
+            EnvBacked::var_name(HEADLESS_TOKEN_KEY),
+            "not-a-real-token".to_string(),
+        );
+        let prompt = EnvBacked::with_env(env);
+        let mut out = Vec::new();
+        let err = run_pairing(&prompt, "http://127.0.0.1:1", &mut out).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("IRONCLAW_SETUP_TELEGRAM_BOT_TOKEN")
+                && msg.contains("validation"),
+            "error should name the env var and the failure (got: {msg})"
+        );
+    }
+
+    #[test]
+    fn pairing_scripted_two_identical_invalids_bails() {
+        // Same guard exercised through the scripted prompt: two
+        // identical invalid values back-to-back means there's no way
+        // for the loop to ever exit successfully.
+        let prompt = Scripted::new()
+            .with(HEADLESS_TOKEN_KEY, "rubbish")
+            .with(HEADLESS_TOKEN_KEY, "rubbish");
+        let mut out = Vec::new();
+        let err = run_pairing(&prompt, "http://127.0.0.1:1", &mut out).unwrap_err();
+        assert!(
+            err.to_string().contains("validation"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn pairing_scripted_two_different_invalids_then_skip_does_not_bail() {
+        // Distinct invalid attempts shouldn't trip the guard — the
+        // operator might be fat-fingering a paste. Only the
+        // identical-repeat case is a headless dead-end.
+        let prompt = Scripted::new()
+            .with(HEADLESS_TOKEN_KEY, "garbage-one")
+            .with(HEADLESS_TOKEN_KEY, "garbage-two")
+            .with(HEADLESS_TOKEN_KEY, "skip");
+        let mut out = Vec::new();
+        let res = run_pairing(&prompt, "http://127.0.0.1:1", &mut out).unwrap();
+        assert!(res.is_none(), "should reach the skip path");
     }
 
     #[tokio::test(flavor = "multi_thread")]

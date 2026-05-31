@@ -66,12 +66,26 @@ const CENTRAL: &[Migration] = &[
         name: "013_sessions_source_session",
         sql: include_str!("../migrations/013_sessions_source_session.sql"),
     },
+    Migration {
+        name: "014_container_config_surface_thinking",
+        sql: include_str!("../migrations/014_container_config_surface_thinking.sql"),
+    },
+    Migration {
+        name: "016_pending_approvals_unique",
+        sql: include_str!("../migrations/016_pending_approvals_unique.sql"),
+    },
 ];
 
-const SESSION_INBOUND: &[Migration] = &[Migration {
-    name: "002_session_inbound",
-    sql: include_str!("../migrations/002_session_inbound.sql"),
-}];
+const SESSION_INBOUND: &[Migration] = &[
+    Migration {
+        name: "002_session_inbound",
+        sql: include_str!("../migrations/002_session_inbound.sql"),
+    },
+    Migration {
+        name: "015_messages_in_reply_to_is_group",
+        sql: include_str!("../migrations/015_messages_in_reply_to_is_group.sql"),
+    },
+];
 
 const SESSION_OUTBOUND: &[Migration] = &[Migration {
     name: "003_session_outbound",

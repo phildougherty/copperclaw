@@ -80,6 +80,11 @@ impl ContainerManager {
             ContainerStatus::Running => {
                 if Self::heartbeat_stale(&paths, self.cfg.heartbeat_stale_secs)
                     .unwrap_or(false)
+                    || Self::heartbeat_missing_and_session_old(
+                        &paths,
+                        session,
+                        self.cfg.heartbeat_stale_secs,
+                    )
                 {
                     ReconcileAction::CrashRestart
                 } else if Self::session_idle(session, self.cfg.idle_timeout_secs)
@@ -236,6 +241,40 @@ impl ContainerManager {
             .duration_since(mtime)
             .unwrap_or(std::time::Duration::ZERO);
         Ok(age > std::time::Duration::from_secs(threshold_secs))
+    }
+
+    /// Backstop for the case where the heartbeat file never appears at
+    /// all — a container that crashed mid-boot, a short-lived child
+    /// that processed its inbound and exited without ever writing the
+    /// heartbeat, etc.
+    ///
+    /// [`Self::heartbeat_stale`] returns `false` when the file is
+    /// missing (a freshly-spawned runner needs a few seconds to start
+    /// writing). That's correct for newly-spawned sessions but turns
+    /// into forever-stuck when a container dies before the first
+    /// heartbeat is ever written: the DB stays `Running`, the manager
+    /// keeps observing "no heartbeat file means not-stale," and the
+    /// session never gets respawned to drain its inbound queue.
+    ///
+    /// This helper closes that gap: if the heartbeat file is missing
+    /// AND `last_active` (which gets set at spawn time and updated by
+    /// every heartbeat tick) is older than `threshold_secs`, the
+    /// session is genuinely dead and the manager should reconcile.
+    ///
+    /// Lived through on 2026-05-24: 3 child research agents spawned,
+    /// processed their kicker, exited; their containers were gone in
+    /// `docker ps` but the DB held them in `Running` for 8+ minutes
+    /// because the heartbeat file was never written.
+    pub(super) fn heartbeat_missing_and_session_old(
+        paths: &SessionPaths,
+        session: &Session,
+        threshold_secs: u64,
+    ) -> bool {
+        // Only triggers when the heartbeat file truly doesn't exist —
+        // an IO error (permission, path, etc.) leaves the existing
+        // `heartbeat_stale` path to handle it.
+        let missing = matches!(paths.heartbeat_mtime(), Ok(None));
+        missing && Self::session_idle(session, threshold_secs)
     }
 
     /// Whether `last_active` is older than the configured idle window.
@@ -506,6 +545,7 @@ mod tests {
             default_image_tag: "ironclaw/session:test".into(),
             default_provider: "anthropic".into(),
             default_model: "claude-sonnet-4-6".into(),
+            default_effort: None,
             anthropic_api_key: Some("sk-test".into()),
             anthropic_base_url: Some("https://openrouter.ai/api/v1".into()),
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
@@ -585,6 +625,8 @@ mod tests {
                 channel_type: Some(ironclaw_types::ChannelType::new("cli")),
                 thread_id: None,
                 source_session_id: None,
+                reply_to: None,
+                is_group: None,
             },
         )
         .unwrap();
@@ -674,6 +716,50 @@ mod tests {
     }
 
     #[test]
+    fn classify_running_with_missing_heartbeat_and_stale_session_is_crash_restart() {
+        // Regression for the 2026-05-24 incident: a child container that
+        // processed its inbound and exited WITHOUT EVER WRITING THE
+        // HEARTBEAT FILE stayed in `Running` forever because
+        // `heartbeat_stale()` returns `false` when the file doesn't
+        // exist (treating the freshly-spawned grace window as "not
+        // stale"). The backstop check `heartbeat_missing_and_session_old`
+        // catches the "missing forever" case via last_active age.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let mut session = fixture_session(&db);
+        sessions::mark_container_running(&db, session.id).unwrap();
+        session.container_status = ContainerStatus::Running;
+        // last_active is older than heartbeat_stale_secs (120s default).
+        session.last_active = chrono::Utc::now()
+            - chrono::Duration::seconds(
+                i64::try_from(DEFAULT_HEARTBEAT_STALE_SECS).unwrap() + 30,
+            );
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        // Heartbeat file deliberately NOT created — this is the bug
+        // condition the new helper guards against.
+        assert!(!paths.heartbeat.exists());
+        assert_eq!(mgr.classify(&session), ReconcileAction::CrashRestart);
+    }
+
+    #[test]
+    fn classify_running_with_missing_heartbeat_but_recent_session_is_noop() {
+        // Fresh spawns must NOT be crash-restarted while the runner is
+        // still booting and writing its first heartbeat. The missing-file
+        // backstop only fires when last_active is also stale.
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let mut session = fixture_session(&db);
+        sessions::mark_container_running(&db, session.id).unwrap();
+        session.container_status = ContainerStatus::Running;
+        session.last_active = chrono::Utc::now();
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        assert!(!paths.heartbeat.exists());
+        assert_eq!(mgr.classify(&session), ReconcileAction::Noop);
+    }
+
+    #[test]
     fn classify_running_with_quiet_session_but_active_runner_is_noop() {
         // Regression: the manager used to idle-stop any session whose
         // last_active was older than idle_timeout_secs, even if the
@@ -736,6 +822,8 @@ mod tests {
                 channel_type: Some(ironclaw_types::ChannelType::new("cli")),
                 thread_id: None,
                 source_session_id: None,
+                reply_to: None,
+                is_group: None,
             },
         )
         .unwrap();
@@ -823,6 +911,8 @@ mod tests {
                 channel_type: Some(ironclaw_types::ChannelType::new("telegram")),
                 thread_id: Some("thread-7".into()),
                 source_session_id: None,
+                reply_to: None,
+                is_group: None,
             },
         )
         .unwrap();
@@ -966,6 +1056,8 @@ mod tests {
                 channel_type: None,
                 thread_id: None,
                 source_session_id: None,
+                reply_to: None,
+                is_group: None,
             },
         )
         .unwrap();

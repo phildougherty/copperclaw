@@ -6,6 +6,1531 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (heartbeat / breadcrumb / diff / thinking missed when parent processes child-forwarded inbound)
+
+The four user-facing observability emits (`emit_status`,
+`emit_breadcrumb`, `emit_breadcrumb_finish`, `emit_diff`,
+`emit_thinking` on `RunnerToolCtx`) gated on "origin must have
+`channel_type` AND `platform_id`," which over-strictly skipped
+during a perfectly common scenario: a root parent session processing
+an agent-dispatched inbound (a child's report forwarded into the
+parent's inbound). Those rows carry NULL channel routing — the user
+channel comes from the messaging-group wiring's `session_routing`
+fallback at delivery time (`crates/ironclaw-host-delivery/src/service.rs::resolve_target`).
+
+Lived through on 2026-05-24 in a Telegram session that asked for
+"parallel research, then build a prototype." The parent spawned three
+F1-research children. The first two delivered close in time and got
+batched into one drive_turn that produced a chat acknowledgment. The
+third arrived 8 seconds later and triggered its own drive_turn —
+during which the model went straight into synthesis (41 LLM turns +
+7 plan updates over 5+ minutes) without saying anything. The
+heartbeat I added on this same date *should* have fired at the 60s
+mark, but `emit_status` skipped because the originating inbound (the
+forwarded child report) had NULL channel routing. The user saw
+"Waiting for the fantasy gaming research report..." → 5 minutes of
+silence → "Strategy Masters... Prototype Complete," reasonably
+concluding it was stuck.
+
+Fix in `crates/ironclaw-runner/src/tools.rs`:
+
+- New `RunnerToolCtx::should_skip_user_facing_emit()` helper. Skips
+  ONLY when the runner itself is a child session
+  (`self.source_session_id.is_some()` — set by the host's
+  `create_agent` path through `runner.json` and into the ctx at
+  startup via `main.rs:132-134`). Whether the originating inbound
+  has channel routing is no longer part of the gate.
+- All four emits now use the new helper. Channel-routing fields on
+  the written row may be `None`; delivery's `resolve_target`
+  fallback fills them from the session's `session_routing` table
+  before dispatch (same path normal `send_message` uses, which is
+  already proven to work for forwarded-inbound scenarios).
+- Child sessions still skip cleanly. `send_message` routing is
+  unchanged (it goes through `resolve_outbound_routing`'s
+  `inbound_came_from_parent` branch and still emits Agent-kind rows
+  back UP to parent — completely separate code path).
+
+Six tests cover the new behavior: two existing skip-when-no-routing
+tests inverted to assert root-session emits fire even with NULL
+origin routing; four new tests pin child-session skip behavior
+(`emit_breadcrumb_skips_for_child_session`,
+`emit_diff_skips_for_child_session`,
+`emit_status_writes_for_root_session_with_null_routing`,
+`emit_status_skips_for_child_session`). All 63 runner tools tests
+green, workspace clippy clean, 0 failed tests.
+
+### Changed (web_fetch + explore: smaller cap, sharper tool-selection guidance)
+
+A 2026-05-24 Telegram session asked for "parallel research on F1 app
+ideas, then build a prototype." The model picked `explore` (an
+in-process subagent with a 50k cumulative input-token budget) instead
+of `create_agent` (full child sessions with their own ~200k budgets
+and real parallelism). The explore subagent fetched
+`https://www.formula1.com` — a JS-heavy SPA whose markdown-converted
+body alone was ~30 KiB. Replayed across 3 explore-loop turns of
+identical history, one fetch's tool result consumed the entire 60k
+budget and the subagent stopped with `token budget exceeded` having
+done zero substantive research. The agent then went ahead and built
+the prototype from training-data priors anyway.
+
+Two coordinated changes target the root cause:
+
+- **`WEB_FETCH_CAP` lowered 32 KiB → 16 KiB**
+  (`crates/ironclaw-mcp/src/tools/computer_use.rs`). 16 KiB of
+  markdown-extracted text is ~4k tokens, leaving room for ~6 real
+  fetches inside a default explore budget instead of 1-2. The tool
+  description now explicitly states "Response body is capped at 16
+  KiB (~4k tokens) to keep one fetch from eating an entire
+  subagent's budget" and points callers to `shell` + `curl` +
+  `head -c` / `grep` when they need more. Truncation regression
+  test renamed `web_fetch_caps_body_at_32k` →
+  `web_fetch_caps_body_at_16k` with payload sizes halved.
+- **`explore` description gained a tool-selection prelude**
+  (`crates/ironclaw-mcp/src/tools/explore.rs`). New explicit guidance:
+  "`explore` is for QUICK in-process lookups (single-focus, 1-3
+  tool calls expected). `create_agent` is for SUBSTANTIVE PARALLEL
+  RESEARCH — each child agent gets its own ~200k token budget and
+  full tool access." A "Budget caveat" paragraph spells out the
+  cumulative-input-token gotcha: each subagent turn replays the
+  full prior history + tool results, so a single large fetch
+  consumes a disproportionate share when repeated in subsequent
+  turns' context. The fix pushes the model toward the right tool
+  before it ever invokes the wrong one.
+
+### Fixed (false-positive "I'm having trouble" toast during legitimate long work)
+
+The sweep's stuck-inbound apology check was firing on message AGE
+alone (`messages_in.status='pending'` + `now - timestamp > 5min`),
+which produced a false-positive "I'm having trouble processing your
+message right now" toast during legitimate multi-minute model
+turns. Lived through on 2026-05-24: a Telegram session 6 minutes
+into a multi-file prototype build got the toast even though the
+heartbeat was 1 second old, the `golfflow` working directory was
+modified just then, and ~30 rapid `usage_report` rows had landed in
+outbound. The root cause: the runner doesn't flip
+`messages_in.status` until `finalize_messages` at the very end of
+the turn, so a 6-minute turn looks identical to a 6-minute stuck
+container if you only look at age.
+
+Fix in `crates/ironclaw-host-sweep/src/checks/apology.rs`:
+
+- New `inbound_is_being_processed(outbound_conn, message_id)`
+  helper that returns true when `processing_ack.status='processing'`
+  for the inbound. The runner writes this ack inside `ack_picked_up`
+  (called immediately after pulling a row), so a fresh `processing`
+  ack means the runner is genuinely on the row.
+- New liveness gate in `check()`: when the apology reason is
+  `PendingTooLong` AND the container is `Running` AND the inbound's
+  ack is `processing`, suppress the apology. The spawn-failed
+  branch is exempt (it definitionally implies `container_status =
+  Stopped`); the dedupe marker is NOT stamped (the next sweep
+  re-evaluates from scratch if the runner does eventually crash).
+- Crash-while-processing still surfaces: when the container is
+  `Stopped`, the gate skips its check and the apology fires
+  normally — the runner is dead and the user deserves the toast.
+- Done / Failed acks don't suppress either — by then the runner is
+  off the row, and if the inbound is still `status=pending`
+  something else broke and the apology is appropriate.
+
+Four new tests cover the truth table (gate truth table, suppression
+on Running+Processing, fire on Stopped+Processing, fire on
+Done/Failed acks). All 13 apology tests green, full workspace at
+5599 passing.
+
+### Changed (todo tools push back on premature plan completion)
+
+After a 2026-05-24 Telegram run shipped a "3/3 done" pinned plan
+while the model was still writing 20+ more files, the todo tools
+got three coordinated nudges:
+
+- **`todo_add` description** now includes an explicit granularity
+  rule: prefer many small items over a few coarse ones, ≥5 for any
+  build that touches >5 files or runs >10 minutes. A 3-item
+  `[research, design, build]` plan is called out as almost always
+  too coarse.
+- **`todo_update` description** spells out that `completed` means
+  VERIFIED done, not started or partly done, with concrete examples
+  of what does NOT count ("wrote `package.json` and `server.js`"
+  for a 'build prototype' item is still `in_progress`). Adds an
+  inline rule: if you're about to make MORE tool calls related to
+  an item, it's not done yet.
+- **`is_acceptable_evidence` got stricter**
+  (`crates/ironclaw-mcp/src/tools/todo.rs`). Minimum length bumped
+  from 20 → 40 chars. Evidence must now contain at least one
+  concrete signal: a file path (slash-bearing token of ≥3 chars), a
+  dot-extension reference (`.json`, `.rs`, `.tsx`), or a
+  verification verb from a curated list (`ran`/`tested`/`verified`/
+  `passed`/`returned`/`started`/`compiled`/etc). `FORBIDDEN_GENERIC`
+  picked up five more entries (`all good`/`looks good`/`lgtm`/
+  `shipped`/`wrapped up`). The validation error message now spells
+  out exactly what shape of evidence is accepted, with examples.
+  Three new tests cover the new gates: rejection of <40-char
+  evidence, rejection of long prose without concrete signals, and
+  acceptance of verification-verb-only evidence (for non-write
+  items like "send confirmation email").
+
+These don't *prevent* a determined model from writing convincing
+fake evidence — that would require runtime tool-call-pattern
+detection which is a separate slice. They make the lazy / generic
+premature-completion path much harder.
+
+### Fixed (`/clear` now wipes the todo store too)
+
+`/clear` (and its `/reset` / `/new` aliases) previously only wiped
+`state.history` + `state.continuation`; the per-session todo store
+at `/data/agent_todos.json` survived. Lived through on 2026-05-24:
+a Telegram session's `/clear` left an email-triage plan from an
+unrelated prior task in place, the next prompt's model picked it up,
+appended new items on top, and the user saw a "13/26 done"
+Frankenstein plan with items from three different runs (Gmail
+OAuth2, compliance-deadlines DB, golf-prototype) all marked done or
+pending against the same list. Fix: new `clear_store()` helper in
+`ironclaw-mcp/src/tools/todo.rs` (re-exported as
+`ironclaw_mcp::clear_todo_store`); the slash handler in
+`ironclaw-runner/src/run/mod.rs` calls it after the history wipe.
+Error is best-effort (a missing or locked store must not abort the
+clear confirmation). The confirmation text picks up "The plan/todo
+list was also cleared." when a store was actually present.
+
+The pinned-message chip on Telegram will go stale visually until the
+next `todo_add` rebuilds it — automatic unpin-on-clear is a
+follow-up; the load-bearing fix (preventing the model from seeing
+the stale plan) is what shipped here.
+
+### Added (runner UX: still-working heartbeat, child-failure toast, retry-nudged apology)
+
+Three loosely-coupled changes to the runner so a long silent stretch
+(tool-heavy turn, or a parent processing a child's failure) doesn't
+read as "the agent has hung." Lived through on 2026-05-24 with the
+Telegram session that went silent for 5+ minutes after
+`golf-research-market` died — no heartbeat, no signal, just typing
+indicators that eventually timed out.
+
+- **`emit_status` hook on `ToolContext` + 60s "still working"
+  heartbeat in `drive_turn`**
+  (`crates/ironclaw-mcp/src/context.rs`,
+  `crates/ironclaw-runner/src/tools.rs`,
+  `crates/ironclaw-runner/src/run/drive_turn.rs`). After each tool
+  turn, the runner checks whether more than 60s have elapsed since
+  the last user-facing emit; if so, it writes a brief `Still working
+  on this — Xs in, N tool calls so far (latest: shell). I'll keep
+  going.` row to the originating channel. The hook is gated inside
+  `RunnerToolCtx::emit_status` to channels with real user routing
+  (`channel_type` + `platform_id` both set) — child agents skip
+  cleanly because the recipient is another LLM, not a person, and
+  status chatter would just bloat the parent's history.
+- **Surface child-agent failure notices to the user channel BEFORE
+  the parent's LLM digests them**
+  (`crates/ironclaw-runner/src/run/mod.rs`, new
+  `emit_failure_notice_toasts`). When `run_loop` picks up a batch
+  of pending inbounds and any of them is an `Agent`-kind row whose
+  text starts with `sub-task failed:`, the runner immediately
+  writes a `Heads up — a sub-task reported failure. Handling it
+  now.` toast to the user channel via the same `emit_status` path.
+  No-op for the common case (no failure rows) and for parent
+  sessions without channel routing (themselves child agents).
+- **Retry-nudged child-failure apology text**
+  (`crates/ironclaw-runner/src/run/mod.rs`, `agent_apology_text`).
+  Old text: "Report the failure upstream rather than retrying with
+  the same prompt." New text: "You may retry by calling
+  create_agent again with the same name + instructions — these
+  failures are often transient (parse-error cap, brief provider
+  hiccup, container crash). If a second attempt also fails, report
+  the failure upstream so the user can intervene." Smallest
+  intervention that turns "report failure" into "try once more,
+  then report" without DB or scheduler changes. Pure host-side
+  auto-retry (respawn-on-failure with a per-`agent_group`
+  `retry_count` column and original-create-agent-spec seed) is
+  deferred — it needs a migration plus coordinated changes in the
+  runner's `emit_terminal_failure_apologies`, the sweep's
+  `apology::check`, and `image_health::emit_degraded_apology`, all
+  of which currently emit independent apology rows. Picking a
+  single chokepoint for that is a worthwhile but separate slice.
+
+### Fixed (container/runtime hardening: mount-arg injection, USTAR overflow, SerpAPI key leak)
+
+Three correctness/security bugs across the container backends and the
+web-search tool:
+
+- **Apple-Container `mount_arg` no longer lets an operator-controlled
+  path inject `--mount` options**
+  (`crates/ironclaw-container-rt/src/apple.rs`). `mount_arg` was
+  interpolating `source` / `target` straight into a comma-separated
+  `--mount type=bind,source=<source>,target=<target>` value, so a
+  `source` ending in `,readonly=false` silently flipped mount
+  semantics. The function now validates BOTH `source` and `target`
+  (and `Volume` `name`, and `Tmpfs` `target`) for the reserved
+  characters `,`, `=`, `\n` and returns
+  `RtError::Unsupported("Apple container mount <role> path contains
+  forbidden character '<ch>': <path>")`. Errors propagate through
+  `run_args` -> `spawn`, so an operator gets a clear failure at
+  install / first-spawn time rather than at runtime with mutated
+  mount flags. Tests added: `mount_arg_bind_rejects_comma_in_source`,
+  `mount_arg_bind_rejects_comma_in_target`,
+  `mount_arg_bind_rejects_equals_in_source`,
+  `mount_arg_bind_rejects_newline`,
+  `mount_arg_volume_rejects_comma_in_name`,
+  `mount_arg_tmpfs_rejects_comma_in_target`,
+  `mount_arg_injection_blocked` (the literal `,readonly=false` attack
+  payload), and `run_args_propagates_mount_validation_error`.
+- **Docker USTAR writer no longer silently truncates filenames > 100
+  bytes** (`crates/ironclaw-container-rt/src/docker.rs`). The inline
+  `tar::append` was only copying the first 100 bytes of `name` into
+  the `name` field and never populating the `prefix` field at offset
+  345, so any `files/<long-basename>` produced opaque image-build
+  failures or silent path collisions in the build context. The writer
+  now (a) writes paths ≤ 100 bytes inline as before; (b) for 101..=256
+  bytes splits at the last `/` that fits both fields (`name` ≤ 100,
+  `prefix` ≤ 155) and writes the prefix at offset 345 (which is
+  included in the existing whole-header checksum sum); (c) returns
+  `TarError::PathTooLong` / `NoValidSplit` (surfaced as
+  `RtError::Container`) for paths that cannot be encoded. Tests
+  added: `short_name_written_inline_prefix_empty`,
+  `medium_name_split_into_prefix_and_name` (round-trips a 130-byte
+  prefix + 80-byte basename), `medium_name_checksum_includes_prefix_bytes`
+  (proves the prefix bytes participate in the checksum),
+  `too_long_name_returns_error`,
+  `medium_name_no_split_point_returns_error`, and
+  `build_context_tar_rejects_oversize_extra_file_name` at the public
+  entry point.
+- **`SERPAPI_API_KEY` no longer leaks into model history via reqwest
+  errors** (`crates/ironclaw-mcp/src/tools/web_search.rs`). SerpAPI
+  only supports query-string auth, so the key lived in the URL of
+  every request. On transport failure, `reqwest::Error`'s `Display`
+  walks the URL into the error message, which was being returned as
+  the tool result, persisted into the agent's conversation, and
+  re-sent to upstream providers on every subsequent turn. The fix
+  introduces a `redact_reqwest_error` helper that builds a bounded
+  error string from `reqwest::Error::is_timeout()` / `is_connect()` /
+  `is_request()` / `is_body()` / `is_decode()` / `status()` only —
+  it never invokes `Display` on the underlying error. The other
+  providers were audited and are safe: Exa uses `x-api-key` header,
+  Brave uses `X-Subscription-Token` header, Tavily passes the key in
+  a POST JSON body (not in the URL). Tests added:
+  `search_error_does_not_leak_api_key` (connect failure against an
+  unbound port) and `search_error_against_bad_scheme_does_not_leak_key`
+  (invalid-URL failure path), both asserting the literal `api_key`
+  string never appears in the rendered error.
+
+### Fixed (setup hardening: secret-file modes, headless token loop, launchd env)
+
+Four bugs in `ironclaw-setup` that bit fresh installs hardest:
+
+- **`setup-state.json` no longer leaves the OneCLI bearer token
+  world-readable** (`crates/ironclaw-setup/src/state.rs`).
+  `SetupState::save` was calling `fs::write`, which goes through the
+  umask (typically `0o644`). The state file embeds
+  `OneCliConfig.bearer_token` — a long-lived vault credential — so
+  any local user on the host could read it. Saves now go through a
+  new `write_secret_file` helper that opens with mode `0o600` from
+  the start on Unix (`OpenOptions::mode(0o600)`) and explicitly
+  re-tightens an existing-file's bits if a pre-batch install left
+  them loose. Test added: `save_creates_file_with_mode_0600`
+  (Unix-only) plants a bearer token, saves, asserts `mode() & 0o777
+  == 0o600`. Companion `save_tightens_mode_on_pre_existing_loose_file`
+  pins idempotent re-runs that converge to `0o600`.
+- **`.env` writers no longer expose secrets through a chmod TOCTOU
+  window** (`crates/ironclaw-setup/src/steps/auth.rs`,
+  `crates/ironclaw-setup/src/steps/telegram.rs`).
+  `write_env_file` and `append_env_var` were doing `fs::write` +
+  chmod-after, leaving a brief window where the freshly written file
+  existed at `0o644` before being tightened. Both paths now route
+  through `state::write_secret_file`, so the bytes never land on
+  disk under looser bits than `0o600`. The orphaned
+  `restrict_permissions` helpers in those files are gone. Tests
+  added: `write_env_file_sets_mode_0600_from_creation`,
+  `write_env_file_tightens_perms_when_path_pre_exists_loose`.
+- **Headless setup no longer spins forever on a malformed
+  `IRONCLAW_SETUP_TELEGRAM_BOT_TOKEN`**
+  (`crates/ironclaw-setup/src/steps/telegram.rs`). `capture_token`
+  was an unbounded `loop { prompt.secret(...); ... }` with no break
+  on validation failure. Under `EnvBacked` (headless mode),
+  `secret()` is deterministic, so a malformed token spun the loop
+  indefinitely with no log output. The loop now tracks the previous
+  invalid value and bails with a clear `StepError::Other`
+  ("`IRONCLAW_SETUP_TELEGRAM_BOT_TOKEN` failed bot-token validation;
+  expected format `<bot_id>:<token>`") on the first identical
+  repeat. Distinct invalid attempts still get a "try again"
+  message, so an interactive fat-finger path isn't affected. Tests
+  added: `pairing_headless_malformed_token_bails_instead_of_looping`
+  (via `EnvBacked`), `pairing_scripted_two_identical_invalids_bails`,
+  and `pairing_scripted_two_different_invalids_then_skip_does_not_bail`
+  (negative-case guard so the heuristic doesn't over-fire).
+- **macOS launchd plist now actually sources the `.env`**
+  (`crates/ironclaw-setup/src/units.rs`). The generator was emitting
+  `<key>EnvFile</key><string>...</string>`, but launchd has no
+  `EnvFile` key — only `EnvironmentVariables` (a static plist
+  dict). launchd silently ignored the bogus key, so the host
+  booted on macOS without `ANTHROPIC_API_KEY` and every other
+  secret captured into `.env`. Fixed by chasing the standard
+  launchd pattern: a small POSIX-shell wrapper that sources the
+  `.env` (`set -a; . file; set +a; exec ironclaw run --data-dir
+  ...`) is generated next to the host binary, and the plist's
+  `ProgramArguments` points at the wrapper. New helpers:
+  `render_launchd_wrapper`, `launchd_wrapper_path`,
+  `write_launchd_wrapper` (writes `0o755`). Snapshot test
+  `render_launchd_does_not_emit_bogus_envfile_key` pins the
+  absence of the bad key;
+  `render_launchd_program_arguments_has_only_the_wrapper` pins the
+  new single-arg shape so the wrapper's own args aren't duplicated;
+  `render_launchd_wrapper_sources_env_and_execs_binary` and
+  `render_launchd_wrapper_guards_missing_env_file` pin the
+  shell-script body; `write_launchd_wrapper_creates_executable_file`
+  pins the `0o755` install. **Follow-up needed:** the service-unit
+  install step (`steps/service_unit.rs`) should call
+  `write_launchd_wrapper` on macOS before writing the plist; this
+  batch only ships the generators + corrected plist body.
+
+Test delta: +15 in `ironclaw-setup` (275 → 290 lib tests).
+
+### Fixed
+
+- **Splitter retry no longer duplicates already-delivered chunks on
+  partial failure** (`crates/ironclaw-host-delivery/src/service.rs`).
+  When `split_chat_content_if_needed` produced 2+ parts and the
+  adapter delivered chunk 0 successfully but failed chunk 1 with a
+  retryable error (`AdapterError::Rate` / `Transport` / `Io`), the
+  `?` in the dispatch loop propagated the error before any progress
+  was recorded — the next retry restarted at chunk 0 and re-sent
+  every earlier chunk, so users on every channel with a
+  `max_message_chars()` cap (Telegram, Discord, Slack, Teams, …)
+  saw chunk 0 twice or thrice (up to `MAX_DELIVERY_ATTEMPTS = 3`
+  copies). `RetryState` now tracks `chunks_sent` and
+  `first_chunk_pid`; `dispatch_chat` reads `chunks_sent` to resume
+  mid-split and records the FIRST chunk's platform message id once
+  (so subsequent `edit_message` / `add_reaction` target the same
+  anchor across retries). The retry-state entry is naturally scoped
+  per `(session_id, msg_id)` and cleared by the existing
+  `process_session_once` success / failure paths. Limitation: if
+  `max_message_chars()` changes between attempts (e.g. operator
+  hot-reloads config mid-retry), the resume index could land in a
+  different chunk; operators don't hot-reload in production, so
+  out-of-scope. +4 regression tests
+  (`split_happy_path_no_duplicate_chunks`,
+  `split_partial_success_retry_skips_delivered_chunks`,
+  `split_retry_exhaustion_does_not_replay_first_chunk`,
+  `split_first_chunk_pid_stable_across_retries`).
+
+### Fixed (5 host-process correctness + auth-bypass bugs)
+
+- **iclaw socket now derives caller identity from `SO_PEERCRED` (Linux
+  `getpeereid` on macOS) instead of trusting the JSON `caller` field
+  on the wire** (`crates/ironclaw-host/src/socket.rs`). Previously any
+  local UID-matching process — including a container that somehow
+  reached the admin socket — could send `{"caller":{"kind":"host"}}`
+  and execute every host-only mutation (`db.backup`, `groups.delete`,
+  `mcp.add` with secrets, etc.); the audit log even recorded the
+  attacker as "host". The new `serve_unix_connection` reads
+  `UnixStream::peer_cred()` (tokio 1.x built-in — no `nix` / no
+  `unsafe` needed) and compares the peer UID against the host's own
+  effective UID (resolved from `/proc/self` ownership, same trick
+  `container_manager::spawn::host_uid_gid` uses). A non-matching peer
+  UID yields a `permission_denied` response; matching peers may
+  self-identify as a particular agent via the wire `Agent` claim but
+  `Caller::Host` is now an authoritative kernel-derived label, never
+  a wire-supplied one. +5 socket-layer tests
+  (`derive_caller_*` + two end-to-end UnixStream round-trips
+  including a cross-UID rejection).
+- **Socket-server bind errors now abort `run_host` with
+  `BootError::Socket` instead of being swallowed**
+  (`crates/ironclaw-host/src/boot.rs` + `socket.rs`). The old fused
+  `tokio::spawn(run_server(...))` discarded the JoinHandle's
+  bind-result, so a stale non-socket file or an unwritable parent
+  directory would leave the host printing "boot complete" with a
+  dead admin surface. The new `bind_listener` runs synchronously
+  inside `run_host` (exit code 4 via the existing
+  `BootError::exit_code` mapping); `serve_listener` only spawns
+  after the bind succeeds. +1 integration test that drives `run_host`
+  against an unbindable socket path and asserts
+  `BootError::Socket(_)`.
+- **Per-frame and per-connection caps on the iclaw socket close a
+  local DoS** (`crates/ironclaw-host/src/socket.rs`). `read_until`
+  on the NDJSON wire had no upper bound — a local process could
+  feed a 1 GiB frame and OOM the host before any parse ran. Each
+  request frame is now wrapped in `BufReader::take(1 MiB)` via the
+  new `MAX_REQUEST_FRAME_BYTES` and overflows surface as a protocol
+  error instead of pinned memory. Concurrent accepted connections
+  are gated by a `tokio::sync::Semaphore` capped at
+  `MAX_CONCURRENT_CONNECTIONS = 32`; the permit is held for the
+  task's lifetime so a flood of opens can't exhaust the host's fd
+  table. +2 tests
+  (`oversized_request_frame_is_rejected_not_oomed`,
+  `concurrent_connection_cap_actually_limits`) plus a
+  defence-in-depth regression (`under_cap_request_still_works`).
+- **`dropped_messages` `parse_since` no longer panics on multi-byte
+  UTF-8 inputs** (`crates/ironclaw-host/src/handlers/dropped_messages.rs`).
+  The old `s.split_at(s.len().saturating_sub(1))` operated on byte
+  indices, so a `since="é"` or `since="5🦀"` from an agent-side
+  caller would land split_at inside a UTF-8 code point and panic the
+  handler task. Replaced with `s.chars().next_back()` + `len_utf8()`
+  arithmetic so multi-byte inputs fall through to the existing
+  `bad_request` error path. +3 tests
+  (`parse_since_rejects_multibyte_inputs_without_panicking`,
+  `parse_since_accepts_valid_shorthand`,
+  `outbound_list_with_multibyte_since_errors_cleanly`).
+- **`todo_watcher` notification text is now emoji-free**
+  (`crates/ironclaw-host/src/todo_watcher.rs`). The `📋 Plan` and
+  `✅ done` prefixes violated the project-wide "no emojis" rule
+  (CLAUDE.md). Replaced with plain ASCII `[todo]` / `[done]` tags
+  matching the surrounding tone. +1 enforcement test
+  (`notifications_contain_no_emoji`) that walks every code path in
+  `diff_to_notifications` (first-time, completion, plan-grew) and
+  asserts no Unicode codepoint in the emoji blocks
+  (`U+1F300..1F5FF`, `U+1F600..1F64F`, `U+1F680..1F6FF`,
+  `U+1F900..1F9FF`, `U+1FA70..1FAFF`, `U+2600..27BF`,
+  `U+1F1E6..1F1FF`) appears in any emitted notification.
+
+### Fixed (4 mid-stream / dedup / TOCTOU correctness bugs)
+
+- **Runner no longer crashes mid-stream on transient
+  `container_state` write errors.** `crates/ironclaw-runner/src/run/provider_call.rs`
+  used `?` to propagate `set_current_tool` / `clear_current_tool`
+  results, so a single SQLite lock contention writing the stuck-tool
+  housekeeping row would abort the entire `pump_events` stream,
+  discard every queued mid-stream tool_use event, crash the runner,
+  and force the container to respawn. These writes are best-effort
+  (the stuck-tool detector only loses one tool's `started_at` for one
+  pass) and now warn-log and continue rather than propagating —
+  matching the let-the-write-fail convention used elsewhere in the
+  runner. Covered by
+  `pump_completes_when_container_state_writes_fail` (drops the
+  `container_state` table before the run, asserts the assistant
+  Chat row still lands).
+
+- **Resume-after-crash dedup now scans backwards past tool turns.**
+  `crates/ironclaw-runner/src/run/mod.rs` only checked
+  `state.history.last()` for a matching `User` entry. Because
+  `persist_mid_message` saves history after each tool turn, a
+  mid-tool-loop crash leaves history ending in `Tool { ... }` (or
+  `ToolUse`), so the prior fix's `.last()` check returned `false` and
+  the runner re-pushed the user prompt, producing `[..., User(p),
+  Assistant, ToolUse, Tool, User(p)]` and either a second answer or a
+  confused model. Extracted the dedup into
+  `is_prompt_already_in_history`, which walks the most recent
+  `RESUME_DEDUP_LOOKBACK = 10` entries backwards and stops at the
+  first `User` — if it matches the current prompt, skip the push.
+  Covered by `resume_mid_tool_loop_skips_duplicate_push`.
+
+- **`recurrence::check` no longer aborts the session's sweep on
+  slice-3 kinds.** `crates/ironclaw-host-sweep/src/checks/recurrence.rs`
+  hand-rolled a six-variant `parse_kind` helper missing `breadcrumb`,
+  `diff`, `todo_list`, `error`, and `thinking`. A recurring inbound
+  with any of those kinds returned `unknown kind` and aborted the
+  whole recurrence sweep for that session. Replaced the call with
+  `MessageKind::parse_str` (the canonical column-string parser) and
+  deleted the local helper so this drift cannot recur. Covered by
+  `all_message_kinds_parse_without_error_in_recurrence_sweep` —
+  seeds one recurring row per documented variant and asserts each
+  one fans out.
+
+- **`processing::check` no longer races a finishing runner into a
+  duplicate reply.** `crates/ironclaw-host-sweep/src/checks/processing.rs`
+  read `processing_ack` (status=Processing, stale) + scanned for any
+  `in_reply_to=msg_id` reply, then did the inbound-reset UPDATE
+  later. Between the SELECT and the UPDATE the runner could finish
+  the turn — writing its reply and flipping `processing_ack.status`
+  to Done — and the sweep would still reset the inbound to
+  `pending`, causing the runner to re-pick the same message and
+  produce a duplicate reply. The reset path now calls a new
+  `atomic_reclaim_claim` helper that opens an IMMEDIATE transaction
+  on the outbound DB, re-reads the claim row, re-checks the staleness
+  threshold AND the absence of any reply in `messages_out`, and only
+  deletes the claim atomically if all guards still hold. The
+  cross-DB inbound reset only runs when the delete succeeded, so a
+  runner that races past us is honoured. A new `check_with_hook`
+  test seam exposes a `before_reset` callback so the regression test
+  can inject the concurrent (reply + ack=Done) write between the
+  initial scan and the re-check; the test asserts the inbound stays
+  untouched and the runner-set `Done` ack is preserved.
+
+### Fixed (3 race / serde correctness bugs)
+
+- **`MessageKind::TodoList` JSON round-trip.**
+  `crates/ironclaw-types/src/message.rs` had `#[serde(rename_all =
+  "lowercase")]` on `MessageKind`, which serialised `TodoList` as
+  `"todolist"` (no underscore). The DB column form via `as_str()` /
+  `parse_str()` is `"todo_list"`, so any path that round-tripped a
+  `MessageKind` through JSON and then tried `parse_str` on the wire
+  tag silently lost the kind. Switched to `rename_all = "snake_case"`
+  — single-word variants serialise identically, `TodoList` now
+  serialises as `"todo_list"` matching the DB form. The dedicated
+  per-variant unit tests and the previously broken-on-purpose
+  `"todolist"` assertion were updated; a new
+  `message_kind_serde_tag_matches_as_str_for_every_variant` test pins
+  the new contract for every variant.
+- **`unregistered_senders::upsert` race.**
+  `crates/ironclaw-db/src/tables/unregistered_senders.rs` was
+  SELECT-then-INSERT/UPDATE against a pooled (max=8) writer. Two
+  concurrent first-time inbounds for the same `(channel_type,
+  platform_id)` could both observe missing row, both INSERT, the
+  loser bubbled a UNIQUE-violation `DbError::Sqlite` and the router
+  dead-lettered the inbound. Collapsed into a single atomic
+  `INSERT ... ON CONFLICT(channel_type, platform_id) DO UPDATE`
+  against the existing primary key. New `tokio::test(flavor =
+  "multi_thread")` regression test spawns 16 concurrent upserts
+  against a file-backed pool and asserts exactly one row with
+  `message_count == 16`.
+- **`pending_approvals::upsert` race + new migration.**
+  `crates/ironclaw-db/src/tables/pending_approvals.rs` had the same
+  SELECT-then-INSERT shape and no DB-side constraint on
+  `(request_id, action)` — concurrent upserts produced silent
+  duplicate pending rows. New migration
+  `crates/ironclaw-db/migrations/016_pending_approvals_unique.sql`
+  adds a partial unique index `WHERE status = 'pending'` (terminal
+  rows can repeat across statuses; only the live pending row is
+  unique). Registered in `MigrationSet::Central` at
+  `crates/ironclaw-db/src/migrate.rs`. The upsert is now a single
+  atomic `INSERT ... ON CONFLICT(request_id, action) WHERE status =
+  'pending' DO UPDATE`. Two new tests: a 16-task concurrency
+  regression test, plus a `upsert_after_denial_creates_fresh_pending_row`
+  test that pins the partial-index contract.
+
+### Fixed (slice-2 conversation-context follow-up: persist reply_to + is_group)
+
+The two channel-event signals Agent A had been populating on
+`InboundEvent` (`reply_to`, `message.is_group`) were stopping at the
+router — they were never persisted onto `messages_in`, so when the
+runner read `MessageInRow` and built the per-turn "Conversation context"
+block (Agent B's work) the signals weren't there and the block
+degraded to channel-only phrasing. This closes the gap end-to-end:
+
+- **New per-session inbound migration
+  `crates/ironclaw-db/migrations/015_messages_in_reply_to_is_group.sql`**
+  adds `reply_to TEXT NULL` + `is_group INTEGER NULL` columns to
+  `messages_in`. Registered in `MigrationSet::SessionInbound` at
+  `crates/ironclaw-db/src/migrate.rs`. Existing rows are unaffected
+  (both columns default to NULL).
+- **`WriteInbound` + `MessageInRow` extended** with `reply_to:
+  Option<String>` and `is_group: Option<bool>`. The INSERT/SELECT
+  paths in `crates/ironclaw-db/src/tables/messages_in.rs` write +
+  read both columns; the row parser coalesces a legacy
+  `reply_to = ''` shape to `None` (parallel to the existing
+  `source_session_id` defence).
+- **Router insert site at
+  `crates/ironclaw-host-router/src/route.rs::deliver_to_session`**
+  now pulls `event.reply_to.thread_id` (the parent platform message
+  id every adapter stuffs there) and `event.message.is_group` and
+  passes both through `WriteInbound`.
+- **`render_conversation_context` in
+  `crates/ironclaw-runner/src/run/prompt.rs`** consumes the new
+  fields: `is_group=Some(true)` renders "a group chat",
+  `Some(false)` renders "a 1-on-1 DM", `None` keeps the existing
+  thread-id-derived fallback. `reply_to=Some(...)` appends ", in
+  reply to an earlier message" after the venue/channel run. Both
+  signals degrade silently when `None` so adapters that don't
+  populate them (cli, file-watcher, webhook-only) see the legacy
+  phrasing unchanged.
+- **Recurrence fan-out
+  (`crates/ironclaw-host-sweep/src/checks/recurrence.rs`)** now
+  carries the parent row's `reply_to` / `is_group` onto every
+  fan-out so the runner's context block stays consistent across a
+  recurring series.
+- **Coverage:** DB-side round-trip + empty-string coalescing tests
+  in `messages_in.rs`; router-side persist + None-pass-through
+  tests in `route.rs::tests`; runner-side context-block extension
+  tests in `prompt.rs::tests` (DM+reply, group+reply, group-no-thread,
+  legacy-no-signals). +8 tests total.
+
+### Fixed (skill body cap + channel doc follow-ups)
+
+- **Skill body cap aligned with the documented 8 KiB ceiling.**
+  `MAX_SKILL_BODY_BYTES` in `crates/ironclaw-skills/tests/coverage.rs`
+  was enforcing 4 KiB while `skills/README.md` advertised 8 KiB, which
+  forced new long-form taxonomy skills (e.g. `native-ui`) to compress
+  per-channel tables into legend codes. Bumped the test ceiling to
+  8 KiB to match the README intent; the 4 KiB target is preserved in
+  the doc-comment as the spec goal.
+- **`skills/native-ui/SKILL.md` restored to its full shape.** Replaced
+  the legend-coded N/L/R/T rendering table with the descriptive
+  per-channel table (telegram / slack / discord / gchat / matrix
+  columns, one row per shape), brought back the `../send-file/SKILL.md`
+  cross-reference, expanded the anti-pattern section with concrete
+  WRONG/RIGHT examples. Body now ~6.4 KiB, well under the 8 KiB cap.
+- **`docs/channels/gchat.md` + composite heatmap in
+  `docs/channels/README.md`** updated to reflect that gchat
+  `deliver_breadcrumb` has shipped (Cards v2 `decoratedText` single-
+  section card with in-place `spaces.messages.patch` edits,
+  `crates/ironclaw-channels/gchat/src/adapter.rs:191`). Stale
+  "landing this week (agent G)" marker removed.
+- **`docs/channels/mattermost.md` `is_group` row** rewritten to
+  "no (not in payload)" with the wire-field rationale. Mattermost
+  outgoing-webhook payload (`token` / `channel_id` / `channel_name`
+  / `user_id` / `text` / `trigger_word` / `file_ids`) carries no
+  channel-type signal; deriving DM-vs-group requires a follow-up
+  `GET /api/v4/channels/{channel_id}` lookup. `TODO(channel-ux)`
+  comment added in
+  `crates/ironclaw-channels/mattermost/src/router.rs` at the
+  `InboundEvent` construction site documenting the contract.
+- **Discord `thread_id`/`reply_to` doc row verified** against
+  `crates/ironclaw-channels/discord/src/events.rs:64-75`. The
+  legacy `thread_id` mirror is real (kept to avoid breaking
+  existing routing); the documented row already matches.
+
+### Fixed (slice 3 integration pass)
+
+Five slice-3 agents (Diff / TodoList / Error / Long-output / Thinking) landed in parallel; the integration pass closed the seams between them:
+
+- **`apply_emit_todo_list` body rewritten** to use `serde_json::Map::new()` + `.insert()` rather than the `json!({...})` macro so the runner-emit-set coverage test (`runner_emit_set_matches_source`) doesn't misclassify the `"todo_list"` content key as a `MessageKind::System` action name. Mirrors the same dodge in `apply_send_card`. (`crates/ironclaw-runner/src/tools.rs::apply_emit_todo_list`)
+- **`EXPANDER_BYTE_THRESHOLD` raised from 4 KB → 64 KB.** The original threshold collided with Telegram's 4096-char `max_message_chars()` cap and with Slack's 40 000-char cap, so any agent message just over a platform cap got folded into the expander chip rather than going through the slice-1 splitter. The expander is for *long tool output* (pages of shell stdout) — well over 64 KB in real use; the new threshold preserves that intent without competing with the splitter. (`crates/ironclaw-runner/src/tools.rs:914-919`)
+- **Wired `emit_breadcrumb_finish` into the runner's tool loop.** After Agent G shipped the trait surface, the chip stayed stuck on "Running" forever because no one was calling the finish hook. New helper `finish_tool_breadcrumb` in `drive_turn.rs` fires after every `invoke_tool` return, passing the tool's first non-empty result line (char-truncated to 200) as the summary.
+- **`cli/provider-timeout` replay fixture updated** for the slice-3.3 ErrorCard apology shape. The runner's terminal-failure apology is now a `MessageKind::Error` row carrying a full `ErrorCard`; the fixture's pre-3.3 expected output of a plain `Chat` row was stale.
+- **`approvals.rs` doc-markdown clippy fix** (backticks around `self_mod`).
+- **`drive_turn` carries `#[allow(clippy::too_many_lines)]`** — the function is the central tool-loop state machine; intrinsic.
+
+Workspace: 5,788 passing, 0 failing, 6 ignored. Clippy clean on `cargo clippy --workspace --all-targets -- -D warnings`.
+
+### Added (slice 3.5 — opt-in surfaced thinking blocks)
+
+Reasoning-capable models (Anthropic extended thinking, `Kimi K2.6`,
+`Qwen QwQ`, `DeepSeek R1`, …) stream a chain-of-thought block before
+their user-facing reply. Until this batch the Anthropic provider
+absorbed those silently — they didn't pollute the agent's reply (see
+`ThinkingAccumulator`), but the user couldn't see them either. Slice
+3.5 adds an OPT-IN pipeline that, when an operator flips the
+per-group `surface_thinking` flag, persists each completed reasoning
+block as a `MessageKind::Thinking` outbound row and renders it as a
+collapsed native UI primitive on every adapter that has one.
+
+Default is **OFF** — surfacing model chain-of-thought has privacy
+implications (mid-thought speculation about the user, debugging notes
+the model didn't intend the user to see, etc.). This matches the
+Ironclaw tenet of "secure-by-default, public-by-deliberate-act".
+
+- **Canonical `ThinkingBlock` schema**
+  (`crates/ironclaw-channels/core/src/thinking.rs`,
+  `crates/ironclaw-channels/core/src/lib.rs`). Fields: `text` (≤
+  `MAX_THINKING_CHARS` = 8000 codepoints), `redacted: bool` (mirrors
+  the upstream `redacted_thinking` block type — renderers MUST
+  substitute a placeholder rather than display any text), `model:
+  Option<String>` (optional provenance tag, ≤ 64 chars). `validate()`
+  enforces non-empty text unless `redacted`. `to_text_fallback()`
+  emits a `[reasoning]`-headered quoted block so plain-text channels
+  still surface the reasoning clearly.
+- **`MessageKind::Thinking` variant**
+  (`crates/ironclaw-types/src/message.rs`) — alphabetical placement
+  among the slice-3 new variants. Serde lowercase `"thinking"` on the
+  wire; `as_str` / `parse_str` round-trip pinned by a new test.
+- **New `ChannelAdapter::deliver_thinking` hook**
+  (`crates/ironclaw-channels/core/src/adapter.rs`). Default impl
+  converts the block via `to_text_fallback` and routes through
+  `deliver` as `MessageKind::Chat`, so every adapter has a usable
+  rendering for free.
+- **Per-channel native renderers**:
+  - Telegram (`crates/ironclaw-channels/telegram/src/adapter.rs`):
+    HTML `<blockquote expandable>` (Bot API 7.6+, same primitive as
+    surface 4) with `<i>reasoning</i>` prefix.
+  - Slack (`crates/ironclaw-channels/slack/src/adapter.rs`): Block
+    Kit `context` block (the platform's idiomatic muted-metadata
+    affordance) with `:thought_balloon:` emoji + reasoning label,
+    chunked across multiple blocks under Slack's 3000-char element
+    cap.
+  - Discord (`crates/ironclaw-channels/discord/src/adapter.rs`):
+    embed with secondary-grey color (`0x99AAB5`), `author.name =
+    "reasoning"` (with optional provenance), description fenced as
+    `text` to defang user-supplied markdown / backticks.
+  - Google Chat (`crates/ironclaw-channels/gchat/src/adapter.rs`):
+    Cards v2 `collapsibleSection` (native disclosure-widget
+    primitive — same as surface 4 long-output) with
+    `uncollapsibleWidgetsCount: 0` so the body stays behind the
+    fold.
+  - Matrix (`crates/ironclaw-channels/matrix/src/adapter.rs`):
+    `m.notice` with HTML `<details>` disclosure widget — Element /
+    SchildiChat / Cinny render it as a clickable expander natively.
+- **New `ProviderEvent::Thinking { text, redacted }` variant**
+  (`crates/ironclaw-types/src/provider.rs`). The Anthropic provider
+  (`crates/ironclaw-providers/src/anthropic.rs`) emits one of these
+  at every `content_block_stop` boundary closing a `thinking` /
+  `redacted_thinking` block, carrying the accumulated text. Two new
+  SSE-pump tests pin the emit shape (visible + redacted).
+- **`ToolContext::emit_thinking`**
+  (`crates/ironclaw-mcp/src/context.rs`) + runner impl
+  (`crates/ironclaw-runner/src/tools.rs`). Mirrors
+  `emit_breadcrumb`: best-effort, swallows errors, no-op when there's
+  no channel routing to surface to.
+- **Runner-side opt-in gate**
+  (`crates/ironclaw-runner/src/run/provider_call.rs`): the gate lives
+  in `pump_events`, gated on the new `RunnerDeps::surface_thinking`
+  flag. When off, `ProviderEvent::Thinking` events drop on the
+  floor; when on, the runner calls `tool_ctx.emit_thinking` which
+  writes the canonical row.
+- **Per-group `surface_thinking` column on `container_configs`**
+  (new migration
+  `crates/ironclaw-db/migrations/014_container_config_surface_thinking.sql`,
+  schema additions in
+  `crates/ironclaw-db/src/tables/container_configs.rs`,
+  `set_surface_thinking` setter). Default `0` matches the privacy
+  default. Plumbed from the host's container manager into the
+  runner's JSON config via the new
+  `RunnerConfigForFile::surface_thinking` field (skipped when off so
+  existing-group config files stay bit-identical).
+- **Host delivery dispatch**
+  (`crates/ironclaw-host-delivery/src/service.rs`): new
+  `dispatch_thinking` arm routes `MessageKind::Thinking` rows through
+  the adapter's `deliver_thinking` hook, with the standard
+  `AdapterError::Unsupported` → text-fallback degradation.
+- **Orthogonal to `strip_reasoning_blocks`** — the existing
+  sanitiser that scrubs inline `<thinking>` markup from `Chat` rows
+  is unchanged: that path protects against prose contamination in
+  the chat reply; this surface emits structured reasoning as its
+  own row.
+
+### Added (slice 3.1 — structured diff cards on file edits)
+
+File edits previously emitted only a `[edit_file] foo.rs` text
+breadcrumb; the user had to read your follow-up prose to find out what
+actually changed. The runner now emits a structured `DiffCard`
+*alongside* the breadcrumb after every successful `edit_file` /
+`multi_edit` / `apply_patch` / `write_file` (overwriting) write,
+rendered natively as a syntax-coloured diff with `+` / `-` gutters on
+every adapter that supports a code-block primitive (Telegram, Slack,
+Discord, Google Chat, Matrix). Breadcrumb = "what tool ran"; diff
+card = "what changed".
+
+- **New canonical `DiffCard` schema**
+  (`crates/ironclaw-channels/core/src/diff.rs`,
+  `crates/ironclaw-channels/core/src/lib.rs`). Fields: `path` (≤256
+  chars), optional `language`, `hunks: Vec<DiffHunk>` (≤8), `added`,
+  `removed`, `truncated`. Each `DiffHunk` carries `old_start /
+  old_lines / new_start / new_lines` (unified-diff convention,
+  1-based) and `lines: Vec<DiffLine>` (≤60); each `DiffLine` is
+  `{kind: Context|Add|Remove, text}` (text ≤500 chars). `validate()`
+  + `to_text_fallback()` mirror the `Breadcrumb` / `Card` shape;
+  `clamp()` enforces caps idempotently before emit so the wire
+  payload always passes `validate()`. Companion `BlobReplaced` shape
+  for the overwrite-of-large-file path.
+- **New `MessageKind::Diff` variant**
+  (`crates/ironclaw-types/src/message.rs`). Serialises as `"diff"`
+  (lowercase); DB column round-trip via `as_str` / `parse_str`.
+- **New `ChannelAdapter::deliver_diff` trait method**
+  (`crates/ironclaw-channels/core/src/adapter.rs`). Default impl
+  converts via `DiffCard::to_text_fallback` (standard unified diff
+  with `--- a/<path>` / `+++ b/<path>` header, `@@ -…@@` hunks,
+  `+`/`-`/` ` prefixes, `(+N / -M)` footer) and routes through
+  `deliver` as `MessageKind::Chat`. No `existing_message_id`: diffs
+  are immutable post-emit.
+- **Runner-side diff computation**
+  (`crates/ironclaw-mcp/src/tools/diff_util.rs`). New helper uses
+  the `similar` crate to build a structured `DiffCard` from
+  pre/post-edit string snapshots; `edit_file` / `multi_edit` /
+  `apply_patch` snapshot the pre-edit content and call
+  `ToolContext::emit_diff` after the atomic write lands; `write_file`
+  reads the prior content (when the target exists, isn't being
+  appended to, and is under the 256 KB cutoff) and does the same.
+  Over-cutoff overwrites emit a `BlobReplaced` summary instead of
+  trying to diff multi-megabyte blobs.
+- **New `ToolContext::emit_diff` hook** (`crates/ironclaw-mcp/src/context.rs`).
+  Default no-op so non-runner contexts (mock, subagent adapter)
+  compile unchanged; `RunnerToolCtx::emit_diff` overrides it to
+  persist a `MessageKind::Diff` outbound row with the canonical
+  payload under `content.diff`. Mock context records diff calls so
+  file-edit tool tests can assert the wiring.
+- **New `dispatch_diff` arm in the host delivery service**
+  (`crates/ironclaw-host-delivery/src/service.rs`). Mirrors
+  `dispatch_breadcrumb`: deserialises `content.diff` into the
+  canonical `DiffCard`, hands it to `deliver_diff`, falls back to a
+  unified-diff text body via `deliver` on
+  `AdapterError::Unsupported`. No typing indicator (the breadcrumb
+  already signalled), no `to` hint.
+- **Native renderers — priority channels:**
+  - **Telegram** (`crates/ironclaw-channels/telegram/src/adapter.rs`):
+    `sendMessage` MarkdownV2 wrapping the diff body in a
+    ` ```diff … ``` ` fenced code block, with a bold path header and
+    `(+N / -M)` totals. Mobile clients colourise `diff` syntax
+    natively.
+  - **Slack** (`crates/ironclaw-channels/slack/src/adapter.rs`):
+    Block Kit `section` header (`*<path>* (+N / -M)`) + one
+    `rich_text_preformatted` block per hunk. Honours `+` / `-`
+    gutters and dodges the 3000-char per-section truncation surprise.
+  - **Discord** (`crates/ironclaw-channels/discord/src/adapter.rs`):
+    Single embed with `description` carrying the ` ```diff … ``` `
+    fenced block; embed `color` keys off add/remove balance
+    (`0x57F287` green / `0xED4245` red / `0xFEE75C` yellow);
+    over-budget hunks spill into `fields`.
+  - **Google Chat** (`crates/ironclaw-channels/gchat/src/adapter.rs`):
+    Cards v2 card with one `decoratedText` widget per hunk
+    (`topLabel = @@ -…@@`, body wrapped in `<font face="monospace">`
+    with HTML-escaped source).
+  - **Matrix** (`crates/ironclaw-channels/matrix/src/adapter.rs`):
+    `m.notice` with `formatted_body = <pre><code
+    class="language-diff">…</code></pre>`. Element honours the
+    `language-diff` class natively.
+- **Workspace dep:** `similar = "2"` added to root `Cargo.toml` and
+  pulled into `ironclaw-mcp` for diff computation. Pure-Rust MIT
+  crate; no runtime requirements.
+- **Skills:** `skills/edit-file/SKILL.md` and `skills/write-file/SKILL.md`
+  each gain a "Diff card surfaced to the user" section telling the
+  agent the diff is already on screen — no need to summarise the
+  change in prose.
+
+### Added (slice 3.3 — host-emitted `Error` cards with red affordance)
+
+Host-emitted errors that previously landed as plain chat (or as the
+`failed` row in `iclaw dropped-messages` only) now ride a dedicated
+`MessageKind::Error` surface, rendered with the red bar / bold prefix
+each platform supports so users actually see "something broke" instead
+of being shown a normal-looking reply (or nothing at all).
+
+Crucially this surface is HOST-EMITTED, not model-emitted. There is no
+`send_error` MCP tool. The host produces these from three sites:
+
+1. Provider terminal failures (`TurnOutcome::Failed` after retry
+   exhaustion) — replaces the plain-text apology row.
+2. Delivery retry exhaustion (3 failed adapter sends on a single
+   outbound row) — emitted *in addition to* the existing
+   `delivered.status="failed"` row so `iclaw dropped-messages`
+   continues to work unchanged.
+3. Internal tool errors that bubble past the runner's retry budget
+   (path wired via the same trait + dispatch machinery; emit sites
+   land as future tool handlers add them).
+
+- **New canonical `ErrorCard` schema**
+  (`crates/ironclaw-channels/core/src/error_card.rs`,
+  `crates/ironclaw-channels/core/src/lib.rs`). Fields: `title` (≤120
+  chars, default "Something went wrong"), `summary` (≤500), `kind`
+  (`Internal` / `Provider` / `Delivery`), optional `details` (≤2000,
+  monospace), `retryable: bool`. `validate()` + `to_text_fallback()`
+  follow the same shape as `Breadcrumb` / `Card`. Re-exports use
+  `MAX_ERROR_*` names so they don't collide with `Card`'s
+  `MAX_TITLE_CHARS`; the type itself is renamed `ErrorCard` (not
+  `Error`) so it doesn't shadow `AdapterError`.
+- **New `MessageKind::Error` variant**
+  (`crates/ironclaw-types/src/message.rs`). Serialises as `"error"`
+  (lowercase, `serde(rename_all)`); DB column round-trip via
+  `as_str` / `parse_str`.
+- **New `ChannelAdapter::deliver_error` trait method**
+  (`crates/ironclaw-channels/core/src/adapter.rs`). Default impl
+  converts via `ErrorCard::to_text_fallback` and routes through
+  `deliver` as `MessageKind::Chat`, so every adapter has a usable
+  rendering — `[ERROR: <kind>] <title>\n<summary>` — even before
+  shipping a native renderer. No `existing_message_id` argument:
+  error receipts are immutable.
+- **New `dispatch_error` arm in `process_row`**
+  (`crates/ironclaw-host-delivery/src/service.rs`). Deserialises
+  `content.error` into the canonical `ErrorCard`; calls
+  `deliver_error`; falls back to text `deliver` on
+  `AdapterError::Unsupported` (belt-and-braces mirror of
+  `dispatch_card` / `dispatch_breadcrumb`). No typing indicator —
+  the error is the visual signal.
+- **Retry-exhaustion `ErrorCard` emit**
+  (`crates/ironclaw-host-delivery/src/service.rs::emit_delivery_failure_error_card`).
+  When `DeferOutcome::Fail` fires the host now writes a fresh Error-
+  kind outbound row addressed back at the failed row's channel +
+  platform + thread, with `kind = ErrorCardKind::Delivery`,
+  `retryable = false`, and the underlying adapter error spliced into
+  the summary. The next delivery pass routes it through
+  `dispatch_error`. The existing `delivered::insert(.., "failed")`
+  write is preserved — operators still see the row in `iclaw
+  dropped-messages`; the user additionally sees a visible error in
+  chat.
+- **Terminal-failure-apology promoted to `ErrorCard`**
+  (`crates/ironclaw-runner/src/run/mod.rs::emit_terminal_failure_apologies`).
+  The human-channel branch now writes a `MessageKind::Error` row
+  carrying an `ErrorCardKind::Provider` card whose `summary` is the
+  same user-facing apology text the old plain-text path used. The
+  parent-agent branch (LLM reader, not human) stays as
+  `MessageKind::Agent` plain prose — feeding another agent a
+  structured error card would hand it a side-channel signal harder
+  to handle than a sentence.
+- **Per-channel native renderers** (red where the platform has color,
+  bold + monospace where it doesn't):
+  - Telegram (`crates/ironclaw-channels/telegram/src/adapter.rs`):
+    HTML `<b>{kind label}: {title}</b>` prefix (Telegram has no
+    colour affordance; weight + monospace details + the canonical
+    `[ERROR]` text prefix carry the severity signal). Details ride
+    in `<pre>…</pre>`. Retryable footer `<i>will retry
+    automatically</i>`.
+  - Slack (`crates/ironclaw-channels/slack/src/adapter.rs`): new
+    `SlackApi::post_message_with_attachments` so we can drive the
+    `attachments[].color = "danger"` red bar (Block Kit primary
+    blocks can't produce a bar on their own). `header` + `section
+    mrkdwn` + optional `rich_text_preformatted` for details. Text
+    fallback rides on the top-level `text` for notification preview.
+  - Discord (`crates/ironclaw-channels/discord/src/adapter.rs`):
+    single embed with `color = 0xE74C3C` (red), title + description
+    + fenced-code details, retryable footer. Embedded backticks in
+    user-supplied details are neutralised so the body can't break
+    out of the fence.
+  - Google Chat (`crates/ironclaw-channels/gchat/src/adapter.rs`):
+    Cards v2 with `Error:`-prefixed header, severity-label
+    decorated-text widget, optional monospace details paragraph,
+    italic retryable footer. (Google Chat cardsV2 has no color
+    primitive — icon + bold copy + the title prefix carry severity.)
+  - Matrix (`crates/ironclaw-channels/matrix/src/adapter.rs`):
+    `m.text` (NOT `m.notice` — errors warrant notification badges;
+    muting them in Element would defeat the surface's purpose) with
+    `<font color="#cc3333">` wrapping the bold title. `<pre><code>`
+    for details, `<em>` retryable footer.
+- **Test count delta**: +27 tests
+  (20 channels-core (schema + trait default) + 5 telegram + 5 slack
+  + 5 discord + 5 gchat + 5 matrix + 3 host-delivery (dispatch +
+  retry-exhaustion-emit). Two existing runner tests
+  (`terminal_failure_emits_apology_to_originating_channel`,
+  `malformed_tool_use_gives_up_after_three_attempts`) updated to
+  decode the new `MessageKind::Error` row shape via
+  `serde_json::from_value::<ErrorCard>`; the user-facing apology
+  text invariants they pinned are unchanged.
+
+### Added (slice 3.4 — native long-output expander decorator)
+
+Long tool outputs (shell stdout, `web_fetch` bodies, `read_file` of
+oversized files, long agent replies) now ride as a "summary +
+collapsible expander" decorator on the existing `MessageKind::Chat`
+row rather than dumping the full body into chat as ugly multi-line
+output. The decorator is invisible to the model — no new MCP tool, no
+new MessageKind — the runner auto-attaches it on `apply_send_message` /
+`apply_send_file` when the chat body exceeds 30 lines OR 4 KB.
+
+- **New runner-side threshold detector**
+  (`crates/ironclaw-runner/src/tools.rs`):
+  `build_expander_decorator(text)` returns `Some(json)` when either
+  threshold trips, otherwise `None`. Decorator JSON shape:
+  `{ summary, summary_kind: "lines"|"bytes", preview_lines: [...] }`
+  with the first 6 lines as preview. Constants
+  `EXPANDER_LINE_THRESHOLD = 30`, `EXPANDER_BYTE_THRESHOLD = 4 * 1024`,
+  `EXPANDER_PREVIEW_LINES = 6`. Helper is invoked from
+  `apply_send_message` and `apply_send_file` (for the caption body)
+  on Chat-kind rows only — Agent-kind rows skip decoration.
+- **New `ChannelAdapter::deliver_collapsible` trait method**
+  (`crates/ironclaw-channels/core/src/adapter.rs`). Default impl
+  composes a summary-plus-preview-plus-truncation-marker body via
+  `render_collapsible_text_fallback` and routes through `deliver`, so
+  every adapter has a usable rendering for free even without a native
+  override. Shared helper exported as
+  `ironclaw_channels_core::render_collapsible_text_fallback`.
+- **New dispatch branch in `dispatch_chat`**
+  (`crates/ironclaw-host-delivery/src/service.rs`). Chat-kind rows
+  whose `content.expander` decorator is present route to the new
+  `dispatch_collapsible` helper which calls the adapter's
+  `deliver_collapsible` hook with the full text + summary + preview;
+  rows without the decorator continue through the unchanged
+  text-splitter path. `AdapterError::Unsupported` falls back to a
+  plain `deliver` with the helper-rendered body (belt-and-braces,
+  same shape as `dispatch_card` / `dispatch_breadcrumb`).
+- **Per-channel native renderers**:
+  - Telegram (`crates/ironclaw-channels/telegram/src/adapter.rs`):
+    HTML `<i>{summary}</i>` outside, `<blockquote expandable>` wrapping
+    the full body. Bot API 7.6+ native primitive; clients without
+    `expandable` see a fully-rendered blockquote (graceful).
+  - Slack (`crates/ironclaw-channels/slack/src/adapter.rs`): Block Kit
+    `section` mrkdwn for the summary, a preview `rich_text_preformatted`
+    when present, and a second `rich_text_preformatted` with the full
+    body. Slack's native "Show more" collapses oversized preformatted
+    blocks behind a click — functionally equivalent to a disclosure
+    widget without needing a `block_actions` callback round-trip.
+  - Discord (`crates/ironclaw-channels/discord/src/adapter.rs`):
+    single embed with `author.name = "long output"`, `title = summary`,
+    `description = preview fence + "—— full output ——" + body fence`,
+    truncated to fit the 4096-char embed cap with a
+    `…(truncated; N more bytes)` footer when the body overflows.
+  - Google Chat (`crates/ironclaw-channels/gchat/src/adapter.rs`):
+    Cards v2 `collapsibleSection` (native disclosure primitive).
+    Preview lines ride as uncollapsible widgets above the fold; full
+    body wraps in `<font face="monospace">` for legible log/source
+    rendering.
+  - Matrix (`crates/ironclaw-channels/matrix/src/adapter.rs`):
+    `<details><summary><em>{summary}</em></summary><pre><code>…</code></pre></details>`
+    — Element renders the native disclosure widget. Plain-text body
+    on the same event handles non-HTML clients.
+- **Test count delta**: +25 tests
+  (3 trait-default + 11 runner threshold/integration + 4 host
+  dispatch + 4 telegram + 3 slack + 4 discord + 3 gchat + 3 matrix).
+
+### Added (slice 3.2 — native `TodoList` checklist chip)
+
+The agent's `todo_add` / `todo_update` / `todo_delete` MCP tools now emit
+a structured post-mutation `TodoList` alongside their existing on-disk
+persistence so adapters can render the plan as a native checklist chip
+that edits in place on every mutation (and pins on platforms that
+support it) instead of the legacy plain-text `todo_watcher` notification
+stream.
+
+- **New canonical `TodoList` schema**
+  (`crates/ironclaw-channels/core/src/todo_list.rs`,
+  `crates/ironclaw-channels/core/src/lib.rs`). Fields: `items:
+  Vec<TodoListItem>` (capped at `TODO_MAX_ITEMS = 50`), `title:
+  Option<String>` (≤ `TODO_MAX_TITLE_CHARS = 64`). Each item carries
+  `id`, `text` (≤ `TODO_MAX_ITEM_TEXT_CHARS = 200`), and `status:
+  Pending | InProgress | Completed`. `validate()` enforces non-empty
+  list, unique ids, non-empty trimmed text per item; `to_text_fallback()`
+  renders one line per item with status glyph + a footer counter for
+  adapters without a native renderer. Helpers `is_fully_completed`,
+  `pending_count`, `in_progress_count`, `completed_count`,
+  `title_or_default` round out the API.
+- **New `ChannelAdapter::deliver_todo_list` hook**
+  (`crates/ironclaw-channels/core/src/adapter.rs`). Default impl
+  converts the list to its text fallback and routes through `deliver`,
+  so every adapter has a usable rendering for free. Signature carries
+  `existing_message_id` (for edit-in-place) and `pin_hint` (for
+  pin/unpin on platforms that support pinning).
+- **New `MessageKind::TodoList`**
+  (`crates/ironclaw-types/src/message.rs`) routed via
+  `dispatch_todo_list` in `crates/ironclaw-host-delivery/src/service.rs`.
+  Looks up the prior list row in the session via the newly-extracted
+  generic `lookup_prior_kind_external_id` helper (factored out of
+  `lookup_prior_breadcrumb_external_id` so both surfaces share one
+  scan), threads the prior platform message id through to the adapter
+  for in-place editing, and derives `pin_hint` from "first emit OR
+  list just transitioned to fully-completed".
+- **Per-channel native chip renderers**:
+  - Telegram (`crates/ironclaw-channels/telegram/src/adapter.rs`,
+    `api.rs`): MarkdownV2 `*Plan*` header, one line per item with
+    `☑` / `▶` / `☐` glyph + (for completed items) `~strikethrough~`,
+    `_done/total_` footer. First emit via `sendMessage` then
+    `pinChatMessage` (new API call); subsequent mutations via
+    `editMessageText`; `unpinChatMessage` when fully completed.
+  - Slack (`crates/ironclaw-channels/slack/src/adapter.rs`,
+    `api.rs`): Block Kit `header` block with title + `done/total`
+    counter, one `section` block per item with status emoji + mrkdwn
+    body. First emit via `chat.postMessage` then `pins.add` (new API
+    call); mutations via `chat.update`; `pins.remove` when fully
+    completed.
+  - Discord (`crates/ironclaw-channels/discord/src/adapter.rs`,
+    `rest.rs`): single embed with title + `done/total` counter,
+    description rendering one line per item with `✅` / `▶️` / `⬜`
+    glyphs and strikethrough on completed items. Embed color keys off
+    completion state (green when fully done, yellow when in progress,
+    blurple otherwise). First emit via `POST /messages` then `PUT
+    /pins/...` (new REST call); mutations via the new
+    `patch_message_payload`; `DELETE /pins/...` when fully completed.
+    Pin permission failures are swallowed at `debug` — bots routinely
+    lack `MANAGE_MESSAGES`.
+  - Google Chat (`crates/ironclaw-channels/gchat/src/adapter.rs`):
+    Cards v2 single-section card with a `decoratedText` widget per
+    item, `startIcon` keyed off status (`CHECK_CIRCLE` /
+    `CIRCLE` / `STAR`). First emit via `spaces.messages.create`,
+    mutations via `spaces.messages.patch`. No public pin API on
+    Google Chat — `pin_hint` is silently honoured as a no-op.
+  - Matrix (`crates/ironclaw-channels/matrix/src/adapter.rs`,
+    `api.rs`): `m.text` HTML event with `<h4>` title + `<ul>` list,
+    status glyph prefix per item, `<s>` strikethrough on completed
+    items. Mutations via the new `edit_message_html` (`m.replace`
+    relation). Pin via `m.room.pinned_events` is deferred; bot
+    permission requirements weren't worth the complexity for a
+    decoration.
+- **MCP-side emit pipeline**: new
+  `OutboundToolEffect::EmitTodoList(EmitTodoListSpec)` variant
+  (`crates/ironclaw-mcp/src/context.rs`) carries the canonical list;
+  `crates/ironclaw-mcp/src/tools/todo.rs` invokes
+  `emit_after_mutation` at the end of every `add::handle`,
+  `update::handle`, and `delete::handle`, building the wire list
+  from the on-disk items (with per-item text truncation to fit the
+  schema cap). Empty lists are intentionally NOT emitted — no "empty
+  plan" UX.
+- **Runner apply path**: new `apply_emit_todo_list` in
+  `crates/ironclaw-runner/src/tools.rs` mirrors `apply_send_card` —
+  resolves the originating routing, forces `MessageKind::TodoList`,
+  inserts the row with `content.todo_list = <canonical TodoList>`.
+- **Skill prose update**: `skills/todo-tracker/SKILL.md` notes that
+  todos are now rendered as a live pinned chip on supporting channels;
+  agents should pick text the user will appreciate seeing.
+
+### Added (slice-2 integration — runner wires `emit_breadcrumb_finish`)
+
+After Agent G shipped the `Breadcrumb` shape + `deliver_breadcrumb` trait
+method + per-channel native renderers (telegram/slack/discord/gchat/matrix),
+the runner's tool-loop in `crates/ironclaw-runner/src/run/drive_turn.rs`
+now calls `deps.tool_ctx.emit_breadcrumb_finish(...)` immediately after
+every `invoke_tool` return. The chip transitions in place from Running
+to Done/Failed, with the tool result's first non-empty line (char-truncated
+to 200) as the summary. Without this wire-up the chip would have stayed
+stuck on "Running" forever — visible UX gap closed.
+
+New unit helper `first_line_truncated` + 3 tests pin the truncation rules.
+`drive_turn` carries an `#[allow(clippy::too_many_lines)]` — the function
+is the central tool-loop state machine; splitting it further would just
+push locals into a struct without readability gain.
+
+### Added (native breadcrumb chips replace plain-text tool narration)
+
+The runner used to emit tool-progress breadcrumbs (`[shell] cargo check`,
+`[edit_file] foo.rs`, …) as regular `MessageKind::Chat` rows. That bloated
+the conversation and made the agent look like it was narrating itself. This
+batch replaces the chat-row pipeline with a structured `Breadcrumb` shape
+that adapters render as compact native chips and update in place once the
+tool finishes — the Claude Code mobile-app aesthetic.
+
+- **New canonical `Breadcrumb` schema**
+  (`crates/ironclaw-channels/core/src/breadcrumb.rs`,
+  `crates/ironclaw-channels/core/src/lib.rs`). Fields:
+  `tool_name`, `detail: Option<String>`, `status: Running | Done | Failed`,
+  `summary: Option<String>` (post-completion blurb such as
+  `"passed (0.4s)"`). `validate()` enforces tight caps so the chip stays a
+  one-glance UX cue on mobile. `to_text_fallback()` mirrors the legacy
+  `[tool] detail` shape for adapters without a native renderer.
+- **New `ChannelAdapter::deliver_breadcrumb` hook**
+  (`crates/ironclaw-channels/core/src/adapter.rs`). Default impl converts
+  the breadcrumb to the text fallback and routes through `deliver`, so
+  every adapter has a usable rendering for free. Native renderers override
+  the hook and use `existing_message_id` to drive in-place edits when
+  available.
+- **Per-channel native chip renderers**:
+  - Telegram (`crates/ironclaw-channels/telegram/src/adapter.rs`,
+    `api.rs`): HTML `<code>` chip via `sendMessage(parse_mode=HTML)`;
+    in-place edit via the new `edit_message_text_with_mode` so update
+    keeps HTML formatting.
+  - Slack (`crates/ironclaw-channels/slack/src/adapter.rs`,
+    `api.rs`): Block Kit `context` block (the platform's idiomatic
+    "metadata chip") with a status emoji + inline-code mrkdwn fragment;
+    in-place edit via the new `chat_update_with_blocks`.
+  - Discord (`crates/ironclaw-channels/discord/src/adapter.rs`): inline
+    `` `tool` `` formatting in `content`; in-place edit via the existing
+    `PATCH /channels/.../messages/...`.
+  - Google Chat (`crates/ironclaw-channels/gchat/src/adapter.rs`,
+    `api.rs`): cards v2 single-section `decoratedText` widget with a
+    `knownIcon` for the status glyph; in-place edit via the new
+    `edit_card` (`spaces.messages.patch`, `updateMask=cardsV2`).
+  - Matrix (`crates/ironclaw-channels/matrix/src/adapter.rs`,
+    `api.rs`): `m.notice` event with HTML `<code>` body; in-place edit
+    via the new `edit_message_notice_html` (`m.replace` relation).
+- **New `MessageKind::Breadcrumb` variant + delivery dispatch**
+  (`crates/ironclaw-types/src/message.rs`,
+  `crates/ironclaw-host-delivery/src/service.rs`). The delivery service
+  routes Breadcrumb-kind rows through a dedicated `dispatch_breadcrumb`
+  that pulls the canonical `Breadcrumb` out of `content.breadcrumb`,
+  hands it to `deliver_breadcrumb`, and falls back to a plain-text
+  `deliver` if the adapter returns `Unsupported`.
+- **In-place update via `update_breadcrumb` system action**
+  (`crates/ironclaw-runner/src/tools.rs`,
+  `crates/ironclaw-host-delivery/src/service.rs`). The runner's new
+  `emit_breadcrumb_finish` (added to the `ToolContext` trait as a
+  default no-op) writes a `MessageKind::System` row carrying an
+  `update_breadcrumb` action. The host's delivery service intercepts the
+  action inline, scans the session's recent Breadcrumb-kind rows for the
+  matching `tool_name`, resolves the prior chip's platform message id
+  from the `delivered` table, and re-runs `deliver_breadcrumb` with
+  `existing_message_id=Some(...)` so adapters with an edit API replace
+  the chip's contents in place rather than emit a fresh row.
+- `db/tables/messages_{in,out}.rs` switched their `kind`-column parser
+  to `MessageKind::parse_str` so adding a new variant doesn't require
+  touching the SQL row reader.
+
+Behaviour on adapters without a native override (CLI, webhooks, line,
+imessage, signal, …) is unchanged — the trait-level default still emits
+a `[tool] detail` text line via `deliver`. Channels without an edit API
+(currently CLI / webhooks) emit a fresh chip on completion rather than
+editing in place; that's visible but harmless.
+
+### Added (native `send_card` for Slack + Discord, with round-trip button taps)
+
+The portable `send_card` rollout shipped a canonical [`Card`] schema with a
+text-fallback default impl so every adapter had a working `send_card` on
+day one. Wave 2 landed a Telegram-native renderer + `callback_query`
+round-trip. This batch closes the next two majors:
+
+- **Slack — Block Kit `deliver_card`**
+  (`crates/ironclaw-channels/slack/src/{api.rs,adapter.rs}`).
+  `build_card_blocks()` maps `card.title` → `header`,
+  `card.body` (+ optional image as section accessory) → `section` mrkdwn,
+  `card.fields` → `section.fields` chunked at Slack's 10-per-section cap,
+  `card.buttons` → `actions` block with `card_btn_<index>` `action_id`s.
+  The `chat.postMessage` `text` parameter carries
+  [`Card::to_text_fallback`] so notification surfaces (mobile previews,
+  email digests, screen readers) and any future block-render downgrade
+  still show a readable card body. `value` buttons receive the
+  `style: "primary" | "danger"` Slack supports; other style strings
+  silently degrade to default.
+- **Slack — interactive `block_actions` round-trip**
+  (`crates/ironclaw-channels/slack/src/events/router.rs`).
+  The Events API handler now dispatches on `Content-Type`: JSON falls
+  through to the existing `event_callback` path; form-encoded
+  `payload=<urlencoded-json>` parses as a `block_actions` payload via
+  the new `parse_block_actions()`, synthesises an inbound chat event
+  whose text IS the tapped button's `value`, ACKs Slack with the
+  required empty 200 within 3 s so the user's spinner clears, and
+  surfaces full callback metadata (`action_id`, `block_id`,
+  `message_ts`, `trigger_id`, `response_url`) under
+  `content.callback`. Channel routing handles both `container.channel_id`
+  (post-2020 messages) and `channel.id` (legacy / some DM shapes), and
+  preserves `thread_ts` for cards that lived inside a thread. The
+  webhook signature check applies to both shapes — same HMAC contract,
+  no new endpoint to register.
+- **Discord — embed + components `deliver_card`**
+  (`crates/ironclaw-channels/discord/src/{rest.rs,adapter.rs}`).
+  `build_card_payload()` maps `card.title`/`card.body` → an embed's
+  `title`/`description`, `card.image_url` → `embed.image.url`,
+  `card.fields` → `embed.fields[]` (with `inline` honoured),
+  `card.buttons` → `components` array of `ActionRow` (`type: 1`)
+  containing `Button` (`type: 2`) elements. Style mapping: `primary` →
+  1, `success` → 3, `danger` → 4, anything else → 2 (default
+  secondary); URL buttons override to style 5 (LINK) regardless of
+  agent-supplied style. Discord's 5-button-per-row cap is honoured by
+  chunking into multiple ActionRows; the 5-row platform limit can't be
+  hit because the canonical card cap is 8 total buttons.
+  `post_message_payload()` on `DiscordRest` ships the assembled JSON
+  via `POST /channels/{id}/messages` and surfaces the message id.
+- **Discord — `INTERACTION_CREATE` (`MESSAGE_COMPONENT`) round-trip**
+  (`crates/ironclaw-channels/discord/src/{events.rs,adapter.rs}`).
+  The gateway loop now pumps `INTERACTION_CREATE` dispatches through
+  the new `interaction_create_to_inbound()` — type-3 (component) taps
+  produce an `InteractionInbound { event, interaction_id,
+  interaction_token }`. The adapter fires a fire-and-forget type-6
+  (`DEFERRED_UPDATE_MESSAGE`) ACK via
+  `DiscordRest::create_interaction_response_ack()` so the user's
+  spinner clears within Discord's 3 s budget regardless of inbound-
+  channel pressure. Routing mirrors the Slack pattern: the button's
+  `custom_id` becomes both the synthesised chat `text` and the
+  `content.callback.value`, with `original_message_id` and
+  `component_type` preserved under `callback` for agents that want to
+  branch.
+
+Status by channel after this batch:
+- **Telegram, Slack, Discord**: native + callback round-trip.
+- **18 other channels**: text fallback via the trait default impl.
+
+Net new tests: 34 (16 Slack + 18 Discord). Workspace clippy clean on
+the touched crates; pre-existing `breadcrumb` warnings + the
+`orphan_depth_cap_rejection_emits_warn` flake are untouched.
+
+### Added (runner-side conversation-context prompt + provider-stream typing keepalive)
+
+Two visible-to-every-channel UX gaps closed in the runner without
+touching the host's typing-ticker or any channel adapter:
+
+- `crates/ironclaw-runner/src/run/prompt.rs` — new module that renders
+  a per-inbound "Conversation context: ..." paragraph (channel,
+  platform, thread-vs-DM shape, batch-coalesce count, history depth,
+  source-session-id when relayed from a parent agent) and splices it
+  onto `RunnerDeps::system` for the duration of one provider call.
+  Drives the model to address group threads differently from DMs
+  instead of speaking identically in both. Only fields actually
+  populated on `MessageInRow` are surfaced; `is_group` /
+  `reply_to` from `InboundEvent` aren't persisted to the row yet so
+  they're omitted rather than always-`None`.
+- `crates/ironclaw-runner/src/run/provider_call.rs` — new
+  `ProviderActivityPinger` trait (with `HeartbeatPinger` /
+  `NoopPinger` impls re-exported from `ironclaw_runner`) plus a
+  `ProviderActivityTicker` RAII guard that fires every ~3s while a
+  provider call is in flight, *and* once per useful SSE chunk in
+  `pump_events`. The production binary wires `HeartbeatPinger` so
+  each ping refreshes the heartbeat file — keeping the host's
+  typing-ticker willing to fire across long LLM streams (a 30s
+  Anthropic response no longer lets the bubble fade out between
+  chunks). Tests use a counting mock to assert the ping count climbs
+  with stream-time.
+
+`RunnerDeps` gains one new field (`activity_pinger`). The two host
+integration tests that constructed it inline (`tests/e2e_chat.rs`,
+`tests/replay/harness.rs`) wire `NoopPinger`. 13 new unit tests
+(10 in `run::prompt`, 3 in `run::provider_call`) cover both halves.
+
+### Added (replay-fixture coverage for slice-1 delivery behaviours)
+
+Four new replay fixtures + supporting harness extensions pin the
+slice-1 cohesive-UX baseline (chat-text splitter, adapter rate-limit
+backoff). The harness now wraps each `MockAdapter` in a `CappedAdapter`
+that reports a per-channel `max_message_chars` matching production
+(`telegram=4096`, `slack=40000`, `discord=2000`, etc. — see
+`default_cap_for` in `crates/ironclaw-host/tests/replay/harness.rs`)
+and recognises two new optional manifest fields: `pre_delivery_failures`
+(queue `MockAdapter::fail_next_deliver` errors before driving inbound)
+and `redrive_after_ms` (sleep + re-run `process_session_once` per
+session). All existing fixtures continue to pass — short-text replies
+are below every per-channel cap so the splitter no-ops.
+
+- `fixtures/telegram/long-message-split`, `fixtures/slack/long-message-split`,
+  `fixtures/discord/long-message-split`: agent emits a single oversized
+  chat reply (5 002 / 50 002 / 2 402 chars respectively); the delivery
+  loop's splitter cuts at the paragraph boundary into exactly 2 chunks.
+  Each fixture's test asserts the chunk count + per-chunk char count
+  via `MockAdapter::deliveries()` on top of the JSONL diff, so a
+  regression that double-splits, drops a chunk, or stops honouring the
+  `\n\n` boundary surfaces directly.
+- `fixtures/telegram/rate-limited-retry`: telegram adapter's first
+  `deliver` returns `Rate { retry_after: 1 }`; the row is deferred,
+  the harness sleeps 1 200 ms (past the 1 s `retry_after` window) and
+  re-drives the session; the second pass succeeds. The test asserts
+  exactly ONE successful adapter delivery (the deferred attempt does
+  not register) and that elapsed wall time is >= 1 s — implicitly
+  pinning that `bump_retry` honoured the adapter's `retry_after` over
+  the default 5 s exponential schedule.
+
+The `telegram/webhook-secret-rejected` scenario the parent agent
+listed turned out to be impossible against the current harness: the
+`direct` replay mode pushes already-parsed `InboundEvent`s at the
+router, skipping the webhook secret check entirely. Surfaced in
+`docs/replay-fixtures.md`'s "What the suite does not cover" section
+alongside the other transport-layer gaps; the secret-compare itself
+is exercised by unit tests in the telegram and whatsapp-cloud crates.
+
+### Added (`iclaw approvals approve-id <id>` and `iclaw approvals deny <id>` — generic per-family approval write surface)
+
+Until now only `Sender` approvals had a CLI write path
+(`iclaw approvals approve --channel <ct> --identity <id>`); the other
+families (Channel, InstallPackages, AddMcpServer) piled up as rows in
+`pending_approvals` and the operator had to hand-CRUD them via the
+central DB. The new generic verbs close that gap:
+
+- `iclaw approvals approve-id <id>` (wire: `approvals.approve`) — looks
+  up the row, dispatches on the `action` column, applies the per-family
+  side effect, then marks the row `status = 'approved'`. Re-approving
+  an already-approved row is a no-op (`applied: false`,
+  `reason: "already_approved"`). Approving a denied/expired row is
+  `conflict`.
+- `iclaw approvals deny <id>` (wire: `approvals.deny`) — marks the row
+  `status = 'denied'` without applying any side effect. Idempotent;
+  denying an already-approved row is `conflict`.
+
+Per-family dispatch arms in
+`crates/ironclaw-host/src/handlers/approvals.rs`:
+
+- `action = "sender"` | `"approve_sender"` — upsert into `users` by
+  `(channel_type, platform_id)` from the row's columns. Display name
+  is read from `payload.display_name`.
+- `action = "channel"` — upsert a `messaging_groups` row by
+  `(channel_type, platform_id)`. Optional `name`, `is_group`,
+  `unknown_sender_policy` from `payload`. No auto-wiring (a separate
+  operator decision via `iclaw wirings create`); the response includes
+  a `wiring_hint` with the exact follow-up command.
+- `action = "install_packages"` — read `payload.apt[]` /
+  `payload.npm[]`, merge into the affected group's
+  `container_configs.packages_apt` / `packages_npm`. Does NOT
+  auto-rebuild; the response includes a `rebuild_hint` so the operator
+  knows to run `iclaw groups restart <ag_id>`.
+- `action = "add_mcp_server"` — read `payload.{name, transport}`,
+  insert into `container_configs.mcp_servers` (replacing any entry
+  with the same name). Same no-auto-rebuild stance + `rebuild_hint`.
+
+Both verbs are registered as host-only commands in
+`crates/ironclaw-host/src/handlers/mod.rs::HOST_ONLY_COMMANDS`, which
+auto-wires them into the audit log (the socket dispatcher writes an
+`audit_log` row for every host-only command, success or error). 19
+new unit tests cover each family's happy path, the idempotency
+contract, conflict-on-status-reversal, missing fields, and unknown
+actions; a new socket-level dispatch test in
+`crates/ironclaw-host/src/socket.rs` confirms the audit row lands.
+
+Files changed:
+- `crates/ironclaw-iclaw/src/commands.rs` — new `ApprovalsCmd::ApproveById`
+  + `ApprovalsCmd::Deny` variants, `to_call` arms, `ALL_COMMANDS` entries.
+- `crates/ironclaw-host/src/handlers/approvals.rs` — `approve` /
+  `deny` handlers + four per-family appliers (`apply_sender`,
+  `apply_channel`, `apply_install_packages`, `apply_add_mcp_server`)
+  + a local `ensure_config_row` helper mirroring the one in
+  `handlers::groups` (no cross-module dep).
+- `crates/ironclaw-host/src/handlers/mod.rs` — `approvals.approve` /
+  `approvals.deny` added to `HOST_ONLY_COMMANDS`.
+- `crates/ironclaw-host/src/socket.rs` — dispatch-table registration +
+  the integration test.
+
+### Fixed (`CreateAgentModule` no longer leaks one entry per ever-spawned agent group)
+
+`CreateAgentModule` carried an `Arc<Mutex<HashMap<AgentGroupId, u8>>>`
+"spawned" cache as a write-through accelerator for the subagent-depth
+gate. On a long-running host with many short-lived agent groups the
+map grew without bound (one entry per ever-spawned group), and it
+returned stale depths when an `AgentGroupId` was deleted and a later
+group reused the slot.
+
+`crates/ironclaw-modules/src/agent_to_agent/create_agent.rs` now reads
+depth straight from `agent_groups.subagent_depth` on every
+`create_agent` call. The DB is the canonical source so this is also
+the correctness fix: id reuse and ad-hoc admin resets of the depth
+column are observed immediately, not after a host restart. The
+TOCTOU re-check around the central-DB insert is preserved via a
+process-wide `Arc<Mutex<()>>` (`depth_gate`) — `create_agent` is
+operator-driven, not the message hot path, so the extra SELECT and
+the single coarse mutex are irrelevant to throughput.
+
+Two new tests pin the bounded-memory invariant:
+
+- `lookup_parent_depth_does_not_grow_per_agent_group` runs 10 000
+  distinct group ids through the lookup and asserts the handler's
+  only synchronisation field is the `()`-payload mutex (caught at
+  compile time via a type-annotated binding).
+- `lookup_parent_depth_does_not_return_stale_on_depth_reset` resets
+  a parent's persisted depth and asserts the handler observes the
+  new value, not a cached one.
+
+Tests reseeding parent depth previously poked the cache directly;
+they now seed via `agent_groups::set_subagent_depth` so they exercise
+the same DB path the production gate hits. Total tests in
+`ironclaw-modules` go from 205 to 207.
+
+### Added (`reply_to` populated from the wire across 7 channels)
+
+Slice-2 continuation. The `InboundEvent.reply_to: Option<ReplyTo>` field
+has existed since slice 1, but every channel adapter was hardcoding it
+to `None`. Now seven channels populate it from the wire payload when the
+platform tells us a message is a reply, so the agent (and any downstream
+threading logic) can stitch replies back to the parent message:
+
+- **Telegram** (`crates/ironclaw-channels/telegram/src/ingress/mod.rs`):
+  from `message.reply_to_message.message_id`. Required adding
+  `reply_to_message: Option<Box<Message>>` to the local `Message` type
+  (`crates/ironclaw-channels/telegram/src/types.rs`) plus the matching
+  `None` in the `api.rs::empty_message` constructor.
+- **Slack** (`crates/ironclaw-channels/slack/src/events/router.rs`):
+  from `thread_ts` when it differs from the message's own `ts` (the
+  equality case is the thread root, which is NOT a reply).
+- **Discord** (`crates/ironclaw-channels/discord/src/events.rs`):
+  from `message_reference.message_id`. The existing `thread_id` mirror
+  is kept (Discord callers rely on it); `reply_to` is the cleaner
+  semantic.
+- **Matrix** (`crates/ironclaw-channels/matrix/src/parse.rs`):
+  from `content."m.relates_to"."m.in_reply_to".event_id`. Independent
+  of the existing `m.thread` → `thread_id` extraction.
+- **Teams** (`crates/ironclaw-channels/teams/src/events/router.rs`):
+  from `replyToId` on the fetched Graph message body.
+- **Signal** (`crates/ironclaw-channels/signal/src/parse.rs`):
+  from `dataMessage.quote.id` (the quoted message's millisecond
+  timestamp, which is exactly our `message.id` format).
+- **WhatsApp Cloud**
+  (`crates/ironclaw-channels/whatsapp-cloud/src/events/router.rs`):
+  from `messages[].context.message_id`.
+
+Each channel got 2 new unit tests (happy path + negative), 14 total.
+Channels left at `reply_to = None`: Google Chat (the wire payload
+doesn't carry a per-message reply id; `thread` is the only stitching
+signal and that's already on `thread_id`); iMessage (the inbound
+`MockMessageRow` doesn't carry `associated_message_guid` and the
+bridge file was out of scope for this slice); webhook-only / DM-only
+channels (line, x, etc.) where the platform doesn't expose the signal.
+
+### Added (cohesive cross-channel UX baseline — slice 1)
+
+Three contract changes on the `ChannelAdapter` trait + delivery loop so
+every channel benefits at once instead of fixing the same UX bug 21
+times. These are the foundations for the parallel slice-2 polish work
+that follows.
+
+- **`max_message_chars()` on `ChannelAdapter`** with a chat-text splitter
+  in the delivery loop (`crates/ironclaw-host-delivery/src/service.rs`).
+  When an adapter advertises a per-message char cap, oversized outbound
+  chat rows are split (paragraph → sentence → hard cut) into a sequence
+  of sends before they hit the platform API, eliminating silent
+  "message too long" 400 failures. Char-based (not byte-based) so
+  CJK content rounds the right way. Per-channel caps shipped: Telegram
+  4096, Discord 2000, Slack 40 000, gchat 4096, Teams 28 000,
+  whatsapp-cloud 4096, wechat 600 (conservative under-approximation of
+  the 2 KiB byte cap), webex 7439, line 5000. New metric
+  `ironclaw_delivery_chat_split_total{channel_type}` fires once per
+  split row. 6 new unit tests + the per-channel overrides are exercised
+  by the existing adapter test suites.
+- **Honour adapter `Rate { retry_after }` hints** in
+  `DeliveryService::bump_retry`. Previously the delivery loop always
+  used a fixed exponential schedule (5 s × 2^(tries-1)) regardless of
+  what Telegram / Slack / GitHub / Linear / Webex etc. had told us via
+  `Retry-After`. Now the platform-supplied wait wins (capped at
+  `ABSOLUTE_CEILING_MS`), falling back to the exponential schedule only
+  when no hint is present. New `DeliveryError::retry_after_secs()`
+  accessor; 2 new tests pinning both paths.
+- **Constant-time webhook secret comparison** for Telegram
+  (`crates/ironclaw-channels/telegram/src/ingress/webhook.rs`) and
+  whatsapp-cloud
+  (`crates/ironclaw-channels/whatsapp-cloud/src/events/router.rs`).
+  Both previously used a plain `!=` byte compare on bearer-token-shaped
+  inputs, which leaks the secret one char at a time via response
+  timing. Now use `subtle::ConstantTimeEq`. Other webhook channels
+  (Slack, GitHub, Linear, Teams, gchat, Webex) were already constant-
+  time and unchanged. `subtle = "2"` added to the Telegram crate's
+  dependencies.
+
+Workspace: 5410 passing / 1 pre-existing flake
+(`agent_to_agent::create_agent::tests::orphan_depth_cap_rejection_emits_warn`,
+passes in isolation — global tracing-subscriber buffer race, untouched
+by this slice). Clippy clean on
+`cargo clippy --workspace --all-targets -- -D warnings`.
+
 ### Added (portable `send_card` — works on every channel)
 
 The user-visible goal: `send_card` works on every channel. The mechanism:

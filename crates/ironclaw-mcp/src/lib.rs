@@ -27,10 +27,10 @@ pub mod tools;
 pub use client::{McpClient, RemoteTool, SharedMcpClient};
 pub use context::{
     AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec, EditMessageSpec,
-    InstallSpec, MockToolContext, OutboundToolEffect, Recipient, ScheduleSpec, SendCardSpec,
-    SendFileSpec, SendMessageSpec, SubagentRequest, SubagentResult, SubagentToolCall,
-    TaskSummary, ToolContext, ToolEffectAck, UpdateTaskSpec, SUBAGENT_MAX_TOKENS_LIMIT,
-    SUBAGENT_MAX_TURNS_LIMIT, SUBAGENT_WALL_CLOCK_SECS,
+    EmitTodoListSpec, InstallSpec, MockToolContext, OutboundToolEffect, Recipient, ScheduleSpec,
+    SendCardSpec, SendFileSpec, SendMessageSpec, SubagentRequest, SubagentResult,
+    SubagentToolCall, TaskSummary, ToolContext, ToolEffectAck, UpdateTaskSpec,
+    SUBAGENT_MAX_TOKENS_LIMIT, SUBAGENT_MAX_TURNS_LIMIT, SUBAGENT_WALL_CLOCK_SECS,
 };
 pub use error::{McpError, ToolError};
 
@@ -41,6 +41,10 @@ pub use tools::compact_now::pending_path as compact_now_pending_path;
 /// Sentinel file the `clear_history` tool drops to ask the runner to
 /// wipe history at the start of its next turn.
 pub use tools::clear_history::pending_path as clear_history_pending_path;
+/// Wipe the per-session todo store. Re-exported so the runner can
+/// call it from the user-side `/clear` slash command — see the helper
+/// for the bug that motivated this.
+pub use tools::todo::clear_store as clear_todo_store;
 pub use server::{build_server, IronclawServer};
 pub use tools::{build_tool_map, build_tool_set, ToolEntry, ToolHandler};
 

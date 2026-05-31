@@ -649,6 +649,15 @@ pub mod serpapi {
             "" => "google",
             other => other,
         };
+        // SerpAPI only authenticates via the `api_key` query string —
+        // there is no header-based auth path. That means
+        // `reqwest::Error::Display` will render the full request URL
+        // (with the secret) on transport failures, and the message
+        // ends up in tool output, persisted into agent history, and
+        // re-sent upstream. We must build the error string ourselves
+        // from the structured fields (`status()`, `is_timeout()`,
+        // `is_connect()`) without ever invoking `Display` on the
+        // underlying error.
         let resp = client
             .get(url)
             .query(&[
@@ -659,12 +668,12 @@ pub mod serpapi {
             ])
             .send()
             .await
-            .map_err(|e| ToolError::Internal(format!("serpapi request: {e}")))?;
+            .map_err(|e| ToolError::Internal(redact_reqwest_error("serpapi request", &e)))?;
         let status = resp.status();
         let payload: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| ToolError::Internal(format!("serpapi response: {e}")))?;
+            .map_err(|e| ToolError::Internal(redact_reqwest_error("serpapi response", &e)))?;
         if !status.is_success() {
             let msg = payload
                 .get("error")
@@ -708,6 +717,94 @@ pub mod serpapi {
             })
             .collect();
         Ok(out)
+    }
+
+    /// Build a `reqwest` error message that NEVER includes the
+    /// request URL (which carries the `api_key` query parameter for
+    /// `SerpAPI`). We only read structured fields so the rendered
+    /// string is bounded by what we explicitly emit.
+    ///
+    /// IMPORTANT: do not add `e.to_string()` or `format!("{e}")` /
+    /// `{:?}` here. `reqwest::Error`'s `Display` impl walks the
+    /// request URL into the message; that's the leak we're closing.
+    pub(super) fn redact_reqwest_error(prefix: &str, e: &reqwest::Error) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if e.is_timeout() {
+            parts.push("timeout".into());
+        }
+        if e.is_connect() {
+            parts.push("connect failure".into());
+        }
+        if e.is_request() {
+            parts.push("request error".into());
+        }
+        if e.is_body() {
+            parts.push("body error".into());
+        }
+        if e.is_decode() {
+            parts.push("decode error".into());
+        }
+        if let Some(status) = e.status() {
+            parts.push(format!("status {}", status.as_u16()));
+        }
+        if parts.is_empty() {
+            // Unknown failure shape — emit a generic marker rather
+            // than the upstream Display string (which would include
+            // the URL).
+            parts.push("transport error".into());
+        }
+        format!("{prefix}: {}", parts.join(", "))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn search_error_does_not_leak_api_key() {
+            // Point at a port nothing is listening on so reqwest
+            // returns a connect error. The api_key appears in the
+            // request URL; the returned error string must NOT.
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_millis(500))
+                .build()
+                .unwrap();
+            let api_key = "SECRET_KEY_THAT_MUST_NEVER_LEAK";
+            let err = search(
+                &client,
+                "http://127.0.0.1:1/search",
+                api_key,
+                "anything",
+                3,
+                None,
+            )
+            .await
+            .expect_err("connect to port 1 should fail");
+            let msg = format!("{err}");
+            assert!(
+                !msg.contains(api_key),
+                "api key leaked into error message: {msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn search_error_against_bad_scheme_does_not_leak_key() {
+            // Defence in depth: a different failure shape (invalid
+            // URL → request build failure inside reqwest) must also
+            // route through `redact_reqwest_error`. The url parse
+            // itself happens inside reqwest::Client::get, surfacing
+            // as a `reqwest::Error` of kind `Builder` or `Request`.
+            let client = reqwest::Client::new();
+            let api_key = "ANOTHER_SECRET_KEY_42";
+            let err = search(&client, "not a url", api_key, "q", 1, None)
+                .await
+                .expect_err("invalid url must fail");
+            let msg = format!("{err}");
+            assert!(
+                !msg.contains(api_key),
+                "api key leaked into error message: {msg}"
+            );
+        }
     }
 }
 

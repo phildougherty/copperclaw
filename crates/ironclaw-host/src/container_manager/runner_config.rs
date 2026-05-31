@@ -60,6 +60,26 @@ pub(crate) struct RunnerConfigForFile {
     /// inherited messaging-group channel.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) source_session_id: Option<String>,
+    /// Slice-3.5 opt-in: surface the model's reasoning blocks as
+    /// collapsed native UI primitives. Plumbed in from
+    /// `container_configs.surface_thinking`. Skipped when None /
+    /// default so existing runner config files don't gain a new
+    /// always-present field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) surface_thinking: Option<bool>,
+    /// Reasoning-effort tier (`low`/`medium`/`high`). Mapped onto each
+    /// provider's native knob: `OpenRouter`'s unified API takes it as
+    /// `reasoning: { effort: ... }` (forwarded to any underlying
+    /// reasoning-capable model — `DeepSeek` R1, `OpenAI` o-series, etc.).
+    /// Anthropic's native API ignores it.
+    ///
+    /// Sourced from per-group `container_configs.effort` when set,
+    /// then `ManagerConfig::default_effort` (set from the host's
+    /// `IRONCLAW_DEFAULT_EFFORT` env var at boot). Skipped when None
+    /// so a "use the model's default" deployment doesn't gain a new
+    /// always-present field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) effort: Option<ironclaw_types::Effort>,
 }
 
 impl ContainerManager {
@@ -260,6 +280,27 @@ impl ContainerManager {
             (None, None)
         };
 
+        // Plumb the per-group slice-3.5 `surface_thinking` flag into
+        // the runner's JSON config file. Skip emitting the field when
+        // off (the default) so the runner_config.json shape for groups
+        // that never opt in stays bit-identical to the pre-3.5 shape.
+        let surface_thinking = cc
+            .map(|c| c.surface_thinking)
+            .filter(|on| *on)
+            .map(|_| true);
+
+        // Effort precedence: per-group `container_configs.effort` (when
+        // present) wins over the host-wide `default_effort` (which the
+        // operator sets via `IRONCLAW_DEFAULT_EFFORT` in `.env`).
+        // `Medium` is treated as "no override" so the wire-level
+        // `reasoning.effort` field is only emitted when the operator
+        // deliberately picked low or high. (Most providers default to
+        // their own "medium" already, so emitting it is just noise.)
+        let effort = cc
+            .and_then(|c| c.effort)
+            .or(self.cfg.default_effort)
+            .filter(|e| !matches!(e, ironclaw_types::Effort::Medium));
+
         RunnerConfigForFile {
             session_id: session.id.as_uuid().to_string(),
             agent_group_id: session.agent_group_id.as_uuid().to_string(),
@@ -279,6 +320,8 @@ impl ContainerManager {
             source_session_id: session
                 .source_session_id
                 .map(|s| s.as_uuid().to_string()),
+            surface_thinking,
+            effort,
         }
     }
 }
@@ -304,6 +347,7 @@ mod tests {
             default_image_tag: "ironclaw/session:test".into(),
             default_provider: "anthropic".into(),
             default_model: "claude-sonnet-4-6".into(),
+            default_effort: None,
             anthropic_api_key: Some("sk-test".into()),
             anthropic_base_url: Some("https://openrouter.ai/api/v1".into()),
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
@@ -402,6 +446,7 @@ mod tests {
             egress_allow: vec![],
             resource_limits: serde_json::json!({}),
             coding_enabled: false,
+            surface_thinking: false,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -458,6 +503,7 @@ mod tests {
             egress_allow: vec![],
             resource_limits: serde_json::json!({}),
             coding_enabled: false,
+            surface_thinking: false,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -505,6 +551,7 @@ mod tests {
             egress_allow: vec![],
             resource_limits: serde_json::json!({}),
             coding_enabled: false,
+            surface_thinking: false,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -545,6 +592,7 @@ mod tests {
             egress_allow: vec![],
             resource_limits: serde_json::json!({}),
             coding_enabled: false,
+            surface_thinking: false,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -578,6 +626,7 @@ mod tests {
             egress_allow: vec![],
             resource_limits: serde_json::json!({}),
             coding_enabled,
+            surface_thinking: false,
             updated_at: chrono::Utc::now(),
         }
     }

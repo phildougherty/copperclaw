@@ -91,6 +91,14 @@ pub struct RunnerConfigFile {
     /// the parent session id), rather than dumping into the user
     /// channel inherited from the parent's MG.
     pub source_session_id: Option<String>,
+    /// Slice-3.5 opt-in flag for surfacing the model's `thinking` /
+    /// `redacted_thinking` blocks to the user as collapsed native UI
+    /// primitives. Plumbed in from
+    /// `container_configs.surface_thinking` by the host's container
+    /// manager. Defaults to `false` — surfacing model
+    /// chain-of-thought has privacy implications.
+    #[serde(default)]
+    pub surface_thinking: Option<bool>,
 }
 
 /// Fully-resolved runner config.
@@ -141,6 +149,11 @@ pub struct RunnerConfig {
     /// sessions created via `create_agent`; `None` for sessions
     /// kicked off by a real user channel.
     pub source_session_id: Option<SessionId>,
+    /// Per-group slice-3.5 opt-in: surface the model's reasoning
+    /// blocks as collapsed native UI primitives. Default `false` —
+    /// privacy-default tenet. Plumbed in from
+    /// `container_configs.surface_thinking`.
+    pub surface_thinking: bool,
 }
 
 impl RunnerConfig {
@@ -209,6 +222,7 @@ impl RunnerConfig {
             codex_binary: file.codex_binary,
             codex_args: file.codex_args,
             source_session_id,
+            surface_thinking: file.surface_thinking.unwrap_or(false),
         })
     }
 
@@ -296,6 +310,7 @@ mod tests {
             codex_binary: None,
             codex_args: None,
             source_session_id: None,
+            surface_thinking: None,
         }
     }
 

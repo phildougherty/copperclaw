@@ -22,6 +22,14 @@ pub struct WriteInbound {
     pub channel_type: Option<ChannelType>,
     pub thread_id: Option<String>,
     pub source_session_id: Option<String>,
+    /// Platform-side parent message id when the wire event was a reply.
+    /// `None` when the originating message is a top-level send or the
+    /// channel doesn't carry a reply link. See `MessageInRow::reply_to`.
+    pub reply_to: Option<String>,
+    /// Whether the originating venue is a group chat (vs. a 1-on-1 DM).
+    /// `None` when the channel doesn't distinguish. See
+    /// `MessageInRow::is_group`.
+    pub is_group: Option<bool>,
 }
 
 /// Insert a row using the next even sequence number (host parity).
@@ -54,14 +62,14 @@ fn insert_impl(conn: &Connection, msg: &WriteInbound, idempotent: bool) -> Resul
         "INSERT OR IGNORE INTO messages_in
            (id, seq, kind, timestamp, status, process_after, recurrence,
             series_id, tries, trigger, platform_id, channel_type, thread_id,
-            content, source_session_id, on_wake)
-         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+            content, source_session_id, on_wake, reply_to, is_group)
+         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
     } else {
         "INSERT INTO messages_in
            (id, seq, kind, timestamp, status, process_after, recurrence,
             series_id, tries, trigger, platform_id, channel_type, thread_id,
-            content, source_session_id, on_wake)
-         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
+            content, source_session_id, on_wake, reply_to, is_group)
+         VALUES (?1, ?2, ?3, ?4, 'pending', ?5, ?6, ?7, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
     };
     let rows = conn.execute(
         sql,
@@ -80,6 +88,8 @@ fn insert_impl(conn: &Connection, msg: &WriteInbound, idempotent: bool) -> Resul
             msg.content.to_string(),
             &msg.source_session_id,
             i32::from(msg.on_wake),
+            &msg.reply_to,
+            msg.is_group.map(i32::from),
         ],
     )?;
     if rows == 0 {
@@ -162,7 +172,7 @@ pub fn get_pending(conn: &Connection, first_poll: bool, limit: i64) -> Result<Ve
     let mut stmt = conn.prepare(
         "SELECT id, seq, kind, timestamp, status, process_after, recurrence,
                 series_id, tries, trigger, platform_id, channel_type, thread_id,
-                content, source_session_id, on_wake
+                content, source_session_id, on_wake, reply_to, is_group
          FROM messages_in
          WHERE status = 'pending'
            AND (process_after IS NULL OR process_after <= ?1)
@@ -182,21 +192,13 @@ fn row_to_message_in(row: &Row<'_>) -> rusqlite::Result<MessageInRow> {
     let id = uuid::Uuid::parse_str(&id_str)
         .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
     let kind: String = row.get("kind")?;
-    let kind = match kind.as_str() {
-        "chat" => MessageKind::Chat,
-        "task" => MessageKind::Task,
-        "webhook" => MessageKind::Webhook,
-        "system" => MessageKind::System,
-        "agent" => MessageKind::Agent,
-        "card" => MessageKind::Card,
-        other => {
-            return Err(rusqlite::Error::FromSqlConversionFailure(
-                0,
-                rusqlite::types::Type::Text,
-                format!("unknown kind {other}").into(),
-            ))
-        }
-    };
+    let kind = MessageKind::parse_str(&kind).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            format!("unknown kind {kind}").into(),
+        )
+    })?;
     let timestamp = parse_dt(row, "timestamp")?;
     let process_after = parse_dt_opt(row, "process_after")?;
     let content_str: String = row.get("content")?;
@@ -239,6 +241,21 @@ fn row_to_message_in(row: &Row<'_>) -> rusqlite::Result<MessageInRow> {
         on_wake: {
             let v: i64 = row.get("on_wake")?;
             v != 0
+        },
+        reply_to: {
+            // Empty-string-as-Some defence (parallel to source_session_id
+            // above): a legacy / adapter-misbehaving row with `reply_to = ''`
+            // would propagate into the runner's context-block as an empty
+            // " in reply to ''" fragment. Coalesce to None at the boundary.
+            let v: Option<String> = row.get("reply_to")?;
+            v.filter(|s| !s.is_empty())
+        },
+        is_group: {
+            // SQLite stores the value as INTEGER 0/1, but the column is
+            // nullable: `None` (channel doesn't distinguish) is distinct
+            // from `Some(false)` (DM) and `Some(true)` (group).
+            let v: Option<i64> = row.get("is_group")?;
+            v.map(|n| n != 0)
         },
     })
 }
@@ -294,6 +311,8 @@ mod tests {
             channel_type: Some(ChannelType::new("cli")),
             thread_id: None,
             source_session_id: None,
+            reply_to: None,
+            is_group: None,
         }
     }
 
@@ -407,6 +426,54 @@ mod tests {
         m.process_after = Some(Utc::now() + chrono::Duration::seconds(60));
         insert(&conn, &m).unwrap();
         assert_eq!(count_pending_for_typing(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn insert_round_trips_reply_to_and_is_group() {
+        // The runner's "Conversation context" block reads these fields
+        // off `MessageInRow`; persisting them and reading them back is
+        // the gate that lets the block say "in a group chat" / "in
+        // reply to the user's earlier message" instead of degrading to
+        // the venue-shape-only phrasing.
+        let (_tmp, conn) = fresh_inbound();
+        let mut msg = make_msg();
+        msg.reply_to = Some("parent-msg-42".into());
+        msg.is_group = Some(true);
+        insert(&conn, &msg).unwrap();
+
+        let rows = get_pending(&conn, true, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reply_to.as_deref(), Some("parent-msg-42"));
+        assert_eq!(rows[0].is_group, Some(true));
+
+        // The Some(false) case is distinct from None — DMs explicitly
+        // set is_group=false, channels that don't distinguish leave it
+        // None.
+        let mut dm = make_msg();
+        dm.is_group = Some(false);
+        insert(&conn, &dm).unwrap();
+        let rows = get_pending(&conn, true, 10).unwrap();
+        let dm_row = rows.iter().find(|r| r.id == dm.id).expect("dm row");
+        assert_eq!(dm_row.is_group, Some(false));
+        assert_eq!(dm_row.reply_to, None);
+    }
+
+    #[test]
+    fn row_to_message_in_coalesces_empty_reply_to() {
+        // Parallel to the source_session_id branch: an adapter that
+        // writes `Some("")` instead of `None` must read back as `None`
+        // so the runner's context-block doesn't render "in reply to ''".
+        let (_tmp, conn) = fresh_inbound();
+        let msg = make_msg();
+        insert(&conn, &msg).unwrap();
+        conn.execute(
+            "UPDATE messages_in SET reply_to = '' WHERE id = ?1",
+            params![msg.id.as_uuid().to_string()],
+        )
+        .unwrap();
+        let rows = get_pending(&conn, true, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reply_to, None);
     }
 
     #[test]

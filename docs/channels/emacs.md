@@ -1,5 +1,23 @@
 # emacs channel audit
 
+## Native UI capabilities
+
+| Capability | Native | Notes |
+|---|---|---|
+| Chat (text) | yes | Elisp template `eval` of the configured outbound s-expression |
+| Auto-split long messages | no | no `max_message_chars()` override; Emacs has no wire cap |
+| Honour `Retry-After` | yes | shared via delivery loop (client surfaces transport errors; emacs has no rate-limit semantic) |
+| Typing indicator | no | trait default; no buffer concept of typing |
+| Native cards (buttons/sections) | no | falls back via trait-default text render — cards land in the buffer as formatted text |
+| Native breadcrumbs (tool chips) | fallback | trait-default `[tool]` text line — appears in the buffer |
+| Inbound reply_to context | no | poll-loop alist parser sets `reply_to: None` (adapter.rs:248) |
+| Inbound group vs DM distinction | no | `is_group: Some(false)` always (adapter.rs:246) — single buffer model |
+| Edit messages | no | system action → Unsupported (out of scope; buffer edits are too implementation-specific) |
+| Reactions | no | system action → Unsupported |
+| Files / attachments | no | explicit `Unsupported` — file handling in Emacs is too buffer-specific |
+| Threading | no | `supports_threads()` defaults to false |
+| Webhook secret verification | n/a (local) | inbound polls the Emacs inbound-queue s-expression via the client; no network surface |
+
 ## Implemented
 - deliver: COMPLETE for text via Elisp template eval. Files +
   system-actions are explicitly Unsupported (genuinely out of scope —

@@ -189,6 +189,22 @@ fn build_request_body(input: &QueryInput) -> Value {
     if !input.tools.is_empty() {
         obj.insert("tools".into(), Value::Array(tools_to_json(&input.tools)));
     }
+    // Reasoning-effort hint. Only emitted for low / high — Medium is
+    // the implicit default for every provider that supports a tier,
+    // so omitting it keeps the request body bit-identical to the
+    // pre-effort shape for the common case. OpenRouter's unified API
+    // forwards `reasoning.effort` to any underlying reasoning-capable
+    // model (DeepSeek R1, OpenAI o-series, Anthropic extended-thinking
+    // shim, etc.); providers that don't understand it ignore it.
+    match input.effort {
+        ironclaw_types::Effort::Low => {
+            obj.insert("reasoning".into(), json!({ "effort": "low" }));
+        }
+        ironclaw_types::Effort::High => {
+            obj.insert("reasoning".into(), json!({ "effort": "high" }));
+        }
+        ironclaw_types::Effort::Medium => {}
+    }
     body
 }
 
@@ -327,14 +343,22 @@ struct ToolUseAccumulator {
 /// Reasoning models (Anthropic extended thinking, `Kimi K2.6`, `Qwen QwQ`,
 /// `DeepSeek R1`, etc.) stream chain-of-thought as `thinking_delta` events
 /// interleaved with `signature_delta` events that authenticate the block
-/// for re-submission. We accumulate but do NOT surface the thinking text
-/// to the user — only the final `text` content block reaches the agent's
-/// reply. The signature is captured for future use (history re-submission
+/// for re-submission. We accumulate the text and the signature, and on
+/// `content_block_stop` emit a [`ProviderEvent::Thinking`] event carrying
+/// the completed prose; the runner decides whether to surface it to the
+/// user (gated on per-group `surface_thinking`).
+///
+/// The signature is captured for future use (history re-submission
 /// requires it for some providers); presently dropped at stop.
 #[derive(Debug, Default)]
 struct ThinkingAccumulator {
     text: String,
+    #[allow(dead_code)] // captured for future history-passthrough; see TODO above.
     signature: String,
+    /// `true` when the upstream block was a `redacted_thinking` rather
+    /// than a regular `thinking` block. Renderers MUST substitute a
+    /// placeholder for redacted blocks instead of displaying any text.
+    redacted: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -469,7 +493,17 @@ async fn handle_sse_event(
                         // Surface Activity so the runner's drive loop sees
                         // liveness — thinking phases can run 30-90s before
                         // any user-visible text appears.
-                        state.thinking = Some(ThinkingAccumulator::default());
+                        //
+                        // Track which variant we're in so the
+                        // `content_block_stop` handler can emit a
+                        // `ProviderEvent::Thinking { redacted: … }` event
+                        // with the right flag.
+                        let redacted = block.block_type == "redacted_thinking";
+                        state.thinking = Some(ThinkingAccumulator {
+                            text: String::new(),
+                            signature: String::new(),
+                            redacted,
+                        });
                         let _ = tx.send(ProviderEvent::Activity).await;
                     }
                     _ => {
@@ -516,8 +550,22 @@ async fn handle_sse_event(
             // Close any in-flight thinking block first — thinking and
             // tool_use are mutually exclusive within a single index, but
             // closing it here keeps the state machine simple.
-            if state.thinking.take().is_some() {
+            if let Some(acc) = state.thinking.take() {
                 let _ = tx.send(ProviderEvent::Activity).await;
+                // Emit the structured Thinking event so the runner can
+                // optionally surface it to the user (gated on per-group
+                // `surface_thinking`). The signature is dropped here —
+                // we don't yet re-submit thinking content across turns.
+                if tx
+                    .send(ProviderEvent::Thinking {
+                        text: acc.text,
+                        redacted: acc.redacted,
+                    })
+                    .await
+                    .is_err()
+                {
+                    return false;
+                }
             }
             if let Some(acc) = state.tool_use.take() {
                 // Empty input is the typical zero-arg call.
@@ -763,6 +811,7 @@ mod tests {
                 ProviderEvent::ToolStart { .. } => "tool_start",
                 ProviderEvent::ToolEnd => "tool_end",
                 ProviderEvent::ToolCall { .. } => "tool_call",
+                ProviderEvent::Thinking { .. } => "thinking",
                 _ => "other",
             })
             .collect();
@@ -809,6 +858,73 @@ mod tests {
             _ => None,
         });
         assert_eq!(final_text.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn thinking_block_stop_emits_provider_event_thinking_with_full_text() {
+        // Slice-3.5 contract: when the upstream closes a `thinking` block
+        // we surface a structured `ProviderEvent::Thinking` carrying the
+        // accumulated text. The runner consumes this (gated on per-group
+        // `surface_thinking`) and persists a `MessageKind::Thinking` row
+        // so the user can optionally see the reasoning as a collapsed
+        // native primitive.
+        let (tx, mut rx) = mpsc::channel(64);
+        let mut state = SseState::default();
+        for ev in [
+            sse(r#"{"type":"message_start","message":{"id":"gen_t1"}}"#),
+            sse(r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#),
+            sse(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"The user is asking"}}"#),
+            sse(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":" a simple greeting."}}"#),
+            sse(r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-abc"}}"#),
+            sse(r#"{"type":"content_block_stop","index":0}"#),
+            sse(r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#),
+            sse(r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hi!"}}"#),
+            sse(r#"{"type":"content_block_stop","index":1}"#),
+            sse(r#"{"type":"message_stop"}"#),
+        ] {
+            handle_sse_event(&ev, &tx, &mut state).await;
+        }
+        let events = drain(&mut rx);
+        let thinking = events.iter().find_map(|e| match e {
+            ProviderEvent::Thinking { text, redacted } => Some((text.clone(), *redacted)),
+            _ => None,
+        });
+        let (text, redacted) = thinking.expect("expected ProviderEvent::Thinking to be emitted");
+        assert_eq!(text, "The user is asking a simple greeting.");
+        assert!(!redacted, "regular `thinking` block must have redacted=false");
+    }
+
+    #[tokio::test]
+    async fn redacted_thinking_block_emits_provider_event_thinking_with_redacted_flag() {
+        // `redacted_thinking` blocks must still surface a Thinking event
+        // (so the runner can record an audit row / render a placeholder)
+        // — but with `redacted=true` so downstream code knows to
+        // substitute a placeholder rather than display any text.
+        let (tx, mut rx) = mpsc::channel(32);
+        let mut state = SseState::default();
+        for ev in [
+            sse(r#"{"type":"message_start","message":{"id":"gen_r1"}}"#),
+            sse(r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque-secret-blob"}}"#),
+            sse(r#"{"type":"content_block_stop","index":0}"#),
+            sse(r#"{"type":"message_stop"}"#),
+        ] {
+            handle_sse_event(&ev, &tx, &mut state).await;
+        }
+        let events = drain(&mut rx);
+        let thinking = events.iter().find_map(|e| match e {
+            ProviderEvent::Thinking { text, redacted } => Some((text.clone(), *redacted)),
+            _ => None,
+        });
+        let (text, redacted) =
+            thinking.expect("expected ProviderEvent::Thinking even for redacted blocks");
+        assert!(redacted, "redacted_thinking must have redacted=true");
+        // The accumulator doesn't capture the `data` field — we never
+        // surface the opaque blob on the wire, even via the Thinking
+        // event. Text stays empty.
+        assert!(
+            text.is_empty(),
+            "redacted blocks must not capture the opaque data blob; got {text:?}"
+        );
     }
 
     #[test]

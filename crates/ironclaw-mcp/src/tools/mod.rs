@@ -23,6 +23,7 @@ pub mod apply_patch;
 pub mod computer_use;
 pub mod copy_file;
 pub mod core;
+pub(crate) mod diff_util;
 pub mod edit_file;
 pub mod explore;
 pub mod multi_edit;

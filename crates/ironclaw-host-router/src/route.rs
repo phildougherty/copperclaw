@@ -354,6 +354,19 @@ impl Router {
             .session_paths
             .inbound_pool(&session.agent_group_id, &session.id)?;
         let message_id = MessageId::new();
+        // Pull the parent message id off `event.reply_to.thread_id` —
+        // every adapter that populates `InboundEvent.reply_to` (Telegram,
+        // Signal, ...) stuffs the parent's platform-side message id there
+        // (the `platform_id` field on the `ReplyTo` struct is the *chat*
+        // routing handle, which is the same as the inbound's own
+        // `platform_id` for in-chat replies). Keeping just the parent
+        // message id matches what the runner's context-block needs to
+        // say "in reply to the user's earlier message" without lugging
+        // the redundant chat handle into per-session storage.
+        let reply_to_id = event
+            .reply_to
+            .as_ref()
+            .and_then(|r| r.thread_id.clone());
         let write = WriteInbound {
             id: message_id,
             kind: event.message.kind,
@@ -368,6 +381,8 @@ impl Router {
             channel_type: Some(event.channel_type.clone()),
             thread_id: event.thread_id.clone(),
             source_session_id: source_session_for(event),
+            reply_to: reply_to_id,
+            is_group: event.message.is_group,
         };
         let seq = pool.with_conn(|c| insert_in(c, &write))?;
 
@@ -681,6 +696,78 @@ mod tests {
             } => {}
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn route_persists_reply_to_and_is_group_into_messages_in() {
+        // The runner's "Conversation context" block reads
+        // MessageInRow::reply_to / is_group; the router has to forward
+        // the channel-populated InboundEvent fields onto the persisted
+        // row. Without this test, A's and B's slice-2 work nets out at
+        // "the agent thinks every turn is a generic DM with no reply
+        // context" because the runner reads from the DB, not the
+        // InboundEvent.
+        let fx = fixture(SessionMode::Shared);
+        let mut ev = event(None, "m-reply");
+        ev.message.is_group = Some(true);
+        ev.reply_to = Some(ironclaw_types::ReplyTo {
+            channel_type: ChannelType::new("cli"),
+            platform_id: "chat-1".into(),
+            // The parent's platform-side message id — this is what the
+            // router persists onto messages_in.reply_to.
+            thread_id: Some("parent-msg-77".into()),
+        });
+        let out = fx.router.route(ev).await.unwrap();
+        let RouteOutcome::Delivered { sessions } = out else {
+            panic!("expected delivered, got {out:?}");
+        };
+        assert_eq!(sessions.len(), 1);
+        let target = &sessions[0];
+
+        // Read back the row the router just wrote and confirm both
+        // fields landed.
+        let pool = fx
+            .router
+            .session_paths()
+            .inbound_pool(&target.agent_group_id, &target.session_id)
+            .unwrap();
+        let rows = pool
+            .with_conn(|c| ironclaw_db::tables::messages_in::get_pending(c, true, 10))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].is_group, Some(true));
+        assert_eq!(rows[0].reply_to.as_deref(), Some("parent-msg-77"));
+    }
+
+    #[tokio::test]
+    async fn route_writes_none_reply_to_when_event_has_no_reply() {
+        // The complement: a vanilla inbound (no reply_to on the wire)
+        // must land as NULL on the row so the runner's context-block
+        // doesn't fabricate a "in reply to" clause.
+        let fx = fixture(SessionMode::Shared);
+        let mut ev = event(None, "m-plain");
+        ev.message.is_group = Some(false); // explicit DM
+        // ev.reply_to stays None as constructed by the helper.
+        let out = fx.router.route(ev).await.unwrap();
+        let RouteOutcome::Delivered { sessions } = out else {
+            panic!("expected delivered, got {out:?}");
+        };
+        let target = &sessions[0];
+        let pool = fx
+            .router
+            .session_paths()
+            .inbound_pool(&target.agent_group_id, &target.session_id)
+            .unwrap();
+        let rows = pool
+            .with_conn(|c| ironclaw_db::tables::messages_in::get_pending(c, true, 10))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reply_to, None);
+        // is_group=Some(false) is distinct from None: the channel
+        // explicitly said "this is a DM"; the runner uses that to
+        // render "in a 1-on-1 DM" instead of the thread-fallback
+        // phrasing.
+        assert_eq!(rows[0].is_group, Some(false));
     }
 
     #[tokio::test]

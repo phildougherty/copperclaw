@@ -5,7 +5,7 @@
 
 use chrono::{DateTime, TimeZone, Utc};
 use ironclaw_types::{
-    ChannelType, InboundEvent, InboundMessage, MessageKind, SenderIdentity,
+    ChannelType, InboundEvent, InboundMessage, MessageKind, ReplyTo, SenderIdentity,
 };
 use serde_json::{Value, json};
 
@@ -117,6 +117,21 @@ pub fn event_to_inbound(
             }
         });
 
+    // Matrix surfaces direct replies via the (legacy-but-universal)
+    // `m.relates_to."m.in_reply_to".event_id`. This lives alongside any
+    // thread relation: a threaded reply still names the message it's
+    // replying to via in_reply_to.
+    let reply_to = content
+        .get("m.relates_to")
+        .and_then(|r| r.get("m.in_reply_to"))
+        .and_then(|i| i.get("event_id"))
+        .and_then(Value::as_str)
+        .map(|parent| ReplyTo {
+            channel_type: ChannelType::new(CHANNEL_TYPE_STR),
+            platform_id: room_id.to_owned(),
+            thread_id: Some(parent.to_owned()),
+        });
+
     let is_mention = Some(detect_mention(content, bot_user_id));
 
     Some(InboundEvent {
@@ -131,7 +146,7 @@ pub fn event_to_inbound(
             is_mention,
             is_group: Some(true),
         },
-        reply_to: None,
+        reply_to,
         sender: Some(SenderIdentity {
             channel_type,
             identity: sender.to_owned(),
@@ -548,6 +563,37 @@ mod tests {
         let s = sync_with("!a:m.org", &[event]);
         let evts = sync_to_events(&s, "@bot:m.org");
         assert_eq!(evts[0].message.timestamp.timestamp(), 1_700_000_000);
+    }
+
+    #[test]
+    fn in_reply_to_populates_reply_to() {
+        let extra = json!({
+            "m.relates_to": {
+                "m.in_reply_to": { "event_id": "$parent:m.org" }
+            }
+        });
+        let s = sync_with(
+            "!room:m.org",
+            &[message_event("@alice:m.org", "agreed", Some(extra))],
+        );
+        let evts = sync_to_events(&s, "@bot:m.org");
+        let rt = evts[0]
+            .reply_to
+            .as_ref()
+            .expect("reply_to populated from m.in_reply_to");
+        assert_eq!(rt.channel_type.as_str(), "matrix");
+        assert_eq!(rt.platform_id, "!room:m.org");
+        assert_eq!(rt.thread_id.as_deref(), Some("$parent:m.org"));
+    }
+
+    #[test]
+    fn plain_message_without_in_reply_to_has_no_reply_to() {
+        let s = sync_with(
+            "!room:m.org",
+            &[message_event("@alice:m.org", "fresh thought", None)],
+        );
+        let evts = sync_to_events(&s, "@bot:m.org");
+        assert!(evts[0].reply_to.is_none());
     }
 
     #[test]

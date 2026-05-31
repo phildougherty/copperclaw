@@ -34,6 +34,10 @@ struct RecurrenceParent {
     thread_id: Option<String>,
     content: serde_json::Value,
     source_session_id: Option<String>,
+    // Carried onto each fan-out so the runner's per-turn context block
+    // sees the same venue shape on every member of a recurring series.
+    reply_to: Option<String>,
+    is_group: Option<bool>,
 }
 
 /// Returns one [`SeriesFanout`] per series that fired during this pass.
@@ -83,6 +87,11 @@ pub fn check(
             channel_type: parent.channel_type.clone(),
             thread_id: parent.thread_id.clone(),
             source_session_id: parent.source_session_id.clone(),
+            // Carry the parent's reply_to/is_group signal onto every
+            // recurrence fan-out so the runner's context-block sees the
+            // same venue shape across a recurring series.
+            reply_to: parent.reply_to.clone(),
+            is_group: parent.is_group,
         };
         insert(inbound.conn_mut(), &write)?;
         out.push(SeriesFanout {
@@ -115,7 +124,7 @@ fn newest_per_series(
     let mut stmt = conn.prepare(
         "SELECT id, kind, process_after, recurrence, series_id,
                 trigger, on_wake, platform_id, channel_type, thread_id,
-                content, source_session_id, seq,
+                content, source_session_id, reply_to, is_group, seq,
                 COALESCE(series_id, id) AS series_key
          FROM messages_in
          WHERE recurrence IS NOT NULL AND TRIM(recurrence) != ''
@@ -150,7 +159,16 @@ fn newest_per_series(
         let id_uuid = uuid::Uuid::parse_str(&id_str)
             .map_err(|e| SweepError::ScheduleParse(format!("bad uuid {id_str}: {e}")))?;
         let kind_str: String = row.get("kind")?;
-        let kind = parse_kind(&kind_str)?;
+        // Delegate to the canonical `MessageKind::parse_str` so this
+        // call site does NOT need updating every time a new variant
+        // lands (slice-3 added Breadcrumb / Diff / TodoList / Error /
+        // Thinking on top of the original six). A drift here aborts
+        // the whole session's recurrence sweep with an
+        // `unknown kind` error — strictly worse than letting the row
+        // ride for one pass.
+        let kind = MessageKind::parse_str(&kind_str).ok_or_else(|| {
+            SweepError::ScheduleParse(format!("unknown kind `{kind_str}`"))
+        })?;
         let recurrence: String = row.get("recurrence")?;
         let series_id: Option<String> = row.get("series_id")?;
         let trigger_i: i64 = row.get("trigger")?;
@@ -162,6 +180,11 @@ fn newest_per_series(
         let content: serde_json::Value = serde_json::from_str(&content_str)
             .map_err(|e| SweepError::ScheduleParse(format!("bad content json: {e}")))?;
         let source_session_id: Option<String> = row.get("source_session_id")?;
+        let reply_to: Option<String> = row.get("reply_to")?;
+        let is_group: Option<bool> = {
+            let v: Option<i64> = row.get("is_group")?;
+            v.map(|n| n != 0)
+        };
 
         parents.push(RecurrenceParent {
             id: MessageId::from(id_uuid),
@@ -175,21 +198,11 @@ fn newest_per_series(
             thread_id,
             content,
             source_session_id,
+            reply_to,
+            is_group,
         });
     }
     Ok(parents)
-}
-
-fn parse_kind(s: &str) -> Result<MessageKind, SweepError> {
-    Ok(match s {
-        "chat" => MessageKind::Chat,
-        "task" => MessageKind::Task,
-        "webhook" => MessageKind::Webhook,
-        "system" => MessageKind::System,
-        "agent" => MessageKind::Agent,
-        "card" => MessageKind::Card,
-        other => return Err(SweepError::ScheduleParse(format!("unknown kind `{other}`"))),
-    })
 }
 
 #[cfg(test)]
@@ -378,5 +391,65 @@ mod tests {
         );
         let r = check(&root, &sess.agent_group_id, &sess.id, now).unwrap();
         assert_eq!(r.len(), 1);
+    }
+
+    /// Regression: the original `parse_kind` hand-rolled only six
+    /// variants (chat/task/webhook/system/agent/card) and aborted the
+    /// whole session's recurrence sweep with `unknown kind` whenever a
+    /// recurring row of a newer kind landed (slice-3 added breadcrumb,
+    /// diff, `todo_list`, error, thinking). Now that we delegate to
+    /// `MessageKind::parse_str`, every documented variant must round-
+    /// trip cleanly. We seed one recurring row per variant and assert
+    /// the check completes (no Err) and fans out the expected count.
+    #[test]
+    fn all_message_kinds_parse_without_error_in_recurrence_sweep() {
+        for kind in [
+            MessageKind::Chat,
+            MessageKind::Task,
+            MessageKind::Webhook,
+            MessageKind::System,
+            MessageKind::Agent,
+            MessageKind::Card,
+            MessageKind::Breadcrumb,
+            MessageKind::Diff,
+            MessageKind::TodoList,
+            MessageKind::Error,
+            MessageKind::Thinking,
+        ] {
+            let (root, sess, now) = fixture();
+            // Hand-rolled insert so we can pick the kind directly —
+            // the shared `insert_recurring_inbound` helper hard-codes
+            // `Task`, which would defeat the test.
+            let id = ironclaw_types::MessageId::new();
+            let write = WriteInbound {
+                id,
+                kind,
+                timestamp: now,
+                content: serde_json::json!({"text": "recurring"}),
+                trigger: true,
+                on_wake: false,
+                process_after: Some(now - ChDuration::minutes(5)),
+                recurrence: Some("0 */2 * * *".into()),
+                series_id: Some(format!("series-kind-{}", kind.as_str())),
+                platform_id: None,
+                channel_type: None,
+                thread_id: None,
+                source_session_id: None,
+                reply_to: None,
+                is_group: None,
+            };
+            {
+                let mut pool = root.inbound_pool(&sess.agent_group_id, &sess.id).unwrap();
+                insert(pool.conn_mut(), &write).unwrap();
+            }
+            let r = check(&root, &sess.agent_group_id, &sess.id, now)
+                .unwrap_or_else(|e| panic!("kind `{}` aborted sweep: {e}", kind.as_str()));
+            assert_eq!(
+                r.len(),
+                1,
+                "expected exactly one fan-out for kind `{}`",
+                kind.as_str(),
+            );
+        }
     }
 }

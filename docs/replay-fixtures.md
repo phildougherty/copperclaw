@@ -61,6 +61,26 @@ is `fixture.rs::load`.
 }
 ```
 
+Optional fields used by failure-mode fixtures:
+
+- `adapter_caps`: `{ "<channel>": <usize> }` — override the per-channel
+  `max_message_chars` cap the harness's wrapped `MockAdapter` reports
+  (defaults: `telegram=4096`, `slack=40000`, `discord=2000`, etc.; see
+  `default_cap_for` in `crates/ironclaw-host/tests/replay/harness.rs`).
+  Used by the `*-long-message-split` fixtures to exercise the delivery
+  loop's chat-text splitter.
+- `pre_delivery_failures`: `[{"channel": "telegram", "kind": "rate",
+  "retry_after": 7}]` — queue one or more `MockAdapter::fail_next_deliver`
+  errors on the named channel before driving inbound. Accepted `kind`s:
+  `"rate"`, `"transport"`, `"bad_request"`. Used by `rate-limited-retry`
+  to pin the slice-1 contract where `bump_retry` honours
+  `Rate { retry_after }` over the default exponential backoff.
+- `redrive_after_ms`: `<u64>` — after each per-step delivery pass, sleep
+  the given milliseconds and call `DeliveryService::process_session_once`
+  a second time. Lets a fixture pin "row deferred on first tick,
+  delivered on the second tick after the retry window elapses" without
+  poking at `DeliveryService`'s private retry-state map.
+
 `replay.mode` is `direct` for the current harness — inbound payloads
 are handed to the adapter's `MockAdapter::inject` rather than through
 a webhook listener / gateway / poll / rpc front-door. (The
@@ -210,6 +230,15 @@ replay suite:
 - **Real network.** The harness never opens an outbound socket.
   Every transport goes through a trait impl whose test variant is
   in-process.
+- **Webhook authentication / signature rejection paths.** The harness
+  drives `replay.mode = "direct"`, pushing already-parsed `InboundEvent`s
+  at the router. The HMAC / bearer-token checks live in the channel
+  adapter's webhook handler (e.g. `telegram::ingress::webhook`,
+  `whatsapp-cloud::events::router`), which the harness skips entirely.
+  These paths have their own unit tests in the channel crate; pinning
+  "401 on bad `X-Telegram-Bot-Api-Secret-Token`" through a replay
+  fixture would require a new `replay.mode = "webhook"` variant that
+  wires up the adapter's HTTP listener — not implemented today.
 
 When a regression surfaces that the suite does not catch, the right
 response is to capture a new fixture, not to bend the harness.

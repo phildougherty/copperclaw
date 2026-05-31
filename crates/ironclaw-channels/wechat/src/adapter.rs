@@ -160,6 +160,16 @@ impl ChannelAdapter for WeChatAdapter {
         false
     }
 
+    /// Work Weixin `message/send` text caps at 2 048 bytes. Our splitter
+    /// is char-based, so we use 600 chars as a safe under-approximation
+    /// (CJK in UTF-8 is up to 3 bytes per char → 600 chars ≈ 1 800 bytes).
+    /// Operators with mostly-ASCII workloads will hit this earlier than
+    /// strictly necessary; tightening this requires a byte-aware splitter
+    /// — out of scope for the initial cohesive-UX pass.
+    fn max_message_chars(&self) -> Option<usize> {
+        Some(600)
+    }
+
     async fn deliver(
         &self,
         platform_id: &str,

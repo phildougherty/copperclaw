@@ -60,9 +60,9 @@ mod factory;
 mod signature;
 
 pub use adapter::SlackAdapter;
-pub use api::SlackApi;
+pub use api::{SlackApi, build_card_blocks};
 pub use config::{SlackConfig, WebhookConfig};
-pub use events::router::{EventDedup, SlackEventsState, build_events_router};
+pub use events::router::{EventDedup, SlackEventsState, build_events_router, parse_block_actions};
 pub use events::types::{SlackEvent, SlackEventCallback, SlackEventEnvelope};
 pub use factory::{CHANNEL_TYPE_STR, SlackFactory, register};
 pub use signature::{SignatureError, compute_signature, verify_signature};

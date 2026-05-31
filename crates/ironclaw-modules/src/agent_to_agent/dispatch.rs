@@ -183,6 +183,12 @@ impl DeliveryActionHandler for AgentDispatchHandler {
             channel_type: None,
             thread_id,
             source_session_id: source_session_id.map(|s| s.as_uuid().to_string()),
+            // Agent-to-agent dispatch has no channel-level reply/group
+            // signal — the parent agent's send is the "wire event" and
+            // it carries no platform-side thread or group context to
+            // propagate.
+            reply_to: None,
+            is_group: None,
         };
         // 7. INSERT OR IGNORE on a constraint conflict. Transient SQLite
         //    errors (busy_timeout exceeded, disk full) are propagated as

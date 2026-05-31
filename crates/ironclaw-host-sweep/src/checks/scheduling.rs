@@ -58,6 +58,8 @@ pub fn check(
             channel_type: None,
             thread_id: None,
             source_session_id: None,
+            reply_to: None,
+            is_group: None,
         };
         let mut inbound = root.inbound_pool(&task.agent_group_id, &task.session_id)?;
         insert_in(inbound.conn_mut(), &write)?;

@@ -159,6 +159,19 @@ async fn main() -> Result<()> {
         max_tool_turns: resolve_max_tool_turns(&env),
         provider_deadline,
         tool_deadline_secs: resolve_tool_deadline_secs(&env),
+        // Keep the typing indicator alive across long LLM streams by
+        // refreshing the heartbeat file on every chunk + every ~3s
+        // tick. The host's typing-ticker gates on container=Running
+        // (which gates on a fresh heartbeat), so a stale heartbeat
+        // would otherwise let the bubble vanish mid-response.
+        activity_pinger: std::sync::Arc::new(
+            ironclaw_runner::HeartbeatPinger::new(Some(paths.heartbeat.clone())),
+        ),
+        // Slice-3.5 opt-in: surface the model's reasoning blocks as
+        // collapsed native UI primitives when the host has the
+        // per-group `surface_thinking` flag on. Default-off keeps the
+        // historical "drop on the floor" behaviour for existing groups.
+        surface_thinking: cfg.surface_thinking,
     };
 
     tracing::info!(
@@ -263,6 +276,7 @@ mod build_provider_tests {
             codex_binary: None,
             codex_args: None,
             source_session_id: None,
+            surface_thinking: false,
         }
     }
 

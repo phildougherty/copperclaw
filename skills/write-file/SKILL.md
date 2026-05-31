@@ -50,6 +50,15 @@ destination; pass `append: true` to grow an existing file instead.
 | `true` | yes | appended (file kept) |
 | `true` | no | created, then appended (same as overwrite of empty file) |
 
+## Diff card surfaced to the user
+
+When `write_file` overwrites an existing file the host emits a
+structured diff card to the originating channel showing what changed.
+Pure first-writes and `append: true` calls skip the card (no "before"
+to diff against). You don't need to summarise the change in prose;
+the user already sees it. Files over 256 KB skip the full diff and
+get a one-line `before / after` size summary instead.
+
 ## When to prefer other tools
 
 - **Editing a few bytes in the middle of a large file**: use `shell`

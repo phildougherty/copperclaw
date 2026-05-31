@@ -231,6 +231,14 @@ pub struct Message {
     pub video_note: Option<VideoNote>,
     #[serde(default)]
     pub sticker: Option<Sticker>,
+    /// When this message is itself a reply, Telegram embeds the parent
+    /// message under `reply_to_message`. We surface the parent's
+    /// `message_id` on the [`ironclaw_types::InboundEvent::reply_to`]
+    /// field so the agent can stitch the conversation together.
+    ///
+    /// Boxed because the type is otherwise recursive.
+    #[serde(default)]
+    pub reply_to_message: Option<Box<Message>>,
 }
 
 /// A Telegram `Update`. The adapter handles message- and `callback_query`-
@@ -440,6 +448,7 @@ mod tests {
                 voice: None,
                 video_note: None,
                 sticker: None,
+                reply_to_message: None,
             }),
             edited_message: None,
             channel_post: None,

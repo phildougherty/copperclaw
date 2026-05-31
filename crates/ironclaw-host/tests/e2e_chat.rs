@@ -351,6 +351,12 @@ async fn run_one_turn(
         // 60-second stall.
         provider_deadline: Duration::from_millis(5_000),
         tool_deadline_secs: 30,
+        // Tests don't observe the typing-keepalive signal; the noop
+        // pinger keeps `RunnerDeps` construction trivial without
+        // touching the heartbeat file behind the e2e test's back.
+        activity_pinger: Arc::new(ironclaw_runner::NoopPinger),
+        // Slice-3.5 surface defaults to off — tests don't rely on it.
+        surface_thinking: false,
     };
     run_loop(deps).await.context("runner one-turn")?;
     Ok(())

@@ -88,6 +88,81 @@ impl DiscordRest {
             .ok_or_else(|| AdapterError::Transport("post_message: missing id in response".into()))
     }
 
+    /// `POST /channels/{channel_id}/messages` with a structured Discord
+    /// payload (`embeds`, `components`, optional `content`).
+    ///
+    /// Used by [`crate::adapter::DiscordAdapter::deliver_card`] to ship a
+    /// canonical [`ironclaw_channels_core::Card`] as a Discord embed plus
+    /// `ActionRow` components. The full payload is sent verbatim so the
+    /// caller has full control over the JSON shape; we just wrap the
+    /// HTTP / auth / status-mapping plumbing.
+    ///
+    /// Returns the platform message id (`id` field from the response).
+    pub async fn post_message_payload(
+        &self,
+        channel_id: &str,
+        payload: &Value,
+    ) -> Result<String, AdapterError> {
+        let url = format!("{}/channels/{}/messages", self.api_base, channel_id);
+        let resp = self
+            .client
+            .post(&url)
+            .headers(self.auth_headers()?)
+            .header(CONTENT_TYPE, "application/json")
+            .body(payload.to_string())
+            .send()
+            .await
+            .map_err(|e| AdapterError::Transport(format!("post_message_payload: {e}")))?;
+        let resp = check_response(resp).await?;
+        let body: Value = resp.json().await.map_err(|e| {
+            AdapterError::Transport(format!("post_message_payload decode: {e}"))
+        })?;
+        body.get("id")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                AdapterError::Transport("post_message_payload: missing id in response".into())
+            })
+    }
+
+    /// `POST /interactions/{interaction_id}/{token}/callback`.
+    ///
+    /// ACK an inbound component interaction so the user's client clears
+    /// the spinner on the tapped button. We always send type `6`
+    /// (`DEFERRED_UPDATE_MESSAGE`) — Discord treats this as "I'm handling
+    /// it; don't expect a new message, but the spinner goes away". The
+    /// agent-side reply (if any) flows through the normal `deliver`
+    /// outbound path so we don't need to use type `4` here.
+    pub async fn create_interaction_response_ack(
+        &self,
+        interaction_id: &str,
+        interaction_token: &str,
+    ) -> Result<(), AdapterError> {
+        let url = format!(
+            "{}/interactions/{}/{}/callback",
+            self.api_base, interaction_id, interaction_token
+        );
+        // Type 6 = DEFERRED_UPDATE_MESSAGE — clears the spinner without
+        // forcing us to send a message body in the callback response.
+        let payload = json!({ "type": 6 });
+        // Note: this endpoint does NOT require the bot Authorization header
+        // (the interaction token authenticates the response). We still pass
+        // it for parity with the rest of the client; Discord ignores it
+        // here.
+        let resp = self
+            .client
+            .post(&url)
+            .header(CONTENT_TYPE, "application/json")
+            .body(payload.to_string())
+            .send()
+            .await
+            .map_err(|e| {
+                AdapterError::Transport(format!("create_interaction_response: {e}"))
+            })?;
+        check_response(resp).await?;
+        Ok(())
+    }
+
     /// `PATCH /channels/{channel_id}/messages/{message_id}`.
     pub async fn patch_message(
         &self,
@@ -108,6 +183,84 @@ impl DiscordRest {
             .send()
             .await
             .map_err(|e| AdapterError::Transport(format!("patch_message: {e}")))?;
+        check_response(resp).await?;
+        Ok(())
+    }
+
+    /// `PATCH /channels/{channel_id}/messages/{message_id}` with an
+    /// arbitrary JSON payload (embeds, components, etc.). Mirrors
+    /// [`Self::post_message_payload`] for the edit path; used by
+    /// `deliver_todo_list` to update the embed without losing it.
+    pub async fn patch_message_payload(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        payload: &serde_json::Value,
+    ) -> Result<(), AdapterError> {
+        let url = format!(
+            "{}/channels/{}/messages/{}",
+            self.api_base, channel_id, message_id
+        );
+        let resp = self
+            .client
+            .patch(&url)
+            .headers(self.auth_headers()?)
+            .header(CONTENT_TYPE, "application/json")
+            .body(payload.to_string())
+            .send()
+            .await
+            .map_err(|e| AdapterError::Transport(format!("patch_message_payload: {e}")))?;
+        check_response(resp).await?;
+        Ok(())
+    }
+
+    /// `PUT /channels/{channel_id}/pins/{message_id}`. Used by
+    /// `deliver_todo_list` on first emit. Best-effort: bots often
+    /// lack the `MANAGE_MESSAGES` permission required to pin, in
+    /// which case Discord returns `50013` (missing permissions) and
+    /// the caller swallows.
+    pub async fn put_pin(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+    ) -> Result<(), AdapterError> {
+        let url = format!(
+            "{}/channels/{}/pins/{}",
+            self.api_base, channel_id, message_id
+        );
+        let resp = self
+            .client
+            .put(&url)
+            .headers(self.auth_headers()?)
+            .header(CONTENT_TYPE, "application/json")
+            .body("")
+            .send()
+            .await
+            .map_err(|e| AdapterError::Transport(format!("put_pin: {e}")))?;
+        check_response(resp).await?;
+        Ok(())
+    }
+
+    /// `DELETE /channels/{channel_id}/pins/{message_id}`. Called
+    /// when a [`TodoList`](ironclaw_channels_core::TodoList) transitions
+    /// to fully-completed. Same permission-failure caveat as
+    /// [`Self::put_pin`].
+    pub async fn delete_pin(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+    ) -> Result<(), AdapterError> {
+        let url = format!(
+            "{}/channels/{}/pins/{}",
+            self.api_base, channel_id, message_id
+        );
+        let resp = self
+            .client
+            .delete(&url)
+            .headers(self.auth_headers()?)
+            .send()
+            .await
+            .map_err(|e| AdapterError::Transport(format!("delete_pin: {e}")))?;
         check_response(resp).await?;
         Ok(())
     }
@@ -602,6 +755,80 @@ mod tests {
         assert_eq!(seconds_ceil(-1.0), 0);
         assert_eq!(seconds_ceil(0.0), 0);
         assert_eq!(seconds_ceil(f64::NAN), 0);
+    }
+
+    #[tokio::test]
+    async fn post_message_payload_returns_id() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/channels/c1/messages"))
+            .and(header("authorization", "Bot test-token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"id": "m-card-1"})),
+            )
+            .mount(&server)
+            .await;
+        let r = client(&server);
+        let payload = json!({
+            "embeds": [{"title": "T"}],
+            "components": []
+        });
+        let id = r.post_message_payload("c1", &payload).await.unwrap();
+        assert_eq!(id, "m-card-1");
+    }
+
+    #[tokio::test]
+    async fn post_message_payload_400_maps_to_bad_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/channels/c1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("invalid embed"))
+            .mount(&server)
+            .await;
+        let r = client(&server);
+        let err = r
+            .post_message_payload("c1", &json!({"embeds": []}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AdapterError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn create_interaction_response_ack_posts_type_six() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/interactions/int-1/tok-1/callback"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let r = client(&server);
+        r.create_interaction_response_ack("int-1", "tok-1")
+            .await
+            .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        let req = reqs
+            .iter()
+            .find(|r| r.url.path() == "/interactions/int-1/tok-1/callback")
+            .expect("callback request");
+        let body: Value = serde_json::from_slice(&req.body).unwrap();
+        // Type 6 = DEFERRED_UPDATE_MESSAGE.
+        assert_eq!(body["type"], 6);
+    }
+
+    #[tokio::test]
+    async fn create_interaction_response_ack_propagates_5xx_as_transport() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/interactions/int-1/tok-1/callback"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let r = client(&server);
+        let err = r
+            .create_interaction_response_ack("int-1", "tok-1")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AdapterError::Transport(_)));
     }
 
     #[test]

@@ -1,0 +1,1 @@
+{"id":"<UUID>","seq":2,"kind":"chat","timestamp":"<TS>","status":"completed","process_after":null,"recurrence":null,"series_id":null,"tries":0,"trigger":true,"platform_id":"100","channel_type":"telegram","thread_id":null,"content":{"text":"please reply with a long message"},"source_session_id":null,"on_wake":false}

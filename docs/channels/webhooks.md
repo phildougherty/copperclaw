@@ -1,5 +1,23 @@
 # webhooks channel audit
 
+## Native UI capabilities
+
+| Capability | Native | Notes |
+|---|---|---|
+| Chat (text) | no | inbound-only by design; `deliver` returns `Unsupported("webhooks channel is inbound-only ...")` |
+| Auto-split long messages | no | no outbound path |
+| Honour `Retry-After` | yes | shared via delivery loop (path unused — outbound is Unsupported) |
+| Typing indicator | no | no platform concept (axum receive endpoint) |
+| Native cards (buttons/sections) | no | inbound-only |
+| Native breadcrumbs (tool chips) | no | inbound-only |
+| Inbound reply_to context | passthrough | router copies `reply_to` from the payload if the sender includes it (router.rs) |
+| Inbound group vs DM distinction | no | `is_group: None`; the generic shape doesn't pin platform semantics |
+| Edit messages | n/a | trait-default Unsupported (outbound is Unsupported) |
+| Reactions | n/a | trait-default Unsupported |
+| Files / attachments | n/a | inbound-only |
+| Threading | no | `supports_threads() = false` (adapter.rs:84) |
+| Webhook secret verification | yes | generic HMAC-SHA256 over body with operator-supplied prefix (e.g. `sha256=`, GitHub style). Constant-time via `hmac::Mac::verify_slice` (signature.rs:73) |
+
 ## Implemented
 - deliver: returns `Unsupported("webhooks channel is inbound-only ...")`
   by design. `crates/ironclaw-channels/webhooks/src/adapter.rs:88`

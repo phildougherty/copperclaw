@@ -14,7 +14,10 @@
 //! Error response bodies follow `{"message": "...", "errors": [...]}` and the
 //! `message` text is surfaced in the error string.
 
-use ironclaw_channels_core::AdapterError;
+use ironclaw_channels_core::{
+    AdapterError, Breadcrumb, BreadcrumbStatus, Card, CardButton, DiffCard, ErrorCard,
+    ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList,
+};
 use reqwest::multipart::{Form, Part};
 use reqwest::{Client, Response, StatusCode};
 use serde::Deserialize;
@@ -337,6 +340,422 @@ impl WebexApi {
         }
         read_empty(resp).await
     }
+}
+
+// ---------------------------------------------------------------------------
+// Adaptive Cards (slice-4 native renderers).
+//
+// Webex uses the Microsoft Adaptive Cards schema for inline rich
+// content — attached to `POST /messages` as
+// `application/vnd.microsoft.card.adaptive`. The seven canonical
+// surfaces (Card / Breadcrumb / Diff / Error / TodoList / Collapsible /
+// Thinking) are mapped via the builders below.
+//
+// IMPORTANT: Webex's adaptive-card subset rejects a few elements the
+// full Teams spec accepts. Notable gaps as of 2024:
+//
+//   - `CodeBlock` (Adaptive Cards 1.5) is NOT rendered — we fall back
+//     to monospace `TextBlock` (`fontType: "Monospace"`).
+//   - `Action.ToggleVisibility` is supported but the rendered chevron
+//     differs from Teams's; we still emit it for Collapsible / Thinking.
+//
+// EDIT-IN-PLACE LIMITATION: Webex `PUT /messages/{id}` does NOT support
+// editing the `attachments[]` field — only `text` / `markdown`. So
+// Breadcrumb + TodoList update paths fall back to emitting a FRESH
+// adaptive card; the host's delivery service will need to track the
+// new id. This is a platform constraint documented in
+// `WebexAdapter::deliver_breadcrumb` / `deliver_todo_list`.
+// ---------------------------------------------------------------------------
+
+/// Adaptive Cards schema URL.
+pub(crate) const ADAPTIVE_CARD_SCHEMA: &str = "http://adaptivecards.io/schemas/adaptive-card.json";
+/// Adaptive Cards schema version Webex renders. 1.2 is the safe
+/// floor across the Webex client matrix; we use 1.2 features only
+/// (`TextBlock`, `FactSet`, `Image`, `Container`, `Action.Submit`,
+/// `Action.OpenUrl`, `Action.ToggleVisibility`).
+pub(crate) const ADAPTIVE_CARD_VERSION: &str = "1.2";
+
+/// Render a canonical [`Card`] into an Adaptive Card JSON Value.
+///
+/// Mapping (identical to the Teams renderer; Adaptive Cards is the
+/// shared schema):
+///
+/// - `card.title` → bold `TextBlock` (size: Large).
+/// - `card.body` → wrapping `TextBlock`.
+/// - `card.image_url` → `Image` (size: Medium).
+/// - `card.fields` → `FactSet`.
+/// - `card.buttons` (`value`) → `Action.Submit` carrying `{value}`.
+/// - `card.buttons` (`url`) → `Action.OpenUrl`.
+#[must_use]
+pub fn build_adaptive_card(card: &Card) -> Value {
+    let mut body: Vec<Value> = Vec::new();
+    if let Some(t) = card.title.as_deref() {
+        let t = t.trim();
+        if !t.is_empty() {
+            body.push(json!({
+                "type": "TextBlock",
+                "text": t,
+                "weight": "Bolder",
+                "size": "Large",
+                "wrap": true,
+            }));
+        }
+    }
+    if let Some(b) = card.body.as_deref() {
+        let b = b.trim();
+        if !b.is_empty() {
+            body.push(json!({
+                "type": "TextBlock",
+                "text": b,
+                "wrap": true,
+            }));
+        }
+    }
+    if let Some(img) = card.image_url.as_deref() {
+        let img = img.trim();
+        if !img.is_empty() {
+            body.push(json!({
+                "type": "Image",
+                "url": img,
+                "size": "Medium",
+                "altText": "card image",
+            }));
+        }
+    }
+    if !card.fields.is_empty() {
+        let facts: Vec<Value> = card
+            .fields
+            .iter()
+            .map(|f| json!({"title": f.label, "value": f.value}))
+            .collect();
+        body.push(json!({
+            "type": "FactSet",
+            "facts": facts,
+        }));
+    }
+    let actions: Vec<Value> = card
+        .buttons
+        .iter()
+        .filter_map(button_to_action)
+        .collect();
+    let mut out = json!({
+        "type": "AdaptiveCard",
+        "$schema": ADAPTIVE_CARD_SCHEMA,
+        "version": ADAPTIVE_CARD_VERSION,
+        "body": body,
+    });
+    if !actions.is_empty() {
+        out["actions"] = Value::Array(actions);
+    }
+    out
+}
+
+fn button_to_action(btn: &CardButton) -> Option<Value> {
+    match (btn.value.as_deref(), btn.url.as_deref()) {
+        (Some(v), None) => {
+            let style = match btn.style.as_deref() {
+                Some("primary") => "positive",
+                Some("danger") => "destructive",
+                _ => "default",
+            };
+            Some(json!({
+                "type": "Action.Submit",
+                "title": btn.label,
+                "style": style,
+                "data": { "value": v },
+            }))
+        }
+        (None, Some(u)) => Some(json!({
+            "type": "Action.OpenUrl",
+            "title": btn.label,
+            "url": u,
+        })),
+        _ => None,
+    }
+}
+
+/// Render a [`Breadcrumb`] chip as an Adaptive Card.
+///
+/// Webex doesn't support message edits with attachment changes; the
+/// adapter's `deliver_breadcrumb` always POSTS a fresh card and the
+/// host gets a new id for each update. Renderer is otherwise identical
+/// to the Teams chip.
+#[must_use]
+pub fn build_adaptive_breadcrumb(b: &Breadcrumb) -> Value {
+    let color = match b.status {
+        BreadcrumbStatus::Running => "Accent",
+        BreadcrumbStatus::Done => "Good",
+        BreadcrumbStatus::Failed => "Attention",
+    };
+    let mut text = format!("`{}`", b.tool_name);
+    if let Some(d) = b.detail.as_deref() {
+        let d = d.trim();
+        if !d.is_empty() {
+            text.push_str(" \u{00B7} ");
+            text.push_str(d);
+        }
+    }
+    if let Some(s) = b.summary.as_deref() {
+        let s = s.trim();
+        if !s.is_empty() {
+            if b.status == BreadcrumbStatus::Failed {
+                text.push_str(" — failed: ");
+            } else {
+                text.push_str(" — ");
+            }
+            text.push_str(s);
+        }
+    }
+    json!({
+        "type": "AdaptiveCard",
+        "$schema": ADAPTIVE_CARD_SCHEMA,
+        "version": ADAPTIVE_CARD_VERSION,
+        "body": [{
+            "type": "TextBlock",
+            "text": text,
+            "size": "Small",
+            "color": color,
+            "isSubtle": true,
+            "wrap": true,
+        }],
+    })
+}
+
+/// Render a [`DiffCard`] as an Adaptive Card. Webex's subset doesn't
+/// render `CodeBlock` — we use monospace `TextBlock` per hunk.
+#[must_use]
+pub fn build_adaptive_diff(diff: &DiffCard) -> Value {
+    let totals = if diff.truncated {
+        format!("(+{} / -{} · truncated)", diff.added, diff.removed)
+    } else {
+        format!("(+{} / -{})", diff.added, diff.removed)
+    };
+    let mut body: Vec<Value> = Vec::with_capacity(1 + diff.hunks.len());
+    body.push(json!({
+        "type": "TextBlock",
+        "text": format!("**{}**  {totals}", diff.path),
+        "weight": "Bolder",
+        "wrap": true,
+    }));
+    for h in &diff.hunks {
+        let mut buf = String::with_capacity(64 + h.lines.len() * 64);
+        buf.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            h.old_start, h.old_lines, h.new_start, h.new_lines
+        ));
+        for line in &h.lines {
+            buf.push(line.kind.unified_prefix());
+            buf.push_str(&line.text);
+            buf.push('\n');
+        }
+        while buf.ends_with('\n') {
+            buf.pop();
+        }
+        body.push(json!({
+            "type": "TextBlock",
+            "text": buf,
+            "fontType": "Monospace",
+            "wrap": true,
+        }));
+    }
+    json!({
+        "type": "AdaptiveCard",
+        "$schema": ADAPTIVE_CARD_SCHEMA,
+        "version": ADAPTIVE_CARD_VERSION,
+        "body": body,
+    })
+}
+
+/// Render an [`ErrorCard`] as an Adaptive Card with an
+/// `attention`-styled top container + red header.
+#[must_use]
+pub fn build_adaptive_error(err: &ErrorCard) -> Value {
+    let kind_label = match err.kind {
+        ErrorCardKind::Internal => "tool",
+        ErrorCardKind::Provider => "provider",
+        ErrorCardKind::Delivery => "delivery",
+    };
+    let mut inner: Vec<Value> = Vec::with_capacity(4);
+    inner.push(json!({
+        "type": "TextBlock",
+        "text": format!("[ERROR: {kind_label}] {}", err.title.trim()),
+        "weight": "Bolder",
+        "color": "Attention",
+        "wrap": true,
+    }));
+    inner.push(json!({
+        "type": "TextBlock",
+        "text": err.summary.trim(),
+        "wrap": true,
+    }));
+    if let Some(d) = err.details.as_deref() {
+        let d = d.trim();
+        if !d.is_empty() {
+            inner.push(json!({
+                "type": "TextBlock",
+                "text": d,
+                "fontType": "Monospace",
+                "wrap": true,
+                "isSubtle": true,
+            }));
+        }
+    }
+    if err.retryable {
+        inner.push(json!({
+            "type": "TextBlock",
+            "text": "(will retry automatically)",
+            "size": "Small",
+            "isSubtle": true,
+            "wrap": true,
+        }));
+    }
+    json!({
+        "type": "AdaptiveCard",
+        "$schema": ADAPTIVE_CARD_SCHEMA,
+        "version": ADAPTIVE_CARD_VERSION,
+        "body": [{
+            "type": "Container",
+            "style": "attention",
+            "items": inner,
+        }],
+    })
+}
+
+/// Render a [`TodoList`] as an Adaptive Card. Webex's no-message-edit
+/// limitation means every list mutation emits a fresh card; the host
+/// tracks the new id but the user sees a new chip per update.
+#[must_use]
+pub fn build_adaptive_todo_list(list: &TodoList) -> Value {
+    let done = list.completed_count();
+    let total = list.items.len();
+    let in_prog = list.in_progress_count();
+    let pending = list.pending_count();
+    let mut body: Vec<Value> = Vec::with_capacity(2 + list.items.len());
+    body.push(json!({
+        "type": "TextBlock",
+        "text": format!("{} ({done}/{total})", list.title_or_default()),
+        "weight": "Bolder",
+        "wrap": true,
+    }));
+    for item in list.items.iter().take(48) {
+        let (glyph, color) = match item.status {
+            TodoItemStatus::Completed => ("[x]", "Good"),
+            TodoItemStatus::InProgress => ("[~]", "Warning"),
+            TodoItemStatus::Pending => ("[ ]", "Default"),
+        };
+        body.push(json!({
+            "type": "TextBlock",
+            "text": format!("{glyph} {}", item.text.trim()),
+            "color": color,
+            "wrap": true,
+            "spacing": "Small",
+        }));
+    }
+    body.push(json!({
+        "type": "TextBlock",
+        "text": format!("({done}/{total} done, {in_prog} in progress, {pending} pending)"),
+        "size": "Small",
+        "isSubtle": true,
+        "spacing": "Medium",
+        "wrap": true,
+    }));
+    json!({
+        "type": "AdaptiveCard",
+        "$schema": ADAPTIVE_CARD_SCHEMA,
+        "version": ADAPTIVE_CARD_VERSION,
+        "body": body,
+    })
+}
+
+/// Render a long-output expander as an Adaptive Card with
+/// `Action.ToggleVisibility` flipping a hidden container.
+#[must_use]
+pub fn build_adaptive_collapsible(text: &str, summary: &str, preview_lines: &[String]) -> Value {
+    let mut body: Vec<Value> = Vec::with_capacity(4);
+    body.push(json!({
+        "type": "TextBlock",
+        "text": summary.trim(),
+        "weight": "Bolder",
+        "wrap": true,
+    }));
+    if !preview_lines.is_empty() {
+        body.push(json!({
+            "type": "TextBlock",
+            "text": preview_lines.join("\n"),
+            "fontType": "Monospace",
+            "wrap": true,
+            "isSubtle": true,
+        }));
+    }
+    body.push(json!({
+        "type": "Container",
+        "id": "expander_full",
+        "isVisible": false,
+        "items": [{
+            "type": "TextBlock",
+            "text": text,
+            "fontType": "Monospace",
+            "wrap": true,
+        }],
+    }));
+    json!({
+        "type": "AdaptiveCard",
+        "$schema": ADAPTIVE_CARD_SCHEMA,
+        "version": ADAPTIVE_CARD_VERSION,
+        "body": body,
+        "actions": [{
+            "type": "Action.ToggleVisibility",
+            "title": "Show full output",
+            "targetElements": ["expander_full"],
+        }],
+    })
+}
+
+/// Render a [`ThinkingBlock`] as an Adaptive Card with a collapsed
+/// container + toggle action. Redacted blocks emit the placeholder
+/// — the raw blob NEVER reaches the wire.
+#[must_use]
+pub fn build_adaptive_thinking(t: &ThinkingBlock) -> Value {
+    let label = match t.model.as_deref() {
+        Some(m) if !m.trim().is_empty() => format!("_reasoning ({})_", m.trim()),
+        _ => "_reasoning_".to_string(),
+    };
+    let mut body: Vec<Value> = Vec::with_capacity(2);
+    body.push(json!({
+        "type": "TextBlock",
+        "text": label,
+        "size": "Small",
+        "color": "Accent",
+        "isSubtle": true,
+        "wrap": true,
+    }));
+    let inner_text = if t.redacted {
+        "(redacted reasoning)".to_string()
+    } else {
+        t.text.clone()
+    };
+    body.push(json!({
+        "type": "Container",
+        "id": "thinking_full",
+        "isVisible": false,
+        "items": [{
+            "type": "TextBlock",
+            "text": inner_text,
+            "wrap": true,
+            "isSubtle": true,
+        }],
+    }));
+    json!({
+        "type": "AdaptiveCard",
+        "$schema": ADAPTIVE_CARD_SCHEMA,
+        "version": ADAPTIVE_CARD_VERSION,
+        "body": body,
+        "actions": [{
+            "type": "Action.ToggleVisibility",
+            "title": "Show reasoning",
+            "targetElements": ["thinking_full"],
+        }],
+    })
 }
 
 fn attach_body_fields(

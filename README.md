@@ -325,9 +325,9 @@ iclaw wirings create --mg <messaging-group-id> --ag <agent-group-id> --engage al
 | Channel | Ingress | Egress | Notes |
 | --- | --- | --- | --- |
 | `cli` | stdin / FIFO | stdout / log file | Local REPL for development. |
-| `telegram` | webhook or long-poll | Bot API | Inbound attachment download (text, photo, audio, video, voice, doc) with size cap. |
-| `slack` | events API | Web API | HMAC-SHA256 signature verification, files v2 upload. |
-| `discord` | slim gateway | REST | Pure codec/lifecycle parsers; gateway intent `38_401`. |
+| `telegram` | webhook or long-poll | Bot API | Inbound attachment download (text, photo, audio, video, voice, doc) with size cap. Native `send_card` (MarkdownV2 + `inline_keyboard`); button taps round-trip as inbound chat. |
+| `slack` | events API | Web API | HMAC-SHA256 signature verification, files v2 upload. Native `send_card` (Block Kit `header` / `section` / `image` / `actions`); `block_actions` interactive payloads on the same webhook path round-trip button taps as inbound chat. |
+| `discord` | slim gateway | REST | Pure codec/lifecycle parsers; gateway intent `38_401`. Native `send_card` (embed + `ActionRow` buttons, chunked at 5 per row); `INTERACTION_CREATE` `MESSAGE_COMPONENT` taps round-trip as inbound chat with a fire-and-forget `DEFERRED_UPDATE_MESSAGE` ACK. |
 | `matrix` | `/sync` long-poll | Client-Server REST | Threads via `m.relates_to`; alias resolution cached. |
 | `teams` | change-notifications webhook | Graph REST | Validation handshake + constant-time `clientState` compare; channel-target files supported, chat-target files Unsupported (delegated-auth limit). |
 | `gchat` | HTTP push | REST v1 | `cardsV2` for cards; emoji shortcode map; two-step `attachments:upload` for files. |

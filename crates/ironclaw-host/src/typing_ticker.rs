@@ -325,6 +325,8 @@ mod tests {
                 channel_type: None,
                 thread_id: None,
                 source_session_id: None,
+                reply_to: None,
+                is_group: None,
             },
         )
         .unwrap();
@@ -538,6 +540,8 @@ mod tests {
                 channel_type: None,
                 thread_id: None,
                 source_session_id: None,
+                reply_to: None,
+                is_group: None,
             },
         )
         .unwrap();

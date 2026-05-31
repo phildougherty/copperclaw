@@ -131,6 +131,7 @@ toml               = "0.8"
 ignore             = "0.4"
 globset            = "0.4"
 regex              = "1"
+similar            = "2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -1,5 +1,23 @@
 # github channel audit
 
+## Native UI capabilities
+
+| Capability | Native | Notes |
+|---|---|---|
+| Chat (text) | yes | `POST /repos/:o/:r/issues/:n/comments` |
+| Auto-split long messages | no | no `max_message_chars()` override; GitHub Markdown comments have no practical cap |
+| Honour `Retry-After` | yes | `AdapterError::Rate { retry_after }` from `api.rs`; delivery loop reads it |
+| Typing indicator | no | trait default; GitHub has no typing concept (adapter.rs:106) |
+| Native cards (buttons/sections) | no | falls back via trait-default text render (GitHub Markdown only) |
+| Native breadcrumbs (tool chips) | fallback | trait-default `[tool]` text line |
+| Inbound reply_to context | no | router does not set `reply_to`; PR review threads use comment trees that aren't surfaced as replies in v1 |
+| Inbound group vs DM distinction | yes (always group) | `is_group: Some(true)` — every comment lives on a repo, no DM concept |
+| Edit messages | yes (via action) | `content.action = "edit"` → `PATCH comment`. Trait-level `edit_message` NOT overridden |
+| Reactions | yes (via action) | `content.action = "reaction"` with shortcode → GitHub slug (`+1`, `heart`, ...). Trait-level `add_reaction` NOT overridden |
+| Files / attachments | no | explicit `Unsupported` — GitHub API rejects binary uploads on issue comments (adapter.rs:181) |
+| Threading | no | `supports_threads() = false` (adapter.rs:102) |
+| Webhook secret verification | yes | HMAC-SHA256 over body, `X-Hub-Signature-256: sha256=<hex>` (signature.rs:69) |
+
 ## Implemented
 - deliver: COMPLETE — POST /repos/:o/:r/issues/:n/comments; edit /
   reaction via system-action shape. `crates/ironclaw-channels/github/src/adapter.rs:125`

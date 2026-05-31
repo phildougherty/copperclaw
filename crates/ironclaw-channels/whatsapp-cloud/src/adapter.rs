@@ -154,6 +154,11 @@ impl ChannelAdapter for WhatsappCloudAdapter {
         false
     }
 
+    /// Cloud API text messages cap at 4096 chars per send.
+    fn max_message_chars(&self) -> Option<usize> {
+        Some(4096)
+    }
+
     async fn set_typing(
         &self,
         platform_id: &str,

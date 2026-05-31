@@ -10,9 +10,13 @@ A scratchpad you control. Four tools — `todo_add`, `todo_list`,
 `/data/agent_todos.json` inside your container. Items survive runner
 restarts within the same session but never cross between sessions.
 
-This is for *your* benefit, not the user's. The user doesn't see your
-todos. You read them at the top of a turn so you don't forget where you
-are.
+This is for *your* benefit, not the user's. You read them at the top of
+a turn so you don't forget where you are. **However:** on channels that
+support it (Telegram, Slack, Discord, Google Chat, Matrix), the host
+also renders your todos to the user as a live, pinned checklist chip
+that edits in place on every mutation — so pick item text the user will
+appreciate seeing (imperative, specific). Avoid verbose internal-jargon
+items; the chip is the user's window into your plan.
 
 ## When to reach for it
 

@@ -72,6 +72,54 @@ pub struct Manifest {
     /// process runner as if a fresh inbound had arrived.
     #[serde(default)]
     pub trigger_sweep: bool,
+    /// Override the per-channel `max_message_chars` cap the harness's
+    /// wrapped `MockAdapter` reports. Keys are channel-type strings
+    /// (e.g. `"telegram"`); values are the cap in chars. Adapters
+    /// without an entry fall back to the harness's built-in defaults
+    /// (`telegram=4096`, `slack=40000`, `discord=2000`); other channel
+    /// types report `None` (splitter disabled — matches the trait
+    /// default). Used by the `*-long-message-split` fixtures to
+    /// exercise the chat-text splitter in the delivery loop.
+    #[serde(default)]
+    pub adapter_caps: BTreeMap<String, usize>,
+    /// Queue an adapter failure to fire on the next `deliver` call
+    /// before the harness drives any inbound. Each entry maps to one
+    /// `MockAdapter::fail_next_deliver` call on the named channel's
+    /// adapter. Used by `rate-limited-retry` to script a `Rate { retry_after }`
+    /// failure on the first delivery attempt.
+    #[serde(default)]
+    pub pre_delivery_failures: Vec<PreDeliveryFailure>,
+    /// When `Some(ms)`, after the per-step delivery pass the harness
+    /// sleeps the given milliseconds and then re-runs
+    /// `DeliveryService::process_session_once` for the same session.
+    /// Lets fixtures pin "row was deferred on first tick, delivered on
+    /// the second tick after waiting `retry_after`" without poking at
+    /// `DeliveryService`'s private retry state. Default `None`
+    /// (one delivery pass per inbound, the legacy behaviour).
+    #[serde(default)]
+    pub redrive_after_ms: Option<u64>,
+}
+
+/// Script one `MockAdapter::fail_next_deliver` call. `kind` decides the
+/// `AdapterError` variant:
+///
+/// - `"rate"` — `AdapterError::Rate { retry_after }` (in seconds; `None`
+///   when omitted).
+/// - `"transport"` — `AdapterError::Transport(message_or_default)`.
+/// - `"bad_request"` — `AdapterError::BadRequest(message_or_default)`.
+///
+/// Failures are queued in FIFO order on the named channel's adapter,
+/// matching the [`MockAdapter::fail_next_deliver`](
+/// ironclaw_channels_core::testing::MockAdapter::fail_next_deliver)
+/// contract.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PreDeliveryFailure {
+    pub channel: String,
+    pub kind: String,
+    #[serde(default)]
+    pub retry_after: Option<u64>,
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 /// One scripted response from the harness's LLM stub. `kind` decides what

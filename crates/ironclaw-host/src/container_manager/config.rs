@@ -90,6 +90,12 @@ pub struct ManagerConfig {
     pub default_provider: String,
     /// Default model id.
     pub default_model: String,
+    /// Default reasoning-effort tier (`low`/`medium`/`high`). Read from
+    /// `IRONCLAW_DEFAULT_EFFORT` at boot. `None` (or `Medium`) means
+    /// "use the model's default" and emits no `reasoning.effort`
+    /// field on the wire. `OpenRouter` / `DeepSeek` R1 / `OpenAI` o-series
+    /// honour `low`/`high` to budget more or less chain-of-thought.
+    pub default_effort: Option<ironclaw_types::Effort>,
     /// `ANTHROPIC_API_KEY` value the runner inside the container will
     /// see. Read from the host's process env at boot.
     pub anthropic_api_key: Option<String>,

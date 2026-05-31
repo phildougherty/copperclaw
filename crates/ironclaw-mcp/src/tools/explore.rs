@@ -81,14 +81,26 @@ struct Input {
 pub fn schema() -> Tool {
     make_tool(
         "explore",
-        "Open a lightweight in-process subagent to research a specific question. \
+        "Open a lightweight in-process subagent to research a SPECIFIC, NARROW question. \
          The subagent runs a bounded LLM tool-use loop (default 5 turns, 50_000 \
-         input-token budget, 60s wall-clock, read-only tools only) and returns \
-         a single summary string. Use this when a question requires reading 3+ \
-         files or running 2+ search queries — it shields the parent's context \
-         from the intermediate exploration. The `task` field must be \
-         self-contained; the subagent does not see the parent's conversation \
-         history.",
+         CUMULATIVE input-token budget across all turns, 60s wall-clock, read-only \
+         tools only) and returns a single summary string. It shields the parent's \
+         context from the intermediate exploration. The `task` field must be \
+         self-contained; the subagent does not see the parent's conversation history.\n\n\
+         **When to use `explore` vs `create_agent`:**\n\
+         - `explore` is for QUICK in-process lookups: 'find the function that handles \
+         X in this codebase', 'fetch /api/version and tell me the schema', 'what does \
+         the README say about Y'. Single-focus, 1-3 tool calls expected.\n\
+         - `create_agent` is for SUBSTANTIVE PARALLEL RESEARCH: 'research market trends, \
+         user pain points, and competitive landscape in parallel'. Each child agent gets \
+         its own ~200k token budget, full tool access, and a dedicated container — none \
+         of explore's constraints apply.\n\n\
+         **Budget caveat:** the 50k token budget is CUMULATIVE input tokens across all \
+         subagent turns. Each turn replays the full prior history + tool results, so a \
+         single fetch of a large page (e.g. a JS-heavy SPA homepage) can consume a \
+         disproportionate share of the budget when repeated in subsequent turns' context. \
+         For multi-source research, prefer `create_agent` (each child has its own fresh \
+         budget) over one `explore` with many fetches.",
         serde_json::json!({
             "type": "object",
             "additionalProperties": false,

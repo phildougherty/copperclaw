@@ -47,15 +47,25 @@ const SHELL_MAX_TIMEOUT_SECS: u64 = 600;
 const READ_FILE_CAP: usize = 128 * 1024;
 /// Default timeout for `web_fetch`.
 const WEB_FETCH_DEFAULT_TIMEOUT_SECS: u64 = 30;
-/// Max body bytes `web_fetch` will surface to the model. 32 KiB of
-/// markdown-extracted text is enough context for the model to
-/// understand a page; if it needs more, it can `web_fetch` again with
-/// a different URL or strategy.
+/// Max body bytes `web_fetch` will surface to the model. 16 KiB of
+/// markdown-extracted text (~4k tokens) is enough context for the
+/// model to understand a page; if it needs more, it can `web_fetch`
+/// again with a different URL or strategy.
 ///
 /// Tool results live in conversation history forever until compaction;
 /// size is the dominant cost. Aggressive caps are correctness, not
 /// just optimization — Sonnet produces malformed JSON at high context.
-const WEB_FETCH_CAP: usize = 32 * 1024;
+///
+/// Reduced from 32 KiB → 16 KiB on 2026-05-24 after a Telegram session
+/// asked for parallel F1 research and the model launched an `explore`
+/// subagent that fetched the F1 homepage (JS-heavy SPA → ~30 KiB of
+/// markdown-converted bundle text). One fetch's result, accumulated
+/// across 3 explore-loop turns of identical history replay, consumed
+/// the entire 60k token budget and the subagent stopped with
+/// `token budget exceeded` having done effectively zero research. At
+/// 16 KiB / ~4k tokens per fetch, the same budget supports ~6
+/// real fetches before exhaustion.
+const WEB_FETCH_CAP: usize = 16 * 1024;
 /// Default path of the per-session shell state file. The container
 /// runtime bind-mounts the session's host directory at `/data`, so
 /// the state file is automatically scoped to a single session — no
@@ -642,6 +652,7 @@ pub mod write_file {
         json, parse_args, success_json, CallToolResult, Deserialize, JsonObject,
         PathBuf, Tool, ToolEntry, ToolError, ToolHandler,
     };
+    use crate::tools::diff_util::{build_blob_card, build_diff_card, over_blob_cutoff};
 
     #[derive(Debug, Deserialize)]
     struct Input {
@@ -677,7 +688,7 @@ pub mod write_file {
 
     pub async fn handle(
         arguments: Option<JsonObject>,
-        _ctx: &dyn crate::context::ToolContext,
+        ctx: &dyn crate::context::ToolContext,
     ) -> Result<CallToolResult, ToolError> {
         let input: Input = parse_args(arguments)?;
         let path = PathBuf::from(&input.path);
@@ -694,7 +705,33 @@ pub mod write_file {
                 }
             }
         }
+        // Snapshot the pre-write content when this is an *overwrite*
+        // (not append, not first write) and the file is small enough
+        // to diff safely. The blob-cutoff check is on the new content
+        // size too — if the model is overwriting a 50 KB source with
+        // a 5 MB binary blob we don't want to read either side.
+        // `before_content` is None when (a) `append == true`, (b) the
+        // file didn't exist, or (c) either side is over the blob
+        // cutoff. The diff-card emit path uses that signal directly.
+        let new_size = input.content.len() as u64;
+        let new_content = input.content.clone();
         let bytes = input.content.into_bytes();
+        let before_content: Option<(String, u64)> = if input.append {
+            None
+        } else {
+            match tokio::fs::metadata(&path).await {
+                Ok(m) if m.is_file() => {
+                    let prev_size = m.len();
+                    if over_blob_cutoff(prev_size, new_size) {
+                        // Defer to the BlobReplaced path below.
+                        Some((String::new(), prev_size))
+                    } else {
+                        tokio::fs::read_to_string(&path).await.ok().map(|s| (s, prev_size))
+                    }
+                }
+                _ => None,
+            }
+        };
         if input.append {
             use tokio::io::AsyncWriteExt;
             let mut f = tokio::fs::OpenOptions::new()
@@ -718,6 +755,20 @@ pub mod write_file {
             tokio::fs::write(&path, &bytes).await.map_err(|e| {
                 ToolError::Internal(format!("write_file({}): {e}", path.display()))
             })?;
+        }
+        // Diff-card emit happens only for non-append overwrites where
+        // we snapshotted the prior content (or stubbed it under the
+        // blob-cutoff path). Pure new-file writes and append-mode
+        // writes intentionally skip the card — there is no "before"
+        // worth showing in either case.
+        if let Some((before, before_size)) = before_content {
+            let display = path.display().to_string();
+            if over_blob_cutoff(before_size, new_size) {
+                ctx.emit_diff(build_blob_card(&display, before_size, new_size))
+                    .await;
+            } else if let Some(card) = build_diff_card(&display, &before, &new_content) {
+                ctx.emit_diff(card).await;
+            }
         }
         Ok(success_json(&json!({
             "path": path.display().to_string(),
@@ -774,7 +825,7 @@ pub mod web_fetch {
     pub fn schema() -> Tool {
         super::make_tool(
             "web_fetch",
-            "Fetch an HTTP(S) URL. Defaults to GET; pass `method: POST` and `body` for posts. HTML responses are automatically converted to markdown to save context — pass `raw: true` to receive the original bytes. Response body is capped at 32 KiB. Returns `status`, `content_type`, `size_bytes`, and `body`; full response headers are not surfaced — if you need them, use `shell` with `curl -I`.",
+            "Fetch an HTTP(S) URL. Defaults to GET; pass `method: POST` and `body` for posts. HTML responses are automatically converted to markdown to save context — pass `raw: true` to receive the original bytes. **Response body is capped at 16 KiB (~4k tokens)** to keep one fetch from eating an entire subagent's budget; if the response was truncated, `truncated: true` is set in the result. For full-page extraction beyond the cap, use `shell` with `curl` and pipe through `head -c` / `grep` for the specific section you need. Returns `status`, `content_type`, `size_bytes`, `truncated`, and `body`; full response headers are not surfaced — for those use `shell` with `curl -I`.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -1515,11 +1566,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn web_fetch_caps_body_at_32k() {
-        // Regression guard: the cap is 32 KiB, not 256 KiB. A 64 KiB
-        // JSON payload must come back truncated.
+    async fn web_fetch_caps_body_at_16k() {
+        // Regression guard: the cap is 16 KiB (lowered from 32 on
+        // 2026-05-24 — see `WEB_FETCH_CAP` rationale). A 32 KiB JSON
+        // payload must come back truncated.
         let server = wiremock::MockServer::start().await;
-        let big = "x".repeat(64 * 1024);
+        let big = "x".repeat(32 * 1024);
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/big"))
             .respond_with(
@@ -1541,8 +1593,8 @@ mod tests {
         .unwrap();
         let body = result_text(&res);
         assert!(body.contains("\"truncated\": true"), "got: {body}");
-        // The raw size header should still report the full 64 KiB.
-        assert!(body.contains("\"size_bytes\": 65536"), "got: {body}");
+        // The raw size header should still report the full 32 KiB.
+        assert!(body.contains("\"size_bytes\": 32768"), "got: {body}");
     }
 
     #[tokio::test]
@@ -1635,6 +1687,123 @@ mod tests {
         }
         let got = std::fs::read_to_string(&path).unwrap();
         assert_eq!(got, "one\ntwo\n");
+    }
+
+    /// Append-mode writes intentionally skip the diff-card emit —
+    /// there's no meaningful "before" to compare against (we're
+    /// adding bytes, not editing them) and the breadcrumb already
+    /// tells the user *what tool* ran.
+    #[tokio::test]
+    async fn write_file_append_does_not_emit_diff_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("log.txt");
+        let mock = std::sync::Arc::new(crate::context::MockToolContext::new());
+        write_file::handle(
+            Some(
+                json!({
+                    "path": path.to_string_lossy(),
+                    "content": "hello\n",
+                    "append": true,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            mock.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert!(mock.diff_calls().is_empty());
+    }
+
+    /// First-write (target doesn't exist) intentionally skips the
+    /// diff-card emit — there's no "before" file to diff against.
+    #[tokio::test]
+    async fn write_file_first_write_does_not_emit_diff_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.rs");
+        let mock = std::sync::Arc::new(crate::context::MockToolContext::new());
+        write_file::handle(
+            Some(
+                json!({
+                    "path": path.to_string_lossy(),
+                    "content": "fn main() {}\n",
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            mock.as_ref(),
+        )
+        .await
+        .unwrap();
+        assert!(mock.diff_calls().is_empty());
+    }
+
+    /// Overwriting an existing file with new content emits exactly
+    /// one DiffCard via `ctx.emit_diff` carrying the structured diff
+    /// of before-vs-after.
+    #[tokio::test]
+    async fn write_file_overwrite_emits_diff_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.rs");
+        std::fs::write(&path, "fn old() {}\n").unwrap();
+
+        let mock = std::sync::Arc::new(crate::context::MockToolContext::new());
+        write_file::handle(
+            Some(
+                json!({
+                    "path": path.to_string_lossy(),
+                    "content": "fn new() {}\n",
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            mock.as_ref(),
+        )
+        .await
+        .unwrap();
+        let diffs = mock.diff_calls();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].added, 1);
+        assert_eq!(diffs[0].removed, 1);
+        assert_eq!(diffs[0].language.as_deref(), Some("rust"));
+    }
+
+    /// Overwriting a > 256 KB blob trips the cutoff and emits a
+    /// `BlobReplaced` summary card (rendered as a single-line
+    /// `DiffCard` with `truncated = true`) instead of a full diff.
+    #[tokio::test]
+    async fn write_file_overwrite_over_blob_cutoff_emits_blob_card() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.bin");
+        let big = "x".repeat(300 * 1024);
+        std::fs::write(&path, &big).unwrap();
+
+        let mock = std::sync::Arc::new(crate::context::MockToolContext::new());
+        let new_content = "y".repeat(300 * 1024);
+        write_file::handle(
+            Some(
+                json!({
+                    "path": path.to_string_lossy(),
+                    "content": new_content,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            mock.as_ref(),
+        )
+        .await
+        .unwrap();
+        let diffs = mock.diff_calls();
+        assert_eq!(diffs.len(), 1);
+        assert!(diffs[0].truncated);
+        assert_eq!(diffs[0].added, 0);
+        assert_eq!(diffs[0].removed, 0);
+        let summary = &diffs[0].hunks[0].lines[0].text;
+        assert!(summary.contains("diff suppressed"), "got: {summary}");
     }
 
     #[tokio::test]

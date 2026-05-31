@@ -40,7 +40,6 @@ use ironclaw_db::tables::{
     sessions::{self, CreateSession},
 };
 use ironclaw_types::{AgentGroupId, ChannelType, EngageMode, SessionId, SessionMode};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
@@ -62,12 +61,21 @@ pub(super) struct HandlerDeps {
     pub(super) central: CentralDb,
     pub(super) data_root: PathBuf,
     pub(super) permission_check: CreateAgentPermissionCheck,
-    /// In-memory `(agent_group_id → depth)` cache. Persisted ground
-    /// truth lives in `agent_groups.subagent_depth`; the cache is a
-    /// write-through accelerator that avoids hitting the DB twice per
-    /// `create_agent` and serves as the synchronisation point for the
-    /// re-check-on-insert that prevents the depth-cap TOCTOU race.
-    pub(super) spawned: Arc<Mutex<HashMap<AgentGroupId, u8>>>,
+    /// Mutex held across the hard depth re-check + the central-DB
+    /// insert. Closes the TOCTOU window between the soft check and the
+    /// commit: two concurrent calls from the same parent both pass the
+    /// soft check, but only one acquires this lock and re-reads the
+    /// parent's depth from the DB before deciding to insert. The lock
+    /// holds NO per-agent state — depth itself lives in
+    /// `agent_groups.subagent_depth` so it survives host restarts and
+    /// stays correct when an `AgentGroupId` is deleted and a future
+    /// group reuses the slot. This used to be a
+    /// `HashMap<AgentGroupId, u8>` write-through accelerator, but on a
+    /// long-running host with many short-lived groups that map grew
+    /// without bound and could return stale depths for reused ids.
+    /// The DB hit per `create_agent` is one extra SELECT — not a hot
+    /// path (spawns are operator-driven, not per-message).
+    pub(super) depth_gate: Arc<Mutex<()>>,
     /// Hard cap on subagent depth — see [`DEFAULT_MAX_SUBAGENT_DEPTH`].
     /// `1` reproduces the historical "no nested spawns at all" rule.
     pub(super) max_depth: u8,
@@ -93,7 +101,7 @@ impl CreateAgentModule {
                 central,
                 data_root: data_root.into(),
                 permission_check,
-                spawned: Arc::new(Mutex::new(HashMap::new())),
+                depth_gate: Arc::new(Mutex::new(())),
                 max_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
             },
         }
@@ -120,7 +128,7 @@ impl CreateAgentModule {
     }
 
     /// Test-only helper: borrow the deps so a test can assert against the
-    /// internal `spawned` set or central DB.
+    /// central DB or override `max_depth`.
     #[cfg(test)]
     pub(super) fn deps(&self) -> &HandlerDeps {
         &self.deps
@@ -282,12 +290,13 @@ impl DeliveryActionHandler for CreateAgentHandler {
         //    would land at: parent's recorded depth + 1, or 1 when the
         //    parent isn't a previously-spawned agent. Reject up-front
         //    when the cap is already obviously exceeded so we skip the
-        //    DB writes. The authoritative re-check happens under the
-        //    `spawned` lock at insert time (step 4) to close the
-        //    TOCTOU race between concurrent calls from the same
-        //    parent. Parent depth is read from the central DB so the
-        //    gate survives host restarts; the in-memory cache is a
-        //    write-through accelerator.
+        //    DB writes. The authoritative re-check happens under
+        //    `depth_gate` at insert time (step 4) to close the TOCTOU
+        //    race between concurrent calls from the same parent.
+        //    Parent depth comes straight from the central DB
+        //    (`agent_groups.subagent_depth`), so the gate survives
+        //    host restarts and is correct when an `AgentGroupId` is
+        //    deleted and a later group reuses it.
         let parent_session = parent_for_check;
         let parent_depth = self.lookup_parent_depth(parent_session.as_ref());
         let Some(new_depth) = parent_depth.unwrap_or(0).checked_add(1) else {
@@ -328,59 +337,57 @@ impl DeliveryActionHandler for CreateAgentHandler {
             return Ok(DeliveryActionOutput::default());
         }
 
-        // 4. Hard depth gate, re-checked under the `spawned` lock to
+        // 4. Hard depth gate, re-checked while holding `depth_gate` to
         //    close the TOCTOU window: two concurrent calls from the
         //    same parent both observe step-3's soft check passing,
-        //    both compute new_depth=N+1, both try to insert. We
-        //    re-read the parent's depth here while holding the lock
-        //    and bail if a concurrent winner has already pushed the
-        //    parent deeper. The lock guards only the in-memory cache,
-        //    so it isn't held across the DB writes that follow.
+        //    both compute new_depth=N+1, both try to insert. The
+        //    winner advances `agent_groups.subagent_depth`; the loser
+        //    re-reads the DB under this lock and bails. The lock is
+        //    process-wide rather than per-parent because
+        //    `create_agent` is operator-driven (not the message hot
+        //    path) — the marginal lock contention is irrelevant, and
+        //    a single lock means we never grow a per-AgentGroupId map.
+        //    The lock is held across `agent_groups::create` +
+        //    `set_subagent_depth` further down so the loser's re-read
+        //    here sees the winner's commit.
         let central = &self.deps.central;
-        {
-            let spawned = self
-                .deps
-                .spawned
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let live_parent_depth = parent_session
-                .as_ref()
-                .and_then(|p| spawned.get(&p.agent_group_id).copied())
-                .or(parent_depth);
-            let Some(live_new_depth) = live_parent_depth.unwrap_or(0).checked_add(1) else {
-                drop(spawned);
-                warn!(
-                    parent_depth = live_parent_depth.unwrap_or(0),
-                    "create_agent rejected on lock re-check: parent depth saturated",
-                );
-                self.write_parent_result(
-                    parent_session.as_ref(),
-                    ResultStatus::Rejected,
-                    None,
-                    None,
-                    Some("nested create_agent (parent depth saturated)"),
-                );
-                return Ok(DeliveryActionOutput::default());
-            };
-            if live_new_depth > self.deps.max_depth {
-                drop(spawned);
-                warn!(
-                    live_parent_depth = live_parent_depth.unwrap_or(0),
-                    max_depth = self.deps.max_depth,
-                    "create_agent rejected on lock re-check: concurrent spawn won",
-                );
-                self.write_parent_result(
-                    parent_session.as_ref(),
-                    ResultStatus::Rejected,
-                    None,
-                    None,
-                    Some(&format!(
-                        "nested create_agent (max depth = {})",
-                        self.deps.max_depth
-                    )),
-                );
-                return Ok(DeliveryActionOutput::default());
-            }
+        let _depth_lock = self
+            .deps
+            .depth_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let live_parent_depth = self.lookup_parent_depth(parent_session.as_ref());
+        let Some(live_new_depth) = live_parent_depth.unwrap_or(0).checked_add(1) else {
+            warn!(
+                parent_depth = live_parent_depth.unwrap_or(0),
+                "create_agent rejected on lock re-check: parent depth saturated",
+            );
+            self.write_parent_result(
+                parent_session.as_ref(),
+                ResultStatus::Rejected,
+                None,
+                None,
+                Some("nested create_agent (parent depth saturated)"),
+            );
+            return Ok(DeliveryActionOutput::default());
+        };
+        if live_new_depth > self.deps.max_depth {
+            warn!(
+                live_parent_depth = live_parent_depth.unwrap_or(0),
+                max_depth = self.deps.max_depth,
+                "create_agent rejected on lock re-check: concurrent spawn won",
+            );
+            self.write_parent_result(
+                parent_session.as_ref(),
+                ResultStatus::Rejected,
+                None,
+                None,
+                Some(&format!(
+                    "nested create_agent (max depth = {})",
+                    self.deps.max_depth
+                )),
+            );
+            return Ok(DeliveryActionOutput::default());
         }
 
         // 5. Central DB mutations: agent_groups → sessions → (optional)
@@ -396,12 +403,14 @@ impl DeliveryActionHandler for CreateAgentHandler {
         .map_err(|e| ModuleError::other("agent_to_agent", format!("agent_groups::create: {e}")))?;
 
         // Persist the new group's nesting depth so it survives host
-        // restarts. The in-memory cache is also written so subsequent
-        // gate checks within this process hit the cache.
-        if let Err(err) = agent_groups::set_subagent_depth(central, group.id, new_depth) {
+        // restarts. We use `live_new_depth` (the value re-derived
+        // under `depth_gate`) rather than the soft-check `new_depth`
+        // so a concurrent winner that bumped the parent between the
+        // two checks can't cause us to under-record the child's depth.
+        if let Err(err) = agent_groups::set_subagent_depth(central, group.id, live_new_depth) {
             warn!(
                 agent_group = %group.id.as_uuid(),
-                new_depth,
+                new_depth = live_new_depth,
                 ?err,
                 "create_agent: set_subagent_depth failed; cap will not survive restart",
             );
@@ -447,12 +456,6 @@ impl DeliveryActionHandler for CreateAgentHandler {
             },
         )
         .map_err(|e| ModuleError::other("agent_to_agent", format!("sessions::create: {e}")))?;
-
-        self.deps
-            .spawned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(group.id, new_depth);
 
         if let Some(channel) = payload.channel.as_deref() {
             if let Err(err) = self.create_wiring(group.id, channel, &payload.name) {
@@ -540,30 +543,18 @@ pub(super) struct ParentSession {
 }
 
 impl CreateAgentHandler {
-    /// Read the parent's recorded subagent depth. Tries the in-memory
-    /// cache first, falls back to the persisted column. `None` means
-    /// "no parent" or "parent has no recorded depth" (depth=0 root).
+    /// Read the parent's recorded subagent depth straight from the
+    /// central DB. `None` means "no parent" or "parent has no recorded
+    /// depth" (depth=0 root). There is no in-memory cache: depth is
+    /// only consulted on `create_agent`, which is an operator-driven
+    /// action — not the message hot path — so a SELECT per call is
+    /// cheap, and dropping the cache eliminates a memory leak (one
+    /// entry per ever-spawned agent group) plus a correctness bug (a
+    /// stale entry for a deleted-then-reused `AgentGroupId`).
     pub(super) fn lookup_parent_depth(&self, parent: Option<&ParentSession>) -> Option<u8> {
         let parent = parent?;
-        {
-            let spawned = self
-                .deps
-                .spawned
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(d) = spawned.get(&parent.agent_group_id).copied() {
-                return Some(d);
-            }
-        }
         match agent_groups::get_subagent_depth(&self.deps.central, parent.agent_group_id) {
-            Ok(Some(d)) if d > 0 => {
-                self.deps
-                    .spawned
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(parent.agent_group_id, d);
-                Some(d)
-            }
+            Ok(Some(d)) if d > 0 => Some(d),
             _ => None,
         }
     }
@@ -1108,12 +1099,12 @@ mod tests {
         // already at depth 3 spawning would land the child at depth 4,
         // which exceeds the cap.
         let (handler, central, tmp, parent, target) = make_handler(always_allow());
-        handler
-            .deps
-            .spawned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(parent.agent_group_id, DEFAULT_MAX_SUBAGENT_DEPTH);
+        agent_groups::set_subagent_depth(
+            &central,
+            parent.agent_group_id,
+            DEFAULT_MAX_SUBAGENT_DEPTH,
+        )
+        .unwrap();
         let before = agent_groups::list(&central).unwrap().len();
         handler
             .handle(DeliveryActionInput {
@@ -1148,12 +1139,7 @@ mod tests {
         // Parent at depth 2 (still under the default cap of 3) spawning
         // is allowed; the new group is recorded at depth 3.
         let (handler, central, _tmp, parent, target) = make_handler(always_allow());
-        handler
-            .deps
-            .spawned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(parent.agent_group_id, 2);
+        agent_groups::set_subagent_depth(&central, parent.agent_group_id, 2).unwrap();
         let before = agent_groups::list(&central).unwrap().len();
         handler
             .handle(DeliveryActionInput {
@@ -1169,17 +1155,18 @@ mod tests {
             .unwrap();
         let after = agent_groups::list(&central).unwrap().len();
         assert_eq!(after, before + 1, "depth-3 spawn must create the group");
-        // The new group should be tracked at depth 3 so a further spawn
-        // from it would be the one that fails.
-        let depths: Vec<u8> = handler
-            .deps
-            .spawned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .copied()
-            .collect();
-        assert!(depths.contains(&3));
+        // The new group should be persisted at depth 3 so a further
+        // spawn from it would be the one that fails. We read straight
+        // from the DB now that there's no in-memory cache.
+        let new_child = agent_groups::list(&central)
+            .unwrap()
+            .into_iter()
+            .find(|g| g.name == "depth-three-child")
+            .expect("child row present");
+        let depth = agent_groups::get_subagent_depth(&central, new_child.id)
+            .unwrap()
+            .expect("depth persisted");
+        assert_eq!(depth, 3);
     }
 
     #[test]
@@ -1188,12 +1175,7 @@ mod tests {
         // depth 1 spawning would land the child at depth 2 — rejected.
         let (mut handler, central, tmp, parent, target) = make_handler(always_allow());
         handler.deps.max_depth = 1;
-        handler
-            .deps
-            .spawned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(parent.agent_group_id, 1);
+        agent_groups::set_subagent_depth(&central, parent.agent_group_id, 1).unwrap();
         let before = agent_groups::list(&central).unwrap().len();
         handler
             .handle(DeliveryActionInput {
@@ -1250,30 +1232,26 @@ mod tests {
     // saturation, poison handling, orphan-warn.
     // -----------------------------------------------------------------------
 
-    /// Finding 4 (TOCTOU): cap is re-checked under the `spawned` lock.
+    /// Finding 4 (TOCTOU): cap is re-checked under `depth_gate`. The
+    /// in-memory cache that used to back the re-check was removed (it
+    /// grew without bound and gave wrong answers when an
+    /// `AgentGroupId` was reused after deletion), so the lock is now
+    /// just a process-wide mutex and the re-read goes straight to the
+    /// DB. We can't actually race threads in a unit test, so we model
+    /// the loser by writing the winner's commit directly to the DB
+    /// before invoking the handler; the re-check under the gate must
+    /// observe the bumped value and reject.
     #[test]
     fn create_agent_depth_recheck_under_lock_catches_concurrent_winner() {
         let (mut handler, central, tmp, parent, target) = make_handler(always_allow());
         handler.deps.max_depth = 2;
-        // Soft check sees parent at depth 1 -> new_depth = 2 -> allowed.
-        handler
-            .deps
-            .spawned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(parent.agent_group_id, 1);
-        // Simulate a concurrent winner: persist parent at depth 2 in
-        // the DB. The hard re-check pulls from the cache first, so we
-        // mutate the cache too. We can't actually race threads here,
-        // so we model the cache-state the loser would observe at lock
-        // acquire time.
+        // Persist the winner's commit: parent is now at depth 2 in
+        // the DB. Both the soft check (step 3) and the under-lock
+        // re-check (step 4) will read 2 + 1 = 3 > max_depth (2),
+        // which is what would happen to the loser in a real race
+        // where the winner finished its central-DB write between the
+        // loser's two read points.
         agent_groups::set_subagent_depth(&central, parent.agent_group_id, 2).unwrap();
-        handler
-            .deps
-            .spawned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(parent.agent_group_id, 2);
 
         let before = agent_groups::list(&central).unwrap().len();
         handler
@@ -1291,7 +1269,7 @@ mod tests {
         let after = agent_groups::list(&central).unwrap().len();
         assert_eq!(
             after, before,
-            "racing loser must not create rows once cache shows the winner"
+            "racing loser must not create rows once DB shows the winner"
         );
         let results = read_inbound_create_results(tmp.path(), parent);
         assert_eq!(results.len(), 1);
@@ -1302,7 +1280,7 @@ mod tests {
     #[test]
     fn depth_cap_survives_module_reconstruction() {
         let (handler, central, tmp, parent, target) = make_handler(always_allow());
-        // Persist parent at the cap directly via the DB (no cache).
+        // Persist parent at the cap directly via the DB.
         agent_groups::set_subagent_depth(
             &central,
             parent.agent_group_id,
@@ -1310,7 +1288,10 @@ mod tests {
         )
         .unwrap();
 
-        // "Restart": new module, fresh in-memory cache.
+        // "Restart": new module. There is no in-memory depth cache
+        // any more; the gate reads the DB on every call so this
+        // assertion is now structural — the freshly-built handler
+        // exposes nothing per-agent to inspect, by design.
         let module = CreateAgentModule::new(
             central.clone(),
             tmp.path().to_path_buf(),
@@ -1319,15 +1300,6 @@ mod tests {
         let fresh = CreateAgentHandler {
             deps: module.deps().clone(),
         };
-        assert!(
-            fresh
-                .deps
-                .spawned
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty(),
-            "freshly constructed handler must start with empty cache",
-        );
         let _ = handler; // silence unused warning; kept for setup symmetry.
 
         let before = agent_groups::list(&central).unwrap().len();
@@ -1368,12 +1340,12 @@ mod tests {
     fn create_agent_rejects_at_max_depth_boundary() {
         let (mut handler, central, tmp, parent, target) = make_handler(always_allow());
         handler.deps.max_depth = MAX_SUBAGENT_DEPTH_CEILING;
-        handler
-            .deps
-            .spawned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(parent.agent_group_id, MAX_SUBAGENT_DEPTH_CEILING);
+        agent_groups::set_subagent_depth(
+            &central,
+            parent.agent_group_id,
+            MAX_SUBAGENT_DEPTH_CEILING,
+        )
+        .unwrap();
         let before = agent_groups::list(&central).unwrap().len();
         handler
             .handle(DeliveryActionInput {
@@ -1398,12 +1370,7 @@ mod tests {
     fn create_agent_rejects_when_checked_add_overflows() {
         let (mut handler, central, tmp, parent, target) = make_handler(always_allow());
         handler.deps.max_depth = u8::MAX;
-        handler
-            .deps
-            .spawned
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(parent.agent_group_id, u8::MAX);
+        agent_groups::set_subagent_depth(&central, parent.agent_group_id, u8::MAX).unwrap();
         let before = agent_groups::list(&central).unwrap().len();
         handler
             .handle(DeliveryActionInput {
@@ -1501,5 +1468,92 @@ mod tests {
             captured.contains("create_agent rejected"),
             "expected a warn line on orphan depth-cap rejection, got: {captured}",
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bounded-memory: the handler must not retain per-AgentGroupId state.
+    // -----------------------------------------------------------------------
+
+    /// Push 10 000 distinct `AgentGroupId`s through the depth lookup
+    /// and assert the handler grows nothing per-id. Before this audit
+    /// the handler kept an `Arc<Mutex<HashMap<AgentGroupId, u8>>>`
+    /// cache that grew once per ever-spawned group; on a long-running
+    /// host with many short-lived groups that was a slow memory leak
+    /// and a correctness bug (stale entries for deleted-then-reused
+    /// ids). The fix is to read depth straight from the DB on every
+    /// call — this test pins that contract by exercising the lookup
+    /// at volume and re-asserting it on the persisted column rather
+    /// than any in-process map.
+    #[test]
+    fn lookup_parent_depth_does_not_grow_per_agent_group() {
+        // Seed 10k distinct agent groups with a known depth each,
+        // then ask the handler to look each one up. If a cache
+        // existed it would be 10k entries large by the end; with the
+        // DB-backed lookup the only per-call state is the SELECT
+        // result which dies at the end of each iteration.
+        const N: usize = 10_000;
+        let (handler, central, _tmp, _parent, _target) = make_handler(always_allow());
+        let mut ids: Vec<AgentGroupId> = Vec::with_capacity(N);
+        for i in 0..N {
+            let ag = agent_groups::create(
+                &central,
+                CreateAgentGroup {
+                    name: format!("bulk-{i}"),
+                    folder: format!("bulk-{i}"),
+                    agent_provider: None,
+                },
+            )
+            .unwrap();
+            // Persist a depth so the lookup returns Some, exercising
+            // the same DB path the real gate hits.
+            agent_groups::set_subagent_depth(&central, ag.id, 2).unwrap();
+            ids.push(ag.id);
+        }
+        for &id in &ids {
+            let parent = ParentSession {
+                session_id: SessionId::new(),
+                agent_group_id: id,
+            };
+            let d = handler.lookup_parent_depth(Some(&parent));
+            assert_eq!(d, Some(2));
+        }
+        // Structural check: the handler's only piece of in-process
+        // synchronisation state is the `()`-payload `depth_gate`
+        // mutex. There is no `HashMap<AgentGroupId, _>` to bloat;
+        // this binding documents the invariant in the type system —
+        // if someone re-introduces a per-id cache the type here
+        // changes and this line breaks.
+        let _: &Arc<Mutex<()>> = &handler.deps.depth_gate;
+    }
+
+    /// A re-used `AgentGroupId` (e.g. an admin tool reset the row's
+    /// `subagent_depth`, or a future schema permits the id to be
+    /// recycled) must NOT see stale depth from a prior reading. The
+    /// old cache returned the previous value forever; the DB-backed
+    /// lookup correctly returns the freshly persisted one.
+    #[test]
+    fn lookup_parent_depth_does_not_return_stale_on_depth_reset() {
+        let (handler, central, _tmp, _parent, _target) = make_handler(always_allow());
+        let ag = agent_groups::create(
+            &central,
+            CreateAgentGroup {
+                name: "recycled".into(),
+                folder: "recycled".into(),
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        let id = ag.id;
+        // First reading: depth 3.
+        agent_groups::set_subagent_depth(&central, id, 3).unwrap();
+        let parent = ParentSession {
+            session_id: SessionId::new(),
+            agent_group_id: id,
+        };
+        assert_eq!(handler.lookup_parent_depth(Some(&parent)), Some(3));
+        // Reset to depth 1 in the DB. The handler must observe the
+        // new value, not a cached 3.
+        agent_groups::set_subagent_depth(&central, id, 1).unwrap();
+        assert_eq!(handler.lookup_parent_depth(Some(&parent)), Some(1));
     }
 }

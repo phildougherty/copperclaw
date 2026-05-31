@@ -9,6 +9,9 @@ use crate::DbError;
 use chrono::{DateTime, Utc};
 use ironclaw_types::{AgentGroupId, ChannelType, MessagingGroupId, UserId};
 use rusqlite::{params, OptionalExtension, Row};
+// Note: the primary key is `(channel_type, platform_id)` per migration
+// `001_initial.sql`, which is exactly what we target in the ON CONFLICT
+// clause below so the upsert collapses to one atomic statement.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnregisteredSender {
@@ -75,76 +78,60 @@ fn row_to_unregistered_sender(row: &Row<'_>) -> rusqlite::Result<UnregisteredSen
     })
 }
 
-/// First-seen insert; subsequent calls increment `message_count` and update `last_seen`.
+/// First-seen insert; subsequent calls increment `message_count` and
+/// update `last_seen`.
+///
+/// Implemented as a single atomic `INSERT ... ON CONFLICT DO UPDATE`
+/// against the `(channel_type, platform_id)` primary key. The previous
+/// SELECT-then-`INSERT`/`UPDATE` shape raced when two concurrent
+/// first-time inbounds for the same sender hit the pooled writer at
+/// once — both observed missing row, both `INSERT`ed, the loser
+/// bubbled a `UNIQUE` violation and the router dead-lettered the
+/// inbound. The atomic form turns the race into a deterministic
+/// increment.
 pub fn upsert(db: &CentralDb, req: UpsertUnregisteredSender) -> Result<UnregisteredSender, DbError> {
+    // Destructure once so the SQL bindings are obviously moves (instead
+    // of looking like field reads on an owned value clippy can't tell
+    // are consumed). Keeps the existing public-API by-value signature.
+    let UpsertUnregisteredSender {
+        channel_type,
+        platform_id,
+        user_id,
+        sender_name,
+        reason,
+        messaging_group_id,
+        agent_group_id,
+    } = req;
     let conn = db.conn()?;
     let now = Utc::now();
-    let existing: Option<i64> = conn
-        .query_row(
-            "SELECT message_count FROM unregistered_senders
-             WHERE channel_type = ?1 AND platform_id = ?2",
-            params![req.channel_type.as_str(), req.platform_id],
-            |r| r.get(0),
-        )
-        .optional()?;
-
-    if existing.is_some() {
-        conn.execute(
-            "UPDATE unregistered_senders
-             SET user_id = COALESCE(?1, user_id),
-                 sender_name = COALESCE(?2, sender_name),
-                 reason = ?3,
-                 messaging_group_id = COALESCE(?4, messaging_group_id),
-                 agent_group_id = COALESCE(?5, agent_group_id),
-                 message_count = message_count + 1,
-                 last_seen = ?6
-             WHERE channel_type = ?7 AND platform_id = ?8",
-            params![
-                req.user_id.map(|u| u.as_uuid().to_string()),
-                req.sender_name,
-                req.reason,
-                req.messaging_group_id.map(|m| m.as_uuid().to_string()),
-                req.agent_group_id.map(|a| a.as_uuid().to_string()),
-                now.to_rfc3339(),
-                req.channel_type.as_str(),
-                req.platform_id,
-            ],
-        )?;
-        drop(conn);
-        return get(db, &req.channel_type, &req.platform_id)?.ok_or_else(|| {
-            DbError::invariant("unregistered_senders row missing immediately after upsert")
-        });
-    }
-
     conn.execute(
         "INSERT INTO unregistered_senders
            (channel_type, platform_id, user_id, sender_name, reason,
             messaging_group_id, agent_group_id, message_count,
             first_seen, last_seen)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?8)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?8)
+         ON CONFLICT(channel_type, platform_id) DO UPDATE SET
+           user_id            = COALESCE(excluded.user_id, user_id),
+           sender_name        = COALESCE(excluded.sender_name, sender_name),
+           reason             = excluded.reason,
+           messaging_group_id = COALESCE(excluded.messaging_group_id, messaging_group_id),
+           agent_group_id     = COALESCE(excluded.agent_group_id, agent_group_id),
+           message_count      = message_count + 1,
+           last_seen          = excluded.last_seen",
         params![
-            req.channel_type.as_str(),
-            req.platform_id,
-            req.user_id.map(|u| u.as_uuid().to_string()),
-            req.sender_name,
-            req.reason,
-            req.messaging_group_id.map(|m| m.as_uuid().to_string()),
-            req.agent_group_id.map(|a| a.as_uuid().to_string()),
+            channel_type.as_str(),
+            platform_id,
+            user_id.map(|u| u.as_uuid().to_string()),
+            sender_name,
+            reason,
+            messaging_group_id.map(|m| m.as_uuid().to_string()),
+            agent_group_id.map(|a| a.as_uuid().to_string()),
             now.to_rfc3339(),
         ],
     )?;
-    Ok(UnregisteredSender {
-        channel_type: req.channel_type,
-        platform_id: req.platform_id,
-        user_id: req.user_id,
-        sender_name: req.sender_name,
-        reason: req.reason,
-        messaging_group_id: req.messaging_group_id,
-        agent_group_id: req.agent_group_id,
-        message_count: 1,
-        first_seen: now,
-        last_seen: now,
-    })
+    drop(conn);
+    get(db, &channel_type, &platform_id)?
+        .ok_or_else(|| DbError::invariant("unregistered_senders row missing immediately after upsert"))
 }
 
 pub fn list(db: &CentralDb, since: Option<DateTime<Utc>>) -> Result<Vec<UnregisteredSender>, DbError> {
@@ -339,5 +326,55 @@ mod tests {
     fn list_empty_when_no_rows() {
         let db = db();
         assert!(list(&db, None).unwrap().is_empty());
+    }
+
+    /// Race regression: 16 concurrent upserts against the same
+    /// `(channel_type, platform_id)` against a real file-backed pool
+    /// (max=8) must collapse to one row with `message_count == 16` and
+    /// never bubble a UNIQUE violation. Pre-fix the SELECT-then-INSERT
+    /// shape would have several losers raise
+    /// `SQLITE_CONSTRAINT_PRIMARYKEY` and the router would
+    /// dead-letter their inbounds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn upsert_is_atomic_under_concurrent_writers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("ironclaw.db");
+        let db = CentralDb::open(&path).unwrap();
+        let channel = ChannelType::new("telegram");
+        let platform_id = "shared-platform-id";
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let db = db.clone();
+            let channel = channel.clone();
+            handles.push(tokio::task::spawn_blocking(move || {
+                upsert(
+                    &db,
+                    UpsertUnregisteredSender {
+                        channel_type: channel,
+                        platform_id: platform_id.into(),
+                        user_id: None,
+                        sender_name: Some("racer".into()),
+                        reason: "unknown_user".into(),
+                        messaging_group_id: None,
+                        agent_group_id: None,
+                    },
+                )
+            }));
+        }
+
+        for h in handles {
+            // Both layers must succeed: the join, and the DB call. If
+            // the loser of a race bubbled a UNIQUE violation we'd see
+            // a `DbError::Sqlite(...)` here and the test would fail.
+            h.await
+                .expect("spawn_blocking task panicked")
+                .expect("upsert returned a DB error under contention");
+        }
+
+        let rows = list(&db, None).unwrap();
+        assert_eq!(rows.len(), 1, "exactly one row should exist after 16 concurrent upserts");
+        assert_eq!(rows[0].platform_id, platform_id);
+        assert_eq!(rows[0].message_count, 16, "every concurrent call must contribute to the count");
     }
 }

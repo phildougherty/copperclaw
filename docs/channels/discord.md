@@ -1,5 +1,23 @@
 # discord channel audit
 
+## Native UI capabilities
+
+| Capability | Native | Notes |
+|---|---|---|
+| Chat (text) | yes | `POST /channels/:id/messages` |
+| Auto-split long messages | yes | 2000-char cap declared via `max_message_chars()` (adapter.rs:359) |
+| Honour `Retry-After` | yes | `AdapterError::Rate { retry_after }` from `rest.rs`; delivery loop reads it |
+| Typing indicator | yes | `POST /channels/:id/typing` (adapter.rs:373) |
+| Native cards (buttons/sections) | yes | Embed + `components` (ActionRow of Button). `deliver_card` override at adapter.rs:416 |
+| Native breadcrumbs (tool chips) | landing this week (agent G) | Trait default today; planned override uses embed footer + `PATCH` for in-place edits |
+| Inbound reply_to context | yes | `message_reference.message_id` → `InboundEvent.reply_to` (events.rs:71); legacy `thread_id` mirror kept |
+| Inbound group vs DM distinction | yes | `guild_id.is_some()` (events.rs:56) |
+| Edit messages | yes | `PATCH /channels/:cid/messages/:mid` (adapter.rs:395) |
+| Reactions | yes | `PUT /channels/:cid/messages/:mid/reactions/:emoji/@me` (adapter.rs:428) |
+| Files / attachments | yes | multipart POST |
+| Threading | no | Discord models threads as separate channels; `supports_threads() = false` (adapter.rs:349) |
+| Webhook secret verification | n/a (gateway) | inbound rides the gateway WebSocket authenticated by bot token; no HTTP webhook signature |
+
 ## Implemented
 - deliver: COMPLETE — POST /channels/:id/messages, multipart when files
   are present. `crates/ironclaw-channels/discord/src/adapter.rs:337`

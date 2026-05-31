@@ -164,6 +164,7 @@ pub fn config_update(args: &Value, central: &CentralDb) -> Result<Value, ErrorPa
             egress_allow: existing.egress_allow,
             resource_limits: existing.resource_limits,
             coding_enabled: existing.coding_enabled,
+            surface_thinking: existing.surface_thinking,
         },
     )
     .map_err(db_err)?;
@@ -347,6 +348,7 @@ fn default_config(id: AgentGroupId) -> container_configs::ContainerConfig {
         egress_allow: Vec::new(),
         resource_limits: Value::Object(serde_json::Map::new()),
         coding_enabled: false,
+        surface_thinking: false,
         updated_at: chrono::Utc::now(),
     }
 }
@@ -374,6 +376,7 @@ fn ensure_config_row(central: &CentralDb, id: AgentGroupId) -> Result<(), ErrorP
                 egress_allow: row.egress_allow,
                 resource_limits: row.resource_limits,
                 coding_enabled: row.coding_enabled,
+                surface_thinking: row.surface_thinking,
             },
         )
         .map_err(db_err)?;

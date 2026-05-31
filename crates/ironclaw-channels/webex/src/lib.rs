@@ -67,6 +67,8 @@ pub mod signature;
 pub use adapter::{PERSON_PREFIX, WebexAdapter};
 pub use api::{
     AttachmentAction, MessageView, PersonMe, PostMessageResponse, WebexApi,
+    build_adaptive_breadcrumb, build_adaptive_card, build_adaptive_collapsible,
+    build_adaptive_diff, build_adaptive_error, build_adaptive_thinking, build_adaptive_todo_list,
 };
 pub use config::{WebexConfig, WebhookConfig};
 pub use events::{EventDedup, WebexEventsState, WebexWebhookEnvelope, build_events_router};

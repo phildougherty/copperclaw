@@ -144,6 +144,18 @@ async fn handle(
         display_name: user_name,
     });
 
+    // TODO(channel-ux): Mattermost outgoing-webhook payload does NOT
+    // expose channel type (direct / group-direct / open / private), so
+    // we cannot populate `is_group` from the wire fields alone. The
+    // documented payload (token / team_id / channel_id / channel_name /
+    // user_id / text / trigger_word / file_ids — see
+    // https://developers.mattermost.com/integrate/webhooks/outgoing/) is
+    // type-agnostic. To populate this we'd need a REST follow-up to
+    // `GET /api/v4/channels/{channel_id}` and map `type` (`D`/`G` →
+    // group=false / DM, `O`/`P` → group=true). That requires an
+    // `MattermostApi` handle on the router state and a cache (channels
+    // rarely change type) so we don't add a synchronous lookup per
+    // inbound. Left as `None` until that follow-up lands.
     let event = InboundEvent {
         channel_type: state.channel_type.clone(),
         platform_id: channel_id.to_string(),

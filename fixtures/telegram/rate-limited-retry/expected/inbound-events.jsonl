@@ -1,0 +1,1 @@
+{"channel_type":"telegram","platform_id":"100","thread_id":null,"message":{"id":"tg-msg-rate-001","kind":"chat","content":{"text":"say hi (we'll rate-limit the first send)"},"timestamp":"2026-01-01T00:00:00Z","is_mention":null,"is_group":null},"reply_to":null,"sender":{"channel_type":"telegram","identity":"200","display_name":"Test User"}}

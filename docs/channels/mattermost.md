@@ -1,5 +1,23 @@
 # mattermost channel audit
 
+## Native UI capabilities
+
+| Capability | Native | Notes |
+|---|---|---|
+| Chat (text) | yes | `POST /api/v4/posts` |
+| Auto-split long messages | no | no `max_message_chars()` override; Mattermost accepts long posts |
+| Honour `Retry-After` | yes | `AdapterError::Rate { retry_after }` from `api.rs`; delivery loop reads it |
+| Typing indicator | no | trait default; outgoing webhooks adapter cannot push typing back |
+| Native cards (buttons/sections) | no | falls back via trait-default text render. Interactive Message Buttons are a future override |
+| Native breadcrumbs (tool chips) | fallback | trait-default `[tool]` text line |
+| Inbound reply_to context | no | router does not set `reply_to`; threading rides `thread_id = post_id` (router.rs:150) |
+| Inbound group vs DM distinction | no (not in payload) | `is_group: None` — outgoing-webhook payload (token / channel_id / channel_name / user_id / text / trigger_word / file_ids) carries no channel-type field. Deriving `D`/`G`/`O`/`P` requires a follow-up `GET /api/v4/channels/{channel_id}` — tracked by `TODO(channel-ux)` in router.rs around the `InboundEvent` construction site (router.rs:147) |
+| Edit messages | yes (via action) | `content.action = "edit"` → `update_post`. Trait-level `edit_message` NOT overridden |
+| Reactions | yes (via action) | `content.action = "reaction"` → `add_reaction`. Requires `bot_user_id` in config; absent → Unsupported |
+| Files / attachments | yes | two-step: `POST /api/v4/files` upload then `posts.file_ids` |
+| Threading | yes | `root_id`; `supports_threads() = true` |
+| Webhook secret verification | yes | shared `token` field in body, constant-time compare against `webhook_token` (router.rs:96) |
+
 ## Implemented
 - deliver: COMPLETE for text + files + edit + reaction.
   `crates/ironclaw-channels/mattermost/src/adapter.rs:106`

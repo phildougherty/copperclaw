@@ -136,6 +136,87 @@ impl MatrixApi {
         self.send_room_event(room_id, "m.room.message", body).await
     }
 
+    /// Send an `m.notice` HTML message — Matrix's idiomatic shape for
+    /// bot-generated "metadata" content (typing notices, build statuses,
+    /// breadcrumb chips). Clients render `m.notice` in a less
+    /// prominent visual style than `m.text`, which is exactly the
+    /// chip aesthetic the breadcrumb path needs.
+    pub async fn send_notice_html(
+        &self,
+        room_id: &str,
+        plain: &str,
+        html: &str,
+    ) -> Result<SendResponse, AdapterError> {
+        let body = json!({
+            "msgtype": "m.notice",
+            "body": plain,
+            "format": "org.matrix.custom.html",
+            "formatted_body": html,
+        });
+        self.send_room_event(room_id, "m.room.message", body).await
+    }
+
+    /// Edit a previously-sent message with an `m.notice` HTML body
+    /// (mirrors [`edit_message`](Self::edit_message) but produces a
+    /// notice rather than a text replacement). Used by the
+    /// breadcrumb adapter to update a chip in place via Matrix's
+    /// `m.replace` relation.
+    pub async fn edit_message_notice_html(
+        &self,
+        room_id: &str,
+        target_event_id: &str,
+        plain: &str,
+        html: &str,
+    ) -> Result<SendResponse, AdapterError> {
+        let body = json!({
+            "msgtype": "m.notice",
+            "body": format!("* {plain}"),
+            "format": "org.matrix.custom.html",
+            "formatted_body": format!("* {html}"),
+            "m.new_content": {
+                "msgtype": "m.notice",
+                "body": plain,
+                "format": "org.matrix.custom.html",
+                "formatted_body": html,
+            },
+            "m.relates_to": {
+                "rel_type": "m.replace",
+                "event_id": target_event_id,
+            }
+        });
+        self.send_room_event(room_id, "m.room.message", body).await
+    }
+
+    /// As [`Self::edit_message_notice_html`] but for `m.text` events
+    /// (so Element raises the same notification a fresh message
+    /// would). Used by `deliver_todo_list` to update an HTML
+    /// checklist in place via Matrix's `m.replace` relation.
+    pub async fn edit_message_html(
+        &self,
+        room_id: &str,
+        target_event_id: &str,
+        plain: &str,
+        html: &str,
+    ) -> Result<SendResponse, AdapterError> {
+        let body = json!({
+            "msgtype": "m.text",
+            "body": format!("* {plain}"),
+            "format": "org.matrix.custom.html",
+            "formatted_body": format!("* {html}"),
+            "m.new_content": {
+                "msgtype": "m.text",
+                "body": plain,
+                "format": "org.matrix.custom.html",
+                "formatted_body": html,
+            },
+            "m.relates_to": {
+                "rel_type": "m.replace",
+                "event_id": target_event_id,
+            }
+        });
+        self.send_room_event(room_id, "m.room.message", body).await
+    }
+
     /// Send a text message into an existing Matrix thread (per MSC3440).
     pub async fn send_threaded(
         &self,

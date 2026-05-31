@@ -1,5 +1,23 @@
 # webex channel audit
 
+## Native UI capabilities
+
+| Capability | Native | Notes |
+|---|---|---|
+| Chat (text) | yes | `POST /messages` text or markdown |
+| Auto-split long messages | yes | 7439-char cap declared via `max_message_chars()` (adapter.rs:298) |
+| Honour `Retry-After` | yes | `AdapterError::Rate { retry_after }` from `api.rs`; delivery loop reads it |
+| Typing indicator | no | trait default; Webex has no public typing API |
+| Native cards (buttons/sections) | yes | Adaptive Cards via `attachments[]` on `POST /messages` (handled inside `deliver_chat`); no trait-level `deliver_card` override — cards ride the deliver path with a `card` content field |
+| Native breadcrumbs (tool chips) | fallback | trait-default `[tool]` text line; no native override planned in slice 2 |
+| Inbound reply_to context | no | router does not set `reply_to`; Webex `parentId` lands on `thread_id` instead |
+| Inbound group vs DM distinction | yes | room type lookup via `rooms/<id>` returns `direct` vs `group` (events/router.rs:275) |
+| Edit messages | yes (via action) | `content.action = "edit"` → `PUT /messages/<id>` |
+| Reactions | yes (via action) | `content.action = "reaction"` → `POST <api_base>/reactions`. 404 / 501 from a deployment without the reactions API → Unsupported |
+| Files / attachments | yes | multipart `POST /messages` — one HTTP call per file |
+| Threading | yes | `parentId`; `supports_threads() = true` |
+| Webhook secret verification | yes | HMAC over body in `X-Spark-Signature`. Supports `sha1`, `sha256`, and `auto` (infer by hex length) modes (signature.rs:80) |
+
 ## Implemented
 - deliver: COMPLETE — text + markdown + card + files (multipart, one
   POST per file), plus system actions (edit / delete / reaction).

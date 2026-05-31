@@ -158,15 +158,32 @@ impl CreateAgentHandler {
             Some(p) => format!(
                 "You are agent `{name}`, spawned by parent agent `{p}` for \
                  the task below. Work through it autonomously, then call \
-                 `send_message` to deliver a single consolidated report. \
-                 Your replies route back to the parent by default; the \
-                 parent will summarise across siblings (if any) before \
-                 surfacing anything to the end user.\n\nTask:\n\n"
+                 `send_message` EXACTLY ONCE to deliver your full \
+                 consolidated report.\n\
+                 \n\
+                 STRICT RULES for your final turn:\n\
+                 1. Make EXACTLY ONE `send_message` call carrying the \
+                    complete report.\n\
+                 2. Do NOT send a follow-up \"report delivered\" / \
+                    \"research complete\" / \"here's a summary\" message. \
+                    That's a duplicate and the parent will see it as one.\n\
+                 3. Do NOT call any other tool after your final \
+                    `send_message`. Your turn ends with that one call.\n\
+                 4. Your reply routes back to the parent by default — \
+                    you do not need to set `to:`.\n\
+                 \n\
+                 The parent will synthesise across siblings (if any) \
+                 before surfacing anything to the end user. Your job is \
+                 to produce ONE thorough report and stop.\n\
+                 \n\
+                 Task:\n\n"
             ),
             None => format!(
                 "You are agent `{name}`, spawned for the task below. Work \
-                 through it autonomously, then call `send_message` to \
-                 deliver your findings.\n\nTask:\n\n"
+                 through it autonomously, then call `send_message` \
+                 EXACTLY ONCE to deliver your findings. Do not send a \
+                 follow-up acknowledgement message after the report — \
+                 your turn ends with that single send.\n\nTask:\n\n"
             ),
         };
         let text = format!("{prelude}{instructions}");
@@ -216,6 +233,8 @@ impl CreateAgentHandler {
             channel_type: None,
             thread_id: None,
             source_session_id: None,
+            reply_to: None,
+            is_group: None,
         };
         if let Err(err) = messages_in::insert(&conn, &msg) {
             warn!(

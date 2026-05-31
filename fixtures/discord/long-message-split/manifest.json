@@ -1,0 +1,16 @@
+{
+  "name": "discord-long-message-split",
+  "channel": "discord",
+  "description": "Agent emits a single chat outbound whose text exceeds the discord 2000-char cap. Expected: the host's chat-text splitter cuts at the paragraph boundary, producing 2 adapter deliveries while keeping one messages_out row; the recorded `delivered` row references the first chunk's platform id.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

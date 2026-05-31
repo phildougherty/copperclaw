@@ -196,6 +196,25 @@ pub struct SendCardSpec {
     pub card: ironclaw_channels_core::Card,
 }
 
+/// Spec for the host-side `TodoList` emit triggered by every
+/// `todo_add` / `todo_update` / `todo_delete` MCP tool handler. The
+/// runner serialises this into a `MessageKind::TodoList` outbound
+/// row (routed to the originating inbound channel); the delivery
+/// service deserialises it back into
+/// [`ironclaw_channels_core::TodoList`] and hands it to the adapter's
+/// `deliver_todo_list` hook for native rendering and (where supported)
+/// pinning. The agent never sees this spec — there's no MCP tool
+/// named `emit_todo_list`; the runner emits it implicitly after each
+/// mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EmitTodoListSpec {
+    /// Canonical todo list. Validated against the schema at
+    /// construction time by the `todo_*` MCP tool handlers — anything
+    /// that reaches the runner is guaranteed to pass
+    /// [`ironclaw_channels_core::TodoList::validate`].
+    pub list: ironclaw_channels_core::TodoList,
+}
+
 /// The sum type of every side effect a tool may emit.
 ///
 /// The runner's `ToolContext` impl pattern-matches on this to write the
@@ -216,6 +235,14 @@ pub enum OutboundToolEffect {
     AskUserQuestion(AskUserQuestionSpec),
     /// `send_card`.
     SendCard(SendCardSpec),
+    /// Host-side `MessageKind::TodoList` emit triggered by every
+    /// mutating `todo_*` MCP-tool handler. NOT a model-facing tool
+    /// (the model continues to call `todo_add` / `todo_update` /
+    /// `todo_delete` unchanged) — the handler builds the full
+    /// post-mutation list and routes it through this effect so the
+    /// delivery service can render it natively via
+    /// `deliver_todo_list` and pin it on platforms that support it.
+    EmitTodoList(EmitTodoListSpec),
     /// `create_agent`.
     CreateAgent(CreateAgentSpec),
     /// `install_packages`.
@@ -255,6 +282,7 @@ impl OutboundToolEffect {
             Self::AddReaction(_) => "add_reaction",
             Self::AskUserQuestion(_) => "ask_user_question",
             Self::SendCard(_) => "send_card",
+            Self::EmitTodoList(_) => "emit_todo_list",
             Self::CreateAgent(_) => "create_agent",
             Self::InstallPackages(_) => "install_packages",
             Self::AddMcpServer(_) => "add_mcp_server",
@@ -414,6 +442,20 @@ pub trait ToolContext: Send + Sync {
     /// routing.
     fn clear_originating(&self) {}
 
+    /// True when this context represents a child agent session that
+    /// has already emitted its first `send_message` to the parent.
+    /// The runner's main loop checks this after every turn and exits
+    /// cleanly when set — enforcing one-shot semantics for child
+    /// agents at runtime instead of relying on the LLM to follow
+    /// soft prompt rules like "EXACTLY ONE send_message."
+    ///
+    /// Default `false` so test / mock contexts compile unchanged.
+    /// Root sessions also return `false` (the gate is only meaningful
+    /// for child sessions spawned via `create_agent`).
+    fn parent_reply_sent(&self) -> bool {
+        false
+    }
+
     /// Optional UX-observability hook: emit a brief
     /// `[tool_name detail]` chat message to the originating channel
     /// right before a tool call fires, so users see what the agent
@@ -428,6 +470,96 @@ pub trait ToolContext: Send + Sync {
     /// only emits when there's real channel routing.
     async fn emit_breadcrumb(&self, tool_name: &str, input: Option<&serde_json::Value>) {
         let _ = (tool_name, input);
+    }
+
+    /// Finalisation half of [`Self::emit_breadcrumb`] — called once
+    /// the tool returns (or fails). `ok` indicates success, `summary`
+    /// is the optional post-completion blurb (`"passed (0.4s)"`,
+    /// `"wrote 12 lines"`, `"timeout"`). Implementations route this
+    /// through whatever update mechanism their target supports —
+    /// the runner writes a `MessageKind::System`
+    /// `update_breadcrumb` row that the host's delivery loop
+    /// translates into an in-place edit of the original chip on
+    /// adapters that expose an edit API. Default no-op.
+    async fn emit_breadcrumb_finish(
+        &self,
+        tool_name: &str,
+        input: Option<&serde_json::Value>,
+        ok: bool,
+        summary: Option<&str>,
+    ) {
+        let _ = (tool_name, input, ok, summary);
+    }
+
+    /// Slice-3.5 opt-in: emit a structured `MessageKind::Thinking` row
+    /// carrying the model's just-completed reasoning block so the host
+    /// delivery service can render it as a collapsed native UI
+    /// primitive (Telegram `<blockquote expandable>`, Slack `context`
+    /// block, Discord muted-grey embed, Google Chat
+    /// `collapsibleSection`, Matrix `<details>`).
+    ///
+    /// `text` is the accumulated thinking prose (empty for redacted
+    /// blocks); `redacted` mirrors the upstream `redacted_thinking`
+    /// flag — renderers MUST substitute a placeholder for redacted
+    /// blocks rather than display the raw blob. `model` is optional
+    /// provenance (e.g. `"claude-opus-4-7"`) so the user can
+    /// disambiguate which model produced the reasoning when their
+    /// group fans out across several.
+    ///
+    /// The opt-in gate (per-group `surface_thinking`) is enforced by
+    /// the runner BEFORE calling this method — implementations
+    /// receive only events the operator has consented to surface.
+    /// Default no-op so contexts that don't speak to a user channel
+    /// (mocks, subagent adapters) compile unchanged.
+    async fn emit_thinking(
+        &self,
+        text: &str,
+        redacted: bool,
+        model: Option<&str>,
+    ) {
+        let _ = (text, redacted, model);
+    }
+
+    /// Periodic "still working" status hook. The runner calls this
+    /// from `drive_turn` after each tool turn when more than
+    /// `STATUS_INTERVAL_SECS` of wall-clock has elapsed without a chat
+    /// row going to the user, so a long tool-heavy stretch (or a long
+    /// silent reasoning pass) doesn't look like the agent has hung.
+    /// `text` is the pre-rendered status sentence — implementations
+    /// route it as-is.
+    ///
+    /// Default no-op so test / mock contexts compile unchanged. The
+    /// runner's `RunnerToolCtx` writes a `MessageKind::Chat` row to
+    /// `outbound.db` against the originating channel — but ONLY when
+    /// real user channel routing exists. Child-agent sessions (no
+    /// channel routing, just a `source_session_id`) skip the emit
+    /// because the recipient is another LLM and "still working"
+    /// chatter would just bloat its history.
+    async fn emit_status(&self, text: &str) {
+        let _ = text;
+    }
+
+    /// Optional UX-observability hook: emit a structured file-edit
+    /// diff card to the originating channel after a successful
+    /// `edit_file` / `multi_edit` / `apply_patch` / `write_file` write.
+    /// The `diff` is the canonical [`DiffCard`](
+    /// ironclaw_channels_core::DiffCard) computed by the tool handler
+    /// from the pre-edit snapshot vs the post-edit content (the
+    /// handler runs the diff once and hands us the structured result —
+    /// reserialising into unified-diff text and re-parsing in every
+    /// renderer is wasted work).
+    ///
+    /// Default no-op so contexts that don't need diff cards (mocks,
+    /// subagent adapters) continue to compile unchanged. The runner's
+    /// `RunnerToolCtx` overrides this with a real implementation that
+    /// writes a `MessageKind::Diff` row to `outbound.db`; the host's
+    /// delivery service then routes it through the adapter's
+    /// `deliver_diff` hook for native rendering.
+    ///
+    /// Errors are swallowed: diff cards are best-effort UX, NOT
+    /// load-bearing — a failed write must not abort the file edit.
+    async fn emit_diff(&self, diff: ironclaw_channels_core::DiffCard) {
+        let _ = diff;
     }
 }
 
@@ -459,6 +591,10 @@ struct MockInner {
     next_subagent_result: Option<SubagentResult>,
     /// If set, the next `spawn_subagent` returns this Err instead.
     next_subagent_err: Option<ToolError>,
+    /// Diff cards recorded in order — populated by `emit_diff` (the
+    /// MCP slice-3.1 surface). Lets file-edit tool tests assert the
+    /// runner-side diff card emit fired with the expected payload.
+    diff_calls: Vec<ironclaw_channels_core::DiffCard>,
 }
 
 impl MockToolContext {
@@ -541,6 +677,15 @@ impl MockToolContext {
             .expect("MockToolContext mutex poisoned")
             .next_subagent_err = Some(err);
     }
+
+    /// Snapshot of diff cards recorded via `emit_diff`.
+    pub fn diff_calls(&self) -> Vec<ironclaw_channels_core::DiffCard> {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .diff_calls
+            .clone()
+    }
 }
 
 #[async_trait]
@@ -583,6 +728,11 @@ impl ToolContext for MockToolContext {
         let result = g.next_subagent_result.take().unwrap_or(canned);
         g.subagent_calls.push(req);
         Ok(result)
+    }
+
+    async fn emit_diff(&self, diff: ironclaw_channels_core::DiffCard) {
+        let mut g = self.inner.lock().expect("MockToolContext mutex poisoned");
+        g.diff_calls.push(diff);
     }
 }
 

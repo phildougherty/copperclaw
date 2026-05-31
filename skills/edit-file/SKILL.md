@@ -43,6 +43,14 @@ changes elsewhere.
 }
 ```
 
+## Diff card surfaced to the user
+
+After every successful `edit_file` write the host emits a structured
+diff card to the originating channel — same path, same `+`/`-`
+gutters every code review tool uses. You don't need to summarise the
+change in prose; the user already sees it. Save your tokens for
+explaining *why*, not *what*.
+
 ## How to use it
 
 1. **`read_file` first.** Pull the file (or the relevant region via

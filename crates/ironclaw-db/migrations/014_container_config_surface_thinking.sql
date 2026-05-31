@@ -1,0 +1,26 @@
+-- Per-group toggle for whether the agent's reasoning blocks are
+-- surfaced to the user as collapsed UI elements.
+--
+-- Slice 3.5 (Thinking surface) adds an opt-in pipeline that takes the
+-- model's `thinking` / `redacted_thinking` content blocks (Anthropic
+-- extended thinking, Kimi K2.6, Qwen QwQ, DeepSeek R1, …) — which the
+-- Anthropic provider has historically dropped on the floor — and
+-- persists them as `MessageKind::Thinking` rows. The host's delivery
+-- service routes those rows through the adapter's `deliver_thinking`
+-- hook, which renders them as a collapsed native primitive (Telegram
+-- `<blockquote expandable>`, Slack `context` block, Discord muted
+-- embed, Google Chat `collapsibleSection`, Matrix `<details>`).
+--
+-- The orthogonal `strip_reasoning_blocks` sanitiser that removes
+-- inline `<thinking>` markup from `Chat` rows stays unchanged — that
+-- path scrubs prose contamination from the chat reply, this surface
+-- emits structured reasoning as its own row.
+--
+-- Default 0 (off) reflects the Ironclaw tenet "secure-by-default,
+-- public-by-deliberate-act": surfacing model chain-of-thought has
+-- privacy implications (mid-thought speculation about the user,
+-- debugging notes the model didn't intend the user to see, etc.),
+-- so existing installs continue to drop thinking on the floor until
+-- the operator opts in. Operators enable per-group via
+-- `iclaw groups config edit <id>`.
+ALTER TABLE container_configs ADD COLUMN surface_thinking INTEGER NOT NULL DEFAULT 0;

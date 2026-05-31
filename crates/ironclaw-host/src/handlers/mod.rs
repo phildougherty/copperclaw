@@ -73,6 +73,8 @@ pub const HOST_ONLY_COMMANDS: &[&str] = &[
     "destinations.remove",
     "sessions.delete",
     "approvals.approve_sender",
+    "approvals.approve",
+    "approvals.deny",
     "budgets.set",
     "db.backup",
     "db.restore",

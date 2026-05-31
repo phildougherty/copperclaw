@@ -1,5 +1,23 @@
 # x (Twitter/X) channel audit
 
+## Native UI capabilities
+
+| Capability | Native | Notes |
+|---|---|---|
+| Chat (text) | yes | DM event create via v2 endpoint (user-with or conversation form) |
+| Auto-split long messages | no | no `max_message_chars()` override; X DM caps at ~10 000 chars, splitter not yet wired |
+| Honour `Retry-After` | yes | `AdapterError::Rate { retry_after }` from `api.rs` (prefers `x-rate-limit-reset` then `Retry-After`); delivery loop reads it |
+| Typing indicator | no | trait default — X v2 has no public DM typing API (adapter.rs:207) |
+| Native cards (buttons/sections) | no | falls back via trait-default text render |
+| Native breadcrumbs (tool chips) | fallback | trait-default `[tool]` text line |
+| Inbound reply_to context | no | parser does not set `reply_to`; DM events are flat |
+| Inbound group vs DM distinction | no | `is_group: None` (parse.rs:89) — DM-only adapter |
+| Edit messages | no | any system action → Unsupported |
+| Reactions | no | any system action → Unsupported |
+| Files / attachments | yes | one DM per file; first carries the text, subsequent use filename as required-non-empty body |
+| Threading | no | `supports_threads() = false` (adapter.rs:203) |
+| Webhook secret verification | n/a (poll) | inbound rides a since-id poll loop over `/2/dm_events`; no webhook surface |
+
 ## Implemented
 - deliver: COMPLETE — text + files (one DM per file; first carries the
   text, subsequent use the filename as the required-non-empty body).

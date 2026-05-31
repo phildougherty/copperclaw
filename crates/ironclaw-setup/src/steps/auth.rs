@@ -150,15 +150,19 @@ impl Step for AuthStep {
     }
 }
 
-/// Write the `.env` body described by `spec` and chmod it to `0o600` on
-/// Unix.
+/// Write the `.env` body described by `spec`.
+///
+/// The file is created with mode `0o600` from the start on Unix — there
+/// is no window where the bytes are on disk under the default umask
+/// (typically `0o644`, world-readable) before a follow-up chmod
+/// tightens them. This closes a TOCTOU race during initial install
+/// where a local reader could grab the freshly written API key.
 pub fn write_env_file(path: &Path, spec: &EnvFileSpec) -> Result<(), StepError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let contents = render_env_file(spec);
-    std::fs::write(path, contents)?;
-    restrict_permissions(path)?;
+    crate::state::write_secret_file(path, contents.as_bytes())?;
     Ok(())
 }
 
@@ -198,21 +202,6 @@ pub fn render_env_file(spec: &EnvFileSpec) -> String {
         ));
     }
     out
-}
-
-#[cfg(unix)]
-fn restrict_permissions(path: &Path) -> Result<(), StepError> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = std::fs::metadata(path)?.permissions();
-    perms.set_mode(0o600);
-    std::fs::set_permissions(path, perms)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> Result<(), StepError> {
-    // Non-Unix platforms don't have the same mode bits; treat as a no-op.
-    Ok(())
 }
 
 #[cfg(test)]
@@ -296,6 +285,39 @@ mod tests {
             let perms = std::fs::metadata(&path).unwrap().permissions();
             assert_eq!(perms.mode() & 0o777, 0o600);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_env_file_sets_mode_0600_from_creation() {
+        // Pinned regression: previously the file was created with the
+        // default umask (typically 0o644) and chmod'd to 0o600 in a
+        // second syscall — a brief window where any local user could
+        // read the secret. The helper used here opens with `mode(0o600)`
+        // so the file never exists with looser bits.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".env");
+        write_env_file(&path, &spec("sk-pinned")).unwrap();
+        let perms = std::fs::metadata(&path).unwrap().permissions();
+        assert_eq!(perms.mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_env_file_tightens_perms_when_path_pre_exists_loose() {
+        // Idempotent re-runs: if an older install left .env at 0o644,
+        // a fresh write must converge to 0o600.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".env");
+        std::fs::write(&path, b"stale\n").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&path, perms).unwrap();
+        write_env_file(&path, &spec("sk-rerun")).unwrap();
+        let after = std::fs::metadata(&path).unwrap().permissions();
+        assert_eq!(after.mode() & 0o777, 0o600);
     }
 
     #[test]

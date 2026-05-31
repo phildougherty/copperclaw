@@ -43,7 +43,9 @@
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use ironclaw_channels_core::{testing::MockAdapter, ChannelAdapter};
+use ironclaw_channels_core::{
+    testing::MockAdapter, AdapterError, Card, ChannelAdapter, DmHandle,
+};
 use ironclaw_container_rt::{
     ContainerHandle, ContainerRuntime, ContainerSpec, ImageBuildSpec, RtError,
 };
@@ -67,7 +69,7 @@ use ironclaw_modules::{ApprovalsModule, Module};
 use ironclaw_providers::AnthropicProvider;
 use ironclaw_runner::{compaction::CompactionCfg, run_loop, RunnerDeps, RunnerToolCtx};
 use ironclaw_types::{
-    AgentGroupId, ChannelType, Effort, InboundEvent, SessionId, SessionStatus,
+    AgentGroupId, ChannelType, Effort, InboundEvent, OutboundMessage, SessionId, SessionStatus,
 };
 use rusqlite::Connection;
 use std::collections::HashSet;
@@ -160,7 +162,21 @@ impl ReplayHarness {
         let mut initial: Vec<(ChannelType, Arc<dyn ChannelAdapter>)> = Vec::new();
         for ct in channel_types {
             let mock = Arc::new(MockAdapter::new(ct.as_str()));
-            initial.push((ct.clone(), mock.clone() as Arc<dyn ChannelAdapter>));
+            // Per-channel max_message_chars cap. The manifest can
+            // override; otherwise apply the built-in defaults so the
+            // long-message-split fixtures trigger the splitter even
+            // without an explicit override. Channels not in the
+            // default-cap list report `None` (splitter disabled —
+            // matches the trait default).
+            let cap = fixture
+                .manifest
+                .adapter_caps
+                .get(ct.as_str())
+                .copied()
+                .or_else(|| default_cap_for(ct.as_str()));
+            let wrapped: Arc<dyn ChannelAdapter> =
+                Arc::new(CappedAdapter::new(mock.clone(), cap));
+            initial.push((ct.clone(), wrapped));
             adapters.push((ct, mock));
         }
         let delivery =
@@ -222,6 +238,13 @@ impl ReplayHarness {
         if self.fixture.manifest.trigger_sweep {
             self.trigger_sweep_pass().await?;
         }
+
+        // Queue any scripted adapter failures (rate-limit, transport,
+        // bad-request) BEFORE driving inbound. `MockAdapter` pops these
+        // FIFO on each `deliver` call, so a fixture can pin
+        // "first delivery returns Rate { retry_after: 7 }, second
+        // succeeds" by listing exactly one entry here.
+        self.apply_pre_delivery_failures()?;
 
         let events: Vec<InboundEvent> = self.fixture.inbound.clone();
         for event in events {
@@ -471,6 +494,7 @@ impl ReplayHarness {
             default_image_tag: "ironclaw/session:replay".into(),
             default_provider: "anthropic".into(),
             default_model: "claude-sonnet-4-6".into(),
+            default_effort: None,
             anthropic_api_key: Some("harness".into()),
             anthropic_base_url: Some(self.anthropic_server.uri()),
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
@@ -575,6 +599,14 @@ impl ReplayHarness {
             // inside the per-step `step_timeout_ms` budget.
             provider_deadline: Duration::from_millis(200),
             tool_deadline_secs: 30,
+            // Replay tests don't observe the typing-keepalive signal;
+            // a noop pinger keeps `RunnerDeps` construction trivial
+            // without touching the heartbeat file behind the
+            // harness's back.
+            activity_pinger: Arc::new(ironclaw_runner::NoopPinger),
+            // Replay fixtures don't exercise the slice-3.5 thinking
+            // surface — default off.
+            surface_thinking: false,
         };
         run_loop(deps).await.context("runner one-turn")?;
         Ok(())
@@ -589,6 +621,65 @@ impl ReplayHarness {
             .process_session_once(&session)
             .await
             .context("delivery.process_session_once")?;
+        // Optional re-drive after a sleep, used by fixtures that pin
+        // "row deferred on first tick, delivered on the second tick
+        // after waiting `retry_after`". We sleep `redrive_after_ms`
+        // (chosen by the fixture to be slightly larger than its
+        // queued `Rate { retry_after }`), then run another pass. Any
+        // row that's still inside its backoff window will defer again;
+        // any row whose window has elapsed will deliver this time.
+        if let Some(ms) = self.fixture.manifest.redrive_after_ms {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            let _report = self
+                .delivery
+                .process_session_once(&session)
+                .await
+                .context("delivery.process_session_once (redrive)")?;
+        }
+        Ok(())
+    }
+
+    /// Drain `manifest.pre_delivery_failures` into the appropriate
+    /// `MockAdapter::fail_next_deliver` queues. Unknown channel names
+    /// are reported as a setup error (so a typo doesn't silently
+    /// no-op).
+    fn apply_pre_delivery_failures(&self) -> Result<()> {
+        for entry in &self.fixture.manifest.pre_delivery_failures {
+            let mock = self
+                .adapters
+                .iter()
+                .find(|(ct, _)| ct.as_str() == entry.channel)
+                .map(|(_, m)| Arc::clone(m))
+                .ok_or_else(|| {
+                    anyhow!(
+                        "pre_delivery_failures references unknown channel \
+                         {:?} (registered: {:?})",
+                        entry.channel,
+                        self.adapters
+                            .iter()
+                            .map(|(ct, _)| ct.as_str().to_string())
+                            .collect::<Vec<_>>(),
+                    )
+                })?;
+            let err = match entry.kind.as_str() {
+                "rate" => AdapterError::Rate {
+                    retry_after: entry.retry_after,
+                },
+                "transport" => AdapterError::Transport(
+                    entry.message.clone().unwrap_or_else(|| "transport blip".into()),
+                ),
+                "bad_request" => AdapterError::BadRequest(
+                    entry.message.clone().unwrap_or_else(|| "bad request".into()),
+                ),
+                other => {
+                    return Err(anyhow!(
+                        "pre_delivery_failures: unknown kind {other:?} \
+                         (accepted: rate, transport, bad_request)"
+                    ));
+                }
+            };
+            mock.fail_next_deliver(err);
+        }
         Ok(())
     }
 
@@ -1015,5 +1106,131 @@ impl ContainerRuntime for HarnessRuntime {
     }
     async fn build_image(&self, spec: ImageBuildSpec) -> Result<String, RtError> {
         Ok(spec.image_tag())
+    }
+}
+
+/// Built-in `max_message_chars` cap per channel type. Mirrors the
+/// production `ChannelAdapter::max_message_chars` overrides shipped
+/// by the slice-1 cohesive-UX baseline (see `CHANGELOG.md`
+/// [Unreleased]) so replay fixtures can pin the host-side splitter
+/// behaviour without hand-rolling per-adapter wiring. Returns `None`
+/// for channels whose production adapter also returns `None` (cli,
+/// matrix, generic webhooks).
+fn default_cap_for(channel_type: &str) -> Option<usize> {
+    match channel_type {
+        "telegram" | "gchat" | "whatsapp-cloud" => Some(4096),
+        "slack" => Some(40_000),
+        "discord" => Some(2000),
+        "teams" => Some(28_000),
+        "wechat" => Some(600),
+        "webex" => Some(7439),
+        "line" => Some(5000),
+        _ => None,
+    }
+}
+
+/// Wrap a [`MockAdapter`] so the harness can report a per-channel
+/// `max_message_chars` cap matching production adapter behaviour
+/// without modifying the channels-core `MockAdapter` itself.
+///
+/// Every other trait method delegates straight to the inner mock — so
+/// `deliveries()`, `fail_next_deliver()`, edit / reaction capture, and
+/// the open-DM hook all continue to work through the harness's
+/// `Arc<MockAdapter>` handle held alongside the wrapper.
+struct CappedAdapter {
+    inner: Arc<MockAdapter>,
+    max_message_chars: Option<usize>,
+}
+
+impl CappedAdapter {
+    fn new(inner: Arc<MockAdapter>, max_message_chars: Option<usize>) -> Self {
+        Self {
+            inner,
+            max_message_chars,
+        }
+    }
+}
+
+#[async_trait]
+impl ChannelAdapter for CappedAdapter {
+    fn channel_type(&self) -> &ChannelType {
+        self.inner.channel_type()
+    }
+
+    fn supports_threads(&self) -> bool {
+        self.inner.supports_threads()
+    }
+
+    fn max_message_chars(&self) -> Option<usize> {
+        self.max_message_chars
+    }
+
+    async fn subscribe(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+    ) -> Result<(), AdapterError> {
+        self.inner.subscribe(platform_id, thread_id).await
+    }
+
+    async fn set_typing(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+    ) -> Result<(), AdapterError> {
+        self.inner.set_typing(platform_id, thread_id).await
+    }
+
+    async fn deliver(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        message: &OutboundMessage,
+    ) -> Result<Option<String>, AdapterError> {
+        self.inner.deliver(platform_id, thread_id, message).await
+    }
+
+    async fn deliver_card(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        card: &Card,
+        to: Option<&str>,
+    ) -> Result<Option<String>, AdapterError> {
+        self.inner
+            .deliver_card(platform_id, thread_id, card, to)
+            .await
+    }
+
+    async fn open_dm(&self, user_id: &str) -> Result<Option<DmHandle>, AdapterError> {
+        self.inner.open_dm(user_id).await
+    }
+
+    async fn edit_message(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        external_id: &str,
+        new_text: &str,
+    ) -> Result<(), AdapterError> {
+        self.inner
+            .edit_message(platform_id, thread_id, external_id, new_text)
+            .await
+    }
+
+    async fn add_reaction(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        external_id: &str,
+        emoji: &str,
+    ) -> Result<(), AdapterError> {
+        self.inner
+            .add_reaction(platform_id, thread_id, external_id, emoji)
+            .await
+    }
+
+    fn plain_text_fallback(&self, msg: &OutboundMessage) -> Option<OutboundMessage> {
+        self.inner.plain_text_fallback(msg)
     }
 }

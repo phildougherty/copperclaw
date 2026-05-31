@@ -230,6 +230,8 @@ pub fn insert_inbound_message_with_process_after(
         channel_type: Some(ChannelType::new("cli")),
         thread_id: None,
         source_session_id: None,
+        reply_to: None,
+        is_group: None,
     };
     let mut pool = root
         .inbound_pool(&session.agent_group_id, &session.id)
@@ -260,6 +262,8 @@ pub fn insert_recurring_inbound(
         channel_type: None,
         thread_id: None,
         source_session_id: None,
+        reply_to: None,
+        is_group: None,
     };
     let mut pool = root
         .inbound_pool(&session.agent_group_id, &session.id)

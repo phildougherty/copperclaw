@@ -1,5 +1,23 @@
 # matrix channel audit
 
+## Native UI capabilities
+
+| Capability | Native | Notes |
+|---|---|---|
+| Chat (text) | yes | `send_text` / `send_html` / `send_threaded` |
+| Auto-split long messages | no | `max_message_chars()` returns `None`; Matrix has no documented hard cap |
+| Honour `Retry-After` | yes | `AdapterError::Rate { retry_after }` from `api.rs`; delivery loop reads it |
+| Typing indicator | yes | `PUT /typing` (adapter.rs:165) |
+| Native cards (buttons/sections) | no | Matrix has no card primitive at the protocol level; falls back via trait-default text render |
+| Native breadcrumbs (tool chips) | landing this week (agent G) | Trait default today; planned override uses `m.notice` with `<code>` HTML body and `m.replace` for in-place edits |
+| Inbound reply_to context | yes | `content."m.relates_to"."m.in_reply_to".event_id` → `InboundEvent.reply_to` (parse.rs:124) |
+| Inbound group vs DM distinction | no | `is_group` hardcoded to `Some(true)`; Matrix has no protocol-level DM concept (parse.rs:147) |
+| Edit messages | yes (via action) | `content.action = "edit"` → `m.replace`. Trait-level `edit_message` NOT overridden |
+| Reactions | yes (via action) | `content.action = "reaction"` → `m.annotation`. Trait-level `add_reaction` NOT overridden |
+| Files / attachments | yes | media upload + `m.image` / `m.file` / etc. event |
+| Threading | yes | `m.thread`; `supports_threads() = true` |
+| Webhook secret verification | n/a (sync) | inbound rides `/sync` long-poll authenticated by access token; no webhook |
+
 ## Implemented
 - deliver: COMPLETE — text, html, files (upload + media event), plus
   system-action shape for edit / reaction. `crates/ironclaw-channels/matrix/src/adapter.rs:174`

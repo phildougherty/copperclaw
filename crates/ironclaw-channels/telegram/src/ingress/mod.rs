@@ -9,7 +9,7 @@ use crate::types::{
 };
 use chrono::{DateTime, TimeZone, Utc};
 use ironclaw_channels_core::AdapterError;
-use ironclaw_types::{ChannelType, InboundEvent, InboundMessage, MessageKind, SenderIdentity};
+use ironclaw_types::{ChannelType, InboundEvent, InboundMessage, MessageKind, ReplyTo, SenderIdentity};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -238,6 +238,16 @@ async fn message_to_event(
         .as_deref()
         .map(|name| message_mentions(msg, name));
 
+    // Telegram embeds the parent message under `reply_to_message` when the
+    // inbound is a reply. We surface its `message_id` (formatted to match
+    // our own `message.id` shape) on `InboundEvent.reply_to`. Replies stay
+    // in the same chat, so the parent routes via the same `chat.id`.
+    let reply_to = msg.reply_to_message.as_deref().map(|parent| ReplyTo {
+        channel_type: channel_type.clone(),
+        platform_id: msg.chat.id.to_string(),
+        thread_id: Some(parent.message_id.to_string()),
+    });
+
     Some(InboundEvent {
         channel_type: channel_type.clone(),
         platform_id: msg.chat.id.to_string(),
@@ -250,7 +260,7 @@ async fn message_to_event(
             is_mention,
             is_group: Some(is_group),
         },
-        reply_to: None,
+        reply_to,
         sender: msg.from.as_ref().map(|u| SenderIdentity {
             channel_type: channel_type.clone(),
             identity: u.id.to_string(),
@@ -662,6 +672,7 @@ mod tests {
             voice: None,
             video_note: None,
             sticker: None,
+            reply_to_message: None,
         }
     }
 
@@ -1007,6 +1018,55 @@ mod tests {
         )
         .await;
         assert_eq!(evts[0].message.is_mention, Some(false));
+    }
+
+    #[tokio::test]
+    async fn reply_to_message_populates_reply_to_field() {
+        let mut m = text_msg("yes");
+        let mut parent = text_msg("should we ship?");
+        parent.message_id = 42;
+        m.reply_to_message = Some(Box::new(parent));
+        let dir = TempDir::new().unwrap();
+        let (api, _s) = dummy_api().await;
+        let evts = updates_to_events(
+            &Update {
+                update_id: 1,
+                message: Some(m),
+                edited_message: None,
+                channel_post: None,
+                callback_query: None,
+            },
+            &api,
+            &default_settings(dir.path()),
+        )
+        .await;
+        let rt = evts[0]
+            .reply_to
+            .as_ref()
+            .expect("reply_to populated from reply_to_message");
+        assert_eq!(rt.channel_type.as_str(), "telegram");
+        assert_eq!(rt.platform_id, "100");
+        assert_eq!(rt.thread_id.as_deref(), Some("42"));
+    }
+
+    #[tokio::test]
+    async fn plain_message_without_reply_leaves_reply_to_none() {
+        let m = text_msg("hi");
+        let dir = TempDir::new().unwrap();
+        let (api, _s) = dummy_api().await;
+        let evts = updates_to_events(
+            &Update {
+                update_id: 1,
+                message: Some(m),
+                edited_message: None,
+                channel_post: None,
+                callback_query: None,
+            },
+            &api,
+            &default_settings(dir.path()),
+        )
+        .await;
+        assert!(evts[0].reply_to.is_none());
     }
 
     #[test]

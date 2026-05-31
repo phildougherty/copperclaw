@@ -29,7 +29,7 @@
 
 use chrono::{DateTime, TimeZone, Utc};
 use ironclaw_types::{
-    ChannelType, InboundEvent, InboundMessage, MessageKind, SenderIdentity,
+    ChannelType, InboundEvent, InboundMessage, MessageKind, ReplyTo, SenderIdentity,
 };
 use serde_json::{Value, json};
 
@@ -116,6 +116,20 @@ pub fn envelope_to_inbound(envelope: &Value) -> Option<InboundEvent> {
     let channel_type = ChannelType::new(CHANNEL_TYPE_STR);
     let message_id = timestamp_ms.to_string();
 
+    // signal-cli surfaces "this message quotes <parent>" via the `quote`
+    // object on the dataMessage. The quote's `id` is the millisecond
+    // timestamp of the quoted message — which is exactly the format we
+    // use for `message.id`, so it pairs up cleanly on the agent side.
+    let reply_to = data
+        .get("quote")
+        .and_then(|q| q.get("id"))
+        .and_then(Value::as_i64)
+        .map(|qid| ReplyTo {
+            channel_type: channel_type.clone(),
+            platform_id: platform_id.clone(),
+            thread_id: Some(qid.to_string()),
+        });
+
     let sender_identity = if source.is_empty() {
         None
     } else {
@@ -138,7 +152,7 @@ pub fn envelope_to_inbound(envelope: &Value) -> Option<InboundEvent> {
             is_mention: None,
             is_group: Some(is_group),
         },
-        reply_to: None,
+        reply_to,
         sender: sender_identity,
     })
 }
@@ -400,6 +414,35 @@ mod tests {
         });
         let evt = envelope_to_inbound(&v).unwrap();
         assert_eq!(evt.platform_id, "user:+1");
+    }
+
+    #[test]
+    fn quote_populates_reply_to_with_quoted_timestamp() {
+        let env = json!({
+            "envelope": {
+                "source": "+15551112222",
+                "timestamp": 1_700_000_005_000_i64,
+                "dataMessage": {
+                    "message": "agreed",
+                    "quote": {
+                        "id": 1_700_000_000_000_i64,
+                        "author": "+15553334444",
+                        "text": "should we ship?"
+                    }
+                }
+            }
+        });
+        let evt = params_to_inbound(&env).unwrap();
+        let rt = evt.reply_to.expect("reply_to populated from quote.id");
+        assert_eq!(rt.channel_type.as_str(), "signal");
+        assert_eq!(rt.platform_id, "user:+15551112222");
+        assert_eq!(rt.thread_id.as_deref(), Some("1700000000000"));
+    }
+
+    #[test]
+    fn message_without_quote_leaves_reply_to_none() {
+        let evt = params_to_inbound(&one_to_one("just thinking out loud")).unwrap();
+        assert!(evt.reply_to.is_none());
     }
 
     #[test]

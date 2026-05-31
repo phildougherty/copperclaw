@@ -219,6 +219,41 @@ impl GchatApi {
         Ok(parsed)
     }
 
+    /// Edit a previously-sent message's `cardsV2` payload.
+    ///
+    /// `message_name` is the full resource path of the original card
+    /// message (returned by [`send_card`](Self::send_card)). `card` is
+    /// the inner card object — same shape `send_card` accepts.
+    /// `card_id` defaults to `"default"` so callers can omit it for
+    /// the common single-card case.
+    pub async fn edit_card(
+        &self,
+        message_name: &str,
+        card_id: &str,
+        card: &Value,
+    ) -> Result<MessageResponse, AdapterError> {
+        let body = json!({
+            "cardsV2": [{
+                "cardId": card_id,
+                "card": card,
+            }]
+        });
+        let url = self.url(&format!("/v1/{message_name}"));
+        let resp = self
+            .client
+            .put(url)
+            .bearer_auth(&self.bot_token)
+            .query(&[("updateMask", "cardsV2")])
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| transport(&e))?;
+        let value = read_gchat_json(resp).await?;
+        let parsed: MessageResponse = serde_json::from_value(value)
+            .map_err(|e| AdapterError::Transport(format!("edit card decode: {e}")))?;
+        Ok(parsed)
+    }
+
     /// Delete a message by full resource name.
     pub async fn delete_message(&self, message_name: &str) -> Result<(), AdapterError> {
         let url = self.url(&format!("/v1/{message_name}"));

@@ -725,6 +725,7 @@ mod tests {
             default_image_tag: "ironclaw/session:test".into(),
             default_provider: "anthropic".into(),
             default_model: "claude-sonnet-4-6".into(),
+            default_effort: None,
             anthropic_api_key: Some("sk-test".into()),
             anthropic_base_url: Some("https://openrouter.ai/api/v1".into()),
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
@@ -967,6 +968,7 @@ mod tests {
             egress_allow: vec![],
             resource_limits: serde_json::json!({"cpus": "1.5", "memory_mb": 512u64}),
             coding_enabled: false,
+            surface_thinking: false,
             updated_at: chrono::Utc::now(),
         };
         let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg));
@@ -1004,6 +1006,7 @@ mod tests {
             egress_allow: vec!["api.example.com:443".into(), "db.local:5432".into()],
             resource_limits: serde_json::json!({}),
             coding_enabled: false,
+            surface_thinking: false,
             updated_at: chrono::Utc::now(),
         };
         let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg));
@@ -1039,6 +1042,7 @@ mod tests {
             egress_allow: vec![],
             resource_limits: serde_json::json!({}),
             coding_enabled: false,
+            surface_thinking: false,
             updated_at: chrono::Utc::now(),
         };
         let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg));
@@ -1096,6 +1100,8 @@ mod tests {
                 channel_type: Some(ironclaw_types::ChannelType::new("cli")),
                 thread_id: None,
                 source_session_id: None,
+                reply_to: None,
+                is_group: None,
             },
         )
         .unwrap();
@@ -1220,6 +1226,8 @@ mod tests {
                 channel_type: Some(ironclaw_types::ChannelType::new("cli")),
                 thread_id: None,
                 source_session_id: None,
+                reply_to: None,
+                is_group: None,
             },
         )
         .unwrap();

@@ -218,8 +218,17 @@ pub async fn run_inner_loop(
 
         while let Some(event) = query.next_event().await {
             match event {
-                ProviderEvent::Init { .. } | ProviderEvent::ToolStart { .. } | ProviderEvent::ToolEnd
-                | ProviderEvent::Progress { .. } | ProviderEvent::Activity => {}
+                // Subagents intentionally drop `Thinking` events on the
+                // floor — they're bounded single-shot loops with no user
+                // channel to surface reasoning to. The main runner handles
+                // the structured-thinking emit path (gated on per-group
+                // `surface_thinking`); see `run::provider_call::pump_events`.
+                ProviderEvent::Init { .. }
+                | ProviderEvent::ToolStart { .. }
+                | ProviderEvent::ToolEnd
+                | ProviderEvent::Progress { .. }
+                | ProviderEvent::Activity
+                | ProviderEvent::Thinking { .. } => {}
                 ProviderEvent::Usage {
                     input_tokens,
                     output_tokens,

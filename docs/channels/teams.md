@@ -1,5 +1,23 @@
 # teams (Microsoft Teams) channel audit
 
+## Native UI capabilities
+
+| Capability | Native | Notes |
+|---|---|---|
+| Chat (text) | yes | Graph `chatMessage` POST on channel or chat targets |
+| Auto-split long messages | yes | 28 000-char cap declared via `max_message_chars()` (adapter.rs:337) |
+| Honour `Retry-After` | yes | `AdapterError::Rate { retry_after }` from `api.rs`; delivery loop reads it |
+| Typing indicator | no | trait default; Graph has no typing indicator on channel messages |
+| Native cards (buttons/sections) | no | falls back via trait-default text render. Adaptive Cards are a future override |
+| Native breadcrumbs (tool chips) | fallback | trait-default `[tool]` text line |
+| Inbound reply_to context | yes | `replyToId` on the fetched Graph message → `InboundEvent.reply_to` (events/router.rs:354) |
+| Inbound group vs DM distinction | yes | channel notifications are always group; chats use `chat.chatType != "oneOnOne"` (events/router.rs:302, 331) |
+| Edit messages | yes (via action) | `content.action = "edit"` → `PATCH` on channel or chat message |
+| Reactions | yes (via action) | `content.action = "reaction"` with shortcode → `reactionType` map (≈6 mapped). Unknown emoji → Unsupported |
+| Files / attachments | yes (channel only) | Graph `filesFolder` → `/drives/.../content` → attachment-by-reference. Chat-target files explicitly Unsupported (delegated-auth limit) |
+| Threading | yes | channel `replies`; `supports_threads() = true` |
+| Webhook secret verification | n/a (Graph bearer) | change-notification handler validates via Graph subscription handshake + bearer token; no operator-supplied secret to verify |
+
 ## Implemented
 - deliver: COMPLETE for text/html + edit + reaction in both channel and
   chat targets; channel-target files supported via Graph

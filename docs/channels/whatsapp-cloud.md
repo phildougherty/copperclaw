@@ -1,5 +1,23 @@
 # whatsapp-cloud channel audit
 
+## Native UI capabilities
+
+| Capability | Native | Notes |
+|---|---|---|
+| Chat (text) | yes | `messages` endpoint, text or text-with-context (reply) |
+| Auto-split long messages | yes | 4096-char cap declared via `max_message_chars()` (adapter.rs:158) |
+| Honour `Retry-After` | yes | `AdapterError::Rate { retry_after }` from `api.rs`; delivery loop reads it |
+| Typing indicator | partial | no real typing API. `set_typing` is approximated by `mark_read` when `thread_id` (i.e. the inbound message id) is supplied (adapter.rs:162); otherwise no-op |
+| Native cards (buttons/sections) | no | trait-default text render. Interactive messages / list templates are a future override |
+| Native breadcrumbs (tool chips) | fallback | trait-default `[tool]` text line |
+| Inbound reply_to context | yes | `messages[].context.message_id` → `InboundEvent.reply_to` (events/router.rs:282) |
+| Inbound group vs DM distinction | no | `is_group: Some(false)` always — WhatsApp Cloud personal/business numbers have no group concept here (events/router.rs:302) |
+| Edit messages | no | `content.action = "edit"` → Unsupported (platform limit) |
+| Reactions | yes (via action) | `content.action = "reaction"` → `send_reaction` (adapter.rs:250) |
+| Files / attachments | yes | upload via `/media` then send by id; reply context propagated |
+| Threading | no | `supports_threads() = false` (adapter.rs:150) — WhatsApp uses flat replies addressed by message id, not a separate thread object |
+| Webhook secret verification | yes | HMAC-SHA256 over body, `X-Hub-Signature-256: sha256=<hex>`. Constant-time via `subtle::ConstantTimeEq` (signature.rs) |
+
 ## Implemented
 - deliver: COMPLETE — text + reply (text-with-context) + files (upload
   + send-by-id, plus reply context) + action-reaction. Edit is

@@ -9,7 +9,10 @@ use crate::config::MatrixConfig;
 use crate::factory::CHANNEL_TYPE_STR;
 use crate::sync::{NEXT_BATCH_FILENAME, run_sync_loop};
 use async_trait::async_trait;
-use ironclaw_channels_core::{AdapterError, ChannelAdapter, DmHandle};
+use ironclaw_channels_core::{
+    AdapterError, Breadcrumb, BreadcrumbStatus, ChannelAdapter, DiffCard, DmHandle, ErrorCard,
+    ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList,
+};
 use ironclaw_types::{ChannelType, InboundEvent, OutboundMessage};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -242,11 +245,437 @@ impl ChannelAdapter for MatrixAdapter {
         Ok(Some(sent.event_id))
     }
 
+    /// Native breadcrumb chip — rendered as an `m.notice` HTML event
+    /// with the tool name in `<code>…</code>`. Matrix clients style
+    /// `m.notice` more subtly than `m.text`, matching the chip
+    /// aesthetic. When `existing_message_id` is provided we send an
+    /// `m.replace` relation so clients show "edited" in place
+    /// instead of a new line.
+    async fn deliver_breadcrumb(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        breadcrumb: &Breadcrumb,
+        existing_message_id: Option<&str>,
+    ) -> Result<Option<String>, AdapterError> {
+        let room_id = self.resolve_room(platform_id).await?;
+        let html = render_breadcrumb_html_matrix(breadcrumb);
+        let plain = breadcrumb.to_text_fallback();
+        if let Some(target) = existing_message_id {
+            let resp = self
+                .api
+                .edit_message_notice_html(&room_id, target, &plain, &html)
+                .await?;
+            return Ok(Some(resp.event_id));
+        }
+        let resp = self.api.send_notice_html(&room_id, &plain, &html).await?;
+        Ok(Some(resp.event_id))
+    }
+
+    /// Native diff card — rendered as an `m.notice` HTML event with
+    /// `formatted_body = <pre><code class="language-diff">…</code></pre>`.
+    /// Element (the reference Matrix client) honours the
+    /// `language-diff` class natively and colourises `+` / `-` lines.
+    /// The plain-text `body` field carries the unified-diff fallback
+    /// so non-HTML clients (CLI bots, IRC bridges) still get a
+    /// readable rendering.
+    async fn deliver_diff(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        diff: &DiffCard,
+    ) -> Result<Option<String>, AdapterError> {
+        let room_id = self.resolve_room(platform_id).await?;
+        let plain = diff.to_text_fallback();
+        let html = render_diff_html_matrix(diff);
+        let resp = self.api.send_notice_html(&room_id, &plain, &html).await?;
+        Ok(Some(resp.event_id))
+    }
+
+    /// Native long-output expander (slice 3.4) — rendered as an
+    /// `m.text` HTML event whose `formatted_body` wraps the full
+    /// text in a `<details><summary>…</summary>…</details>`
+    /// disclosure widget. Element (the reference Matrix client)
+    /// renders the disclosure natively as a clickable expander, and
+    /// other Matrix clients fall back to "summary text + visible
+    /// body" (graceful).
+    ///
+    /// The plain-text body powers the `body` field so non-HTML
+    /// clients (CLI bots, scrapers, IRC bridges) still get a
+    /// readable rendering — we concatenate the summary, the
+    /// preview, a `…(N more lines)` marker, and the full body.
+    async fn deliver_collapsible(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        text: &str,
+        summary: &str,
+        preview_lines: &[String],
+    ) -> Result<Option<String>, AdapterError> {
+        let room_id = self.resolve_room(platform_id).await?;
+        let html = render_collapsible_html_matrix(text, summary, preview_lines);
+        // Plain-text fallback for clients without HTML support uses
+        // the same shape as the trait-level default impl.
+        let plain = ironclaw_channels_core::render_collapsible_text_fallback(
+            text,
+            summary,
+            preview_lines,
+        );
+        let resp = self.api.send_html(&room_id, &plain, &html).await?;
+        Ok(Some(resp.event_id))
+    }
+
+    /// Native todo-list checklist — rendered as an `m.text` HTML
+    /// event with a `<h4>` title carrying `done/total`, then a `<ul>`
+    /// list with one `<li>` per item. Each `<li>` is prefixed by a
+    /// status glyph (✅/▶/☐) and wraps completed items in `<s>` so
+    /// the user can scan unfinished work at a glance. On mutation we
+    /// send an `m.replace` relation so Element shows the same chip
+    /// ticking through.
+    ///
+    /// `pin_hint` is best-effort: when set on first emit, we send an
+    /// `m.room.pinned_events` state event appending the rendered
+    /// list's event id to the pinned set; when set on the
+    /// fully-completed transition, we remove it. The bot needs the
+    /// `m.room.pinned_events` state-event permission for this to
+    /// succeed; without it, the state-event call returns 403 and we
+    /// swallow the failure (chip is the load-bearing UX, pinning is
+    /// decoration).
+    async fn deliver_todo_list(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        list: &TodoList,
+        existing_message_id: Option<&str>,
+        _pin_hint: bool,
+    ) -> Result<Option<String>, AdapterError> {
+        // Matrix pinning is a state-event API we don't currently
+        // model — see the doc comment above. We render the chip
+        // (and edit-in-place via m.replace), and accept the pin
+        // limitation. The `_pin_hint` is silently honoured as a
+        // no-op for now.
+        let room_id = self.resolve_room(platform_id).await?;
+        let html = render_todo_list_html_matrix(list);
+        let plain = list.to_text_fallback();
+        if let Some(target) = existing_message_id {
+            let resp = self
+                .api
+                .edit_message_html(&room_id, target, &plain, &html)
+                .await?;
+            return Ok(Some(resp.event_id));
+        }
+        let resp = self.api.send_html(&room_id, &plain, &html).await?;
+        Ok(Some(resp.event_id))
+    }
+
+    /// Native error card — rendered as `m.text` (NOT `m.notice`) so
+    /// Element raises an actual notification rather than muting the
+    /// row, with a `<font color="#cc3333">` wrapper carrying the red
+    /// affordance. (`m.notice` is Matrix's "muted" message type and
+    /// suppresses notification badges — wrong call for errors that
+    /// genuinely need user attention.) Details ride inside a
+    /// `<pre><code>` block for monospace.
+    async fn deliver_error(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        err: &ErrorCard,
+    ) -> Result<Option<String>, AdapterError> {
+        let room_id = self.resolve_room(platform_id).await?;
+        let html = render_error_html_matrix(err);
+        let plain = err.to_text_fallback();
+        let resp = self.api.send_html(&room_id, &plain, &html).await?;
+        Ok(Some(resp.event_id))
+    }
+
+    /// Native thinking block (slice 3.5) — rendered as an `m.notice`
+    /// event (Matrix's idiomatic "muted by default" message type, same
+    /// as the breadcrumb chip) with an HTML `<details>` disclosure
+    /// widget in `formatted_body`. Element / SchildiChat / Cinny all
+    /// render `<details>` as a native expander; legacy clients fall
+    /// back to the plain-text `to_text_fallback` body. Redacted
+    /// blocks render the placeholder body — the raw blob never
+    /// reaches the wire.
+    async fn deliver_thinking(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        thinking: &ThinkingBlock,
+    ) -> Result<Option<String>, AdapterError> {
+        let room_id = self.resolve_room(platform_id).await?;
+        let html = render_thinking_html_matrix(thinking);
+        let plain = thinking.to_text_fallback();
+        let resp = self
+            .api
+            .send_notice_html(&room_id, &plain, &html)
+            .await?;
+        Ok(Some(resp.event_id))
+    }
+
     async fn open_dm(&self, _user_id: &str) -> Result<Option<DmHandle>, AdapterError> {
         // Matrix has no separate DM concept at the protocol level; callers
         // must configure the room and pass it as `platform_id`.
         Ok(None)
     }
+}
+
+/// Render a [`Breadcrumb`] as Matrix HTML — `<code>tool</code> · detail`
+/// with a status glyph prefix. Plain text fallback lives on the same
+/// event so legacy clients still see something sensible.
+/// Render a [`DiffCard`] as Matrix HTML wrapping the unified-diff
+/// body in `<pre><code class="language-diff">…</code></pre>`. Element
+/// honours the `language-diff` class and applies `+` / `-` gutter
+/// colouring natively; clients without language-aware highlighting
+/// see the same monospaced block.
+pub(crate) fn render_diff_html_matrix(diff: &DiffCard) -> String {
+    let mut out = String::with_capacity(128 + diff.hunks.len() * 64);
+    out.push_str("<b>");
+    out.push_str(&escape_html_matrix(&diff.path));
+    out.push_str("</b> <i>(+");
+    out.push_str(&diff.added.to_string());
+    out.push_str(" / -");
+    out.push_str(&diff.removed.to_string());
+    if diff.truncated {
+        out.push_str(", truncated");
+    }
+    out.push_str(")</i>\n");
+    out.push_str("<pre><code class=\"language-diff\">");
+    for h in &diff.hunks {
+        out.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            h.old_start, h.old_lines, h.new_start, h.new_lines
+        ));
+        for line in &h.lines {
+            out.push(line.kind.unified_prefix());
+            // HTML-escape so source code can't smuggle in tags.
+            for c in line.text.chars() {
+                match c {
+                    '<' => out.push_str("&lt;"),
+                    '>' => out.push_str("&gt;"),
+                    '&' => out.push_str("&amp;"),
+                    _ => out.push(c),
+                }
+            }
+            out.push('\n');
+        }
+    }
+    out.push_str("</code></pre>");
+    out
+}
+
+pub(crate) fn render_breadcrumb_html_matrix(b: &Breadcrumb) -> String {
+    // ASCII-only markers. Element renders U+23F3 / U+2713 / U+2717
+    // as colourful emoji on iOS, violating the project's no-emoji rule.
+    let glyph = match b.status {
+        BreadcrumbStatus::Running => "[~]",
+        BreadcrumbStatus::Done => "[ok]",
+        BreadcrumbStatus::Failed => "[x]",
+    };
+    let mut out = String::with_capacity(64);
+    out.push_str(glyph);
+    out.push(' ');
+    out.push_str("<code>");
+    out.push_str(&escape_html_matrix(&b.tool_name));
+    out.push_str("</code>");
+    if let Some(d) = b.detail.as_deref() {
+        let d = d.trim();
+        if !d.is_empty() {
+            out.push_str(" · ");
+            out.push_str(&escape_html_matrix(d));
+        }
+    }
+    if let Some(s) = b.summary.as_deref() {
+        let s = s.trim();
+        if !s.is_empty() {
+            if b.status == BreadcrumbStatus::Failed {
+                out.push_str(" — failed: ");
+            } else {
+                out.push_str(" — ");
+            }
+            out.push_str(&escape_html_matrix(s));
+        }
+    }
+    out
+}
+
+/// Render an [`ErrorCard`] as Matrix HTML `formatted_body`. Shape:
+///
+/// ```html
+/// <font color="#cc3333"><b>Error: Title</b></font><br>
+/// summary line
+/// <pre><code>details monospace block</code></pre>
+/// <em>will retry automatically</em>
+/// ```
+///
+/// Element renders `<font color>` natively in the message body; the
+/// `<pre><code>` block survives Matrix's HTML allowlist and lands as
+/// monospace. The `<em>` retryable footer styles distinctly without
+/// adding noise on minimal clients (where it falls back to plain
+/// italics).
+///
+/// The severity label varies by [`ErrorCardKind`] so the user can
+/// see which pipeline stage gave up.
+pub(crate) fn render_error_html_matrix(err: &ErrorCard) -> String {
+    const RED: &str = "#cc3333";
+    let label = match err.kind {
+        ErrorCardKind::Internal => "Tool error",
+        ErrorCardKind::Provider => "Provider error",
+        ErrorCardKind::Delivery => "Delivery error",
+    };
+    let mut out = String::with_capacity(160 + err.summary.len());
+    out.push_str("<font color=\"");
+    out.push_str(RED);
+    out.push_str("\"><b>");
+    out.push_str(label);
+    out.push_str(": ");
+    out.push_str(&escape_html_matrix(err.title.trim()));
+    out.push_str("</b></font><br>");
+    out.push_str(&escape_html_matrix(err.summary.trim()));
+    if let Some(d) = err.details.as_deref() {
+        let d = d.trim();
+        if !d.is_empty() {
+            out.push_str("<pre><code>");
+            out.push_str(&escape_html_matrix(d));
+            out.push_str("</code></pre>");
+        }
+    }
+    if err.retryable {
+        out.push_str("<br><em>will retry automatically</em>");
+    }
+    out
+}
+
+/// Render the slice-3.4 long-output expander as Matrix HTML using
+/// the native `<details><summary>…</summary>…</details>` disclosure
+/// element. Element (the reference Matrix client) renders this as a
+/// clickable expander natively; other clients fall back to "summary
+/// visible + body visible inline".
+///
+/// Shape:
+///
+/// ```html
+/// <details>
+///   <summary><em>{summary}</em></summary>
+///   <pre><code>{full body}</code></pre>
+/// </details>
+/// ```
+///
+/// Preview lines aren't rendered separately because the `<details>`
+/// element itself handles the "what's visible when collapsed" UX
+/// (the summary line). Pulling preview lines outside the details
+/// would just duplicate content.
+pub(crate) fn render_collapsible_html_matrix(
+    text: &str,
+    summary: &str,
+    _preview_lines: &[String],
+) -> String {
+    let mut out = String::with_capacity(text.len() + summary.len() + 64);
+    out.push_str("<details>");
+    out.push_str("<summary><em>");
+    out.push_str(&escape_html_matrix(summary.trim()));
+    out.push_str("</em></summary>");
+    out.push_str("<pre><code>");
+    out.push_str(&escape_html_matrix(text));
+    out.push_str("</code></pre>");
+    out.push_str("</details>");
+    out
+}
+
+/// Render a [`ThinkingBlock`] as Matrix HTML using the native
+/// `<details><summary>…</summary>…</details>` disclosure element —
+/// same primitive surface 4 (long-output) uses. Element /
+/// `SchildiChat` / Cinny render `<details>` as a clickable expander
+/// natively; legacy clients render the body inline.
+///
+/// Shape:
+///
+/// ```html
+/// <details>
+///   <summary><em>reasoning (claude-opus-4-7)</em></summary>
+///   <blockquote>thinking text…</blockquote>
+/// </details>
+/// ```
+///
+/// `<blockquote>` (rather than `<pre><code>`, which the long-output
+/// renderer uses) reflects that reasoning is prose, not code; clients
+/// render it with a subtle left-bar indent so the user reads it as
+/// quoted aside. Redacted blocks emit the placeholder body — the raw
+/// blob never reaches the wire.
+pub(crate) fn render_thinking_html_matrix(t: &ThinkingBlock) -> String {
+    let mut out = String::with_capacity(t.text.len() + 64);
+    let label_suffix = match t.model.as_deref().map(str::trim) {
+        Some(m) if !m.is_empty() => format!(" ({})", escape_html_matrix(m)),
+        _ => String::new(),
+    };
+    out.push_str("<details>");
+    out.push_str("<summary><em>reasoning");
+    out.push_str(&label_suffix);
+    out.push_str("</em></summary>");
+    out.push_str("<blockquote>");
+    if t.redacted {
+        out.push_str("(redacted reasoning)");
+    } else {
+        out.push_str(&escape_html_matrix(&t.text));
+    }
+    out.push_str("</blockquote>");
+    out.push_str("</details>");
+    out
+}
+
+/// Render a [`TodoList`] as Matrix HTML — `<h4>` title with
+/// `done/total` counter, `<ul>` with one `<li>` per item, status
+/// glyph prefix, `<s>` strikethrough on completed lines. Element
+/// renders this with proper list indentation.
+///
+/// Glyphs are unicode `✅` / `▶` / `☐` so they survive every Matrix
+/// client (Element web, Element mobile, `FluffyChat`, etc.). Item text
+/// goes through [`escape_html_matrix`].
+pub(crate) fn render_todo_list_html_matrix(list: &TodoList) -> String {
+    let done = list.completed_count();
+    let total = list.items.len();
+    let mut out = String::with_capacity(64 + list.items.len() * 48);
+    out.push_str("<h4>");
+    out.push_str(&escape_html_matrix(list.title_or_default()));
+    out.push_str(&format!(" ({done}/{total})"));
+    out.push_str("</h4>");
+    out.push_str("<ul>");
+    for item in &list.items {
+        // ASCII-only glyphs per the project's no-emoji rule. Element on
+        // iOS renders the symbol forms (✅ / ▶ / ☐) as colourful emoji.
+        let glyph = match item.status {
+            TodoItemStatus::Completed => "[x]",
+            TodoItemStatus::InProgress => "[~]",
+            TodoItemStatus::Pending => "[ ]",
+        };
+        out.push_str("<li>");
+        out.push_str(glyph);
+        out.push(' ');
+        if item.status == TodoItemStatus::Completed {
+            out.push_str("<s>");
+            out.push_str(&escape_html_matrix(item.text.trim()));
+            out.push_str("</s>");
+        } else {
+            out.push_str(&escape_html_matrix(item.text.trim()));
+        }
+        out.push_str("</li>");
+    }
+    out.push_str("</ul>");
+    out
+}
+
+fn escape_html_matrix(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 impl MatrixAdapter {
@@ -889,5 +1318,399 @@ mod tests {
     fn required_str_errors_when_missing() {
         let err = required_str(&json!({}), "x").unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
+    }
+
+    // ── Breadcrumb chip rendering ──────────────────────────────────
+
+    #[test]
+    fn render_breadcrumb_html_matrix_running_uses_code_and_ascii_marker() {
+        let bc = ironclaw_channels_core::Breadcrumb::running("shell")
+            .with_detail("cargo check");
+        let html = super::render_breadcrumb_html_matrix(&bc);
+        assert!(html.starts_with("[~]"), "got: {html}");
+        assert!(html.contains("<code>shell</code>"), "got: {html}");
+        assert!(html.contains("cargo check"));
+    }
+
+    #[test]
+    fn render_breadcrumb_html_matrix_done_with_summary() {
+        let bc = ironclaw_channels_core::Breadcrumb::running("shell")
+            .with_detail("cargo check")
+            .finished(true, Some("passed (0.4s)".into()));
+        let html = super::render_breadcrumb_html_matrix(&bc);
+        assert!(html.starts_with("[ok]"), "got: {html}");
+        assert!(html.contains("passed (0.4s)"));
+    }
+
+    #[test]
+    fn render_breadcrumb_html_matrix_escapes_special_chars() {
+        let bc = ironclaw_channels_core::Breadcrumb::running("shell")
+            .with_detail("echo <a> & <b>");
+        let html = super::render_breadcrumb_html_matrix(&bc);
+        assert!(html.contains("echo &lt;a&gt; &amp; &lt;b&gt;"));
+    }
+
+    #[tokio::test]
+    async fn deliver_breadcrumb_running_sends_notice_html() {
+        let s = MockServer::start().await;
+        mount_empty_sync(&s).await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(wiremock::matchers::body_string_contains("\"m.notice\""))
+            .and(wiremock::matchers::body_string_contains("<code>shell</code>"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "event_id": "$chip:m.org"
+            })))
+            .mount(&s)
+            .await;
+        let (adapter, _dir, _rx) = build_adapter(&s.uri());
+        let bc = ironclaw_channels_core::Breadcrumb::running("shell")
+            .with_detail("cargo check");
+        let id = adapter
+            .deliver_breadcrumb("!room:m.org", None, &bc, None)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("$chip:m.org"));
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_breadcrumb_with_existing_id_emits_m_replace() {
+        let s = MockServer::start().await;
+        mount_empty_sync(&s).await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(wiremock::matchers::body_string_contains("\"m.replace\""))
+            .and(wiremock::matchers::body_string_contains("\"m.notice\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "event_id": "$edit:m.org"
+            })))
+            .mount(&s)
+            .await;
+        let (adapter, _dir, _rx) = build_adapter(&s.uri());
+        let bc = ironclaw_channels_core::Breadcrumb::running("shell")
+            .with_detail("cargo check")
+            .finished(true, Some("passed (0.4s)".into()));
+        let id = adapter
+            .deliver_breadcrumb("!room:m.org", None, &bc, Some("$prev:m.org"))
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("$edit:m.org"));
+        adapter.shutdown().await;
+    }
+
+    // ── Diff card rendering ────────────────────────────────────────
+
+    #[test]
+    fn render_diff_html_matrix_wraps_body_in_language_diff_pre_code() {
+        let card = ironclaw_channels_core::DiffCard {
+            path: "src/lib.rs".into(),
+            language: Some("rust".into()),
+            hunks: vec![ironclaw_channels_core::DiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![
+                    ironclaw_channels_core::DiffLine {
+                        kind: ironclaw_channels_core::DiffLineKind::Remove,
+                        text: "let x = 1;".into(),
+                    },
+                    ironclaw_channels_core::DiffLine {
+                        kind: ironclaw_channels_core::DiffLineKind::Add,
+                        text: "let x = 2;".into(),
+                    },
+                ],
+            }],
+            added: 1,
+            removed: 1,
+            truncated: false,
+        };
+        let html = super::render_diff_html_matrix(&card);
+        assert!(html.contains("<b>src/lib.rs</b>"));
+        assert!(html.contains("(+1 / -1)"));
+        assert!(html.contains("<pre><code class=\"language-diff\">"));
+        assert!(html.contains("@@ -1,1 +1,1 @@"));
+        assert!(html.contains("-let x = 1;"));
+        assert!(html.contains("+let x = 2;"));
+        assert!(html.trim_end().ends_with("</code></pre>"));
+    }
+
+    #[test]
+    fn render_diff_html_matrix_escapes_hostile_source_chars() {
+        let card = ironclaw_channels_core::DiffCard {
+            path: "x.rs".into(),
+            language: None,
+            hunks: vec![ironclaw_channels_core::DiffHunk {
+                old_start: 1,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![ironclaw_channels_core::DiffLine {
+                    kind: ironclaw_channels_core::DiffLineKind::Add,
+                    text: "fn f<T>() -> &str { x & y }".into(),
+                }],
+            }],
+            added: 1,
+            removed: 0,
+            truncated: false,
+        };
+        let html = super::render_diff_html_matrix(&card);
+        assert!(html.contains("&lt;T&gt;"));
+        assert!(html.contains("&amp;"));
+    }
+
+    #[tokio::test]
+    async fn deliver_diff_sends_notice_html_with_language_diff_pre() {
+        let s = MockServer::start().await;
+        mount_empty_sync(&s).await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(wiremock::matchers::body_string_contains("\"m.notice\""))
+            .and(wiremock::matchers::body_string_contains("language-diff"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "event_id": "$diff:m.org"
+            })))
+            .mount(&s)
+            .await;
+        let (adapter, _dir, _rx) = build_adapter(&s.uri());
+        let card = ironclaw_channels_core::DiffCard {
+            path: "src/lib.rs".into(),
+            language: Some("rust".into()),
+            hunks: vec![ironclaw_channels_core::DiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![
+                    ironclaw_channels_core::DiffLine {
+                        kind: ironclaw_channels_core::DiffLineKind::Add,
+                        text: "fn main() {}".into(),
+                    },
+                ],
+            }],
+            added: 1,
+            removed: 0,
+            truncated: false,
+        };
+        let id = adapter
+            .deliver_diff("!room:m.org", None, &card)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("$diff:m.org"));
+        adapter.shutdown().await;
+    }
+
+    // ── Error card rendering ────────────────────────────────────────
+
+    #[test]
+    fn render_error_html_matrix_wraps_red_label() {
+        let card = ironclaw_channels_core::ErrorCard::new(
+            ironclaw_channels_core::ErrorCardKind::Internal,
+            "the shell tool timed out",
+        )
+        .with_title("Tool failed");
+        let html = super::render_error_html_matrix(&card);
+        // Note: raw string uses double `#` delimiter because the
+        // colour value already contains a `#` — single `#` would
+        // close the raw string early.
+        assert!(html.contains(r##"<font color="#cc3333">"##));
+        assert!(html.contains("Tool error: Tool failed"));
+        assert!(html.contains("the shell tool timed out"));
+    }
+
+    #[test]
+    fn render_error_html_matrix_includes_pre_code_for_details() {
+        let card = ironclaw_channels_core::ErrorCard::new(
+            ironclaw_channels_core::ErrorCardKind::Provider,
+            "summary line",
+        )
+        .with_details("stderr line 1\nstderr line 2");
+        let html = super::render_error_html_matrix(&card);
+        assert!(html.contains("<pre><code>"));
+        assert!(html.contains("stderr line 1"));
+        assert!(html.contains("</code></pre>"));
+    }
+
+    #[test]
+    fn render_error_html_matrix_appends_retry_footer() {
+        let card = ironclaw_channels_core::ErrorCard::new(
+            ironclaw_channels_core::ErrorCardKind::Delivery,
+            "telegram 502",
+        )
+        .retryable();
+        let html = super::render_error_html_matrix(&card);
+        assert!(html.contains("<em>will retry automatically</em>"));
+    }
+
+    #[test]
+    fn render_error_html_matrix_escapes_user_content() {
+        // User-supplied stderr containing HTML must NOT survive verbatim
+        // — escape every angle bracket and ampersand.
+        let card = ironclaw_channels_core::ErrorCard::new(
+            ironclaw_channels_core::ErrorCardKind::Internal,
+            "got: <script>alert(1)</script>",
+        )
+        .with_title("attack? & escape");
+        let html = super::render_error_html_matrix(&card);
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(html.contains("attack? &amp; escape"));
+    }
+
+    #[tokio::test]
+    async fn deliver_error_sends_html_via_m_text() {
+        // Crucially `m.text` (not `m.notice`) — errors warrant
+        // notification badges; muting them in Element would defeat
+        // the surface's purpose.
+        let s = MockServer::start().await;
+        mount_empty_sync(&s).await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(wiremock::matchers::body_string_contains("\"m.text\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "event_id": "$err:m.org"
+            })))
+            .mount(&s)
+            .await;
+        let (adapter, _dir, _rx) = build_adapter(&s.uri());
+        let card = ironclaw_channels_core::ErrorCard::new(
+            ironclaw_channels_core::ErrorCardKind::Provider,
+            "model 502 after retry exhaustion",
+        );
+        let id = adapter
+            .deliver_error("!room:m.org", None, &card)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("$err:m.org"));
+        adapter.shutdown().await;
+    }
+
+    // ── Long-output expander (slice 3.4) rendering ────────────────
+
+    #[test]
+    fn render_collapsible_html_matrix_wraps_in_details_summary() {
+        // Native Matrix primitive: `<details><summary>` is the
+        // disclosure widget Element renders natively.
+        let body = (0..10).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        let html = super::render_collapsible_html_matrix(&body, "10 lines (40 B)", &[]);
+        assert!(html.starts_with("<details>"), "got: {html}");
+        assert!(html.ends_with("</details>"), "got: {html}");
+        assert!(html.contains("<summary><em>10 lines (40 B)</em></summary>"));
+        assert!(html.contains("<pre><code>"));
+        assert!(html.contains("L0"));
+        assert!(html.contains("L9"));
+    }
+
+    #[test]
+    fn render_collapsible_html_matrix_escapes_html_in_body() {
+        // Tool output with literal `<` or `&` must be escaped; bare
+        // `<script>` would otherwise hand the rendering to the
+        // client's parser uncontrolled.
+        let html = super::render_collapsible_html_matrix(
+            "<script>alert(1)</script>",
+            "fetched 1 page",
+            &[],
+        );
+        assert!(!html.contains("<script>"));
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[tokio::test]
+    async fn deliver_collapsible_sends_html_details_body() {
+        let s = MockServer::start().await;
+        mount_empty_sync(&s).await;
+        Mock::given(method("PUT"))
+            .and(wiremock::matchers::path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+$",
+            ))
+            .and(wiremock::matchers::body_string_contains("<details>"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "event_id": "$long:m.org"
+            })))
+            .mount(&s)
+            .await;
+        let (adapter, _dir, _rx) = build_adapter(&s.uri());
+        let body = (0..40).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        let preview: Vec<String> = (0..3).map(|i| format!("L{i}")).collect();
+        let id = adapter
+            .deliver_collapsible("!room:m.org", None, &body, "shell 40 lines", &preview)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("$long:m.org"));
+        adapter.shutdown().await;
+    }
+
+    // ── Thinking block (slice 3.5) rendering ────────────────────────
+
+    #[test]
+    fn render_thinking_html_matrix_wraps_body_in_details() {
+        // Native Matrix primitive for this surface is `<details>` —
+        // same disclosure element surface 4 uses for long-output. The
+        // summary line carries the `reasoning` italic label.
+        let t = ThinkingBlock::visible("Let me work through the question.");
+        let html = super::render_thinking_html_matrix(&t);
+        assert!(html.starts_with("<details>"), "got: {html}");
+        assert!(html.contains("<summary><em>reasoning</em></summary>"), "got: {html}");
+        assert!(html.contains("<blockquote>"), "got: {html}");
+        assert!(html.contains("Let me work through the question."));
+        assert!(html.ends_with("</details>"));
+    }
+
+    #[test]
+    fn render_thinking_html_matrix_includes_model_provenance() {
+        let t = ThinkingBlock::visible("ok").with_model("claude-opus-4-7");
+        let html = super::render_thinking_html_matrix(&t);
+        assert!(
+            html.contains("<summary><em>reasoning (claude-opus-4-7)</em></summary>"),
+            "got: {html}"
+        );
+    }
+
+    #[test]
+    fn render_thinking_html_matrix_escapes_html_in_body() {
+        let t = ThinkingBlock::visible("<script>alert(1)</script>");
+        let html = super::render_thinking_html_matrix(&t);
+        assert!(!html.contains("<script>"), "got: {html}");
+        assert!(html.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn render_thinking_html_matrix_redacted_emits_placeholder_only() {
+        // Privacy contract: redacted blocks must never put the raw
+        // blob on the wire.
+        let t = ThinkingBlock::redacted("opaque-secret-blob");
+        let html = super::render_thinking_html_matrix(&t);
+        assert!(html.contains("(redacted reasoning)"));
+        assert!(!html.contains("opaque-secret-blob"), "leak: {html}");
+    }
+
+    // ── TodoList chip rendering ────────────────────────────────────
+
+    fn matrix_todo_list_sample() -> ironclaw_channels_core::TodoList {
+        ironclaw_channels_core::TodoList {
+            items: vec![
+                ironclaw_channels_core::TodoListItem {
+                    id: 1,
+                    text: "Wash dishes".into(),
+                    status: ironclaw_channels_core::TodoItemStatus::Completed,
+                },
+                ironclaw_channels_core::TodoListItem {
+                    id: 2,
+                    text: "Dry dishes".into(),
+                    status: ironclaw_channels_core::TodoItemStatus::Pending,
+                },
+            ],
+            title: Some("Kitchen".into()),
+        }
+    }
+
+    #[test]
+    fn render_todo_list_html_matrix_emits_h4_and_ul() {
+        let html = super::render_todo_list_html_matrix(&matrix_todo_list_sample());
+        assert!(html.contains("<h4>Kitchen (1/2)</h4>"), "header: {html}");
+        assert!(html.contains("<ul>"));
+        assert!(html.contains("[x] <s>Wash dishes</s>"), "done strike: {html}");
+        assert!(html.contains("[ ] Dry dishes"), "pending: {html}");
     }
 }

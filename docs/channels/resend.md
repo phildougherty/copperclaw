@@ -1,5 +1,23 @@
 # resend channel audit
 
+## Native UI capabilities
+
+| Capability | Native | Notes |
+|---|---|---|
+| Chat (text) | yes | outbound `POST /emails` with subject/text/html |
+| Auto-split long messages | no | no `max_message_chars()` override; email bodies have no practical wire cap |
+| Honour `Retry-After` | yes | `AdapterError::Rate { retry_after }` from `api.rs`; delivery loop reads it |
+| Typing indicator | no | trait default; email has no typing concept |
+| Native cards (buttons/sections) | no | falls back via trait-default text render. Card → HTML email is a future override |
+| Native breadcrumbs (tool chips) | no | not surfaced — email is too high-latency for live tool chips |
+| Inbound reply_to context | n/a | outbound-only by design |
+| Inbound group vs DM distinction | n/a | outbound-only |
+| Edit messages | no | trait-default Unsupported — email can't be edited after send |
+| Reactions | no | trait-default Unsupported |
+| Files / attachments | yes | base64-encoded `attachments[]` on the email |
+| Threading | yes | RFC 2822 `In-Reply-To` / `References` headers set when `thread_id` present; `supports_threads() = true` (adapter.rs:208) |
+| Webhook secret verification | n/a (outbound) | no inbound endpoint; Resend's bounce/complaint webhooks are deferred for follow-up |
+
 ## Implemented
 - deliver: COMPLETE — POST /emails with subject/text/html/attachments/
   thread headers. `crates/ironclaw-channels/resend/src/adapter.rs:214`

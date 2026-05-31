@@ -131,7 +131,7 @@ impl ContainerRuntime for AppleContainerRuntime {
                     .into(),
             ));
         }
-        let args = run_args(&spec);
+        let args = run_args(&spec)?;
         let out = Command::new(&self.binary)
             .args(&args)
             .output()
@@ -243,7 +243,7 @@ pub(crate) fn stop_args(name: &str, grace: Duration) -> Vec<String> {
 /// We always pass `--detach`, name, image, labels, env, mounts,
 /// extra-hosts, user, and entrypoint in a deterministic order so the
 /// snapshot tests stay stable.
-pub(crate) fn run_args(spec: &ContainerSpec) -> Vec<String> {
+pub(crate) fn run_args(spec: &ContainerSpec) -> Result<Vec<String>, RtError> {
     let mut a = vec!["run".into(), "--detach".into(), "--name".into(), spec.name.clone()];
 
     if let Some(user) = &spec.user {
@@ -270,7 +270,7 @@ pub(crate) fn run_args(spec: &ContainerSpec) -> Vec<String> {
 
     for m in &spec.mounts {
         a.push("--mount".into());
-        a.push(mount_arg(m));
+        a.push(mount_arg(m)?);
     }
 
     a.push(spec.image.clone());
@@ -279,39 +279,66 @@ pub(crate) fn run_args(spec: &ContainerSpec) -> Vec<String> {
         a.push(piece.clone());
     }
 
-    a
+    Ok(a)
+}
+
+/// Validate that an Apple-Container mount path (source or target) does
+/// not contain characters that would break the comma-separated
+/// `--mount` value syntax. A `,` would inject arbitrary mount options
+/// (e.g. flipping `readonly`); `=` would corrupt key=value parsing;
+/// `\n` could split the argv on some shells / shims. Operator-
+/// controlled paths must be rejected at the function boundary so the
+/// failure surfaces at setup time, not at first session spawn.
+fn validate_mount_path(role: &str, path: &str) -> Result<(), RtError> {
+    for (ch, label) in [(',', "','"), ('=', "'='"), ('\n', "'\\n'")] {
+        if path.contains(ch) {
+            return Err(RtError::Unsupported(format!(
+                "Apple container mount {role} path contains forbidden character {label}: {path}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Render a single mount as the `--mount type=...,...` value.
-pub(crate) fn mount_arg(m: &Mount) -> String {
+///
+/// Returns [`RtError::Unsupported`] if any path component contains a
+/// reserved character (`,`, `=`, `\n`) that would let an attacker
+/// inject mount options via an operator-controlled path.
+pub(crate) fn mount_arg(m: &Mount) -> Result<String, RtError> {
     match m {
         Mount::Bind {
             source,
             target,
             read_only,
         } => {
+            validate_mount_path("source", source)?;
+            validate_mount_path("target", target)?;
             let mut s = format!("type=bind,source={source},target={target}");
             if *read_only {
                 s.push_str(",readonly");
             }
-            s
+            Ok(s)
         }
         Mount::Volume {
             name,
             target,
             read_only,
         } => {
+            validate_mount_path("source", name)?;
+            validate_mount_path("target", target)?;
             let mut s = format!("type=volume,source={name},target={target}");
             if *read_only {
                 s.push_str(",readonly");
             }
-            s
+            Ok(s)
         }
         Mount::Tmpfs { target, size_bytes } => {
+            validate_mount_path("target", target)?;
             if *size_bytes == 0 {
-                format!("type=tmpfs,target={target}")
+                Ok(format!("type=tmpfs,target={target}"))
             } else {
-                format!("type=tmpfs,target={target},tmpfs-size={size_bytes}")
+                Ok(format!("type=tmpfs,target={target},tmpfs-size={size_bytes}"))
             }
         }
     }
@@ -411,7 +438,8 @@ mod tests {
             source: "/h".into(),
             target: "/c".into(),
             read_only: false,
-        });
+        })
+        .unwrap();
         assert_eq!(s, "type=bind,source=/h,target=/c");
     }
 
@@ -421,7 +449,8 @@ mod tests {
             source: "/h".into(),
             target: "/c".into(),
             read_only: true,
-        });
+        })
+        .unwrap();
         assert!(s.ends_with(",readonly"));
         assert!(s.starts_with("type=bind,source=/h,target=/c"));
     }
@@ -432,7 +461,8 @@ mod tests {
             name: "cache".into(),
             target: "/cache".into(),
             read_only: true,
-        });
+        })
+        .unwrap();
         assert_eq!(s, "type=volume,source=cache,target=/cache,readonly");
     }
 
@@ -441,7 +471,8 @@ mod tests {
         let s = mount_arg(&Mount::Tmpfs {
             target: "/tmp".into(),
             size_bytes: 0,
-        });
+        })
+        .unwrap();
         assert_eq!(s, "type=tmpfs,target=/tmp");
     }
 
@@ -450,14 +481,106 @@ mod tests {
         let s = mount_arg(&Mount::Tmpfs {
             target: "/tmp".into(),
             size_bytes: 1024,
-        });
+        })
+        .unwrap();
         assert_eq!(s, "type=tmpfs,target=/tmp,tmpfs-size=1024");
+    }
+
+    #[test]
+    fn mount_arg_bind_rejects_comma_in_source() {
+        let err = mount_arg(&Mount::Bind {
+            source: "/a,b/c".into(),
+            target: "/c".into(),
+            read_only: false,
+        })
+        .unwrap_err();
+        match err {
+            RtError::Unsupported(msg) => {
+                assert!(msg.contains("source"), "{msg}");
+                assert!(msg.contains("','"), "{msg}");
+                assert!(msg.contains("/a,b/c"), "{msg}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_arg_bind_rejects_comma_in_target() {
+        let err = mount_arg(&Mount::Bind {
+            source: "/h".into(),
+            target: "/x,y".into(),
+            read_only: false,
+        })
+        .unwrap_err();
+        match err {
+            RtError::Unsupported(msg) => {
+                assert!(msg.contains("target"), "{msg}");
+                assert!(msg.contains("/x,y"), "{msg}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mount_arg_bind_rejects_equals_in_source() {
+        let err = mount_arg(&Mount::Bind {
+            source: "/a=b".into(),
+            target: "/c".into(),
+            read_only: false,
+        })
+        .unwrap_err();
+        assert!(matches!(err, RtError::Unsupported(_)));
+    }
+
+    #[test]
+    fn mount_arg_bind_rejects_newline() {
+        let err = mount_arg(&Mount::Bind {
+            source: "/a\nb".into(),
+            target: "/c".into(),
+            read_only: false,
+        })
+        .unwrap_err();
+        assert!(matches!(err, RtError::Unsupported(_)));
+    }
+
+    #[test]
+    fn mount_arg_volume_rejects_comma_in_name() {
+        let err = mount_arg(&Mount::Volume {
+            name: "vol,evil".into(),
+            target: "/x".into(),
+            read_only: false,
+        })
+        .unwrap_err();
+        assert!(matches!(err, RtError::Unsupported(_)));
+    }
+
+    #[test]
+    fn mount_arg_tmpfs_rejects_comma_in_target() {
+        let err = mount_arg(&Mount::Tmpfs {
+            target: "/tmp,evil".into(),
+            size_bytes: 0,
+        })
+        .unwrap_err();
+        assert!(matches!(err, RtError::Unsupported(_)));
+    }
+
+    #[test]
+    fn mount_arg_injection_blocked() {
+        // The exact attack from the bug report: a `source` containing
+        // `,readonly=false` must not silently mutate mount semantics.
+        let err = mount_arg(&Mount::Bind {
+            source: "/data,readonly=false".into(),
+            target: "/c".into(),
+            read_only: true,
+        })
+        .unwrap_err();
+        assert!(matches!(err, RtError::Unsupported(_)));
     }
 
     #[test]
     fn run_args_basic() {
         let spec = ContainerSpec::new("c1", "alpine:3");
-        let a = run_args(&spec);
+        let a = run_args(&spec).unwrap();
         assert_eq!(a[0], "run");
         assert_eq!(a[1], "--detach");
         assert!(a.windows(2).any(|w| w == ["--name", "c1"]));
@@ -473,7 +596,7 @@ mod tests {
             labels,
             ..ContainerSpec::new("c", "img")
         };
-        let a = run_args(&spec);
+        let a = run_args(&spec).unwrap();
         // Find label positions.
         let pos_a = a.iter().position(|x| x == "a=1").unwrap();
         let pos_b = a.iter().position(|x| x == "b=2").unwrap();
@@ -492,7 +615,7 @@ mod tests {
                 read_only: true,
             })
             .with_entrypoint(vec!["/bin/sh".into(), "-c".into(), "echo hi".into()]);
-        let a = run_args(&spec);
+        let a = run_args(&spec).unwrap();
         assert!(a.windows(2).any(|w| w == ["--user", "1000:1000"]));
         assert!(a.windows(2).any(|w| w == ["--env", "FOO=bar"]));
         assert!(a.windows(2).any(|w| w == ["--add-host", "api.local:10.0.0.5"]));
@@ -500,6 +623,17 @@ mod tests {
         // entrypoint pieces come after image.
         let image_pos = a.iter().position(|s| s == "img").unwrap();
         assert_eq!(&a[image_pos + 1..], &["/bin/sh", "-c", "echo hi"]);
+    }
+
+    #[test]
+    fn run_args_propagates_mount_validation_error() {
+        let spec = ContainerSpec::new("c", "img").with_mount(Mount::Bind {
+            source: "/a,b".into(),
+            target: "/c".into(),
+            read_only: false,
+        });
+        let err = run_args(&spec).unwrap_err();
+        assert!(matches!(err, RtError::Unsupported(_)));
     }
 
     #[test]

@@ -864,12 +864,34 @@ pub enum ApprovalsCmd {
         /// Approval id.
         id: String,
     },
+    /// Approve a pending row by id. Dispatches per family based on the
+    /// row's `action` column: `sender` / `approve_sender` upserts into
+    /// `users`; `channel` creates a `messaging_groups` row (no auto-wire);
+    /// `install_packages` merges into `container_configs.packages_apt` /
+    /// `packages_npm`; `add_mcp_server` inserts into
+    /// `container_configs.mcp_servers`. Re-approving an already-resolved
+    /// row is a no-op that returns the row unchanged.
+    ///
+    /// The package / MCP families do NOT auto-rebuild the container; the
+    /// response includes a hint instructing the operator to run
+    /// `iclaw groups restart <id>` when convenient.
+    #[command(name = "approve-id")]
+    ApproveById {
+        /// Pending-approval row id (UUID).
+        id: String,
+    },
+    /// Deny a pending row by id. Marks the row `status = 'denied'`
+    /// without applying any side effects. Idempotent.
+    #[command(name = "deny")]
+    Deny {
+        /// Pending-approval row id (UUID).
+        id: String,
+    },
     /// Approve a sender by `(channel_type, identity)`. Persists a
     /// `users` row keyed on that pair; the host's sender-scope
     /// gate consults `users` on every inbound, so the approval
     /// takes effect on the next message without a host restart.
-    /// (Channel / install / MCP approvals don't have a generic CLI
-    /// write surface yet — see docs/plans/vaporware-followups.md.)
+    /// (Use `iclaw approvals approve-id <id>` for non-sender families.)
     Approve {
         /// Channel kind the sender uses (e.g. `telegram`, `slack`).
         #[arg(long)]
@@ -1473,6 +1495,12 @@ impl ApprovalsCmd {
         match self {
             Self::List => ParsedCall::new("approvals.list", json!({})),
             Self::Get { id } => ParsedCall::new("approvals.get", json!({"id": id})),
+            Self::ApproveById { id } => {
+                ParsedCall::new("approvals.approve", json!({"id": id}))
+            }
+            Self::Deny { id } => {
+                ParsedCall::new("approvals.deny", json!({"id": id}))
+            }
             Self::Approve {
                 channel,
                 identity,
@@ -1585,6 +1613,8 @@ pub const ALL_COMMANDS: &[&str] = &[
     "approvals.list",
     "approvals.get",
     "approvals.approve_sender",
+    "approvals.approve",
+    "approvals.deny",
     "audit.list",
     "budgets.list",
     "budgets.set",
@@ -2310,6 +2340,20 @@ mod tests {
         assert_eq!(p.args, json!({"id":"appr_1"}));
     }
 
+    #[test]
+    fn approvals_generic_approve_emits_approve_with_id() {
+        let p = parse(&["iclaw", "approvals", "approve-id", "appr_2"]);
+        assert_eq!(p.command, "approvals.approve");
+        assert_eq!(p.args, json!({"id": "appr_2"}));
+    }
+
+    #[test]
+    fn approvals_deny_emits_deny_with_id() {
+        let p = parse(&["iclaw", "approvals", "deny", "appr_3"]);
+        assert_eq!(p.command, "approvals.deny");
+        assert_eq!(p.args, json!({"id": "appr_3"}));
+    }
+
     // --- meta --------------------------------------------------------------
 
     #[test]
@@ -2439,6 +2483,8 @@ mod tests {
                 "--identity",
                 "user-42",
             ],
+            &["iclaw", "approvals", "approve-id", "appr-1"],
+            &["iclaw", "approvals", "deny", "appr-1"],
             &["iclaw", "audit", "list"],
             &["iclaw", "budgets", "list"],
             &[

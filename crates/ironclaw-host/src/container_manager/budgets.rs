@@ -258,6 +258,7 @@ mod tests {
             default_image_tag: "ironclaw/session:test".into(),
             default_provider: "anthropic".into(),
             default_model: "claude-sonnet-4-6".into(),
+            default_effort: None,
             anthropic_api_key: Some("sk-test".into()),
             anthropic_base_url: Some("https://openrouter.ai/api/v1".into()),
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
@@ -439,6 +440,8 @@ mod tests {
                 channel_type: Some(ironclaw_types::ChannelType::new("cli")),
                 thread_id: None,
                 source_session_id: None,
+                reply_to: None,
+                is_group: None,
             },
         )
         .unwrap();

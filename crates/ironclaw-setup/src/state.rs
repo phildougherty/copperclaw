@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::config::SetupConfig;
@@ -87,6 +88,12 @@ impl SetupState {
 
     /// Persist state to `<data_dir>/setup-state.json`. Creates the
     /// directory if missing.
+    ///
+    /// The state file holds long-lived secrets — notably the `OneCLI`
+    /// `bearer_token` from [`crate::config::OneCliConfig`] — so on Unix
+    /// it is created with mode `0o600` from the start (no
+    /// world-readable window between the bytes landing and a chmod).
+    /// On other platforms the default ACLs apply.
     pub fn save(&self, data_dir: &Path) -> Result<(), StateError> {
         let path = Self::path_in(data_dir);
         if let Some(parent) = path.parent() {
@@ -96,7 +103,7 @@ impl SetupState {
             })?;
         }
         let bytes = serde_json::to_vec_pretty(self).expect("setup state always serializes");
-        fs::write(&path, bytes).map_err(|source| StateError::Io { path, source })?;
+        write_secret_file(&path, &bytes).map_err(|source| StateError::Io { path, source })?;
         Ok(())
     }
 
@@ -112,6 +119,44 @@ impl SetupState {
     pub fn is_completed(&self, step: &str) -> bool {
         self.completed_steps.iter().any(|s| s == step)
     }
+}
+
+/// Write `bytes` to `path` using a secret-friendly mode.
+///
+/// On Unix the file is opened with mode `0o600` from the start (no
+/// world-readable window between create and chmod). On other targets
+/// the default ACLs apply — there's no portable equivalent of `0o600`
+/// on Windows so this falls back to a plain create+truncate.
+///
+/// Used by the setup-state writer and the `.env` writers in
+/// [`crate::steps::auth`] / [`crate::steps::telegram`] to close the
+/// TOCTOU window where a chmod-after-write left a brief moment where
+/// any local user could read the long-lived credentials inside.
+pub(crate) fn write_secret_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(path)?;
+    file.write_all(bytes)?;
+    file.flush()?;
+    // On Unix the create-with-mode path above is enough; but if the
+    // file already existed with looser bits we explicitly tighten
+    // them here so re-runs converge to `0o600`. (`OpenOptions::mode`
+    // only applies on creation.)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = file.metadata()?.permissions();
+        if perms.mode() & 0o777 != 0o600 {
+            perms.set_mode(0o600);
+            fs::set_permissions(path, perms)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -211,6 +256,48 @@ mod tests {
     #[test]
     fn default_version_helper_is_one() {
         assert_eq!(default_version(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_creates_file_with_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let mut s = SetupState::new();
+        // Plant a credential so the regression is obvious if the bits
+        // ever loosen again — the file holds a OneCLI bearer token.
+        s.config.onecli = Some(crate::config::OneCliConfig {
+            base_url: "https://vault.example".into(),
+            bearer_token: "secret-bearer-token".into(),
+            ..crate::config::OneCliConfig::default()
+        });
+        s.save(dir.path()).unwrap();
+        let perms = fs::metadata(SetupState::path_in(dir.path()))
+            .unwrap()
+            .permissions();
+        assert_eq!(
+            perms.mode() & 0o777,
+            0o600,
+            "setup-state.json must be 0o600 because it stores secrets"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_tightens_mode_on_pre_existing_loose_file() {
+        // Simulate an older install whose state file was created with
+        // the historical world-readable default. A subsequent save
+        // must converge to 0o600 rather than preserve the loose bits.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().unwrap();
+        let path = SetupState::path_in(dir.path());
+        fs::write(&path, b"{}").unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&path, perms).unwrap();
+        SetupState::new().save(dir.path()).unwrap();
+        let after = fs::metadata(&path).unwrap().permissions();
+        assert_eq!(after.mode() & 0o777, 0o600);
     }
 
     #[test]

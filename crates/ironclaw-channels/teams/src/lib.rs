@@ -96,7 +96,11 @@ mod factory;
 mod html;
 
 pub use adapter::TeamsAdapter;
-pub use api::{ChatInfoResponse, ChatMessageResponse, TeamsApi};
+pub use api::{
+    ChatInfoResponse, ChatMessageResponse, TeamsApi, build_adaptive_breadcrumb, build_adaptive_card,
+    build_adaptive_collapsible, build_adaptive_diff, build_adaptive_error, build_adaptive_message_body,
+    build_adaptive_thinking, build_adaptive_todo_list,
+};
 pub use config::{
     DEFAULT_GRAPH_BASE, DEFAULT_HOST, DEFAULT_PATH, DEFAULT_PORT, TeamsConfig, WebhookConfig,
 };

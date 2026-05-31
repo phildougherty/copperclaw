@@ -1,5 +1,23 @@
 # linear channel audit
 
+## Native UI capabilities
+
+| Capability | Native | Notes |
+|---|---|---|
+| Chat (text) | yes | GraphQL `commentCreate` |
+| Auto-split long messages | no | no `max_message_chars()` override; Linear comments accept long markdown |
+| Honour `Retry-After` | yes | `AdapterError::Rate { retry_after }` from `api.rs`; delivery loop reads it |
+| Typing indicator | no | trait default; Linear has no typing concept |
+| Native cards (buttons/sections) | no | falls back via trait-default text render |
+| Native breadcrumbs (tool chips) | fallback | trait-default `[tool]` text line |
+| Inbound reply_to context | no | router does not set `reply_to`; thread context rides on `thread_id` via `parent_id` |
+| Inbound group vs DM distinction | yes (always group) | `is_group: Some(true)` — every comment lives on a workspace issue, no DM concept |
+| Edit messages | yes (via action) | `content.action = "edit"` → `commentUpdate`. Trait-level `edit_message` NOT overridden |
+| Reactions | yes (via action) | `content.action = "reaction"` → `reactionCreate`. Trait-level `add_reaction` NOT overridden |
+| Files / attachments | no | explicit `Unsupported` — Linear's `commentCreate` only accepts attachments-by-URL, which the host doesn't model in v1 (adapter.rs:106) |
+| Threading | yes | comment parent_id; `supports_threads() = true` |
+| Webhook secret verification | yes | HMAC-SHA256 over body, `Linear-Signature: <hex>` (signature.rs:39) |
+
 ## Implemented
 - deliver: COMPLETE — GraphQL `commentCreate`, plus system-action for
   edit / reaction. `crates/ironclaw-channels/linear/src/adapter.rs:86`

@@ -1,0 +1,24 @@
+{
+  "name": "telegram-rate-limited-retry",
+  "channel": "telegram",
+  "description": "Provider stream succeeds and the runner queues a chat outbound, but the telegram adapter's first deliver returns Rate { retry_after: 1 }. The harness re-drives delivery 1200 ms later (past the retry_after window); the second tick succeeds. Pins the slice-1 behaviour where DeliveryService::bump_retry honours the adapter's retry_after hint instead of defaulting to the 5 s exponential backoff.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 8000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  },
+  "pre_delivery_failures": [
+    {
+      "channel": "telegram",
+      "kind": "rate",
+      "retry_after": 1
+    }
+  ],
+  "redrive_after_ms": 1200
+}

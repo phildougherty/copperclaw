@@ -34,27 +34,6 @@ redact captured material; both are design-only.
   is fine and we delete the plan entry. If yes — invest in the
   pipeline.
 
-### Generic `iclaw approvals approve <id>` / `deny <id>`
-
-Today only sender approvals have a write path
-(`iclaw approvals approve --channel <ct> --identity <id>`). The
-other approval families (Channel, InstallPackages, AddMcpServer)
-exist as rows in `pending_approvals` but the operator has to
-hand-CRUD them via the central DB (or re-run the workflow that
-registered the row).
-
-- **What it takes:** new `Approvals::Approve { id }` and
-  `Approvals::Deny { id }` variants in
-  `crates/ironclaw-iclaw/src/commands.rs`; dispatch to a new
-  host-side handler that switches on the row's `action` and
-  applies the appropriate per-family update. ~day with tests for
-  each family.
-- **Load-bearing question:** for InstallPackages / AddMcpServer
-  approvals, what does "approve" mean exactly? Insert the
-  packages/servers into `container_configs` and queue a rebuild?
-  Just mark the row resolved and rely on the agent to re-issue?
-  Decide this before writing the code or the dispatch will rot.
-
 ### Mattermost / line / generic-webhooks default ports
 
 `line`, `mattermost`, and the generic `webhooks` channel default to
@@ -94,20 +73,6 @@ land via post-setup `iclaw messaging-groups create` +
   is more involved. Probably worth offering a "you already have
   the token, paste it" branch instead of trying to guide the user
   through the platform's UI.
-
-### Channel-level / install / MCP approval write-handlers
-
-Companion to "Generic `iclaw approvals approve`" above — once the
-CLI exists, the host-side handlers need real implementations:
-
-- Channel approval → `messaging_groups` row creation, optionally
-  with an auto-wiring step.
-- InstallPackages approval → merge into
-  `container_configs.packages_apt` / `packages_npm`, queue rebuild.
-- AddMcpServer approval → insert into
-  `container_configs.mcp_servers`, queue rebuild.
-
-~day for all three.
 
 ### `IRONCLAW.md` per-session briefing surface
 

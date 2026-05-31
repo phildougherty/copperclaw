@@ -1,4 +1,17 @@
 //! Axum router for the Slack Events API webhook.
+//!
+//! The router serves two payload shapes on the same path so operators can
+//! point Slack's "Request URL" (events) and "Interactivity Request URL"
+//! (block-kit actions) at the same endpoint:
+//!
+//! - JSON `event_callback` envelopes (the canonical Events API),
+//!   demultiplexed by [`SlackEventEnvelope`].
+//! - Form-encoded `payload=<urlencoded-json>` (interactive components — what
+//!   Block Kit `button` taps land as). The JSON inside is a `block_actions`
+//!   payload; we parse it via [`parse_block_actions`] and synthesise an
+//!   inbound chat event whose text is the tapped button's `value` so the
+//!   agent sees the tap as if the user typed the value, mirroring the
+//!   Telegram `callback_query` pattern.
 
 use crate::events::types::{MessageEvent, SlackEvent, SlackEventEnvelope};
 use crate::signature::verify_signature;
@@ -12,9 +25,9 @@ use axum::{
 };
 use chrono::{TimeZone, Utc};
 use ironclaw_types::{
-    ChannelType, InboundEvent, InboundMessage, MessageKind, SenderIdentity,
+    ChannelType, InboundEvent, InboundMessage, MessageKind, ReplyTo, SenderIdentity,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc::Sender};
@@ -111,6 +124,15 @@ async fn handle_events(
     if verify_signature(&state.signing_secret, ts, sig, &body, state.now_secs()).is_err() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+
+    // Interactivity payloads (block_actions) arrive form-encoded as
+    // `payload=<urlencoded-json>`. Detect by the Content-Type header (Slack
+    // always sets `application/x-www-form-urlencoded` for these) so we don't
+    // misroute JSON envelopes that happen to start with `payload=`.
+    if is_form_urlencoded(&headers) {
+        return handle_interactive(&state, &body).await;
+    }
+
     let envelope: SlackEventEnvelope = match serde_json::from_slice(&body) {
         Ok(e) => e,
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
@@ -134,6 +156,229 @@ async fn handle_events(
             }
             StatusCode::OK.into_response()
         }
+    }
+}
+
+/// Handle an interactive payload (`block_actions` / `interactive_message`).
+///
+/// Slack expects an empty `200 OK` within 3 s — the tap spinner clears as
+/// soon as we respond, so we ACK immediately and ship the synthesised
+/// inbound event to the host channel without round-tripping any further
+/// Slack API calls.
+async fn handle_interactive(state: &SlackEventsState, body: &[u8]) -> Response {
+    // Body is `payload=<urlencoded-json>`. Strip the prefix, then percent-
+    // decode (form encoding == percent encoding with `+` standing in for a
+    // space; we use a tiny inline decoder so we don't pull a new crate just
+    // for this).
+    let Ok(body_str) = std::str::from_utf8(body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(("payload", encoded)) = body_str.split_once('=') else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Ok(json_text) = form_decode(encoded) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Ok(payload): Result<Value, _> = serde_json::from_str(&json_text) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+
+    if let Some(evt) = parse_block_actions(state, &payload) {
+        // Best-effort send; the ACK still goes out either way so the user's
+        // client clears its spinner. Slack will retry the interactive
+        // payload if we send a non-2xx, so failing the channel send by
+        // returning an error here would create user-visible duplicates.
+        if let Err(err) = state.inbound_tx.send(evt).await {
+            tracing::warn!(error=%err, "slack inbound channel closed (interactive)");
+        }
+    }
+    // Empty 200 OK — Slack's "do nothing else" ACK.
+    StatusCode::OK.into_response()
+}
+
+/// Map a `block_actions` JSON payload to a chat-shaped `InboundEvent`.
+///
+/// Returns `None` when the payload isn't a `block_actions` shape, no
+/// `actions[]` entry was usable (no `value`), or required routing fields
+/// are missing — in which case the caller still ACKs to clear the spinner.
+///
+/// The synthesised event mimics a regular chat message so the agent's
+/// existing branching code Just Works:
+///
+/// - `kind = MessageKind::Chat`,
+/// - `content.text = action.value` (the tapped button's canonical value),
+/// - `content.callback` carries the platform metadata an agent might want
+///   (`action_id`, `block_id`, `trigger_id`, container) without inflating
+///   the primary `text` field.
+pub fn parse_block_actions(state: &SlackEventsState, payload: &Value) -> Option<InboundEvent> {
+    let kind = payload.get("type").and_then(Value::as_str)?;
+    if kind != "block_actions" {
+        return None;
+    }
+
+    let action = payload
+        .get("actions")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())?;
+    let value = action.get("value").and_then(Value::as_str)?;
+    let action_id = action.get("action_id").and_then(Value::as_str);
+    let block_id = action.get("block_id").and_then(Value::as_str);
+
+    // Slack puts the channel + message + ts inside `container` for block
+    // taps in a regular channel. For DMs the same fields land under
+    // `channel`. Try `container` first, then fall back to `channel`.
+    let container = payload.get("container");
+    let channel_id = container
+        .and_then(|c| c.get("channel_id"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .get("channel")
+                .and_then(|c| c.get("id"))
+                .and_then(Value::as_str)
+        })?;
+
+    let message_ts = container
+        .and_then(|c| c.get("message_ts"))
+        .and_then(Value::as_str);
+    // Slack threading: when the original card lives inside a thread, the
+    // interactive payload carries `container.thread_ts`. Otherwise the tap
+    // is at the channel root and we leave thread_id None.
+    let thread_id = container
+        .and_then(|c| c.get("thread_ts"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+
+    let user = payload.get("user");
+    let user_id = user.and_then(|u| u.get("id")).and_then(Value::as_str);
+    let display_name = user
+        .and_then(|u| u.get("username"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            user.and_then(|u| u.get("name"))
+                .and_then(Value::as_str)
+        })
+        .map(str::to_owned);
+
+    let trigger_id = payload.get("trigger_id").and_then(Value::as_str);
+    let response_url = payload.get("response_url").and_then(Value::as_str);
+
+    let sender = user_id.map(|uid| SenderIdentity {
+        channel_type: state.channel_type.clone(),
+        identity: uid.to_owned(),
+        display_name,
+    });
+
+    // The interactive payload doesn't carry the message ts in the way a
+    // regular `message` event does, so use the action_id + trigger_id (or
+    // the original message_ts when present) as a unique-enough id for
+    // dedup on the host side. This matches Telegram's strategy of using
+    // the callback_query id as the inbound message id.
+    let message_id = if let Some(a) = action_id {
+        if let Some(ts) = message_ts {
+            format!("{a}:{ts}")
+        } else if let Some(t) = trigger_id {
+            format!("{a}:{t}")
+        } else {
+            a.to_owned()
+        }
+    } else {
+        // Falling back to the value keeps the event stable across
+        // retries when no other id is present.
+        value.to_owned()
+    };
+
+    let mut callback = json!({
+        "value": value,
+    });
+    if let Some(a) = action_id {
+        callback["action_id"] = Value::String(a.to_owned());
+    }
+    if let Some(b) = block_id {
+        callback["block_id"] = Value::String(b.to_owned());
+    }
+    if let Some(ts) = message_ts {
+        callback["message_ts"] = Value::String(ts.to_owned());
+    }
+    if let Some(t) = trigger_id {
+        callback["trigger_id"] = Value::String(t.to_owned());
+    }
+    if let Some(r) = response_url {
+        callback["response_url"] = Value::String(r.to_owned());
+    }
+
+    let content = json!({
+        "text": value,
+        "callback": callback,
+    });
+
+    let is_group = Some(channel_id.starts_with('C') || channel_id.starts_with('G'));
+
+    Some(InboundEvent {
+        channel_type: state.channel_type.clone(),
+        platform_id: channel_id.to_owned(),
+        thread_id,
+        message: InboundMessage {
+            id: message_id,
+            kind: MessageKind::Chat,
+            content,
+            timestamp: Utc::now(),
+            is_mention: None,
+            is_group,
+        },
+        reply_to: None,
+        sender,
+    })
+}
+
+fn is_form_urlencoded(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| {
+            // Header may include `; charset=...` — match the prefix.
+            s.trim()
+                .to_ascii_lowercase()
+                .starts_with("application/x-www-form-urlencoded")
+        })
+}
+
+/// Inline form-decoder. Replaces `+` with space and percent-decodes the rest.
+/// Returns an error only when a percent escape is malformed.
+fn form_decode(s: &str) -> Result<String, ()> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' => {
+                if i + 2 >= bytes.len() {
+                    return Err(());
+                }
+                let hi = hex_digit(bytes[i + 1])?;
+                let lo = hex_digit(bytes[i + 2])?;
+                out.push((hi << 4) | lo);
+                i += 3;
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).map_err(|_| ())
+}
+
+fn hex_digit(b: u8) -> Result<u8, ()> {
+    match b {
+        b'0'..=b'9' => Ok(b - b'0'),
+        b'a'..=b'f' => Ok(b - b'a' + 10),
+        b'A'..=b'F' => Ok(b - b'A' + 10),
+        _ => Err(()),
     }
 }
 
@@ -162,6 +407,21 @@ fn convert_message(
         display_name: None,
     });
     let timestamp = parse_slack_ts(&m.ts);
+    // Slack uses `thread_ts` for two distinct things:
+    //   * On the thread root, `thread_ts == ts`.
+    //   * On a reply within a thread, `thread_ts` points at the root
+    //     (which IS the message being replied to from Slack's POV).
+    // Only the latter is a real reply, so we surface `reply_to` only when
+    // the two timestamps differ.
+    let reply_to = m
+        .thread_ts
+        .as_deref()
+        .filter(|parent| *parent != m.ts.as_str())
+        .map(|parent| ReplyTo {
+            channel_type: state.channel_type.clone(),
+            platform_id: m.channel.clone(),
+            thread_id: Some(parent.to_owned()),
+        });
     InboundEvent {
         channel_type: state.channel_type.clone(),
         platform_id: m.channel.clone(),
@@ -174,7 +434,7 @@ fn convert_message(
             is_mention,
             is_group,
         },
-        reply_to: None,
+        reply_to,
         sender,
     }
 }
@@ -514,6 +774,58 @@ mod tests {
         assert!(dedup.observe("e0").await);
     }
 
+    #[tokio::test]
+    async fn thread_reply_populates_reply_to() {
+        let (state, mut rx) = make_state(None);
+        let app = build_events_router("/slack/events", state.clone());
+        // thread_ts != ts → this is a reply inside an existing thread.
+        let body = serde_json::to_vec(&json!({
+            "type":"event_callback",
+            "event_id":"Ev-Reply",
+            "event":{
+                "type":"message",
+                "ts":"1700000020.000010",
+                "channel":"C-CHAN",
+                "user":"U-REPLIER",
+                "text":"+1",
+                "thread_ts":"1700000010.000001"
+            }
+        }))
+        .unwrap();
+        let req = signed_request(&state, "/slack/events", &body);
+        let _ = app.oneshot(req).await.unwrap();
+        let evt = rx.recv().await.unwrap();
+        let rt = evt.reply_to.expect("reply_to populated for in-thread reply");
+        assert_eq!(rt.channel_type.as_str(), "slack");
+        assert_eq!(rt.platform_id, "C-CHAN");
+        assert_eq!(rt.thread_id.as_deref(), Some("1700000010.000001"));
+    }
+
+    #[tokio::test]
+    async fn thread_root_does_not_populate_reply_to() {
+        let (state, mut rx) = make_state(None);
+        let app = build_events_router("/slack/events", state.clone());
+        // thread_ts == ts → the message IS the thread root, not a reply.
+        let body = serde_json::to_vec(&json!({
+            "type":"event_callback",
+            "event_id":"Ev-Root",
+            "event":{
+                "type":"message",
+                "ts":"1700000030.000001",
+                "channel":"C-CHAN",
+                "user":"U-AUTHOR",
+                "text":"starting a thread",
+                "thread_ts":"1700000030.000001"
+            }
+        }))
+        .unwrap();
+        let req = signed_request(&state, "/slack/events", &body);
+        let _ = app.oneshot(req).await.unwrap();
+        let evt = rx.recv().await.unwrap();
+        assert!(evt.reply_to.is_none(),
+            "thread root carries thread_ts==ts; that should NOT be a reply_to");
+    }
+
     #[test]
     fn parse_slack_ts_returns_unix_timestamp() {
         let dt = parse_slack_ts("1700000000.000001");
@@ -526,6 +838,261 @@ mod tests {
         let before = Utc::now().timestamp() - 5;
         let dt = parse_slack_ts("not-a-ts");
         assert!(dt.timestamp() >= before);
+    }
+
+    /// Build a Slack `block_actions` payload, percent-encode it, and POST
+    /// it as `payload=<encoded>` so the interactive branch exercises the
+    /// same shape Slack actually sends.
+    fn signed_interactive_request(
+        state: &SlackEventsState,
+        path: &str,
+        payload_json: &str,
+    ) -> Request<Body> {
+        let encoded = percent_encode_form(payload_json);
+        let body = format!("payload={encoded}");
+        let body_bytes = body.into_bytes();
+        let sig = compute_signature(&state.signing_secret, TS, &body_bytes);
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("x-slack-request-timestamp", TS)
+            .header("x-slack-signature", sig)
+            .body(Body::from(body_bytes))
+            .unwrap()
+    }
+
+    /// Minimal `application/x-www-form-urlencoded` value encoder — only the
+    /// reserved set so test strings round-trip predictably.
+    fn percent_encode_form(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for &b in s.as_bytes() {
+            let unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~');
+            if unreserved {
+                out.push(b as char);
+            } else if b == b' ' {
+                out.push('+');
+            } else {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn interactive_block_actions_emits_inbound_with_value_text() {
+        let (state, mut rx) = make_state(None);
+        let app = build_events_router("/slack/events", state.clone());
+        let payload = json!({
+            "type": "block_actions",
+            "user": {"id": "U42", "username": "alice"},
+            "trigger_id": "trig-1",
+            "response_url": "https://hooks.slack.test/r",
+            "container": {
+                "type": "message",
+                "channel_id": "C100",
+                "message_ts": "1700000050.000100"
+            },
+            "actions": [{
+                "type": "button",
+                "action_id": "card_btn_0",
+                "block_id": "card_actions",
+                "value": "deploy:yes"
+            }]
+        });
+        let req = signed_interactive_request(
+            &state,
+            "/slack/events",
+            &payload.to_string(),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        // Slack requires a 2xx ACK so the spinner clears.
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let evt = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("event delivered within timeout")
+            .expect("inbound channel open");
+        assert_eq!(evt.channel_type.as_str(), "slack");
+        assert_eq!(evt.platform_id, "C100");
+        assert!(evt.thread_id.is_none());
+        assert_eq!(evt.message.kind, MessageKind::Chat);
+        // Text mimics what the user "typed" — the button value.
+        assert_eq!(evt.message.content["text"], "deploy:yes");
+        // Callback metadata is preserved for agents that want to branch on it.
+        assert_eq!(evt.message.content["callback"]["action_id"], "card_btn_0");
+        assert_eq!(evt.message.content["callback"]["value"], "deploy:yes");
+        assert_eq!(evt.message.content["callback"]["message_ts"], "1700000050.000100");
+        let sender = evt.sender.expect("sender");
+        assert_eq!(sender.identity, "U42");
+        assert_eq!(sender.display_name.as_deref(), Some("alice"));
+        // is_group derived from the `C` channel prefix.
+        assert_eq!(evt.message.is_group, Some(true));
+    }
+
+    #[tokio::test]
+    async fn interactive_dm_routes_to_channel_id_under_channel_field() {
+        // Slack puts the channel under `channel.id` instead of
+        // `container.channel_id` for some legacy / DM interactive shapes.
+        let (state, mut rx) = make_state(None);
+        let app = build_events_router("/slack/events", state.clone());
+        let payload = json!({
+            "type": "block_actions",
+            "user": {"id": "U7", "name": "bob"},
+            "channel": {"id": "D1", "name": "directmessage"},
+            "actions": [{
+                "type": "button",
+                "action_id": "card_btn_1",
+                "value": "approve"
+            }]
+        });
+        let req = signed_interactive_request(
+            &state,
+            "/slack/events",
+            &payload.to_string(),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let evt = rx.recv().await.unwrap();
+        assert_eq!(evt.platform_id, "D1");
+        assert_eq!(evt.message.is_group, Some(false));
+        assert_eq!(evt.message.content["text"], "approve");
+    }
+
+    #[tokio::test]
+    async fn interactive_preserves_thread_ts_when_card_was_in_thread() {
+        let (state, mut rx) = make_state(None);
+        let app = build_events_router("/slack/events", state.clone());
+        let payload = json!({
+            "type": "block_actions",
+            "user": {"id": "U7"},
+            "container": {
+                "channel_id": "C1",
+                "message_ts": "1700000060.000010",
+                "thread_ts": "1700000050.000001"
+            },
+            "actions": [{
+                "type": "button",
+                "action_id": "card_btn_0",
+                "value": "ack"
+            }]
+        });
+        let req = signed_interactive_request(
+            &state,
+            "/slack/events",
+            &payload.to_string(),
+        );
+        let _ = app.oneshot(req).await.unwrap();
+        let evt = rx.recv().await.unwrap();
+        assert_eq!(evt.thread_id.as_deref(), Some("1700000050.000001"));
+    }
+
+    #[tokio::test]
+    async fn interactive_url_button_taps_have_no_value_so_no_event() {
+        // Slack doesn't fire block_actions for `url` buttons — but we still
+        // defend the parser against payloads with a missing `value`.
+        let (state, mut rx) = make_state(None);
+        let app = build_events_router("/slack/events", state.clone());
+        let payload = json!({
+            "type": "block_actions",
+            "user": {"id": "U7"},
+            "container": {"channel_id": "C1", "message_ts": "1.0"},
+            "actions": [{
+                "type": "button",
+                "action_id": "card_btn_0",
+                "url": "https://example.com"
+            }]
+        });
+        let req = signed_interactive_request(
+            &state,
+            "/slack/events",
+            &payload.to_string(),
+        );
+        let resp = app.oneshot(req).await.unwrap();
+        // ACK still 200.
+        assert_eq!(resp.status(), StatusCode::OK);
+        // But no event.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn interactive_unsigned_request_returns_401() {
+        let (state, _rx) = make_state(None);
+        let app = build_events_router("/slack/events", state.clone());
+        let body = b"payload=%7B%7D".to_vec();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/slack/events")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("x-slack-request-timestamp", TS)
+            .header(
+                "x-slack-signature",
+                format!("v0={}", "00".repeat(32)),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn interactive_malformed_form_body_returns_400_no_panic() {
+        let (state, _rx) = make_state(None);
+        let app = build_events_router("/slack/events", state.clone());
+        // No `payload=` prefix.
+        let body = b"foo=bar".to_vec();
+        let sig = compute_signature(&state.signing_secret, TS, &body);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/slack/events")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header("x-slack-request-timestamp", TS)
+            .header("x-slack-signature", sig)
+            .body(Body::from(body))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn form_decode_handles_plus_and_percent_escapes() {
+        assert_eq!(form_decode("hello+world").unwrap(), "hello world");
+        assert_eq!(form_decode("a%20b").unwrap(), "a b");
+        assert_eq!(form_decode("%7B%22a%22%3A1%7D").unwrap(), "{\"a\":1}");
+        // Truncated escape — should error rather than panic.
+        assert!(form_decode("%2").is_err());
+        // Non-hex digit.
+        assert!(form_decode("%ZZ").is_err());
+    }
+
+    #[test]
+    fn parse_block_actions_returns_none_for_other_payload_types() {
+        let (state, _rx) = make_state(None);
+        let payload = json!({"type": "view_submission"});
+        assert!(parse_block_actions(&state, &payload).is_none());
+    }
+
+    #[test]
+    fn is_form_urlencoded_handles_charset_suffix() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/x-www-form-urlencoded; charset=utf-8"
+                .parse()
+                .unwrap(),
+        );
+        assert!(is_form_urlencoded(&h));
+
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::CONTENT_TYPE,
+            "application/json".parse().unwrap(),
+        );
+        assert!(!is_form_urlencoded(&h));
     }
 
     #[test]

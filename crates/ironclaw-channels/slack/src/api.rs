@@ -4,7 +4,7 @@
 //! HTTP 200 even for logical failures (with `{"ok": false, "error": "..."}`),
 //! so the client lifts those into [`AdapterError`].
 
-use ironclaw_channels_core::AdapterError;
+use ironclaw_channels_core::{AdapterError, Card, CardButton};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -37,6 +37,163 @@ pub struct CompleteUploadEntry {
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+}
+
+/// Render a canonical [`Card`] into a Slack Block Kit `blocks` array.
+///
+/// Mapping:
+///
+/// - `card.title` -> `header` block (Slack caps header text at 150 chars; we
+///   pre-trim defensively so a long agent-generated title doesn't trip the
+///   400-validation path).
+/// - `card.body` -> `section` block with `mrkdwn` text. If the card carries an
+///   `image_url` it rides as the section's `accessory` (a small thumbnail to
+///   the right of the text) so the body and image stay visually paired.
+/// - `card.image_url` standalone (no body) -> dedicated `image` block.
+/// - `card.fields` -> a single `section` block with a `fields` array, two
+///   columns per row in Slack's UI; each entry is a `mrkdwn` `*label*\nvalue`
+///   string. Slack caps `fields` per section at 10 — we split into multiple
+///   section blocks when we exceed that.
+/// - `card.buttons` -> one `actions` block with one `button` element per
+///   button. `value` buttons set `value` and (when `style == "primary" |
+///   "danger"`) the matching `style` field; `url` buttons set `url`. Slack
+///   allows up to 25 elements per actions block, well above the card's hard
+///   limit of 8 buttons, so we never need to chunk on the Slack side.
+///
+/// Every `action_id` is set to `card_btn_<index>` so the events router can
+/// trace the tap back to the position-in-card without us round-tripping the
+/// original card payload.
+#[must_use]
+pub fn build_card_blocks(card: &Card) -> Value {
+    /// Slack's per-`header` text cap (`plain_text`, max 150 chars).
+    const HEADER_TEXT_CAP: usize = 150;
+    /// Slack's per-`section.fields` cap.
+    const FIELDS_PER_SECTION_CAP: usize = 10;
+
+    let mut blocks: Vec<Value> = Vec::new();
+
+    if let Some(title) = card.title.as_deref() {
+        let t = title.trim();
+        if !t.is_empty() {
+            let trimmed: String = t.chars().take(HEADER_TEXT_CAP).collect();
+            blocks.push(json!({
+                "type": "header",
+                "text": { "type": "plain_text", "text": trimmed, "emoji": true }
+            }));
+        }
+    }
+
+    // Body section. Carries the image as an `accessory` when both are present
+    // so the message keeps visual cohesion; if there's an image but no body,
+    // the image gets its own `image` block lower down.
+    if let Some(body) = card.body.as_deref() {
+        let b = body.trim();
+        if !b.is_empty() {
+            let mut section = json!({
+                "type": "section",
+                "text": { "type": "mrkdwn", "text": b }
+            });
+            if let Some(img) = card.image_url.as_deref() {
+                let img = img.trim();
+                if !img.is_empty() {
+                    section["accessory"] = json!({
+                        "type": "image",
+                        "image_url": img,
+                        "alt_text": "card image"
+                    });
+                }
+            }
+            blocks.push(section);
+        }
+    }
+
+    // Image-only card (no body): standalone image block.
+    let body_carries_image = card
+        .body
+        .as_deref()
+        .is_some_and(|b| !b.trim().is_empty());
+    if !body_carries_image {
+        if let Some(img) = card.image_url.as_deref() {
+            let img = img.trim();
+            if !img.is_empty() {
+                blocks.push(json!({
+                    "type": "image",
+                    "image_url": img,
+                    "alt_text": "card image"
+                }));
+            }
+        }
+    }
+
+    if !card.fields.is_empty() {
+        for chunk in card.fields.chunks(FIELDS_PER_SECTION_CAP) {
+            let fields: Vec<Value> = chunk
+                .iter()
+                .map(|f| {
+                    json!({
+                        "type": "mrkdwn",
+                        "text": format!("*{}*\n{}", f.label, f.value)
+                    })
+                })
+                .collect();
+            blocks.push(json!({
+                "type": "section",
+                "fields": fields
+            }));
+        }
+    }
+
+    if !card.buttons.is_empty() {
+        let elements: Vec<Value> = card
+            .buttons
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| button_to_element(i, b))
+            .collect();
+        if !elements.is_empty() {
+            blocks.push(json!({
+                "type": "actions",
+                "block_id": "card_actions",
+                "elements": elements,
+            }));
+        }
+    }
+
+    Value::Array(blocks)
+}
+
+/// Map one canonical [`CardButton`] to a Slack Block Kit button element.
+/// `index` is the button's position in the card; we encode it into the
+/// `action_id` (`card_btn_<index>`) so the interactive-payload handler can
+/// thread the tap back to the button without round-tripping the whole card.
+fn button_to_element(index: usize, btn: &CardButton) -> Option<Value> {
+    let text = json!({"type": "plain_text", "text": btn.label.clone(), "emoji": true});
+    let action_id = format!("card_btn_{index}");
+    let mut out = json!({
+        "type": "button",
+        "action_id": action_id,
+        "text": text,
+    });
+    match (btn.value.as_deref(), btn.url.as_deref()) {
+        (Some(v), None) => {
+            out["value"] = Value::String(v.to_owned());
+            // Slack only accepts the exact strings "primary" or "danger";
+            // anything else (the default secondary look) must omit `style`.
+            if let Some(style) = btn.style.as_deref() {
+                if matches!(style, "primary" | "danger") {
+                    out["style"] = Value::String(style.to_owned());
+                }
+            }
+            Some(out)
+        }
+        (None, Some(u)) => {
+            out["url"] = Value::String(u.to_owned());
+            Some(out)
+        }
+        // The card validator rejects these shapes — fall through silently if
+        // a malformed card slips past.
+        (Some(_), Some(_)) | (None, None) => None,
+    }
 }
 
 /// Minimal Slack Web API client.
@@ -120,6 +277,44 @@ impl SlackApi {
         Ok(parsed)
     }
 
+    /// `chat.postMessage` — text + (optional) attachments. The
+    /// secondary-message-attachment API is the way to drive a coloured
+    /// left bar (`attachments[].color = "danger"` for red, etc.) which
+    /// Block Kit's primary blocks API can't produce on its own. Used
+    /// by `deliver_error` to render an error card with the red bar
+    /// affordance.
+    pub async fn post_message_with_attachments(
+        &self,
+        channel: &str,
+        thread_ts: Option<&str>,
+        text: &str,
+        attachments: &Value,
+    ) -> Result<PostMessageResponse, AdapterError> {
+        let mut body = json!({
+            "channel": channel,
+            "text": text,
+            "attachments": attachments.clone(),
+        });
+        if let Some(thread) = thread_ts {
+            body["thread_ts"] = Value::String(thread.to_owned());
+        }
+        let resp = self
+            .client
+            .post(self.url("chat.postMessage"))
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| transport(&e))?;
+        let value = read_slack_json(resp).await?;
+        let parsed: PostMessageResponse = serde_json::from_value(value).map_err(|e| {
+            AdapterError::Transport(format!(
+                "chat.postMessage (attachments) decode: {e}"
+            ))
+        })?;
+        Ok(parsed)
+    }
+
     /// `chat.postEphemeral` — text visible to a single user only.
     pub async fn post_ephemeral(
         &self,
@@ -153,7 +348,23 @@ impl SlackApi {
         ts: &str,
         text: &str,
     ) -> Result<PostMessageResponse, AdapterError> {
-        let body = json!({"channel": channel, "ts": ts, "text": text});
+        self.chat_update_with_blocks(channel, ts, text, None).await
+    }
+
+    /// As [`chat_update`] but lets the caller pass an optional `blocks`
+    /// array so chip-style edits (Block Kit `context` blocks used by
+    /// `deliver_breadcrumb`) keep their structured rendering on update.
+    pub async fn chat_update_with_blocks(
+        &self,
+        channel: &str,
+        ts: &str,
+        text: &str,
+        blocks: Option<&Value>,
+    ) -> Result<PostMessageResponse, AdapterError> {
+        let mut body = json!({"channel": channel, "ts": ts, "text": text});
+        if let Some(blocks) = blocks {
+            body["blocks"] = blocks.clone();
+        }
         let resp = self
             .client
             .post(self.url("chat.update"))
@@ -179,6 +390,52 @@ impl SlackApi {
         let resp = self
             .client
             .post(self.url("reactions.add"))
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| transport(&e))?;
+        let _ = read_slack_json(resp).await?;
+        Ok(())
+    }
+
+    /// `pins.add` — pin a message to a channel. Used by
+    /// [`crate::adapter::SlackAdapter::deliver_todo_list`] on the
+    /// first emit so the todo chip stays surfaced in the channel
+    /// pins. Best-effort: the bot may lack the `pins:write` scope
+    /// (legacy workspaces), in which case Slack returns
+    /// `not_authed` and the caller swallows.
+    pub async fn pins_add(
+        &self,
+        channel: &str,
+        timestamp: &str,
+    ) -> Result<(), AdapterError> {
+        let body = json!({"channel": channel, "timestamp": timestamp});
+        let resp = self
+            .client
+            .post(self.url("pins.add"))
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| transport(&e))?;
+        let _ = read_slack_json(resp).await?;
+        Ok(())
+    }
+
+    /// `pins.remove` — unpin a previously-pinned message. Called
+    /// when a [`TodoList`](ironclaw_channels_core::TodoList) transitions
+    /// to fully-completed so the channel pin list doesn't fill with
+    /// stale finished plans.
+    pub async fn pins_remove(
+        &self,
+        channel: &str,
+        timestamp: &str,
+    ) -> Result<(), AdapterError> {
+        let body = json!({"channel": channel, "timestamp": timestamp});
+        let resp = self
+            .client
+            .post(self.url("pins.remove"))
             .bearer_auth(&self.bot_token)
             .json(&body)
             .send()
@@ -434,6 +691,137 @@ mod tests {
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"title\":\"hi\""));
+    }
+
+    #[test]
+    fn build_card_blocks_full_card_shape() {
+        use ironclaw_channels_core::{CardButton, CardField};
+        let card = Card {
+            title: Some("Approve deploy?".into()),
+            body: Some("Push green to prod-canary?".into()),
+            fields: vec![
+                CardField {
+                    label: "Branch".into(),
+                    value: "main".into(),
+                    inline: true,
+                },
+                CardField {
+                    label: "Commit".into(),
+                    value: "a1b2c3d".into(),
+                    inline: true,
+                },
+            ],
+            buttons: vec![
+                CardButton {
+                    label: "Yes".into(),
+                    value: Some("deploy:yes".into()),
+                    url: None,
+                    style: Some("primary".into()),
+                },
+                CardButton {
+                    label: "Docs".into(),
+                    value: None,
+                    url: Some("https://example.com/docs".into()),
+                    style: None,
+                },
+            ],
+            image_url: Some("https://example.com/x.png".into()),
+        };
+        let blocks = build_card_blocks(&card);
+        let arr = blocks.as_array().expect("array");
+        // header / section(body+accessory) / section(fields) / actions
+        assert_eq!(arr.len(), 4);
+        assert_eq!(arr[0]["type"], "header");
+        assert_eq!(arr[0]["text"]["text"], "Approve deploy?");
+        assert_eq!(arr[1]["type"], "section");
+        assert_eq!(arr[1]["text"]["text"], "Push green to prod-canary?");
+        assert_eq!(arr[1]["accessory"]["type"], "image");
+        assert_eq!(arr[1]["accessory"]["image_url"], "https://example.com/x.png");
+        assert_eq!(arr[2]["type"], "section");
+        assert_eq!(arr[2]["fields"].as_array().unwrap().len(), 2);
+        assert_eq!(arr[3]["type"], "actions");
+        assert_eq!(arr[3]["block_id"], "card_actions");
+        let elements = arr[3]["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 2);
+        assert_eq!(elements[0]["action_id"], "card_btn_0");
+        assert_eq!(elements[0]["value"], "deploy:yes");
+        assert_eq!(elements[0]["style"], "primary");
+        assert_eq!(elements[1]["action_id"], "card_btn_1");
+        assert_eq!(elements[1]["url"], "https://example.com/docs");
+        assert!(elements[1].get("value").is_none());
+        assert!(elements[1].get("style").is_none());
+    }
+
+    #[test]
+    fn build_card_blocks_image_only_emits_image_block() {
+        let card = Card {
+            title: Some("Snap".into()),
+            image_url: Some("https://example.com/p.png".into()),
+            ..Card::default()
+        };
+        let blocks = build_card_blocks(&card);
+        let arr = blocks.as_array().unwrap();
+        // header + standalone image (no body to attach accessory to).
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[1]["type"], "image");
+        assert_eq!(arr[1]["image_url"], "https://example.com/p.png");
+    }
+
+    #[test]
+    fn build_card_blocks_unsupported_button_style_is_omitted() {
+        let card = Card {
+            title: Some("hi".into()),
+            buttons: vec![CardButton {
+                label: "Maybe".into(),
+                value: Some("m".into()),
+                url: None,
+                style: Some("secondary".into()),
+            }],
+            ..Card::default()
+        };
+        let arr = build_card_blocks(&card)
+            .as_array()
+            .cloned()
+            .unwrap();
+        let btn = &arr.last().unwrap()["elements"][0];
+        assert!(btn.get("style").is_none());
+    }
+
+    #[test]
+    fn build_card_blocks_long_header_truncated() {
+        let long = "a".repeat(500);
+        let card = Card {
+            title: Some(long),
+            body: Some("x".into()),
+            ..Card::default()
+        };
+        let blocks = build_card_blocks(&card);
+        let header_text = blocks[0]["text"]["text"].as_str().unwrap();
+        assert_eq!(header_text.chars().count(), 150);
+    }
+
+    #[test]
+    fn build_card_blocks_field_chunking_at_ten() {
+        let fields = (0..15)
+            .map(|i| ironclaw_channels_core::CardField {
+                label: format!("L{i}"),
+                value: format!("V{i}"),
+                inline: false,
+            })
+            .collect();
+        // Note: card validator caps fields at 25 — 15 is legal and forces a
+        // chunk split (10 + 5) because Slack section.fields caps at 10.
+        let card = Card {
+            title: Some("hi".into()),
+            fields,
+            ..Card::default()
+        };
+        let blocks = build_card_blocks(&card);
+        let arr = blocks.as_array().unwrap();
+        // header + 2 field-sections = 3
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[1]["fields"].as_array().unwrap().len(), 10);
+        assert_eq!(arr[2]["fields"].as_array().unwrap().len(), 5);
     }
 
     #[test]

@@ -7,7 +7,10 @@ use crate::dispatch::{AdapterResolver, HostDispatcher};
 use crate::error::DeliveryError;
 use crate::system_actions::{parse_system_content, ParsedAction};
 use dashmap::DashMap;
-use ironclaw_channels_core::{AdapterError, Card, ChannelAdapter};
+use ironclaw_channels_core::{
+    AdapterError, Breadcrumb, Card, ChannelAdapter, DiffCard, ErrorCard, ErrorCardKind,
+    ThinkingBlock, TodoList,
+};
 use ironclaw_db::central::CentralDb;
 use ironclaw_db::session::{open_inbound, open_outbound, SessionPaths};
 use ironclaw_db::tables::{delivered, messages_in, messages_out, session_routing};
@@ -164,12 +167,31 @@ impl DeliveryReport {
 }
 
 /// Track in-memory retry state for in-flight messages.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RetryState {
     /// Number of attempts already made (>= 1).
     tries: u32,
     /// `Instant` after which the row may be retried.
     not_before: Instant,
+    /// Number of chat-split chunks already successfully delivered for the
+    /// CURRENT outbound row. Used by `dispatch_chat` to resume mid-split
+    /// after a retryable adapter failure (e.g. `AdapterError::Rate` on
+    /// chunk 1 of 3) without re-sending the earlier chunks. Naturally
+    /// scoped per `(session_id, msg_id)` because that's the
+    /// [`DeliveryKey`] the `retries` map is keyed by — each outbound row
+    /// owns exactly one chunk-progress counter. Cleared (with the rest
+    /// of the entry) when the row is marked delivered or failed in
+    /// `process_session_once`.
+    chunks_sent: u32,
+    /// Platform-side message id from the FIRST chunk's successful
+    /// `deliver()` call. The delivery loop records THIS id in the
+    /// `delivered` row so subsequent `edit_message` / `add_reaction`
+    /// targets the same anchor message every time, even across retries
+    /// where the local in-process state would otherwise lose it
+    /// (the success of chunk 0 happens in attempt N, but the row only
+    /// reaches `delivered::insert` after attempt N+M when the final
+    /// chunk lands). Persisted across retries to survive that gap.
+    first_chunk_pid: Option<String>,
 }
 
 /// Outcome of [`DeliveryService::try_action_via_adapter`].
@@ -349,6 +371,12 @@ impl DeliveryService {
     ///
     /// Returns a `DeliveryReport` summarising the number of rows delivered,
     /// failed, or deferred during this pass.
+    // The `MessageKind` match below is intentionally heavily documented:
+    // each arm spells out why that surface exists and where its native
+    // rendering lives. Splitting the arms into one-liner helpers loses
+    // that context for marginal-at-best readability; keep the body long
+    // and explicit.
+    #[allow(clippy::too_many_lines)]
     pub async fn process_session_once(
         &self,
         sess: &Session,
@@ -387,8 +415,10 @@ impl DeliveryService {
             }
 
             // Backoff guard.
-            if let Some(state) = self.retries.get(&key).map(|r| *r) {
-                if now < state.not_before {
+            if let Some(not_before) =
+                self.retries.get(&key).map(|r| r.not_before)
+            {
+                if now < not_before {
                     report.deferred += 1;
                     continue;
                 }
@@ -412,7 +442,7 @@ impl DeliveryService {
                     ironclaw_metrics::inc_messages_outbound(&channel_label);
                 }
                 Err(err) if err.is_retryable() => {
-                    let outcome = self.bump_retry(&key);
+                    let outcome = self.bump_retry(&key, err.retry_after_secs());
                     match outcome {
                         DeferOutcome::Defer => {
                             report.deferred += 1;
@@ -420,11 +450,34 @@ impl DeliveryService {
                         }
                         DeferOutcome::Fail => {
                             let in_conn = inbound_pool.connect()?;
+                            // Keep the `failed` row insertion — operators
+                            // rely on `iclaw dropped-messages` reading
+                            // these. Slice-3.3 ADDS a user-visible
+                            // ErrorCard on top so the user actually sees
+                            // that their message didn't get out.
                             delivered::insert(&in_conn, row.id, None, "failed")?;
                             self.retries.remove(&key);
                             report.failed += 1;
                             ironclaw_metrics::inc_delivery_failed(&channel_label);
                             warn!(?err, ?row.id, "exhausted retry budget, marking failed");
+                            // Best-effort: emit an Error-kind outbound
+                            // row addressed back at the originating
+                            // channel so the next delivery pass renders
+                            // it visibly to the user. Swallow errors —
+                            // an emit failure here can't be allowed to
+                            // poison the delivery loop, and the `failed`
+                            // row above is the load-bearing record.
+                            if let Err(emit_err) = self.emit_delivery_failure_error_card(
+                                sess,
+                                &row,
+                                &err.to_string(),
+                            ) {
+                                warn!(
+                                    ?emit_err,
+                                    ?row.id,
+                                    "could not emit retry-exhaustion ErrorCard"
+                                );
+                            }
                         }
                     }
                 }
@@ -514,7 +567,7 @@ impl DeliveryService {
                 delivered::insert(&in_conn, row.id, None, "ok")?;
             }
             MessageKind::Chat | MessageKind::Task | MessageKind::Webhook => {
-                self.dispatch_chat(row, &target, inbound_pool).await?;
+                self.dispatch_chat(sess.id, row, &target, inbound_pool).await?;
             }
             // Wave 2 of the cards rollout: deserialize the canonical
             // Card from `content.card` and call the adapter's
@@ -529,6 +582,79 @@ impl DeliveryService {
             // opt out of cards entirely.)
             MessageKind::Card => {
                 self.dispatch_card(row, &target, inbound_pool).await?;
+            }
+            // Breadcrumb-kind rows ride a dedicated dispatch that
+            // pulls the canonical `Breadcrumb` out of `content.breadcrumb`
+            // and hands it to the adapter's `deliver_breadcrumb` hook.
+            // Adapters with rich native rendering (Telegram HTML
+            // `<code>`, Slack Block Kit `context`, Discord embed
+            // footer, Google Chat cards v2, Matrix `m.notice`)
+            // render a compact chip; the trait-level default falls
+            // back to a `[tool] detail` text line via `deliver`.
+            MessageKind::Breadcrumb => {
+                self.dispatch_breadcrumb(row, &target, inbound_pool, None).await?;
+            }
+            // Diff-kind rows: see `dispatch_diff` for the wire shape
+            // and per-channel rendering notes.
+            MessageKind::Diff => {
+                self.dispatch_diff(row, &target, inbound_pool).await?;
+            }
+            // Placeholder branch for sibling slice-3 surfaces that
+            // haven't landed their dedicated dispatcher yet. The
+            // long-output-expander surface (this branch's owner) does
+            // NOT add new MessageKinds, but other surfaces do. Until
+            // those dispatchers exist we route the rows through
+            // `dispatch_chat` so the row is still delivered (degraded
+            // to text via the row's `content.text` field if present,
+            // recorded as failed if not — never silently swallowed).
+            // Sibling agents replace this arm with their own
+            // dispatchers; nothing else here changes.
+            // TodoList-kind rows ride a dedicated dispatch that pulls
+            // the canonical `TodoList` out of `content.todo_list`, looks
+            // up the prior list's platform message id (so adapters
+            // with an edit API replace the chip in place rather than
+            // spam a new message on every mutation), and threads a
+            // `pin_hint` derived from whether this is the first emit
+            // OR the list just transitioned to fully-completed (so
+            // the adapter can unpin). Adapters with rich native
+            // rendering (Telegram `editMessageText` MarkdownV2 +
+            // `pinChatMessage`, Slack Block Kit + `pins.add`,
+            // Discord embed `PATCH`, Google Chat Cards v2 + `patch`,
+            // Matrix `m.replace` + pinned-events) draw a live
+            // checklist; the trait-level default emits a text-line
+            // checklist via `deliver`.
+            MessageKind::TodoList => {
+                self.dispatch_todo_list(row, &target, inbound_pool, sess).await?;
+            }
+            // Error-kind rows ride a dedicated dispatch that pulls the
+            // canonical `ErrorCard` out of `content.error` and hands it
+            // to the adapter's `deliver_error` hook. Adapters with rich
+            // native rendering (Slack `attachments.color: "danger"`,
+            // Discord embed `color = 0xE74C3C`, Matrix `<font
+            // color="red">`, Telegram bold HTML, Google Chat decorated
+            // icon) draw a red / emphasised affordance. The trait-level
+            // default emits `[ERROR: <kind>] <title>\n<summary>` via
+            // `deliver` so adapters without an override still surface
+            // the failure visibly.
+            MessageKind::Error => {
+                self.dispatch_error(row, &target, inbound_pool).await?;
+            }
+            // Thinking-kind rows ride a dedicated dispatch that pulls
+            // the canonical `ThinkingBlock` out of `content.thinking`
+            // and hands it to the adapter's `deliver_thinking` hook.
+            // Adapters with native collapsed-section primitives
+            // (Telegram `<blockquote expandable>`, Slack `context`
+            // block, Discord muted-grey embed, Google Chat
+            // `collapsibleSection`, Matrix `<details>`) render the
+            // reasoning collapsed by default; the trait-level default
+            // emits a `[reasoning]`-headered quoted block via
+            // `deliver` so adapters without an override still surface
+            // the block visibly. Rows arrive here only when the
+            // runner has confirmed the operator's per-group
+            // `surface_thinking` opt-in — see
+            // `ironclaw_runner::run::provider_call::pump_events`.
+            MessageKind::Thinking => {
+                self.dispatch_thinking(row, &target, inbound_pool).await?;
             }
         }
         Ok(())
@@ -577,6 +703,27 @@ impl DeliveryService {
         if action.name == "add_mcp_server" {
             let apply = apply_add_mcp_server(&self.central, sess.agent_group_id, &action.payload);
             self.finish_self_mod("add_mcp_server", sess, row, inbound_pool, apply)?;
+            return Ok(());
+        }
+
+        // `update_breadcrumb` is the finalisation half of the runner's
+        // tool-progress chip pipeline. The payload carries the new
+        // (`Done` / `Failed`) `Breadcrumb` shape; we resolve the prior
+        // chip's platform message id and re-render via
+        // `deliver_breadcrumb(..., existing_message_id=Some(...))`
+        // so adapters with an edit API replace the original chip in
+        // place. Falls back to a fresh emit when the prior chip's
+        // platform id isn't known (no edit-API support, or chip
+        // hasn't been delivered yet).
+        if action.name == "update_breadcrumb" {
+            self.handle_update_breadcrumb(
+                row,
+                target,
+                inbound_pool,
+                &action.payload,
+                sess,
+            )
+            .await?;
             return Ok(());
         }
 
@@ -839,6 +986,7 @@ impl DeliveryService {
 
     async fn dispatch_chat(
         &self,
+        session_id: SessionId,
         row: &MessageOutRow,
         target: &DispatchTarget,
         inbound_pool: &SessionPool,
@@ -865,18 +1013,180 @@ impl DeliveryService {
             debug!(?err, "set_typing failed (ignored)");
         }
 
-        let outbound = OutboundMessage {
-            kind: row.kind,
-            content: row.content.clone(),
-            files: vec![],
+        // Slice 3.4 (long-output expander): when the runner has
+        // attached an `expander` decorator to the row (because the
+        // text exceeded the threshold), route to the adapter's
+        // `deliver_collapsible` hook so it can render a native
+        // disclosure widget (`<blockquote expandable>`, Slack
+        // "Show full" button, Discord embed, Cards v2
+        // `collapsibleSection`, Matrix `<details>`, …). The default
+        // trait impl falls back to a summary-plus-preview text row.
+        //
+        // We deliberately branch BEFORE the splitter — `dispatch_collapsible`
+        // owns its own length handling (the whole point is to NOT
+        // dump the body into chat), so feeding it through
+        // `split_chat_content_if_needed` would double up.
+        if let Some(expander) = row.content.get("expander").cloned() {
+            return self
+                .dispatch_collapsible(
+                    row,
+                    target,
+                    inbound_pool,
+                    adapter.as_ref(),
+                    &platform_id,
+                    &expander,
+                )
+                .await;
+        }
+
+        // Split if the adapter advertises a per-message char cap and the
+        // body would exceed it. Returns a vec of contents to send in order;
+        // the first element's platform_message_id is the one we record so
+        // future `edit_message` / `add_reaction` calls target the anchor.
+        let parts = split_chat_content_if_needed(&row.content, adapter.max_message_chars());
+
+        // Resume mid-split: when a previous attempt for THIS row delivered
+        // the first `chunks_sent` chunks but then failed retryably (rate-
+        // limit, transport blip, IO error), the retry MUST skip the
+        // already-delivered chunks. Without this, the user sees duplicates
+        // of every prior chunk on every retry — up to
+        // `MAX_DELIVERY_ATTEMPTS` copies for chunk 0 alone.
+        //
+        // `chunks_sent` lives on the same `(session_id, msg_id)`-keyed
+        // RetryState as `tries` / `not_before`, so the counter is
+        // automatically scoped per-row. Cleared (with the rest of the
+        // entry) by `process_session_once` when the row finally lands as
+        // `delivered=ok` or exhausts its retry budget.
+        let key = DeliveryKey::new(session_id, row.id);
+        let (start_index, mut first_platform_id) = self.retries.get(&key).map_or(
+            (0usize, None),
+            |s| (s.chunks_sent as usize, s.first_chunk_pid.clone()),
+        );
+
+        let total_parts = parts.len();
+        for (i, content) in parts.iter().enumerate().skip(start_index) {
+            let outbound = OutboundMessage {
+                kind: row.kind,
+                content: content.clone(),
+                files: vec![],
+            };
+            let pid = call_adapter(
+                adapter.as_ref(),
+                &platform_id,
+                target.thread_id.as_deref(),
+                &outbound,
+            )
+            .await?;
+            if i == 0 {
+                first_platform_id = pid;
+            }
+            // For single-chunk rows the success path runs once, returns
+            // Ok, and `process_session_once` clears any retry state — no
+            // chunk bookkeeping needed (and we skip the allocation).
+            // For split rows we MUST record progress BEFORE the next
+            // iteration so a failure on chunk i+1 leaves
+            // `chunks_sent = i+1` in the retry-state map; the next retry
+            // will then resume at chunk i+1, not from chunk 0.
+            if total_parts > 1 {
+                let mut entry = self.retries.entry(key).or_insert(RetryState {
+                    tries: 0,
+                    not_before: Instant::now(),
+                    chunks_sent: 0,
+                    first_chunk_pid: None,
+                });
+                // `i` is bounded by `parts.len()` which is bounded by the
+                // splitter's chunk count; in practice this fits in u32
+                // comfortably (a single outbound row that splits into 2^32
+                // chunks is not a thing). Saturate as a belt-and-braces.
+                let next_count = u32::try_from(i).unwrap_or(u32::MAX).saturating_add(1);
+                entry.chunks_sent = next_count;
+                if i == 0 {
+                    entry.first_chunk_pid.clone_from(&first_platform_id);
+                }
+            }
+        }
+
+        if parts.len() > 1 {
+            ironclaw_metrics::inc_delivery_chat_split(adapter.channel_type().as_str());
+        }
+        let in_conn = inbound_pool.connect()?;
+        delivered::insert(&in_conn, row.id, first_platform_id.as_deref(), "ok")?;
+        Ok(())
+    }
+
+    /// Dispatch a Chat-kind row whose `content.expander` decorator is
+    /// set (slice 3.4 long-output expander surface). Pulls the
+    /// full body out of `content.text`, the summary + preview out of
+    /// `content.expander`, and calls the adapter's
+    /// `deliver_collapsible` hook.
+    ///
+    /// Belt-and-braces on `AdapterError::Unsupported`: degrade to a
+    /// plain `deliver` carrying the summary + preview rendered via
+    /// [`ironclaw_channels_core::render_collapsible_text_fallback`].
+    /// The trait-level default impl already does this — this branch
+    /// only fires for adapters that deliberately override
+    /// `deliver_collapsible` to opt out.
+    async fn dispatch_collapsible(
+        &self,
+        row: &MessageOutRow,
+        target: &DispatchTarget,
+        inbound_pool: &SessionPool,
+        adapter: &dyn ChannelAdapter,
+        platform_id: &str,
+        expander: &serde_json::Value,
+    ) -> Result<(), DeliveryError> {
+        let text = row
+            .content
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned();
+        let summary = expander
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(long output)")
+            .to_owned();
+        let preview_lines: Vec<String> = expander
+            .get("preview_lines")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let platform_message_id = match adapter
+            .deliver_collapsible(
+                platform_id,
+                target.thread_id.as_deref(),
+                &text,
+                &summary,
+                &preview_lines,
+            )
+            .await
+        {
+            Ok(id) => id,
+            Err(AdapterError::Unsupported(reason)) => {
+                info!(
+                    channel = adapter.channel_type().as_str(),
+                    reason,
+                    "deliver_collapsible unsupported; falling back to summary text deliver"
+                );
+                let body = ironclaw_channels_core::render_collapsible_text_fallback(
+                    &text,
+                    &summary,
+                    &preview_lines,
+                );
+                let outbound = OutboundMessage {
+                    kind: MessageKind::Chat,
+                    content: serde_json::json!({ "text": body }),
+                    files: vec![],
+                };
+                call_adapter(adapter, platform_id, target.thread_id.as_deref(), &outbound).await?
+            }
+            Err(other) => return Err(DeliveryError::Adapter(other)),
         };
-        let platform_message_id = call_adapter(
-            adapter.as_ref(),
-            &platform_id,
-            target.thread_id.as_deref(),
-            &outbound,
-        )
-        .await?;
         let in_conn = inbound_pool.connect()?;
         delivered::insert(&in_conn, row.id, platform_message_id.as_deref(), "ok")?;
         Ok(())
@@ -993,6 +1303,645 @@ impl DeliveryService {
         Ok(())
     }
 
+    /// Dispatch a `MessageKind::Breadcrumb` row.
+    ///
+    /// Row content shape (written by `RunnerToolCtx::emit_breadcrumb`):
+    ///
+    /// ```json
+    /// { "breadcrumb": { ...canonical Breadcrumb... } }
+    /// ```
+    ///
+    /// `existing_message_id` is `None` for first-emit (Running) rows;
+    /// the `update_breadcrumb` system-action path passes
+    /// `Some(prev_platform_id)` so adapters with an in-place edit
+    /// API can replace the prior chip's contents. Adapters without
+    /// an edit API ignore the argument and emit a fresh chip.
+    ///
+    /// On `AdapterError::Unsupported` we degrade to a plain
+    /// `deliver` call with the breadcrumb's `to_text_fallback` so
+    /// the chip is still visible (even though it can't be a real
+    /// chip on that channel). Mirrors `dispatch_card`'s belt-and-
+    /// braces fallback.
+    async fn dispatch_breadcrumb(
+        &self,
+        row: &MessageOutRow,
+        target: &DispatchTarget,
+        inbound_pool: &SessionPool,
+        existing_message_id: Option<&str>,
+    ) -> Result<(), DeliveryError> {
+        let channel_type = target
+            .channel_type
+            .clone()
+            .ok_or(DeliveryError::NoRoute(SessionId::nil()))?;
+        let platform_id = target
+            .platform_id
+            .clone()
+            .ok_or(DeliveryError::NoRoute(SessionId::nil()))?;
+        let adapter = self
+            .adapters
+            .get(&channel_type)
+            .map(|r| r.clone())
+            .ok_or_else(|| DeliveryError::NoAdapter(channel_type.clone()))?;
+
+        // Pull the canonical Breadcrumb out of `content.breadcrumb`.
+        // A parse failure is a host bug (corrupted row) — surface as
+        // SystemAction so the retry loop doesn't bang on it forever.
+        let breadcrumb: Breadcrumb = match row.content.get("breadcrumb") {
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                DeliveryError::SystemAction(format!(
+                    "breadcrumb row content.breadcrumb failed to deserialise: {e}"
+                ))
+            })?,
+            None => {
+                return Err(DeliveryError::SystemAction(
+                    "breadcrumb row missing content.breadcrumb".into(),
+                ));
+            }
+        };
+
+        let platform_message_id = match adapter
+            .deliver_breadcrumb(
+                &platform_id,
+                target.thread_id.as_deref(),
+                &breadcrumb,
+                existing_message_id,
+            )
+            .await
+        {
+            Ok(id) => id,
+            Err(AdapterError::Unsupported(reason)) => {
+                info!(
+                    channel = adapter.channel_type().as_str(),
+                    reason,
+                    "deliver_breadcrumb unsupported; falling back to text deliver"
+                );
+                let outbound = OutboundMessage {
+                    kind: MessageKind::Chat,
+                    content: serde_json::json!({ "text": breadcrumb.to_text_fallback() }),
+                    files: vec![],
+                };
+                call_adapter(
+                    adapter.as_ref(),
+                    &platform_id,
+                    target.thread_id.as_deref(),
+                    &outbound,
+                )
+                .await?
+            }
+            Err(other) => return Err(DeliveryError::Adapter(other)),
+        };
+        let in_conn = inbound_pool.connect()?;
+        delivered::insert(&in_conn, row.id, platform_message_id.as_deref(), "ok")?;
+        Ok(())
+    }
+
+    /// Dispatch a `MessageKind::TodoList` row — the slice-3.2
+    /// "live, pinned checklist" surface.
+    ///
+    /// Row content shape (written by the MCP `todo_*` tool handlers
+    /// after every mutation):
+    ///
+    /// ```json
+    /// { "todo_list": { ...canonical TodoList... } }
+    /// ```
+    ///
+    /// Behaviour:
+    /// - Look up the most recent prior `TodoList` row in the session
+    ///   via [`lookup_prior_kind_external_id`]. When found, thread
+    ///   its platform message id through as `existing_message_id` so
+    ///   adapters with an edit API (Telegram `editMessageText`, Slack
+    ///   `chat.update`, Discord `PATCH`, Google Chat
+    ///   `spaces.messages.patch`, Matrix `m.replace`) REPLACE the
+    ///   prior chip rather than emit a new message on every mutation.
+    /// - Derive `pin_hint`: `true` on the very first emit per session
+    ///   (so the adapter pins) AND on the transition to fully-completed
+    ///   (so the adapter can unpin). When neither condition holds the
+    ///   adapter is told `false` and leaves the existing pin state
+    ///   alone.
+    /// - On `AdapterError::Unsupported`, downgrade to a plain
+    ///   `deliver` call with the list's `to_text_fallback` body so
+    ///   the checklist still reaches the user (just without
+    ///   edit-in-place or pinning). Mirrors `dispatch_breadcrumb`'s
+    ///   belt-and-braces fallback.
+    ///
+    /// No typing indicator — the agent isn't "typing" a todo list,
+    /// the list is structured metadata. Same call-pattern as
+    /// `dispatch_breadcrumb`.
+    async fn dispatch_todo_list(
+        &self,
+        row: &MessageOutRow,
+        target: &DispatchTarget,
+        inbound_pool: &SessionPool,
+        sess: &Session,
+    ) -> Result<(), DeliveryError> {
+        let channel_type = target
+            .channel_type
+            .clone()
+            .ok_or(DeliveryError::NoRoute(SessionId::nil()))?;
+        let platform_id = target
+            .platform_id
+            .clone()
+            .ok_or(DeliveryError::NoRoute(SessionId::nil()))?;
+        let adapter = self
+            .adapters
+            .get(&channel_type)
+            .map(|r| r.clone())
+            .ok_or_else(|| DeliveryError::NoAdapter(channel_type.clone()))?;
+
+        // Pull the canonical TodoList out of `content.todo_list`. A
+        // parse failure is a host bug (corrupted row) — surface as
+        // SystemAction so the retry loop doesn't bang on it forever.
+        let list: TodoList = match row.content.get("todo_list") {
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                DeliveryError::SystemAction(format!(
+                    "todo_list row content.todo_list failed to deserialise: {e}"
+                ))
+            })?,
+            None => {
+                return Err(DeliveryError::SystemAction(
+                    "todo_list row missing content.todo_list".into(),
+                ));
+            }
+        };
+
+        // Look up the prior list's platform message id (when one
+        // exists). The predicate is "always true" because the
+        // most-recent TodoList row in the session IS the prior chip
+        // — there's only ever one logical list per session, so we
+        // don't need a tool_name-style scope filter.
+        let prior_external_id = lookup_prior_kind_external_id(
+            &self
+                .session_paths
+                .outbound_pool(&sess.agent_group_id, &sess.id)?
+                .connect()?,
+            &inbound_pool.connect()?,
+            MessageKind::TodoList,
+            |_| true,
+        )?;
+
+        // pin_hint:
+        // - First emit (no prior chip yet) → true so the adapter pins.
+        // - All-completed transition → true so the adapter can unpin.
+        // - Otherwise → false (leave existing pin state alone).
+        let pin_hint = prior_external_id.is_none() || list.is_fully_completed();
+
+        let platform_message_id = match adapter
+            .deliver_todo_list(
+                &platform_id,
+                target.thread_id.as_deref(),
+                &list,
+                prior_external_id.as_deref(),
+                pin_hint,
+            )
+            .await
+        {
+            Ok(id) => id,
+            Err(AdapterError::Unsupported(reason)) => {
+                info!(
+                    channel = adapter.channel_type().as_str(),
+                    reason,
+                    "deliver_todo_list unsupported; falling back to text deliver"
+                );
+                let outbound = OutboundMessage {
+                    kind: MessageKind::Chat,
+                    content: serde_json::json!({ "text": list.to_text_fallback() }),
+                    files: vec![],
+                };
+                call_adapter(
+                    adapter.as_ref(),
+                    &platform_id,
+                    target.thread_id.as_deref(),
+                    &outbound,
+                )
+                .await?
+            }
+            Err(other) => return Err(DeliveryError::Adapter(other)),
+        };
+        let in_conn = inbound_pool.connect()?;
+        delivered::insert(&in_conn, row.id, platform_message_id.as_deref(), "ok")?;
+        Ok(())
+    }
+
+    /// Dispatch a `MessageKind::Error` row — the slice-3.3
+    /// "visually-distinct error" surface.
+    ///
+    /// Row content shape (written by the host emit sites in
+    /// `host-delivery::service` retry-exhaustion and
+    /// `ironclaw-runner::run::mod` terminal-failure-apology):
+    ///
+    /// ```json
+    /// { "error": { ...canonical ErrorCard... } }
+    /// ```
+    ///
+    /// Errors are immutable receipts — there is no `existing_message_id`
+    /// argument and no `update_error` system action to mirror
+    /// `update_breadcrumb`. Belt-and-braces fallback mirrors
+    /// `dispatch_breadcrumb`: if the adapter explicitly returns
+    /// `Unsupported`, downgrade to a plain `deliver` call with the
+    /// `ErrorCard::to_text_fallback` body so the failure still reaches
+    /// the user (just without color styling).
+    ///
+    /// Note we deliberately do NOT call `set_typing` here — the user
+    /// is being shown an error, the visual signal is the error itself,
+    /// not "agent is still working". And no `to` hint — error
+    /// recipients are always the originating channel.
+    async fn dispatch_error(
+        &self,
+        row: &MessageOutRow,
+        target: &DispatchTarget,
+        inbound_pool: &SessionPool,
+    ) -> Result<(), DeliveryError> {
+        let channel_type = target
+            .channel_type
+            .clone()
+            .ok_or(DeliveryError::NoRoute(SessionId::nil()))?;
+        let platform_id = target
+            .platform_id
+            .clone()
+            .ok_or(DeliveryError::NoRoute(SessionId::nil()))?;
+        let adapter = self
+            .adapters
+            .get(&channel_type)
+            .map(|r| r.clone())
+            .ok_or_else(|| DeliveryError::NoAdapter(channel_type.clone()))?;
+
+        // Deserialize the canonical ErrorCard. A parse failure here is
+        // a host bug (the row was written by one of our own emit sites
+        // — there's no model in the loop) so surface as SystemAction
+        // and stop retrying.
+        let err_card: ErrorCard = match row.content.get("error") {
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                DeliveryError::SystemAction(format!(
+                    "error row content.error failed to deserialise into ErrorCard: {e}"
+                ))
+            })?,
+            None => {
+                return Err(DeliveryError::SystemAction(
+                    "error row missing content.error".into(),
+                ));
+            }
+        };
+
+        let platform_message_id = match adapter
+            .deliver_error(&platform_id, target.thread_id.as_deref(), &err_card)
+            .await
+        {
+            Ok(id) => id,
+            Err(AdapterError::Unsupported(reason)) => {
+                info!(
+                    channel = adapter.channel_type().as_str(),
+                    reason,
+                    "deliver_error unsupported; falling back to text deliver"
+                );
+                let outbound = OutboundMessage {
+                    kind: MessageKind::Chat,
+                    content: serde_json::json!({ "text": err_card.to_text_fallback() }),
+                    files: vec![],
+                };
+                call_adapter(
+                    adapter.as_ref(),
+                    &platform_id,
+                    target.thread_id.as_deref(),
+                    &outbound,
+                )
+                .await?
+            }
+            Err(other) => return Err(DeliveryError::Adapter(other)),
+        };
+        let in_conn = inbound_pool.connect()?;
+        delivered::insert(&in_conn, row.id, platform_message_id.as_deref(), "ok")?;
+        Ok(())
+    }
+
+    /// Dispatch a `MessageKind::Thinking` row — the slice-3.5 opt-in
+    /// surface for the model's `thinking` / `redacted_thinking` blocks.
+    ///
+    /// Row content shape (written by `RunnerToolCtx::emit_thinking`):
+    ///
+    /// ```json
+    /// { "thinking": { ...canonical ThinkingBlock... } }
+    /// ```
+    ///
+    /// Mirrors `dispatch_error` in shape: deserialise the canonical
+    /// [`ThinkingBlock`] from `content.thinking`, hand it to the
+    /// adapter's `deliver_thinking` hook, fall back to a plain
+    /// `deliver` call with the `[reasoning]`-headered quoted text
+    /// rendering on `AdapterError::Unsupported`.
+    ///
+    /// No typing indicator (the thinking block lands beside the
+    /// reply, not between user inputs). No edit-in-place — thinking
+    /// blocks are point-in-time receipts.
+    ///
+    /// The privacy gate lives upstream in
+    /// `ironclaw_runner::run::provider_call::pump_events`; rows only
+    /// reach this method when the operator has flipped the per-group
+    /// `surface_thinking` flag.
+    async fn dispatch_thinking(
+        &self,
+        row: &MessageOutRow,
+        target: &DispatchTarget,
+        inbound_pool: &SessionPool,
+    ) -> Result<(), DeliveryError> {
+        let channel_type = target
+            .channel_type
+            .clone()
+            .ok_or(DeliveryError::NoRoute(SessionId::nil()))?;
+        let platform_id = target
+            .platform_id
+            .clone()
+            .ok_or(DeliveryError::NoRoute(SessionId::nil()))?;
+        let adapter = self
+            .adapters
+            .get(&channel_type)
+            .map(|r| r.clone())
+            .ok_or_else(|| DeliveryError::NoAdapter(channel_type.clone()))?;
+
+        // Deserialize the canonical ThinkingBlock. The runner went
+        // through the schema's caps before writing, so a parse failure
+        // here is a host bug (corrupted row) — surface as SystemAction
+        // so the retry loop doesn't bang on a row that will never
+        // parse.
+        let thinking: ThinkingBlock = match row.content.get("thinking") {
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                DeliveryError::SystemAction(format!(
+                    "thinking row content.thinking failed to deserialise: {e}"
+                ))
+            })?,
+            None => {
+                return Err(DeliveryError::SystemAction(
+                    "thinking row missing content.thinking".into(),
+                ));
+            }
+        };
+
+        let platform_message_id = match adapter
+            .deliver_thinking(&platform_id, target.thread_id.as_deref(), &thinking)
+            .await
+        {
+            Ok(id) => id,
+            Err(AdapterError::Unsupported(reason)) => {
+                info!(
+                    channel = adapter.channel_type().as_str(),
+                    reason,
+                    "deliver_thinking unsupported; falling back to text deliver"
+                );
+                let outbound = OutboundMessage {
+                    kind: MessageKind::Chat,
+                    content: serde_json::json!({ "text": thinking.to_text_fallback() }),
+                    files: vec![],
+                };
+                call_adapter(
+                    adapter.as_ref(),
+                    &platform_id,
+                    target.thread_id.as_deref(),
+                    &outbound,
+                )
+                .await?
+            }
+            Err(other) => return Err(DeliveryError::Adapter(other)),
+        };
+        let in_conn = inbound_pool.connect()?;
+        delivered::insert(&in_conn, row.id, platform_message_id.as_deref(), "ok")?;
+        Ok(())
+    }
+
+    /// Dispatch a `MessageKind::Diff` row.
+    ///
+    /// Row content shape (written by `RunnerToolCtx::emit_diff`):
+    ///
+    /// ```json
+    /// { "diff": { ...canonical DiffCard... } }
+    /// ```
+    ///
+    /// Mirrors `dispatch_breadcrumb` in shape: deserialise the
+    /// canonical [`DiffCard`] from `content.diff`, hand it to the
+    /// adapter's `deliver_diff` hook, fall back to a plain `deliver`
+    /// call with the unified-diff text rendering on
+    /// `AdapterError::Unsupported`.
+    ///
+    /// No typing indicator: diff cards always follow a tool breadcrumb
+    /// which already signalled activity. No `to` hint: diffs are scoped
+    /// to the originating channel by construction (file-edit tools run
+    /// in the agent's container, not on behalf of a third party).
+    async fn dispatch_diff(
+        &self,
+        row: &MessageOutRow,
+        target: &DispatchTarget,
+        inbound_pool: &SessionPool,
+    ) -> Result<(), DeliveryError> {
+        let channel_type = target
+            .channel_type
+            .clone()
+            .ok_or(DeliveryError::NoRoute(SessionId::nil()))?;
+        let platform_id = target
+            .platform_id
+            .clone()
+            .ok_or(DeliveryError::NoRoute(SessionId::nil()))?;
+        let adapter = self
+            .adapters
+            .get(&channel_type)
+            .map(|r| r.clone())
+            .ok_or_else(|| DeliveryError::NoAdapter(channel_type.clone()))?;
+
+        // Pull the canonical DiffCard out of `content.diff`. A parse
+        // failure is a host bug (corrupted row) — surface as
+        // SystemAction so the retry loop doesn't bang on it forever.
+        let diff: DiffCard = match row.content.get("diff") {
+            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+                DeliveryError::SystemAction(format!(
+                    "diff row content.diff failed to deserialise: {e}"
+                ))
+            })?,
+            None => {
+                return Err(DeliveryError::SystemAction(
+                    "diff row missing content.diff".into(),
+                ));
+            }
+        };
+
+        let platform_message_id = match adapter
+            .deliver_diff(&platform_id, target.thread_id.as_deref(), &diff)
+            .await
+        {
+            Ok(id) => id,
+            Err(AdapterError::Unsupported(reason)) => {
+                info!(
+                    channel = adapter.channel_type().as_str(),
+                    reason,
+                    "deliver_diff unsupported; falling back to text deliver"
+                );
+                let outbound = OutboundMessage {
+                    kind: MessageKind::Chat,
+                    content: serde_json::json!({ "text": diff.to_text_fallback() }),
+                    files: vec![],
+                };
+                call_adapter(
+                    adapter.as_ref(),
+                    &platform_id,
+                    target.thread_id.as_deref(),
+                    &outbound,
+                )
+                .await?
+            }
+            Err(other) => return Err(DeliveryError::Adapter(other)),
+        };
+        let in_conn = inbound_pool.connect()?;
+        delivered::insert(&in_conn, row.id, platform_message_id.as_deref(), "ok")?;
+        Ok(())
+    }
+
+    /// Best-effort: emit a `MessageKind::Error` row addressed at the
+    /// originating channel of `failed_row` so the user sees a
+    /// visually-distinct receipt for "your message did not get out".
+    ///
+    /// Called from the retry-exhaustion arm of `process_session_once`.
+    /// Routing is copied verbatim from `failed_row` (same channel /
+    /// platform / thread) so the error lands where the user is
+    /// already looking. If `failed_row` has no channel routing
+    /// (agent-to-agent, system, …) we silently skip — there is no
+    /// human on the other end to surface to.
+    ///
+    /// Errors propagate so the caller can log them, but the caller
+    /// (the retry-exhaustion branch) MUST treat any error as
+    /// non-fatal — the `delivered.status = "failed"` write is the
+    /// load-bearing artefact for `iclaw dropped-messages`; this card
+    /// is purely UI surface.
+    fn emit_delivery_failure_error_card(
+        &self,
+        sess: &Session,
+        failed_row: &MessageOutRow,
+        reason: &str,
+    ) -> Result<(), DeliveryError> {
+        // Only emit if the failed row had real channel routing.
+        // Agent-to-agent and system rows have no human recipient on
+        // the other end — surfacing a card to "nowhere" is worse than
+        // silence.
+        let (Some(channel_type), Some(platform_id)) = (
+            failed_row.channel_type.clone(),
+            failed_row.platform_id.clone(),
+        ) else {
+            return Ok(());
+        };
+        // Build the card. `retryable = false` here — we just GAVE UP
+        // retrying; telling the user we'll retry again would be a lie.
+        let trimmed = reason.trim();
+        let summary = if trimmed.is_empty() {
+            "delivery failed after exhausting the retry budget".to_owned()
+        } else {
+            // Cap the reason at the summary cap so a giant adapter
+            // error doesn't blow the card's validation.
+            let capped: String = trimmed.chars().take(400).collect();
+            format!(
+                "delivery failed after exhausting the retry budget: {capped}"
+            )
+        };
+        let card = ErrorCard::new(ErrorCardKind::Delivery, summary)
+            .with_title("Could not deliver message");
+        // Write to the session's outbound DB — the next delivery
+        // pass picks it up and routes through `dispatch_error`.
+        let outbound_pool = self
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)?;
+        let out_conn = outbound_pool.connect()?;
+        let body = serde_json::json!({ "error": card });
+        let write = messages_out::WriteOutbound {
+            id: ironclaw_types::MessageId::new(),
+            in_reply_to: failed_row.in_reply_to,
+            timestamp: chrono::Utc::now(),
+            deliver_after: None,
+            recurrence: None,
+            kind: MessageKind::Error,
+            platform_id: Some(platform_id),
+            channel_type: Some(channel_type),
+            thread_id: failed_row.thread_id.clone(),
+            content: body,
+        };
+        messages_out::insert(&out_conn, &write)?;
+        Ok(())
+    }
+
+    /// Handle a `MessageKind::System` row whose top-level action is
+    /// `update_breadcrumb`. Resolves the most recent Breadcrumb-kind
+    /// row matching the same tool / channel / platform and feeds the
+    /// adapter the prior chip's platform message id so the chip can
+    /// be edited in place.
+    ///
+    /// Payload shape (from `RunnerToolCtx::emit_breadcrumb_finish`):
+    ///
+    /// ```json
+    /// { "tool_name": "shell", "breadcrumb": { ...canonical Breadcrumb... } }
+    /// ```
+    ///
+    /// Records the row as `delivered.status = "ok"` whether or not
+    /// the prior chip was found — the update is best-effort UX, NOT
+    /// load-bearing.
+    async fn handle_update_breadcrumb(
+        &self,
+        row: &MessageOutRow,
+        target: &DispatchTarget,
+        inbound_pool: &SessionPool,
+        payload: &serde_json::Value,
+        sess: &Session,
+    ) -> Result<(), DeliveryError> {
+        let Some(breadcrumb_value) = payload.get("breadcrumb") else {
+            warn!("update_breadcrumb payload missing `breadcrumb`; dropping");
+            let in_conn = inbound_pool.connect()?;
+            delivered::insert(&in_conn, row.id, None, "ok")?;
+            return Ok(());
+        };
+        let breadcrumb: Breadcrumb =
+            serde_json::from_value(breadcrumb_value.clone()).map_err(|e| {
+                DeliveryError::SystemAction(format!(
+                    "update_breadcrumb.breadcrumb failed to deserialise: {e}"
+                ))
+            })?;
+        let tool_name = payload
+            .get("tool_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(breadcrumb.tool_name.as_str())
+            .to_owned();
+
+        // Best-effort: look up the most recent Breadcrumb-kind row in
+        // this session whose `breadcrumb.tool_name` matches. The
+        // platform message id (if any) gets fed back as
+        // `existing_message_id` so the adapter can edit in place.
+        let prior_external_id = lookup_prior_breadcrumb_external_id(
+            &self
+                .session_paths
+                .outbound_pool(&sess.agent_group_id, &sess.id)?
+                .connect()?,
+            &inbound_pool.connect()?,
+            &tool_name,
+        )?;
+
+        // Dispatch via the same path as a regular Breadcrumb-kind
+        // row, but with the resolved existing_message_id so adapters
+        // can edit in place. We synthesise a temporary row carrying
+        // the canonical breadcrumb under the same `content.breadcrumb`
+        // key the dispatch path expects.
+        let synthetic_content = serde_json::json!({ "breadcrumb": breadcrumb });
+        let synthetic_row = MessageOutRow {
+            id: row.id,
+            seq: row.seq,
+            in_reply_to: row.in_reply_to,
+            timestamp: row.timestamp,
+            deliver_after: row.deliver_after,
+            recurrence: row.recurrence.clone(),
+            kind: MessageKind::Breadcrumb,
+            platform_id: row.platform_id.clone(),
+            channel_type: row.channel_type.clone(),
+            thread_id: row.thread_id.clone(),
+            content: synthetic_content,
+        };
+        self.dispatch_breadcrumb(
+            &synthetic_row,
+            target,
+            inbound_pool,
+            prior_external_id.as_deref(),
+        )
+        .await
+    }
+
     fn resolve_target(
         row: &MessageOutRow,
         routing: Option<&ironclaw_types::routing::SessionRouting>,
@@ -1029,17 +1978,34 @@ impl DeliveryService {
         None
     }
 
-    fn bump_retry(&self, key: &DeliveryKey) -> DeferOutcome {
+    fn bump_retry(&self, key: &DeliveryKey, retry_after_secs: Option<u64>) -> DeferOutcome {
         let now = Instant::now();
+        // `or_insert` only initialises when the entry is absent — partial-
+        // split progress (`chunks_sent`, `first_chunk_pid`) recorded by
+        // `dispatch_chat` BEFORE the failing chunk survives the bump, which
+        // is exactly what we need so the next retry skips the already-
+        // delivered chunks instead of re-sending them.
         let mut entry = self.retries.entry(*key).or_insert(RetryState {
             tries: 0,
             not_before: now,
+            chunks_sent: 0,
+            first_chunk_pid: None,
         });
         entry.tries += 1;
         if entry.tries >= MAX_DELIVERY_ATTEMPTS {
             return DeferOutcome::Fail;
         }
-        let delay = backoff_delay_ms(entry.tries);
+        // Honour the adapter's `retry_after` hint when present (Telegram /
+        // Slack / GitHub / Linear / Webex all parse it from `Retry-After`
+        // or the platform's equivalent). Cap at the absolute ceiling so a
+        // pathological hint can't park a row for hours. Fall back to the
+        // fixed exponential schedule when no hint is given.
+        let delay = match retry_after_secs {
+            Some(s) => s
+                .saturating_mul(1_000)
+                .min(ABSOLUTE_CEILING_MS),
+            None => backoff_delay_ms(entry.tries),
+        };
         entry.not_before = now + Duration::from_millis(delay);
         DeferOutcome::Defer
     }
@@ -1054,6 +2020,117 @@ impl DeliveryService {
     pub fn list_active_sessions(&self) -> Result<Vec<Session>, DeliveryError> {
         Ok(ironclaw_db::tables::sessions::list_active(&self.central)?)
     }
+}
+
+/// Split `content` into a sequence of chat-content values when the adapter
+/// advertises a per-message char cap (`max`) and `content.text`'s `char`
+/// count exceeds it.
+///
+/// - Returns `vec![content.clone()]` when no cap is configured, when the
+///   text is short enough, or when the row isn't a recognisable text-shaped
+///   chat row (e.g. it carries a non-string `text` field). Non-text rows
+///   pass through unchanged — splitter is a chat-only concern.
+/// - Cuts on paragraph (`\n\n`) first, then on sentence boundaries
+///   (`. `, `! `, `? `, also CJK `。`/`！`/`？`), then on a hard char index
+///   if neither produced a small-enough chunk.
+/// - Preserves the rest of `content`'s shape on every chunk so adapter-
+///   specific keys like `parse_mode` continue to apply per part.
+pub(crate) fn split_chat_content_if_needed(
+    content: &serde_json::Value,
+    max: Option<usize>,
+) -> Vec<serde_json::Value> {
+    let Some(max) = max.filter(|m| *m > 0) else {
+        return vec![content.clone()];
+    };
+    let Some(text) = content.get("text").and_then(|v| v.as_str()) else {
+        return vec![content.clone()];
+    };
+    if text.chars().count() <= max {
+        return vec![content.clone()];
+    }
+    let chunks = split_text_into_chunks(text, max);
+    chunks
+        .into_iter()
+        .map(|chunk| {
+            let mut next = content.clone();
+            if let Some(obj) = next.as_object_mut() {
+                obj.insert("text".to_string(), serde_json::Value::String(chunk));
+            }
+            next
+        })
+        .collect()
+}
+
+/// Greedy chunker honoring `max` chars per chunk. Preference order for
+/// each cut: paragraph boundary (`\n\n`) → sentence boundary → hard cut.
+/// Operates on `char` indices, never on bytes.
+fn split_text_into_chunks(text: &str, max: usize) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut start = 0usize;
+    while start < chars.len() {
+        let remaining = chars.len() - start;
+        if remaining <= max {
+            out.push(chars[start..].iter().collect());
+            break;
+        }
+        let window_end = start + max;
+        let cut = find_cut(&chars, start, window_end);
+        let chunk: String = chars[start..cut].iter().collect();
+        out.push(chunk.trim_end().to_string());
+        // Skip whitespace at the cut so the next chunk doesn't start with a
+        // leading newline or space.
+        start = cut;
+        while start < chars.len()
+            && (chars[start] == ' ' || chars[start] == '\n' || chars[start] == '\t')
+        {
+            start += 1;
+        }
+    }
+    out.retain(|s| !s.is_empty());
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Find the best cut point in `[lo, hi)` (char indices). Tries paragraph
+/// (`\n\n`) → sentence-ender then space (`. `, `! `, `? `, `。`, `！`,
+/// `？`) → fallback to `hi` (hard cut).
+fn find_cut(chars: &[char], lo: usize, hi: usize) -> usize {
+    // Look for the last `\n\n` in the window.
+    let mut i = hi.saturating_sub(1);
+    while i > lo + 1 {
+        if chars[i - 1] == '\n' && chars[i] == '\n' {
+            return i + 1;
+        }
+        i -= 1;
+    }
+    // Sentence boundary: `.`, `!`, `?` followed by space; or a CJK
+    // full-stop / exclamation / question mark.
+    let mut i = hi.saturating_sub(1);
+    while i > lo {
+        let c = chars[i];
+        if c == '。' || c == '！' || c == '？' {
+            return i + 1;
+        }
+        if i + 1 < chars.len()
+            && (c == '.' || c == '!' || c == '?')
+            && chars[i + 1] == ' '
+        {
+            return i + 1;
+        }
+        i -= 1;
+    }
+    // Last space before hi.
+    let mut i = hi.saturating_sub(1);
+    while i > lo {
+        if chars[i] == ' ' || chars[i] == '\n' {
+            return i;
+        }
+        i -= 1;
+    }
+    hi
 }
 
 /// Wrap an adapter `deliver` call so the `?` operator at the call sites can
@@ -1155,6 +2232,101 @@ fn message_id_for_seq(
         DeliveryError::SystemAction(format!("invalid outbound row uuid: {e}"))
     })?;
     Ok(Some(MessageId(uuid)))
+}
+
+/// Find the most recent Breadcrumb-kind outbound row whose
+/// `content.breadcrumb.tool_name` matches `tool_name`, and resolve its
+/// platform message id via the `delivered` table. Returns `Ok(None)`
+/// when no prior chip exists, the prior chip wasn't delivered yet, or
+/// the platform didn't expose a message id (e.g. CLI / webhook channels).
+///
+/// Thin wrapper around [`lookup_prior_kind_external_id`], the generic
+/// helper every edit-in-place dispatch path (Breadcrumb chips,
+/// `TodoList` rows, …) shares.
+fn lookup_prior_breadcrumb_external_id(
+    out_conn: &Connection,
+    in_conn: &Connection,
+    tool_name: &str,
+) -> Result<Option<String>, DeliveryError> {
+    lookup_prior_kind_external_id(
+        out_conn,
+        in_conn,
+        MessageKind::Breadcrumb,
+        |content| {
+            content
+                .get("breadcrumb")
+                .and_then(|v| v.get("tool_name"))
+                .and_then(serde_json::Value::as_str)
+                == Some(tool_name)
+        },
+    )
+}
+
+/// Find the most recent outbound row of `kind` whose decoded JSON
+/// `content` satisfies the `matches` predicate, and resolve its
+/// platform message id via the `delivered` table. Returns `Ok(None)`
+/// when no matching row exists, the row wasn't delivered yet, or the
+/// platform didn't expose a message id (e.g. CLI / webhook channels).
+///
+/// This is the generic "edit-in-place" lookup shared by every dispatch
+/// path that wants to reuse a prior chip's platform message id —
+/// `dispatch_breadcrumb` (via [`lookup_prior_breadcrumb_external_id`]
+/// for its tool-name filter), `dispatch_todo_list` (the most recent
+/// list-kind row is always the right target — predicate returns
+/// `true` unconditionally), future surfaces, … Each caller supplies
+/// the predicate so it can scope the lookup to whatever shape its
+/// rows carry.
+///
+/// Edit-in-place is a UX detail (mutations look like one live chip
+/// rather than a stream of fresh messages), NOT load-bearing: any
+/// failure to resolve a prior id results in a fresh emit, which is
+/// always safe. The O(N) scan is bounded by `LIMIT 32`; beyond that
+/// horizon we let the adapter emit a fresh chip rather than scan the
+/// whole table.
+fn lookup_prior_kind_external_id<F>(
+    out_conn: &Connection,
+    in_conn: &Connection,
+    kind: MessageKind,
+    matches: F,
+) -> Result<Option<String>, DeliveryError>
+where
+    F: Fn(&serde_json::Value) -> bool,
+{
+    let kind_str = kind.as_str();
+    let mut stmt = out_conn
+        .prepare(
+            "SELECT id, content FROM messages_out
+             WHERE kind = ?1
+             ORDER BY seq DESC
+             LIMIT 32",
+        )
+        .map_err(ironclaw_db::DbError::from)?;
+    let rows = stmt
+        .query_map([kind_str], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+            ))
+        })
+        .map_err(ironclaw_db::DbError::from)?;
+    for row in rows {
+        let (id_str, content_str) = row.map_err(ironclaw_db::DbError::from)?;
+        let content: serde_json::Value = match serde_json::from_str(&content_str) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if !matches(&content) {
+            continue;
+        }
+        let Ok(uuid) = uuid::Uuid::parse_str(&id_str) else {
+            continue;
+        };
+        let message_id = MessageId(uuid);
+        if let Some(external) = platform_message_id_for(in_conn, message_id)? {
+            return Ok(Some(external));
+        }
+    }
+    Ok(None)
 }
 
 /// Look up the platform-side message id recorded against an outbound row
@@ -1333,6 +2505,8 @@ fn record_self_mod_failure(
         channel_type: None,
         thread_id: None,
         source_session_id: None,
+        reply_to: None,
+        is_group: None,
     };
     if let Err(insert_err) = messages_in::insert(&in_conn, &inbound_row) {
         warn!(
@@ -1376,6 +2550,7 @@ fn ensure_config_row(
             egress_allow: vec![],
             resource_limits: serde_json::json!({}),
             coding_enabled: false,
+            surface_thinking: false,
         },
     )?;
     Ok(())
@@ -1560,6 +2735,71 @@ mod tests {
     }
 
     #[test]
+    fn split_chat_passthrough_when_no_cap_or_short_text() {
+        let v = json!({"text":"hello"});
+        let parts = split_chat_content_if_needed(&v, None);
+        assert_eq!(parts.len(), 1);
+        let parts = split_chat_content_if_needed(&v, Some(4096));
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0], v);
+    }
+
+    #[test]
+    fn split_chat_passthrough_when_no_text_field() {
+        let v = json!({"foo":"bar"});
+        let parts = split_chat_content_if_needed(&v, Some(10));
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0], v);
+    }
+
+    #[test]
+    fn split_chat_breaks_on_paragraph_when_possible() {
+        let text = format!("{}\n\n{}", "a".repeat(50), "b".repeat(50));
+        let v = json!({"text": text, "parse_mode": "MarkdownV2"});
+        let parts = split_chat_content_if_needed(&v, Some(60));
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"].as_str().unwrap(), "a".repeat(50));
+        assert_eq!(parts[1]["text"].as_str().unwrap(), "b".repeat(50));
+        // Other content keys are preserved on every chunk.
+        assert_eq!(parts[0]["parse_mode"].as_str(), Some("MarkdownV2"));
+        assert_eq!(parts[1]["parse_mode"].as_str(), Some("MarkdownV2"));
+    }
+
+    #[test]
+    fn split_chat_breaks_on_sentence_when_no_paragraph() {
+        let text = format!(
+            "{}. {}",
+            "a".repeat(40),
+            "b".repeat(40)
+        );
+        let v = json!({"text": text});
+        let parts = split_chat_content_if_needed(&v, Some(50));
+        assert_eq!(parts.len(), 2);
+        assert!(parts[0]["text"].as_str().unwrap().ends_with('.'));
+    }
+
+    #[test]
+    fn split_chat_hard_cuts_when_no_natural_boundary() {
+        let text = "x".repeat(100);
+        let v = json!({"text": text});
+        let parts = split_chat_content_if_needed(&v, Some(30));
+        assert!(parts.len() >= 4);
+        for p in &parts {
+            assert!(p["text"].as_str().unwrap().chars().count() <= 30);
+        }
+    }
+
+    #[test]
+    fn split_chat_counts_chars_not_bytes() {
+        // CJK char is 3 bytes in UTF-8 but should count as 1.
+        let text = "漢".repeat(20);
+        let v = json!({"text": text});
+        let parts = split_chat_content_if_needed(&v, Some(10));
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"].as_str().unwrap().chars().count(), 10);
+    }
+
+    #[test]
     fn helpers_filter_by_status() {
         let mut s = crate::test_support::make_session();
         s.container_status = ContainerStatus::Running;
@@ -1616,6 +2856,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rate_retry_after_overrides_fixed_backoff() {
+        // When the adapter surfaces Rate { retry_after: Some(s) }, the
+        // delivery loop should park the row for ~s seconds instead of
+        // using the fixed exponential schedule (which would be 5s for the
+        // first attempt). 10s ≠ 5s so the override is observable.
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let row = make_row(MessageKind::Chat, json!({"text":"hi"}));
+        write_row(&out_pool, &row);
+        mock.fail_next_deliver(AdapterError::Rate {
+            retry_after: Some(10),
+        });
+        let before = Instant::now();
+        let _ = service.process_session_once(&sess).await.unwrap();
+        let key = DeliveryKey::new(sess.id, row.id);
+        let entry = service.retries.get(&key).expect("retry state recorded");
+        let delay = entry.not_before.saturating_duration_since(before);
+        // Allow a tight tolerance for the ~milliseconds spent in the loop.
+        assert!(
+            delay >= Duration::from_millis(9_500)
+                && delay <= Duration::from_millis(10_500),
+            "expected ~10s backoff, got {delay:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_without_hint_falls_back_to_exponential() {
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let row = make_row(MessageKind::Chat, json!({"text":"hi"}));
+        write_row(&out_pool, &row);
+        mock.fail_next_deliver(AdapterError::Rate { retry_after: None });
+        let before = Instant::now();
+        let _ = service.process_session_once(&sess).await.unwrap();
+        let key = DeliveryKey::new(sess.id, row.id);
+        let entry = service.retries.get(&key).expect("retry state recorded");
+        let delay = entry.not_before.saturating_duration_since(before);
+        // First-attempt exponential = BACKOFF_BASE_MS (5s).
+        assert!(
+            delay >= Duration::from_millis(4_500)
+                && delay <= Duration::from_millis(5_500),
+            "expected ~5s exponential backoff, got {delay:?}",
+        );
+    }
+
+    #[tokio::test]
     async fn retryable_failure_defers_then_succeeds() {
         let (service, _root, sess, mock) = make_service().await;
         let out_pool = service
@@ -1663,7 +2955,142 @@ mod tests {
             }
             let _ = service.process_session_once(&sess).await.unwrap();
         }
-        // After enough attempts the row must be marked failed.
+        // After enough attempts the row must be marked failed —
+        // operators rely on the `failed` delivery row for the
+        // `iclaw dropped-messages` list. Slice-3.3 ADDED a
+        // user-visible ErrorCard emission on top; we assert
+        // both invariants in `retry_exhaustion_also_emits_error_card`
+        // below. This test stays narrowly focused on the load-bearing
+        // `failed` row insertion.
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let in_conn = in_pool.connect().unwrap();
+        let listed = delivered::list(&in_conn).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, "failed");
+    }
+
+    #[tokio::test]
+    async fn retry_exhaustion_also_emits_error_card() {
+        // Slice-3.3 addition: in addition to the load-bearing `failed`
+        // delivery row, the host emits a `MessageKind::Error` outbound
+        // back through the originating channel so the user sees a
+        // visually-distinct receipt for "your message did not get out".
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let row = make_row(MessageKind::Chat, json!({"text":"hi"}));
+        write_row(&out_pool, &row);
+
+        let key = DeliveryKey::new(sess.id, row.id);
+        for _ in 0..MAX_DELIVERY_ATTEMPTS {
+            mock.fail_next_deliver(AdapterError::Transport("502".into()));
+            if let Some(mut entry) = service.retries.get_mut(&key) {
+                entry.not_before = Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .unwrap_or_else(Instant::now);
+            }
+            let _ = service.process_session_once(&sess).await.unwrap();
+        }
+        // Read the outbound DB and find the Error-kind row routed at
+        // the same channel/platform as the failed row.
+        let out_conn = out_pool.connect().unwrap();
+        let rows = messages_out::list_due(&out_conn).unwrap();
+        let error_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == MessageKind::Error)
+            .collect();
+        assert_eq!(
+            error_rows.len(),
+            1,
+            "expected exactly one ErrorCard emitted by retry exhaustion"
+        );
+        let err_row = error_rows[0];
+        assert_eq!(err_row.platform_id.as_deref(), Some("plat-1"));
+        assert_eq!(
+            err_row.channel_type.as_ref().map(ironclaw_types::ChannelType::as_str),
+            Some("mock")
+        );
+        // The row carries the canonical ErrorCard in content.error,
+        // tagged with kind=Delivery and `retryable=false` (we GAVE UP
+        // retrying — promising another retry would be a lie).
+        let card: ErrorCard =
+            serde_json::from_value(err_row.content["error"].clone()).unwrap();
+        assert_eq!(card.kind, ErrorCardKind::Delivery);
+        assert!(!card.retryable);
+        // Summary mentions both the retry budget AND the underlying
+        // adapter error so operators can grep for the failure mode.
+        assert!(card.summary.contains("retry budget"));
+        assert!(card.summary.contains("502"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_error_routes_through_deliver_error_with_full_card() {
+        // An Error-kind outbound row (regardless of who wrote it)
+        // must land on the adapter's `deliver_error` hook with the
+        // canonical ErrorCard reconstructed from `content.error`.
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let card = ErrorCard::new(ErrorCardKind::Internal, "tool exit 137")
+            .with_title("Tool failed")
+            .with_details("stderr: SIGKILL");
+        let row = make_row(MessageKind::Error, json!({ "error": card }));
+        write_row(&out_pool, &row);
+
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.delivered, 1);
+
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let in_conn = in_pool.connect().unwrap();
+        let listed = delivered::list(&in_conn).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, "ok");
+
+        // MockAdapter falls back through the default `deliver_error`
+        // impl (which routes to `deliver` as Chat-kind with the text
+        // fallback); confirm the body is the canonical
+        // `[ERROR: tool] …` text fallback so the card actually
+        // reached the adapter.
+        let calls = mock.deliveries();
+        assert_eq!(calls.len(), 1);
+        let text = calls[0]
+            .message
+            .content
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert!(text.starts_with("[ERROR: tool]"), "got: {text}");
+        assert!(text.contains("Tool failed"));
+        assert!(text.contains("tool exit 137"));
+        assert!(text.contains("> stderr: SIGKILL"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_error_with_missing_content_marks_failed() {
+        // An Error-kind row whose `content.error` is missing is a host
+        // bug (corrupted row, schema drift) — must be marked failed and
+        // NOT retried indefinitely. Surfaced as SystemAction by
+        // `dispatch_error` and the outer loop turns it into a `failed`
+        // delivery row.
+        let (service, _root, sess, _mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let row = make_row(MessageKind::Error, json!({ "not_the_error_key": {} }));
+        write_row(&out_pool, &row);
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.failed, 1);
         let in_pool = service
             .session_paths
             .inbound_pool(&sess.agent_group_id, &sess.id)
@@ -2345,6 +3772,7 @@ mod tests {
                 egress_allow: vec![],
                 resource_limits: json!({}),
                 coding_enabled: false,
+                surface_thinking: false,
             },
         )
         .unwrap();
@@ -2381,6 +3809,7 @@ mod tests {
                 egress_allow: vec![],
                 resource_limits: json!({}),
                 coding_enabled: false,
+                surface_thinking: false,
             },
         )
         .unwrap();
@@ -3063,5 +4492,833 @@ mod tests {
         assert_eq!(rpt.failed, 1);
         assert_eq!(rpt.delivered, 0);
         assert!(mock.deliveries().is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // Slice 3.4 — long-output expander dispatch routing.
+    //
+    // When `dispatch_chat` sees a Chat-kind row with `content.expander`
+    // set, it must branch to `dispatch_collapsible` (which in turn
+    // calls the adapter's `deliver_collapsible` hook) rather than the
+    // ordinary text-splitter pipeline.
+    // ---------------------------------------------------------------
+    #[tokio::test]
+    async fn chat_row_with_expander_routes_via_deliver_collapsible() {
+        // Build a chat row that carries the slice-3.4 decorator
+        // alongside the full body. The default `deliver_collapsible`
+        // impl on MockAdapter routes through `deliver` with a
+        // summary + preview body, so we verify the recorded text
+        // matches the helper output (proving the host invoked the
+        // collapsible hook and not the regular `deliver`).
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let body = (0..40)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let preview: Vec<String> = (0..4).map(|i| format!("line {i}")).collect();
+        let content = json!({
+            "text": body,
+            "expander": {
+                "summary": "shell produced 40 lines",
+                "summary_kind": "lines",
+                "preview_lines": preview,
+            },
+        });
+        write_row(&out_pool, &make_row(MessageKind::Chat, content));
+
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.delivered, 1);
+        assert_eq!(rpt.failed, 0);
+        let deliveries = mock.deliveries();
+        assert_eq!(deliveries.len(), 1);
+        let text = deliveries[0]
+            .message
+            .content
+            .get("text")
+            .and_then(|v| v.as_str())
+            .expect("collapsible fallback text rendering must land on `text`");
+        // The trait-default fallback's body starts with the summary
+        // and includes the truncation marker for the remaining lines.
+        assert!(text.starts_with("shell produced 40 lines"), "got: {text:?}");
+        assert!(text.contains("…(36 more lines"), "got: {text:?}");
+        // First preview line is in the body too.
+        assert!(text.contains("line 0"), "got: {text:?}");
+    }
+
+    #[tokio::test]
+    async fn chat_row_without_expander_skips_collapsible_path() {
+        // Sanity: a regular chat row (no `expander` decorator) must
+        // continue to flow through the ordinary text-splitter path.
+        // We verify by checking the adapter received exactly the
+        // original body — no summary/truncation rewrite.
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let content = json!({ "text": "plain short reply" });
+        write_row(&out_pool, &make_row(MessageKind::Chat, content));
+
+        service.process_session_once(&sess).await.unwrap();
+        let deliveries = mock.deliveries();
+        assert_eq!(deliveries.len(), 1);
+        let text = deliveries[0]
+            .message
+            .content
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert_eq!(text, "plain short reply");
+    }
+
+    #[tokio::test]
+    async fn chat_row_with_expander_falls_back_when_unsupported() {
+        // Adapters that explicitly override `deliver_collapsible` to
+        // return `Err(AdapterError::Unsupported)` get the host's
+        // belt-and-braces fallback: a plain `deliver` call with the
+        // summary + preview rendering. Dual of the existing card path
+        // `card_kind_row_falls_back_when_adapter_reports_unsupported`.
+        use ironclaw_channels_core::AdapterError as AE;
+        struct RefusingCollapsibleAdapter {
+            channel_type: ChannelType,
+            text_deliveries: StdMutex<Vec<String>>,
+        }
+        #[async_trait::async_trait]
+        impl ChannelAdapter for RefusingCollapsibleAdapter {
+            fn channel_type(&self) -> &ChannelType {
+                &self.channel_type
+            }
+            async fn deliver(
+                &self,
+                _platform_id: &str,
+                _thread_id: Option<&str>,
+                message: &OutboundMessage,
+            ) -> Result<Option<String>, AE> {
+                let text = message
+                    .content
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                self.text_deliveries.lock().unwrap().push(text);
+                Ok(Some("plat-id-1".into()))
+            }
+            async fn deliver_collapsible(
+                &self,
+                _platform_id: &str,
+                _thread_id: Option<&str>,
+                _text: &str,
+                _summary: &str,
+                _preview_lines: &[String],
+            ) -> Result<Option<String>, AE> {
+                Err(AE::Unsupported("adapter rejects collapsible".into()))
+            }
+        }
+        let refusing = Arc::new(RefusingCollapsibleAdapter {
+            channel_type: ChannelType::new("mock"),
+            text_deliveries: StdMutex::new(vec![]),
+        });
+
+        let (service, _root, sess, _mock) = make_service().await;
+        service.register_adapter(
+            ChannelType::new("mock"),
+            refusing.clone() as Arc<dyn ChannelAdapter>,
+        );
+
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let body = "alpha\nbeta\ngamma";
+        let content = json!({
+            "text": body,
+            "expander": {
+                "summary": "shell 3 lines",
+                "summary_kind": "lines",
+                "preview_lines": ["alpha"],
+            },
+        });
+        write_row(&out_pool, &make_row(MessageKind::Chat, content));
+
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.delivered, 1);
+        let texts = refusing.text_deliveries.lock().unwrap().clone();
+        assert_eq!(texts.len(), 1, "expected exactly one fallback deliver");
+        assert!(texts[0].starts_with("shell 3 lines"), "got: {:?}", texts[0]);
+    }
+
+    #[tokio::test]
+    async fn chat_row_with_expander_missing_fields_uses_defaults() {
+        // If the row's `content.expander` lacks `summary` or
+        // `preview_lines` (corrupted row / runner bug) the dispatch
+        // path must still deliver — falling back to sensible
+        // defaults rather than failing the row.
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let content = json!({
+            "text": "some\ntext\nhere",
+            "expander": {}, // intentionally empty
+        });
+        write_row(&out_pool, &make_row(MessageKind::Chat, content));
+
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.delivered, 1);
+        assert_eq!(rpt.failed, 0);
+        let deliveries = mock.deliveries();
+        assert_eq!(deliveries.len(), 1);
+        let text = deliveries[0]
+            .message
+            .content
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        // The default summary string is "(long output)" — verifies
+        // the missing-field defensive path.
+        assert!(text.contains("(long output)"), "got: {text:?}");
+    }
+
+    /// The Breadcrumb-kind dispatch path mirrors the Card-kind one:
+    /// the host pulls `content.breadcrumb` out of the row, hands it to
+    /// the adapter's `deliver_breadcrumb` hook, and the trait-level
+    /// default text-fallback rendering reaches `deliver`. Proves the
+    /// row's structured payload survives the round trip and the host
+    /// invokes the right adapter method.
+    #[tokio::test]
+    async fn breadcrumb_kind_row_invokes_deliver_breadcrumb_path() {
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let breadcrumb = ironclaw_channels_core::Breadcrumb::running("shell")
+            .with_detail("cargo check");
+        let content = json!({
+            "breadcrumb": serde_json::to_value(&breadcrumb).unwrap(),
+        });
+        write_row(&out_pool, &make_row(MessageKind::Breadcrumb, content));
+
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.delivered, 1);
+        assert_eq!(rpt.failed, 0);
+        let deliveries = mock.deliveries();
+        assert_eq!(deliveries.len(), 1);
+        let text = deliveries[0]
+            .message
+            .content
+            .get("text")
+            .and_then(|v| v.as_str())
+            .expect("trait-default text fallback must land on `text`");
+        assert_eq!(text, "[shell] cargo check");
+    }
+
+    /// A Breadcrumb-kind row whose `content.breadcrumb` is malformed
+    /// or missing is a host-level bug — record `failed` and don't
+    /// retry forever.
+    #[tokio::test]
+    async fn breadcrumb_kind_row_with_malformed_payload_marks_failed() {
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        write_row(
+            &out_pool,
+            &make_row(MessageKind::Breadcrumb, json!({"junk": "x"})),
+        );
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.failed, 1);
+        assert_eq!(rpt.delivered, 0);
+        assert!(mock.deliveries().is_empty());
+    }
+
+    /// The `update_breadcrumb` system action resolves the prior chip's
+    /// platform message id (from the inbound `delivered` table) and
+    /// re-runs `deliver_breadcrumb` with `existing_message_id=Some`.
+    /// The MockAdapter doesn't have a real edit API, so this end-to-
+    /// end test verifies the row is recorded as delivered and the
+    /// breadcrumb's finished state (Done / summary) reached the
+    /// adapter via the text fallback.
+    #[tokio::test]
+    async fn update_breadcrumb_system_action_dispatches_via_deliver_breadcrumb() {
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        // Step 1: write & process a Running chip so the dispatcher
+        // records it in `delivered` with a platform message id.
+        let running = ironclaw_channels_core::Breadcrumb::running("shell")
+            .with_detail("cargo check");
+        write_row(
+            &out_pool,
+            &make_row(
+                MessageKind::Breadcrumb,
+                json!({ "breadcrumb": serde_json::to_value(&running).unwrap() }),
+            ),
+        );
+        let _ = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(mock.deliveries().len(), 1);
+
+        // Step 2: write the update — System row carrying the
+        // `update_breadcrumb` action with the Done shape.
+        let done = running.clone().finished(true, Some("passed (0.4s)".into()));
+        write_row(
+            &out_pool,
+            &make_row(
+                MessageKind::System,
+                json!({
+                    "update_breadcrumb": {
+                        "tool_name": "shell",
+                        "breadcrumb": serde_json::to_value(&done).unwrap(),
+                    }
+                }),
+            ),
+        );
+        let _ = service.process_session_once(&sess).await.unwrap();
+        // Mock's trait-default `deliver_breadcrumb` adds another
+        // `deliver` call carrying the finished chip's text fallback.
+        let deliveries = mock.deliveries();
+        assert!(deliveries.len() >= 2);
+        let last_text = deliveries
+            .last()
+            .unwrap()
+            .message
+            .content
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert!(
+            last_text.contains("passed (0.4s)"),
+            "finished chip's summary must reach the adapter: {last_text:?}",
+        );
+    }
+
+    /// A Diff-kind row pulls `content.diff` out, hands the canonical
+    /// `DiffCard` to the adapter's `deliver_diff` hook, and the
+    /// trait-level default text-fallback rendering reaches `deliver`.
+    /// Mirrors `breadcrumb_kind_row_invokes_deliver_breadcrumb_path`.
+    #[tokio::test]
+    async fn diff_kind_row_invokes_deliver_diff_path() {
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let card = ironclaw_channels_core::DiffCard {
+            path: "src/main.rs".into(),
+            language: Some("rust".into()),
+            hunks: vec![ironclaw_channels_core::DiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![
+                    ironclaw_channels_core::DiffLine {
+                        kind: ironclaw_channels_core::DiffLineKind::Remove,
+                        text: "fn old() {}".into(),
+                    },
+                    ironclaw_channels_core::DiffLine {
+                        kind: ironclaw_channels_core::DiffLineKind::Add,
+                        text: "fn new() {}".into(),
+                    },
+                ],
+            }],
+            added: 1,
+            removed: 1,
+            truncated: false,
+        };
+        let content = json!({ "diff": serde_json::to_value(&card).unwrap() });
+        write_row(&out_pool, &make_row(MessageKind::Diff, content));
+
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.delivered, 1);
+        assert_eq!(rpt.failed, 0);
+        let deliveries = mock.deliveries();
+        assert_eq!(deliveries.len(), 1);
+        let text = deliveries[0]
+            .message
+            .content
+            .get("text")
+            .and_then(|v| v.as_str())
+            .expect("trait-default text fallback must land on `text`");
+        assert!(text.contains("--- a/src/main.rs"));
+        assert!(text.contains("+fn new() {}"));
+        assert!(text.contains("-fn old() {}"));
+        assert!(text.contains("(+1 / -1)"));
+    }
+
+    /// A Diff-kind row whose `content.diff` is malformed or missing
+    /// is a host-level bug — record `failed` and don't retry forever.
+    #[tokio::test]
+    async fn diff_kind_row_with_malformed_payload_marks_failed() {
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        write_row(
+            &out_pool,
+            &make_row(MessageKind::Diff, json!({"junk": "x"})),
+        );
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.failed, 1);
+        assert_eq!(rpt.delivered, 0);
+        assert!(mock.deliveries().is_empty());
+    }
+
+    // ── TodoList dispatch ──────────────────────────────────────────
+
+    fn build_dispatch_todo_list() -> ironclaw_channels_core::TodoList {
+        ironclaw_channels_core::TodoList {
+            items: vec![
+                ironclaw_channels_core::TodoListItem {
+                    id: 1,
+                    text: "Reply with order status".into(),
+                    status: ironclaw_channels_core::TodoItemStatus::Pending,
+                },
+            ],
+            title: None,
+        }
+    }
+
+    /// A TodoList-kind row pulls `content.todo_list` out, hands the
+    /// canonical `TodoList` to the adapter's `deliver_todo_list` hook,
+    /// and the trait-level default text-fallback rendering reaches
+    /// `deliver` carrying the `[ ]` glyph + footer. Mirrors
+    /// `breadcrumb_kind_row_invokes_deliver_breadcrumb_path`.
+    #[tokio::test]
+    async fn todo_list_kind_row_invokes_deliver_todo_list_path() {
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let list = build_dispatch_todo_list();
+        let content = json!({
+            "todo_list": serde_json::to_value(&list).unwrap(),
+        });
+        write_row(&out_pool, &make_row(MessageKind::TodoList, content));
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.delivered, 1);
+        assert_eq!(rpt.failed, 0);
+        let deliveries = mock.deliveries();
+        assert_eq!(deliveries.len(), 1);
+        let text = deliveries[0]
+            .message
+            .content
+            .get("text")
+            .and_then(|v| v.as_str())
+            .expect("trait-default text fallback must land on `text`");
+        // Text fallback includes the default title + the pending glyph.
+        assert!(text.starts_with("Plan\n"), "got: {text:?}");
+        assert!(text.contains("[ ] Reply with order status"));
+    }
+
+    /// A TodoList-kind row whose `content.todo_list` is malformed or
+    /// missing is a host-level bug — record `failed` and don't retry
+    /// forever. Mirrors `breadcrumb_kind_row_with_malformed_payload_marks_failed`.
+    #[tokio::test]
+    async fn todo_list_kind_row_with_malformed_payload_marks_failed() {
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        write_row(
+            &out_pool,
+            &make_row(MessageKind::TodoList, json!({"junk": "x"})),
+        );
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.failed, 1);
+        assert_eq!(rpt.delivered, 0);
+        assert!(mock.deliveries().is_empty());
+    }
+
+    // ----------------------------------------------------------------------
+    // Splitter / chunk-progress retry coverage (regression for the bug where
+    // a partial-success split would re-send chunk 0 on every retry, up to
+    // MAX_DELIVERY_ATTEMPTS copies of every already-delivered chunk).
+    //
+    // The shared `MockAdapter` returns `None` from `max_message_chars`, so
+    // these tests wrap it with a minimal forwarding adapter that overrides
+    // the cap. Every other method delegates to the inner mock so the
+    // existing `deliveries()` / `fail_next_deliver()` helpers keep working.
+    // ----------------------------------------------------------------------
+
+    /// Test-only adapter wrapper: forces a `max_message_chars()` cap so the
+    /// host's splitter actually fires, while delegating `deliver` to the
+    /// inner `MockAdapter`. Adds a `fail_at_call_index` map so tests can
+    /// say "the Nth `deliver` call on this wrapper returns `err`" — useful
+    /// for "fail chunk 1 but let chunk 0 through" patterns that the inner
+    /// mock's FIFO queue can't express. Failures from this map DO NOT
+    /// touch the inner mock's recorder, so `deliveries()` reflects the
+    /// successful chunks only — same shape as a real adapter that errored
+    /// out without sending anything.
+    struct SplittingMockAdapter {
+        inner: Arc<MockAdapter>,
+        cap: usize,
+        call_count: StdMutex<u32>,
+        // (call-index, error)
+        scheduled_failures: StdMutex<Vec<(u32, AdapterError)>>,
+    }
+
+    impl SplittingMockAdapter {
+        fn new(inner: Arc<MockAdapter>, cap: usize) -> Self {
+            Self {
+                inner,
+                cap,
+                call_count: StdMutex::new(0),
+                scheduled_failures: StdMutex::new(vec![]),
+            }
+        }
+
+        /// Schedule a failure for the `index`-th `deliver` call (0-based).
+        /// Multiple schedulings stack; the wrapper consumes the entry when
+        /// it fires. Indices that never come up (e.g. failed retries
+        /// drained early) stay in the list — tests don't have to clean up.
+        fn fail_at_call(&self, index: u32, err: AdapterError) {
+            self.scheduled_failures
+                .lock()
+                .expect("poisoned")
+                .push((index, err));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelAdapter for SplittingMockAdapter {
+        fn channel_type(&self) -> &ChannelType {
+            self.inner.channel_type()
+        }
+        fn max_message_chars(&self) -> Option<usize> {
+            Some(self.cap)
+        }
+        async fn deliver(
+            &self,
+            platform_id: &str,
+            thread_id: Option<&str>,
+            message: &OutboundMessage,
+        ) -> Result<Option<String>, AdapterError> {
+            let this_call = {
+                let mut c = self.call_count.lock().expect("poisoned");
+                let cur = *c;
+                *c += 1;
+                cur
+            };
+            // Pop a scheduled failure matching this index, if any.
+            let popped = {
+                let mut guard = self.scheduled_failures.lock().expect("poisoned");
+                guard
+                    .iter()
+                    .position(|(idx, _)| *idx == this_call)
+                    .map(|pos| guard.remove(pos).1)
+            };
+            if let Some(err) = popped {
+                return Err(err);
+            }
+            self.inner.deliver(platform_id, thread_id, message).await
+        }
+    }
+
+    /// Build a 3-chunk text under a 10-char cap. Uses paragraph breaks so
+    /// the splitter cuts cleanly on `\n\n` boundaries: ten `a`s, ten `b`s,
+    /// ten `c`s, total 32 chars body, cap 10 → 3 chunks of 10 chars each.
+    fn three_chunk_text() -> String {
+        format!(
+            "{}\n\n{}\n\n{}",
+            "a".repeat(10),
+            "b".repeat(10),
+            "c".repeat(10)
+        )
+    }
+
+    /// Install a `SplittingMockAdapter` over the existing `MockAdapter` on
+    /// channel "mock". The host re-resolves adapters by channel-type lookup
+    /// on every dispatch, so this swap is picked up immediately. Returns
+    /// the wrapper Arc so tests can schedule per-call failures.
+    fn install_splitting_adapter(
+        service: &Arc<DeliveryService>,
+        inner: Arc<MockAdapter>,
+        cap: usize,
+    ) -> Arc<SplittingMockAdapter> {
+        let wrapper = Arc::new(SplittingMockAdapter::new(inner, cap));
+        service.register_adapter(
+            ChannelType::new("mock"),
+            wrapper.clone() as Arc<dyn ChannelAdapter>,
+        );
+        wrapper
+    }
+
+    #[tokio::test]
+    async fn split_happy_path_no_duplicate_chunks() {
+        // 3-chunk text, all 3 succeed on the first attempt. Assert the
+        // adapter saw exactly 3 deliver calls, in order, and the retry
+        // entry was cleaned up (no chunk-progress state left behind to
+        // confuse a future row reusing the same key).
+        let (service, _root, sess, mock) = make_service().await;
+        install_splitting_adapter(&service, mock.clone(), 10);
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let row = make_row(
+            MessageKind::Chat,
+            json!({"text": three_chunk_text()}),
+        );
+        write_row(&out_pool, &row);
+
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.delivered, 1);
+        assert_eq!(rpt.failed, 0);
+        assert_eq!(rpt.deferred, 0);
+
+        let calls = mock.deliveries();
+        assert_eq!(
+            calls.len(),
+            3,
+            "expected exactly 3 chunks (no duplicates), got {} ({:?})",
+            calls.len(),
+            calls
+                .iter()
+                .map(|c| c.message.content.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(calls[0].message.content["text"], json!("a".repeat(10)));
+        assert_eq!(calls[1].message.content["text"], json!("b".repeat(10)));
+        assert_eq!(calls[2].message.content["text"], json!("c".repeat(10)));
+
+        // process_session_once clears the retry-state entry on success.
+        let key = DeliveryKey::new(sess.id, row.id);
+        assert!(service.retries.get(&key).is_none());
+
+        // The delivered row recorded the FIRST chunk's platform id.
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let in_conn = in_pool.connect().unwrap();
+        let listed = delivered::list(&in_conn).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, "ok");
+        assert_eq!(listed[0].platform_message_id.as_deref(), Some("mock-1"));
+    }
+
+    #[tokio::test]
+    async fn split_partial_success_retry_skips_delivered_chunks() {
+        // 3-chunk text, chunk 0 succeeds, chunk 1 returns
+        // AdapterError::Rate { retry_after: Some(1) }. After the backoff
+        // window we run the loop again. The retry MUST resume at chunk 1
+        // (not chunk 0), so the inner mock sees the call sequence:
+        //   attempt 1: chunk 0 (ok via inner mock), chunk 1 (rate from wrapper)
+        //   attempt 2: chunk 1 (ok via inner mock), chunk 2 (ok via inner mock)
+        // Inner mock's `deliveries()` records ONLY the calls that landed
+        // on it — chunk 0 once, chunk 1 once, chunk 2 once (no
+        // duplicate of chunk 0). This is the headline bug.
+        let (service, _root, sess, mock) = make_service().await;
+        let wrapper = install_splitting_adapter(&service, mock.clone(), 10);
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let row = make_row(
+            MessageKind::Chat,
+            json!({"text": three_chunk_text()}),
+        );
+        write_row(&out_pool, &row);
+
+        // The wrapper sees three `deliver` calls per attempt (one per
+        // chunk). On attempt 1: call 0 = chunk 0 (let through), call 1 =
+        // chunk 1 (fail Rate). On attempt 2: call 2 = chunk 1 (let
+        // through), call 3 = chunk 2 (let through). Schedule the chunk-1
+        // failure at wrapper call index 1.
+        wrapper.fail_at_call(1, AdapterError::Rate { retry_after: Some(1) });
+
+        let rpt1 = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt1.deferred, 1);
+        assert_eq!(rpt1.delivered, 0);
+
+        // After attempt 1 the inner mock recorded ONLY chunk 0 — the
+        // wrapper short-circuited chunk 1 before it reached the recorder.
+        let after1 = mock.deliveries();
+        assert_eq!(
+            after1.len(),
+            1,
+            "after attempt 1 expected only chunk 0 recorded on the inner mock, got {after1:?}"
+        );
+        assert_eq!(after1[0].message.content["text"], json!("a".repeat(10)));
+
+        // Retry-state should reflect chunks_sent=1 and the first chunk's pid.
+        let key = DeliveryKey::new(sess.id, row.id);
+        {
+            let state = service.retries.get(&key).expect("retry state recorded");
+            assert_eq!(state.chunks_sent, 1, "must record chunk-0 success");
+            assert_eq!(state.first_chunk_pid.as_deref(), Some("mock-1"));
+        }
+
+        // Force backoff window into the past so the retry runs.
+        if let Some(mut entry) = service.retries.get_mut(&key) {
+            entry.not_before = Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .unwrap_or_else(Instant::now);
+        }
+
+        let rpt2 = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt2.delivered, 1, "retry should deliver the row");
+        assert_eq!(rpt2.failed, 0);
+
+        // The inner mock must have seen exactly 3 successful deliveries
+        // in the canonical order — NOT 4 (which would mean chunk 0 was
+        // re-sent on the retry). This is the regression assertion.
+        let calls = mock.deliveries();
+        assert_eq!(
+            calls.len(),
+            3,
+            "expected 3 successful chunks (chunk 0 from attempt 1, chunks 1 + 2 from attempt 2); got {} — duplicate chunk 0 would mean the splitter retry regression",
+            calls.len()
+        );
+        assert_eq!(calls[0].message.content["text"], json!("a".repeat(10)));
+        assert_eq!(calls[1].message.content["text"], json!("b".repeat(10)));
+        assert_eq!(calls[2].message.content["text"], json!("c".repeat(10)));
+
+        // Retry state cleared on final success.
+        assert!(service.retries.get(&key).is_none());
+    }
+
+    #[tokio::test]
+    async fn split_retry_exhaustion_does_not_replay_first_chunk() {
+        // Chunk 0 succeeds on attempt 1, chunk 1 fails on every attempt.
+        // After MAX_DELIVERY_ATTEMPTS (3) the row is marked failed.
+        // Without the fix, the adapter would see chunk 0 re-sent on
+        // every retry: chunk-0 count = 3. With the fix, chunk 0 reaches
+        // the inner mock exactly once (attempt 1); attempts 2 and 3
+        // resume at chunk 1, hit the scheduled failure, and never touch
+        // chunk 0 again.
+        let (service, _root, sess, mock) = make_service().await;
+        let wrapper = install_splitting_adapter(&service, mock.clone(), 10);
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let row = make_row(
+            MessageKind::Chat,
+            json!({"text": three_chunk_text()}),
+        );
+        write_row(&out_pool, &row);
+
+        // Wrapper call indices that should fail (one per attempt):
+        //   attempt 1: calls 0 (chunk 0 ok) + 1 (chunk 1 FAIL).
+        //   attempt 2: call 2 (chunk 1 FAIL — resume from index 1).
+        //   attempt 3: call 3 (chunk 1 FAIL — resume from index 1).
+        wrapper.fail_at_call(1, AdapterError::Transport("502-attempt1".into()));
+        wrapper.fail_at_call(2, AdapterError::Transport("502-attempt2".into()));
+        wrapper.fail_at_call(3, AdapterError::Transport("502-attempt3".into()));
+
+        let key = DeliveryKey::new(sess.id, row.id);
+        for _attempt in 0..MAX_DELIVERY_ATTEMPTS {
+            // Force the backoff window into the past for the next loop.
+            if let Some(mut entry) = service.retries.get_mut(&key) {
+                entry.not_before = Instant::now()
+                    .checked_sub(Duration::from_secs(2))
+                    .unwrap_or_else(Instant::now);
+            }
+            let _ = service.process_session_once(&sess).await.unwrap();
+        }
+
+        // The row is now marked failed in the inbound `delivered` table.
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let in_conn = in_pool.connect().unwrap();
+        let listed = delivered::list(&in_conn).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, "failed");
+
+        // The inner mock saw chunk 0 EXACTLY ONCE across all three
+        // attempts — the regression would have it appear three times.
+        let calls = mock.deliveries();
+        let chunk0_text = "a".repeat(10);
+        let chunk0_count = calls
+            .iter()
+            .filter(|c| c.message.content["text"] == json!(chunk0_text))
+            .count();
+        assert_eq!(
+            chunk0_count, 1,
+            "chunk 0 must be delivered exactly once across retries (got {chunk0_count}); pre-fix bug duplicates it on every retry"
+        );
+
+        // And chunk 1 never reached the inner mock — it failed at the
+        // wrapper boundary every time. Belt-and-braces assertion that
+        // matches the test's chunk-routing intent.
+        let chunk1_text = "b".repeat(10);
+        let chunk1_count = calls
+            .iter()
+            .filter(|c| c.message.content["text"] == json!(chunk1_text))
+            .count();
+        assert_eq!(chunk1_count, 0, "chunk 1 should never have reached the inner mock");
+
+        // Retry state cleared once the row was marked failed.
+        assert!(service.retries.get(&key).is_none());
+    }
+
+    #[tokio::test]
+    async fn split_first_chunk_pid_stable_across_retries() {
+        // The `delivered` row's `platform_message_id` is the address that
+        // future `edit_message` / `add_reaction` calls will target. It
+        // MUST be the FIRST chunk's platform id — even if later chunks
+        // fail and retry, the recorded id stays anchored to chunk 0.
+        //
+        // Sequence: chunk 0 ok (pid "mock-1"), chunk 1 fails, retry
+        // delivers chunk 1 (mock-2) and chunk 2 (mock-3). The delivered
+        // row must show "mock-1", not "mock-2" or "mock-3".
+        let (service, _root, sess, mock) = make_service().await;
+        let wrapper = install_splitting_adapter(&service, mock.clone(), 10);
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let row = make_row(
+            MessageKind::Chat,
+            json!({"text": three_chunk_text()}),
+        );
+        write_row(&out_pool, &row);
+
+        // Fail wrapper call index 1 (chunk 1 on attempt 1); attempt 2
+        // resumes at chunk 1 with no scheduled failure → success.
+        wrapper.fail_at_call(1, AdapterError::Transport("502".into()));
+        let _ = service.process_session_once(&sess).await.unwrap();
+
+        // Pop the backoff window for the retry.
+        let key = DeliveryKey::new(sess.id, row.id);
+        if let Some(mut entry) = service.retries.get_mut(&key) {
+            entry.not_before = Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .unwrap_or_else(Instant::now);
+        }
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.delivered, 1);
+
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let in_conn = in_pool.connect().unwrap();
+        let listed = delivered::list(&in_conn).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, "ok");
+        // mock-1 is the id the inner MockAdapter returned for chunk 0's
+        // `deliver`. mock-2 / mock-3 are the retry deliveries; neither
+        // must be recorded as the row's anchor pid.
+        assert_eq!(
+            listed[0].platform_message_id.as_deref(),
+            Some("mock-1"),
+            "platform_message_id must remain the first chunk's id across retries"
+        );
     }
 }

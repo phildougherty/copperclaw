@@ -162,7 +162,7 @@ impl ContainerRuntime for DockerRuntime {
 
     async fn build_image(&self, spec: ImageBuildSpec) -> Result<String, RtError> {
         let image_tag = spec.image_tag();
-        let context_bytes = build_context_tar(&spec);
+        let context_bytes = build_context_tar(&spec)?;
         let opts = BuildImageOptions::<String> {
             dockerfile: "Dockerfile".into(),
             t: image_tag.clone(),
@@ -359,10 +359,11 @@ pub(crate) fn translate_mount(m: &Mount) -> DockerMount {
 
 /// Pack the build context (Dockerfile + extra files) into a USTAR
 /// tarball that bollard can POST to `/build`.
-pub(crate) fn build_context_tar(spec: &ImageBuildSpec) -> Vec<u8> {
+pub(crate) fn build_context_tar(spec: &ImageBuildSpec) -> Result<Vec<u8>, RtError> {
     let mut out = Vec::new();
     let dockerfile = spec.dockerfile();
-    tar::append(&mut out, "Dockerfile", 0o644, dockerfile.as_bytes());
+    tar::append(&mut out, "Dockerfile", 0o644, dockerfile.as_bytes())
+        .map_err(|e| RtError::Container(format!("tar Dockerfile: {e}")))?;
     for f in &spec.extra_files {
         let basename = f
             .path
@@ -370,10 +371,11 @@ pub(crate) fn build_context_tar(spec: &ImageBuildSpec) -> Vec<u8> {
             .map_or_else(|| "file".to_string(), |s| s.to_string_lossy().into_owned());
         let name = format!("files/{basename}");
         let mode = if f.mode == 0 { 0o644 } else { f.mode };
-        tar::append(&mut out, &name, mode, &f.contents);
+        tar::append(&mut out, &name, mode, &f.contents)
+            .map_err(|e| RtError::Container(format!("tar {name}: {e}")))?;
     }
     tar::finish(&mut out);
-    out
+    Ok(out)
 }
 
 /// Minimal USTAR writer. Just enough to feed `docker build`.
@@ -381,14 +383,111 @@ mod tar {
     /// Each tar block is 512 bytes.
     const BLOCK: usize = 512;
 
+    /// Errors from the USTAR writer. These bubble up out of
+    /// [`super::build_context_tar`] as [`crate::RtError::Container`]
+    /// so callers see an actionable failure instead of a silently
+    /// truncated path (which would surface later as an opaque image
+    /// build error or, worse, a path collision).
+    #[derive(Debug)]
+    pub enum TarError {
+        /// Path is longer than the USTAR maximum (256 bytes total —
+        /// `name` ≤ 100 + `prefix` ≤ 155 + the `/` separator).
+        PathTooLong { path: String, len: usize },
+        /// Path is 101..=256 bytes but cannot be split into a
+        /// `name`/`prefix` pair satisfying the USTAR field-width
+        /// limits. Happens e.g. with a single 200-byte basename, or
+        /// when the only viable split point lands in the middle of a
+        /// multi-byte UTF-8 sequence (we only split at ASCII `/`).
+        NoValidSplit { path: String },
+    }
+
+    impl std::fmt::Display for TarError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::PathTooLong { path, len } => write!(
+                    f,
+                    "USTAR path exceeds 256 bytes (got {len}): {path}"
+                ),
+                Self::NoValidSplit { path } => write!(
+                    f,
+                    "USTAR path cannot be split into name (<=100) + prefix (<=155): {path}"
+                ),
+            }
+        }
+    }
+
+    impl std::error::Error for TarError {}
+
+    /// USTAR `name` field width.
+    const NAME_MAX: usize = 100;
+    /// USTAR `prefix` field width (offset 345).
+    const PREFIX_MAX: usize = 155;
+
+    /// Split a long path into (`prefix`, `name`) per the USTAR spec.
+    /// The final archived path is `format!("{prefix}/{name}")`.
+    ///
+    /// Returns the components only if both fit their respective fields
+    /// (≤155, ≤100) and a split point exists at an ASCII `/`. Callers
+    /// for paths ≤100 bytes should write `name` directly and skip
+    /// `prefix`.
+    fn split_long(path: &str) -> Option<(&str, &str)> {
+        let bytes = path.as_bytes();
+        if bytes.len() <= NAME_MAX {
+            // Caller should not be splitting this — handled upstream.
+            return Some(("", path));
+        }
+        // Find the LAST `/` such that the suffix after it is ≤100 and
+        // the prefix before it is ≤155.
+        for i in (0..bytes.len()).rev() {
+            if bytes[i] != b'/' {
+                continue;
+            }
+            let prefix = &bytes[..i];
+            let name = &bytes[i + 1..];
+            if prefix.len() <= PREFIX_MAX && name.len() <= NAME_MAX && !name.is_empty() {
+                // Safe to slice — we only split at ASCII `/`, which is
+                // never inside a multi-byte UTF-8 sequence.
+                return Some((
+                    std::str::from_utf8(prefix).ok()?,
+                    std::str::from_utf8(name).ok()?,
+                ));
+            }
+        }
+        None
+    }
+
     /// Append a single file entry to `out`.
-    pub fn append(out: &mut Vec<u8>, name: &str, mode: u32, body: &[u8]) {
+    ///
+    /// Returns [`TarError`] when `name` exceeds the USTAR addressable
+    /// limit (256 bytes split as 155 prefix + `/` + 100 name) instead
+    /// of silently truncating, which previously produced opaque
+    /// build failures or path collisions.
+    pub fn append(
+        out: &mut Vec<u8>,
+        name: &str,
+        mode: u32,
+        body: &[u8],
+    ) -> Result<(), TarError> {
         let mut header = [0u8; BLOCK];
 
-        // name (first 100)
         let nbytes = name.as_bytes();
-        let n = nbytes.len().min(100);
-        header[..n].copy_from_slice(&nbytes[..n]);
+        if nbytes.len() <= NAME_MAX {
+            // Short path: write entirely into `name`, leave `prefix`
+            // (offset 345, 155 bytes) zero-filled.
+            header[..nbytes.len()].copy_from_slice(nbytes);
+        } else if nbytes.len() <= NAME_MAX + 1 + PREFIX_MAX {
+            // Medium path: split at the LAST `/` that fits both fields.
+            let (prefix, suffix) = split_long(name).ok_or_else(|| TarError::NoValidSplit {
+                path: name.to_string(),
+            })?;
+            header[..suffix.len()].copy_from_slice(suffix.as_bytes());
+            header[345..345 + prefix.len()].copy_from_slice(prefix.as_bytes());
+        } else {
+            return Err(TarError::PathTooLong {
+                path: name.to_string(),
+                len: nbytes.len(),
+            });
+        }
 
         // mode (8 bytes, octal ASCII + nul)
         write_octal(&mut header[100..108], u64::from(mode), 7);
@@ -411,6 +510,8 @@ mod tar {
 
         // checksum: sum of all bytes in header (with placeholder spaces).
         // Per USTAR, the field is six octal digits, then NUL, then space.
+        // This covers the full 512-byte block, so the `prefix` bytes
+        // we may have just written at offset 345 are included.
         let sum: u32 = header.iter().map(|b| u32::from(*b)).sum();
         write_octal(&mut header[148..155], u64::from(sum), 6);
         header[155] = b' ';
@@ -420,6 +521,7 @@ mod tar {
         // pad to block boundary
         let pad = (BLOCK - (body.len() % BLOCK)) % BLOCK;
         out.extend(std::iter::repeat_n(0u8, pad));
+        Ok(())
     }
 
     /// Write `value` as a zero-padded octal ASCII string of width
@@ -446,7 +548,7 @@ mod tar {
         #[test]
         fn single_entry_layout() {
             let mut buf = Vec::new();
-            append(&mut buf, "Dockerfile", 0o644, b"FROM x\n");
+            append(&mut buf, "Dockerfile", 0o644, b"FROM x\n").unwrap();
             finish(&mut buf);
             // header (512) + body padded to 512 + 2*512 footer = 2048
             assert_eq!(buf.len(), 512 + 512 + 1024);
@@ -463,8 +565,8 @@ mod tar {
         #[test]
         fn multiple_entries_pad_to_blocks() {
             let mut buf = Vec::new();
-            append(&mut buf, "a", 0o644, b"x");
-            append(&mut buf, "b", 0o644, b"y");
+            append(&mut buf, "a", 0o644, b"x").unwrap();
+            append(&mut buf, "b", 0o644, b"y").unwrap();
             finish(&mut buf);
             // 2 * (header + padded body) + 2 footer blocks
             assert_eq!(buf.len(), 4 * 512 + 2 * 512);
@@ -473,7 +575,7 @@ mod tar {
         #[test]
         fn checksum_matches_header_bytes_sum() {
             let mut buf = Vec::new();
-            append(&mut buf, "a", 0o644, b"");
+            append(&mut buf, "a", 0o644, b"").unwrap();
             // After write, checksum field at 148..156 should be the
             // octal sum of every byte in the header (where 148..156
             // was spaces during the computation).
@@ -493,6 +595,90 @@ mod tar {
             // NUL + SPACE trailer.
             assert_eq!(header[154], 0);
             assert_eq!(header[155], b' ');
+        }
+
+        #[test]
+        fn short_name_written_inline_prefix_empty() {
+            // Pre-fix path (≤100 bytes): goes entirely into `name`,
+            // `prefix` at offset 345..500 stays zero.
+            let mut buf = Vec::new();
+            let name = "files/short.txt";
+            append(&mut buf, name, 0o644, b"hi").unwrap();
+            assert_eq!(&buf[..name.len()], name.as_bytes());
+            assert!(buf[345..500].iter().all(|&b| b == 0));
+        }
+
+        #[test]
+        fn medium_name_split_into_prefix_and_name() {
+            // 101..=256 bytes: must split at a `/` so the resulting
+            // `name` ≤ 100 and `prefix` ≤ 155. Choose a path whose
+            // last `/` lands inside the splittable window.
+            let dir = "a".repeat(130);
+            let base = "b".repeat(80);
+            let name = format!("{dir}/{base}");
+            assert!(name.len() > 100 && name.len() <= 256);
+
+            let mut buf = Vec::new();
+            append(&mut buf, &name, 0o644, b"x").unwrap();
+
+            // `name` at offset 0..100, `prefix` at offset 345..500.
+            let name_field = &buf[..100];
+            let prefix_field = &buf[345..500];
+            let name_str = std::str::from_utf8(&name_field[..base.len()]).unwrap();
+            let prefix_str = std::str::from_utf8(&prefix_field[..dir.len()]).unwrap();
+            assert_eq!(name_str, base);
+            assert_eq!(prefix_str, dir);
+            // Reconstruct: `prefix/name` (the readback convention).
+            let reconstructed = format!("{prefix_str}/{name_str}");
+            assert_eq!(reconstructed, name);
+            // Padding bytes past the written content must be zero so
+            // the field is properly NUL-terminated.
+            assert!(name_field[base.len()..].iter().all(|&b| b == 0));
+            assert!(prefix_field[dir.len()..].iter().all(|&b| b == 0));
+        }
+
+        #[test]
+        fn medium_name_checksum_includes_prefix_bytes() {
+            // The checksum sums the WHOLE 512-byte header. If the
+            // `prefix` write isn't included, the recorded sum won't
+            // match a re-computation that has those bytes filled in.
+            let dir = "d".repeat(120);
+            let base = "f".repeat(70);
+            let name = format!("{dir}/{base}");
+
+            let mut buf = Vec::new();
+            append(&mut buf, &name, 0o644, b"").unwrap();
+            let header = &buf[..512];
+
+            let mut work = [0u8; 512];
+            work.copy_from_slice(header);
+            for b in &mut work[148..156] {
+                *b = b' ';
+            }
+            let expected: u32 = work.iter().map(|b| u32::from(*b)).sum();
+            let recorded = std::str::from_utf8(&header[148..154]).unwrap();
+            let parsed = u32::from_str_radix(recorded, 8).unwrap();
+            assert_eq!(parsed, expected);
+        }
+
+        #[test]
+        fn too_long_name_returns_error() {
+            // > 256 bytes: no valid USTAR encoding exists.
+            let name = "x".repeat(300);
+            let mut buf = Vec::new();
+            let err = append(&mut buf, &name, 0o644, b"").unwrap_err();
+            assert!(matches!(err, TarError::PathTooLong { .. }));
+        }
+
+        #[test]
+        fn medium_name_no_split_point_returns_error() {
+            // 101..=256 bytes but no `/` in the right window: e.g. a
+            // single 200-byte basename. Cannot fit in `name` (max
+            // 100) and there's no separator to peel off into `prefix`.
+            let name = "z".repeat(200);
+            let mut buf = Vec::new();
+            let err = append(&mut buf, &name, 0o644, b"").unwrap_err();
+            assert!(matches!(err, TarError::NoValidSplit { .. }));
         }
     }
 }
@@ -628,7 +814,7 @@ mod tests {
     #[test]
     fn build_context_tar_contains_dockerfile() {
         let spec = ImageBuildSpec::new("r", "debian:12-slim");
-        let tar = build_context_tar(&spec);
+        let tar = build_context_tar(&spec).unwrap();
         // The Dockerfile name lives at offset 0 of the first header.
         assert_eq!(&tar[..10], b"Dockerfile");
     }
@@ -637,7 +823,7 @@ mod tests {
     fn build_context_tar_with_extra_files() {
         let mut spec = ImageBuildSpec::new("r", "debian:12-slim");
         spec.extra_files = vec![ExtraFile::new("/etc/x.conf", "hi")];
-        let tar = build_context_tar(&spec);
+        let tar = build_context_tar(&spec).unwrap();
         // Look for "files/x.conf" in the second header (offset depends
         // on Dockerfile body length; do a substring search).
         let hay = tar.windows(12).any(|w| w == b"files/x.conf");
@@ -647,10 +833,23 @@ mod tests {
     #[test]
     fn build_context_tar_terminates_with_zero_blocks() {
         let spec = ImageBuildSpec::new("r", "debian:12-slim");
-        let tar = build_context_tar(&spec);
+        let tar = build_context_tar(&spec).unwrap();
         let n = tar.len();
         // Last 1024 bytes are end-of-archive markers.
         assert!(tar[n - 1024..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn build_context_tar_rejects_oversize_extra_file_name() {
+        let mut spec = ImageBuildSpec::new("r", "debian:12-slim");
+        // Force a basename so long that `files/<base>` > 256 bytes.
+        let huge = "z".repeat(260);
+        spec.extra_files = vec![ExtraFile::new(format!("/etc/{huge}"), "hi")];
+        let err = build_context_tar(&spec).unwrap_err();
+        match err {
+            RtError::Container(msg) => assert!(msg.contains("USTAR path"), "{msg}"),
+            other => panic!("expected Container, got {other:?}"),
+        }
     }
 
     #[test]

@@ -6,6 +6,68 @@ tree" — was checked against each adapter's `deliver()`, `subscribe()`,
 `set_typing()`, `edit_message()`, `add_reaction()`, and
 `plain_text_fallback()` implementations.
 
+## Native UI capability heatmap (post-slice-1 + in-flight slice-2)
+
+One row per channel. `yes` = native platform primitive used; `text` =
+trait-default text-fallback rendering; `fallback` = renders via the
+trait default that converts to a chat-text send; `no` = adapter
+explicitly declines; `n/a` = capability does not apply at this layer
+(e.g. webhook signing on a gateway-only adapter); `partial` =
+approximation only (e.g. WhatsApp `set_typing` reuses `mark_read`).
+Cells reading `landing` reference a slice-2 agent whose edits are in
+flight; they currently use the trait default but native overrides are
+expected this week.
+
+Columns: Split = host splitter via `max_message_chars`; Retry =
+honours platform `Retry-After`; Typing = platform-side indicator;
+Cards = native `deliver_card`; Crumbs = native `deliver_breadcrumb`;
+Reply = inbound `reply_to` populated; Grp/DM = `is_group` set;
+Edit = `edit_message` API; React = reactions API; Files = attachment
+flow; Thread = `supports_threads`; Sig = webhook secret verification.
+
+| Channel | Split | Retry | Typing | Cards | Crumbs | Reply | Grp/DM | Edit | React | Files | Thread | Sig |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| cli | no | yes | no | text | text | no | no | no | no | rendered | no | n/a |
+| telegram | yes (4096) | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes | yes (ct) |
+| slack | yes (40000) | yes | partial | yes | landing (G) | yes | yes | yes | yes | yes | yes | yes (HMAC-SHA256, ct) |
+| discord | yes (2000) | yes | yes | yes | landing (G) | yes | yes | yes | yes | yes | no | n/a (gateway) |
+| matrix | no | yes | yes | text | landing (G) | yes | yes | action | action | yes | yes | n/a (sync) |
+| webhooks | no | yes | no | text | text | passthrough | no | n/a | n/a | n/a | no | yes (HMAC-SHA256) |
+| github | no | yes | no | text | text | no | yes (always true) | action | action | no | no | yes (HMAC-SHA256) |
+| linear | no | yes | no | text | text | no | yes (always true) | action | action | no | yes | yes (HMAC-SHA256) |
+| resend | no | yes | no | text | text | n/a | n/a | no | no | yes | yes (RFC 2822) | n/a (outbound) |
+| mattermost | no | yes | no | text | text | no | no | action | action | yes | yes | yes (shared token, ct) |
+| teams | yes (28000) | yes | no | text | text | yes | yes | action | action | yes (channel only) | yes | n/a (Graph bearer) |
+| gchat | yes (4096) | yes | no | yes (content.card) | yes (cards v2) | no | yes | action | action | yes | yes | yes (query token, ct) |
+| webex | yes (7439) | yes | no | yes (attachments[]) | text | no | yes | action | action | yes | yes | yes (HMAC-SHA1 or 256, auto) |
+| line | yes (5000) | yes | no | text | text | no | yes | no | no | no | no | yes (HMAC-SHA256) |
+| imessage | no | yes | no | text | text | no | yes | no | no | yes | no | n/a (local) |
+| signal | no | yes | yes | text | text | yes | yes | action | action | yes | no | n/a (RPC) |
+| deltachat | no | yes | no | text | text | no | yes | no | action | yes | no | n/a (RPC) |
+| wechat | yes (600) | yes | no | yes (template_card) | text | no | no | no | no | yes | no | yes (SHA1 sorted-concat) |
+| whatsapp-cloud | yes (4096) | yes | partial (mark_read) | text | text | yes | no | no | action | yes | no | yes (HMAC-SHA256, ct) |
+| emacs | no | yes | no | text | text | no | no | no | no | no | no | n/a (local) |
+| x | no | yes | no | text | text | no | no | no | no | yes | no | n/a (poll) |
+
+Slice-1 invariants the table above bakes in:
+
+- Every channel honours platform `Retry-After` via
+  `DeliveryService::bump_retry` reading `AdapterError::Rate.retry_after`.
+- `max_message_chars()` opts a channel into the host chat-splitter;
+  the 9 channels with a `yes (n)` cell are the ones that override it.
+- All webhook-signature columns marked `ct` use a constant-time byte
+  compare (`subtle::ConstantTimeEq` or `hmac::Mac::verify_slice`).
+  Telegram + whatsapp-cloud were converted from a plain `!=` byte
+  compare in slice 1; the others were already constant-time.
+- Slice-2 agent A landed `reply_to` population across telegram, slack,
+  discord, matrix, teams, signal, whatsapp-cloud. Agent G is landing
+  native `deliver_breadcrumb` overrides for slack / discord / matrix;
+  gchat shipped (Cards v2 `decoratedText` chip + in-place
+  `spaces.messages.patch` edit, adapter.rs:191) alongside telegram's
+  native chip renderer.
+
+
+
 ## Verdict
 
 | # | Adapter | Status | High-severity gaps | Notes |

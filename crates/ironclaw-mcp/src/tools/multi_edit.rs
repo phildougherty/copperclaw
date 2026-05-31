@@ -30,6 +30,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::error::ToolError;
+use crate::tools::diff_util::{build_blob_card, build_diff_card, over_blob_cutoff};
 use crate::tools::{make_tool, parse_args, success_json, ToolEntry, ToolHandler};
 
 /// Hard cap on the number of edits in a single call. Mirrored in the
@@ -83,7 +84,7 @@ pub fn schema() -> Tool {
 
 pub async fn handle(
     arguments: Option<JsonObject>,
-    _ctx: &dyn crate::context::ToolContext,
+    ctx: &dyn crate::context::ToolContext,
 ) -> Result<CallToolResult, ToolError> {
     let input: Input = parse_args(arguments)?;
 
@@ -128,6 +129,17 @@ pub async fn handle(
         .await
         .map_err(|e| ToolError::Internal(format!("multi_edit({display}) join: {e}")))??;
 
+    // Best-effort diff card — same pattern as `edit_file`. See
+    // `slice-3-native-ui.md` § Surface 1.
+    let before_size = result.before.len() as u64;
+    let after_size = result.after.len() as u64;
+    if over_blob_cutoff(before_size, after_size) {
+        ctx.emit_diff(build_blob_card(&result.path, before_size, after_size))
+            .await;
+    } else if let Some(card) = build_diff_card(&result.path, &result.before, &result.after) {
+        ctx.emit_diff(card).await;
+    }
+
     Ok(success_json(&json!({
         "path": result.path,
         "edits_applied": result.edits_applied,
@@ -139,6 +151,12 @@ struct MultiEditOutcome {
     path: String,
     edits_applied: usize,
     total_replacements: usize,
+    /// Pre-edit content snapshot, kept so we can build a `DiffCard`
+    /// after the atomic write succeeds.
+    before: String,
+    /// Post-edit content (the bytes the atomic rename just landed
+    /// on disk).
+    after: String,
 }
 
 fn do_multi_edit(path: &Path, edits: &[EditSpec]) -> Result<MultiEditOutcome, ToolError> {
@@ -171,8 +189,10 @@ fn do_multi_edit(path: &Path, edits: &[EditSpec]) -> Result<MultiEditOutcome, To
     })?;
 
     // Apply edits in order against a mutable buffer. Failures bail
-    // out before we ever touch disk.
-    let mut current = original;
+    // out before we ever touch disk. We clone `original` here so the
+    // pre-edit snapshot survives the loop — the diff card builder
+    // wants both sides post-write.
+    let mut current = original.clone();
     let mut total_replacements = 0usize;
     for (i, e) in edits.iter().enumerate() {
         let count = current.matches(&e.old_string).count();
@@ -204,6 +224,8 @@ fn do_multi_edit(path: &Path, edits: &[EditSpec]) -> Result<MultiEditOutcome, To
         path: path.display().to_string(),
         edits_applied: edits.len(),
         total_replacements,
+        before: original,
+        after: current,
     })
 }
 

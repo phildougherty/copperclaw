@@ -259,6 +259,7 @@ fn ensure_config_row(central: &CentralDb, id: AgentGroupId) -> Result<(), ErrorP
                 egress_allow: vec![],
                 resource_limits: json!({}),
                 coding_enabled: false,
+                surface_thinking: false,
             },
         )
         .map_err(db_err)?;
