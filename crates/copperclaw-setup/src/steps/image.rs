@@ -199,6 +199,12 @@ pub const DEFAULT_BASE_APT_PACKAGES: &[&str] = &[
     "jq",
     "less",
     "procps",
+    // Code navigation: ripgrep for fast content search, universal-ctags
+    // for cross-language definition lookup. Containers have no
+    // Debian-repo egress at runtime (`apt-get update` exits 100), so
+    // these must ship in the baseline rather than install on demand.
+    "ripgrep",
+    "universal-ctags",
 ];
 
 /// Find the `copperclaw-runner` binary that should be baked into the

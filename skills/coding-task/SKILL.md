@@ -38,6 +38,12 @@ evidence, not vibes. Recipes:
   `curl`, confirm a real response.
 - **Tests exist:** run `pytest` / `npm test` / equivalent. "It
   compiles" is not the bar.
+- **Use the project's *canonical* build, not an ad-hoc script.** Run
+  the whole-package build the way anyone else would — `go build ./...`,
+  `cargo build`, `npm run build`. A custom check that compiles one file
+  at a time can pass while `go build ./...` fails (e.g. two `main`
+  functions in one package). If you tell the user `go run main.go`,
+  that exact command has to work.
 
 If you couldn't run it, **say so**. "I wrote X but couldn't run it
 because Y" is honest. "Done" without evidence isn't.

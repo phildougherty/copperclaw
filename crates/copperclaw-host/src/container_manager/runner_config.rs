@@ -80,6 +80,12 @@ pub(crate) struct RunnerConfigForFile {
     /// always-present field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) effort: Option<copperclaw_types::Effort>,
+    /// Sampling temperature passed through to the provider. Sourced from
+    /// `COPPERCLAW_DEFAULT_TEMPERATURE` in `.env`; a low value (~0.3)
+    /// steadies agentic tool-calling on local models. Skipped when None
+    /// so the model/provider default is left untouched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) temperature: Option<f32>,
 }
 
 impl ContainerManager {
@@ -301,6 +307,13 @@ impl ContainerManager {
             .or(self.cfg.default_effort)
             .filter(|e| !matches!(e, copperclaw_types::Effort::Medium));
 
+        // Host-wide sampling temperature from `COPPERCLAW_DEFAULT_TEMPERATURE`
+        // (`.env`). Low (~0.3) makes tool-calling steadier on local
+        // models; unset leaves the provider/model default in place.
+        let temperature = std::env::var("COPPERCLAW_DEFAULT_TEMPERATURE")
+            .ok()
+            .and_then(|s| s.trim().parse::<f32>().ok());
+
         RunnerConfigForFile {
             session_id: session.id.as_uuid().to_string(),
             agent_group_id: session.agent_group_id.as_uuid().to_string(),
@@ -322,6 +335,7 @@ impl ContainerManager {
                 .map(|s| s.as_uuid().to_string()),
             surface_thinking,
             effort,
+            temperature,
         }
     }
 }

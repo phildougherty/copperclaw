@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (local-model optimizations — 2026-05-31)
+
+Tuning for self-hosted/local-model (ollama) deployments, surfaced while
+debugging a local agent:
+
+- **Configurable sampling temperature.** `COPPERCLAW_DEFAULT_TEMPERATURE`
+  in `.env` is now read at spawn and threaded through to the provider
+  (`crates/copperclaw-host/src/container_manager/runner_config.rs` →
+  `RunnerConfigForFile.temperature`; the runner→`QueryInput` path already
+  existed). A low value (~0.3) steadies agentic tool-calling on small
+  local models; unset leaves the model/provider default untouched.
+- **`ripgrep` + `universal-ctags` in the baseline session image**
+  (`crates/copperclaw-setup/src/steps/image.rs`). Containers have no
+  Debian-repo egress at runtime (`apt-get update` exits 100), so code
+  navigation tools must ship in the image. Lands on the next base-image
+  rebake.
+- **`coding-task` skill: require the canonical build.** "Done" now means
+  `go build ./...` / `cargo build` / `npm run build` passes, not an
+  ad-hoc per-file script — closing the class of bug where a custom test
+  builds one file at a time and passes while the real package build
+  fails (two `main`s in one package).
+
 ### Fixed (session container `HOME` and cwd were `/` and unwritable, breaking all build tooling — 2026-05-31)
 
 The session container runs as a non-root uid (`<host-uid>:<gid>`) with

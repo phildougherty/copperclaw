@@ -88,6 +88,62 @@ Current baseline: ~5,200 passing tests. Don't break that.
   - `copperclaw start | stop | status | logs -f` — host lifecycle
   - `copperclaw run` — original foreground mode (debugging / under systemd)
 
+## Operating a live agent (clear history, switch model, tune ollama)
+
+Run against the live host with `cclaw`. The telegram agent is group
+`019e4905-e124-7d61-8b46-728b53a72fc5`.
+
+**Clear an agent's history / context (fresh start).** `cclaw sessions
+delete <session-id>` removes the session row, its per-session rows, and
+its on-disk `/data` dir. The group config (model, wirings, approvals) is
+untouched; the next inbound spawns a fresh empty session.
+
+```
+cclaw sessions list --agent-group <group-id>   # find the active session id
+cclaw sessions delete <session-id>
+```
+
+It also deletes the session's `/data` working files — copy anything
+worth keeping first (`<data_dir>/sessions/<group>/<session>/`). There's
+no "clear chat, keep files" operator command; that's the agent-side
+`clear_history` / `compact_now` tools. A session delete is the clean
+operator reset.
+
+**Switch a group's model / provider.**
+
+```
+cclaw groups config update --field 'model="qwen3.6:27b"' <group-id>
+cclaw groups restart <group-id>                                # next spawn uses it
+docker rm -f $(docker ps --filter name=copperclaw-<session-prefix> -q)   # drop the warm container if still up
+```
+
+`--field` is `key=value` with the value JSON-encoded (note the inner
+quotes for strings). Takes effect on the *next* container spawn only.
+
+**Local ollama tuning** (systemd service; needs sudo). Drop-in at
+`/etc/systemd/system/ollama.service.d/override.conf`:
+
+```
+[Service]
+Environment="OLLAMA_KEEP_ALIVE=-1"        # keep model resident (no 5-min unload)
+Environment="OLLAMA_NUM_PARALLEL=2"       # concurrent agents; each costs KV-cache VRAM
+Environment="OLLAMA_MAX_LOADED_MODELS=1"  # one model in VRAM — keep all agents on the same model
+```
+
+then `sudo systemctl daemon-reload && sudo systemctl restart ollama`.
+This box also runs `OLLAMA_FLASH_ATTENTION=1` + `OLLAMA_KV_CACHE_TYPE=q8_0`
+(8-bit KV cache — halves KV VRAM, needed to fit parallel slots on 24GB).
+Per-group sampling temperature: `COPPERCLAW_DEFAULT_TEMPERATURE` in the
+host `.env` (~0.3 steadies tool-calling on small local models).
+
+**Local-model reality.** Tool-calling reliability scales hard with model
+size: gemma4:26b chats instead of emitting tool calls; 27B–31B-class
+(gemma4:31b, qwen3.6:27b) actually drive multi-step builds. Before
+blaming the prompt for "won't follow instructions," confirm it's in the
+session's `runner.json` and `HOME=/data` in the container — then suspect
+the model. Corroborate "what the agent did" against GPU activity and
+on-disk files, not runner `tool_turn` log lines alone.
+
 ## Diagnosing "the agent isn't replying"
 
 In order of cost:
