@@ -47,6 +47,25 @@ considers correct.
 goes red after your change, `git bisect` (or just reading the diff)
 is faster than staring.
 
+## Iterating to green
+
+Fixing a failing test is a loop, not one shot:
+
+1. Run the test, read the **actual** failure — never patch blind off
+   the test name.
+2. Make the smallest change that addresses *that* failure.
+3. Re-run the same narrow scope. Repeat.
+
+- **One hypothesis per iteration.** Change three things at once and a
+  green result tells you nothing about which one worked.
+- **Cap your attempts.** Same test still red after a few focused
+  tries: stop guessing. Re-read the test and the code under test
+  together, or say "stuck on X, here's what I ruled out." Ten
+  near-identical patches usually means you're fixing the wrong thing.
+
+Don't widen to the full suite until the narrow scope is green; then
+run it once to catch anything you knocked over elsewhere.
+
 ## Adding tests
 
 **Add tests when the change introduces new behaviour without

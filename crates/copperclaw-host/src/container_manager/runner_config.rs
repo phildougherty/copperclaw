@@ -749,7 +749,7 @@ mod tests {
         // preamble + environment block, even when the session_root is
         // None (the briefing is the only optional piece). That gives us
         // a couple of cheap structural sanity checks here.
-        assert!(rc.system.contains("You are an Copperclaw agent"));
+        assert!(rc.system.contains("You are a Copperclaw agent"));
         assert!(rc.system.contains("# Environment"));
     }
 

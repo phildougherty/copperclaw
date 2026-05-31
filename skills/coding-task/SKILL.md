@@ -5,7 +5,7 @@ description: Disciplines for doing real coding work — editing files, running t
 
 # coding-task
 
-How to do coding work as an Copperclaw agent. The base session image
+How to do coding work as a Copperclaw agent. The base session image
 ships with `python3`, `pip`, `node`, `npm`, `git`, `curl`, `wget`,
 `jq`, and `build-essential` available via `shell`. Use them.
 

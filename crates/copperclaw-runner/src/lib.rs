@@ -1,7 +1,7 @@
 //! Container-side agent runner for copperclaw.
 //!
 //! See `PLAN.md` § 6 (T5) for the responsibilities of this crate. In short,
-//! the runner is the binary process that lives inside an copperclaw session
+//! the runner is the binary process that lives inside a copperclaw session
 //! container. It polls `inbound.db::messages_in`, formats new rows into a
 //! provider turn, drives the configured [`AgentProvider`] tool-use loop,
 //! and writes the resulting effects into `outbound.db`.

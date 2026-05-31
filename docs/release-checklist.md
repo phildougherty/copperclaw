@@ -1,6 +1,6 @@
 # Release 0.1.0 checklist
 
-Use this checklist to drive an Copperclaw release. The numbers reset
+Use this checklist to drive a Copperclaw release. The numbers reset
 for each release; "0.1.0" below is illustrative.
 
 ---

@@ -6,6 +6,48 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (system prompt slimmed ~51%, all directives intact — 2026-05-31)
+
+`BASE_PREAMBLE` in `crates/copperclaw-host/src/container_manager/prompt.rs`
+— the universal preamble sent on every turn to every agent — rewritten
+for density: 7,596 → 3,684 source chars (~600 fewer tokens of always-on
+context per turn) with every behavioural directive preserved. Verified
+by the existing `container_manager::prompt` tests, which assert the
+load-bearing phrases (`You are a Copperclaw agent`, `Acting with care`,
+`Picking tools`, `Never use emojis`). What was cut is justification prose
+("the operator has no idea whether you're on step 2 or step 8", "burns
+trust harder than…", "…is vapor"), never a rule. The two separate
+`# Don't fabricate capabilities` / `# Don't fabricate completion on
+coding work` sections merged into one `# Don't fabricate` with two
+compact bullets.
+
+### Added (skill discipline for autonomous coding — 2026-05-31)
+
+Enhanced three opt-in coding skills (pure markdown, hot-loaded via the
+`data/skills` symlink — live on next session spawn, no rebuild):
+
+- `skills/testing/SKILL.md` — "Iterating to green": the
+  write → run → read-the-actual-failure → smallest-patch loop, one
+  hypothesis per iteration, cap attempts and stop rather than thrash.
+- `skills/code-review/SKILL.md` — "Adversarial pass": boundary /
+  malformed / concurrency / error-path attacks before sign-off, and when
+  to spawn a `create_agent` critic for high-stakes changes vs. an
+  in-context pass. Cross-links `create-agent` and `testing`.
+- `skills/grep/SKILL.md` — "When text search isn't enough": use the
+  language's own checker (`cargo check` / `tsc` / `go build` / `mypy`)
+  as the precise find-references oracle before a refactor, and
+  `ast-grep` for structural matches; reserve text grep for "where is
+  this string".
+
+### Fixed (rename grammar — "an Copperclaw" → "a Copperclaw" — 2026-05-31)
+
+The ironclaw → copperclaw rename turned the grammatically-correct
+"an Ironclaw" (vowel) into "an Copperclaw" (consonant) across 9 files,
+most visibly the agent persona in
+`crates/copperclaw-host/src/container_manager/prompt.rs` ("You are an
+Copperclaw agent" → "a Copperclaw agent") and its test assertions.
+Fixed in prompts, doc comments, CLI help text, and `docs/`.
+
 ### Fixed (heartbeat / breadcrumb / diff / thinking missed when parent processes child-forwarded inbound)
 
 The four user-facing observability emits (`emit_status`,

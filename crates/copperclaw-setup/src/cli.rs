@@ -17,7 +17,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Parser, Default)]
 #[command(
     name = "copperclaw-setup",
-    about = "Interactive first-time setup for an copperclaw host",
+    about = "Interactive first-time setup for a copperclaw host",
     version,
     disable_help_subcommand = true
 )]

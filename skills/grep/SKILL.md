@@ -84,6 +84,26 @@ patterns containing spaces.
   expose** (`-A`/`-B` asymmetric context, perl-compatible regex):
   fall back to `shell` then.
 
+## When text search isn't enough
+
+`grep` matches *text*. Two jobs it does badly, and what beats it:
+
+- **"Find every caller / every implementor" before a refactor.** A
+  regex over a name catches comments, strings, and same-named symbols
+  in unrelated scopes, and misses calls split across lines. The
+  precise oracle is the language's own checker: change the signature
+  and run `cargo check` / `tsc --noEmit` / `go build` / `mypy` — every
+  real reference surfaces as an error, zero false positives. Safest
+  way to scope a refactor.
+- **Structural matches** ("calls to `foo(` with a literal first arg",
+  "every `match` with no wildcard arm"). Text regex can't see syntax;
+  `ast-grep` matches on the parse tree across most languages (e.g.
+  `ast-grep -p 'foo($A)'`). Not in the base image — `npm i -g
+  @ast-grep/cli` when a refactor actually needs it.
+
+Reach for these when correctness matters; for everyday "where is this
+string" lookups, plain `grep` is right.
+
 ## Errors
 
 - Invalid regex (`(invalid`) returns `Validation` with the

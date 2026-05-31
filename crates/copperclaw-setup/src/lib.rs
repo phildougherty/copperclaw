@@ -1,4 +1,4 @@
-//! `copperclaw-setup` — interactive first-time setup for an copperclaw host.
+//! `copperclaw-setup` — interactive first-time setup for a copperclaw host.
 //!
 //! See `PLAN.md` § 6 (T10). The crate ships a single binary
 //! (`copperclaw-setup`) that walks an operator through environment checks,

@@ -277,7 +277,7 @@ fn backtick_tokens(body: &str) -> impl Iterator<Item = &str> {
 /// "agent reaches for a tool that doesn't exist". The cost of a false
 /// positive is "test refuses to land an unrelated skill edit". Lean
 /// toward the latter.
-/// Verb prefixes that an Copperclaw tool name *would* start with. If
+/// Verb prefixes that a Copperclaw tool name *would* start with. If
 /// none of these match, the token is almost certainly a schema field
 /// or unrelated identifier.
 const VERB_PREFIXES: &[&str] = &[

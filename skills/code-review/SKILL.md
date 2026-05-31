@@ -49,6 +49,29 @@ operation or several mixed together.
 - **Code that the diff didn't touch.** "Could we also fix X while
   we're here" is scope creep — surface it as a separate ticket.
 
+## Adversarial pass — try to break it
+
+Reading for correctness catches the bugs you can see; the ones that
+bite later are the inputs the author didn't picture. Before signing
+off on anything non-trivial, spend sixty seconds attacking it:
+
+- **Boundaries:** empty, single element, huge, zero, negative,
+  off-by-one at the ends of every loop and slice.
+- **Malformed input:** wrong types, missing fields, oversized
+  payloads, embedded quotes/newlines, non-UTF-8.
+- **Concurrency:** runs twice, or interleaves with another writer — is
+  the "check then act" actually atomic?
+- **Error paths:** force the failure (network down, file missing,
+  parse error) and confirm it's handled, not swallowed.
+
+For most changes that's an in-context pass — you, thinking like an
+attacker. For genuinely high-stakes code (auth, money, data loss,
+anything hard to roll back), spin up a dedicated critic with
+`create_agent`: hand it the diff and one instruction — "find inputs
+that break this and prove it with a repro." A second context with an
+adversarial mandate sees what the author's context is blind to. It
+costs a full sibling agent, so reserve it for changes that earn it.
+
 ## Producing the summary
 
 Reply with at most a few short sections:
@@ -80,3 +103,6 @@ that case — don't try to grind through it anyway.
   diff in the first place.
 - [[git-commit]] — what the commit message should look like once the
   change is ready.
+- [[create-agent]] — spawn an adversarial critic for high-stakes
+  changes (see the adversarial pass above).
+- [[testing]] — the test discipline that backs the coverage check.

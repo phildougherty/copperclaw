@@ -1,4 +1,4 @@
-//! All MCP tools provided by an copperclaw agent container.
+//! All MCP tools provided by a copperclaw agent container.
 //!
 //! Each tool lives in its own submodule and exposes:
 //! - `pub fn schema() -> rmcp::model::Tool` — the rmcp tool descriptor with a
