@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# install.sh — one-command installer for ironclaw.
+# install.sh — one-command installer for copperclaw.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/phildougherty/ironclaw/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/phildougherty/copperclaw/main/install.sh | bash
 #   ./install.sh                                   # from inside a checkout
-#   IRONCLAW_REPO=owner/fork ./install.sh          # override release source
-#   IRONCLAW_INSTALL_DIR=$HOME/bin ./install.sh    # override install prefix
-#   IRONCLAW_SKIP_SETUP=1 ./install.sh             # install binaries only
+#   COPPERCLAW_REPO=owner/fork ./install.sh          # override release source
+#   COPPERCLAW_INSTALL_DIR=$HOME/bin ./install.sh    # override install prefix
+#   COPPERCLAW_SKIP_SETUP=1 ./install.sh             # install binaries only
 #
 # Picks the first of these that works, in order:
 #   (a) prebuilt tarball from GitHub Releases
@@ -18,8 +18,8 @@
 #
 # Test-only escape hatches (default-off; preserve normal behaviour):
 #   INSTALL_SH_SKIP_DOCKER_CHECK=1   # skip the container-runtime check
-#   IRONCLAW_INSTALL_DRY_RUN=1       # print the release-tarball URL and exit 0
-#   IRONCLAW_FORCE_TARGET=<triple>   # override platform detection (e.g.
+#   COPPERCLAW_INSTALL_DRY_RUN=1       # print the release-tarball URL and exit 0
+#   COPPERCLAW_FORCE_TARGET=<triple>   # override platform detection (e.g.
 #                                    # aarch64-unknown-linux-gnu) — pairs with
 #                                    # the dry-run mode for tarball-URL tests.
 
@@ -27,33 +27,33 @@ set -euo pipefail
 
 # ----- configuration ---------------------------------------------------------
 
-IRONCLAW_REPO="${IRONCLAW_REPO:-phildougherty/ironclaw}"
-IRONCLAW_INSTALL_DIR="${IRONCLAW_INSTALL_DIR:-$HOME/.local/bin}"
-IRONCLAW_SKIP_SETUP="${IRONCLAW_SKIP_SETUP:-0}"
-IRONCLAW_FORCE_REINSTALL="${IRONCLAW_FORCE_REINSTALL:-0}"
-IRONCLAW_RELEASE_TAG="${IRONCLAW_RELEASE_TAG:-latest}"
+COPPERCLAW_REPO="${COPPERCLAW_REPO:-phildougherty/copperclaw}"
+COPPERCLAW_INSTALL_DIR="${COPPERCLAW_INSTALL_DIR:-$HOME/.local/bin}"
+COPPERCLAW_SKIP_SETUP="${COPPERCLAW_SKIP_SETUP:-0}"
+COPPERCLAW_FORCE_REINSTALL="${COPPERCLAW_FORCE_REINSTALL:-0}"
+COPPERCLAW_RELEASE_TAG="${COPPERCLAW_RELEASE_TAG:-latest}"
 # TODO(team-j): test-only knobs. Default off; do not document beyond the
 # header comment. Used by tests/install/test_install_sh.sh.
 INSTALL_SH_SKIP_DOCKER_CHECK="${INSTALL_SH_SKIP_DOCKER_CHECK:-0}"
-IRONCLAW_INSTALL_DRY_RUN="${IRONCLAW_INSTALL_DRY_RUN:-0}"
-IRONCLAW_FORCE_TARGET="${IRONCLAW_FORCE_TARGET:-}"
+COPPERCLAW_INSTALL_DRY_RUN="${COPPERCLAW_INSTALL_DRY_RUN:-0}"
+COPPERCLAW_FORCE_TARGET="${COPPERCLAW_FORCE_TARGET:-}"
 
-BINARIES=(ironclaw iclaw ironclaw-setup)
+BINARIES=(copperclaw cclaw copperclaw-setup)
 # crate path per binary, used by the --path fallback.
 crate_for_bin() {
     case "$1" in
-        ironclaw)       echo "crates/ironclaw-host" ;;
-        iclaw)          echo "crates/ironclaw-iclaw" ;;
-        ironclaw-setup) echo "crates/ironclaw-setup" ;;
+        copperclaw)       echo "crates/copperclaw-host" ;;
+        cclaw)          echo "crates/copperclaw-cclaw" ;;
+        copperclaw-setup) echo "crates/copperclaw-setup" ;;
         *)              return 1 ;;
     esac
 }
 # crate name per binary, used by the --git fallback (cargo install <name>).
 crate_name_for_bin() {
     case "$1" in
-        ironclaw)       echo "ironclaw-host" ;;
-        iclaw)          echo "ironclaw-iclaw" ;;
-        ironclaw-setup) echo "ironclaw-setup" ;;
+        copperclaw)       echo "copperclaw-host" ;;
+        cclaw)          echo "copperclaw-cclaw" ;;
+        copperclaw-setup) echo "copperclaw-setup" ;;
         *)              return 1 ;;
     esac
 }
@@ -82,7 +82,7 @@ err()   { printf '%serr%s %s\n'   "${C_RED}${C_BOLD}" "${C_RESET}" "$*" >&2; }
 dim()   { printf '%s%s%s\n'       "${C_DIM}"          "$*" "${C_RESET}"; }
 
 # Verbose log buffer — kept silent on success, dumped on failure for triage.
-LOG_FILE="$(mktemp -t ironclaw-install.XXXXXX.log)"
+LOG_FILE="$(mktemp -t copperclaw-install.XXXXXX.log)"
 trap '_on_exit $?' EXIT
 
 _on_exit() {
@@ -112,24 +112,24 @@ run_quiet() {
 
 detect_platform() {
     local uname_s uname_m os arch triple
-    # TODO(team-j): IRONCLAW_FORCE_TARGET lets the install-sh integration test
+    # TODO(team-j): COPPERCLAW_FORCE_TARGET lets the install-sh integration test
     # exercise the per-triple tarball URL without faking uname. No effect when
     # unset.
-    if [ -n "$IRONCLAW_FORCE_TARGET" ]; then
-        case "$IRONCLAW_FORCE_TARGET" in
+    if [ -n "$COPPERCLAW_FORCE_TARGET" ]; then
+        case "$COPPERCLAW_FORCE_TARGET" in
             x86_64-unknown-linux-gnu)   os="linux";  arch="x86_64" ;;
             aarch64-unknown-linux-gnu)  os="linux";  arch="aarch64" ;;
             x86_64-apple-darwin)        os="macos";  arch="x86_64" ;;
             aarch64-apple-darwin)       os="macos";  arch="aarch64" ;;
             *)
-                err "IRONCLAW_FORCE_TARGET=$IRONCLAW_FORCE_TARGET is not a recognised triple"
+                err "COPPERCLAW_FORCE_TARGET=$COPPERCLAW_FORCE_TARGET is not a recognised triple"
                 exit 1 ;;
         esac
         PLATFORM_OS="$os"
         # shellcheck disable=SC2034  # exposed for completeness / future use
         PLATFORM_ARCH="$arch"
-        PLATFORM_TRIPLE="$IRONCLAW_FORCE_TARGET"
-        ok "platform: $os/$arch ($IRONCLAW_FORCE_TARGET) [forced]"
+        PLATFORM_TRIPLE="$COPPERCLAW_FORCE_TARGET"
+        ok "platform: $os/$arch ($COPPERCLAW_FORCE_TARGET) [forced]"
         return 0
     fi
     uname_s="$(uname -s 2>/dev/null || echo unknown)"
@@ -204,7 +204,7 @@ check_container_runtime() {
         fi
     elif [ "$PLATFORM_OS" = "macos" ] && command -v container >/dev/null 2>&1; then
         # Apple Container (the new macOS-native container runtime). Detected
-        # by ironclaw-setup's env_check step as well; included here so a
+        # by copperclaw-setup's env_check step as well; included here so a
         # fresh mac user with only Apple Container installed doesn't get a
         # misleading "install Docker" prompt.
         found="apple-container"
@@ -267,7 +267,7 @@ remote_exists() {
 already_installed() {
     local missing=0
     for b in "${BINARIES[@]}"; do
-        if [ ! -x "$IRONCLAW_INSTALL_DIR/$b" ] && ! command -v "$b" >/dev/null 2>&1; then
+        if [ ! -x "$COPPERCLAW_INSTALL_DIR/$b" ] && ! command -v "$b" >/dev/null 2>&1; then
             missing=1
             break
         fi
@@ -281,7 +281,7 @@ prompt_upgrade_or_skip() {
         warn "existing install detected; re-installing (non-interactive)"
         return 0
     fi
-    printf '%sironclaw is already installed.%s\n' "${C_BOLD}" "${C_RESET}"
+    printf '%scopperclaw is already installed.%s\n' "${C_BOLD}" "${C_RESET}"
     printf '  [u] upgrade / reinstall (default)\n'
     printf '  [s] skip binary install, just rerun setup\n'
     printf '  [q] quit\n'
@@ -298,13 +298,13 @@ prompt_upgrade_or_skip() {
 # ----- install strategies ----------------------------------------------------
 
 install_via_release() {
-    local tag="$IRONCLAW_RELEASE_TAG" base
+    local tag="$COPPERCLAW_RELEASE_TAG" base
     if [ "$tag" = "latest" ]; then
-        base="https://github.com/${IRONCLAW_REPO}/releases/latest/download"
+        base="https://github.com/${COPPERCLAW_REPO}/releases/latest/download"
     else
-        base="https://github.com/${IRONCLAW_REPO}/releases/download/${tag}"
+        base="https://github.com/${COPPERCLAW_REPO}/releases/download/${tag}"
     fi
-    local tarball="ironclaw-${PLATFORM_TRIPLE}.tar.gz"
+    local tarball="copperclaw-${PLATFORM_TRIPLE}.tar.gz"
     local url="$base/$tarball"
 
     step "checking for prebuilt release at $url"
@@ -314,7 +314,7 @@ install_via_release() {
     fi
 
     local tmpdir
-    tmpdir="$(mktemp -d -t ironclaw-dl.XXXXXX)"
+    tmpdir="$(mktemp -d -t copperclaw-dl.XXXXXX)"
     # shellcheck disable=SC2064
     trap "rm -rf '$tmpdir'" RETURN
 
@@ -330,7 +330,7 @@ install_via_release() {
         return 1
     fi
 
-    mkdir -p "$IRONCLAW_INSTALL_DIR"
+    mkdir -p "$COPPERCLAW_INSTALL_DIR"
     local bin found_any=0
     for bin in "${BINARIES[@]}"; do
         # Tarballs may put binaries at the top level or inside a versioned
@@ -341,11 +341,11 @@ install_via_release() {
             warn "tarball did not contain $bin — falling back to source build"
             return 1
         fi
-        install -m 0755 "$src" "$IRONCLAW_INSTALL_DIR/$bin"
+        install -m 0755 "$src" "$COPPERCLAW_INSTALL_DIR/$bin"
         found_any=1
     done
     [ "$found_any" -eq 1 ] || return 1
-    ok "installed ${BINARIES[*]} -> $IRONCLAW_INSTALL_DIR"
+    ok "installed ${BINARIES[*]} -> $COPPERCLAW_INSTALL_DIR"
     return 0
 }
 
@@ -359,18 +359,18 @@ check_cargo() {
 }
 
 cargo_root() {
-    # cargo --root places binaries in <root>/bin. If IRONCLAW_INSTALL_DIR
+    # cargo --root places binaries in <root>/bin. If COPPERCLAW_INSTALL_DIR
     # already ends in /bin, strip it so cargo's implicit /bin lines up with
     # what the user asked for. Otherwise warn — the user's directory will
     # gain a /bin subdirectory containing the actual binaries.
-    case "$IRONCLAW_INSTALL_DIR" in
-        */bin) echo "${IRONCLAW_INSTALL_DIR%/bin}" ;;
+    case "$COPPERCLAW_INSTALL_DIR" in
+        */bin) echo "${COPPERCLAW_INSTALL_DIR%/bin}" ;;
         *)
-            warn "IRONCLAW_INSTALL_DIR ($IRONCLAW_INSTALL_DIR) does not end in /bin;"
-            warn "  cargo will install into $IRONCLAW_INSTALL_DIR/bin instead."
+            warn "COPPERCLAW_INSTALL_DIR ($COPPERCLAW_INSTALL_DIR) does not end in /bin;"
+            warn "  cargo will install into $COPPERCLAW_INSTALL_DIR/bin instead."
             # TODO(team-a): consider symlinking after install for paths that
             # don't end in /bin, or rejecting non-/bin dirs outright.
-            echo "$IRONCLAW_INSTALL_DIR" ;;
+            echo "$COPPERCLAW_INSTALL_DIR" ;;
     esac
 }
 
@@ -379,7 +379,7 @@ install_via_cargo_git() {
     step "building from source via 'cargo install --git'"
     local crate_name
     local args=(install --locked --root "$(cargo_root)" \
-                --git "https://github.com/${IRONCLAW_REPO}.git")
+                --git "https://github.com/${COPPERCLAW_REPO}.git")
     for bin in "${BINARIES[@]}"; do
         crate_name="$(crate_name_for_bin "$bin")"
         args+=("$crate_name")
@@ -388,7 +388,7 @@ install_via_cargo_git() {
         warn "'cargo install --git' failed"
         return 1
     fi
-    ok "installed ${BINARIES[*]} -> $IRONCLAW_INSTALL_DIR"
+    ok "installed ${BINARIES[*]} -> $COPPERCLAW_INSTALL_DIR"
     return 0
 }
 
@@ -410,7 +410,7 @@ install_via_cargo_path() {
             return 1
         fi
     done
-    ok "installed ${BINARIES[*]} -> $IRONCLAW_INSTALL_DIR"
+    ok "installed ${BINARIES[*]} -> $COPPERCLAW_INSTALL_DIR"
     return 0
 }
 
@@ -419,7 +419,7 @@ install_binaries() {
         dim "skipping binary install (user choice)"
         return 0
     fi
-    mkdir -p "$IRONCLAW_INSTALL_DIR"
+    mkdir -p "$COPPERCLAW_INSTALL_DIR"
     if install_via_release; then return 0; fi
     # Prefer a local checkout if we're sitting in one — faster, fewer surprises
     # than reaching for the network.
@@ -433,7 +433,7 @@ install_binaries() {
 
 warn_if_not_on_path() {
     case ":${PATH:-}:" in
-        *":$IRONCLAW_INSTALL_DIR:"*) return 0 ;;
+        *":$COPPERCLAW_INSTALL_DIR:"*) return 0 ;;
     esac
     local shell_rc=""
     case "${SHELL:-}" in
@@ -442,30 +442,30 @@ warn_if_not_on_path() {
         */fish) shell_rc="$HOME/.config/fish/config.fish" ;;
         *)      shell_rc="your shell rc" ;;
     esac
-    warn "$IRONCLAW_INSTALL_DIR is not on \$PATH"
+    warn "$COPPERCLAW_INSTALL_DIR is not on \$PATH"
     if [ "${SHELL:-}" = "${SHELL%/fish}" ] || [ "${SHELL:-}" = "" ]; then
         warn "  add this to $shell_rc:"
-        warn "    export PATH=\"$IRONCLAW_INSTALL_DIR:\$PATH\""
+        warn "    export PATH=\"$COPPERCLAW_INSTALL_DIR:\$PATH\""
     else
         warn "  add this to $shell_rc:"
-        warn "    set -gx PATH $IRONCLAW_INSTALL_DIR \$PATH"
+        warn "    set -gx PATH $COPPERCLAW_INSTALL_DIR \$PATH"
     fi
 }
 
 # ----- locate setup state & launch setup ------------------------------------
 
 setup_data_dir() {
-    if [ -n "${IRONCLAW_DATA_DIR:-}" ]; then
-        echo "$IRONCLAW_DATA_DIR"; return
+    if [ -n "${COPPERCLAW_DATA_DIR:-}" ]; then
+        echo "$COPPERCLAW_DATA_DIR"; return
     fi
     case "$PLATFORM_OS" in
         linux)
             if [ -n "${XDG_DATA_HOME:-}" ]; then
-                echo "$XDG_DATA_HOME/ironclaw"
+                echo "$XDG_DATA_HOME/copperclaw"
             else
-                echo "$HOME/.local/share/ironclaw"
+                echo "$HOME/.local/share/copperclaw"
             fi ;;
-        macos) echo "$HOME/Library/Application Support/ironclaw" ;;
+        macos) echo "$HOME/Library/Application Support/copperclaw" ;;
     esac
 }
 
@@ -474,17 +474,17 @@ state_file_path() {
 }
 
 run_setup() {
-    if [ "$IRONCLAW_SKIP_SETUP" = "1" ]; then
-        dim "skipping ironclaw-setup (IRONCLAW_SKIP_SETUP=1)"
+    if [ "$COPPERCLAW_SKIP_SETUP" = "1" ]; then
+        dim "skipping copperclaw-setup (COPPERCLAW_SKIP_SETUP=1)"
         return 0
     fi
 
-    local setup_bin="$IRONCLAW_INSTALL_DIR/ironclaw-setup"
+    local setup_bin="$COPPERCLAW_INSTALL_DIR/copperclaw-setup"
     if [ ! -x "$setup_bin" ]; then
-        if command -v ironclaw-setup >/dev/null 2>&1; then
-            setup_bin="$(command -v ironclaw-setup)"
+        if command -v copperclaw-setup >/dev/null 2>&1; then
+            setup_bin="$(command -v copperclaw-setup)"
         else
-            err "ironclaw-setup not found after install — something went wrong"
+            err "copperclaw-setup not found after install — something went wrong"
             exit 1
         fi
     fi
@@ -528,17 +528,17 @@ run_setup() {
     # If headless, surface the prompt-passthrough envs setup understands so
     # the user can re-run unattended.
     local extra_args=()
-    if [ "${IRONCLAW_SETUP_HEADLESS:-0}" = "1" ]; then
+    if [ "${COPPERCLAW_SETUP_HEADLESS:-0}" = "1" ]; then
         extra_args+=(--headless)
     fi
-    if [ -n "${IRONCLAW_DATA_DIR:-}" ]; then
-        extra_args+=(--data-dir "$IRONCLAW_DATA_DIR")
+    if [ -n "${COPPERCLAW_DATA_DIR:-}" ]; then
+        extra_args+=(--data-dir "$COPPERCLAW_DATA_DIR")
     fi
 
-    step "running ironclaw-setup"
+    step "running copperclaw-setup"
     # Run setup *attached* — it's interactive by default. Don't swallow.
     if ! "$setup_bin" "${extra_args[@]}"; then
-        err "ironclaw-setup exited non-zero"
+        err "copperclaw-setup exited non-zero"
         exit 1
     fi
     ok "setup complete"
@@ -551,22 +551,22 @@ print_next_steps() {
     data_dir="$(setup_data_dir)"
     cat <<EOF
 
-${C_BOLD}${C_GREEN}ironclaw is installed.${C_RESET}
+${C_BOLD}${C_GREEN}copperclaw is installed.${C_RESET}
 
 Start the host:
-  ${C_BOLD}ironclaw run${C_RESET}
+  ${C_BOLD}copperclaw run${C_RESET}
 
 In another terminal, talk to it:
-  ${C_BOLD}iclaw chat${C_RESET}
+  ${C_BOLD}cclaw chat${C_RESET}
 
 Useful one-shots:
-  iclaw status            # full wiring digest
-  iclaw health            # operator probe (sessions, audit, drops)
-  iclaw usage --since 24h # per-group token rollup
+  cclaw status            # full wiring digest
+  cclaw health            # operator probe (sessions, audit, drops)
+  cclaw usage --since 24h # per-group token rollup
 
 Data directory: ${data_dir}
 Logs:           ${data_dir}/logs/
-Docs:           https://github.com/${IRONCLAW_REPO}#documentation
+Docs:           https://github.com/${COPPERCLAW_REPO}#documentation
 
 EOF
 }
@@ -574,30 +574,30 @@ EOF
 # ----- main ------------------------------------------------------------------
 
 print_release_url() {
-    local tag="$IRONCLAW_RELEASE_TAG" base
+    local tag="$COPPERCLAW_RELEASE_TAG" base
     if [ "$tag" = "latest" ]; then
-        base="https://github.com/${IRONCLAW_REPO}/releases/latest/download"
+        base="https://github.com/${COPPERCLAW_REPO}/releases/latest/download"
     else
-        base="https://github.com/${IRONCLAW_REPO}/releases/download/${tag}"
+        base="https://github.com/${COPPERCLAW_REPO}/releases/download/${tag}"
     fi
-    printf '%s/ironclaw-%s.tar.gz\n' "$base" "$PLATFORM_TRIPLE"
+    printf '%s/copperclaw-%s.tar.gz\n' "$base" "$PLATFORM_TRIPLE"
 }
 
 main() {
-    step "ironclaw installer"
+    step "copperclaw installer"
     detect_platform
 
     # TODO(team-j): dry-run prints the tarball URL the installer would fetch
     # and exits 0, without touching docker, cargo, or the filesystem. Used by
     # the platform-detection test case.
-    if [ "$IRONCLAW_INSTALL_DRY_RUN" = "1" ]; then
+    if [ "$COPPERCLAW_INSTALL_DRY_RUN" = "1" ]; then
         print_release_url
         exit 0
     fi
 
     check_container_runtime
 
-    if already_installed && [ "$IRONCLAW_FORCE_REINSTALL" != "1" ]; then
+    if already_installed && [ "$COPPERCLAW_FORCE_REINSTALL" != "1" ]; then
         prompt_upgrade_or_skip
     fi
 

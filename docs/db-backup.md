@@ -1,14 +1,14 @@
 # Database backup and restore
 
-The central database `<data_dir>/ironclaw.db` is a single SQLite file
+The central database `<data_dir>/copperclaw.db` is a single SQLite file
 holding every agent group, messaging-group wiring, audit-log row,
 token-usage record, sender approval, and per-group budget. A loss of
 this file requires re-seeding all of that state by hand. The
 operational story is straightforward but has one important sharp edge.
 
-## Backup — `iclaw db backup <path>`
+## Backup — `cclaw db backup <path>`
 
-Routes through the iclaw socket so the action lands in `audit_log`.
+Routes through the cclaw socket so the action lands in `audit_log`.
 Steps the handler runs, in order:
 
 1. `PRAGMA wal_checkpoint(TRUNCATE)` against the open host connection
@@ -27,7 +27,7 @@ Example:
 
 ```
 # Stop-the-world is NOT required.
-iclaw db backup /var/backups/ironclaw-$(date +%F).db
+cclaw db backup /var/backups/copperclaw-$(date +%F).db
 
 # Returns: { "path": "...", "wal_pages_remaining": 0 }
 # wal_pages_remaining > 0 means the WAL didn't fully drain.
@@ -44,17 +44,17 @@ The handler errors are:
 The backup file is a self-contained SQLite database — you can open it
 read-only with `sqlite3 backup.db .dump` to inspect, or restore it
 into a different install by overwriting that install's
-`<data_dir>/ironclaw.db` while its host is stopped.
+`<data_dir>/copperclaw.db` while its host is stopped.
 
 ### Cadence
 
-There is no built-in scheduler. Pair `iclaw db backup` with a cron
+There is no built-in scheduler. Pair `cclaw db backup` with a cron
 job or systemd timer:
 
 ```
-# /etc/systemd/system/ironclaw-backup.timer
+# /etc/systemd/system/copperclaw-backup.timer
 [Unit]
-Description=Nightly Ironclaw central DB backup
+Description=Nightly Copperclaw central DB backup
 
 [Timer]
 OnCalendar=daily
@@ -65,21 +65,21 @@ WantedBy=timers.target
 ```
 
 ```
-# /etc/systemd/system/ironclaw-backup.service
+# /etc/systemd/system/copperclaw-backup.service
 [Unit]
-Description=Ironclaw central DB backup
+Description=Copperclaw central DB backup
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/iclaw db backup /var/backups/ironclaw/ironclaw-%i.db
+ExecStart=/usr/local/bin/cclaw db backup /var/backups/copperclaw/copperclaw-%i.db
 ```
 
 Pair with the logrotate-style retention policy you already use for
 `<data_dir>/logs/` (see `docs/observability.md`).
 
-## Restore — why the iclaw command always refuses
+## Restore — why the cclaw command always refuses
 
-`iclaw db restore <path>` exists in the CLI for discoverability, but
+`cclaw db restore <path>` exists in the CLI for discoverability, but
 the handler **always** returns:
 
 ```
@@ -87,7 +87,7 @@ host_running: db restore cannot run while the host is active...
 ```
 
 The reason is structural: the host process holds an open WAL
-connection to `<data_dir>/ironclaw.db`. Replacing the file underneath
+connection to `<data_dir>/copperclaw.db`. Replacing the file underneath
 that connection would corrupt the database — the WAL header would no
 longer match the main file's page count, and the next write would
 race a concurrent reader against a stale page cache.
@@ -96,31 +96,31 @@ The correct procedure is **offline restore**:
 
 ```
 # 1. Stop the host. systemd:
-sudo systemctl stop ironclaw
+sudo systemctl stop copperclaw
 
 # Or, manual (preferred — handles SIGTERM grace + SIGKILL fallback):
-ironclaw stop
+copperclaw stop
 # Or if you have to do it by PID:
-kill "$(cat <data_dir>/ironclaw.pid)"
-# Wait until `ironclaw status` reports stopped and the iclaw.sock
+kill "$(cat <data_dir>/copperclaw.pid)"
+# Wait until `copperclaw status` reports stopped and the cclaw.sock
 # file is gone.
 
 # 2. Copy the backup over the live file.
-sudo cp /var/backups/ironclaw-2026-05-21.db /srv/ironclaw/data/ironclaw.db
+sudo cp /var/backups/copperclaw-2026-05-21.db /srv/copperclaw/data/copperclaw.db
 
 # 3. (Optional) re-apply migrations against the restored file.  This
 # is a no-op if the backup was taken from a release with the same
 # schema version, and forward-compatible-fills any gap if the backup
 # came from an older release.
-sudo -u ironclaw ironclaw migrate
+sudo -u copperclaw copperclaw migrate
 
 # 4. Restart.
-sudo systemctl start ironclaw
+sudo systemctl start copperclaw
 ```
 
 ## What is **not** in the backup
 
-The central DB is the only thing `iclaw db backup` captures. To restore
+The central DB is the only thing `cclaw db backup` captures. To restore
 a complete install you also need:
 
 - `<data_dir>/sessions/` — per-session `inbound.db` / `outbound.db`

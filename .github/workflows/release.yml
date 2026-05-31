@@ -1,10 +1,10 @@
 name: release
 
-# Cuts a tagged release of the three ironclaw binaries (ironclaw,
-# iclaw, ironclaw-setup) as one tar.gz per target triple, attaches a
+# Cuts a tagged release of the three copperclaw binaries (copperclaw,
+# cclaw, copperclaw-setup) as one tar.gz per target triple, attaches a
 # SHA256SUMS manifest, and uploads everything to a GitHub Release with
 # notes extracted from CHANGELOG.md. The naming convention
-# (`ironclaw-<target>.tar.gz`, binaries at the top level) is what
+# (`copperclaw-<target>.tar.gz`, binaries at the top level) is what
 # install.sh expects in `install_via_release`; do not change it
 # without updating install.sh in lockstep.
 #
@@ -39,7 +39,7 @@ env:
   CARGO_TERM_COLOR: always
   # Three binaries from three workspace crates. Mirrors install.sh's
   # BINARIES array; keep in sync.
-  IRONCLAW_BINARIES: "ironclaw iclaw ironclaw-setup"
+  COPPERCLAW_BINARIES: "copperclaw cclaw copperclaw-setup"
 
 jobs:
   build:
@@ -104,9 +104,9 @@ jobs:
         # `--bins` resolves unambiguously. `--locked` matches CI.
         run: |
           cargo build --release --locked --target ${{ matrix.target }} \
-            -p ironclaw-host \
-            -p ironclaw-iclaw \
-            -p ironclaw-setup \
+            -p copperclaw-host \
+            -p copperclaw-cclaw \
+            -p copperclaw-setup \
             --bins
 
       - name: Strip binaries
@@ -118,7 +118,7 @@ jobs:
         run: |
           set -euo pipefail
           out="target/${{ matrix.target }}/release"
-          for bin in $IRONCLAW_BINARIES; do
+          for bin in $COPPERCLAW_BINARIES; do
             path="$out/$bin"
             [ -f "$path" ] || { echo "missing binary: $path" >&2; exit 1; }
             if [ "${{ runner.os }}" = "macOS" ]; then
@@ -140,16 +140,16 @@ jobs:
           # Binaries land at the top level of the archive — install.sh
           # tolerates a versioned subdir but top-level is what its
           # `find -type f -name <bin> -print -quit` resolves first.
-          for bin in $IRONCLAW_BINARIES; do
+          for bin in $COPPERCLAW_BINARIES; do
             cp "$out/$bin" "$stage/$bin"
           done
           mkdir -p dist
-          tarball="dist/ironclaw-${{ matrix.target }}.tar.gz"
+          tarball="dist/copperclaw-${{ matrix.target }}.tar.gz"
           # GNU tar (Linux runner) and bsdtar (macOS runner) both
           # accept this basic form; we skip --owner/--group rather
           # than fork the command, since the tarball is consumed by
           # `install`(1) which sets perms anyway.
-          tar -czf "$tarball" -C "$stage" $IRONCLAW_BINARIES
+          tar -czf "$tarball" -C "$stage" $COPPERCLAW_BINARIES
           ls -lh "$tarball"
           # Quick sanity check: archive must contain exactly the
           # three binaries at the top level. Catches accidental
@@ -163,21 +163,21 @@ jobs:
           set -euo pipefail
           cd dist
           if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "ironclaw-${{ matrix.target }}.tar.gz" > "ironclaw-${{ matrix.target }}.tar.gz.sha256"
+            sha256sum "copperclaw-${{ matrix.target }}.tar.gz" > "copperclaw-${{ matrix.target }}.tar.gz.sha256"
           else
             # macOS doesn't ship sha256sum; shasum -a 256 matches the
             # `<hash>  <file>` format sha256sum produces.
-            shasum -a 256 "ironclaw-${{ matrix.target }}.tar.gz" > "ironclaw-${{ matrix.target }}.tar.gz.sha256"
+            shasum -a 256 "copperclaw-${{ matrix.target }}.tar.gz" > "copperclaw-${{ matrix.target }}.tar.gz.sha256"
           fi
-          cat "ironclaw-${{ matrix.target }}.tar.gz.sha256"
+          cat "copperclaw-${{ matrix.target }}.tar.gz.sha256"
 
       - name: Upload tarball artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ironclaw-${{ matrix.target }}
+          name: copperclaw-${{ matrix.target }}
           path: |
-            dist/ironclaw-${{ matrix.target }}.tar.gz
-            dist/ironclaw-${{ matrix.target }}.tar.gz.sha256
+            dist/copperclaw-${{ matrix.target }}.tar.gz
+            dist/copperclaw-${{ matrix.target }}.tar.gz.sha256
           if-no-files-found: error
           retention-days: 7
 
@@ -205,15 +205,15 @@ jobs:
           mkdir -p release
           # Artifacts download into per-name subdirectories; flatten.
           find dist-staging -type f \
-            \( -name "ironclaw-*.tar.gz" -o -name "ironclaw-*.tar.gz.sha256" \) \
+            \( -name "copperclaw-*.tar.gz" -o -name "copperclaw-*.tar.gz.sha256" \) \
             -exec cp {} release/ \;
           ls -lh release/
           # Combine per-target .sha256 files into one SHA256SUMS that
           # `sha256sum -c SHA256SUMS` can verify in one shot.
-          ( cd release && cat ironclaw-*.tar.gz.sha256 > SHA256SUMS )
+          ( cd release && cat copperclaw-*.tar.gz.sha256 > SHA256SUMS )
           # Drop the per-target .sha256 files now that SHA256SUMS
           # supersedes them — keeps the release page tidy.
-          rm -f release/ironclaw-*.tar.gz.sha256
+          rm -f release/copperclaw-*.tar.gz.sha256
           echo "---- final release assets ----"
           ls -lh release/
           echo "---- SHA256SUMS ----"
@@ -270,7 +270,7 @@ jobs:
           prerelease: false
           fail_on_unmatched_files: true
           files: |
-            release/ironclaw-*.tar.gz
+            release/copperclaw-*.tar.gz
             release/SHA256SUMS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

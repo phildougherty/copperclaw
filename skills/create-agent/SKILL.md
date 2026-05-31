@@ -22,27 +22,27 @@ unless an admin moves it to a different group later.
 ```
 
 - `name` (required, non-blank). Becomes the agent group's display name
-  in the central DB. Used in audit logs, in `iclaw groups list`, and as
+  in the central DB. Used in audit logs, in `cclaw groups list`, and as
   the sender display name when the new agent emits messages.
 - `instructions` (required, non-blank). The system prompt of the new
   agent. Write this the way you would write a `claude.system_prompt`:
   describe the persona, scope, and the channels it owns.
 - `channel` (optional). A fully-qualified channel id the new agent
   should be wired to immediately. If absent, the new agent boots
-  unbound and waits for an admin to attach it via `iclaw wirings create`.
+  unbound and waits for an admin to attach it via `cclaw wirings create`.
 
 ## What "instructions" means
 
 The text becomes the new agent's persistent system prompt. Describe
 the persona, the scope / constraints, and what tools and channels it
-owns. Admins can rewrite later via `iclaw groups update <id>
+owns. Admins can rewrite later via `cclaw groups update <id>
 --system-prompt '<text>'`.
 
 ## Channel routing
 
 Set `channel` to wire the new agent to a specific channel at spawn.
 Omit it for an unbound agent — you can attach one later with
-`iclaw wirings create --mg <mg> --ag <ag>`, or just `send_message`
+`cclaw wirings create --mg <mg> --ag <ag>`, or just `send_message`
 to it directly with `to: {kind: "agent", session_id: ...}`.
 
 ## Result

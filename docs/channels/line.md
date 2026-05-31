@@ -20,7 +20,7 @@
 
 ## Implemented
 - deliver: PARTIAL — text only. Reply-or-push fallback uses the
-  inbound reply token cache. `crates/ironclaw-channels/line/src/adapter.rs:129`
+  inbound reply token cache. `crates/copperclaw-channels/line/src/adapter.rs:129`
 - subscribe: trait-default Ok (router handles webhook).
 - set_typing: trait-default Ok (no platform concept).
 - edit_message: NOT implemented. Any non-"post" action returns BadRequest.
@@ -39,7 +39,7 @@ HIGH:
 MED:
 - Files unsupported. LINE supports image / video / audio / file
   messages, but encoding them requires a multipart upload step we
-  haven't built. `crates/ironclaw-channels/line/src/adapter.rs:135`
+  haven't built. `crates/copperclaw-channels/line/src/adapter.rs:135`
 
 LOW:
 - Reply tokens are single-use and time-limited; if the cache slot is

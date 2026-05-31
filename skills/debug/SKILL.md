@@ -6,7 +6,7 @@ description: Troubleshooting flow for when the user reports a problem ("you didn
 # debug
 
 Investigates a user-reported issue. The agent runs *inside* the
-container; the host log and `iclaw` socket are *outside*. Pull
+container; the host log and `cclaw` socket are *outside*. Pull
 whatever diagnostics you can from the container, then hand the
 remaining commands to the operator.
 
@@ -28,8 +28,8 @@ expired credential, and the user's answer narrows the search.
   (`/data/*.log` if present).
 
 Host-side data is **not** reachable from `read_file`. The host log
-lives at `<data_dir>/logs/ironclaw.out.log` (and `.err.log`) and
-the `iclaw` socket is the only way into the central DB. Both are
+lives at `<data_dir>/logs/copperclaw.out.log` (and `.err.log`) and
+the `cclaw` socket is the only way into the central DB. Both are
 operator-side.
 
 ## Step 3 — route the rest to the operator
@@ -38,20 +38,20 @@ Print these commands and ask the operator to paste the results
 back:
 
 ```
-iclaw doctor                                   # composite first-run / ongoing diagnostic; FAIL rows include `fix:` hints
-iclaw health                                   # structured health probe (sessions + audit + drops snapshot)
-iclaw status                                   # wiring digest
-iclaw audit list --since 1h                    # recent mutations
-iclaw dropped-messages list --since 1h         # delivery failures
-iclaw sessions get <session_id>                # this session's state
+cclaw doctor                                   # composite first-run / ongoing diagnostic; FAIL rows include `fix:` hints
+cclaw health                                   # structured health probe (sessions + audit + drops snapshot)
+cclaw status                                   # wiring digest
+cclaw audit list --since 1h                    # recent mutations
+cclaw dropped-messages list --since 1h         # delivery failures
+cclaw sessions get <session_id>                # this session's state
 ```
 
-The host log is at `<data_dir>/logs/ironclaw.out.log` and
-`<data_dir>/logs/ironclaw.err.log`. Ask the operator to grep for
+The host log is at `<data_dir>/logs/copperclaw.out.log` and
+`<data_dir>/logs/copperclaw.err.log`. Ask the operator to grep for
 `ERROR` or `WARN` in the last 10 minutes:
 
 ```
-tail -n 500 <data_dir>/logs/ironclaw.err.log | grep -iE 'error|warn'
+tail -n 500 <data_dir>/logs/copperclaw.err.log | grep -iE 'error|warn'
 ```
 
 ## Step 4 — synthesize
@@ -66,14 +66,14 @@ Once you have the diagnostics, write a single message that names:
 Common patterns:
 
 - Delivery rows in `dropped-messages` with `Auth` failures → channel
-  credential expired. Operator runs `ironclaw-setup` or rotates the
-  token via `iclaw destinations update ...`.
+  credential expired. Operator runs `copperclaw-setup` or rotates the
+  token via `cclaw destinations update ...`.
 - `audit list` shows recent failed `groups.config.update` → policy
-  rejected the mutation; check approvals: `iclaw approvals list`.
+  rejected the mutation; check approvals: `cclaw approvals list`.
 - No outbound rows but inbound has new entries → runner stalled.
-  `iclaw groups restart <id>`.
-- `health` reports degraded with stuck sessions → ironclaw bounce:
-  `ironclaw stop && ironclaw start`.
+  `cclaw groups restart <id>`.
+- `health` reports degraded with stuck sessions → copperclaw bounce:
+  `copperclaw stop && copperclaw start`.
 
 ## Step 5 — fall through
 
@@ -92,9 +92,9 @@ checkmarks), whether other agents on the same install respond.
 
 ## Do NOT
 
-- Do not call `shell` to run `iclaw` — `iclaw` is not on the
+- Do not call `shell` to run `cclaw` — `cclaw` is not on the
   container's PATH and the socket isn't bind-mounted. Always route
-  iclaw commands to the operator.
+  cclaw commands to the operator.
 - Do not retry sending the message that "didn't go through" until
   diagnostics rule out a duplicate-delivery race — the host's
   delivery loop already retries up to 3 times.

@@ -3,7 +3,7 @@
 A replay fixture is a captured platform interaction — webhook
 bodies, gateway frames, REST responses — bundled with the
 configuration that produced it. Replaying a fixture against a
-freshly-spawned Ironclaw host should produce a byte-identical
+freshly-spawned Copperclaw host should produce a byte-identical
 outbound trace.
 
 This is differential testing: the same input that hit production
@@ -39,7 +39,7 @@ fixtures/<channel>/<scenario>/
     └── delivered.jsonl       # outbound platform calls
 ```
 
-The harness lives in `crates/ironclaw-host/tests/replay/`; the loader
+The harness lives in `crates/copperclaw-host/tests/replay/`; the loader
 is `fixture.rs::load`.
 
 ### `manifest.json`
@@ -66,7 +66,7 @@ Optional fields used by failure-mode fixtures:
 - `adapter_caps`: `{ "<channel>": <usize> }` — override the per-channel
   `max_message_chars` cap the harness's wrapped `MockAdapter` reports
   (defaults: `telegram=4096`, `slack=40000`, `discord=2000`, etc.; see
-  `default_cap_for` in `crates/ironclaw-host/tests/replay/harness.rs`).
+  `default_cap_for` in `crates/copperclaw-host/tests/replay/harness.rs`).
   Used by the `*-long-message-split` fixtures to exercise the delivery
   loop's chat-text splitter.
 - `pre_delivery_failures`: `[{"channel": "telegram", "kind": "rate",
@@ -139,8 +139,8 @@ specific: `messages-in[0].content.text` differs by 1 char.
 
 ## Harness layout
 
-The replay harness lives in `crates/ironclaw-host/tests/replay/`
-(or a dedicated `crates/ironclaw-replay/` if the surface grows). It
+The replay harness lives in `crates/copperclaw-host/tests/replay/`
+(or a dedicated `crates/copperclaw-replay/` if the surface grows). It
 re-uses everything in the host's existing integration test surface:
 
 - `CentralDb::open_in_memory()` for the central DB.
@@ -175,14 +175,14 @@ zero or more `Mismatch { path, expected, actual }` entries.
 When a real platform interaction reveals a bug, capture it for the
 replay suite:
 
-1. **Record.** Run the host with `IRONCLAW_FIXTURE_CAPTURE=<dir>` —
+1. **Record.** Run the host with `COPPERCLAW_FIXTURE_CAPTURE=<dir>` —
    the channel adapter and router will tee inbound bodies, the
    Anthropic provider will tee the SSE stream, and the database
    layer will tee writes. The directory ends up with the same shape
    as a hand-authored fixture.
 2. **Redact.** `target/fixture-capture/...` will contain bearer
    tokens, signing secrets, and personal text. The redaction pass
-   lives at `crates/ironclaw-host/src/fixture/redact.rs` but is not
+   lives at `crates/copperclaw-host/src/fixture/redact.rs` but is not
    wired to a CLI subcommand — write a small one-shot Rust binary
    or shell script that walks the capture dir and feeds each file
    through `redact::redact_bytes` (see the unit tests in that file
@@ -222,8 +222,8 @@ replay suite:
 ## What the suite does **not** cover
 
 - **Container build correctness.** Image-build, package install,
-  and skill mount are covered by `ironclaw-container-rt`,
-  `ironclaw-skills`, and the runner integration tests. Replay
+  and skill mount are covered by `copperclaw-container-rt`,
+  `copperclaw-skills`, and the runner integration tests. Replay
   fixtures assume the container is up.
 - **OneCLI authentication.** Replays run with `Caller::Host` and a
   fake CLI scope; OneCLI's gateway is tested independently.

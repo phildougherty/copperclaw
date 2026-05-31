@@ -23,5 +23,5 @@ The fixture asserts:
 - `delivered.jsonl` — one chat-kind message routed back to `cli/stdin`
   asking the operator to approve the unknown sender.
 
-See also `crates/ironclaw-host-router/src/route.rs` (`PendingReason::
-SenderUnregistered`) and `crates/ironclaw-modules/src/approvals.rs`.
+See also `crates/copperclaw-host-router/src/route.rs` (`PendingReason::
+SenderUnregistered`) and `crates/copperclaw-modules/src/approvals.rs`.

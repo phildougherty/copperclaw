@@ -426,6 +426,871 @@ dependencies = [
 ]
 
 [[package]]
+name = "copperclaw-cclaw"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "clap_complete",
+ "copperclaw-db",
+ "copperclaw-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "copperclaw-channels-cli"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "copperclaw-channels-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "copperclaw-types",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "copperclaw-channels-deltachat"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "copperclaw-channels-discord"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "copperclaw-channels-emacs"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "copperclaw-channels-gchat"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "bytes",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "hex",
+ "hmac",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "copperclaw-channels-github"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "hex",
+ "hmac",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "copperclaw-channels-imessage"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "copperclaw-channels-line"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "bytes",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "hex",
+ "hmac",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "copperclaw-channels-linear"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "hex",
+ "hmac",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "copperclaw-channels-matrix"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "copperclaw-channels-mattermost"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "copperclaw-channels-resend"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "copperclaw-channels-signal"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "copperclaw-channels-slack"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "futures",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "copperclaw-channels-teams"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64",
+ "bytes",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "hex",
+ "hmac",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "copperclaw-channels-telegram"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "futures",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "copperclaw-channels-webex"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "hex",
+ "hmac",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha1",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "copperclaw-channels-webhooks"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "hex",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "copperclaw-channels-wechat"
+version = "0.1.0"
+dependencies = [
+ "aes",
+ "async-trait",
+ "axum",
+ "base64",
+ "bytes",
+ "cbc",
+ "chrono",
+ "cipher",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "hex",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha1",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "url",
+ "wiremock",
+]
+
+[[package]]
+name = "copperclaw-channels-whatsapp-cloud"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "hex",
+ "hmac",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "copperclaw-channels-x"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-types",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "copperclaw-container-rt"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bollard",
+ "bytes",
+ "copperclaw-types",
+ "futures",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "copperclaw-db"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "copperclaw-types",
+ "hex",
+ "libc",
+ "r2d2",
+ "r2d2_sqlite",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "copperclaw-host"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "clap",
+ "copperclaw-cclaw",
+ "copperclaw-channels-cli",
+ "copperclaw-channels-core",
+ "copperclaw-channels-deltachat",
+ "copperclaw-channels-discord",
+ "copperclaw-channels-emacs",
+ "copperclaw-channels-gchat",
+ "copperclaw-channels-github",
+ "copperclaw-channels-imessage",
+ "copperclaw-channels-line",
+ "copperclaw-channels-linear",
+ "copperclaw-channels-matrix",
+ "copperclaw-channels-mattermost",
+ "copperclaw-channels-resend",
+ "copperclaw-channels-signal",
+ "copperclaw-channels-slack",
+ "copperclaw-channels-teams",
+ "copperclaw-channels-telegram",
+ "copperclaw-channels-webex",
+ "copperclaw-channels-webhooks",
+ "copperclaw-channels-wechat",
+ "copperclaw-channels-whatsapp-cloud",
+ "copperclaw-channels-x",
+ "copperclaw-container-rt",
+ "copperclaw-db",
+ "copperclaw-host-delivery",
+ "copperclaw-host-router",
+ "copperclaw-host-sweep",
+ "copperclaw-mcp",
+ "copperclaw-metrics",
+ "copperclaw-modules",
+ "copperclaw-onecli",
+ "copperclaw-providers",
+ "copperclaw-runner",
+ "copperclaw-skills",
+ "copperclaw-types",
+ "dashmap",
+ "dotenvy",
+ "filetime",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "copperclaw-host-delivery"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-db",
+ "copperclaw-metrics",
+ "copperclaw-modules",
+ "copperclaw-types",
+ "dashmap",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "copperclaw-host-router"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "copperclaw-db",
+ "copperclaw-metrics",
+ "copperclaw-modules",
+ "copperclaw-types",
+ "dashmap",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "copperclaw-host-sweep"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-db",
+ "copperclaw-metrics",
+ "copperclaw-modules",
+ "copperclaw-types",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "copperclaw-mcp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "copperclaw-channels-core",
+ "copperclaw-db",
+ "copperclaw-types",
+ "git2",
+ "globset",
+ "htmd",
+ "ignore",
+ "regex",
+ "reqwest",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "similar",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "copperclaw-metrics"
+version = "0.1.0"
+dependencies = [
+ "metrics",
+ "metrics-exporter-prometheus",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "copperclaw-modules"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "copperclaw-db",
+ "copperclaw-types",
+ "croner",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "copperclaw-onecli"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "copperclaw-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "wiremock",
+]
+
+[[package]]
+name = "copperclaw-providers"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "copperclaw-types",
+ "eventsource-stream",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "copperclaw-runner"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "clap",
+ "copperclaw-channels-core",
+ "copperclaw-db",
+ "copperclaw-mcp",
+ "copperclaw-metrics",
+ "copperclaw-providers",
+ "copperclaw-types",
+ "rmcp",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "copperclaw-setup"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "copperclaw-container-rt",
+ "copperclaw-db",
+ "copperclaw-onecli",
+ "copperclaw-types",
+ "dialoguer",
+ "dotenvy",
+ "indicatif",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wiremock",
+]
+
+[[package]]
+name = "copperclaw-skills"
+version = "0.1.0"
+dependencies = [
+ "copperclaw-types",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "copperclaw-types"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1377,871 +2242,6 @@ name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
-
-[[package]]
-name = "ironclaw-channels-cli"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "ironclaw-channels-core",
- "ironclaw-types",
- "libc",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "ironclaw-channels-core"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "ironclaw-types",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "ironclaw-channels-deltachat"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "ironclaw-channels-core",
- "ironclaw-types",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "ironclaw-channels-discord"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "chrono",
- "futures",
- "ironclaw-channels-core",
- "ironclaw-types",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "url",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "ironclaw-channels-emacs"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "ironclaw-channels-core",
- "ironclaw-types",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "ironclaw-channels-gchat"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "base64",
- "bytes",
- "chrono",
- "hex",
- "hmac",
- "ironclaw-channels-core",
- "ironclaw-types",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tracing",
- "url",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "ironclaw-channels-github"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "bytes",
- "chrono",
- "hex",
- "hmac",
- "ironclaw-channels-core",
- "ironclaw-types",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tracing",
- "url",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "ironclaw-channels-imessage"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "ironclaw-channels-core",
- "ironclaw-types",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "ironclaw-channels-line"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "base64",
- "bytes",
- "chrono",
- "hex",
- "hmac",
- "ironclaw-channels-core",
- "ironclaw-types",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tracing",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "ironclaw-channels-linear"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "bytes",
- "chrono",
- "hex",
- "hmac",
- "ironclaw-channels-core",
- "ironclaw-types",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tracing",
- "url",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "ironclaw-channels-matrix"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "ironclaw-channels-core",
- "ironclaw-types",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "ironclaw-channels-mattermost"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "bytes",
- "chrono",
- "ironclaw-channels-core",
- "ironclaw-types",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tracing",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "ironclaw-channels-resend"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "ironclaw-channels-core",
- "ironclaw-types",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "wiremock",
-]
-
-[[package]]
-name = "ironclaw-channels-signal"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "base64",
- "chrono",
- "ironclaw-channels-core",
- "ironclaw-types",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "ironclaw-channels-slack"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "bytes",
- "chrono",
- "futures",
- "hex",
- "ironclaw-channels-core",
- "ironclaw-types",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tracing",
- "url",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "ironclaw-channels-teams"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "base64",
- "bytes",
- "chrono",
- "hex",
- "hmac",
- "ironclaw-channels-core",
- "ironclaw-types",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tracing",
- "url",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "ironclaw-channels-telegram"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "bytes",
- "chrono",
- "futures",
- "hex",
- "ironclaw-channels-core",
- "ironclaw-types",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tower",
- "tracing",
- "url",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "ironclaw-channels-webex"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "bytes",
- "chrono",
- "hex",
- "hmac",
- "ironclaw-channels-core",
- "ironclaw-types",
- "reqwest",
- "serde",
- "serde_json",
- "sha1",
- "sha2",
- "subtle",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tracing",
- "url",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "ironclaw-channels-webhooks"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "bytes",
- "chrono",
- "hex",
- "hmac",
- "ironclaw-channels-core",
- "ironclaw-types",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "ironclaw-channels-wechat"
-version = "0.1.0"
-dependencies = [
- "aes",
- "async-trait",
- "axum",
- "base64",
- "bytes",
- "cbc",
- "chrono",
- "cipher",
- "hex",
- "ironclaw-channels-core",
- "ironclaw-types",
- "reqwest",
- "serde",
- "serde_json",
- "sha1",
- "subtle",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tracing",
- "url",
- "wiremock",
-]
-
-[[package]]
-name = "ironclaw-channels-whatsapp-cloud"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "bytes",
- "chrono",
- "hex",
- "hmac",
- "ironclaw-channels-core",
- "ironclaw-types",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tracing",
- "url",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "ironclaw-channels-x"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "chrono",
- "futures",
- "ironclaw-channels-core",
- "ironclaw-types",
- "reqwest",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "url",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "ironclaw-container-rt"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bollard",
- "bytes",
- "futures",
- "hex",
- "ironclaw-types",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "ironclaw-db"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "hex",
- "ironclaw-types",
- "libc",
- "r2d2",
- "r2d2_sqlite",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "ironclaw-host"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "clap",
- "dashmap",
- "dotenvy",
- "filetime",
- "ironclaw-channels-cli",
- "ironclaw-channels-core",
- "ironclaw-channels-deltachat",
- "ironclaw-channels-discord",
- "ironclaw-channels-emacs",
- "ironclaw-channels-gchat",
- "ironclaw-channels-github",
- "ironclaw-channels-imessage",
- "ironclaw-channels-line",
- "ironclaw-channels-linear",
- "ironclaw-channels-matrix",
- "ironclaw-channels-mattermost",
- "ironclaw-channels-resend",
- "ironclaw-channels-signal",
- "ironclaw-channels-slack",
- "ironclaw-channels-teams",
- "ironclaw-channels-telegram",
- "ironclaw-channels-webex",
- "ironclaw-channels-webhooks",
- "ironclaw-channels-wechat",
- "ironclaw-channels-whatsapp-cloud",
- "ironclaw-channels-x",
- "ironclaw-container-rt",
- "ironclaw-db",
- "ironclaw-host-delivery",
- "ironclaw-host-router",
- "ironclaw-host-sweep",
- "ironclaw-iclaw",
- "ironclaw-mcp",
- "ironclaw-metrics",
- "ironclaw-modules",
- "ironclaw-onecli",
- "ironclaw-providers",
- "ironclaw-runner",
- "ironclaw-skills",
- "ironclaw-types",
- "metrics",
- "metrics-exporter-prometheus",
- "regex",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "ironclaw-host-delivery"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "dashmap",
- "ironclaw-channels-core",
- "ironclaw-db",
- "ironclaw-metrics",
- "ironclaw-modules",
- "ironclaw-types",
- "metrics",
- "metrics-exporter-prometheus",
- "rusqlite",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "ironclaw-host-router"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "dashmap",
- "ironclaw-db",
- "ironclaw-metrics",
- "ironclaw-modules",
- "ironclaw-types",
- "rusqlite",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "ironclaw-host-sweep"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "ironclaw-channels-core",
- "ironclaw-db",
- "ironclaw-metrics",
- "ironclaw-modules",
- "ironclaw-types",
- "rusqlite",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "ironclaw-iclaw"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "clap",
- "clap_complete",
- "ironclaw-db",
- "ironclaw-types",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "toml",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "ironclaw-mcp"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "git2",
- "globset",
- "htmd",
- "ignore",
- "ironclaw-channels-core",
- "ironclaw-db",
- "ironclaw-types",
- "regex",
- "reqwest",
- "rmcp",
- "serde",
- "serde_json",
- "similar",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "wiremock",
-]
-
-[[package]]
-name = "ironclaw-metrics"
-version = "0.1.0"
-dependencies = [
- "metrics",
- "metrics-exporter-prometheus",
- "thiserror 2.0.18",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "ironclaw-modules"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "croner",
- "ironclaw-db",
- "ironclaw-types",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "ironclaw-onecli"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "chrono",
- "ironclaw-types",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "url",
- "wiremock",
-]
-
-[[package]]
-name = "ironclaw-providers"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "bytes",
- "chrono",
- "eventsource-stream",
- "futures",
- "ironclaw-types",
- "reqwest",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "url",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "ironclaw-runner"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-trait",
- "chrono",
- "clap",
- "ironclaw-channels-core",
- "ironclaw-db",
- "ironclaw-mcp",
- "ironclaw-metrics",
- "ironclaw-providers",
- "ironclaw-types",
- "rmcp",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
-name = "ironclaw-setup"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "dialoguer",
- "dotenvy",
- "indicatif",
- "ironclaw-container-rt",
- "ironclaw-db",
- "ironclaw-onecli",
- "ironclaw-types",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "wiremock",
-]
-
-[[package]]
-name = "ironclaw-skills"
-version = "0.1.0"
-dependencies = [
- "ironclaw-types",
- "serde",
- "serde_json",
- "serde_yaml",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "ironclaw-types"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "uuid",
-]
 
 [[package]]
 name = "is_terminal_polyfill"

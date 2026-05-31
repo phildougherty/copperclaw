@@ -38,7 +38,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-IMAGE_TAG="${IRONCLAW_INSTALL_TEST_IMAGE:-ironclaw-install-test:latest}"
+IMAGE_TAG="${COPPERCLAW_INSTALL_TEST_IMAGE:-copperclaw-install-test:latest}"
 
 # ----- output helpers --------------------------------------------------------
 
@@ -117,38 +117,38 @@ case_1_missing_docker() {
     ok "exit=$sh_exit, output mentions docker/container runtime"
 }
 
-# Case 2: install.sh with INSTALL_SH_SKIP_DOCKER_CHECK=1 + IRONCLAW_SKIP_SETUP=1
+# Case 2: install.sh with INSTALL_SH_SKIP_DOCKER_CHECK=1 + COPPERCLAW_SKIP_SETUP=1
 # should install the three binaries via cargo --path (we have the workspace
 # checkout mounted read-only — copy it into a writable scratch dir first).
 case_2_install_binaries() {
     step "case 2: binary install via cargo --path (escape-hatch)"
     local script
-    # The /repo mount is read-only, so copy the workspace into /tmp/iclaw-src
+    # The /repo mount is read-only, so copy the workspace into /tmp/cclaw-src
     # before running install.sh.  Cargo writes target/ during the build.
     # Hand-build with --offline disabled (we need crates.io); allow network.
     script=$(cat <<'INNER'
 set -euo pipefail
-cp -a /repo /tmp/iclaw-src
-chown -R tester:tester /tmp/iclaw-src
+cp -a /repo /tmp/cclaw-src
+chown -R tester:tester /tmp/cclaw-src
 sudo -u tester -H bash -c '
     set -euo pipefail
     export PATH="/home/tester/.local/bin:$PATH"
     export CARGO_HOME="$HOME/.cargo"
     INSTALL_SH_SKIP_DOCKER_CHECK=1 \
-    IRONCLAW_SKIP_SETUP=1 \
-    bash /tmp/iclaw-src/install.sh
-    test -x "$HOME/.local/bin/ironclaw"
-    test -x "$HOME/.local/bin/iclaw"
-    test -x "$HOME/.local/bin/ironclaw-setup"
+    COPPERCLAW_SKIP_SETUP=1 \
+    bash /tmp/cclaw-src/install.sh
+    test -x "$HOME/.local/bin/copperclaw"
+    test -x "$HOME/.local/bin/cclaw"
+    test -x "$HOME/.local/bin/copperclaw-setup"
 '
 INNER
 )
     # Allow network for crates.io.  This case is the slow one — a clean
     # `cargo install --path` for three crates from scratch dwarfs every
-    # other case combined.  Opt-in via IRONCLAW_INSTALL_TEST_RUN_BUILD=1
+    # other case combined.  Opt-in via COPPERCLAW_INSTALL_TEST_RUN_BUILD=1
     # to keep the default suite under the 2-minute budget.
-    if [ "${IRONCLAW_INSTALL_TEST_RUN_BUILD:-0}" != "1" ]; then
-        note "skipping case 2 (set IRONCLAW_INSTALL_TEST_RUN_BUILD=1 to run; ~5+ min)"
+    if [ "${COPPERCLAW_INSTALL_TEST_RUN_BUILD:-0}" != "1" ]; then
+        note "skipping case 2 (set COPPERCLAW_INSTALL_TEST_RUN_BUILD=1 to run; ~5+ min)"
         return 0
     fi
     "$CONTAINER_BIN" run --rm \
@@ -169,16 +169,16 @@ case_3_idempotent_rerun() {
     script=$(cat <<'INNER'
 set -euo pipefail
 mkdir -p /home/tester/.local/bin
-for b in ironclaw iclaw ironclaw-setup; do
+for b in copperclaw cclaw copperclaw-setup; do
     printf '#!/bin/sh\necho sentinel-%s\n' "$b" > "/home/tester/.local/bin/$b"
     chmod +x "/home/tester/.local/bin/$b"
 done
 # Dry-run exits before touching the filesystem.
-IRONCLAW_INSTALL_DRY_RUN=1 \
+COPPERCLAW_INSTALL_DRY_RUN=1 \
 INSTALL_SH_SKIP_DOCKER_CHECK=1 \
 bash /repo/install.sh >/dev/null
 # Sentinels must still be byte-identical.
-for b in ironclaw iclaw ironclaw-setup; do
+for b in copperclaw cclaw copperclaw-setup; do
     grep -q "sentinel-$b" "/home/tester/.local/bin/$b" || { echo "sentinel for $b clobbered"; exit 1; }
 done
 INNER
@@ -187,17 +187,17 @@ INNER
     ok "pre-existing sentinels intact after re-run"
 }
 
-# Case 4: platform detection — IRONCLAW_FORCE_TARGET + IRONCLAW_INSTALL_DRY_RUN
+# Case 4: platform detection — COPPERCLAW_FORCE_TARGET + COPPERCLAW_INSTALL_DRY_RUN
 # should print the correct tarball URL for each supported triple.
 case_4_platform_detection() {
     step "case 4: platform detection picks the right tarball URL"
     local triple expected out
     for triple in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
                   x86_64-apple-darwin aarch64-apple-darwin; do
-        expected="https://github.com/phildougherty/ironclaw/releases/latest/download/ironclaw-${triple}.tar.gz"
+        expected="https://github.com/phildougherty/copperclaw/releases/latest/download/copperclaw-${triple}.tar.gz"
         out="$(run_in_container \
-            "IRONCLAW_INSTALL_DRY_RUN=1" \
-            "IRONCLAW_FORCE_TARGET=$triple" \
+            "COPPERCLAW_INSTALL_DRY_RUN=1" \
+            "COPPERCLAW_FORCE_TARGET=$triple" \
             "INSTALL_SH_SKIP_DOCKER_CHECK=1" \
             -- 'bash /repo/install.sh')"
         if ! grep -qF "$expected" <<<"$out"; then
@@ -206,11 +206,11 @@ case_4_platform_detection() {
         note "$triple -> ok"
     done
     # And an explicit tag.
-    expected="https://github.com/phildougherty/ironclaw/releases/download/v9.9.9/ironclaw-x86_64-unknown-linux-gnu.tar.gz"
+    expected="https://github.com/phildougherty/copperclaw/releases/download/v9.9.9/copperclaw-x86_64-unknown-linux-gnu.tar.gz"
     out="$(run_in_container \
-        "IRONCLAW_INSTALL_DRY_RUN=1" \
-        "IRONCLAW_FORCE_TARGET=x86_64-unknown-linux-gnu" \
-        "IRONCLAW_RELEASE_TAG=v9.9.9" \
+        "COPPERCLAW_INSTALL_DRY_RUN=1" \
+        "COPPERCLAW_FORCE_TARGET=x86_64-unknown-linux-gnu" \
+        "COPPERCLAW_RELEASE_TAG=v9.9.9" \
         "INSTALL_SH_SKIP_DOCKER_CHECK=1" \
         -- 'bash /repo/install.sh')"
     if ! grep -qF "$expected" <<<"$out"; then

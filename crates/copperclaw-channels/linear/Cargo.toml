@@ -1,0 +1,34 @@
+[package]
+name = "copperclaw-channels-linear"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+copperclaw-types = { workspace = true }
+copperclaw-channels-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+bytes = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+hmac = "0.12"
+subtle = "2"
+
+[dev-dependencies]
+wiremock = "=0.6.2"
+tempfile = "3"
+
+[lints]
+workspace = true

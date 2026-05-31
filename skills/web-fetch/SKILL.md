@@ -83,7 +83,7 @@ with the right access wired up.
 
 ## When to prefer other tools
 
-- **Authenticated API**: an MCP server (`iclaw mcp add linear ...`)
+- **Authenticated API**: an MCP server (`cclaw mcp add linear ...`)
   beats threading API keys through the agent.
 - **Same URL many times**: cache the first result in conversational
   memory.

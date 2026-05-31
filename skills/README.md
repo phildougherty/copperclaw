@@ -7,8 +7,8 @@ system prompt at session spawn, so the union of skill bodies is on the
 hot path for every container start.
 
 The conventions below are pinned by integration tests in
-`crates/ironclaw-skills/tests/coverage.rs`. If you violate one,
-`cargo test -p ironclaw-skills` will fail with a pointer back to this
+`crates/copperclaw-skills/tests/coverage.rs`. If you violate one,
+`cargo test -p copperclaw-skills` will fail with a pointer back to this
 document.
 
 ## Directory layout
@@ -22,7 +22,7 @@ skills/
 
 `<skill-name>` is the canonical id. It must be kebab-case
 (`[a-z0-9][a-z0-9-]{0,63}`); the runtime validator at
-`crates/ironclaw-skills/src/name.rs` rejects anything else.
+`crates/copperclaw-skills/src/name.rs` rejects anything else.
 
 ## SKILL.md format
 
@@ -57,18 +57,18 @@ the *what* (schema, examples, edge cases).
   for sessions that selected this skill explicitly.
 - **`tools:`** — *reserved*. No skill currently uses this key. If you
   adopt it, every listed name must resolve to a tool returned by
-  `ironclaw_mcp::tools::build_tool_set`. Test:
+  `copperclaw_mcp::tools::build_tool_set`. Test:
   `skill_tools_frontmatter_when_present_references_real_tools`.
 
 ## Body conventions
 
 ### Reference real tools, by name, in backticks
 
-Every tool returned by `ironclaw_mcp::tools::build_tool_set` must be
+Every tool returned by `copperclaw_mcp::tools::build_tool_set` must be
 mentioned in at least one `SKILL.md` (test:
 `every_registry_tool_appears_in_some_skill`). Conversely, every
 backtick-quoted token that *looks* like a tool reference (multi-word
-`snake_case` starting with one of the verb prefixes ironclaw tools use:
+`snake_case` starting with one of the verb prefixes copperclaw tools use:
 `send_`, `edit_`, `add_`, `cancel_`, `pause_`, `resume_`, `update_`,
 `list_`, `schedule_`, `ask_`, `create_`, `install_`, `git_`, `web_`,
 `read_`, `write_`) must resolve to a real tool. Test:
@@ -113,18 +113,18 @@ order anywhere downstream. Test: `skill_loading_order_is_alphabetical`.
 ## Adding a new skill
 
 1. Create `skills/<name>/SKILL.md` with the required frontmatter.
-2. Run `cargo test -p ironclaw-skills` — the coverage tests will tell
+2. Run `cargo test -p copperclaw-skills` — the coverage tests will tell
    you immediately if you've broken any convention.
 3. If you reference a new MCP tool, make sure it's in
-   `ironclaw_mcp::tools::build_tool_set` first. The reverse-coverage
+   `copperclaw_mcp::tools::build_tool_set` first. The reverse-coverage
    test (`every_registry_tool_appears_in_some_skill`) will not flag a
    missing skill until the tool is registered.
 
 ## Renaming or deleting an MCP tool
 
-1. Update the registry in `crates/ironclaw-mcp/src/tools/mod.rs`.
+1. Update the registry in `crates/copperclaw-mcp/src/tools/mod.rs`.
 2. Update every `SKILL.md` that mentions the old name.
-3. Run `cargo test -p ironclaw-skills` — both
+3. Run `cargo test -p copperclaw-skills` — both
    `every_registry_tool_appears_in_some_skill` (if you renamed) and
    `skill_tool_mentions_resolve_to_registry` (if you deleted) will
    point at the orphans.

@@ -120,7 +120,7 @@ fall into one of these documented buckets:
 
 None outstanding. (The previously-documented `imessage` empty-body
 silent-drop was fixed: empty body now returns `BadRequest` at
-`crates/ironclaw-channels/imessage/src/adapter.rs:133-137`, pinned by
+`crates/copperclaw-channels/imessage/src/adapter.rs:133-137`, pinned by
 `deliver_empty_body_is_bad_request_not_silent_drop`.)
 
 ## Low-severity gaps (LOW)

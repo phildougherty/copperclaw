@@ -61,7 +61,7 @@ The throttle is in-memory on the host and resets on host restart.
 
 ## Config
 
-`TypingConfig` (in `ironclaw-modules::typing`) is:
+`TypingConfig` (in `copperclaw-modules::typing`) is:
 
 ```rust
 TypingConfig {

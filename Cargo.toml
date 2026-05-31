@@ -1,44 +1,44 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/ironclaw-types",
-    "crates/ironclaw-db",
-    "crates/ironclaw-host",
-    "crates/ironclaw-host-router",
-    "crates/ironclaw-host-delivery",
-    "crates/ironclaw-host-sweep",
-    "crates/ironclaw-container-rt",
-    "crates/ironclaw-runner",
-    "crates/ironclaw-providers",
-    "crates/ironclaw-mcp",
-    "crates/ironclaw-channels/core",
-    "crates/ironclaw-channels/cli",
-    "crates/ironclaw-channels/telegram",
-    "crates/ironclaw-channels/slack",
-    "crates/ironclaw-channels/discord",
-    "crates/ironclaw-channels/resend",
-    "crates/ironclaw-channels/github",
-    "crates/ironclaw-channels/linear",
-    "crates/ironclaw-channels/webex",
-    "crates/ironclaw-channels/matrix",
-    "crates/ironclaw-channels/teams",
-    "crates/ironclaw-channels/mattermost",
-    "crates/ironclaw-channels/line",
-    "crates/ironclaw-channels/gchat",
-    "crates/ironclaw-channels/imessage",
-    "crates/ironclaw-channels/wechat",
-    "crates/ironclaw-channels/whatsapp-cloud",
-    "crates/ironclaw-channels/webhooks",
-    "crates/ironclaw-channels/signal",
-    "crates/ironclaw-channels/deltachat",
-    "crates/ironclaw-channels/emacs",
-    "crates/ironclaw-channels/x",
-    "crates/ironclaw-modules",
-    "crates/ironclaw-skills",
-    "crates/ironclaw-iclaw",
-    "crates/ironclaw-setup",
-    "crates/ironclaw-onecli",
-    "crates/ironclaw-metrics",
+    "crates/copperclaw-types",
+    "crates/copperclaw-db",
+    "crates/copperclaw-host",
+    "crates/copperclaw-host-router",
+    "crates/copperclaw-host-delivery",
+    "crates/copperclaw-host-sweep",
+    "crates/copperclaw-container-rt",
+    "crates/copperclaw-runner",
+    "crates/copperclaw-providers",
+    "crates/copperclaw-mcp",
+    "crates/copperclaw-channels/core",
+    "crates/copperclaw-channels/cli",
+    "crates/copperclaw-channels/telegram",
+    "crates/copperclaw-channels/slack",
+    "crates/copperclaw-channels/discord",
+    "crates/copperclaw-channels/resend",
+    "crates/copperclaw-channels/github",
+    "crates/copperclaw-channels/linear",
+    "crates/copperclaw-channels/webex",
+    "crates/copperclaw-channels/matrix",
+    "crates/copperclaw-channels/teams",
+    "crates/copperclaw-channels/mattermost",
+    "crates/copperclaw-channels/line",
+    "crates/copperclaw-channels/gchat",
+    "crates/copperclaw-channels/imessage",
+    "crates/copperclaw-channels/wechat",
+    "crates/copperclaw-channels/whatsapp-cloud",
+    "crates/copperclaw-channels/webhooks",
+    "crates/copperclaw-channels/signal",
+    "crates/copperclaw-channels/deltachat",
+    "crates/copperclaw-channels/emacs",
+    "crates/copperclaw-channels/x",
+    "crates/copperclaw-modules",
+    "crates/copperclaw-skills",
+    "crates/copperclaw-cclaw",
+    "crates/copperclaw-setup",
+    "crates/copperclaw-onecli",
+    "crates/copperclaw-metrics",
 ]
 
 [workspace.package]
@@ -46,45 +46,45 @@ edition = "2024"
 license = "MIT"
 rust-version = "1.85"
 version = "0.1.0"
-authors = ["Ironclaw Contributors"]
-repository = "https://github.com/phildougherty/ironclaw"
+authors = ["Copperclaw Contributors"]
+repository = "https://github.com/phildougherty/copperclaw"
 
 [workspace.dependencies]
-ironclaw-types          = { path = "crates/ironclaw-types" }
-ironclaw-db             = { path = "crates/ironclaw-db" }
-ironclaw-container-rt   = { path = "crates/ironclaw-container-rt" }
-ironclaw-providers      = { path = "crates/ironclaw-providers" }
-ironclaw-mcp            = { path = "crates/ironclaw-mcp" }
-ironclaw-channels-core  = { path = "crates/ironclaw-channels/core" }
-ironclaw-channels-cli   = { path = "crates/ironclaw-channels/cli" }
-ironclaw-channels-telegram = { path = "crates/ironclaw-channels/telegram" }
-ironclaw-channels-slack    = { path = "crates/ironclaw-channels/slack" }
-ironclaw-channels-discord  = { path = "crates/ironclaw-channels/discord" }
-ironclaw-channels-resend   = { path = "crates/ironclaw-channels/resend" }
-ironclaw-channels-github   = { path = "crates/ironclaw-channels/github" }
-ironclaw-channels-linear   = { path = "crates/ironclaw-channels/linear" }
-ironclaw-channels-webex    = { path = "crates/ironclaw-channels/webex" }
-ironclaw-channels-matrix   = { path = "crates/ironclaw-channels/matrix" }
-ironclaw-channels-teams    = { path = "crates/ironclaw-channels/teams" }
-ironclaw-channels-mattermost = { path = "crates/ironclaw-channels/mattermost" }
-ironclaw-channels-line     = { path = "crates/ironclaw-channels/line" }
-ironclaw-channels-gchat    = { path = "crates/ironclaw-channels/gchat" }
-ironclaw-channels-imessage = { path = "crates/ironclaw-channels/imessage" }
-ironclaw-channels-wechat   = { path = "crates/ironclaw-channels/wechat" }
-ironclaw-channels-whatsapp-cloud = { path = "crates/ironclaw-channels/whatsapp-cloud" }
-ironclaw-channels-webhooks = { path = "crates/ironclaw-channels/webhooks" }
-ironclaw-channels-signal   = { path = "crates/ironclaw-channels/signal" }
-ironclaw-channels-deltachat = { path = "crates/ironclaw-channels/deltachat" }
-ironclaw-channels-emacs    = { path = "crates/ironclaw-channels/emacs" }
-ironclaw-channels-x        = { path = "crates/ironclaw-channels/x" }
-ironclaw-modules        = { path = "crates/ironclaw-modules" }
-ironclaw-skills         = { path = "crates/ironclaw-skills" }
-ironclaw-onecli         = { path = "crates/ironclaw-onecli" }
-ironclaw-metrics        = { path = "crates/ironclaw-metrics" }
-ironclaw-host-router    = { path = "crates/ironclaw-host-router" }
-ironclaw-host-delivery  = { path = "crates/ironclaw-host-delivery" }
-ironclaw-host-sweep     = { path = "crates/ironclaw-host-sweep" }
-ironclaw-runner         = { path = "crates/ironclaw-runner" }
+copperclaw-types          = { path = "crates/copperclaw-types" }
+copperclaw-db             = { path = "crates/copperclaw-db" }
+copperclaw-container-rt   = { path = "crates/copperclaw-container-rt" }
+copperclaw-providers      = { path = "crates/copperclaw-providers" }
+copperclaw-mcp            = { path = "crates/copperclaw-mcp" }
+copperclaw-channels-core  = { path = "crates/copperclaw-channels/core" }
+copperclaw-channels-cli   = { path = "crates/copperclaw-channels/cli" }
+copperclaw-channels-telegram = { path = "crates/copperclaw-channels/telegram" }
+copperclaw-channels-slack    = { path = "crates/copperclaw-channels/slack" }
+copperclaw-channels-discord  = { path = "crates/copperclaw-channels/discord" }
+copperclaw-channels-resend   = { path = "crates/copperclaw-channels/resend" }
+copperclaw-channels-github   = { path = "crates/copperclaw-channels/github" }
+copperclaw-channels-linear   = { path = "crates/copperclaw-channels/linear" }
+copperclaw-channels-webex    = { path = "crates/copperclaw-channels/webex" }
+copperclaw-channels-matrix   = { path = "crates/copperclaw-channels/matrix" }
+copperclaw-channels-teams    = { path = "crates/copperclaw-channels/teams" }
+copperclaw-channels-mattermost = { path = "crates/copperclaw-channels/mattermost" }
+copperclaw-channels-line     = { path = "crates/copperclaw-channels/line" }
+copperclaw-channels-gchat    = { path = "crates/copperclaw-channels/gchat" }
+copperclaw-channels-imessage = { path = "crates/copperclaw-channels/imessage" }
+copperclaw-channels-wechat   = { path = "crates/copperclaw-channels/wechat" }
+copperclaw-channels-whatsapp-cloud = { path = "crates/copperclaw-channels/whatsapp-cloud" }
+copperclaw-channels-webhooks = { path = "crates/copperclaw-channels/webhooks" }
+copperclaw-channels-signal   = { path = "crates/copperclaw-channels/signal" }
+copperclaw-channels-deltachat = { path = "crates/copperclaw-channels/deltachat" }
+copperclaw-channels-emacs    = { path = "crates/copperclaw-channels/emacs" }
+copperclaw-channels-x        = { path = "crates/copperclaw-channels/x" }
+copperclaw-modules        = { path = "crates/copperclaw-modules" }
+copperclaw-skills         = { path = "crates/copperclaw-skills" }
+copperclaw-onecli         = { path = "crates/copperclaw-onecli" }
+copperclaw-metrics        = { path = "crates/copperclaw-metrics" }
+copperclaw-host-router    = { path = "crates/copperclaw-host-router" }
+copperclaw-host-delivery  = { path = "crates/copperclaw-host-delivery" }
+copperclaw-host-sweep     = { path = "crates/copperclaw-host-sweep" }
+copperclaw-runner         = { path = "crates/copperclaw-runner" }
 
 tokio              = { version = "1", features = ["full"] }
 serde              = { version = "1", features = ["derive"] }

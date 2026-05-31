@@ -73,7 +73,7 @@ provider-specific and omitted when the backend doesn't expose one
 | **Brave** | Keyword search, independent index | `BRAVE_SEARCH_API_KEY` |
 | **SerpAPI** | Google/Bing/DDG wrapper | `SERPAPI_API_KEY` |
 
-When multiple keys are present and `IRONCLAW_WEB_SEARCH_PROVIDER` is
+When multiple keys are present and `COPPERCLAW_WEB_SEARCH_PROVIDER` is
 unset, default order is `tavily, exa, brave, serpapi`.
 
 ## Examples

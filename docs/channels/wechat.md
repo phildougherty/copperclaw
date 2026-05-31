@@ -21,7 +21,7 @@
 ## Implemented
 - deliver: COMPLETE — text + files (image / voice / video / file with
   per-type upload + send-by-id) + template_card passthrough.
-  `crates/ironclaw-channels/wechat/src/adapter.rs:163`
+  `crates/copperclaw-channels/wechat/src/adapter.rs:163`
 - subscribe: trait-default Ok (webhook events route via events/router.rs).
 - set_typing: trait-default Ok.
 - edit_message: action="edit" → Unsupported (platform doesn't allow).

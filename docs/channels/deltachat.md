@@ -22,7 +22,7 @@
 - deliver: COMPLETE — text + files (with caption on first), plus
   action-shape reaction / delete. Edit is explicitly Unsupported
   (Delta Chat protocol does not allow editing already-sent messages).
-  `crates/ironclaw-channels/deltachat/src/adapter.rs:422`
+  `crates/copperclaw-channels/deltachat/src/adapter.rs:422`
 - subscribe: validates the `account/<id>/chat/<id>` shape.
 - set_typing: trait-default Ok (no typing API).
 - edit_message: returns Unsupported via action shape.

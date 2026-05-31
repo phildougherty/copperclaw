@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Ironclaw are recorded here. The format follows
+All notable changes to Copperclaw are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
@@ -16,7 +16,7 @@ during a perfectly common scenario: a root parent session processing
 an agent-dispatched inbound (a child's report forwarded into the
 parent's inbound). Those rows carry NULL channel routing — the user
 channel comes from the messaging-group wiring's `session_routing`
-fallback at delivery time (`crates/ironclaw-host-delivery/src/service.rs::resolve_target`).
+fallback at delivery time (`crates/copperclaw-host-delivery/src/service.rs::resolve_target`).
 
 Lived through on 2026-05-24 in a Telegram session that asked for
 "parallel research, then build a prototype." The parent spawned three
@@ -32,7 +32,7 @@ forwarded child report) had NULL channel routing. The user saw
 silence → "Strategy Masters... Prototype Complete," reasonably
 concluding it was stuck.
 
-Fix in `crates/ironclaw-runner/src/tools.rs`:
+Fix in `crates/copperclaw-runner/src/tools.rs`:
 
 - New `RunnerToolCtx::should_skip_user_facing_emit()` helper. Skips
   ONLY when the runner itself is a child session
@@ -76,7 +76,7 @@ the prototype from training-data priors anyway.
 Two coordinated changes target the root cause:
 
 - **`WEB_FETCH_CAP` lowered 32 KiB → 16 KiB**
-  (`crates/ironclaw-mcp/src/tools/computer_use.rs`). 16 KiB of
+  (`crates/copperclaw-mcp/src/tools/computer_use.rs`). 16 KiB of
   markdown-extracted text is ~4k tokens, leaving room for ~6 real
   fetches inside a default explore budget instead of 1-2. The tool
   description now explicitly states "Response body is capped at 16
@@ -86,7 +86,7 @@ Two coordinated changes target the root cause:
   test renamed `web_fetch_caps_body_at_32k` →
   `web_fetch_caps_body_at_16k` with payload sizes halved.
 - **`explore` description gained a tool-selection prelude**
-  (`crates/ironclaw-mcp/src/tools/explore.rs`). New explicit guidance:
+  (`crates/copperclaw-mcp/src/tools/explore.rs`). New explicit guidance:
   "`explore` is for QUICK in-process lookups (single-focus, 1-3
   tool calls expected). `create_agent` is for SUBSTANTIVE PARALLEL
   RESEARCH — each child agent gets its own ~200k token budget and
@@ -112,7 +112,7 @@ outbound. The root cause: the runner doesn't flip
 the turn, so a 6-minute turn looks identical to a 6-minute stuck
 container if you only look at age.
 
-Fix in `crates/ironclaw-host-sweep/src/checks/apology.rs`:
+Fix in `crates/copperclaw-host-sweep/src/checks/apology.rs`:
 
 - New `inbound_is_being_processed(outbound_conn, message_id)`
   helper that returns true when `processing_ack.status='processing'`
@@ -155,7 +155,7 @@ got three coordinated nudges:
   inline rule: if you're about to make MORE tool calls related to
   an item, it's not done yet.
 - **`is_acceptable_evidence` got stricter**
-  (`crates/ironclaw-mcp/src/tools/todo.rs`). Minimum length bumped
+  (`crates/copperclaw-mcp/src/tools/todo.rs`). Minimum length bumped
   from 20 → 40 chars. Evidence must now contain at least one
   concrete signal: a file path (slash-bearing token of ≥3 chars), a
   dot-extension reference (`.json`, `.rs`, `.tsx`), or a
@@ -185,9 +185,9 @@ appended new items on top, and the user saw a "13/26 done"
 Frankenstein plan with items from three different runs (Gmail
 OAuth2, compliance-deadlines DB, golf-prototype) all marked done or
 pending against the same list. Fix: new `clear_store()` helper in
-`ironclaw-mcp/src/tools/todo.rs` (re-exported as
-`ironclaw_mcp::clear_todo_store`); the slash handler in
-`ironclaw-runner/src/run/mod.rs` calls it after the history wipe.
+`copperclaw-mcp/src/tools/todo.rs` (re-exported as
+`copperclaw_mcp::clear_todo_store`); the slash handler in
+`copperclaw-runner/src/run/mod.rs` calls it after the history wipe.
 Error is best-effort (a missing or locked store must not abort the
 clear confirmation). The confirmation text picks up "The plan/todo
 list was also cleared." when a store was actually present.
@@ -208,9 +208,9 @@ indicators that eventually timed out.
 
 - **`emit_status` hook on `ToolContext` + 60s "still working"
   heartbeat in `drive_turn`**
-  (`crates/ironclaw-mcp/src/context.rs`,
-  `crates/ironclaw-runner/src/tools.rs`,
-  `crates/ironclaw-runner/src/run/drive_turn.rs`). After each tool
+  (`crates/copperclaw-mcp/src/context.rs`,
+  `crates/copperclaw-runner/src/tools.rs`,
+  `crates/copperclaw-runner/src/run/drive_turn.rs`). After each tool
   turn, the runner checks whether more than 60s have elapsed since
   the last user-facing emit; if so, it writes a brief `Still working
   on this — Xs in, N tool calls so far (latest: shell). I'll keep
@@ -221,7 +221,7 @@ indicators that eventually timed out.
   status chatter would just bloat the parent's history.
 - **Surface child-agent failure notices to the user channel BEFORE
   the parent's LLM digests them**
-  (`crates/ironclaw-runner/src/run/mod.rs`, new
+  (`crates/copperclaw-runner/src/run/mod.rs`, new
   `emit_failure_notice_toasts`). When `run_loop` picks up a batch
   of pending inbounds and any of them is an `Agent`-kind row whose
   text starts with `sub-task failed:`, the runner immediately
@@ -230,7 +230,7 @@ indicators that eventually timed out.
   No-op for the common case (no failure rows) and for parent
   sessions without channel routing (themselves child agents).
 - **Retry-nudged child-failure apology text**
-  (`crates/ironclaw-runner/src/run/mod.rs`, `agent_apology_text`).
+  (`crates/copperclaw-runner/src/run/mod.rs`, `agent_apology_text`).
   Old text: "Report the failure upstream rather than retrying with
   the same prompt." New text: "You may retry by calling
   create_agent again with the same name + instructions — these
@@ -254,7 +254,7 @@ web-search tool:
 
 - **Apple-Container `mount_arg` no longer lets an operator-controlled
   path inject `--mount` options**
-  (`crates/ironclaw-container-rt/src/apple.rs`). `mount_arg` was
+  (`crates/copperclaw-container-rt/src/apple.rs`). `mount_arg` was
   interpolating `source` / `target` straight into a comma-separated
   `--mount type=bind,source=<source>,target=<target>` value, so a
   `source` ending in `,readonly=false` silently flipped mount
@@ -274,7 +274,7 @@ web-search tool:
   `mount_arg_injection_blocked` (the literal `,readonly=false` attack
   payload), and `run_args_propagates_mount_validation_error`.
 - **Docker USTAR writer no longer silently truncates filenames > 100
-  bytes** (`crates/ironclaw-container-rt/src/docker.rs`). The inline
+  bytes** (`crates/copperclaw-container-rt/src/docker.rs`). The inline
   `tar::append` was only copying the first 100 bytes of `name` into
   the `name` field and never populating the `prefix` field at offset
   345, so any `files/<long-basename>` produced opaque image-build
@@ -294,7 +294,7 @@ web-search tool:
   `build_context_tar_rejects_oversize_extra_file_name` at the public
   entry point.
 - **`SERPAPI_API_KEY` no longer leaks into model history via reqwest
-  errors** (`crates/ironclaw-mcp/src/tools/web_search.rs`). SerpAPI
+  errors** (`crates/copperclaw-mcp/src/tools/web_search.rs`). SerpAPI
   only supports query-string auth, so the key lived in the URL of
   every request. On transport failure, `reqwest::Error`'s `Display`
   walks the URL into the error message, which was being returned as
@@ -314,10 +314,10 @@ web-search tool:
 
 ### Fixed (setup hardening: secret-file modes, headless token loop, launchd env)
 
-Four bugs in `ironclaw-setup` that bit fresh installs hardest:
+Four bugs in `copperclaw-setup` that bit fresh installs hardest:
 
 - **`setup-state.json` no longer leaves the OneCLI bearer token
-  world-readable** (`crates/ironclaw-setup/src/state.rs`).
+  world-readable** (`crates/copperclaw-setup/src/state.rs`).
   `SetupState::save` was calling `fs::write`, which goes through the
   umask (typically `0o644`). The state file embeds
   `OneCliConfig.bearer_token` — a long-lived vault credential — so
@@ -330,8 +330,8 @@ Four bugs in `ironclaw-setup` that bit fresh installs hardest:
   == 0o600`. Companion `save_tightens_mode_on_pre_existing_loose_file`
   pins idempotent re-runs that converge to `0o600`.
 - **`.env` writers no longer expose secrets through a chmod TOCTOU
-  window** (`crates/ironclaw-setup/src/steps/auth.rs`,
-  `crates/ironclaw-setup/src/steps/telegram.rs`).
+  window** (`crates/copperclaw-setup/src/steps/auth.rs`,
+  `crates/copperclaw-setup/src/steps/telegram.rs`).
   `write_env_file` and `append_env_var` were doing `fs::write` +
   chmod-after, leaving a brief window where the freshly written file
   existed at `0o644` before being tightened. Both paths now route
@@ -341,14 +341,14 @@ Four bugs in `ironclaw-setup` that bit fresh installs hardest:
   added: `write_env_file_sets_mode_0600_from_creation`,
   `write_env_file_tightens_perms_when_path_pre_exists_loose`.
 - **Headless setup no longer spins forever on a malformed
-  `IRONCLAW_SETUP_TELEGRAM_BOT_TOKEN`**
-  (`crates/ironclaw-setup/src/steps/telegram.rs`). `capture_token`
+  `COPPERCLAW_SETUP_TELEGRAM_BOT_TOKEN`**
+  (`crates/copperclaw-setup/src/steps/telegram.rs`). `capture_token`
   was an unbounded `loop { prompt.secret(...); ... }` with no break
   on validation failure. Under `EnvBacked` (headless mode),
   `secret()` is deterministic, so a malformed token spun the loop
   indefinitely with no log output. The loop now tracks the previous
   invalid value and bails with a clear `StepError::Other`
-  ("`IRONCLAW_SETUP_TELEGRAM_BOT_TOKEN` failed bot-token validation;
+  ("`COPPERCLAW_SETUP_TELEGRAM_BOT_TOKEN` failed bot-token validation;
   expected format `<bot_id>:<token>`") on the first identical
   repeat. Distinct invalid attempts still get a "try again"
   message, so an interactive fat-finger path isn't affected. Tests
@@ -357,14 +357,14 @@ Four bugs in `ironclaw-setup` that bit fresh installs hardest:
   and `pairing_scripted_two_different_invalids_then_skip_does_not_bail`
   (negative-case guard so the heuristic doesn't over-fire).
 - **macOS launchd plist now actually sources the `.env`**
-  (`crates/ironclaw-setup/src/units.rs`). The generator was emitting
+  (`crates/copperclaw-setup/src/units.rs`). The generator was emitting
   `<key>EnvFile</key><string>...</string>`, but launchd has no
   `EnvFile` key — only `EnvironmentVariables` (a static plist
   dict). launchd silently ignored the bogus key, so the host
   booted on macOS without `ANTHROPIC_API_KEY` and every other
   secret captured into `.env`. Fixed by chasing the standard
   launchd pattern: a small POSIX-shell wrapper that sources the
-  `.env` (`set -a; . file; set +a; exec ironclaw run --data-dir
+  `.env` (`set -a; . file; set +a; exec copperclaw run --data-dir
   ...`) is generated next to the host binary, and the plist's
   `ProgramArguments` points at the wrapper. New helpers:
   `render_launchd_wrapper`, `launchd_wrapper_path`,
@@ -381,12 +381,12 @@ Four bugs in `ironclaw-setup` that bit fresh installs hardest:
   `write_launchd_wrapper` on macOS before writing the plist; this
   batch only ships the generators + corrected plist body.
 
-Test delta: +15 in `ironclaw-setup` (275 → 290 lib tests).
+Test delta: +15 in `copperclaw-setup` (275 → 290 lib tests).
 
 ### Fixed
 
 - **Splitter retry no longer duplicates already-delivered chunks on
-  partial failure** (`crates/ironclaw-host-delivery/src/service.rs`).
+  partial failure** (`crates/copperclaw-host-delivery/src/service.rs`).
   When `split_chat_content_if_needed` produced 2+ parts and the
   adapter delivered chunk 0 successfully but failed chunk 1 with a
   retryable error (`AdapterError::Rate` / `Transport` / `Io`), the
@@ -413,9 +413,9 @@ Test delta: +15 in `ironclaw-setup` (275 → 290 lib tests).
 
 ### Fixed (5 host-process correctness + auth-bypass bugs)
 
-- **iclaw socket now derives caller identity from `SO_PEERCRED` (Linux
+- **cclaw socket now derives caller identity from `SO_PEERCRED` (Linux
   `getpeereid` on macOS) instead of trusting the JSON `caller` field
-  on the wire** (`crates/ironclaw-host/src/socket.rs`). Previously any
+  on the wire** (`crates/copperclaw-host/src/socket.rs`). Previously any
   local UID-matching process — including a container that somehow
   reached the admin socket — could send `{"caller":{"kind":"host"}}`
   and execute every host-only mutation (`db.backup`, `groups.delete`,
@@ -433,7 +433,7 @@ Test delta: +15 in `ironclaw-setup` (275 → 290 lib tests).
   including a cross-UID rejection).
 - **Socket-server bind errors now abort `run_host` with
   `BootError::Socket` instead of being swallowed**
-  (`crates/ironclaw-host/src/boot.rs` + `socket.rs`). The old fused
+  (`crates/copperclaw-host/src/boot.rs` + `socket.rs`). The old fused
   `tokio::spawn(run_server(...))` discarded the JoinHandle's
   bind-result, so a stale non-socket file or an unwritable parent
   directory would leave the host printing "boot complete" with a
@@ -443,8 +443,8 @@ Test delta: +15 in `ironclaw-setup` (275 → 290 lib tests).
   after the bind succeeds. +1 integration test that drives `run_host`
   against an unbindable socket path and asserts
   `BootError::Socket(_)`.
-- **Per-frame and per-connection caps on the iclaw socket close a
-  local DoS** (`crates/ironclaw-host/src/socket.rs`). `read_until`
+- **Per-frame and per-connection caps on the cclaw socket close a
+  local DoS** (`crates/copperclaw-host/src/socket.rs`). `read_until`
   on the NDJSON wire had no upper bound — a local process could
   feed a 1 GiB frame and OOM the host before any parse ran. Each
   request frame is now wrapped in `BufReader::take(1 MiB)` via the
@@ -458,7 +458,7 @@ Test delta: +15 in `ironclaw-setup` (275 → 290 lib tests).
   `concurrent_connection_cap_actually_limits`) plus a
   defence-in-depth regression (`under_cap_request_still_works`).
 - **`dropped_messages` `parse_since` no longer panics on multi-byte
-  UTF-8 inputs** (`crates/ironclaw-host/src/handlers/dropped_messages.rs`).
+  UTF-8 inputs** (`crates/copperclaw-host/src/handlers/dropped_messages.rs`).
   The old `s.split_at(s.len().saturating_sub(1))` operated on byte
   indices, so a `since="é"` or `since="5🦀"` from an agent-side
   caller would land split_at inside a UTF-8 code point and panic the
@@ -469,7 +469,7 @@ Test delta: +15 in `ironclaw-setup` (275 → 290 lib tests).
   `parse_since_accepts_valid_shorthand`,
   `outbound_list_with_multibyte_since_errors_cleanly`).
 - **`todo_watcher` notification text is now emoji-free**
-  (`crates/ironclaw-host/src/todo_watcher.rs`). The `📋 Plan` and
+  (`crates/copperclaw-host/src/todo_watcher.rs`). The `📋 Plan` and
   `✅ done` prefixes violated the project-wide "no emojis" rule
   (CLAUDE.md). Replaced with plain ASCII `[todo]` / `[done]` tags
   matching the surrounding tone. +1 enforcement test
@@ -483,7 +483,7 @@ Test delta: +15 in `ironclaw-setup` (275 → 290 lib tests).
 ### Fixed (4 mid-stream / dedup / TOCTOU correctness bugs)
 
 - **Runner no longer crashes mid-stream on transient
-  `container_state` write errors.** `crates/ironclaw-runner/src/run/provider_call.rs`
+  `container_state` write errors.** `crates/copperclaw-runner/src/run/provider_call.rs`
   used `?` to propagate `set_current_tool` / `clear_current_tool`
   results, so a single SQLite lock contention writing the stuck-tool
   housekeeping row would abort the entire `pump_events` stream,
@@ -498,7 +498,7 @@ Test delta: +15 in `ironclaw-setup` (275 → 290 lib tests).
   Chat row still lands).
 
 - **Resume-after-crash dedup now scans backwards past tool turns.**
-  `crates/ironclaw-runner/src/run/mod.rs` only checked
+  `crates/copperclaw-runner/src/run/mod.rs` only checked
   `state.history.last()` for a matching `User` entry. Because
   `persist_mid_message` saves history after each tool turn, a
   mid-tool-loop crash leaves history ending in `Tool { ... }` (or
@@ -512,7 +512,7 @@ Test delta: +15 in `ironclaw-setup` (275 → 290 lib tests).
   Covered by `resume_mid_tool_loop_skips_duplicate_push`.
 
 - **`recurrence::check` no longer aborts the session's sweep on
-  slice-3 kinds.** `crates/ironclaw-host-sweep/src/checks/recurrence.rs`
+  slice-3 kinds.** `crates/copperclaw-host-sweep/src/checks/recurrence.rs`
   hand-rolled a six-variant `parse_kind` helper missing `breadcrumb`,
   `diff`, `todo_list`, `error`, and `thinking`. A recurring inbound
   with any of those kinds returned `unknown kind` and aborted the
@@ -524,7 +524,7 @@ Test delta: +15 in `ironclaw-setup` (275 → 290 lib tests).
   one fans out.
 
 - **`processing::check` no longer races a finishing runner into a
-  duplicate reply.** `crates/ironclaw-host-sweep/src/checks/processing.rs`
+  duplicate reply.** `crates/copperclaw-host-sweep/src/checks/processing.rs`
   read `processing_ack` (status=Processing, stale) + scanned for any
   `in_reply_to=msg_id` reply, then did the inbound-reset UPDATE
   later. Between the SELECT and the UPDATE the runner could finish
@@ -546,7 +546,7 @@ Test delta: +15 in `ironclaw-setup` (275 → 290 lib tests).
 ### Fixed (3 race / serde correctness bugs)
 
 - **`MessageKind::TodoList` JSON round-trip.**
-  `crates/ironclaw-types/src/message.rs` had `#[serde(rename_all =
+  `crates/copperclaw-types/src/message.rs` had `#[serde(rename_all =
   "lowercase")]` on `MessageKind`, which serialised `TodoList` as
   `"todolist"` (no underscore). The DB column form via `as_str()` /
   `parse_str()` is `"todo_list"`, so any path that round-tripped a
@@ -559,7 +559,7 @@ Test delta: +15 in `ironclaw-setup` (275 → 290 lib tests).
   `message_kind_serde_tag_matches_as_str_for_every_variant` test pins
   the new contract for every variant.
 - **`unregistered_senders::upsert` race.**
-  `crates/ironclaw-db/src/tables/unregistered_senders.rs` was
+  `crates/copperclaw-db/src/tables/unregistered_senders.rs` was
   SELECT-then-INSERT/UPDATE against a pooled (max=8) writer. Two
   concurrent first-time inbounds for the same `(channel_type,
   platform_id)` could both observe missing row, both INSERT, the
@@ -571,15 +571,15 @@ Test delta: +15 in `ironclaw-setup` (275 → 290 lib tests).
   against a file-backed pool and asserts exactly one row with
   `message_count == 16`.
 - **`pending_approvals::upsert` race + new migration.**
-  `crates/ironclaw-db/src/tables/pending_approvals.rs` had the same
+  `crates/copperclaw-db/src/tables/pending_approvals.rs` had the same
   SELECT-then-INSERT shape and no DB-side constraint on
   `(request_id, action)` — concurrent upserts produced silent
   duplicate pending rows. New migration
-  `crates/ironclaw-db/migrations/016_pending_approvals_unique.sql`
+  `crates/copperclaw-db/migrations/016_pending_approvals_unique.sql`
   adds a partial unique index `WHERE status = 'pending'` (terminal
   rows can repeat across statuses; only the live pending row is
   unique). Registered in `MigrationSet::Central` at
-  `crates/ironclaw-db/src/migrate.rs`. The upsert is now a single
+  `crates/copperclaw-db/src/migrate.rs`. The upsert is now a single
   atomic `INSERT ... ON CONFLICT(request_id, action) WHERE status =
   'pending' DO UPDATE`. Two new tests: a 16-task concurrency
   regression test, plus a `upsert_after_denial_creates_fresh_pending_row`
@@ -595,24 +595,24 @@ block (Agent B's work) the signals weren't there and the block
 degraded to channel-only phrasing. This closes the gap end-to-end:
 
 - **New per-session inbound migration
-  `crates/ironclaw-db/migrations/015_messages_in_reply_to_is_group.sql`**
+  `crates/copperclaw-db/migrations/015_messages_in_reply_to_is_group.sql`**
   adds `reply_to TEXT NULL` + `is_group INTEGER NULL` columns to
   `messages_in`. Registered in `MigrationSet::SessionInbound` at
-  `crates/ironclaw-db/src/migrate.rs`. Existing rows are unaffected
+  `crates/copperclaw-db/src/migrate.rs`. Existing rows are unaffected
   (both columns default to NULL).
 - **`WriteInbound` + `MessageInRow` extended** with `reply_to:
   Option<String>` and `is_group: Option<bool>`. The INSERT/SELECT
-  paths in `crates/ironclaw-db/src/tables/messages_in.rs` write +
+  paths in `crates/copperclaw-db/src/tables/messages_in.rs` write +
   read both columns; the row parser coalesces a legacy
   `reply_to = ''` shape to `None` (parallel to the existing
   `source_session_id` defence).
 - **Router insert site at
-  `crates/ironclaw-host-router/src/route.rs::deliver_to_session`**
+  `crates/copperclaw-host-router/src/route.rs::deliver_to_session`**
   now pulls `event.reply_to.thread_id` (the parent platform message
   id every adapter stuffs there) and `event.message.is_group` and
   passes both through `WriteInbound`.
 - **`render_conversation_context` in
-  `crates/ironclaw-runner/src/run/prompt.rs`** consumes the new
+  `crates/copperclaw-runner/src/run/prompt.rs`** consumes the new
   fields: `is_group=Some(true)` renders "a group chat",
   `Some(false)` renders "a 1-on-1 DM", `None` keeps the existing
   thread-id-derived fallback. `reply_to=Some(...)` appends ", in
@@ -621,7 +621,7 @@ degraded to channel-only phrasing. This closes the gap end-to-end:
   populate them (cli, file-watcher, webhook-only) see the legacy
   phrasing unchanged.
 - **Recurrence fan-out
-  (`crates/ironclaw-host-sweep/src/checks/recurrence.rs`)** now
+  (`crates/copperclaw-host-sweep/src/checks/recurrence.rs`)** now
   carries the parent row's `reply_to` / `is_group` onto every
   fan-out so the runner's context block stays consistent across a
   recurring series.
@@ -634,7 +634,7 @@ degraded to channel-only phrasing. This closes the gap end-to-end:
 ### Fixed (skill body cap + channel doc follow-ups)
 
 - **Skill body cap aligned with the documented 8 KiB ceiling.**
-  `MAX_SKILL_BODY_BYTES` in `crates/ironclaw-skills/tests/coverage.rs`
+  `MAX_SKILL_BODY_BYTES` in `crates/copperclaw-skills/tests/coverage.rs`
   was enforcing 4 KiB while `skills/README.md` advertised 8 KiB, which
   forced new long-form taxonomy skills (e.g. `native-ui`) to compress
   per-channel tables into legend codes. Bumped the test ceiling to
@@ -650,7 +650,7 @@ degraded to channel-only phrasing. This closes the gap end-to-end:
   `docs/channels/README.md`** updated to reflect that gchat
   `deliver_breadcrumb` has shipped (Cards v2 `decoratedText` single-
   section card with in-place `spaces.messages.patch` edits,
-  `crates/ironclaw-channels/gchat/src/adapter.rs:191`). Stale
+  `crates/copperclaw-channels/gchat/src/adapter.rs:191`). Stale
   "landing this week (agent G)" marker removed.
 - **`docs/channels/mattermost.md` `is_group` row** rewritten to
   "no (not in payload)" with the wire-field rationale. Mattermost
@@ -659,10 +659,10 @@ degraded to channel-only phrasing. This closes the gap end-to-end:
   channel-type signal; deriving DM-vs-group requires a follow-up
   `GET /api/v4/channels/{channel_id}` lookup. `TODO(channel-ux)`
   comment added in
-  `crates/ironclaw-channels/mattermost/src/router.rs` at the
+  `crates/copperclaw-channels/mattermost/src/router.rs` at the
   `InboundEvent` construction site documenting the contract.
 - **Discord `thread_id`/`reply_to` doc row verified** against
-  `crates/ironclaw-channels/discord/src/events.rs:64-75`. The
+  `crates/copperclaw-channels/discord/src/events.rs:64-75`. The
   legacy `thread_id` mirror is real (kept to avoid breaking
   existing routing); the documented row already matches.
 
@@ -670,8 +670,8 @@ degraded to channel-only phrasing. This closes the gap end-to-end:
 
 Five slice-3 agents (Diff / TodoList / Error / Long-output / Thinking) landed in parallel; the integration pass closed the seams between them:
 
-- **`apply_emit_todo_list` body rewritten** to use `serde_json::Map::new()` + `.insert()` rather than the `json!({...})` macro so the runner-emit-set coverage test (`runner_emit_set_matches_source`) doesn't misclassify the `"todo_list"` content key as a `MessageKind::System` action name. Mirrors the same dodge in `apply_send_card`. (`crates/ironclaw-runner/src/tools.rs::apply_emit_todo_list`)
-- **`EXPANDER_BYTE_THRESHOLD` raised from 4 KB → 64 KB.** The original threshold collided with Telegram's 4096-char `max_message_chars()` cap and with Slack's 40 000-char cap, so any agent message just over a platform cap got folded into the expander chip rather than going through the slice-1 splitter. The expander is for *long tool output* (pages of shell stdout) — well over 64 KB in real use; the new threshold preserves that intent without competing with the splitter. (`crates/ironclaw-runner/src/tools.rs:914-919`)
+- **`apply_emit_todo_list` body rewritten** to use `serde_json::Map::new()` + `.insert()` rather than the `json!({...})` macro so the runner-emit-set coverage test (`runner_emit_set_matches_source`) doesn't misclassify the `"todo_list"` content key as a `MessageKind::System` action name. Mirrors the same dodge in `apply_send_card`. (`crates/copperclaw-runner/src/tools.rs::apply_emit_todo_list`)
+- **`EXPANDER_BYTE_THRESHOLD` raised from 4 KB → 64 KB.** The original threshold collided with Telegram's 4096-char `max_message_chars()` cap and with Slack's 40 000-char cap, so any agent message just over a platform cap got folded into the expander chip rather than going through the slice-1 splitter. The expander is for *long tool output* (pages of shell stdout) — well over 64 KB in real use; the new threshold preserves that intent without competing with the splitter. (`crates/copperclaw-runner/src/tools.rs:914-919`)
 - **Wired `emit_breadcrumb_finish` into the runner's tool loop.** After Agent G shipped the trait surface, the chip stayed stuck on "Running" forever because no one was calling the finish hook. New helper `finish_tool_breadcrumb` in `drive_turn.rs` fires after every `invoke_tool` return, passing the tool's first non-empty result line (char-truncated to 200) as the summary.
 - **`cli/provider-timeout` replay fixture updated** for the slice-3.3 ErrorCard apology shape. The runner's terminal-failure apology is now a `MessageKind::Error` row carrying a full `ErrorCard`; the fixture's pre-3.3 expected output of a plain `Chat` row was stale.
 - **`approvals.rs` doc-markdown clippy fix** (backticks around `self_mod`).
@@ -694,11 +694,11 @@ collapsed native UI primitive on every adapter that has one.
 Default is **OFF** — surfacing model chain-of-thought has privacy
 implications (mid-thought speculation about the user, debugging notes
 the model didn't intend the user to see, etc.). This matches the
-Ironclaw tenet of "secure-by-default, public-by-deliberate-act".
+Copperclaw tenet of "secure-by-default, public-by-deliberate-act".
 
 - **Canonical `ThinkingBlock` schema**
-  (`crates/ironclaw-channels/core/src/thinking.rs`,
-  `crates/ironclaw-channels/core/src/lib.rs`). Fields: `text` (≤
+  (`crates/copperclaw-channels/core/src/thinking.rs`,
+  `crates/copperclaw-channels/core/src/lib.rs`). Fields: `text` (≤
   `MAX_THINKING_CHARS` = 8000 codepoints), `redacted: bool` (mirrors
   the upstream `redacted_thinking` block type — renderers MUST
   substitute a placeholder rather than display any text), `model:
@@ -707,64 +707,64 @@ Ironclaw tenet of "secure-by-default, public-by-deliberate-act".
   emits a `[reasoning]`-headered quoted block so plain-text channels
   still surface the reasoning clearly.
 - **`MessageKind::Thinking` variant**
-  (`crates/ironclaw-types/src/message.rs`) — alphabetical placement
+  (`crates/copperclaw-types/src/message.rs`) — alphabetical placement
   among the slice-3 new variants. Serde lowercase `"thinking"` on the
   wire; `as_str` / `parse_str` round-trip pinned by a new test.
 - **New `ChannelAdapter::deliver_thinking` hook**
-  (`crates/ironclaw-channels/core/src/adapter.rs`). Default impl
+  (`crates/copperclaw-channels/core/src/adapter.rs`). Default impl
   converts the block via `to_text_fallback` and routes through
   `deliver` as `MessageKind::Chat`, so every adapter has a usable
   rendering for free.
 - **Per-channel native renderers**:
-  - Telegram (`crates/ironclaw-channels/telegram/src/adapter.rs`):
+  - Telegram (`crates/copperclaw-channels/telegram/src/adapter.rs`):
     HTML `<blockquote expandable>` (Bot API 7.6+, same primitive as
     surface 4) with `<i>reasoning</i>` prefix.
-  - Slack (`crates/ironclaw-channels/slack/src/adapter.rs`): Block
+  - Slack (`crates/copperclaw-channels/slack/src/adapter.rs`): Block
     Kit `context` block (the platform's idiomatic muted-metadata
     affordance) with `:thought_balloon:` emoji + reasoning label,
     chunked across multiple blocks under Slack's 3000-char element
     cap.
-  - Discord (`crates/ironclaw-channels/discord/src/adapter.rs`):
+  - Discord (`crates/copperclaw-channels/discord/src/adapter.rs`):
     embed with secondary-grey color (`0x99AAB5`), `author.name =
     "reasoning"` (with optional provenance), description fenced as
     `text` to defang user-supplied markdown / backticks.
-  - Google Chat (`crates/ironclaw-channels/gchat/src/adapter.rs`):
+  - Google Chat (`crates/copperclaw-channels/gchat/src/adapter.rs`):
     Cards v2 `collapsibleSection` (native disclosure-widget
     primitive — same as surface 4 long-output) with
     `uncollapsibleWidgetsCount: 0` so the body stays behind the
     fold.
-  - Matrix (`crates/ironclaw-channels/matrix/src/adapter.rs`):
+  - Matrix (`crates/copperclaw-channels/matrix/src/adapter.rs`):
     `m.notice` with HTML `<details>` disclosure widget — Element /
     SchildiChat / Cinny render it as a clickable expander natively.
 - **New `ProviderEvent::Thinking { text, redacted }` variant**
-  (`crates/ironclaw-types/src/provider.rs`). The Anthropic provider
-  (`crates/ironclaw-providers/src/anthropic.rs`) emits one of these
+  (`crates/copperclaw-types/src/provider.rs`). The Anthropic provider
+  (`crates/copperclaw-providers/src/anthropic.rs`) emits one of these
   at every `content_block_stop` boundary closing a `thinking` /
   `redacted_thinking` block, carrying the accumulated text. Two new
   SSE-pump tests pin the emit shape (visible + redacted).
 - **`ToolContext::emit_thinking`**
-  (`crates/ironclaw-mcp/src/context.rs`) + runner impl
-  (`crates/ironclaw-runner/src/tools.rs`). Mirrors
+  (`crates/copperclaw-mcp/src/context.rs`) + runner impl
+  (`crates/copperclaw-runner/src/tools.rs`). Mirrors
   `emit_breadcrumb`: best-effort, swallows errors, no-op when there's
   no channel routing to surface to.
 - **Runner-side opt-in gate**
-  (`crates/ironclaw-runner/src/run/provider_call.rs`): the gate lives
+  (`crates/copperclaw-runner/src/run/provider_call.rs`): the gate lives
   in `pump_events`, gated on the new `RunnerDeps::surface_thinking`
   flag. When off, `ProviderEvent::Thinking` events drop on the
   floor; when on, the runner calls `tool_ctx.emit_thinking` which
   writes the canonical row.
 - **Per-group `surface_thinking` column on `container_configs`**
   (new migration
-  `crates/ironclaw-db/migrations/014_container_config_surface_thinking.sql`,
+  `crates/copperclaw-db/migrations/014_container_config_surface_thinking.sql`,
   schema additions in
-  `crates/ironclaw-db/src/tables/container_configs.rs`,
+  `crates/copperclaw-db/src/tables/container_configs.rs`,
   `set_surface_thinking` setter). Default `0` matches the privacy
   default. Plumbed from the host's container manager into the
   runner's JSON config via the new
   `RunnerConfigForFile::surface_thinking` field (skipped when off so
   existing-group config files stay bit-identical).
 - **Host delivery dispatch**
-  (`crates/ironclaw-host-delivery/src/service.rs`): new
+  (`crates/copperclaw-host-delivery/src/service.rs`): new
   `dispatch_thinking` arm routes `MessageKind::Thinking` rows through
   the adapter's `deliver_thinking` hook, with the standard
   `AdapterError::Unsupported` → text-fallback degradation.
@@ -787,8 +787,8 @@ Discord, Google Chat, Matrix). Breadcrumb = "what tool ran"; diff
 card = "what changed".
 
 - **New canonical `DiffCard` schema**
-  (`crates/ironclaw-channels/core/src/diff.rs`,
-  `crates/ironclaw-channels/core/src/lib.rs`). Fields: `path` (≤256
+  (`crates/copperclaw-channels/core/src/diff.rs`,
+  `crates/copperclaw-channels/core/src/lib.rs`). Fields: `path` (≤256
   chars), optional `language`, `hunks: Vec<DiffHunk>` (≤8), `added`,
   `removed`, `truncated`. Each `DiffHunk` carries `old_start /
   old_lines / new_start / new_lines` (unified-diff convention,
@@ -799,17 +799,17 @@ card = "what changed".
   payload always passes `validate()`. Companion `BlobReplaced` shape
   for the overwrite-of-large-file path.
 - **New `MessageKind::Diff` variant**
-  (`crates/ironclaw-types/src/message.rs`). Serialises as `"diff"`
+  (`crates/copperclaw-types/src/message.rs`). Serialises as `"diff"`
   (lowercase); DB column round-trip via `as_str` / `parse_str`.
 - **New `ChannelAdapter::deliver_diff` trait method**
-  (`crates/ironclaw-channels/core/src/adapter.rs`). Default impl
+  (`crates/copperclaw-channels/core/src/adapter.rs`). Default impl
   converts via `DiffCard::to_text_fallback` (standard unified diff
   with `--- a/<path>` / `+++ b/<path>` header, `@@ -…@@` hunks,
   `+`/`-`/` ` prefixes, `(+N / -M)` footer) and routes through
   `deliver` as `MessageKind::Chat`. No `existing_message_id`: diffs
   are immutable post-emit.
 - **Runner-side diff computation**
-  (`crates/ironclaw-mcp/src/tools/diff_util.rs`). New helper uses
+  (`crates/copperclaw-mcp/src/tools/diff_util.rs`). New helper uses
   the `similar` crate to build a structured `DiffCard` from
   pre/post-edit string snapshots; `edit_file` / `multi_edit` /
   `apply_patch` snapshot the pre-edit content and call
@@ -818,44 +818,44 @@ card = "what changed".
   appended to, and is under the 256 KB cutoff) and does the same.
   Over-cutoff overwrites emit a `BlobReplaced` summary instead of
   trying to diff multi-megabyte blobs.
-- **New `ToolContext::emit_diff` hook** (`crates/ironclaw-mcp/src/context.rs`).
+- **New `ToolContext::emit_diff` hook** (`crates/copperclaw-mcp/src/context.rs`).
   Default no-op so non-runner contexts (mock, subagent adapter)
   compile unchanged; `RunnerToolCtx::emit_diff` overrides it to
   persist a `MessageKind::Diff` outbound row with the canonical
   payload under `content.diff`. Mock context records diff calls so
   file-edit tool tests can assert the wiring.
 - **New `dispatch_diff` arm in the host delivery service**
-  (`crates/ironclaw-host-delivery/src/service.rs`). Mirrors
+  (`crates/copperclaw-host-delivery/src/service.rs`). Mirrors
   `dispatch_breadcrumb`: deserialises `content.diff` into the
   canonical `DiffCard`, hands it to `deliver_diff`, falls back to a
   unified-diff text body via `deliver` on
   `AdapterError::Unsupported`. No typing indicator (the breadcrumb
   already signalled), no `to` hint.
 - **Native renderers — priority channels:**
-  - **Telegram** (`crates/ironclaw-channels/telegram/src/adapter.rs`):
+  - **Telegram** (`crates/copperclaw-channels/telegram/src/adapter.rs`):
     `sendMessage` MarkdownV2 wrapping the diff body in a
     ` ```diff … ``` ` fenced code block, with a bold path header and
     `(+N / -M)` totals. Mobile clients colourise `diff` syntax
     natively.
-  - **Slack** (`crates/ironclaw-channels/slack/src/adapter.rs`):
+  - **Slack** (`crates/copperclaw-channels/slack/src/adapter.rs`):
     Block Kit `section` header (`*<path>* (+N / -M)`) + one
     `rich_text_preformatted` block per hunk. Honours `+` / `-`
     gutters and dodges the 3000-char per-section truncation surprise.
-  - **Discord** (`crates/ironclaw-channels/discord/src/adapter.rs`):
+  - **Discord** (`crates/copperclaw-channels/discord/src/adapter.rs`):
     Single embed with `description` carrying the ` ```diff … ``` `
     fenced block; embed `color` keys off add/remove balance
     (`0x57F287` green / `0xED4245` red / `0xFEE75C` yellow);
     over-budget hunks spill into `fields`.
-  - **Google Chat** (`crates/ironclaw-channels/gchat/src/adapter.rs`):
+  - **Google Chat** (`crates/copperclaw-channels/gchat/src/adapter.rs`):
     Cards v2 card with one `decoratedText` widget per hunk
     (`topLabel = @@ -…@@`, body wrapped in `<font face="monospace">`
     with HTML-escaped source).
-  - **Matrix** (`crates/ironclaw-channels/matrix/src/adapter.rs`):
+  - **Matrix** (`crates/copperclaw-channels/matrix/src/adapter.rs`):
     `m.notice` with `formatted_body = <pre><code
     class="language-diff">…</code></pre>`. Element honours the
     `language-diff` class natively.
 - **Workspace dep:** `similar = "2"` added to root `Cargo.toml` and
-  pulled into `ironclaw-mcp` for diff computation. Pure-Rust MIT
+  pulled into `copperclaw-mcp` for diff computation. Pure-Rust MIT
   crate; no runtime requirements.
 - **Skills:** `skills/edit-file/SKILL.md` and `skills/write-file/SKILL.md`
   each gain a "Diff card surfaced to the user" section telling the
@@ -865,7 +865,7 @@ card = "what changed".
 ### Added (slice 3.3 — host-emitted `Error` cards with red affordance)
 
 Host-emitted errors that previously landed as plain chat (or as the
-`failed` row in `iclaw dropped-messages` only) now ride a dedicated
+`failed` row in `cclaw dropped-messages` only) now ride a dedicated
 `MessageKind::Error` surface, rendered with the red bar / bold prefix
 each platform supports so users actually see "something broke" instead
 of being shown a normal-looking reply (or nothing at all).
@@ -877,15 +877,15 @@ Crucially this surface is HOST-EMITTED, not model-emitted. There is no
    exhaustion) — replaces the plain-text apology row.
 2. Delivery retry exhaustion (3 failed adapter sends on a single
    outbound row) — emitted *in addition to* the existing
-   `delivered.status="failed"` row so `iclaw dropped-messages`
+   `delivered.status="failed"` row so `cclaw dropped-messages`
    continues to work unchanged.
 3. Internal tool errors that bubble past the runner's retry budget
    (path wired via the same trait + dispatch machinery; emit sites
    land as future tool handlers add them).
 
 - **New canonical `ErrorCard` schema**
-  (`crates/ironclaw-channels/core/src/error_card.rs`,
-  `crates/ironclaw-channels/core/src/lib.rs`). Fields: `title` (≤120
+  (`crates/copperclaw-channels/core/src/error_card.rs`,
+  `crates/copperclaw-channels/core/src/lib.rs`). Fields: `title` (≤120
   chars, default "Something went wrong"), `summary` (≤500), `kind`
   (`Internal` / `Provider` / `Delivery`), optional `details` (≤2000,
   monospace), `retryable: bool`. `validate()` + `to_text_fallback()`
@@ -894,36 +894,36 @@ Crucially this surface is HOST-EMITTED, not model-emitted. There is no
   `MAX_TITLE_CHARS`; the type itself is renamed `ErrorCard` (not
   `Error`) so it doesn't shadow `AdapterError`.
 - **New `MessageKind::Error` variant**
-  (`crates/ironclaw-types/src/message.rs`). Serialises as `"error"`
+  (`crates/copperclaw-types/src/message.rs`). Serialises as `"error"`
   (lowercase, `serde(rename_all)`); DB column round-trip via
   `as_str` / `parse_str`.
 - **New `ChannelAdapter::deliver_error` trait method**
-  (`crates/ironclaw-channels/core/src/adapter.rs`). Default impl
+  (`crates/copperclaw-channels/core/src/adapter.rs`). Default impl
   converts via `ErrorCard::to_text_fallback` and routes through
   `deliver` as `MessageKind::Chat`, so every adapter has a usable
   rendering — `[ERROR: <kind>] <title>\n<summary>` — even before
   shipping a native renderer. No `existing_message_id` argument:
   error receipts are immutable.
 - **New `dispatch_error` arm in `process_row`**
-  (`crates/ironclaw-host-delivery/src/service.rs`). Deserialises
+  (`crates/copperclaw-host-delivery/src/service.rs`). Deserialises
   `content.error` into the canonical `ErrorCard`; calls
   `deliver_error`; falls back to text `deliver` on
   `AdapterError::Unsupported` (belt-and-braces mirror of
   `dispatch_card` / `dispatch_breadcrumb`). No typing indicator —
   the error is the visual signal.
 - **Retry-exhaustion `ErrorCard` emit**
-  (`crates/ironclaw-host-delivery/src/service.rs::emit_delivery_failure_error_card`).
+  (`crates/copperclaw-host-delivery/src/service.rs::emit_delivery_failure_error_card`).
   When `DeferOutcome::Fail` fires the host now writes a fresh Error-
   kind outbound row addressed back at the failed row's channel +
   platform + thread, with `kind = ErrorCardKind::Delivery`,
   `retryable = false`, and the underlying adapter error spliced into
   the summary. The next delivery pass routes it through
   `dispatch_error`. The existing `delivered::insert(.., "failed")`
-  write is preserved — operators still see the row in `iclaw
+  write is preserved — operators still see the row in `cclaw
   dropped-messages`; the user additionally sees a visible error in
   chat.
 - **Terminal-failure-apology promoted to `ErrorCard`**
-  (`crates/ironclaw-runner/src/run/mod.rs::emit_terminal_failure_apologies`).
+  (`crates/copperclaw-runner/src/run/mod.rs::emit_terminal_failure_apologies`).
   The human-channel branch now writes a `MessageKind::Error` row
   carrying an `ErrorCardKind::Provider` card whose `summary` is the
   same user-facing apology text the old plain-text path used. The
@@ -933,29 +933,29 @@ Crucially this surface is HOST-EMITTED, not model-emitted. There is no
   to handle than a sentence.
 - **Per-channel native renderers** (red where the platform has color,
   bold + monospace where it doesn't):
-  - Telegram (`crates/ironclaw-channels/telegram/src/adapter.rs`):
+  - Telegram (`crates/copperclaw-channels/telegram/src/adapter.rs`):
     HTML `<b>{kind label}: {title}</b>` prefix (Telegram has no
     colour affordance; weight + monospace details + the canonical
     `[ERROR]` text prefix carry the severity signal). Details ride
     in `<pre>…</pre>`. Retryable footer `<i>will retry
     automatically</i>`.
-  - Slack (`crates/ironclaw-channels/slack/src/adapter.rs`): new
+  - Slack (`crates/copperclaw-channels/slack/src/adapter.rs`): new
     `SlackApi::post_message_with_attachments` so we can drive the
     `attachments[].color = "danger"` red bar (Block Kit primary
     blocks can't produce a bar on their own). `header` + `section
     mrkdwn` + optional `rich_text_preformatted` for details. Text
     fallback rides on the top-level `text` for notification preview.
-  - Discord (`crates/ironclaw-channels/discord/src/adapter.rs`):
+  - Discord (`crates/copperclaw-channels/discord/src/adapter.rs`):
     single embed with `color = 0xE74C3C` (red), title + description
     + fenced-code details, retryable footer. Embedded backticks in
     user-supplied details are neutralised so the body can't break
     out of the fence.
-  - Google Chat (`crates/ironclaw-channels/gchat/src/adapter.rs`):
+  - Google Chat (`crates/copperclaw-channels/gchat/src/adapter.rs`):
     Cards v2 with `Error:`-prefixed header, severity-label
     decorated-text widget, optional monospace details paragraph,
     italic retryable footer. (Google Chat cardsV2 has no color
     primitive — icon + bold copy + the title prefix carry severity.)
-  - Matrix (`crates/ironclaw-channels/matrix/src/adapter.rs`):
+  - Matrix (`crates/copperclaw-channels/matrix/src/adapter.rs`):
     `m.text` (NOT `m.notice` — errors warrant notification badges;
     muting them in Element would defeat the surface's purpose) with
     `<font color="#cc3333">` wrapping the bold title. `<pre><code>`
@@ -981,7 +981,7 @@ new MessageKind — the runner auto-attaches it on `apply_send_message` /
 `apply_send_file` when the chat body exceeds 30 lines OR 4 KB.
 
 - **New runner-side threshold detector**
-  (`crates/ironclaw-runner/src/tools.rs`):
+  (`crates/copperclaw-runner/src/tools.rs`):
   `build_expander_decorator(text)` returns `Some(json)` when either
   threshold trips, otherwise `None`. Decorator JSON shape:
   `{ summary, summary_kind: "lines"|"bytes", preview_lines: [...] }`
@@ -991,14 +991,14 @@ new MessageKind — the runner auto-attaches it on `apply_send_message` /
   `apply_send_message` and `apply_send_file` (for the caption body)
   on Chat-kind rows only — Agent-kind rows skip decoration.
 - **New `ChannelAdapter::deliver_collapsible` trait method**
-  (`crates/ironclaw-channels/core/src/adapter.rs`). Default impl
+  (`crates/copperclaw-channels/core/src/adapter.rs`). Default impl
   composes a summary-plus-preview-plus-truncation-marker body via
   `render_collapsible_text_fallback` and routes through `deliver`, so
   every adapter has a usable rendering for free even without a native
   override. Shared helper exported as
-  `ironclaw_channels_core::render_collapsible_text_fallback`.
+  `copperclaw_channels_core::render_collapsible_text_fallback`.
 - **New dispatch branch in `dispatch_chat`**
-  (`crates/ironclaw-host-delivery/src/service.rs`). Chat-kind rows
+  (`crates/copperclaw-host-delivery/src/service.rs`). Chat-kind rows
   whose `content.expander` decorator is present route to the new
   `dispatch_collapsible` helper which calls the adapter's
   `deliver_collapsible` hook with the full text + summary + preview;
@@ -1007,27 +1007,27 @@ new MessageKind — the runner auto-attaches it on `apply_send_message` /
   plain `deliver` with the helper-rendered body (belt-and-braces,
   same shape as `dispatch_card` / `dispatch_breadcrumb`).
 - **Per-channel native renderers**:
-  - Telegram (`crates/ironclaw-channels/telegram/src/adapter.rs`):
+  - Telegram (`crates/copperclaw-channels/telegram/src/adapter.rs`):
     HTML `<i>{summary}</i>` outside, `<blockquote expandable>` wrapping
     the full body. Bot API 7.6+ native primitive; clients without
     `expandable` see a fully-rendered blockquote (graceful).
-  - Slack (`crates/ironclaw-channels/slack/src/adapter.rs`): Block Kit
+  - Slack (`crates/copperclaw-channels/slack/src/adapter.rs`): Block Kit
     `section` mrkdwn for the summary, a preview `rich_text_preformatted`
     when present, and a second `rich_text_preformatted` with the full
     body. Slack's native "Show more" collapses oversized preformatted
     blocks behind a click — functionally equivalent to a disclosure
     widget without needing a `block_actions` callback round-trip.
-  - Discord (`crates/ironclaw-channels/discord/src/adapter.rs`):
+  - Discord (`crates/copperclaw-channels/discord/src/adapter.rs`):
     single embed with `author.name = "long output"`, `title = summary`,
     `description = preview fence + "—— full output ——" + body fence`,
     truncated to fit the 4096-char embed cap with a
     `…(truncated; N more bytes)` footer when the body overflows.
-  - Google Chat (`crates/ironclaw-channels/gchat/src/adapter.rs`):
+  - Google Chat (`crates/copperclaw-channels/gchat/src/adapter.rs`):
     Cards v2 `collapsibleSection` (native disclosure primitive).
     Preview lines ride as uncollapsible widgets above the fold; full
     body wraps in `<font face="monospace">` for legible log/source
     rendering.
-  - Matrix (`crates/ironclaw-channels/matrix/src/adapter.rs`):
+  - Matrix (`crates/copperclaw-channels/matrix/src/adapter.rs`):
     `<details><summary><em>{summary}</em></summary><pre><code>…</code></pre></details>`
     — Element renders the native disclosure widget. Plain-text body
     on the same event handles non-HTML clients.
@@ -1045,8 +1045,8 @@ support it) instead of the legacy plain-text `todo_watcher` notification
 stream.
 
 - **New canonical `TodoList` schema**
-  (`crates/ironclaw-channels/core/src/todo_list.rs`,
-  `crates/ironclaw-channels/core/src/lib.rs`). Fields: `items:
+  (`crates/copperclaw-channels/core/src/todo_list.rs`,
+  `crates/copperclaw-channels/core/src/lib.rs`). Fields: `items:
   Vec<TodoListItem>` (capped at `TODO_MAX_ITEMS = 50`), `title:
   Option<String>` (≤ `TODO_MAX_TITLE_CHARS = 64`). Each item carries
   `id`, `text` (≤ `TODO_MAX_ITEM_TEXT_CHARS = 200`), and `status:
@@ -1057,14 +1057,14 @@ stream.
   `pending_count`, `in_progress_count`, `completed_count`,
   `title_or_default` round out the API.
 - **New `ChannelAdapter::deliver_todo_list` hook**
-  (`crates/ironclaw-channels/core/src/adapter.rs`). Default impl
+  (`crates/copperclaw-channels/core/src/adapter.rs`). Default impl
   converts the list to its text fallback and routes through `deliver`,
   so every adapter has a usable rendering for free. Signature carries
   `existing_message_id` (for edit-in-place) and `pin_hint` (for
   pin/unpin on platforms that support pinning).
 - **New `MessageKind::TodoList`**
-  (`crates/ironclaw-types/src/message.rs`) routed via
-  `dispatch_todo_list` in `crates/ironclaw-host-delivery/src/service.rs`.
+  (`crates/copperclaw-types/src/message.rs`) routed via
+  `dispatch_todo_list` in `crates/copperclaw-host-delivery/src/service.rs`.
   Looks up the prior list row in the session via the newly-extracted
   generic `lookup_prior_kind_external_id` helper (factored out of
   `lookup_prior_breadcrumb_external_id` so both surfaces share one
@@ -1072,19 +1072,19 @@ stream.
   for in-place editing, and derives `pin_hint` from "first emit OR
   list just transitioned to fully-completed".
 - **Per-channel native chip renderers**:
-  - Telegram (`crates/ironclaw-channels/telegram/src/adapter.rs`,
+  - Telegram (`crates/copperclaw-channels/telegram/src/adapter.rs`,
     `api.rs`): MarkdownV2 `*Plan*` header, one line per item with
     `☑` / `▶` / `☐` glyph + (for completed items) `~strikethrough~`,
     `_done/total_` footer. First emit via `sendMessage` then
     `pinChatMessage` (new API call); subsequent mutations via
     `editMessageText`; `unpinChatMessage` when fully completed.
-  - Slack (`crates/ironclaw-channels/slack/src/adapter.rs`,
+  - Slack (`crates/copperclaw-channels/slack/src/adapter.rs`,
     `api.rs`): Block Kit `header` block with title + `done/total`
     counter, one `section` block per item with status emoji + mrkdwn
     body. First emit via `chat.postMessage` then `pins.add` (new API
     call); mutations via `chat.update`; `pins.remove` when fully
     completed.
-  - Discord (`crates/ironclaw-channels/discord/src/adapter.rs`,
+  - Discord (`crates/copperclaw-channels/discord/src/adapter.rs`,
     `rest.rs`): single embed with title + `done/total` counter,
     description rendering one line per item with `✅` / `▶️` / `⬜`
     glyphs and strikethrough on completed items. Embed color keys off
@@ -1094,13 +1094,13 @@ stream.
     `patch_message_payload`; `DELETE /pins/...` when fully completed.
     Pin permission failures are swallowed at `debug` — bots routinely
     lack `MANAGE_MESSAGES`.
-  - Google Chat (`crates/ironclaw-channels/gchat/src/adapter.rs`):
+  - Google Chat (`crates/copperclaw-channels/gchat/src/adapter.rs`):
     Cards v2 single-section card with a `decoratedText` widget per
     item, `startIcon` keyed off status (`CHECK_CIRCLE` /
     `CIRCLE` / `STAR`). First emit via `spaces.messages.create`,
     mutations via `spaces.messages.patch`. No public pin API on
     Google Chat — `pin_hint` is silently honoured as a no-op.
-  - Matrix (`crates/ironclaw-channels/matrix/src/adapter.rs`,
+  - Matrix (`crates/copperclaw-channels/matrix/src/adapter.rs`,
     `api.rs`): `m.text` HTML event with `<h4>` title + `<ul>` list,
     status glyph prefix per item, `<s>` strikethrough on completed
     items. Mutations via the new `edit_message_html` (`m.replace`
@@ -1109,15 +1109,15 @@ stream.
     decoration.
 - **MCP-side emit pipeline**: new
   `OutboundToolEffect::EmitTodoList(EmitTodoListSpec)` variant
-  (`crates/ironclaw-mcp/src/context.rs`) carries the canonical list;
-  `crates/ironclaw-mcp/src/tools/todo.rs` invokes
+  (`crates/copperclaw-mcp/src/context.rs`) carries the canonical list;
+  `crates/copperclaw-mcp/src/tools/todo.rs` invokes
   `emit_after_mutation` at the end of every `add::handle`,
   `update::handle`, and `delete::handle`, building the wire list
   from the on-disk items (with per-item text truncation to fit the
   schema cap). Empty lists are intentionally NOT emitted — no "empty
   plan" UX.
 - **Runner apply path**: new `apply_emit_todo_list` in
-  `crates/ironclaw-runner/src/tools.rs` mirrors `apply_send_card` —
+  `crates/copperclaw-runner/src/tools.rs` mirrors `apply_send_card` —
   resolves the originating routing, forces `MessageKind::TodoList`,
   inserts the row with `content.todo_list = <canonical TodoList>`.
 - **Skill prose update**: `skills/todo-tracker/SKILL.md` notes that
@@ -1128,7 +1128,7 @@ stream.
 
 After Agent G shipped the `Breadcrumb` shape + `deliver_breadcrumb` trait
 method + per-channel native renderers (telegram/slack/discord/gchat/matrix),
-the runner's tool-loop in `crates/ironclaw-runner/src/run/drive_turn.rs`
+the runner's tool-loop in `crates/copperclaw-runner/src/run/drive_turn.rs`
 now calls `deps.tool_ctx.emit_breadcrumb_finish(...)` immediately after
 every `invoke_tool` return. The chip transitions in place from Running
 to Done/Failed, with the tool result's first non-empty line (char-truncated
@@ -1150,48 +1150,48 @@ that adapters render as compact native chips and update in place once the
 tool finishes — the Claude Code mobile-app aesthetic.
 
 - **New canonical `Breadcrumb` schema**
-  (`crates/ironclaw-channels/core/src/breadcrumb.rs`,
-  `crates/ironclaw-channels/core/src/lib.rs`). Fields:
+  (`crates/copperclaw-channels/core/src/breadcrumb.rs`,
+  `crates/copperclaw-channels/core/src/lib.rs`). Fields:
   `tool_name`, `detail: Option<String>`, `status: Running | Done | Failed`,
   `summary: Option<String>` (post-completion blurb such as
   `"passed (0.4s)"`). `validate()` enforces tight caps so the chip stays a
   one-glance UX cue on mobile. `to_text_fallback()` mirrors the legacy
   `[tool] detail` shape for adapters without a native renderer.
 - **New `ChannelAdapter::deliver_breadcrumb` hook**
-  (`crates/ironclaw-channels/core/src/adapter.rs`). Default impl converts
+  (`crates/copperclaw-channels/core/src/adapter.rs`). Default impl converts
   the breadcrumb to the text fallback and routes through `deliver`, so
   every adapter has a usable rendering for free. Native renderers override
   the hook and use `existing_message_id` to drive in-place edits when
   available.
 - **Per-channel native chip renderers**:
-  - Telegram (`crates/ironclaw-channels/telegram/src/adapter.rs`,
+  - Telegram (`crates/copperclaw-channels/telegram/src/adapter.rs`,
     `api.rs`): HTML `<code>` chip via `sendMessage(parse_mode=HTML)`;
     in-place edit via the new `edit_message_text_with_mode` so update
     keeps HTML formatting.
-  - Slack (`crates/ironclaw-channels/slack/src/adapter.rs`,
+  - Slack (`crates/copperclaw-channels/slack/src/adapter.rs`,
     `api.rs`): Block Kit `context` block (the platform's idiomatic
     "metadata chip") with a status emoji + inline-code mrkdwn fragment;
     in-place edit via the new `chat_update_with_blocks`.
-  - Discord (`crates/ironclaw-channels/discord/src/adapter.rs`): inline
+  - Discord (`crates/copperclaw-channels/discord/src/adapter.rs`): inline
     `` `tool` `` formatting in `content`; in-place edit via the existing
     `PATCH /channels/.../messages/...`.
-  - Google Chat (`crates/ironclaw-channels/gchat/src/adapter.rs`,
+  - Google Chat (`crates/copperclaw-channels/gchat/src/adapter.rs`,
     `api.rs`): cards v2 single-section `decoratedText` widget with a
     `knownIcon` for the status glyph; in-place edit via the new
     `edit_card` (`spaces.messages.patch`, `updateMask=cardsV2`).
-  - Matrix (`crates/ironclaw-channels/matrix/src/adapter.rs`,
+  - Matrix (`crates/copperclaw-channels/matrix/src/adapter.rs`,
     `api.rs`): `m.notice` event with HTML `<code>` body; in-place edit
     via the new `edit_message_notice_html` (`m.replace` relation).
 - **New `MessageKind::Breadcrumb` variant + delivery dispatch**
-  (`crates/ironclaw-types/src/message.rs`,
-  `crates/ironclaw-host-delivery/src/service.rs`). The delivery service
+  (`crates/copperclaw-types/src/message.rs`,
+  `crates/copperclaw-host-delivery/src/service.rs`). The delivery service
   routes Breadcrumb-kind rows through a dedicated `dispatch_breadcrumb`
   that pulls the canonical `Breadcrumb` out of `content.breadcrumb`,
   hands it to `deliver_breadcrumb`, and falls back to a plain-text
   `deliver` if the adapter returns `Unsupported`.
 - **In-place update via `update_breadcrumb` system action**
-  (`crates/ironclaw-runner/src/tools.rs`,
-  `crates/ironclaw-host-delivery/src/service.rs`). The runner's new
+  (`crates/copperclaw-runner/src/tools.rs`,
+  `crates/copperclaw-host-delivery/src/service.rs`). The runner's new
   `emit_breadcrumb_finish` (added to the `ToolContext` trait as a
   default no-op) writes a `MessageKind::System` row carrying an
   `update_breadcrumb` action. The host's delivery service intercepts the
@@ -1218,7 +1218,7 @@ day one. Wave 2 landed a Telegram-native renderer + `callback_query`
 round-trip. This batch closes the next two majors:
 
 - **Slack — Block Kit `deliver_card`**
-  (`crates/ironclaw-channels/slack/src/{api.rs,adapter.rs}`).
+  (`crates/copperclaw-channels/slack/src/{api.rs,adapter.rs}`).
   `build_card_blocks()` maps `card.title` → `header`,
   `card.body` (+ optional image as section accessory) → `section` mrkdwn,
   `card.fields` → `section.fields` chunked at Slack's 10-per-section cap,
@@ -1230,7 +1230,7 @@ round-trip. This batch closes the next two majors:
   `style: "primary" | "danger"` Slack supports; other style strings
   silently degrade to default.
 - **Slack — interactive `block_actions` round-trip**
-  (`crates/ironclaw-channels/slack/src/events/router.rs`).
+  (`crates/copperclaw-channels/slack/src/events/router.rs`).
   The Events API handler now dispatches on `Content-Type`: JSON falls
   through to the existing `event_callback` path; form-encoded
   `payload=<urlencoded-json>` parses as a `block_actions` payload via
@@ -1245,7 +1245,7 @@ round-trip. This batch closes the next two majors:
   webhook signature check applies to both shapes — same HMAC contract,
   no new endpoint to register.
 - **Discord — embed + components `deliver_card`**
-  (`crates/ironclaw-channels/discord/src/{rest.rs,adapter.rs}`).
+  (`crates/copperclaw-channels/discord/src/{rest.rs,adapter.rs}`).
   `build_card_payload()` maps `card.title`/`card.body` → an embed's
   `title`/`description`, `card.image_url` → `embed.image.url`,
   `card.fields` → `embed.fields[]` (with `inline` honoured),
@@ -1259,7 +1259,7 @@ round-trip. This batch closes the next two majors:
   `post_message_payload()` on `DiscordRest` ships the assembled JSON
   via `POST /channels/{id}/messages` and surfaces the message id.
 - **Discord — `INTERACTION_CREATE` (`MESSAGE_COMPONENT`) round-trip**
-  (`crates/ironclaw-channels/discord/src/{events.rs,adapter.rs}`).
+  (`crates/copperclaw-channels/discord/src/{events.rs,adapter.rs}`).
   The gateway loop now pumps `INTERACTION_CREATE` dispatches through
   the new `interaction_create_to_inbound()` — type-3 (component) taps
   produce an `InteractionInbound { event, interaction_id,
@@ -1286,7 +1286,7 @@ the touched crates; pre-existing `breadcrumb` warnings + the
 Two visible-to-every-channel UX gaps closed in the runner without
 touching the host's typing-ticker or any channel adapter:
 
-- `crates/ironclaw-runner/src/run/prompt.rs` — new module that renders
+- `crates/copperclaw-runner/src/run/prompt.rs` — new module that renders
   a per-inbound "Conversation context: ..." paragraph (channel,
   platform, thread-vs-DM shape, batch-coalesce count, history depth,
   source-session-id when relayed from a parent agent) and splices it
@@ -1296,9 +1296,9 @@ touching the host's typing-ticker or any channel adapter:
   populated on `MessageInRow` are surfaced; `is_group` /
   `reply_to` from `InboundEvent` aren't persisted to the row yet so
   they're omitted rather than always-`None`.
-- `crates/ironclaw-runner/src/run/provider_call.rs` — new
+- `crates/copperclaw-runner/src/run/provider_call.rs` — new
   `ProviderActivityPinger` trait (with `HeartbeatPinger` /
-  `NoopPinger` impls re-exported from `ironclaw_runner`) plus a
+  `NoopPinger` impls re-exported from `copperclaw_runner`) plus a
   `ProviderActivityTicker` RAII guard that fires every ~3s while a
   provider call is in flight, *and* once per useful SSE chunk in
   `pump_events`. The production binary wires `HeartbeatPinger` so
@@ -1320,7 +1320,7 @@ slice-1 cohesive-UX baseline (chat-text splitter, adapter rate-limit
 backoff). The harness now wraps each `MockAdapter` in a `CappedAdapter`
 that reports a per-channel `max_message_chars` matching production
 (`telegram=4096`, `slack=40000`, `discord=2000`, etc. — see
-`default_cap_for` in `crates/ironclaw-host/tests/replay/harness.rs`)
+`default_cap_for` in `crates/copperclaw-host/tests/replay/harness.rs`)
 and recognises two new optional manifest fields: `pre_delivery_failures`
 (queue `MockAdapter::fail_next_deliver` errors before driving inbound)
 and `redrive_after_ms` (sleep + re-run `process_session_once` per
@@ -1352,26 +1352,26 @@ router, skipping the webhook secret check entirely. Surfaced in
 alongside the other transport-layer gaps; the secret-compare itself
 is exercised by unit tests in the telegram and whatsapp-cloud crates.
 
-### Added (`iclaw approvals approve-id <id>` and `iclaw approvals deny <id>` — generic per-family approval write surface)
+### Added (`cclaw approvals approve-id <id>` and `cclaw approvals deny <id>` — generic per-family approval write surface)
 
 Until now only `Sender` approvals had a CLI write path
-(`iclaw approvals approve --channel <ct> --identity <id>`); the other
+(`cclaw approvals approve --channel <ct> --identity <id>`); the other
 families (Channel, InstallPackages, AddMcpServer) piled up as rows in
 `pending_approvals` and the operator had to hand-CRUD them via the
 central DB. The new generic verbs close that gap:
 
-- `iclaw approvals approve-id <id>` (wire: `approvals.approve`) — looks
+- `cclaw approvals approve-id <id>` (wire: `approvals.approve`) — looks
   up the row, dispatches on the `action` column, applies the per-family
   side effect, then marks the row `status = 'approved'`. Re-approving
   an already-approved row is a no-op (`applied: false`,
   `reason: "already_approved"`). Approving a denied/expired row is
   `conflict`.
-- `iclaw approvals deny <id>` (wire: `approvals.deny`) — marks the row
+- `cclaw approvals deny <id>` (wire: `approvals.deny`) — marks the row
   `status = 'denied'` without applying any side effect. Idempotent;
   denying an already-approved row is `conflict`.
 
 Per-family dispatch arms in
-`crates/ironclaw-host/src/handlers/approvals.rs`:
+`crates/copperclaw-host/src/handlers/approvals.rs`:
 
 - `action = "sender"` | `"approve_sender"` — upsert into `users` by
   `(channel_type, platform_id)` from the row's columns. Display name
@@ -1379,37 +1379,37 @@ Per-family dispatch arms in
 - `action = "channel"` — upsert a `messaging_groups` row by
   `(channel_type, platform_id)`. Optional `name`, `is_group`,
   `unknown_sender_policy` from `payload`. No auto-wiring (a separate
-  operator decision via `iclaw wirings create`); the response includes
+  operator decision via `cclaw wirings create`); the response includes
   a `wiring_hint` with the exact follow-up command.
 - `action = "install_packages"` — read `payload.apt[]` /
   `payload.npm[]`, merge into the affected group's
   `container_configs.packages_apt` / `packages_npm`. Does NOT
   auto-rebuild; the response includes a `rebuild_hint` so the operator
-  knows to run `iclaw groups restart <ag_id>`.
+  knows to run `cclaw groups restart <ag_id>`.
 - `action = "add_mcp_server"` — read `payload.{name, transport}`,
   insert into `container_configs.mcp_servers` (replacing any entry
   with the same name). Same no-auto-rebuild stance + `rebuild_hint`.
 
 Both verbs are registered as host-only commands in
-`crates/ironclaw-host/src/handlers/mod.rs::HOST_ONLY_COMMANDS`, which
+`crates/copperclaw-host/src/handlers/mod.rs::HOST_ONLY_COMMANDS`, which
 auto-wires them into the audit log (the socket dispatcher writes an
 `audit_log` row for every host-only command, success or error). 19
 new unit tests cover each family's happy path, the idempotency
 contract, conflict-on-status-reversal, missing fields, and unknown
 actions; a new socket-level dispatch test in
-`crates/ironclaw-host/src/socket.rs` confirms the audit row lands.
+`crates/copperclaw-host/src/socket.rs` confirms the audit row lands.
 
 Files changed:
-- `crates/ironclaw-iclaw/src/commands.rs` — new `ApprovalsCmd::ApproveById`
+- `crates/copperclaw-cclaw/src/commands.rs` — new `ApprovalsCmd::ApproveById`
   + `ApprovalsCmd::Deny` variants, `to_call` arms, `ALL_COMMANDS` entries.
-- `crates/ironclaw-host/src/handlers/approvals.rs` — `approve` /
+- `crates/copperclaw-host/src/handlers/approvals.rs` — `approve` /
   `deny` handlers + four per-family appliers (`apply_sender`,
   `apply_channel`, `apply_install_packages`, `apply_add_mcp_server`)
   + a local `ensure_config_row` helper mirroring the one in
   `handlers::groups` (no cross-module dep).
-- `crates/ironclaw-host/src/handlers/mod.rs` — `approvals.approve` /
+- `crates/copperclaw-host/src/handlers/mod.rs` — `approvals.approve` /
   `approvals.deny` added to `HOST_ONLY_COMMANDS`.
-- `crates/ironclaw-host/src/socket.rs` — dispatch-table registration +
+- `crates/copperclaw-host/src/socket.rs` — dispatch-table registration +
   the integration test.
 
 ### Fixed (`CreateAgentModule` no longer leaks one entry per ever-spawned agent group)
@@ -1421,7 +1421,7 @@ map grew without bound (one entry per ever-spawned group), and it
 returned stale depths when an `AgentGroupId` was deleted and a later
 group reused the slot.
 
-`crates/ironclaw-modules/src/agent_to_agent/create_agent.rs` now reads
+`crates/copperclaw-modules/src/agent_to_agent/create_agent.rs` now reads
 depth straight from `agent_groups.subagent_depth` on every
 `create_agent` call. The DB is the canonical source so this is also
 the correctness fix: id reuse and ad-hoc admin resets of the depth
@@ -1444,7 +1444,7 @@ Two new tests pin the bounded-memory invariant:
 Tests reseeding parent depth previously poked the cache directly;
 they now seed via `agent_groups::set_subagent_depth` so they exercise
 the same DB path the production gate hits. Total tests in
-`ironclaw-modules` go from 205 to 207.
+`copperclaw-modules` go from 205 to 207.
 
 ### Added (`reply_to` populated from the wire across 7 channels)
 
@@ -1454,28 +1454,28 @@ to `None`. Now seven channels populate it from the wire payload when the
 platform tells us a message is a reply, so the agent (and any downstream
 threading logic) can stitch replies back to the parent message:
 
-- **Telegram** (`crates/ironclaw-channels/telegram/src/ingress/mod.rs`):
+- **Telegram** (`crates/copperclaw-channels/telegram/src/ingress/mod.rs`):
   from `message.reply_to_message.message_id`. Required adding
   `reply_to_message: Option<Box<Message>>` to the local `Message` type
-  (`crates/ironclaw-channels/telegram/src/types.rs`) plus the matching
+  (`crates/copperclaw-channels/telegram/src/types.rs`) plus the matching
   `None` in the `api.rs::empty_message` constructor.
-- **Slack** (`crates/ironclaw-channels/slack/src/events/router.rs`):
+- **Slack** (`crates/copperclaw-channels/slack/src/events/router.rs`):
   from `thread_ts` when it differs from the message's own `ts` (the
   equality case is the thread root, which is NOT a reply).
-- **Discord** (`crates/ironclaw-channels/discord/src/events.rs`):
+- **Discord** (`crates/copperclaw-channels/discord/src/events.rs`):
   from `message_reference.message_id`. The existing `thread_id` mirror
   is kept (Discord callers rely on it); `reply_to` is the cleaner
   semantic.
-- **Matrix** (`crates/ironclaw-channels/matrix/src/parse.rs`):
+- **Matrix** (`crates/copperclaw-channels/matrix/src/parse.rs`):
   from `content."m.relates_to"."m.in_reply_to".event_id`. Independent
   of the existing `m.thread` → `thread_id` extraction.
-- **Teams** (`crates/ironclaw-channels/teams/src/events/router.rs`):
+- **Teams** (`crates/copperclaw-channels/teams/src/events/router.rs`):
   from `replyToId` on the fetched Graph message body.
-- **Signal** (`crates/ironclaw-channels/signal/src/parse.rs`):
+- **Signal** (`crates/copperclaw-channels/signal/src/parse.rs`):
   from `dataMessage.quote.id` (the quoted message's millisecond
   timestamp, which is exactly our `message.id` format).
 - **WhatsApp Cloud**
-  (`crates/ironclaw-channels/whatsapp-cloud/src/events/router.rs`):
+  (`crates/copperclaw-channels/whatsapp-cloud/src/events/router.rs`):
   from `messages[].context.message_id`.
 
 Each channel got 2 new unit tests (happy path + negative), 14 total.
@@ -1494,7 +1494,7 @@ times. These are the foundations for the parallel slice-2 polish work
 that follows.
 
 - **`max_message_chars()` on `ChannelAdapter`** with a chat-text splitter
-  in the delivery loop (`crates/ironclaw-host-delivery/src/service.rs`).
+  in the delivery loop (`crates/copperclaw-host-delivery/src/service.rs`).
   When an adapter advertises a per-message char cap, oversized outbound
   chat rows are split (paragraph → sentence → hard cut) into a sequence
   of sends before they hit the platform API, eliminating silent
@@ -1503,7 +1503,7 @@ that follows.
   4096, Discord 2000, Slack 40 000, gchat 4096, Teams 28 000,
   whatsapp-cloud 4096, wechat 600 (conservative under-approximation of
   the 2 KiB byte cap), webex 7439, line 5000. New metric
-  `ironclaw_delivery_chat_split_total{channel_type}` fires once per
+  `copperclaw_delivery_chat_split_total{channel_type}` fires once per
   split row. 6 new unit tests + the per-channel overrides are exercised
   by the existing adapter test suites.
 - **Honour adapter `Rate { retry_after }` hints** in
@@ -1515,9 +1515,9 @@ that follows.
   when no hint is present. New `DeliveryError::retry_after_secs()`
   accessor; 2 new tests pinning both paths.
 - **Constant-time webhook secret comparison** for Telegram
-  (`crates/ironclaw-channels/telegram/src/ingress/webhook.rs`) and
+  (`crates/copperclaw-channels/telegram/src/ingress/webhook.rs`) and
   whatsapp-cloud
-  (`crates/ironclaw-channels/whatsapp-cloud/src/events/router.rs`).
+  (`crates/copperclaw-channels/whatsapp-cloud/src/events/router.rs`).
   Both previously used a plain `!=` byte compare on bearer-token-shaped
   inputs, which leaks the secret one char at a time via response
   timing. Now use `subtle::ConstantTimeEq`. Other webhook channels
@@ -1540,7 +1540,7 @@ formatted text everywhere else — so no channel gets left behind.
 
 Shipped in three waves, all in this batch:
 
-- **Wave 1 — foundation** (`crates/ironclaw-channels/core/src/card.rs`):
+- **Wave 1 — foundation** (`crates/copperclaw-channels/core/src/card.rs`):
   canonical `Card`, `CardField`, `CardButton`, `CardError` types with
   `Card::validate()` + `to_text_fallback()`. New `MessageKind::Card`
   variant. New trait method `ChannelAdapter::deliver_card()` with a
@@ -1573,11 +1573,11 @@ Workspace: 5400 passing; clippy clean.
 ### Changed (cards rollout wave 2a — production path)
 
 Wave 1 added the canonical portable `Card` schema in
-`ironclaw-channels-core`, the `MessageKind::Card` variant, and the
+`copperclaw-channels-core`, the `MessageKind::Card` variant, and the
 trait-level `ChannelAdapter::deliver_card()` with a text-fallback
 default impl. Wave 2a wires the production path:
 
-- `send_card` MCP tool (`crates/ironclaw-mcp/src/tools/interactive.rs`)
+- `send_card` MCP tool (`crates/copperclaw-mcp/src/tools/interactive.rs`)
   rewritten to accept the canonical `Card` schema directly. JSON
   schema now documents `title`/`body`/`fields`/`buttons`/`image_url`
   with the right types; `Card::validate()` runs at the MCP boundary
@@ -1586,11 +1586,11 @@ default impl. Wave 2a wires the production path:
   story ("Portable card schema — works on every channel. Channels
   with native card support render the structure; channels without it
   fall back to formatted text.").
-- `SendCardSpec` (`crates/ironclaw-mcp/src/context.rs`) now carries a
-  typed `ironclaw_channels_core::Card` instead of an opaque
+- `SendCardSpec` (`crates/copperclaw-mcp/src/context.rs`) now carries a
+  typed `copperclaw_channels_core::Card` instead of an opaque
   `serde_json::Value`. Cards travel through the runner with their
   schema preserved.
-- `apply_send_card` (`crates/ironclaw-runner/src/tools.rs`) now writes
+- `apply_send_card` (`crates/copperclaw-runner/src/tools.rs`) now writes
   a `MessageKind::Card` row to `messages_out` (NOT a `MessageKind::System`
   action). Row content shape: `{ "card": <Card JSON>, "to": <Recipient> }`
   with `to` present only when the caller passed an explicit recipient.
@@ -1600,7 +1600,7 @@ default impl. Wave 2a wires the production path:
   (`"send_card"` action key on a System row) is gone — the previous
   flow only wrapped the opaque blob and forwarded it, so removing it
   doesn't change any channel adapter's contract.
-- Host delivery service (`crates/ironclaw-host-delivery/src/service.rs`)
+- Host delivery service (`crates/copperclaw-host-delivery/src/service.rs`)
   picks up `MessageKind::Card` rows in a dedicated `dispatch_card`
   branch: deserialise `content.card` back into `Card`, pull the
   optional `content.to` hint, call `adapter.deliver_card(platform_id,
@@ -1616,7 +1616,7 @@ default impl. Wave 2a wires the production path:
   and `recurrence.rs`. Card rows now read back correctly from every
   per-session DB and central dropped-message table.
 - `runner_emit_set()` in
-  `crates/ironclaw-host/tests/action_handler_coverage.rs` updated:
+  `crates/copperclaw-host/tests/action_handler_coverage.rs` updated:
   `send_card` removed from the System-action set (the runner no
   longer emits it as a System action; the structural test would
   have failed otherwise).
@@ -1636,26 +1636,26 @@ underlying issue across many places: the model is doing work the host
 could do directly, burning tokens and round-trips. These four tools
 close the biggest gaps:
 
-- **`multi_edit`** (`crates/ironclaw-mcp/src/tools/multi_edit.rs`): apply
+- **`multi_edit`** (`crates/copperclaw-mcp/src/tools/multi_edit.rs`): apply
   N find-replaces to one file in a single call. Replaces the pattern
   of 5 sequential `edit_file` calls, each re-emitting overlapping
   surrounding context as `old_string`. Atomic — if any edit fails, the
   whole call rolls back. 50-edit hard cap. Later edits see earlier
   edits applied. 5-10× reduction on multi-edit refactor sessions.
-- **`apply_patch`** (`crates/ironclaw-mcp/src/tools/apply_patch.rs`):
+- **`apply_patch`** (`crates/copperclaw-mcp/src/tools/apply_patch.rs`):
   apply a unified diff to one file. For multi-region edits this is
   3-10× more compact than the equivalent `edit_file` sequence — the
   model writes a small diff instead of repeating overlapping
   `old_string` context. Hand-rolled parser (no new crate deps).
   Exact-context required, atomic on any hunk mismatch.
-- **`copy_file`** (`crates/ironclaw-mcp/src/tools/copy_file.rs`):
+- **`copy_file`** (`crates/copperclaw-mcp/src/tools/copy_file.rs`):
   filesystem-level copy that doesn't round-trip the bytes through the
   LLM. Replaces the `read_file(src)` + `write_file(dst, content=...)`
   pattern that previously moved every byte through the model's
   context twice. 32 MB hard ceiling. Optional `create_parents` and
   `overwrite` flags. Binary-safe.
 - **`read_file` extended with `offset` / `limit` / `mode`**
-  (`crates/ironclaw-mcp/src/tools/computer_use.rs`): the existing
+  (`crates/copperclaw-mcp/src/tools/computer_use.rs`): the existing
   `read_file` tool now accepts a byte or line range. Lets the model
   read precise regions of large files instead of pulling the whole
   thing (or getting the truncated head). `mode: "lines"` is 1-indexed;
@@ -1686,7 +1686,7 @@ per-tool detail extracted from the model's input JSON:
 - `[install_packages] jq, ripgrep, typescript`
 - `[create_agent] Biotech News Researcher`
 
-Implementation in `crates/ironclaw-runner/src/tools.rs`:
+Implementation in `crates/copperclaw-runner/src/tools.rs`:
 
 - New `breadcrumb_detail(name, input) -> Option<String>` formatter.
   Per-tool field extraction (`command` for shell, `query` for
@@ -1700,8 +1700,8 @@ Implementation in `crates/ironclaw-runner/src/tools.rs`:
   `read_file`, `grep`, `glob` alongside the existing shell /
   web_search / web_fetch / file-write / etc. set.
 
-Plumbing in `crates/ironclaw-mcp/src/context.rs` +
-`crates/ironclaw-runner/src/run/provider_call.rs`:
+Plumbing in `crates/copperclaw-mcp/src/context.rs` +
+`crates/copperclaw-runner/src/run/provider_call.rs`:
 
 - `ToolContext::emit_breadcrumb` signature gained an
   `input: Option<&serde_json::Value>` parameter. Default trait
@@ -1731,7 +1731,7 @@ optimization.
 
 Two parallel agents on disjoint file scopes:
 
-- **`crates/ironclaw-mcp/src/tools/web_search.rs`**:
+- **`crates/copperclaw-mcp/src/tools/web_search.rs`**:
   - `DEFAULT_MAX_RESULTS` 10 → 5. Models can still ask for more via
     the `max_results` arg (ceiling stays 25).
   - `SNIPPET_CAP_BYTES` 4096 → 400. A 400-char snippet is enough to
@@ -1739,7 +1739,7 @@ Two parallel agents on disjoint file scopes:
   - Net: a typical 4-search session drops from ~35 KB → ~8 KB of
     snippet bloat.
 
-- **`crates/ironclaw-mcp/src/tools/computer_use.rs`** (web_fetch /
+- **`crates/copperclaw-mcp/src/tools/computer_use.rs`** (web_fetch /
   shell / read_file all live here):
   - `WEB_FETCH_CAP` 256 KB → 32 KB. Markdown-extracted content of
     a typical page fits in 32 KB; pages that need more depth are
@@ -1796,7 +1796,7 @@ Sequence:
    nothing — the apology emit that lives BELOW the ack update never
    ran.
 
-Fix in `crates/ironclaw-runner/src/run/mod.rs`:
+Fix in `crates/copperclaw-runner/src/run/mod.rs`:
 
 - `finalize_messages`: tolerate `DbError::NotFound` from
   `processing_ack::update_status` (the row legitimately disappeared
@@ -1837,7 +1837,7 @@ independent architectural bugs combined:
 
 Three parallel fixes, each on disjoint file scope:
 
-- **`crates/ironclaw-host/src/container_manager/classify.rs`**: the
+- **`crates/copperclaw-host/src/container_manager/classify.rs`**: the
   `CrashRestart` action now (a) captures the last 200 lines of the
   container's stdout/stderr to `<session_root>/crash-<rfc3339>.log`
   BEFORE removing the container, (b) scans `processing_ack` for
@@ -1851,7 +1851,7 @@ Three parallel fixes, each on disjoint file scope:
   method `ContainerRuntime::logs(name, tail) -> Result<String>` with
   a default empty-string impl; only `DockerRuntime` overrides it
   (bollard `LogsOptions{tail, stdout, stderr}`). 3 new unit tests.
-- **`crates/ironclaw-runner/src/run/{mod,drive_turn}.rs`**: `drive_turn`
+- **`crates/copperclaw-runner/src/run/{mod,drive_turn}.rs`**: `drive_turn`
   now calls `save_state` AFTER each tool-turn iteration (not just at
   end of message) via a `persist_mid_message` helper. A mid-message
   crash now preserves the assistant + tool_use + tool_result history
@@ -1860,14 +1860,14 @@ Three parallel fixes, each on disjoint file scope:
   message with the same content as `formatted.prompt`, it logs a
   debug line ("resuming mid-message — skipping duplicate user push")
   and skips the push. Two regression tests cover both halves.
-- **`crates/ironclaw-host/src/container_manager/spawn.rs` +
+- **`crates/copperclaw-host/src/container_manager/spawn.rs` +
   `boot.rs`**: raised `DEFAULT_HEARTBEAT_STALE_SECS` 60 → 120, added
   startup safety check `check_heartbeat_deadline_alignment` (warns
   when `heartbeat_stale_secs < 2 * provider_deadline_secs`), cross-
   referenced the constants. See the "Changed
   (heartbeat-vs-provider-deadline race hardening)" entry below for
-  details. (Promoted `ironclaw-runner` from dev-dep to runtime dep
-  in `crates/ironclaw-host/Cargo.toml` to read the runner's effective
+  details. (Promoted `copperclaw-runner` from dev-dep to runtime dep
+  in `crates/copperclaw-host/Cargo.toml` to read the runner's effective
   provider deadline from `resolve_provider_deadline(&SystemEnv)` at
   boot.)
 
@@ -1886,12 +1886,12 @@ SIGKILL it the same instant `provider.query()` returned
 `Err(DeadlineExceeded)` — losing the work and triggering a respawn
 loop on slow Sonnet calls.
 
-- `crates/ironclaw-host/src/container_manager/spawn.rs`:
+- `crates/copperclaw-host/src/container_manager/spawn.rs`:
   `DEFAULT_HEARTBEAT_STALE_SECS` raised from `60` → `120` so the host
   always gives the runner at least the full provider budget plus a
   turn-worth of margin to fail cleanly before declaring the container
   dead. Doc comment now cross-references the runner-side default.
-- `crates/ironclaw-host/src/container_manager/spawn.rs`: new free
+- `crates/copperclaw-host/src/container_manager/spawn.rs`: new free
   function `check_heartbeat_deadline_alignment(heartbeat_stale_secs,
   provider_deadline_ms)` returns `Err(String)` when the host's stale
   threshold is `< 2 * (provider_deadline / 1000)`. Boundary cases
@@ -1901,20 +1901,20 @@ loop on slow Sonnet calls.
   the boot path emits a `warn!` line naming both values and the
   required minimum, then continues. Operators can still pin a tighter
   pair deliberately — the check warns, it does not panic.
-- `crates/ironclaw-host/src/boot.rs`: startup safety check reads the
-  operator-supplied `IRONCLAW_RUNNER_PROVIDER_DEADLINE_MS` via
-  `ironclaw_runner::resolve_provider_deadline` so the warn line
+- `crates/copperclaw-host/src/boot.rs`: startup safety check reads the
+  operator-supplied `COPPERCLAW_RUNNER_PROVIDER_DEADLINE_MS` via
+  `copperclaw_runner::resolve_provider_deadline` so the warn line
   reflects the value the runner will actually be configured with at
   spawn (not just the compiled-in default).
-- `crates/ironclaw-host/Cargo.toml`: `ironclaw-runner` promoted from
+- `crates/copperclaw-host/Cargo.toml`: `copperclaw-runner` promoted from
   `dev-dependencies` to `dependencies`. Used only at boot to resolve
   the configured provider deadline — no runtime coupling to the
   poll loop.
-- `crates/ironclaw-runner/src/run/mod.rs`: doc comment on
+- `crates/copperclaw-runner/src/run/mod.rs`: doc comment on
   `DEFAULT_PROVIDER_DEADLINE_MS` now explains the 2x relationship
   with the host's stale threshold and points future contributors at
   the host-side check.
-- `crates/ironclaw-host/src/container_manager/classify.rs`: the
+- `crates/copperclaw-host/src/container_manager/classify.rs`: the
   `classify_running_with_stale_heartbeat_is_crash_restart` test
   backdates the heartbeat by 240s (was 120s) so it sits comfortably
   past the new 120s default with margin for test wall-clock jitter
@@ -1938,7 +1938,7 @@ issues; this batch fixes all of them. Grouped by file:
 - **Critical**: the new image-tag-repoint UPDATE wrote
   `updated_at=datetime('now')` (sqlite default format, no T separator,
   no timezone). `DateTime::parse_from_rfc3339` requires both — chrono
-  returns `premature end of input`. Confirmed live: `iclaw groups
+  returns `premature end of input`. Confirmed live: `cclaw groups
   config get` was already erroring against the post-rebuild DB.
   Replaced with `strftime('%Y-%m-%dT%H:%M:%fZ','now')` and added a
   comment naming the bug shape.
@@ -1949,10 +1949,10 @@ issues; this batch fixes all of them. Grouped by file:
   interpolation — guards against future tag schemes containing quote
   chars that would silently break the UPDATE.
 - When `sqlite3` is missing, the repoint now emits a `warn` telling
-  the operator to install sqlite3 or run `iclaw groups config update
+  the operator to install sqlite3 or run `cclaw groups config update
   <id> image_tag <tag>` manually, instead of silently no-op'ing.
 
-`crates/ironclaw-runner/src/run/{mod,drive_turn,provider_call}.rs`:
+`crates/copperclaw-runner/src/run/{mod,drive_turn,provider_call}.rs`:
 - `compact_now` sentinel branch now runs `compact()` BEFORE removing
   the sentinel file, so a transient provider failure during
   summarisation doesn't silently drop the user's compaction request.
@@ -1970,7 +1970,7 @@ issues; this batch fixes all of them. Grouped by file:
   which it couldn't act on.
 - `resolve_max_tool_turns` warns once per process via `OnceLock`
   instead of once per misconfigured spawn, eliminating log flooding
-  from a sticky `IRONCLAW_MAX_TOOL_TURNS=6o`-style typo.
+  from a sticky `COPPERCLAW_MAX_TOOL_TURNS=6o`-style typo.
 - `apology_text` trims trailing `.`/`?`/`!` from the reason before
   splicing so future contributors writing natural-English reasons
   ending in punctuation don't produce visible double-punctuation.
@@ -1982,8 +1982,8 @@ issues; this batch fixes all of them. Grouped by file:
   `drive_turn` preserves the inner reason in `TurnOutcome::Failed`
   when non-empty.
 
-`crates/ironclaw-host/src/typing_ticker.rs` +
-`crates/ironclaw-db/src/tables/messages_in.rs`:
+`crates/copperclaw-host/src/typing_ticker.rs` +
+`crates/copperclaw-db/src/tables/messages_in.rs`:
 - New `messages_in::count_pending_for_typing` — no `trigger = 1`
   filter, so the ticker now pulses typing during turns processing
   agent-dispatch, Task-wake, or system inbounds (the original
@@ -2034,14 +2034,14 @@ operator intervened.
 Fix: every optional UUID / datetime column decoder now treats `Some("")`
 identically to `None`. Touched:
 
-- `crates/ironclaw-db/src/tables/container_state.rs` —
+- `crates/copperclaw-db/src/tables/container_state.rs` —
   `tool_started_at`, `updated_at` (and `current_tool` collapsed via
   `Option::filter`).
-- `crates/ironclaw-db/src/tables/messages_in.rs` — `process_after`
+- `crates/copperclaw-db/src/tables/messages_in.rs` — `process_after`
   via the shared `parse_dt_opt` helper.
-- `crates/ironclaw-db/src/tables/messages_out.rs` — `deliver_after`.
-- `crates/ironclaw-db/src/tables/tasks.rs` — `next_fire`.
-- `crates/ironclaw-db/src/tables/sessions.rs` — `messaging_group_id`,
+- `crates/copperclaw-db/src/tables/messages_out.rs` — `deliver_after`.
+- `crates/copperclaw-db/src/tables/tasks.rs` — `next_fire`.
+- `crates/copperclaw-db/src/tables/sessions.rs` — `messaging_group_id`,
   `source_session_id`.
 
 Each site got a short comment naming the actual failure mode so the
@@ -2050,14 +2050,14 @@ next reader doesn't undo the defence thinking it's redundant.
 ### Fixed (rebuild.sh left existing groups pinned to the old image)
 
 Caught when a fresh rebuild visibly shipped the new runner binary at
-`~/.local/bin/ironclaw-runner`, the host log confirmed a new image was
-baked, and `IRONCLAW_DEFAULT_IMAGE_TAG` in `.env` was repointed — yet
+`~/.local/bin/copperclaw-runner`, the host log confirmed a new image was
+baked, and `COPPERCLAW_DEFAULT_IMAGE_TAG` in `.env` was repointed — yet
 the running session container kept spawning with the old image hash and
 the agent kept emitting the old "I hit a snag … see runner stderr"
 apology that the new runner code no longer contains.
 
 Root cause: `container_configs.image_tag` (central DB) is pinned
-per-agent-group. `.env`'s `IRONCLAW_DEFAULT_IMAGE_TAG` is only consulted
+per-agent-group. `.env`'s `COPPERCLAW_DEFAULT_IMAGE_TAG` is only consulted
 when *creating* a new group; existing rows retain whatever image tag
 was pinned at first spawn. So `rebuild.sh` was leaving every existing
 agent group running the previous baked image forever.
@@ -2072,21 +2072,21 @@ Gated on `sqlite3` being available; silent no-op otherwise.
 A "Build me a clone of an App Store app" run surfaced three independent
 papercuts in one shot:
 
-- **`IRONCLAW_TOOL_BREADCRUMBS=1` silently no-op'd.** The runner inside
+- **`COPPERCLAW_TOOL_BREADCRUMBS=1` silently no-op'd.** The runner inside
   the container reads the env var via `std::env::var`, but the host's
-  `collect_forward_env` in `crates/ironclaw-host/src/boot.rs` only
+  `collect_forward_env` in `crates/copperclaw-host/src/boot.rs` only
   forwarded provider keys + Ollama base URL. The operator's `.env`
   setting never reached the container; the runner saw it unset and
-  treated breadcrumbs as off. Added `IRONCLAW_TOOL_BREADCRUMBS` (and
-  `IRONCLAW_MAX_TOOL_TURNS`, for symmetry with the cap change below)
+  treated breadcrumbs as off. Added `COPPERCLAW_TOOL_BREADCRUMBS` (and
+  `COPPERCLAW_MAX_TOOL_TURNS`, for symmetry with the cap change below)
   to the `FORWARDED` list.
 - **`max_tool_turns` hard-coded at 20 was too low for build/research
   tasks.** Live session bailed after exactly 20 turns with the agent
   mid-flight on a real "research apps then scaffold a TypeScript
   clone" workload. Bumped the default to 60 in
-  `crates/ironclaw-runner/src/run/mod.rs` (new
+  `crates/copperclaw-runner/src/run/mod.rs` (new
   `DEFAULT_MAX_TOOL_TURNS` + bounds + `resolve_max_tool_turns(env)`
-  helper). Operators can override via `IRONCLAW_MAX_TOOL_TURNS`
+  helper). Operators can override via `COPPERCLAW_MAX_TOOL_TURNS`
   (clamped to [5, 500]).
 - **Apology said "I hit a snag … see runner stderr" — useless to the
   user.** When a turn failed (provider error, 3-strikes parse-error
@@ -2121,12 +2121,12 @@ and tool-triggered clears hit this path; the inline comment claimed
 the user message had to be dropped to "avoid surprising the operator,"
 but in practice that just made the next inbound silently disappear.
 
-Fix in `crates/ironclaw-runner/src/run/mod.rs`: process the clear /
+Fix in `crates/copperclaw-runner/src/run/mod.rs`: process the clear /
 compact sentinels **before** pushing the user message, so the incoming
 inbound always reaches the model against the requested baseline (cleared
 or compacted) rather than being thrown out alongside it. Also updated
 the `clear_history` tool docstring in
-`crates/ironclaw-mcp/src/tools/clear_history.rs` to reflect the
+`crates/copperclaw-mcp/src/tools/clear_history.rs` to reflect the
 corrected semantics ("drops everything prior to the next inbound").
 
 ### Fixed (typing ticker was always-on; agent self-introducing on tasks)
@@ -2146,7 +2146,7 @@ Two issues caught in the Sonnet retest:
   the new behaviour.
 - **Bot recited a self-introduction when the user gave a task.**
   User: "Build me a clone of one of the top apps in the App Store."
-  Bot: "I'm the Ironclaw agent — a self-hosted AI assistant
+  Bot: "I'm the Copperclaw agent — a self-hosted AI assistant
   running inside a per-session Linux container. Here's a quick
   overview of what I am..." — ignoring the actual task and ending
   with "What can I help you with?". The `identity` skill says only
@@ -2154,7 +2154,7 @@ Two issues caught in the Sonnet retest:
   hard rule to `BASE_PREAMBLE`: "Do NOT introduce yourself unless
   the user explicitly asks" + "No preamble or postamble on
   substantive replies." Identity introductions are reserved for
-  "who are you?" / "what is Ironclaw?" messages.
+  "who are you?" / "what is Copperclaw?" messages.
 
 ### Changed (anti-fabrication on coding-task completion)
 
@@ -2172,7 +2172,7 @@ in the todo list — while writing zero backend code. The
 
 Three-pronged fix:
 
-- **`crates/ironclaw-mcp/src/tools/todo.rs::update`** — mandatory
+- **`crates/copperclaw-mcp/src/tools/todo.rs::update`** — mandatory
   `evidence` field when setting `status: "completed"`. Schema-level
   + handler-side validation:
     - `>= 20 chars` (generic affirmations don't fit a real citation),
@@ -2185,7 +2185,7 @@ Three-pronged fix:
   acceptance on substantive citation, no-evidence-required for
   `in_progress` transitions. Existing tests updated to pass real
   evidence where they hit `completed`.
-- **`crates/ironclaw-host/src/container_manager/prompt.rs`** — new
+- **`crates/copperclaw-host/src/container_manager/prompt.rs`** — new
   `# Don't fabricate completion on coding work` section in
   `BASE_PREAMBLE` with four hard rules: verify on disk before
   marking complete (read_file / glob / git_status); never write
@@ -2200,7 +2200,7 @@ Three-pronged fix:
 - **`skills/todo-tracker/SKILL.md`** — documented the new
   `evidence` requirement on `todo_update` with a concrete example.
 
-Also: bumped **`IRONCLAW_DEFAULT_MODEL`** from
+Also: bumped **`COPPERCLAW_DEFAULT_MODEL`** from
 `anthropic/claude-haiku-4-5` to `anthropic/claude-sonnet-4-6` in
 the live install's `.env`. Sonnet follows multi-step discipline
 better than Haiku; this is a per-deployment decision, not a code
@@ -2218,7 +2218,7 @@ project, start coding") take 1-5 minutes and the user has zero
 visibility into what the agent is doing between turns. Three new
 host- and runner-side feedback mechanisms:
 
-- **`crates/ironclaw-host/src/typing_ticker.rs`** (always on).
+- **`crates/copperclaw-host/src/typing_ticker.rs`** (always on).
   Background tokio task wired into `boot::run_host` alongside the
   delivery + sweep loops. Every 4 seconds, iterates
   `sessions::list_running` and fires `HostDispatcher::set_typing`
@@ -2231,8 +2231,8 @@ host- and runner-side feedback mechanisms:
   (fires per running session, skips idle, skips no-MG sessions,
   loops until shutdown).
 
-- **`crates/ironclaw-host/src/todo_watcher.rs`** (gated by
-  `IRONCLAW_TODO_NOTIFICATIONS=1`, default off). Background task
+- **`crates/copperclaw-host/src/todo_watcher.rs`** (gated by
+  `COPPERCLAW_TODO_NOTIFICATIONS=1`, default off). Background task
   that polls each running session's `agent_todos.json` every 5
   seconds, diffs against the last snapshot, and emits chat
   notifications via the dispatcher when:
@@ -2246,8 +2246,8 @@ host- and runner-side feedback mechanisms:
   Deletes are silent; status-unchanged items don't re-emit.
   Eight unit tests pin the delta logic.
 
-- **`crates/ironclaw-runner/src/tools.rs`** + **`run/provider_call.rs`**
-  (gated by `IRONCLAW_TOOL_BREADCRUMBS=1`, default off). New
+- **`crates/copperclaw-runner/src/tools.rs`** + **`run/provider_call.rs`**
+  (gated by `COPPERCLAW_TOOL_BREADCRUMBS=1`, default off). New
   `ToolContext::emit_breadcrumb` trait method (default no-op) +
   `RunnerToolCtx::emit_breadcrumb` impl that writes a short
   `[tool_name]` chat row at the start of every "visible" tool
@@ -2260,8 +2260,8 @@ host- and runner-side feedback mechanisms:
   their own breadcrumbs.
 
 Operator wiring: the env vars are read at host boot
-(`IRONCLAW_TODO_NOTIFICATIONS`) and runner startup
-(`IRONCLAW_TOOL_BREADCRUMBS`) respectively. Set both to `1` in
+(`COPPERCLAW_TODO_NOTIFICATIONS`) and runner startup
+(`COPPERCLAW_TOOL_BREADCRUMBS`) respectively. Set both to `1` in
 `.env` for the live-testing experience the user requested in the
 session that drove this work.
 
@@ -2275,7 +2275,7 @@ itself" before the actual reply. The provider-side
 `thinking`/`redacted_thinking` block handling can't catch this case
 because the markup is content, not metadata.
 
-- **`crates/ironclaw-runner/src/tools.rs`** — new
+- **`crates/copperclaw-runner/src/tools.rs`** — new
   `strip_reasoning_blocks(text)` helper that drops every closed
   `<thinking>...</thinking>` pair (case-insensitive tag, multi-line
   content), collapses the blank-line runs left behind, and
@@ -2289,21 +2289,21 @@ because the markup is content, not metadata.
 
 ### Added
 
-- **`iclaw sessions delete <id> [--force]`.** Closes the operator gap
+- **`cclaw sessions delete <id> [--force]`.** Closes the operator gap
   that forced raw `sqlite3` cleanup when a session row needed to go
-  away (e.g. so `iclaw groups delete <id>` would stop failing with
+  away (e.g. so `cclaw groups delete <id>` would stop failing with
   `FOREIGN KEY constraint failed`). The new subcommand deletes the
   central `sessions` row plus every per-session row that referenced
   it — `agent_turns`, `tasks`, `pending_questions`,
   `pending_approvals` — in a single transaction, then removes the
   on-disk session tree at `<data_dir>/sessions/<agent>/<session>/`.
   Refuses by default if the session's container is not in `stopped`
-  state so the operator runs `iclaw groups restart <ag>` first; pass
+  state so the operator runs `cclaw groups restart <ag>` first; pass
   `--force` to override. Filesystem removal is best-effort: a warn
   is logged but the command still succeeds when the central rows
   are already gone. New table function:
-  `ironclaw_db::tables::sessions::delete`. New handler:
-  `ironclaw_host::handlers::sessions::delete` (registered as a
+  `copperclaw_db::tables::sessions::delete`. New handler:
+  `copperclaw_host::handlers::sessions::delete` (registered as a
   host-only mutation, so every call lands in `audit_log`).
 
 ### Fixed (subagent routing follow-up: 15 code-review findings)
@@ -2360,7 +2360,7 @@ multi-angle review surfaced 15 defects — all addressed here. Highlights:
 - **No parent-status check (#8).** `AgentDispatchHandler` now refuses
   to dead-letter into a non-`Active` target session. Logs and returns
   Ok (permanent — retry won't help). New `sessions::set_status` helper
-  in `ironclaw-db` powers the test that pins this.
+  in `copperclaw-db` powers the test that pins this.
 - **Retry duplicates (#10).** A successful handler call followed by a
   failed `delivered::insert` previously caused the loop to re-run the
   handler with a fresh `MessageId`, writing the parent's inbound twice.
@@ -2381,7 +2381,7 @@ multi-angle review surfaced 15 defects — all addressed here. Highlights:
   documented behavior: explicit Channel keeps the row's column routing
   inherited (delivery loop doesn't parse channel-id strings yet). The
   body's `to` is preserved so future versions can override.
-- **Replay harness wired (#13).** `crates/ironclaw-host/tests/replay/harness.rs`
+- **Replay harness wired (#13).** `crates/copperclaw-host/tests/replay/harness.rs`
   now threads `source_session_id` onto the runner ctx the same way
   production's `main.rs` does, so replay fixtures actually exercise
   the new Agent-kind routing path.
@@ -2392,43 +2392,43 @@ multi-angle review surfaced 15 defects — all addressed here. Highlights:
 
 Service-level integration test gap (#14 — make_service tests register
 a Failer mock for `agent_dispatch` instead of the real handler) is
-not addressed here because pulling `ironclaw-modules` into
-`ironclaw-host-delivery`'s dev-deps would create a circular concern.
+not addressed here because pulling `copperclaw-modules` into
+`copperclaw-host-delivery`'s dev-deps would create a circular concern.
 The dispatch.rs in-module tests (10 passing) cover the handler
 end-to-end; this gap is logged in `docs/plans/vaporware-followups.md`.
 
 Migrations + new code:
 
-- **`crates/ironclaw-db/migrations/013_sessions_source_session.sql`** —
+- **`crates/copperclaw-db/migrations/013_sessions_source_session.sql`** —
   comment rewritten; migration body unchanged.
-- **`crates/ironclaw-db/src/tables/messages_in.rs`** — new
+- **`crates/copperclaw-db/src/tables/messages_in.rs`** — new
   `insert_idempotent` variant.
-- **`crates/ironclaw-db/src/tables/sessions.rs`** — new
+- **`crates/copperclaw-db/src/tables/sessions.rs`** — new
   `set_status(db, id, status)` helper.
-- **`crates/ironclaw-types/src/session.rs`** —
+- **`crates/copperclaw-types/src/session.rs`** —
   `SessionStatus::as_str()` impl (mirrors `ContainerStatus`).
-- **`crates/ironclaw-modules/src/context.rs`** —
+- **`crates/copperclaw-modules/src/context.rs`** —
   `DeliveryActionInput.row_id: Option<MessageId>`.
-- **`crates/ironclaw-modules/src/agent_to_agent/dispatch.rs`** — full
+- **`crates/copperclaw-modules/src/agent_to_agent/dispatch.rs`** — full
   handler rewrite covering findings #1, #8, #10, #11, #12. Five new
   unit tests for the new behaviors.
-- **`crates/ironclaw-host-delivery/src/service.rs`** — passes
+- **`crates/copperclaw-host-delivery/src/service.rs`** — passes
   `row_id` into `DeliveryActionInput`; Agent-kind arm dropped the
   swallow-error `let _ =` pattern in favour of propagating the handler's
   Err.
-- **`crates/ironclaw-runner/src/tools.rs`** — `resolve_outbound_routing`
+- **`crates/copperclaw-runner/src/tools.rs`** — `resolve_outbound_routing`
   rewritten: routes up to parent only when inbound has no channel info,
   elides `in_reply_to` for Agent-kind, propagates `thread_id` into
   body. `apply_send_file` falls back to Chat-kind when routing
   resolved to Agent. `SubagentCtxAdapter` inherits the parent's
   originating routing. Replaced silent `unwrap_or_default` with
   `expect`. Four new tests pin the routing rules.
-- **`crates/ironclaw-host-sweep/src/checks/apology.rs`** — apology
+- **`crates/copperclaw-host-sweep/src/checks/apology.rs`** — apology
   cascade walks `source_session_id` for inbounds without channel
   routing.
-- **`crates/ironclaw-runner/src/run/mod.rs`** — same cascade for the
+- **`crates/copperclaw-runner/src/run/mod.rs`** — same cascade for the
   in-runner terminal-failure apology emit.
-- **`crates/ironclaw-host/tests/replay/harness.rs`** — replay
+- **`crates/copperclaw-host/tests/replay/harness.rs`** — replay
   threads `source_session_id` onto `RunnerToolCtx`.
 
 Verification: cargo test --workspace --no-fail-fast = 5219 passed, 0
@@ -2461,24 +2461,24 @@ originating session id in `source_session_id`. Explicit
 
 Migrations + code touched:
 
-- **`crates/ironclaw-db/migrations/013_sessions_source_session.sql`** —
+- **`crates/copperclaw-db/migrations/013_sessions_source_session.sql`** —
   new `sessions.source_session_id TEXT REFERENCES sessions(id) ON DELETE
   SET NULL` column + `idx_sessions_source` index. Registered in
-  `crates/ironclaw-db/src/migrate.rs`.
-- **`crates/ironclaw-types/src/session.rs`** + **`crates/ironclaw-db/src/tables/sessions.rs`** —
+  `crates/copperclaw-db/src/migrate.rs`.
+- **`crates/copperclaw-types/src/session.rs`** + **`crates/copperclaw-db/src/tables/sessions.rs`** —
   `Session` and `CreateSession` carry the new column; every SELECT /
   INSERT updated via a `SESSION_SELECT_COLS` constant so column order
   stays in sync across the half-dozen reads. Roundtrip test pinned.
-- **`crates/ironclaw-modules/src/agent_to_agent/create_agent.rs`** —
+- **`crates/copperclaw-modules/src/agent_to_agent/create_agent.rs`** —
   `CreateAgentHandler` now sets `source_session_id =
   parent.session_id` when creating the child session. New test
   `child_session_records_source_session_id_pointing_at_parent` pins
   the behaviour.
-- **`crates/ironclaw-runner/src/config.rs`** — `RunnerConfigFile` /
-  `RunnerConfig` gain `source_session_id`. **`crates/ironclaw-runner/src/main.rs`** —
-  threads it onto `RunnerToolCtx`. **`crates/ironclaw-host/src/container_manager/runner_config.rs`** —
+- **`crates/copperclaw-runner/src/config.rs`** — `RunnerConfigFile` /
+  `RunnerConfig` gain `source_session_id`. **`crates/copperclaw-runner/src/main.rs`** —
+  threads it onto `RunnerToolCtx`. **`crates/copperclaw-host/src/container_manager/runner_config.rs`** —
   host writes the field into `runner.json` so it reaches the container.
-- **`crates/ironclaw-runner/src/tools.rs`** — `OriginatingRouting`
+- **`crates/copperclaw-runner/src/tools.rs`** — `OriginatingRouting`
   carries `source_session_id`; new `RunnerToolCtx::with_source_session_id`
   builder; new `resolve_outbound_routing` helper decides
   `MessageKind::Agent` vs `MessageKind::Chat` based on the recipient
@@ -2487,7 +2487,7 @@ Migrations + code touched:
   Two new tests:
   `child_send_message_with_no_to_routes_to_parent` and
   `child_send_message_with_explicit_channel_still_works`.
-- **`crates/ironclaw-modules/src/agent_to_agent/dispatch.rs`** — new
+- **`crates/copperclaw-modules/src/agent_to_agent/dispatch.rs`** — new
   `AgentDispatchModule` + handler. Implements the `agent_dispatch`
   delivery action the host's delivery service was already calling
   into (but had no real implementation for outside test fakes).
@@ -2496,10 +2496,10 @@ Migrations + code touched:
   `source_session_id` set to the originating session. Four
   unit tests cover the happy path, missing-target, malformed-payload,
   and parser cases.
-- **`crates/ironclaw-host/src/boot.rs`** — installs
+- **`crates/copperclaw-host/src/boot.rs`** — installs
   `AgentDispatchModule` alongside `CreateAgentModule` so the delivery
   loop's `agent_dispatch` action handler is no longer a no-op.
-- **`crates/ironclaw-modules/src/agent_to_agent/inbound_seed.rs`** —
+- **`crates/copperclaw-modules/src/agent_to_agent/inbound_seed.rs`** —
   the kicker prompt no longer tells the child to use
   `to: "agent:<parent>"`. The new prelude just says "your replies
   route back to the parent by default; consolidate, send once."
@@ -2508,7 +2508,7 @@ Migrations + code touched:
   (no more `agent:<name>` magic).
 
 Verification: `cargo test --workspace --no-fail-fast` = 5210 passed,
-0 failed (one pre-existing flake in `ironclaw-mcp::tools::compact_now`
+0 failed (one pre-existing flake in `copperclaw-mcp::tools::compact_now`
 under parallel-test load — passes alone, unrelated to this change).
 Clippy clean.
 
@@ -2517,7 +2517,7 @@ Clippy clean.
 - **`install.sh`** — `check_container_runtime` now also accepts the
   Apple Container runtime (`container` binary) on macOS, in addition
   to Docker / Podman. Brings the installer in line with the wizard's
-  `env_check` step (`crates/ironclaw-setup/src/steps/env_check.rs`),
+  `env_check` step (`crates/copperclaw-setup/src/steps/env_check.rs`),
   which already detected it. A fresh macOS user with only Apple
   Container installed no longer sees a misleading "install Docker"
   prompt. Also added the Apple Container install link to the
@@ -2526,13 +2526,13 @@ Clippy clean.
   Apple Container alongside Docker / Podman as detected by
   `install.sh`.
 
-### Changed (iclaw subcommand `--help` text — 2026-05-23)
+### Changed (cclaw subcommand `--help` text — 2026-05-23)
 
-- **`crates/ironclaw-iclaw/src/commands.rs`** — added `///`
+- **`crates/copperclaw-cclaw/src/commands.rs`** — added `///`
   doc-comments to every variant and every `#[arg(long)]` field on
   `MessagingGroupsCmd`, `WiringsCmd`, `UsersCmd`, `RolesCmd`,
   `MembersCmd`, `DestinationsCmd`, `SessionsCmd`, `UserDmsCmd`, and
-  `ApprovalsCmd`. Operators running `iclaw <foo> <bar> --help` now
+  `ApprovalsCmd`. Operators running `cclaw <foo> <bar> --help` now
   see a description of every command and flag instead of a bare
   usage line. The `ApprovalsCmd::Approve` variant also notes the
   scope limitation (sender-only — see
@@ -2549,10 +2549,10 @@ exist. Highlights:
   the tree" / "surprises don't ship here" framing in favour of an
   honest pre-1.0 stance. New `## What's rough` section enumerating
   shipped-but-unpolished surfaces. Fixed the in-tree tool count
-  (`33` → `36`), test count (`~5160` → `~5200`), the `ICLAW_SOCKET`
-  env-key row (now `IRONCLAW_ICLAW_SOCKET` for the host with a note
-  about the client-side `ICLAW_SOCKET`), and added rows for
-  `IRONCLAW_CONTAINER_GPU` and the new session-control tools
+  (`33` → `36`), test count (`~5160` → `~5200`), the `CCLAW_SOCKET`
+  env-key row (now `COPPERCLAW_CCLAW_SOCKET` for the host with a note
+  about the client-side `CCLAW_SOCKET`), and added rows for
+  `COPPERCLAW_CONTAINER_GPU` and the new session-control tools
   (`compact_now`, `clear_history`, `artifact_path`). Operator
   cheatsheet now includes `users` / `roles` / `members` /
   `schema-version` / `quickstart cli`. Removed the duplicated `cli`
@@ -2588,41 +2588,41 @@ exist. Highlights:
   Softened the "all webhook channels perform HMAC verification"
   claim — Teams uses `clientState`, Mattermost uses
   `webhook_token`, gchat uses a query-string client_token.
-- **`docs/db-backup.md`** — replaced `/var/run/ironclaw.pid` example
-  with `<data_dir>/ironclaw.pid` (or `ironclaw stop`). Corrected the
+- **`docs/db-backup.md`** — replaced `/var/run/copperclaw.pid` example
+  with `<data_dir>/copperclaw.pid` (or `copperclaw stop`). Corrected the
   "not in the backup" list — per-session `inbox/` and `outbox/` live
   inside each session's dir under `<data_dir>/sessions/`, not at the
   data root.
-- **`docs/observability.md`** — `iclaw groups budget set` (does not
-  exist) → `iclaw budgets set --agent-group-id <id> --daily-tokens <n>`.
-- **`docs/cutover.md`** — removed `ironclaw run --once --check` (no
-  such flag combo) — replaced with `iclaw schema-version` + `ironclaw
-  migrate`. `ironclaw setup` → `ironclaw-setup` (binary name). Fixed
+- **`docs/observability.md`** — `cclaw groups budget set` (does not
+  exist) → `cclaw budgets set --agent-group-id <id> --daily-tokens <n>`.
+- **`docs/cutover.md`** — removed `copperclaw run --once --check` (no
+  such flag combo) — replaced with `cclaw schema-version` + `copperclaw
+  migrate`. `copperclaw setup` → `copperclaw-setup` (binary name). Fixed
   the migrator description: the migrator only copies the central DB,
   not per-session DBs; operators must rsync `data/sessions/` separately.
   Dedup'd the `Webex` entry in the channel-disable bullet list.
 - **`docs/release-checklist.md`** — replaced fictional
-  `ironclaw run --check` with `iclaw schema-version` + `ironclaw
+  `copperclaw run --check` with `cclaw schema-version` + `copperclaw
   migrate`.
 - **`docs/replay-fixtures.md`** — rewrote the fixture-shape section
   to match the real on-disk layout (`manifest.json`, not
   `manifest.toml`; `inbound/NNN-*.json`, not `.http`; `mode: "direct"`,
   not `webhook|gateway|poll|rpc`). Acknowledged that the
-  capture-and-redact pipeline (`IRONCLAW_FIXTURE_CAPTURE` env,
-  `ironclaw fixture redact <dir>` subcommand,
-  `crates/ironclaw-host/src/fixture/redact.rs`) is design-only.
-- **`docs/container-config.md`** — replaced the "no top-level `iclaw
+  capture-and-redact pipeline (`COPPERCLAW_FIXTURE_CAPTURE` env,
+  `copperclaw fixture redact <dir>` subcommand,
+  `crates/copperclaw-host/src/fixture/redact.rs`) is design-only.
+- **`docs/container-config.md`** — replaced the "no top-level `cclaw
   groups config show` command yet" sqlite3 workaround with the actual
-  shipped `iclaw groups config get <id>`.
-- **`CLAUDE.md`** — `ironclaw logs --tail` (does not exist) → `-n` /
+  shipped `cclaw groups config get <id>`.
+- **`CLAUDE.md`** — `copperclaw logs --tail` (does not exist) → `-n` /
   `--lines`. Bumped test baseline (`~5,160` → `~5,200`).
 
 ### Changed (skill bodies match real tool behaviour — 2026-05-23)
 
 - **`skills/debug/SKILL.md`** — removed the false claim "There is no
-  `iclaw doctor` — `iclaw health` is the equivalent." (Doctor IS
-  implemented at `crates/ironclaw-iclaw/src/lib.rs:703`.) Added
-  `iclaw doctor` to the operator-side command list. Dropped an
+  `cclaw doctor` — `cclaw health` is the equivalent." (Doctor IS
+  implemented at `crates/copperclaw-cclaw/src/lib.rs:703`.) Added
+  `cclaw doctor` to the operator-side command list. Dropped an
   HTML-comment `TODO(team-h)` body marker.
 - **`skills/read-file/SKILL.md`** — result shape now uses
   `size_bytes` (not the fictional `bytes_read` / `total_bytes`). The
@@ -2637,13 +2637,13 @@ exist. Highlights:
   it via `headers`). Result-shape fields fixed to match what the
   tool actually emits (`size_bytes` + `elapsed_ms`, not
   `bytes_read` / `total_bytes` / `elapsed_secs`).
-- **`skills/add-mcp-server/SKILL.md`** — `iclaw groups config
-  get-mcp-servers <ag>` (does not exist) → `iclaw groups config
+- **`skills/add-mcp-server/SKILL.md`** — `cclaw groups config
+  get-mcp-servers <ag>` (does not exist) → `cclaw groups config
   get <ag>`.
 - **`skills/approvals/SKILL.md`** — `pending_approvals` schema uses
   an `action` string column, not a typed `kind` enum. Removed the
   fictional `OneCli` approval kind. Replaced the aspirational
-  `iclaw approvals approve <id>` / `deny <id>` generic CLI with the
+  `cclaw approvals approve <id>` / `deny <id>` generic CLI with the
   actual sender-only surface. Trimmed body to stay under the
   4 KiB skill-body cap.
 - **`skills/schedule-task/SKILL.md`** — example task id changed to
@@ -2656,23 +2656,23 @@ exist. Highlights:
   the 4 KiB cap.
 - **`skills/edit-file/SKILL.md`** — removed a stale HTML-comment
   `TODO(team-u)` from the body (the work it described shipped).
-- **`crates/ironclaw-skills/tests/coverage.rs`** — synced the
+- **`crates/copperclaw-skills/tests/coverage.rs`** — synced the
   hardcoded `REGISTRY_TOOLS` list to the real
-  `ironclaw_mcp::tools::build_tool_set` inventory (27 → 36 entries).
+  `copperclaw_mcp::tools::build_tool_set` inventory (27 → 36 entries).
   The `every_registry_tool_appears_in_some_skill` test was silently
   undercovering by 9 tools (`load_skill`, `compact_now`,
   `clear_history`, `artifact_path`, plus the four `todo_*` tools).
 
 ### Changed (code cleanup — dropped vapor surfaces, stale TODOs)
 
-- **`crates/ironclaw-iclaw/src/commands.rs`** + **`lib.rs`** — dropped
-  the dead `iclaw doctor --no-ping` flag. The flag was wired into
+- **`crates/copperclaw-cclaw/src/commands.rs`** + **`lib.rs`** — dropped
+  the dead `cclaw doctor --no-ping` flag. The flag was wired into
   the CLI parser but read into `_no_ping` and never used; no LLM
   ping is performed by `run_doctor`. The help text claimed otherwise,
   so the flag was a small lie.
-- **`crates/ironclaw-host/src/boot.rs`**,
-  **`crates/ironclaw-modules/src/agent_to_agent/create_agent.rs`**,
-  **`crates/ironclaw-host-delivery/src/service.rs`** — removed three
+- **`crates/copperclaw-host/src/boot.rs`**,
+  **`crates/copperclaw-modules/src/agent_to_agent/create_agent.rs`**,
+  **`crates/copperclaw-host-delivery/src/service.rs`** — removed three
   stale `TODO(team-…)` comments whose work has already shipped
   (`SqliteTaskStore` installed at boot, `CreateAgentModule` installed
   at boot, `session_id` plumbed through `DeliveryActionInput`).
@@ -2687,7 +2687,7 @@ exist. Highlights:
 
 ### Changed (anti-fabrication prompt + sharper schedule-task description)
 
-- **`crates/ironclaw-host/src/container_manager/prompt.rs`** — added a
+- **`crates/copperclaw-host/src/container_manager/prompt.rs`** — added a
   "Don't fabricate capabilities" section to `BASE_PREAMBLE`. The agent
   was inventing fictional capabilities like a "Real-Time News Monitor"
   with "persistent loops," then backtracking when asked to verify.
@@ -2701,7 +2701,7 @@ exist. Highlights:
   previous wording let the agent miss the skill and fabricate a
   background-loop pattern instead. Quoted the cron expression as plain
   text (no backticks/colons inside YAML) so the frontmatter parses.
-- **`crates/ironclaw-host/src/container_manager/runner_config.rs`**
+- **`crates/copperclaw-host/src/container_manager/runner_config.rs`**
   (`runner_config_callable_falls_back_to_inline_when_catalogue_write_fails`
   test) — relaxed the inline-fallback assertion from `!contains("\`load_skill\`")`
   to `!contains("catalogue of skills available to you")`. The base
@@ -2711,15 +2711,15 @@ exist. Highlights:
 
 ### Added (per-group coding-skills toggle)
 
-- **`crates/ironclaw-db/migrations/012_container_config_coding_enabled.sql`**
+- **`crates/copperclaw-db/migrations/012_container_config_coding_enabled.sql`**
   — new `container_configs.coding_enabled INTEGER NOT NULL DEFAULT 0`
-  column. Registered in `crates/ironclaw-db/src/migrate.rs`.
-- **`crates/ironclaw-db/src/tables/container_configs.rs`** — added
+  column. Registered in `crates/copperclaw-db/src/migrate.rs`.
+- **`crates/copperclaw-db/src/tables/container_configs.rs`** — added
   `ContainerConfig.coding_enabled: bool` and matching field on
   `UpsertContainerConfig`; `get` / `upsert` paths now read and write
   the new column. New narrow setter `set_coding_enabled(central, id, enabled)`
   does a single-column UPDATE.
-- **`crates/ironclaw-host/src/container_manager.rs`** — new public
+- **`crates/copperclaw-host/src/container_manager.rs`** — new public
   constant `CODING_SKILL_NAMES = &["coding-task", "git-commit",
   "code-review", "testing"]`. `runner_config_for` builds an
   `exclude_names` filter that drops those four skills from the
@@ -2729,20 +2729,20 @@ exist. Highlights:
   `assemble_system_prompt_with_catalogue`. Explicit selector lists
   are honoured as-is; the flag only caps the `SkillsSelector::All`
   default.
-- **`crates/ironclaw-host/src/handlers/groups.rs`** — new
+- **`crates/copperclaw-host/src/handlers/groups.rs`** — new
   `config_set_coding_enabled` handler bound to the
   `groups.config.set-coding-enabled` host-only socket method, plus
   `coding_enabled` surfaced in `container_config_to_json`.
-- **`crates/ironclaw-host/src/handlers/mod.rs`**,
-  **`crates/ironclaw-host/src/socket.rs`** — host-only entry and
+- **`crates/copperclaw-host/src/handlers/mod.rs`**,
+  **`crates/copperclaw-host/src/socket.rs`** — host-only entry and
   dispatch wiring for the new command.
-- **`crates/ironclaw-iclaw/src/commands.rs`** — two new
-  subcommands `iclaw groups enable-coding <id>` and
-  `iclaw groups disable-coding <id>` that dispatch to
+- **`crates/copperclaw-cclaw/src/commands.rs`** — two new
+  subcommands `cclaw groups enable-coding <id>` and
+  `cclaw groups disable-coding <id>` that dispatch to
   `groups.config.set-coding-enabled` with `enabled: true|false`.
-- **`crates/ironclaw-iclaw/src/lib.rs`** (`render_config_toml`) —
+- **`crates/copperclaw-cclaw/src/lib.rs`** (`render_config_toml`) —
   current value is shown as a `# read-only: coding_enabled = …`
-  line in the `iclaw groups config edit` buffer so operators can
+  line in the `cclaw groups config edit` buffer so operators can
   see the state when they open the TOML, with a hint pointing at
   the dedicated subcommands.
 - **`README.md`** — replaced the "Per-group skill selection …
@@ -2756,20 +2756,20 @@ exist. Highlights:
   migration 012 applies, every existing group's `coding_enabled`
   defaults to 0, so coding skills stop loading by default. To
   restore the prior behaviour for a specific group, run
-  `iclaw groups enable-coding <id>`.
+  `cclaw groups enable-coding <id>`.
 
 ### Added (Codex subprocess provider routed by build_provider)
 
-- **`crates/ironclaw-runner/src/main.rs`** (`build_provider`) — added a
+- **`crates/copperclaw-runner/src/main.rs`** (`build_provider`) — added a
   `"codex"` arm that constructs a `CodexProvider` via
   `CodexProvider::new(binary_path, extra_args)`. Binary path resolves
   from `RunnerConfig::codex_binary`, then the runner's
-  `IRONCLAW_CODEX_BINARY` env var, then `/usr/local/bin/codex`. Args
+  `COPPERCLAW_CODEX_BINARY` env var, then `/usr/local/bin/codex`. Args
   resolve from `RunnerConfig::codex_args`, then a comma-separated
-  `IRONCLAW_CODEX_ARGS`, then `["--json"]`. The function is now
+  `COPPERCLAW_CODEX_ARGS`, then `["--json"]`. The function is now
   `pub(crate)` so the new `build_provider_tests` module can exercise
   it directly.
-- **`crates/ironclaw-runner/src/config.rs`** — `RunnerConfigFile` and
+- **`crates/copperclaw-runner/src/config.rs`** — `RunnerConfigFile` and
   `RunnerConfig` grew `codex_binary: Option<String>` and
   `codex_args: Option<Vec<String>>`. `from_file_struct` carries them
   through; `provider` recognises `"codex"` as a known value (no more
@@ -2777,7 +2777,7 @@ exist. Highlights:
   `provider_codex_passes_through`, `codex_binary_and_args_default_to_none`,
   `codex_binary_and_args_pass_through_from_file`,
   `codex_empty_args_round_trip`.
-- **`crates/ironclaw-host/src/container_manager.rs`** —
+- **`crates/copperclaw-host/src/container_manager.rs`** —
   `RunnerConfigForFile` mirrors the new fields. `runner_config_for`
   sources them from the rotatable `forward_env` so an operator can
   edit `.env` + SIGHUP to swap binaries without restarting the host.
@@ -2787,75 +2787,75 @@ exist. Highlights:
   picks them up. New unit tests:
   `runner_config_propagates_codex_provider`,
   `runner_config_codex_omits_overrides_when_env_unset`.
-- **`crates/ironclaw-host/src/boot.rs`** (`collect_forward_env`) —
-  forwards `IRONCLAW_CODEX_BINARY` and `IRONCLAW_CODEX_ARGS` into the
+- **`crates/copperclaw-host/src/boot.rs`** (`collect_forward_env`) —
+  forwards `COPPERCLAW_CODEX_BINARY` and `COPPERCLAW_CODEX_ARGS` into the
   manager's initial `forward_env` at boot.
-- **`crates/ironclaw-host/src/config.rs`** — env-var table in the
+- **`crates/copperclaw-host/src/config.rs`** — env-var table in the
   module docstring lists the two new keys.
 - **`README.md`** — Multiple-providers bullet now advertises the Codex
   subprocess bridge instead of disclaiming it. Configuration table
-  lists `IRONCLAW_CODEX_BINARY` and `IRONCLAW_CODEX_ARGS`.
+  lists `COPPERCLAW_CODEX_BINARY` and `COPPERCLAW_CODEX_ARGS`.
 
 ### Fixed (container_manager.rs — seven code-review findings)
 
-- **`crates/ironclaw-host/src/container_manager.rs`** (runner_config_for)
-  — Finding 1: switching `IRONCLAW_SKILLS_MODE` from `callable` to
+- **`crates/copperclaw-host/src/container_manager.rs`** (runner_config_for)
+  — Finding 1: switching `COPPERCLAW_SKILLS_MODE` from `callable` to
   `inline` between spawns no longer leaves a stale `skills.json` on
   disk for `load_skill` to read.
-- **`crates/ironclaw-host/src/container_manager.rs`** (runner_config_for)
+- **`crates/copperclaw-host/src/container_manager.rs`** (runner_config_for)
   — Finding 2: when the Callable-mode catalogue write fails, the
   prompt now falls back to Inline shape so the agent never sees a
   `load_skill` advert pointing at a missing file.
-- **`crates/ironclaw-host/src/container_manager.rs`** (select_callable_skills,
+- **`crates/copperclaw-host/src/container_manager.rs`** (select_callable_skills,
   render_callable_skill_index) — Finding 3: new helper is the single
   source of truth shared by the in-prompt index and the on-disk
   catalogue, so the two cannot disagree about which skills exist.
-- **`crates/ironclaw-host/src/container_manager.rs`** (build_spec memory
+- **`crates/copperclaw-host/src/container_manager.rs`** (build_spec memory
   mount) — Finding 7: when the per-group memory dir can't be created,
   a session-local `memory/UNAVAILABLE.md` marker is dropped so the
   agent inside the container learns its writes won't persist.
-- **`crates/ironclaw-host/src/container_manager.rs`** (set_memory_dir_perms)
+- **`crates/copperclaw-host/src/container_manager.rs`** (set_memory_dir_perms)
   — Finding 8: per-group memory dir is relaxed to `0o775` after
   creation so the operator can `rm` files the container's root user
   wrote into the bind without sudo.
-- **`crates/ironclaw-host/src/container_manager.rs`** (read_project_briefing)
-  — Finding 11: non-`NotFound` errors reading `IRONCLAW.md` now surface
+- **`crates/copperclaw-host/src/container_manager.rs`** (read_project_briefing)
+  — Finding 11: non-`NotFound` errors reading `COPPERCLAW.md` now surface
   as a `Briefing diagnostics` section in the assembled prompt, so the
   agent can mention the failure if asked.
-- **`crates/ironclaw-host/src/container_manager.rs`** (build_skill_system_prompt,
+- **`crates/copperclaw-host/src/container_manager.rs`** (build_skill_system_prompt,
   render_callable_skill_index) — Finding 13a: `skill.name` is now
   passed through `escape_attr` symmetrically with `skill.description`
   at both call sites; defence in depth against an unescaped `&` or `"`.
 
 ### Fixed (`create_agent` depth-cap correctness, persistence, poison handling)
 
-- **`crates/ironclaw-modules/src/agent_to_agent.rs`** (~L475/~L536) —
+- **`crates/copperclaw-modules/src/agent_to_agent.rs`** (~L475/~L536) —
   Finding 4: closed the TOCTOU race where two concurrent
   `create_agent` calls from the same parent could both pass the cap
   check and double-spawn at depth N+1. Hard cap is now re-checked
   under the `spawned` lock just before the cache insert.
-- **`crates/ironclaw-modules/src/agent_to_agent.rs`** + new
-  **`crates/ironclaw-db/migrations/011_agent_group_subagent_depth.sql`**
+- **`crates/copperclaw-modules/src/agent_to_agent.rs`** + new
+  **`crates/copperclaw-db/migrations/011_agent_group_subagent_depth.sql`**
   — Finding 5: in-memory depth map reset on host restart, letting a
   depth-3 grandchild re-spawn fresh depth-1 children. Added
   `agent_groups.subagent_depth`; gate reads from DB on cache miss,
   writes through to DB on success.
-- **`crates/ironclaw-modules/src/agent_to_agent.rs`** (~L478) —
+- **`crates/copperclaw-modules/src/agent_to_agent.rs`** (~L478) —
   Finding 9: replaced `saturating_add(1)` with `checked_add(1)` so a
   parent at `u8::MAX` cannot keep passing the gate. Added a
   `MAX_SUBAGENT_DEPTH_CEILING = 16` clamp in `with_max_depth`.
-- **`crates/ironclaw-modules/src/agent_to_agent.rs`** (~L475/~L536) —
+- **`crates/copperclaw-modules/src/agent_to_agent.rs`** (~L475/~L536) —
   Finding 10: replaced inconsistent `.lock().unwrap()` on the
   `spawned` Mutex with `.lock().unwrap_or_else(std::sync::PoisonError::into_inner)`
   to match the workspace convention.
-- **`crates/ironclaw-modules/src/agent_to_agent.rs`** (~L481) —
+- **`crates/copperclaw-modules/src/agent_to_agent.rs`** (~L481) —
   Finding 12: orphan rejection path (depth-cap exceeded with no
   resolvable parent) previously returned silently. `warn!` is now
   unconditional so the failure is always auditable.
 
 ### Fixed (todo store: atomic writes + recovery from a corrupt file)
 
-- **`crates/ironclaw-mcp/src/tools/todo.rs`** (`read_all` / `write_all`,
+- **`crates/copperclaw-mcp/src/tools/todo.rs`** (`read_all` / `write_all`,
   ~line 102 onward) — `write_all` now writes to a sibling `<path>.tmp`
   and `rename`s into place, so a runner panic or SIGKILL mid-write
   leaves either the old or new file intact instead of a truncated
@@ -2867,9 +2867,9 @@ exist. Highlights:
 
 ### Fixed (load_skill rendering + server test brittleness)
 
-- **`crates/ironclaw-mcp/src/tools/load_skill.rs`** (render at ~L180,
+- **`crates/copperclaw-mcp/src/tools/load_skill.rs`** (render at ~L180,
   empty-catalogue branch at ~L150) and
-  **`crates/ironclaw-mcp/src/server.rs`** (`lists_all_in_process_tools`
+  **`crates/copperclaw-mcp/src/server.rs`** (`lists_all_in_process_tools`
   test at ~L163) — extracted an `escape_attr` helper so the rendered
   `<skill name="...">` attribute is entity-encoded symmetrically with
   `description`; added a fast path that returns a clear "catalogue is
@@ -2879,7 +2879,7 @@ exist. Highlights:
 
 ### Changed (subagent depth cap raised from 1 to configurable, default 3)
 
-- **`crates/ironclaw-modules/src/agent_to_agent.rs`** — `create_agent`'s
+- **`crates/copperclaw-modules/src/agent_to_agent.rs`** — `create_agent`'s
   nesting gate now tracks per-group *depth* rather than a binary
   spawned-or-not flag. `HandlerDeps.spawned` is now
   `HashMap<AgentGroupId, u8>` and the gate computes the new child's
@@ -2895,7 +2895,7 @@ exist. Highlights:
 ### Added (opt-in coding skill bundle)
 
 - **`skills/coding-task/SKILL.md`** — disciplines for editing files,
-  running tests, deciding when to comment, when to stop. The Ironclaw
+  running tests, deciding when to comment, when to stop. The Copperclaw
   analog of Claude Code's "doing tasks" section, scoped to coding work.
 - **`skills/git-commit/SKILL.md`** — staging, commit-message style, and
   the things to never do (amend pushed commits, `--no-verify`, force-
@@ -2913,7 +2913,7 @@ prompt is unchanged.
 
 ### Added (per-agent-group persistent memory mount)
 
-- **`crates/ironclaw-host/src/container_manager.rs`** — `build_spec`
+- **`crates/copperclaw-host/src/container_manager.rs`** — `build_spec`
   now adds a second bind mount at `/data/memory/` backed by
   `<groups_dir>/<agent_group_id>/memory/` (created lazily). The mount
   is shared across every session of the same agent group, so memory
@@ -2921,7 +2921,7 @@ prompt is unchanged.
   when `groups_dir` is unset. Two tests pin the present / absent
   cases.
 - **`skills/agent-memory/SKILL.md`** — the auto-memory protocol from
-  Claude Code adapted for Ironclaw: four entry types (user, feedback,
+  Claude Code adapted for Copperclaw: four entry types (user, feedback,
   project, reference), a `MEMORY.md` index, kebab-case slugs, and
   `[[name]]` cross-links. Agents read/write via the existing
   `read_file` / `write_file` tools — no new tool. Universal: every
@@ -2930,7 +2930,7 @@ prompt is unchanged.
 
 ### Added (todo tracker: per-session self-planning scratchpad)
 
-- **`crates/ironclaw-mcp/src/tools/todo.rs`** — four new MCP tools
+- **`crates/copperclaw-mcp/src/tools/todo.rs`** — four new MCP tools
   (`todo_add`, `todo_list`, `todo_update`, `todo_delete`) backed by
   `/data/agent_todos.json` in the session dir. Universal (not coding-
   specific) — any agent juggling multi-step work can use the scratchpad
@@ -2946,17 +2946,17 @@ prompt is unchanged.
 
 ### Added (callable skills loader: index in prompt, bodies on demand)
 
-- **`crates/ironclaw-host/src/container_manager.rs`** — new
+- **`crates/copperclaw-host/src/container_manager.rs`** — new
   `SkillsMode` enum (`Inline` | `Callable`) on `ManagerConfig`.
   `Inline` (default) preserves today's behaviour — every selected
   skill's full SKILL.md body is dumped into the system prompt at spawn
   time. `Callable` emits only a compact `<skill name=… description=… />`
   index in the prompt and writes a per-session `skills.json` (one
   `{name, description, body}` per selected skill) next to `runner.json`.
-- **`crates/ironclaw-host/src/config.rs`** — `HostConfig.skills_mode`
-  parsed from `IRONCLAW_SKILLS_MODE`. Unknown values fall back to
+- **`crates/copperclaw-host/src/config.rs`** — `HostConfig.skills_mode`
+  parsed from `COPPERCLAW_SKILLS_MODE`. Unknown values fall back to
   `Inline` with a `WARN` so a typo never silently mutes skills.
-- **`crates/ironclaw-mcp/src/tools/load_skill.rs`** — new `load_skill`
+- **`crates/copperclaw-mcp/src/tools/load_skill.rs`** — new `load_skill`
   MCP tool. Reads `/data/skills.json` and returns the named skill's
   body wrapped in the same `<skill>` envelope the inline-mode prompt
   uses, so the agent's experience is consistent across modes. Errors
@@ -2970,16 +2970,16 @@ prompt is unchanged.
   - 3 new manager-level tests pinning the callable-mode prompt shape,
     `skills.json` contents, the inline-mode no-write guarantee, and
     stale-catalogue cleanup when no skills are selected.
-  - 3 config tests for `IRONCLAW_SKILLS_MODE` default / parse / unknown.
-- **Workspace tool inventory test** in `crates/ironclaw-mcp/src/server.rs`
+  - 3 config tests for `COPPERCLAW_SKILLS_MODE` default / parse / unknown.
+- **Workspace tool inventory test** in `crates/copperclaw-mcp/src/server.rs`
   updated to expect `load_skill` as the new tail of the tool list.
 
 ### Added (universal system prompt: preamble, environment, project briefing)
 
-- **`crates/ironclaw-host/src/container_manager.rs`** — every agent now
+- **`crates/copperclaw-host/src/container_manager.rs`** — every agent now
   receives a structured system prompt with three new sections prepended
   to the existing skill catalogue:
-  1. A mode-agnostic `BASE_PREAMBLE` that establishes Ironclaw-agent
+  1. A mode-agnostic `BASE_PREAMBLE` that establishes Copperclaw-agent
      identity, planning discipline, reversibility-aware action-taking,
      tool-selection preferences, and reply conciseness (incl. no-emojis).
      The text is deliberately *not* coding-specific so it applies to
@@ -2987,9 +2987,9 @@ prompt is unchanged.
   2. An `environment_block` carrying today's date, the session id, the
      agent-group id, the in-container working directory, and the
      assistant's display name when set.
-  3. An optional project briefing read from `IRONCLAW.md`. Two sources
-     are checked, both optional: `<groups_dir>/<id>/IRONCLAW.md` (per-
-     group) and `<session_root>/IRONCLAW.md` (per-session). When both
+  3. An optional project briefing read from `COPPERCLAW.md`. Two sources
+     are checked, both optional: `<groups_dir>/<id>/COPPERCLAW.md` (per-
+     group) and `<session_root>/COPPERCLAW.md` (per-session). When both
      exist the group briefing precedes the session briefing.
 - **`runner_config_for`** now accepts an optional `session_root` and
   delegates prompt assembly to a new top-level `assemble_system_prompt`
@@ -3002,18 +3002,18 @@ prompt is unchanged.
 
 ### Added (runner provider factory: native Ollama wiring)
 
-- **`crates/ironclaw-runner/src/main.rs`** — replaced the hard-coded
+- **`crates/copperclaw-runner/src/main.rs`** — replaced the hard-coded
   `AnthropicProvider::new(api_key)` with a `build_provider(&cfg, &env)`
   dispatch on `cfg.provider`. Recognises `"anthropic"` (default),
   `"ollama"` (native `/api/chat` NDJSON via `OllamaProvider::new`),
   `"ollama-shim"` (legacy Anthropic-shaped proxy via
   `OllamaProvider::shim`). Ollama paths read `OLLAMA_BASE_URL` from
   the container env (defaults to `http://localhost:11434`).
-- **`crates/ironclaw-runner/src/config.rs`** — new `provider` field on
+- **`crates/copperclaw-runner/src/config.rs`** — new `provider` field on
   `RunnerConfigFile` / `RunnerConfig` with `"claude"` alias for
   `"anthropic"` and a graceful fallback when the value is unknown.
   Five new unit tests pin the alias / fallback semantics.
-- **`crates/ironclaw-host/src/container_manager.rs`** — the host's
+- **`crates/copperclaw-host/src/container_manager.rs`** — the host's
   `runner_config_for` now emits `provider`, `api_key_env`, and
   `api_base_url` consistent with the chosen provider (Ollama native
   doesn't get `ANTHROPIC_API_KEY` injected; the rotatable
@@ -3025,7 +3025,7 @@ prompt is unchanged.
 
 ### Fixed (CreateAgent permission gate replaces always-allow)
 
-- **`crates/ironclaw-modules/src/agent_to_agent.rs`** — type signature
+- **`crates/copperclaw-modules/src/agent_to_agent.rs`** — type signature
   of `CreateAgentPermissionCheck` changed from `Fn() -> bool` to
   `Fn(&CreateAgentPermissionCtx) -> bool` so the check sees the
   parent's agent-group id, session id, and requested name. New
@@ -3034,7 +3034,7 @@ prompt is unchanged.
   `user_roles`, or (b) the parent's scope has a granted Owner/Admin.
   DB read errors fail closed. Three new unit tests pin the deny /
   global-allow / scoped-allow paths.
-- **`crates/ironclaw-host/src/boot.rs`** — `install_modules` now wires
+- **`crates/copperclaw-host/src/boot.rs`** — `install_modules` now wires
   `create_agent_users_table_check(central)` in place of the
   `always_allow()` stub used during initial integration. A fresh
   install with no role grants denies every `create_agent` call until
@@ -3042,7 +3042,7 @@ prompt is unchanged.
 
 ### Changed (skill body cap tightened to 4 KiB)
 
-- **`crates/ironclaw-skills/tests/coverage.rs`** — `MAX_SKILL_BODY_BYTES`
+- **`crates/copperclaw-skills/tests/coverage.rs`** — `MAX_SKILL_BODY_BYTES`
   drops from 8 KiB to 4 KiB after a prose-cull pass on the nine
   previously-oversize skills (`explore`, `web-search`, `add-mcp-server`,
   `git`, `error-handling`, `web-fetch`, `messaging-context`,
@@ -3053,7 +3053,7 @@ prompt is unchanged.
 
 ### Fixed (iMessage empty-body silent drop)
 
-- **`crates/ironclaw-channels/imessage/src/adapter.rs`** — the
+- **`crates/copperclaw-channels/imessage/src/adapter.rs`** — the
   `deliver` path used to return `Ok(None)` when the outbound message
   carried no text and no files, which the host's delivery loop
   interpreted as delivered-ok. Replaced with
@@ -3065,12 +3065,12 @@ prompt is unchanged.
 
 ### Added (Mattermost file uploads — two-step `/api/v4/files` + `posts.file_ids`)
 
-- **`crates/ironclaw-channels/mattermost/src/api.rs`** — new
+- **`crates/copperclaw-channels/mattermost/src/api.rs`** — new
   `upload_file(channel_id, filename, bytes)` (multipart against
   `/api/v4/files`, returns the file id) and
   `create_post_with_files(...)` (POST `/api/v4/posts` with `file_ids`).
   `create_post` is now a thin wrapper.
-- **`crates/ironclaw-channels/mattermost/src/adapter.rs`** — the
+- **`crates/copperclaw-channels/mattermost/src/adapter.rs`** — the
   `post` action now uploads files into the destination channel and
   attaches their ids on the message. Edit / reaction actions
   reject files with `BadRequest`. Three new tests cover the upload
@@ -3078,7 +3078,7 @@ prompt is unchanged.
 
 ### Added (Teams + Google Chat attachments)
 
-- **`crates/ironclaw-channels/teams/src/api.rs`** — `get_channel_files_folder`
+- **`crates/copperclaw-channels/teams/src/api.rs`** — `get_channel_files_folder`
   resolves the channel's SharePoint drive + folder ids;
   `upload_channel_file` PUTs bytes to
   `/drives/{drive}/items/{item}:/{filename}:/content`;
@@ -3089,7 +3089,7 @@ prompt is unchanged.
   user-OneDrive auth that the bot's app-only token cannot reach. New
   unit tests cover both the happy-path channel upload and the chat
   rejection.
-- **`crates/ironclaw-channels/gchat/src/api.rs`** — new
+- **`crates/copperclaw-channels/gchat/src/api.rs`** — new
   `upload_attachment(space, filename, bytes)` (multipart against
   `/upload/v1/spaces/{space}/attachments:upload`, returns the
   `attachmentDataRef.resourceName`) and `send_text_with_attachments`
@@ -3101,7 +3101,7 @@ prompt is unchanged.
 
 ### Added (Signal daemon respawn)
 
-- **`crates/ironclaw-channels/signal/src/rpc.rs`** — new
+- **`crates/copperclaw-channels/signal/src/rpc.rs`** — new
   `SignalSupervisor` wraps `Arc<JsonRpcClient>` behind a poll-based
   watchdog. When the underlying `signal-cli daemon` exits (writer or
   reader task finishes), the supervisor respawns the process with
@@ -3109,12 +3109,12 @@ prompt is unchanged.
   notifications from each successive child through a shared mpsc so
   the adapter's notification loop sees the respawn as transparent.
   Adapter-facing trait surface (`RpcTransport`) is unchanged.
-- **`crates/ironclaw-channels/signal/src/factory.rs`** — `init` now
+- **`crates/copperclaw-channels/signal/src/factory.rs`** — `init` now
   builds a `SignalSupervisor` instead of a bare `JsonRpcClient`.
 
 ### Added (Webex sha256 webhook signature with `SignatureAlgo::Auto`)
 
-- **`crates/ironclaw-channels/webex/src/signature.rs`** — new
+- **`crates/copperclaw-channels/webex/src/signature.rs`** — new
   `SignatureAlgo::Auto` variant. When configured, the verifier picks
   the concrete algorithm from the incoming signature's hex length
   (40 → sha1, 64 → sha256) before constant-time comparing. Lets
@@ -3124,11 +3124,11 @@ prompt is unchanged.
 
 ### Added (X v2 media upload, opt-in)
 
-- **`crates/ironclaw-channels/x/src/api.rs`** — `upload_media_v2`
+- **`crates/copperclaw-channels/x/src/api.rs`** — `upload_media_v2`
   posts a multipart upload to `{api_base}/2/media/upload` and reads
   the media id from `data.id` (with a tolerant fallback to the
   top-level `media_id_string` shape some early v2 responses used).
-- **`crates/ironclaw-channels/x/src/config.rs`** — new
+- **`crates/copperclaw-channels/x/src/config.rs`** — new
   `media_api_version` field (`"v1"` default; `"v2"` opts in to the
   new endpoint). `XConfig::from_value` parses `v1`/`v2` (with
   `1`/`2`/`1.1` aliases) case-insensitively. `XAdapter::upload_files`
@@ -3136,7 +3136,7 @@ prompt is unchanged.
 
 ### Fixed (boot: install CreateAgentModule so create_agent action is no longer inert)
 
-- **`crates/ironclaw-host/src/boot.rs`** — `install_modules` now constructs
+- **`crates/copperclaw-host/src/boot.rs`** — `install_modules` now constructs
   `CreateAgentModule::new(central, data_root, create_agent_always_allow())`
   and adds it to the install list alongside the legacy unit-struct
   `AgentToAgentModule`. Before this fix, Team CA's `CreateAgentModule`
@@ -3144,7 +3144,7 @@ prompt is unchanged.
   emitted system rows that the delivery loop logged as "no handler;
   skipping" and silently marked delivered=ok. Caught by the new
   structural meta-test `every_runner_emit_has_a_host_handler`.
-- **`crates/ironclaw-host/tests/action_handler_coverage.rs`** — also
+- **`crates/copperclaw-host/tests/action_handler_coverage.rs`** — also
   updated to mirror the production module list. Production and test
   module lists are now in lock-step; the test will fail loudly if
   either drifts.
@@ -3154,7 +3154,7 @@ prompt is unchanged.
 
 ### Added (Test (structural): every runner-emitted action has a handler)
 
-- **`crates/ironclaw-host/tests/action_handler_coverage.rs`** — new
+- **`crates/copperclaw-host/tests/action_handler_coverage.rs`** — new
   integration test file that ships four structural meta-tests sealing
   the bug class behind today's seven silently-inert subsystems
   (`ask_question` vs `ask_user_question`, `card` vs `send_card`,
@@ -3178,13 +3178,13 @@ prompt is unchanged.
   `SchedulingModule`, `AgentToAgentModule`, `SelfModModule`) against
   a `MockModuleContext` and reading back `delivery_actions()`.
   (2) `runner_emit_set_matches_source` re-derives the runner emit
-  set from `crates/ironclaw-runner/src/tools.rs` (`fn apply_*`
-  bodies) and `crates/ironclaw-runner/src/run.rs`
+  set from `crates/copperclaw-runner/src/tools.rs` (`fn apply_*`
+  bodies) and `crates/copperclaw-runner/src/run.rs`
   (`fn emit_usage_report` body) via a brace-matching parser +
   regex over `serde_json::json!({ "<name>": …`; asserts no drift
   from the hard-coded list in (1).
   (3) `host_handle_set_matches_inline_arms` scans
-  `crates/ironclaw-host-delivery/src/service.rs` for every
+  `crates/copperclaw-host-delivery/src/service.rs` for every
   `if action.name == "…"` arm plus the typed `match action_name`
   block in `try_action_via_adapter`; asserts no drift.
   (4) `every_module_action_name_is_lowercase_snake` — every name
@@ -3195,15 +3195,15 @@ prompt is unchanged.
   (the unit-struct interceptor sibling), so the `create_agent`
   delivery action is unwired in production. Tests (2)-(4) pass.
   Tracked as a follow-up: add `CreateAgentModule::new(…)` to the
-  `install_modules` vec in `crates/ironclaw-host/src/boot.rs`.
+  `install_modules` vec in `crates/copperclaw-host/src/boot.rs`.
 
 ### Added (skill ↔ tool coverage tests + `skills/README.md` conventions)
 
-- **`crates/ironclaw-skills/tests/coverage.rs`** — new integration test
+- **`crates/copperclaw-skills/tests/coverage.rs`** — new integration test
   file pinning the `tools ↔ skills` matrix. Nine tests:
   (1) every `skills/<dirname>/SKILL.md` has frontmatter `name:` equal
   to `<dirname>`; (2) every tool returned by
-  `ironclaw_mcp::tools::build_tool_set` is mentioned in at least one
+  `copperclaw_mcp::tools::build_tool_set` is mentioned in at least one
   skill, so the model always learns when to reach for it;
   (3) every backtick-quoted "looks like a tool" token in any skill
   body resolves to a real registry entry (catches typos and
@@ -3233,7 +3233,7 @@ prompt is unchanged.
 
 ### Fixed (providers: native Ollama support that actually talks `/api/chat`)
 
-- **`crates/ironclaw-providers/src/ollama.rs`** — replaced the
+- **`crates/copperclaw-providers/src/ollama.rs`** — replaced the
   Anthropic-Messages shim with a native `/api/chat` NDJSON adapter.
   The previous implementation always hit `<base_url>/v1/messages`, which
   vanilla `ollama serve` does not expose (`404`), so the path only
@@ -3247,19 +3247,19 @@ prompt is unchanged.
   `ProviderEvent::Usage`. The shim path remains reachable via the new
   `OllamaProvider::shim(...)` constructor for operators with a
   proxy front-end.
-- **`crates/ironclaw-providers/tests/ollama_conformance.rs`** — new,
+- **`crates/copperclaw-providers/tests/ollama_conformance.rs`** — new,
   12 wiremock conformance tests covering every `ProviderEvent`
   emission path on the native code path (text, tool round-trip,
   streaming heartbeats, abort, usage, model passthrough, tool schema
   translation, tool-result history translation, system prompt
   placement, error classification, empty body, malformed JSON
   recovery).
-- **`crates/ironclaw-providers/tests/ollama_live.rs`** — new,
+- **`crates/copperclaw-providers/tests/ollama_live.rs`** — new,
   `#[ignore]`d live test against a real Ollama server. Reads
   `OLLAMA_HOST` (default `http://localhost:11434`) and `OLLAMA_MODEL`
   (default `llama3.1:8b`); run with
-  `cargo test --ignored ollama_live -p ironclaw-providers`.
-- **`crates/ironclaw-providers/tests/ollama_shim.rs`** — renamed from
+  `cargo test --ignored ollama_live -p copperclaw-providers`.
+- **`crates/copperclaw-providers/tests/ollama_shim.rs`** — renamed from
   `ollama_sse.rs` and converted to drive `OllamaProvider::shim(...)` so
   the legacy facade path stays pinned against regressions.
 - **`docs/providers/ollama.md`** — new audit document covering the
@@ -3279,19 +3279,19 @@ prompt is unchanged.
   MED-severity finding documented (imessage empty body returns silently,
   enshrined in an existing test). Each per-channel doc lists tested
   edges + deferred punch list with line-level pointers.
-- `crates/ironclaw-channels/telegram/src/adapter.rs` — 3 new
+- `crates/copperclaw-channels/telegram/src/adapter.rs` — 3 new
   adapter-level edge tests: rate-limit retry-after,
   malformed-response-body → Transport, non-object content → BadRequest.
-- `crates/ironclaw-channels/slack/src/adapter.rs` — 3 new
+- `crates/copperclaw-channels/slack/src/adapter.rs` — 3 new
   adapter-level edge tests: empty text still posts, non-object content
   as empty text, 429 Retry-After → AdapterError::Rate.
-- `crates/ironclaw-channels/discord/src/adapter.rs` — 3 new
+- `crates/copperclaw-channels/discord/src/adapter.rs` — 3 new
   adapter-level edge tests: empty content object still posts,
   non-object content renders as JSON, 429 Retry-After → AdapterError::Rate.
 
 ### Fixed (scheduling: persist tasks and fire due ones from the sweep loop)
 
-- **`crates/ironclaw-modules/src/scheduling.rs`** — `SchedulingModule::install`
+- **`crates/copperclaw-modules/src/scheduling.rs`** — `SchedulingModule::install`
   now registers a real `"schedule"` delivery action against the host's
   module context. Previously the module's `install` was a literal no-op,
   so every `schedule_task` / `list_tasks` / `cancel_task` / `pause_task` /
@@ -3303,15 +3303,15 @@ prompt is unchanged.
   `ScheduleHandler` drives a `TaskStore` trait (in-memory store for
   tests; the host wires a sqlite-backed `SqliteTaskStore`) and dispatches
   on the payload's `op` field.
-- **`crates/ironclaw-db/migrations/010_tasks.sql`** — new `tasks` table
+- **`crates/copperclaw-db/migrations/010_tasks.sql`** — new `tasks` table
   on the central DB. Columns: `id` (server-generated `task_<uuid>`),
   `agent_group_id`, `session_id`, `name`, `prompt`, `when_spec`,
   `recurrence`, `next_fire`, `status`
   (`active`/`paused`/`cancelled`/`completed`), `created_at`, `updated_at`.
-- **`crates/ironclaw-db/src/tables/tasks.rs`** — CRUD module for the
+- **`crates/copperclaw-db/src/tables/tasks.rs`** — CRUD module for the
   new table: `insert`, `get`, `list_for_session`, `list_due`,
   `set_status`, `set_next_fire`, `update`.
-- **`crates/ironclaw-host-sweep/src/checks/scheduling.rs`** — new sweep
+- **`crates/copperclaw-host-sweep/src/checks/scheduling.rs`** — new sweep
   check called once per pass. For every `active` task with
   `next_fire <= now`, the check synthesises a `kind: task`, `on_wake: true`
   inbound row into the originating session's `inbound.db` and either
@@ -3319,14 +3319,14 @@ prompt is unchanged.
   transitions to `completed` (one-shot tasks clear `next_fire`). The
   existing `wake.rs` check then picks up the new pending row and walks
   the container back to `running`.
-- **`crates/ironclaw-host-sweep/src/task_store.rs`** — the sqlite-backed
+- **`crates/copperclaw-host-sweep/src/task_store.rs`** — the sqlite-backed
   `SqliteTaskStore` impl of `TaskStore`. Lives in the sweep crate so the
-  modules crate stays decoupled from `ironclaw-db`.
-- **`crates/ironclaw-host/src/boot.rs`** — boot now constructs
+  modules crate stays decoupled from `copperclaw-db`.
+- **`crates/copperclaw-host/src/boot.rs`** — boot now constructs
   `SqliteTaskStore::new(host_ctx.central().clone())` and passes it
   through `SchedulingModule::with_store(...)` so created tasks land in
   the same `tasks` table the sweep scans.
-- **`crates/ironclaw-modules/src/context.rs`** — `DeliveryActionInput`
+- **`crates/copperclaw-modules/src/context.rs`** — `DeliveryActionInput`
   gains `session_id: Option<SessionId>` and `DispatchTarget` derives
   `Default`. The host's delivery service populates both for system
   actions so the `ScheduleHandler` can identify the originating session.
@@ -3335,7 +3335,7 @@ prompt is unchanged.
 
 ### Added (modules: wire the `create_agent` delivery action)
 
-- **`crates/ironclaw-modules/src/agent_to_agent.rs`** — the
+- **`crates/copperclaw-modules/src/agent_to_agent.rs`** — the
   `AgentToAgentModule` now registers a `create_agent` delivery action
   via `register_delivery_action`. Previously the runner emitted the
   `{"create_agent": {...}}` system row but the host had no handler, so
@@ -3357,11 +3357,11 @@ prompt is unchanged.
   runner's `apply_create_agent` had returned a synthetic ack). Denied,
   rejected (nested), and invalid-payload requests surface a matching
   status row.
-- **`crates/ironclaw-modules/src/lib.rs`** — re-exports
+- **`crates/copperclaw-modules/src/lib.rs`** — re-exports
   `CreateAgentHandler`, `CreateAgentPermissionCheck`,
   `create_agent_always_allow`, `create_agent_always_deny` for host
   wiring + tests.
-- **`crates/ironclaw-modules/Cargo.toml`** — adds `ironclaw-db` as a
+- **`crates/copperclaw-modules/Cargo.toml`** — adds `copperclaw-db` as a
   dependency (previously the modules crate avoided the dep by routing
   DB access through closures, but the create-agent flow's CRUD surface
   is too wide to plumb that way cleanly). `tempfile` added under
@@ -3377,30 +3377,30 @@ prompt is unchanged.
 
 ### Added (wire up agent `edit_message` / `add_reaction` end-to-end)
 
-- **`crates/ironclaw-channels/core/src/adapter.rs`** — `ChannelAdapter`
+- **`crates/copperclaw-channels/core/src/adapter.rs`** — `ChannelAdapter`
   gains two default-`Unsupported` trait methods, `edit_message` and
   `add_reaction`, so adapters that don't expose those APIs fall
   through cleanly to the host's fallback path.
-- **`crates/ironclaw-channels/telegram/src/adapter.rs`** plus
-  **`crates/ironclaw-channels/telegram/src/api.rs`** — implements the
+- **`crates/copperclaw-channels/telegram/src/adapter.rs`** plus
+  **`crates/copperclaw-channels/telegram/src/api.rs`** — implements the
   trait against Telegram's `editMessageText` and `setMessageReaction`
   endpoints.
-- **`crates/ironclaw-channels/slack/src/adapter.rs`** — implements the
+- **`crates/copperclaw-channels/slack/src/adapter.rs`** — implements the
   trait against Slack's `chat.update` and `reactions.add` (strips
   surrounding `:` from the emoji name before forwarding).
-- **`crates/ironclaw-channels/discord/src/adapter.rs`** — implements
+- **`crates/copperclaw-channels/discord/src/adapter.rs`** — implements
   the trait against Discord's `PATCH /channels/{id}/messages/{msg}`
   and `PUT /channels/{id}/messages/{msg}/reactions/{emoji}/@me`.
-- **`crates/ironclaw-channels/core/src/testing.rs`** — `MockAdapter`
+- **`crates/copperclaw-channels/core/src/testing.rs`** — `MockAdapter`
   records `edit_message` / `add_reaction` calls and exposes
   `set_edit_unsupported` / `set_reaction_unsupported` knobs so tests
   can drive the host's fallback path.
-- **`crates/ironclaw-modules/src/interactive.rs`** — `InteractiveModule`
+- **`crates/copperclaw-modules/src/interactive.rs`** — `InteractiveModule`
   now registers `edit` and `reaction` delivery-action handlers. They
   emit a synthetic chat message of the form `"(edit) <text>"` /
   `"(reaction: <emoji>)"`; the host invokes them only when the
   adapter call falls through.
-- **`crates/ironclaw-host-delivery/src/service.rs`** — the
+- **`crates/copperclaw-host-delivery/src/service.rs`** — the
   registered-handler path now intercepts `action.name == "edit"` and
   `"reaction"`, resolves the original message's `platform_message_id`
   via the inbound `delivered` table (joined to `messages_out` by
@@ -3420,12 +3420,12 @@ prompt is unchanged.
 
 ### Fixed (delivery: surface install_packages / add_mcp_server apply failures)
 
-- **`crates/ironclaw-host-delivery/src/service.rs`** — the
+- **`crates/copperclaw-host-delivery/src/service.rs`** — the
   `install_packages` and `add_mcp_server` system-action handlers no
   longer mark a row `delivered.status="ok"` after the underlying
   `container_configs` update failed. On apply error the row is now
   recorded as `delivered.status="failed"` with the error message in
-  the payload (so it surfaces in `iclaw dropped-messages outbound-list`),
+  the payload (so it surfaces in `cclaw dropped-messages outbound-list`),
   the failure is logged at `error!` (not `warn!`), and a
   `MessageKind::System` row carrying a `self_mod_error` envelope is
   written to the session's `inbound.db` so the agent learns its tool
@@ -3433,24 +3433,24 @@ prompt is unchanged.
   agent would loop thinking its install succeeded while the next
   container spawn silently lacked the package.
 - New metric counters
-  `ironclaw_self_mod_failed_total{action}` and
-  `ironclaw_self_mod_succeeded_total{action}` (`action` ∈
+  `copperclaw_self_mod_failed_total{action}` and
+  `copperclaw_self_mod_succeeded_total{action}` (`action` ∈
   `{install_packages, add_mcp_server}`) — fired on every self-mod
   apply outcome so operators can chart the failure rate.
-- New env var `IRONCLAW_SELFMOD_HARD_FAIL=1` flips failed applies
+- New env var `COPPERCLAW_SELFMOD_HARD_FAIL=1` flips failed applies
   into a non-retryable `DeliveryError::SystemAction` so the outer
   delivery loop records the row in `dropped-messages` instead of
   handling the failure inline. Default off; useful for tests + paranoid
   operators that want the message in the failed-deliveries view.
-- **`crates/ironclaw-metrics/src/lib.rs`** — new
+- **`crates/copperclaw-metrics/src/lib.rs`** — new
   `inc_self_mod_failed(action)` / `inc_self_mod_succeeded(action)`
   helpers + `SELF_MOD_FAILED_TOTAL` / `SELF_MOD_SUCCEEDED_TOTAL`
   name constants, following the existing pattern.
 
 ### Fixed (runner: route chat outbounds back to the originating channel)
 
-- **`crates/ironclaw-runner/src/tools.rs`** and
-  **`crates/ironclaw-runner/src/run.rs`** — when the model emits a
+- **`crates/copperclaw-runner/src/tools.rs`** and
+  **`crates/copperclaw-runner/src/run.rs`** — when the model emits a
   reply (final assistant text or an explicit `send_message` /
   `send_file` with `to: None`), the `messages_out` row's
   `channel_type` / `platform_id` / `thread_id` / `in_reply_to`
@@ -3460,7 +3460,7 @@ prompt is unchanged.
   correctly but the user saw silence. **Live-caught on Telegram**:
   every successful turn produced a chat outbound with empty routing
   and the user got nothing.
-- **`crates/ironclaw-mcp/src/context.rs`** — the `ToolContext`
+- **`crates/copperclaw-mcp/src/context.rs`** — the `ToolContext`
   trait gains `set_originating(...)` / `clear_originating()`
   methods with no-op default impls. The runner's `RunnerToolCtx`
   implements the real plumbing via a `Mutex<OriginatingRouting>`
@@ -3473,14 +3473,14 @@ prompt is unchanged.
   keeps `in_reply_to: null` because that reply is host-side, not
   runner-side.
 
-### Fixed (rebuild.sh: don't let `ironclaw-setup --headless` wipe channel config from .env)
+### Fixed (rebuild.sh: don't let `copperclaw-setup --headless` wipe channel config from .env)
 
 - **`rebuild.sh`** — the image-rebake step invokes the full
-  `ironclaw-setup --headless` wizard, which rewrites `.env` from
+  `copperclaw-setup --headless` wizard, which rewrites `.env` from
   scratch with only the keys it knows about (`ANTHROPIC_API_KEY`,
-  `IRONCLAW_DATA_DIR`, `IRONCLAW_DEFAULT_IMAGE_TAG`, etc.) — silently
+  `COPPERCLAW_DATA_DIR`, `COPPERCLAW_DEFAULT_IMAGE_TAG`, etc.) — silently
   dropping channel-specific keys (`TELEGRAM_BOT_TOKEN`,
-  `IRONCLAW_CHANNELS`, `IRONCLAW_CHANNELS_CONFIG`) and third-party
+  `COPPERCLAW_CHANNELS`, `COPPERCLAW_CHANNELS_CONFIG`) and third-party
   provider keys (`TAVILY_API_KEY`, etc.). Caught live: a `./rebuild.sh`
   run silently disabled the Telegram channel by wiping its config.
   Real users would notice nothing — the host log would say
@@ -3491,25 +3491,25 @@ prompt is unchanged.
   then re-appends any `KEY=VALUE` lines whose `KEY` is missing from
   the post-setup `.env`. Effectively makes the wizard additive for
   the rebuild use case. The proper long-term fix is to add an
-  `ironclaw-setup image` subcommand that runs ONLY the image build
+  `copperclaw-setup image` subcommand that runs ONLY the image build
   without touching `.env` — filed for a follow-up.
 
 ### Fixed (recover from malformed tool_use JSON by feeding the parse error back to the model)
 
-- **`crates/ironclaw-types/src/provider.rs`** — new
+- **`crates/copperclaw-types/src/provider.rs`** — new
   `ProviderEvent::ToolInputParseError { tool_use_id, tool_name, raw_input, parse_error }`
   variant. Emitted by the provider when a `tool_use` content block's
   reassembled `input_json_delta` chunks fail to parse as JSON. Carries
   enough metadata for the runner to synthesise a corrective
   `tool_result` keyed by `tool_use_id`.
-- **`crates/ironclaw-providers/src/anthropic.rs`** — on a `tool_use`
+- **`crates/copperclaw-providers/src/anthropic.rs`** — on a `tool_use`
   input JSON parse failure (the live-caught `send_file` "EOF while
   parsing an object at line 1 column 37" case), the SSE pump now
   emits `ProviderEvent::ToolInputParseError` followed by
   `ProviderEvent::ToolEnd` instead of a terminal
   `ProviderEvent::Error`. The previous behaviour terminated the
   inbound with only the generic apology row reaching the user.
-- **`crates/ironclaw-runner/src/run.rs`** — `pump_events` converts
+- **`crates/copperclaw-runner/src/run.rs`** — `pump_events` converts
   the new event into a synthetic `PendingToolCall` tagged with the
   parse error. `drive_turn` recognises these, skips the real tool
   invocation, and pushes a `HistoryMessage::Tool { is_error: true,
@@ -3521,11 +3521,11 @@ prompt is unchanged.
   terminal-failure / apology path. Real tool calls emitted in the
   same turn (e.g. a clean `shell` alongside a malformed `send_file`)
   still execute normally.
-- **`crates/ironclaw-runner/src/subagent.rs`** — exhaustive-match arm
+- **`crates/copperclaw-runner/src/subagent.rs`** — exhaustive-match arm
   added for the new variant. Subagent turns are single-shot, so the
   parse-error path bails the subagent turn (the parent runner is
   where the self-correction loop lives).
-- **Tests** — four new tests in `crates/ironclaw-runner/src/run.rs`:
+- **Tests** — four new tests in `crates/copperclaw-runner/src/run.rs`:
   `malformed_tool_use_recovers_after_one_retry`,
   `malformed_tool_use_gives_up_after_three_attempts`,
   `malformed_tool_use_other_tools_still_work`, and
@@ -3534,7 +3534,7 @@ prompt is unchanged.
 
 ### Added (delivery: plain-text fallback retry for formatting BadRequests)
 
-- **`crates/ironclaw-channels/core/src/adapter.rs`** — new
+- **`crates/copperclaw-channels/core/src/adapter.rs`** — new
   `ChannelAdapter::plain_text_fallback(&self, msg) -> Option<OutboundMessage>`
   trait method with a default impl that returns `None`. Adapters whose
   upstream platform has a known formatting-validation failure mode
@@ -3545,7 +3545,7 @@ prompt is unchanged.
   text. Default-`None` means "no clean fallback known; fail fast", which
   preserves the previous behaviour for adapters that don't opt in
   (matrix, webhooks, github, etc.).
-- **`crates/ironclaw-host-delivery/src/service.rs`** — `call_adapter` now
+- **`crates/copperclaw-host-delivery/src/service.rs`** — `call_adapter` now
   inspects `AdapterError::BadRequest(msg)` for a formatting-error
   signature (`parse entities`, `rich text`, `blocks`, `block_kit`,
   `block kit`, `embed`, `embeds`, `format`, `formatting`; case-
@@ -3554,29 +3554,29 @@ prompt is unchanged.
   the result. If the fallback succeeds the row is recorded as
   delivered, an info-level "delivered with reduced formatting" log
   line fires, and the new metric
-  `ironclaw_delivery_formatting_fallback_total{channel_type}` is
+  `copperclaw_delivery_formatting_fallback_total{channel_type}` is
   incremented. If the fallback fails (or the adapter has no
   fallback), the ORIGINAL `BadRequest` is surfaced and the existing
   terminal-failure path takes over — non-formatting BadRequests
   (e.g. "chat_id required") fail fast without a retry.
 - **Per-channel `plain_text_fallback` impls** in:
-  - `crates/ironclaw-channels/telegram/src/adapter.rs` — strips
+  - `crates/copperclaw-channels/telegram/src/adapter.rs` — strips
     `parse_mode`, keeps `text`. Fixes the regression where the agent
     opting into `parse_mode=MarkdownV2` and emitting natural-language
     text with bare `!` / `.` / `-` / `(` / `)` / `[` / `]` would hit
     Telegram's 400 "can't parse entities" and the user got nothing.
-  - `crates/ironclaw-channels/slack/src/adapter.rs` — strips
+  - `crates/copperclaw-channels/slack/src/adapter.rs` — strips
     `blocks`, keeps the `text` fallback string Slack already requires
     on `chat.postMessage`.
-  - `crates/ironclaw-channels/discord/src/adapter.rs` — strips
+  - `crates/copperclaw-channels/discord/src/adapter.rs` — strips
     `embeds`, keeps `text`.
-- **`crates/ironclaw-metrics/src/lib.rs`** — adds
+- **`crates/copperclaw-metrics/src/lib.rs`** — adds
   `DELIVERY_FORMATTING_FALLBACK_TOTAL` constant and
   `inc_delivery_formatting_fallback(channel_type)` helper, alongside
   the existing `inc_delivery_failed`. Surfaced in the metric-name
   prefix / ends-with-`_total` invariants so an operator scraping
   `/metrics` can alert on "delivered but downgraded".
-- **`crates/ironclaw-channels/core/src/testing.rs`** — `MockAdapter`
+- **`crates/copperclaw-channels/core/src/testing.rs`** — `MockAdapter`
   gains `enable_plain_text_fallback(bool)` and (under the hood) a
   FIFO queue for `fail_next_deliver` so a single test can preload
   multiple consecutive failures — required to exercise both the
@@ -3599,7 +3599,7 @@ prompt is unchanged.
 
 ### Added (sweep: user-visible apology when an inbound is stuck)
 
-- **`crates/ironclaw-host-sweep/src/checks/apology.rs`** — new sweep
+- **`crates/copperclaw-host-sweep/src/checks/apology.rs`** — new sweep
   responsibility. On every 60s pass the sweep scans each active session's
   `inbound.db` for chat rows with `status='pending'` and `kind='chat'`
   whose `(now - timestamp) > APOLOGY_AFTER_SECS` (5 min, hard-coded), and
@@ -3616,7 +3616,7 @@ prompt is unchanged.
   after a successful apology emit. The host's regular retry path tops
   out at `MAX_TRIES=5`, so 99 is safely out-of-band. The query filter is
   `tries < 99`, so a second sweep skips the row.
-- **`crates/ironclaw-host-sweep/src/spawn_tracker.rs`** — new in-memory
+- **`crates/copperclaw-host-sweep/src/spawn_tracker.rs`** — new in-memory
   `SpawnAttemptTracker` shared between the host's container manager and
   the sweep. The manager calls `record_failure(session_id)` on every
   failed `runtime.spawn(...)` and `record_success(session_id)` on a
@@ -3626,17 +3626,17 @@ prompt is unchanged.
   `reason=container_spawn_failed` branch — which emits the apology even
   for inbounds under the 5-min age threshold, because if the container
   can't come up at all the user shouldn't have to wait 5 min.
-- **`crates/ironclaw-metrics/src/lib.rs`** — new counter
-  `ironclaw_stuck_inbound_apology_total{agent_group_id, reason}` with
+- **`crates/copperclaw-metrics/src/lib.rs`** — new counter
+  `copperclaw_stuck_inbound_apology_total{agent_group_id, reason}` with
   reason ∈ {`pending_too_long`, `container_spawn_failed`}. Operators
   can alert on it spiking to detect a container that flat-out won't
   start (image corruption, OCI error, OOM at launch).
-- **`crates/ironclaw-host/src/container_manager.rs`** — `maybe_spawn`
+- **`crates/copperclaw-host/src/container_manager.rs`** — `maybe_spawn`
   now bumps the spawn-attempt tracker on every `runtime.spawn` failure
   and clears it on success. The shared `Arc<SpawnAttemptTracker>` is
   threaded through `with_spawn_tracker(...)` from `boot.rs`, where the
   same tracker is also handed to the sweep service.
-- **`crates/ironclaw-host-sweep/src/lib.rs`** — exposes
+- **`crates/copperclaw-host-sweep/src/lib.rs`** — exposes
   `APOLOGY_AFTER_SECS` (=300) and re-exports the new types
   (`ApologyEmit`, `ApologyReason`, `SpawnAttemptTracker`).
 - **Tests** — five spec tests in `apology.rs`:
@@ -3652,8 +3652,8 @@ prompt is unchanged.
 
 ### Added (boot-time image health check + host degraded mode)
 
-- **`crates/ironclaw-host/src/image_health.rs`** — new module that
-  inspects the configured `IRONCLAW_DEFAULT_IMAGE_TAG` at boot
+- **`crates/copperclaw-host/src/image_health.rs`** — new module that
+  inspects the configured `COPPERCLAW_DEFAULT_IMAGE_TAG` at boot
   before the container manager starts. Three checks:
   1. **Image exists locally** — `docker image inspect <tag>`. A
      missing image is what happens when an operator runs the host
@@ -3661,17 +3661,17 @@ prompt is unchanged.
      `./rebuild.sh` to refresh the session image. This is the
      bug-class the change closes.
   2. **Runner binary present + executable** — one-shot
-     `docker run --rm --entrypoint /bin/ls <tag> -l /usr/local/bin/ironclaw-runner`
+     `docker run --rm --entrypoint /bin/ls <tag> -l /usr/local/bin/copperclaw-runner`
      bounded by a 5 s per-call timeout and `kill_on_drop(true)` so
      a wedged daemon can't monopolise boot.
   3. **Fingerprint compare** — reads the image's
-     `ironclaw.fingerprint` label (set by `ironclaw-setup`) and
+     `copperclaw.fingerprint` label (set by `copperclaw-setup`) and
      compares it to the sha256 of the host's runner binary. A
      mismatch is a WARN, **not** a degrade — fingerprints can
      legitimately differ across architectures and build flavours,
      so we only flag the suspicion.
   The whole pipeline is bounded by an outer 10 s `tokio::time::timeout`.
-- **`crates/ironclaw-host/src/boot.rs::run_boot_image_health_check`**
+- **`crates/copperclaw-host/src/boot.rs::run_boot_image_health_check`**
   wires the check into `run_host` between migrations and the
   container-manager spawn. On failure the host enters degraded mode
   via `image_health::enter_degraded_mode`: the metric gauge is set,
@@ -3682,12 +3682,12 @@ prompt is unchanged.
   and the container manager is flipped into refuse-spawn mode via
   the new `ContainerManager::set_degraded()`. The startup log line
   starts with `HOST DEGRADED:` so a quick log tail surfaces it.
-- **`crates/ironclaw-host/src/container_manager.rs`** — new
+- **`crates/copperclaw-host/src/container_manager.rs`** — new
   `ManagerError::HostDegraded` variant; `maybe_spawn` short-circuits
   with it when degraded; the reconcile loop swallows the error so
   the host log isn't spammed every tick.
-- **`crates/ironclaw-metrics/src/lib.rs`** — new
-  `ironclaw_degraded_state{reason}` Prometheus gauge with five label
+- **`crates/copperclaw-metrics/src/lib.rs`** — new
+  `copperclaw_degraded_state{reason}` Prometheus gauge with five label
   values: `image_not_found`, `runner_binary_missing`,
   `runner_binary_not_executable`, `health_check_timeout`,
   `health_check_failed`. Exposed via `set_degraded_state` /
@@ -3705,24 +3705,24 @@ prompt is unchanged.
 
 - **`rebuild.sh`** — now also rebuilds the session container image
   (and pins the new sha256 tag in `.env`) after installing fresh
-  binaries. Previously a code change to `ironclaw-runner` landed on
+  binaries. Previously a code change to `copperclaw-runner` landed on
   disk but the agent inside the container kept running the old runner
   baked into the stale image, so new tools / new fixes never reached
   the live agent. Caught live: model kept hitting the `send_file`
   malformed-JSON tic on the old image's old runner, with no apology
   emit because that fix only existed in the on-disk-but-unbaked
-  binary. The script now triggers `ironclaw-setup --headless` after
+  binary. The script now triggers `copperclaw-setup --headless` after
   install (with `image` cleared from `setup-state.json`'s completed
   list), reads the resulting image tag, and rewrites
-  `IRONCLAW_DEFAULT_IMAGE_TAG` so the next session spawn picks it up.
-- **`rebuild.sh` install list** now includes `ironclaw-runner` so
+  `COPPERCLAW_DEFAULT_IMAGE_TAG` so the next session spawn picks it up.
+- **`rebuild.sh` install list** now includes `copperclaw-runner` so
   the binary the image step bakes in is current.
 - **`CLAUDE.md`** — documents the new step in the "Local development
   loop" section.
 
 ### Changed (web_fetch: auto-convert HTML responses to markdown)
 
-- **`crates/ironclaw-mcp/src/tools/computer_use.rs`** — `web_fetch`
+- **`crates/copperclaw-mcp/src/tools/computer_use.rs`** — `web_fetch`
   now detects HTML responses by Content-Type (`text/html`, including
   parametrised forms like `text/html; charset=utf-8`, plus
   `application/xhtml+xml`) and runs them through the pure-Rust `htmd`
@@ -3742,7 +3742,7 @@ prompt is unchanged.
   string content for HTML responses.
 - **`skills/web-fetch/SKILL.md`** — documents the new default
   behaviour and the `raw` flag.
-- **`crates/ironclaw-mcp/Cargo.toml`** — adds `htmd = "0.2"`. Pinned
+- **`crates/copperclaw-mcp/Cargo.toml`** — adds `htmd = "0.2"`. Pinned
   to 0.2 because 0.3+ require Rust 1.88's let-chains feature and the
   workspace pins 1.85. License is Apache-2.0, MIT-compatible.
 - Four wiremock-backed tests pin the new behaviour:
@@ -3752,7 +3752,7 @@ prompt is unchanged.
 
 ### Changed (shell: persist working directory and env vars across calls)
 
-- **`crates/ironclaw-mcp/src/tools/computer_use.rs`** — environment
+- **`crates/copperclaw-mcp/src/tools/computer_use.rs`** — environment
   variables exported during a `shell` call now persist to subsequent
   `shell` calls in the same session, and `cd` carries forward
   between calls. Previously every call started in `/` with a fresh
@@ -3778,7 +3778,7 @@ prompt is unchanged.
 
 ### Added (agent tool: `edit_file` for string-replacement edits)
 
-- **`crates/ironclaw-mcp/src/tools/edit_file.rs`** — new in-process
+- **`crates/copperclaw-mcp/src/tools/edit_file.rs`** — new in-process
   MCP tool that swaps an exact substring inside an existing file.
   Mirrors Claude Code's `Edit` semantics: `old_string` must appear
   exactly once unless `replace_all` is set, `old_string` must
@@ -3789,7 +3789,7 @@ prompt is unchanged.
   before the rename so permissions survive. Removes the token tax
   the agent was paying by re-emitting whole files via `write_file`
   for one-line tweaks.
-- **`crates/ironclaw-mcp/src/tools/mod.rs`** — registers
+- **`crates/copperclaw-mcp/src/tools/mod.rs`** — registers
   `edit_file` in `build_tool_set` (alphabetically within the
   computer-use group, before `read_file`). Tool count is now 21;
   the `tool_set_lists_every_in_process_tool` inventory test was
@@ -3806,7 +3806,7 @@ prompt is unchanged.
 
 ### Added (agent tools: `grep` and `glob` for structured filesystem search)
 
-- **`crates/ironclaw-mcp/src/tools/grep.rs`** — new in-process tool
+- **`crates/copperclaw-mcp/src/tools/grep.rs`** — new in-process tool
   that regex-searches files under a path and returns structured
   `{path, line, text, context_before, context_after}` rows. Uses
   the `ignore` crate (the same one `ripgrep` uses) for `.gitignore`-
@@ -3819,7 +3819,7 @@ prompt is unchanged.
   filename filter (e.g. `*.rs`), `case_insensitive`, `context_lines`
   (cap 20), and `no_ignore` to bypass `.gitignore`/`.ignore` for
   cases like log file search.
-- **`crates/ironclaw-mcp/src/tools/glob.rs`** — companion tool that
+- **`crates/copperclaw-mcp/src/tools/glob.rs`** — companion tool that
   lists files under a path matching a gitignore-style glob. Uses
   `globset` for the pattern and the same `ignore`-walker for
   traversal. Default cap of 1000 results with a hard ceiling of
@@ -3841,7 +3841,7 @@ prompt is unchanged.
 
 ### Added (agent tools: native git inspection via libgit2)
 
-- **`crates/ironclaw-mcp/src/tools/git_status.rs`,
+- **`crates/copperclaw-mcp/src/tools/git_status.rs`,
   `git_log.rs`, `git_diff.rs`, `git_blame.rs`** — four read-only
   git tools, backed by `git2` (libgit2 with the `vendored-libgit2`
   feature, so no host-side libgit2 install required). Output is
@@ -3863,11 +3863,11 @@ prompt is unchanged.
   - `git_blame` — per-line blame rows with short SHA / author /
     RFC 3339 date / line text. Range via `from_line`/`to_line`;
     out-of-bounds clamps to the file's actual size.
-- **`crates/ironclaw-mcp/src/tools/git_common.rs`** — shared
+- **`crates/copperclaw-mcp/src/tools/git_common.rs`** — shared
   repository discovery, path resolution, libgit2 error wrapping,
   and short-OID / RFC 3339 helpers so the four tools render
   errors identically.
-- **`crates/ironclaw-mcp/src/tools/mod.rs`** — registers all
+- **`crates/copperclaw-mcp/src/tools/mod.rs`** — registers all
   four entries in `build_tool_set()`. The crate's smoke test in
   `lib.rs` notes git tools test themselves (they need an on-disk
   repo the smoke harness doesn't stand up).
@@ -3876,7 +3876,7 @@ prompt is unchanged.
   changed in the last hour", "who wrote this function", "is the
   working tree clean"), and the explicit "these are read-only;
   hand mutations back to the operator" reminder.
-- **`crates/ironclaw-mcp/Cargo.toml`** — pins `git2 = "0.19"`
+- **`crates/copperclaw-mcp/Cargo.toml`** — pins `git2 = "0.19"`
   with `default-features = false, features = ["vendored-libgit2"]`
   so the build is self-contained (cmake + cc pulled in at
   compile time only; the resulting binary statically links
@@ -3887,7 +3887,7 @@ prompt is unchanged.
 
 ### Added (agent tools: `explore` — lightweight in-process subagent)
 
-- **`crates/ironclaw-mcp/src/tools/explore.rs`** — new `explore` tool
+- **`crates/copperclaw-mcp/src/tools/explore.rs`** — new `explore` tool
   that opens a bounded LLM loop against the same upstream the parent
   runner uses (same provider, same model, same API key, same base
   URL) and returns a single summary string. Built for "go look at
@@ -3899,16 +3899,16 @@ prompt is unchanged.
   explicit `tools` array to widen. Nested `explore` (subagent calling
   `explore` from inside itself) is refused at validation. Tool count
   in `build_tool_set` goes from 20 to 21; the smoke test in
-  `crates/ironclaw-mcp/src/lib.rs::smoke` and the order pin in
-  `crates/ironclaw-mcp/src/server.rs::tests` are updated accordingly.
-- **`crates/ironclaw-mcp/src/context.rs`** — adds `SubagentRequest`,
+  `crates/copperclaw-mcp/src/lib.rs::smoke` and the order pin in
+  `crates/copperclaw-mcp/src/server.rs::tests` are updated accordingly.
+- **`crates/copperclaw-mcp/src/context.rs`** — adds `SubagentRequest`,
   `SubagentResult`, `SubagentToolCall` types, plus a new
   `ToolContext::spawn_subagent` trait method with a default impl that
   returns `ToolError::Context("subagent not supported in this
   context")`. `MockToolContext` records subagent calls and returns
   canned results so the `explore` tool's unit tests stay
   transport-free.
-- **`crates/ironclaw-runner/src/subagent.rs`** — new module containing
+- **`crates/copperclaw-runner/src/subagent.rs`** — new module containing
   `run_inner_loop`, the slimmed-down sibling of `run::drive_turn`. It
   does not touch `outbound.db`, does not emit `send_message`, does
   not write `usage_report`, and filters the tool inventory to the
@@ -3919,7 +3919,7 @@ prompt is unchanged.
   `"explore stopped: max_turns reached"`, `"explore stopped: token
   budget exceeded"`, `"explore stopped: wall-clock timeout"`,
   `"explore stopped: provider error"`.
-- **`crates/ironclaw-runner/src/tools.rs`** — `RunnerToolCtx` gains
+- **`crates/copperclaw-runner/src/tools.rs`** — `RunnerToolCtx` gains
   optional `SubagentRunnerDeps` (provider + tool_map + model + system
   prompt + per-turn max_tokens + provider deadline) wired in via a
   new `with_subagent(...)` builder method. `spawn_subagent` flips a
@@ -3928,7 +3928,7 @@ prompt is unchanged.
   loop. The subagent's `ToolContext` is a fresh `SubagentCtxAdapter`
   whose `spawn_subagent` impl unconditionally refuses, giving us
   defense-in-depth against the nested case.
-- **`crates/ironclaw-runner/src/main.rs`** — populates the
+- **`crates/copperclaw-runner/src/main.rs`** — populates the
   `SubagentRunnerDeps` after building the tool map / provider /
   config, so the `explore` tool is fully wired the moment the runner
   starts.
@@ -3942,7 +3942,7 @@ prompt is unchanged.
 
 ### Fixed (runner: surface a reply when a turn fails terminally)
 
-- **`crates/ironclaw-runner/src/run.rs`** — `finalize_messages` now
+- **`crates/copperclaw-runner/src/run.rs`** — `finalize_messages` now
   emits a one-line chat outbound to the originating channel when an
   inbound is marked `failed`. Previously the user just saw the typing
   indicator clear with no reply, because all the host-side delivery
@@ -3965,21 +3965,21 @@ prompt is unchanged.
 - **`rebuild.sh`** — symlinks `<install_root>/data/skills` at the
   repo's `skills/` directory so dev edits to `SKILL.md` files land
   in the next session spawn without manual copying. Caught live:
-  `IRONCLAW_SKILLS_DIR` defaults to `<install_root>/data/skills`
+  `COPPERCLAW_SKILLS_DIR` defaults to `<install_root>/data/skills`
   but setup never copied the repo's skills into that path. Result:
   the running session had an EMPTY system prompt (verified:
   `runner.json:system` was `""`), every skill we'd authored was
   invisible to the agent, and the identity skill in particular
-  didn't fire when the user asked "what is Ironclaw?" — the model
+  didn't fire when the user asked "what is Copperclaw?" — the model
   pulled from training data and described a tabletop RPG.
 - **`CLAUDE.md`** — documents the symlink + the gotcha for the
   next contributor.
 
 ### Fixed (container rebuild: preserve runner binary)
 
-- **`crates/ironclaw-host/src/container_manager.rs`** —
+- **`crates/copperclaw-host/src/container_manager.rs`** —
   `rebuild_image` now bases per-group image rebuilds on the install's
-  `default_image_tag` (which has `/usr/local/bin/ironclaw-runner`
+  `default_image_tag` (which has `/usr/local/bin/copperclaw-runner`
   baked in at setup time) instead of bare `debian:trixie-slim`. The
   rebuild Dockerfile only adds layers (apt / npm / labels); it never
   re-COPIES the runner binary. Caught live: agent on this box
@@ -3987,7 +3987,7 @@ prompt is unchanged.
   M13 auto-apply flow triggered a rebuild against debian-slim, the
   resulting image had apt packages but no runner, and every
   subsequent `runc create` failed with `stat
-  /usr/local/bin/ironclaw-runner: no such file or directory`. New
+  /usr/local/bin/copperclaw-runner: no such file or directory`. New
   `resolve_rebuild_base()` helper picks the default tag when set,
   falls back to `debian:trixie-slim` only when default is empty
   (tests). Two regression tests:
@@ -3997,26 +3997,26 @@ prompt is unchanged.
 ### Added (skill: agent identity)
 
 - **`skills/identity/SKILL.md`** — auto-loads into every agent's
-  system prompt and teaches the agent that it's an Ironclaw agent.
+  system prompt and teaches the agent that it's an Copperclaw agent.
   Previously the agent answered "who are you?" with the model's
   generic Claude-or-AI-assistant intro, denying any connection to
-  Ironclaw (caught live: agent told a user "I'm not Ironclaw — I'm
+  Copperclaw (caught live: agent told a user "I'm not Copperclaw — I'm
   an AI assistant"). The skill names the system, describes the
   per-session container runtime + channel brokering, and includes
   three example phrasings to anchor the answer.
 
 ### Fixed (setup: telegram channel now ships fully wired)
 
-- **`crates/ironclaw-setup/src/steps/quickstart_group.rs`** —
+- **`crates/copperclaw-setup/src/steps/quickstart_group.rs`** —
   `quickstart_group` now handles `first_channel = telegram` (previously
   only `cli`).  Closes the live gap I hit on this box: after the
   channel step persisted `TELEGRAM_BOT_TOKEN`, I still had to manually
-  (a) add `IRONCLAW_CHANNELS=cli,telegram` to `.env`, (b) add
-  `IRONCLAW_CHANNELS_CONFIG='{"telegram":{"bot_token":"...","mode":"long_poll"}}'`
-  (single-quoted so dotenvy parses it), (c) `iclaw messaging-groups
+  (a) add `COPPERCLAW_CHANNELS=cli,telegram` to `.env`, (b) add
+  `COPPERCLAW_CHANNELS_CONFIG='{"telegram":{"bot_token":"...","mode":"long_poll"}}'`
+  (single-quoted so dotenvy parses it), (c) `cclaw messaging-groups
   create --channel-type telegram --platform-id <chat_id>`, (d)
-  `iclaw wirings create --mg ... --ag ... --engage pattern --pattern '.*'`,
-  and (e) `iclaw approvals approve --channel telegram --identity <chat_id>`.
+  `cclaw wirings create --mg ... --ag ... --engage pattern --pattern '.*'`,
+  and (e) `cclaw approvals approve --channel telegram --identity <chat_id>`.
   All five now happen automatically when setup completes.
 - New helper `bootstrap_telegram_install(db, cfg, name)` writes the
   channel-enable env vars + creates an agent group + (when the channel
@@ -4032,11 +4032,11 @@ prompt is unchanged.
 
 ### Fixed (runner: retry on transient stream errors)
 
-- **`crates/ironclaw-providers/src/anthropic.rs`** — SSE
+- **`crates/copperclaw-providers/src/anthropic.rs`** — SSE
   transport/decode failures are now tagged `retryable: true` (was
   `false`). These almost always represent a dropped connection or
   malformed chunk mid-stream, not a fundamental upstream problem.
-- **`crates/ironclaw-runner/src/run.rs`** — `run_llm_turn` now wraps
+- **`crates/copperclaw-runner/src/run.rs`** — `run_llm_turn` now wraps
   `query + pump_events` in a second retry layer (in addition to the
   query-level retry Team Q added). When `pump_events` returns a
   failure tagged `retryable_failure=true` and there are attempts
@@ -4055,7 +4055,7 @@ prompt is unchanged.
 
 ### Fixed (telegram: plain-text default for outbound)
 
-- **`crates/ironclaw-channels/telegram/src/adapter.rs`** — `DEFAULT_PARSE_MODE`
+- **`crates/copperclaw-channels/telegram/src/adapter.rs`** — `DEFAULT_PARSE_MODE`
   flipped from `"MarkdownV2"` to `""`. The previous default unconditionally
   told Telegram to parse outbound text as MarkdownV2, but the agent generates
   natural-language replies that contain bare `!`, `.`, `-`, `(`, `)`, `[`,
@@ -4068,7 +4068,7 @@ prompt is unchanged.
 
 ### Removed (dead `pending_sender_approvals` module)
 
-- **`crates/ironclaw-db/src/tables/pending_sender_approvals.rs`** and
+- **`crates/copperclaw-db/src/tables/pending_sender_approvals.rs`** and
   the `pending_sender_approvals` table from migration `001_initial.sql`
   are gone. The CRUD module shipped with full schema + insert/select +
   12 unit tests but no host code ever called it. The real
@@ -4077,15 +4077,15 @@ prompt is unchanged.
   unregistered row on every unknown-sender inbound, the approvals
   module's host-side notifier reads it for dedup before posting the
   in-channel "approve this sender?" prompt, and
-  `iclaw approvals approve_sender` upserts into `users`. With no
+  `cclaw approvals approve_sender` upserts into `users`. With no
   release yet on the `001_initial` schema the table is removed in
   place rather than via an additional drop migration. Doc strings in
-  `crates/ironclaw-modules/src/{approvals.rs,context.rs}` and
+  `crates/copperclaw-modules/src/{approvals.rs,context.rs}` and
   `skills/approvals/SKILL.md` updated to point at the real table.
 
 ### Added (runner: provider retry loop + per-call deadline)
 
-- **`crates/ironclaw-runner/src/run.rs`** — `provider.query()` is now
+- **`crates/copperclaw-runner/src/run.rs`** — `provider.query()` is now
   wrapped in an exponential-backoff retry loop with a per-attempt
   deadline. The new helper `query_with_retry()` honours
   `ProviderError::is_retryable()` (5xx, transport, overload retry; 4xx
@@ -4094,23 +4094,23 @@ prompt is unchanged.
   and wraps each attempt in `tokio::time::timeout(provider_deadline,
   ...)`. Terminal failures mark the inbound `status='failed'` via the
   existing `finalize_messages` path; the runner never panics.
-- **`crates/ironclaw-runner/src/run.rs`** — new `provider_deadline`
+- **`crates/copperclaw-runner/src/run.rs`** — new `provider_deadline`
   field on `RunnerDeps`, defaulting to
   `DEFAULT_PROVIDER_DEADLINE_MS = 60_000`. Configurable per-process via
-  the new env var `IRONCLAW_RUNNER_PROVIDER_DEADLINE_MS` (clamped to
+  the new env var `COPPERCLAW_RUNNER_PROVIDER_DEADLINE_MS` (clamped to
   the `[30_000, 300_000]` ms range; out-of-range values warn and fall
   back to the default). `resolve_provider_deadline(env)` is re-exported
   from the crate root so the runner binary picks it up at startup.
-- **`crates/ironclaw-providers/src/error.rs`** — new
+- **`crates/copperclaw-providers/src/error.rs`** — new
   `ProviderError::DeadlineExceeded { deadline_ms, attempts }` variant
   emitted by the runner once all retries trip the per-call deadline.
   Non-retryable; carries the deadline and attempt count so log scrapers
   can spot flapping upstreams.
-- **`crates/ironclaw-metrics/src/lib.rs`** — two new counters:
-  `ironclaw_provider_retry_total{provider}` (fires once per retry
-  decision) and `ironclaw_provider_deadline_total{provider}` (fires
+- **`crates/copperclaw-metrics/src/lib.rs`** — two new counters:
+  `copperclaw_provider_retry_total{provider}` (fires once per retry
+  decision) and `copperclaw_provider_deadline_total{provider}` (fires
   when the retry budget is exhausted by deadline trips).
-- **`crates/ironclaw-host/tests/replay.rs`** — un-`#[ignore]`d
+- **`crates/copperclaw-host/tests/replay.rs`** — un-`#[ignore]`d
   `cli_provider_5xx_retry` and `cli_provider_timeout`; both pass
   against the new runner behaviour. The harness sets a short
   `provider_deadline` (200ms) so the timeout fixture finishes in well
@@ -4121,26 +4121,26 @@ prompt is unchanged.
 
 ### Added (budget-gate Prometheus counters)
 
-- **`ironclaw_budget_exhausted_total{agent_group_id, gate}`** — fired by
+- **`copperclaw_budget_exhausted_total{agent_group_id, gate}`** — fired by
   `ContainerManager::maybe_spawn` every time the budget or rate-limit
   gate refuses to spawn. `gate` is one of `daily_tokens`,
   `turns_per_minute`, `turns_per_hour`. Operators can now alert on
   "budget exhausted spike" with
-  `sum by (agent_group_id, gate) (rate(ironclaw_budget_exhausted_total[15m])) > 0`
+  `sum by (agent_group_id, gate) (rate(copperclaw_budget_exhausted_total[15m])) > 0`
   instead of grepping logs.
-- **`ironclaw_budget_exhausted_replies_total{agent_group_id}`** — fired
+- **`copperclaw_budget_exhausted_replies_total{agent_group_id}`** — fired
   when the in-channel "budget exhausted" notice is actually written to
   outbound (i.e. AFTER the per-group dedup window check).
-- **`ironclaw_budget_exhausted_suppressed_total{agent_group_id}`** —
+- **`copperclaw_budget_exhausted_suppressed_total{agent_group_id}`** —
   fired when a refusal notice is suppressed by the per-group dedup
   window. Pair with the replies counter to see the user-visible
   notification rate independent of refusal volume.
-- The three counters land on the existing `IRONCLAW_METRICS_ADDR`
+- The three counters land on the existing `COPPERCLAW_METRICS_ADDR`
   endpoint automatically — no new opt-in. `docs/observability.md` and
   the README counter list were updated. New helpers
-  `ironclaw_metrics::inc_budget_exhausted{,_reply,_suppressed}` and the
+  `copperclaw_metrics::inc_budget_exhausted{,_reply,_suppressed}` and the
   `BUDGET_GATE_*` label constants are added without changing any
-  existing public symbols in `ironclaw-metrics`.
+  existing public symbols in `copperclaw-metrics`.
 
 ### Added (replay-fixture coverage for tool-use loop)
 
@@ -4152,7 +4152,7 @@ prompt is unchanged.
   final assistant text. Asserts the full inbound → router → runner →
   outbound → delivery pipeline still completes when the model uses a
   tool mid-turn. Backed by `cli_tool_use_shell` in
-  `crates/ironclaw-host/tests/replay.rs`. No harness changes were
+  `crates/copperclaw-host/tests/replay.rs`. No harness changes were
   needed: `mount_claude_turns` already dispenses pre-recorded turns
   sequentially across all LLM calls (not just one per inbound).
 
@@ -4172,14 +4172,14 @@ prompt is unchanged.
     Documents the give-up-and-mark-failed shape an eventual runner-side
     deadline should land. `#[ignore]`d in `replay.rs` until that
     deadline exists.
-- **`crates/ironclaw-host/tests/replay/fixture.rs`** — new optional
+- **`crates/copperclaw-host/tests/replay/fixture.rs`** — new optional
   `provider_responses` array on the fixture manifest. Each entry is one
   scripted response: `{"kind": "success", "file": "001-turn.json"}`,
   `{"kind": "error", "status": 503}`, or
   `{"kind": "timeout", "delay_ms": 60000}`. When absent, the harness
   keeps the legacy "i-th `claude/NNN-turn.json` for the i-th request"
   behaviour, so existing fixtures stay untouched.
-- **`crates/ironclaw-host/tests/replay/harness.rs`** — honours the new
+- **`crates/copperclaw-host/tests/replay/harness.rs`** — honours the new
   field via `mount_provider_responses`, and now captures (instead of
   panicking on) per-turn `run_loop` errors so failure-mode fixtures
   can snapshot post-state even when the runner bails. Three new
@@ -4210,7 +4210,7 @@ prompt is unchanged.
     `SweepService::run_once()` pass; the wake check transitions the
     session to `running`; the in-process runner serves a canned
     Claude reply; the delivery loop fans it out.
-- **`crates/ironclaw-host/tests/replay/harness.rs`** — extends the
+- **`crates/copperclaw-host/tests/replay/harness.rs`** — extends the
   replay harness with three small seams to drive the above:
   - `Manifest.gates: ["approvals" | "budget"]` opt-in. The harness
     installs `ApprovalsModule` (with a `users`-table persistent
@@ -4228,24 +4228,24 @@ prompt is unchanged.
 
 ### Added (E2E chat round-trip integration test)
 
-- **`crates/ironclaw-host/tests/e2e_chat.rs`** — boots
-  `ironclaw_host::run_host` in-process against a tempdir install root,
+- **`crates/copperclaw-host/tests/e2e_chat.rs`** — boots
+  `copperclaw_host::run_host` in-process against a tempdir install root,
   mounts a `wiremock` Anthropic-flavoured streaming stub, writes
   `"hello\n"` into the cli channel's real FIFO, and asserts the mocked
   reply (`"hi from the mock"`) appears in `<install_root>/chat.log`.
   The host's container manager is left disabled and an in-process
   runner driver (mirroring `replay/harness.rs`'s seam) processes
   inbound for each new session, so the test runs without Docker or
-  network access. A second smaller test drives `iclaw chat
-  --no-autostart` via `ironclaw_iclaw::run_cli` against a missing
-  FIFO and asserts the friendly "run `ironclaw start`" hint. This
+  network access. A second smaller test drives `cclaw chat
+  --no-autostart` via `copperclaw_cclaw::run_cli` against a missing
+  FIFO and asserts the friendly "run `copperclaw start`" hint. This
   pair is the gate that would have caught the FIFO-vs-stdin wiring
   bug that motivated M11.
 
 ### Added (setup wizard e2e harness)
 
 - **End-to-end wizard integration test** at
-  `crates/ironclaw-setup/tests/wizard_e2e.rs`. Drives the full step
+  `crates/copperclaw-setup/tests/wizard_e2e.rs`. Drives the full step
   loop against a fresh `tempfile::tempdir` and asserts the install
   layout an operator would actually rely on: central DB migrated to
   `expected_central_schema_version()`, `.env` with the right keys at
@@ -4263,12 +4263,12 @@ prompt is unchanged.
 ### Changed (setup wizard schema-mismatch guard)
 
 - **`central_db` step now refuses to run against a future schema.**
-  Mirrors `ironclaw_host::boot::check_schema_version`: if the on-disk
+  Mirrors `copperclaw_host::boot::check_schema_version`: if the on-disk
   `schema_version` table reports more applied migrations than
   `expected_central_schema_version()`, the step returns an error
   rather than silently running migrations against a DB that was
   migrated by a newer binary. This protects operators who try to
-  downgrade ironclaw without restoring from a backup.
+  downgrade copperclaw without restoring from a backup.
 
 ### Added (install.sh integration test)
 
@@ -4277,10 +4277,10 @@ prompt is unchanged.
   container, mounts the repo read-only, and drives the installer
   through four scenarios: (1) missing-Docker clean-failure path,
   (2) full binary install via `cargo install --path` (opt-in via
-  `IRONCLAW_INSTALL_TEST_RUN_BUILD=1`; default-skipped because it
+  `COPPERCLAW_INSTALL_TEST_RUN_BUILD=1`; default-skipped because it
   adds ~5 minutes), (3) re-run idempotency — pre-existing binaries
   survive a dry-run re-invocation, (4) platform detection across all
-  four supported triples plus an explicit `IRONCLAW_RELEASE_TAG`.
+  four supported triples plus an explicit `COPPERCLAW_RELEASE_TAG`.
   Default suite runtime: ~3 s after the image is cached.
 - New CI job `install-sh` in `.github/workflows/ci.yml` runs the
   suite on `ubuntu-latest` and shellchecks both files, with a
@@ -4289,8 +4289,8 @@ prompt is unchanged.
 - Three test-only escape hatches added to `install.sh`,
   default-off and silent unless explicitly set:
   `INSTALL_SH_SKIP_DOCKER_CHECK=1` skips the container-runtime
-  check; `IRONCLAW_INSTALL_DRY_RUN=1` prints the tarball URL the
-  installer would fetch and exits 0; `IRONCLAW_FORCE_TARGET=<triple>`
+  check; `COPPERCLAW_INSTALL_DRY_RUN=1` prints the tarball URL the
+  installer would fetch and exits 0; `COPPERCLAW_FORCE_TARGET=<triple>`
   overrides platform detection for the URL test.
 
 ### Added (replay fixture coverage — round 2)
@@ -4302,7 +4302,7 @@ prompt is unchanged.
   `github/webhook-issue-comment/` (GitHub `issue_comment.created`),
   and `webhooks/generic-hmac/` (generic HMAC-signed webhook, e.g.
   Grafana / Stripe / Sentry style). Each runs through the existing
-  in-process `ReplayHarness` in `crates/ironclaw-host/tests/replay.rs`
+  in-process `ReplayHarness` in `crates/copperclaw-host/tests/replay.rs`
   via four new `#[tokio::test]` entries, exercising the inbound ->
   router -> runner -> outbound -> delivery pipeline for those channel
   types against the harness's per-channel-type `MockAdapter`s.
@@ -4312,7 +4312,7 @@ prompt is unchanged.
 - **Three new replay fixtures** under `fixtures/`:
   `telegram/inbound-text-message/`, `slack/event-message/`, and
   `cli/multi-turn/`. Each runs through the existing in-process
-  `ReplayHarness` in `crates/ironclaw-host/tests/replay.rs`. The
+  `ReplayHarness` in `crates/copperclaw-host/tests/replay.rs`. The
   telegram and slack fixtures exercise the inbound -> router ->
   runner -> outbound -> delivery pipeline for those channel types
   (against `MockAdapter`s pre-registered in the harness), and
@@ -4326,29 +4326,29 @@ prompt is unchanged.
   per-channel routing.
 - **Harness test entry points are deduplicated** behind a single
   `run_fixture(channel, scenario)` helper. Adding a new fixture is
-  now a one-line `#[tokio::test]` in `crates/ironclaw-host/tests/replay.rs`.
+  now a one-line `#[tokio::test]` in `crates/copperclaw-host/tests/replay.rs`.
 
 ### Fixed (cli channel bridge)
 
-- **`iclaw chat` now actually reaches the host.** The cli channel
+- **`cclaw chat` now actually reaches the host.** The cli channel
   adapter previously read from the host process's own `tokio::io::stdin()`
   and wrote outbound replies to `tokio::io::stdout()` — so messages
-  typed into `iclaw chat` (which wrote to `<install_root>/chat.fifo`)
+  typed into `cclaw chat` (which wrote to `<install_root>/chat.fifo`)
   were never picked up, and replies were never appended to
   `<install_root>/chat.log` for the chat tailing loop to see. The
-  adapter gains a FIFO/log mode: when `IRONCLAW_CLI_FIFO` and/or
-  `IRONCLAW_CLI_LOG` are set (or defaulted from `IRONCLAW_DATA_DIR`'s
+  adapter gains a FIFO/log mode: when `COPPERCLAW_CLI_FIFO` and/or
+  `COPPERCLAW_CLI_LOG` are set (or defaulted from `COPPERCLAW_DATA_DIR`'s
   parent), the cli channel opens the FIFO with `O_RDWR | O_NONBLOCK`
   via `tokio::net::unix::pipe::Receiver` and appends outbound to the
   log, flushing each line. The `O_RDWR` open is the standard
   "reader is its own writer" trick that keeps the pipe alive across
-  external-writer disconnects (Ctrl-D in one `iclaw chat` no longer
+  external-writer disconnects (Ctrl-D in one `cclaw chat` no longer
   EOFs the host's read side). With no paths configured the adapter
   still falls back to stdin/stdout for the developer REPL.
-- **Setup wires the bridge by default.** `ironclaw-setup`'s
+- **Setup wires the bridge by default.** `copperclaw-setup`'s
   `quickstart_group` step now also `mkfifo`s `chat.fifo` (0600),
-  touches `chat.log` (0600), and writes `IRONCLAW_CLI_FIFO` and
-  `IRONCLAW_CLI_LOG` lines into the install's `.env` so the host
+  touches `chat.log` (0600), and writes `COPPERCLAW_CLI_FIFO` and
+  `COPPERCLAW_CLI_LOG` lines into the install's `.env` so the host
   picks them up on next boot. Idempotent — re-running setup leaves
   an existing FIFO / log / env line alone.
 - **Stray blank lines are no longer reified into `{"text":""}`
@@ -4361,11 +4361,11 @@ prompt is unchanged.
 
 - **Binary release workflow** at `.github/workflows/release.yml`.
   Triggered by `git push` of a `v*` tag (and manually via
-  `workflow_dispatch` for smoke tests). Builds `ironclaw`, `iclaw`,
-  and `ironclaw-setup` in parallel for four targets
+  `workflow_dispatch` for smoke tests). Builds `copperclaw`, `cclaw`,
+  and `copperclaw-setup` in parallel for four targets
   (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
   `x86_64-apple-darwin`, `aarch64-apple-darwin`), strips each
-  binary, packages one `ironclaw-<target>.tar.gz` per target with
+  binary, packages one `copperclaw-<target>.tar.gz` per target with
   binaries at the top level (the layout `install.sh` expects),
   generates a combined `SHA256SUMS`, extracts release notes from
   `CHANGELOG.md` for the tagged version, and publishes a GitHub
@@ -4388,7 +4388,7 @@ prompt is unchanged.
   pick up rotated values. SIGHUP handler wired in
   `wait_for_signal_or_sighup`; `run_host` gains an `env_file`
   parameter that the SIGHUP handler reads on each signal. New
-  metric `ironclaw_secrets_rotated_total`. Running containers see
+  metric `copperclaw_secrets_rotated_total`. Running containers see
   rotated keys after idle-stop + respawn (default 5 min).
 - **Webhooks TLS documentation.** New
   [`docs/webhooks-tls.md`](docs/webhooks-tls.md) covers the
@@ -4400,13 +4400,13 @@ prompt is unchanged.
   manager gates spawn on both windows in `maybe_spawn`; an
   in-channel reply explains the cap via the same outbound-write
   path the budget gate uses, dedup'd on a 1-minute window. New
-  `iclaw budgets set --turns-per-minute N --turns-per-hour N`.
+  `cclaw budgets set --turns-per-minute N --turns-per-hour N`.
 - **Versioned migrations.** New `expected_central_schema_version()`
   and `applied_central_schema_version()` helpers in
-  `ironclaw-db::migrate`. Boot now refuses to start with
+  `copperclaw-db::migrate`. Boot now refuses to start with
   `BootError::SchemaMismatch` (exit code 5) when the on-disk
   schema is newer than this binary expects (downgrade detection).
-  New `iclaw schema-version` subcommand prints `{expected, applied,
+  New `cclaw schema-version` subcommand prints `{expected, applied,
   status}` as JSON.
 - **`sessions/sessions/` path cleanup.** `HostConfig::sessions_root()`
   now returns `data_dir` directly; the double-`sessions/` layout
@@ -4417,7 +4417,7 @@ prompt is unchanged.
 
 ### Added (onboarding polish slice)
 
-- `iclaw doctor` — first-run / ongoing health probe. Walks the
+- `cclaw doctor` — first-run / ongoing health probe. Walks the
   install end-to-end (host reachability, agent groups, wirings,
   active sessions, recent audit errors, dropped-message backlog,
   `ANTHROPIC_API_KEY` presence, web-search provider keys) and
@@ -4428,12 +4428,12 @@ prompt is unchanged.
 - Setup auto-bootstraps a default cli agent group + wiring. New
   `quickstart_group` step runs after `verify` and writes a
   `(cli, stdin)` messaging group + agent group + pattern-`.*`
-  wiring directly to the central DB so `iclaw chat` works on the
-  very first `ironclaw run`. Idempotent (skips when any agent group
-  already exists). Opt out with `IRONCLAW_SETUP_QUICKSTART=no` or
+  wiring directly to the central DB so `cclaw chat` works on the
+  very first `copperclaw run`. Idempotent (skips when any agent group
+  already exists). Opt out with `COPPERCLAW_SETUP_QUICKSTART=no` or
   decline the interactive prompt. Override the slug with
-  `IRONCLAW_SETUP_QUICKSTART_NAME`. The `first_chat` step's
-  "what to do next" output flips to recommend `iclaw chat`
+  `COPPERCLAW_SETUP_QUICKSTART_NAME`. The `first_chat` step's
+  "what to do next" output flips to recommend `cclaw chat`
   directly when the bootstrap landed.
 - Budget-exhausted reply to original sender. When the container
   manager's spawn gate refuses because today's tokens exceeded
@@ -4456,18 +4456,18 @@ prompt is unchanged.
     `EXA_API_KEY`.
   - **Brave** — independent keyword index. `BRAVE_SEARCH_API_KEY`.
   - **SerpAPI** — Google / Bing / etc. wrapper. `SERPAPI_API_KEY`.
-- Provider resolution: explicit `provider` arg → `IRONCLAW_WEB_SEARCH_PROVIDER`
+- Provider resolution: explicit `provider` arg → `COPPERCLAW_WEB_SEARCH_PROVIDER`
   env → auto-detect from configured keys in order
   `tavily, exa, brave, serpapi`. No keys configured surfaces a
   validation error naming all four env vars (errors over silent
   fallback).
 - Host's `ContainerManager` now forwards
-  `IRONCLAW_WEB_SEARCH_PROVIDER` + the four provider keys into the
+  `COPPERCLAW_WEB_SEARCH_PROVIDER` + the four provider keys into the
   session container at spawn via a new `forward_env` field, so the
   operator only configures keys once in the host's `.env`.
 - New skill: `skills/web-search/SKILL.md` (auto-loaded into the
   system prompt under the existing
-  `IRONCLAW_SKILLS_DIR` mechanism).
+  `COPPERCLAW_SKILLS_DIR` mechanism).
 - New doc: [`docs/web-search.md`](docs/web-search.md) — operator
   setup, provider trade-offs, egress allow-list interaction.
 
@@ -4483,8 +4483,8 @@ prompt is unchanged.
   with auto-mkdir), `web_fetch` (HTTP GET/POST, 256 KiB body cap,
   30 s default / 120 s ceiling).
 - Skill content auto-loaded into the agent's system prompt.
-  `IRONCLAW_SKILLS_DIR` points at the SKILL.md library, optional
-  `IRONCLAW_GROUPS_DIR` enables per-agent-group overrides under
+  `COPPERCLAW_SKILLS_DIR` points at the SKILL.md library, optional
+  `COPPERCLAW_GROUPS_DIR` enables per-agent-group overrides under
   `<groups_dir>/<ag_uuid>/skills/`. Setup writes both env vars.
 - New skills documenting the computer-use tools: `shell`,
   `read-file`, `write-file`, `web-fetch`.
@@ -4495,39 +4495,39 @@ prompt is unchanged.
   fingerprints (`config_fingerprint` column) the rebuild-relevant
   fields and rebuilds + retags before the next spawn when they
   change. Rebuild failures log + emit
-  `ironclaw_image_rebuild_failed_total` and fall back to the
+  `copperclaw_image_rebuild_failed_total` and fall back to the
   last-known-good image so the agent group is not blocked.
 - **Container egress allow-list.** New
   `container_configs.egress_allow` (JSON array of host:port).
   Default empty == allow-all (default-allow + opt-in lockdown).
   Docker runtime translates to user-defined network policy; Apple
   Container runtime returns `RtError::Unsupported`. New
-  `iclaw groups config set-egress-allow <id> --allow host:port ...`.
+  `cclaw groups config set-egress-allow <id> --allow host:port ...`.
 - **Per-group resource caps.** New
   `container_configs.resource_limits` JSON
   (`cpus` / `memory_mb` / `pids_limit`, all optional). Docker
   runtime applies via `--cpus` / `--memory` / `--pids-limit`. New
-  `iclaw groups config set-resource-limits`.
+  `cclaw groups config set-resource-limits`.
 - **Auto-applied `install_packages` / `add_mcp_server`.** The
   delivery loop now intercepts these system actions and writes
   directly to `container_configs.packages_apt` /
   `packages_npm` / `mcp_servers`. Combined with the rebuild
   fingerprint, the next spawn picks up the agent's tool calls
   automatically — no operator step required.
-- **Central DB backup / restore.** `iclaw db backup <path>` runs
-  a WAL checkpoint and atomically copies the file. `iclaw db
+- **Central DB backup / restore.** `cclaw db backup <path>` runs
+  a WAL checkpoint and atomically copies the file. `cclaw db
   restore <path>` always refuses with `host_running`; the
   operator-facing procedure is documented in
   `docs/db-backup.md` (stop host, copy file, restart).
 - **Outbound dead-letter replay.** New
   `outbound_dropped_messages` table (migration `008_*`). Delivery
   failures that exhaust 3 retries land here.
-  `iclaw dropped-messages outbound-list --since <window>` and
-  `iclaw dropped-messages replay <id>` give the operator
+  `cclaw dropped-messages outbound-list --since <window>` and
+  `cclaw dropped-messages replay <id>` give the operator
   inspection / retry.
-- **MCP server preset registry.** `iclaw mcp list-presets` shows
+- **MCP server preset registry.** `cclaw mcp list-presets` shows
   the curated library (postgres, linear, github, notion,
-  filesystem, browserbase). `iclaw mcp add <preset>
+  filesystem, browserbase). `cclaw mcp add <preset>
   --agent-group-id <id> --env K=V` writes the chosen preset into
   `container_configs.mcp_servers` (env values are redacted in the
   audit log).
@@ -4537,20 +4537,20 @@ prompt is unchanged.
   messaging group. Dedup uses `unregistered_senders` so repeat
   senders don't re-spam.
 - **Prometheus metrics endpoint.** Opt-in via
-  `IRONCLAW_METRICS_ADDR=127.0.0.1:9090` (bare port auto-prefixes
+  `COPPERCLAW_METRICS_ADDR=127.0.0.1:9090` (bare port auto-prefixes
   to loopback). Counters:
-  `ironclaw_messages_inbound_total{channel_type}`,
-  `ironclaw_messages_outbound_total{channel_type}`,
-  `ironclaw_containers_spawned_total`,
-  `ironclaw_containers_crashed_total`,
-  `ironclaw_delivery_failed_total{channel_type}`,
-  `ironclaw_image_rebuild_failed_total`. Histograms:
-  `ironclaw_llm_call_seconds`, `ironclaw_llm_tokens_input`,
-  `ironclaw_llm_tokens_output`, `ironclaw_container_spawn_seconds`.
-  New crate `ironclaw-metrics`.
-- **Log rotation.** Opt-in via `IRONCLAW_LOG_DIR=<path>`. Adds a
+  `copperclaw_messages_inbound_total{channel_type}`,
+  `copperclaw_messages_outbound_total{channel_type}`,
+  `copperclaw_containers_spawned_total`,
+  `copperclaw_containers_crashed_total`,
+  `copperclaw_delivery_failed_total{channel_type}`,
+  `copperclaw_image_rebuild_failed_total`. Histograms:
+  `copperclaw_llm_call_seconds`, `copperclaw_llm_tokens_input`,
+  `copperclaw_llm_tokens_output`, `copperclaw_container_spawn_seconds`.
+  New crate `copperclaw-metrics`.
+- **Log rotation.** Opt-in via `COPPERCLAW_LOG_DIR=<path>`. Adds a
   daily-rotating file writer (`host.log.<YYYY-MM-DD>`) alongside
-  the existing stderr writer. `IRONCLAW_LOG` filter applies to
+  the existing stderr writer. `COPPERCLAW_LOG` filter applies to
   both. Default stderr-only behaviour unchanged.
 - **Audit-log env redaction.** The host's audit dispatch now masks
   values under any `env` block for `mcp.add` and
@@ -4565,7 +4565,7 @@ prompt is unchanged.
 
 - One-command installer at `install.sh`: detects platform (Linux
   x86_64/aarch64, macOS arm64/x86_64), verifies Docker or Podman is
-  reachable, then installs `ironclaw`, `iclaw`, and `ironclaw-setup`
+  reachable, then installs `copperclaw`, `cclaw`, and `copperclaw-setup`
   to `~/.local/bin` — preferring a prebuilt release tarball, falling
   back to `cargo install --git`, and finally `cargo install --path`
   when run inside a checkout. Re-running detects an existing install
@@ -4575,18 +4575,18 @@ prompt is unchanged.
 - README "Install" section now leads with the one-liner; the
   longstanding `cargo build` instructions move under a "Manual install"
   subsection.
-- One-terminal operator flow for the `ironclaw` binary: new
-  `ironclaw start` (daemonize, write PID file, wait for admin socket
-  ready), `ironclaw stop` (SIGTERM with SIGKILL escalation after a
-  10s grace), `ironclaw status [--json]` (PID, uptime, paths, active
+- One-terminal operator flow for the `copperclaw` binary: new
+  `copperclaw start` (daemonize, write PID file, wait for admin socket
+  ready), `copperclaw stop` (SIGTERM with SIGKILL escalation after a
+  10s grace), `copperclaw status [--json]` (PID, uptime, paths, active
   session count; exits non-zero when not running for CI use), and
-  `ironclaw logs [-f] [-n N]` (tail the host log). `ironclaw run`
+  `copperclaw logs [-f] [-n N]` (tail the host log). `copperclaw run`
   is preserved for foreground / service-managed deployments.
-- `iclaw chat` now auto-starts the host via `ironclaw start` when
+- `cclaw chat` now auto-starts the host via `copperclaw start` when
   the chat FIFO is missing; pass `--no-autostart` to keep the old
   "fail loudly" behaviour for scripted / CI use. Quick start
-  collapses to `ironclaw start && iclaw chat` in one terminal.
-- Interactive Telegram pairing wizard inside `ironclaw-setup`'s
+  collapses to `copperclaw start && cclaw chat` in one terminal.
+- Interactive Telegram pairing wizard inside `copperclaw-setup`'s
   `channel` step. When the operator picks `telegram`, the wizard walks
   them through `@BotFather`, validates the token format
   (`^\d+:[A-Za-z0-9_-]+$`), verifies it via Telegram's `getMe`
@@ -4594,28 +4594,28 @@ prompt is unchanged.
   polls `getUpdates` for ~60 s to capture the first chat id, and
   appends `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` to the data-dir
   `.env`. Headless mode is driven by
-  `IRONCLAW_SETUP_TELEGRAM_BOT_TOKEN` and
-  `IRONCLAW_SETUP_TELEGRAM_CHAT_ID`. Tokens are never logged — the
+  `COPPERCLAW_SETUP_TELEGRAM_BOT_TOKEN` and
+  `COPPERCLAW_SETUP_TELEGRAM_CHAT_ID`. Tokens are never logged — the
   audit messages use `<digits>:****<last-4>` redaction.
-- `ironclaw-setup` `service_unit` step now installs and enables the
+- `copperclaw-setup` `service_unit` step now installs and enables the
   generated systemd unit / launchd plist end-to-end rather than just
   writing it to disk. Operators pick a scope at the prompt
   (`system` / `user` / `print`) or via
-  `IRONCLAW_SETUP_SERVICE_SCOPE`; `IRONCLAW_SETUP_SERVICE_ENABLE`
+  `COPPERCLAW_SETUP_SERVICE_SCOPE`; `COPPERCLAW_SETUP_SERVICE_ENABLE`
   controls whether `systemctl enable --now` / `launchctl bootstrap`
   fires. The step polls the admin socket for ~10s after enabling and
   prints a clear "service is running" / "didn't come up — check
   journalctl" line. `system` scope refuses to silently shell out to
   `sudo` and falls back to `user` when not root. Idempotent on re-
   run: identical bodies are detected and the step is skipped.
-- `iclaw` with no subcommand now prints a one-shot operator dashboard
+- `cclaw` with no subcommand now prints a one-shot operator dashboard
   (install root, agent groups, wirings, active sessions, recent audit
   + drop activity, 24h budget usage, and up to three heuristic
   next-step suggestions). Fans out to existing read-only handlers in
   parallel via `tokio::join!`; `--json` emits the same payload as a
   single object. When the host socket is unreachable the dashboard
   exits non-zero with a friendly "host not running" pointer.
-- `iclaw groups config edit <id>` — opens the container config as
+- `cclaw groups config edit <id>` — opens the container config as
   TOML in `$EDITOR` (falls back to `$VISUAL`, then `vi`), diffs on
   save, and applies the changes via the existing `groups.config.*`
   socket commands. Supports `--dry-run` to preview the diff without
@@ -4625,15 +4625,15 @@ prompt is unchanged.
 - Two guided-flow agent skills under `skills/`: `customize` (walks
   the user through model swaps, package/MCP installs, behavior
   prompt edits, and budget changes, routing host-only mutations to
-  the operator with the exact `iclaw` command) and `debug` (pulls
+  the operator with the exact `cclaw` command) and `debug` (pulls
   diagnostics reachable from inside the container and prints the
-  `iclaw health` / `audit list` / `dropped-messages list` commands
+  `cclaw health` / `audit list` / `dropped-messages list` commands
   the operator must run to complete triage).
 - Initial Rust workspace with 16 crates across the host, runner,
   providers, MCP server, modules, skills, container runtime, OneCLI
-  gateway, iclaw admin client, and interactive setup.
-- Central DB schema (`ironclaw.db`) with idempotent migrations under
-  `crates/ironclaw-db/migrations/`. Per-session inbound and outbound DBs
+  gateway, cclaw admin client, and interactive setup.
+- Central DB schema (`copperclaw.db`) with idempotent migrations under
+  `crates/copperclaw-db/migrations/`. Per-session inbound and outbound DBs
   with attachment-safety helpers (`safe_attachment_name`,
   `extract_to_inbox`, `read_from_outbox`).
 - Host pipeline: router (hook chain, fan-out, session resolution),
@@ -4655,13 +4655,13 @@ prompt is unchanged.
 - Skill discovery (frontmatter parse + per-group override) and
   symlink-based container materialisation; 17 authored skills under
   `skills/`.
-- `ironclaw-iclaw` Unix-socket admin server inside the host plus the
-  `iclaw` client binary; 41 distinct commands exported as
-  `ironclaw_iclaw::ALL_COMMANDS`.
-- `ironclaw-setup` interactive setup with `dialoguer`, systemd /
+- `copperclaw-cclaw` Unix-socket admin server inside the host plus the
+  `cclaw` client binary; 41 distinct commands exported as
+  `copperclaw_cclaw::ALL_COMMANDS`.
+- `copperclaw-setup` interactive setup with `dialoguer`, systemd /
   launchd unit generators, headless env-var-driven mode, and the
   `--migrate-from` data-directory migrator.
-- `ironclaw-onecli` HTTP credential gateway with full wiremock coverage
+- `copperclaw-onecli` HTTP credential gateway with full wiremock coverage
   for 401/404/409/429/5xx and `Retry-After` parsing.
 - M11 documentation: `docs/cutover.md` for predecessor migration,
   `docs/replay-fixtures.md` describing the differential-testing
@@ -4673,18 +4673,18 @@ prompt is unchanged.
   the session base image to GHCR (`ghcr.io/<repo>/session`) for every
   push to `main` (as `:edge`) and tagged release (as `:<semver>` and
   `:latest`), with multi-arch (linux/amd64, linux/arm64) buildx output,
-  GHA build cache, and an `ironclaw.fingerprint` provenance label.
+  GHA build cache, and an `copperclaw.fingerprint` provenance label.
 - Checked-in `container/Dockerfile` for the session base image, carrying
-  an `IRONCLAW_FINGERPRINT` build-arg stamped as an
-  `ironclaw.fingerprint=<sha>` LABEL so pulled images can be verified
+  an `COPPERCLAW_FINGERPRINT` build-arg stamped as an
+  `copperclaw.fingerprint=<sha>` LABEL so pulled images can be verified
   against the locally-expected spec hash.
-- `ironclaw-setup` `image` step now attempts a `docker pull` of the
+- `copperclaw-setup` `image` step now attempts a `docker pull` of the
   pre-built GHCR image before falling back to a local build. Pulls are
-  verified by inspecting the image's `ironclaw.fingerprint` label;
+  verified by inspecting the image's `copperclaw.fingerprint` label;
   mismatches fall through to a local build with a clear "pulling
-  failed, building locally" message. `IRONCLAW_SETUP_NO_PULL=1` skips
+  failed, building locally" message. `COPPERCLAW_SETUP_NO_PULL=1` skips
   the pull attempt for air-gapped or reproducible-build use cases;
-  `IRONCLAW_SETUP_PULL_REGISTRY` overrides the registry slug for forks.
+  `COPPERCLAW_SETUP_PULL_REGISTRY` overrides the registry slug for forks.
 
 ### Fixed
 
@@ -4704,4 +4704,4 @@ prompt is unchanged.
   `docs/replay-fixtures.md` but the in-tree harness and captured
   fixtures are not yet committed.
 
-[Unreleased]: https://github.com/phildougherty/ironclaw/compare/v0.0.0...HEAD
+[Unreleased]: https://github.com/phildougherty/copperclaw/compare/v0.0.0...HEAD

@@ -20,7 +20,7 @@
 
 ## Implemented
 - deliver: COMPLETE for text + files (one AppleScript invocation per
-  file). `crates/ironclaw-channels/imessage/src/adapter.rs:105`
+  file). `crates/copperclaw-channels/imessage/src/adapter.rs:105`
 - subscribe: trait-default Ok (poll loop over the Messages SQLite DB).
 - set_typing: trait-default Ok (AppleScript can't reach the typing
   indicator reliably).

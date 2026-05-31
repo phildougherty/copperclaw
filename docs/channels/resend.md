@@ -20,7 +20,7 @@
 
 ## Implemented
 - deliver: COMPLETE — POST /emails with subject/text/html/attachments/
-  thread headers. `crates/ironclaw-channels/resend/src/adapter.rs:214`
+  thread headers. `crates/copperclaw-channels/resend/src/adapter.rs:214`
 - subscribe: trait-default Ok (email is outbound-only by design).
 - set_typing: trait-default Ok (no platform concept).
 - edit_message: trait-default Unsupported (email can't be edited

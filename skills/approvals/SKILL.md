@@ -1,18 +1,18 @@
 ---
 name: approvals
-description: Pending approvals — sender, channel, install, and MCP — and how an admin resolves them via the iclaw tool.
+description: Pending approvals — sender, channel, install, and MCP — and how an admin resolves them via the cclaw tool.
 ---
 
 # approvals
 
-Several operations in ironclaw require an admin's explicit consent
+Several operations in copperclaw require an admin's explicit consent
 before the host acts on them. The flow is uniform: the requestor
 writes an "approval" row; an admin (a user with the `admin` role)
 inspects and either approves or denies; the host applies the
 decision.
 
 This skill covers the four kinds of approval an agent will encounter
-and how a human resolves them via `iclaw`.
+and how a human resolves them via `cclaw`.
 
 ## The approval families
 
@@ -35,7 +35,7 @@ When an inbound event arrives whose sender identity is not in
 `unregistered_senders` row keyed by
 `(channel_type, platform_id)` and returns `Pending`. The agent does
 **not** process the message until the admin approves the sender via
-`iclaw approvals approve --channel <ct> --identity <id>`, which
+`cclaw approvals approve --channel <ct> --identity <id>`, which
 inserts a `users` row.
 
 ## Channel approvals
@@ -53,19 +53,19 @@ session id, the agent group, the request payload, and a timestamp.
 
 ## How an admin resolves an approval
 
-`iclaw` exposes read everywhere, write only for sender approvals:
+`cclaw` exposes read everywhere, write only for sender approvals:
 
 ```bash
-iclaw approvals list                                       # list pending (all families)
-iclaw approvals get <approval-id>                          # show one
-iclaw approvals approve --channel <ct> --identity <id> [--display-name "Name"]
+cclaw approvals list                                       # list pending (all families)
+cclaw approvals get <approval-id>                          # show one
+cclaw approvals approve --channel <ct> --identity <id> [--display-name "Name"]
                                                            # approves a Sender row
 ```
 
-There is no generic `iclaw approvals approve <id>` / `deny <id>` today.
+There is no generic `cclaw approvals approve <id>` / `deny <id>` today.
 Channel / InstallPackages / AddMcpServer approvals are resolved by the
 operator either via the underlying CRUD on the central DB
-(`ironclaw-db::pending_approvals` and the per-kind tables) or by
+(`copperclaw-db::pending_approvals` and the per-kind tables) or by
 re-running the action through whatever workflow registered the row.
 
 Approve → sender becomes a `users` row / channel becomes a

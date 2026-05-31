@@ -20,7 +20,7 @@
 
 ## Implemented
 - deliver: COMPLETE — chat.postMessage / chat.postEphemeral, then
-  files.completeUploadExternal for attachments. `crates/ironclaw-channels/slack/src/adapter.rs:130`
+  files.completeUploadExternal for attachments. `crates/copperclaw-channels/slack/src/adapter.rs:130`
 - subscribe: trait-default Ok (Events API delivers everything for the
   bot's joined channels).
 - set_typing: assistant.threads.setStatus when thread_id present;

@@ -1,6 +1,6 @@
 # cli channel audit
 
-Reference adapter. Drives the `iclaw chat` REPL via stdio + FIFO.
+Reference adapter. Drives the `cclaw chat` REPL via stdio + FIFO.
 
 ## Native UI capabilities
 
@@ -21,7 +21,7 @@ Reference adapter. Drives the `iclaw chat` REPL via stdio + FIFO.
 | Webhook secret verification | n/a | local process, no network surface |
 
 ## Implemented
-- deliver: COMPLETE (`crates/ironclaw-channels/cli/src/lib.rs:438`)
+- deliver: COMPLETE (`crates/copperclaw-channels/cli/src/lib.rs:438`)
 - subscribe: noop (no platform concept)
 - set_typing: noop (no platform concept)
 - edit_message: trait-default Unsupported (no platform concept)

@@ -20,7 +20,7 @@
 
 ## Implemented
 - deliver: COMPLETE for text + threaded text + card + edit / delete /
-  reaction. `crates/ironclaw-channels/gchat/src/adapter.rs:91`
+  reaction. `crates/copperclaw-channels/gchat/src/adapter.rs:91`
 - subscribe: trait-default Ok (webhook ingress).
 - set_typing: trait-default Ok (no platform concept).
 - edit_message: action="edit" → PUT with updateMask.

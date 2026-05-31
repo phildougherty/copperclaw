@@ -6,7 +6,7 @@ and the slice-2 native `deliver_card` overrides are on `main`.
 
 ## Goal
 
-Extend slice 2's pattern — *canonical schema in `ironclaw-channels-core`,
+Extend slice 2's pattern — *canonical schema in `copperclaw-channels-core`,
 dedicated `MessageKind`, trait method with text-fallback default impl,
 `dispatch_X` in delivery service, per-channel native renderers, MCP tool
 the runner routes into the right effect* — to five more UX surfaces:
@@ -21,7 +21,7 @@ the runner routes into the right effect* — to five more UX surfaces:
 
 None of these redesign anything from slice 2; each lifts the Breadcrumb
 pattern wholesale. The canonical templates to crib from are
-`crates/ironclaw-channels/core/src/breadcrumb.rs` (schema +
+`crates/copperclaw-channels/core/src/breadcrumb.rs` (schema +
 `to_text_fallback` shape), `adapter.rs::deliver_breadcrumb` default impl
 (adapter trait shape), `service.rs::dispatch_breadcrumb` ~L1063 (host
 dispatch shape), `tools.rs::apply_send_card` L956 (runner apply-fn
@@ -470,7 +470,7 @@ alongside `breadcrumbs_enabled`. When `true`: Anthropic provider's
 analogously). Runner observes in `provider_call.rs`, emits via new
 `ToolContext::emit_thinking` mirroring `emit_breadcrumb` (best-effort,
 direct `insert_outbound_row`, swallowed errors). Per-group override via
-`iclaw groups config edit <id>`.
+`cclaw groups config edit <id>`.
 
 ### Trait method
 

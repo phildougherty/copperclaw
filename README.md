@@ -1,10 +1,10 @@
-# Ironclaw
+# Copperclaw
 
 A self-hosted runtime for Claude-style agents. Each session runs in
 its own Linux container; the host wires 21 messaging-channel adapters
 into a router on the inbound side and a delivery loop on the outbound
-side. An admin client (`iclaw`) and a setup wizard (`ironclaw-setup`)
-live alongside the host binary (`ironclaw`).
+side. An admin client (`cclaw`) and a setup wizard (`copperclaw-setup`)
+live alongside the host binary (`copperclaw`).
 
 Written in Rust. Pre-1.0 — no tagged releases yet, no prebuilt binary
 artifacts, install path is `cargo install --git` until the first tag
@@ -87,20 +87,20 @@ Honest list of things that exist but aren't polished:
   config before fronting them with a reverse proxy.
 - **The replay-fixture capture pipeline is design-only** —
   `docs/replay-fixtures.md` describes hand-authored fixtures; the
-  `IRONCLAW_FIXTURE_CAPTURE` env var and `ironclaw fixture redact`
+  `COPPERCLAW_FIXTURE_CAPTURE` env var and `copperclaw fixture redact`
   subcommand named in the design doc are not implemented yet.
 - **Setup's `channel` step only has an interactive pairing wizard for
   Telegram.** Slack / Discord / etc. land via post-setup
-  `iclaw messaging-groups create` + `iclaw wirings create`.
-- **A few `iclaw` subcommands ship without descriptive `--help`
+  `cclaw messaging-groups create` + `cclaw wirings create`.
+- **A few `cclaw` subcommands ship without descriptive `--help`
   text** (`messaging-groups`, `wirings`, `users`, `roles`,
   `members`, `destinations`). The flags work; the help is sparse.
 - **`docs/cutover.md` describes a migrator that copies only the
   central DB** — per-session DBs (history, attachments) must be
   rsynced separately if you want to preserve them across the cutover.
-- **`iclaw approvals`** ships `list`, `get`, and `approve --channel
+- **`cclaw approvals`** ships `list`, `get`, and `approve --channel
   --identity` (sender approvals); there is no generic
-  `iclaw approvals approve <id>` / `deny <id>` yet for the other
+  `cclaw approvals approve <id>` / `deny <id>` yet for the other
   approval families (channel / install / MCP).
 
 See [`docs/plans/`](docs/plans/) for tracked follow-ups.
@@ -118,7 +118,7 @@ See [`docs/plans/`](docs/plans/) for tracked follow-ups.
 One command, on Linux or macOS:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/phildougherty/ironclaw/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/phildougherty/copperclaw/main/install.sh | bash
 ```
 
 What it does:
@@ -126,12 +126,12 @@ What it does:
 1. Detects your platform (Linux x86_64 / aarch64, macOS arm64 / x86_64).
 2. Checks for Docker or Podman (won't install one — too invasive — but
    tells you what to install).
-3. Installs `ironclaw`, `iclaw`, and `ironclaw-setup` to `~/.local/bin`.
+3. Installs `copperclaw`, `cclaw`, and `copperclaw-setup` to `~/.local/bin`.
    The script tries three strategies in order: (a) prebuilt release
    tarball from GitHub Releases — 404s until the first tag; (b)
    `cargo install --git` — this is the path that works today;
    (c) from inside a checkout, `cargo install --path`.
-4. Launches `ironclaw-setup` to walk provider credentials, the data
+4. Launches `copperclaw-setup` to walk provider credentials, the data
    directory, and the first channel.
 
 Re-running is safe — it detects an existing install and offers to
@@ -140,24 +140,24 @@ upgrade, skip, or resume setup.
 Useful environment overrides for `install.sh`:
 
 ```
-IRONCLAW_REPO=owner/fork                 # pull from a fork
-IRONCLAW_INSTALL_DIR=$HOME/.local/bin    # where binaries land
-IRONCLAW_RELEASE_TAG=v0.2.0              # pin a specific release (once tags exist)
-IRONCLAW_SKIP_SETUP=1                    # install binaries only
-IRONCLAW_SETUP_HEADLESS=1                # pass --headless through to the wizard
+COPPERCLAW_REPO=owner/fork                 # pull from a fork
+COPPERCLAW_INSTALL_DIR=$HOME/.local/bin    # where binaries land
+COPPERCLAW_RELEASE_TAG=v0.2.0              # pin a specific release (once tags exist)
+COPPERCLAW_SKIP_SETUP=1                    # install binaries only
+COPPERCLAW_SETUP_HEADLESS=1                # pass --headless through to the wizard
 ```
 
 Windows is supported via WSL2 — run the one-liner inside the WSL shell.
 
-Three binaries land on your PATH (a fourth, `ironclaw-runner`, is
+Three binaries land on your PATH (a fourth, `copperclaw-runner`, is
 baked into the session container image, not placed on the operator's
 PATH):
 
 | Binary | Role |
 | --- | --- |
-| `ironclaw` | Host orchestrator. Long-running; runs the inbound router, the outbound delivery loop, the per-session container manager, and the local admin socket. |
-| `iclaw` | Admin client. Talks to the host's Unix socket. Read paths are open to in-container agents; mutations are host-only. |
-| `ironclaw-setup` | Interactive one-time installer. Writes `.env`, builds the container image, drops a systemd unit or launchd plist, and creates a default CLI agent group so the first chat works. |
+| `copperclaw` | Host orchestrator. Long-running; runs the inbound router, the outbound delivery loop, the per-session container manager, and the local admin socket. |
+| `cclaw` | Admin client. Talks to the host's Unix socket. Read paths are open to in-container agents; mutations are host-only. |
+| `copperclaw-setup` | Interactive one-time installer. Writes `.env`, builds the container image, drops a systemd unit or launchd plist, and creates a default CLI agent group so the first chat works. |
 
 A pre-built session container image is produced as part of setup;
 rebuilds are automatic on config change.
@@ -170,8 +170,8 @@ macOS — `install.sh` and the wizard's `env_check` step detect all
 three).
 
 ```bash
-git clone https://github.com/phildougherty/ironclaw
-cd ironclaw
+git clone https://github.com/phildougherty/copperclaw
+cd copperclaw
 cargo build --release --workspace
 ```
 
@@ -190,7 +190,7 @@ Docker (or Podman via `CONTAINER_BIN=podman`):
 bash tests/install/test_install_sh.sh
 ```
 
-Pass `IRONCLAW_INSTALL_TEST_RUN_BUILD=1` to also exercise the
+Pass `COPPERCLAW_INSTALL_TEST_RUN_BUILD=1` to also exercise the
 `cargo install --path` strategy (slow — adds ~5 minutes). The CI job
 at `.github/workflows/ci.yml#install-sh` only runs on PRs that touch
 `install.sh`, `tests/install/**`, or the workflow itself.
@@ -202,61 +202,61 @@ at `.github/workflows/ci.yml#install-sh` only runs on PRs that touch
 Zero to a working chat in one terminal:
 
 ```bash
-ironclaw-setup                # interactive; press Enter to accept defaults
-ironclaw start && iclaw chat  # background the host, drop into the REPL
+copperclaw-setup                # interactive; press Enter to accept defaults
+copperclaw start && cclaw chat  # background the host, drop into the REPL
 ```
 
-`iclaw chat` auto-starts the host the first time you run it, so
-`ironclaw start` is optional. Pass `--no-autostart` to `iclaw chat` to
+`cclaw chat` auto-starts the host the first time you run it, so
+`copperclaw start` is optional. Pass `--no-autostart` to `cclaw chat` to
 keep the historic "fail loudly when the host isn't running" behaviour
 for scripted use.
 
 Other lifecycle commands:
 
 ```bash
-ironclaw status               # PID, uptime, paths, active session count
-ironclaw status --json        # machine-readable status
-ironclaw logs -f              # tail the host log (or -n 200 for the last 200 lines)
-ironclaw stop                 # graceful SIGTERM (SIGKILL after grace)
-ironclaw run                  # original foreground flow (for systemd / launchd)
-iclaw doctor                  # composite probe; every FAIL prints a `fix:` (non-zero exit on FAIL)
-iclaw health                  # sessions, audit, dropped-messages snapshot
-iclaw usage --since 24h       # per-group token rollup
-iclaw audit list --since 1h   # recent mutations against the host socket
+copperclaw status               # PID, uptime, paths, active session count
+copperclaw status --json        # machine-readable status
+copperclaw logs -f              # tail the host log (or -n 200 for the last 200 lines)
+copperclaw stop                 # graceful SIGTERM (SIGKILL after grace)
+copperclaw run                  # original foreground flow (for systemd / launchd)
+cclaw doctor                  # composite probe; every FAIL prints a `fix:` (non-zero exit on FAIL)
+cclaw health                  # sessions, audit, dropped-messages snapshot
+cclaw usage --since 24h       # per-group token rollup
+cclaw audit list --since 1h   # recent mutations against the host socket
 ```
 
-`ironclaw-setup` auto-creates a default `cli/stdin` messaging group
+`copperclaw-setup` auto-creates a default `cli/stdin` messaging group
 wired to an agent group named `first` with session mode `shared`, so
-`iclaw chat` works on the very first start. Opt out with
-`IRONCLAW_SETUP_QUICKSTART=no`.
+`cclaw chat` works on the very first start. Opt out with
+`COPPERCLAW_SETUP_QUICKSTART=no`.
 
-The setup step also wires the `iclaw chat` bridge: a named pipe at
+The setup step also wires the `cclaw chat` bridge: a named pipe at
 `<install_root>/chat.fifo` (read by the host) and an append-log at
 `<install_root>/chat.log` (written by the host, tailed by
-`iclaw chat`). The host picks both paths up automatically via
-`IRONCLAW_CLI_FIFO` and `IRONCLAW_CLI_LOG` (written to the install's
+`cclaw chat`). The host picks both paths up automatically via
+`COPPERCLAW_CLI_FIFO` and `COPPERCLAW_CLI_LOG` (written to the install's
 `.env`). To relocate them — onto `tmpfs` for lower write latency, or
 out of the install root for permissions reasons — set the env vars
 explicitly:
 
 ```bash
-IRONCLAW_CLI_FIFO=/run/ironclaw/chat.fifo
-IRONCLAW_CLI_LOG=/var/log/ironclaw/chat.log
+COPPERCLAW_CLI_FIFO=/run/copperclaw/chat.fifo
+COPPERCLAW_CLI_LOG=/var/log/copperclaw/chat.log
 ```
 
-When neither var is set and `IRONCLAW_DATA_DIR` is also unset (e.g.
-you ran `cargo run -p ironclaw-host run` in a checkout), the cli
+When neither var is set and `COPPERCLAW_DATA_DIR` is also unset (e.g.
+you ran `cargo run -p copperclaw-host run` in a checkout), the cli
 channel falls back to reading/writing the host process's own
 stdin / stdout — the historic developer REPL.
 
 ### Headless / scripted install
 
 ```bash
-IRONCLAW_SETUP_ANTHROPIC_API_KEY=sk-ant-... ironclaw-setup --headless
+COPPERCLAW_SETUP_ANTHROPIC_API_KEY=sk-ant-... copperclaw-setup --headless
 ```
 
 The only required variable is the provider API key. Override any
-prompt by setting the matching env var; run `ironclaw-setup
+prompt by setting the matching env var; run `copperclaw-setup
 --list-steps` for the canonical step list, or `--skip-step <name>` to
 defer a step (valid names come from that list — `env_check`,
 `data_dir`, `central_db`, `image`, `onecli`, `auth`, `mounts`,
@@ -265,18 +265,18 @@ defer a step (valid names come from that list — `env_check`,
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `IRONCLAW_SETUP_ANTHROPIC_API_KEY` | _required_ | Provider API key (Anthropic or compatible). |
-| `IRONCLAW_SETUP_USE_ONECLI` | `no` | Enable OneCLI credential gateway. |
-| `IRONCLAW_SETUP_BUILD_IMAGE` | `yes` | Build the session container image during setup. |
-| `IRONCLAW_SETUP_MOUNTS` | empty | Comma-separated host paths to bind-mount read-only into every session. |
-| `IRONCLAW_SETUP_WRITE_SERVICE_UNIT` | `no` | Drop a systemd / launchd unit. |
-| `IRONCLAW_SETUP_SERVICE_SCOPE` | `print` | Service install scope: `system` / `user` / `print`. See [Running as a service](#running-as-a-service). |
-| `IRONCLAW_SETUP_SERVICE_ENABLE` | `yes` | When scope is not `print`, also enable + start the service. |
-| `IRONCLAW_SETUP_TIMEZONE` | system | Container timezone. |
-| `IRONCLAW_SETUP_FIRST_CHANNEL` | `cli` | Which channel to wire first. |
-| `IRONCLAW_SETUP_TELEGRAM_BOT_TOKEN` | empty | Bot token; required when `FIRST_CHANNEL=telegram` and `--headless`. Verified via `getMe`. |
-| `IRONCLAW_SETUP_TELEGRAM_CHAT_ID` | empty | Optional chat id; supplied means setup skips the `/start` polling step. |
-| `IRONCLAW_SETUP_QUICKSTART` | `yes` | Auto-create the default CLI agent group + wiring. |
+| `COPPERCLAW_SETUP_ANTHROPIC_API_KEY` | _required_ | Provider API key (Anthropic or compatible). |
+| `COPPERCLAW_SETUP_USE_ONECLI` | `no` | Enable OneCLI credential gateway. |
+| `COPPERCLAW_SETUP_BUILD_IMAGE` | `yes` | Build the session container image during setup. |
+| `COPPERCLAW_SETUP_MOUNTS` | empty | Comma-separated host paths to bind-mount read-only into every session. |
+| `COPPERCLAW_SETUP_WRITE_SERVICE_UNIT` | `no` | Drop a systemd / launchd unit. |
+| `COPPERCLAW_SETUP_SERVICE_SCOPE` | `print` | Service install scope: `system` / `user` / `print`. See [Running as a service](#running-as-a-service). |
+| `COPPERCLAW_SETUP_SERVICE_ENABLE` | `yes` | When scope is not `print`, also enable + start the service. |
+| `COPPERCLAW_SETUP_TIMEZONE` | system | Container timezone. |
+| `COPPERCLAW_SETUP_FIRST_CHANNEL` | `cli` | Which channel to wire first. |
+| `COPPERCLAW_SETUP_TELEGRAM_BOT_TOKEN` | empty | Bot token; required when `FIRST_CHANNEL=telegram` and `--headless`. Verified via `getMe`. |
+| `COPPERCLAW_SETUP_TELEGRAM_CHAT_ID` | empty | Optional chat id; supplied means setup skips the `/start` polling step. |
+| `COPPERCLAW_SETUP_QUICKSTART` | `yes` | Auto-create the default CLI agent group + wiring. |
 
 ### Choosing a provider
 
@@ -301,10 +301,10 @@ perms; tokens are never echoed in logs.
 For headless installs supply the answers via env vars:
 
 ```
-IRONCLAW_SETUP_FIRST_CHANNEL=telegram \
-IRONCLAW_SETUP_TELEGRAM_BOT_TOKEN=123456:ABC-DEF... \
-IRONCLAW_SETUP_TELEGRAM_CHAT_ID=42      # optional — skips /start poll \
-ironclaw-setup --headless
+COPPERCLAW_SETUP_FIRST_CHANNEL=telegram \
+COPPERCLAW_SETUP_TELEGRAM_BOT_TOKEN=123456:ABC-DEF... \
+COPPERCLAW_SETUP_TELEGRAM_CHAT_ID=42      # optional — skips /start poll \
+copperclaw-setup --headless
 ```
 
 Network reachability to `api.telegram.org` is tested at setup time (10 s
@@ -314,8 +314,8 @@ warning so air-gapped installs aren't blocked.
 Slack / Discord / other channels pair post-setup:
 
 ```bash
-iclaw messaging-groups create --channel-type slack --platform-id C01XYZ
-iclaw wirings create --mg <messaging-group-id> --ag <agent-group-id> --engage all
+cclaw messaging-groups create --channel-type slack --platform-id C01XYZ
+cclaw wirings create --mg <messaging-group-id> --ag <agent-group-id> --engage all
 ```
 
 ---
@@ -403,7 +403,7 @@ intermediate exploration never enters the parent's context. Nested
 `explore` calls are refused.
 
 **Skill loader.** `load_skill` returns a named skill's `SKILL.md`
-body on demand when `IRONCLAW_SKILLS_MODE=callable`. The default mode
+body on demand when `COPPERCLAW_SKILLS_MODE=callable`. The default mode
 is `inline` (every selected skill body inlined at spawn) and is still
 preferred for small skill catalogues; flip to `callable` when prompt-
 token cost starts to matter.
@@ -417,7 +417,7 @@ coding-specific.
 conversation immediately rather than waiting for the threshold) and
 `clear_history` (drop conversation state without losing the session).
 
-**Persistent memory (opt-in via `IRONCLAW_GROUPS_DIR`).** When the
+**Persistent memory (opt-in via `COPPERCLAW_GROUPS_DIR`).** When the
 host is configured with a groups dir, each agent group also gets
 `<groups_dir>/<id>/memory/` bind-mounted at `/data/memory/`. Agents
 read and write memory files via the existing `read_file` /
@@ -426,12 +426,12 @@ read and write memory files via the existing `read_file` /
 Every agent also receives a universal base preamble + an
 `# Environment` block (today's date, session id, agent group id,
 working directory, assistant name) at the top of its system prompt,
-plus an optional operator-supplied `IRONCLAW.md` briefing from the
-session dir or `<groups_dir>/<id>/IRONCLAW.md`.
+plus an optional operator-supplied `COPPERCLAW.md` briefing from the
+session dir or `<groups_dir>/<id>/COPPERCLAW.md`.
 
 Per-skill `SKILL.md` prose is auto-inlined into the runner's system
 prompt at spawn (default `inline` mode) so the model knows *when* to
-reach for each tool. Switch to `IRONCLAW_SKILLS_MODE=callable` to swap
+reach for each tool. Switch to `COPPERCLAW_SKILLS_MODE=callable` to swap
 inlined bodies for a name+description index and have the agent
 retrieve bodies on demand via `load_skill`.
 
@@ -439,52 +439,52 @@ retrieve bodies on demand via `load_skill`.
 
 ## Operator commands
 
-`iclaw` is the local admin client; it talks to the host's Unix
+`cclaw` is the local admin client; it talks to the host's Unix
 socket. The most-used commands:
 
 ```bash
-iclaw                                 # no-args dashboard: groups, wirings,
+cclaw                                 # no-args dashboard: groups, wirings,
                                       # sessions, recent activity, next steps
-iclaw doctor                          # composite first-run / ongoing diagnostic
+cclaw doctor                          # composite first-run / ongoing diagnostic
                                       # — non-zero exit on any FAIL
-iclaw health                          # one-shot probe — session breakdown + audit + drops
-iclaw chat                            # interactive REPL against the cli channel
-iclaw status                          # wiring digest
+cclaw health                          # one-shot probe — session breakdown + audit + drops
+cclaw chat                            # interactive REPL against the cli channel
+cclaw status                          # wiring digest
 
-iclaw groups list                     # configured agent groups
-iclaw groups config get <id>          # render the merged container config
-iclaw groups config edit <id>         # multi-field config edit via $EDITOR (TOML)
-iclaw messaging-groups list           # channel groups (e.g. slack/C12345)
-iclaw wirings list                    # which messaging group → which agent group
+cclaw groups list                     # configured agent groups
+cclaw groups config get <id>          # render the merged container config
+cclaw groups config edit <id>         # multi-field config edit via $EDITOR (TOML)
+cclaw messaging-groups list           # channel groups (e.g. slack/C12345)
+cclaw wirings list                    # which messaging group → which agent group
 
-iclaw users list                      # known sender identities
-iclaw roles grant <user> admin        # role grants on the central DB
-iclaw members add <agent-group> <user>  # group membership
+cclaw users list                      # known sender identities
+cclaw roles grant <user> admin        # role grants on the central DB
+cclaw members add <agent-group> <user>  # group membership
 
-iclaw approvals list                  # pending approvals (all families)
-iclaw approvals approve --channel telegram --identity 12345
+cclaw approvals list                  # pending approvals (all families)
+cclaw approvals approve --channel telegram --identity 12345
 
-iclaw usage --since 24h               # per-group token rollup
-iclaw budgets set --agent-group-id <id> --daily-tokens 100000
-iclaw budgets set --agent-group-id <id> --turns-per-minute 4
+cclaw usage --since 24h               # per-group token rollup
+cclaw budgets set --agent-group-id <id> --daily-tokens 100000
+cclaw budgets set --agent-group-id <id> --turns-per-minute 4
 
-iclaw audit list --since 1h           # mutation log
-iclaw schema-version                  # central-DB schema check
-                                      # status: ok | pending (run `ironclaw migrate`) | future (downgrade — restore from backup)
+cclaw audit list --since 1h           # mutation log
+cclaw schema-version                  # central-DB schema check
+                                      # status: ok | pending (run `copperclaw migrate`) | future (downgrade — restore from backup)
 
-iclaw mcp list-presets                # curated MCP servers
-iclaw mcp add postgres --agent-group-id <id> --env POSTGRES_CONNECTION_STRING=postgres://localhost/mydb
-iclaw groups config set-resource-limits <id> --cpus 1 --memory-mb 1024
-iclaw groups config set-egress-allow <id> example.com:443
+cclaw mcp list-presets                # curated MCP servers
+cclaw mcp add postgres --agent-group-id <id> --env POSTGRES_CONNECTION_STRING=postgres://localhost/mydb
+cclaw groups config set-resource-limits <id> --cpus 1 --memory-mb 1024
+cclaw groups config set-egress-allow <id> example.com:443
 
-iclaw dropped-messages outbound-list --since 24h
-iclaw dropped-messages replay <id>
+cclaw dropped-messages outbound-list --since 24h
+cclaw dropped-messages replay <id>
 
-iclaw db backup /backups/ironclaw.sqlite
-iclaw db restore /backups/ironclaw.sqlite  # only when host is stopped
+cclaw db backup /backups/copperclaw.sqlite
+cclaw db restore /backups/copperclaw.sqlite  # only when host is stopped
 
-iclaw quickstart cli --name <name>    # one-shot: create agent group + cli wiring + start
-iclaw completions <bash|zsh|fish>     # drop a completion script
+cclaw quickstart cli --name <name>    # one-shot: create agent group + cli wiring + start
+cclaw completions <bash|zsh|fish>     # drop a completion script
 ```
 
 Run any command with `--json` for machine-readable output. Read paths
@@ -536,7 +536,7 @@ Background loops on host:
   - Sweep delivery poll   (60s, all active sessions)
   - Sweep                 (60s, stuck detection, recurrence, heartbeat)
   - Container manager     (1s, reconcile Stopped/Idle/Running)
-  - iclaw socket server   (Unix socket; newline-delimited JSON)
+  - cclaw socket server   (Unix socket; newline-delimited JSON)
 ```
 
 **Three invariants** the code holds the line on:
@@ -554,32 +554,32 @@ Background loops on host:
 
 ## Configuration
 
-`.env` keys the host reads at boot. `ironclaw-setup` writes a
+`.env` keys the host reads at boot. `copperclaw-setup` writes a
 populated copy; production overrides go in your service unit.
 
 | Key | Purpose |
 | --- | --- |
 | `ANTHROPIC_API_KEY` | Provider key forwarded into every spawned container. |
 | `ANTHROPIC_BASE_URL` | Optional Anthropic-compatible base URL (OpenRouter, internal proxy). Trailing `/v1` stripped automatically. |
-| `IRONCLAW_DATA_DIR` | Host data root. Setup writes per-platform install path; defaults to `./data` when unset. |
-| `IRONCLAW_ICLAW_SOCKET` | Override socket path the host listens on; otherwise resolved per-platform. (The `iclaw` client reads `ICLAW_SOCKET` for the same purpose on the dial side; setup writes both into `.env`.) |
-| `IRONCLAW_SKILLS_DIR` | Skills directory whose `SKILL.md` bodies get auto-inlined into the runner's system prompt at spawn (`inline` mode) or advertised as a name+description index (`callable` mode). |
-| `IRONCLAW_GROUPS_DIR` | Per-agent-group override root. `<groups_dir>/<id>/skills/` shadows global skills with matching names. `<groups_dir>/<id>/memory/` is bind-mounted at `/data/memory/` so per-group memory persists across sessions. `<groups_dir>/<id>/IRONCLAW.md` is read as an operator-supplied briefing into every spawn's system prompt. |
-| `IRONCLAW_SKILLS_MODE` | `inline` (default) or `callable`. Inline puts every selected skill body in the prompt at spawn. Callable emits only an index and writes a per-session `skills.json` for the `load_skill` MCP tool. |
-| `IRONCLAW_METRICS_ADDR` | Bind address for the Prometheus endpoint (e.g. `127.0.0.1:9090`). Off when unset. |
-| `IRONCLAW_LOG_DIR` | Enable daily-rotating file appender alongside stderr. Off when unset. |
-| `IRONCLAW_DEFAULT_PROVIDER` | Provider name for sessions whose group hasn't pinned one. |
-| `IRONCLAW_DEFAULT_IMAGE_TAG` | Default container image tag when no `container_configs` row pins one. |
-| `IRONCLAW_CONTAINER_GPU` | Set to `1` to enable Nvidia GPU passthrough on session containers (requires nvidia-container-toolkit on the host). Off by default. |
+| `COPPERCLAW_DATA_DIR` | Host data root. Setup writes per-platform install path; defaults to `./data` when unset. |
+| `COPPERCLAW_CCLAW_SOCKET` | Override socket path the host listens on; otherwise resolved per-platform. (The `cclaw` client reads `CCLAW_SOCKET` for the same purpose on the dial side; setup writes both into `.env`.) |
+| `COPPERCLAW_SKILLS_DIR` | Skills directory whose `SKILL.md` bodies get auto-inlined into the runner's system prompt at spawn (`inline` mode) or advertised as a name+description index (`callable` mode). |
+| `COPPERCLAW_GROUPS_DIR` | Per-agent-group override root. `<groups_dir>/<id>/skills/` shadows global skills with matching names. `<groups_dir>/<id>/memory/` is bind-mounted at `/data/memory/` so per-group memory persists across sessions. `<groups_dir>/<id>/COPPERCLAW.md` is read as an operator-supplied briefing into every spawn's system prompt. |
+| `COPPERCLAW_SKILLS_MODE` | `inline` (default) or `callable`. Inline puts every selected skill body in the prompt at spawn. Callable emits only an index and writes a per-session `skills.json` for the `load_skill` MCP tool. |
+| `COPPERCLAW_METRICS_ADDR` | Bind address for the Prometheus endpoint (e.g. `127.0.0.1:9090`). Off when unset. |
+| `COPPERCLAW_LOG_DIR` | Enable daily-rotating file appender alongside stderr. Off when unset. |
+| `COPPERCLAW_DEFAULT_PROVIDER` | Provider name for sessions whose group hasn't pinned one. |
+| `COPPERCLAW_DEFAULT_IMAGE_TAG` | Default container image tag when no `container_configs` row pins one. |
+| `COPPERCLAW_CONTAINER_GPU` | Set to `1` to enable Nvidia GPU passthrough on session containers (requires nvidia-container-toolkit on the host). Off by default. |
 | `TAVILY_API_KEY` / `EXA_API_KEY` / `BRAVE_SEARCH_API_KEY` / `SERPAPI_API_KEY` | Forwarded into the container so `web_search` auto-selects a backend. |
-| `IRONCLAW_CODEX_BINARY` | Runner-side: absolute path to the Codex CLI inside the container. Read by the runner only when `provider == "codex"`. Defaults to `/usr/local/bin/codex`. Host forwards this through. |
-| `IRONCLAW_CODEX_ARGS` | Runner-side: comma-separated extra args appended to every Codex spawn (e.g. `--json,--no-color`). Defaults to `--json`. |
+| `COPPERCLAW_CODEX_BINARY` | Runner-side: absolute path to the Codex CLI inside the container. Read by the runner only when `provider == "codex"`. Defaults to `/usr/local/bin/codex`. Host forwards this through. |
+| `COPPERCLAW_CODEX_ARGS` | Runner-side: comma-separated extra args appended to every Codex spawn (e.g. `--json,--no-color`). Defaults to `--json`. |
 
 A SIGHUP on the host re-reads the `.env` file, updates the forwarded
-keys, and increments the `ironclaw_secrets_rotated_total` metric
+keys, and increments the `copperclaw_secrets_rotated_total` metric
 counter. Running containers see the rotated values after the next
 idle-stop + respawn (default 5 minutes); for an immediate rotation,
-`iclaw groups restart <id>`.
+`cclaw groups restart <id>`.
 
 ---
 
@@ -588,27 +588,27 @@ idle-stop + respawn (default 5 minutes); for an immediate rotation,
 Opt-in Prometheus endpoint:
 
 ```bash
-IRONCLAW_METRICS_ADDR=127.0.0.1:9090 ironclaw run
+COPPERCLAW_METRICS_ADDR=127.0.0.1:9090 copperclaw run
 ```
 
-Counters: `ironclaw_messages_inbound_total`,
-`ironclaw_messages_outbound_total`,
-`ironclaw_containers_spawned_total`,
-`ironclaw_containers_crashed_total`,
-`ironclaw_delivery_failed_total`,
-`ironclaw_image_rebuild_failed_total`,
-`ironclaw_secrets_rotated_total`,
-`ironclaw_budget_exhausted_total{agent_group_id, gate}`,
-`ironclaw_budget_exhausted_replies_total{agent_group_id}`,
-`ironclaw_budget_exhausted_suppressed_total{agent_group_id}`.
+Counters: `copperclaw_messages_inbound_total`,
+`copperclaw_messages_outbound_total`,
+`copperclaw_containers_spawned_total`,
+`copperclaw_containers_crashed_total`,
+`copperclaw_delivery_failed_total`,
+`copperclaw_image_rebuild_failed_total`,
+`copperclaw_secrets_rotated_total`,
+`copperclaw_budget_exhausted_total{agent_group_id, gate}`,
+`copperclaw_budget_exhausted_replies_total{agent_group_id}`,
+`copperclaw_budget_exhausted_suppressed_total{agent_group_id}`.
 
-Histograms: `ironclaw_llm_call_seconds`, `ironclaw_llm_tokens_input`,
-`ironclaw_llm_tokens_output`, `ironclaw_container_spawn_seconds`.
+Histograms: `copperclaw_llm_call_seconds`, `copperclaw_llm_tokens_input`,
+`copperclaw_llm_tokens_output`, `copperclaw_container_spawn_seconds`.
 
 Log rotation (also opt-in):
 
 ```bash
-IRONCLAW_LOG_DIR=/var/log/ironclaw ironclaw run
+COPPERCLAW_LOG_DIR=/var/log/copperclaw copperclaw run
 ```
 
 Writes one daily-rotated file alongside the stderr stream so container
@@ -621,32 +621,32 @@ operator playbook.
 
 ## Running as a service
 
-For local / developer installs the `ironclaw start` / `ironclaw stop`
+For local / developer installs the `copperclaw start` / `copperclaw stop`
 lifecycle commands are usually enough. For server installs that need
-auto-start at boot, `ironclaw-setup`'s `service_unit` step handles the
+auto-start at boot, `copperclaw-setup`'s `service_unit` step handles the
 whole install end-to-end instead of just printing the unit file.
 
-At the prompt (or via `IRONCLAW_SETUP_SERVICE_SCOPE`) pick one of:
+At the prompt (or via `COPPERCLAW_SETUP_SERVICE_SCOPE`) pick one of:
 
-- `system` — install to `/etc/systemd/system/ironclaw.service` (or
-  `/Library/LaunchDaemons/com.ironclaw.host.plist`), then
-  `systemctl daemon-reload` + `systemctl enable --now ironclaw`
+- `system` — install to `/etc/systemd/system/copperclaw.service` (or
+  `/Library/LaunchDaemons/com.copperclaw.host.plist`), then
+  `systemctl daemon-reload` + `systemctl enable --now copperclaw`
   (`launchctl bootstrap system <plist>` on macOS). Requires the wizard
   to be running as root. When the wizard is not root, it falls back to
   `user` scope and prints a warning rather than prompting for the sudo
   password mid-run.
-- `user` — install to `~/.config/systemd/user/ironclaw.service` (or
-  `~/Library/LaunchAgents/com.ironclaw.host.plist`), then `systemctl
+- `user` — install to `~/.config/systemd/user/copperclaw.service` (or
+  `~/Library/LaunchAgents/com.copperclaw.host.plist`), then `systemctl
   --user enable --now` (`launchctl bootstrap gui/<uid>` on macOS). No
   privilege elevation needed.
 - `print` — write the unit to the per-user default path and print the
   enable command. Default for headless installs so unattended pipelines
   don't change shape unless they opt in.
 
-After enabling, setup polls the `iclaw.sock` admin socket for ~10s and
-prints either `ironclaw service is running, socket at <path>` or
-`service didn't come up — check journalctl -u ironclaw` (or
-`launchctl print gui/<uid>/com.ironclaw.host` on macOS). Re-running
+After enabling, setup polls the `cclaw.sock` admin socket for ~10s and
+prints either `copperclaw service is running, socket at <path>` or
+`service didn't come up — check journalctl -u copperclaw` (or
+`launchctl print gui/<uid>/com.copperclaw.host` on macOS). Re-running
 setup with the same scope is idempotent: if the on-disk unit already
 matches the generated body, the step is a no-op.
 
@@ -659,28 +659,28 @@ config-management tool without going through the full wizard.
 ## Agent skills
 
 Skills under `skills/` are markdown bundles auto-discovered by
-`ironclaw-skills` and either inlined into the running agent's system
+`copperclaw-skills` and either inlined into the running agent's system
 prompt (default `inline` mode) or advertised as a compact
 name+description index and served on demand via the `load_skill` tool
-(`IRONCLAW_SKILLS_MODE=callable`). Capability docs (`send-message`,
+(`COPPERCLAW_SKILLS_MODE=callable`). Capability docs (`send-message`,
 `install-packages`, ...) describe the in-tree MCP tools; guided-flow
 skills describe a multi-turn interaction the agent runs with the
 user:
 
 - `skills/customize/` — change the model, install a package or MCP
   server, edit the per-group behavior prompt, raise/lower the
-  daily-token budget. The agent prints the exact `iclaw` command for
+  daily-token budget. The agent prints the exact `cclaw` command for
   any host-only mutation.
 - `skills/debug/` — triage a "you didn't reply" / "it's slow" report:
   pull what's reachable from inside the container, then hand
-  `iclaw health`, `iclaw audit list`, and `iclaw dropped-messages list`
+  `cclaw health`, `cclaw audit list`, and `cclaw dropped-messages list`
   to the operator.
 - `skills/todo-tracker/`, `skills/agent-memory/` — universal
   scratchpad and persistent-memory disciplines for any agent.
 - `skills/coding-task/`, `skills/git-commit/`, `skills/code-review/`,
   `skills/testing/` — bundle for agents doing coding work. Off by
-  default — flip on per agent group with `iclaw groups enable-coding
-  <id>`, off again with `iclaw groups disable-coding <id>`.
+  default — flip on per agent group with `cclaw groups enable-coding
+  <id>`, off again with `cclaw groups disable-coding <id>`.
 
 Drop a new directory with a `SKILL.md` (YAML frontmatter + markdown
 body) into `skills/` and the next container boot picks it up — no
@@ -707,7 +707,7 @@ Operator-facing guides:
 - [`docs/webhooks-tls.md`](docs/webhooks-tls.md) — TLS termination via
   Caddy / nginx / Cloudflare Tunnel, per-channel default ports.
 - [`docs/cutover.md`](docs/cutover.md) — migrate from a predecessor
-  installation onto Ironclaw.
+  installation onto Copperclaw.
 - [`docs/replay-fixtures.md`](docs/replay-fixtures.md) — the
   differential-replay test harness.
 - [`docs/release-checklist.md`](docs/release-checklist.md) — steps for

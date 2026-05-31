@@ -21,7 +21,7 @@
 ## Implemented
 - deliver: COMPLETE — text + markdown + card + files (multipart, one
   POST per file), plus system actions (edit / delete / reaction).
-  `crates/ironclaw-channels/webex/src/adapter.rs:297`
+  `crates/copperclaw-channels/webex/src/adapter.rs:297`
 - subscribe: trait-default Ok (webhook ingress; firehose model).
 - set_typing: trait-default Ok (no public typing API).
 - edit_message: action="edit" → PUT.

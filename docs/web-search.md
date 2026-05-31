@@ -51,7 +51,7 @@ Resolution order on every `web_search` invocation, first match wins:
 1. The explicit `provider` argument in the tool call. The agent can
    override per-call when it has a reason — e.g. neural search for a
    conceptual query.
-2. `IRONCLAW_WEB_SEARCH_PROVIDER` — operator-set default. Useful
+2. `COPPERCLAW_WEB_SEARCH_PROVIDER` — operator-set default. Useful
    when multiple keys are configured but the operator wants to pin
    a specific backend.
 3. Auto-detect: first non-empty key in the order `tavily, exa,
@@ -73,7 +73,7 @@ across providers can also be a cost optimisation.
 # .env — Tavily as default, Exa available for semantic queries
 TAVILY_API_KEY=tvly-...
 EXA_API_KEY=...
-IRONCLAW_WEB_SEARCH_PROVIDER=tavily
+COPPERCLAW_WEB_SEARCH_PROVIDER=tavily
 ```
 
 ## Forwarding into containers
@@ -82,13 +82,13 @@ The host reads these vars from its own environment (or its `.env`)
 at boot and forwards them into every session container at spawn
 time via `ContainerSpec`. The forwarding list is intentionally
 small — see `collect_forward_env` in
-[`crates/ironclaw-host/src/boot.rs`](../crates/ironclaw-host/src/boot.rs).
+[`crates/copperclaw-host/src/boot.rs`](../crates/copperclaw-host/src/boot.rs).
 
 What this means in practice:
 
 - **The keys live in `.env`, never in `container_configs`.** Rotating
   a key is a host restart, not a database write.
-- **They are not visible in `iclaw audit list`.** The audit log
+- **They are not visible in `cclaw audit list`.** The audit log
   records the `web_search` tool calls themselves, but not the env
   forwarded into the container.
 - **They are visible to anything running in the container.** The
@@ -116,7 +116,7 @@ even though the API key is correct.
 If everything your agent needs to know lives in a system you can
 front with an MCP server (Linear, GitHub, Notion, Postgres, an
 internal docs index), wiring that up via
-[`iclaw mcp add <preset>`](container-config.md#image-rebuild-on-container_configs-change)
+[`cclaw mcp add <preset>`](container-config.md#image-rebuild-on-container_configs-change)
 is strictly better than searching the public web for the same data.
 The result is authenticated, structured, and not subject to a
 third-party search provider's index freshness.
@@ -130,7 +130,7 @@ project pages, anything not behind an integration you already own.
 Every provider's response is normalised to the same shape. From the
 operator's perspective, this means the agent's downstream behaviour
 is provider-agnostic — switching from Tavily to Brave by flipping
-`IRONCLAW_WEB_SEARCH_PROVIDER` doesn't require any changes in the
+`COPPERCLAW_WEB_SEARCH_PROVIDER` doesn't require any changes in the
 skill docs or in the agent's prompting. See
 [`skills/web-search/SKILL.md`](../skills/web-search/SKILL.md) for
 the exact shape.
@@ -144,7 +144,7 @@ Per-provider defaults (subject to provider's own quota updates):
 - **Brave**: 2k/month free; paid plans for higher volume.
 - **SerpAPI**: paid-only, ~$50/mo for the entry plan.
 
-Pair with the `iclaw budgets` token cap (see PLAN.md M13 cost/
+Pair with the `cclaw budgets` token cap (see PLAN.md M13 cost/
 safety) to bound the number of LLM calls per group per day; one
 `web_search` call costs an LLM turn plus the provider's
 per-search fee. The host does not currently track per-provider

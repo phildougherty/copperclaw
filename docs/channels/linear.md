@@ -20,7 +20,7 @@
 
 ## Implemented
 - deliver: COMPLETE — GraphQL `commentCreate`, plus system-action for
-  edit / reaction. `crates/ironclaw-channels/linear/src/adapter.rs:86`
+  edit / reaction. `crates/copperclaw-channels/linear/src/adapter.rs:86`
 - subscribe: trait-default Ok (webhook ingress).
 - set_typing: trait-default Ok (no platform concept).
 - edit_message: routed via `content.action="edit"` (commentUpdate).

@@ -2,7 +2,7 @@
 --
 -- Single agent group "Replay" wired to a single discord messaging
 -- group keyed on channel id "c1" (the same channel id used in
--- ironclaw-channels-discord's events unit tests). Engage mode
+-- copperclaw-channels-discord's events unit tests). Engage mode
 -- `pattern` with `.*` so every inbound matches; session mode `shared`.
 INSERT INTO agent_groups (id, name, folder, agent_provider, created_at) VALUES
   ('00000000-0000-0000-0000-000000000001', 'Replay', 'replay', 'anthropic', '2026-01-01T00:00:00Z');

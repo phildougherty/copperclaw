@@ -20,7 +20,7 @@ that isn't prose.
    → Do nothing. The runner auto-emits a `MessageKind::Breadcrumb`
    chip on tool start and edits it to `Done`/`Failed` on completion
    (native chips on telegram/slack/discord/gchat/matrix). Default ON
-   — operators can disable via `IRONCLAW_TOOL_BREADCRUMBS=0`. Don't
+   — operators can disable via `COPPERCLAW_TOOL_BREADCRUMBS=0`. Don't
    pre-announce; that's a duplicate chip.
 
 2. **Editing a file** (`edit_file`, `multi_edit`, `apply_patch`,
@@ -42,7 +42,7 @@ that isn't prose.
 5. **Operator approval before a destructive action.** → For built-in
    families (`install_packages`, `add_mcp_server`, sender, channel)
    the runner writes `pending_approvals` automatically and an
-   operator clears via `iclaw approvals approve-id <id>` /
+   operator clears via `cclaw approvals approve-id <id>` /
    `deny <id>` (`../approvals/SKILL.md`). For agent-defined gates use
    `send_card` with two `value` buttons: Approve (`primary`), Deny
    (`danger`). The tap routes back as inbound chat carrying the

@@ -20,7 +20,7 @@
 
 ## Implemented
 - deliver: COMPLETE — POST /repos/:o/:r/issues/:n/comments; edit /
-  reaction via system-action shape. `crates/ironclaw-channels/github/src/adapter.rs:125`
+  reaction via system-action shape. `crates/copperclaw-channels/github/src/adapter.rs:125`
 - subscribe: trait-default Ok (webhook ingress watches all repos).
 - set_typing: noop (no platform concept).
 - edit_message: routed via `content.action="edit"` (PATCH comment).

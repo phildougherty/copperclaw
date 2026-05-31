@@ -1,0 +1,88 @@
+[package]
+name = "copperclaw-host"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[lib]
+name = "copperclaw_host"
+path = "src/lib.rs"
+
+[[bin]]
+name = "copperclaw"
+path = "src/main.rs"
+
+[dependencies]
+copperclaw-types         = { workspace = true }
+copperclaw-db            = { workspace = true }
+copperclaw-container-rt  = { workspace = true }
+copperclaw-host-router   = { workspace = true }
+copperclaw-host-delivery = { workspace = true }
+copperclaw-host-sweep    = { workspace = true }
+copperclaw-channels-core = { workspace = true }
+copperclaw-channels-cli  = { workspace = true }
+copperclaw-channels-telegram = { workspace = true }
+copperclaw-channels-slack    = { workspace = true }
+copperclaw-channels-discord  = { workspace = true }
+copperclaw-channels-resend   = { workspace = true }
+copperclaw-channels-github   = { workspace = true }
+copperclaw-channels-linear   = { workspace = true }
+copperclaw-channels-webex    = { workspace = true }
+copperclaw-channels-matrix   = { workspace = true }
+copperclaw-channels-teams    = { workspace = true }
+copperclaw-channels-mattermost = { workspace = true }
+copperclaw-channels-line     = { workspace = true }
+copperclaw-channels-gchat    = { workspace = true }
+copperclaw-channels-imessage = { workspace = true }
+copperclaw-channels-wechat   = { workspace = true }
+copperclaw-channels-whatsapp-cloud = { workspace = true }
+copperclaw-channels-webhooks = { workspace = true }
+copperclaw-channels-signal   = { workspace = true }
+copperclaw-channels-deltachat = { workspace = true }
+copperclaw-channels-emacs    = { workspace = true }
+copperclaw-channels-x        = { workspace = true }
+copperclaw-modules       = { workspace = true }
+copperclaw-skills        = { workspace = true }
+copperclaw-onecli        = { workspace = true }
+copperclaw-metrics       = { workspace = true }
+# Used at startup to compute the runner's effective provider
+# deadline (honouring `COPPERCLAW_RUNNER_PROVIDER_DEADLINE_MS`) so the
+# boot-time heartbeat-vs-deadline alignment check warns against the
+# value the runner will actually be configured with. Read-only — no
+# runtime coupling to the runner's poll loop.
+copperclaw-runner        = { workspace = true }
+copperclaw-cclaw           = { path = "../copperclaw-cclaw" }
+tokio                  = { workspace = true }
+tokio-util             = "0.7"
+tracing                = { workspace = true }
+tracing-subscriber     = { workspace = true }
+tracing-appender       = { workspace = true }
+anyhow                 = { workspace = true }
+clap                   = { workspace = true }
+dotenvy                = { workspace = true }
+chrono                 = { workspace = true }
+serde                  = { workspace = true }
+serde_json             = { workspace = true }
+dashmap                = { workspace = true }
+async-trait            = { workspace = true }
+thiserror              = { workspace = true }
+uuid                   = { workspace = true }
+rusqlite               = { workspace = true }
+sha2                   = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+filetime = "0.2"
+copperclaw-cclaw = { path = "../copperclaw-cclaw" }
+copperclaw-runner = { workspace = true }
+copperclaw-providers = { workspace = true }
+copperclaw-mcp = { workspace = true }
+tokio = { workspace = true }
+wiremock = "=0.6.2"
+regex = "1"
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+
+[lints]
+workspace = true

@@ -9,9 +9,9 @@ Walks the user through a self-modification. Most container-config
 mutations are host-only (mutation tools refuse from inside the
 container), so alternate between tools you *can* call
 (`install_packages`, `add_mcp_server`, `read_file`, `send_message`)
-and printing the exact `iclaw` command the operator must run.
+and printing the exact `cclaw` command the operator must run.
 
-`iclaw` is **not** mounted inside the container — do not `shell` it.
+`cclaw` is **not** mounted inside the container — do not `shell` it.
 Hand the command back to the operator.
 
 ## Step 1 — establish what to change
@@ -37,8 +37,8 @@ Use `ask_user_question` if the channel renders buttons; plain
 3. Print and stop:
 
    ```
-   iclaw groups config update <agent_group_id> --field model=<value>
-   iclaw groups restart <agent_group_id>
+   cclaw groups config update <agent_group_id> --field model=<value>
+   cclaw groups restart <agent_group_id>
    ```
 
    `agent_group_id` is in `/data/runner.json`.
@@ -50,7 +50,7 @@ Use `ask_user_question` if the channel renders buttons; plain
 - **MCP server**: call `add_mcp_server`. If the server needs a
   binary, install the package first.
 - Show what's already configured first: read `/data/runner.json` if
-  it lists mcp servers, or ask the operator to run `iclaw groups
+  it lists mcp servers, or ask the operator to run `cclaw groups
   config get <id>`.
 
 ### Behavior
@@ -63,7 +63,7 @@ Use `ask_user_question` if the channel renders buttons; plain
 
    ```
    $EDITOR <data_dir>/groups/<folder>/CLAUDE.md
-   iclaw groups restart <agent_group_id>
+   cclaw groups restart <agent_group_id>
    ```
 
    Do **not** `write_file` blindly into `/data/group/...` — behavior
@@ -72,8 +72,8 @@ Use `ask_user_question` if the channel renders buttons; plain
 ### Budgets
 
 ```
-iclaw budgets list
-iclaw budgets set --agent-group-id <id> --daily-tokens <N>
+cclaw budgets list
+cclaw budgets set --agent-group-id <id> --daily-tokens <N>
 ```
 
 `--daily-tokens 0` or `--clear` removes the cap.
@@ -83,10 +83,10 @@ iclaw budgets set --agent-group-id <id> --daily-tokens <N>
 After any change, the container must restart:
 
 ```
-iclaw groups restart <agent_group_id>
+cclaw groups restart <agent_group_id>
 ```
 
-Or `ironclaw stop && ironclaw start` for a full host bounce.
+Or `copperclaw stop && copperclaw start` for a full host bounce.
 
 ## Triggers
 
@@ -98,7 +98,7 @@ Or `ironclaw stop && ironclaw start` for a full host bounce.
 
 ## Do NOT
 
-- `shell iclaw` — binary isn't in the container.
+- `shell cclaw` — binary isn't in the container.
 - `write_file` outside `/data` — rest of the FS is the image; changes
   won't persist.
 - Propose a model name without confirming the provider supports it

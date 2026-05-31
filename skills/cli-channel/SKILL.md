@@ -31,9 +31,9 @@ config = { label = "agent> " }
 ```
 
 2. Create a messaging group with `channel_type = "cli"` and
-   `platform_id = "stdin"` via `iclaw messaging-groups create`.
+   `platform_id = "stdin"` via `cclaw messaging-groups create`.
 3. Create a wiring from that messaging group to an agent group via
-   `iclaw wirings create --mg <mg> --ag <ag> --engage pattern --pattern '.*'`.
+   `cclaw wirings create --mg <mg> --ag <ag> --engage pattern --pattern '.*'`.
 
 After boot, every line you type on stdin reaches the wired agent.
 
@@ -107,8 +107,8 @@ This avoids tying tests to the process's real stdin/stdout.
 ## Example session
 
 ```text
-$ ironclaw run --config local.toml
-ironclaw boot complete; idling
+$ copperclaw run --config local.toml
+copperclaw boot complete; idling
 hello there
 agent> Hi! How can I help?
 schedule a daily standup at 9am

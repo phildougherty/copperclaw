@@ -2,7 +2,7 @@
 --
 -- Single agent group "Replay" wired to a single slack messaging
 -- group keyed on channel id "C1" (the same channel id used in
--- ironclaw-channels-slack's events router unit tests). Engage mode
+-- copperclaw-channels-slack's events router unit tests). Engage mode
 -- `pattern` with `.*` so every inbound matches; session mode `shared`.
 INSERT INTO agent_groups (id, name, folder, agent_provider, created_at) VALUES
   ('00000000-0000-0000-0000-000000000001', 'Replay', 'replay', 'anthropic', '2026-01-01T00:00:00Z');

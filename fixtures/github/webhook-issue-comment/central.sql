@@ -2,7 +2,7 @@
 --
 -- Single agent group "Replay" wired to a single github messaging
 -- group keyed on the platform_id "octocat/hello#7" (issue number 7 in
--- the octocat/hello repo, matching the shape ironclaw-channels-github
+-- the octocat/hello repo, matching the shape copperclaw-channels-github
 -- emits for `issue_comment.created`). Engage mode `pattern` with `.*`
 -- so every inbound matches; session mode `shared`.
 INSERT INTO agent_groups (id, name, folder, agent_provider, created_at) VALUES

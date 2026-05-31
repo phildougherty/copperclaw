@@ -1,6 +1,6 @@
 # Webhooks TLS termination
 
-Ironclaw webhook channels receive inbound events over HTTP. This document
+Copperclaw webhook channels receive inbound events over HTTP. This document
 explains why the host binds plain HTTP by default and how to add TLS in
 production.
 
@@ -13,7 +13,7 @@ network until an operator explicitly exposes it. Routing TLS termination
 to a reverse proxy (rather than embedding rustls in every channel) keeps
 each channel's authentication surface small and auditable. A reverse proxy
 also lets you rotate certificates, adjust cipher suites, and add rate
-limiting without touching the ironclaw binary.
+limiting without touching the copperclaw binary.
 
 Native rustls is **not** supported in 0.1.0 by deliberate design. Adding
 TLS to every webhook channel would multiply the auth surface and introduce
@@ -26,7 +26,7 @@ is the recommended and supported path.
 
 Caddy obtains and renews certificates automatically via ACME. The
 `Caddyfile` snippet below terminates TLS on port 443 and forwards to the
-ironclaw telegram webhook listener on port 8081.
+copperclaw telegram webhook listener on port 8081.
 
 ```
 # /etc/caddy/Caddyfile (or /home/<user>/.config/caddy/Caddyfile)
@@ -51,7 +51,7 @@ Register each webhook URL with the upstream service using the HTTPS form:
 ### Pattern 2 — nginx reverse proxy
 
 ```nginx
-# /etc/nginx/sites-available/ironclaw
+# /etc/nginx/sites-available/copperclaw
 
 server {
     listen 443 ssl http2;
@@ -107,7 +107,7 @@ package), then create and configure a tunnel:
 ```bash
 # Authenticate and create the tunnel.
 cloudflared tunnel login
-cloudflared tunnel create ironclaw
+cloudflared tunnel create copperclaw
 
 # Write the ingress config.
 # Replace <TUNNEL-ID> with the UUID printed by the create command.
@@ -133,7 +133,7 @@ ingress:
 Run the tunnel (or install the systemd service):
 
 ```bash
-cloudflared tunnel run ironclaw
+cloudflared tunnel run copperclaw
 # or: cloudflared service install && systemctl start cloudflared
 ```
 
@@ -159,7 +159,7 @@ webhook channel exposes a `host` field in its per-channel config block:
 }
 ```
 
-Set `IRONCLAW_CHANNELS_CONFIG` to a JSON object containing this override,
+Set `COPPERCLAW_CHANNELS_CONFIG` to a JSON object containing this override,
 or write it directly to the channel's section if you use a structured
 config file. The `host` field accepts any IP address or `0.0.0.0`.
 **Only change this when the host is behind a network-level firewall or
@@ -177,7 +177,7 @@ scheme — and that it's enabled — before binding on `0.0.0.0`.
 
 ## Per-channel default ports and paths
 
-These are the constants in each `crates/ironclaw-channels/<name>/src/config.rs`
+These are the constants in each `crates/copperclaw-channels/<name>/src/config.rs`
 as of the current tree. **Note that telegram and slack default to
 `0.0.0.0`** (they're typically fronted by a public proxy); every other
 HTTP-listening channel defaults to `127.0.0.1` for a reverse-proxy
@@ -205,7 +205,7 @@ config should override (or accept) consciously.
 
 ## Summary
 
-1. Run ironclaw with channel listeners on `127.0.0.1` (the default).
+1. Run copperclaw with channel listeners on `127.0.0.1` (the default).
 2. Place a reverse proxy (Caddy, nginx, or Cloudflare Tunnel) in front.
 3. Register the HTTPS URL (`https://bot.example.com/channel/path`) with
    the upstream service.

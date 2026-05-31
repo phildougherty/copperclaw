@@ -34,7 +34,7 @@ user) and wrong for others:
    grandparent, or the user. The current `inherit messaging_group_id`
    silently picks "the user."
 4. **Channel-bound wiring is sticky.** If the parent later changes
-   channels (e.g. via `iclaw groups change-channel`) the child
+   channels (e.g. via `cclaw groups change-channel`) the child
    sessions still point at the old MG until they're recreated.
 
 ## What the proper model should provide
@@ -63,10 +63,10 @@ shape for depth-tracking (we already have `agent_groups.subagent_depth`
 but that's a flat number; chain walks are more useful for routing).
 
 Code touch points:
-- `crates/ironclaw-db/migrations/013_sessions_source_session.sql`
-- `crates/ironclaw-db/src/tables/sessions.rs` — `Session` struct,
+- `crates/copperclaw-db/migrations/013_sessions_source_session.sql`
+- `crates/copperclaw-db/src/tables/sessions.rs` — `Session` struct,
   `CreateSession`, all SELECTs/INSERTs.
-- `crates/ironclaw-modules/src/agent_to_agent.rs` — set
+- `crates/copperclaw-modules/src/agent_to_agent.rs` — set
   `source_session_id` when creating the child session (alongside the
   messaging-group inheritance we already do).
 
@@ -100,7 +100,7 @@ for free; messaging agents at depth 0 still talk to the user.
 
 ### Phase 4 — Surface the chain in observability
 
-`iclaw audit list` and `iclaw health` should expose the parent →
+`cclaw audit list` and `cclaw health` should expose the parent →
 child relationships so operators can see "Telegram session → agent
 spawned scout A → scout A spawned ScoutA.1" without joining tables
 by hand. Small CLI work; pure SELECT additions.
@@ -111,7 +111,7 @@ by hand. Small CLI work; pure SELECT additions.
   Stacking migrations is fine but each one should land with its
   consumer fully wired, not as plumbing-only.
 - Phase 2 changes the runner's send_message default behaviour. Needs
-  fixture coverage in `crates/ironclaw-host/tests/replay/` so we
+  fixture coverage in `crates/copperclaw-host/tests/replay/` so we
   don't regress existing single-agent flows.
 - Phase 3 touches every operator's existing agent prompts.
 

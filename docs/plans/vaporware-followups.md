@@ -13,18 +13,18 @@ decide before writing code.
 
 ## Small
 
-### `ironclaw fixture redact <dir>` subcommand
+### `copperclaw fixture redact <dir>` subcommand
 
 Doc claim now removed from `docs/replay-fixtures.md`, but the
-underlying library at `crates/ironclaw-host/src/fixture/redact.rs`
+underlying library at `crates/copperclaw-host/src/fixture/redact.rs`
 doesn't actually exist either. The doc previously promised both a
-capture pipeline (`IRONCLAW_FIXTURE_CAPTURE=<dir>`) and a CLI to
+capture pipeline (`COPPERCLAW_FIXTURE_CAPTURE=<dir>`) and a CLI to
 redact captured material; both are design-only.
 
-- **If we want it:** add a `crates/ironclaw-host/src/fixture/`
+- **If we want it:** add a `crates/copperclaw-host/src/fixture/`
   module with the redaction passes (bearer tokens, signing
-  secrets, personal text). Expose as `ironclaw fixture redact <dir>`
-  in `crates/ironclaw-host/src/bin/main.rs`. ~half-day including
+  secrets, personal text). Expose as `copperclaw fixture redact <dir>`
+  in `crates/copperclaw-host/src/bin/main.rs`. ~half-day including
   unit tests for each redaction rule.
 - **If we don't:** leave the doc as-is (current edit already
   describes the manual workaround) and remove the design-doc
@@ -56,16 +56,16 @@ endpoint for the reverse proxy.
 ### Setup wizard `channel` step for Slack / Discord
 
 Today only Telegram has an interactive pairing wizard in
-`crates/ironclaw-setup/src/steps/telegram.rs`. Slack and Discord
-land via post-setup `iclaw messaging-groups create` +
-`iclaw wirings create`.
+`crates/copperclaw-setup/src/steps/telegram.rs`. Slack and Discord
+land via post-setup `cclaw messaging-groups create` +
+`cclaw wirings create`.
 
 - **What it takes:** for Slack: prompt for bot token, validate via
   `auth.test`, prompt for the channel id (or default to the bot's
   most-recent channel), write `SLACK_BOT_TOKEN` + the messaging
   group / wiring. For Discord: same shape with gateway token +
   guild/channel id. New step files under
-  `crates/ironclaw-setup/src/steps/`; register in `step_list`.
+  `crates/copperclaw-setup/src/steps/`; register in `step_list`.
   ~day per channel.
 - **Load-bearing question:** does each platform's bot-creation
   flow lend itself to a 60-second wizard the way Telegram's does
@@ -74,16 +74,16 @@ land via post-setup `iclaw messaging-groups create` +
   the token, paste it" branch instead of trying to guide the user
   through the platform's UI.
 
-### `IRONCLAW.md` per-session briefing surface
+### `COPPERCLAW.md` per-session briefing surface
 
-The runner already reads `<session_root>/IRONCLAW.md` and
-`<groups_dir>/<id>/IRONCLAW.md` into the system prompt, but
+The runner already reads `<session_root>/COPPERCLAW.md` and
+`<groups_dir>/<id>/COPPERCLAW.md` into the system prompt, but
 there's no operator-facing way to create / edit either. Today
 operators write the file by hand.
 
-- **What it takes:** `iclaw groups briefing edit <id>` (TOML-style
+- **What it takes:** `cclaw groups briefing edit <id>` (TOML-style
   but plain markdown) opens `$EDITOR` on the per-group file;
-  `iclaw sessions briefing edit <id>` does the same for a single
+  `cclaw sessions briefing edit <id>` does the same for a single
   session. Skip the upload — it's just a file-write under the
   host's data root, which the host already owns.
 - **Load-bearing question:** scope. If this is "edit it like

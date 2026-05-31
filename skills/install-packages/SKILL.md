@@ -11,7 +11,7 @@ group's container config. The host applies the change directly to
 manager's fingerprint check detects the diff and rebuilds the image
 at the **next** spawn with your packages baked in.
 
-No approval gate today. Operators audit via `iclaw audit list`;
+No approval gate today. Operators audit via `cclaw audit list`;
 `container_configs` history is reconstructable from the audit log. If
 your policy needs preflight approval, file feedback — the gate is
 trivial to re-add.
@@ -60,7 +60,7 @@ For tools you reach for every conversation, use the rebuild path. For
 - Name validation matches apt/npm rules. Bad names surface at
   build-time as a rebuild failure — manager falls back to the
   last-known-good image and emits
-  `ironclaw_image_rebuild_failed_total`. The agent keeps running on
+  `copperclaw_image_rebuild_failed_total`. The agent keeps running on
   the stale image until the bad name is removed.
 - `reason` is for the audit log, not the model. Other agents reading
   history won't see it; do not encode load-bearing info there.
@@ -88,11 +88,11 @@ For tools you reach for every conversation, use the rebuild path. For
 - `add_mcp_server` wires an MCP server as a first-class tool. Many
   MCP servers are themselves npm/pipx packages — install the
   underlying package first, then configure the server. Or use the
-  preset library: `iclaw mcp list-presets`.
+  preset library: `cclaw mcp list-presets`.
 
 ## Failure modes
 
-- **Bad name** — counted as `ironclaw_image_rebuild_failed_total`.
+- **Bad name** — counted as `copperclaw_image_rebuild_failed_total`.
   Fingerprint not updated; rebuild retries on each spawn until the
   operator fixes the config.
 - **Disk-full at build** — same as above.

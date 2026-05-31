@@ -30,7 +30,7 @@ Before every spawn it compares the live fingerprint to the stored
 
 When does the fingerprint change?
 
-- **Operator-driven**: `iclaw groups config add-package --apt jq`,
+- **Operator-driven**: `cclaw groups config add-package --apt jq`,
   `... remove-package --npm typescript`, `... set-skills ...`,
   `... set-mcp-servers ...`.
 - **Agent-driven**: the agent calls the `install_packages` /
@@ -49,7 +49,7 @@ blip during `apt-get update`, etc.):
   the spawn falls back to that tag so the agent group is **not**
   blocked. The agent runs on the stale image; future tool changes
   will not take effect until the operator fixes the broken config.
-- The `ironclaw_image_rebuild_failed_total` counter increments.
+- The `copperclaw_image_rebuild_failed_total` counter increments.
   Watch this metric per the recommended alert in
   [docs/observability.md](observability.md).
 - If the group has **no** prior `image_tag` (first-ever build for a
@@ -72,7 +72,7 @@ listed targets. The Apple Container runtime returns
 network-policy surface the manager can use, so the operator must
 either:
 
-- clear the allow-list (`iclaw groups config set-egress-allow <id>`
+- clear the allow-list (`cclaw groups config set-egress-allow <id>`
   with no `--allow` flags), or
 - switch to the Docker runtime, or
 - accept that the unsupported case is the error: secure-by-default
@@ -81,12 +81,12 @@ either:
 ### Setting it
 
 ```
-iclaw groups config set-egress-allow <group-id> \
+cclaw groups config set-egress-allow <group-id> \
     --allow api.anthropic.com:443 \
     --allow openrouter.ai:443
 
 # Clear:
-iclaw groups config set-egress-allow <group-id>
+cclaw groups config set-egress-allow <group-id>
 ```
 
 A `set-egress-allow` mutation also lands in `audit_log` so the
@@ -116,18 +116,18 @@ is an empty object (no caps).
 ### Setting it
 
 ```
-iclaw groups config set-resource-limits <group-id> \
+cclaw groups config set-resource-limits <group-id> \
     --cpus 1.5 --memory-mb 512 --pids-limit 256
 
 # Clear one dimension by omitting its flag and re-setting the others.
 # To clear everything, omit all three flags:
-iclaw groups config set-resource-limits <group-id>
+cclaw groups config set-resource-limits <group-id>
 ```
 
 ### Malformed JSON tolerance
 
 If the `resource_limits` column ever contains invalid JSON (e.g. a
-hand-edited `ironclaw.db` row), the manager logs a warning at spawn
+hand-edited `copperclaw.db` row), the manager logs a warning at spawn
 time and **spawns without caps** rather than refusing. This is a
 deliberate weakening of secure-by-default for this specific field:
 the alternative (refuse to spawn) blocks the whole group on a
@@ -139,14 +139,14 @@ to fix it.
 Read the current container config row as JSON:
 
 ```
-iclaw groups config get <agent-group-id>
+cclaw groups config get <agent-group-id>
 ```
 
 (Raw SQL fallback for forensic / read-only-disk situations:
-`sqlite3 /srv/ironclaw/data/ironclaw.db "SELECT * FROM container_configs WHERE agent_group_id = '<id>'"`.)
+`sqlite3 /srv/copperclaw/data/copperclaw.db "SELECT * FROM container_configs WHERE agent_group_id = '<id>'"`.)
 
 The audit log captures every mutation:
 
 ```
-iclaw audit list --since 7d --limit 20
+cclaw audit list --since 7d --limit 20
 ```

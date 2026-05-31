@@ -22,7 +22,7 @@
 - deliver: COMPLETE for text via Elisp template eval. Files +
   system-actions are explicitly Unsupported (genuinely out of scope —
   file handling in Emacs is too platform/buffer-specific).
-  `crates/ironclaw-channels/emacs/src/adapter.rs:97`
+  `crates/copperclaw-channels/emacs/src/adapter.rs:97`
 - subscribe: trait-default Ok (poll loop hits the inbound queue sexp).
 - set_typing: trait-default Ok.
 - edit_message: system action → Unsupported.

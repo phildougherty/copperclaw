@@ -1,6 +1,6 @@
 # Release 0.1.0 checklist
 
-Use this checklist to drive an Ironclaw release. The numbers reset
+Use this checklist to drive an Copperclaw release. The numbers reset
 for each release; "0.1.0" below is illustrative.
 
 ---
@@ -24,7 +24,7 @@ for each release; "0.1.0" below is illustrative.
 
 ## 2. Schema and migrations
 
-- [ ] Every migration in `crates/ironclaw-db/migrations/` applies
+- [ ] Every migration in `crates/copperclaw-db/migrations/` applies
       cleanly against an empty DB.
 - [ ] No migration was reordered or rewritten — only **new** files
       were added. If you renamed one, that is a footgun: roll it back
@@ -40,7 +40,7 @@ for each release; "0.1.0" below is illustrative.
 ## 3. Channel surface
 
 - [ ] Every channel registered in
-      `crates/ironclaw-host/src/channels_init.rs::build_registry`
+      `crates/copperclaw-host/src/channels_init.rs::build_registry`
       has a `register()` function exported from its crate root.
 - [ ] `build_registry_has_every_in_tree_channel` passes.
 - [ ] Each channel crate's README-equivalent docs (in `lib.rs`'s
@@ -58,7 +58,7 @@ for each release; "0.1.0" below is illustrative.
 - [ ] `PLAN.md` Progress section ticked accurately. Each tick
       references the artifact that landed it.
 - [ ] `docs/adding-a-channel.md` is up to date with the actual
-      trait surface in `crates/ironclaw-channels/core/`.
+      trait surface in `crates/copperclaw-channels/core/`.
 - [ ] `docs/cutover.md` reflects the actual binary names and CLI
       flags.
 - [ ] `docs/replay-fixtures.md` describes the harness that exists
@@ -77,13 +77,13 @@ for each release; "0.1.0" below is illustrative.
 ## 6. Binary artifacts
 
 - [ ] `cargo build --release --workspace` produces:
-      - `target/release/ironclaw` (host)
-      - `target/release/iclaw` (admin client)
-      - `target/release/ironclaw-setup` (setup helper)
+      - `target/release/copperclaw` (host)
+      - `target/release/cclaw` (admin client)
+      - `target/release/copperclaw-setup` (setup helper)
 - [ ] Binaries `--version` strings include the release version.
-- [ ] `iclaw schema-version` reports `ok` against a fresh empty data
-      directory after `ironclaw migrate`.
-- [ ] `iclaw groups list` against a host with one group returns one
+- [ ] `cclaw schema-version` reports `ok` against a fresh empty data
+      directory after `copperclaw migrate`.
+- [ ] `cclaw groups list` against a host with one group returns one
       row.
 
 ## 7. Tag and publish
@@ -110,7 +110,7 @@ for each release; "0.1.0" below is illustrative.
 ## [0.1.0] - 2026-MM-DD
 
 ### Added
-- Initial Ironclaw release. ...
+- Initial Copperclaw release. ...
 
 ### Changed
 - ...

@@ -9,6 +9,6 @@ chat outbound.
 The wiremock plan lists three `kind=timeout` responses (one per
 attempt). Each `delay_ms` exceeds the harness-side deadline so every
 attempt trips. In production the deadline is sourced from
-`IRONCLAW_RUNNER_PROVIDER_DEADLINE_MS` (default 60s, range 30-300s);
+`COPPERCLAW_RUNNER_PROVIDER_DEADLINE_MS` (default 60s, range 30-300s);
 the replay harness sets a much smaller value so the fixture finishes
 in well under a second.

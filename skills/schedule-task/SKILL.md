@@ -37,7 +37,7 @@ Six tools cover the lifecycle:
 - Friendly relative forms (`"in 5m"`, `"daily at 09:00"`) are accepted
   by the host's natural-language layer and normalised before the row
   is written; they are not part of the JSON schema you call directly
-  with, but iclaw admins can use them.
+  with, but cclaw admins can use them.
 
 If both `when` and `recurrence` are supplied, `when` is the first
 fire time and `recurrence` controls everything after that.

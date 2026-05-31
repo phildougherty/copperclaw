@@ -1,19 +1,19 @@
 # Adding a channel
 
 This guide is for contributors writing a new channel adapter for
-ironclaw. It walks through the contract surface, the crate layout, the
+copperclaw. It walks through the contract surface, the crate layout, the
 inbound and outbound mapping you must get right, the error variants,
 configuration, container contributions, testing, and host wiring.
 
 The reference implementations to read alongside this guide are:
 
-- `crates/ironclaw-channels/cli/` — the smallest possible adapter,
+- `crates/copperclaw-channels/cli/` — the smallest possible adapter,
   shipped as the in-tree default.
-- `crates/ironclaw-channels/telegram/` — HTTP long-poll plus webhook,
+- `crates/copperclaw-channels/telegram/` — HTTP long-poll plus webhook,
   REST sends, `reqwest` + `axum` + `wiremock`.
-- `crates/ironclaw-channels/slack/` — events API plus Web API, signed
+- `crates/copperclaw-channels/slack/` — events API plus Web API, signed
   request verification, structured-message rendering.
-- `crates/ironclaw-channels/discord/` — gateway websocket via
+- `crates/copperclaw-channels/discord/` — gateway websocket via
   `tokio-tungstenite`, REST sends.
 
 By the time you are done, the new crate will compile, pass its own
@@ -21,7 +21,7 @@ tests, and the host will start it on boot via `boot::run_host`.
 
 ## 1. The contract
 
-Two traits in `ironclaw-channels-core` define everything a channel must
+Two traits in `copperclaw-channels-core` define everything a channel must
 implement.
 
 ### `ChannelAdapter`
@@ -104,22 +104,22 @@ adapter the factory returns.
 ## 2. Crate layout
 
 Every channel crate follows the same shape. Create a new directory at
-`crates/ironclaw-channels/<name>/` and add it to the workspace
+`crates/copperclaw-channels/<name>/` and add it to the workspace
 `Cargo.toml`.
 
 ### `Cargo.toml`
 
 ```toml
 [package]
-name = "ironclaw-channels-<name>"
+name = "copperclaw-channels-<name>"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-ironclaw-types = { workspace = true }
-ironclaw-channels-core = { workspace = true }
+copperclaw-types = { workspace = true }
+copperclaw-channels-core = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
@@ -182,7 +182,7 @@ any HTTP dependencies.
 
 When a platform sends you an event, you build an `InboundEvent` and
 push it to the mpsc sender the host gave you in `ChannelSetup`. The
-struct is in `ironclaw-types::message`:
+struct is in `copperclaw-types::message`:
 
 ```rust
 pub struct InboundEvent {
@@ -215,7 +215,7 @@ pub struct InboundMessage {
   otherwise `None`. Slack supplies `thread_ts`; Discord supplies the
   thread's snowflake; Telegram has topic ids; most others have `None`.
 - `message.id` — the platform's message id, **as a string**. Different
-  type from `ironclaw_types::MessageId`. Used by the host for
+  type from `copperclaw_types::MessageId`. Used by the host for
   idempotency keys.
 - `message.kind` — usually `MessageKind::Chat`. Webhook adapters set
   `MessageKind::Webhook`. System / Task / Agent are reserved for
@@ -479,20 +479,20 @@ The host's `boot::run_host` calls `channels_init::build_registry` to
 construct a `ChannelRegistry`. Add your factory there:
 
 ```rust
-// crates/ironclaw-host/src/channels_init.rs
+// crates/copperclaw-host/src/channels_init.rs
 pub fn build_registry() -> ChannelRegistry {
     let mut reg = ChannelRegistry::new();
-    if let Err(err) = ironclaw_channels_cli::register(&mut reg) {
+    if let Err(err) = copperclaw_channels_cli::register(&mut reg) {
         tracing::warn!(?err, "failed to register cli factory");
     }
-    if let Err(err) = ironclaw_channels_<name>::register(&mut reg) {
+    if let Err(err) = copperclaw_channels_<name>::register(&mut reg) {
         tracing::warn!(?err, "failed to register <name> factory");
     }
     reg
 }
 ```
 
-…and add the new crate as a dependency in `ironclaw-host/Cargo.toml`.
+…and add the new crate as a dependency in `copperclaw-host/Cargo.toml`.
 Boot is intentionally non-fatal on duplicate registrations: if you
 launch a host with two crates registering the same `ChannelType`,
 the host logs and skips rather than crashing.
@@ -506,18 +506,18 @@ channel_type = "<name>"
 config = { token = "...", base_url = "..." }
 ```
 
-…and via `iclaw messaging-groups create --channel-type <name>
+…and via `cclaw messaging-groups create --channel-type <name>
 --platform-id <id> --name "Some chat"` plus
-`iclaw wirings create --mg <mg> --ag <ag> --engage <mode> [--pattern <re>]`.
+`cclaw wirings create --mg <mg> --ag <ag> --engage <mode> [--pattern <re>]`.
 
 ## 10. Checklist
 
 Before opening a PR, walk through this list:
 
-- `cargo build -p ironclaw-channels-<name>` passes.
-- `cargo clippy -p ironclaw-channels-<name> --all-targets -- -D warnings`
+- `cargo build -p copperclaw-channels-<name>` passes.
+- `cargo clippy -p copperclaw-channels-<name> --all-targets -- -D warnings`
   is clean.
-- `cargo test -p ironclaw-channels-<name>` covers every variant of
+- `cargo test -p copperclaw-channels-<name>` covers every variant of
   `AdapterError` your code emits.
 - `Config::from_value` rejects unknown fields and bad types with
   `AdapterError::BadRequest` and a clear message.

@@ -1,8 +1,8 @@
 # Cutover guide
 
 This guide walks an operator through replacing a running predecessor
-installation with the Ironclaw Rust host. The two systems are
-intentionally schema-compatible: Ironclaw reads the same `ironclaw.db`
+installation with the Copperclaw Rust host. The two systems are
+intentionally schema-compatible: Copperclaw reads the same `copperclaw.db`
 central schema, the same per-session `inbound.db` / `outbound.db`
 layout, and the same `data/sessions/<agent-group>/<session>/`
 folder structure as the predecessor.
@@ -16,15 +16,15 @@ sure nothing is mid-flight when you flip the switch.
 
 Before you begin:
 
-- **Pin a version.** Build or download the exact `ironclaw` binary
-  you intend to deploy. Verify `ironclaw version` reports a version
+- **Pin a version.** Build or download the exact `copperclaw` binary
+  you intend to deploy. Verify `copperclaw version` reports a version
   you have changelog notes for.
 - **Read `docs/adding-a-channel.md`** if you operate a channel that
   is not yet covered. Cutover does not regress channel coverage —
   any platform you used in the predecessor must have an in-tree
   channel crate before you cut over.
 - **Confirm container runtime.** Run `docker info` (Linux) or
-  `container --help` (macOS). Ironclaw will not start if its
+  `container --help` (macOS). Copperclaw will not start if its
   configured runtime is unreachable.
 - **Capture a known-good baseline.** Tail the predecessor's logs and
   the host metrics dashboard. Record the in-flight session count,
@@ -49,12 +49,12 @@ in-flight.
    trend to zero. Sessions in `running` should finish their current
    turn; sessions in `idle` should stay idle.
 3. **Snapshot.** With the predecessor stopped, copy the entire data
-   directory to a known-good location. The minimum is `data/ironclaw.db`
+   directory to a known-good location. The minimum is `data/copperclaw.db`
    plus `data/sessions/`, but copying the whole tree (logs
    included) preserves diagnostic state.
 
    ```
-   cp -a /var/lib/ironclaw-old /var/lib/ironclaw-old.snapshot.$(date +%Y%m%dT%H%M%S)
+   cp -a /var/lib/copperclaw-old /var/lib/copperclaw-old.snapshot.$(date +%Y%m%dT%H%M%S)
    ```
 
    The snapshot is your rollback target.
@@ -65,15 +65,15 @@ Run the data-directory migrator. This is idempotent — running it
 twice on the same destination is safe.
 
 ```
-ironclaw-setup --migrate-from /var/lib/ironclaw-old \
-               --data-dir /var/lib/ironclaw
+copperclaw-setup --migrate-from /var/lib/copperclaw-old \
+               --data-dir /var/lib/copperclaw
 ```
 
 The migrator:
 
-- Copies `<source>/data/ironclaw.db` to `<dest>/data/ironclaw.db`.
+- Copies `<source>/data/copperclaw.db` to `<dest>/data/copperclaw.db`.
 - Calls `CentralDb::open`, which runs every central migration in
-  `crates/ironclaw-db/migrations/` against the copy. Migrations are
+  `crates/copperclaw-db/migrations/` against the copy. Migrations are
   recorded in `schema_migrations`; re-running is a no-op.
 - Does NOT touch per-session DBs. If you want session history
   preserved, separately `rsync -a <source>/data/sessions/
@@ -83,7 +83,7 @@ The migrator:
 
 If the migrator reports `copied_db: false` and you expected a copy,
 re-check the `--migrate-from` path — it should point at the
-predecessor's **data root**, the directory that contains `data/ironclaw.db`.
+predecessor's **data root**, the directory that contains `data/copperclaw.db`.
 
 ## 4. Verify
 
@@ -91,18 +91,18 @@ Do not start the channel ingress yet. Run a read-only verification
 pass first.
 
 ```
-# Sanity: schema is at the expected version (any pending → run `ironclaw migrate`).
-iclaw schema-version
+# Sanity: schema is at the expected version (any pending → run `copperclaw migrate`).
+cclaw schema-version
 
 # Apply pending migrations (idempotent — no-op when already current).
-ironclaw migrate
+copperclaw migrate
 
-# Schema introspection via iclaw on an idle host.
-ironclaw start
-iclaw groups list
-iclaw sessions list --status active
-iclaw approvals list
-ironclaw stop
+# Schema introspection via cclaw on an idle host.
+copperclaw start
+cclaw groups list
+cclaw sessions list --status active
+cclaw approvals list
+copperclaw stop
 ```
 
 What you are looking for:
@@ -147,7 +147,7 @@ Things to monitor for an hour after cutover:
   past the sweep interval means delivery is broken for that
   channel.
 - **Approvals.** Any pre-existing `pending_*_approvals` rows should
-  still be addressable via `iclaw approvals get <id>`.
+  still be addressable via `cclaw approvals get <id>`.
 - **Container restarts.** If the host kills a container as "stuck"
   in the first 10 minutes, that is the heartbeat / processing-ack
   check working as intended, but a sustained restart loop indicates
@@ -157,9 +157,9 @@ Things to monitor for an hour after cutover:
 
 Rollback is a swap back, never a transform:
 
-1. Stop the new host (`systemctl stop ironclaw`).
+1. Stop the new host (`systemctl stop copperclaw`).
 2. Disable channel ingress again at the platform side.
-3. Replace `/var/lib/ironclaw` with the snapshot from step 2.
+3. Replace `/var/lib/copperclaw` with the snapshot from step 2.
 4. Start the predecessor.
 5. Re-enable channel ingress.
 
@@ -179,7 +179,7 @@ back live SQL is a known footgun. Snapshot, swap, move on.
   your responsibility for any session that was open at quiesce
   time. Easiest fix: stop the predecessor cleanly so WAL files are
   checkpointed and removed before snapshot.
-- **Skill content paths.** The predecessor and Ironclaw both expect
+- **Skill content paths.** The predecessor and Copperclaw both expect
   skill content under `skills/`. If you ran the predecessor with a
   custom path, re-symlink before the new host's first boot — the
   skill discovery runs at agent-startup and an empty skill set
@@ -188,8 +188,8 @@ back live SQL is a known footgun. Snapshot, swap, move on.
   directory (`~/.config/onecli/`). Cutover preserves them. If you
   rotate them, rotate via `onecli login` after the cutover, not
   during.
-- **systemd unit naming.** The generated unit is `ironclaw.service`.
-  If the predecessor's unit was also named `ironclaw.service`,
+- **systemd unit naming.** The generated unit is `copperclaw.service`.
+  If the predecessor's unit was also named `copperclaw.service`,
   disable and remove the old one before `daemon-reload` to avoid a
   startup race.
 - **Time skew.** The sweep loop uses wall-clock `Utc::now()` to

@@ -1,0 +1,27 @@
+[package]
+name = "copperclaw-host-router"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+copperclaw-types   = { workspace = true }
+copperclaw-db      = { workspace = true }
+copperclaw-modules = { workspace = true }
+copperclaw-metrics = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+dashmap = { workspace = true }
+uuid = { workspace = true }
+rusqlite = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

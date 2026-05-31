@@ -20,7 +20,7 @@
 
 ## Implemented
 - deliver: COMPLETE — text + files, plus action-shape edit / reaction /
-  delete. `crates/ironclaw-channels/signal/src/adapter.rs:296`
+  delete. `crates/copperclaw-channels/signal/src/adapter.rs:296`
 - subscribe: trait-default Ok (signal-cli daemon streams everything).
 - set_typing: send_typing(stop=false).
 - edit_message: action="edit" — send_edit.

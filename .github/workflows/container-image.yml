@@ -1,7 +1,7 @@
 name: container-image
 
-# Build and publish the ironclaw session base image to GHCR so first-run
-# `ironclaw-setup` can `docker pull` it instead of paying a 1-2 minute
+# Build and publish the copperclaw session base image to GHCR so first-run
+# `copperclaw-setup` can `docker pull` it instead of paying a 1-2 minute
 # `docker build` cold-start.
 #
 # Triggers:
@@ -11,7 +11,7 @@ name: container-image
 #
 # TODO(team-c): once the per-session fingerprint becomes decoupled from
 # the runner binary, this workflow should also stamp the image with the
-# spec fingerprint so `ironclaw-setup` can confirm a pulled image
+# spec fingerprint so `copperclaw-setup` can confirm a pulled image
 # matches the locally-expected build inputs before tagging it.
 
 on:
@@ -93,8 +93,8 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: |
             ${{ steps.meta.outputs.labels }}
-            ironclaw.fingerprint=${{ steps.fingerprint.outputs.value }}
+            copperclaw.fingerprint=${{ steps.fingerprint.outputs.value }}
           build-args: |
-            IRONCLAW_FINGERPRINT=${{ steps.fingerprint.outputs.value }}
+            COPPERCLAW_FINGERPRINT=${{ steps.fingerprint.outputs.value }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

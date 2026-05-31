@@ -5,13 +5,13 @@ description: Distinguish retryable from non-retryable errors in tool calls and d
 
 # error-handling
 
-Errors in ironclaw are layered. A tool call can fail at validation;
+Errors in copperclaw are layered. A tool call can fail at validation;
 delivery can fail at the channel adapter. Either layer's failure is
 either *retryable* (transient) or *non-retryable* (request is broken).
 
 ## Tool-level errors
 
-`ToolError` (in `ironclaw-mcp::error`):
+`ToolError` (in `copperclaw-mcp::error`):
 
 - `Validation(String)` — arguments are wrong. **Not retryable.**
   Examples: empty `text`, non-positive `message_id`, malformed base64,
@@ -29,7 +29,7 @@ true` and a message. Read it, adjust, do not re-issue verbatim.
 After the MCP layer succeeds, the row sits in `outbound.db` until the
 host's delivery loop picks it up. The delivery loop is your safety net.
 
-`AdapterError` (in `ironclaw-channels-core::error`):
+`AdapterError` (in `copperclaw-channels-core::error`):
 
 - `Io(std::io::Error)` — transport I/O. **Retryable.**
 - `Transport(String)` — non-IO transport (HTTP 5xx, ws close).
@@ -71,7 +71,7 @@ For tool-result `is_error = true`:
   a polite "I hit an internal error" message; do not silently loop.
 
 Delivery failures are mostly invisible to the agent. The host records
-`delivered.status` rows; admins inspect via `iclaw dropped-messages
+`delivered.status` rows; admins inspect via `cclaw dropped-messages
 list`. If a critical send is gating your workflow (e.g. an
 `ask_user_question`), schedule a follow-up with `schedule_task`.
 

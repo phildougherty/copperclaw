@@ -23,7 +23,7 @@
   chat targets; channel-target files supported via Graph
   filesFolder + drive upload + attachment-by-reference; chat-target files
   remain Unsupported (delegated-auth limit).
-  `crates/ironclaw-channels/teams/src/adapter.rs:334` (top-level deliver);
+  `crates/copperclaw-channels/teams/src/adapter.rs:334` (top-level deliver);
   `adapter.rs:106` (deliver_chat — the channel/chat split helper).
 - subscribe: trait-default Ok (Graph subscription managed externally).
 - set_typing: trait-default Ok (Graph has no typing indicator on

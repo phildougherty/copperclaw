@@ -84,7 +84,7 @@ Find all migration files under a specific crate:
 ```json
 {
   "pattern": "**/*.sql",
-  "path": "crates/ironclaw-db/migrations"
+  "path": "crates/copperclaw-db/migrations"
 }
 ```
 

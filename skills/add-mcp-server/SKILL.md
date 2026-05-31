@@ -12,7 +12,7 @@ container manager's fingerprint check detects the change and rebuilds
 the image at the next spawn.
 
 For curated presets (Postgres, GitHub, Linear, Notion, Filesystem,
-Browserbase, …), the operator runs `iclaw mcp add <preset>`; the result
+Browserbase, …), the operator runs `cclaw mcp add <preset>`; the result
 is identical. Use this tool when you need a server outside the preset
 library or with custom transport.
 
@@ -86,10 +86,10 @@ can call the new tools directly.
 
 - **Refresh credentials.** Same `name` + new env; merge replaces.
 - **Remove a server.** Not exposed as a tool. Operator runs
-  `iclaw groups config remove-mcp-server --agent-group-id <id>
+  `cclaw groups config remove-mcp-server --agent-group-id <id>
   --name <name>`; fingerprint change forces a rebuild that drops it.
-- **Preset shortcut.** `iclaw mcp add <preset>` writes the same
-  shape. `iclaw mcp list-presets` for the catalog.
+- **Preset shortcut.** `cclaw mcp add <preset>` writes the same
+  shape. `cclaw mcp list-presets` for the catalog.
 
 ## Example
 
@@ -109,7 +109,7 @@ can call the new tools directly.
 ## Result
 
 Returns an `Accepted` ack. Re-attempt the operation that needed it
-after the next container boot. `iclaw groups config get <ag>` renders
+after the next container boot. `cclaw groups config get <ag>` renders
 the merged container config (including the `mcp_servers` map) so the
 operator can confirm the merge.
 
@@ -118,5 +118,5 @@ operator can confirm the merge.
 - **Blank name.** Apply step drops the call as a no-op (no rebuild).
 - **Image rebuild fails.** Same as `install_packages`: manager falls
   back to last-known-good, increments
-  `ironclaw_image_rebuild_failed_total`, retries on next spawn until
+  `copperclaw_image_rebuild_failed_total`, retries on next spawn until
   the operator fixes the config.

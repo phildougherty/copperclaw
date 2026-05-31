@@ -8,8 +8,8 @@ description: Inventory the MCP tools available to this agent, introspect their s
 The agent's tool list is the union of:
 
 - The built-in tools served by the in-process MCP server
-  (`ironclaw-mcp`). The registry is built in
-  `crates/ironclaw-mcp/src/tools/mod.rs::build_tool_set` — that's
+  (`copperclaw-mcp`). The registry is built in
+  `crates/copperclaw-mcp/src/tools/mod.rs::build_tool_set` — that's
   the canonical inventory. Always-on, no admin step.
 - External MCP servers configured via `container_configs.mcp_servers`
   (which an admin or the agent itself registered through
@@ -71,7 +71,7 @@ spawn a test runner to see the live `tools/list` output.
 ## Reading a tool's schema
 
 Every built-in tool's schema is declared verbatim in
-`crates/ironclaw-mcp/src/tools/*.rs`. Standard shape:
+`crates/copperclaw-mcp/src/tools/*.rs`. Standard shape:
 `additionalProperties: false`, an explicit `required` list, and
 `minLength: 1` on string fields meaning "non-empty". External tool
 schemas come from the upstream MCP server; treat as advisory.

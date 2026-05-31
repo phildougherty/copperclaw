@@ -20,7 +20,7 @@
 
 ## Implemented
 - deliver: COMPLETE — POST /channels/:id/messages, multipart when files
-  are present. `crates/ironclaw-channels/discord/src/adapter.rs:337`
+  are present. `crates/copperclaw-channels/discord/src/adapter.rs:337`
 - subscribe: trait-default Ok (gateway streams everything).
 - set_typing: POST /channels/:id/typing.
 - edit_message: PATCH /channels/:cid/messages/:mid.

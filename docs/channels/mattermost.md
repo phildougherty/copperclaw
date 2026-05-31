@@ -20,7 +20,7 @@
 
 ## Implemented
 - deliver: COMPLETE for text + files + edit + reaction.
-  `crates/ironclaw-channels/mattermost/src/adapter.rs:106`
+  `crates/copperclaw-channels/mattermost/src/adapter.rs:106`
 - subscribe: trait-default Ok (router handles all incoming webhooks).
 - set_typing: trait-default Ok.
 - edit_message: action="edit" → update_post.

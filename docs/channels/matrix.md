@@ -20,7 +20,7 @@
 
 ## Implemented
 - deliver: COMPLETE — text, html, files (upload + media event), plus
-  system-action shape for edit / reaction. `crates/ironclaw-channels/matrix/src/adapter.rs:174`
+  system-action shape for edit / reaction. `crates/copperclaw-channels/matrix/src/adapter.rs:174`
 - subscribe: adds the room to the live /sync set; resolves room alias if needed.
 - set_typing: PUT /typing endpoint.
 - edit_message: routed via `content.action="edit"` in deliver (uses m.replace).

@@ -22,7 +22,7 @@
 - deliver: COMPLETE — text + reply (text-with-context) + files (upload
   + send-by-id, plus reply context) + action-reaction. Edit is
   Unsupported (WhatsApp Cloud API does not allow editing sent messages).
-  `crates/ironclaw-channels/whatsapp-cloud/src/adapter.rs:174`
+  `crates/copperclaw-channels/whatsapp-cloud/src/adapter.rs:174`
 - subscribe: trait-default Ok (webhook ingress).
 - set_typing: approximates typing by marking the user's last message
   as read when thread_id (containing the message_id) is supplied.

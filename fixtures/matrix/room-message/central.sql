@@ -2,7 +2,7 @@
 --
 -- Single agent group "Replay" wired to a single matrix messaging
 -- group keyed on room id "!a:m.org" (the same room id used in
--- ironclaw-channels-matrix's parse unit tests). Engage mode `pattern`
+-- copperclaw-channels-matrix's parse unit tests). Engage mode `pattern`
 -- with `.*` so every inbound matches; session mode `shared`.
 INSERT INTO agent_groups (id, name, folder, agent_provider, created_at) VALUES
   ('00000000-0000-0000-0000-000000000001', 'Replay', 'replay', 'anthropic', '2026-01-01T00:00:00Z');

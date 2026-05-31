@@ -20,7 +20,7 @@
 
 ## Implemented
 - deliver: returns `Unsupported("webhooks channel is inbound-only ...")`
-  by design. `crates/ironclaw-channels/webhooks/src/adapter.rs:88`
+  by design. `crates/copperclaw-channels/webhooks/src/adapter.rs:88`
 - subscribe: trait-default Ok (the axum server is already bound).
 - set_typing: trait-default Ok (no platform concept).
 - edit_message / add_reaction: trait-default Unsupported.

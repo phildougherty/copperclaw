@@ -20,7 +20,7 @@
 
 ## Implemented
 - deliver: COMPLETE — text via sendMessage, files via sendDocument
-  (first file picks up the caption). `crates/ironclaw-channels/telegram/src/adapter.rs:190`
+  (first file picks up the caption). `crates/copperclaw-channels/telegram/src/adapter.rs:190`
 - subscribe: validates bot token via getMe.
 - set_typing: sendChatAction(typing).
 - edit_message: editMessageText.

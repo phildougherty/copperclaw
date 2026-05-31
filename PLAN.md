@@ -1,4 +1,4 @@
-# Ironclaw — Implementation Plan
+# Copperclaw — Implementation Plan
 
 > **Audience.** This plan is written so that multiple agent teams can work
 > in parallel on independent crates without stepping on each other. Each
@@ -10,7 +10,7 @@
 
 ## Project tenets — "OpenBSD of claw agents"
 
-Ironclaw's defining posture is the OpenBSD playbook applied to agent
+Copperclaw's defining posture is the OpenBSD playbook applied to agent
 runtimes. Every operational decision in M13 onwards is judged against
 these invariants. They are not aspirations; a PR that violates one is
 not landing.
@@ -26,21 +26,21 @@ not landing.
    sender. The `.env` is `0o600`. The host writes tracing to
    stderr so log capture never contaminates the data path. Add
    capabilities, never default to them.
-3. **One process, single binary.** `ironclaw` is the host;
-   `ironclaw-runner` runs inside containers; `iclaw` is the admin
+3. **One process, single binary.** `copperclaw` is the host;
+   `copperclaw-runner` runs inside containers; `cclaw` is the admin
    client. No daemons-spawning-daemons. No optional foreground /
    background mode flags. Setup writes one `.env` and one
    service-unit and that's the deploy surface.
 4. **Documentation is a deliverable.** Every crate's `lib.rs`
    doc-string explains what the crate does, what its inputs are,
-   and what the error paths mean. Every command in `iclaw` has
+   and what the error paths mean. Every command in `cclaw` has
    `--help` text written for an operator, not a developer. The
    bar is OpenSSH's man pages, not "auto-generated from docstrings".
 5. **Conservative defaults.** Idle-stop timeout: minutes, not
    hours. Retry cap: 3, not infinity. Token / cost budget: opt-in
    capped, not unlimited. Rate limit: present even when low.
    Surprises always cost money.
-6. **Audit everything that mutates.** Every iclaw socket call
+6. **Audit everything that mutates.** Every cclaw socket call
    that writes — `groups.create`, `wirings.create`, etc. — lands
    in an `audit_log` table with caller, command, args, and
    result. Read paths excluded. The host can be forensically
@@ -89,17 +89,17 @@ Older M-section "totals" lines are historical snapshots and will drift —
 trust the table above.
 
 ### M0 — Workspace skeleton + T1 types (gate)
-- [x] Create `/home/phil/dev/ironclaw/` and `git init`
+- [x] Create `/home/phil/dev/copperclaw/` and `git init`
 - [x] Write workspace `Cargo.toml`, `rust-toolchain.toml`, `.gitignore`
 - [x] Scaffold all crate directories
 - [x] Write every crate's `Cargo.toml`
 - [x] Copy `LICENSE`
-- [x] Write `ironclaw-types` lib — modules `id`, `channel`, `message`, `routing`, `session`, `provider`, `approval`, `schedule`
-- [x] `cargo build -p ironclaw-types` passes
+- [x] Write `copperclaw-types` lib — modules `id`, `channel`, `message`, `routing`, `session`, `provider`, `approval`, `schedule`
+- [x] `cargo build -p copperclaw-types` passes
 - [x] Serde round-trip tests (15 unit tests, all passing)
 - [x] `cargo build --workspace` passes (all scaffolds compile)
 
-### M1 — T2 ironclaw-db (gate for everything else)
+### M1 — T2 copperclaw-db (gate for everything else)
 
 Infrastructure (done):
 - [x] `migrations/001_initial.sql` — consolidated central schema
@@ -110,7 +110,7 @@ Infrastructure (done):
 - [x] `SessionPaths` + `open_inbound` / `open_outbound` / `open_inbound_ro_no_mmap`
 - [x] Attachment safety helpers (`safe_attachment_name`, `extract_to_inbox`, `read_from_outbox`)
 - [x] Cross-mount visibility integration test (3 tests in `tests/cross_mount_visibility.rs`)
-- [x] `cargo test -p ironclaw-db` passes (57 tests)
+- [x] `cargo test -p copperclaw-db` passes (57 tests)
 
 Exemplar table modules (done — establishes the pattern for other teams):
 - [x] `tables/agent_groups.rs` — full CRUD with 9 tests
@@ -142,7 +142,7 @@ Per-session DB modules:
 - [x] `tables/session_state.rs` — 7 tests (get, set, delete, list)
 - [x] `tables/container_state.rs` — 9 tests (get, set, clear_tool — single-row table)
 
-M1 totals (this slice): 211 new table-module tests + 57 infrastructure tests = **272 passing tests in `ironclaw-db`**.
+M1 totals (this slice): 211 new table-module tests + 57 infrastructure tests = **272 passing tests in `copperclaw-db`**.
 Workspace totals: **290 passing tests** (272 db + 3 db integration + 15 types). Clippy clean on `--all-targets`.
 
 ### M2 — T4 container-rt, T8 skills, T11 onecli (parallel after M1)
@@ -165,28 +165,28 @@ Workspace totals: **290 passing tests** (272 db + 3 db integration + 15 types). 
 M2+M3 totals (this slice): 460 new tests across 9 crates; full workspace **~950 passing tests**. Clippy clean on `cargo clippy --workspace --all-targets -- -D warnings`.
 
 ### M4 — T3 host (integrates M2+M3)
-- [x] Host `main` boot sequence (signals, migrations, runtime check, orphan cleanup) — `ironclaw {run,migrate,version}`; graceful SIGINT/SIGTERM with 30s shutdown deadline
+- [x] Host `main` boot sequence (signals, migrations, runtime check, orphan cleanup) — `copperclaw {run,migrate,version}`; graceful SIGINT/SIGTERM with 30s shutdown deadline
 - [x] Router (hook chain, fan-out, session resolution) — 58 tests; session_mode policy: Shared / PerThread / AgentShared all implemented; 500ms debouncer + in-flight re-entry guard
 - [x] Delivery (active 1s, sweep 60s, re-entry guard, retries) — 71 tests; exponential backoff `5_000 * 2^(tries-1)` capped at `ABSOLUTE_CEILING_MS`; 3-attempt cap then marks failed
 - [x] Sweep (stuck detection, recurrence fanout, processing-ack reset) — 61 tests; injectable `Clock` for deterministic time; series_id correlation; emits `SweepReport` for the host's container manager
-- [x] `ironclaw run` boots successfully and idles cleanly — verified via `boot::tests::run_host_boots_with_noop_runtime_and_idles`; live runtime not exercised in this slice (no daemon available)
+- [x] `copperclaw run` boots successfully and idles cleanly — verified via `boot::tests::run_host_boots_with_noop_runtime_and_idles`; live runtime not exercised in this slice (no daemon available)
 
-### M5 — T9 iclaw
-- [x] Unix-socket server inside host — newline-delimited JSON at `data/iclaw.sock` mode `0o600`; cancellation token shutdown
-- [x] `iclaw` binary client — 87 tests; lib + bin; pluggable `CallTransport`
-- [x] All resource subcommands (see § A2) — 41 distinct command strings exported as `ironclaw_iclaw::ALL_COMMANDS`; every handler maps to `ironclaw-db` table fns
+### M5 — T9 cclaw
+- [x] Unix-socket server inside host — newline-delimited JSON at `data/cclaw.sock` mode `0o600`; cancellation token shutdown
+- [x] `cclaw` binary client — 87 tests; lib + bin; pluggable `CallTransport`
+- [x] All resource subcommands (see § A2) — 41 distinct command strings exported as `copperclaw_cclaw::ALL_COMMANDS`; every handler maps to `copperclaw-db` table fns
 - [x] CLI-scope enforcement for agent callers — `HOST_ONLY_COMMANDS` set; agents calling mutation cmds get `permission_denied`
 
-M4+M5 totals (this slice): 446 new tests across 5 crates (router 58 + delivery 71 + sweep 61 + iclaw 87 + host 169). Full workspace **1396 passing tests, 3 ignored, 0 failures**. Clippy clean on `cargo clippy --workspace --all-targets -- -D warnings`.
+M4+M5 totals (this slice): 446 new tests across 5 crates (router 58 + delivery 71 + sweep 61 + cclaw 87 + host 169). Full workspace **1396 passing tests, 3 ignored, 0 failures**. Clippy clean on `cargo clippy --workspace --all-targets -- -D warnings`.
 
 M6+M7+M9+M10 totals (this slice): 575 new tests across 6 deliverables (setup 175 + telegram 120 + slack 101 + discord 134 + providers +45 = 94 total + 17 skills authored). Full workspace **1971 passing tests, 3 ignored, 0 failures**. Clippy clean.
 
 ### M6 — T10 setup
 - [x] Interactive setup (`dialoguer`) — 13 step modules; `Prompt` trait with `Interactive` / `EnvBacked` / `Scripted` impls
 - [x] systemd unit / launchd plist generators — `units.rs` snapshot-tested
-- [x] Headless mode (env-var driven) — `IRONCLAW_SETUP_*` env-var surface
-- [x] Optional data-directory migrator — `--migrate-from <path>` copies `ironclaw.db` and re-runs migrations
-- 175 tests in `ironclaw-setup`. Stubs: image-build step requires live runtime (skipped without); CLI-agent step only checks PATH.
+- [x] Headless mode (env-var driven) — `COPPERCLAW_SETUP_*` env-var surface
+- [x] Optional data-directory migrator — `--migrate-from <path>` copies `copperclaw.db` and re-runs migrations
+- 175 tests in `copperclaw-setup`. Stubs: image-build step requires live runtime (skipped without); CLI-agent step only checks PATH.
 
 ### M7 — First three real channels (T6 parallel)
 - [x] T6 telegram (long-poll + webhook) — 162 tests; both ingress modes; multipart `sendDocument`; inbound `document` / `photo` (largest variant) / `audio` / `video` / `voice` / `video_note` / `sticker` downloaded via `getFile` + the file endpoint and written under `data_dir/inbox/<msg_id>/<filename>` (path + metadata in `content.attachment`); `attachment_download` (default `true`) toggles back to the metadata-only `MessageKind::System` fallback; `max_attachment_bytes` (default 20 MB — Bot API hard cap) demotes oversized files / `getFile` failures to `System` with `reason` + captured error
@@ -210,7 +210,7 @@ Batch 2 (REST/webhook + long-poll):
 Batch 3 (subprocess RPC + REST/poll):
 - [x] signal (signal-cli daemon, stdio JSON-RPC) — 144 tests, 3466 LOC; `RpcTransport` trait abstracts the subprocess (no test spawns `signal-cli`); `user:<e164>` + `group:<base64>` platform_id; JSON-RPC error codes -1 → Auth, -3 → Rate; safe-attachment-name validation; system actions: edit / reaction / delete supported
 - [x] deltachat (`deltachat-rpc-server` stdio JSON-RPC) — 165 tests; `RpcTransport` + `MockTransport` (no test spawns the server); `account/<id>/chat/<id>` platform_id; chat-type → `is_group` mapping; `edit` → `Unsupported`; outbound attachments written to `data_dir/outgoing/`; inbound attachments go through `download_full_msg` when `download_state != "Done"`, then the blob is `stat` + `open`-verified and the resolved on-disk path surfaced under `content.attachment.bytes_path` (with `size` / `mime`); `attachment_download` (default `true`), `blob_dir` (optional override for shared-blob deployments), and `max_attachment_bytes` (default 50 MiB) gate the behaviour, with oversized files / `download_full_msg` / `stat` / `open` failures demoted to `MessageKind::System` with `reason` + captured error; `add_account` called eagerly when configured `account_id = 0` and no accounts exist
-- [x] emacs (emacsclient subprocess) — 117 tests, 2336 LOC; `EmacsClient` trait abstracts the spawn (real `EmacsClientCli` only invoked when intentionally testing a missing-binary case); `${BUFFER_JSON}` / `${TEXT_JSON}` template substitution; defaults `(ironclaw-pop-inbound)` + `(ironclaw-deliver ${BUFFER_JSON} ${TEXT_JSON})`; files + `edit` + `reaction` → `Unsupported`; stderr matching `can't find socket` → `Auth`
+- [x] emacs (emacsclient subprocess) — 117 tests, 2336 LOC; `EmacsClient` trait abstracts the spawn (real `EmacsClientCli` only invoked when intentionally testing a missing-binary case); `${BUFFER_JSON}` / `${TEXT_JSON}` template substitution; defaults `(copperclaw-pop-inbound)` + `(copperclaw-deliver ${BUFFER_JSON} ${TEXT_JSON})`; files + `edit` + `reaction` → `Unsupported`; stderr matching `can't find socket` → `Auth`
 - [x] x (Twitter/X v2 DMs + v1.1 media upload + `/2/dm_events` polling) — 141 tests, 3224 LOC; `user:<id>` + `conversation:<id>` platform_id; since-id persisted to `data_dir/x_dm_since_id.txt`; 429 priority order `x-rate-limit-reset` → `Retry-After` → 60s fallback; media_category inferred from filename extension; `set_typing` no-op; `edit`/`reaction` → `Unsupported`
 
 - [x] All 15 registered in host `build_registry` — single test asserts every in-tree factory is present (cli + 3 M7 + 4 batch 1 + 4 batch 2 + 4 batch 3 + wechat + imessage + whatsapp = 19)
@@ -226,17 +226,17 @@ M8 totals (3 slices + tail): 2433 new tests across 15 channels (batch 1: 114 + 1
 - [x] codex provider (subprocess + JSON protocol) — thin wrapper over shared `SubprocessProvider`
 - [x] opencode provider (same shape, different binary) — `PushPolicy::Accept` by default
 - [x] ollama provider (Anthropic-compatible base URL) — built on `AnthropicProvider::with_base_url`, default model `llama3.1:8b`; no changes to `anthropic.rs`
-- 94 tests in `ironclaw-providers` (was 49). JSON-Lines bridge protocol documented for subprocess providers.
+- 94 tests in `copperclaw-providers` (was 49). JSON-Lines bridge protocol documented for subprocess providers.
 
 ### M10 — Skill content
-- [x] Author ironclaw-native skill content for each capability under `skills/` — 17 skills authored (send-message, send-file, edit-message, add-reaction, send-card, ask-user-question, schedule-task, install-packages, add-mcp-server, create-agent, messaging-context, destinations, approvals, typing-indicator, cli-channel, discovering-tools, error-handling)
+- [x] Author copperclaw-native skill content for each capability under `skills/` — 17 skills authored (send-message, send-file, edit-message, add-reaction, send-card, ask-user-question, schedule-task, install-packages, add-mcp-server, create-agent, messaging-context, destinations, approvals, typing-indicator, cli-channel, discovering-tools, error-handling)
 - [x] Document the "adding a channel" workflow — `docs/adding-a-channel.md` (500 lines): traits, crate layout, inbound/outbound mapping, error mapping, testing strategy, host wiring, PR checklist
 
 ### M11 — Differential testing + release
 - [x] Cutover docs — `docs/cutover.md` (preflight → quiesce → snapshot → migrate → verify → switch ingress → first-hour watch → rollback)
 - [x] Replay-fixture suite design — `docs/replay-fixtures.md` (fixture layout, harness internals, capture/redact workflow)
 - [x] Release-checklist + CI — `docs/release-checklist.md`; `.github/workflows/ci.yml` runs fmt + clippy + test on Linux/macOS with an 85% coverage gate; `CHANGELOG.md` seeded with the Keep-a-Changelog `[Unreleased]` section
-- [x] Replay-fixture harness implementation + first captured fixture (the M11 acceptance gate). In-process harness lives under `crates/ironclaw-host/tests/replay/` (`fixture.rs` + `diff.rs` + `harness.rs`); first fixture lives under `fixtures/cli/text-reply/`. Drives `Router::route` → in-process `run_loop` (with a wiremock-served Anthropic SSE stub) → `DeliveryService::process_session_once` → `MockAdapter::deliveries()`, then diffs the four captured JSONL streams (inbound-events / messages-in / messages-out / delivered) against `expected/*.jsonl` with manifest-driven regex substitutions for non-deterministic UUIDs and timestamps.
+- [x] Replay-fixture harness implementation + first captured fixture (the M11 acceptance gate). In-process harness lives under `crates/copperclaw-host/tests/replay/` (`fixture.rs` + `diff.rs` + `harness.rs`); first fixture lives under `fixtures/cli/text-reply/`. Drives `Router::route` → in-process `run_loop` (with a wiremock-served Anthropic SSE stub) → `DeliveryService::process_session_once` → `MockAdapter::deliveries()`, then diffs the four captured JSONL streams (inbound-events / messages-in / messages-out / delivered) against `expected/*.jsonl` with manifest-driven regex substitutions for non-deterministic UUIDs and timestamps.
 - [ ] Release 0.1.0 (cut the tag, bump `workspace.package.version`, publish release notes from CHANGELOG)
 
 ### M11 — Post-M10 hardening (this slice)
@@ -272,11 +272,11 @@ the cosmetic follow-ups it surfaced.
   so users can paste `https://openrouter.ai/api/v1` verbatim.
 - [x] **Setup writes a complete `.env`.** Auth step now persists
   `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`,
-  `IRONCLAW_DATA_DIR`, `ICLAW_SOCKET`, and the
-  `IRONCLAW_DEFAULT_IMAGE_TAG` from the image build step. Host
+  `COPPERCLAW_DATA_DIR`, `CCLAW_SOCKET`, and the
+  `COPPERCLAW_DEFAULT_IMAGE_TAG` from the image build step. Host
   auto-loads `.env` from the platform install root before falling
-  back to CWD-dotenv, so `ironclaw run` works from any cwd.
-- [x] **Container manager** — new `ironclaw_host::container_manager`
+  back to CWD-dotenv, so `copperclaw run` works from any cwd.
+- [x] **Container manager** — new `copperclaw_host::container_manager`
   module. Polls `sessions` every 1s; for any row with
   `container_status='stopped'` and `messages_in.count_due > 0`,
   writes a `runner.json` (mirrored `RunnerConfigFile` schema) into
@@ -284,9 +284,9 @@ the cosmetic follow-ups it surfaced.
   bind / labels / entrypoint. 6 unit tests + a `NoopRuntime`
   `spawn_calls()` introspection helper.
 - [x] **Image bakes the runner binary.** Setup's image step finds
-  `ironclaw-runner` next to its own exe (or via
-  `IRONCLAW_RUNNER_BIN` / `PATH`) and copies it into the image at
-  `/usr/local/bin/ironclaw-runner`. Image fingerprint includes
+  `copperclaw-runner` next to its own exe (or via
+  `COPPERCLAW_RUNNER_BIN` / `PATH`) and copies it into the image at
+  `/usr/local/bin/copperclaw-runner`. Image fingerprint includes
   the binary bytes, so re-cargo-build → re-image-build is
   automatic.
 - [x] **Router seeds `session_routing`.** On session create the
@@ -295,7 +295,7 @@ the cosmetic follow-ups it surfaced.
   Without this the delivery loop marked every outbound `NoRoute`
   because the runner emits text with no explicit destination.
 - [x] **`ApprovalsModule` pre-seeded with `cli:local`.** The cli
-  channel's only sender is the operator running `ironclaw run`,
+  channel's only sender is the operator running `copperclaw run`,
   not a remote identity that warrants approval. Boot now
   constructs `ApprovalsModule::with_initial_approved` with the
   `cli:local` identity baked in; everything else still flows
@@ -335,10 +335,10 @@ changes.
 
 Most of M13 shipped over an autonomous slice. The remaining
 items moved to the "Top 10 next" list at the end of M14.
-Container lifecycle, observability (audit log + `iclaw health`),
+Container lifecycle, observability (audit log + `cclaw health`),
 cost/safety (token accounting + per-group budgets), sender
 approval (persistent users-table-backed), and setup polish
-(OpenRouter shortcut, `iclaw chat` REPL) are all live.
+(OpenRouter shortcut, `cclaw chat` REPL) are all live.
 
 #### Container lifecycle
 
@@ -365,7 +365,7 @@ approval (persistent users-table-backed), and setup polish
 
 #### Observability
 
-- [x] **`iclaw health`**. New composite command. Sequential
+- [x] **`cclaw health`**. New composite command. Sequential
   round-trips to `sessions.list` (all + active filter) and
   `audit.list`; reports session count, breakdown by
   container_status (running/idle/stopped), and last 5 audit
@@ -378,16 +378,16 @@ approval (persistent users-table-backed), and setup polish
   `llm_call_seconds`, `llm_tokens_input`, `llm_tokens_output`,
   `container_spawn_seconds`. Optional bind, default off.
 - [ ] **Log rotation**. `chat.log` and `host.log` grow unbounded
-  when ironclaw is run as a long-lived daemon; setup's systemd /
+  when copperclaw is run as a long-lived daemon; setup's systemd /
   launchd units don't currently wire up logrotate or
   size-capping. Either document the recommended logrotate config
   or use `tracing-appender::rolling`.
-- [x] **Audit log of iclaw socket actions**. Migration
+- [x] **Audit log of cclaw socket actions**. Migration
   `004_audit_log.sql`, `tables::audit_log` module, dispatch
-  hook in `ironclaw-host::socket` writes one row per mutation
+  hook in `copperclaw-host::socket` writes one row per mutation
   with caller / command / args (truncated at 4KiB) / result /
   error_code / error_message / latency_ms. Read paths
-  excluded. New `iclaw audit list --since <window> --limit N`
+  excluded. New `cclaw audit list --since <window> --limit N`
   subcommand renders the table.
 
 #### Cost and safety
@@ -400,10 +400,10 @@ approval (persistent users-table-backed), and setup polish
   at end-of-turn. Host's delivery loop intercepts that action
   and writes a row into the new `agent_turns` table
   (migration `005_agent_turns.sql`). New
-  `iclaw usage --since <window>` rolls up per-group totals.
+  `cclaw usage --since <window>` rolls up per-group totals.
 - [x] **Per-group budgets**. New `group_budgets` table
   (`daily_token_cap`, `daily_cost_cap`; cost reserved) +
-  `iclaw budgets list` / `iclaw budgets set --agent-group-id <id>
+  `cclaw budgets list` / `cclaw budgets set --agent-group-id <id>
   --daily-tokens N`. Manager's `is_over_budget` check runs before
   every spawn, summing today's `agent_turns` (UTC midnight day
   boundary). Over-budget refusal is soft: the inbound row stays
@@ -417,8 +417,8 @@ approval (persistent users-table-backed), and setup polish
 
 #### Sender approval
 
-- [x] **`iclaw approvals approve`** + DB-backed gate. New
-  subcommand `iclaw approvals approve --channel <ct> --identity
+- [x] **`cclaw approvals approve`** + DB-backed gate. New
+  subcommand `cclaw approvals approve --channel <ct> --identity
   <id> --display-name <name?>` upserts the central `users` row.
   ApprovalsModule grows an optional `SenderLookup` closure the
   host wires to `users::get_by_identity` — the gate checks the
@@ -439,10 +439,10 @@ approval (persistent users-table-backed), and setup polish
   loop marks an outbound row `failed` and moves on. Need a
   `dropped_messages` flow (table already exists) so an operator
   can replay or inspect failures.
-- [ ] **Central DB backup / restore**. `iclaw db backup <path>`
-  + `iclaw db restore <path>`. The central DB is single-file
+- [ ] **Central DB backup / restore**. `cclaw db backup <path>`
+  + `cclaw db restore <path>`. The central DB is single-file
   SQLite; a backup is a copy under a held WAL checkpoint.
-- [ ] **Versioned migrations**. `ironclaw migrate` already
+- [ ] **Versioned migrations**. `copperclaw migrate` already
   runs the central migrations but there's no
   schema-version table the host can check on boot to refuse a
   downgrade or warn about an in-progress upgrade.
@@ -478,7 +478,7 @@ approval (persistent users-table-backed), and setup polish
 - [x] **systemd `Restart=on-failure`** in the generated unit.
   Already in `units::render_systemd` since the unit template
   was first written — kept as [x] for the audit trail.
-- [x] **`iclaw chat` shell**. New `iclaw chat` interactive REPL
+- [x] **`cclaw chat` shell**. New `cclaw chat` interactive REPL
   opens the install's `chat.fifo` for writing and tails
   `chat.log` from EOF for new replies. Pure file I/O — no
   socket call. Path defaults match the setup-produced layout
@@ -531,7 +531,7 @@ passed `tools: Vec::new()` to the provider, and even with a
   records each call separately.
 - [x] **15 messaging / scheduling / self-mod tools wired**.
   `main.rs` builds the `tool_map` from
-  `ironclaw_mcp::build_tool_set()` once at startup; the same
+  `copperclaw_mcp::build_tool_set()` once at startup; the same
   pass produces the `ToolDef` list for the provider. The
   model now actually receives the schemas for `send_message`,
   `send_file`, `edit_message`, `add_reaction`,
@@ -540,7 +540,7 @@ passed `tools: Vec::new()` to the provider, and even with a
   `list_tasks`, `cancel_task`, `pause_task`, `resume_task`,
   `update_task`.
 - [x] **4 computer-use tools added**
-  (`crates/ironclaw-mcp/src/tools/computer_use.rs`):
+  (`crates/copperclaw-mcp/src/tools/computer_use.rs`):
   * `shell(command, cwd?, timeout_secs?)` — bash inside the
     container. Returns stdout/stderr/exit/elapsed. 64 KiB
     output cap, 60 s default timeout, 600 s ceiling.
@@ -566,7 +566,7 @@ passed `tools: Vec::new()` to the provider, and even with a
   `claude-sonnet-4-5`. Six call sites updated in lockstep.
 
 **Verified live** (OpenRouter, local cli channel via
-`iclaw chat`):
+`cclaw chat`):
 
     > Use the shell tool to run: whoami && uname -a && pwd.
     > Report the output exactly.
@@ -587,13 +587,13 @@ liner for a system prompt. The runner received the tool schemas but
 not the per-skill prose explaining when to reach for each one. This
 slice closes that gap.
 
-- [x] **`ironclaw-skills` exposes a body reader**. New
+- [x] **`copperclaw-skills` exposes a body reader**. New
   `frontmatter::skip_frontmatter(&str) -> &str` and
   `registry::read_skill_body(&Skill) -> Result<String, _>` return
   the markdown body with the YAML frontmatter stripped (BOM + CRLF
   aware). Lets the host inline a SKILL.md without re-parsing.
 - [x] **`HostConfig` learns `skills_dir` + `groups_dir`**. Two new
-  env-var fields (`IRONCLAW_SKILLS_DIR`, `IRONCLAW_GROUPS_DIR`) both
+  env-var fields (`COPPERCLAW_SKILLS_DIR`, `COPPERCLAW_GROUPS_DIR`) both
   optional and unset by default. Empty strings collapse to `None` so
   an unset variable means "skip skill injection".
 - [x] **`ContainerManager::runner_config_for` populates `system`**.
@@ -605,15 +605,15 @@ slice closes that gap.
   preceded by a short framing sentence. Read or parse failures for
   individual skills are logged and skipped — the spawn still
   succeeds with the remaining content.
-- [x] **`ironclaw-setup` writes both env vars**. `EnvFileSpec` gains
+- [x] **`copperclaw-setup` writes both env vars**. `EnvFileSpec` gains
   `skills_dir` + `groups_dir`; `AuthStep` defaults them to
   `<data_dir>/skills` and `<data_dir>/groups` respectively (env-var
   override takes precedence). Empty paths omit the line so existing
   installs that haven't re-run setup stay unchanged.
 
 **Slice totals**: 4436 passing, 0 failing. Clippy clean. +20 tests
-across `ironclaw-skills` (+7), `ironclaw-host` (+12), and
-`ironclaw-setup` (+1).
+across `copperclaw-skills` (+7), `copperclaw-host` (+12), and
+`copperclaw-setup` (+1).
 
 ### M13 hardening — parallel-agent Top 10 sweep
 
@@ -645,36 +645,36 @@ about).
   `container_configs.resource_limits` JSON (`cpus`, `memory_mb`,
   `pids_limit`; all optional). Docker runtime translates to
   `--cpus`, `--memory`, `--pids-limit`. Apple runtime: best-effort
-  fall-through. New `iclaw groups config set-resource-limits` /
+  fall-through. New `cclaw groups config set-resource-limits` /
   `set-egress-allow` subcommands.
 
 Migration `007_container_config_extensions.sql` adds the three
 columns. Audit log captures the new mutation commands.
 
-**Agent B — Operator iclaw commands**
+**Agent B — Operator cclaw commands**
 
-- [x] **Central DB backup / restore** (Top 10 #5). `iclaw db backup
+- [x] **Central DB backup / restore** (Top 10 #5). `cclaw db backup
   <path>` runs `PRAGMA wal_checkpoint(TRUNCATE)` then writes a
-  temp file + atomic `rename`. `iclaw db restore <path>` refuses
+  temp file + atomic `rename`. `cclaw db restore <path>` refuses
   with `host_running` when the host is up (the central DB has an
   open writer; you can't safely swap it). Both commands route
-  through the iclaw socket and write `audit_log` rows; both are in
+  through the cclaw socket and write `audit_log` rows; both are in
   `HOST_ONLY_COMMANDS`.
 - [x] **Outbound dead-letter replay** (Top 10 #7). New
   `outbound_dropped_messages` table (migration `008_*` after
   renumbering — see merge note above). Delivery loop writes a
   dead-letter row when an outbound exhausts its retries. New
-  commands `iclaw dropped-messages outbound-list --since <window>
-  --limit N` and `iclaw dropped-messages replay <id>`. `replay`
+  commands `cclaw dropped-messages outbound-list --since <window>
+  --limit N` and `cclaw dropped-messages replay <id>`. `replay`
   fetches the dead-letter, opens the per-session `outbound.db`,
   inserts a fresh `WriteOutbound`, and deletes the dead-letter row
   so the delivery loop picks it up again. `parse_since` accepts
   ISO-8601 or relative shorthands (`24h`, `30m`, `7d`).
-- [x] **MCP server registry + first-class iclaw subcommand**
+- [x] **MCP server registry + first-class cclaw subcommand**
   (Top 10 #3). Curated preset library (`postgres`, `linear`,
   `github`, `notion`, `filesystem`, `browserbase`) shipped as a
-  static `McpPreset` const array. `iclaw mcp list-presets`
-  (no-socket; pure local catalog) and `iclaw mcp add <preset>
+  static `McpPreset` const array. `cclaw mcp list-presets`
+  (no-socket; pure local catalog) and `cclaw mcp add <preset>
   --agent-group-id <id> [--env KEY=VAL]...` merge the chosen
   preset into `container_configs.mcp_servers` (JSON object keyed
   by server name). Audited mutation.
@@ -687,7 +687,7 @@ columns. Audit log captures the new mutation commands.
   resolves the agent group's primary messaging group, and (c)
   dispatches a plain-ASCII notification via the existing
   `DeliveryDispatcher`. Notification text: `Unknown sender pending
-  approval. Run: iclaw approvals approve --channel <ct> --identity
+  approval. Run: cclaw approvals approve --channel <ct> --identity
   <id>` plus a small structured block (channel / identity /
   display name / first contact). Silently no-ops when the group
   has no messaging group attached. `pending_sender_approvals::
@@ -698,16 +698,16 @@ columns. Audit log captures the new mutation commands.
 **Agent D — Observability**
 
 - [x] **Prometheus metrics endpoint** (Top 10 #9). New
-  `ironclaw-metrics` crate. Opt-in via `IRONCLAW_METRICS_ADDR=
+  `copperclaw-metrics` crate. Opt-in via `COPPERCLAW_METRICS_ADDR=
   127.0.0.1:9090` (bare port auto-prefixed to `127.0.0.1:`); off
   by default per the conservative-defaults tenet. Counters:
-  `ironclaw_messages_inbound_total{channel_type}`,
-  `ironclaw_messages_outbound_total{channel_type}`,
-  `ironclaw_containers_spawned_total`,
-  `ironclaw_containers_crashed_total`,
-  `ironclaw_delivery_failed_total{channel_type}`. Histograms:
-  `ironclaw_llm_call_seconds`, `ironclaw_llm_tokens_input`,
-  `ironclaw_llm_tokens_output`, `ironclaw_container_spawn_seconds`.
+  `copperclaw_messages_inbound_total{channel_type}`,
+  `copperclaw_messages_outbound_total{channel_type}`,
+  `copperclaw_containers_spawned_total`,
+  `copperclaw_containers_crashed_total`,
+  `copperclaw_delivery_failed_total{channel_type}`. Histograms:
+  `copperclaw_llm_call_seconds`, `copperclaw_llm_tokens_input`,
+  `copperclaw_llm_tokens_output`, `copperclaw_container_spawn_seconds`.
   Hand-rolled `tokio::net::TcpListener` accept-loop, no axum/warp.
   Bumps live in router (inbound after DB write), delivery (outbound
   on success + final-failure), container manager (spawn success +
@@ -715,20 +715,20 @@ columns. Audit log captures the new mutation commands.
   `run_llm_turn`).
 - [x] **Log rotation** (Top 10 #10). `tracing-appender::rolling`
   daily file writer wired into the host's main, opt-in via
-  `IRONCLAW_LOG_DIR=<path>` (default off; stderr-only behaviour
+  `COPPERCLAW_LOG_DIR=<path>` (default off; stderr-only behaviour
   unchanged). Pinned versions: `tracing-appender = "0.2"`,
   `metrics = "0.24"`, `metrics-exporter-prometheus = "0.16"`.
 
 **Slice totals**: 4436 → 4540 passing (+104 tests). 0 failing.
-Clippy clean. New crate: `ironclaw-metrics`. New migrations:
+Clippy clean. New crate: `copperclaw-metrics`. New migrations:
 `007_container_config_extensions`, `008_outbound_dropped_messages`.
-New iclaw subcommands: `db backup/restore`, `dropped-messages
+New cclaw subcommands: `db backup/restore`, `dropped-messages
 outbound-list/replay`, `mcp list-presets/add`, `groups config
 set-resource-limits/set-egress-allow`.
 
 ### Post-merge hardening (docs + edge cases + gap fixes)
 
-- [x] **Audit-log env redaction.** `iclaw mcp add postgres --env
+- [x] **Audit-log env redaction.** `cclaw mcp add postgres --env
   DATABASE_URL=postgres://u:p@h/d` used to persist the connection
   string in `audit_log.args`. Added a per-command redactor in
   `socket.rs` that masks values under any `env` block for
@@ -737,7 +737,7 @@ set-resource-limits/set-egress-allow`.
 - [x] **Image-rebuild failure fallback.** A bad apt name used to
   block the whole agent group indefinitely. The manager now falls
   back to the last-known-good image, emits
-  `ironclaw_image_rebuild_failed_total`, and keeps the
+  `copperclaw_image_rebuild_failed_total`, and keeps the
   fingerprint unchanged so the rebuild retries on the next spawn
   when the operator fixes the config.
 - [x] **`install_packages` / `add_mcp_server` were silent no-ops.**
@@ -768,7 +768,7 @@ the operator has configured.
   (`{title, url, snippet, published?, score?}`) so the agent's
   downstream behaviour is provider-agnostic.
 - [x] **Provider resolution**: explicit `provider` arg →
-  `IRONCLAW_WEB_SEARCH_PROVIDER` env → auto-detect from configured
+  `COPPERCLAW_WEB_SEARCH_PROVIDER` env → auto-detect from configured
   keys in the order `tavily, exa, brave, serpapi`. No keys → loud
   validation error naming all four env vars.
 - [x] **Per-call result cap** (1–25, default 10) and per-result
@@ -787,11 +787,11 @@ ensure paths). 0 failing. Clippy clean.
 
 ### Onboarding polish slice
 
-Smoothing the gap between "I ran `ironclaw-setup`" and "my agent is
+Smoothing the gap between "I ran `copperclaw-setup`" and "my agent is
 talking back to me". Three changes, each closing a distinct first-
 run footgun.
 
-- [x] **`iclaw doctor`** — composite first-run diagnostic.
+- [x] **`cclaw doctor`** — composite first-run diagnostic.
   Sequence: host reachability via `groups.list` → agent group
   count → wiring count → active session count → recent audit
   errors (1h, top 3 by `result=error`) → dropped-message
@@ -807,11 +807,11 @@ run footgun.
   agent group named `first`, and a pattern-`.*` wiring with
   `session_mode = Shared`. Idempotent against any pre-existing
   agent group. The `first_chat` step's "what to do next" output
-  flips to recommend `iclaw chat` directly when the bootstrap
-  landed, falling back to the `iclaw quickstart cli` instruction
+  flips to recommend `cclaw chat` directly when the bootstrap
+  landed, falling back to the `cclaw quickstart cli` instruction
   when the operator declined. Opt out via
-  `IRONCLAW_SETUP_QUICKSTART=no`; rename the slug via
-  `IRONCLAW_SETUP_QUICKSTART_NAME`.
+  `COPPERCLAW_SETUP_QUICKSTART=no`; rename the slug via
+  `COPPERCLAW_SETUP_QUICKSTART_NAME`.
 - [x] **Budget-exhausted reply to original sender.** When the
   container manager's spawn gate refuses because today's tokens
   exceeded `group_budgets.daily_token_cap`, the host now posts
@@ -836,7 +836,7 @@ Three worktree-isolated agents landed in one slice. After-merge:
   per-hour text said "Per-minute"; agent B's helper wrote to
   inbound DB while main's pattern writes to outbound — unified
   via a new `post_cap_reply` helper that both paths share).
-- Agent A's hand-rolled `ironclaw-metrics` collided with the
+- Agent A's hand-rolled `copperclaw-metrics` collided with the
   real crate landed in observability — counter ported across
   via `inc_secrets_rotated()`.
 
@@ -850,7 +850,7 @@ Three worktree-isolated agents landed in one slice. After-merge:
   `mgr.reload_env(env_file.as_deref())`. `run_host` gained an
   `env_file: Option<PathBuf>` parameter the main binary fills
   from `cli.env_file`. New metric
-  `ironclaw_secrets_rotated_total`. Running containers see the
+  `copperclaw_secrets_rotated_total`. Running containers see the
   rotated keys after idle-stop + respawn (default 5 min).
 
 - [x] **Webhooks TLS termination doc** (was Next #2). New
@@ -865,15 +865,15 @@ Three worktree-isolated agents landed in one slice. After-merge:
   gate fires in `maybe_spawn` after the budget gate: checks both
   windows, posts an in-channel reply on the outbound path (same
   `post_cap_reply` helper as the budget gate) with a 1-minute
-  dedup window. `iclaw budgets set` extended with
+  dedup window. `cclaw budgets set` extended with
   `--turns-per-minute` and `--turns-per-hour` flags.
 
 - [x] **Versioned migrations** (was Next #5).
   `expected_central_schema_version()` (= `CENTRAL.len()`) and
   `applied_central_schema_version()` helpers in
-  `ironclaw-db::migrate`. `BootError::SchemaMismatch` (exit code
+  `copperclaw-db::migrate`. `BootError::SchemaMismatch` (exit code
   5) fires when applied > expected (downgrade detection).
-  `iclaw schema-version` subcommand returns
+  `cclaw schema-version` subcommand returns
   `{ "expected": N, "applied": M, "status": "ok|pending|future" }`.
 
 - [x] **Double `sessions/sessions/` path cleanup** (was Next #6).
@@ -897,15 +897,15 @@ services end-to-end against a wiremock-served Anthropic stub, and
 diff the four captured streams against `expected/*.jsonl` with
 substitution-aware comparison.
 
-- [x] `crates/ironclaw-host/tests/replay/fixture.rs` — load
+- [x] `crates/copperclaw-host/tests/replay/fixture.rs` — load
   `manifest.json` + `central.sql` + `inbound/*` + `claude/*` +
   `expected/*.jsonl` from a fixture directory. JSON manifest for
   v1 (TOML deferred behind an unused dep).
-- [x] `crates/ironclaw-host/tests/replay/diff.rs` — substitution
+- [x] `crates/copperclaw-host/tests/replay/diff.rs` — substitution
   table (regex → replacement, applied to the serialized form of
   both sides before reparse), `walk`-based JSON-pointer-path
   mismatch reporter.
-- [x] `crates/ironclaw-host/tests/replay/harness.rs` —
+- [x] `crates/copperclaw-host/tests/replay/harness.rs` —
   `ReplayHarness` driving `Router::route` against an in-memory
   `CentralDb`, an in-process runner via `run_loop` with
   `max_turns = Some(1)` against `wiremock`-served Anthropic SSE,
@@ -919,14 +919,14 @@ substitution-aware comparison.
   Manifest substitutions normalise UUIDs (`[0-9a-f]{8}-...{12}`)
   and three timestamp shapes (`timestamp` / `started_at` /
   `ended_at`).
-- [x] `crates/ironclaw-host/tests/replay.rs` — integration test
+- [x] `crates/copperclaw-host/tests/replay.rs` — integration test
   entry. One `#[tokio::test]` loads the cli fixture and asserts
   `harness.compare().is_clean()`.
 
 **Slice totals**: 4633 → 4634 passing (+1 integration test;
 harness internals are exercised through it). 0 failing. Clippy
-clean. New dev-deps in `ironclaw-host`: `wiremock`, `regex`,
-`ironclaw-runner` / `-providers` / `-mcp` as workspace path deps.
+clean. New dev-deps in `copperclaw-host`: `wiremock`, `regex`,
+`copperclaw-runner` / `-providers` / `-mcp` as workspace path deps.
 
 ---
 
@@ -953,13 +953,13 @@ remaining items, ranked:
 
 ## 0. Context
 
-Ironclaw is a multi-channel Claude-agent runtime:
+Copperclaw is a multi-channel Claude-agent runtime:
 
 - The host orchestrates per-session Linux containers; one container per
   session.
 - All host ↔ container IPC is **SQLite-on-bind-mount**: each session has
   an `inbound.db` (host writes, container reads) and an `outbound.db`
-  (container writes, host reads). A central `ironclaw.db` holds identity,
+  (container writes, host reads). A central `copperclaw.db` holds identity,
   wiring, sessions, and configs.
 - Channels (Telegram, Slack, Discord, …) feed the router; the router
   resolves a session and writes `messages_in`; the container's poll loop
@@ -967,7 +967,7 @@ Ironclaw is a multi-channel Claude-agent runtime:
   delivers via the channel adapter.
 
 Goal of this plan: define crate boundaries, contracts, milestones, and
-team assignments so a swarm of agents can build ironclaw in parallel.
+team assignments so a swarm of agents can build copperclaw in parallel.
 
 The Anthropic Agent SDK and MCP SDK both have viable Rust counterparts.
 `rmcp` is the official MCP Rust SDK (used here). The agent loop itself
@@ -1020,7 +1020,7 @@ Background loops on host:
   - Active delivery poll (1s, running sessions only)
   - Sweep delivery poll (60s, all active sessions)
   - Host sweep (60s — stuck detection, recurrence, heartbeat sync)
-  - CLI Unix socket server (listener for `iclaw`)
+  - CLI Unix socket server (listener for `cclaw`)
 ```
 
 **Three invariants that must not change:**
@@ -1035,7 +1035,7 @@ Background loops on host:
 ## 2. Cargo workspace layout
 
 ```
-ironclaw/
+copperclaw/
 ├── Cargo.toml                          # workspace + shared deps
 ├── rust-toolchain.toml                 # pin edition 2024 / rust 1.85+
 ├── PLAN.md                             # this document
@@ -1043,32 +1043,32 @@ ironclaw/
 ├── LICENSE
 ├── .github/workflows/                  # ci.yml (fmt+clippy+test)
 ├── crates/
-│   ├── ironclaw-types/                 # T1 — shared types, no I/O
-│   ├── ironclaw-db/                    # T2 — central DB + per-session DB
-│   ├── ironclaw-host/                  # T3 — binary: orchestrator
-│   ├── ironclaw-host-router/           # T3 — inbound router
-│   ├── ironclaw-host-delivery/         # T3 — outbound delivery loop
-│   ├── ironclaw-host-sweep/            # T3 — 60s maintenance loop
-│   ├── ironclaw-container-rt/          # T4 — Docker + Apple Container
-│   ├── ironclaw-runner/                # T5 — binary: container-side agent runner
-│   ├── ironclaw-providers/             # T5 — Claude/Codex/OpenCode/Ollama trait + impls
-│   ├── ironclaw-mcp/                   # T5 — MCP server + tool impls
-│   ├── ironclaw-channels/              # T6 — Channel trait + per-channel crates
+│   ├── copperclaw-types/                 # T1 — shared types, no I/O
+│   ├── copperclaw-db/                    # T2 — central DB + per-session DB
+│   ├── copperclaw-host/                  # T3 — binary: orchestrator
+│   ├── copperclaw-host-router/           # T3 — inbound router
+│   ├── copperclaw-host-delivery/         # T3 — outbound delivery loop
+│   ├── copperclaw-host-sweep/            # T3 — 60s maintenance loop
+│   ├── copperclaw-container-rt/          # T4 — Docker + Apple Container
+│   ├── copperclaw-runner/                # T5 — binary: container-side agent runner
+│   ├── copperclaw-providers/             # T5 — Claude/Codex/OpenCode/Ollama trait + impls
+│   ├── copperclaw-mcp/                   # T5 — MCP server + tool impls
+│   ├── copperclaw-channels/              # T6 — Channel trait + per-channel crates
 │   │   ├── core/                       # trait + registry
 │   │   ├── cli/                        # stdin/stdout adapter
 │   │   └── …                           # added per channel
-│   ├── ironclaw-modules/               # T7 — typing, permissions, approvals, scheduling, …
-│   ├── ironclaw-skills/                # T8 — skill discovery/validation/mount
-│   ├── ironclaw-iclaw/                   # T9 — binary: admin CLI + socket server
-│   ├── ironclaw-setup/                 # T10 — binary: interactive setup
-│   └── ironclaw-onecli/                # T11 — OneCLI credential gateway
+│   ├── copperclaw-modules/               # T7 — typing, permissions, approvals, scheduling, …
+│   ├── copperclaw-skills/                # T8 — skill discovery/validation/mount
+│   ├── copperclaw-cclaw/                   # T9 — binary: admin CLI + socket server
+│   ├── copperclaw-setup/                 # T10 — binary: interactive setup
+│   └── copperclaw-onecli/                # T11 — OneCLI credential gateway
 ├── container/
 │   ├── Dockerfile                      # Debian-slim + Chromium + static runner
 │   ├── build.sh
-│   └── entrypoint.sh                   # tini + ironclaw-runner
-├── data/                               # runtime (gitignored): ironclaw.db, sessions/, logs/
+│   └── entrypoint.sh                   # tini + copperclaw-runner
+├── data/                               # runtime (gitignored): copperclaw.db, sessions/, logs/
 ├── groups/                             # per-agent workspaces (created at runtime)
-├── skills/                             # ironclaw skill content (authored under T10)
+├── skills/                             # copperclaw skill content (authored under T10)
 ├── docs/                               # architecture docs
 ├── config-examples/
 ├── launchd/                            # macOS plist template
@@ -1077,14 +1077,14 @@ ironclaw/
 
 ---
 
-## 3. Shared types contract (`ironclaw-types`)
+## 3. Shared types contract (`copperclaw-types`)
 
 This crate is **the contract surface** between all other crates. It has
 zero I/O dependencies and must compile fast. Every team consumes it.
 **Owner: T1.** Other teams MUST NOT add new types here without T1 review.
 
 ```rust
-// crates/ironclaw-types/src/lib.rs
+// crates/copperclaw-types/src/lib.rs
 
 pub mod id;
 pub mod session;
@@ -1133,7 +1133,7 @@ JSON blob. Typed boundaries beat JSON blobs.
 
 DB ownership and schemas are fixed for the first port. **Owner: T2.**
 
-### 4.1 Central DB `data/ironclaw.db`
+### 4.1 Central DB `data/copperclaw.db`
 
 | Table | PK | Unique | FKs | Indexes |
 |---|---|---|---|---|
@@ -1332,10 +1332,10 @@ impl HostContext {
 }
 ```
 
-### 5.4 `iclaw` Unix-socket wire protocol
+### 5.4 `cclaw` Unix-socket wire protocol
 
 JSON, newline-delimited, request-response, half-close per request.
-Lives at `data/iclaw.sock` (mode `0o600`).
+Lives at `data/cclaw.sock` (mode `0o600`).
 
 ```rust
 #[derive(Serialize, Deserialize)]
@@ -1357,7 +1357,7 @@ pub enum Response {
 }
 ```
 
-Agent caller comes through the **session DBs** (container-side `iclaw`
+Agent caller comes through the **session DBs** (container-side `cclaw`
 writes a `cli_request` system message; container poll loop forwards to
 host; host writes the response back), not through the socket.
 
@@ -1396,12 +1396,12 @@ Each team is a parallel work stream. **Dependencies are explicit** — a
 team can begin once its dependencies' contracts are merged, even if
 those teams aren't done implementing.
 
-### T1 — `ironclaw-types` (gate; serial)
+### T1 — `copperclaw-types` (gate; serial)
 
 Shared types + serde + enum kinds. No I/O. Acceptance: all types in
 § 3 compile; serde round-trip tests; no tokio/reqwest/rusqlite deps.
 
-### T2 — `ironclaw-db`
+### T2 — `copperclaw-db`
 
 Depends on T1. Central DB + per-session DB layer, migrations,
 attachment safety. Acceptance: migrations apply cleanly; per-table
@@ -1417,7 +1417,7 @@ sequence, router, delivery loops, and sweep.
 `ABSOLUTE_CEILING_MS=1_800_000`, `CLAIM_STUCK_MS=60_000`,
 `MAX_DELIVERY_ATTEMPTS=3`, `MAX_TRIES=5`, `BACKOFF_BASE_MS=5_000`.
 
-### T4 — `ironclaw-container-rt`
+### T4 — `copperclaw-container-rt`
 
 Depends on T1. Docker + Apple Container; image build.
 
@@ -1442,7 +1442,7 @@ continue.
 **Session resume**: persist `(message_history, continuation_seq)` to
 `outbound.session_state` after every turn; reload on container startup.
 
-### T6 — `ironclaw-channels/*`
+### T6 — `copperclaw-channels/*`
 
 Depends on T1, T3 trait. Channels for M7: telegram, slack, discord.
 Channels for M8: whatsapp, whatsapp-cloud, signal, deltachat, imessage,
@@ -1452,27 +1452,27 @@ teams, matrix, gchat, webex, linear, github, resend, wechat, emacs, x.
 `pub struct <Name>Factory; impl ChannelFactory for <Name>Factory`, and a
 `register(reg: &mut ChannelRegistry)` function. No other public API.
 
-### T7 — `ironclaw-modules`
+### T7 — `copperclaw-modules`
 
 Depends on T1, T2, T3. Sub-modules: typing, mount-security, permissions,
 approvals, interactive, scheduling, agent-to-agent, self-mod.
 
-### T8 — `ironclaw-skills`
+### T8 — `copperclaw-skills`
 
 Depends on T1. Skill discovery (frontmatter parse), per-group override,
 container materialization via symlinks.
 
-### T9 — `ironclaw-iclaw`
+### T9 — `copperclaw-cclaw`
 
 Depends on T1, T2, T3. See § A2 for subcommand inventory.
 
-### T10 — `ironclaw-setup`
+### T10 — `copperclaw-setup`
 
 Depends on most other crates. Interactive setup; environment check,
 container build, OneCLI init, auth, mounts, service unit, cli-agent,
 timezone, channel, verify, first-chat.
 
-### T11 — `ironclaw-onecli`
+### T11 — `copperclaw-onecli`
 
 Depends on T1. OneCLI HTTP client.
 
@@ -1512,7 +1512,7 @@ M3  T5 runner+providers+mcp        ┐
     T6 channels/core + T6 cli      ├─ parallel
     T7 modules                     ┘
 M4  T3 host                        — assembles M2/M3
-M5  T9 iclaw
+M5  T9 cclaw
 M6  T10 setup
 M7  T6 telegram + T6 slack + T6 discord  (parallel)
 M8  T6 batch: remaining channels         (parallel teams per channel)
@@ -1546,7 +1546,7 @@ is incomplete work — the step is not done until the tests are in place.
 - T3 host: integration tests with stubbed channel + stubbed container.
 - T5 runner: integration tests against a mock Anthropic server
   (`wiremock`); end-to-end test with a real Claude API key gated by
-  `IRONCLAW_E2E=1`.
+  `COPPERCLAW_E2E=1`.
 - T6 channels: replay tests against captured platform fixtures.
 
 ### Cross-crate (M4 onward)
@@ -1613,58 +1613,58 @@ session_state: get, set
 container_state: get, set
 ```
 
-### A2 — `iclaw` subcommand inventory (T9 implements)
+### A2 — `cclaw` subcommand inventory (T9 implements)
 
 ```
-iclaw groups list
-iclaw groups get <id>
-iclaw groups create --folder <f> --name <n> [--provider <p>]
-iclaw groups update <id> [--name <n>] [--provider <p>]
-iclaw groups delete <id>
-iclaw groups restart <id>
-iclaw groups config get <id>
-iclaw groups config update <id> --field <k>=<v>
-iclaw groups config add-mcp-server <id> --json '<config>'
-iclaw groups config remove-mcp-server <id> --name <name>
-iclaw groups config add-package <id> --apt <pkg> | --npm <pkg>
-iclaw groups config remove-package <id> --apt <pkg> | --npm <pkg>
+cclaw groups list
+cclaw groups get <id>
+cclaw groups create --folder <f> --name <n> [--provider <p>]
+cclaw groups update <id> [--name <n>] [--provider <p>]
+cclaw groups delete <id>
+cclaw groups restart <id>
+cclaw groups config get <id>
+cclaw groups config update <id> --field <k>=<v>
+cclaw groups config add-mcp-server <id> --json '<config>'
+cclaw groups config remove-mcp-server <id> --name <name>
+cclaw groups config add-package <id> --apt <pkg> | --npm <pkg>
+cclaw groups config remove-package <id> --apt <pkg> | --npm <pkg>
 
-iclaw messaging-groups list
-iclaw messaging-groups get <id>
-iclaw messaging-groups create --channel-type <t> --platform-id <p> [--name <n>] [--is-group]
-iclaw messaging-groups update <id> [...]
-iclaw messaging-groups delete <id>
+cclaw messaging-groups list
+cclaw messaging-groups get <id>
+cclaw messaging-groups create --channel-type <t> --platform-id <p> [--name <n>] [--is-group]
+cclaw messaging-groups update <id> [...]
+cclaw messaging-groups delete <id>
 
-iclaw wirings list
-iclaw wirings get <id>
-iclaw wirings create --mg <id> --ag <id> --engage <pattern|mention|mention-sticky> [--pattern <re>] [--sender-scope <all|known>] [--session-mode <shared|per-thread|agent-shared>] [--priority <n>]
-iclaw wirings update <id> [...]
-iclaw wirings delete <id>
+cclaw wirings list
+cclaw wirings get <id>
+cclaw wirings create --mg <id> --ag <id> --engage <pattern|mention|mention-sticky> [--pattern <re>] [--sender-scope <all|known>] [--session-mode <shared|per-thread|agent-shared>] [--priority <n>]
+cclaw wirings update <id> [...]
+cclaw wirings delete <id>
 
-iclaw users list
-iclaw users get <id>
-iclaw users create --identity <channel:handle> [--display-name <n>]
-iclaw users update <id> [...]
+cclaw users list
+cclaw users get <id>
+cclaw users create --identity <channel:handle> [--display-name <n>]
+cclaw users update <id> [...]
 
-iclaw roles list
-iclaw roles grant <user> <role> [--agent-group <id>]
-iclaw roles revoke <user> <role> [--agent-group <id>]
+cclaw roles list
+cclaw roles grant <user> <role> [--agent-group <id>]
+cclaw roles revoke <user> <role> [--agent-group <id>]
 
-iclaw members list <agent-group>
-iclaw members add <agent-group> <user>
-iclaw members remove <agent-group> <user>
+cclaw members list <agent-group>
+cclaw members add <agent-group> <user>
+cclaw members remove <agent-group> <user>
 
-iclaw destinations list <agent-group>
-iclaw destinations add <agent-group> --name <n> --type <channel|agent> [...]
-iclaw destinations remove <agent-group> --name <n>
+cclaw destinations list <agent-group>
+cclaw destinations add <agent-group> --name <n> --type <channel|agent> [...]
+cclaw destinations remove <agent-group> --name <n>
 
-iclaw sessions list [--agent-group <id>] [--status <s>]
-iclaw sessions get <id>
+cclaw sessions list [--agent-group <id>] [--status <s>]
+cclaw sessions get <id>
 
-iclaw user-dms list
-iclaw dropped-messages list [--since <ts>]
-iclaw approvals list
-iclaw approvals get <id>
+cclaw user-dms list
+cclaw dropped-messages list [--since <ts>]
+cclaw approvals list
+cclaw approvals get <id>
 ```
 
 Output formats: human table by default; `--json` for machine output.
@@ -1680,7 +1680,7 @@ Load-bearing properties of this codebase that are convention rather than enforce
 - **Heartbeat liveness uses file mtime, not DB queries.** The host `stat()`s `<session>/.heartbeat`; the container touches it. Switching to a DB-backed liveness would re-introduce the cross-mount visibility hazard `journal_mode=DELETE` exists to prevent.
 - **Destinations are dual-written.** Approvals + group-membership mutations land in both the central DB and the per-session DB inside the same router call. Don't lazy-sync — stale destinations are how cross-channel messages get sent to the wrong place.
 - **Wake messages bypass debounce.** The `on_wake = 1` column on `messages_in` is processed once at container boot regardless of recurrence state; it is how the host hands over in-flight context to a freshly-spawned container without racing the poll loop.
-- **Per-install service slug.** systemd / launchd unit names are SHA1-suffixed by project root so a developer can run two installs side-by-side without one stomping the other's `iclaw.sock`.
+- **Per-install service slug.** systemd / launchd unit names are SHA1-suffixed by project root so a developer can run two installs side-by-side without one stomping the other's `cclaw.sock`.
 - **Single-writer per SQLite file.** Inbound DB: host writes only. Outbound DB: container writes only. Central DB: host process only. Every test that opens a writer outside the owning process must use `open_inbound_ro_no_mmap` or equivalent.
 
 ## Future work
@@ -1688,9 +1688,9 @@ Load-bearing properties of this codebase that are convention rather than enforce
 Items deliberately deferred from 0.1.0; tracked here so they don't get rediscovered.
 
 - **Scheduled tasks table.** A first-class `scheduled_tasks` table for recurring agent jobs (independent of the per-message `recurrence` column). The MCP `schedule_task` tool currently writes into `messages_in` with a recurrence and a `process_after`; a dedicated table would let us list/cancel without scanning the message log.
-- **WhatsApp Signal Protocol session state.** The Curve25519 / Ed25519 / HKDF / AES-GCM primitives in `crates/ironclaw-channels/whatsapp/src/crypto/dalek.rs` are RFC-tested and ready. What sits above them — X3DH key agreement, the Double Ratchet, Sender Keys for group chat, the WA wire-envelope construction — is the next-contributor task. Adapter `deliver()` surfaces a distinct error message so the gap is testable.
+- **WhatsApp Signal Protocol session state.** The Curve25519 / Ed25519 / HKDF / AES-GCM primitives in `crates/copperclaw-channels/whatsapp/src/crypto/dalek.rs` are RFC-tested and ready. What sits above them — X3DH key agreement, the Double Ratchet, Sender Keys for group chat, the WA wire-envelope construction — is the next-contributor task. Adapter `deliver()` surfaces a distinct error message so the gap is testable.
 - **Docker Sandbox runtime backend.** A third `ContainerRuntime` impl using a micro-VM (`firecracker`, `cloud-hypervisor`, or Apple's `Virtualization.framework`) for installations that want a stronger isolation boundary than a Docker container.
-- **Replay-fixture capture tooling.** The harness reads hand-authored or captured fixtures (see `docs/replay-fixtures.md` and `fixtures/cli/text-reply/`). The capture-time tooling described in the design doc — `IRONCLAW_FIXTURE_CAPTURE=<dir>` taps in the channel adapter, router, provider, and DB layer, plus an `ironclaw fixture redact <dir>` pass — is still unwritten. Until it lands new fixtures must be hand-authored.
+- **Replay-fixture capture tooling.** The harness reads hand-authored or captured fixtures (see `docs/replay-fixtures.md` and `fixtures/cli/text-reply/`). The capture-time tooling described in the design doc — `COPPERCLAW_FIXTURE_CAPTURE=<dir>` taps in the channel adapter, router, provider, and DB layer, plus an `copperclaw fixture redact <dir>` pass — is still unwritten. Until it lands new fixtures must be hand-authored.
 
 
 ## Sign-off

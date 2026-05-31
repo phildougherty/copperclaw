@@ -2,7 +2,7 @@
 
 Team OLLAMA — May 2026.
 
-This document captures the audit of `crates/ironclaw-providers/src/ollama.rs`
+This document captures the audit of `crates/copperclaw-providers/src/ollama.rs`
 and the gaps fixed to make a vanilla `ollama serve` actually work
 end-to-end with the runner's tool loops.
 
@@ -101,9 +101,9 @@ consumes `Result` today.
 
 ## Wiring into the runner
 
-`OllamaProvider` is not yet wired into `ironclaw-runner::main` — the
+`OllamaProvider` is not yet wired into `copperclaw-runner::main` — the
 runner currently constructs an `AnthropicProvider` unconditionally
-(`crates/ironclaw-runner/src/main.rs:70-74`). Wiring is out of scope for
+(`crates/copperclaw-runner/src/main.rs:70-74`). Wiring is out of scope for
 this audit (runner-side change, separate file scope) but the provider
 itself is now production-ready when that's plumbed up.
 
@@ -114,7 +114,7 @@ itself is now production-ready when that's plumbed up.
 * `tests/ollama_shim.rs` — pinning tests for the legacy Anthropic-shim
   path (renamed from `tests/ollama_sse.rs`).
 * `tests/ollama_live.rs` — single `#[ignore]`d smoke test against a real
-  Ollama server. Opt-in via `cargo test --ignored ollama_live -p ironclaw-providers`.
+  Ollama server. Opt-in via `cargo test --ignored ollama_live -p copperclaw-providers`.
 
 ## Known limitations / follow-ups
 
@@ -124,7 +124,7 @@ itself is now production-ready when that's plumbed up.
   tracking still works, but the runner can't render token-by-token.
 * `// TODO(team-ollama)`: the runner does not yet construct
   `OllamaProvider` from config; operators have to wire it themselves.
-  Tracking ticket needed against `ironclaw-runner`.
+  Tracking ticket needed against `copperclaw-runner`.
 * `// TODO(team-ollama)`: Ollama's `keep_alive` parameter is not yet
   surfaced. Long-lived local sessions could keep the model warm with
   e.g. `keep_alive: "30m"`.
