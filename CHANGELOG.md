@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (system-prompt proactivity directive for weak local models — 2026-05-31)
+
+A telegram agent on a small local model (`ollama/gemma4:26b`) kept
+stalling mid-task — it would announce "I'll start working now," end the
+turn, and wait to be coaxed; the runner log showed ~4 tool turns then
+silence. Small models lack agentic stamina (the model is the ceiling),
+but the prompt can push one further. Added a `# Keep going until it's
+done` section to `BASE_PREAMBLE`
+(`crates/copperclaw-host/src/container_manager/prompt.rs`): do the work
+in this turn's tool loop; never announce-then-stop (nothing runs after
+the reply ends); execute todos to completion; stop only when done and
+verified or genuinely blocked — and then name the blocker instead of
+going quiet.
+
 ### Fixed (agents no longer fake-wait on install_packages "provisioning" — 2026-05-31)
 
 An agent asked to build in Go hit "no `go`", called `install_packages
