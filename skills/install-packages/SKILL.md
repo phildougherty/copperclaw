@@ -44,15 +44,26 @@ trivial to re-add.
 4. New image tag + fingerprint persist back to `container_configs`;
    subsequent spawns reuse the cached image.
 
-The change is **not** retroactive — you keep running on the current
-image for this turn. If you need a package *now*:
+The change is **not** retroactive. `install_packages` does NOT touch
+the container you're in now — the package appears only when a *future*
+session spawns on the rebuilt image (after an idle-stop or operator
+restart). There is no in-session provisioning step and nothing to poll
+or wait for; call it, then move on. If you sit waiting for the tool to
+appear this turn, you will wait forever.
 
-- `shell apt-get install -y <pkg>` inside the running container.
-  Ephemeral (lost on idle-stop) but immediate.
-- Wait for the next spawn after an idle period / operator restart.
+Need the tool *this* session? Install it into `/data` yourself:
 
-For tools you reach for every conversation, use the rebuild path. For
-"I need it once right now," `shell`.
+- **A language toolchain** (Go, Rust, a JVM): download the official
+  build into `/data` and add it to `PATH`. e.g. Go —
+  `curl -fsSL https://go.dev/dl/go1.23.0.linux-amd64.tar.gz | tar -C /data -xz`
+  then `export PATH=/data/go/bin:$PATH`. No root, no apt.
+- **A Python / Node library**: `pip install --user <pkg>` or a local
+  `npm install <pkg>` in the project dir.
+- `apt-get install` works only if the container has Debian-repo egress
+  — it often doesn't (`apt-get update` exits 100). Don't depend on it.
+
+Use `install_packages` for tools you'll want in *every* future session;
+install into `/data` for "I need it right now."
 
 ## Constraints
 

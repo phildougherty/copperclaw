@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (agents no longer fake-wait on install_packages "provisioning" — 2026-05-31)
+
+An agent asked to build in Go hit "no `go`", called `install_packages
+golang-go` — which only rebuilds the image for the NEXT session spawn,
+never the running container — then looped indefinitely "waiting for the
+Go environment to be provisioned." There is no in-session provisioning
+step or background task to wait on, and the skill's documented immediate
+fallback (`shell apt-get install`) is dead in containers without
+Debian-repo egress (`apt-get update` exits 100). The tool's only inline
+signal was a bare `{"kind":"accepted"}` ack with no timing. Fixed on
+three always-reachable surfaces:
+
+- `crates/copperclaw-host/src/container_manager/prompt.rs` (`BASE_PREAMBLE`,
+  always-on): a `# Don't fabricate` bullet — `install_packages` /
+  `add_mcp_server` change the image for the NEXT session, not the
+  current container; the tool won't appear this turn and there is
+  nothing to wait for; install into `/data` for an immediate need.
+- `skills/install-packages/SKILL.md`: replaced the "wait for the next
+  spawn" / `apt-get install` advice with the reliable in-session path
+  (download the toolchain into `/data`; Go tarball example) and the
+  apt-exit-100 caveat.
+- `skills/coding-task/SKILL.md`: "toolchain not in the base image →
+  download it into `/data` this session" with a Go example.
+
 ### Changed (system prompt slimmed ~51%, all directives intact — 2026-05-31)
 
 `BASE_PREAMBLE` in `crates/copperclaw-host/src/container_manager/prompt.rs`

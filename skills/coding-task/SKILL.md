@@ -9,6 +9,15 @@ How to do coding work as a Copperclaw agent. The base session image
 ships with `python3`, `pip`, `node`, `npm`, `git`, `curl`, `wget`,
 `jq`, and `build-essential` available via `shell`. Use them.
 
+Need a toolchain that *isn't* in that list (Go, Rust, a JVM)? Don't
+reach for `install_packages` and wait — it only rebuilds the image for
+a *future* session, so the binary never appears this turn. Download it
+into `/data` now instead: e.g. Go is `curl -fsSL
+https://go.dev/dl/go1.23.0.linux-amd64.tar.gz | tar -C /data -xz`
+(check go.dev/dl for the current version; match `uname -m`), then
+`export PATH=/data/go/bin:$PATH` — no root, no apt. See
+[[install-packages]].
+
 ## Doing the task
 
 - **Read before you write.** Match the surrounding style.
