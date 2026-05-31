@@ -259,6 +259,7 @@ pub(crate) fn container_config(spec: &ContainerSpec) -> Config<String> {
             Some(spec.entrypoint.clone())
         },
         user: spec.user.clone(),
+        working_dir: spec.working_dir.clone(),
         labels: if labels.is_empty() { None } else { Some(labels) },
         host_config: Some(host_config),
         ..Default::default()
@@ -787,6 +788,7 @@ mod tests {
     fn container_config_full() {
         let spec = ContainerSpec::new("c", "img")
             .with_user("nobody")
+            .with_working_dir("/data")
             .with_env("A", "1")
             .with_env("B", "2")
             .with_label("k", "v")
@@ -799,6 +801,7 @@ mod tests {
             .with_entrypoint(vec!["sh".into()]);
         let cfg = container_config(&spec);
         assert_eq!(cfg.user.as_deref(), Some("nobody"));
+        assert_eq!(cfg.working_dir.as_deref(), Some("/data"));
         assert_eq!(cfg.env.as_deref(), Some(&["A=1".to_string(), "B=2".to_string()][..]));
         assert_eq!(cfg.entrypoint.as_deref(), Some(&["sh".to_string()][..]));
         let labels = cfg.labels.expect("labels");

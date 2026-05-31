@@ -251,6 +251,11 @@ pub(crate) fn run_args(spec: &ContainerSpec) -> Result<Vec<String>, RtError> {
         a.push(user.clone());
     }
 
+    if let Some(dir) = &spec.working_dir {
+        a.push("--workdir".into());
+        a.push(dir.clone());
+    }
+
     // Labels: emit sorted by key so the argv is deterministic.
     let labels: BTreeMap<&String, &String> = spec.labels.iter().collect();
     for (k, v) in labels {
@@ -623,6 +628,16 @@ mod tests {
         // entrypoint pieces come after image.
         let image_pos = a.iter().position(|s| s == "img").unwrap();
         assert_eq!(&a[image_pos + 1..], &["/bin/sh", "-c", "echo hi"]);
+    }
+
+    #[test]
+    fn run_args_emits_workdir_when_set() {
+        let spec = ContainerSpec::new("c", "img").with_working_dir("/data");
+        let a = run_args(&spec).unwrap();
+        assert!(
+            a.windows(2).any(|w| w == ["--workdir", "/data"]),
+            "expected --workdir /data in argv, got {a:?}"
+        );
     }
 
     #[test]

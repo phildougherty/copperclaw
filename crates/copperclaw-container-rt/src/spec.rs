@@ -153,6 +153,13 @@ pub struct ContainerSpec {
     pub entrypoint: Vec<String>,
     /// Optional `user[:group]` override.
     pub user: Option<String>,
+    /// Working directory the entrypoint starts in. When `None` the
+    /// runtime falls back to the image's `WORKDIR` — typically `/`,
+    /// which a non-root `user` cannot write to (and which leaves
+    /// `$HOME`-relative tool caches like `go-build`/`npm`/`pip`
+    /// pointing at unwritable paths). The host sets this to the
+    /// session's writable bind mount.
+    pub working_dir: Option<String>,
     /// Additional `/etc/hosts` entries as `(hostname, ip)`.
     pub extra_hosts: Vec<(String, String)>,
     /// Per-group resource caps applied at spawn time.
@@ -215,6 +222,13 @@ impl ContainerSpec {
     #[must_use]
     pub fn with_user(mut self, user: impl Into<String>) -> Self {
         self.user = Some(user.into());
+        self
+    }
+
+    /// Set the working directory the entrypoint starts in.
+    #[must_use]
+    pub fn with_working_dir(mut self, dir: impl Into<String>) -> Self {
+        self.working_dir = Some(dir.into());
         self
     }
 

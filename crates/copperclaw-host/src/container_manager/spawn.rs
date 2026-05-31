@@ -364,6 +364,16 @@ impl ContainerManager {
     ) -> ContainerSpec {
         let mut spec = ContainerSpec::new(container_name(session.agent_group_id, session.id), image_tag)
             .with_entrypoint(vec![CONTAINER_RUNNER_PATH.to_string()])
+            // Start the agent in the writable session bind mount, and
+            // anchor $HOME there too. The container runs as a non-root
+            // uid with no passwd entry, so the image defaults (cwd `/`,
+            // `HOME=/`) are unwritable: every tool that caches under
+            // $HOME (go-build, npm, pip, cargo) dies with
+            // "mkdir /.cache: permission denied", and every relative
+            // write/`mkdir` fails with EACCES until the agent manually
+            // cds. Pointing both at the session dir fixes both classes.
+            .with_working_dir(CONTAINER_SESSION_DIR)
+            .with_env("HOME", CONTAINER_SESSION_DIR)
             .with_label("copperclaw.install", self.cfg.install_slug.clone())
             .with_label("copperclaw.session", session.id.as_uuid().to_string())
             .with_label(
@@ -835,6 +845,34 @@ mod tests {
         let meta = std::fs::metadata("/proc/self").unwrap();
         assert_eq!(uid, meta.uid());
         assert_eq!(gid, meta.gid());
+    }
+
+    #[test]
+    fn build_spec_sets_writable_home_and_workdir() {
+        // Regression: the container runs as a non-root uid with no
+        // passwd entry, so cwd and $HOME both defaulted to `/`
+        // (unwritable). `go build` died on "mkdir /.cache: permission
+        // denied" — the agent never saw its compile errors and claimed
+        // a non-compiling program was "built". Both must point at the
+        // writable session bind mount.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None);
+        assert_eq!(spec.working_dir.as_deref(), Some(CONTAINER_SESSION_DIR));
+        assert!(
+            spec.env
+                .iter()
+                .any(|(k, v)| k == "HOME" && v == CONTAINER_SESSION_DIR),
+            "HOME must be the writable session dir, got env {:?}",
+            spec.env
+        );
     }
 
     #[test]

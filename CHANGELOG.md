@@ -6,6 +6,37 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (session container `HOME` and cwd were `/` and unwritable, breaking all build tooling — 2026-05-31)
+
+The session container runs as a non-root uid (`<host-uid>:<gid>`) with
+no matching passwd entry, so both the working directory and `$HOME`
+defaulted to `/` — which that uid cannot write to. Seen live when a
+telegram agent tried to build a Go project:
+
+- Every tool that caches under `$HOME` failed. `go build` died on
+  `mkdir /.cache: permission denied`, which *masked the program's real
+  compile errors on every run* — the agent couldn't see why it failed,
+  retried the same command, and ultimately claimed a non-compiling
+  program was "built." `npm`, `pip`, `cargo`, and `git config` hit the
+  same wall.
+- The first relative-path `write_file` / `mkdir` failed with EACCES
+  until the agent manually `cd`'d into `/data`.
+
+Fix: the host now starts the container in the writable session bind
+mount and anchors `$HOME` there.
+
+- `crates/copperclaw-container-rt/src/spec.rs`: new
+  `ContainerSpec::working_dir` field + `with_working_dir` builder.
+- `crates/copperclaw-container-rt/src/docker.rs`: wires it into the
+  bollard `Config.working_dir`.
+- `crates/copperclaw-container-rt/src/apple.rs`: emits `--workdir` in
+  `run_args`.
+- `crates/copperclaw-host/src/container_manager/spawn.rs::build_spec`:
+  sets `working_dir` and `HOME` to `CONTAINER_SESSION_DIR` (`/data`).
+
+Image-independent (applied at container create), so it takes effect on
+the next session spawn — no image rebake.
+
 ### Added (system-prompt proactivity directive for weak local models — 2026-05-31)
 
 A telegram agent on a small local model (`ollama/gemma4:26b`) kept
