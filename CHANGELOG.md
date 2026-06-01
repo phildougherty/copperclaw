@@ -6,6 +6,34 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (MiniMax/OpenRouter tool-pairing rejection — 2026-06-01)
+
+minimax-m3 (and other strict OpenAI-compatible models behind OpenRouter)
+rejected the whole conversation midstream — `invalid params, tool call
+result does not follow tool call` — whenever the transcript held a user
+message that mixed a `tool_result` block with a `text` block. That
+happens when a turn ends on a tool call without a final reply and a new
+inbound user message arrives: the Anthropic provider coalesced both into
+one user message (valid for Claude, rejected by MiniMax). Once such a
+turn was recorded, every later turn replayed it and failed, wedging the
+agent permanently. Diagnosed by replaying the live 289-message transcript
+against OpenRouter and bisecting to the exact offending turn.
+
+- `crates/copperclaw-providers/src/anthropic.rs`: `push_block` keeps
+  `tool_result` and `text` blocks in separate user messages. Parallel
+  tool_results still coalesce; the Anthropic API recombines consecutive
+  same-role turns server-side, so the native backend is unaffected.
+- Same file: a tool_use whose argument JSON failed to parse (stored with
+  a null input) now serializes as `{}` rather than `null` — strict
+  gateways reject a tool call with null arguments.
+- `crates/copperclaw-runner/src/run/provider_call.rs`: record the
+  unparseable-input placeholder as `{}` at the source, not `Value::Null`.
+
+Root cause was downstream of the old 4096 output cap: minimax-m3 truncated
+a `write_file` argument JSON at the token limit, producing the malformed
+tool call that wedged the session — see the `COPPERCLAW_DEFAULT_MAX_TOKENS`
+bump below, which makes that truncation far less likely.
+
 ### Added (configurable per-turn output-token cap — 2026-06-01)
 
 `COPPERCLAW_DEFAULT_MAX_TOKENS` in `.env` now sets the per-turn output

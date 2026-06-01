@@ -242,7 +242,12 @@ fn history_to_messages(history: &[HistoryMessage]) -> Vec<Value> {
                     "type": "tool_use",
                     "id": id,
                     "name": name,
-                    "input": input,
+                    // A tool call whose argument JSON failed to parse (e.g. the
+                    // model truncated it at the token limit) is recorded with a
+                    // null input. Anthropic tolerates that, but strict
+                    // OpenAI-compatible gateways reject a tool call with null
+                    // arguments — coerce to an empty object.
+                    "input": if input.is_null() { json!({}) } else { input.clone() },
                 }),
             ),
             HistoryMessage::Tool { tool_use_id, content, is_error } => (
@@ -264,12 +269,35 @@ fn push_block(out: &mut Vec<Value>, role: &str, block: Value) {
     if let Some(last) = out.last_mut() {
         if last.get("role").and_then(Value::as_str) == Some(role) {
             if let Some(arr) = last.get_mut("content").and_then(Value::as_array_mut) {
-                arr.push(block);
-                return;
+                // Anthropic tolerates a single user message that mixes
+                // `tool_result` and `text` blocks (it happens when a turn ends
+                // on a tool call without a final reply and a new inbound user
+                // message arrives). Strict OpenAI-compatible gateways
+                // (OpenRouter -> MiniMax, etc.) reject it midstream with
+                // "tool call result does not follow tool call". Keep
+                // tool_result and text in separate user messages; the Anthropic
+                // API recombines consecutive same-role turns server-side, so
+                // this stays valid for the native backend too.
+                if !would_mix_tool_result_and_text(arr, &block) {
+                    arr.push(block);
+                    return;
+                }
             }
         }
     }
     out.push(json!({ "role": role, "content": [block] }));
+}
+
+/// True when appending `block` to `existing` would put a `tool_result` block
+/// in the same message as a non-`tool_result` (text) block, or vice versa.
+fn would_mix_tool_result_and_text(existing: &[Value], block: &Value) -> bool {
+    fn is_tool_result(v: &Value) -> bool {
+        v.get("type").and_then(Value::as_str) == Some("tool_result")
+    }
+    let block_is_tr = is_tool_result(block);
+    let has_tr = existing.iter().any(is_tool_result);
+    let has_other = existing.iter().any(|b| !is_tool_result(b));
+    (block_is_tr && has_other) || (!block_is_tr && has_tr)
 }
 
 fn map_http_error(status: u16, body: String) -> ProviderError {
@@ -753,6 +781,67 @@ mod tests {
         assert_eq!(user_blocks.len(), 1);
         assert_eq!(user_blocks[0]["type"], "tool_result");
         assert_eq!(user_blocks[0]["is_error"], false);
+    }
+
+    #[test]
+    fn tool_result_and_user_text_split_into_separate_messages() {
+        // A turn that ended on a tool call without a final reply, then a fresh
+        // inbound user message. The tool_result and the user text must NOT share
+        // one user message — strict OpenAI-compatible gateways (MiniMax) reject
+        // that with "tool call result does not follow tool call".
+        let hist = vec![
+            HistoryMessage::ToolUse {
+                id: "tu_1".into(),
+                name: "write_file".into(),
+                input: json!({ "path": "/x" }),
+            },
+            HistoryMessage::Tool {
+                tool_use_id: "tu_1".into(),
+                content: "boom".into(),
+                is_error: true,
+            },
+            HistoryMessage::User { content: "what happened?".into() },
+        ];
+        let out = history_to_messages(&hist);
+        // assistant[tool_use], user[tool_result], user[text]
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1]["role"], "user");
+        let res = out[1]["content"].as_array().unwrap();
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0]["type"], "tool_result");
+        assert_eq!(out[2]["role"], "user");
+        let txt = out[2]["content"].as_array().unwrap();
+        assert_eq!(txt.len(), 1);
+        assert_eq!(txt[0]["type"], "text");
+    }
+
+    #[test]
+    fn parallel_tool_results_still_coalesce() {
+        // Multiple tool_results from one parallel batch DO still share a user
+        // message (valid everywhere); only the tool_result/text mix splits.
+        let hist = vec![
+            HistoryMessage::ToolUse { id: "a".into(), name: "t".into(), input: json!({}) },
+            HistoryMessage::ToolUse { id: "b".into(), name: "t".into(), input: json!({}) },
+            HistoryMessage::Tool { tool_use_id: "a".into(), content: "1".into(), is_error: false },
+            HistoryMessage::Tool { tool_use_id: "b".into(), content: "2".into(), is_error: false },
+        ];
+        let out = history_to_messages(&hist);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["content"].as_array().unwrap().len(), 2); // two tool_use
+        assert_eq!(out[1]["content"].as_array().unwrap().len(), 2); // two tool_result
+    }
+
+    #[test]
+    fn null_tool_use_input_serializes_as_empty_object() {
+        // Truncated/unparseable argument JSON is recorded as a null input;
+        // it must serialize as `{}`, never `null`, for OpenAI-compatible gateways.
+        let hist = vec![HistoryMessage::ToolUse {
+            id: "tu_1".into(),
+            name: "write_file".into(),
+            input: Value::Null,
+        }];
+        let out = history_to_messages(&hist);
+        assert_eq!(out[0]["content"][0]["input"], json!({}));
     }
 
     /// Build an `eventsource_stream::Event` from a JSON payload for

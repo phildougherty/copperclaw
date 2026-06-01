@@ -350,7 +350,13 @@ pub(super) async fn pump_events(
                 out.tool_calls.push(PendingToolCall {
                     id: tool_use_id,
                     name: tool_name,
-                    input: serde_json::Value::Null,
+                    // Empty object, not Null: this tool_use is recorded into
+                    // history and replayed every turn. A null `input`
+                    // serializes as a tool call with null arguments, which
+                    // strict OpenAI-compatible gateways (OpenRouter -> MiniMax)
+                    // reject. The real (unparseable) args are surfaced to the
+                    // model via the is_error tool_result instead.
+                    input: serde_json::Value::Object(serde_json::Map::new()),
                     parse_error: Some(parse_error),
                 });
             }
