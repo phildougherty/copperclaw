@@ -6,18 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Added (sub-agents can review the parent's codebase — 2026-06-01)
+### Added (sub-agents work on the parent's codebase — writable git worktrees — 2026-06-01)
 
 `create_agent` siblings run in their own container with an empty `/data`,
-so "spawn sub-agents to review the codebase" produced reviewers with no
-source to look at. Now every sibling gets the PARENT agent's session dir
-bind-mounted **read-only at `/parent`** (`build_spec`, located by scanning
-`<data>/sessions/*/<parent_session_id>`). The sibling can review/audit/
-search the parent's code but can't modify it; its own writable workspace
-stays at `/data`. The `create_agent` / `explore` descriptions and the
-system prompt were reframed: `explore` for quick in-process lookups
-(shares your live `/data`), `create_agent` for substantive parallel
-review/work (reads your code at `/parent`).
+so "spawn sub-agents to review/build on the codebase" produced siblings
+with no source to work on. Now `build_spec` locates the PARENT agent's
+session dir (scanning `<data>/sessions/*/<parent_session_id>`) and shares
+it with the sibling, Claude-Code-style:
+
+- **Git-repo parent** → the sibling gets a **writable `git worktree`** of
+  the parent repo at `/workspace` on its own branch `sib/<session-id>`
+  (`git worktree add -b`, idempotent across container restarts). It can
+  edit AND commit there in isolation; the parent's checked-out files are
+  never mounted, so they stay physically untouched. The parent's `.git` is
+  bind-mounted **read-write at its identical host-absolute path** so the
+  worktree's `gitdir:` pointer resolves in-container with no rewriting, and
+  commits land in the shared object store — the parent sees branch
+  `sib/<id>` immediately and reviews/merges it from its own `/data`
+  (`git diff main..sib/<id>`, `git merge sib/<id>`, then `git worktree
+  remove .copperclaw/wt/<id>`). `.copperclaw/` is appended to the parent's
+  `.git/info/exclude` so worktree scratch never pollutes its `git status`.
+- **Non-git parent** → falls back to the prior behaviour: the parent
+  workspace mounted **read-only at `/parent`** (review/audit only).
+
+`COPPERCLAW_WORKSPACE` / `COPPERCLAW_WORKSPACE_BRANCH` env vars are set in
+the sibling for tooling. The `create_agent` / `explore` descriptions and
+the system prompt were reframed accordingly (quick in-process `explore` vs
+substantive parallel `create_agent` that can implement-and-commit on a
+branch or review read-only). Trade-off: sharing `.git` read-write means a
+sibling *could* write to the shared object store; the parent's working
+tree is the safety boundary that stays untouched.
 
 ### Changed (default max tool turns 60 → 150 — 2026-06-01)
 

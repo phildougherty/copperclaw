@@ -22,14 +22,19 @@ pub mod create_agent {
             "create_agent",
             "Request the host to spawn a sibling agent (own container, full tool access, \
              unbounded — it reports back into your messages_in). The sibling has its OWN \
-             fresh writable workspace at /data, AND your CURRENT workspace is mounted \
-             READ-ONLY at /parent — so it can read, review, audit, or search your code and \
-             files there (it cannot modify them; its writable space is /data). \
-             ALWAYS tell the sibling where your code is in its `instructions` — e.g. \
-             'review the code under /parent'. Use `create_agent` for SUBSTANTIVE PARALLEL \
-             work over your codebase (spawn one reviewer/auditor per area, each analysing \
-             /parent) or for independent research. For a QUICK in-process lookup that shares \
-             your live workspace directly, prefer `explore`.",
+             fresh workspace at /data. If your workspace is a GIT REPO, the sibling also \
+             gets a WRITABLE git worktree of it at /workspace on its own branch \
+             (sib/<id>): it can edit AND commit there, isolated from your files. Commits \
+             go into the shared object store, so after it finishes you review and merge \
+             its branch from your own repo (`git diff main..sib/<id>`, `git merge \
+             sib/<id>`); your checked-out files are never touched until you merge. If your \
+             workspace is NOT a git repo, your code is instead mounted READ-ONLY at \
+             /parent (review/audit only). ALWAYS point the sibling at its workspace in \
+             `instructions` — e.g. 'implement X under /workspace and commit' (git repo) or \
+             'review the code under /parent' (read-only). Use `create_agent` for \
+             SUBSTANTIVE PARALLEL work over your codebase or independent research; for a \
+             QUICK in-process lookup that shares your live workspace directly, prefer \
+             `explore`.",
             serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,

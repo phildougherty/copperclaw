@@ -19,11 +19,21 @@ pub const POLL_INTERVAL_MS: u64 = 1000;
 pub const CONTAINER_SESSION_DIR: &str = "/data";
 
 /// Path inside a `create_agent` sibling's container where the PARENT
-/// agent's session dir is mounted read-only, so the sibling can review /
-/// audit / search the parent's workspace and code. Read-only: the sibling
-/// can read but never corrupt the parent's files; its own writable
-/// workspace stays at [`CONTAINER_SESSION_DIR`].
+/// agent's session dir is mounted read-only. Used ONLY as the fallback
+/// when the parent workspace is NOT a git repo (so there's nothing to make
+/// a worktree from): the sibling can still review / audit / search the
+/// parent's code, but can't modify it. When the parent IS a git repo, the
+/// sibling instead gets a WRITABLE worktree at [`CONTAINER_WORKSPACE_DIR`].
 pub const CONTAINER_PARENT_DIR: &str = "/parent";
+
+/// Path inside a `create_agent` sibling's container where a WRITABLE git
+/// worktree of the parent's repo is mounted (branch `sib/<session-id>`).
+/// The sibling edits + commits here; commits land in the parent repo's
+/// shared object store, so the parent sees the branch immediately and can
+/// review/merge it (`git diff main..sib/<id>`, `git merge sib/<id>`) from
+/// its own `/data`. The parent's *checked-out* working tree is never
+/// mounted into the sibling, so the parent's files on disk stay untouched.
+pub const CONTAINER_WORKSPACE_DIR: &str = "/workspace";
 
 /// Filename of the runner-config JSON written into the session dir.
 pub const RUNNER_CONFIG_FILENAME: &str = "runner.json";
@@ -439,27 +449,10 @@ impl ContainerManager {
             }
         }
 
-        // A `create_agent` sibling (recorded with a parent `source_session_id`)
-        // gets the PARENT agent's session dir mounted READ-ONLY at /parent, so
-        // a spawned reviewer / auditor can read the parent's workspace and code
-        // (the sibling's own /data starts empty). The parent lives under a
-        // different agent group, so we locate it by scanning
-        // `<data>/sessions/*/<parent_session_id>` — session ids are unique
-        // UUIDs. Read-only keeps the sibling from corrupting the parent's
-        // files. Best-effort: if the parent dir can't be located, skip it.
-        if let Some(parent_sid) = session.source_session_id {
-            if let Some(sessions_dir) = paths.root.parent().and_then(|p| p.parent()) {
-                if let Some(parent_root) =
-                    find_session_root(sessions_dir, &parent_sid.as_uuid().to_string())
-                {
-                    spec = spec.with_mount(Mount::Bind {
-                        source: parent_root.to_string_lossy().into_owned(),
-                        target: CONTAINER_PARENT_DIR.to_string(),
-                        read_only: true,
-                    });
-                }
-            }
-        }
+        // A `create_agent` sibling gets access to the PARENT agent's
+        // workspace (writable git worktree, or read-only fallback). See
+        // [`apply_parent_workspace`].
+        spec = apply_parent_workspace(spec, session, paths);
 
         // The runner reads its config from this path via the
         // `--config` flag wired into the entrypoint args. ContainerSpec
@@ -528,6 +521,68 @@ impl ContainerManager {
     }
 }
 
+/// Share the PARENT agent's workspace into a `create_agent` sibling.
+///
+/// A sibling (recorded with a parent `source_session_id`) starts with an
+/// empty `/data`. The parent lives under a different agent group, so we
+/// locate it by scanning `<data>/sessions/*/<parent_session_id>` — session
+/// ids are unique UUIDs. Best-effort: if the parent can't be located, the
+/// spec is returned unchanged.
+///
+/// If the parent workspace is a GIT REPO, the sibling gets a WRITABLE
+/// worktree on its own branch (`sib/<id>`) at `/workspace` — it can edit
+/// and commit, and the parent reviews/merges the branch from its own
+/// `/data` (the worktree shares the parent repo's object store). The
+/// parent's `.git` is mounted at its IDENTICAL host-absolute path so the
+/// worktree's `gitdir:` pointer resolves inside the container with no
+/// rewriting; the parent's checked-out files are never mounted, so they
+/// stay physically untouched. Otherwise (no repo) we fall back to the
+/// legacy READ-ONLY `/parent` mount so the sibling can still review.
+fn apply_parent_workspace(
+    mut spec: ContainerSpec,
+    session: &Session,
+    paths: &SessionPaths,
+) -> ContainerSpec {
+    let Some(parent_sid) = session.source_session_id else {
+        return spec;
+    };
+    let Some(sessions_dir) = paths.root.parent().and_then(|p| p.parent()) else {
+        return spec;
+    };
+    let Some(parent_root) = find_session_root(sessions_dir, &parent_sid.as_uuid().to_string())
+    else {
+        return spec;
+    };
+
+    let sibling_sid = session.id.as_uuid().to_string();
+    if let Some(wt) = provision_parent_worktree(&parent_root, &sibling_sid) {
+        let git_dir = wt.git_dir.to_string_lossy().into_owned();
+        spec = spec
+            // Shared `.git` at its host-absolute path (RW: the worktree's
+            // commits write to this object store).
+            .with_mount(Mount::Bind {
+                source: git_dir.clone(),
+                target: git_dir,
+                read_only: false,
+            })
+            // The writable worktree checkout itself.
+            .with_mount(Mount::Bind {
+                source: wt.worktree_dir.to_string_lossy().into_owned(),
+                target: CONTAINER_WORKSPACE_DIR.to_string(),
+                read_only: false,
+            })
+            .with_env("COPPERCLAW_WORKSPACE", CONTAINER_WORKSPACE_DIR)
+            .with_env("COPPERCLAW_WORKSPACE_BRANCH", &wt.branch);
+    } else {
+        spec = spec.with_mount(Mount::Bind {
+            source: parent_root.to_string_lossy().into_owned(),
+            target: CONTAINER_PARENT_DIR.to_string(),
+            read_only: true,
+        });
+    }
+    spec
+}
+
 /// Container name format. Uses the session id (which is a UUID) so
 /// names are globally unique and DNS-safe.
 /// Resolve the host process's effective UID/GID for the container's
@@ -562,6 +617,101 @@ fn find_session_root(
         }
     }
     None
+}
+
+/// The host paths a `create_agent` sibling needs mounted to operate a
+/// writable git worktree of its parent's repo.
+struct ParentWorktree {
+    /// The parent repo's `.git` directory (shared object store + refs).
+    /// Mounted into the sibling at this same host-absolute path.
+    git_dir: std::path::PathBuf,
+    /// The worktree checkout dir (the sibling's writable `/workspace`).
+    worktree_dir: std::path::PathBuf,
+    /// The branch the worktree is checked out on (`sib/<session-id>`).
+    branch: String,
+}
+
+/// Run `git -C <repo> <args...>`, returning `true` on a clean exit.
+/// Best-effort: any spawn failure (git absent, etc.) reports `false`.
+fn git_ok(repo: &std::path::Path, args: &[&str]) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Provision (or reuse) a git worktree of the parent repo for a sibling.
+///
+/// Returns `None` when the parent workspace is not a usable git repo (no
+/// top-level `.git` dir, no commit yet, or git is unavailable), in which
+/// case the caller falls back to the legacy read-only `/parent` mount.
+///
+/// Idempotent: a container can re-spawn within a session (crash/restart),
+/// so an existing worktree dir is reused rather than re-created.
+fn provision_parent_worktree(
+    parent_root: &std::path::Path,
+    sibling_sid: &str,
+) -> Option<ParentWorktree> {
+    let git_dir = parent_root.join(".git");
+    // Only a top-level repo with at least one commit can seed a worktree.
+    if !git_dir.is_dir() || !git_ok(parent_root, &["rev-parse", "--verify", "HEAD"]) {
+        return None;
+    }
+
+    // Keep the worktree scratch dir out of the parent's `git status` — it
+    // lives inside the parent working tree, so without this every parent
+    // status call would show `.copperclaw/` as untracked. Best-effort;
+    // worktrees share `info/exclude` via the common dir.
+    exclude_copperclaw_dir(&git_dir);
+
+    let worktree_dir = parent_root.join(".copperclaw").join("wt").join(sibling_sid);
+    let branch = format!("sib/{sibling_sid}");
+
+    if !worktree_dir.exists() {
+        // `git worktree add` creates the leaf, but make sure the parents
+        // exist so it can't fail on a missing `.copperclaw/wt`.
+        let _ = std::fs::create_dir_all(worktree_dir.parent()?);
+        let wt = worktree_dir.to_str()?;
+        // Fresh branch off HEAD; if the branch already exists (dir was
+        // removed but the branch lingered) attach to it instead.
+        let added = git_ok(parent_root, &["worktree", "add", "-b", &branch, wt, "HEAD"])
+            || git_ok(parent_root, &["worktree", "add", wt, &branch]);
+        if !added {
+            return None;
+        }
+    }
+
+    Some(ParentWorktree {
+        git_dir,
+        worktree_dir,
+        branch,
+    })
+}
+
+/// Append `.copperclaw/` to the repo's `.git/info/exclude` if it's not
+/// already listed, so sibling worktree scratch never shows up as untracked
+/// in the parent's `git status`. Best-effort and silent on any IO error.
+fn exclude_copperclaw_dir(git_dir: &std::path::Path) {
+    let info = git_dir.join("info");
+    if std::fs::create_dir_all(&info).is_err() {
+        return;
+    }
+    let exclude = info.join("exclude");
+    let current = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if current.lines().any(|l| l.trim() == ".copperclaw/") {
+        return;
+    }
+    let mut next = current;
+    if !next.is_empty() && !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push_str(".copperclaw/\n");
+    let _ = std::fs::write(&exclude, next);
 }
 
 /// Choose the base image for a per-group rebuild. Returns the install's
@@ -967,6 +1117,7 @@ mod tests {
 
     #[test]
     fn build_spec_mounts_parent_workspace_read_only_for_siblings() {
+        // Non-git parent workspace -> legacy read-only /parent fallback.
         let tmp = tempfile::tempdir().unwrap();
         let db = CentralDb::open_in_memory().unwrap();
         let mgr = ContainerManager::new(
@@ -1016,6 +1167,153 @@ mod tests {
             ),
             "root session must not get a /parent mount"
         );
+    }
+
+    /// `true` if a usable `git` is on PATH. Worktree tests are skipped
+    /// (pass vacuously) on the rare box without git so CI never flakes.
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Initialise a git repo with one commit at `root`.
+    fn init_repo_with_commit(root: &std::path::Path) {
+        let run = |args: &[&str]| {
+            assert!(super::git_ok(root, args), "git {args:?} failed in test repo");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "t@t"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(root.join("README.md"), "hi\n").unwrap();
+        run(&["add", "README.md"]);
+        run(&["commit", "-q", "-m", "init"]);
+    }
+
+    #[test]
+    fn build_spec_mounts_writable_worktree_for_git_parent() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        // A git-repo parent workspace under a different agent group.
+        let parent_group = AgentGroupId::new();
+        let parent_sid = copperclaw_types::SessionId::new();
+        let parent_root = SessionPaths::new(tmp.path(), parent_group, parent_sid).root;
+        std::fs::create_dir_all(&parent_root).unwrap();
+        init_repo_with_commit(&parent_root);
+
+        let mut sibling = fixture_session(&db);
+        sibling.source_session_id = Some(parent_sid);
+        let paths = SessionPaths::new(tmp.path(), sibling.agent_group_id, sibling.id);
+        let spec = mgr.build_spec(&sibling, &paths, "img", None);
+
+        // No read-only /parent — the writable worktree replaces it.
+        assert!(
+            !spec.mounts.iter().any(
+                |m| matches!(m, Mount::Bind { target, .. } if target == CONTAINER_PARENT_DIR)
+            ),
+            "git parent must not get the read-only /parent fallback"
+        );
+
+        // /workspace is the worktree checkout, read-write.
+        let ws = spec
+            .mounts
+            .iter()
+            .find_map(|m| match m {
+                Mount::Bind {
+                    source,
+                    target,
+                    read_only,
+                } if target == CONTAINER_WORKSPACE_DIR => Some((source.clone(), *read_only)),
+                _ => None,
+            })
+            .expect("/workspace mount present");
+        assert!(!ws.1, "/workspace must be read-write");
+        let expected_wt = parent_root
+            .join(".copperclaw")
+            .join("wt")
+            .join(sibling.id.as_uuid().to_string());
+        assert_eq!(ws.0, expected_wt.to_string_lossy());
+        assert!(
+            expected_wt.join("README.md").is_file(),
+            "worktree checked out"
+        );
+
+        // The shared .git is mounted RW at its identical host-absolute path
+        // so the worktree's `gitdir:` pointer resolves in-container.
+        let git_src = parent_root.join(".git").to_string_lossy().into_owned();
+        let git_mount = spec.mounts.iter().find_map(|m| match m {
+            Mount::Bind {
+                source,
+                target,
+                read_only,
+            } if *source == git_src => Some((target.clone(), *read_only)),
+            _ => None,
+        });
+        let (git_target, git_ro) = git_mount.expect(".git mount present");
+        assert_eq!(git_target, git_src, ".git target must equal its host path");
+        assert!(!git_ro, ".git must be read-write (commits write objects here)");
+
+        // The branch was created off the parent's HEAD.
+        let branch = format!("sib/{}", sibling.id.as_uuid());
+        assert!(
+            super::git_ok(&parent_root, &["rev-parse", "--verify", &branch]),
+            "branch {branch} must exist in the parent repo"
+        );
+        assert!(spec
+            .env
+            .iter()
+            .any(|(k, v)| k == "COPPERCLAW_WORKSPACE_BRANCH" && *v == branch));
+    }
+
+    #[test]
+    fn build_spec_worktree_provisioning_is_idempotent() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let parent_group = AgentGroupId::new();
+        let parent_sid = copperclaw_types::SessionId::new();
+        let parent_root = SessionPaths::new(tmp.path(), parent_group, parent_sid).root;
+        std::fs::create_dir_all(&parent_root).unwrap();
+        init_repo_with_commit(&parent_root);
+
+        let mut sibling = fixture_session(&db);
+        sibling.source_session_id = Some(parent_sid);
+        let paths = SessionPaths::new(tmp.path(), sibling.agent_group_id, sibling.id);
+
+        // A second spawn (container restart within a session) must reuse the
+        // existing worktree, not error out.
+        let spec1 = mgr.build_spec(&sibling, &paths, "img", None);
+        let spec2 = mgr.build_spec(&sibling, &paths, "img", None);
+        let has_workspace = |s: &ContainerSpec| {
+            s.mounts.iter().any(
+                |m| matches!(m, Mount::Bind { target, .. } if target == CONTAINER_WORKSPACE_DIR),
+            )
+        };
+        assert!(has_workspace(&spec1) && has_workspace(&spec2));
+
+        // `.copperclaw/` is excluded so it doesn't pollute parent git status.
+        let exclude =
+            std::fs::read_to_string(parent_root.join(".git/info/exclude")).unwrap_or_default();
+        assert!(exclude.lines().any(|l| l.trim() == ".copperclaw/"));
     }
 
     #[test]

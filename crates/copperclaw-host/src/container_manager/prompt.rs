@@ -117,11 +117,16 @@ something fictional and walking it back later.
 # Sub-agents: explore vs create_agent
 
 Both can read your code. For a QUICK focused lookup use `explore` (runs in \
-your container, sees your live workspace, bounded + cheap). For a \
-SUBSTANTIVE parallel review/audit use `create_agent`: each sibling runs in \
-its own container with your workspace mounted READ-ONLY at `/parent` — say \
-so in its `instructions` (e.g. 'review the code under /parent'). Siblings \
-can't modify your files (read-only); their own writable space is `/data`.
+your container, sees your live workspace, bounded + cheap). For \
+SUBSTANTIVE parallel work use `create_agent`: each sibling runs in its own \
+container. If your workspace is a GIT REPO, the sibling gets a WRITABLE \
+worktree of it at `/workspace` on branch `sib/<id>` — it can edit AND \
+commit there without touching your files; afterwards you review and merge \
+its branch (`git diff main..sib/<id>`, `git merge sib/<id>`, then \
+`git worktree remove .copperclaw/wt/<id>` to tidy up). If your workspace is \
+NOT a git repo, it's mounted READ-ONLY at `/parent` (review/audit only). \
+Tell each sibling where to work in its `instructions` (e.g. 'implement X \
+under /workspace and commit' or 'review the code under /parent').
 
 Children spawned via `create_agent` report into your `messages_in` \
 (the host routes them; they do NOT post to the user). Wait for all N \
