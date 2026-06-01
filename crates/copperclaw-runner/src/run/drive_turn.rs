@@ -263,7 +263,7 @@ pub(super) async fn drive_turn(
             "executing tool calls"
         );
         for call in &output.tool_calls {
-            let (content, is_error) = if let Some(parse_err) = call.parse_error.as_deref() {
+            let (content, images, is_error) = if let Some(parse_err) = call.parse_error.as_deref() {
                 // Synthetic call from `ProviderEvent::ToolInputParseError`:
                 // we never actually invoke the tool — instead we hand the
                 // model a tool_result describing what went wrong so it
@@ -272,6 +272,7 @@ pub(super) async fn drive_turn(
                     format!(
                         "Your tool_use input JSON could not be parsed: {parse_err}. Please re-issue this exact tool call with valid JSON.",
                     ),
+                    Vec::new(),
                     true,
                 )
             } else {
@@ -285,6 +286,13 @@ pub(super) async fn drive_turn(
                 content,
                 is_error,
             });
+            // A tool that returned image content (e.g. `view_image`)
+            // surfaces it as follow-on Image entries so vision models see
+            // the pixels. The anthropic serializer puts each in its own
+            // user message, so it never mixes with the tool_result block.
+            for (media_type, data) in images {
+                history.push(HistoryMessage::Image { media_type, data });
+            }
         }
 
         // Persisted mid-message so a crash here (OOM, panic, container

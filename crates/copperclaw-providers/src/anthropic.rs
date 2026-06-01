@@ -259,6 +259,17 @@ fn history_to_messages(history: &[HistoryMessage]) -> Vec<Value> {
                     "is_error": is_error,
                 }),
             ),
+            HistoryMessage::Image { media_type, data } => (
+                "user",
+                json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": data,
+                    },
+                }),
+            ),
         };
         push_block(&mut out, role, block);
     }
@@ -829,6 +840,56 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0]["content"].as_array().unwrap().len(), 2); // two tool_use
         assert_eq!(out[1]["content"].as_array().unwrap().len(), 2); // two tool_result
+    }
+
+    #[test]
+    fn image_serializes_as_base64_image_block_on_user_role() {
+        // The exact shape verified live against minimax-m3 via OpenRouter.
+        let hist = vec![
+            HistoryMessage::User { content: "what is this?".into() },
+            HistoryMessage::Image {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+            },
+        ];
+        let out = history_to_messages(&hist);
+        // User text + image coalesce into one user message [text, image].
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["role"], "user");
+        let blocks = out[0]["content"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["source"]["type"], "base64");
+        assert_eq!(blocks[1]["source"]["media_type"], "image/png");
+        assert_eq!(blocks[1]["source"]["data"], "QUJD");
+    }
+
+    #[test]
+    fn image_after_tool_result_splits_into_its_own_message() {
+        // A tool (view_image) returns an image: the tool_result and the
+        // image must NOT share a user message (minimax rejects the mix).
+        let hist = vec![
+            HistoryMessage::ToolUse {
+                id: "tu_1".into(),
+                name: "view_image".into(),
+                input: json!({ "path": "/data/x.png" }),
+            },
+            HistoryMessage::Tool {
+                tool_use_id: "tu_1".into(),
+                content: "loaded".into(),
+                is_error: false,
+            },
+            HistoryMessage::Image {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+            },
+        ];
+        let out = history_to_messages(&hist);
+        // assistant[tool_use], user[tool_result], user[image]
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1]["content"][0]["type"], "tool_result");
+        assert_eq!(out[2]["role"], "user");
+        assert_eq!(out[2]["content"][0]["type"], "image");
     }
 
     #[test]

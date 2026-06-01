@@ -292,6 +292,19 @@ pub(crate) fn history_to_messages(input: &QueryInput) -> Vec<Value> {
                     "content": content,
                 }));
             }
+            HistoryMessage::Image { media_type, data } => {
+                // OpenAI-compatible vision shape: a user message whose
+                // content is an `image_url` part carrying a data URI.
+                // Vision-capable local models read it; text-only models
+                // ignore the part rather than erroring.
+                out.push(json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "image_url",
+                        "image_url": { "url": format!("data:{media_type};base64,{data}") },
+                    }],
+                }));
+            }
         }
     }
     out

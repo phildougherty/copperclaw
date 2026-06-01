@@ -57,6 +57,31 @@ pub fn format_messages(mut messages: Vec<MessageInRow>) -> FormattedTurn {
     }
 }
 
+/// Pull inlined inbound images out of the picked rows, in seq order, as
+/// `(media_type, base64_data)`. The channel ingress sets
+/// `content.attachment.data_base64` for image attachments; each becomes a
+/// `HistoryMessage::Image` so vision-capable models see photos the user
+/// sent. Rows are already seq-sorted by [`format_messages`]'s caller.
+#[must_use]
+pub fn extract_inbound_images(rows: &[MessageInRow]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for m in rows {
+        let Some(att) = m.content.get("attachment") else {
+            continue;
+        };
+        let Some(data) = att.get("data_base64").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let media_type = att
+            .get("mime_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("image/jpeg")
+            .to_string();
+        out.push((media_type, data.to_string()));
+    }
+    out
+}
+
 /// Best-effort extraction of a text body from a stored JSON content blob.
 ///
 /// Recognised shapes (in order):
@@ -65,6 +90,18 @@ pub fn format_messages(mut messages: Vec<MessageInRow>) -> FormattedTurn {
 /// 3. Anything else — the JSON is rendered as a compact string.
 fn body_text(content: &serde_json::Value) -> String {
     if let Some(s) = content.get("text").and_then(|v| v.as_str()) {
+        if !s.is_empty() {
+            return s.to_string();
+        }
+        // Empty caption but an inlined image rides as a separate content
+        // block — note it so the user turn isn't a blank line.
+        if content
+            .get("attachment")
+            .and_then(|a| a.get("data_base64"))
+            .is_some()
+        {
+            return "[sent an image]".to_string();
+        }
         return s.to_string();
     }
     if let Some(s) = content.get("prompt").and_then(|v| v.as_str()) {
@@ -101,6 +138,41 @@ mod tests {
             reply_to: None,
             is_group: None,
         }
+    }
+
+    #[test]
+    fn extract_inbound_images_pulls_inlined_attachments() {
+        let rows = vec![
+            row(1, json!({"text": "no attachment"})),
+            row(
+                2,
+                json!({
+                    "text": "look at this",
+                    "attachment": {
+                        "kind": "telegram.photo",
+                        "mime_type": "image/jpeg",
+                        "data_base64": "QUJD"
+                    }
+                }),
+            ),
+            // Attachment present but no inlined bytes (e.g. a document) → skipped.
+            row(
+                3,
+                json!({"attachment": {"kind": "telegram.document", "path": "/x"}}),
+            ),
+        ];
+        let imgs = extract_inbound_images(&rows);
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].0, "image/jpeg");
+        assert_eq!(imgs[0].1, "QUJD");
+    }
+
+    #[test]
+    fn extract_inbound_images_defaults_mime_when_absent() {
+        let rows = vec![row(1, json!({"attachment": {"data_base64": "QQ=="}}))];
+        let imgs = extract_inbound_images(&rows);
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].0, "image/jpeg");
     }
 
     #[test]

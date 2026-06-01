@@ -43,6 +43,7 @@ pub mod sentinel;
 pub mod scheduling;
 pub mod self_mod;
 pub mod todo;
+pub mod view_image;
 pub mod web_search;
 
 /// A registered tool: its schema plus a type-erased async handler.
@@ -94,6 +95,7 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         computer_use::read_file::entry(),
         computer_use::write_file::entry(),
         computer_use::web_fetch::entry(),
+        view_image::entry(),
         // Git inspection tools — read-only structured access to a
         // libgit2-backed repository view. Registered alphabetically.
         git_blame::entry(),
@@ -201,6 +203,7 @@ mod tests {
             "read_file",
             "write_file",
             "web_fetch",
+            "view_image",
             "git_blame",
             "git_diff",
             "git_log",

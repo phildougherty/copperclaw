@@ -582,6 +582,15 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
             state
                 .history
                 .push(HistoryMessage::User { content: formatted.prompt });
+            // Inbound images (e.g. a telegram photo) the user attached
+            // become follow-on Image entries so vision-capable models see
+            // them. Pushed right after the User text so the anthropic
+            // serializer coalesces them into one [text, image] message.
+            for (media_type, data) in crate::formatter::extract_inbound_images(&formatted.rows) {
+                state
+                    .history
+                    .push(HistoryMessage::Image { media_type, data });
+            }
         }
 
         let turn = drive_turn(

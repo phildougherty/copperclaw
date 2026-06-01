@@ -199,10 +199,13 @@ async fn message_to_event(
             DownloadOutcome::Ok { path, size } => {
                 let mut content_obj = serde_json::Map::new();
                 content_obj.insert("text".to_owned(), Value::String(caption_or_text.clone()));
-                content_obj.insert(
-                    "attachment".to_owned(),
-                    Value::Object(attachment_json(&descriptor, &path, size)),
-                );
+                let mut att = attachment_json(&descriptor, &path, size);
+                // Inline image bytes as base64 so vision-capable models
+                // (e.g. minimax-m3) actually see the photo. Bounded by
+                // MAX_INLINE_IMAGE_BYTES; larger or non-image attachments
+                // keep the path-only form for the agent to read with tools.
+                inline_image_base64(&mut att, &descriptor, &path, size).await;
+                content_obj.insert("attachment".to_owned(), Value::Object(att));
                 (MessageKind::Chat, Value::Object(content_obj))
             }
             DownloadOutcome::TooLarge { reported } => {
@@ -450,6 +453,42 @@ fn attachment_json(
     );
     obj.insert("size".to_owned(), Value::from(actual_size));
     obj
+}
+
+/// Largest image we inline as base64 into the inbound message. The base64
+/// rides in the transcript (re-sent every turn until compaction), and a
+/// tiled vision model gains nothing past a few megapixels — so cap it and
+/// leave larger images path-only.
+const MAX_INLINE_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// If `descriptor` is an image within the size cap, read the downloaded
+/// file and add a `data_base64` field to the attachment object so the
+/// runner can lift it into a vision content block. Best-effort: a read
+/// failure just leaves the path-only form (warn-and-continue).
+async fn inline_image_base64(
+    att: &mut serde_json::Map<String, Value>,
+    descriptor: &AttachmentDescriptor,
+    path: &Path,
+    size: u64,
+) {
+    let is_image = descriptor
+        .mime_type
+        .as_deref()
+        .is_some_and(|m| m.starts_with("image/"));
+    if !is_image || size > MAX_INLINE_IMAGE_BYTES {
+        return;
+    }
+    match tokio::fs::read(path).await {
+        Ok(bytes) => {
+            att.insert(
+                "data_base64".to_owned(),
+                Value::String(copperclaw_types::encode_base64(&bytes)),
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "failed to inline inbound image");
+        }
+    }
 }
 
 /// Outcome of a single attachment fetch.

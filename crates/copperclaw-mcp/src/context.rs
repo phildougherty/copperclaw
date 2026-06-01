@@ -745,7 +745,10 @@ pub(crate) mod bytes_b64 {
     const ALPHABET: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+    /// Encode bytes as standard base64 (with `=` padding, no line breaks).
+    /// Shared by the serde `serialize` below and by tools that need a
+    /// plain `&[u8] -> String` encode (e.g. `view_image`).
+    pub(crate) fn encode(bytes: &[u8]) -> String {
         let mut out = String::with_capacity((bytes.len() / 3 + 1) * 4);
         for chunk in bytes.chunks(3) {
             let b0 = chunk[0];
@@ -765,7 +768,11 @@ pub(crate) mod bytes_b64 {
                 out.push('=');
             }
         }
-        s.serialize_str(&out)
+        out
+    }
+
+    pub fn serialize<S: Serializer>(bytes: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&encode(bytes))
     }
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {

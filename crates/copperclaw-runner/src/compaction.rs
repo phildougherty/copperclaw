@@ -104,6 +104,13 @@ fn chars_of(m: &HistoryMessage) -> usize {
             content,
             is_error: _,
         } => tool_use_id.chars().count() + content.chars().count(),
+        HistoryMessage::Image { media_type, data: _ } => {
+            // An image's token cost is tile-based, not its base64 length —
+            // counting `data` would massively overestimate and trigger
+            // needless compaction. Use a flat ~1500-token estimate
+            // (the caller divides chars by 4).
+            media_type.chars().count() + 6_000
+        }
     }
 }
 
@@ -215,6 +222,15 @@ fn write_archive(dir: &Path, history: &[HistoryMessage]) -> std::io::Result<Path
                 body.push_str("tool_result\n\n");
                 body.push_str(&format!(
                     "tool_use_id: {tool_use_id}\nis_error: {is_error}\n\n{content}"
+                ));
+            }
+            HistoryMessage::Image { media_type, data } => {
+                // Record presence + size only; the base64 payload would
+                // bloat the archive for no human benefit.
+                body.push_str("image\n\n");
+                body.push_str(&format!(
+                    "media_type: {media_type}\nbase64_bytes: {}",
+                    data.len()
                 ));
             }
         }

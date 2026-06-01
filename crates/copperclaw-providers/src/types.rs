@@ -54,6 +54,18 @@ pub enum HistoryMessage {
         content: String,
         is_error: bool,
     },
+    /// An image supplied to the model — an inbound photo, or the result of
+    /// a `view_image` tool call. Carried as base64 so the transcript is
+    /// self-contained (no dependency on a file that may be cleaned up).
+    /// Serializes as a `user`-role image content block; vision-capable
+    /// models (e.g. minimax-m3) read it, text-only providers drop it to a
+    /// placeholder.
+    Image {
+        /// MIME type, e.g. `image/png`, `image/jpeg`, `image/webp`.
+        media_type: String,
+        /// Base64-encoded image bytes, with no `data:` URI prefix.
+        data: String,
+    },
 }
 
 /// Input bundle for one provider turn. Construct via [`QueryInput::default`]

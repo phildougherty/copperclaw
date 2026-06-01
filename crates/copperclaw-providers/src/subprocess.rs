@@ -327,6 +327,11 @@ fn history_message_to_json(m: &HistoryMessage) -> Value {
             "content": content,
             "is_error": is_error,
         }),
+        HistoryMessage::Image { media_type, data } => json!({
+            "role": "image",
+            "media_type": media_type,
+            "data": data,
+        }),
     }
 }
 

@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (multimodal: inbound photos + view_image tool — 2026-06-01)
+
+Vision support for image-capable models. Verified live that minimax-m3
+(via OpenRouter) reads both PNG and JPEG through the Anthropic
+`/v1/messages` path the runner uses.
+
+- New `HistoryMessage::Image { media_type, data }` (base64) carries an
+  image in the transcript. The anthropic provider serializes it as a
+  `user`-role base64 `image` block; ollama emits the OpenAI `image_url`
+  shape; subprocess passes it through. Compaction estimates an image's
+  tokens tile-based (flat ~1500), not by base64 length, and the archive
+  records presence/size only.
+- Inbound photos: the Telegram ingress inlines image attachment bytes as
+  base64 (`data_base64`, ≤4 MB) into the inbound message; the runner lifts
+  them into `Image` entries right after the caption. Send the agent a
+  photo and it sees it.
+- `view_image` tool: load a PNG/JPEG/WebP/GIF already on disk (≤5 MB) and
+  attach it for the model to see (screenshots, charts, fetched/generated
+  images). Tool-result image blocks are threaded into `Image` entries,
+  split from the tool_result so strict gateways (MiniMax) accept them.
+
+A shared base64 encoder is exposed from `copperclaw-types`. Each layer is
+unit-tested; provider serialization shape verified live. End-to-end with a
+real telegram photo verifies on the next image-capable deploy.
+
 ### Added (shell background jobs + write_file overwrite steer — 2026-06-01)
 
 - `shell` gains `background: true`: launches the command detached in its

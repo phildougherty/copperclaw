@@ -8,25 +8,29 @@ use super::drive_turn::PendingToolCall;
 use super::provider_call::HeartbeatTicker;
 use super::RunnerDeps;
 
-/// Execute one tool call against the runner's tool map. Returns the
-/// `(content, is_error)` pair for the `HistoryMessage::Tool` row the
-/// model sees on the next turn.
+/// Execute one tool call against the runner's tool map. Returns
+/// `(content, images, is_error)`: the text for the `HistoryMessage::Tool`
+/// row, any image blocks the tool returned (each becomes a follow-on
+/// `HistoryMessage::Image` so vision models can see them), and whether
+/// the call errored.
 pub(super) async fn invoke_tool(
     deps: &RunnerDeps,
     call: &PendingToolCall,
-) -> (String, bool) {
+) -> (String, Vec<ToolImage>, bool) {
     if is_disallowed(&call.name) {
         return (
             format!(
                 "Tool `{}` is disallowed inside the copperclaw container.",
                 call.name
             ),
+            Vec::new(),
             true,
         );
     }
     let Some(entry) = deps.tool_map.get(&call.name) else {
         return (
             format!("Unknown tool `{}` — no handler registered.", call.name),
+            Vec::new(),
             true,
         );
     };
@@ -42,6 +46,7 @@ pub(super) async fn invoke_tool(
                     call.name,
                     short_type(&call.input)
                 ),
+                Vec::new(),
                 true,
             );
         }
@@ -61,16 +66,40 @@ pub(super) async fn invoke_tool(
     let call_fut = entry.handler.call(arguments, deps.tool_ctx.as_ref());
     let timeout = std::time::Duration::from_secs(deps.tool_deadline_secs);
     match tokio::time::timeout(timeout, call_fut).await {
-        Ok(Ok(result)) => (render_tool_result(&result), false),
-        Ok(Err(err)) => (format!("Tool `{}` failed: {err}", call.name), true),
+        Ok(Ok(result)) => (
+            render_tool_result(&result),
+            extract_tool_images(&result),
+            false,
+        ),
+        Ok(Err(err)) => (format!("Tool `{}` failed: {err}", call.name), Vec::new(), true),
         Err(_) => (
             format!(
                 "Tool `{}` did not return within {}s (per-tool deadline); the runner aborted it. Consider breaking the work into smaller steps.",
                 call.name, deps.tool_deadline_secs
             ),
+            Vec::new(),
             true,
         ),
     }
+}
+
+/// An image block a tool returned: `(mime_type, base64_data)`.
+pub(super) type ToolImage = (String, String);
+
+/// Pull any image content blocks out of a `CallToolResult`. Each becomes
+/// a `HistoryMessage::Image` so vision-capable models actually see the
+/// pixels (the text render only notes `<image>`).
+pub(super) fn extract_tool_images(result: &rmcp::model::CallToolResult) -> Vec<ToolImage> {
+    result
+        .content
+        .iter()
+        .filter_map(|block| match &block.raw {
+            rmcp::model::RawContent::Image(img) => {
+                Some((img.mime_type.clone(), img.data.clone()))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Pluck the textual content out of a `CallToolResult`. Multiple
