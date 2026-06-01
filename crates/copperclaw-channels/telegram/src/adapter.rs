@@ -802,10 +802,12 @@ fn breadcrumb_glyph(status: BreadcrumbStatus) -> &'static str {
     }
 }
 
-/// Cap on steps rendered inside the expandable region — keeps the whole
-/// message well under Telegram's ~4096-char limit on a long turn. Older
-/// steps beyond this are summarised as a `+N earlier` line.
-const ACTIVITY_MAX_STEPS: usize = 40;
+/// Rendered-length budget for the whole activity message. Telegram rejects
+/// messages over ~4096 chars with `MESSAGE_TOO_LONG`; long shell commands /
+/// file paths blow a step-COUNT cap well before 40 steps (and a failed edit
+/// freezes the chip mid-run). So we cap by rendered length, keeping the
+/// most recent steps that fit and folding the rest into a `+N earlier` note.
+const ACTIVITY_HTML_BUDGET: usize = 3500;
 
 pub(crate) fn render_breadcrumb_html(b: &Breadcrumb) -> String {
     // Aggregate "activity" chip: a collapsed summary line plus an
@@ -855,35 +857,62 @@ pub(crate) fn render_breadcrumb_html(b: &Breadcrumb) -> String {
 /// </blockquote>
 /// ```
 fn render_activity_html(b: &Breadcrumb) -> String {
-    let mut out = String::with_capacity(128 + b.steps.len() * 56);
-    // Collapsed summary line from the top-level fields.
-    out.push_str(breadcrumb_glyph(b.status));
-    out.push(' ');
+    // Collapsed summary line from the top-level fields. The current-activity
+    // detail is truncated so one long command can't dominate the line.
+    let mut summary = String::with_capacity(96);
+    summary.push_str(breadcrumb_glyph(b.status));
+    summary.push(' ');
     match b.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
-        Some(d) => out.push_str(&escape_html(d)),
-        None => out.push_str("working"),
+        Some(d) => summary.push_str(&escape_html(&truncate_chars(d, 80))),
+        None => summary.push_str("working"),
     }
     if let Some(s) = b.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        out.push_str(" · ");
-        out.push_str(&escape_html(s));
+        summary.push_str(" · ");
+        summary.push_str(&escape_html(s));
     }
+
+    // Render steps NEWEST-FIRST into a rendered-length budget; keep the most
+    // recent that fit, fold the rest behind a "+N earlier" note. Capping by
+    // length (not step count) is what keeps the message under Telegram's
+    // MESSAGE_TOO_LONG limit so the chip can always reach its final state.
+    let mut lines: Vec<String> = Vec::with_capacity(b.steps.len().min(64));
+    let mut used = summary.len() + 96; // blockquote tags + "+N earlier" margin
+    for step in b.steps.iter().rev() {
+        let line = render_step_line_html(step);
+        if !lines.is_empty() && used + line.len() + 1 > ACTIVITY_HTML_BUDGET {
+            break;
+        }
+        used += line.len() + 1;
+        lines.push(line);
+    }
+    lines.reverse();
+    let hidden = b.steps.len() - lines.len();
+
+    let mut out = String::with_capacity(used + 96);
+    out.push_str(&summary);
     out.push('\n');
-    // Expandable body — one styled line per step, newest-biased when the
-    // turn ran more than ACTIVITY_MAX_STEPS tools.
     out.push_str("<blockquote expandable>");
-    let total = b.steps.len();
-    let shown = b.steps.iter().skip(total.saturating_sub(ACTIVITY_MAX_STEPS));
-    let hidden = total.saturating_sub(ACTIVITY_MAX_STEPS);
     if hidden > 0 {
         out.push_str(&format!("<i>+{hidden} earlier step(s)</i>\n"));
     }
-    for (i, step) in shown.enumerate() {
+    for (i, line) in lines.iter().enumerate() {
         if i > 0 {
             out.push('\n');
         }
-        out.push_str(&render_step_line_html(step));
+        out.push_str(line);
     }
     out.push_str("</blockquote>");
+    out
+}
+
+/// Truncate `s` to at most `max` chars (char-boundary safe), appending an
+/// ellipsis when cut. Keeps a single long detail from blowing the budget.
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
     out
 }
 
@@ -899,7 +928,7 @@ fn render_step_line_html(s: &Breadcrumb) -> String {
     out.push_str("</b>");
     if let Some(d) = s.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
         out.push_str(" <code>");
-        out.push_str(&escape_html(d));
+        out.push_str(&escape_html(&truncate_chars(d, 120)));
         out.push_str("</code>");
     }
     if let Some(sum) = s.summary.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
@@ -908,7 +937,7 @@ fn render_step_line_html(s: &Breadcrumb) -> String {
         } else {
             out.push_str(" <i>— ");
         }
-        out.push_str(&escape_html(sum));
+        out.push_str(&escape_html(&truncate_chars(sum, 120)));
         out.push_str("</i>");
     }
     out
@@ -2974,28 +3003,36 @@ mod tests {
     }
 
     #[test]
-    fn render_breadcrumb_aggregate_escapes_and_caps_steps() {
+    fn render_breadcrumb_aggregate_caps_by_length_under_telegram_limit() {
         use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
-        let mut steps: Vec<Breadcrumb> = (0..50)
+        // Many steps with long, realistic details (the case that produced
+        // MESSAGE_TOO_LONG): a step-count cap let it through, a length cap
+        // keeps the whole message under Telegram's ~4096-char limit.
+        let mut steps: Vec<Breadcrumb> = (0..60)
             .map(|i| {
                 Breadcrumb::running("shell")
-                    .with_detail(format!("step {i}"))
-                    .finished(true, None)
+                    .with_detail(format!(
+                        "cd /data/fairway-focus && npx vite build 2>&1 # iteration {i}"
+                    ))
+                    .finished(true, Some("ok".into()))
             })
             .collect();
+        // Newest step carries HTML that must be escaped.
         steps.push(Breadcrumb::running("write_file").with_detail("a <b> & c"));
         let agg = Breadcrumb {
             tool_name: "activity".into(),
             detail: Some("write_file a <b> & c".into()),
             status: BreadcrumbStatus::Running,
-            summary: Some("50/51 steps".into()),
+            summary: Some("60/61 steps".into()),
             steps,
         };
         let html = super::render_breadcrumb_html(&agg);
-        // Over the cap → "+N earlier step(s)" prefix inside the blockquote.
+        // Stays under Telegram's hard limit so the edit never fails.
+        assert!(html.len() < 4096, "len {} must be < 4096", html.len());
+        // Older steps folded behind a "+N earlier" note.
         assert!(html.contains("earlier step(s)"), "cap note: {html}");
-        // HTML in a detail is escaped (no raw < > & reaching the client).
-        assert!(html.contains("a &lt;b&gt; &amp; c"), "escaped: {html}");
+        // Newest step is kept (newest-first budget) and HTML is escaped.
+        assert!(html.contains("a &lt;b&gt; &amp; c"), "escaped newest: {html}");
     }
 
     #[test]
