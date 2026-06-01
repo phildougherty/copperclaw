@@ -1,6 +1,8 @@
 //! HTTP-level integration tests for `AnthropicProvider` using wiremock.
 
-use copperclaw_providers::{AgentProvider, AnthropicProvider, HistoryMessage, ProviderError, QueryInput};
+use copperclaw_providers::{
+    AgentProvider, AnthropicProvider, HistoryMessage, ProviderError, QueryInput,
+};
 use copperclaw_types::ProviderEvent;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -33,7 +35,9 @@ fn expect_query_err<T>(r: Result<T, ProviderError>) -> ProviderError {
 
 fn basic_input() -> QueryInput {
     let mut q = QueryInput::new("you are helpful", "claude-sonnet-4-6");
-    q.history.push(HistoryMessage::User { content: "hi".into() });
+    q.history.push(HistoryMessage::User {
+        content: "hi".into(),
+    });
     q
 }
 
@@ -41,11 +45,26 @@ fn basic_input() -> QueryInput {
 async fn happy_path_single_text_turn() {
     let server = MockServer::start().await;
     let body = sse_body(&[
-        ("message_start", r#"{"type":"message_start","message":{"id":"msg_01"}}"#),
-        ("content_block_start", r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#),
-        ("content_block_delta", r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello "}}"#),
-        ("content_block_delta", r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world"}}"#),
-        ("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_01"}}"#,
+        ),
+        (
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello "}}"#,
+        ),
+        (
+            "content_block_delta",
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world"}}"#,
+        ),
+        (
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        ),
         ("message_stop", r#"{"type":"message_stop"}"#),
     ]);
 
@@ -84,7 +103,10 @@ async fn happy_path_single_text_turn() {
 async fn happy_path_empty_text_yields_none() {
     let server = MockServer::start().await;
     let body = sse_body(&[
-        ("message_start", r#"{"type":"message_start","message":{"id":"msg_02"}}"#),
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_02"}}"#,
+        ),
         ("message_stop", r#"{"type":"message_stop"}"#),
     ]);
     Mock::given(method("POST"))
@@ -111,9 +133,18 @@ async fn happy_path_empty_text_yields_none() {
 async fn tool_use_emits_tool_start_and_end() {
     let server = MockServer::start().await;
     let body = sse_body(&[
-        ("message_start", r#"{"type":"message_start","message":{"id":"msg_03"}}"#),
-        ("content_block_start", r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_1","name":"weather","input":{}}}"#),
-        ("content_block_stop", r#"{"type":"content_block_stop","index":0}"#),
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_03"}}"#,
+        ),
+        (
+            "content_block_start",
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tu_1","name":"weather","input":{}}}"#,
+        ),
+        (
+            "content_block_stop",
+            r#"{"type":"content_block_stop","index":0}"#,
+        ),
         ("message_stop", r#"{"type":"message_stop"}"#),
     ]);
     Mock::given(method("POST"))
@@ -134,7 +165,10 @@ async fn tool_use_emits_tool_start_and_end() {
     let mut saw_result = false;
     while let Some(ev) = q.next_event().await {
         match ev {
-            ProviderEvent::ToolStart { name, declared_timeout_ms } => {
+            ProviderEvent::ToolStart {
+                name,
+                declared_timeout_ms,
+            } => {
                 assert_eq!(name, "weather");
                 assert!(declared_timeout_ms.is_none());
                 saw_start = true;
@@ -158,7 +192,9 @@ async fn rate_limit_is_overloaded() {
         .respond_with(
             ResponseTemplate::new(429)
                 .insert_header("retry-after", "5")
-                .set_body_string("{\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}"),
+                .set_body_string(
+                    "{\"error\":{\"type\":\"rate_limit_error\",\"message\":\"slow down\"}}",
+                ),
         )
         .mount(&server)
         .await;
@@ -235,7 +271,10 @@ async fn bad_request_400() {
 async fn malformed_sse_event_surfaces_decode_error() {
     let server = MockServer::start().await;
     let body = sse_body(&[
-        ("message_start", r#"{"type":"message_start","message":{"id":"msg_04"}}"#),
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_04"}}"#,
+        ),
         ("content_block_delta", "not-json"),
         ("message_stop", r#"{"type":"message_stop"}"#),
     ]);
@@ -266,8 +305,14 @@ async fn malformed_sse_event_surfaces_decode_error() {
 async fn upstream_error_event_is_forwarded() {
     let server = MockServer::start().await;
     let body = sse_body(&[
-        ("message_start", r#"{"type":"message_start","message":{"id":"msg_05"}}"#),
-        ("error", r#"{"type":"error","error":{"type":"overloaded_error","message":"slow"}}"#),
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_05"}}"#,
+        ),
+        (
+            "error",
+            r#"{"type":"error","error":{"type":"overloaded_error","message":"slow"}}"#,
+        ),
     ]);
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -295,7 +340,10 @@ async fn upstream_error_event_is_forwarded() {
 async fn ping_event_surfaces_activity() {
     let server = MockServer::start().await;
     let body = sse_body(&[
-        ("message_start", r#"{"type":"message_start","message":{"id":"msg_06"}}"#),
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_06"}}"#,
+        ),
         ("ping", r#"{"type":"ping"}"#),
         ("message_stop", r#"{"type":"message_stop"}"#),
     ]);
@@ -327,7 +375,10 @@ async fn ping_event_surfaces_activity() {
 async fn push_is_rejected_for_anthropic() {
     let server = MockServer::start().await;
     let body = sse_body(&[
-        ("message_start", r#"{"type":"message_start","message":{"id":"msg_07"}}"#),
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_07"}}"#,
+        ),
         ("message_stop", r#"{"type":"message_stop"}"#),
     ]);
     Mock::given(method("POST"))
@@ -350,9 +401,10 @@ async fn push_is_rejected_for_anthropic() {
 async fn abort_drops_pending_stream() {
     let server = MockServer::start().await;
     // Slow stream — only an init, then nothing for a long time.
-    let body = sse_body(&[
-        ("message_start", r#"{"type":"message_start","message":{"id":"msg_08"}}"#),
-    ]);
+    let body = sse_body(&[(
+        "message_start",
+        r#"{"type":"message_start","message":{"id":"msg_08"}}"#,
+    )]);
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
         .respond_with(

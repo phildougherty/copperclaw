@@ -1,10 +1,10 @@
 //! Handler for `user-dms.list`.
 
 use super::db_err;
+use copperclaw_cclaw::ErrorPayload;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::{user_dms, users};
-use copperclaw_cclaw::ErrorPayload;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub fn list(_args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     // The table is keyed per-user with no global list query, so we walk
@@ -28,9 +28,9 @@ pub fn list(_args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use copperclaw_db::tables::messaging_groups::{upsert as upsert_mg, UpsertMessagingGroup};
+    use copperclaw_db::tables::messaging_groups::{UpsertMessagingGroup, upsert as upsert_mg};
     use copperclaw_db::tables::user_dms::upsert as upsert_dm;
-    use copperclaw_db::tables::users::{upsert as upsert_user, UpsertUser};
+    use copperclaw_db::tables::users::{UpsertUser, upsert as upsert_user};
     use copperclaw_types::ChannelType;
 
     fn db() -> CentralDb {

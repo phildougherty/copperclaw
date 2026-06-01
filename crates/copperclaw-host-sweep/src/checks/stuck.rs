@@ -26,7 +26,9 @@ pub fn check(
     let Some(state) = state else {
         return Ok(false);
     };
-    let (Some(_current_tool), Some(started_at)) = (state.current_tool.as_deref(), state.tool_started_at) else {
+    let (Some(_current_tool), Some(started_at)) =
+        (state.current_tool.as_deref(), state.tool_started_at)
+    else {
         return Ok(false);
     };
 
@@ -52,11 +54,16 @@ pub fn check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{seed_running_session, MemSessionRoot};
+    use crate::test_support::{MemSessionRoot, seed_running_session};
     use chrono::{Duration as ChDuration, TimeZone};
     use copperclaw_db::central::CentralDb;
 
-    fn fixture() -> (CentralDb, MemSessionRoot, copperclaw_types::Session, DateTime<Utc>) {
+    fn fixture() -> (
+        CentralDb,
+        MemSessionRoot,
+        copperclaw_types::Session,
+        DateTime<Utc>,
+    ) {
         let central = CentralDb::open_in_memory().unwrap();
         let root = MemSessionRoot::new();
         let session = seed_running_session(&central);
@@ -68,9 +75,7 @@ mod tests {
     fn returns_false_when_no_state_row() {
         let (_c, root, sess, now) = fixture();
         // Touch the outbound pool so the row table exists.
-        let _ = root
-            .outbound_pool(&sess.agent_group_id, &sess.id)
-            .unwrap();
+        let _ = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
         let stuck = check(&root, &sess.agent_group_id, &sess.id, now).unwrap();
         assert!(!stuck);
     }
@@ -78,9 +83,7 @@ mod tests {
     #[test]
     fn returns_false_when_current_tool_is_none() {
         let (_c, root, sess, now) = fixture();
-        let mut pool = root
-            .outbound_pool(&sess.agent_group_id, &sess.id)
-            .unwrap();
+        let mut pool = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
         container_state::set(
             pool.conn_mut(),
             &container_state::ContainerState {
@@ -97,9 +100,7 @@ mod tests {
     #[test]
     fn returns_false_when_tool_started_at_is_none() {
         let (_c, root, sess, now) = fixture();
-        let mut pool = root
-            .outbound_pool(&sess.agent_group_id, &sess.id)
-            .unwrap();
+        let mut pool = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
         container_state::set(
             pool.conn_mut(),
             &container_state::ContainerState {
@@ -116,9 +117,7 @@ mod tests {
     #[test]
     fn returns_false_when_started_at_in_future() {
         let (_c, root, sess, now) = fixture();
-        let mut pool = root
-            .outbound_pool(&sess.agent_group_id, &sess.id)
-            .unwrap();
+        let mut pool = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
         container_state::set(
             pool.conn_mut(),
             &container_state::ContainerState {
@@ -135,9 +134,7 @@ mod tests {
     #[test]
     fn returns_true_when_elapsed_exceeds_claim_stuck() {
         let (_c, root, sess, now) = fixture();
-        let mut pool = root
-            .outbound_pool(&sess.agent_group_id, &sess.id)
-            .unwrap();
+        let mut pool = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
         container_state::set(
             pool.conn_mut(),
             &container_state::ContainerState {
@@ -154,9 +151,7 @@ mod tests {
     #[test]
     fn declared_timeout_overrides_claim_stuck() {
         let (_c, root, sess, now) = fixture();
-        let mut pool = root
-            .outbound_pool(&sess.agent_group_id, &sess.id)
-            .unwrap();
+        let mut pool = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
         // Declared 5 minutes, elapsed 90 seconds — under the declared
         // threshold so NOT stuck (declared wins over CLAIM_STUCK_MS).
         container_state::set(
@@ -175,9 +170,7 @@ mod tests {
     #[test]
     fn absolute_ceiling_marks_long_runs_stuck() {
         let (_c, root, sess, now) = fixture();
-        let mut pool = root
-            .outbound_pool(&sess.agent_group_id, &sess.id)
-            .unwrap();
+        let mut pool = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
         // Declared 1 hour but tool has been running for >30 minutes — the
         // ABSOLUTE_CEILING_MS overrides the declared timeout.
         container_state::set(
@@ -196,9 +189,7 @@ mod tests {
     #[test]
     fn returns_false_when_under_threshold() {
         let (_c, root, sess, now) = fixture();
-        let mut pool = root
-            .outbound_pool(&sess.agent_group_id, &sess.id)
-            .unwrap();
+        let mut pool = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
         container_state::set(
             pool.conn_mut(),
             &container_state::ContainerState {

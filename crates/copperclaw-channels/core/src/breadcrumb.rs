@@ -241,7 +241,12 @@ impl Breadcrumb {
                 _ => "working".to_string(),
             };
             out.push_str(&head);
-            if let Some(s) = self.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(s) = self
+                .summary
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 out.push_str(" · ");
                 out.push_str(s);
             }
@@ -359,10 +364,7 @@ mod tests {
     #[test]
     fn text_fallback_done_with_summary() {
         let b = running_shell().finished(true, Some("passed (0.4s)".into()));
-        assert_eq!(
-            b.to_text_fallback(),
-            "[shell] cargo check — passed (0.4s)"
-        );
+        assert_eq!(b.to_text_fallback(), "[shell] cargo check — passed (0.4s)");
     }
 
     #[test]

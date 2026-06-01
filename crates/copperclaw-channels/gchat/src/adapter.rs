@@ -8,7 +8,7 @@ use copperclaw_channels_core::{
     ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList,
 };
 use copperclaw_types::{ChannelType, OutboundMessage};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Mutex;
 use tokio::task::JoinHandle;
 
@@ -538,7 +538,12 @@ pub(crate) fn build_activity_card(b: &Breadcrumb) -> Value {
         Some(d) => header.push_str(&escape_html_gchat(d)),
         None => header.push_str("working"),
     }
-    if let Some(s) = b.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(s) = b
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         header.push_str(" · ");
         header.push_str(&escape_html_gchat(s));
     }
@@ -595,7 +600,12 @@ fn render_activity_step_line(s: &Breadcrumb) -> String {
         out.push_str(&escape_html_gchat(d));
         out.push_str("</font>");
     }
-    if let Some(sum) = s.summary.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+    if let Some(sum) = s
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+    {
         if s.status == BreadcrumbStatus::Failed {
             out.push_str(" <i>— failed: ");
         } else {
@@ -755,11 +765,7 @@ pub(crate) fn build_thinking_card(t: &ThinkingBlock) -> Value {
 /// the preview always visible (above the disclosure fold) while
 /// the full body collapses underneath. The full body wraps in
 /// `<font face="monospace">` so log / source output stays aligned.
-pub(crate) fn build_collapsible_card(
-    text: &str,
-    summary: &str,
-    preview_lines: &[String],
-) -> Value {
+pub(crate) fn build_collapsible_card(text: &str, summary: &str, preview_lines: &[String]) -> Value {
     let mut widgets: Vec<Value> = Vec::with_capacity(preview_lines.len() + 1);
     for line in preview_lines {
         widgets.push(json!({
@@ -870,12 +876,9 @@ impl GchatAdapter {
                             "edit action requires `message_name` (spaces/.../messages/...)".into(),
                         )
                     })?;
-                let text = content
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| {
-                        AdapterError::BadRequest("edit action requires `text` field".into())
-                    })?;
+                let text = content.get("text").and_then(Value::as_str).ok_or_else(|| {
+                    AdapterError::BadRequest("edit action requires `text` field".into())
+                })?;
                 let resp = self.api.edit_text(message_name, text).await?;
                 Ok(Some(resp.name))
             }
@@ -884,9 +887,7 @@ impl GchatAdapter {
                     .get("message_name")
                     .and_then(Value::as_str)
                     .ok_or_else(|| {
-                        AdapterError::BadRequest(
-                            "delete action requires `message_name`".into(),
-                        )
+                        AdapterError::BadRequest("delete action requires `message_name`".into())
                     })?;
                 self.api.delete_message(message_name).await?;
                 Ok(Some(message_name.to_owned()))
@@ -896,9 +897,7 @@ impl GchatAdapter {
                     .get("message_name")
                     .and_then(Value::as_str)
                     .ok_or_else(|| {
-                        AdapterError::BadRequest(
-                            "reaction action requires `message_name`".into(),
-                        )
+                        AdapterError::BadRequest("reaction action requires `message_name`".into())
                     })?;
                 let shortcode = content
                     .get("emoji")
@@ -1244,10 +1243,7 @@ mod tests {
                 data: b"hi".to_vec(),
             }],
         };
-        let id = adapter
-            .deliver("spaces/AAA", None, &msg)
-            .await
-            .unwrap();
+        let id = adapter.deliver("spaces/AAA", None, &msg).await.unwrap();
         assert_eq!(id.as_deref(), Some("spaces/AAA/messages/M-with-att"));
     }
 
@@ -1358,7 +1354,10 @@ mod tests {
         let server = MockServer::start().await;
         let adapter = adapter_for(&server);
         adapter.subscribe("spaces/A", None).await.unwrap();
-        adapter.subscribe("spaces/A", Some("spaces/A/threads/X")).await.unwrap();
+        adapter
+            .subscribe("spaces/A", Some("spaces/A/threads/X"))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1422,10 +1421,7 @@ mod tests {
 
     #[test]
     fn space_segment_strips_prefix() {
-        assert_eq!(
-            GchatAdapter::space_segment("spaces/AAA").unwrap(),
-            "AAA"
-        );
+        assert_eq!(GchatAdapter::space_segment("spaces/AAA").unwrap(), "AAA");
         assert!(GchatAdapter::space_segment("AAA").is_err());
         assert!(GchatAdapter::space_segment("").is_err());
     }
@@ -1434,8 +1430,7 @@ mod tests {
 
     #[test]
     fn build_breadcrumb_card_running_uses_ascii_marker_in_top_label() {
-        let bc = copperclaw_channels_core::Breadcrumb::running("shell")
-            .with_detail("cargo check");
+        let bc = copperclaw_channels_core::Breadcrumb::running("shell").with_detail("cargo check");
         let card = super::build_breadcrumb_card(&bc);
         let section = &card["sections"][0]["widgets"][0]["decoratedText"];
         assert_eq!(section["topLabel"], "[~] shell");
@@ -1453,10 +1448,7 @@ mod tests {
         let card = super::build_breadcrumb_card(&bc);
         let section = &card["sections"][0]["widgets"][0]["decoratedText"];
         assert_eq!(section["topLabel"], "[ok] shell");
-        assert!(section["text"]
-            .as_str()
-            .unwrap()
-            .contains("passed (0.4s)"));
+        assert!(section["text"].as_str().unwrap().contains("passed (0.4s)"));
     }
 
     #[test]
@@ -1467,10 +1459,12 @@ mod tests {
         let card = super::build_breadcrumb_card(&bc);
         let section = &card["sections"][0]["widgets"][0]["decoratedText"];
         assert_eq!(section["topLabel"], "[x] shell");
-        assert!(section["text"]
-            .as_str()
-            .unwrap()
-            .contains("failed: timeout"));
+        assert!(
+            section["text"]
+                .as_str()
+                .unwrap()
+                .contains("failed: timeout")
+        );
     }
 
     // ── Rolling "activity" aggregate breadcrumb ────────────────────
@@ -1513,7 +1507,11 @@ mod tests {
             "[~] <b>shell</b> <font face=\"monospace\">npm run build</font>"
         );
         // Legacy single-tool decoratedText shape is NOT used for aggregates.
-        assert!(section.get("widgets").unwrap()[0].get("decoratedText").is_none());
+        assert!(
+            section.get("widgets").unwrap()[0]
+                .get("decoratedText")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1543,10 +1541,12 @@ mod tests {
         assert_eq!(note, "<i>+11 earlier step(s)</i>");
         // HTML in a dynamic field is escaped in both header and step body
         // (no raw < > & reaching the client).
-        assert!(section["header"]
-            .as_str()
-            .unwrap()
-            .contains("a &lt;b&gt; &amp; c"));
+        assert!(
+            section["header"]
+                .as_str()
+                .unwrap()
+                .contains("a &lt;b&gt; &amp; c")
+        );
         let last = widgets.last().unwrap()["textParagraph"]["text"]
             .as_str()
             .unwrap();
@@ -1586,7 +1586,13 @@ mod tests {
             .unwrap();
         assert_eq!(id.as_deref(), Some("spaces/AAA/messages/M1"));
         let req_body: serde_json::Value = serde_json::from_slice(
-            &server.received_requests().await.unwrap().last().unwrap().body,
+            &server
+                .received_requests()
+                .await
+                .unwrap()
+                .last()
+                .unwrap()
+                .body,
         )
         .unwrap();
         // The patched card carries the collapsibleSection aggregate.
@@ -1610,15 +1616,20 @@ mod tests {
             .mount(&server)
             .await;
         let adapter = adapter_for(&server);
-        let bc = copperclaw_channels_core::Breadcrumb::running("shell")
-            .with_detail("cargo check");
+        let bc = copperclaw_channels_core::Breadcrumb::running("shell").with_detail("cargo check");
         let id = adapter
             .deliver_breadcrumb("spaces/AAA", None, &bc, None)
             .await
             .unwrap();
         assert_eq!(id.as_deref(), Some("spaces/AAA/messages/M1"));
         let req_body: serde_json::Value = serde_json::from_slice(
-            &server.received_requests().await.unwrap().last().unwrap().body,
+            &server
+                .received_requests()
+                .await
+                .unwrap()
+                .last()
+                .unwrap()
+                .body,
         )
         .unwrap();
         // cardsV2 array with our chip card.
@@ -1646,12 +1657,7 @@ mod tests {
             .with_detail("cargo check")
             .finished(true, Some("passed (0.4s)".into()));
         let id = adapter
-            .deliver_breadcrumb(
-                "spaces/AAA",
-                None,
-                &bc,
-                Some("spaces/AAA/messages/M1"),
-            )
+            .deliver_breadcrumb("spaces/AAA", None, &bc, Some("spaces/AAA/messages/M1"))
             .await
             .unwrap();
         assert_eq!(id.as_deref(), Some("spaces/AAA/messages/M1"));
@@ -1757,7 +1763,13 @@ mod tests {
             .unwrap();
         assert_eq!(id.as_deref(), Some("spaces/AAA/messages/M9"));
         let req_body: serde_json::Value = serde_json::from_slice(
-            &server.received_requests().await.unwrap().last().unwrap().body,
+            &server
+                .received_requests()
+                .await
+                .unwrap()
+                .last()
+                .unwrap()
+                .body,
         )
         .unwrap();
         assert_eq!(req_body["cardsV2"][0]["cardId"], "diff");
@@ -1858,16 +1870,19 @@ mod tests {
             .unwrap();
         assert_eq!(id.as_deref(), Some("spaces/AAA/messages/E1"));
         let req_body: serde_json::Value = serde_json::from_slice(
-            &server.received_requests().await.unwrap().last().unwrap().body,
+            &server
+                .received_requests()
+                .await
+                .unwrap()
+                .last()
+                .unwrap()
+                .body,
         )
         .unwrap();
         // Sent via cardsV2 with a sensible card id.
         let card_v2 = &req_body["cardsV2"][0];
         assert_eq!(card_v2["cardId"], "error");
-        assert_eq!(
-            card_v2["card"]["header"]["title"],
-            "Error: Provider failed"
-        );
+        assert_eq!(card_v2["card"]["header"]["title"], "Error: Provider failed");
     }
 
     // ── Long-output expander (slice 3.4) rendering ────────────────
@@ -1939,7 +1954,10 @@ mod tests {
         assert_eq!(section["header"], "reasoning");
         let widgets = section["widgets"].as_array().unwrap();
         let body = widgets[0]["textParagraph"]["text"].as_str().unwrap();
-        assert!(body.contains("Let me work through the question."), "got: {body}");
+        assert!(
+            body.contains("Let me work through the question."),
+            "got: {body}"
+        );
         assert!(body.contains("<i>"), "expected italic wrap, got: {body}");
     }
 

@@ -86,7 +86,10 @@ mod tests {
 
     #[test]
     fn adapter_rate_is_retryable() {
-        let err: DeliveryError = AdapterError::Rate { retry_after: Some(2) }.into();
+        let err: DeliveryError = AdapterError::Rate {
+            retry_after: Some(2),
+        }
+        .into();
         assert!(err.is_retryable());
     }
 

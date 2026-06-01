@@ -1,12 +1,12 @@
 //! Handlers for the `groups.*` and `groups.config.*` commands.
 
 use super::{db_err, opt_str, parse_agent_group_id, req_str};
+use copperclaw_cclaw::ErrorPayload;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::{agent_groups, container_configs, sessions};
-use copperclaw_types::ContainerStatus;
-use copperclaw_cclaw::ErrorPayload;
 use copperclaw_types::AgentGroupId;
-use serde_json::{json, Value};
+use copperclaw_types::ContainerStatus;
+use serde_json::{Value, json};
 
 /// `groups.list`
 pub fn list(_args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
@@ -133,7 +133,7 @@ pub fn config_update(args: &Value, central: &CentralDb) -> Result<Value, ErrorPa
                     return Err(ErrorPayload::new(
                         "bad_request",
                         "`max_messages_per_prompt` must be a non-negative integer or null",
-                    ))
+                    ));
                 }
             };
         }
@@ -179,7 +179,10 @@ pub fn config_add_mcp_server(args: &Value, central: &CentralDb) -> Result<Value,
         .cloned()
         .ok_or_else(|| ErrorPayload::new("bad_request", "missing `server`"))?;
     let name = server.get("name").and_then(Value::as_str).ok_or_else(|| {
-        ErrorPayload::new("bad_request", "`server.name` is required and must be a string")
+        ErrorPayload::new(
+            "bad_request",
+            "`server.name` is required and must be a string",
+        )
     })?;
     ensure_config_row(central, id)?;
     let mut current = container_configs::get_mcp_servers(central, id)
@@ -288,14 +291,20 @@ pub fn config_set_coding_enabled(args: &Value, central: &CentralDb) -> Result<Va
 }
 
 /// `groups.config.set-resource-limits`
-pub fn config_set_resource_limits(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
+pub fn config_set_resource_limits(
+    args: &Value,
+    central: &CentralDb,
+) -> Result<Value, ErrorPayload> {
     let id = parse_agent_group_id(args, "id")?;
     let limits = args
         .get("limits")
         .cloned()
         .ok_or_else(|| ErrorPayload::new("bad_request", "missing `limits` object"))?;
     if !limits.is_object() {
-        return Err(ErrorPayload::new("bad_request", "`limits` must be a JSON object"));
+        return Err(ErrorPayload::new(
+            "bad_request",
+            "`limits` must be a JSON object",
+        ));
     }
     // Validate via ResourceLimits::from_json to catch bad types eagerly.
     copperclaw_container_rt::ResourceLimits::from_json(&limits)
@@ -354,7 +363,10 @@ fn default_config(id: AgentGroupId) -> container_configs::ContainerConfig {
 }
 
 fn ensure_config_row(central: &CentralDb, id: AgentGroupId) -> Result<(), ErrorPayload> {
-    if container_configs::get(central, id).map_err(db_err)?.is_none() {
+    if container_configs::get(central, id)
+        .map_err(db_err)?
+        .is_none()
+    {
         let row = default_config(id);
         container_configs::upsert(
             central,
@@ -587,8 +599,14 @@ mod tests {
         s::mark_container_running(&db, s1.id).unwrap();
         s::mark_container_running(&db, s2.id).unwrap();
         restart(&json!({"id": g1.id.as_uuid().to_string()}), &db).unwrap();
-        assert_eq!(s::get(&db, s1.id).unwrap().container_status, ContainerStatus::Stopped);
-        assert_eq!(s::get(&db, s2.id).unwrap().container_status, ContainerStatus::Running);
+        assert_eq!(
+            s::get(&db, s1.id).unwrap().container_status,
+            ContainerStatus::Stopped
+        );
+        assert_eq!(
+            s::get(&db, s2.id).unwrap().container_status,
+            ContainerStatus::Running
+        );
     }
 
     #[test]
@@ -709,8 +727,8 @@ mod tests {
     fn config_add_mcp_server_requires_server_field() {
         let db = db();
         let g = make_group(&db, "g");
-        let err = config_add_mcp_server(&json!({"id": g.id.as_uuid().to_string()}), &db)
-            .unwrap_err();
+        let err =
+            config_add_mcp_server(&json!({"id": g.id.as_uuid().to_string()}), &db).unwrap_err();
         assert_eq!(err.code, "bad_request");
     }
 
@@ -797,11 +815,9 @@ mod tests {
         )
         .unwrap();
         // Then clear.
-        let v = config_set_egress_allow(
-            &json!({"id": g.id.as_uuid().to_string(), "allow": []}),
-            &db,
-        )
-        .unwrap();
+        let v =
+            config_set_egress_allow(&json!({"id": g.id.as_uuid().to_string(), "allow": []}), &db)
+                .unwrap();
         assert_eq!(v["egress_allow"].as_array().unwrap().len(), 0);
     }
 
@@ -845,11 +861,8 @@ mod tests {
     fn config_set_egress_allow_requires_allow_key() {
         let db = db();
         let g = make_group(&db, "g");
-        let err = config_set_egress_allow(
-            &json!({"id": g.id.as_uuid().to_string()}),
-            &db,
-        )
-        .unwrap_err();
+        let err =
+            config_set_egress_allow(&json!({"id": g.id.as_uuid().to_string()}), &db).unwrap_err();
         assert_eq!(err.code, "bad_request");
     }
 
@@ -916,11 +929,8 @@ mod tests {
     fn config_set_resource_limits_requires_limits_key() {
         let db = db();
         let g = make_group(&db, "g");
-        let err = config_set_resource_limits(
-            &json!({"id": g.id.as_uuid().to_string()}),
-            &db,
-        )
-        .unwrap_err();
+        let err = config_set_resource_limits(&json!({"id": g.id.as_uuid().to_string()}), &db)
+            .unwrap_err();
         assert_eq!(err.code, "bad_request");
     }
 
@@ -951,11 +961,8 @@ mod tests {
     fn config_set_coding_enabled_requires_enabled_key() {
         let db = db();
         let g = make_group(&db, "g");
-        let err = config_set_coding_enabled(
-            &json!({"id": g.id.as_uuid().to_string()}),
-            &db,
-        )
-        .unwrap_err();
+        let err =
+            config_set_coding_enabled(&json!({"id": g.id.as_uuid().to_string()}), &db).unwrap_err();
         assert_eq!(err.code, "bad_request");
     }
 

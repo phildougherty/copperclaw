@@ -16,13 +16,13 @@ pub mod task_store;
 #[cfg(test)]
 mod test_support;
 
-pub use checks::apology::{ApologyEmit, ApologyReason, APOLOGY_TRIES_MARKER};
+pub use checks::apology::{APOLOGY_TRIES_MARKER, ApologyEmit, ApologyReason};
 pub use clock::{Clock, SystemClock};
 pub use error::SweepError;
 pub use service::{
     MessageReset, SeriesFanout, SessionPool, SessionRoot, SweepReport, SweepService,
 };
-pub use spawn_tracker::{SpawnAttemptTracker, SPAWN_FAIL_THRESHOLD};
+pub use spawn_tracker::{SPAWN_FAIL_THRESHOLD, SpawnAttemptTracker};
 pub use task_store::SqliteTaskStore;
 
 /// Wall-clock age threshold for a pending chat inbound before the

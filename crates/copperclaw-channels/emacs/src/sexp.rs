@@ -263,9 +263,8 @@ impl Parser<'_> {
                         while end < self.bytes.len() && (self.bytes[end] & 0xC0) == 0x80 {
                             end += 1;
                         }
-                        let slice = std::str::from_utf8(&self.bytes[start..end]).map_err(|_| {
-                            ParseError::BadEscape { pos: start }
-                        })?;
+                        let slice = std::str::from_utf8(&self.bytes[start..end])
+                            .map_err(|_| ParseError::BadEscape { pos: start })?;
                         out.push_str(slice);
                         self.pos = end;
                     }
@@ -447,13 +446,19 @@ mod tests {
     #[test]
     fn rejects_missing_close_cons() {
         let err = parse("((\"k\" . \"v\"").unwrap_err();
-        assert!(matches!(err, ParseError::Expected { .. } | ParseError::UnexpectedEof));
+        assert!(matches!(
+            err,
+            ParseError::Expected { .. } | ParseError::UnexpectedEof
+        ));
     }
 
     #[test]
     fn rejects_missing_close_list() {
         let err = parse("((\"k\" . \"v\")").unwrap_err();
-        assert!(matches!(err, ParseError::Expected { .. } | ParseError::UnexpectedEof));
+        assert!(matches!(
+            err,
+            ParseError::Expected { .. } | ParseError::UnexpectedEof
+        ));
     }
 
     #[test]
@@ -540,7 +545,10 @@ mod tests {
 
     #[test]
     fn as_map_dedups_duplicate_keys_last_wins() {
-        let v = SexpValue::Alist(vec![("k".into(), "first".into()), ("k".into(), "last".into())]);
+        let v = SexpValue::Alist(vec![
+            ("k".into(), "first".into()),
+            ("k".into(), "last".into()),
+        ]);
         let m = v.as_map().unwrap();
         assert_eq!(m.get("k"), Some(&"last".to_string()));
     }

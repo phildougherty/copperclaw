@@ -91,12 +91,19 @@ mod tests {
 
     #[test]
     fn session_mode_serde() {
-        for m in [SessionMode::Shared, SessionMode::PerThread, SessionMode::AgentShared] {
+        for m in [
+            SessionMode::Shared,
+            SessionMode::PerThread,
+            SessionMode::AgentShared,
+        ] {
             let json = serde_json::to_string(&m).unwrap();
             let back: SessionMode = serde_json::from_str(&json).unwrap();
             assert_eq!(m, back);
         }
-        assert_eq!(serde_json::to_string(&SessionMode::PerThread).unwrap(), "\"per-thread\"");
+        assert_eq!(
+            serde_json::to_string(&SessionMode::PerThread).unwrap(),
+            "\"per-thread\""
+        );
     }
 
     #[test]

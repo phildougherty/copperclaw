@@ -61,9 +61,7 @@ mod queries;
 mod signature;
 
 pub use adapter::LinearAdapter;
-pub use api::{
-    CommentCreateInput, CommentRef, CommentUpdateInput, LinearApi, ReactionCreateInput,
-};
+pub use api::{CommentCreateInput, CommentRef, CommentUpdateInput, LinearApi, ReactionCreateInput};
 pub use config::{LinearConfig, WebhookConfig};
 pub use events::router::{EventDedup, LinearEventsState, build_events_router};
 pub use factory::{CHANNEL_TYPE_STR, LinearFactory, register};

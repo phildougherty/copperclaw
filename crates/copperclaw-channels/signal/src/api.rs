@@ -85,12 +85,7 @@ pub async fn send_to_group(
     group_id: &str,
     message: &str,
 ) -> Result<Option<String>, AdapterError> {
-    send_text(
-        transport,
-        &SendTarget::Group(group_id.to_owned()),
-        message,
-    )
-    .await
+    send_text(transport, &SendTarget::Group(group_id.to_owned()), message).await
 }
 
 /// Send a message with attachments. `attachment_paths` is a list of
@@ -142,10 +137,15 @@ pub async fn send_reaction(
     let mut params = serde_json::Map::new();
     target.inject(&mut params);
     params.insert("emoji".into(), Value::String(emoji.to_owned()));
-    params.insert("targetAuthor".into(), Value::String(target_author.to_owned()));
+    params.insert(
+        "targetAuthor".into(),
+        Value::String(target_author.to_owned()),
+    );
     params.insert("targetSentTimestamp".into(), json!(target_sent_timestamp));
     params.insert("remove".into(), Value::Bool(remove));
-    let v = transport.call("sendReaction", Value::Object(params)).await?;
+    let v = transport
+        .call("sendReaction", Value::Object(params))
+        .await?;
     Ok(extract_timestamp(&v))
 }
 
@@ -172,14 +172,18 @@ pub async fn remote_delete(
     let mut params = serde_json::Map::new();
     target.inject(&mut params);
     params.insert("targetSentTimestamp".into(), json!(target_sent_timestamp));
-    let v = transport.call("remoteDelete", Value::Object(params)).await?;
+    let v = transport
+        .call("remoteDelete", Value::Object(params))
+        .await?;
     Ok(extract_timestamp(&v))
 }
 
 /// List groups the account is a member of. Returns the raw JSON-RPC `result`
 /// (typically an array of group descriptors).
 pub async fn list_groups(transport: &Arc<dyn RpcTransport>) -> Result<Value, AdapterError> {
-    transport.call("listGroups", Value::Object(serde_json::Map::new())).await
+    transport
+        .call("listGroups", Value::Object(serde_json::Map::new()))
+        .await
 }
 
 #[cfg(test)]
@@ -199,13 +203,9 @@ mod tests {
         let (t, ctl) = arc_mock();
         ctl.expect_ok("send", json!({"timestamp": 1_700_000_000_000_i64}))
             .await;
-        let id = send_text(
-            &t,
-            &SendTarget::Recipients(vec!["+15551234".into()]),
-            "hi",
-        )
-        .await
-        .unwrap();
+        let id = send_text(&t, &SendTarget::Recipients(vec!["+15551234".into()]), "hi")
+            .await
+            .unwrap();
         assert_eq!(id.as_deref(), Some("1700000000000"));
         let calls = ctl.calls().await;
         assert_eq!(calls.len(), 1);
@@ -250,7 +250,8 @@ mod tests {
     #[tokio::test]
     async fn send_edit_uses_send_edit_message_method() {
         let (t, ctl) = arc_mock();
-        ctl.expect_ok("sendEditMessage", json!({"timestamp": 22})).await;
+        ctl.expect_ok("sendEditMessage", json!({"timestamp": 22}))
+            .await;
         let id = send_edit(
             &t,
             &SendTarget::Recipients(vec!["+1".into()]),
@@ -297,16 +298,9 @@ mod tests {
     async fn send_reaction_remove_flag_propagates() {
         let (t, ctl) = arc_mock();
         ctl.expect_ok("sendReaction", json!({})).await;
-        let _ = send_reaction(
-            &t,
-            &SendTarget::Group("G==".into()),
-            "",
-            "+2",
-            1700,
-            true,
-        )
-        .await
-        .unwrap();
+        let _ = send_reaction(&t, &SendTarget::Group("G==".into()), "", "+2", 1700, true)
+            .await
+            .unwrap();
         let calls = ctl.calls().await;
         assert_eq!(calls[0].1["remove"], true);
         assert_eq!(calls[0].1["emoji"], "");
@@ -317,13 +311,9 @@ mod tests {
     async fn send_typing_passes_stop_flag() {
         let (t, ctl) = arc_mock();
         ctl.expect_ok("sendTyping", json!({})).await;
-        send_typing(
-            &t,
-            &SendTarget::Recipients(vec!["+1".into()]),
-            false,
-        )
-        .await
-        .unwrap();
+        send_typing(&t, &SendTarget::Recipients(vec!["+1".into()]), false)
+            .await
+            .unwrap();
         let calls = ctl.calls().await;
         assert_eq!(calls[0].0, "sendTyping");
         assert_eq!(calls[0].1["stop"], false);
@@ -344,14 +334,11 @@ mod tests {
     #[tokio::test]
     async fn remote_delete_uses_target_timestamp() {
         let (t, ctl) = arc_mock();
-        ctl.expect_ok("remoteDelete", json!({"timestamp": 99})).await;
-        let id = remote_delete(
-            &t,
-            &SendTarget::Recipients(vec!["+1".into()]),
-            1700,
-        )
-        .await
-        .unwrap();
+        ctl.expect_ok("remoteDelete", json!({"timestamp": 99}))
+            .await;
+        let id = remote_delete(&t, &SendTarget::Recipients(vec!["+1".into()]), 1700)
+            .await
+            .unwrap();
         assert_eq!(id.as_deref(), Some("99"));
         let calls = ctl.calls().await;
         assert_eq!(calls[0].0, "remoteDelete");
@@ -361,11 +348,8 @@ mod tests {
     #[tokio::test]
     async fn list_groups_returns_result_array() {
         let (t, ctl) = arc_mock();
-        ctl.expect_ok(
-            "listGroups",
-            json!([{"id": "G==", "name": "Group"}]),
-        )
-        .await;
+        ctl.expect_ok("listGroups", json!([{"id": "G==", "name": "Group"}]))
+            .await;
         let v = list_groups(&t).await.unwrap();
         let arr = v.as_array().unwrap();
         assert_eq!(arr.len(), 1);
@@ -384,13 +368,9 @@ mod tests {
             },
         )
         .await;
-        let err = send_text(
-            &t,
-            &SendTarget::Recipients(vec!["+1".into()]),
-            "hi",
-        )
-        .await
-        .unwrap_err();
+        let err = send_text(&t, &SendTarget::Recipients(vec!["+1".into()]), "hi")
+            .await
+            .unwrap_err();
         assert!(matches!(err, AdapterError::Rate { retry_after: None }));
     }
 
@@ -406,13 +386,9 @@ mod tests {
             },
         )
         .await;
-        let err = send_text(
-            &t,
-            &SendTarget::Recipients(vec!["+1".into()]),
-            "hi",
-        )
-        .await
-        .unwrap_err();
+        let err = send_text(&t, &SendTarget::Recipients(vec!["+1".into()]), "hi")
+            .await
+            .unwrap_err();
         assert!(matches!(err, AdapterError::Auth(_)));
     }
 
@@ -428,13 +404,9 @@ mod tests {
             },
         )
         .await;
-        let err = send_text(
-            &t,
-            &SendTarget::Recipients(vec!["+1".into()]),
-            "hi",
-        )
-        .await
-        .unwrap_err();
+        let err = send_text(&t, &SendTarget::Recipients(vec!["+1".into()]), "hi")
+            .await
+            .unwrap_err();
         match err {
             AdapterError::BadRequest(m) => assert!(m.contains("-32601")),
             other => panic!("unexpected: {other:?}"),

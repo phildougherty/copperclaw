@@ -1,10 +1,10 @@
 //! CRUD for `pending_approvals`.
 
-use crate::central::CentralDb;
 use crate::DbError;
+use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
 use copperclaw_types::{AgentGroupId, ApprovalId, ChannelType, SessionId};
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{OptionalExtension, Row, params};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ApprovalStatus {
@@ -70,36 +70,46 @@ pub struct UpsertPendingApproval {
 
 fn row_to_pending_approval(row: &Row<'_>) -> rusqlite::Result<PendingApproval> {
     let approval_id_str: String = row.get("approval_id")?;
-    let approval_id = uuid::Uuid::parse_str(&approval_id_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let approval_id = uuid::Uuid::parse_str(&approval_id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let session_id_opt: Option<String> = row.get("session_id")?;
     let session_id = session_id_opt
         .as_deref()
         .map(uuid::Uuid::parse_str)
         .transpose()
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .map(SessionId);
     let agent_group_id_opt: Option<String> = row.get("agent_group_id")?;
     let agent_group_id = agent_group_id_opt
         .as_deref()
         .map(uuid::Uuid::parse_str)
         .transpose()
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .map(AgentGroupId);
     let channel_type: Option<String> = row.get("channel_type")?;
     let payload_str: String = row.get("payload")?;
-    let payload: serde_json::Value = serde_json::from_str(&payload_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let payload: serde_json::Value = serde_json::from_str(&payload_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let created_at_str: String = row.get("created_at")?;
     let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .with_timezone(&Utc);
     let expires_at_str: Option<String> = row.get("expires_at")?;
     let expires_at = expires_at_str
         .as_deref()
         .map(|s| DateTime::parse_from_rfc3339(s).map(|d| d.with_timezone(&Utc)))
         .transpose()
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?;
     let status_str: String = row.get("status")?;
     let status = ApprovalStatus::parse(&status_str).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -109,8 +119,9 @@ fn row_to_pending_approval(row: &Row<'_>) -> rusqlite::Result<PendingApproval> {
         )
     })?;
     let options_json: String = row.get("options_json")?;
-    let options: Vec<String> = serde_json::from_str(&options_json)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let options: Vec<String> = serde_json::from_str(&options_json).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     Ok(PendingApproval {
         approval_id: ApprovalId(approval_id),
         session_id,
@@ -264,13 +275,20 @@ pub fn upsert(db: &CentralDb, req: UpsertPendingApproval) -> Result<PendingAppro
         params![request_id, action],
         |r| r.get(0),
     )?;
-    let parsed = uuid::Uuid::parse_str(&id_str)
-        .map_err(|e| DbError::Invariant(format!("invalid uuid in pending_approvals.approval_id: {e}")))?;
+    let parsed = uuid::Uuid::parse_str(&id_str).map_err(|e| {
+        DbError::Invariant(format!(
+            "invalid uuid in pending_approvals.approval_id: {e}"
+        ))
+    })?;
     drop(conn);
     get(db, ApprovalId(parsed))
 }
 
-pub fn update_status(db: &CentralDb, id: ApprovalId, status: ApprovalStatus) -> Result<(), DbError> {
+pub fn update_status(
+    db: &CentralDb,
+    id: ApprovalId,
+    status: ApprovalStatus,
+) -> Result<(), DbError> {
     let conn = db.conn()?;
     let n = conn.execute(
         "UPDATE pending_approvals SET status = ?1 WHERE approval_id = ?2",
@@ -340,7 +358,10 @@ mod tests {
         assert_eq!(a, fetched);
         assert_eq!(fetched.status, ApprovalStatus::Pending);
         assert_eq!(fetched.title, "Send?");
-        assert_eq!(fetched.options, vec!["approve".to_string(), "deny".to_string()]);
+        assert_eq!(
+            fetched.options,
+            vec!["approve".to_string(), "deny".to_string()]
+        );
         assert_eq!(fetched.payload, json!({"text":"hi"}));
     }
 
@@ -352,7 +373,10 @@ mod tests {
         req.title = "Updated".into();
         req.payload = json!({"text":"bye"});
         let second = upsert(&db, req).unwrap();
-        assert_eq!(first.approval_id, second.approval_id, "upsert should reuse id");
+        assert_eq!(
+            first.approval_id, second.approval_id,
+            "upsert should reuse id"
+        );
         assert_eq!(second.title, "Updated");
         assert_eq!(second.payload, json!({"text":"bye"}));
     }
@@ -437,7 +461,10 @@ mod tests {
         let db = db();
         let a = upsert(&db, sample("r1")).unwrap();
         delete(&db, a.approval_id).unwrap();
-        assert!(matches!(get(&db, a.approval_id).unwrap_err(), DbError::NotFound));
+        assert!(matches!(
+            get(&db, a.approval_id).unwrap_err(),
+            DbError::NotFound
+        ));
     }
 
     #[test]

@@ -244,7 +244,12 @@ pub(crate) fn stop_args(name: &str, grace: Duration) -> Vec<String> {
 /// extra-hosts, user, and entrypoint in a deterministic order so the
 /// snapshot tests stay stable.
 pub(crate) fn run_args(spec: &ContainerSpec) -> Result<Vec<String>, RtError> {
-    let mut a = vec!["run".into(), "--detach".into(), "--name".into(), spec.name.clone()];
+    let mut a = vec![
+        "run".into(),
+        "--detach".into(),
+        "--name".into(),
+        spec.name.clone(),
+    ];
 
     if let Some(user) = &spec.user {
         a.push("--user".into());
@@ -343,7 +348,9 @@ pub(crate) fn mount_arg(m: &Mount) -> Result<String, RtError> {
             if *size_bytes == 0 {
                 Ok(format!("type=tmpfs,target={target}"))
             } else {
-                Ok(format!("type=tmpfs,target={target},tmpfs-size={size_bytes}"))
+                Ok(format!(
+                    "type=tmpfs,target={target},tmpfs-size={size_bytes}"
+                ))
             }
         }
     }
@@ -623,7 +630,10 @@ mod tests {
         let a = run_args(&spec).unwrap();
         assert!(a.windows(2).any(|w| w == ["--user", "1000:1000"]));
         assert!(a.windows(2).any(|w| w == ["--env", "FOO=bar"]));
-        assert!(a.windows(2).any(|w| w == ["--add-host", "api.local:10.0.0.5"]));
+        assert!(
+            a.windows(2)
+                .any(|w| w == ["--add-host", "api.local:10.0.0.5"])
+        );
         assert!(a.iter().any(|s| s.starts_with("type=bind")));
         // entrypoint pieces come after image.
         let image_pos = a.iter().position(|s| s == "img").unwrap();
@@ -744,11 +754,10 @@ mod tests {
     #[tokio::test]
     async fn spawn_rejects_resource_limits() {
         let rt = AppleContainerRuntime::with_binary("/no/such/binary-9b3f");
-        let spec = ContainerSpec::new("c", "img")
-            .with_resource_limits(crate::ResourceLimits {
-                cpus: Some(1.0),
-                ..Default::default()
-            });
+        let spec = ContainerSpec::new("c", "img").with_resource_limits(crate::ResourceLimits {
+            cpus: Some(1.0),
+            ..Default::default()
+        });
         let err = rt.spawn(spec).await.unwrap_err();
         assert!(
             matches!(err, RtError::Unsupported(_)),
@@ -759,8 +768,8 @@ mod tests {
     #[tokio::test]
     async fn spawn_rejects_egress_allow() {
         let rt = AppleContainerRuntime::with_binary("/no/such/binary-9b3f");
-        let spec = ContainerSpec::new("c", "img")
-            .with_egress_allow(vec!["api.example.com:443".into()]);
+        let spec =
+            ContainerSpec::new("c", "img").with_egress_allow(vec!["api.example.com:443".into()]);
         let err = rt.spawn(spec).await.unwrap_err();
         assert!(
             matches!(err, RtError::Unsupported(_)),

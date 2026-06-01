@@ -39,9 +39,10 @@ pub struct MattermostAdapter {
 
 impl std::fmt::Debug for MattermostAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let server_state = self.server.lock().map_or("poisoned", |g| {
-            g.as_ref().map_or("stopped", |_| "running")
-        });
+        let server_state = self
+            .server
+            .lock()
+            .map_or("poisoned", |g| g.as_ref().map_or("stopped", |_| "running"));
         // `api` skipped on purpose — it holds the bearer token and we
         // don't want it in logs/error chains.
         f.debug_struct("MattermostAdapter")
@@ -57,11 +58,7 @@ impl MattermostAdapter {
     /// Build a new adapter. The factory calls
     /// [`Self::set_server_handle`] right after spawning.
     #[must_use]
-    pub fn new(
-        channel_type: ChannelType,
-        api: MattermostApi,
-        bot_user_id: Option<String>,
-    ) -> Self {
+    pub fn new(channel_type: ChannelType, api: MattermostApi, bot_user_id: Option<String>) -> Self {
         Self {
             channel_type,
             api,
@@ -152,15 +149,11 @@ impl ChannelAdapter for MattermostAdapter {
                 let target = content
                     .get("target_id")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| {
-                        AdapterError::BadRequest("edit requires `target_id`".into())
-                    })?;
+                    .ok_or_else(|| AdapterError::BadRequest("edit requires `target_id`".into()))?;
                 let text = content
                     .get("text")
                     .and_then(serde_json::Value::as_str)
-                    .ok_or_else(|| {
-                        AdapterError::BadRequest("edit requires `text`".into())
-                    })?;
+                    .ok_or_else(|| AdapterError::BadRequest("edit requires `text`".into()))?;
                 self.api.update_post(target, text).await?;
                 Ok(Some(target.to_string()))
             }
@@ -197,7 +190,7 @@ mod tests {
     use super::*;
     use copperclaw_types::MessageKind;
     use serde_json::json;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{Duration, sleep};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -211,11 +204,7 @@ mod tests {
 
     fn make(server: &MockServer, bot: Option<&str>) -> MattermostAdapter {
         let api = MattermostApi::new(&server.uri(), "tok");
-        MattermostAdapter::new(
-            ChannelType::new("mattermost"),
-            api,
-            bot.map(str::to_string),
-        )
+        MattermostAdapter::new(ChannelType::new("mattermost"), api, bot.map(str::to_string))
     }
 
     #[tokio::test]

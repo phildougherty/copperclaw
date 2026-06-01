@@ -7,9 +7,7 @@
 use crate::api::{ChatInfo, MessageView};
 use crate::factory::CHANNEL_TYPE_STR;
 use chrono::{DateTime, TimeZone, Utc};
-use copperclaw_types::{
-    ChannelType, InboundEvent, InboundMessage, MessageKind, SenderIdentity,
-};
+use copperclaw_types::{ChannelType, InboundEvent, InboundMessage, MessageKind, SenderIdentity};
 use serde_json::{Value, json};
 
 /// Build the `platform_id` shape this channel uses on inbound and parses
@@ -82,10 +80,7 @@ pub fn event_to_inbound(
             attachment.insert("filename".to_owned(), Value::String(name.to_owned()));
         }
         if !msg.view_type.is_empty() {
-            attachment.insert(
-                "view_type".to_owned(),
-                Value::String(msg.view_type.clone()),
-            );
+            attachment.insert("view_type".to_owned(), Value::String(msg.view_type.clone()));
         }
         content.insert("attachment".to_owned(), Value::Object(attachment));
     }
@@ -300,7 +295,9 @@ mod tests {
     fn event_to_inbound_group_chat_sets_is_group_true() {
         let msg = base_msg();
         let chat = ChatInfo {
-            id: 42, chat_type: 2, name: "Team".into(),
+            id: 42,
+            chat_type: 2,
+            name: "Team".into(),
         };
         let evt = event_to_inbound(1, &msg, &chat).unwrap();
         assert_eq!(evt.message.is_group, Some(true));
@@ -311,7 +308,9 @@ mod tests {
         let msg = base_msg();
         for chat_type in [3i64, 4] {
             let chat = ChatInfo {
-                id: 1, chat_type, name: "list".into(),
+                id: 1,
+                chat_type,
+                name: "list".into(),
             };
             let evt = event_to_inbound(1, &msg, &chat).unwrap();
             assert_eq!(evt.message.is_group, Some(true));
@@ -378,7 +377,10 @@ mod tests {
     fn extract_incoming_msg_none_for_other_kinds() {
         for kind in ["Info", "Warning", "Error", "MsgsChanged", "ChatModified"] {
             let evt = json!({"kind": kind, "msg": "x"});
-            assert!(extract_incoming_msg(&evt).is_none(), "kind {kind} should not match");
+            assert!(
+                extract_incoming_msg(&evt).is_none(),
+                "kind {kind} should not match"
+            );
         }
     }
 
@@ -416,7 +418,8 @@ mod tests {
     #[test]
     fn parsed_platform_id_clone_and_debug() {
         let p = ParsedPlatformId {
-            account_id: 1, chat_id: 2,
+            account_id: 1,
+            chat_id: 2,
         };
         let _ = p.clone();
         assert!(format!("{p:?}").contains("ParsedPlatformId"));
@@ -425,7 +428,9 @@ mod tests {
     #[test]
     fn incoming_msg_ref_clone_and_debug() {
         let r = IncomingMsgRef {
-            account_id: 1, chat_id: 2, msg_id: 3,
+            account_id: 1,
+            chat_id: 2,
+            msg_id: 3,
         };
         let _ = r.clone();
         assert!(format!("{r:?}").contains("IncomingMsgRef"));

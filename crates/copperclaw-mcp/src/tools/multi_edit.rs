@@ -31,7 +31,7 @@ use serde_json::json;
 
 use crate::error::ToolError;
 use crate::tools::diff_util::{build_blob_card, build_diff_card, over_blob_cutoff};
-use crate::tools::{make_tool, parse_args, success_json, ToolEntry, ToolHandler};
+use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args, success_json};
 
 /// Hard cap on the number of edits in a single call. Mirrored in the
 /// JSON Schema's `maxItems` so the runtime check is just a backstop
@@ -164,9 +164,8 @@ fn do_multi_edit(path: &Path, edits: &[EditSpec]) -> Result<MultiEditOutcome, To
     // entry is a symlink, then refuse anything that isn't a regular
     // file. We keep the *resolved* metadata around so we can restore
     // the permissions onto the temp file pre-rename.
-    let lmeta = std::fs::symlink_metadata(path).map_err(|e| {
-        ToolError::Internal(format!("multi_edit({}): stat: {e}", path.display()))
-    })?;
+    let lmeta = std::fs::symlink_metadata(path)
+        .map_err(|e| ToolError::Internal(format!("multi_edit({}): stat: {e}", path.display())))?;
     let meta = if lmeta.file_type().is_symlink() {
         std::fs::metadata(path).map_err(|e| {
             ToolError::Internal(format!(
@@ -184,9 +183,8 @@ fn do_multi_edit(path: &Path, edits: &[EditSpec]) -> Result<MultiEditOutcome, To
         )));
     }
 
-    let original = std::fs::read_to_string(path).map_err(|e| {
-        ToolError::Internal(format!("multi_edit({}): read: {e}", path.display()))
-    })?;
+    let original = std::fs::read_to_string(path)
+        .map_err(|e| ToolError::Internal(format!("multi_edit({}): read: {e}", path.display())))?;
 
     // Apply edits in order against a mutable buffer. Failures bail
     // out before we ever touch disk. We clone `original` here so the
@@ -234,11 +232,7 @@ fn do_multi_edit(path: &Path, edits: &[EditSpec]) -> Result<MultiEditOutcome, To
 /// the rename. Lifted verbatim from `edit_file` so the two tools
 /// share semantics — if/when this needs to move into a shared helper
 /// it should move for both at once.
-fn atomic_write(
-    path: &Path,
-    bytes: &[u8],
-    orig_meta: &std::fs::Metadata,
-) -> Result<(), ToolError> {
+fn atomic_write(path: &Path, bytes: &[u8], orig_meta: &std::fs::Metadata) -> Result<(), ToolError> {
     use std::io::Write;
 
     struct TmpGuard<'a>(&'a Path, bool);
@@ -298,14 +292,9 @@ fn atomic_write(
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = orig_meta.permissions().mode();
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).map_err(
-            |e| {
-                ToolError::Internal(format!(
-                    "multi_edit({}): chmod tmp: {e}",
-                    path.display()
-                ))
-            },
-        )?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).map_err(|e| {
+            ToolError::Internal(format!("multi_edit({}): chmod tmp: {e}", path.display()))
+        })?;
     }
     #[cfg(not(unix))]
     let _ = orig_meta;

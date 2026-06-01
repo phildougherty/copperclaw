@@ -46,7 +46,9 @@ impl ReplyTokenCache {
 
     /// Consume the stored token for `platform_id` (if any).
     pub fn take(&self, platform_id: &String) -> Option<String> {
-        self.lock_inner().ok().and_then(|mut g| g.remove(platform_id))
+        self.lock_inner()
+            .ok()
+            .and_then(|mut g| g.remove(platform_id))
     }
 
     fn lock_inner(&self) -> Result<MutexGuard<'_, HashMap<String, String>>, ()> {
@@ -66,9 +68,10 @@ pub struct LineAdapter {
 
 impl std::fmt::Debug for LineAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let server_state = self.server.lock().map_or("poisoned", |g| {
-            g.as_ref().map_or("stopped", |_| "running")
-        });
+        let server_state = self
+            .server
+            .lock()
+            .map_or("poisoned", |g| g.as_ref().map_or("stopped", |_| "running"));
         // `api` carries the bearer token; render a placeholder.
         f.debug_struct("LineAdapter")
             .field("channel_type", &self.channel_type)
@@ -156,9 +159,7 @@ impl ChannelAdapter for LineAdapter {
             .content
             .get("text")
             .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                AdapterError::BadRequest("missing `text` in outbound content".into())
-            })?;
+            .ok_or_else(|| AdapterError::BadRequest("missing `text` in outbound content".into()))?;
 
         if let Some(token) = self.reply_tokens.take(&platform_id.to_string()) {
             // Reply path: free but single-use. If the token is stale
@@ -179,7 +180,7 @@ mod tests {
     use copperclaw_types::MessageKind;
     use serde_json::json;
     use std::sync::Arc;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{Duration, sleep};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 

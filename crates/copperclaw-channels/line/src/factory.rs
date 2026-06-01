@@ -11,7 +11,7 @@
 use crate::adapter::{LineAdapter, ReplyTokenCache};
 use crate::api::LineApi;
 use crate::config::{ConfigError, LineConfig};
-use crate::router::{build_router, RouterState};
+use crate::router::{RouterState, build_router};
 use async_trait::async_trait;
 use copperclaw_channels_core::{
     AdapterError, ChannelAdapter, ChannelFactory, ChannelRegistry, ChannelSetup,

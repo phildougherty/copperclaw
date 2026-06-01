@@ -7,11 +7,11 @@
 //! action handler (`SchedulingModule`) writes here; the sweep loop
 //! reads here to fire due tasks.
 
-use crate::central::CentralDb;
 use crate::DbError;
+use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
 use copperclaw_types::{AgentGroupId, SessionId};
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{OptionalExtension, Row, params};
 
 /// Lifecycle states of a task. Stored as TEXT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,7 +292,7 @@ pub fn update(db: &CentralDb, id: &str, fields: UpdateFields) -> Result<Task, Db
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+    use crate::tables::agent_groups::{CreateAgentGroup, create as create_ag};
 
     fn db() -> CentralDb {
         CentralDb::open_in_memory().unwrap()

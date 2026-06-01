@@ -59,10 +59,7 @@ pub enum Caller {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Response {
     /// The call succeeded; `data` holds the command-specific payload.
-    Ok {
-        id: String,
-        data: serde_json::Value,
-    },
+    Ok { id: String, data: serde_json::Value },
     /// The call failed.
     Err { id: String, error: ErrorPayload },
 }

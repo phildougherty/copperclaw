@@ -140,14 +140,15 @@ impl WebhookConfig {
             }
         };
         let port = match obj.get("port") {
-            Some(Value::Number(n)) => n
-                .as_u64()
-                .and_then(|u| u16::try_from(u).ok())
-                .ok_or_else(|| {
-                    AdapterError::BadRequest(
-                        "teams `webhook.port` must be a u16 in range".into(),
-                    )
-                })?,
+            Some(Value::Number(n)) => {
+                n.as_u64()
+                    .and_then(|u| u16::try_from(u).ok())
+                    .ok_or_else(|| {
+                        AdapterError::BadRequest(
+                            "teams `webhook.port` must be a u16 in range".into(),
+                        )
+                    })?
+            }
             Some(Value::Null) | None => DEFAULT_PORT,
             Some(_) => {
                 return Err(AdapterError::BadRequest(
@@ -254,10 +255,8 @@ mod tests {
 
     #[test]
     fn rejects_empty_bot_token() {
-        let err = TeamsConfig::from_value(
-            &json!({"bot_token": "", "client_state_secret": "s"}),
-        )
-        .unwrap_err();
+        let err = TeamsConfig::from_value(&json!({"bot_token": "", "client_state_secret": "s"}))
+            .unwrap_err();
         match err {
             AdapterError::BadRequest(m) => assert!(m.contains("non-empty")),
             other => panic!("got {other:?}"),
@@ -266,28 +265,22 @@ mod tests {
 
     #[test]
     fn rejects_non_string_bot_token() {
-        let err = TeamsConfig::from_value(
-            &json!({"bot_token": 1, "client_state_secret": "s"}),
-        )
-        .unwrap_err();
+        let err = TeamsConfig::from_value(&json!({"bot_token": 1, "client_state_secret": "s"}))
+            .unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 
     #[test]
     fn rejects_empty_client_state_secret() {
-        let err = TeamsConfig::from_value(
-            &json!({"bot_token": "t", "client_state_secret": ""}),
-        )
-        .unwrap_err();
+        let err = TeamsConfig::from_value(&json!({"bot_token": "t", "client_state_secret": ""}))
+            .unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 
     #[test]
     fn rejects_non_string_client_state_secret() {
-        let err = TeamsConfig::from_value(
-            &json!({"bot_token": "t", "client_state_secret": 9}),
-        )
-        .unwrap_err();
+        let err = TeamsConfig::from_value(&json!({"bot_token": "t", "client_state_secret": 9}))
+            .unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 

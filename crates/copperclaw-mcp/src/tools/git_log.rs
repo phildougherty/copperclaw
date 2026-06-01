@@ -4,7 +4,7 @@
 //! `git log --oneline` text.
 
 use crate::error::ToolError;
-use crate::tools::{make_tool, parse_args, success_json, ToolEntry, ToolHandler};
+use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args, success_json};
 use rmcp::model::{CallToolResult, JsonObject, Tool};
 use serde::Deserialize;
 use serde_json::json;
@@ -121,10 +121,7 @@ fn compute(root: &Path, input: &Input) -> Result<serde_json::Value, ToolError> {
         }
 
         let author = commit.author();
-        let subject = commit
-            .summary()
-            .unwrap_or("")
-            .to_string();
+        let subject = commit.summary().unwrap_or("").to_string();
         let body = commit
             .message()
             .map(|m| {
@@ -163,9 +160,7 @@ fn parse_since(s: &str) -> Result<i64, ToolError> {
         return Ok(dt.timestamp());
     }
     if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-        let dt = d
-            .and_hms_opt(0, 0, 0)
-            .map(|nd| nd.and_utc().timestamp());
+        let dt = d.and_hms_opt(0, 0, 0).map(|nd| nd.and_utc().timestamp());
         if let Some(ts) = dt {
             return Ok(ts);
         }
@@ -234,7 +229,10 @@ fn commit_touches_any(
         .diff_tree_to_tree(old_tree.as_ref(), Some(&new_tree), None)
         .map_err(|e| super::git_common::map_err("git_log: diff", &e))?;
     for delta in diff.deltas() {
-        for side in [delta.new_file().path(), delta.old_file().path()].iter().flatten() {
+        for side in [delta.new_file().path(), delta.old_file().path()]
+            .iter()
+            .flatten()
+        {
             if path_matches_filter(side, filter) {
                 return Ok(true);
             }
@@ -302,7 +300,12 @@ mod tests {
         super::super::git_common::tests::rewrite_and_commit(&repo, "a.txt", "2", "second");
 
         let res = handle(
-            Some(json!({"path": td.path().to_string_lossy()}).as_object().unwrap().clone()),
+            Some(
+                json!({"path": td.path().to_string_lossy()})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
             &ctx(),
         )
         .await
@@ -405,7 +408,12 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         git2::Repository::init(td.path()).unwrap();
         let res = handle(
-            Some(json!({"path": td.path().to_string_lossy()}).as_object().unwrap().clone()),
+            Some(
+                json!({"path": td.path().to_string_lossy()})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
             &ctx(),
         )
         .await
@@ -418,7 +426,12 @@ mod tests {
     async fn non_repo_errors() {
         let td = tempfile::tempdir().unwrap();
         let err = handle(
-            Some(json!({"path": td.path().to_string_lossy()}).as_object().unwrap().clone()),
+            Some(
+                json!({"path": td.path().to_string_lossy()})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
             &ctx(),
         )
         .await

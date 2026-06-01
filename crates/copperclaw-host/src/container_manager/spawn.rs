@@ -47,8 +47,7 @@ pub const CONTAINER_RUNNER_PATH: &str = "/usr/local/bin/copperclaw-runner";
 /// is false. Acts as a cap on `SkillsSelector::All`; explicit
 /// selector lists are honoured as-is (the operator picked the names
 /// deliberately).
-pub const CODING_SKILL_NAMES: &[&str] =
-    &["coding-task", "git-commit", "code-review", "testing"];
+pub const CODING_SKILL_NAMES: &[&str] = &["coding-task", "git-commit", "code-review", "testing"];
 
 /// Default idle window before the manager stops a running container.
 /// 300s (5 min) matches the OpenBSD-of-claw-agents "conservative
@@ -138,11 +137,7 @@ impl ContainerManager {
         if self.is_degraded() {
             return Err(ManagerError::HostDegraded);
         }
-        let paths = SessionPaths::new(
-            &self.cfg.data_dir,
-            session.agent_group_id,
-            session.id,
-        );
+        let paths = SessionPaths::new(&self.cfg.data_dir, session.agent_group_id, session.id);
         paths.ensure_dirs().map_err(ManagerError::Io)?;
 
         if !Self::has_pending_inbound(&paths)? {
@@ -201,7 +196,8 @@ impl ContainerManager {
 
         let cfg_row = container_configs::get(&self.central, session.agent_group_id)
             .map_err(ManagerError::Db)?;
-        let runner_cfg = self.runner_config_for(session, cfg_row.as_ref(), Some(paths.root.as_path()));
+        let runner_cfg =
+            self.runner_config_for(session, cfg_row.as_ref(), Some(paths.root.as_path()));
         let runner_json = serde_json::to_vec_pretty(&runner_cfg).map_err(ManagerError::Json)?;
         std::fs::write(paths.root.join(RUNNER_CONFIG_FILENAME), runner_json)
             .map_err(ManagerError::Io)?;
@@ -223,7 +219,10 @@ impl ContainerManager {
         let image_tag = if let Some(ref cfg) = cfg_row {
             let live_fp = container_configs::compute_fingerprint(cfg);
             let stored_fp = cfg.config_fingerprint.as_deref().unwrap_or("");
-            let base_tag = cfg.image_tag.clone().unwrap_or_else(|| self.cfg.default_image_tag.clone());
+            let base_tag = cfg
+                .image_tag
+                .clone()
+                .unwrap_or_else(|| self.cfg.default_image_tag.clone());
             if stored_fp == live_fp {
                 base_tag
             } else if let Some(cooldown_remaining) =
@@ -237,8 +236,7 @@ impl ContainerManager {
                 // backoff window, or the backoff expires naturally.
                 if base_tag.is_empty() {
                     return Err(ManagerError::Spawn(RtError::Container(
-                        "image rebuild in cooldown and no fallback tag is configured"
-                            .into(),
+                        "image rebuild in cooldown and no fallback tag is configured".into(),
                     )));
                 }
                 warn!(
@@ -355,7 +353,11 @@ impl ContainerManager {
         let mut build_spec = ImageBuildSpec::new("copperclaw/session", &base);
         build_spec.apt_packages.clone_from(&cfg.packages_apt);
         build_spec.npm_packages.clone_from(&cfg.packages_npm);
-        let tag = self.runtime.build_image(build_spec).await.map_err(ManagerError::Spawn)?;
+        let tag = self
+            .runtime
+            .build_image(build_spec)
+            .await
+            .map_err(ManagerError::Spawn)?;
         let live_fp = container_configs::compute_fingerprint(cfg);
         container_configs::set_image_tag_and_fingerprint(
             &self.central,
@@ -379,29 +381,32 @@ impl ContainerManager {
         image_tag: &str,
         cfg: Option<&container_configs::ContainerConfig>,
     ) -> ContainerSpec {
-        let mut spec = ContainerSpec::new(container_name(session.agent_group_id, session.id), image_tag)
-            .with_entrypoint(vec![CONTAINER_RUNNER_PATH.to_string()])
-            // Start the agent in the writable session bind mount, and
-            // anchor $HOME there too. The container runs as a non-root
-            // uid with no passwd entry, so the image defaults (cwd `/`,
-            // `HOME=/`) are unwritable: every tool that caches under
-            // $HOME (go-build, npm, pip, cargo) dies with
-            // "mkdir /.cache: permission denied", and every relative
-            // write/`mkdir` fails with EACCES until the agent manually
-            // cds. Pointing both at the session dir fixes both classes.
-            .with_working_dir(CONTAINER_SESSION_DIR)
-            .with_env("HOME", CONTAINER_SESSION_DIR)
-            .with_label("copperclaw.install", self.cfg.install_slug.clone())
-            .with_label("copperclaw.session", session.id.as_uuid().to_string())
-            .with_label(
-                "copperclaw.agent_group",
-                session.agent_group_id.as_uuid().to_string(),
-            )
-            .with_mount(Mount::Bind {
-                source: paths.root.to_string_lossy().into_owned(),
-                target: CONTAINER_SESSION_DIR.to_string(),
-                read_only: false,
-            });
+        let mut spec = ContainerSpec::new(
+            container_name(session.agent_group_id, session.id),
+            image_tag,
+        )
+        .with_entrypoint(vec![CONTAINER_RUNNER_PATH.to_string()])
+        // Start the agent in the writable session bind mount, and
+        // anchor $HOME there too. The container runs as a non-root
+        // uid with no passwd entry, so the image defaults (cwd `/`,
+        // `HOME=/`) are unwritable: every tool that caches under
+        // $HOME (go-build, npm, pip, cargo) dies with
+        // "mkdir /.cache: permission denied", and every relative
+        // write/`mkdir` fails with EACCES until the agent manually
+        // cds. Pointing both at the session dir fixes both classes.
+        .with_working_dir(CONTAINER_SESSION_DIR)
+        .with_env("HOME", CONTAINER_SESSION_DIR)
+        .with_label("copperclaw.install", self.cfg.install_slug.clone())
+        .with_label("copperclaw.session", session.id.as_uuid().to_string())
+        .with_label(
+            "copperclaw.agent_group",
+            session.agent_group_id.as_uuid().to_string(),
+        )
+        .with_mount(Mount::Bind {
+            source: paths.root.to_string_lossy().into_owned(),
+            target: CONTAINER_SESSION_DIR.to_string(),
+            read_only: false,
+        });
 
         // Run the container as the host operator's UID:GID so anything
         // the agent writes through the bind mount (session_state,
@@ -458,8 +463,10 @@ impl ContainerManager {
         // `--config` flag wired into the entrypoint args. ContainerSpec
         // doesn't have a dedicated args field, so we encode the flag
         // by extending the entrypoint vector.
-        spec.entrypoint
-            .extend(vec!["--config".to_string(), format!("{CONTAINER_SESSION_DIR}/{RUNNER_CONFIG_FILENAME}")]);
+        spec.entrypoint.extend(vec![
+            "--config".to_string(),
+            format!("{CONTAINER_SESSION_DIR}/{RUNNER_CONFIG_FILENAME}"),
+        ]);
 
         // All three forwarded surfaces (anthropic key, base URL,
         // provider keys) live behind the rotatable read-lock so the
@@ -732,15 +739,13 @@ pub fn resolve_rebuild_base(default_image_tag: &str) -> String {
 
 /// Initial backoff after the first rebuild failure for an agent group.
 /// Doubles per subsequent failure up to [`REBUILD_BACKOFF_CEILING`].
-const REBUILD_BACKOFF_INITIAL: std::time::Duration =
-    std::time::Duration::from_secs(60);
+const REBUILD_BACKOFF_INITIAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Ceiling for the rebuild backoff per group. 30 min mirrors the
 /// delivery loop's `ABSOLUTE_CEILING_MS`: after this much time has
 /// passed without operator action, retrying the build won't have
 /// gotten cheaper, but unblocking the group does have value.
-const REBUILD_BACKOFF_CEILING: std::time::Duration =
-    std::time::Duration::from_secs(1_800);
+const REBUILD_BACKOFF_CEILING: std::time::Duration = std::time::Duration::from_secs(1_800);
 
 /// Per-agent-group cooldown table for image rebuilds. Wraps a
 /// `Mutex<HashMap>` because the spawn path is already async + holds
@@ -834,9 +839,9 @@ mod tests {
     use super::*;
     use copperclaw_db::central::CentralDb;
     use copperclaw_db::session::open_inbound;
-    use copperclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+    use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
     use copperclaw_db::tables::messages_in;
-    use copperclaw_db::tables::sessions::{create as create_session, CreateSession};
+    use copperclaw_db::tables::sessions::{CreateSession, create as create_session};
     use copperclaw_types::{ContainerStatus, SessionId};
     use std::path::PathBuf;
 
@@ -871,7 +876,10 @@ mod tests {
         // Push past the doubling threshold a few times.
         for _ in 0..6 {
             let next = bo.record_failure(ag);
-            assert!(next >= prev, "backoff should not regress: prev={prev:?} next={next:?}");
+            assert!(
+                next >= prev,
+                "backoff should not regress: prev={prev:?} next={next:?}"
+            );
             assert!(next <= REBUILD_BACKOFF_CEILING);
             prev = next;
         }
@@ -899,7 +907,10 @@ mod tests {
         let b = AgentGroupId::new();
         let _ = bo.record_failure(a);
         assert!(bo.in_cooldown(a).is_some());
-        assert!(bo.in_cooldown(b).is_none(), "other group must be unaffected");
+        assert!(
+            bo.in_cooldown(b).is_none(),
+            "other group must be unaffected"
+        );
     }
 
     /// Regression: image rebuilds must base off the install's default
@@ -999,17 +1010,32 @@ mod tests {
             .mounts
             .iter()
             .find_map(|m| match m {
-                Mount::Bind { source, target, read_only } => Some((source, target, read_only)),
+                Mount::Bind {
+                    source,
+                    target,
+                    read_only,
+                } => Some((source, target, read_only)),
                 _ => None,
             })
             .unwrap();
         assert_eq!(bind.1, CONTAINER_SESSION_DIR);
         assert!(!*bind.2);
         // Env carries both API key and base URL.
-        assert!(spec.env.iter().any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == "sk-test"));
-        assert!(spec.env.iter().any(|(k, v)| k == "ANTHROPIC_BASE_URL" && v.contains("openrouter")));
+        assert!(
+            spec.env
+                .iter()
+                .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == "sk-test")
+        );
+        assert!(
+            spec.env
+                .iter()
+                .any(|(k, v)| k == "ANTHROPIC_BASE_URL" && v.contains("openrouter"))
+        );
         // Labels for orphan cleanup.
-        assert_eq!(spec.labels.get("copperclaw.install").map(String::as_str), Some("test"));
+        assert_eq!(
+            spec.labels.get("copperclaw.install").map(String::as_str),
+            Some("test")
+        );
         assert!(spec.labels.contains_key("copperclaw.session"));
         assert!(spec.labels.contains_key("copperclaw.agent_group"));
     }
@@ -1090,8 +1116,16 @@ mod tests {
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
         let spec = mgr.build_spec(&session, &paths, "img", None);
-        assert!(spec.env.iter().any(|(k, v)| k == "TAVILY_API_KEY" && v == "tav-secret"));
-        assert!(spec.env.iter().any(|(k, v)| k == "EXA_API_KEY" && v == "exa-secret"));
+        assert!(
+            spec.env
+                .iter()
+                .any(|(k, v)| k == "TAVILY_API_KEY" && v == "tav-secret")
+        );
+        assert!(
+            spec.env
+                .iter()
+                .any(|(k, v)| k == "EXA_API_KEY" && v == "exa-secret")
+        );
         assert!(
             spec.env.iter().all(|(k, _)| k != "BRAVE_SEARCH_API_KEY"),
             "empty-valued forward must be skipped"
@@ -1162,9 +1196,10 @@ mod tests {
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
         let spec = mgr.build_spec(&session, &paths, "img", None);
         assert!(
-            !spec.mounts.iter().any(
-                |m| matches!(m, Mount::Bind { target, .. } if target == CONTAINER_PARENT_DIR)
-            ),
+            !spec
+                .mounts
+                .iter()
+                .any(|m| matches!(m, Mount::Bind { target, .. } if target == CONTAINER_PARENT_DIR)),
             "root session must not get a /parent mount"
         );
     }
@@ -1184,7 +1219,10 @@ mod tests {
     /// Initialise a git repo with one commit at `root`.
     fn init_repo_with_commit(root: &std::path::Path) {
         let run = |args: &[&str]| {
-            assert!(super::git_ok(root, args), "git {args:?} failed in test repo");
+            assert!(
+                super::git_ok(root, args),
+                "git {args:?} failed in test repo"
+            );
         };
         run(&["init", "-q", "-b", "main"]);
         run(&["config", "user.email", "t@t"]);
@@ -1220,9 +1258,10 @@ mod tests {
 
         // No read-only /parent — the writable worktree replaces it.
         assert!(
-            !spec.mounts.iter().any(
-                |m| matches!(m, Mount::Bind { target, .. } if target == CONTAINER_PARENT_DIR)
-            ),
+            !spec
+                .mounts
+                .iter()
+                .any(|m| matches!(m, Mount::Bind { target, .. } if target == CONTAINER_PARENT_DIR)),
             "git parent must not get the read-only /parent fallback"
         );
 
@@ -1263,7 +1302,10 @@ mod tests {
         });
         let (git_target, git_ro) = git_mount.expect(".git mount present");
         assert_eq!(git_target, git_src, ".git target must equal its host path");
-        assert!(!git_ro, ".git must be read-write (commits write objects here)");
+        assert!(
+            !git_ro,
+            ".git must be read-write (commits write objects here)"
+        );
 
         // The branch was created off the parent's HEAD.
         let branch = format!("sib/{}", sibling.id.as_uuid());
@@ -1271,10 +1313,11 @@ mod tests {
             super::git_ok(&parent_root, &["rev-parse", "--verify", &branch]),
             "branch {branch} must exist in the parent repo"
         );
-        assert!(spec
-            .env
-            .iter()
-            .any(|(k, v)| k == "COPPERCLAW_WORKSPACE_BRANCH" && *v == branch));
+        assert!(
+            spec.env
+                .iter()
+                .any(|(k, v)| k == "COPPERCLAW_WORKSPACE_BRANCH" && *v == branch)
+        );
     }
 
     #[test]
@@ -1370,7 +1413,10 @@ mod tests {
             Mount::Bind { target, .. } => target == &format!("{CONTAINER_SESSION_DIR}/memory"),
             _ => false,
         });
-        assert!(!has_memory, "memory mount must not appear without groups_dir");
+        assert!(
+            !has_memory,
+            "memory mount must not appear without groups_dir"
+        );
     }
 
     #[test]
@@ -1445,7 +1491,10 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
         let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg));
-        assert_eq!(spec.egress_allow, vec!["api.example.com:443", "db.local:5432"]);
+        assert_eq!(
+            spec.egress_allow,
+            vec!["api.example.com:443", "db.local:5432"]
+        );
     }
 
     #[test]
@@ -1547,9 +1596,12 @@ mod tests {
         let updated = sessions::get(&db, session.id).unwrap();
         assert!(matches!(updated.container_status, ContainerStatus::Running));
         // The noop runtime records the spawn call.
-        assert!(runtime.spawn_calls().iter().any(|name| {
-            name.contains(&session.id.as_uuid().to_string())
-        }));
+        assert!(
+            runtime
+                .spawn_calls()
+                .iter()
+                .any(|name| { name.contains(&session.id.as_uuid().to_string()) })
+        );
         // Runner config got written.
         assert!(paths.root.join(RUNNER_CONFIG_FILENAME).is_file());
     }
@@ -1582,7 +1634,10 @@ mod tests {
             Mount::Bind { target, .. } => target == &format!("{CONTAINER_SESSION_DIR}/memory"),
             _ => false,
         });
-        assert!(!has_memory_mount, "memory mount must not appear when source prep failed");
+        assert!(
+            !has_memory_mount,
+            "memory mount must not appear when source prep failed"
+        );
         // The marker file lands inside the session root so /data/memory
         // is still browsable from the container.
         let marker = paths.root.join("memory").join(MEMORY_UNAVAILABLE_FILENAME);
@@ -1700,14 +1755,25 @@ mod tests {
             manager_cfg(tmp.path().to_path_buf()),
         );
         let env_path = tmp.path().join(".env");
-        std::fs::write(&env_path, "ANTHROPIC_API_KEY=rotated-key\nEXA_API_KEY=exa-1\n").unwrap();
+        std::fs::write(
+            &env_path,
+            "ANTHROPIC_API_KEY=rotated-key\nEXA_API_KEY=exa-1\n",
+        )
+        .unwrap();
         let changed = mgr.reload_env(Some(&env_path));
-        assert!(changed.contains(&"ANTHROPIC_API_KEY".to_string()), "{changed:?}");
+        assert!(
+            changed.contains(&"ANTHROPIC_API_KEY".to_string()),
+            "{changed:?}"
+        );
         assert!(changed.contains(&"EXA_API_KEY".to_string()), "{changed:?}");
         // RwLock now reflects the rotation.
         let r = mgr.rotatable.read().unwrap();
         assert_eq!(r.anthropic_api_key.as_deref(), Some("rotated-key"));
-        assert!(r.forward_env.iter().any(|(k, v)| k == "EXA_API_KEY" && v == "exa-1"));
+        assert!(
+            r.forward_env
+                .iter()
+                .any(|(k, v)| k == "EXA_API_KEY" && v == "exa-1")
+        );
     }
 
     #[test]
@@ -1791,7 +1857,10 @@ mod tests {
         // Original (pre-fix) configuration: same value on both sides.
         let err = check_heartbeat_deadline_alignment(60, 60_000)
             .expect_err("60s heartbeat vs 60s deadline must trip the check");
-        assert!(err.contains("60s"), "warning must show heartbeat value: {err}");
+        assert!(
+            err.contains("60s"),
+            "warning must show heartbeat value: {err}"
+        );
         assert!(
             err.contains("60000ms") || err.contains("60_000"),
             "warning must show deadline ms value: {err}"
@@ -1826,5 +1895,4 @@ mod tests {
         // deadline against a tiny heartbeat — must Err, not panic.
         assert!(check_heartbeat_deadline_alignment(10, 300_000).is_err());
     }
-
 }

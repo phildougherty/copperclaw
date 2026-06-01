@@ -111,14 +111,15 @@ impl WebhookConfig {
             }
         };
         let port = match obj.get("port") {
-            Some(Value::Number(n)) => n
-                .as_u64()
-                .and_then(|u| u16::try_from(u).ok())
-                .ok_or_else(|| {
-                    AdapterError::BadRequest(
-                        "slack `webhook.port` must be a u16 in range".into(),
-                    )
-                })?,
+            Some(Value::Number(n)) => {
+                n.as_u64()
+                    .and_then(|u| u16::try_from(u).ok())
+                    .ok_or_else(|| {
+                        AdapterError::BadRequest(
+                            "slack `webhook.port` must be a u16 in range".into(),
+                        )
+                    })?
+            }
             Some(Value::Null) | None => DEFAULT_PORT,
             Some(_) => {
                 return Err(AdapterError::BadRequest(
@@ -232,8 +233,8 @@ mod tests {
 
     #[test]
     fn rejects_non_string_bot_token() {
-        let err = SlackConfig::from_value(&json!({"bot_token":42, "signing_secret":"s"}))
-            .unwrap_err();
+        let err =
+            SlackConfig::from_value(&json!({"bot_token":42, "signing_secret":"s"})).unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 

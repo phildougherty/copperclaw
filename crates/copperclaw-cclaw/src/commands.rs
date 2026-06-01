@@ -1004,9 +1004,7 @@ impl TopCommand {
             Self::Status => ParsedCall::new("composite.status", json!({})),
             Self::Health => ParsedCall::new("composite.health", json!({})),
             Self::Doctor => ParsedCall::new("composite.doctor", json!({})),
-            Self::Usage { since } => {
-                ParsedCall::new("usage.rollup", json!({"since": since}))
-            }
+            Self::Usage { since } => ParsedCall::new("usage.rollup", json!({"since": since})),
             Self::Chat {
                 fifo,
                 log,
@@ -1136,11 +1134,7 @@ impl GroupsCmd {
                 insert_opt(&mut o, "provider", provider.clone());
                 ParsedCall::new("groups.create", Value::Object(o))
             }
-            Self::Update {
-                id,
-                name,
-                provider,
-            } => {
+            Self::Update { id, name, provider } => {
                 let mut o = Map::new();
                 o.insert("id".into(), id.clone().into());
                 insert_opt(&mut o, "name", name.clone());
@@ -1390,10 +1384,9 @@ impl RolesCmd {
 impl MembersCmd {
     pub fn to_call(&self) -> ParsedCall {
         match self {
-            Self::List { agent_group } => ParsedCall::new(
-                "members.list",
-                json!({"agent_group_id": agent_group}),
-            ),
+            Self::List { agent_group } => {
+                ParsedCall::new("members.list", json!({"agent_group_id": agent_group}))
+            }
             Self::Add { agent_group, user } => ParsedCall::new(
                 "members.add",
                 json!({"agent_group_id": agent_group, "user": user}),
@@ -1409,10 +1402,9 @@ impl MembersCmd {
 impl DestinationsCmd {
     pub fn to_call(&self) -> ParsedCall {
         match self {
-            Self::List { agent_group } => ParsedCall::new(
-                "destinations.list",
-                json!({"agent_group_id": agent_group}),
-            ),
+            Self::List { agent_group } => {
+                ParsedCall::new("destinations.list", json!({"agent_group_id": agent_group}))
+            }
             Self::Add {
                 agent_group,
                 name,
@@ -1453,10 +1445,9 @@ impl SessionsCmd {
                 ParsedCall::new("sessions.list", Value::Object(o))
             }
             Self::Get { id } => ParsedCall::new("sessions.get", json!({"id": id})),
-            Self::Delete { id, force } => ParsedCall::new(
-                "sessions.delete",
-                json!({"id": id, "force": *force}),
-            ),
+            Self::Delete { id, force } => {
+                ParsedCall::new("sessions.delete", json!({"id": id, "force": *force}))
+            }
         }
     }
 }
@@ -1483,9 +1474,7 @@ impl DroppedMessagesCmd {
                 o.insert("limit".into(), (*limit).into());
                 ParsedCall::new("dropped-messages.outbound-list", Value::Object(o))
             }
-            Self::Replay { id } => {
-                ParsedCall::new("dropped-messages.replay", json!({"id": id}))
-            }
+            Self::Replay { id } => ParsedCall::new("dropped-messages.replay", json!({"id": id})),
         }
     }
 }
@@ -1495,12 +1484,8 @@ impl ApprovalsCmd {
         match self {
             Self::List => ParsedCall::new("approvals.list", json!({})),
             Self::Get { id } => ParsedCall::new("approvals.get", json!({"id": id})),
-            Self::ApproveById { id } => {
-                ParsedCall::new("approvals.approve", json!({"id": id}))
-            }
-            Self::Deny { id } => {
-                ParsedCall::new("approvals.deny", json!({"id": id}))
-            }
+            Self::ApproveById { id } => ParsedCall::new("approvals.approve", json!({"id": id})),
+            Self::Deny { id } => ParsedCall::new("approvals.deny", json!({"id": id})),
             Self::Approve {
                 channel,
                 identity,
@@ -1519,10 +1504,9 @@ impl ApprovalsCmd {
 impl AuditCmd {
     pub fn to_call(&self) -> ParsedCall {
         match self {
-            Self::List { since, limit } => ParsedCall::new(
-                "audit.list",
-                json!({ "since": since, "limit": limit }),
-            ),
+            Self::List { since, limit } => {
+                ParsedCall::new("audit.list", json!({ "since": since, "limit": limit }))
+            }
         }
     }
 }
@@ -1655,13 +1639,18 @@ mod tests {
     #[test]
     fn groups_create_required_and_optional() {
         let p = parse(&[
-            "cclaw", "groups", "create", "--folder", "f", "--name", "n", "--provider", "claude",
+            "cclaw",
+            "groups",
+            "create",
+            "--folder",
+            "f",
+            "--name",
+            "n",
+            "--provider",
+            "claude",
         ]);
         assert_eq!(p.command, "groups.create");
-        assert_eq!(
-            p.args,
-            json!({"folder":"f","name":"n","provider":"claude"})
-        );
+        assert_eq!(p.args, json!({"folder":"f","name":"n","provider":"claude"}));
 
         let p = parse(&["cclaw", "groups", "create", "--folder", "f", "--name", "n"]);
         assert_eq!(p.args, json!({"folder":"f","name":"n"}));
@@ -1685,8 +1674,14 @@ mod tests {
 
     #[test]
     fn groups_delete_and_restart() {
-        assert_eq!(parse(&["cclaw", "groups", "delete", "x"]).command, "groups.delete");
-        assert_eq!(parse(&["cclaw", "groups", "restart", "x"]).command, "groups.restart");
+        assert_eq!(
+            parse(&["cclaw", "groups", "delete", "x"]).command,
+            "groups.delete"
+        );
+        assert_eq!(
+            parse(&["cclaw", "groups", "restart", "x"]).command,
+            "groups.restart"
+        );
     }
 
     // --- group config ------------------------------------------------------
@@ -1701,7 +1696,13 @@ mod tests {
     #[test]
     fn groups_config_update_field_parses_json_value() {
         let p = parse(&[
-            "cclaw", "groups", "config", "update", "id1", "--field", "max_tokens=4096",
+            "cclaw",
+            "groups",
+            "config",
+            "update",
+            "id1",
+            "--field",
+            "max_tokens=4096",
         ]);
         assert_eq!(p.command, "groups.config.update");
         assert_eq!(
@@ -1713,7 +1714,13 @@ mod tests {
     #[test]
     fn groups_config_update_field_falls_back_to_string() {
         let p = parse(&[
-            "cclaw", "groups", "config", "update", "id1", "--field", "name=hello world",
+            "cclaw",
+            "groups",
+            "config",
+            "update",
+            "id1",
+            "--field",
+            "name=hello world",
         ]);
         assert_eq!(
             p.args,
@@ -1726,10 +1733,7 @@ mod tests {
         let p = parse(&[
             "cclaw", "groups", "config", "update", "id1", "--field", "stripped",
         ]);
-        assert_eq!(
-            p.args,
-            json!({"id":"id1","field":"stripped","value":""})
-        );
+        assert_eq!(p.args, json!({"id":"id1","field":"stripped","value":""}));
     }
 
     #[test]
@@ -1767,9 +1771,7 @@ mod tests {
         assert_eq!(p.command, "composite.groups.config-edit");
         assert_eq!(p.args, json!({"id": "id1", "dry_run": false}));
 
-        let p = parse(&[
-            "cclaw", "groups", "config", "edit", "id1", "--dry-run",
-        ]);
+        let p = parse(&["cclaw", "groups", "config", "edit", "id1", "--dry-run"]);
         assert_eq!(p.args, json!({"id": "id1", "dry_run": true}));
     }
 
@@ -1798,7 +1800,13 @@ mod tests {
     #[test]
     fn groups_config_add_package_apt() {
         let p = parse(&[
-            "cclaw", "groups", "config", "add-package", "id1", "--apt", "curl",
+            "cclaw",
+            "groups",
+            "config",
+            "add-package",
+            "id1",
+            "--apt",
+            "curl",
         ]);
         assert_eq!(p.command, "groups.config.add-package");
         assert_eq!(p.args, json!({"id":"id1","kind":"apt","name":"curl"}));
@@ -1807,7 +1815,13 @@ mod tests {
     #[test]
     fn groups_config_add_package_npm() {
         let p = parse(&[
-            "cclaw", "groups", "config", "add-package", "id1", "--npm", "left-pad",
+            "cclaw",
+            "groups",
+            "config",
+            "add-package",
+            "id1",
+            "--npm",
+            "left-pad",
         ]);
         assert_eq!(p.args, json!({"id":"id1","kind":"npm","name":"left-pad"}));
     }
@@ -1875,9 +1889,7 @@ mod tests {
 
     #[test]
     fn groups_config_set_egress_allow_empty_clears() {
-        let p = parse(&[
-            "cclaw", "groups", "config", "set-egress-allow", "id1",
-        ]);
+        let p = parse(&["cclaw", "groups", "config", "set-egress-allow", "id1"]);
         assert_eq!(p.command, "groups.config.set-egress-allow");
         assert_eq!(p.args, json!({"id": "id1", "allow": []}));
     }
@@ -1912,8 +1924,13 @@ mod tests {
     #[test]
     fn groups_config_set_resource_limits_partial_cpus_only() {
         let p = parse(&[
-            "cclaw", "groups", "config", "set-resource-limits", "id1",
-            "--cpus", "2.0",
+            "cclaw",
+            "groups",
+            "config",
+            "set-resource-limits",
+            "id1",
+            "--cpus",
+            "2.0",
         ]);
         assert_eq!(p.command, "groups.config.set-resource-limits");
         assert_eq!(p.args, json!({"id": "id1", "limits": {"cpus": "2.0"}}));
@@ -1921,9 +1938,7 @@ mod tests {
 
     #[test]
     fn groups_config_set_resource_limits_empty_clears() {
-        let p = parse(&[
-            "cclaw", "groups", "config", "set-resource-limits", "id1",
-        ]);
+        let p = parse(&["cclaw", "groups", "config", "set-resource-limits", "id1"]);
         assert_eq!(p.command, "groups.config.set-resource-limits");
         assert_eq!(p.args, json!({"id": "id1", "limits": {}}));
     }
@@ -1999,7 +2014,10 @@ mod tests {
             "true",
         ]);
         assert_eq!(p.command, "messaging-groups.update");
-        assert_eq!(p.args, json!({"id":"mg_1","name":"Renamed","is_group":true}));
+        assert_eq!(
+            p.args,
+            json!({"id":"mg_1","name":"Renamed","is_group":true})
+        );
 
         assert_eq!(
             parse(&["cclaw", "messaging-groups", "delete", "mg_1"]).command,
@@ -2103,7 +2121,10 @@ mod tests {
     #[test]
     fn wirings_list_get_delete() {
         assert_eq!(parse(&["cclaw", "wirings", "list"]).command, "wirings.list");
-        assert_eq!(parse(&["cclaw", "wirings", "get", "w"]).args, json!({"id":"w"}));
+        assert_eq!(
+            parse(&["cclaw", "wirings", "get", "w"]).args,
+            json!({"id":"w"})
+        );
         assert_eq!(
             parse(&["cclaw", "wirings", "delete", "w"]).command,
             "wirings.delete"
@@ -2113,7 +2134,14 @@ mod tests {
     #[test]
     fn wirings_update_partial() {
         let p = parse(&[
-            "cclaw", "wirings", "update", "w", "--engage", "mention", "--priority", "7",
+            "cclaw",
+            "wirings",
+            "update",
+            "w",
+            "--engage",
+            "mention",
+            "--priority",
+            "7",
         ]);
         assert_eq!(p.command, "wirings.update");
         assert_eq!(p.args, json!({"id":"w","engage":"mention","priority":7}));
@@ -2152,7 +2180,10 @@ mod tests {
     #[test]
     fn users_all() {
         assert_eq!(parse(&["cclaw", "users", "list"]).command, "users.list");
-        assert_eq!(parse(&["cclaw", "users", "get", "u"]).args, json!({"id":"u"}));
+        assert_eq!(
+            parse(&["cclaw", "users", "get", "u"]).args,
+            json!({"id":"u"})
+        );
         let p = parse(&[
             "cclaw",
             "users",
@@ -2167,9 +2198,7 @@ mod tests {
             p.args,
             json!({"identity":"telegram:1","display_name":"Phil"})
         );
-        let p = parse(&[
-            "cclaw", "users", "update", "u", "--display-name", "Updated",
-        ]);
+        let p = parse(&["cclaw", "users", "update", "u", "--display-name", "Updated"]);
         assert_eq!(p.args, json!({"id":"u","display_name":"Updated"}));
     }
 
@@ -2398,7 +2427,15 @@ mod tests {
                 "--name",
                 "n",
             ],
-            &["cclaw", "groups", "config", "add-package", "x", "--apt", "p"],
+            &[
+                "cclaw",
+                "groups",
+                "config",
+                "add-package",
+                "x",
+                "--apt",
+                "p",
+            ],
             &[
                 "cclaw",
                 "groups",
@@ -2460,7 +2497,12 @@ mod tests {
             &["cclaw", "user-dms", "list"],
             &["cclaw", "dropped-messages", "list"],
             &["cclaw", "dropped-messages", "outbound-list"],
-            &["cclaw", "dropped-messages", "replay", "00000000-0000-0000-0000-000000000000"],
+            &[
+                "cclaw",
+                "dropped-messages",
+                "replay",
+                "00000000-0000-0000-0000-000000000000",
+            ],
             &["cclaw", "db", "backup", "/tmp/copperclaw.db.bak"],
             &["cclaw", "db", "restore", "/tmp/copperclaw.db.bak"],
             &["cclaw", "mcp", "list-presets"],
@@ -2521,10 +2563,8 @@ mod tests {
         }
         // And the reverse: every entry in ALL_COMMANDS should have been
         // emitted at least once above.
-        let emitted: std::collections::HashSet<String> = invocations
-            .iter()
-            .map(|args| parse(args).command)
-            .collect();
+        let emitted: std::collections::HashSet<String> =
+            invocations.iter().map(|args| parse(args).command).collect();
         for c in ALL_COMMANDS {
             assert!(
                 emitted.contains(*c),
@@ -2576,7 +2616,10 @@ mod tests {
     fn resolve_socket_prefers_explicit_flag() {
         let cli =
             Cli::try_parse_from(["cclaw", "--socket", "/tmp/x.sock", "groups", "list"]).unwrap();
-        assert_eq!(cli.resolve_socket(), std::path::PathBuf::from("/tmp/x.sock"));
+        assert_eq!(
+            cli.resolve_socket(),
+            std::path::PathBuf::from("/tmp/x.sock")
+        );
     }
 
     #[test]
@@ -2607,7 +2650,10 @@ mod tests {
     #[test]
     fn user_socket_for_other_os_falls_back_to_dot_dir() {
         let p = user_socket_for(std::path::Path::new("/h"), "freebsd");
-        assert_eq!(p, std::path::PathBuf::from("/h/.copperclaw/data/cclaw.sock"));
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/h/.copperclaw/data/cclaw.sock")
+        );
     }
 
     // --- schema-version -------------------------------------------------------

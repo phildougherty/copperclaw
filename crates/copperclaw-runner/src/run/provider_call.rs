@@ -15,7 +15,7 @@ use crate::disallowed::is_disallowed;
 
 use super::drive_turn::{LlmTurnOutput, PendingToolCall, TurnOutcome};
 use super::prompt::system_with_context;
-use super::{emit_usage_report, set_current_tool, clear_current_tool, RunnerDeps};
+use super::{RunnerDeps, clear_current_tool, emit_usage_report, set_current_tool};
 
 /// Maximum number of `provider.query()` attempts (including the first)
 /// before the runner gives up and marks the inbound failed. Hard-coded
@@ -48,7 +48,10 @@ fn format_provider_failure_reason(err: &ProviderError) -> String {
     if raw.chars().count() <= FAILURE_REASON_CAP {
         return raw;
     }
-    let prefix: String = raw.chars().take(FAILURE_REASON_CAP.saturating_sub(1)).collect();
+    let prefix: String = raw
+        .chars()
+        .take(FAILURE_REASON_CAP.saturating_sub(1))
+        .collect();
     format!("{prefix}…")
 }
 
@@ -140,14 +143,7 @@ pub(super) async fn run_llm_turn(
                 // path below. `drive_turn` will preserve this reason
                 // verbatim when wrapping the per-turn output for the
                 // run loop (see #12 in code-review notes).
-                emit_usage_report(
-                    deps,
-                    0,
-                    0,
-                    turn_started_at,
-                    &TurnOutcome::Failed(reason),
-                )
-                .await;
+                emit_usage_report(deps, 0, 0, turn_started_at, &TurnOutcome::Failed(reason)).await;
                 return Ok(out);
             }
         };
@@ -158,7 +154,8 @@ pub(super) async fn run_llm_turn(
         // Retry only if the failure was tagged retryable AND we have
         // budget left. Use the same backoff schedule as query_with_retry
         // for consistency.
-        if pumped.0.failed && pumped.0.retryable_failure && stream_attempts < MAX_PROVIDER_ATTEMPTS {
+        if pumped.0.failed && pumped.0.retryable_failure && stream_attempts < MAX_PROVIDER_ATTEMPTS
+        {
             tracing::warn!(
                 attempt = stream_attempts,
                 max = MAX_PROVIDER_ATTEMPTS,
@@ -270,9 +267,8 @@ pub(super) async fn pump_events(
                     } else {
                         ""
                     };
-                    out.failure_reason = format!(
-                        "provider stream ended with an error event ({trimmed}{suffix})"
-                    );
+                    out.failure_reason =
+                        format!("provider stream ended with an error event ({trimmed}{suffix})");
                 }
                 break;
             }
@@ -598,9 +594,8 @@ impl HeartbeatTicker {
         // sees its heartbeat refreshed.
         touch_heartbeat(Some(&path));
         let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(
-                std::time::Duration::from_millis(HEARTBEAT_TICK_INTERVAL_MS),
-            );
+            let mut interval =
+                tokio::time::interval(std::time::Duration::from_millis(HEARTBEAT_TICK_INTERVAL_MS));
             // We already touched once; skip the immediate tick.
             interval.tick().await;
             loop {
@@ -608,7 +603,9 @@ impl HeartbeatTicker {
                 touch_heartbeat(Some(&path));
             }
         });
-        Self { handle: Some(handle) }
+        Self {
+            handle: Some(handle),
+        }
     }
 }
 
@@ -728,7 +725,9 @@ impl ProviderActivityTicker {
                 pinger.ping();
             }
         });
-        Self { handle: Some(handle) }
+        Self {
+            handle: Some(handle),
+        }
     }
 }
 
@@ -744,17 +743,17 @@ impl Drop for ProviderActivityTicker {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use copperclaw_db::session::{open_inbound, open_outbound, SessionPaths};
-    use copperclaw_db::tables::messages_in::{insert as insert_in, WriteInbound};
+    use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
+    use copperclaw_db::tables::messages_in::{WriteInbound, insert as insert_in};
     use copperclaw_providers::{AgentProvider, AgentQuery, ProviderError, QueryInput};
     use copperclaw_types::{
         AgentGroupId, ChannelType, MessageId, MessageKind, ProviderEvent, SessionId,
     };
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
 
-    use crate::run::{run_loop, RunnerDeps};
+    use crate::run::{RunnerDeps, run_loop};
     use crate::tools::RunnerToolCtx;
 
     /// Counting pinger: every call to [`ProviderActivityPinger::ping`]
@@ -786,7 +785,9 @@ mod tests {
 
     impl ScriptedProvider {
         fn new(scripts: Vec<Vec<ProviderEvent>>) -> Arc<Self> {
-            Arc::new(Self { scripts: StdMutex::new(scripts) })
+            Arc::new(Self {
+                scripts: StdMutex::new(scripts),
+            })
         }
     }
 
@@ -839,7 +840,14 @@ mod tests {
 
     /// Slimmed setup mirroring `super::tests::build_setup` but with a
     /// counting pinger so the typing-keepalive path can be observed.
-    fn build_setup(scripts: Vec<Vec<ProviderEvent>>) -> (RunnerDeps, Arc<CountingPinger>, tempfile::TempDir, SessionPaths) {
+    fn build_setup(
+        scripts: Vec<Vec<ProviderEvent>>,
+    ) -> (
+        RunnerDeps,
+        Arc<CountingPinger>,
+        tempfile::TempDir,
+        SessionPaths,
+    ) {
         let tmp = tempfile::tempdir().unwrap();
         let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
         let inbound = open_inbound(&paths).unwrap();
@@ -888,11 +896,20 @@ mod tests {
     #[tokio::test]
     async fn provider_stream_chunks_fire_activity_pings() {
         let (mut deps, pinger, _tmp, _paths) = build_setup(vec![vec![
-            ProviderEvent::Init { continuation: "c1".into() },
+            ProviderEvent::Init {
+                continuation: "c1".into(),
+            },
             ProviderEvent::Activity,
-            ProviderEvent::Progress { message: "thinking".into() },
-            ProviderEvent::Usage { input_tokens: 5, output_tokens: 0 },
-            ProviderEvent::Result { text: Some("hello".into()) },
+            ProviderEvent::Progress {
+                message: "thinking".into(),
+            },
+            ProviderEvent::Usage {
+                input_tokens: 5,
+                output_tokens: 0,
+            },
+            ProviderEvent::Result {
+                text: Some("hello".into()),
+            },
         ]]);
         {
             let g = deps.inbound.lock().await;
@@ -978,7 +995,9 @@ mod tests {
     #[tokio::test]
     async fn pump_completes_when_container_state_writes_fail() {
         let (mut deps, _pinger, _tmp, paths) = build_setup(vec![vec![
-            ProviderEvent::Init { continuation: "c1".into() },
+            ProviderEvent::Init {
+                continuation: "c1".into(),
+            },
             ProviderEvent::ToolStart {
                 name: "shell".into(),
                 declared_timeout_ms: Some(5_000),

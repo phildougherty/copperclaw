@@ -91,9 +91,7 @@ impl MessageEvent {
     #[must_use]
     pub fn mentions_user(&self, bot_user_id: &str) -> bool {
         let needle = format!("<@{bot_user_id}>");
-        self.text
-            .as_deref()
-            .is_some_and(|t| t.contains(&needle))
+        self.text.as_deref().is_some_and(|t| t.contains(&needle))
     }
 }
 

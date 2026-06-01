@@ -4,11 +4,11 @@
 //! with a known user. The first encounter inserts a row; subsequent
 //! encounters bump `message_count` and refresh `last_seen`.
 
-use crate::central::CentralDb;
 use crate::DbError;
+use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
 use copperclaw_types::{AgentGroupId, ChannelType, MessagingGroupId, UserId};
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{OptionalExtension, Row, params};
 // Note: the primary key is `(channel_type, platform_id)` per migration
 // `001_initial.sql`, which is exactly what we target in the ON CONFLICT
 // clause below so the upsert collapses to one atomic statement.
@@ -41,9 +41,9 @@ pub struct UpsertUnregisteredSender {
 fn parse_uuid_opt(s: Option<String>) -> rusqlite::Result<Option<uuid::Uuid>> {
     match s {
         None => Ok(None),
-        Some(s) => uuid::Uuid::parse_str(&s)
-            .map(Some)
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))),
+        Some(s) => uuid::Uuid::parse_str(&s).map(Some).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        }),
     }
 }
 
@@ -51,11 +51,15 @@ fn row_to_unregistered_sender(row: &Row<'_>) -> rusqlite::Result<UnregisteredSen
     let channel_type_str: String = row.get("channel_type")?;
     let first_seen_str: String = row.get("first_seen")?;
     let first_seen = DateTime::parse_from_rfc3339(&first_seen_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .with_timezone(&Utc);
     let last_seen_str: String = row.get("last_seen")?;
     let last_seen = DateTime::parse_from_rfc3339(&last_seen_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .with_timezone(&Utc);
     let user_id_str: Option<String> = row.get("user_id")?;
     let user_id = parse_uuid_opt(user_id_str)?.map(UserId);
@@ -89,7 +93,10 @@ fn row_to_unregistered_sender(row: &Row<'_>) -> rusqlite::Result<UnregisteredSen
 /// bubbled a `UNIQUE` violation and the router dead-lettered the
 /// inbound. The atomic form turns the race into a deterministic
 /// increment.
-pub fn upsert(db: &CentralDb, req: UpsertUnregisteredSender) -> Result<UnregisteredSender, DbError> {
+pub fn upsert(
+    db: &CentralDb,
+    req: UpsertUnregisteredSender,
+) -> Result<UnregisteredSender, DbError> {
     // Destructure once so the SQL bindings are obviously moves (instead
     // of looking like field reads on an owned value clippy can't tell
     // are consumed). Keeps the existing public-API by-value signature.
@@ -130,11 +137,15 @@ pub fn upsert(db: &CentralDb, req: UpsertUnregisteredSender) -> Result<Unregiste
         ],
     )?;
     drop(conn);
-    get(db, &channel_type, &platform_id)?
-        .ok_or_else(|| DbError::invariant("unregistered_senders row missing immediately after upsert"))
+    get(db, &channel_type, &platform_id)?.ok_or_else(|| {
+        DbError::invariant("unregistered_senders row missing immediately after upsert")
+    })
 }
 
-pub fn list(db: &CentralDb, since: Option<DateTime<Utc>>) -> Result<Vec<UnregisteredSender>, DbError> {
+pub fn list(
+    db: &CentralDb,
+    since: Option<DateTime<Utc>>,
+) -> Result<Vec<UnregisteredSender>, DbError> {
     let conn = db.conn()?;
     let rows: Vec<UnregisteredSender> = if let Some(ts) = since {
         let mut stmt = conn.prepare(
@@ -249,8 +260,8 @@ mod tests {
 
     #[test]
     fn upsert_associates_ids_when_supplied() {
-        use crate::tables::agent_groups::{create as create_ag, CreateAgentGroup};
-        use crate::tables::messaging_groups::{upsert as upsert_mg, UpsertMessagingGroup};
+        use crate::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+        use crate::tables::messaging_groups::{UpsertMessagingGroup, upsert as upsert_mg};
         let db = db();
         let ag = create_ag(
             &db,
@@ -373,8 +384,15 @@ mod tests {
         }
 
         let rows = list(&db, None).unwrap();
-        assert_eq!(rows.len(), 1, "exactly one row should exist after 16 concurrent upserts");
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one row should exist after 16 concurrent upserts"
+        );
         assert_eq!(rows[0].platform_id, platform_id);
-        assert_eq!(rows[0].message_count, 16, "every concurrent call must contribute to the count");
+        assert_eq!(
+            rows[0].message_count, 16,
+            "every concurrent call must contribute to the count"
+        );
     }
 }

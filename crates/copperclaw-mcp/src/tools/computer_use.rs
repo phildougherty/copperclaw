@@ -14,7 +14,7 @@
 //! crashes restart it from clean state.
 
 use crate::error::ToolError;
-use crate::tools::{make_tool, parse_args, success_json, ToolEntry, ToolHandler};
+use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args, success_json};
 use rmcp::model::{CallToolResult, JsonObject, Tool};
 use serde::Deserialize;
 use serde_json::json;
@@ -80,9 +80,9 @@ pub mod shell {
     //! `shell`: run a bash command inside the container.
 
     use super::{
-        cap_output, json, parse_args, shell_state_path, success_json, CallToolResult,
-        Deserialize, Duration, JsonObject, Tool, ToolEntry, ToolError, ToolHandler,
-        SHELL_DEFAULT_TIMEOUT_SECS, SHELL_MAX_TIMEOUT_SECS, SHELL_OUTPUT_CAP,
+        CallToolResult, Deserialize, Duration, JsonObject, SHELL_DEFAULT_TIMEOUT_SECS,
+        SHELL_MAX_TIMEOUT_SECS, SHELL_OUTPUT_CAP, Tool, ToolEntry, ToolError, ToolHandler,
+        cap_output, json, parse_args, shell_state_path, success_json,
     };
 
     #[derive(Debug, Deserialize)]
@@ -241,9 +241,9 @@ pub mod shell {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let child = cmd.spawn().map_err(|e| {
-            ToolError::Internal(format!("shell spawn failed: {e}"))
-        })?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| ToolError::Internal(format!("shell spawn failed: {e}")))?;
 
         let started = std::time::Instant::now();
         let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
@@ -480,8 +480,8 @@ pub mod read_file {
     //! tail-style reads the agent should use `shell tail -n N`.
 
     use super::{
-        json, parse_args, success_json, CallToolResult, Deserialize, JsonObject,
-        PathBuf, Tool, ToolEntry, ToolError, ToolHandler, READ_FILE_CAP,
+        CallToolResult, Deserialize, JsonObject, PathBuf, READ_FILE_CAP, Tool, ToolEntry,
+        ToolError, ToolHandler, json, parse_args, success_json,
     };
     use serde_json::Value;
     use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
@@ -609,28 +609,20 @@ pub mod read_file {
         offset: u64,
         limit: u64,
     ) -> Result<(String, bool, u64), ToolError> {
-        let mut f = tokio::fs::File::open(path).await.map_err(|e| {
-            ToolError::Internal(format!("read_file({}): {e}", path.display()))
-        })?;
+        let mut f = tokio::fs::File::open(path)
+            .await
+            .map_err(|e| ToolError::Internal(format!("read_file({}): {e}", path.display())))?;
         let len = f
             .metadata()
             .await
-            .map_err(|e| {
-                ToolError::Internal(format!(
-                    "read_file({}) stat: {e}",
-                    path.display()
-                ))
-            })?
+            .map_err(|e| ToolError::Internal(format!("read_file({}) stat: {e}", path.display())))?
             .len();
         if offset >= len {
             return Ok((String::new(), false, 0));
         }
-        f.seek(SeekFrom::Start(offset)).await.map_err(|e| {
-            ToolError::Internal(format!(
-                "read_file({}) seek: {e}",
-                path.display()
-            ))
-        })?;
+        f.seek(SeekFrom::Start(offset))
+            .await
+            .map_err(|e| ToolError::Internal(format!("read_file({}) seek: {e}", path.display())))?;
         // Cap reads at READ_FILE_CAP regardless of caller's `limit` to
         // protect the context window.
         let cap = limit.min(READ_FILE_CAP as u64);
@@ -638,12 +630,9 @@ pub mod read_file {
         let to_read = cap.min(available);
         #[allow(clippy::cast_possible_truncation)]
         let mut buf = vec![0u8; to_read as usize];
-        f.read_exact(&mut buf).await.map_err(|e| {
-            ToolError::Internal(format!(
-                "read_file({}) read: {e}",
-                path.display()
-            ))
-        })?;
+        f.read_exact(&mut buf)
+            .await
+            .map_err(|e| ToolError::Internal(format!("read_file({}) read: {e}", path.display())))?;
         // `truncated` reflects "there was more we didn't return". If
         // the caller's limit was higher than the cap and the file had
         // more bytes past the cap, flag it.
@@ -667,9 +656,9 @@ pub mod read_file {
         // Read the whole file up to the cap+1 so we can detect overflow.
         // For very large files this is the same memory pressure as the
         // existing implementation — we don't make it worse.
-        let bytes = tokio::fs::read(path).await.map_err(|e| {
-            ToolError::Internal(format!("read_file({}): {e}", path.display()))
-        })?;
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|e| ToolError::Internal(format!("read_file({}): {e}", path.display())))?;
         let text = String::from_utf8_lossy(&bytes);
         // Normalise offset: 1-indexed, but accept 0 as "from the start".
         let start_line = offset.max(1);
@@ -718,12 +707,8 @@ pub mod read_file {
         // limit beyond the cap) we preserve the pre-existing read-the-
         // whole-file-and-truncate-the-head shape. Tests pin this.
         let (body, truncated, bytes_read) = match plan.mode {
-            Mode::Bytes => {
-                read_bytes_range(&plan.path, plan.offset, plan.limit).await?
-            }
-            Mode::Lines => {
-                read_lines_range(&plan.path, plan.offset, plan.limit).await?
-            }
+            Mode::Bytes => read_bytes_range(&plan.path, plan.offset, plan.limit).await?,
+            Mode::Lines => read_lines_range(&plan.path, plan.offset, plan.limit).await?,
         };
 
         // `limit_applied` is the cap actually enforced for this call.
@@ -775,8 +760,8 @@ pub mod write_file {
     //! `write_file`: write UTF-8 text to a file inside the container.
 
     use super::{
-        json, parse_args, success_json, CallToolResult, Deserialize, JsonObject,
-        PathBuf, Tool, ToolEntry, ToolError, ToolHandler,
+        CallToolResult, Deserialize, JsonObject, PathBuf, Tool, ToolEntry, ToolError, ToolHandler,
+        json, parse_args, success_json,
     };
     use crate::tools::diff_util::{build_blob_card, build_diff_card, over_blob_cutoff};
 
@@ -852,7 +837,10 @@ pub mod write_file {
                         // Defer to the BlobReplaced path below.
                         Some((String::new(), prev_size))
                     } else {
-                        tokio::fs::read_to_string(&path).await.ok().map(|s| (s, prev_size))
+                        tokio::fs::read_to_string(&path)
+                            .await
+                            .ok()
+                            .map(|s| (s, prev_size))
                     }
                 }
                 _ => None,
@@ -866,21 +854,15 @@ pub mod write_file {
                 .open(&path)
                 .await
                 .map_err(|e| {
-                    ToolError::Internal(format!(
-                        "write_file({}) append open: {e}",
-                        path.display()
-                    ))
+                    ToolError::Internal(format!("write_file({}) append open: {e}", path.display()))
                 })?;
             f.write_all(&bytes).await.map_err(|e| {
-                ToolError::Internal(format!(
-                    "write_file({}) append: {e}",
-                    path.display()
-                ))
+                ToolError::Internal(format!("write_file({}) append: {e}", path.display()))
             })?;
         } else {
-            tokio::fs::write(&path, &bytes).await.map_err(|e| {
-                ToolError::Internal(format!("write_file({}): {e}", path.display()))
-            })?;
+            tokio::fs::write(&path, &bytes)
+                .await
+                .map_err(|e| ToolError::Internal(format!("write_file({}): {e}", path.display())))?;
         }
         // Diff-card emit happens only for non-append overwrites where
         // we snapshotted the prior content (or stubbed it under the
@@ -927,9 +909,8 @@ pub mod web_fetch {
     //! `web_fetch`: HTTP GET (or POST) against a URL from the container.
 
     use super::{
-        cap_output, json, parse_args, success_json, CallToolResult, Deserialize,
-        Duration, JsonObject, Tool, ToolEntry, ToolError, ToolHandler,
-        WEB_FETCH_CAP, WEB_FETCH_DEFAULT_TIMEOUT_SECS,
+        CallToolResult, Deserialize, Duration, JsonObject, Tool, ToolEntry, ToolError, ToolHandler,
+        WEB_FETCH_CAP, WEB_FETCH_DEFAULT_TIMEOUT_SECS, cap_output, json, parse_args, success_json,
     };
 
     #[derive(Debug, Deserialize)]
@@ -973,7 +954,10 @@ pub mod web_fetch {
     ) -> Result<CallToolResult, ToolError> {
         let input: Input = parse_args(arguments)?;
         let timeout = Duration::from_secs(
-            input.timeout_secs.unwrap_or(WEB_FETCH_DEFAULT_TIMEOUT_SECS).min(120),
+            input
+                .timeout_secs
+                .unwrap_or(WEB_FETCH_DEFAULT_TIMEOUT_SECS)
+                .min(120),
         );
         let client = reqwest::Client::builder()
             .timeout(timeout)
@@ -1000,9 +984,10 @@ pub mod web_fetch {
                 )));
             }
         };
-        let resp = req.send().await.map_err(|e| {
-            ToolError::Internal(format!("web_fetch({}): {e}", input.url))
-        })?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| ToolError::Internal(format!("web_fetch({}): {e}", input.url)))?;
         let status = resp.status().as_u16();
         // Pull Content-Type before consuming the body — once we call
         // `bytes()` the response is moved. We intentionally do NOT
@@ -1015,16 +1000,13 @@ pub mod web_fetch {
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        let bytes = resp.bytes().await.map_err(|e| {
-            ToolError::Internal(format!("web_fetch({}) read body: {e}", input.url))
-        })?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| ToolError::Internal(format!("web_fetch({}) read body: {e}", input.url)))?;
 
         let raw_bytes = bytes.len();
-        let conversion = decide_body_conversion(
-            content_type_header.as_deref(),
-            input.raw,
-            &bytes,
-        );
+        let conversion = decide_body_conversion(content_type_header.as_deref(), input.raw, &bytes);
         let (body, truncated) = cap_output(&conversion.body, WEB_FETCH_CAP);
         let mut out = json!({
             "url": input.url,
@@ -1135,14 +1117,12 @@ pub mod web_fetch {
 /// `Mutex` so tests can install their own per-test tempdir without
 /// resorting to (forbidden) `unsafe` env-var mutation.
 #[cfg(test)]
-static SHELL_STATE_TEST_OVERRIDE: std::sync::OnceLock<
-    std::sync::Mutex<Option<PathBuf>>,
-> = std::sync::OnceLock::new();
+static SHELL_STATE_TEST_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<PathBuf>>> =
+    std::sync::OnceLock::new();
 
 #[cfg(test)]
 fn shell_state_test_override_set(path: PathBuf) {
-    let cell = SHELL_STATE_TEST_OVERRIDE
-        .get_or_init(|| std::sync::Mutex::new(None));
+    let cell = SHELL_STATE_TEST_OVERRIDE.get_or_init(|| std::sync::Mutex::new(None));
     *cell
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path);
@@ -1159,13 +1139,11 @@ fn shell_state_test_override_clear() {
 
 #[cfg(test)]
 fn shell_state_test_override() -> Option<PathBuf> {
-    SHELL_STATE_TEST_OVERRIDE
-        .get()
-        .and_then(|m| {
-            m.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-        })
+    SHELL_STATE_TEST_OVERRIDE.get().and_then(|m| {
+        m.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    })
 }
 
 #[cfg(not(test))]
@@ -1242,7 +1220,10 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("shell_state");
             shell_state_test_override_set(path);
-            Self { _dir: dir, _lock: lock }
+            Self {
+                _dir: dir,
+                _lock: lock,
+            }
         }
     }
 
@@ -1275,12 +1256,7 @@ mod tests {
     async fn shell_reports_nonzero_exit() {
         let _g = ShellTestGuard::new();
         let res = shell::handle(
-            Some(
-                json!({"command": "false"})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            ),
+            Some(json!({"command": "false"}).as_object().unwrap().clone()),
             ctx().as_ref(),
         )
         .await
@@ -1311,12 +1287,7 @@ mod tests {
     async fn shell_rejects_empty_command() {
         let _g = ShellTestGuard::new();
         let err = shell::handle(
-            Some(
-                json!({"command": "   "})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            ),
+            Some(json!({"command": "   "}).as_object().unwrap().clone()),
             ctx().as_ref(),
         )
         .await
@@ -1359,23 +1330,13 @@ mod tests {
     async fn shell_persists_cwd_across_calls() {
         let _g = ShellTestGuard::new();
         shell::handle(
-            Some(
-                json!({"command": "cd /tmp"})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            ),
+            Some(json!({"command": "cd /tmp"}).as_object().unwrap().clone()),
             ctx().as_ref(),
         )
         .await
         .unwrap();
         let res = shell::handle(
-            Some(
-                json!({"command": "pwd"})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            ),
+            Some(json!({"command": "pwd"}).as_object().unwrap().clone()),
             ctx().as_ref(),
         )
         .await
@@ -1411,7 +1372,10 @@ mod tests {
         .unwrap();
         let body = result_text(&res);
         // FOO must be empty after reset.
-        assert!(body.contains("FOO=\\n") || body.contains("FOO=\""), "got: {body}");
+        assert!(
+            body.contains("FOO=\\n") || body.contains("FOO=\""),
+            "got: {body}"
+        );
         // And specifically it should not contain `FOO=bar`.
         assert!(!body.contains("FOO=bar"), "got: {body}");
     }
@@ -1472,8 +1436,14 @@ mod tests {
         let state_path = shell_state_path();
         let content = std::fs::read_to_string(&state_path).unwrap_or_default();
         assert!(!content.contains("GH_TOKEN"), "GH_TOKEN leaked: {content}");
-        assert!(!content.contains("AWS_SECRET"), "AWS_SECRET leaked: {content}");
-        assert!(!content.contains("STRIPE_KEY"), "STRIPE_KEY leaked: {content}");
+        assert!(
+            !content.contains("AWS_SECRET"),
+            "AWS_SECRET leaked: {content}"
+        );
+        assert!(
+            !content.contains("STRIPE_KEY"),
+            "STRIPE_KEY leaked: {content}"
+        );
         assert!(content.contains("SAFE_VAR"), "SAFE_VAR missing: {content}");
     }
 
@@ -1499,12 +1469,12 @@ mod tests {
     fn shell_does_not_flag_legitimate_uses() {
         let cases = [
             "ls -la /data",
-            "cat /data/app.css",                       // reading, no redirect
-            "echo hello > /tmp/x",                      // echo redirect — intentionally not blocked
+            "cat /data/app.css",   // reading, no redirect
+            "echo hello > /tmp/x", // echo redirect — intentionally not blocked
             "grep -r foo .",
             "tar -czf out.tgz /data",
             "diff -u a.txt b.txt",
-            "find . -name '*.rs' -exec wc -l {} \\;",   // contains '>' but inside -exec
+            "find . -name '*.rs' -exec wc -l {} \\;", // contains '>' but inside -exec
         ];
         for cmd in cases {
             assert!(
@@ -1527,7 +1497,10 @@ mod tests {
         let ctx = crate::context::MockToolContext::new();
         let err = shell::handle(Some(args), &ctx).await.unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("write_file"), "must redirect to write_file: {msg}");
+        assert!(
+            msg.contains("write_file"),
+            "must redirect to write_file: {msg}"
+        );
         assert!(msg.contains("cat > FILE"), "must name the pattern: {msg}");
     }
 
@@ -1569,7 +1542,9 @@ mod tests {
         assert!(web_fetch::is_html_content_type("text/html"));
         assert!(web_fetch::is_html_content_type("text/html; charset=utf-8"));
         assert!(web_fetch::is_html_content_type("text/HTML"));
-        assert!(web_fetch::is_html_content_type("  text/html ; charset=ascii"));
+        assert!(web_fetch::is_html_content_type(
+            "  text/html ; charset=ascii"
+        ));
         assert!(web_fetch::is_html_content_type("application/xhtml+xml"));
         assert!(!web_fetch::is_html_content_type("application/json"));
         assert!(!web_fetch::is_html_content_type("text/plain"));
@@ -1648,8 +1623,7 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/"))
             .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_raw(html.as_bytes(), "text/html"),
+                wiremock::ResponseTemplate::new(200).set_body_raw(html.as_bytes(), "text/html"),
             )
             .mount(&server)
             .await;
@@ -1700,7 +1674,10 @@ mod tests {
         let body = result_text(&res);
         // The headers map (and our 2 KiB bloat header) must not leak.
         assert!(!body.contains("\"headers\""), "headers leaked: {body}");
-        assert!(!body.contains("x-custom-bloat"), "header bloat leaked: {body}");
+        assert!(
+            !body.contains("x-custom-bloat"),
+            "header bloat leaked: {body}"
+        );
         // But the scalar content_type must be present.
         assert!(
             body.contains("\"content_type\": \"application/json\""),
@@ -1720,8 +1697,7 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/big"))
             .respond_with(
-                wiremock::ResponseTemplate::new(200)
-                    .set_body_raw(big.as_bytes(), "text/plain"),
+                wiremock::ResponseTemplate::new(200).set_body_raw(big.as_bytes(), "text/plain"),
             )
             .mount(&server)
             .await;
@@ -1748,10 +1724,8 @@ mod tests {
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/"))
             .respond_with(
-                wiremock::ResponseTemplate::new(200).set_body_raw(
-                    "<p>hi</p>".as_bytes(),
-                    "text/html; charset=ISO-8859-1",
-                ),
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw("<p>hi</p>".as_bytes(), "text/html; charset=ISO-8859-1"),
             )
             .mount(&server)
             .await;
@@ -1768,7 +1742,10 @@ mod tests {
         .unwrap();
         let body = result_text(&res);
         assert!(body.contains("text/html → markdown"), "got: {body}");
-        assert!(!body.contains("<p>hi</p>"), "raw HTML still present: {body}");
+        assert!(
+            !body.contains("<p>hi</p>"),
+            "raw HTML still present: {body}"
+        );
     }
 
     #[tokio::test]
@@ -1998,10 +1975,7 @@ mod tests {
         assert!(body.contains("\"mode\": \"bytes\""), "got: {body}");
         assert!(body.contains("\"offset\": 0"), "got: {body}");
         // limit_applied should be the cap (131072 = 128 KiB)
-        assert!(
-            body.contains("\"limit_applied\": 131072"),
-            "got: {body}"
-        );
+        assert!(body.contains("\"limit_applied\": 131072"), "got: {body}");
         assert!(body.contains("\"bytes_read\": 7"), "got: {body}");
         assert!(body.contains("abcdef"), "got: {body}");
     }
@@ -2045,12 +2019,9 @@ mod tests {
     async fn read_file_lines_mode_offset_and_limit() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("lines.txt");
-        tokio::fs::write(
-            &path,
-            b"line1\nline2\nline3\nline4\nline5\nline6\n",
-        )
-        .await
-        .unwrap();
+        tokio::fs::write(&path, b"line1\nline2\nline3\nline4\nline5\nline6\n")
+            .await
+            .unwrap();
         let res = read_file::handle(
             Some(
                 json!({
@@ -2164,10 +2135,7 @@ mod tests {
         .unwrap();
         let body = result_text(&res);
         // The cap (131072 = 128 KiB) wins over the caller's 10M.
-        assert!(
-            body.contains("\"limit_applied\": 131072"),
-            "got: {body}"
-        );
+        assert!(body.contains("\"limit_applied\": 131072"), "got: {body}");
         assert!(body.contains("\"bytes_read\": 131072"), "got: {body}");
         assert!(body.contains("\"truncated\": true"), "got: {body}");
     }

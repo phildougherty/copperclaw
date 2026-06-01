@@ -9,10 +9,10 @@
 //! adapter is dispatched. This keeps the per-session writer model
 //! (host writes central, container writes its own session DB) intact.
 
-use crate::central::CentralDb;
 use crate::DbError;
+use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{OptionalExtension, Row, params};
 
 /// One LLM call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,10 +85,7 @@ pub struct UsageRollup {
 }
 
 /// Sum tokens + count turns per `agent_group_id` since `since`.
-pub fn rollup_since(
-    db: &CentralDb,
-    since: DateTime<Utc>,
-) -> Result<Vec<UsageRollup>, DbError> {
+pub fn rollup_since(db: &CentralDb, since: DateTime<Utc>) -> Result<Vec<UsageRollup>, DbError> {
     let conn = db.conn()?;
     let mut stmt = conn.prepare(
         "SELECT agent_group_id,
@@ -185,11 +182,7 @@ fn parse_ts(s: &str) -> rusqlite::Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
         .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                0,
-                rusqlite::types::Type::Text,
-                Box::new(e),
-            )
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
         })
 }
 
@@ -229,8 +222,7 @@ mod tests {
         insert(&db, &turn("ag-1", 100, 200)).unwrap();
         insert(&db, &turn("ag-1", 50, 75)).unwrap();
         insert(&db, &turn("ag-2", 10, 1)).unwrap();
-        let rollups =
-            rollup_since(&db, Utc::now() - chrono::Duration::hours(1)).unwrap();
+        let rollups = rollup_since(&db, Utc::now() - chrono::Duration::hours(1)).unwrap();
         // Ordered DESC by output_tokens
         assert_eq!(rollups[0].agent_group_id, "ag-1");
         assert_eq!(rollups[0].turns, 2);
@@ -248,8 +240,7 @@ mod tests {
         let recent = turn("ag-recent", 5, 5);
         insert(&db, &old).unwrap();
         insert(&db, &recent).unwrap();
-        let rollups =
-            rollup_since(&db, Utc::now() - chrono::Duration::hours(24)).unwrap();
+        let rollups = rollup_since(&db, Utc::now() - chrono::Duration::hours(24)).unwrap();
         assert_eq!(rollups.len(), 1);
         assert_eq!(rollups[0].agent_group_id, "ag-recent");
     }
@@ -265,13 +256,11 @@ mod tests {
         old.ended_at = Utc::now() - chrono::Duration::hours(2);
         insert(&db, &old).unwrap();
         // With a 1-hour window only the two recent turns count.
-        let count =
-            turns_since(&db, "ag-1", Utc::now() - chrono::Duration::hours(1)).unwrap();
+        let count = turns_since(&db, "ag-1", Utc::now() - chrono::Duration::hours(1)).unwrap();
         assert_eq!(count, 2);
         // Other group not counted.
         insert(&db, &turn("ag-2", 1, 1)).unwrap();
-        let count2 =
-            turns_since(&db, "ag-2", Utc::now() - chrono::Duration::hours(1)).unwrap();
+        let count2 = turns_since(&db, "ag-2", Utc::now() - chrono::Duration::hours(1)).unwrap();
         assert_eq!(count2, 1);
     }
 
@@ -282,8 +271,7 @@ mod tests {
         t.status = "error".into();
         t.error = Some("rate limited".into());
         insert(&db, &t).unwrap();
-        let rollups =
-            rollup_since(&db, Utc::now() - chrono::Duration::hours(1)).unwrap();
+        let rollups = rollup_since(&db, Utc::now() - chrono::Duration::hours(1)).unwrap();
         assert_eq!(rollups.len(), 1);
         // Errors still count as turns even if tokens are zero.
         assert_eq!(rollups[0].turns, 1);

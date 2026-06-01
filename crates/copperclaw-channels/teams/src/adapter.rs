@@ -25,10 +25,7 @@ use tokio::task::JoinHandle;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TeamsTarget {
     /// `team/{team_id}/channel/{channel_id}`.
-    Channel {
-        team_id: String,
-        channel_id: String,
-    },
+    Channel { team_id: String, channel_id: String },
     /// `chat/{chat_id}`.
     Chat { chat_id: String },
 }
@@ -186,12 +183,7 @@ impl TeamsAdapter {
                         }
                         None => {
                             self.api
-                                .post_channel_message(
-                                    team_id,
-                                    channel_id,
-                                    content,
-                                    content_type,
-                                )
+                                .post_channel_message(team_id, channel_id, content, content_type)
                                 .await?
                                 .id
                         }
@@ -242,9 +234,7 @@ impl TeamsAdapter {
             .get("action")
             .and_then(Value::as_str)
             .ok_or_else(|| {
-                AdapterError::BadRequest(
-                    "teams system message missing `action` field".into(),
-                )
+                AdapterError::BadRequest("teams system message missing `action` field".into())
             })?;
         match action {
             "edit" => {
@@ -253,9 +243,7 @@ impl TeamsAdapter {
                     .get("target_id")
                     .and_then(Value::as_str)
                     .ok_or_else(|| {
-                        AdapterError::BadRequest(
-                            "teams edit action missing `target_id`".into(),
-                        )
+                        AdapterError::BadRequest("teams edit action missing `target_id`".into())
                     })?;
                 let new_text = message
                     .content
@@ -285,23 +273,17 @@ impl TeamsAdapter {
                     .get("target_id")
                     .and_then(Value::as_str)
                     .ok_or_else(|| {
-                        AdapterError::BadRequest(
-                            "teams reaction action missing `target_id`".into(),
-                        )
+                        AdapterError::BadRequest("teams reaction action missing `target_id`".into())
                     })?;
                 let emoji = message
                     .content
                     .get("emoji")
                     .and_then(Value::as_str)
                     .ok_or_else(|| {
-                        AdapterError::BadRequest(
-                            "teams reaction action missing `emoji`".into(),
-                        )
+                        AdapterError::BadRequest("teams reaction action missing `emoji`".into())
                     })?;
                 let reaction_type = shortcode_to_reaction_type(emoji).ok_or_else(|| {
-                    AdapterError::Unsupported(format!(
-                        "teams does not support reaction `{emoji}`"
-                    ))
+                    AdapterError::Unsupported(format!("teams does not support reaction `{emoji}`"))
                 })?;
                 match target {
                     TeamsTarget::Channel {
@@ -538,29 +520,35 @@ impl TeamsAdapter {
         fallback_text: &str,
     ) -> Result<String, AdapterError> {
         let id = match target {
-            TeamsTarget::Channel { team_id, channel_id } => match thread_id {
-                Some(parent) => self
-                    .api
-                    .post_channel_adaptive_card_reply(
-                        team_id,
-                        channel_id,
-                        parent,
-                        card_json,
-                        fallback_text,
-                    )
-                    .await?
-                    .id,
-                None => self
-                    .api
-                    .post_channel_adaptive_card(team_id, channel_id, card_json, fallback_text)
-                    .await?
-                    .id,
+            TeamsTarget::Channel {
+                team_id,
+                channel_id,
+            } => match thread_id {
+                Some(parent) => {
+                    self.api
+                        .post_channel_adaptive_card_reply(
+                            team_id,
+                            channel_id,
+                            parent,
+                            card_json,
+                            fallback_text,
+                        )
+                        .await?
+                        .id
+                }
+                None => {
+                    self.api
+                        .post_channel_adaptive_card(team_id, channel_id, card_json, fallback_text)
+                        .await?
+                        .id
+                }
             },
-            TeamsTarget::Chat { chat_id } => self
-                .api
-                .post_chat_adaptive_card(chat_id, card_json, fallback_text)
-                .await?
-                .id,
+            TeamsTarget::Chat { chat_id } => {
+                self.api
+                    .post_chat_adaptive_card(chat_id, card_json, fallback_text)
+                    .await?
+                    .id
+            }
         };
         Ok(id)
     }
@@ -578,7 +566,10 @@ impl TeamsAdapter {
         fallback_text: &str,
     ) -> Result<(), AdapterError> {
         match target {
-            TeamsTarget::Channel { team_id, channel_id } => {
+            TeamsTarget::Channel {
+                team_id,
+                channel_id,
+            } => {
                 self.api
                     .edit_channel_adaptive_card(
                         team_id,
@@ -848,10 +839,7 @@ mod tests {
             content: json!({"action":"edit","target_id":"MID","text":"new"}),
             files: vec![],
         };
-        adapter
-            .deliver("chat/CHAT1", None, &msg)
-            .await
-            .unwrap();
+        adapter.deliver("chat/CHAT1", None, &msg).await.unwrap();
     }
 
     #[tokio::test]
@@ -1057,7 +1045,10 @@ mod tests {
     async fn set_typing_uses_default_impl() {
         let server = MockServer::start().await;
         let adapter = adapter_for(&server);
-        adapter.set_typing("team/T1/channel/C1", None).await.unwrap();
+        adapter
+            .set_typing("team/T1/channel/C1", None)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1110,8 +1101,7 @@ mod tests {
     async fn last_adaptive_card(server: &MockServer) -> serde_json::Value {
         let reqs = server.received_requests().await.expect("requests");
         let last = reqs.last().expect("at least one request");
-        let body: serde_json::Value =
-            serde_json::from_slice(&last.body).expect("json body");
+        let body: serde_json::Value = serde_json::from_slice(&last.body).expect("json body");
         let att = body["attachments"][0].clone();
         assert_eq!(
             att["contentType"], "application/vnd.microsoft.card.adaptive",
@@ -1168,7 +1158,10 @@ mod tests {
         assert_eq!(body[0]["text"], "Confirm");
         assert_eq!(body[0]["weight"], "Bolder");
         // FactSet entry should carry the Item fact.
-        let factset = body.iter().find(|b| b["type"] == "FactSet").expect("factset");
+        let factset = body
+            .iter()
+            .find(|b| b["type"] == "FactSet")
+            .expect("factset");
         assert_eq!(factset["facts"][0]["title"], "Item");
         assert_eq!(factset["facts"][0]["value"], "Espresso");
         // Actions: Submit + OpenUrl.
@@ -1457,10 +1450,12 @@ mod tests {
             .await
             .unwrap();
         let card_json = last_adaptive_card(&server).await;
-        assert!(card_json["body"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("truncated"));
+        assert!(
+            card_json["body"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("truncated")
+        );
     }
 
     #[tokio::test]
@@ -1485,10 +1480,7 @@ mod tests {
         assert_eq!(outer["style"], "attention");
         let inner = outer["items"].as_array().unwrap();
         assert_eq!(inner[0]["color"], "Attention");
-        assert!(inner[0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("[ERROR: tool]"));
+        assert!(inner[0]["text"].as_str().unwrap().contains("[ERROR: tool]"));
         assert_eq!(inner[1]["text"], "shell timed out");
         assert_eq!(inner[2]["fontType"], "Monospace");
         assert!(inner[2]["text"].as_str().unwrap().contains("ENOENT"));
@@ -1511,10 +1503,12 @@ mod tests {
         let card_json = last_adaptive_card(&server).await;
         let inner = card_json["body"][0]["items"].as_array().unwrap();
         let last = inner.last().unwrap();
-        assert!(last["text"]
-            .as_str()
-            .unwrap()
-            .contains("will retry automatically"));
+        assert!(
+            last["text"]
+                .as_str()
+                .unwrap()
+                .contains("will retry automatically")
+        );
     }
 
     #[tokio::test]
@@ -1562,10 +1556,7 @@ mod tests {
         assert_eq!(body[2]["color"], "Warning");
         assert!(body[3]["text"].as_str().unwrap().starts_with("[ ]"));
         // Footer summarises counts.
-        assert!(body[4]["text"]
-            .as_str()
-            .unwrap()
-            .contains("1/3 done"));
+        assert!(body[4]["text"].as_str().unwrap().contains("1/3 done"));
     }
 
     #[tokio::test]
@@ -1672,16 +1663,15 @@ mod tests {
         let body = card_json["body"].as_array().unwrap();
         // Header + collapsed container.
         assert_eq!(body.len(), 2);
-        assert!(body[0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("claude-opus-4-7"));
+        assert!(
+            body[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("claude-opus-4-7")
+        );
         assert_eq!(body[1]["type"], "Container");
         assert_eq!(body[1]["isVisible"], false);
-        assert_eq!(
-            body[1]["items"][0]["text"],
-            "Let me think carefully."
-        );
+        assert_eq!(body[1]["items"][0]["text"], "Let me think carefully.");
         let actions = card_json["actions"].as_array().unwrap();
         assert_eq!(actions[0]["type"], "Action.ToggleVisibility");
     }

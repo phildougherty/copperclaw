@@ -7,7 +7,7 @@
 use crate::DbError;
 use copperclaw_types::routing::{DestinationKind, DestinationRow};
 use copperclaw_types::{AgentGroupId, ChannelType};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 /// Atomically rebuild the destinations table.
 ///
@@ -77,7 +77,7 @@ fn row_to_destination(row: &Row<'_>) -> rusqlite::Result<DestinationRow> {
                 0,
                 rusqlite::types::Type::Text,
                 format!("unknown destination type {other}").into(),
-            ))
+            ));
         }
     };
     let channel_type: Option<String> = row.get("channel_type")?;
@@ -103,7 +103,7 @@ fn row_to_destination(row: &Row<'_>) -> rusqlite::Result<DestinationRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{open_inbound, SessionPaths};
+    use crate::session::{SessionPaths, open_inbound};
     use copperclaw_types::{AgentGroupId, SessionId};
 
     fn fresh_inbound() -> (tempfile::TempDir, Connection) {
@@ -170,11 +170,7 @@ mod tests {
     fn replace_all_rolls_back_on_duplicate_name() {
         let (_tmp, mut conn) = fresh_inbound();
         replace_all(&mut conn, &[channel_row("a")]).unwrap();
-        let err = replace_all(
-            &mut conn,
-            &[channel_row("dup"), channel_row("dup")],
-        )
-        .unwrap_err();
+        let err = replace_all(&mut conn, &[channel_row("dup"), channel_row("dup")]).unwrap_err();
         assert!(matches!(err, DbError::Sqlite(_)));
         // Original row from the first call is preserved — the failed call's
         // DELETE-all and partial inserts were rolled back.

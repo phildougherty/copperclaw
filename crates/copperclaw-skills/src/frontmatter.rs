@@ -40,14 +40,11 @@ pub fn parse(input: &str) -> Result<Frontmatter, SkillError> {
     let rest = body
         .strip_prefix("---\n")
         .or_else(|| body.strip_prefix("---\r\n"))
-        .ok_or_else(|| {
-            SkillError::Frontmatter("missing opening `---` delimiter".to_string())
-        })?;
+        .ok_or_else(|| SkillError::Frontmatter("missing opening `---` delimiter".to_string()))?;
 
     // Find the closing `---` on its own line.
-    let end = find_closing_delimiter(rest).ok_or_else(|| {
-        SkillError::Frontmatter("missing closing `---` delimiter".to_string())
-    })?;
+    let end = find_closing_delimiter(rest)
+        .ok_or_else(|| SkillError::Frontmatter("missing closing `---` delimiter".to_string()))?;
 
     let yaml = &rest[..end];
     let fm: Frontmatter = serde_yaml::from_str(yaml)
@@ -173,7 +170,9 @@ mod tests {
     fn missing_description_is_error() {
         let input = "---\nname: x\n---\n";
         let err = parse(input).unwrap_err();
-        assert!(err.to_string().contains("invalid YAML") || err.to_string().contains("description"));
+        assert!(
+            err.to_string().contains("invalid YAML") || err.to_string().contains("description")
+        );
     }
 
     #[test]

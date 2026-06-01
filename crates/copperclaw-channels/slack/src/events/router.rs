@@ -254,10 +254,7 @@ pub fn parse_block_actions(state: &SlackEventsState, payload: &Value) -> Option<
     let display_name = user
         .and_then(|u| u.get("username"))
         .and_then(Value::as_str)
-        .or_else(|| {
-            user.and_then(|u| u.get("name"))
-                .and_then(Value::as_str)
-        })
+        .or_else(|| user.and_then(|u| u.get("name")).and_then(Value::as_str))
         .map(str::to_owned);
 
     let trigger_id = payload.get("trigger_id").and_then(Value::as_str);
@@ -464,9 +461,7 @@ mod tests {
     const SECRET: &str = "test-secret";
     const TS: &str = "1700000000";
 
-    fn make_state(
-        bot: Option<String>,
-    ) -> (SlackEventsState, mpsc::Receiver<InboundEvent>) {
+    fn make_state(bot: Option<String>) -> (SlackEventsState, mpsc::Receiver<InboundEvent>) {
         let (tx, rx) = mpsc::channel::<InboundEvent>(16);
         let mut s = SlackEventsState::new(SECRET, tx, bot, ChannelType::new("slack"));
         s.now_secs_override = Some(TS.parse().unwrap());
@@ -512,10 +507,7 @@ mod tests {
             .method("POST")
             .uri("/slack/events")
             .header("x-slack-request-timestamp", TS)
-            .header(
-                "x-slack-signature",
-                format!("v0={}", "00".repeat(32)),
-            )
+            .header("x-slack-signature", format!("v0={}", "00".repeat(32)))
             .body(Body::from(body))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -795,7 +787,9 @@ mod tests {
         let req = signed_request(&state, "/slack/events", &body);
         let _ = app.oneshot(req).await.unwrap();
         let evt = rx.recv().await.unwrap();
-        let rt = evt.reply_to.expect("reply_to populated for in-thread reply");
+        let rt = evt
+            .reply_to
+            .expect("reply_to populated for in-thread reply");
         assert_eq!(rt.channel_type.as_str(), "slack");
         assert_eq!(rt.platform_id, "C-CHAN");
         assert_eq!(rt.thread_id.as_deref(), Some("1700000010.000001"));
@@ -822,8 +816,10 @@ mod tests {
         let req = signed_request(&state, "/slack/events", &body);
         let _ = app.oneshot(req).await.unwrap();
         let evt = rx.recv().await.unwrap();
-        assert!(evt.reply_to.is_none(),
-            "thread root carries thread_ts==ts; that should NOT be a reply_to");
+        assert!(
+            evt.reply_to.is_none(),
+            "thread root carries thread_ts==ts; that should NOT be a reply_to"
+        );
     }
 
     #[test]
@@ -900,11 +896,7 @@ mod tests {
                 "value": "deploy:yes"
             }]
         });
-        let req = signed_interactive_request(
-            &state,
-            "/slack/events",
-            &payload.to_string(),
-        );
+        let req = signed_interactive_request(&state, "/slack/events", &payload.to_string());
         let resp = app.oneshot(req).await.unwrap();
         // Slack requires a 2xx ACK so the spinner clears.
         assert_eq!(resp.status(), StatusCode::OK);
@@ -922,7 +914,10 @@ mod tests {
         // Callback metadata is preserved for agents that want to branch on it.
         assert_eq!(evt.message.content["callback"]["action_id"], "card_btn_0");
         assert_eq!(evt.message.content["callback"]["value"], "deploy:yes");
-        assert_eq!(evt.message.content["callback"]["message_ts"], "1700000050.000100");
+        assert_eq!(
+            evt.message.content["callback"]["message_ts"],
+            "1700000050.000100"
+        );
         let sender = evt.sender.expect("sender");
         assert_eq!(sender.identity, "U42");
         assert_eq!(sender.display_name.as_deref(), Some("alice"));
@@ -946,11 +941,7 @@ mod tests {
                 "value": "approve"
             }]
         });
-        let req = signed_interactive_request(
-            &state,
-            "/slack/events",
-            &payload.to_string(),
-        );
+        let req = signed_interactive_request(&state, "/slack/events", &payload.to_string());
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let evt = rx.recv().await.unwrap();
@@ -977,11 +968,7 @@ mod tests {
                 "value": "ack"
             }]
         });
-        let req = signed_interactive_request(
-            &state,
-            "/slack/events",
-            &payload.to_string(),
-        );
+        let req = signed_interactive_request(&state, "/slack/events", &payload.to_string());
         let _ = app.oneshot(req).await.unwrap();
         let evt = rx.recv().await.unwrap();
         assert_eq!(evt.thread_id.as_deref(), Some("1700000050.000001"));
@@ -1003,11 +990,7 @@ mod tests {
                 "url": "https://example.com"
             }]
         });
-        let req = signed_interactive_request(
-            &state,
-            "/slack/events",
-            &payload.to_string(),
-        );
+        let req = signed_interactive_request(&state, "/slack/events", &payload.to_string());
         let resp = app.oneshot(req).await.unwrap();
         // ACK still 200.
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1029,10 +1012,7 @@ mod tests {
             .uri("/slack/events")
             .header("content-type", "application/x-www-form-urlencoded")
             .header("x-slack-request-timestamp", TS)
-            .header(
-                "x-slack-signature",
-                format!("v0={}", "00".repeat(32)),
-            )
+            .header("x-slack-signature", format!("v0={}", "00".repeat(32)))
             .body(Body::from(body))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();

@@ -43,7 +43,7 @@
 //! ```
 
 use crate::error::ToolError;
-use crate::tools::{make_tool, parse_args, success_json, ToolEntry, ToolHandler};
+use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args, success_json};
 use rmcp::model::{CallToolResult, JsonObject, Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -203,7 +203,12 @@ impl MapEnv {
         K: Into<String>,
         V: Into<String>,
     {
-        Self(pairs.into_iter().map(|(k, v)| (k.into(), v.into())).collect())
+        Self(
+            pairs
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
+        )
     }
 }
 
@@ -251,7 +256,12 @@ fn ensure_key_present(p: Provider, env: &dyn EnvLookup) -> Result<(), ToolError>
 }
 
 fn autodetect_provider(env: &dyn EnvLookup) -> Result<Provider, ToolError> {
-    for p in [Provider::Tavily, Provider::Exa, Provider::Brave, Provider::SerpApi] {
+    for p in [
+        Provider::Tavily,
+        Provider::Exa,
+        Provider::Brave,
+        Provider::SerpApi,
+    ] {
         if env.get(p.env_var()).is_some() {
             return Ok(p);
         }
@@ -259,7 +269,8 @@ fn autodetect_provider(env: &dyn EnvLookup) -> Result<Provider, ToolError> {
     Err(ToolError::Validation(
         "web_search has no provider configured; set one of \
          TAVILY_API_KEY, EXA_API_KEY, BRAVE_SEARCH_API_KEY, SERPAPI_API_KEY \
-         (or pass `provider` explicitly in the tool call)".to_string(),
+         (or pass `provider` explicitly in the tool call)"
+            .to_string(),
     ))
 }
 
@@ -282,10 +293,7 @@ fn cap_snippet(s: &str, cap: usize) -> String {
 /// directly without going through the rmcp shim — the rmcp wrapper
 /// is the only real consumer in production, but the direct entry
 /// also lets external tests skip the JSON-RPC layer.
-pub async fn search(
-    input: Input,
-    env: &dyn EnvLookup,
-) -> Result<SearchOutput, ToolError> {
+pub async fn search(input: Input, env: &dyn EnvLookup) -> Result<SearchOutput, ToolError> {
     let query = input.query.trim().to_string();
     if query.is_empty() {
         return Err(ToolError::Validation("`query` must be non-empty".into()));
@@ -295,9 +303,12 @@ pub async fn search(
         .unwrap_or(DEFAULT_MAX_RESULTS)
         .clamp(1, MAX_RESULTS_CEILING);
     let provider = resolve_provider(input.provider.as_deref(), env)?;
-    let api_key = env
-        .get(provider.env_var())
-        .ok_or_else(|| ToolError::Internal(format!("api key for `{}` missing after resolve", provider.as_str())))?;
+    let api_key = env.get(provider.env_var()).ok_or_else(|| {
+        ToolError::Internal(format!(
+            "api key for `{}` missing after resolve",
+            provider.as_str()
+        ))
+    })?;
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
@@ -307,16 +318,40 @@ pub async fn search(
     let started = Instant::now();
     let results = match provider {
         Provider::Tavily => {
-            tavily::search(&client, DEFAULT_TAVILY_URL, &api_key, &query, max_results, input.search_type.as_deref()).await?
+            tavily::search(
+                &client,
+                DEFAULT_TAVILY_URL,
+                &api_key,
+                &query,
+                max_results,
+                input.search_type.as_deref(),
+            )
+            .await?
         }
         Provider::Exa => {
-            exa::search(&client, DEFAULT_EXA_URL, &api_key, &query, max_results, input.search_type.as_deref()).await?
+            exa::search(
+                &client,
+                DEFAULT_EXA_URL,
+                &api_key,
+                &query,
+                max_results,
+                input.search_type.as_deref(),
+            )
+            .await?
         }
         Provider::Brave => {
             brave::search(&client, DEFAULT_BRAVE_URL, &api_key, &query, max_results).await?
         }
         Provider::SerpApi => {
-            serpapi::search(&client, DEFAULT_SERPAPI_URL, &api_key, &query, max_results, input.search_type.as_deref()).await?
+            serpapi::search(
+                &client,
+                DEFAULT_SERPAPI_URL,
+                &api_key,
+                &query,
+                max_results,
+                input.search_type.as_deref(),
+            )
+            .await?
         }
     };
     Ok(SearchOutput {
@@ -385,7 +420,7 @@ pub mod tavily {
     //! `search_depth` (`basic` | `advanced`). Response: top-level
     //! `results: [{ title, url, content, score, published_date? }]`.
 
-    use super::{cap_snippet, json, SearchResult, SNIPPET_CAP_BYTES};
+    use super::{SNIPPET_CAP_BYTES, SearchResult, cap_snippet, json};
     use crate::error::ToolError;
 
     pub async fn search(
@@ -448,8 +483,16 @@ pub mod tavily {
         let out: Vec<SearchResult> = arr
             .into_iter()
             .map(|v| SearchResult {
-                title: v.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                url: v.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                title: v
+                    .get("title")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                url: v
+                    .get("url")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 snippet: cap_snippet(
                     v.get("content").and_then(|x| x.as_str()).unwrap_or(""),
                     SNIPPET_CAP_BYTES,
@@ -476,7 +519,7 @@ pub mod exa {
     //! We pass `contents: { text: true }` to opt in to snippet text;
     //! without it Exa returns metadata only.
 
-    use super::{cap_snippet, json, SearchResult, SNIPPET_CAP_BYTES};
+    use super::{SNIPPET_CAP_BYTES, SearchResult, cap_snippet, json};
     use crate::error::ToolError;
 
     pub async fn search(
@@ -537,8 +580,16 @@ pub mod exa {
                     .and_then(|x| x.as_str())
                     .unwrap_or("");
                 SearchResult {
-                    title: v.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                    url: v.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                    title: v
+                        .get("title")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    url: v
+                        .get("url")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     snippet: cap_snippet(snippet_src, SNIPPET_CAP_BYTES),
                     published: v
                         .get("publishedDate")
@@ -560,7 +611,7 @@ pub mod brave {
     //! header `X-Subscription-Token` for the key. Response:
     //! `web.results: [{ title, url, description, age?, published? }]`.
 
-    use super::{cap_snippet, SearchResult, SNIPPET_CAP_BYTES};
+    use super::{SNIPPET_CAP_BYTES, SearchResult, cap_snippet};
     use crate::error::ToolError;
 
     pub async fn search(
@@ -606,8 +657,16 @@ pub mod brave {
         let out = arr
             .into_iter()
             .map(|v| SearchResult {
-                title: v.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                url: v.get("url").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                title: v
+                    .get("title")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                url: v
+                    .get("url")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 snippet: cap_snippet(
                     v.get("description").and_then(|x| x.as_str()).unwrap_or(""),
                     SNIPPET_CAP_BYTES,
@@ -634,7 +693,7 @@ pub mod serpapi {
     //! `search_type` selects the engine — pass `google`, `bing`,
     //! `duckduckgo`, etc. Default `google`.
 
-    use super::{cap_snippet, SearchResult, SNIPPET_CAP_BYTES};
+    use super::{SNIPPET_CAP_BYTES, SearchResult, cap_snippet};
     use crate::error::ToolError;
 
     pub async fn search(
@@ -694,7 +753,11 @@ pub mod serpapi {
         let out = arr
             .into_iter()
             .map(|v| SearchResult {
-                title: v.get("title").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                title: v
+                    .get("title")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 // SerpAPI's organic results carry the URL under `link`.
                 url: v
                     .get("link")
@@ -817,7 +880,11 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn env_with(pairs: &[(&str, &str)]) -> MapEnv {
-        MapEnv::from_pairs(pairs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())))
+        MapEnv::from_pairs(
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string())),
+        )
     }
 
     // ---- Provider parsing / resolution ---------------------------------
@@ -962,9 +1029,15 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].title, "Rust language");
         assert_eq!(results[0].url, "https://www.rust-lang.org");
-        assert_eq!(results[0].snippet, "Rust is a systems programming language.");
+        assert_eq!(
+            results[0].snippet,
+            "Rust is a systems programming language."
+        );
         assert_eq!(results[0].score, Some(0.92));
-        assert_eq!(results[0].published.as_deref(), Some("2025-01-15T00:00:00Z"));
+        assert_eq!(
+            results[0].published.as_deref(),
+            Some("2025-01-15T00:00:00Z")
+        );
         assert_eq!(results[1].score, None);
         assert_eq!(results[1].published, None);
     }
@@ -975,8 +1048,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/"))
             .respond_with(
-                ResponseTemplate::new(401)
-                    .set_body_json(json!({"detail": "invalid api key"})),
+                ResponseTemplate::new(401).set_body_json(json!({"detail": "invalid api key"})),
             )
             .mount(&server)
             .await;
@@ -1050,8 +1122,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/"))
             .respond_with(
-                ResponseTemplate::new(403)
-                    .set_body_json(json!({"message": "quota exceeded"})),
+                ResponseTemplate::new(403).set_body_json(json!({"message": "quota exceeded"})),
             )
             .mount(&server)
             .await;
@@ -1162,9 +1233,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/"))
             .and(query_param("engine", "bing"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"organic_results": []})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"organic_results": []})))
             .mount(&server)
             .await;
         let client = reqwest::Client::new();
@@ -1244,7 +1313,12 @@ mod tests {
 
     #[test]
     fn provider_as_str_matches_parse() {
-        for p in [Provider::Tavily, Provider::Exa, Provider::Brave, Provider::SerpApi] {
+        for p in [
+            Provider::Tavily,
+            Provider::Exa,
+            Provider::Brave,
+            Provider::SerpApi,
+        ] {
             assert_eq!(Provider::parse(p.as_str()).unwrap(), p);
         }
     }

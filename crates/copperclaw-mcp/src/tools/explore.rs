@@ -43,11 +43,11 @@ use rmcp::model::{CallToolResult, JsonObject, Tool};
 use serde::Deserialize;
 
 use crate::context::{
-    SubagentRequest, SubagentResult, ToolContext, SUBAGENT_MAX_TOKENS_LIMIT,
-    SUBAGENT_MAX_TURNS_LIMIT, SUBAGENT_WALL_CLOCK_SECS,
+    SUBAGENT_MAX_TOKENS_LIMIT, SUBAGENT_MAX_TURNS_LIMIT, SUBAGENT_WALL_CLOCK_SECS, SubagentRequest,
+    SubagentResult, ToolContext,
 };
 use crate::error::ToolError;
-use crate::tools::{make_tool, parse_args, success_json, ToolEntry, ToolHandler};
+use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args, success_json};
 
 /// Default `max_turns` when the caller omits it.
 pub const DEFAULT_MAX_TURNS: u32 = 5;
@@ -296,7 +296,9 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, ToolError::Validation(s) if s.contains("nested") || s.contains("inside")));
+        assert!(
+            matches!(err, ToolError::Validation(s) if s.contains("nested") || s.contains("inside"))
+        );
         assert!(ctx.subagent_calls().is_empty());
     }
 

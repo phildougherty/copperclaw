@@ -139,11 +139,7 @@ mod tests {
     async fn factory_init_rejects_missing_access_token() {
         let f = WhatsappCloudFactory::new();
         let (tx, _rx) = mpsc::channel::<InboundEvent>(8);
-        let setup = ChannelSetup::new(
-            json!({"app_secret":"s","verify_token":"v"}),
-            tx,
-            "/tmp",
-        );
+        let setup = ChannelSetup::new(json!({"app_secret":"s","verify_token":"v"}), tx, "/tmp");
         match f.init(setup).await {
             Err(AdapterError::BadRequest(_)) => {}
             Err(other) => panic!("expected BadRequest, got {other:?}"),
@@ -155,11 +151,7 @@ mod tests {
     async fn factory_init_rejects_missing_app_secret() {
         let f = WhatsappCloudFactory::new();
         let (tx, _rx) = mpsc::channel::<InboundEvent>(8);
-        let setup = ChannelSetup::new(
-            json!({"access_token":"t","verify_token":"v"}),
-            tx,
-            "/tmp",
-        );
+        let setup = ChannelSetup::new(json!({"access_token":"t","verify_token":"v"}), tx, "/tmp");
         match f.init(setup).await {
             Err(AdapterError::BadRequest(_)) => {}
             Err(other) => panic!("expected BadRequest, got {other:?}"),
@@ -171,11 +163,7 @@ mod tests {
     async fn factory_init_rejects_missing_verify_token() {
         let f = WhatsappCloudFactory::new();
         let (tx, _rx) = mpsc::channel::<InboundEvent>(8);
-        let setup = ChannelSetup::new(
-            json!({"access_token":"t","app_secret":"s"}),
-            tx,
-            "/tmp",
-        );
+        let setup = ChannelSetup::new(json!({"access_token":"t","app_secret":"s"}), tx, "/tmp");
         match f.init(setup).await {
             Err(AdapterError::BadRequest(_)) => {}
             Err(other) => panic!("expected BadRequest, got {other:?}"),

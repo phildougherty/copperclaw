@@ -1,10 +1,10 @@
 //! CRUD for `agent_groups`.
 
-use crate::central::CentralDb;
 use crate::DbError;
+use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
 use copperclaw_types::AgentGroupId;
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{OptionalExtension, Row, params};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentGroup {
@@ -34,11 +34,14 @@ pub struct UpdateAgentGroup {
 
 fn row_to_agent_group(row: &Row<'_>) -> rusqlite::Result<AgentGroup> {
     let id_str: String = row.get("id")?;
-    let id = uuid::Uuid::parse_str(&id_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let id = uuid::Uuid::parse_str(&id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let created_at_str: String = row.get("created_at")?;
     let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .with_timezone(&Utc);
     let depth_i64: i64 = row.get("subagent_depth")?;
     let subagent_depth = u8::try_from(depth_i64.clamp(0, i64::from(u8::MAX))).unwrap_or(0);
@@ -143,7 +146,11 @@ pub fn get_subagent_depth(db: &CentralDb, id: AgentGroupId) -> Result<Option<u8>
     Ok(row.map(|n| u8::try_from(n.clamp(0, i64::from(u8::MAX))).unwrap_or(0)))
 }
 
-pub fn update(db: &CentralDb, id: AgentGroupId, patch: UpdateAgentGroup) -> Result<AgentGroup, DbError> {
+pub fn update(
+    db: &CentralDb,
+    id: AgentGroupId,
+    patch: UpdateAgentGroup,
+) -> Result<AgentGroup, DbError> {
     let conn = db.conn()?;
     if let Some(name) = patch.name {
         conn.execute(

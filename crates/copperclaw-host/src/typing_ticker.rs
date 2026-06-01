@@ -18,7 +18,7 @@
 //! are the source of truth.
 
 use copperclaw_db::central::CentralDb;
-use copperclaw_db::session::{open_inbound_ro_no_mmap, SessionPaths};
+use copperclaw_db::session::{SessionPaths, open_inbound_ro_no_mmap};
 use copperclaw_db::tables::{messages_in, messaging_groups, sessions};
 use copperclaw_modules::{DeliveryDispatcher, DispatchTarget};
 use copperclaw_types::SessionId;
@@ -246,11 +246,7 @@ mod tests {
         fn set_typing(&self, target: &DispatchTarget) {
             self.typing_calls.lock().unwrap().push(target.clone());
         }
-        fn dispatch(
-            &self,
-            _target: &DispatchTarget,
-            _message: &copperclaw_types::OutboundMessage,
-        ) {
+        fn dispatch(&self, _target: &DispatchTarget, _message: &copperclaw_types::OutboundMessage) {
             // Not used by the ticker; assert at test sites if they
             // expect dispatch.
         }
@@ -346,7 +342,10 @@ mod tests {
             tmp.path(),
         );
         let fired = ticker.tick();
-        assert_eq!(fired, 2, "both running sessions with pending work should fire");
+        assert_eq!(
+            fired, 2,
+            "both running sessions with pending work should fire"
+        );
         let calls = mock.typing_calls.lock().unwrap();
         let kinds: Vec<&str> = calls
             .iter()

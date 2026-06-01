@@ -7,7 +7,7 @@
 use crate::DbError;
 use chrono::{DateTime, Utc};
 use copperclaw_types::MessageId;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 /// Lifecycle states the container reports back to the host. The string form
 /// is what lands in the `status` column.
@@ -142,7 +142,7 @@ fn row_to_claim(row: &Row<'_>) -> rusqlite::Result<ProcessingClaim> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{open_outbound, SessionPaths};
+    use crate::session::{SessionPaths, open_outbound};
     use copperclaw_types::{AgentGroupId, SessionId};
 
     fn fresh_outbound() -> (tempfile::TempDir, Connection) {

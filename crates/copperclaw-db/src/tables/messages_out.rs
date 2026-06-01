@@ -6,7 +6,7 @@
 use crate::DbError;
 use chrono::{DateTime, Utc};
 use copperclaw_types::{ChannelType, MessageId, MessageKind, MessageOutRow};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 #[derive(Debug, Clone)]
 pub struct WriteOutbound {
@@ -111,7 +111,9 @@ fn row_to_message_out(row: &Row<'_>) -> rusqlite::Result<MessageOutRow> {
     let timestamp_str: String = row.get("timestamp")?;
     let timestamp = DateTime::parse_from_rfc3339(&timestamp_str)
         .map(|d| d.with_timezone(&Utc))
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?;
 
     // Same empty-string-as-Some pitfall as messages_in::parse_dt_opt:
     // a row written with `deliver_after=''` would crash the parser with
@@ -122,13 +124,20 @@ fn row_to_message_out(row: &Row<'_>) -> rusqlite::Result<MessageOutRow> {
         Some(ts) => Some(
             DateTime::parse_from_rfc3339(ts)
                 .map(|d| d.with_timezone(&Utc))
-                .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?,
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
         ),
     };
 
     let content_str: String = row.get("content")?;
-    let content: serde_json::Value = serde_json::from_str(&content_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let content: serde_json::Value = serde_json::from_str(&content_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let channel_type: Option<String> = row.get("channel_type")?;
 
     Ok(MessageOutRow {
@@ -149,7 +158,7 @@ fn row_to_message_out(row: &Row<'_>) -> rusqlite::Result<MessageOutRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{open_outbound, SessionPaths};
+    use crate::session::{SessionPaths, open_outbound};
     use copperclaw_types::{AgentGroupId, SessionId};
     use serde_json::json;
 

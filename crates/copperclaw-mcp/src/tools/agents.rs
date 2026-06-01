@@ -5,7 +5,7 @@ pub mod create_agent {
 
     use crate::context::{CreateAgentSpec, OutboundToolEffect, ToolContext};
     use crate::error::ToolError;
-    use crate::tools::{ack_to_result, make_tool, parse_args, ToolEntry, ToolHandler};
+    use crate::tools::{ToolEntry, ToolHandler, ack_to_result, make_tool, parse_args};
     use rmcp::model::{CallToolResult, JsonObject, Tool};
     use serde::Deserialize;
 
@@ -73,7 +73,9 @@ pub mod create_agent {
             instructions: input.instructions,
             channel: input.channel,
         };
-        let ack = ctx.emit_outbound(OutboundToolEffect::CreateAgent(spec)).await?;
+        let ack = ctx
+            .emit_outbound(OutboundToolEffect::CreateAgent(spec))
+            .await?;
         Ok(ack_to_result(&ack))
     }
 

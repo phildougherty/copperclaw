@@ -3,29 +3,28 @@
 //! See `PLAN.md` § 6 T3. The steps in this module mirror the numbered list
 //! there.
 
-use crate::channels_init::{build_registry, init_channels, DEFAULT_INBOUND_BUFFER};
+use crate::channels_init::{DEFAULT_INBOUND_BUFFER, build_registry, init_channels};
 use crate::config::HostConfig;
 use crate::context::HostContext;
 use crate::orphans::cleanup_orphans;
 use crate::sessions::FsSessionRoot;
 use crate::socket::{bind_listener, serve_listener};
 use anyhow::Result;
-use dashmap::DashMap;
 use copperclaw_channels_core::ChannelAdapter;
 use copperclaw_container_rt::{ContainerRuntime, RtError};
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::migrate::{
-    applied_central_schema_version, expected_central_schema_version, run_migrations, MigrationSet,
+    MigrationSet, applied_central_schema_version, expected_central_schema_version, run_migrations,
 };
 use copperclaw_host_delivery::DeliveryService;
 use copperclaw_host_router::Router;
 use copperclaw_host_sweep::{SqliteTaskStore, SweepService};
 use copperclaw_modules::{
-    create_agent_users_table_check, AgentDispatchModule, AgentToAgentModule, ApprovalsModule,
-    CreateAgentModule,
-    InteractiveModule, Module, MountSecurityModule, NewPendingCtx, NewPendingNotifier,
-    PermissionsModule, SchedulingModule, SelfModModule, TypingConfig, TypingModule,
+    AgentDispatchModule, AgentToAgentModule, ApprovalsModule, CreateAgentModule, InteractiveModule,
+    Module, MountSecurityModule, NewPendingCtx, NewPendingNotifier, PermissionsModule,
+    SchedulingModule, SelfModModule, TypingConfig, TypingModule, create_agent_users_table_check,
 };
+use dashmap::DashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,7 +103,10 @@ fn build_pending_notifier(central: copperclaw_db::central::CentralDb) -> NewPend
         };
 
         // Resolve the messaging group's channel + platform coordinates.
-        let mg = match copperclaw_db::tables::messaging_groups::get(&central, wiring.messaging_group_id) {
+        let mg = match copperclaw_db::tables::messaging_groups::get(
+            &central,
+            wiring.messaging_group_id,
+        ) {
             Ok(g) => g,
             Err(err) => {
                 tracing::info!(
@@ -234,8 +236,7 @@ pub fn check_schema_version(cfg: &HostConfig) -> Result<(), BootError> {
         std::cmp::Ordering::Less => {
             warn!(
                 applied,
-                expected,
-                "schema version behind expected; migrations may be pending"
+                expected, "schema version behind expected; migrations may be pending"
             );
         }
         std::cmp::Ordering::Greater => {
@@ -308,7 +309,10 @@ pub fn migrate_sessions_layout(data_dir: &std::path::Path) {
     // were no skipped entries (skips mean the inner dir may not be empty).
     if skipped == 0 {
         if let Err(err) = std::fs::remove_dir(&old_inner) {
-            warn!(?err, "sessions layout migration: remove inner dir failed; continuing");
+            warn!(
+                ?err,
+                "sessions layout migration: remove inner dir failed; continuing"
+            );
         }
     }
     info!(migrated, skipped, "sessions layout migration complete");
@@ -394,27 +398,21 @@ pub async fn install_modules(host_ctx: Arc<HostContext>, data_root: PathBuf) {
         // queries the central `users` table — that's how `cclaw
         // approvals approve` lands without a host restart.
         Box::new(
-            ApprovalsModule::with_initial_approved(vec![
-                copperclaw_types::SenderIdentity {
-                    channel_type: copperclaw_types::ChannelType::new(
-                        copperclaw_types::ChannelType::CLI,
-                    ),
-                    identity: "local".to_string(),
-                    display_name: Some("local".to_string()),
-                },
-            ])
+            ApprovalsModule::with_initial_approved(vec![copperclaw_types::SenderIdentity {
+                channel_type: copperclaw_types::ChannelType::new(
+                    copperclaw_types::ChannelType::CLI,
+                ),
+                identity: "local".to_string(),
+                display_name: Some("local".to_string()),
+            }])
             .with_persistent_lookup({
                 let central = host_ctx.central().clone();
                 std::sync::Arc::new(move |sender| {
                     let kind = sender.channel_type.as_str();
-                    copperclaw_db::tables::users::get_by_identity(
-                        &central,
-                        kind,
-                        &sender.identity,
-                    )
-                    .ok()
-                    .flatten()
-                    .is_some()
+                    copperclaw_db::tables::users::get_by_identity(&central, kind, &sender.identity)
+                        .ok()
+                        .flatten()
+                        .is_some()
                 })
             })
             .with_new_pending_notifier(build_pending_notifier(host_ctx.central().clone())),
@@ -452,8 +450,8 @@ pub async fn install_modules(host_ctx: Arc<HostContext>, data_root: PathBuf) {
     ];
     for m in modules {
         let name = m.name();
-        let ctx: Arc<dyn copperclaw_modules::ModuleContext> = Arc::clone(&host_ctx)
-            as Arc<dyn copperclaw_modules::ModuleContext>;
+        let ctx: Arc<dyn copperclaw_modules::ModuleContext> =
+            Arc::clone(&host_ctx) as Arc<dyn copperclaw_modules::ModuleContext>;
         if let Err(err) = m.install(ctx).await {
             warn!(module = name, ?err, "module install failed; continuing");
         }
@@ -522,8 +520,7 @@ pub async fn run_host(
 
     // 8. Init channels.
     let (inbound_tx, mut inbound_rx) = mpsc::channel(DEFAULT_INBOUND_BUFFER);
-    let initialized =
-        init_channels(&registry, &cfg.channels, inbound_tx, &cfg.data_dir).await;
+    let initialized = init_channels(&registry, &cfg.channels, inbound_tx, &cfg.data_dir).await;
     let adapters: DashMap<copperclaw_types::ChannelType, Arc<dyn ChannelAdapter>> = DashMap::new();
     for ch in &initialized {
         adapters.insert(ch.channel_type.clone(), Arc::clone(&ch.adapter));
@@ -586,12 +583,8 @@ pub async fn run_host(
     });
 
     // 12. Delivery loops.
-    let active = tokio::spawn(
-        Arc::clone(&state.delivery).run_active_loop(shutdown.clone()),
-    );
-    let sweep_delivery = tokio::spawn(
-        Arc::clone(&state.delivery).run_sweep_loop(shutdown.clone()),
-    );
+    let active = tokio::spawn(Arc::clone(&state.delivery).run_active_loop(shutdown.clone()));
+    let sweep_delivery = tokio::spawn(Arc::clone(&state.delivery).run_sweep_loop(shutdown.clone()));
 
     // 13. Sweep loop.
     let sweep_loop = tokio::spawn(Arc::clone(&state.sweep).run_loop(shutdown.clone()));
@@ -708,7 +701,7 @@ pub async fn wait_for_signal_or_sighup(
 ) {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut sigint = match signal(SignalKind::interrupt()) {
             Ok(s) => s,
             Err(err) => {
@@ -859,16 +852,14 @@ fn spawn_container_manager(
     {
         let env_for_check = copperclaw_runner::config::SystemEnv;
         let provider_deadline = copperclaw_runner::resolve_provider_deadline(&env_for_check);
-        let provider_deadline_ms = u64::try_from(provider_deadline.as_millis())
-            .unwrap_or(u64::MAX);
+        let provider_deadline_ms = u64::try_from(provider_deadline.as_millis()).unwrap_or(u64::MAX);
         if let Err(msg) = crate::container_manager::spawn::check_heartbeat_deadline_alignment(
             manager_cfg.heartbeat_stale_secs,
             provider_deadline_ms,
         ) {
             warn!(
                 heartbeat_stale_secs = manager_cfg.heartbeat_stale_secs,
-                provider_deadline_ms,
-                "{msg}"
+                provider_deadline_ms, "{msg}"
             );
         }
     }
@@ -912,11 +903,8 @@ async fn run_boot_image_health_check(
             // Side-effects of degraded mode (metric + apology
             // fan-out) live in `enter_degraded_mode`. Calling it from
             // here keeps boot.rs lean.
-            let notified = crate::image_health::enter_degraded_mode(
-                central,
-                cfg.data_dir(),
-                &reason,
-            );
+            let notified =
+                crate::image_health::enter_degraded_mode(central, cfg.data_dir(), &reason);
             warn!(
                 image_tag = %image_tag,
                 reason = %reason,
@@ -938,7 +926,20 @@ async fn run_boot_image_health_check(
 fn parse_truthy_env(name: &str) -> bool {
     matches!(
         std::env::var(name).ok().as_deref(),
-        Some("1" | "true" | "True" | "TRUE" | "yes" | "Yes" | "YES" | "on" | "On" | "ON" | "all" | "All" | "ALL")
+        Some(
+            "1" | "true"
+                | "True"
+                | "TRUE"
+                | "yes"
+                | "Yes"
+                | "YES"
+                | "on"
+                | "On"
+                | "ON"
+                | "all"
+                | "All"
+                | "ALL"
+        )
     )
 }
 
@@ -1070,12 +1071,13 @@ mod tests {
             BootError::RuntimeDetect(RtError::Unavailable("x".into())).exit_code(),
             3
         );
+        assert_eq!(BootError::Socket(std::io::Error::other("x")).exit_code(), 4);
         assert_eq!(
-            BootError::Socket(std::io::Error::other("x")).exit_code(),
-            4
-        );
-        assert_eq!(
-            BootError::SchemaMismatch { expected: 4, applied: 7 }.exit_code(),
+            BootError::SchemaMismatch {
+                expected: 4,
+                applied: 7
+            }
+            .exit_code(),
             5
         );
     }
@@ -1092,7 +1094,11 @@ mod tests {
                 .to_string()
                 .contains("no container runtime")
         );
-        let msg = BootError::SchemaMismatch { expected: 4, applied: 7 }.to_string();
+        let msg = BootError::SchemaMismatch {
+            expected: 4,
+            applied: 7,
+        }
+        .to_string();
         assert!(msg.contains("downgrade"), "expected 'downgrade' in: {msg}");
         assert!(msg.contains('4') && msg.contains('7'));
     }
@@ -1182,7 +1188,10 @@ mod tests {
         assert!(new_agent.join("existing.db").exists());
         // The old inner dir still exists because we skipped entries.
         // (Whether it stays or goes depends on the skipped count > 0 guard.)
-        assert!(old_inner.exists(), "inner dir should remain when there were skips");
+        assert!(
+            old_inner.exists(),
+            "inner dir should remain when there were skips"
+        );
     }
 
     #[test]
@@ -1275,16 +1284,12 @@ mod tests {
             ..HostConfig::default()
         };
         let state = assemble(&cfg, DashMap::new()).unwrap();
-        let ctx = HostContext::for_router(
-            Arc::clone(&state.router),
-            Arc::clone(&state.delivery),
-        );
+        let ctx = HostContext::for_router(Arc::clone(&state.router), Arc::clone(&state.delivery));
         install_modules(ctx, cfg.data_dir.clone()).await;
         // At least permissions+approvals install hooks; assert something
         // landed on the router's chain.
         assert!(
-            state.router.hooks().has_access_gate()
-                || state.router.hooks().has_sender_scope_gate()
+            state.router.hooks().has_access_gate() || state.router.hooks().has_sender_scope_gate()
         );
     }
 
@@ -1322,7 +1327,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        assert!(tmp.path().join("cclaw.sock").exists(), "socket should be up");
+        assert!(
+            tmp.path().join("cclaw.sock").exists(),
+            "socket should be up"
+        );
         shutdown.cancel();
         tokio::time::timeout(Duration::from_secs(5), task)
             .await
@@ -1367,8 +1375,7 @@ mod tests {
         };
         let shutdown = CancellationToken::new();
         let rt: Box<dyn ContainerRuntime> = Box::new(
-            crate::tests::NoopRuntime::default()
-                .fail_with(RtError::Unavailable("nope".into())),
+            crate::tests::NoopRuntime::default().fail_with(RtError::Unavailable("nope".into())),
         );
         let cancel = shutdown.clone();
         let task = tokio::spawn(async move {
@@ -1393,9 +1400,9 @@ mod tests {
         copperclaw_types::ChannelType,
         String, // platform_id
     ) {
-        use copperclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
-        use copperclaw_db::tables::messaging_group_agents::{upsert as upsert_wire, UpsertWiring};
-        use copperclaw_db::tables::messaging_groups::{upsert as upsert_mg, UpsertMessagingGroup};
+        use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+        use copperclaw_db::tables::messaging_group_agents::{UpsertWiring, upsert as upsert_wire};
+        use copperclaw_db::tables::messaging_groups::{UpsertMessagingGroup, upsert as upsert_mg};
         use copperclaw_types::{ChannelType, EngageMode, SessionMode};
 
         let db = copperclaw_db::central::CentralDb::open_in_memory().unwrap();
@@ -1440,8 +1447,8 @@ mod tests {
 
     #[test]
     fn notifier_dispatches_for_new_sender() {
-        use copperclaw_modules::context::MockDispatcher;
         use copperclaw_modules::DeliveryDispatcher;
+        use copperclaw_modules::context::MockDispatcher;
         use copperclaw_types::{ChannelType, SenderIdentity};
 
         let (db, ag_id, _mg_id, _ct, _pid) = notifier_fixture();
@@ -1487,9 +1494,11 @@ mod tests {
 
     #[test]
     fn notifier_skips_repeat_sender() {
-        use copperclaw_db::tables::unregistered_senders::{upsert as upsert_unreg, UpsertUnregisteredSender};
-        use copperclaw_modules::context::MockDispatcher;
+        use copperclaw_db::tables::unregistered_senders::{
+            UpsertUnregisteredSender, upsert as upsert_unreg,
+        };
         use copperclaw_modules::DeliveryDispatcher;
+        use copperclaw_modules::context::MockDispatcher;
         use copperclaw_types::{ChannelType, SenderIdentity};
 
         let (db, ag_id, _mg_id, _ct, _pid) = notifier_fixture();
@@ -1536,9 +1545,9 @@ mod tests {
 
     #[test]
     fn notifier_skips_when_no_messaging_group_wired() {
-        use copperclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
-        use copperclaw_modules::context::MockDispatcher;
+        use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
         use copperclaw_modules::DeliveryDispatcher;
+        use copperclaw_modules::context::MockDispatcher;
         use copperclaw_types::{ChannelType, SenderIdentity};
 
         // Agent group with NO wired messaging group.
@@ -1574,54 +1583,86 @@ mod tests {
 
     #[test]
     fn notifier_multiple_agent_groups_routes_independently() {
-        use copperclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
-        use copperclaw_db::tables::messaging_group_agents::{upsert as upsert_wire, UpsertWiring};
-        use copperclaw_db::tables::messaging_groups::{upsert as upsert_mg, UpsertMessagingGroup};
-        use copperclaw_modules::context::MockDispatcher;
+        use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+        use copperclaw_db::tables::messaging_group_agents::{UpsertWiring, upsert as upsert_wire};
+        use copperclaw_db::tables::messaging_groups::{UpsertMessagingGroup, upsert as upsert_mg};
         use copperclaw_modules::DeliveryDispatcher;
+        use copperclaw_modules::context::MockDispatcher;
         use copperclaw_types::{ChannelType, EngageMode, SenderIdentity, SessionMode};
 
         let db = copperclaw_db::central::CentralDb::open_in_memory().unwrap();
 
         // Agent group A → slack channel.
-        let ag_a = create_ag(&db, CreateAgentGroup { name: "ag-a".into(), folder: "a".into(), agent_provider: None }).unwrap();
-        let mg_slack = upsert_mg(&db, UpsertMessagingGroup {
-            channel_type: ChannelType::new("slack"),
-            platform_id: "C-slack".into(),
-            name: None,
-            is_group: true,
-            unknown_sender_policy: "strict".into(),
-        }).unwrap();
-        upsert_wire(&db, UpsertWiring {
-            messaging_group_id: mg_slack.id,
-            agent_group_id: ag_a.id,
-            engage_mode: EngageMode::Mention,
-            engage_pattern: None,
-            sender_scope: "known".into(),
-            ignored_message_policy: "drop".into(),
-            session_mode: SessionMode::Shared,
-            priority: 0,
-        }).unwrap();
+        let ag_a = create_ag(
+            &db,
+            CreateAgentGroup {
+                name: "ag-a".into(),
+                folder: "a".into(),
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        let mg_slack = upsert_mg(
+            &db,
+            UpsertMessagingGroup {
+                channel_type: ChannelType::new("slack"),
+                platform_id: "C-slack".into(),
+                name: None,
+                is_group: true,
+                unknown_sender_policy: "strict".into(),
+            },
+        )
+        .unwrap();
+        upsert_wire(
+            &db,
+            UpsertWiring {
+                messaging_group_id: mg_slack.id,
+                agent_group_id: ag_a.id,
+                engage_mode: EngageMode::Mention,
+                engage_pattern: None,
+                sender_scope: "known".into(),
+                ignored_message_policy: "drop".into(),
+                session_mode: SessionMode::Shared,
+                priority: 0,
+            },
+        )
+        .unwrap();
 
         // Agent group B → discord channel.
-        let ag_b = create_ag(&db, CreateAgentGroup { name: "ag-b".into(), folder: "b".into(), agent_provider: None }).unwrap();
-        let mg_discord = upsert_mg(&db, UpsertMessagingGroup {
-            channel_type: ChannelType::new("discord"),
-            platform_id: "C-discord".into(),
-            name: None,
-            is_group: true,
-            unknown_sender_policy: "strict".into(),
-        }).unwrap();
-        upsert_wire(&db, UpsertWiring {
-            messaging_group_id: mg_discord.id,
-            agent_group_id: ag_b.id,
-            engage_mode: EngageMode::Mention,
-            engage_pattern: None,
-            sender_scope: "known".into(),
-            ignored_message_policy: "drop".into(),
-            session_mode: SessionMode::Shared,
-            priority: 0,
-        }).unwrap();
+        let ag_b = create_ag(
+            &db,
+            CreateAgentGroup {
+                name: "ag-b".into(),
+                folder: "b".into(),
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        let mg_discord = upsert_mg(
+            &db,
+            UpsertMessagingGroup {
+                channel_type: ChannelType::new("discord"),
+                platform_id: "C-discord".into(),
+                name: None,
+                is_group: true,
+                unknown_sender_policy: "strict".into(),
+            },
+        )
+        .unwrap();
+        upsert_wire(
+            &db,
+            UpsertWiring {
+                messaging_group_id: mg_discord.id,
+                agent_group_id: ag_b.id,
+                engage_mode: EngageMode::Mention,
+                engage_pattern: None,
+                sender_scope: "known".into(),
+                ignored_message_policy: "drop".into(),
+                session_mode: SessionMode::Shared,
+                priority: 0,
+            },
+        )
+        .unwrap();
 
         let notifier = build_pending_notifier(db);
 
@@ -1630,7 +1671,11 @@ mod tests {
 
         // Fire notifier for a sender targeting agent group A.
         let ctx_a = NewPendingCtx {
-            sender: SenderIdentity { channel_type: ChannelType::new("gchat"), identity: "user-a".into(), display_name: None },
+            sender: SenderIdentity {
+                channel_type: ChannelType::new("gchat"),
+                identity: "user-a".into(),
+                display_name: None,
+            },
             agent_group_id: ag_a.id,
             messaging_group_id: None,
             first_seen: chrono::Utc::now(),
@@ -1639,7 +1684,11 @@ mod tests {
 
         // Fire notifier for a different sender targeting agent group B.
         let ctx_b = NewPendingCtx {
-            sender: SenderIdentity { channel_type: ChannelType::new("gchat"), identity: "user-b".into(), display_name: None },
+            sender: SenderIdentity {
+                channel_type: ChannelType::new("gchat"),
+                identity: "user-b".into(),
+                display_name: None,
+            },
             agent_group_id: ag_b.id,
             messaging_group_id: None,
             first_seen: chrono::Utc::now(),
@@ -1647,13 +1696,20 @@ mod tests {
         notifier(ctx_b, dispatcher);
 
         let all_dispatched = mock.dispatched.lock().unwrap();
-        assert_eq!(all_dispatched.len(), 2, "each agent group gets its own notification");
+        assert_eq!(
+            all_dispatched.len(),
+            2,
+            "each agent group gets its own notification"
+        );
         let targets: Vec<_> = all_dispatched
             .iter()
             .map(|(t, _)| t.channel_type.as_ref().map_or("", ChannelType::as_str))
             .collect();
         assert!(targets.contains(&"slack"), "ag-a should notify via slack");
-        assert!(targets.contains(&"discord"), "ag-b should notify via discord");
+        assert!(
+            targets.contains(&"discord"),
+            "ag-b should notify via discord"
+        );
     }
 
     #[tokio::test]

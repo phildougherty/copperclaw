@@ -1,12 +1,12 @@
 //! Handlers for `sessions.*` commands.
 
 use super::{db_err, opt_str, parse_uuid, req_str};
+use copperclaw_cclaw::ErrorPayload;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::session::SessionPaths;
 use copperclaw_db::tables::sessions;
-use copperclaw_cclaw::ErrorPayload;
 use copperclaw_types::{AgentGroupId, ContainerStatus, Session, SessionId};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::path::Path;
 use tracing::warn;
 
@@ -45,10 +45,7 @@ pub fn get(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
 /// already gone and re-running the command would just `NotFound`.
 pub fn delete(args: &Value, ctx: &crate::socket::HandlerCtx) -> Result<Value, ErrorPayload> {
     let id = SessionId(parse_uuid(&req_str(args, "id")?)?);
-    let force = args
-        .get("force")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
     let session = sessions::get(&ctx.central, id).map_err(db_err)?;
     if !matches!(session.container_status, ContainerStatus::Stopped) && !force {
         return Err(ErrorPayload::new(
@@ -74,11 +71,7 @@ pub fn delete(args: &Value, ctx: &crate::socket::HandlerCtx) -> Result<Value, Er
 /// `true` if the directory existed and was removed, `false` if it was
 /// missing or removal failed (warn-logged in the latter case). Never
 /// fails the parent request.
-fn remove_session_dir(
-    data_dir: &Path,
-    agent: AgentGroupId,
-    session: SessionId,
-) -> bool {
+fn remove_session_dir(data_dir: &Path, agent: AgentGroupId, session: SessionId) -> bool {
     let paths = SessionPaths::new(data_dir, agent, session);
     if !paths.root.exists() {
         return false;
@@ -123,8 +116,10 @@ fn session_status_str(s: copperclaw_types::SessionStatus) -> &'static str {
 mod tests {
     use super::*;
     use crate::socket::HandlerCtx;
-    use copperclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
-    use copperclaw_db::tables::sessions::{create as create_session, CreateSession, mark_container_running};
+    use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+    use copperclaw_db::tables::sessions::{
+        CreateSession, create as create_session, mark_container_running,
+    };
 
     fn ctx_with(central: CentralDb, data_dir: std::path::PathBuf) -> HandlerCtx {
         HandlerCtx::with_data_dir(central, data_dir)
@@ -165,18 +160,10 @@ mod tests {
     #[test]
     fn list_filtered_by_agent_group() {
         let (db, _s, g) = db_with_session();
-        let v = list(
-            &json!({"agent_group_id": g.as_uuid().to_string()}),
-            &db,
-        )
-        .unwrap();
+        let v = list(&json!({"agent_group_id": g.as_uuid().to_string()}), &db).unwrap();
         assert_eq!(v.as_array().unwrap().len(), 1);
         let other = AgentGroupId::new();
-        let v = list(
-            &json!({"agent_group_id": other.as_uuid().to_string()}),
-            &db,
-        )
-        .unwrap();
+        let v = list(&json!({"agent_group_id": other.as_uuid().to_string()}), &db).unwrap();
         assert_eq!(v.as_array().unwrap().len(), 0);
     }
 
@@ -200,19 +187,24 @@ mod tests {
     #[test]
     fn get_missing_is_not_found() {
         let db = CentralDb::open_in_memory().unwrap();
-        let err = get(
-            &json!({"id": uuid::Uuid::now_v7().to_string()}),
-            &db,
-        )
-        .unwrap_err();
+        let err = get(&json!({"id": uuid::Uuid::now_v7().to_string()}), &db).unwrap_err();
         assert_eq!(err.code, "not_found");
     }
 
     #[test]
     fn session_status_str_covers_variants() {
-        assert_eq!(session_status_str(copperclaw_types::SessionStatus::Active), "active");
-        assert_eq!(session_status_str(copperclaw_types::SessionStatus::Archived), "archived");
-        assert_eq!(session_status_str(copperclaw_types::SessionStatus::Stopped), "stopped");
+        assert_eq!(
+            session_status_str(copperclaw_types::SessionStatus::Active),
+            "active"
+        );
+        assert_eq!(
+            session_status_str(copperclaw_types::SessionStatus::Archived),
+            "archived"
+        );
+        assert_eq!(
+            session_status_str(copperclaw_types::SessionStatus::Stopped),
+            "stopped"
+        );
     }
 
     #[test]
@@ -220,19 +212,11 @@ mod tests {
         let (db, s, ag) = db_with_session();
         let tmp = tempfile::tempdir().unwrap();
         let ctx = ctx_with(db, tmp.path().to_path_buf());
-        let v = delete(
-            &json!({"id": s.as_uuid().to_string()}),
-            &ctx,
-        )
-        .unwrap();
+        let v = delete(&json!({"id": s.as_uuid().to_string()}), &ctx).unwrap();
         assert_eq!(v["deleted"], s.as_uuid().to_string());
         assert_eq!(v["agent_group_id"], ag.as_uuid().to_string());
         // Session is gone from the central DB.
-        let err = get(
-            &json!({"id": s.as_uuid().to_string()}),
-            &ctx.central,
-        )
-        .unwrap_err();
+        let err = get(&json!({"id": s.as_uuid().to_string()}), &ctx.central).unwrap_err();
         assert_eq!(err.code, "not_found");
     }
 
@@ -242,18 +226,10 @@ mod tests {
         mark_container_running(&db, s).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let ctx = ctx_with(db, tmp.path().to_path_buf());
-        let err = delete(
-            &json!({"id": s.as_uuid().to_string()}),
-            &ctx,
-        )
-        .unwrap_err();
+        let err = delete(&json!({"id": s.as_uuid().to_string()}), &ctx).unwrap_err();
         assert_eq!(err.code, "container_not_stopped");
         // Session still present.
-        assert!(get(
-            &json!({"id": s.as_uuid().to_string()}),
-            &ctx.central
-        )
-        .is_ok());
+        assert!(get(&json!({"id": s.as_uuid().to_string()}), &ctx.central).is_ok());
     }
 
     #[test]
@@ -262,16 +238,8 @@ mod tests {
         mark_container_running(&db, s).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let ctx = ctx_with(db, tmp.path().to_path_buf());
-        delete(
-            &json!({"id": s.as_uuid().to_string(), "force": true}),
-            &ctx,
-        )
-        .unwrap();
-        let err = get(
-            &json!({"id": s.as_uuid().to_string()}),
-            &ctx.central,
-        )
-        .unwrap_err();
+        delete(&json!({"id": s.as_uuid().to_string(), "force": true}), &ctx).unwrap();
+        let err = get(&json!({"id": s.as_uuid().to_string()}), &ctx.central).unwrap_err();
         assert_eq!(err.code, "not_found");
     }
 
@@ -280,11 +248,7 @@ mod tests {
         let db = CentralDb::open_in_memory().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let ctx = ctx_with(db, tmp.path().to_path_buf());
-        let err = delete(
-            &json!({"id": SessionId::new().as_uuid().to_string()}),
-            &ctx,
-        )
-        .unwrap_err();
+        let err = delete(&json!({"id": SessionId::new().as_uuid().to_string()}), &ctx).unwrap_err();
         assert_eq!(err.code, "not_found");
     }
 
@@ -297,11 +261,7 @@ mod tests {
         paths.ensure_dirs().unwrap();
         assert!(paths.root.exists());
         let ctx = ctx_with(db, tmp.path().to_path_buf());
-        let v = delete(
-            &json!({"id": s.as_uuid().to_string()}),
-            &ctx,
-        )
-        .unwrap();
+        let v = delete(&json!({"id": s.as_uuid().to_string()}), &ctx).unwrap();
         assert_eq!(v["directory_removed"], true);
         assert!(!paths.root.exists(), "session dir should be gone");
     }
@@ -311,11 +271,7 @@ mod tests {
         let (db, s, _ag) = db_with_session();
         let tmp = tempfile::tempdir().unwrap();
         let ctx = ctx_with(db, tmp.path().to_path_buf());
-        let v = delete(
-            &json!({"id": s.as_uuid().to_string()}),
-            &ctx,
-        )
-        .unwrap();
+        let v = delete(&json!({"id": s.as_uuid().to_string()}), &ctx).unwrap();
         // No directory pre-existed.
         assert_eq!(v["directory_removed"], false);
     }

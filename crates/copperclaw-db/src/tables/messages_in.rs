@@ -5,7 +5,7 @@
 use crate::DbError;
 use chrono::{DateTime, Utc};
 use copperclaw_types::{ChannelType, MessageId, MessageInRow, MessageKind};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 #[derive(Debug, Clone)]
 pub struct WriteInbound {
@@ -92,15 +92,14 @@ fn insert_impl(conn: &Connection, msg: &WriteInbound, idempotent: bool) -> Resul
             msg.is_group.map(i32::from),
         ],
     )?;
-    if rows == 0 {
-        Ok(0)
-    } else {
-        Ok(seq)
-    }
+    if rows == 0 { Ok(0) } else { Ok(seq) }
 }
 
 fn next_even_seq(conn: &Connection) -> Result<i64, DbError> {
-    let max: Option<i64> = conn.query_row("SELECT MAX(seq) FROM messages_in", [], |r| r.get(0)).optional()?.flatten();
+    let max: Option<i64> = conn
+        .query_row("SELECT MAX(seq) FROM messages_in", [], |r| r.get(0))
+        .optional()?
+        .flatten();
     let mut next = max.unwrap_or(0) + 1;
     if next % 2 != 0 {
         next += 1;
@@ -167,7 +166,11 @@ pub fn mark_failed(conn: &Connection, id: MessageId) -> Result<(), DbError> {
     Ok(())
 }
 
-pub fn get_pending(conn: &Connection, first_poll: bool, limit: i64) -> Result<Vec<MessageInRow>, DbError> {
+pub fn get_pending(
+    conn: &Connection,
+    first_poll: bool,
+    limit: i64,
+) -> Result<Vec<MessageInRow>, DbError> {
     let now = Utc::now().to_rfc3339();
     let mut stmt = conn.prepare(
         "SELECT id, seq, kind, timestamp, status, process_after, recurrence,
@@ -189,8 +192,9 @@ pub fn get_pending(conn: &Connection, first_poll: bool, limit: i64) -> Result<Ve
 
 fn row_to_message_in(row: &Row<'_>) -> rusqlite::Result<MessageInRow> {
     let id_str: String = row.get("id")?;
-    let id = uuid::Uuid::parse_str(&id_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let id = uuid::Uuid::parse_str(&id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let kind: String = row.get("kind")?;
     let kind = MessageKind::parse_str(&kind).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -264,7 +268,9 @@ fn parse_dt(row: &Row<'_>, col: &str) -> rusqlite::Result<DateTime<Utc>> {
     let s: String = row.get(col)?;
     DateTime::parse_from_rfc3339(&s)
         .map(|d| d.with_timezone(&Utc))
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })
 }
 
 fn parse_dt_opt(row: &Row<'_>, col: &str) -> rusqlite::Result<Option<DateTime<Utc>>> {
@@ -278,14 +284,20 @@ fn parse_dt_opt(row: &Row<'_>, col: &str) -> rusqlite::Result<Option<DateTime<Ut
         None | Some("") => Ok(None),
         Some(ts) => DateTime::parse_from_rfc3339(ts)
             .map(|d| Some(d.with_timezone(&Utc)))
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))),
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            }),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{open_inbound, SessionPaths};
+    use crate::session::{SessionPaths, open_inbound};
     use copperclaw_types::{AgentGroupId, SessionId};
     use serde_json::json;
 

@@ -17,7 +17,7 @@
 //! ```
 
 use crate::error::ToolError;
-use crate::tools::{make_tool, parse_args, success_json, ToolEntry, ToolHandler};
+use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args, success_json};
 use rmcp::model::{CallToolResult, JsonObject, Tool};
 use serde::Deserialize;
 use serde_json::json;
@@ -68,10 +68,7 @@ fn compute(root: &Path) -> Result<serde_json::Value, ToolError> {
     let (branch, head_resolves) = match repo.head() {
         Ok(head) => {
             if head.is_branch() {
-                let name = head
-                    .shorthand()
-                    .unwrap_or("HEAD")
-                    .to_string();
+                let name = head.shorthand().unwrap_or("HEAD").to_string();
                 (name, true)
             } else {
                 // Detached HEAD — report the short OID so the agent can
@@ -157,12 +154,8 @@ fn upstream_delta(repo: &git2::Repository) -> Option<(usize, usize)> {
         .ok()?
         .as_str()
         .map(String::from)?;
-    let upstream_oid = repo
-        .refname_to_id(&upstream_ref)
-        .ok()?;
-    let (ahead, behind) = repo
-        .graph_ahead_behind(local_oid, upstream_oid)
-        .ok()?;
+    let upstream_oid = repo.refname_to_id(&upstream_ref).ok()?;
+    let (ahead, behind) = repo.graph_ahead_behind(local_oid, upstream_oid).ok()?;
     Some((ahead, behind))
 }
 

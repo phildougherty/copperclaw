@@ -67,8 +67,7 @@ async fn opencode_provider_accepts_push() {
 
 #[tokio::test]
 async fn generic_subprocess_spawn_failure_maps_to_transport() {
-    let p =
-        SubprocessProvider::new(SubprocessConfig::new("missing", "/no/such/binary/here"));
+    let p = SubprocessProvider::new(SubprocessConfig::new("missing", "/no/such/binary/here"));
     let r = p.query(QueryInput::new("s", "m")).await;
     match r {
         Err(ProviderError::Transport(msg)) => assert!(msg.starts_with("spawn ")),

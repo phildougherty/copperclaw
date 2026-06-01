@@ -38,8 +38,8 @@ impl Step for VerifyStep {
 
 /// Open the central DB at `path` and return the number of `agent_groups`.
 pub fn count_agent_groups(path: &std::path::Path) -> Result<usize, StepError> {
-    let db = CentralDb::open(path)
-        .map_err(|e| StepError::Other(format!("open central DB: {e}")))?;
+    let db =
+        CentralDb::open(path).map_err(|e| StepError::Other(format!("open central DB: {e}")))?;
     let rows =
         agent_groups::list(&db).map_err(|e| StepError::Other(format!("list agent_groups: {e}")))?;
     Ok(rows.len())

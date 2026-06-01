@@ -32,12 +32,12 @@ pub mod self_mod;
 pub mod typing;
 
 pub use agent_to_agent::{
+    AgentDispatchModule, AgentRef, AgentToAgentModule, CreateAgentHandler, CreateAgentModule,
+    CreateAgentPermissionCheck, CreateAgentPermissionCtx,
     always_allow as create_agent_always_allow, always_deny as create_agent_always_deny,
-    users_table_check as create_agent_users_table_check, AgentDispatchModule, AgentRef,
-    AgentToAgentModule, CreateAgentHandler, CreateAgentModule, CreateAgentPermissionCheck,
-    CreateAgentPermissionCtx,
+    users_table_check as create_agent_users_table_check,
 };
-pub use approvals::{ApprovalsModule, ApprovalSummary, NewPendingCtx, NewPendingNotifier};
+pub use approvals::{ApprovalSummary, ApprovalsModule, NewPendingCtx, NewPendingNotifier};
 pub use context::{
     ChannelRequestCtx, DeliveryActionHandler, DeliveryActionInput, DeliveryActionOutput,
     DeliveryDispatcher, DispatchTarget, GateCtx, GateDecision, InterceptorCtx, InterceptorDecision,
@@ -48,9 +48,9 @@ pub use interactive::{InteractiveModule, PendingQuestion, QuestionId};
 pub use mount_security::{MountError, MountSecurityModule, validate_mount_target};
 pub use permissions::{PermissionOp, PermissionsModule, Role, check as permissions_check};
 pub use scheduling::{
-    compute_next_fire, parse_when, CreateTaskSpec, InMemoryTaskStore, ScheduleError,
-    ScheduleHandler, SchedulingModule, TaskRecord, TaskStatus as ScheduledTaskStatus, TaskStore,
-    UpdateTaskFields, When,
+    CreateTaskSpec, InMemoryTaskStore, ScheduleError, ScheduleHandler, SchedulingModule,
+    TaskRecord, TaskStatus as ScheduledTaskStatus, TaskStore, UpdateTaskFields, When,
+    compute_next_fire, parse_when,
 };
 pub use self_mod::{ChangeRequest, PackageError, PackageManager, SelfModModule};
 pub use typing::{TypingConfig, TypingModule};

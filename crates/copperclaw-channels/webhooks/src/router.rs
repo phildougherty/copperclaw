@@ -18,12 +18,12 @@
 //! See [`crate::signature`] for the HMAC verification path.
 
 use crate::config::WebhooksConfig;
-use crate::signature::{verify, SignatureOutcome};
+use crate::signature::{SignatureOutcome, verify};
+use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
-use axum::Router;
 use chrono::Utc;
 use copperclaw_types::{ChannelType, InboundEvent, InboundMessage, MessageKind};
 use tokio::sync::mpsc::Sender;
@@ -107,12 +107,7 @@ async fn process(
         let header_value = headers
             .get(&state.config.signature_header)
             .and_then(|v| v.to_str().ok());
-        match verify(
-            &body,
-            secret,
-            &state.config.signature_prefix,
-            header_value,
-        ) {
+        match verify(&body, secret, &state.config.signature_prefix, header_value) {
             SignatureOutcome::Ok => {}
             SignatureOutcome::HeaderMissing => {
                 return (StatusCode::UNAUTHORIZED, "signature header missing");
@@ -195,11 +190,7 @@ mod tests {
     #[tokio::test]
     async fn unsigned_post_is_accepted_when_no_secret_configured() {
         let (tx, mut rx) = mpsc::channel::<InboundEvent>(8);
-        let state = WebhooksRouterState::new(
-            ChannelType::new("webhooks"),
-            cfg(None, "/hooks"),
-            tx,
-        );
+        let state = WebhooksRouterState::new(ChannelType::new("webhooks"), cfg(None, "/hooks"), tx);
         let router = build_router(state);
         let resp = post_json(router, "/hooks", None, br#"{"hello":"world"}"#).await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -212,11 +203,7 @@ mod tests {
     #[tokio::test]
     async fn suffix_path_becomes_platform_id() {
         let (tx, mut rx) = mpsc::channel::<InboundEvent>(8);
-        let state = WebhooksRouterState::new(
-            ChannelType::new("webhooks"),
-            cfg(None, "/hooks"),
-            tx,
-        );
+        let state = WebhooksRouterState::new(ChannelType::new("webhooks"), cfg(None, "/hooks"), tx);
         let router = build_router(state);
         let resp = post_json(router, "/hooks/stripe/invoices", None, b"{}").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -272,11 +259,7 @@ mod tests {
     #[tokio::test]
     async fn non_json_rejected_with_415() {
         let (tx, _rx) = mpsc::channel::<InboundEvent>(8);
-        let state = WebhooksRouterState::new(
-            ChannelType::new("webhooks"),
-            cfg(None, "/hooks"),
-            tx,
-        );
+        let state = WebhooksRouterState::new(ChannelType::new("webhooks"), cfg(None, "/hooks"), tx);
         let router = build_router(state);
         let resp = post_json(router, "/hooks", None, b"not json").await;
         assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
@@ -286,11 +269,7 @@ mod tests {
     async fn closed_inbound_returns_503() {
         let (tx, rx) = mpsc::channel::<InboundEvent>(8);
         drop(rx);
-        let state = WebhooksRouterState::new(
-            ChannelType::new("webhooks"),
-            cfg(None, "/hooks"),
-            tx,
-        );
+        let state = WebhooksRouterState::new(ChannelType::new("webhooks"), cfg(None, "/hooks"), tx);
         let router = build_router(state);
         let resp = post_json(router, "/hooks", None, b"{}").await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -299,11 +278,7 @@ mod tests {
     #[tokio::test]
     async fn root_path_works() {
         let (tx, mut rx) = mpsc::channel::<InboundEvent>(8);
-        let state = WebhooksRouterState::new(
-            ChannelType::new("webhooks"),
-            cfg(None, "/"),
-            tx,
-        );
+        let state = WebhooksRouterState::new(ChannelType::new("webhooks"), cfg(None, "/"), tx);
         let router = build_router(state);
         let resp = post_json(router, "/", None, b"{}").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -314,11 +289,7 @@ mod tests {
     #[tokio::test]
     async fn root_path_suffix_works() {
         let (tx, mut rx) = mpsc::channel::<InboundEvent>(8);
-        let state = WebhooksRouterState::new(
-            ChannelType::new("webhooks"),
-            cfg(None, "/"),
-            tx,
-        );
+        let state = WebhooksRouterState::new(ChannelType::new("webhooks"), cfg(None, "/"), tx);
         let router = build_router(state);
         let resp = post_json(router, "/grafana", None, b"{}").await;
         assert_eq!(resp.status(), StatusCode::OK);

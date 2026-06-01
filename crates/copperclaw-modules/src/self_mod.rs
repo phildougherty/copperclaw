@@ -164,7 +164,7 @@ pub fn validate_mcp_transport(transport: &serde_json::Value) -> Result<(), Packa
         other => {
             return Err(PackageError::BadTransport(format!(
                 "unknown transport `{other}`"
-            )))
+            )));
         }
     }
     Ok(())
@@ -385,11 +385,7 @@ mod tests {
     fn build_install_validates() {
         let m = SelfModModule;
         let req = m
-            .build_install_packages(
-                vec!["jq".into()],
-                vec!["left-pad".into()],
-                "tests".into(),
-            )
+            .build_install_packages(vec!["jq".into()], vec!["left-pad".into()], "tests".into())
             .unwrap();
         if let ChangeRequest::InstallPackages { apt, npm, reason } = req {
             assert_eq!(apt, vec!["jq"]);

@@ -80,15 +80,12 @@ impl ChatInfo {
 /// `add_account` — returns the newly created account id.
 pub async fn add_account(transport: &dyn RpcTransport) -> Result<u64, AdapterError> {
     let v = transport.call("add_account", json!([])).await?;
-    v.as_u64().ok_or_else(|| {
-        AdapterError::BadRequest(format!("add_account returned non-number: {v}"))
-    })
+    v.as_u64()
+        .ok_or_else(|| AdapterError::BadRequest(format!("add_account returned non-number: {v}")))
 }
 
 /// `get_all_account_ids` — returns the configured account ids.
-pub async fn get_all_account_ids(
-    transport: &dyn RpcTransport,
-) -> Result<Vec<u64>, AdapterError> {
+pub async fn get_all_account_ids(transport: &dyn RpcTransport) -> Result<Vec<u64>, AdapterError> {
     let v = transport.call("get_all_account_ids", json!([])).await?;
     let arr = v.as_array().ok_or_else(|| {
         AdapterError::BadRequest(format!("get_all_account_ids returned non-array: {v}"))
@@ -117,9 +114,8 @@ pub async fn send_msg(
     let v = transport
         .call("send_msg", json!([account_id, chat_id, payload]))
         .await?;
-    v.as_i64().ok_or_else(|| {
-        AdapterError::BadRequest(format!("send_msg returned non-integer id: {v}"))
-    })
+    v.as_i64()
+        .ok_or_else(|| AdapterError::BadRequest(format!("send_msg returned non-integer id: {v}")))
 }
 
 /// `send_reaction` — react to a message with one or more emoji.
@@ -163,9 +159,8 @@ pub async fn get_message(
     let v = transport
         .call("get_message", json!([account_id, msg_id]))
         .await?;
-    serde_json::from_value(v).map_err(|e| {
-        AdapterError::BadRequest(format!("get_message decode failed: {e}"))
-    })
+    serde_json::from_value(v)
+        .map_err(|e| AdapterError::BadRequest(format!("get_message decode failed: {e}")))
 }
 
 /// `get_basic_chat_info` — fetch a chat's metadata.
@@ -177,9 +172,8 @@ pub async fn get_basic_chat_info(
     let v = transport
         .call("get_basic_chat_info", json!([account_id, chat_id]))
         .await?;
-    serde_json::from_value(v).map_err(|e| {
-        AdapterError::BadRequest(format!("get_basic_chat_info decode failed: {e}"))
-    })
+    serde_json::from_value(v)
+        .map_err(|e| AdapterError::BadRequest(format!("get_basic_chat_info decode failed: {e}")))
 }
 
 /// `get_next_event` — block until the next event from the server.
@@ -210,7 +204,8 @@ mod tests {
     #[tokio::test]
     async fn add_account_returns_id() {
         let m = MockTransport::new();
-        m.push_response(MockResponse::ok("add_account", json!(5))).await;
+        m.push_response(MockResponse::ok("add_account", json!(5)))
+            .await;
         let id = add_account(&m).await.unwrap();
         assert_eq!(id, 5);
         let calls = m.observed().await;
@@ -222,7 +217,8 @@ mod tests {
     #[tokio::test]
     async fn add_account_rejects_non_number_payload() {
         let m = MockTransport::new();
-        m.push_response(MockResponse::ok("add_account", json!("nope"))).await;
+        m.push_response(MockResponse::ok("add_account", json!("nope")))
+            .await;
         let err = add_account(&m).await.unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
@@ -230,7 +226,8 @@ mod tests {
     #[tokio::test]
     async fn get_all_account_ids_decodes_array() {
         let m = MockTransport::new();
-        m.push_response(MockResponse::ok("get_all_account_ids", json!([1, 2, 3]))).await;
+        m.push_response(MockResponse::ok("get_all_account_ids", json!([1, 2, 3])))
+            .await;
         let ids = get_all_account_ids(&m).await.unwrap();
         assert_eq!(ids, vec![1, 2, 3]);
         let calls = m.observed().await;
@@ -240,7 +237,8 @@ mod tests {
     #[tokio::test]
     async fn get_all_account_ids_rejects_non_array() {
         let m = MockTransport::new();
-        m.push_response(MockResponse::ok("get_all_account_ids", json!(1))).await;
+        m.push_response(MockResponse::ok("get_all_account_ids", json!(1)))
+            .await;
         let err = get_all_account_ids(&m).await.unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
@@ -248,7 +246,8 @@ mod tests {
     #[tokio::test]
     async fn get_all_account_ids_rejects_non_integer_entry() {
         let m = MockTransport::new();
-        m.push_response(MockResponse::ok("get_all_account_ids", json!(["a"]))).await;
+        m.push_response(MockResponse::ok("get_all_account_ids", json!(["a"])))
+            .await;
         let err = get_all_account_ids(&m).await.unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
@@ -256,7 +255,8 @@ mod tests {
     #[tokio::test]
     async fn send_msg_returns_message_id_and_params_shape_is_correct() {
         let m = MockTransport::new();
-        m.push_response(MockResponse::ok("send_msg", json!(101))).await;
+        m.push_response(MockResponse::ok("send_msg", json!(101)))
+            .await;
         let id = send_msg(&m, 1, 42, json!({"text": "hi"})).await.unwrap();
         assert_eq!(id, 101);
         let calls = m.observed().await;
@@ -267,7 +267,8 @@ mod tests {
     #[tokio::test]
     async fn send_msg_rejects_non_integer_result() {
         let m = MockTransport::new();
-        m.push_response(MockResponse::ok("send_msg", json!("oops"))).await;
+        m.push_response(MockResponse::ok("send_msg", json!("oops")))
+            .await;
         let err = send_msg(&m, 1, 1, json!({})).await.unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
@@ -275,7 +276,8 @@ mod tests {
     #[tokio::test]
     async fn send_reaction_passes_emojis_array() {
         let m = MockTransport::new();
-        m.push_response(MockResponse::ok("send_reaction", json!(7))).await;
+        m.push_response(MockResponse::ok("send_reaction", json!(7)))
+            .await;
         let id = send_reaction(&m, 1, 50, &["+1".to_owned()]).await.unwrap();
         assert_eq!(id, 7);
         let calls = m.observed().await;
@@ -286,7 +288,8 @@ mod tests {
     #[tokio::test]
     async fn send_reaction_null_result_returns_zero() {
         let m = MockTransport::new();
-        m.push_response(MockResponse::ok("send_reaction", Value::Null)).await;
+        m.push_response(MockResponse::ok("send_reaction", Value::Null))
+            .await;
         let id = send_reaction(&m, 1, 50, &["+1".to_owned()]).await.unwrap();
         assert_eq!(id, 0);
     }
@@ -294,15 +297,19 @@ mod tests {
     #[tokio::test]
     async fn send_reaction_rejects_non_integer_result() {
         let m = MockTransport::new();
-        m.push_response(MockResponse::ok("send_reaction", json!("nope"))).await;
-        let err = send_reaction(&m, 1, 50, &["+1".to_owned()]).await.unwrap_err();
+        m.push_response(MockResponse::ok("send_reaction", json!("nope")))
+            .await;
+        let err = send_reaction(&m, 1, 50, &["+1".to_owned()])
+            .await
+            .unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 
     #[tokio::test]
     async fn delete_messages_invokes_with_account_and_ids() {
         let m = MockTransport::new();
-        m.push_response(MockResponse::ok("delete_messages", Value::Null)).await;
+        m.push_response(MockResponse::ok("delete_messages", Value::Null))
+            .await;
         delete_messages(&m, 1, &[10, 20]).await.unwrap();
         let calls = m.observed().await;
         assert_eq!(calls[0].method, "delete_messages");
@@ -370,7 +377,8 @@ mod tests {
     #[tokio::test]
     async fn get_message_decode_failure_is_bad_request() {
         let m = MockTransport::new();
-        m.push_response(MockResponse::ok("get_message", json!("not an object"))).await;
+        m.push_response(MockResponse::ok("get_message", json!("not an object")))
+            .await;
         let err = get_message(&m, 1, 1).await.unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
@@ -393,7 +401,8 @@ mod tests {
     #[tokio::test]
     async fn get_basic_chat_info_decode_failure_is_bad_request() {
         let m = MockTransport::new();
-        m.push_response(MockResponse::ok("get_basic_chat_info", json!("nope"))).await;
+        m.push_response(MockResponse::ok("get_basic_chat_info", json!("nope")))
+            .await;
         let err = get_basic_chat_info(&m, 1, 1).await.unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
@@ -409,7 +418,8 @@ mod tests {
     #[tokio::test]
     async fn get_next_event_propagates_transport_error() {
         let m = MockTransport::new();
-        m.push_event_error(AdapterError::Transport("nope".into())).await;
+        m.push_event_error(AdapterError::Transport("nope".into()))
+            .await;
         let err = get_next_event(&m).await.unwrap_err();
         assert!(matches!(err, AdapterError::Transport(_)));
     }
@@ -417,19 +427,27 @@ mod tests {
     #[test]
     fn chat_info_is_group_branches() {
         let single = ChatInfo {
-            id: 1, chat_type: 1, name: "Alice".into(),
+            id: 1,
+            chat_type: 1,
+            name: "Alice".into(),
         };
         assert!(!single.is_group());
         let group = ChatInfo {
-            id: 1, chat_type: 2, name: "Team".into(),
+            id: 1,
+            chat_type: 2,
+            name: "Team".into(),
         };
         assert!(group.is_group());
         let ml = ChatInfo {
-            id: 1, chat_type: 3, name: "List".into(),
+            id: 1,
+            chat_type: 3,
+            name: "List".into(),
         };
         assert!(ml.is_group());
         let bc = ChatInfo {
-            id: 1, chat_type: 4, name: "Broadcast".into(),
+            id: 1,
+            chat_type: 4,
+            name: "Broadcast".into(),
         };
         assert!(bc.is_group());
     }
@@ -448,12 +466,19 @@ mod tests {
     #[test]
     fn message_view_clone_and_debug() {
         let v = MessageView {
-            id: 1, chat_id: 1, from_id: 1,
-            text: "x".into(), is_info: false,
-            view_type: "Text".into(), file: None,
-            filename: None, file_mime: None, file_bytes: None,
+            id: 1,
+            chat_id: 1,
+            from_id: 1,
+            text: "x".into(),
+            is_info: false,
+            view_type: "Text".into(),
+            file: None,
+            filename: None,
+            file_mime: None,
+            file_bytes: None,
             download_state: Some("Done".into()),
-            timestamp: 0, sender_name: None,
+            timestamp: 0,
+            sender_name: None,
         };
         let _ = v.clone();
         assert!(format!("{v:?}").contains("MessageView"));
@@ -462,7 +487,9 @@ mod tests {
     #[test]
     fn chat_info_clone_and_debug() {
         let c = ChatInfo {
-            id: 1, chat_type: 1, name: "x".into(),
+            id: 1,
+            chat_type: 1,
+            name: "x".into(),
         };
         let _ = c.clone();
         assert!(format!("{c:?}").contains("ChatInfo"));

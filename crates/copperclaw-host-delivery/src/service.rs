@@ -5,14 +5,13 @@
 
 use crate::dispatch::{AdapterResolver, HostDispatcher};
 use crate::error::DeliveryError;
-use crate::system_actions::{parse_system_content, ParsedAction};
-use dashmap::DashMap;
+use crate::system_actions::{ParsedAction, parse_system_content};
 use copperclaw_channels_core::{
     AdapterError, Breadcrumb, Card, ChannelAdapter, DiffCard, ErrorCard, ErrorCardKind,
     ThinkingBlock, TodoList,
 };
 use copperclaw_db::central::CentralDb;
-use copperclaw_db::session::{open_inbound, open_outbound, SessionPaths};
+use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
 use copperclaw_db::tables::{delivered, messages_in, messages_out, session_routing};
 use copperclaw_modules::{
     DeliveryActionHandler, DeliveryActionInput, DeliveryDispatcher, DispatchTarget,
@@ -21,9 +20,10 @@ use copperclaw_types::{
     AgentGroupId, ChannelType, ContainerStatus, MessageId, MessageKind, MessageOutRow,
     OutboundMessage, Session, SessionId, SessionStatus,
 };
+use dashmap::DashMap;
 use rusqlite::{Connection, OptionalExtension};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -415,9 +415,7 @@ impl DeliveryService {
             }
 
             // Backoff guard.
-            if let Some(not_before) =
-                self.retries.get(&key).map(|r| r.not_before)
-            {
+            if let Some(not_before) = self.retries.get(&key).map(|r| r.not_before) {
                 if now < not_before {
                     report.deferred += 1;
                     continue;
@@ -467,11 +465,9 @@ impl DeliveryService {
                             // an emit failure here can't be allowed to
                             // poison the delivery loop, and the `failed`
                             // row above is the load-bearing record.
-                            if let Err(emit_err) = self.emit_delivery_failure_error_card(
-                                sess,
-                                &row,
-                                &err.to_string(),
-                            ) {
+                            if let Err(emit_err) =
+                                self.emit_delivery_failure_error_card(sess, &row, &err.to_string())
+                            {
                                 warn!(
                                     ?emit_err,
                                     ?row.id,
@@ -527,9 +523,7 @@ impl DeliveryService {
         routing: Option<&copperclaw_types::routing::SessionRouting>,
         inbound_pool: &SessionPool,
     ) -> Result<(), DeliveryError> {
-        let target = Self::resolve_target(row, routing).ok_or(
-            DeliveryError::NoRoute(sess.id),
-        )?;
+        let target = Self::resolve_target(row, routing).ok_or(DeliveryError::NoRoute(sess.id))?;
 
         match row.kind {
             MessageKind::System => {
@@ -567,7 +561,8 @@ impl DeliveryService {
                 delivered::insert(&in_conn, row.id, None, "ok")?;
             }
             MessageKind::Chat | MessageKind::Task | MessageKind::Webhook => {
-                self.dispatch_chat(sess.id, row, &target, inbound_pool).await?;
+                self.dispatch_chat(sess.id, row, &target, inbound_pool)
+                    .await?;
             }
             // Wave 2 of the cards rollout: deserialize the canonical
             // Card from `content.card` and call the adapter's
@@ -592,7 +587,8 @@ impl DeliveryService {
             // render a compact chip; the trait-level default falls
             // back to a `[tool] detail` text line via `deliver`.
             MessageKind::Breadcrumb => {
-                self.dispatch_breadcrumb(row, &target, inbound_pool, None).await?;
+                self.dispatch_breadcrumb(row, &target, inbound_pool, None)
+                    .await?;
             }
             // Diff-kind rows: see `dispatch_diff` for the wire shape
             // and per-channel rendering notes.
@@ -624,7 +620,8 @@ impl DeliveryService {
             // checklist; the trait-level default emits a text-line
             // checklist via `deliver`.
             MessageKind::TodoList => {
-                self.dispatch_todo_list(row, &target, inbound_pool, sess).await?;
+                self.dispatch_todo_list(row, &target, inbound_pool, sess)
+                    .await?;
             }
             // Error-kind rows ride a dedicated dispatch that pulls the
             // canonical `ErrorCard` out of `content.error` and hands it
@@ -716,14 +713,8 @@ impl DeliveryService {
         // platform id isn't known (no edit-API support, or chip
         // hasn't been delivered yet).
         if action.name == "update_breadcrumb" {
-            self.handle_update_breadcrumb(
-                row,
-                target,
-                inbound_pool,
-                &action.payload,
-                sess,
-            )
-            .await?;
+            self.handle_update_breadcrumb(row, target, inbound_pool, &action.payload, sess)
+                .await?;
             return Ok(());
         }
 
@@ -859,7 +850,10 @@ impl DeliveryService {
         outbound_pool: &SessionPool,
     ) -> Result<ActionAdapterOutcome, DeliveryError> {
         let Some(seq) = payload.get("seq").and_then(serde_json::Value::as_i64) else {
-            warn!(action = action_name, "edit/reaction payload missing seq; falling back");
+            warn!(
+                action = action_name,
+                "edit/reaction payload missing seq; falling back"
+            );
             return Ok(ActionAdapterOutcome::FallThrough);
         };
         // Need a target with channel_type + platform_id; otherwise fall back.
@@ -908,7 +902,12 @@ impl DeliveryService {
                     return Ok(ActionAdapterOutcome::FallThrough);
                 };
                 adapter
-                    .edit_message(&platform_id, target.thread_id.as_deref(), &external_id, text)
+                    .edit_message(
+                        &platform_id,
+                        target.thread_id.as_deref(),
+                        &external_id,
+                        text,
+                    )
                     .await
             }
             "reaction" => {
@@ -933,7 +932,10 @@ impl DeliveryService {
         match call_result {
             Ok(()) => Ok(ActionAdapterOutcome::Done),
             Err(AdapterError::Unsupported(reason)) => {
-                info!(action = action_name, reason, "adapter unsupported; falling back");
+                info!(
+                    action = action_name,
+                    reason, "adapter unsupported; falling back"
+                );
                 Ok(ActionAdapterOutcome::FallThrough)
             }
             Err(other) => Err(DeliveryError::Adapter(other)),
@@ -974,9 +976,7 @@ impl DeliveryService {
                         ?err,
                         "self-mod hard-fail; surfacing as DeliveryError",
                     );
-                    return Err(DeliveryError::SystemAction(format!(
-                        "{action}: {err}"
-                    )));
+                    return Err(DeliveryError::SystemAction(format!("{action}: {err}")));
                 }
                 record_self_mod_failure(sess, row, inbound_pool, action, &err)?;
                 Ok(())
@@ -1058,10 +1058,10 @@ impl DeliveryService {
         // entry) by `process_session_once` when the row finally lands as
         // `delivered=ok` or exhausts its retry budget.
         let key = DeliveryKey::new(session_id, row.id);
-        let (start_index, mut first_platform_id) = self.retries.get(&key).map_or(
-            (0usize, None),
-            |s| (s.chunks_sent as usize, s.first_chunk_pid.clone()),
-        );
+        let (start_index, mut first_platform_id) =
+            self.retries.get(&key).map_or((0usize, None), |s| {
+                (s.chunks_sent as usize, s.first_chunk_pid.clone())
+            });
 
         let total_parts = parts.len();
         for (i, content) in parts.iter().enumerate().skip(start_index) {
@@ -1170,8 +1170,7 @@ impl DeliveryService {
             Err(AdapterError::Unsupported(reason)) => {
                 info!(
                     channel = adapter.channel_type().as_str(),
-                    reason,
-                    "deliver_collapsible unsupported; falling back to summary text deliver"
+                    reason, "deliver_collapsible unsupported; falling back to summary text deliver"
                 );
                 let body = copperclaw_channels_core::render_collapsible_text_fallback(
                     &text,
@@ -1280,8 +1279,7 @@ impl DeliveryService {
             Err(AdapterError::Unsupported(reason)) => {
                 info!(
                     channel = adapter.channel_type().as_str(),
-                    reason,
-                    "deliver_card unsupported; falling back to text deliver"
+                    reason, "deliver_card unsupported; falling back to text deliver"
                 );
                 let outbound = OutboundMessage {
                     kind: MessageKind::Chat,
@@ -1372,8 +1370,7 @@ impl DeliveryService {
             Err(AdapterError::Unsupported(reason)) => {
                 info!(
                     channel = adapter.channel_type().as_str(),
-                    reason,
-                    "deliver_breadcrumb unsupported; falling back to text deliver"
+                    reason, "deliver_breadcrumb unsupported; falling back to text deliver"
                 );
                 let outbound = OutboundMessage {
                     kind: MessageKind::Chat,
@@ -1499,8 +1496,7 @@ impl DeliveryService {
             Err(AdapterError::Unsupported(reason)) => {
                 info!(
                     channel = adapter.channel_type().as_str(),
-                    reason,
-                    "deliver_todo_list unsupported; falling back to text deliver"
+                    reason, "deliver_todo_list unsupported; falling back to text deliver"
                 );
                 let outbound = OutboundMessage {
                     kind: MessageKind::Chat,
@@ -1590,8 +1586,7 @@ impl DeliveryService {
             Err(AdapterError::Unsupported(reason)) => {
                 info!(
                     channel = adapter.channel_type().as_str(),
-                    reason,
-                    "deliver_error unsupported; falling back to text deliver"
+                    reason, "deliver_error unsupported; falling back to text deliver"
                 );
                 let outbound = OutboundMessage {
                     kind: MessageKind::Chat,
@@ -1682,8 +1677,7 @@ impl DeliveryService {
             Err(AdapterError::Unsupported(reason)) => {
                 info!(
                     channel = adapter.channel_type().as_str(),
-                    reason,
-                    "deliver_thinking unsupported; falling back to text deliver"
+                    reason, "deliver_thinking unsupported; falling back to text deliver"
                 );
                 let outbound = OutboundMessage {
                     kind: MessageKind::Chat,
@@ -1767,8 +1761,7 @@ impl DeliveryService {
             Err(AdapterError::Unsupported(reason)) => {
                 info!(
                     channel = adapter.channel_type().as_str(),
-                    reason,
-                    "deliver_diff unsupported; falling back to text deliver"
+                    reason, "deliver_diff unsupported; falling back to text deliver"
                 );
                 let outbound = OutboundMessage {
                     kind: MessageKind::Chat,
@@ -1831,9 +1824,7 @@ impl DeliveryService {
             // Cap the reason at the summary cap so a giant adapter
             // error doesn't blow the card's validation.
             let capped: String = trimmed.chars().take(400).collect();
-            format!(
-                "delivery failed after exhausting the retry budget: {capped}"
-            )
+            format!("delivery failed after exhausting the retry budget: {capped}")
         };
         let card = ErrorCard::new(ErrorCardKind::Delivery, summary)
             .with_title("Could not deliver message");
@@ -2001,9 +1992,7 @@ impl DeliveryService {
         // pathological hint can't park a row for hours. Fall back to the
         // fixed exponential schedule when no hint is given.
         let delay = match retry_after_secs {
-            Some(s) => s
-                .saturating_mul(1_000)
-                .min(ABSOLUTE_CEILING_MS),
+            Some(s) => s.saturating_mul(1_000).min(ABSOLUTE_CEILING_MS),
             None => backoff_delay_ms(entry.tries),
         };
         entry.not_before = now + Duration::from_millis(delay);
@@ -2013,7 +2002,9 @@ impl DeliveryService {
     /// Snapshot of sessions visible to the active loop (status=Active,
     /// container=Running).
     pub fn list_running_sessions(&self) -> Result<Vec<Session>, DeliveryError> {
-        Ok(copperclaw_db::tables::sessions::list_running(&self.central)?)
+        Ok(copperclaw_db::tables::sessions::list_running(
+            &self.central,
+        )?)
     }
 
     /// Snapshot of sessions visible to the sweep loop (status=Active).
@@ -2114,10 +2105,7 @@ fn find_cut(chars: &[char], lo: usize, hi: usize) -> usize {
         if c == '。' || c == '！' || c == '？' {
             return i + 1;
         }
-        if i + 1 < chars.len()
-            && (c == '.' || c == '!' || c == '?')
-            && chars[i + 1] == ' '
-        {
+        if i + 1 < chars.len() && (c == '.' || c == '!' || c == '?') && chars[i + 1] == ' ' {
             return i + 1;
         }
         i -= 1;
@@ -2159,10 +2147,7 @@ async fn call_adapter(
             let Some(fallback_msg) = adapter.plain_text_fallback(message) else {
                 return Err(DeliveryError::Adapter(original));
             };
-            match adapter
-                .deliver(platform_id, thread_id, &fallback_msg)
-                .await
-            {
+            match adapter.deliver(platform_id, thread_id, &fallback_msg).await {
                 Ok(id) => {
                     let ct = adapter.channel_type().as_str();
                     info!(channel = ct, "delivered with reduced formatting");
@@ -2214,10 +2199,7 @@ pub(crate) fn is_session_active(s: &Session) -> bool {
 /// Returns `Ok(None)` when no row with that seq exists. Pulled out of
 /// [`DeliveryService::try_action_via_adapter`] so the SELECT lives in one
 /// place and can be unit-tested directly.
-fn message_id_for_seq(
-    out_conn: &Connection,
-    seq: i64,
-) -> Result<Option<MessageId>, DeliveryError> {
+fn message_id_for_seq(out_conn: &Connection, seq: i64) -> Result<Option<MessageId>, DeliveryError> {
     let mut stmt = out_conn
         .prepare("SELECT id FROM messages_out WHERE seq = ?1")
         .map_err(copperclaw_db::DbError::from)?;
@@ -2228,9 +2210,8 @@ fn message_id_for_seq(
     let Some(id_str) = row else {
         return Ok(None);
     };
-    let uuid = uuid::Uuid::parse_str(&id_str).map_err(|e| {
-        DeliveryError::SystemAction(format!("invalid outbound row uuid: {e}"))
-    })?;
+    let uuid = uuid::Uuid::parse_str(&id_str)
+        .map_err(|e| DeliveryError::SystemAction(format!("invalid outbound row uuid: {e}")))?;
     Ok(Some(MessageId(uuid)))
 }
 
@@ -2248,18 +2229,13 @@ fn lookup_prior_breadcrumb_external_id(
     in_conn: &Connection,
     tool_name: &str,
 ) -> Result<Option<String>, DeliveryError> {
-    lookup_prior_kind_external_id(
-        out_conn,
-        in_conn,
-        MessageKind::Breadcrumb,
-        |content| {
-            content
-                .get("breadcrumb")
-                .and_then(|v| v.get("tool_name"))
-                .and_then(serde_json::Value::as_str)
-                == Some(tool_name)
-        },
-    )
+    lookup_prior_kind_external_id(out_conn, in_conn, MessageKind::Breadcrumb, |content| {
+        content
+            .get("breadcrumb")
+            .and_then(|v| v.get("tool_name"))
+            .and_then(serde_json::Value::as_str)
+            == Some(tool_name)
+    })
 }
 
 /// Find the most recent outbound row of `kind` whose decoded JSON
@@ -2303,10 +2279,7 @@ where
         .map_err(copperclaw_db::DbError::from)?;
     let rows = stmt
         .query_map([kind_str], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-            ))
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })
         .map_err(copperclaw_db::DbError::from)?;
     for row in rows {
@@ -2343,10 +2316,9 @@ fn platform_message_id_for(
         )
         .map_err(copperclaw_db::DbError::from)?;
     let row: Option<Option<String>> = stmt
-        .query_row(
-            [message_out_id.as_uuid().to_string()],
-            |r| r.get::<_, Option<String>>(0),
-        )
+        .query_row([message_out_id.as_uuid().to_string()], |r| {
+            r.get::<_, Option<String>>(0)
+        })
         .optional()
         .map_err(copperclaw_db::DbError::from)?;
     Ok(row.flatten())
@@ -2624,7 +2596,10 @@ fn apply_add_mcp_server(
         Some(n) if !n.trim().is_empty() => n.to_string(),
         _ => return Ok(()),
     };
-    let transport = payload.get("transport").cloned().unwrap_or(serde_json::Value::Null);
+    let transport = payload
+        .get("transport")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     ensure_config_row(central, agent_group_id)?;
     let mut current = container_configs::get_mcp_servers(central, agent_group_id)?;
     if !current.is_object() {
@@ -2637,19 +2612,18 @@ fn apply_add_mcp_server(
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{make_service, MockRoot};
+    use crate::test_support::{MockRoot, make_service};
     use chrono::Utc;
-    use copperclaw_channels_core::testing::MockAdapter;
     use copperclaw_channels_core::AdapterError;
+    use copperclaw_channels_core::testing::MockAdapter;
     use copperclaw_db::tables::container_configs;
     use copperclaw_db::tables::messages_out::WriteOutbound;
+    use copperclaw_modules::ModuleError;
     use copperclaw_modules::context::MockDispatcher;
     use copperclaw_modules::{DeliveryActionHandler, DeliveryActionInput, DeliveryActionOutput};
-    use copperclaw_modules::ModuleError;
     use copperclaw_types::routing::SessionRouting;
     use copperclaw_types::{MessageKind, OutboundMessage};
     use serde_json::json;
@@ -2712,8 +2686,7 @@ mod tests {
     #[test]
     fn session_pool_kinds_open_distinct_files() {
         let tmp = tempfile::tempdir().unwrap();
-        let paths =
-            SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
         let inb = SessionPool::inbound(paths.clone());
         let outb = SessionPool::outbound(paths.clone());
         let _ic = inb.connect().unwrap();
@@ -2767,11 +2740,7 @@ mod tests {
 
     #[test]
     fn split_chat_breaks_on_sentence_when_no_paragraph() {
-        let text = format!(
-            "{}. {}",
-            "a".repeat(40),
-            "b".repeat(40)
-        );
+        let text = format!("{}. {}", "a".repeat(40), "b".repeat(40));
         let v = json!({"text": text});
         let parts = split_chat_content_if_needed(&v, Some(50));
         assert_eq!(parts.len(), 2);
@@ -2819,7 +2788,10 @@ mod tests {
             .session_paths
             .outbound_pool(&sess.agent_group_id, &sess.id)
             .unwrap();
-        write_row(&out_pool, &make_row(MessageKind::Chat, json!({"text":"hi"})));
+        write_row(
+            &out_pool,
+            &make_row(MessageKind::Chat, json!({"text":"hi"})),
+        );
         let rpt = service.process_session_once(&sess).await.unwrap();
         assert_eq!(rpt.delivered, 1);
         assert_eq!(rpt.failed, 0);
@@ -2878,8 +2850,7 @@ mod tests {
         let delay = entry.not_before.saturating_duration_since(before);
         // Allow a tight tolerance for the ~milliseconds spent in the loop.
         assert!(
-            delay >= Duration::from_millis(9_500)
-                && delay <= Duration::from_millis(10_500),
+            delay >= Duration::from_millis(9_500) && delay <= Duration::from_millis(10_500),
             "expected ~10s backoff, got {delay:?}",
         );
     }
@@ -2901,8 +2872,7 @@ mod tests {
         let delay = entry.not_before.saturating_duration_since(before);
         // First-attempt exponential = BACKOFF_BASE_MS (5s).
         assert!(
-            delay >= Duration::from_millis(4_500)
-                && delay <= Duration::from_millis(5_500),
+            delay >= Duration::from_millis(4_500) && delay <= Duration::from_millis(5_500),
             "expected ~5s exponential backoff, got {delay:?}",
         );
     }
@@ -2917,14 +2887,14 @@ mod tests {
         let row = make_row(MessageKind::Chat, json!({"text":"hi"}));
         write_row(&out_pool, &row);
         // First attempt -> rate-limited.
-        mock.fail_next_deliver(AdapterError::Rate { retry_after: Some(1) });
+        mock.fail_next_deliver(AdapterError::Rate {
+            retry_after: Some(1),
+        });
         let rpt1 = service.process_session_once(&sess).await.unwrap();
         assert_eq!(rpt1.deferred, 1);
         assert_eq!(rpt1.delivered, 0);
         // Force backoff window to be in the past so the retry can execute.
-        if let Some(mut entry) =
-            service.retries.get_mut(&DeliveryKey::new(sess.id, row.id))
-        {
+        if let Some(mut entry) = service.retries.get_mut(&DeliveryKey::new(sess.id, row.id)) {
             entry.not_before = Instant::now()
                 .checked_sub(Duration::from_secs(1))
                 .unwrap_or_else(Instant::now);
@@ -2950,8 +2920,8 @@ mod tests {
             mock.fail_next_deliver(AdapterError::Transport("502".into()));
             if let Some(mut entry) = service.retries.get_mut(&key) {
                 entry.not_before = Instant::now()
-                .checked_sub(Duration::from_secs(1))
-                .unwrap_or_else(Instant::now);
+                    .checked_sub(Duration::from_secs(1))
+                    .unwrap_or_else(Instant::now);
             }
             let _ = service.process_session_once(&sess).await.unwrap();
         }
@@ -3012,14 +2982,16 @@ mod tests {
         let err_row = error_rows[0];
         assert_eq!(err_row.platform_id.as_deref(), Some("plat-1"));
         assert_eq!(
-            err_row.channel_type.as_ref().map(copperclaw_types::ChannelType::as_str),
+            err_row
+                .channel_type
+                .as_ref()
+                .map(copperclaw_types::ChannelType::as_str),
             Some("mock")
         );
         // The row carries the canonical ErrorCard in content.error,
         // tagged with kind=Delivery and `retryable=false` (we GAVE UP
         // retrying — promising another retry would be a lie).
-        let card: ErrorCard =
-            serde_json::from_value(err_row.content["error"].clone()).unwrap();
+        let card: ErrorCard = serde_json::from_value(err_row.content["error"].clone()).unwrap();
         assert_eq!(card.kind, ErrorCardKind::Delivery);
         assert!(!card.retryable);
         // Summary mentions both the retry budget AND the underlying
@@ -3247,10 +3219,7 @@ mod tests {
             .session_paths
             .outbound_pool(&sess.agent_group_id, &sess.id)
             .unwrap();
-        let row = make_row(
-            MessageKind::System,
-            json!({ "unregistered_action": {} }),
-        );
+        let row = make_row(MessageKind::System, json!({ "unregistered_action": {} }));
         write_row(&out_pool, &row);
         let rpt = service.process_session_once(&sess).await.unwrap();
         // No handler means we mark the row as delivered and move on rather
@@ -3381,10 +3350,7 @@ mod tests {
         }
         let saw = Arc::new(StdMutex::new(0u32));
         let (service, _root, sess, _mock) = make_service().await;
-        service.register_action(
-            "agent_dispatch",
-            Arc::new(Capture { saw: saw.clone() }),
-        );
+        service.register_action("agent_dispatch", Arc::new(Capture { saw: saw.clone() }));
 
         let out_pool = service
             .session_paths
@@ -3626,9 +3592,10 @@ mod tests {
     async fn inflight_len_reflects_active_attempts() {
         let (service, _root, _sess, _mock) = make_service().await;
         assert_eq!(service.inflight_len(), 0);
-        service
-            .inflight
-            .insert(DeliveryKey::new(SessionId::new(), MessageId::new()), Instant::now());
+        service.inflight.insert(
+            DeliveryKey::new(SessionId::new(), MessageId::new()),
+            Instant::now(),
+        );
         assert_eq!(service.inflight_len(), 1);
     }
 
@@ -3663,8 +3630,7 @@ mod tests {
         let central = CentralDb::open_in_memory().unwrap();
         let root: Arc<dyn SessionRoot> = Arc::new(MockRoot::new(tmp.path().to_path_buf()));
         let adapters: DashMap<ChannelType, Arc<dyn ChannelAdapter>> = DashMap::new();
-        let service =
-            DeliveryService::new(central, root, adapters, dispatcher.clone());
+        let service = DeliveryService::new(central, root, adapters, dispatcher.clone());
         let _ = service.dispatcher();
         // Smoke test ensures the dispatcher Arc round-trips cleanly.
     }
@@ -3685,7 +3651,7 @@ mod tests {
     // ── install_packages / add_mcp_server apply ───────────────────────────
 
     fn central_with_ag() -> (copperclaw_db::central::CentralDb, AgentGroupId) {
-        use copperclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+        use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
         let db = copperclaw_db::central::CentralDb::open_in_memory().unwrap();
         let ag = create_ag(
             &db,
@@ -4079,7 +4045,11 @@ mod tests {
             .inbound_pool(&ghost.agent_group_id, &ghost.id)
             .unwrap();
         let sys_rows = list_inbound_system_rows(&in_pool);
-        assert_eq!(sys_rows.len(), 1, "expected one system row, got {sys_rows:?}");
+        assert_eq!(
+            sys_rows.len(),
+            1,
+            "expected one system row, got {sys_rows:?}"
+        );
         let envelope = &sys_rows[0];
         let err_obj = &envelope["content"]["self_mod_error"];
         assert_eq!(err_obj["action"], "install_packages");
@@ -4339,10 +4309,13 @@ mod tests {
         apply_add_mcp_server(&db, ag, &json!({"transport": {}})).unwrap();
         // No exception; container_config row should still be unset.
         let cfg = copperclaw_db::tables::container_configs::get(&db, ag).unwrap();
-        assert!(cfg.is_none() || !cfg.unwrap().mcp_servers.is_object()
-            || copperclaw_db::tables::container_configs::get_mcp_servers(&db, ag)
-                .map(|v| v.as_object().is_some_and(serde_json::Map::is_empty))
-                .unwrap_or(false));
+        assert!(
+            cfg.is_none()
+                || !cfg.unwrap().mcp_servers.is_object()
+                || copperclaw_db::tables::container_configs::get_mcp_servers(&db, ag)
+                    .map(|v| v.as_object().is_some_and(serde_json::Map::is_empty))
+                    .unwrap_or(false)
+        );
     }
 
     /// Card-kind row flows through the new `dispatch_card` path: the
@@ -4697,8 +4670,8 @@ mod tests {
             .session_paths
             .outbound_pool(&sess.agent_group_id, &sess.id)
             .unwrap();
-        let breadcrumb = copperclaw_channels_core::Breadcrumb::running("shell")
-            .with_detail("cargo check");
+        let breadcrumb =
+            copperclaw_channels_core::Breadcrumb::running("shell").with_detail("cargo check");
         let content = json!({
             "breadcrumb": serde_json::to_value(&breadcrumb).unwrap(),
         });
@@ -4754,8 +4727,8 @@ mod tests {
             .unwrap();
         // Step 1: write & process a Running chip so the dispatcher
         // records it in `delivered` with a platform message id.
-        let running = copperclaw_channels_core::Breadcrumb::running("shell")
-            .with_detail("cargo check");
+        let running =
+            copperclaw_channels_core::Breadcrumb::running("shell").with_detail("cargo check");
         write_row(
             &out_pool,
             &make_row(
@@ -4877,13 +4850,11 @@ mod tests {
 
     fn build_dispatch_todo_list() -> copperclaw_channels_core::TodoList {
         copperclaw_channels_core::TodoList {
-            items: vec![
-                copperclaw_channels_core::TodoListItem {
-                    id: 1,
-                    text: "Reply with order status".into(),
-                    status: copperclaw_channels_core::TodoItemStatus::Pending,
-                },
-            ],
+            items: vec![copperclaw_channels_core::TodoListItem {
+                id: 1,
+                text: "Reply with order status".into(),
+                status: copperclaw_channels_core::TodoItemStatus::Pending,
+            }],
             title: None,
         }
     }
@@ -5067,10 +5038,7 @@ mod tests {
             .session_paths
             .outbound_pool(&sess.agent_group_id, &sess.id)
             .unwrap();
-        let row = make_row(
-            MessageKind::Chat,
-            json!({"text": three_chunk_text()}),
-        );
+        let row = make_row(MessageKind::Chat, json!({"text": three_chunk_text()}));
         write_row(&out_pool, &row);
 
         let rpt = service.process_session_once(&sess).await.unwrap();
@@ -5126,10 +5094,7 @@ mod tests {
             .session_paths
             .outbound_pool(&sess.agent_group_id, &sess.id)
             .unwrap();
-        let row = make_row(
-            MessageKind::Chat,
-            json!({"text": three_chunk_text()}),
-        );
+        let row = make_row(MessageKind::Chat, json!({"text": three_chunk_text()}));
         write_row(&out_pool, &row);
 
         // The wrapper sees three `deliver` calls per attempt (one per
@@ -5137,7 +5102,12 @@ mod tests {
         // chunk 1 (fail Rate). On attempt 2: call 2 = chunk 1 (let
         // through), call 3 = chunk 2 (let through). Schedule the chunk-1
         // failure at wrapper call index 1.
-        wrapper.fail_at_call(1, AdapterError::Rate { retry_after: Some(1) });
+        wrapper.fail_at_call(
+            1,
+            AdapterError::Rate {
+                retry_after: Some(1),
+            },
+        );
 
         let rpt1 = service.process_session_once(&sess).await.unwrap();
         assert_eq!(rpt1.deferred, 1);
@@ -5205,10 +5175,7 @@ mod tests {
             .session_paths
             .outbound_pool(&sess.agent_group_id, &sess.id)
             .unwrap();
-        let row = make_row(
-            MessageKind::Chat,
-            json!({"text": three_chunk_text()}),
-        );
+        let row = make_row(MessageKind::Chat, json!({"text": three_chunk_text()}));
         write_row(&out_pool, &row);
 
         // Wrapper call indices that should fail (one per attempt):
@@ -5261,7 +5228,10 @@ mod tests {
             .iter()
             .filter(|c| c.message.content["text"] == json!(chunk1_text))
             .count();
-        assert_eq!(chunk1_count, 0, "chunk 1 should never have reached the inner mock");
+        assert_eq!(
+            chunk1_count, 0,
+            "chunk 1 should never have reached the inner mock"
+        );
 
         // Retry state cleared once the row was marked failed.
         assert!(service.retries.get(&key).is_none());
@@ -5283,10 +5253,7 @@ mod tests {
             .session_paths
             .outbound_pool(&sess.agent_group_id, &sess.id)
             .unwrap();
-        let row = make_row(
-            MessageKind::Chat,
-            json!({"text": three_chunk_text()}),
-        );
+        let row = make_row(MessageKind::Chat, json!({"text": three_chunk_text()}));
         write_row(&out_pool, &row);
 
         // Fail wrapper call index 1 (chunk 1 on attempt 1); attempt 2

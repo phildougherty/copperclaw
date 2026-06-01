@@ -8,9 +8,7 @@ use crate::bridge::MockMessageRow;
 use crate::factory::CHANNEL_TYPE_STR;
 use chrono::{DateTime, TimeZone, Utc};
 use copperclaw_channels_core::AdapterError;
-use copperclaw_types::{
-    ChannelType, InboundEvent, InboundMessage, MessageKind, SenderIdentity,
-};
+use copperclaw_types::{ChannelType, InboundEvent, InboundMessage, MessageKind, SenderIdentity};
 use serde_json::{Value, json};
 
 /// Number of seconds between the Unix epoch (1970-01-01 UTC) and the Cocoa
@@ -397,8 +395,13 @@ mod tests {
     #[test]
     fn row_to_inbound_chat_routes_to_chat_id() {
         let r = row(
-            2, "g2", Some("group hi"), false, Some("+15551234"),
-            Some("chat-guid-xyz"), 0,
+            2,
+            "g2",
+            Some("group hi"),
+            false,
+            Some("+15551234"),
+            Some("chat-guid-xyz"),
+            0,
         );
         let evt = row_to_inbound(&r).unwrap();
         assert_eq!(evt.platform_id, "chat:chat-guid-xyz");
@@ -429,7 +432,10 @@ mod tests {
         let nanos = secs * 1_000_000_000;
         let r = row(5, "g5", Some("x"), false, Some("+1"), None, nanos);
         let evt = row_to_inbound(&r).unwrap();
-        assert_eq!(evt.message.timestamp.to_rfc3339(), "2024-01-01T00:00:00+00:00");
+        assert_eq!(
+            evt.message.timestamp.to_rfc3339(),
+            "2024-01-01T00:00:00+00:00"
+        );
     }
 
     #[test]

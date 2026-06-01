@@ -136,8 +136,8 @@ pub fn parse_inbound_xml(body: &[u8]) -> Result<InboundXml, ParseError> {
     let inner = &s[inner_start..root_close];
 
     let to_user_name = extract_field(inner, "ToUserName").unwrap_or_default();
-    let from_user_name = extract_field(inner, "FromUserName")
-        .ok_or(ParseError::MissingField("FromUserName"))?;
+    let from_user_name =
+        extract_field(inner, "FromUserName").ok_or(ParseError::MissingField("FromUserName"))?;
     let msg_type_raw =
         extract_field(inner, "MsgType").ok_or(ParseError::MissingField("MsgType"))?;
     let msg_type = MsgType::parse(&msg_type_raw);
@@ -419,10 +419,7 @@ mod tests {
 
     #[test]
     fn parse_error_display_unique_per_variant() {
-        let variants = [
-            ParseError::NoRoot,
-            ParseError::MissingField("X"),
-        ];
+        let variants = [ParseError::NoRoot, ParseError::MissingField("X")];
         let mut seen = std::collections::HashSet::new();
         for v in &variants {
             assert!(seen.insert(format!("{v}")));

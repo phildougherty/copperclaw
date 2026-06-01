@@ -3,11 +3,11 @@
 //! A role is a `(user, role-kind, scope)` triple. Scope is either a specific
 //! `agent_group_id` or `None` for a global role.
 
-use crate::central::CentralDb;
 use crate::DbError;
+use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
 use copperclaw_types::{AgentGroupId, UserId};
-use rusqlite::{params, Row};
+use rusqlite::{Row, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -45,8 +45,9 @@ pub struct UserRole {
 }
 
 fn parse_uuid_col(s: &str) -> rusqlite::Result<Uuid> {
-    Uuid::parse_str(s)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))
+    Uuid::parse_str(s).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })
 }
 
 fn row_to_user_role(row: &Row<'_>) -> rusqlite::Result<UserRole> {
@@ -75,7 +76,9 @@ fn row_to_user_role(row: &Row<'_>) -> rusqlite::Result<UserRole> {
     };
     let granted_at_str: String = row.get("granted_at")?;
     let granted_at = DateTime::parse_from_rfc3339(&granted_at_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .with_timezone(&Utc);
     Ok(UserRole {
         user_id,
@@ -112,8 +115,11 @@ pub fn list_for_scope(
              WHERE agent_group_id = ?1 AND role = ?2
              ORDER BY granted_at",
         )?;
-        stmt.query_map(params![ag.as_uuid().to_string(), role.as_str()], row_to_user_role)?
-            .collect()
+        stmt.query_map(
+            params![ag.as_uuid().to_string(), role.as_str()],
+            row_to_user_role,
+        )?
+        .collect()
     } else {
         let mut stmt = conn.prepare(
             "SELECT user_id, role, agent_group_id, granted_by, granted_at
@@ -121,7 +127,8 @@ pub fn list_for_scope(
              WHERE agent_group_id IS NULL AND role = ?1
              ORDER BY granted_at",
         )?;
-        stmt.query_map(params![role.as_str()], row_to_user_role)?.collect()
+        stmt.query_map(params![role.as_str()], row_to_user_role)?
+            .collect()
     };
     Ok(rows?)
 }
@@ -166,7 +173,11 @@ pub fn revoke(
         Some(ag) => conn.execute(
             "DELETE FROM user_roles
              WHERE user_id = ?1 AND role = ?2 AND agent_group_id = ?3",
-            params![user.as_uuid().to_string(), role.as_str(), ag.as_uuid().to_string()],
+            params![
+                user.as_uuid().to_string(),
+                role.as_str(),
+                ag.as_uuid().to_string()
+            ],
         )?,
         None => conn.execute(
             "DELETE FROM user_roles

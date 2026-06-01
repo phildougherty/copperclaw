@@ -34,10 +34,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::stream::StreamExt;
 use copperclaw_types::ProviderEvent;
+use futures::stream::StreamExt;
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -61,7 +61,10 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 #[derive(Debug, Clone)]
 enum Mode {
     /// Native Ollama `/api/chat` NDJSON.
-    Native { http: reqwest::Client, base_url: String },
+    Native {
+        http: reqwest::Client,
+        base_url: String,
+    },
     /// Legacy facade — defer everything to the Anthropic provider against
     /// an Anthropic-compatible proxy in front of Ollama.
     Shim(AnthropicProvider),
@@ -93,7 +96,10 @@ impl OllamaProvider {
         let default_model = model.unwrap_or_else(|| DEFAULT_MODEL.to_string());
         Self {
             inner: Arc::new(Inner {
-                mode: Mode::Native { http, base_url: normalized },
+                mode: Mode::Native {
+                    http,
+                    base_url: normalized,
+                },
                 default_model,
             }),
         }
@@ -178,14 +184,20 @@ async fn native_query(
 
     let status = resp.status();
     if !status.is_success() {
-        return Err(map_http_error(status.as_u16(), resp.text().await.unwrap_or_default()));
+        return Err(map_http_error(
+            status.as_u16(),
+            resp.text().await.unwrap_or_default(),
+        ));
     }
 
     let (tx, rx) = mpsc::channel(32);
     let stream = resp.bytes_stream();
     let handle = tokio::spawn(pump_ndjson(stream, tx));
 
-    Ok(Box::new(OllamaQuery { rx, handle: Some(handle) }))
+    Ok(Box::new(OllamaQuery {
+        rx,
+        handle: Some(handle),
+    }))
 }
 
 /// Build the JSON body for `POST /api/chat`. Public-in-module for tests.
@@ -209,7 +221,10 @@ pub(crate) fn build_native_body(input: &QueryInput) -> Value {
     obj.insert("options".into(), Value::Object(options));
 
     if !input.tools.is_empty() {
-        obj.insert("tools".into(), Value::Array(tools_to_openai_form(&input.tools)));
+        obj.insert(
+            "tools".into(),
+            Value::Array(tools_to_openai_form(&input.tools)),
+        );
     }
     body
 }
@@ -282,7 +297,11 @@ pub(crate) fn history_to_messages(input: &QueryInput) -> Vec<Value> {
                     }));
                 }
             }
-            HistoryMessage::Tool { tool_use_id, content, is_error: _ } => {
+            HistoryMessage::Tool {
+                tool_use_id,
+                content,
+                is_error: _,
+            } => {
                 // Ollama uses a `tool` role message for tool results.
                 // The `tool_call_id` correlates with the prior
                 // `tool_calls[].id` so the model can match them up.
@@ -315,7 +334,10 @@ fn map_http_error(status: u16, body: String) -> ProviderError {
         400 => ProviderError::BadRequest(body),
         401 | 403 => ProviderError::SessionInvalid,
         429 | 529 => ProviderError::Overloaded,
-        _ => ProviderError::Api { status, message: body },
+        _ => ProviderError::Api {
+            status,
+            message: body,
+        },
     }
 }
 
@@ -515,9 +537,9 @@ async fn handle_ndjson_line(
         }
         if let Some(calls) = msg.tool_calls {
             for call in calls {
-                let id = call.id.unwrap_or_else(|| {
-                    format!("toolu_{}", uuid::Uuid::new_v4().simple())
-                });
+                let id = call
+                    .id
+                    .unwrap_or_else(|| format!("toolu_{}", uuid::Uuid::new_v4().simple()));
                 let name = call.function.name.clone();
                 // Arguments can arrive as either an object or a stringified
                 // JSON blob (OpenAI legacy). Normalize either way.
@@ -533,11 +555,7 @@ async fn handle_ndjson_line(
                     return false;
                 }
                 if tx
-                    .send(ProviderEvent::ToolCall {
-                        id,
-                        name,
-                        input,
-                    })
+                    .send(ProviderEvent::ToolCall { id, name, input })
                     .await
                     .is_err()
                 {
@@ -667,7 +685,9 @@ mod tests {
         drop(listener);
         let p = OllamaProvider::new(format!("http://{addr}"), None);
         let mut input = QueryInput::new("s", "");
-        input.history.push(HistoryMessage::User { content: "hi".into() });
+        input.history.push(HistoryMessage::User {
+            content: "hi".into(),
+        });
         let r = p.query(input).await;
         match r {
             Err(ProviderError::Transport(_)) => {}
@@ -679,7 +699,9 @@ mod tests {
     #[test]
     fn build_native_body_minimal() {
         let mut q = QueryInput::new("you are helpful", "llama3.1:8b");
-        q.history.push(HistoryMessage::User { content: "hi".into() });
+        q.history.push(HistoryMessage::User {
+            content: "hi".into(),
+        });
         let body = build_native_body(&q);
         assert_eq!(body["model"], "llama3.1:8b");
         assert_eq!(body["stream"], true);
@@ -693,7 +715,9 @@ mod tests {
     #[test]
     fn build_native_body_omits_system_when_empty() {
         let mut q = QueryInput::new("", "m");
-        q.history.push(HistoryMessage::User { content: "hi".into() });
+        q.history.push(HistoryMessage::User {
+            content: "hi".into(),
+        });
         let body = build_native_body(&q);
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs[0]["role"], "user");
@@ -702,7 +726,9 @@ mod tests {
     #[test]
     fn build_native_body_includes_temperature_and_tools() {
         let mut q = QueryInput::new("s", "m");
-        q.history.push(HistoryMessage::User { content: "hi".into() });
+        q.history.push(HistoryMessage::User {
+            content: "hi".into(),
+        });
         q.temperature = Some(0.3);
         q.tools.push(ToolDef {
             name: "t".into(),
@@ -722,7 +748,9 @@ mod tests {
     fn history_emits_tool_role_for_tool_results() {
         let mut q = QueryInput::new("s", "m");
         q.history = vec![
-            HistoryMessage::Assistant { content: "ok let me look".into() },
+            HistoryMessage::Assistant {
+                content: "ok let me look".into(),
+            },
             HistoryMessage::ToolUse {
                 id: "tu_1".into(),
                 name: "weather".into(),
@@ -747,9 +775,18 @@ mod tests {
 
     #[test]
     fn map_http_error_variants() {
-        assert!(matches!(map_http_error(400, "bad".into()), ProviderError::BadRequest(_)));
-        assert!(matches!(map_http_error(401, "x".into()), ProviderError::SessionInvalid));
-        assert!(matches!(map_http_error(429, "x".into()), ProviderError::Overloaded));
+        assert!(matches!(
+            map_http_error(400, "bad".into()),
+            ProviderError::BadRequest(_)
+        ));
+        assert!(matches!(
+            map_http_error(401, "x".into()),
+            ProviderError::SessionInvalid
+        ));
+        assert!(matches!(
+            map_http_error(429, "x".into()),
+            ProviderError::Overloaded
+        ));
         assert!(matches!(
             map_http_error(500, "boom".into()),
             ProviderError::Api { status: 500, .. }

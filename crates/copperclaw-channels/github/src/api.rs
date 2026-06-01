@@ -110,7 +110,9 @@ impl GithubApi {
         comment_id: i64,
         body: &str,
     ) -> Result<CommentResponse, AdapterError> {
-        let url = self.url(&format!("repos/{owner}/{repo}/issues/comments/{comment_id}"));
+        let url = self.url(&format!(
+            "repos/{owner}/{repo}/issues/comments/{comment_id}"
+        ));
         let resp = self
             .client
             .patch(&url)
@@ -209,15 +211,11 @@ async fn read_github_json(resp: Response) -> Result<Value, AdapterError> {
     }
     if status.is_server_error() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(AdapterError::Transport(format!(
-            "github {status}: {body}"
-        )));
+        return Err(AdapterError::Transport(format!("github {status}: {body}")));
     }
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(AdapterError::BadRequest(format!(
-            "github {status}: {body}"
-        )));
+        return Err(AdapterError::BadRequest(format!("github {status}: {body}")));
     }
 
     // 2xx — body may be empty (e.g. some 201 responses without content).

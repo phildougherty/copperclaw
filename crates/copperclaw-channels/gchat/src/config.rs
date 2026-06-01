@@ -129,12 +129,15 @@ impl WebhookConfig {
             }
         };
         let port = match obj.get("port") {
-            Some(Value::Number(n)) => n
-                .as_u64()
-                .and_then(|u| u16::try_from(u).ok())
-                .ok_or_else(|| {
-                    AdapterError::BadRequest("gchat `webhook.port` must be a u16 in range".into())
-                })?,
+            Some(Value::Number(n)) => {
+                n.as_u64()
+                    .and_then(|u| u16::try_from(u).ok())
+                    .ok_or_else(|| {
+                        AdapterError::BadRequest(
+                            "gchat `webhook.port` must be a u16 in range".into(),
+                        )
+                    })?
+            }
             Some(Value::Null) | None => DEFAULT_PORT,
             Some(_) => {
                 return Err(AdapterError::BadRequest(
@@ -241,8 +244,8 @@ mod tests {
 
     #[test]
     fn rejects_empty_bot_token() {
-        let err = GchatConfig::from_value(&json!({"bot_token": "", "client_token": "y"}))
-            .unwrap_err();
+        let err =
+            GchatConfig::from_value(&json!({"bot_token": "", "client_token": "y"})).unwrap_err();
         match err {
             AdapterError::BadRequest(m) => assert!(m.contains("non-empty")),
             other => panic!("expected BadRequest, got {other:?}"),
@@ -251,15 +254,15 @@ mod tests {
 
     #[test]
     fn rejects_non_string_bot_token() {
-        let err = GchatConfig::from_value(&json!({"bot_token": 12, "client_token": "y"}))
-            .unwrap_err();
+        let err =
+            GchatConfig::from_value(&json!({"bot_token": 12, "client_token": "y"})).unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 
     #[test]
     fn rejects_non_string_client_token() {
-        let err = GchatConfig::from_value(&json!({"bot_token": "x", "client_token": 12}))
-            .unwrap_err();
+        let err =
+            GchatConfig::from_value(&json!({"bot_token": "x", "client_token": 12})).unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 

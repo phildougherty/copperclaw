@@ -3,9 +3,7 @@
 //! Kept free of HTTP so it can be unit-tested with captured fixtures.
 
 use chrono::{DateTime, Utc};
-use copperclaw_types::{
-    ChannelType, InboundEvent, InboundMessage, MessageKind, SenderIdentity,
-};
+use copperclaw_types::{ChannelType, InboundEvent, InboundMessage, MessageKind, SenderIdentity};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 
@@ -112,10 +110,7 @@ pub fn build_user_lookup(page: &Value) -> HashMap<String, UserInfo> {
         let Some(id) = user.get("id").and_then(Value::as_str) else {
             continue;
         };
-        let name = user
-            .get("name")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
+        let name = user.get("name").and_then(Value::as_str).map(str::to_owned);
         let username = user
             .get("username")
             .and_then(Value::as_str)

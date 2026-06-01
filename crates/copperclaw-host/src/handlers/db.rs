@@ -23,8 +23,8 @@
 //! backup attempts even when the file copy itself is handled by the OS.
 
 use super::{db_err, req_str};
-use copperclaw_db::central::CentralDb;
 use copperclaw_cclaw::ErrorPayload;
+use copperclaw_db::central::CentralDb;
 use serde_json::{Value, json};
 use std::path::Path;
 use tracing::warn;
@@ -75,9 +75,8 @@ pub fn backup(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> 
         })?;
     }
 
-    std::fs::copy(src, &tmp).map_err(|e| {
-        ErrorPayload::new("io_error", format!("copy to temp file failed: {e}"))
-    })?;
+    std::fs::copy(src, &tmp)
+        .map_err(|e| ErrorPayload::new("io_error", format!("copy to temp file failed: {e}")))?;
 
     // 4. Atomic rename.
     std::fs::rename(&tmp, dest).map_err(|e| {
@@ -123,11 +122,10 @@ fn checkpoint(central: &CentralDb) -> Result<i64, ErrorPayload> {
     // columns: (busy, log, checkpointed). `log` is the number of WAL
     // frames; `checkpointed` is the number successfully written to the
     // main DB. Remaining = log - checkpointed.
-    let result: rusqlite::Result<(i64, i64, i64)> = conn.query_row(
-        "PRAGMA wal_checkpoint(TRUNCATE)",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-    );
+    let result: rusqlite::Result<(i64, i64, i64)> =
+        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        });
     match result {
         Ok((busy, log, checkpointed)) => {
             let remaining = log.saturating_sub(checkpointed);
@@ -145,7 +143,10 @@ fn checkpoint(central: &CentralDb) -> Result<i64, ErrorPayload> {
         Err(e) => {
             // Some builds or DB modes don't support TRUNCATE; fall back to a
             // PASSIVE checkpoint and return 0.
-            warn!(?e, "PRAGMA wal_checkpoint(TRUNCATE) failed; falling back to PASSIVE");
+            warn!(
+                ?e,
+                "PRAGMA wal_checkpoint(TRUNCATE) failed; falling back to PASSIVE"
+            );
             let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
             Ok(0)
         }
@@ -174,11 +175,7 @@ mod tests {
         let dest_tmp = tempdir().unwrap();
         let dest = dest_tmp.path().join("backup.db");
 
-        let v = backup(
-            &json!({"path": dest.to_str().unwrap()}),
-            &db,
-        )
-        .unwrap();
+        let v = backup(&json!({"path": dest.to_str().unwrap()}), &db).unwrap();
 
         assert!(dest.exists(), "backup file should exist");
         assert_eq!(v["path"], dest.to_str().unwrap());
@@ -239,6 +236,9 @@ mod tests {
         backup(&json!({"path": dest.to_str().unwrap()}), &db).unwrap();
         // The .tmp file must have been renamed away.
         let tmp = dest_tmp.path().join("backup.db.tmp");
-        assert!(!tmp.exists(), ".tmp file should not remain after successful backup");
+        assert!(
+            !tmp.exists(),
+            ".tmp file should not remain after successful backup"
+        );
     }
 }

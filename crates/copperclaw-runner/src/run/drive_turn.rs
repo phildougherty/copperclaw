@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use copperclaw_providers::HistoryMessage;
 
+use super::RunnerDeps;
 use super::provider_call::run_llm_turn;
 use super::tool_dispatch::invoke_tool;
-use super::RunnerDeps;
 use crate::state::save_state;
 
 /// Wall-clock budget the runner gives itself between user-facing emits
@@ -248,10 +248,7 @@ pub(super) async fn drive_turn(
         // so the audit trail captures all attempts (the model never
         // sees the third turn's results, but the persisted history
         // shows three full parse-error cycles for ops review).
-        let turn_had_parse_error = output
-            .tool_calls
-            .iter()
-            .any(|c| c.parse_error.is_some());
+        let turn_had_parse_error = output.tool_calls.iter().any(|c| c.parse_error.is_some());
         if turn_had_parse_error {
             consecutive_parse_error_turns += 1;
         } else {
@@ -372,12 +369,7 @@ async fn finish_tool_breadcrumb(
 ) {
     let summary = first_line_truncated(content, 200);
     deps.tool_ctx
-        .emit_breadcrumb_finish(
-            &call.name,
-            Some(&call.input),
-            !is_error,
-            summary.as_deref(),
-        )
+        .emit_breadcrumb_finish(&call.name, Some(&call.input), !is_error, summary.as_deref())
         .await;
 }
 
@@ -404,11 +396,7 @@ fn first_line_truncated(s: &str, max_chars: usize) -> Option<String> {
     let mut lines = s.lines();
     let first_raw = lines.find_map(|l| {
         let t = l.trim();
-        if t.is_empty() {
-            None
-        } else {
-            Some(t)
-        }
+        if t.is_empty() { None } else { Some(t) }
     })?;
 
     // If it's a meaningful line (not a bare structural opener), use it

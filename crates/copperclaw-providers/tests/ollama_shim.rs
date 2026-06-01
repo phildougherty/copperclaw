@@ -25,7 +25,9 @@ fn sse_body(events: &[(&str, &str)]) -> String {
 
 fn basic_input() -> QueryInput {
     let mut q = QueryInput::new("you are helpful", "");
-    q.history.push(HistoryMessage::User { content: "hi".into() });
+    q.history.push(HistoryMessage::User {
+        content: "hi".into(),
+    });
     q
 }
 
@@ -147,7 +149,9 @@ async fn ollama_explicit_model_passed_through() {
 
     let p = OllamaProvider::shim(server.uri(), Some("custom:override".into()));
     let mut q = QueryInput::new("s", "mistral:7b");
-    q.history.push(HistoryMessage::User { content: "hi".into() });
+    q.history.push(HistoryMessage::User {
+        content: "hi".into(),
+    });
     let mut handle = p.query(q).await.expect("query starts");
     let _ = handle.next_event().await.unwrap();
     let result = handle.next_event().await.unwrap();

@@ -7,16 +7,16 @@
 use crate::error::SweepError;
 use crate::service::{SessionPool, SessionRoot};
 use chrono::{DateTime, TimeZone, Utc};
-use copperclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
-use copperclaw_db::tables::messages_in::{insert as insert_in, WriteInbound};
-use copperclaw_db::tables::messages_out::{insert as insert_out, WriteOutbound};
-use copperclaw_db::tables::processing_ack::{insert as insert_ack, ProcessingStatus};
-use copperclaw_db::tables::sessions::{create as create_sess, mark_container_running, CreateSession};
-use copperclaw_db::tables::container_state;
 use copperclaw_db::central::CentralDb;
-use copperclaw_types::{
-    AgentGroupId, ChannelType, MessageId, MessageKind, Session, SessionId,
+use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+use copperclaw_db::tables::container_state;
+use copperclaw_db::tables::messages_in::{WriteInbound, insert as insert_in};
+use copperclaw_db::tables::messages_out::{WriteOutbound, insert as insert_out};
+use copperclaw_db::tables::processing_ack::{ProcessingStatus, insert as insert_ack};
+use copperclaw_db::tables::sessions::{
+    CreateSession, create as create_sess, mark_container_running,
 };
+use copperclaw_types::{AgentGroupId, ChannelType, MessageId, MessageKind, Session, SessionId};
 use rusqlite::params;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -63,10 +63,7 @@ impl MemSessionRoot {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(&path, b"").unwrap();
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&path)
-            .unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         f.set_modified(when).unwrap();
     }
 
@@ -89,8 +86,11 @@ impl SessionRoot for MemSessionRoot {
         session_id: &SessionId,
     ) -> Result<SessionPool, SweepError> {
         self.refuse_if_strict()?;
-        let paths =
-            copperclaw_db::session::SessionPaths::new(self.tmp.path(), *agent_group_id, *session_id);
+        let paths = copperclaw_db::session::SessionPaths::new(
+            self.tmp.path(),
+            *agent_group_id,
+            *session_id,
+        );
         let conn = copperclaw_db::session::open_outbound(&paths)?;
         Ok(SessionPool::new(conn))
     }
@@ -101,8 +101,11 @@ impl SessionRoot for MemSessionRoot {
         session_id: &SessionId,
     ) -> Result<SessionPool, SweepError> {
         self.refuse_if_strict()?;
-        let paths =
-            copperclaw_db::session::SessionPaths::new(self.tmp.path(), *agent_group_id, *session_id);
+        let paths = copperclaw_db::session::SessionPaths::new(
+            self.tmp.path(),
+            *agent_group_id,
+            *session_id,
+        );
         let conn = copperclaw_db::session::open_inbound(&paths)?;
         Ok(SessionPool::new(conn))
     }

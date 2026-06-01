@@ -11,7 +11,7 @@
 //! reliably.
 
 use crate::error::ToolError;
-use crate::tools::{make_tool, parse_args, success_json, ToolEntry, ToolHandler};
+use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args, success_json};
 use rmcp::model::{CallToolResult, JsonObject, Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -80,12 +80,15 @@ pub async fn handle(
     let matcher = globset::GlobBuilder::new(&input.pattern)
         .literal_separator(false)
         .build()
-        .map_err(|e| {
-            ToolError::Validation(format!("invalid glob `{}`: {e}", input.pattern))
-        })?
+        .map_err(|e| ToolError::Validation(format!("invalid glob `{}`: {e}", input.pattern)))?
         .compile_matcher();
 
-    let root = match input.path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let root = match input
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(p) => PathBuf::from(p),
         None => std::env::current_dir()
             .map_err(|e| ToolError::Internal(format!("cwd unavailable: {e}")))?,

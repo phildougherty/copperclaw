@@ -29,11 +29,11 @@ async fn every_module_installs_and_registers_expected_hooks() {
     let regs = ctx.registered();
     // Each of the following hooks must be wired by at least one module.
     for hook in [
-        "delivery_ready",       // typing
-        "access_gate",          // permissions
-        "sender_scope_gate",    // permissions + approvals
-        "delivery_action",      // approvals + interactive
-        "message_interceptor",  // agent_to_agent
+        "delivery_ready",      // typing
+        "access_gate",         // permissions
+        "sender_scope_gate",   // permissions + approvals
+        "delivery_action",     // approvals + interactive
+        "message_interceptor", // agent_to_agent
     ] {
         assert!(
             regs.contains(&hook),

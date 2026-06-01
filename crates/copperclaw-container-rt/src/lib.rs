@@ -313,10 +313,7 @@ mod tests {
         let dyn_rt: &dyn ContainerRuntime = &rt;
         dyn_rt.ensure_running().await.unwrap();
         dyn_rt.cleanup_orphans("slug").await.unwrap();
-        let handle = dyn_rt
-            .spawn(ContainerSpec::new("c", "img"))
-            .await
-            .unwrap();
+        let handle = dyn_rt.spawn(ContainerSpec::new("c", "img")).await.unwrap();
         assert_eq!(handle.name, "c");
         assert_eq!(handle.id, "mock-c-id");
         dyn_rt.stop("c", Duration::from_secs(5)).await.unwrap();
@@ -331,7 +328,9 @@ mod tests {
         assert!(matches!(calls[0], MockCall::EnsureRunning));
         assert!(matches!(&calls[1], MockCall::CleanupOrphans(s) if s == "slug"));
         assert!(matches!(&calls[2], MockCall::Spawn(s) if s == "c"));
-        assert!(matches!(&calls[3], MockCall::Stop(s, d) if s == "c" && *d == Duration::from_secs(5)));
+        assert!(
+            matches!(&calls[3], MockCall::Stop(s, d) if s == "c" && *d == Duration::from_secs(5))
+        );
         assert!(matches!(&calls[4], MockCall::BuildImage(_)));
     }
 

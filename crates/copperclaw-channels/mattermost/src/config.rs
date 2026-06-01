@@ -219,7 +219,12 @@ mod tests {
     fn empty_bot_user_id_is_none() {
         let mut v = good();
         v["bot_user_id"] = json!("");
-        assert!(MattermostConfig::from_value(&v).unwrap().bot_user_id.is_none());
+        assert!(
+            MattermostConfig::from_value(&v)
+                .unwrap()
+                .bot_user_id
+                .is_none()
+        );
     }
 
     #[test]

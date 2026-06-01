@@ -654,10 +654,7 @@ mod tests {
             body: Some("World".into()),
             ..crate::card::Card::default()
         };
-        let id = a
-            .deliver_card("plat-1", None, &card, None)
-            .await
-            .unwrap();
+        let id = a.deliver_card("plat-1", None, &card, None).await.unwrap();
         assert!(id.is_some());
         let calls = a.deliveries();
         assert_eq!(calls.len(), 1);
@@ -694,8 +691,7 @@ mod tests {
         // legacy `[tool] detail` chat-breadcrumb behaviour for adapters
         // without a native override.
         let a = MockAdapter::new("ch");
-        let bc = crate::breadcrumb::Breadcrumb::running("shell")
-            .with_detail("cargo check");
+        let bc = crate::breadcrumb::Breadcrumb::running("shell").with_detail("cargo check");
         let id = a
             .deliver_breadcrumb("plat-1", None, &bc, None)
             .await
@@ -994,13 +990,8 @@ mod tests {
         // rendering for free even before a native collapsed primitive
         // ships.
         let a = MockAdapter::new("ch");
-        let t = crate::thinking::ThinkingBlock::visible(
-            "Let me think about this question.",
-        );
-        let id = a
-            .deliver_thinking("plat-1", None, &t)
-            .await
-            .unwrap();
+        let t = crate::thinking::ThinkingBlock::visible("Let me think about this question.");
+        let id = a.deliver_thinking("plat-1", None, &t).await.unwrap();
         assert!(id.is_some());
         let calls = a.deliveries();
         assert_eq!(calls.len(), 1);

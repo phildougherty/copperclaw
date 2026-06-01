@@ -31,17 +31,17 @@
 //! Both paths emit exactly one apology row per inbound and stamp
 //! `tries=99` so subsequent sweep passes skip the row.
 
+use crate::APOLOGY_AFTER_SECS;
 use crate::error::SweepError;
 use crate::service::SessionRoot;
 use crate::spawn_tracker::SpawnAttemptTracker;
-use crate::APOLOGY_AFTER_SECS;
 use chrono::{DateTime, Utc};
-use copperclaw_db::tables::messages_out::{insert as insert_out, WriteOutbound};
 use copperclaw_channels_core::{ErrorCard, ErrorCardKind};
+use copperclaw_db::tables::messages_out::{WriteOutbound, insert as insert_out};
 use copperclaw_types::{ChannelType, ContainerStatus, MessageId, MessageKind, Session};
-use rusqlite::params;
 #[cfg(test)]
 use rusqlite::OptionalExtension;
+use rusqlite::params;
 
 /// Dedupe sentinel written back into `messages_in.tries`. The runner's
 /// retry path tops out at `MAX_TRIES=5`, so 99 is safely out-of-band.
@@ -58,8 +58,7 @@ const APOLOGY_SCAN_LIMIT: i64 = 50;
 /// User-facing text. Kept verbatim per the task brief — no operator
 /// jargon ("OCI runtime error", "heartbeat stale") leaks into the user
 /// view. The operator-facing detail lives in the log line + metric.
-pub(crate) const APOLOGY_TEXT: &str =
-    "I'm having trouble processing your message right now (the agent's container isn't responding). \
+pub(crate) const APOLOGY_TEXT: &str = "I'm having trouble processing your message right now (the agent's container isn't responding). \
      The operator has been notified. Please try again in a few minutes.";
 
 /// One row visible to the apology check inside `messages_in`. Mirrors
@@ -154,10 +153,8 @@ pub fn check(
         return Ok(emits);
     }
 
-    let mut inbound_pool =
-        root.inbound_pool(&session.agent_group_id, &session.id)?;
-    let mut outbound_pool =
-        root.outbound_pool(&session.agent_group_id, &session.id)?;
+    let mut inbound_pool = root.inbound_pool(&session.agent_group_id, &session.id)?;
+    let mut outbound_pool = root.outbound_pool(&session.agent_group_id, &session.id)?;
     let agent_group_id_str = session.agent_group_id.as_uuid().to_string();
 
     let container_is_running = matches!(session.container_status, ContainerStatus::Running);
@@ -438,11 +435,11 @@ fn apology_marker_present(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{seed_running_session, MemSessionRoot};
     use crate::APOLOGY_AFTER_SECS;
+    use crate::test_support::{MemSessionRoot, seed_running_session};
     use chrono::{Duration as ChDuration, TimeZone};
     use copperclaw_db::central::CentralDb;
-    use copperclaw_db::tables::messages_in::{insert as insert_in, WriteInbound};
+    use copperclaw_db::tables::messages_in::{WriteInbound, insert as insert_in};
     use copperclaw_db::tables::messages_out;
     use copperclaw_db::tables::sessions as sessions_tbl;
     use copperclaw_types::{ChannelType, MessageKind, Session};
@@ -489,7 +486,9 @@ mod tests {
             reply_to: None,
             is_group: None,
         };
-        let mut pool = root.inbound_pool(&session.agent_group_id, &session.id).unwrap();
+        let mut pool = root
+            .inbound_pool(&session.agent_group_id, &session.id)
+            .unwrap();
         insert_in(pool.conn_mut(), &msg).unwrap();
         id
     }
@@ -575,8 +574,14 @@ mod tests {
         // And no error apology row landed in outbound.
         let outbound = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
         let rows = messages_out::list_due(outbound.conn()).unwrap();
-        let err_rows: Vec<_> = rows.iter().filter(|r| r.kind == MessageKind::Error).collect();
-        assert!(err_rows.is_empty(), "no error outbound expected, got {err_rows:?}");
+        let err_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == MessageKind::Error)
+            .collect();
+        assert!(
+            err_rows.is_empty(),
+            "no error outbound expected, got {err_rows:?}"
+        );
     }
 
     /// Spec test #3: a stuck inbound across two consecutive sweep
@@ -602,7 +607,10 @@ mod tests {
 
         let outbound = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
         let rows = messages_out::list_due(outbound.conn()).unwrap();
-        let apologies: Vec<_> = rows.iter().filter(|r| r.kind == MessageKind::Error).collect();
+        let apologies: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == MessageKind::Error)
+            .collect();
         assert_eq!(apologies.len(), 1, "expected exactly one apology row");
     }
 
@@ -868,7 +876,11 @@ mod tests {
         sess = sessions_tbl::get(&central, sess.id).unwrap();
 
         let emits = check(&root, &tracker, &sess, now).unwrap();
-        assert_eq!(emits.len(), 1, "apology must fire when container is stopped");
+        assert_eq!(
+            emits.len(),
+            1,
+            "apology must fire when container is stopped"
+        );
         assert_eq!(emits[0].message_id, id);
         assert_eq!(emits[0].reason, ApologyReason::PendingTooLong);
     }

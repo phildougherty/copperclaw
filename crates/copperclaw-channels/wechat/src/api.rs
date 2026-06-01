@@ -168,11 +168,12 @@ impl WeChatApi {
             .await
             .map_err(|e| AdapterError::Transport(e.to_string()))?;
         let value = read_wechat_json(resp).await?;
-        let parsed: GetTokenResponse = serde_json::from_value(value).map_err(|e| {
-            AdapterError::Transport(format!("wechat gettoken decode: {e}"))
-        })?;
+        let parsed: GetTokenResponse = serde_json::from_value(value)
+            .map_err(|e| AdapterError::Transport(format!("wechat gettoken decode: {e}")))?;
         let expires_at = Utc::now() + chrono::Duration::seconds(parsed.expires_in.max(60));
-        self.tokens.put(parsed.access_token.clone(), expires_at).await;
+        self.tokens
+            .put(parsed.access_token.clone(), expires_at)
+            .await;
         Ok(parsed.access_token)
     }
 
@@ -263,9 +264,8 @@ impl WeChatApi {
             .await
             .map_err(|e| AdapterError::Transport(e.to_string()))?;
         let value = read_wechat_json(resp).await?;
-        let parsed: UploadResponse = serde_json::from_value(value).map_err(|e| {
-            AdapterError::Transport(format!("wechat media upload decode: {e}"))
-        })?;
+        let parsed: UploadResponse = serde_json::from_value(value)
+            .map_err(|e| AdapterError::Transport(format!("wechat media upload decode: {e}")))?;
         Ok(parsed.media_id)
     }
 
@@ -289,9 +289,7 @@ impl WeChatApi {
                         serde_json::from_value(v).unwrap_or(SendResponse { msgid: None });
                     return Ok(parsed.msgid);
                 }
-                Err(AdapterError::Auth(msg))
-                    if attempts == 0 && msg.contains("42001") =>
-                {
+                Err(AdapterError::Auth(msg)) if attempts == 0 && msg.contains("42001") => {
                     // Force a refresh and try again exactly once.
                     self.tokens.invalidate().await;
                     attempts += 1;
@@ -379,13 +377,14 @@ pub(crate) fn classify_response(
         return Err(AdapterError::Transport(format!("http {status}")));
     }
     if !status.is_success() {
-        return Err(AdapterError::Transport(format!("unexpected status {status}")));
+        return Err(AdapterError::Transport(format!(
+            "unexpected status {status}"
+        )));
     }
 
     // Success path — but Work Weixin folds errors into the body.
-    let value = parsed.ok_or_else(|| {
-        AdapterError::Transport("wechat response was empty or not JSON".into())
-    })?;
+    let value = parsed
+        .ok_or_else(|| AdapterError::Transport("wechat response was empty or not JSON".into()))?;
     if let Some(errcode) = value.get("errcode").and_then(Value::as_i64) {
         if errcode == 0 {
             return Ok(value);
@@ -439,9 +438,12 @@ mod tests {
 
     #[test]
     fn classify_returns_value_with_no_errcode_field() {
-        let v =
-            classify_response(StatusCode::OK, None, r#"{"access_token":"x","expires_in":7200}"#)
-                .unwrap();
+        let v = classify_response(
+            StatusCode::OK,
+            None,
+            r#"{"access_token":"x","expires_in":7200}"#,
+        )
+        .unwrap();
         assert_eq!(v["access_token"], "x");
     }
 
@@ -582,8 +584,8 @@ mod tests {
 
     #[test]
     fn classify_unknown_low_errcode_is_transport() {
-        let err = classify_response(StatusCode::OK, None, r#"{"errcode":-1,"errmsg":"x"}"#)
-            .unwrap_err();
+        let err =
+            classify_response(StatusCode::OK, None, r#"{"errcode":-1,"errmsg":"x"}"#).unwrap_err();
         assert!(matches!(err, AdapterError::Transport(_)));
     }
 
@@ -612,7 +614,8 @@ mod tests {
     #[tokio::test]
     async fn token_store_returns_none_when_close_to_expiry() {
         let s = TokenStore::new();
-        s.put("tok", Utc::now() + chrono::Duration::seconds(5)).await;
+        s.put("tok", Utc::now() + chrono::Duration::seconds(5))
+            .await;
         assert!(s.get().await.is_none());
     }
 

@@ -126,8 +126,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/auth.test"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"ok": true, "user_id": "UBOT"})),
+                ResponseTemplate::new(200).set_body_json(json!({"ok": true, "user_id": "UBOT"})),
             )
             .mount(&mock)
             .await;
@@ -164,8 +163,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/auth.test"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"ok": true, "user_id": "UBOT"})),
+                ResponseTemplate::new(200).set_body_json(json!({"ok": true, "user_id": "UBOT"})),
             )
             .mount(&mock)
             .await;

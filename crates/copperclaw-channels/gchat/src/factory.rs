@@ -9,7 +9,7 @@
 use crate::adapter::GchatAdapter;
 use crate::api::GchatApi;
 use crate::config::GchatConfig;
-use crate::events::router::{build_events_router, GchatEventsState};
+use crate::events::router::{GchatEventsState, build_events_router};
 use async_trait::async_trait;
 use copperclaw_channels_core::{
     AdapterError, ChannelAdapter, ChannelFactory, ChannelRegistry, ChannelSetup,

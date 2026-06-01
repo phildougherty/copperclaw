@@ -51,13 +51,32 @@ Move it aside (`mv data/skills data/skills.bak`) and re-run.
 Before declaring any change done:
 
 ```
+cargo fmt --all
 cargo check --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --no-fail-fast
 ```
 
 The workspace forbids `unsafe_code` and treats clippy warnings as errors.
-Current baseline: ~5,200 passing tests. Don't break that.
+Current baseline: ~5,980 passing tests. Don't break that.
+
+### Formatting (rustfmt is the authority)
+
+The tree is kept rustfmt-clean and CI enforces it (the `fmt` job in
+`.github/workflows/ci.yml` runs `cargo fmt --all -- --check`; a dirty tree
+fails the build). So:
+
+  - Run `cargo fmt --all` before committing — it only rewrites code that
+    drifts from `rustfmt.toml`, so on a clean tree it's a no-op. `cargo fmt
+    --all -- --check` is the gate (what CI runs).
+  - The opinion lives in `rustfmt.toml` (root): stable-toolchain keys only
+    (edition 2024, width 100, Unix newlines, field-init shorthand). Comment
+    wrapping is intentionally OFF (nightly-only), so hand-wrapped doc/comment
+    blocks are preserved — `cargo fmt` will NOT reflow your prose.
+  - Don't fight it by hand-formatting against the grain; if a layout reads
+    badly after fmt, that's a signal to restructure the code, not to skip
+    fmt. `clippy::too_many_lines` is allowed workspace-wide precisely so
+    rustfmt's line layout never forces a function split.
 
 ## Where things live on the local install
 

@@ -152,7 +152,10 @@ mod tests {
         );
         let _ = f.init(setup).await.unwrap();
         let c = f.container_contribution();
-        assert_eq!(c.env, vec![("DISCORD_BOT_TOKEN".into(), "the-token".into())]);
+        assert_eq!(
+            c.env,
+            vec![("DISCORD_BOT_TOKEN".into(), "the-token".into())]
+        );
     }
 
     #[test]

@@ -15,7 +15,7 @@ pub mod hooks;
 pub mod route;
 pub mod session;
 
-pub use debounce::{DebounceKey, Debouncer, InflightKey, InflightSet, DEBOUNCE_WINDOW};
+pub use debounce::{DEBOUNCE_WINDOW, DebounceKey, Debouncer, InflightKey, InflightSet};
 pub use error::RouterError;
 pub use hooks::HookChain;
 pub use route::{DeliveredTo, DropReason, PendingReason, RouteOutcome, Router};

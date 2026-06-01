@@ -9,8 +9,8 @@
 use crate::error::SweepError;
 use crate::service::SessionRoot;
 use chrono::{DateTime, Utc};
-use copperclaw_db::tables::sessions as sessions_tbl;
 use copperclaw_db::central::CentralDb;
+use copperclaw_db::tables::sessions as sessions_tbl;
 use copperclaw_types::{ContainerStatus, Session};
 use rusqlite::params;
 
@@ -44,7 +44,7 @@ pub fn check(
 mod tests {
     use super::*;
     use crate::test_support::{
-        insert_inbound_message_with_process_after, seed_running_session, MemSessionRoot,
+        MemSessionRoot, insert_inbound_message_with_process_after, seed_running_session,
     };
     use chrono::{Duration as ChDuration, TimeZone};
 
@@ -69,7 +69,9 @@ mod tests {
         let woken = check(&central, &root, &session, now).unwrap();
         assert!(woken);
         assert_eq!(
-            sessions_tbl::get(&central, session.id).unwrap().container_status,
+            sessions_tbl::get(&central, session.id)
+                .unwrap()
+                .container_status,
             ContainerStatus::Running,
         );
     }
@@ -101,7 +103,9 @@ mod tests {
         let (central, root, mut session, now) = fixture();
         sessions_tbl::mark_container_idle(&central, session.id).unwrap();
         session = sessions_tbl::get(&central, session.id).unwrap();
-        let _ = root.inbound_pool(&session.agent_group_id, &session.id).unwrap();
+        let _ = root
+            .inbound_pool(&session.agent_group_id, &session.id)
+            .unwrap();
         assert!(!check(&central, &root, &session, now).unwrap());
     }
 

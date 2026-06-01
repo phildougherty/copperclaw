@@ -47,7 +47,9 @@ impl Mount {
     #[must_use]
     pub fn target(&self) -> &str {
         match self {
-            Mount::Bind { target, .. } | Mount::Volume { target, .. } | Mount::Tmpfs { target, .. } => target,
+            Mount::Bind { target, .. }
+            | Mount::Volume { target, .. }
+            | Mount::Tmpfs { target, .. } => target,
         }
     }
 
@@ -122,10 +124,10 @@ impl ResourceLimits {
                 );
             }
             if let Some(pv) = obj.get("pids_limit") {
-                out.pids_limit = Some(
-                    pv.as_u64()
-                        .ok_or_else(|| "`pids_limit` must be a non-negative integer".to_string())?,
-                );
+                out.pids_limit =
+                    Some(pv.as_u64().ok_or_else(|| {
+                        "`pids_limit` must be a non-negative integer".to_string()
+                    })?);
             }
         }
         Ok(out)
@@ -381,15 +383,21 @@ mod tests {
 
     #[test]
     fn spec_with_egress_allow() {
-        let spec = ContainerSpec::new("c", "img")
-            .with_egress_allow(vec!["api.example.com:443".into()]);
+        let spec =
+            ContainerSpec::new("c", "img").with_egress_allow(vec!["api.example.com:443".into()]);
         assert_eq!(spec.egress_allow, vec!["api.example.com:443".to_string()]);
     }
 
     #[test]
     fn resource_limits_empty() {
         assert!(ResourceLimits::default().is_empty());
-        assert!(!ResourceLimits { cpus: Some(1.0), ..Default::default() }.is_empty());
+        assert!(
+            !ResourceLimits {
+                cpus: Some(1.0),
+                ..Default::default()
+            }
+            .is_empty()
+        );
     }
 
     #[test]

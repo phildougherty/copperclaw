@@ -7,7 +7,7 @@
 use crate::DbError;
 use chrono::{DateTime, Utc};
 use copperclaw_types::MessageId;
-use rusqlite::{params, Connection, Row};
+use rusqlite::{Connection, Row, params};
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,7 +91,7 @@ fn row_to_delivered(row: &Row<'_>) -> rusqlite::Result<Delivered> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{open_inbound, SessionPaths};
+    use crate::session::{SessionPaths, open_inbound};
     use copperclaw_types::{AgentGroupId, SessionId};
 
     fn fresh_inbound() -> (tempfile::TempDir, Connection) {

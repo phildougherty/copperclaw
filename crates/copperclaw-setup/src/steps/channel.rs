@@ -11,9 +11,7 @@
 use crate::config::SetupConfig;
 use crate::prompt::Prompt;
 use crate::state::SetupState;
-use crate::steps::telegram::{
-    self, PairingOutcome, TELEGRAM_BOT_TOKEN_ENV, TELEGRAM_CHAT_ID_ENV,
-};
+use crate::steps::telegram::{self, PairingOutcome, TELEGRAM_BOT_TOKEN_ENV, TELEGRAM_CHAT_ID_ENV};
 use crate::steps::{Step, StepError, StepResult};
 
 /// Channels surfaced to the operator at setup time.

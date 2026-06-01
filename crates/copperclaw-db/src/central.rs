@@ -1,7 +1,7 @@
 //! Central database (`data/copperclaw.db`) — pooled, WAL-mode `SQLite`.
 
-use crate::migrate::{run_migrations, MigrationSet};
 use crate::DbError;
+use crate::migrate::{MigrationSet, run_migrations};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use rusqlite::OpenFlags;
@@ -43,7 +43,10 @@ impl CentralDb {
         // and r2d2 logs `ERROR database is locked` for each loser. The pool
         // still succeeds (it retries), but the log noise looks like a real
         // failure. Lazy creation avoids the race entirely.
-        let pool = Pool::builder().max_size(8).min_idle(Some(0)).build(manager)?;
+        let pool = Pool::builder()
+            .max_size(8)
+            .min_idle(Some(0))
+            .build(manager)?;
 
         {
             let mut conn = pool.get()?;

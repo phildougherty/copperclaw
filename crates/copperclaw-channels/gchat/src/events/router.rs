@@ -1,23 +1,21 @@
 //! Axum router for the Google Chat HTTP push webhook.
 
-use crate::events::types::{
-    GchatEvent, GchatEventEnvelope, GchatMessage, GchatSpace, GchatUser,
-};
+use crate::events::types::{GchatEvent, GchatEventEnvelope, GchatMessage, GchatSpace, GchatUser};
 use axum::{
+    Router,
     body::Bytes,
     extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::post,
-    Router,
 };
 use chrono::Utc;
 use copperclaw_types::{ChannelType, InboundEvent, InboundMessage, MessageKind, SenderIdentity};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::Arc;
-use tokio::sync::{mpsc::Sender, Mutex};
+use tokio::sync::{Mutex, mpsc::Sender};
 
 /// Maximum number of recent `message.name`s to keep for duplicate suppression.
 pub const DEDUP_CAPACITY: usize = 256;
@@ -131,9 +129,9 @@ async fn handle_events(
             }
             StatusCode::OK.into_response()
         }
-        GchatEvent::AddedToSpace
-        | GchatEvent::RemovedFromSpace
-        | GchatEvent::Other => StatusCode::OK.into_response(),
+        GchatEvent::AddedToSpace | GchatEvent::RemovedFromSpace | GchatEvent::Other => {
+            StatusCode::OK.into_response()
+        }
     }
 }
 
@@ -174,7 +172,13 @@ async fn convert_message_event(
     if !state.dedup.observe(&message.name).await {
         return None;
     }
-    Some(build_inbound(state, &env.space, user, message, is_card_click))
+    Some(build_inbound(
+        state,
+        &env.space,
+        user,
+        message,
+        is_card_click,
+    ))
 }
 
 fn build_inbound(
@@ -228,9 +232,7 @@ mod tests {
     const TOKEN: &str = "shared-test-secret";
     const WEBHOOK_PATH: &str = "/gchat/webhook";
 
-    fn make_state(
-        bot: Option<String>,
-    ) -> (GchatEventsState, mpsc::Receiver<InboundEvent>) {
+    fn make_state(bot: Option<String>) -> (GchatEventsState, mpsc::Receiver<InboundEvent>) {
         let (tx, rx) = mpsc::channel::<InboundEvent>(16);
         let s = GchatEventsState::new(TOKEN, tx, bot, ChannelType::new("gchat"));
         (s, rx)
@@ -276,8 +278,7 @@ mod tests {
     async fn missing_token_rejected_with_401() {
         let (state, _rx) = make_state(None);
         let app = build_events_router(WEBHOOK_PATH, state);
-        let body = serde_json::to_vec(&json!({"type":"MESSAGE","space":{"name":"x"}}))
-            .unwrap();
+        let body = serde_json::to_vec(&json!({"type":"MESSAGE","space":{"name":"x"}})).unwrap();
         let req = post_with_token(WEBHOOK_PATH, body);
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -287,8 +288,7 @@ mod tests {
     async fn wrong_token_rejected_with_401() {
         let (state, _rx) = make_state(None);
         let app = build_events_router(WEBHOOK_PATH, state);
-        let body =
-            serde_json::to_vec(&json!({"type":"MESSAGE","space":{"name":"x"}})).unwrap();
+        let body = serde_json::to_vec(&json!({"type":"MESSAGE","space":{"name":"x"}})).unwrap();
         let req = post_with_token(&format!("{WEBHOOK_PATH}?token=other"), body);
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -298,8 +298,7 @@ mod tests {
     async fn different_length_token_rejected() {
         let (state, _rx) = make_state(None);
         let app = build_events_router(WEBHOOK_PATH, state);
-        let body =
-            serde_json::to_vec(&json!({"type":"MESSAGE","space":{"name":"x"}})).unwrap();
+        let body = serde_json::to_vec(&json!({"type":"MESSAGE","space":{"name":"x"}})).unwrap();
         let req = post_with_token(&format!("{WEBHOOK_PATH}?token=short"), body);
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);

@@ -21,24 +21,22 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use chrono::Utc;
-use copperclaw_db::tables::{
-    container_state, messages_in, processing_ack,
-};
+use copperclaw_db::tables::{container_state, messages_in, processing_ack};
 use copperclaw_mcp::{ToolContext, ToolEntry};
 use copperclaw_providers::{AgentProvider, HistoryMessage, ToolDef};
 #[cfg_attr(not(test), allow(unused_imports))]
 use copperclaw_types::MessageId;
 use copperclaw_types::{Effort, MessageInRow};
-use std::collections::HashMap;
 use rusqlite::Connection;
+use std::collections::HashMap;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
 
-use crate::compaction::{compact, estimate_tokens, CompactionCfg};
+use crate::compaction::{CompactionCfg, compact, estimate_tokens};
 use crate::formatter::format_messages;
 use crate::state::{load_state, save_state};
 
-use self::drive_turn::{drive_turn, TurnOutcome};
+use self::drive_turn::{TurnOutcome, drive_turn};
 use self::provider_call::touch_heartbeat;
 
 /// Default poll interval (ms) while the loop is idle.
@@ -191,9 +189,7 @@ pub fn resolve_max_tool_turns(env: &dyn crate::config::EnvLookup) -> usize {
     };
     if !(MIN_MAX_TOOL_TURNS..=MAX_MAX_TOOL_TURNS).contains(&parsed) {
         warn_once(
-            &format!(
-                "max tool turns out of range [{MIN_MAX_TOOL_TURNS}, {MAX_MAX_TOOL_TURNS}]"
-            ),
+            &format!("max tool turns out of range [{MIN_MAX_TOOL_TURNS}, {MAX_MAX_TOOL_TURNS}]"),
             &raw,
         );
         return DEFAULT_MAX_TOOL_TURNS;
@@ -504,7 +500,9 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
         if let Some(r) = origin_row {
             let in_reply_to = r.id.as_uuid().to_string();
             deps.tool_ctx.set_originating(
-                r.channel_type.as_ref().map(copperclaw_types::ChannelType::as_str),
+                r.channel_type
+                    .as_ref()
+                    .map(copperclaw_types::ChannelType::as_str),
                 r.platform_id.as_deref(),
                 r.thread_id.as_deref(),
                 Some(in_reply_to.as_str()),
@@ -566,7 +564,10 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
             tracing::info!("history compacted (sentinel consumed)");
         }
 
-        if deps.compaction.should_compact(estimate_tokens(&state.history)) {
+        if deps
+            .compaction
+            .should_compact(estimate_tokens(&state.history))
+        {
             state.history = compact(state.history, deps.provider.as_ref(), &deps.compaction)
                 .await
                 .context("compaction failed")?;
@@ -582,9 +583,9 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
         if already_pushed {
             tracing::debug!("resuming mid-message — skipping duplicate user push");
         } else {
-            state
-                .history
-                .push(HistoryMessage::User { content: formatted.prompt });
+            state.history.push(HistoryMessage::User {
+                content: formatted.prompt,
+            });
             // Inbound images (e.g. a telegram photo) the user attached
             // become follow-on Image entries so vision-capable models see
             // them. Pushed right after the User text so the anthropic
@@ -663,7 +664,7 @@ pub(in crate::run) async fn emit_usage_report(
     started_at: chrono::DateTime<chrono::Utc>,
     outcome: &TurnOutcome,
 ) {
-    use copperclaw_db::tables::messages_out::{insert as insert_out, WriteOutbound};
+    use copperclaw_db::tables::messages_out::{WriteOutbound, insert as insert_out};
     let payload = serde_json::json!({
         "usage_report": {
             "session_id": deps.session_id.to_string(),
@@ -698,7 +699,8 @@ pub(in crate::run) async fn emit_usage_report(
     if let Err(err) = insert_out(conn, &row) {
         tracing::warn!(?err, "usage_report insert failed");
     }
-    deps.turn_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    deps.turn_seq
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Prefix the runner's `agent_apology_text` emits when a child agent
@@ -899,15 +901,13 @@ async fn handle_slash_command(
                  Older context summarised; recent turns kept verbatim."
             )
         }
-        SlashCommand::Help => {
-            "Available commands:\n\
+        SlashCommand::Help => "Available commands:\n\
              - /clear (or /reset, /new) — wipe conversation history and start fresh\n\
              - /compact — summarise older history to free token budget\n\
              - /help (or /?, /commands) — show this list\n\
              \n\
              Anything else is sent to the model as a normal message."
-                .to_string()
-        }
+            .to_string(),
     };
 
     // Persist the cleared / compacted state before the confirmation
@@ -1074,7 +1074,7 @@ async fn emit_terminal_failure_apologies(
     rows: &[MessageInRow],
     reason: &str,
 ) -> Result<()> {
-    use copperclaw_db::tables::messages_out::{insert as insert_out, WriteOutbound};
+    use copperclaw_db::tables::messages_out::{WriteOutbound, insert as insert_out};
     if rows.is_empty() {
         return Ok(());
     }
@@ -1172,8 +1172,8 @@ fn build_terminal_failure_error_card(
     reason: &str,
 ) -> copperclaw_channels_core::ErrorCard {
     use copperclaw_channels_core::{ErrorCard, ErrorCardKind};
-    let mut card = ErrorCard::new(ErrorCardKind::Provider, summary)
-        .with_title("I couldn't finish that reply");
+    let mut card =
+        ErrorCard::new(ErrorCardKind::Provider, summary).with_title("I couldn't finish that reply");
     let trimmed = reason.trim();
     if !trimmed.is_empty() {
         // Cap to fit within the schema's details cap so a long
@@ -1234,10 +1234,7 @@ mod slash_command_tests {
     fn help_aliases() {
         assert_eq!(SlashCommand::parse("/help"), Some(SlashCommand::Help));
         assert_eq!(SlashCommand::parse("/?"), Some(SlashCommand::Help));
-        assert_eq!(
-            SlashCommand::parse("/commands"),
-            Some(SlashCommand::Help)
-        );
+        assert_eq!(SlashCommand::parse("/commands"), Some(SlashCommand::Help));
     }
 
     #[test]
@@ -1253,12 +1250,14 @@ mod slash_command_tests {
 
 #[cfg(test)]
 mod tests {
+    use super::provider_call::{
+        HeartbeatTicker, MAX_PROVIDER_ATTEMPTS, backoff_for_attempt, query_with_retry,
+    };
     use super::*;
-    use super::provider_call::{query_with_retry, backoff_for_attempt, HeartbeatTicker, MAX_PROVIDER_ATTEMPTS};
     use crate::tools::RunnerToolCtx;
     use async_trait::async_trait;
-    use copperclaw_db::session::{open_inbound, open_outbound, SessionPaths};
-    use copperclaw_db::tables::messages_in::{insert as insert_in, WriteInbound};
+    use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
+    use copperclaw_db::tables::messages_in::{WriteInbound, insert as insert_in};
     use copperclaw_db::tables::messages_out;
     use copperclaw_providers::{AgentProvider, AgentQuery, ProviderError, QueryInput};
     use copperclaw_types::{AgentGroupId, ChannelType, MessageKind, ProviderEvent, SessionId};
@@ -1282,10 +1281,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "scripted"
         }
-        async fn query(
-            &self,
-            _input: QueryInput,
-        ) -> Result<Box<dyn AgentQuery>, ProviderError> {
+        async fn query(&self, _input: QueryInput) -> Result<Box<dyn AgentQuery>, ProviderError> {
             let mut g = self.scripts.lock().unwrap();
             let events = if g.is_empty() {
                 vec![ProviderEvent::Result { text: None }]
@@ -1562,7 +1558,10 @@ mod tests {
         );
         let apology = apologies[0];
         assert_eq!(
-            apology.channel_type.as_ref().map(copperclaw_types::ChannelType::as_str),
+            apology
+                .channel_type
+                .as_ref()
+                .map(copperclaw_types::ChannelType::as_str),
             Some("telegram")
         );
         assert_eq!(apology.platform_id.as_deref(), Some("8929393356"));
@@ -1810,7 +1809,12 @@ mod tests {
         // crucially it is NOT the synthetic "could not be parsed"
         // text — that path is reserved for parse-error calls.
         let shell_result = st.history.iter().find_map(|m| {
-            if let HistoryMessage::Tool { tool_use_id, content, is_error } = m {
+            if let HistoryMessage::Tool {
+                tool_use_id,
+                content,
+                is_error,
+            } = m
+            {
                 if tool_use_id == "tu_shell_1" {
                     return Some((content.clone(), *is_error));
                 }
@@ -1828,7 +1832,12 @@ mod tests {
         // The send_file tool_result is the synthetic parse-error
         // message tagged is_error=true.
         let send_result = st.history.iter().find_map(|m| {
-            if let HistoryMessage::Tool { tool_use_id, content, is_error } = m {
+            if let HistoryMessage::Tool {
+                tool_use_id,
+                content,
+                is_error,
+            } = m
+            {
                 if tool_use_id == "tu_send_bad" {
                     return Some((content.clone(), *is_error));
                 }
@@ -1935,7 +1944,10 @@ mod tests {
 
         let outbound = open_outbound(&setup.paths).unwrap();
         let st = container_state::get(&outbound).unwrap().unwrap();
-        assert!(st.current_tool.is_none(), "tool should be cleared by ToolEnd");
+        assert!(
+            st.current_tool.is_none(),
+            "tool should be cleared by ToolEnd"
+        );
         assert!(st.updated_at.is_some());
     }
 
@@ -1945,13 +1957,11 @@ mod tests {
         // the runner pushes a `Tool { is_error: true }` refusal,
         // then runs a second turn where the model concedes.
         let mut setup = build_setup(vec![
-            vec![
-                ProviderEvent::ToolCall {
-                    id: "tu_1".into(),
-                    name: "CronCreate".into(),
-                    input: serde_json::json!({}),
-                },
-            ],
+            vec![ProviderEvent::ToolCall {
+                id: "tu_1".into(),
+                name: "CronCreate".into(),
+                input: serde_json::json!({}),
+            }],
             vec![ProviderEvent::Result {
                 text: Some("ok".into()),
             }],
@@ -2101,7 +2111,10 @@ mod tests {
 
         // No trailing punctuation → unchanged splice.
         let plain = apology_text("provider returned 503");
-        assert!(plain.contains("— provider returned 503. Try"), "got: {plain}");
+        assert!(
+            plain.contains("— provider returned 503. Try"),
+            "got: {plain}"
+        );
 
         // Empty reason still falls through the fallback branch.
         let empty = apology_text("");
@@ -2309,10 +2322,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "plan"
         }
-        async fn query(
-            &self,
-            _input: QueryInput,
-        ) -> Result<Box<dyn AgentQuery>, ProviderError> {
+        async fn query(&self, _input: QueryInput) -> Result<Box<dyn AgentQuery>, ProviderError> {
             self.observed_attempts
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let step = {
@@ -2422,10 +2432,7 @@ mod tests {
             Ok(_) => panic!("expected terminal failure"),
             Err(e) => e,
         };
-        assert!(matches!(
-            err,
-            ProviderError::Api { status: 503, .. }
-        ));
+        assert!(matches!(err, ProviderError::Api { status: 503, .. }));
         assert_eq!(provider.attempts(), MAX_PROVIDER_ATTEMPTS);
     }
 
@@ -2570,10 +2577,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_deadline_uses_env_when_in_range() {
-        let env = crate::config::MapEnv::from_pairs([(
-            PROVIDER_DEADLINE_ENV,
-            "45000",
-        )]);
+        let env = crate::config::MapEnv::from_pairs([(PROVIDER_DEADLINE_ENV, "45000")]);
         let d = resolve_provider_deadline(&env);
         assert_eq!(d, Duration::from_millis(45_000));
     }
@@ -2587,24 +2591,19 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_provider_deadline_rejects_out_of_range() {
-        let env =
-            crate::config::MapEnv::from_pairs([(PROVIDER_DEADLINE_ENV, "1000")]);
+        let env = crate::config::MapEnv::from_pairs([(PROVIDER_DEADLINE_ENV, "1000")]);
         let d = resolve_provider_deadline(&env);
         // Below MIN_PROVIDER_DEADLINE_MS → default.
         assert_eq!(d, Duration::from_millis(DEFAULT_PROVIDER_DEADLINE_MS));
 
-        let env =
-            crate::config::MapEnv::from_pairs([(PROVIDER_DEADLINE_ENV, "999999")]);
+        let env = crate::config::MapEnv::from_pairs([(PROVIDER_DEADLINE_ENV, "999999")]);
         let d = resolve_provider_deadline(&env);
         assert_eq!(d, Duration::from_millis(DEFAULT_PROVIDER_DEADLINE_MS));
     }
 
     #[tokio::test]
     async fn resolve_provider_deadline_rejects_garbage() {
-        let env = crate::config::MapEnv::from_pairs([(
-            PROVIDER_DEADLINE_ENV,
-            "not-a-number",
-        )]);
+        let env = crate::config::MapEnv::from_pairs([(PROVIDER_DEADLINE_ENV, "not-a-number")]);
         let d = resolve_provider_deadline(&env);
         assert_eq!(d, Duration::from_millis(DEFAULT_PROVIDER_DEADLINE_MS));
     }
@@ -2815,14 +2814,18 @@ mod tests {
         let has_user = snapshot
             .iter()
             .any(|m| matches!(m, HistoryMessage::User { content } if content.contains("do a tool then finish")));
-        let has_tool_use = snapshot.iter().any(|m| matches!(
-            m,
-            HistoryMessage::ToolUse { id, name, .. } if id == "tu_mid_1" && name == "shell"
-        ));
-        let has_tool_result = snapshot.iter().any(|m| matches!(
-            m,
-            HistoryMessage::Tool { tool_use_id, .. } if tool_use_id == "tu_mid_1"
-        ));
+        let has_tool_use = snapshot.iter().any(|m| {
+            matches!(
+                m,
+                HistoryMessage::ToolUse { id, name, .. } if id == "tu_mid_1" && name == "shell"
+            )
+        });
+        let has_tool_result = snapshot.iter().any(|m| {
+            matches!(
+                m,
+                HistoryMessage::Tool { tool_use_id, .. } if tool_use_id == "tu_mid_1"
+            )
+        });
         assert!(
             has_user,
             "mid-message snapshot missing the User entry: {snapshot:?}"
@@ -2904,7 +2907,9 @@ mod tests {
         let user_matches = st
             .history
             .iter()
-            .filter(|m| matches!(m, HistoryMessage::User { content } if content == &formatted_prompt))
+            .filter(
+                |m| matches!(m, HistoryMessage::User { content } if content == &formatted_prompt),
+            )
             .count();
         assert_eq!(
             user_matches, 1,
@@ -2951,8 +2956,12 @@ mod tests {
             crate::state::save_state(
                 &g,
                 &[
-                    HistoryMessage::User { content: formatted_prompt.clone() },
-                    HistoryMessage::Assistant { content: String::new() },
+                    HistoryMessage::User {
+                        content: formatted_prompt.clone(),
+                    },
+                    HistoryMessage::Assistant {
+                        content: String::new(),
+                    },
                     HistoryMessage::ToolUse {
                         id: "tu_resume_1".into(),
                         name: "shell".into(),
@@ -2979,7 +2988,9 @@ mod tests {
         let user_matches = st
             .history
             .iter()
-            .filter(|m| matches!(m, HistoryMessage::User { content } if content == &formatted_prompt))
+            .filter(
+                |m| matches!(m, HistoryMessage::User { content } if content == &formatted_prompt),
+            )
             .count();
         assert_eq!(
             user_matches, 1,

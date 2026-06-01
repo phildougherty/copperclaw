@@ -127,16 +127,16 @@ impl SubprocessTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| {
-                AdapterError::Transport(format!("failed to spawn {bin}: {e}"))
-            })?;
+            .map_err(|e| AdapterError::Transport(format!("failed to spawn {bin}: {e}")))?;
 
-        let stdin = child.stdin.take().ok_or_else(|| {
-            AdapterError::Transport("subprocess stdin was not captured".into())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            AdapterError::Transport("subprocess stdout was not captured".into())
-        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| AdapterError::Transport("subprocess stdin was not captured".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AdapterError::Transport("subprocess stdout was not captured".into()))?;
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(32);
@@ -243,15 +243,12 @@ impl SubprocessTransport {
 
 impl std::fmt::Debug for SubprocessTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SubprocessTransport").finish_non_exhaustive()
+        f.debug_struct("SubprocessTransport")
+            .finish_non_exhaustive()
     }
 }
 
-async fn handle_line(
-    line: &str,
-    pending: &PendingMap,
-    event_tx: &mpsc::Sender<Value>,
-) {
+async fn handle_line(line: &str, pending: &PendingMap, event_tx: &mpsc::Sender<Value>) {
     let value: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(err) => {
@@ -564,8 +561,12 @@ mod tests {
     #[tokio::test]
     async fn mock_transport_call_returns_queued_response() {
         let m = MockTransport::new();
-        m.push_response(MockResponse::ok("send_msg", json!(7))).await;
-        let v = m.call("send_msg", json!([1, 2, {"text": "hi"}])).await.unwrap();
+        m.push_response(MockResponse::ok("send_msg", json!(7)))
+            .await;
+        let v = m
+            .call("send_msg", json!([1, 2, {"text": "hi"}]))
+            .await
+            .unwrap();
         assert_eq!(v, json!(7));
     }
 
@@ -633,7 +634,8 @@ mod tests {
     #[tokio::test]
     async fn mock_transport_next_event_propagates_error() {
         let m = MockTransport::new();
-        m.push_event_error(AdapterError::Transport("dead".into())).await;
+        m.push_event_error(AdapterError::Transport("dead".into()))
+            .await;
         let err = m.next_event().await.unwrap_err();
         assert!(matches!(err, AdapterError::Transport(_)));
     }

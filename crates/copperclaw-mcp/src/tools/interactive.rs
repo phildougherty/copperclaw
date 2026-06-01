@@ -11,10 +11,10 @@ fn validate_to(input: Option<RecipientInput>) -> Result<Option<Recipient>, ToolE
 pub mod ask_user_question {
     //! `ask_user_question`: present a titled multiple-choice question.
 
-    use super::{validate_to, RecipientInput};
+    use super::{RecipientInput, validate_to};
     use crate::context::{AskUserQuestionSpec, OutboundToolEffect, ToolContext};
     use crate::error::ToolError;
-    use crate::tools::{ack_to_result, make_tool, parse_args, ToolEntry, ToolHandler};
+    use crate::tools::{ToolEntry, ToolHandler, ack_to_result, make_tool, parse_args};
     use rmcp::model::{CallToolResult, JsonObject, Tool};
     use serde::Deserialize;
 
@@ -109,10 +109,10 @@ pub mod send_card {
     //! `send_card` from any agent on any channel produces a usable
     //! result.
 
-    use super::{validate_to, RecipientInput};
+    use super::{RecipientInput, validate_to};
     use crate::context::{OutboundToolEffect, SendCardSpec, ToolContext};
     use crate::error::ToolError;
-    use crate::tools::{ack_to_result, make_tool, parse_args, ToolEntry, ToolHandler};
+    use crate::tools::{ToolEntry, ToolHandler, ack_to_result, make_tool, parse_args};
     use copperclaw_channels_core::Card;
     use rmcp::model::{CallToolResult, JsonObject, Tool};
     use serde::Deserialize;
@@ -227,7 +227,9 @@ pub mod send_card {
             to,
             card: input.card,
         };
-        let ack = ctx.emit_outbound(OutboundToolEffect::SendCard(spec)).await?;
+        let ack = ctx
+            .emit_outbound(OutboundToolEffect::SendCard(spec))
+            .await?;
         Ok(ack_to_result(&ack))
     }
 

@@ -39,7 +39,7 @@ use serde_json::json;
 
 use crate::error::ToolError;
 use crate::tools::diff_util::{build_blob_card, build_diff_card, over_blob_cutoff};
-use crate::tools::{make_tool, parse_args, success_json, ToolEntry, ToolHandler};
+use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args, success_json};
 
 #[derive(Debug, Deserialize)]
 struct Input {
@@ -92,7 +92,12 @@ pub async fn handle(
     // chasing async equivalents for every step.
     let display = path.display().to_string();
     let result = tokio::task::spawn_blocking(move || {
-        do_edit(&path, &input.old_string, &input.new_string, input.replace_all)
+        do_edit(
+            &path,
+            &input.old_string,
+            &input.new_string,
+            input.replace_all,
+        )
     })
     .await
     .map_err(|e| ToolError::Internal(format!("edit_file({display}) join: {e}")))??;
@@ -147,12 +152,8 @@ fn do_edit(
     // file; we follow symlinks (matching the spec's "follow symlinks
     // but reject if target is non-regular") by then calling metadata
     // for the real check.
-    let lmeta = std::fs::symlink_metadata(path).map_err(|e| {
-        ToolError::Internal(format!(
-            "edit_file({}): stat: {e}",
-            path.display()
-        ))
-    })?;
+    let lmeta = std::fs::symlink_metadata(path)
+        .map_err(|e| ToolError::Internal(format!("edit_file({}): stat: {e}", path.display())))?;
     let meta = if lmeta.file_type().is_symlink() {
         std::fs::metadata(path).map_err(|e| {
             ToolError::Internal(format!(
@@ -170,12 +171,8 @@ fn do_edit(
         )));
     }
 
-    let original = std::fs::read_to_string(path).map_err(|e| {
-        ToolError::Internal(format!(
-            "edit_file({}): read: {e}",
-            path.display()
-        ))
-    })?;
+    let original = std::fs::read_to_string(path)
+        .map_err(|e| ToolError::Internal(format!("edit_file({}): read: {e}", path.display())))?;
 
     let count = original.matches(old_string).count();
     if count == 0 {
@@ -219,11 +216,7 @@ fn do_edit(
 /// container. The atomic rename keeps whatever ownership the temp
 /// file inherits from the calling process, which is also what
 /// `write_file` does today.
-fn atomic_write(
-    path: &Path,
-    bytes: &[u8],
-    orig_meta: &std::fs::Metadata,
-) -> Result<(), ToolError> {
+fn atomic_write(path: &Path, bytes: &[u8], orig_meta: &std::fs::Metadata) -> Result<(), ToolError> {
     use std::io::Write;
 
     // Cleanup guard: if anything below fails, drop the temp file.
@@ -238,10 +231,10 @@ fn atomic_write(
         }
     }
 
-    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).map_or_else(
-        || PathBuf::from("."),
-        Path::to_path_buf,
-    );
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let file_name = path
         .file_name()
         .ok_or_else(|| {
@@ -278,19 +271,13 @@ fn atomic_write(
                 ))
             })?;
         f.write_all(bytes).map_err(|e| {
-            ToolError::Internal(format!(
-                "edit_file({}): write tmp: {e}",
-                path.display()
-            ))
+            ToolError::Internal(format!("edit_file({}): write tmp: {e}", path.display()))
         })?;
         // fsync the contents before rename — without this a crash
         // between rename and journal flush can leave a zero-length
         // file in place of the original on ext4 with data=ordered.
         f.sync_all().map_err(|e| {
-            ToolError::Internal(format!(
-                "edit_file({}): fsync tmp: {e}",
-                path.display()
-            ))
+            ToolError::Internal(format!("edit_file({}): fsync tmp: {e}", path.display()))
         })?;
     }
 
@@ -300,14 +287,9 @@ fn atomic_write(
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = orig_meta.permissions().mode();
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).map_err(
-            |e| {
-                ToolError::Internal(format!(
-                    "edit_file({}): chmod tmp: {e}",
-                    path.display()
-                ))
-            },
-        )?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).map_err(|e| {
+            ToolError::Internal(format!("edit_file({}): chmod tmp: {e}", path.display()))
+        })?;
     }
     // On non-unix the platform's default copy of perms (or absence
     // thereof) is fine; the spec is unix-targeted.
@@ -527,8 +509,7 @@ mod tests {
         let path = dir.path().join("a.sh");
         std::fs::write(&path, "echo old\n").unwrap();
         // 0o741 — distinct from default 0o644 so the test is meaningful.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o741))
-            .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o741)).unwrap();
 
         call(&json!({
             "path": path.to_string_lossy(),
@@ -557,11 +538,7 @@ mod tests {
             std::fs::write(&path, "let x = 1;\n").unwrap();
             // 0o555 = r-x for everyone, no write on the dir.
             let orig = std::fs::metadata(dir.path()).unwrap().permissions();
-            std::fs::set_permissions(
-                dir.path(),
-                std::fs::Permissions::from_mode(0o555),
-            )
-            .unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
 
             let err = call(&json!({
                 "path": path.to_string_lossy(),

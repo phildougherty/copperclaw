@@ -91,7 +91,10 @@ impl CreateAgentHandler {
         let parent_conn = match copperclaw_db::session::open_inbound(&parent_paths) {
             Ok(c) => c,
             Err(err) => {
-                warn!(?err, "create_agent: open parent inbound for routing copy failed");
+                warn!(
+                    ?err,
+                    "create_agent: open parent inbound for routing copy failed"
+                );
                 return;
             }
         };
@@ -109,12 +112,14 @@ impl CreateAgentHandler {
                 return;
             }
         };
-        let child_paths =
-            SessionPaths::new(&self.deps.data_root, child_agent_group, child_session);
+        let child_paths = SessionPaths::new(&self.deps.data_root, child_agent_group, child_session);
         let child_conn = match copperclaw_db::session::open_inbound(&child_paths) {
             Ok(c) => c,
             Err(err) => {
-                warn!(?err, "create_agent: open child inbound for routing write failed");
+                warn!(
+                    ?err,
+                    "create_agent: open child inbound for routing write failed"
+                );
                 return;
             }
         };

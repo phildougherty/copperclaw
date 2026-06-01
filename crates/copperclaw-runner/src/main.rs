@@ -11,18 +11,21 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use copperclaw_db::session::{open_inbound_rw_no_mmap, open_outbound, SessionPaths};
+use copperclaw_db::session::{SessionPaths, open_inbound_rw_no_mmap, open_outbound};
 use copperclaw_providers::{AnthropicProvider, CodexProvider, OllamaProvider};
 use copperclaw_runner::{
-    compaction::CompactionCfg, resolve_max_tool_turns, resolve_provider_deadline,
-    resolve_tool_deadline_secs, run_loop,
-    RunnerConfig, RunnerDeps, RunnerToolCtx, SubagentRunnerDeps,
+    RunnerConfig, RunnerDeps, RunnerToolCtx, SubagentRunnerDeps, compaction::CompactionCfg,
+    resolve_max_tool_turns, resolve_provider_deadline, resolve_tool_deadline_secs, run_loop,
 };
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
-#[command(name = "copperclaw-runner", version, about = "Copperclaw container agent runner")]
+#[command(
+    name = "copperclaw-runner",
+    version,
+    about = "Copperclaw container agent runner"
+)]
 struct Cli {
     /// Path to the runner JSON config file. May also be supplied via
     /// `COPPERCLAW_RUNNER_CONFIG`.
@@ -37,7 +40,9 @@ async fn main() -> Result<()> {
     // container poll loop's formatter output; tracing belongs on stderr.
     let use_ansi = std::io::IsTerminal::is_terminal(&std::io::stderr());
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_target(false)
         .with_writer(std::io::stderr)
         .with_ansi(use_ansi)
@@ -91,15 +96,8 @@ async fn main() -> Result<()> {
         .iter()
         .map(|e| copperclaw_providers::ToolDef {
             name: e.tool.name.to_string(),
-            description: e
-                .tool
-                .description
-                .as_deref()
-                .unwrap_or("")
-                .to_string(),
-            input_schema: serde_json::Value::Object(
-                (*e.tool.input_schema).clone(),
-            ),
+            description: e.tool.description.as_deref().unwrap_or("").to_string(),
+            input_schema: serde_json::Value::Object((*e.tool.input_schema).clone()),
         })
         .collect();
     let tool_map: std::sync::Arc<
@@ -148,9 +146,7 @@ async fn main() -> Result<()> {
         assistant_name: cfg.assistant_name.clone(),
         compaction,
         max_turns: None,
-        idle_sleep: std::time::Duration::from_millis(
-            copperclaw_runner::POLL_INTERVAL_MS,
-        ),
+        idle_sleep: std::time::Duration::from_millis(copperclaw_runner::POLL_INTERVAL_MS),
         heartbeat_path: Some(paths.heartbeat.clone()),
         session_id: cfg.session_id,
         agent_group_id: cfg.agent_group_id,
@@ -164,9 +160,9 @@ async fn main() -> Result<()> {
         // tick. The host's typing-ticker gates on container=Running
         // (which gates on a fresh heartbeat), so a stale heartbeat
         // would otherwise let the bubble vanish mid-response.
-        activity_pinger: std::sync::Arc::new(
-            copperclaw_runner::HeartbeatPinger::new(Some(paths.heartbeat.clone())),
-        ),
+        activity_pinger: std::sync::Arc::new(copperclaw_runner::HeartbeatPinger::new(Some(
+            paths.heartbeat.clone(),
+        ))),
         // Slice-3.5 opt-in: surface the model's reasoning blocks as
         // collapsed native UI primitives when the host has the
         // per-group `surface_thinking` flag on. Default-off keeps the
@@ -206,7 +202,11 @@ pub(crate) fn build_provider(
             let base_url = env
                 .get("OLLAMA_BASE_URL")
                 .unwrap_or_else(|| "http://localhost:11434".to_string());
-            let model = if cfg.model.is_empty() { None } else { Some(cfg.model.clone()) };
+            let model = if cfg.model.is_empty() {
+                None
+            } else {
+                Some(cfg.model.clone())
+            };
             Ok(Arc::new(OllamaProvider::new(base_url, model)))
         }
         "ollama-shim" => {
@@ -215,7 +215,11 @@ pub(crate) fn build_provider(
                 .clone()
                 .or_else(|| env.get("OLLAMA_BASE_URL"))
                 .context("ollama-shim requires api_base_url or OLLAMA_BASE_URL pointing at the Anthropic-shaped proxy")?;
-            let model = if cfg.model.is_empty() { None } else { Some(cfg.model.clone()) };
+            let model = if cfg.model.is_empty() {
+                None
+            } else {
+                Some(cfg.model.clone())
+            };
             Ok(Arc::new(OllamaProvider::shim(base_url, model)))
         }
         "codex" => {
@@ -224,15 +228,18 @@ pub(crate) fn build_provider(
                 .clone()
                 .or_else(|| env.get("COPPERCLAW_CODEX_BINARY"))
                 .unwrap_or_else(|| "/usr/local/bin/codex".to_string());
-            let args = cfg.codex_args.clone().unwrap_or_else(|| match env.get("COPPERCLAW_CODEX_ARGS") {
-                Some(raw) => raw
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>(),
-                None => vec!["--json".to_string()],
-            });
+            let args =
+                cfg.codex_args
+                    .clone()
+                    .unwrap_or_else(|| match env.get("COPPERCLAW_CODEX_ARGS") {
+                        Some(raw) => raw
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>(),
+                        None => vec!["--json".to_string()],
+                    });
             Ok(Arc::new(CodexProvider::new(
                 std::path::PathBuf::from(binary),
                 args,
@@ -317,7 +324,9 @@ mod build_provider_tests {
         let env = MapEnv::default();
         // `Arc<dyn AgentProvider>` doesn't implement Debug, so we can't
         // use `.unwrap_err()`; collapse to a Debug-able String first.
-        let result = build_provider(&cfg, &env).map(|_| "ok").map_err(|e| e.to_string());
+        let result = build_provider(&cfg, &env)
+            .map(|_| "ok")
+            .map_err(|e| e.to_string());
         let err = result.unwrap_err();
         assert!(err.contains("api key"));
     }

@@ -8,8 +8,8 @@ use crate::config::SetupConfig;
 use crate::migrator::migrate_from;
 use crate::prompt::{EnvBacked, Interactive, Prompt};
 use crate::state::SetupState;
-use crate::steps::{all_steps, Step, StepError};
-use crate::units::{generate, UnitContext, UnitKind};
+use crate::steps::{Step, StepError, all_steps};
+use crate::units::{UnitContext, UnitKind, generate};
 use clap::Parser;
 use std::path::PathBuf;
 
@@ -129,7 +129,13 @@ pub fn run_cli(cli: Cli) -> Result<i32, StepError> {
         config = state.config.clone();
     }
     let steps = all_steps();
-    run_steps(&steps, &cli.skip_step, &mut config, prompt.as_ref(), &mut state)?;
+    run_steps(
+        &steps,
+        &cli.skip_step,
+        &mut config,
+        prompt.as_ref(),
+        &mut state,
+    )?;
     state.config = config.clone();
     if !config.data_dir.as_os_str().is_empty() {
         state
@@ -293,7 +299,10 @@ mod tests {
             "onecli",
         ])
         .unwrap();
-        assert_eq!(cli.skip_step, vec!["image".to_string(), "onecli".to_string()]);
+        assert_eq!(
+            cli.skip_step,
+            vec!["image".to_string(), "onecli".to_string()]
+        );
     }
 
     #[test]
@@ -342,8 +351,7 @@ mod tests {
         let prompt = Scripted::new();
         let mut cfg = SetupConfig::default();
         let mut state = SetupState::new();
-        let err =
-            run_steps(&steps, &["b".to_string()], &mut cfg, &prompt, &mut state).unwrap_err();
+        let err = run_steps(&steps, &["b".to_string()], &mut cfg, &prompt, &mut state).unwrap_err();
         assert!(matches!(err, StepError::Other(_)));
     }
 

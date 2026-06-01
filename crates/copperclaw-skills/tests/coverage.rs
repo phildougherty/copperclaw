@@ -215,8 +215,7 @@ fn list_skill_dirs() -> Vec<PathBuf> {
 /// frontmatter — tests in `frontmatter.rs` already pin parsing, this
 /// helper exists to keep the coverage tests readable.
 fn read_frontmatter(skill_dir: &Path) -> Frontmatter {
-    let raw =
-        fs::read_to_string(skill_dir.join("SKILL.md")).expect("read SKILL.md");
+    let raw = fs::read_to_string(skill_dir.join("SKILL.md")).expect("read SKILL.md");
     let yaml = raw
         .strip_prefix("---\n")
         .or_else(|| raw.strip_prefix("---\r\n"))
@@ -230,8 +229,7 @@ fn read_frontmatter(skill_dir: &Path) -> Frontmatter {
 
 /// Markdown body (everything after the closing `---`) for a skill.
 fn read_body(skill_dir: &Path) -> String {
-    let raw =
-        fs::read_to_string(skill_dir.join("SKILL.md")).expect("read SKILL.md");
+    let raw = fs::read_to_string(skill_dir.join("SKILL.md")).expect("read SKILL.md");
     skip_frontmatter(&raw).to_string()
 }
 
@@ -281,9 +279,22 @@ fn backtick_tokens(body: &str) -> impl Iterator<Item = &str> {
 /// none of these match, the token is almost certainly a schema field
 /// or unrelated identifier.
 const VERB_PREFIXES: &[&str] = &[
-    "add_", "ask_", "cancel_", "create_", "edit_", "git_", "install_",
-    "list_", "pause_", "read_", "resume_", "schedule_", "send_",
-    "update_", "web_", "write_",
+    "add_",
+    "ask_",
+    "cancel_",
+    "create_",
+    "edit_",
+    "git_",
+    "install_",
+    "list_",
+    "pause_",
+    "read_",
+    "resume_",
+    "schedule_",
+    "send_",
+    "update_",
+    "web_",
+    "write_",
 ];
 
 fn looks_like_tool_ref(token: &str, registry: &BTreeSet<&str>) -> bool {
@@ -347,17 +358,16 @@ fn every_registry_tool_appears_in_some_skill() {
         })
         .collect();
 
-    let intentional: BTreeSet<&str> =
-        TOOLS_INTENTIONALLY_UNCOVERED.iter().copied().collect();
+    let intentional: BTreeSet<&str> = TOOLS_INTENTIONALLY_UNCOVERED.iter().copied().collect();
     let mut missing = Vec::new();
 
     for tool in REGISTRY_TOOLS {
         if intentional.contains(tool) {
             continue;
         }
-        let mentioned = bodies.iter().any(|(_, body)| {
-            backtick_tokens(body).any(|t| t == *tool)
-        });
+        let mentioned = bodies
+            .iter()
+            .any(|(_, body)| backtick_tokens(body).any(|t| t == *tool));
         if !mentioned {
             missing.push(*tool);
         }
@@ -376,14 +386,12 @@ fn every_registry_tool_appears_in_some_skill() {
 #[test]
 fn skill_tool_mentions_resolve_to_registry() {
     let registry: BTreeSet<&str> = REGISTRY_TOOLS.iter().copied().collect();
-    let allowlist: BTreeSet<&str> =
-        NON_TOOL_TOKEN_ALLOWLIST.iter().copied().collect();
+    let allowlist: BTreeSet<&str> = NON_TOOL_TOKEN_ALLOWLIST.iter().copied().collect();
 
     let mut broken: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     for dir in list_skill_dirs() {
-        let skill_name =
-            dir.file_name().unwrap().to_string_lossy().into_owned();
+        let skill_name = dir.file_name().unwrap().to_string_lossy().into_owned();
         let body = read_body(&dir);
 
         for token in backtick_tokens(&body) {
@@ -424,8 +432,7 @@ fn skill_descriptions_are_substantive() {
     let mut offenders = Vec::new();
 
     for dir in list_skill_dirs() {
-        let name =
-            dir.file_name().unwrap().to_string_lossy().into_owned();
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
         let fm = read_frontmatter(&dir);
         let desc = fm.description.trim();
         if desc.chars().count() < MIN_DESC_CHARS {
@@ -468,11 +475,10 @@ fn skill_bodies_describe_when_to_use() {
         let mut i = 0;
         while i + 4 <= bytes.len() {
             if &bytes[i..i + 4] == b"when" {
-                let before_ok = i == 0
-                    || !bytes[i - 1].is_ascii_alphanumeric();
+                let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
                 let after_idx = i + 4;
-                let after_ok = after_idx >= bytes.len()
-                    || !bytes[after_idx].is_ascii_alphanumeric();
+                let after_ok =
+                    after_idx >= bytes.len() || !bytes[after_idx].is_ascii_alphanumeric();
                 if before_ok && after_ok {
                     return true;
                 }
@@ -486,8 +492,7 @@ fn skill_bodies_describe_when_to_use() {
     for dir in list_skill_dirs() {
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
         let body = read_body(&dir).to_lowercase();
-        let any_hint = HINTS.iter().any(|h| body.contains(h))
-            || has_when_word(&body);
+        let any_hint = HINTS.iter().any(|h| body.contains(h)) || has_when_word(&body);
         if !any_hint {
             weak.push(name);
         }
@@ -519,8 +524,7 @@ fn skill_bodies_describe_when_to_use() {
 fn skill_loading_order_is_alphabetical() {
     use copperclaw_skills::SkillRegistry;
 
-    let reg = SkillRegistry::scan(&skills_root(), None)
-        .expect("scan skills root");
+    let reg = SkillRegistry::scan(&skills_root(), None).expect("scan skills root");
     let names: Vec<&str> = reg.iter().map(|s| s.name.as_str()).collect();
     let mut sorted = names.clone();
     sorted.sort_unstable();
@@ -620,9 +624,10 @@ fn skill_tools_frontmatter_when_present_references_real_tools() {
                         continue;
                     }
                     if !registry.contains(tool) {
-                        broken.entry(name.clone()).or_default().push(
-                            format!("tools entry {tool:?} not in registry"),
-                        );
+                        broken
+                            .entry(name.clone())
+                            .or_default()
+                            .push(format!("tools entry {tool:?} not in registry"));
                     }
                 }
             }

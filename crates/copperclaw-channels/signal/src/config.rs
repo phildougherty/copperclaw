@@ -97,9 +97,7 @@ impl SignalConfig {
                 let mut out = Vec::with_capacity(arr.len());
                 for v in arr {
                     let s = v.as_str().ok_or_else(|| {
-                        AdapterError::BadRequest(
-                            "signal extra_args entries must be strings".into(),
-                        )
+                        AdapterError::BadRequest("signal extra_args entries must be strings".into())
                     })?;
                     out.push(s.to_owned());
                 }

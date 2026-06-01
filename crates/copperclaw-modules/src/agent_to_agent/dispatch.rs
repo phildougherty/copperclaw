@@ -28,7 +28,7 @@ use crate::context::{
 use crate::error::ModuleError;
 use async_trait::async_trait;
 use copperclaw_db::central::CentralDb;
-use copperclaw_db::session::{open_inbound, SessionPaths};
+use copperclaw_db::session::{SessionPaths, open_inbound};
 use copperclaw_db::tables::messages_in::{self, WriteInbound};
 use copperclaw_db::tables::sessions;
 use copperclaw_types::{MessageId, MessageKind, SessionId};
@@ -129,11 +129,7 @@ impl DeliveryActionHandler for AgentDispatchHandler {
         //    transient (FS hiccup, permissions race during a chmod) so
         //    propagate as ModuleError to trigger the delivery loop's
         //    retry/backoff.
-        let paths = SessionPaths::new(
-            &self.deps.data_root,
-            target.agent_group_id,
-            target.id,
-        );
+        let paths = SessionPaths::new(&self.deps.data_root, target.agent_group_id, target.id);
         let conn = open_inbound(&paths).map_err(|err| {
             warn!(
                 ?err,

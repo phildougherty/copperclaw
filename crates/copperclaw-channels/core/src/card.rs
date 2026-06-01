@@ -114,21 +114,37 @@ pub enum CardError {
     /// Button count exceeded [`MAX_BUTTONS`].
     TooManyButtons { count: usize, max: usize },
     /// Field `label` exceeded [`MAX_FIELD_LABEL_CHARS`].
-    FieldLabelTooLong { index: usize, len: usize, max: usize },
+    FieldLabelTooLong {
+        index: usize,
+        len: usize,
+        max: usize,
+    },
     /// Field `value` exceeded [`MAX_FIELD_VALUE_CHARS`].
-    FieldValueTooLong { index: usize, len: usize, max: usize },
+    FieldValueTooLong {
+        index: usize,
+        len: usize,
+        max: usize,
+    },
     /// Field `label` was empty.
     FieldLabelEmpty { index: usize },
     /// Button `label` was empty.
     ButtonLabelEmpty { index: usize },
     /// Button `label` exceeded [`MAX_BUTTON_LABEL_CHARS`].
-    ButtonLabelTooLong { index: usize, len: usize, max: usize },
+    ButtonLabelTooLong {
+        index: usize,
+        len: usize,
+        max: usize,
+    },
     /// Button had neither `value` nor `url` set.
     ButtonMissingTarget { index: usize },
     /// Button had BOTH `value` and `url` set.
     ButtonBothValueAndUrl { index: usize },
     /// Button `value` exceeded [`MAX_BUTTON_VALUE_BYTES`].
-    ButtonValueTooLong { index: usize, len: usize, max: usize },
+    ButtonValueTooLong {
+        index: usize,
+        len: usize,
+        max: usize,
+    },
     /// Button `url` was not a syntactically valid http(s) URL.
     ButtonInvalidUrl { index: usize },
     /// `image_url` was not a syntactically valid http(s) URL.
@@ -154,44 +170,38 @@ impl fmt::Display for CardError {
             Self::TooManyButtons { count, max } => {
                 write!(f, "{count} buttons exceeds maximum of {max}")
             }
-            Self::FieldLabelTooLong { index, len, max } => write!(
-                f,
-                "fields[{index}].label is {len} chars (max {max})"
-            ),
-            Self::FieldValueTooLong { index, len, max } => write!(
-                f,
-                "fields[{index}].value is {len} chars (max {max})"
-            ),
+            Self::FieldLabelTooLong { index, len, max } => {
+                write!(f, "fields[{index}].label is {len} chars (max {max})")
+            }
+            Self::FieldValueTooLong { index, len, max } => {
+                write!(f, "fields[{index}].value is {len} chars (max {max})")
+            }
             Self::FieldLabelEmpty { index } => {
                 write!(f, "fields[{index}].label must be non-empty")
             }
             Self::ButtonLabelEmpty { index } => {
                 write!(f, "buttons[{index}].label must be non-empty")
             }
-            Self::ButtonLabelTooLong { index, len, max } => write!(
-                f,
-                "buttons[{index}].label is {len} chars (max {max})"
-            ),
+            Self::ButtonLabelTooLong { index, len, max } => {
+                write!(f, "buttons[{index}].label is {len} chars (max {max})")
+            }
             Self::ButtonMissingTarget { index } => write!(
                 f,
                 "buttons[{index}] must set exactly one of `value` or `url`"
             ),
-            Self::ButtonBothValueAndUrl { index } => write!(
-                f,
-                "buttons[{index}] set both `value` and `url`; pick one"
-            ),
-            Self::ButtonValueTooLong { index, len, max } => write!(
-                f,
-                "buttons[{index}].value is {len} bytes (max {max})"
-            ),
+            Self::ButtonBothValueAndUrl { index } => {
+                write!(f, "buttons[{index}] set both `value` and `url`; pick one")
+            }
+            Self::ButtonValueTooLong { index, len, max } => {
+                write!(f, "buttons[{index}].value is {len} bytes (max {max})")
+            }
             Self::ButtonInvalidUrl { index } => write!(
                 f,
                 "buttons[{index}].url must be a syntactically valid http(s) URL"
             ),
-            Self::InvalidImageUrl => write!(
-                f,
-                "image_url must be a syntactically valid http(s) URL"
-            ),
+            Self::InvalidImageUrl => {
+                write!(f, "image_url must be a syntactically valid http(s) URL")
+            }
         }
     }
 }
@@ -502,10 +512,7 @@ mod tests {
                 .collect(),
             ..Card::default()
         };
-        assert!(matches!(
-            c.validate(),
-            Err(CardError::TooManyFields { .. })
-        ));
+        assert!(matches!(c.validate(), Err(CardError::TooManyFields { .. })));
     }
 
     #[test]

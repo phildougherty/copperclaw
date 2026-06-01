@@ -172,14 +172,13 @@ fn comment_to_event(state: &LinearEventsState, data: &Value) -> InboundEvent {
         .to_owned();
     let user = data.get("user");
     let sender = user.and_then(|u| {
-        u.get("id").and_then(Value::as_str).map(|uid| SenderIdentity {
-            channel_type: state.channel_type.clone(),
-            identity: uid.to_owned(),
-            display_name: u
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        })
+        u.get("id")
+            .and_then(Value::as_str)
+            .map(|uid| SenderIdentity {
+                channel_type: state.channel_type.clone(),
+                identity: uid.to_owned(),
+                display_name: u.get("name").and_then(Value::as_str).map(str::to_owned),
+            })
     });
     let timestamp = parse_iso8601(data.get("createdAt").and_then(Value::as_str));
     let content = serde_json::json!({"text": body});
@@ -227,14 +226,13 @@ fn issue_to_event(state: &LinearEventsState, data: &Value) -> InboundEvent {
         .unwrap_or("")
         .to_owned();
     let sender = data.get("creator").and_then(|u| {
-        u.get("id").and_then(Value::as_str).map(|uid| SenderIdentity {
-            channel_type: state.channel_type.clone(),
-            identity: uid.to_owned(),
-            display_name: u
-                .get("name")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        })
+        u.get("id")
+            .and_then(Value::as_str)
+            .map(|uid| SenderIdentity {
+                channel_type: state.channel_type.clone(),
+                identity: uid.to_owned(),
+                display_name: u.get("name").and_then(Value::as_str).map(str::to_owned),
+            })
     });
     let timestamp = parse_iso8601(data.get("createdAt").and_then(Value::as_str));
     let content = serde_json::json!({"text": text});
@@ -372,7 +370,10 @@ mod tests {
         assert!(matches!(evt.message.kind, MessageKind::Chat));
         assert_eq!(evt.message.is_group, Some(true));
         assert_eq!(evt.message.is_mention, Some(false));
-        assert_eq!(evt.message.timestamp.to_rfc3339(), "2026-01-02T03:04:05+00:00");
+        assert_eq!(
+            evt.message.timestamp.to_rfc3339(),
+            "2026-01-02T03:04:05+00:00"
+        );
         let sender = evt.sender.expect("sender");
         assert_eq!(sender.identity, "user-1");
         assert_eq!(sender.display_name.as_deref(), Some("Alice"));
@@ -442,10 +443,7 @@ mod tests {
         let evt = rx.recv().await.unwrap();
         assert_eq!(evt.platform_id, "issue-uuid-99");
         assert_eq!(evt.message.id, "issue-uuid-99");
-        assert_eq!(
-            evt.message.content["text"],
-            "Hello\n\na long description"
-        );
+        assert_eq!(evt.message.content["text"], "Hello\n\na long description");
         assert!(evt.thread_id.is_none());
         let sender = evt.sender.expect("sender");
         assert_eq!(sender.identity, "user-9");
@@ -548,8 +546,8 @@ mod tests {
     async fn rejects_bad_signature_with_401() {
         let (state, _rx) = make_state(None, None);
         let app = build_events_router("/linear/webhook", state.clone());
-        let body = serde_json::to_vec(&json!({"type":"Comment","action":"create","data":{}}))
-            .unwrap();
+        let body =
+            serde_json::to_vec(&json!({"type":"Comment","action":"create","data":{}})).unwrap();
         let bad_sig = hex::encode([0u8; 32]);
         let req = Request::builder()
             .method("POST")
@@ -565,8 +563,8 @@ mod tests {
     async fn rejects_missing_signature_header_with_401() {
         let (state, _rx) = make_state(None, None);
         let app = build_events_router("/linear/webhook", state.clone());
-        let body = serde_json::to_vec(&json!({"type":"Comment","action":"create","data":{}}))
-            .unwrap();
+        let body =
+            serde_json::to_vec(&json!({"type":"Comment","action":"create","data":{}})).unwrap();
         let req = Request::builder()
             .method("POST")
             .uri("/linear/webhook")
@@ -590,8 +588,7 @@ mod tests {
     async fn payload_missing_type_is_ignored() {
         let (state, mut rx) = make_state(None, None);
         let app = build_events_router("/linear/webhook", state.clone());
-        let body =
-            serde_json::to_vec(&json!({"action":"create","data":{"id":"c"}})).unwrap();
+        let body = serde_json::to_vec(&json!({"action":"create","data":{"id":"c"}})).unwrap();
         let req = signed_request(&state, "/linear/webhook", &body);
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -603,8 +600,7 @@ mod tests {
     async fn payload_missing_action_is_ignored() {
         let (state, mut rx) = make_state(None, None);
         let app = build_events_router("/linear/webhook", state.clone());
-        let body =
-            serde_json::to_vec(&json!({"type":"Comment","data":{"id":"c"}})).unwrap();
+        let body = serde_json::to_vec(&json!({"type":"Comment","data":{"id":"c"}})).unwrap();
         let req = signed_request(&state, "/linear/webhook", &body);
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

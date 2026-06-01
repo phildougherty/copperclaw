@@ -8,8 +8,8 @@
 //!
 //! [`ProviderEvent::Init`]: copperclaw_types::ProviderEvent::Init
 
-use copperclaw_db::tables::session_state;
 use copperclaw_db::DbError;
+use copperclaw_db::tables::session_state;
 use copperclaw_providers::HistoryMessage;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -68,7 +68,7 @@ pub fn save_state(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use copperclaw_db::session::{open_outbound, SessionPaths};
+    use copperclaw_db::session::{SessionPaths, open_outbound};
     use copperclaw_types::{AgentGroupId, SessionId};
 
     fn fresh_outbound() -> (tempfile::TempDir, Connection) {
@@ -90,8 +90,12 @@ mod tests {
     fn save_then_load_roundtrips() {
         let (_tmp, conn) = fresh_outbound();
         let history = vec![
-            HistoryMessage::User { content: "hi".into() },
-            HistoryMessage::Assistant { content: "hello".into() },
+            HistoryMessage::User {
+                content: "hi".into(),
+            },
+            HistoryMessage::Assistant {
+                content: "hello".into(),
+            },
         ];
         save_state(&conn, &history, Some("cont-abc")).unwrap();
         let st = load_state(&conn).unwrap();
@@ -138,13 +142,17 @@ mod tests {
         let (_tmp, conn) = fresh_outbound();
         save_state(
             &conn,
-            &[HistoryMessage::User { content: "first".into() }],
+            &[HistoryMessage::User {
+                content: "first".into(),
+            }],
             None,
         )
         .unwrap();
         save_state(
             &conn,
-            &[HistoryMessage::User { content: "second".into() }],
+            &[HistoryMessage::User {
+                content: "second".into(),
+            }],
             None,
         )
         .unwrap();

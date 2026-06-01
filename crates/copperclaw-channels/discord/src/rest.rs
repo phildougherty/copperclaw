@@ -14,7 +14,7 @@
 
 use copperclaw_channels_core::AdapterError;
 use copperclaw_types::OutboundFile;
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use reqwest::multipart::{Form, Part};
 use reqwest::{Client, Response, StatusCode};
 use serde_json::{Value, json};
@@ -70,7 +70,10 @@ impl DiscordRest {
                 let part = Part::bytes(f.data.clone()).file_name(f.filename.clone());
                 form = form.part(format!("files[{idx}]"), part);
             }
-            self.client.post(&url).headers(self.auth_headers()?).multipart(form)
+            self.client
+                .post(&url)
+                .headers(self.auth_headers()?)
+                .multipart(form)
         };
 
         let resp = req
@@ -114,9 +117,10 @@ impl DiscordRest {
             .await
             .map_err(|e| AdapterError::Transport(format!("post_message_payload: {e}")))?;
         let resp = check_response(resp).await?;
-        let body: Value = resp.json().await.map_err(|e| {
-            AdapterError::Transport(format!("post_message_payload decode: {e}"))
-        })?;
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| AdapterError::Transport(format!("post_message_payload decode: {e}")))?;
         body.get("id")
             .and_then(Value::as_str)
             .map(str::to_owned)
@@ -156,9 +160,7 @@ impl DiscordRest {
             .body(payload.to_string())
             .send()
             .await
-            .map_err(|e| {
-                AdapterError::Transport(format!("create_interaction_response: {e}"))
-            })?;
+            .map_err(|e| AdapterError::Transport(format!("create_interaction_response: {e}")))?;
         check_response(resp).await?;
         Ok(())
     }
@@ -219,11 +221,7 @@ impl DiscordRest {
     /// lack the `MANAGE_MESSAGES` permission required to pin, in
     /// which case Discord returns `50013` (missing permissions) and
     /// the caller swallows.
-    pub async fn put_pin(
-        &self,
-        channel_id: &str,
-        message_id: &str,
-    ) -> Result<(), AdapterError> {
+    pub async fn put_pin(&self, channel_id: &str, message_id: &str) -> Result<(), AdapterError> {
         let url = format!(
             "{}/channels/{}/pins/{}",
             self.api_base, channel_id, message_id
@@ -245,11 +243,7 @@ impl DiscordRest {
     /// when a [`TodoList`](copperclaw_channels_core::TodoList) transitions
     /// to fully-completed. Same permission-failure caveat as
     /// [`Self::put_pin`].
-    pub async fn delete_pin(
-        &self,
-        channel_id: &str,
-        message_id: &str,
-    ) -> Result<(), AdapterError> {
+    pub async fn delete_pin(&self, channel_id: &str, message_id: &str) -> Result<(), AdapterError> {
         let url = format!(
             "{}/channels/{}/pins/{}",
             self.api_base, channel_id, message_id
@@ -355,15 +349,11 @@ async fn check_response(resp: Response) -> Result<Response, AdapterError> {
         }
         s if s.is_server_error() => {
             let body = body_snippet(resp).await;
-            Err(AdapterError::Transport(format!(
-                "discord {status}: {body}"
-            )))
+            Err(AdapterError::Transport(format!("discord {status}: {body}")))
         }
         _ => {
             let body = body_snippet(resp).await;
-            Err(AdapterError::Transport(format!(
-                "discord {status}: {body}"
-            )))
+            Err(AdapterError::Transport(format!("discord {status}: {body}")))
         }
     }
 }
@@ -409,8 +399,7 @@ async fn body_snippet(resp: Response) -> String {
 fn urlencoding(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
-        let unreserved = b.is_ascii_alphanumeric()
-            || matches!(b, b'-' | b'.' | b'_' | b'~' | b':');
+        let unreserved = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b':');
         if unreserved {
             out.push(b as char);
         } else {
@@ -436,9 +425,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/channels/c1/messages"))
             .and(header("authorization", "Bot test-token"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "id": "m9" })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "m9" })))
             .mount(&server)
             .await;
         let r = client(&server);
@@ -451,9 +438,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/channels/c1/messages"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({ "id": "m10" })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "m10" })))
             .mount(&server)
             .await;
         let r = client(&server);
@@ -522,9 +507,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/channels/c1/messages"))
-            .respond_with(
-                ResponseTemplate::new(429).insert_header("retry-after", "2.5"),
-            )
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "2.5"))
             .mount(&server)
             .await;
         let r = client(&server);
@@ -540,10 +523,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/channels/c1/messages"))
-            .respond_with(
-                ResponseTemplate::new(429)
-                    .insert_header("x-ratelimit-reset-after", "7"),
-            )
+            .respond_with(ResponseTemplate::new(429).insert_header("x-ratelimit-reset-after", "7"))
             .mount(&server)
             .await;
         let r = client(&server);
@@ -763,9 +743,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/channels/c1/messages"))
             .and(header("authorization", "Bot test-token"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"id": "m-card-1"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "m-card-1"})))
             .mount(&server)
             .await;
         let r = client(&server);

@@ -1,10 +1,12 @@
 //! CRUD for `sessions`.
 
-use crate::central::CentralDb;
 use crate::DbError;
+use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
-use copperclaw_types::{AgentGroupId, ContainerStatus, MessagingGroupId, Session, SessionId, SessionStatus};
-use rusqlite::{params, OptionalExtension, Row};
+use copperclaw_types::{
+    AgentGroupId, ContainerStatus, MessagingGroupId, Session, SessionId, SessionStatus,
+};
+use rusqlite::{OptionalExtension, Row, params};
 
 #[derive(Debug, Clone, Default)]
 pub struct CreateSession {
@@ -45,18 +47,26 @@ fn parse_container_status(s: &str) -> ContainerStatus {
 
 fn row_to_session(row: &Row<'_>) -> rusqlite::Result<Session> {
     let id_str: String = row.get("id")?;
-    let id = uuid::Uuid::parse_str(&id_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let id = uuid::Uuid::parse_str(&id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let ag_str: String = row.get("agent_group_id")?;
-    let ag = uuid::Uuid::parse_str(&ag_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let ag = uuid::Uuid::parse_str(&ag_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     // Empty-string-as-Some defence (see `source_session_id` below).
     let mg_opt: Option<String> = row.get("messaging_group_id")?;
     let mg = match mg_opt.as_deref() {
         None | Some("") => None,
-        Some(uuid_str) => Some(MessagingGroupId(uuid::Uuid::parse_str(uuid_str).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
-        })?)),
+        Some(uuid_str) => Some(MessagingGroupId(uuid::Uuid::parse_str(uuid_str).map_err(
+            |e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            },
+        )?)),
     };
 
     let status: String = row.get("status")?;
@@ -67,10 +77,14 @@ fn row_to_session(row: &Row<'_>) -> rusqlite::Result<Session> {
         .as_deref()
         .map(|s| DateTime::parse_from_rfc3339(s).map(|d| d.with_timezone(&Utc)))
         .transpose()
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .unwrap_or_else(Utc::now);
     let created_at_parsed = DateTime::parse_from_rfc3339(&created_at)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .with_timezone(&Utc);
 
     // Empty-string-as-Some defence: a `source_session_id = ''` row
@@ -171,7 +185,10 @@ pub fn find_for_agent(
     Ok(row)
 }
 
-pub fn find_by_agent_group(db: &CentralDb, agent: AgentGroupId) -> Result<Option<Session>, DbError> {
+pub fn find_by_agent_group(
+    db: &CentralDb,
+    agent: AgentGroupId,
+) -> Result<Option<Session>, DbError> {
     let conn = db.conn()?;
     let row = conn
         .query_row(
@@ -220,11 +237,19 @@ pub fn set_status(
     Ok(())
 }
 
-fn set_container_status(db: &CentralDb, id: SessionId, status: ContainerStatus) -> Result<(), DbError> {
+fn set_container_status(
+    db: &CentralDb,
+    id: SessionId,
+    status: ContainerStatus,
+) -> Result<(), DbError> {
     let conn = db.conn()?;
     let n = conn.execute(
         "UPDATE sessions SET container_status = ?1, last_active = ?2 WHERE id = ?3",
-        params![status.as_str(), Utc::now().to_rfc3339(), id.as_uuid().to_string()],
+        params![
+            status.as_str(),
+            Utc::now().to_rfc3339(),
+            id.as_uuid().to_string()
+        ],
     )?;
     if n == 0 {
         return Err(DbError::NotFound);
@@ -243,47 +268,35 @@ pub fn touch_last_active(db: &CentralDb, id: SessionId) -> Result<(), DbError> {
 
 pub fn list_active(db: &CentralDb) -> Result<Vec<Session>, DbError> {
     let conn = db.conn()?;
-    let mut stmt = conn.prepare(
-        &format!(
-            "SELECT {SESSION_SELECT_COLS}
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SESSION_SELECT_COLS}
              FROM sessions
              WHERE status = 'active'
              ORDER BY last_active DESC"
-        ),
-    )?;
+    ))?;
     let rows = stmt.query_map([], row_to_session)?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-pub fn list_for_agent_group(
-    db: &CentralDb,
-    agent: AgentGroupId,
-) -> Result<Vec<Session>, DbError> {
+pub fn list_for_agent_group(db: &CentralDb, agent: AgentGroupId) -> Result<Vec<Session>, DbError> {
     let conn = db.conn()?;
-    let mut stmt = conn.prepare(
-        &format!(
-            "SELECT {SESSION_SELECT_COLS}
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SESSION_SELECT_COLS}
              FROM sessions
              WHERE agent_group_id = ?1
              ORDER BY last_active DESC"
-        ),
-    )?;
-    let rows = stmt.query_map(
-        params![agent.as_uuid().to_string()],
-        row_to_session,
-    )?;
+    ))?;
+    let rows = stmt.query_map(params![agent.as_uuid().to_string()], row_to_session)?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 pub fn list_running(db: &CentralDb) -> Result<Vec<Session>, DbError> {
     let conn = db.conn()?;
-    let mut stmt = conn.prepare(
-        &format!(
-            "SELECT {SESSION_SELECT_COLS}
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {SESSION_SELECT_COLS}
              FROM sessions
              WHERE container_status = 'running'"
-        ),
-    )?;
+    ))?;
     let rows = stmt.query_map([], row_to_session)?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
@@ -329,10 +342,7 @@ pub fn delete(db: &CentralDb, id: SessionId) -> Result<(), DbError> {
         "DELETE FROM agent_turns WHERE session_id = ?1",
         params![id_str],
     )?;
-    tx.execute(
-        "DELETE FROM tasks WHERE session_id = ?1",
-        params![id_str],
-    )?;
+    tx.execute("DELETE FROM tasks WHERE session_id = ?1", params![id_str])?;
     tx.execute(
         "DELETE FROM pending_questions WHERE session_id = ?1",
         params![id_str],
@@ -341,10 +351,7 @@ pub fn delete(db: &CentralDb, id: SessionId) -> Result<(), DbError> {
         "DELETE FROM pending_approvals WHERE session_id = ?1",
         params![id_str],
     )?;
-    tx.execute(
-        "DELETE FROM sessions WHERE id = ?1",
-        params![id_str],
-    )?;
+    tx.execute("DELETE FROM sessions WHERE id = ?1", params![id_str])?;
     tx.commit()?;
     Ok(())
 }
@@ -352,7 +359,7 @@ pub fn delete(db: &CentralDb, id: SessionId) -> Result<(), DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+    use crate::tables::agent_groups::{CreateAgentGroup, create as create_ag};
 
     fn db_with_agent() -> (CentralDb, AgentGroupId) {
         let db = CentralDb::open_in_memory().unwrap();
@@ -450,11 +457,20 @@ mod tests {
         )
         .unwrap();
         mark_container_running(&db, s.id).unwrap();
-        assert_eq!(get(&db, s.id).unwrap().container_status, ContainerStatus::Running);
+        assert_eq!(
+            get(&db, s.id).unwrap().container_status,
+            ContainerStatus::Running
+        );
         mark_container_idle(&db, s.id).unwrap();
-        assert_eq!(get(&db, s.id).unwrap().container_status, ContainerStatus::Idle);
+        assert_eq!(
+            get(&db, s.id).unwrap().container_status,
+            ContainerStatus::Idle
+        );
         mark_container_stopped(&db, s.id).unwrap();
-        assert_eq!(get(&db, s.id).unwrap().container_status, ContainerStatus::Stopped);
+        assert_eq!(
+            get(&db, s.id).unwrap().container_status,
+            ContainerStatus::Stopped
+        );
     }
 
     #[test]
@@ -608,8 +624,8 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn delete_cascades_agent_turns_and_tasks() {
-        use crate::tables::agent_turns::{insert as insert_turn, NewAgentTurn};
-        use crate::tables::tasks::{insert as insert_task, NewTask};
+        use crate::tables::agent_turns::{NewAgentTurn, insert as insert_turn};
+        use crate::tables::tasks::{NewTask, insert as insert_task};
         let (db, ag) = db_with_agent();
         let s = create(
             &db,

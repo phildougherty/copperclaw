@@ -123,9 +123,9 @@ impl WebhookConfig {
         if value.is_null() {
             return Ok(Self::default());
         }
-        let obj = value
-            .as_object()
-            .ok_or_else(|| AdapterError::BadRequest("wechat `webhook` must be a JSON object".into()))?;
+        let obj = value.as_object().ok_or_else(|| {
+            AdapterError::BadRequest("wechat `webhook` must be a JSON object".into())
+        })?;
         let host = match obj.get("host") {
             Some(Value::String(s)) => s.clone(),
             Some(Value::Null) | None => DEFAULT_HOST.to_owned(),
@@ -136,12 +136,15 @@ impl WebhookConfig {
             }
         };
         let port = match obj.get("port") {
-            Some(Value::Number(n)) => n
-                .as_u64()
-                .and_then(|u| u16::try_from(u).ok())
-                .ok_or_else(|| {
-                    AdapterError::BadRequest("wechat `webhook.port` must be a u16 in range".into())
-                })?,
+            Some(Value::Number(n)) => {
+                n.as_u64()
+                    .and_then(|u| u16::try_from(u).ok())
+                    .ok_or_else(|| {
+                        AdapterError::BadRequest(
+                            "wechat `webhook.port` must be a u16 in range".into(),
+                        )
+                    })?
+            }
             Some(Value::Null) | None => DEFAULT_PORT,
             Some(_) => {
                 return Err(AdapterError::BadRequest(

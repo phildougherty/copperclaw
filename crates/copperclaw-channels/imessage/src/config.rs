@@ -158,9 +158,7 @@ fn take_u64(key: &str, value: &Value) -> Result<u64, AdapterError> {
 
 fn take_bool(key: &str, value: &Value) -> Result<bool, AdapterError> {
     value.as_bool().ok_or_else(|| {
-        AdapterError::BadRequest(format!(
-            "imessage config: field `{key}` must be a boolean"
-        ))
+        AdapterError::BadRequest(format!("imessage config: field `{key}` must be a boolean"))
     })
 }
 
@@ -219,68 +217,55 @@ mod tests {
 
     #[test]
     fn rejects_non_string_osascript_bin() {
-        let err =
-            IMessageConfig::from_value(&json!({ "osascript_bin": 5 })).unwrap_err();
+        let err = IMessageConfig::from_value(&json!({ "osascript_bin": 5 })).unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 
     #[test]
     fn rejects_non_string_sqlite3_bin() {
-        let err =
-            IMessageConfig::from_value(&json!({ "sqlite3_bin": 5 })).unwrap_err();
+        let err = IMessageConfig::from_value(&json!({ "sqlite3_bin": 5 })).unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 
     #[test]
     fn rejects_non_string_chat_db_path() {
-        let err =
-            IMessageConfig::from_value(&json!({ "chat_db_path": 5 })).unwrap_err();
+        let err = IMessageConfig::from_value(&json!({ "chat_db_path": 5 })).unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 
     #[test]
     fn rejects_non_string_service_name() {
-        let err =
-            IMessageConfig::from_value(&json!({ "service_name": 5 })).unwrap_err();
+        let err = IMessageConfig::from_value(&json!({ "service_name": 5 })).unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 
     #[test]
     fn rejects_non_string_since_rowid_file() {
-        let err =
-            IMessageConfig::from_value(&json!({ "since_rowid_file": 5 }))
-                .unwrap_err();
+        let err = IMessageConfig::from_value(&json!({ "since_rowid_file": 5 })).unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 
     #[test]
     fn rejects_negative_poll_interval() {
-        let err =
-            IMessageConfig::from_value(&json!({ "poll_interval_ms": -1 }))
-                .unwrap_err();
+        let err = IMessageConfig::from_value(&json!({ "poll_interval_ms": -1 })).unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 
     #[test]
     fn rejects_string_poll_interval() {
-        let err =
-            IMessageConfig::from_value(&json!({ "poll_interval_ms": "fast" }))
-                .unwrap_err();
+        let err = IMessageConfig::from_value(&json!({ "poll_interval_ms": "fast" })).unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 
     #[test]
     fn poll_interval_zero_is_accepted() {
-        let c =
-            IMessageConfig::from_value(&json!({ "poll_interval_ms": 0 })).unwrap();
+        let c = IMessageConfig::from_value(&json!({ "poll_interval_ms": 0 })).unwrap();
         assert_eq!(c.poll_interval_ms, 0);
     }
 
     #[test]
     fn rejects_non_bool_enable_polling() {
-        let err =
-            IMessageConfig::from_value(&json!({ "enable_polling": "yes" }))
-                .unwrap_err();
+        let err = IMessageConfig::from_value(&json!({ "enable_polling": "yes" })).unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 

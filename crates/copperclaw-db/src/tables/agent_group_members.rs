@@ -2,11 +2,11 @@
 //!
 //! Membership grants a user access to an agent group's sessions and conversations.
 
-use crate::central::CentralDb;
 use crate::DbError;
+use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
 use copperclaw_types::{AgentGroupId, UserId};
-use rusqlite::{params, Row};
+use rusqlite::{Row, params};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,8 +18,9 @@ pub struct Member {
 }
 
 fn parse_uuid_col(s: &str) -> rusqlite::Result<Uuid> {
-    Uuid::parse_str(s)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))
+    Uuid::parse_str(s).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })
 }
 
 fn row_to_member(row: &Row<'_>) -> rusqlite::Result<Member> {
@@ -34,7 +35,9 @@ fn row_to_member(row: &Row<'_>) -> rusqlite::Result<Member> {
     };
     let added_at_str: String = row.get("added_at")?;
     let added_at = DateTime::parse_from_rfc3339(&added_at_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .with_timezone(&Utc);
     Ok(Member {
         user_id,
@@ -88,7 +91,10 @@ pub fn remove(db: &CentralDb, user: UserId, agent_group: AgentGroupId) -> Result
     let n = conn.execute(
         "DELETE FROM agent_group_members
          WHERE user_id = ?1 AND agent_group_id = ?2",
-        params![user.as_uuid().to_string(), agent_group.as_uuid().to_string()],
+        params![
+            user.as_uuid().to_string(),
+            agent_group.as_uuid().to_string()
+        ],
     )?;
     if n == 0 {
         return Err(DbError::NotFound);

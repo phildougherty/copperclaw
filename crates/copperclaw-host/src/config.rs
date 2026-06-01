@@ -333,8 +333,8 @@ pub fn load_dotenv_optional(path: Option<&Path>) -> bool {
     if let Some(p) = path {
         return dotenvy::from_path(p).is_ok();
     }
-    let install_loaded = default_install_env_file()
-        .is_some_and(|p| p.is_file() && dotenvy::from_path(&p).is_ok());
+    let install_loaded =
+        default_install_env_file().is_some_and(|p| p.is_file() && dotenvy::from_path(&p).is_ok());
     let cwd_loaded = dotenvy::dotenv().is_ok();
     install_loaded || cwd_loaded
 }
@@ -403,14 +403,17 @@ mod tests {
     #[test]
     fn data_dir_affects_default_socket_path() {
         let cfg = HostConfig::from_map(&m(&[("COPPERCLAW_DATA_DIR", "/srv/copperclaw")])).unwrap();
-        assert_eq!(cfg.ncl_socket_path, PathBuf::from("/srv/copperclaw/cclaw.sock"));
-        assert_eq!(cfg.central_db_path(), PathBuf::from("/srv/copperclaw/copperclaw.db"));
+        assert_eq!(
+            cfg.ncl_socket_path,
+            PathBuf::from("/srv/copperclaw/cclaw.sock")
+        );
+        assert_eq!(
+            cfg.central_db_path(),
+            PathBuf::from("/srv/copperclaw/copperclaw.db")
+        );
         // sessions_root() returns data_dir itself; SessionPaths::new then
         // appends sessions/<ag>/<session> to produce the flat layout.
-        assert_eq!(
-            cfg.sessions_root(),
-            PathBuf::from("/srv/copperclaw")
-        );
+        assert_eq!(cfg.sessions_root(), PathBuf::from("/srv/copperclaw"));
     }
 
     #[test]
@@ -495,7 +498,11 @@ mod tests {
             ("COPPERCLAW_CHANNELS", "cli,telegram"),
         ]))
         .unwrap();
-        let tg = cfg.channels.iter().find(|c| c.channel_type == "telegram").unwrap();
+        let tg = cfg
+            .channels
+            .iter()
+            .find(|c| c.channel_type == "telegram")
+            .unwrap();
         assert!(tg.config.get("fifo").is_none());
         assert!(tg.config.get("log").is_none());
     }
@@ -508,16 +515,16 @@ mod tests {
 
     #[test]
     fn malformed_channels_config_errors() {
-        let err = HostConfig::from_map(&m(&[("COPPERCLAW_CHANNELS_CONFIG", "not json")]))
-            .unwrap_err();
+        let err =
+            HostConfig::from_map(&m(&[("COPPERCLAW_CHANNELS_CONFIG", "not json")])).unwrap_err();
         assert!(matches!(err, HostConfigError::BadChannelsConfig(_)));
         assert!(err.to_string().contains("COPPERCLAW_CHANNELS_CONFIG"));
     }
 
     #[test]
     fn non_object_channels_config_errors() {
-        let err = HostConfig::from_map(&m(&[("COPPERCLAW_CHANNELS_CONFIG", "[1,2,3]")]))
-            .unwrap_err();
+        let err =
+            HostConfig::from_map(&m(&[("COPPERCLAW_CHANNELS_CONFIG", "[1,2,3]")])).unwrap_err();
         assert!(matches!(err, HostConfigError::ChannelsConfigShape));
     }
 
@@ -534,11 +541,8 @@ mod tests {
 
     #[test]
     fn skills_dir_env_var_parses() {
-        let cfg = HostConfig::from_map(&m(&[(
-            "COPPERCLAW_SKILLS_DIR",
-            "/opt/copperclaw/skills",
-        )]))
-        .unwrap();
+        let cfg = HostConfig::from_map(&m(&[("COPPERCLAW_SKILLS_DIR", "/opt/copperclaw/skills")]))
+            .unwrap();
         assert_eq!(
             cfg.skills_dir.as_deref(),
             Some(Path::new("/opt/copperclaw/skills"))
@@ -553,11 +557,8 @@ mod tests {
 
     #[test]
     fn groups_dir_env_var_parses() {
-        let cfg = HostConfig::from_map(&m(&[(
-            "COPPERCLAW_GROUPS_DIR",
-            "/opt/copperclaw/groups",
-        )]))
-        .unwrap();
+        let cfg = HostConfig::from_map(&m(&[("COPPERCLAW_GROUPS_DIR", "/opt/copperclaw/groups")]))
+            .unwrap();
         assert_eq!(
             cfg.groups_dir.as_deref(),
             Some(Path::new("/opt/copperclaw/groups"))

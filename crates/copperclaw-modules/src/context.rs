@@ -279,7 +279,11 @@ pub struct DispatchTarget {
 }
 
 impl DispatchTarget {
-    pub fn channel(channel_type: ChannelType, platform_id: String, thread_id: Option<String>) -> Self {
+    pub fn channel(
+        channel_type: ChannelType,
+        platform_id: String,
+        thread_id: Option<String>,
+    ) -> Self {
         Self {
             channel_type: Some(channel_type),
             platform_id: Some(platform_id),

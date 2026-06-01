@@ -4,7 +4,7 @@
 //! the model to answer "who wrote this" without a second tool call.
 
 use crate::error::ToolError;
-use crate::tools::{make_tool, parse_args, success_json, ToolEntry, ToolHandler};
+use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args, success_json};
 use rmcp::model::{CallToolResult, JsonObject, Tool};
 use serde::Deserialize;
 use serde_json::json;
@@ -79,10 +79,7 @@ fn compute(root: &Path, input: &Input) -> Result<serde_json::Value, ToolError> {
         // Map ENOENT / NotFound to Validation so the agent retries with
         // a different path rather than treating it as a server bug.
         if e.kind() == std::io::ErrorKind::NotFound {
-            ToolError::Validation(format!(
-                "git_blame: no such file `{}`",
-                file.display()
-            ))
+            ToolError::Validation(format!("git_blame: no such file `{}`", file.display()))
         } else {
             ToolError::Internal(format!("git_blame: read {}: {e}", file.display()))
         }
@@ -115,9 +112,9 @@ fn compute(root: &Path, input: &Input) -> Result<serde_json::Value, ToolError> {
     let mut opts = git2::BlameOptions::new();
     opts.min_line(from);
     opts.max_line(to);
-    let blame = repo.blame_file(&rel, Some(&mut opts)).map_err(|e| {
-        super::git_common::map_err("git_blame: blame_file", &e)
-    })?;
+    let blame = repo
+        .blame_file(&rel, Some(&mut opts))
+        .map_err(|e| super::git_common::map_err("git_blame: blame_file", &e))?;
 
     let mut out: Vec<serde_json::Value> = Vec::new();
     for line_no in from..=to {
@@ -193,11 +190,7 @@ mod tests {
     #[tokio::test]
     async fn blames_each_line_to_a_commit() {
         let td = tempfile::tempdir().unwrap();
-        super::super::git_common::tests::init_with_commit(
-            td.path(),
-            "a.txt",
-            "alpha\nbeta\n",
-        );
+        super::super::git_common::tests::init_with_commit(td.path(), "a.txt", "alpha\nbeta\n");
         let res = handle(
             Some(
                 json!({
@@ -304,11 +297,7 @@ mod tests {
     #[tokio::test]
     async fn inverted_range_returns_empty() {
         let td = tempfile::tempdir().unwrap();
-        super::super::git_common::tests::init_with_commit(
-            td.path(),
-            "a.txt",
-            "one\ntwo\n",
-        );
+        super::super::git_common::tests::init_with_commit(td.path(), "a.txt", "one\ntwo\n");
         let res = handle(
             Some(
                 json!({

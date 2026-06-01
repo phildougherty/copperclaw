@@ -8,7 +8,7 @@
 use copperclaw_channels_core::AdapterError;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Response from a successful `spaces.messages.create` (and `update`) call.
 ///
@@ -89,7 +89,9 @@ impl GchatApi {
                 .iter()
                 .map(|name| json!({ "attachmentDataRef": { "resourceName": name } }))
                 .collect();
-            body.as_object_mut().unwrap().insert("attachment".into(), Value::Array(attachments));
+            body.as_object_mut()
+                .unwrap()
+                .insert("attachment".into(), Value::Array(attachments));
         }
         let url = self.url(&format!("/v1/spaces/{space}/messages"));
         self.do_create(&url, &body, None).await
@@ -126,9 +128,7 @@ impl GchatApi {
         let form = reqwest::multipart::Form::new()
             .part("metadata", meta_part)
             .part("data", data_part);
-        let url = self.url(&format!(
-            "/upload/v1/spaces/{space}/attachments:upload"
-        ));
+        let url = self.url(&format!("/upload/v1/spaces/{space}/attachments:upload"));
         let resp = self
             .client
             .post(&url)
@@ -167,8 +167,12 @@ impl GchatApi {
             "thread": { "name": thread_name },
         });
         let url = self.url(&format!("/v1/spaces/{space}/messages"));
-        self.do_create(&url, &body, Some(("messageReplyOption", "REPLY_MESSAGE_OR_FAIL")))
-            .await
+        self.do_create(
+            &url,
+            &body,
+            Some(("messageReplyOption", "REPLY_MESSAGE_OR_FAIL")),
+        )
+        .await
     }
 
     /// Send a card v2 message.
@@ -371,10 +375,7 @@ fn retry_after_seconds(resp: &reqwest::Response) -> Option<u64> {
 /// Inspects the response body for Google's `{"error": {"message": ...}}`
 /// shape so the message reaches the caller. Public so the adapter tests can
 /// exercise it directly.
-pub(crate) async fn map_http_error(
-    status: StatusCode,
-    resp: reqwest::Response,
-) -> AdapterError {
+pub(crate) async fn map_http_error(status: StatusCode, resp: reqwest::Response) -> AdapterError {
     let body = resp.text().await.unwrap_or_default();
     let message = extract_error_message(&body);
     classify_http_status(status, &message, &body)
@@ -405,7 +406,11 @@ pub(crate) fn classify_http_status(
     message: &str,
     raw_body: &str,
 ) -> AdapterError {
-    let surface = if message.is_empty() { raw_body } else { message };
+    let surface = if message.is_empty() {
+        raw_body
+    } else {
+        message
+    };
     match status.as_u16() {
         401 | 403 => AdapterError::Auth(format!("{status}: {surface}")),
         400 | 404 | 422 => AdapterError::BadRequest(format!("{status}: {surface}")),
@@ -495,9 +500,10 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/spaces/ABC/messages"))
             .and(header("authorization", "Bearer tok-test"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"name": "spaces/ABC/messages/100.200"}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"name": "spaces/ABC/messages/100.200"})),
+            )
             .mount(&server)
             .await;
         let resp = api(&server).send_text("ABC", "hi").await.unwrap();
@@ -510,9 +516,10 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/spaces/ABC/messages"))
             .and(query_param("messageReplyOption", "REPLY_MESSAGE_OR_FAIL"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"name": "spaces/ABC/messages/200.300"}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"name": "spaces/ABC/messages/200.300"})),
+            )
             .mount(&server)
             .await;
         let resp = api(&server)
@@ -527,13 +534,18 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/spaces/ABC/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"name": "spaces/ABC/messages/CARD"}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"name": "spaces/ABC/messages/CARD"})),
+            )
             .mount(&server)
             .await;
         let resp = api(&server)
-            .send_card("ABC", "card-1", &serde_json::json!({"header":{"title":"x"}}))
+            .send_card(
+                "ABC",
+                "card-1",
+                &serde_json::json!({"header":{"title":"x"}}),
+            )
             .await
             .unwrap();
         assert_eq!(resp.name, "spaces/ABC/messages/CARD");
@@ -545,9 +557,10 @@ mod tests {
         Mock::given(method("PUT"))
             .and(path("/v1/spaces/ABC/messages/100"))
             .and(query_param("updateMask", "text"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"name": "spaces/ABC/messages/100"}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"name": "spaces/ABC/messages/100"})),
+            )
             .mount(&server)
             .await;
         let resp = api(&server)
@@ -769,15 +782,13 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
             .and(path("/v1/spaces/ABC/messages/1"))
-            .respond_with(ResponseTemplate::new(404).set_body_json(
-                serde_json::json!({"error":{"message":"gone"}}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(404)
+                    .set_body_json(serde_json::json!({"error":{"message":"gone"}})),
+            )
             .mount(&server)
             .await;
-        match api(&server)
-            .edit_text("spaces/ABC/messages/1", "new")
-            .await
-        {
+        match api(&server).edit_text("spaces/ABC/messages/1", "new").await {
             Err(AdapterError::BadRequest(m)) => assert!(m.contains("gone")),
             other => panic!("expected BadRequest, got {other:?}"),
         }
@@ -791,10 +802,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string(""))
             .mount(&server)
             .await;
-        match api(&server)
-            .edit_text("spaces/ABC/messages/1", "new")
-            .await
-        {
+        match api(&server).edit_text("spaces/ABC/messages/1", "new").await {
             Err(AdapterError::Transport(_)) => {}
             other => panic!("expected Transport, got {other:?}"),
         }

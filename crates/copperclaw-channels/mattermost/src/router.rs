@@ -15,15 +15,13 @@
 //! protocol; replies come via the egress API).
 
 use crate::config::MattermostConfig;
+use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
-use axum::Router;
 use chrono::Utc;
-use copperclaw_types::{
-    ChannelType, InboundEvent, InboundMessage, MessageKind, SenderIdentity,
-};
+use copperclaw_types::{ChannelType, InboundEvent, InboundMessage, MessageKind, SenderIdentity};
 use serde::Deserialize;
 use tokio::sync::mpsc::Sender;
 use uuid::Uuid;
@@ -55,9 +53,7 @@ impl RouterState {
 /// the configured path.
 pub fn build_router(state: RouterState) -> Router {
     let path = state.config.webhook.path.clone();
-    Router::new()
-        .route(&path, post(handle))
-        .with_state(state)
+    Router::new().route(&path, post(handle)).with_state(state)
 }
 
 /// Fields Mattermost sends on every outgoing-webhook POST. See the
@@ -100,9 +96,10 @@ async fn handle(
 
     // Drop messages from the bot itself so the agent doesn't reply to
     // its own posts.
-    if let (Some(bot_id), Some(uid)) =
-        (state.config.bot_user_id.as_deref(), payload.user_id.as_deref())
-    {
+    if let (Some(bot_id), Some(uid)) = (
+        state.config.bot_user_id.as_deref(),
+        payload.user_id.as_deref(),
+    ) {
         if bot_id == uid {
             return (StatusCode::OK, "ignored: bot message");
         }
@@ -382,8 +379,7 @@ mod tests {
             cfg(None),
             tx,
         ));
-        let payload =
-            serde_json::json!({"token": "wrong", "channel_id": "c1", "text": "hi"});
+        let payload = serde_json::json!({"token": "wrong", "channel_id": "c1", "text": "hi"});
         let resp = post(
             router,
             "/mattermost/webhook",
@@ -466,8 +462,7 @@ mod tests {
             cfg(None),
             tx,
         ));
-        let payload =
-            serde_json::json!({"token": "wh-secret", "channel_id": "c", "text": "x"});
+        let payload = serde_json::json!({"token": "wh-secret", "channel_id": "c", "text": "x"});
         let resp = post(
             router,
             "/mattermost/webhook",

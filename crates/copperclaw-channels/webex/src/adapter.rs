@@ -141,13 +141,7 @@ impl WebexAdapter {
             let resp = match target {
                 DeliverTarget::Room(room) => {
                     self.api
-                        .post_message(
-                            room,
-                            thread_id,
-                            body_text,
-                            body_markdown,
-                            card.as_ref(),
-                        )
+                        .post_message(room, thread_id, body_text, body_markdown, card.as_ref())
                         .await?
                 }
                 DeliverTarget::Person(person) => {
@@ -599,9 +593,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/messages"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                json!({"id":"M2","roomId":"R1","parentId":"PAR1"}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"id":"M2","roomId":"R1","parentId":"PAR1"})),
+            )
             .mount(&server)
             .await;
         let a = adapter_for(&server);
@@ -828,7 +823,11 @@ mod tests {
     async fn deliver_with_empty_person_platform_id_is_bad_request() {
         let server = MockServer::start().await;
         let a = adapter_for(&server);
-        match a.deliver("person:", None, &chat_text("hi")).await.unwrap_err() {
+        match a
+            .deliver("person:", None, &chat_text("hi"))
+            .await
+            .unwrap_err()
+        {
             AdapterError::BadRequest(_) => {}
             other => panic!("expected BadRequest, got {other:?}"),
         }
@@ -1076,11 +1075,7 @@ mod tests {
             content: json!({"action":"edit","target_id":"M1","text":"hi"}),
             files: vec![],
         };
-        match a
-            .deliver("person:PER1", None, &msg)
-            .await
-            .unwrap_err()
-        {
+        match a.deliver("person:PER1", None, &msg).await.unwrap_err() {
             AdapterError::Unsupported(_) => {}
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -1310,7 +1305,10 @@ mod tests {
         assert!(body.len() >= 3);
         assert_eq!(body[0]["text"], "Confirm");
         assert_eq!(body[0]["weight"], "Bolder");
-        let factset = body.iter().find(|b| b["type"] == "FactSet").expect("factset");
+        let factset = body
+            .iter()
+            .find(|b| b["type"] == "FactSet")
+            .expect("factset");
         assert_eq!(factset["facts"][0]["title"], "Item");
         assert_eq!(factset["facts"][0]["value"], "Espresso");
         let actions = card_json["actions"].as_array().expect("actions");
@@ -1415,7 +1413,10 @@ mod tests {
         assert_eq!(card_json["body"][0]["color"], "Good");
         // No PUT was issued — we only POSTed.
         let reqs = server.received_requests().await.unwrap();
-        assert!(reqs.iter().all(|r| r.method == wiremock::http::Method::POST));
+        assert!(
+            reqs.iter()
+                .all(|r| r.method == wiremock::http::Method::POST)
+        );
     }
 
     #[tokio::test]
@@ -1502,10 +1503,12 @@ mod tests {
         };
         a.deliver_diff("R1", None, &diff).await.unwrap();
         let card_json = last_adaptive_card(&server).await;
-        assert!(card_json["body"][0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("truncated"));
+        assert!(
+            card_json["body"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("truncated")
+        );
     }
 
     #[tokio::test]
@@ -1527,10 +1530,7 @@ mod tests {
         assert_eq!(outer["style"], "attention");
         let inner = outer["items"].as_array().unwrap();
         assert_eq!(inner[0]["color"], "Attention");
-        assert!(inner[0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("[ERROR: tool]"));
+        assert!(inner[0]["text"].as_str().unwrap().contains("[ERROR: tool]"));
         assert_eq!(inner[1]["text"], "shell timed out");
         assert_eq!(inner[2]["fontType"], "Monospace");
     }
@@ -1548,12 +1548,12 @@ mod tests {
         a.deliver_error("R1", None, &err).await.unwrap();
         let card_json = last_adaptive_card(&server).await;
         let inner = card_json["body"][0]["items"].as_array().unwrap();
-        assert!(inner
-            .last()
-            .unwrap()["text"]
-            .as_str()
-            .unwrap()
-            .contains("will retry automatically"));
+        assert!(
+            inner.last().unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .contains("will retry automatically")
+        );
     }
 
     #[tokio::test]
@@ -1627,7 +1627,10 @@ mod tests {
             .unwrap();
         assert_eq!(id.as_deref(), Some("TL-NEW"));
         let reqs = server.received_requests().await.unwrap();
-        assert!(reqs.iter().all(|r| r.method == wiremock::http::Method::POST));
+        assert!(
+            reqs.iter()
+                .all(|r| r.method == wiremock::http::Method::POST)
+        );
     }
 
     #[tokio::test]
@@ -1703,16 +1706,15 @@ mod tests {
         let card_json = last_adaptive_card(&server).await;
         let body = card_json["body"].as_array().unwrap();
         assert_eq!(body.len(), 2);
-        assert!(body[0]["text"]
-            .as_str()
-            .unwrap()
-            .contains("claude-opus-4-7"));
+        assert!(
+            body[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("claude-opus-4-7")
+        );
         assert_eq!(body[1]["type"], "Container");
         assert_eq!(body[1]["isVisible"], false);
-        assert_eq!(
-            body[1]["items"][0]["text"],
-            "Let me think carefully."
-        );
+        assert_eq!(body[1]["items"][0]["text"], "Let me think carefully.");
         let actions = card_json["actions"].as_array().unwrap();
         assert_eq!(actions[0]["type"], "Action.ToggleVisibility");
     }

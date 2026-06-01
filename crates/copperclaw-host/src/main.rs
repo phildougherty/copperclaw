@@ -33,7 +33,7 @@
 #![forbid(unsafe_code)]
 
 use clap::{Parser, Subcommand};
-use copperclaw_host::{boot, config, daemon, run_host, HostConfig};
+use copperclaw_host::{HostConfig, boot, config, daemon, run_host};
 use std::process::ExitCode;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
@@ -115,7 +115,9 @@ async fn main() -> ExitCode {
         // non-fatal — we log the error to stderr and continue without
         // file logging.
         if let Err(e) = std::fs::create_dir_all(dir) {
-            eprintln!("warning: could not create COPPERCLAW_LOG_DIR {dir:?}: {e}; file logging disabled");
+            eprintln!(
+                "warning: could not create COPPERCLAW_LOG_DIR {dir:?}: {e}; file logging disabled"
+            );
             setup_stderr_only(&cfg, use_ansi);
             None
         } else {
@@ -144,13 +146,15 @@ async fn main() -> ExitCode {
     };
 
     match cli.command.unwrap_or(Command::Run) {
-        Command::Run => match run_host(cfg, None, CancellationToken::new(), cli.env_file.clone()).await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(err) => {
-                error!(?err, "copperclaw exited with error");
-                ExitCode::from(err.exit_code())
+        Command::Run => {
+            match run_host(cfg, None, CancellationToken::new(), cli.env_file.clone()).await {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    error!(?err, "copperclaw exited with error");
+                    ExitCode::from(err.exit_code())
+                }
             }
-        },
+        }
         Command::Start => run_start(&cfg),
         Command::Stop { strict } => run_stop(&cfg, strict),
         Command::Status { json } => run_status(&cfg, json),

@@ -133,7 +133,10 @@ mod tests {
         assert_eq!(evt.comment.id, 42);
         assert_eq!(evt.comment.body.as_deref(), Some("hi @bot"));
         assert_eq!(evt.comment.user.login, "alice");
-        assert_eq!(evt.comment.created_at.as_deref(), Some("2024-01-01T00:00:00Z"));
+        assert_eq!(
+            evt.comment.created_at.as_deref(),
+            Some("2024-01-01T00:00:00Z")
+        );
     }
 
     #[test]
@@ -247,9 +250,7 @@ mod tests {
         let c = Comment {
             id: 1,
             body: Some("x".into()),
-            user: User {
-                login: "u".into(),
-            },
+            user: User { login: "u".into() },
             created_at: None,
         };
         let c2 = c.clone();

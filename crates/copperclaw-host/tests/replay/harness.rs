@@ -41,21 +41,21 @@
 //!   fixture's `expected/*.jsonl` files using manifest substitutions.
 #![allow(dead_code)]
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use copperclaw_channels_core::{
-    testing::MockAdapter, AdapterError, Card, ChannelAdapter, DmHandle,
+    AdapterError, Card, ChannelAdapter, DmHandle, testing::MockAdapter,
 };
 use copperclaw_container_rt::{
     ContainerHandle, ContainerRuntime, ContainerSpec, ImageBuildSpec, RtError,
 };
 use copperclaw_db::central::CentralDb;
-use copperclaw_db::migrate::{run_migrations, MigrationSet};
-use copperclaw_db::session::{open_inbound_rw_no_mmap, open_outbound, SessionPaths};
+use copperclaw_db::migrate::{MigrationSet, run_migrations};
+use copperclaw_db::session::{SessionPaths, open_inbound_rw_no_mmap, open_outbound};
 use copperclaw_db::tables::sessions;
 use copperclaw_host::container_manager::{
-    ContainerManager, ManagerConfig, DEFAULT_HEARTBEAT_STALE_SECS, DEFAULT_IDLE_TIMEOUT_SECS,
-    DEFAULT_STOP_GRACE_SECS,
+    ContainerManager, DEFAULT_HEARTBEAT_STALE_SECS, DEFAULT_IDLE_TIMEOUT_SECS,
+    DEFAULT_STOP_GRACE_SECS, ManagerConfig,
 };
 use copperclaw_host_delivery::{
     DeliveryService, FsSessionRoot as DeliveryRoot, SessionRoot as DeliverySessionRoot,
@@ -67,7 +67,7 @@ use copperclaw_host_sweep::service::FilesystemSessionRoot as SweepRoot;
 use copperclaw_host_sweep::{SessionRoot as SweepSessionRoot, SweepService};
 use copperclaw_modules::{ApprovalsModule, Module};
 use copperclaw_providers::AnthropicProvider;
-use copperclaw_runner::{compaction::CompactionCfg, run_loop, RunnerDeps, RunnerToolCtx};
+use copperclaw_runner::{RunnerDeps, RunnerToolCtx, compaction::CompactionCfg, run_loop};
 use copperclaw_types::{
     AgentGroupId, ChannelType, Effort, InboundEvent, OutboundMessage, SessionId, SessionStatus,
 };
@@ -80,7 +80,7 @@ use tokio::sync::Mutex;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::diff::{diff_stream, DiffReport, Substitutions};
+use crate::diff::{DiffReport, Substitutions, diff_stream};
 use crate::fixture::{ClaudeTurn, Fixture, ProviderResponseSpec};
 
 /// Booted harness.
@@ -130,8 +130,7 @@ impl ReplayHarness {
         let central = CentralDb::open_in_memory().context("open in-memory central DB")?;
         {
             let mut conn = central.conn().context("borrow central conn")?;
-            run_migrations(&mut conn, MigrationSet::Central)
-                .context("run central migrations")?;
+            run_migrations(&mut conn, MigrationSet::Central).context("run central migrations")?;
             conn.execute_batch(&fixture.central_sql)
                 .context("apply fixture central.sql")?;
         }
@@ -174,8 +173,7 @@ impl ReplayHarness {
                 .get(ct.as_str())
                 .copied()
                 .or_else(|| default_cap_for(ct.as_str()));
-            let wrapped: Arc<dyn ChannelAdapter> =
-                Arc::new(CappedAdapter::new(mock.clone(), cap));
+            let wrapped: Arc<dyn ChannelAdapter> = Arc::new(CappedAdapter::new(mock.clone(), cap));
             initial.push((ct.clone(), wrapped));
             adapters.push((ct, mock));
         }
@@ -262,8 +260,7 @@ impl ReplayHarness {
                             .iter()
                             .any(|(_, s)| *s == d.session_id)
                         {
-                            self.touched_sessions
-                                .push((d.agent_group_id, d.session_id));
+                            self.touched_sessions.push((d.agent_group_id, d.session_id));
                         }
                         // Ensure session_routing is populated so delivery
                         // can resolve a destination for runner-emitted
@@ -360,15 +357,13 @@ impl ReplayHarness {
         });
 
         let central_for_notifier = self.central.clone();
-        let notifier: copperclaw_modules::NewPendingNotifier = Arc::new(
-            move |ctx: copperclaw_modules::NewPendingCtx, dispatcher| {
-                let Ok(Some(wiring)) =
-                    copperclaw_db::tables::messaging_group_agents::list_for_ag(
-                        &central_for_notifier,
-                        ctx.agent_group_id,
-                    )
-                    .map(|mut v| v.drain(..).next())
-                else {
+        let notifier: copperclaw_modules::NewPendingNotifier =
+            Arc::new(move |ctx: copperclaw_modules::NewPendingCtx, dispatcher| {
+                let Ok(Some(wiring)) = copperclaw_db::tables::messaging_group_agents::list_for_ag(
+                    &central_for_notifier,
+                    ctx.agent_group_id,
+                )
+                .map(|mut v| v.drain(..).next()) else {
                     return;
                 };
                 let Ok(mg) = copperclaw_db::tables::messaging_groups::get(
@@ -393,8 +388,7 @@ impl ReplayHarness {
                     files: vec![],
                 };
                 dispatcher.dispatch(&target, &message);
-            },
-        );
+            });
 
         let module = ApprovalsModule::new()
             .with_persistent_lookup(lookup)
@@ -405,9 +399,10 @@ impl ReplayHarness {
         // dispatcher from the delivery service so the notifier can
         // reach the same `MockAdapter` set the harness scrapes.
         let dispatcher = self.delivery.dispatcher();
-        let ctx: Arc<dyn copperclaw_modules::ModuleContext> = Arc::new(
-            HarnessModuleContext::new(Arc::clone(&self.router), dispatcher),
-        );
+        let ctx: Arc<dyn copperclaw_modules::ModuleContext> = Arc::new(HarnessModuleContext::new(
+            Arc::clone(&self.router),
+            dispatcher,
+        ));
         module
             .install(ctx)
             .await
@@ -426,11 +421,7 @@ impl ReplayHarness {
         let sessions_active = sessions::list_active(&self.central)
             .context("list_active sessions for inbound.sql seed")?;
         for session in sessions_active {
-            let paths = SessionPaths::new(
-                self.tempdir.path(),
-                session.agent_group_id,
-                session.id,
-            );
+            let paths = SessionPaths::new(self.tempdir.path(), session.agent_group_id, session.id);
             paths.ensure_dirs().context("ensure session dirs")?;
             let conn = open_inbound(&paths).context("open inbound for seed")?;
             conn.execute_batch(&self.fixture.inbound_sql)
@@ -447,13 +438,8 @@ impl ReplayHarness {
         // Treat every woken session as touched so the runner + delivery
         // pass picks it up below.
         for sid in report.woken_sessions {
-            let session = sessions::get(&self.central, sid)
-                .context("load woken session row")?;
-            if !self
-                .touched_sessions
-                .iter()
-                .any(|(_, s)| *s == sid)
-            {
+            let session = sessions::get(&self.central, sid).context("load woken session row")?;
+            if !self.touched_sessions.iter().any(|(_, s)| *s == sid) {
                 self.touched_sessions.push((session.agent_group_id, sid));
             }
             // Run a turn for the woken session and drain delivery.
@@ -507,11 +493,7 @@ impl ReplayHarness {
             forward_env: Vec::new(),
         };
         let runtime: Arc<dyn ContainerRuntime> = Arc::new(HarnessRuntime::default());
-        let mgr = Arc::new(ContainerManager::new(
-            self.central.clone(),
-            runtime,
-            cfg,
-        ));
+        let mgr = Arc::new(ContainerManager::new(self.central.clone(), runtime, cfg));
         *slot = Some(Arc::clone(&mgr));
         mgr
     }
@@ -546,23 +528,17 @@ impl ReplayHarness {
             .iter()
             .map(|e| copperclaw_providers::ToolDef {
                 name: e.tool.name.to_string(),
-                description: e
-                    .tool
-                    .description
-                    .as_deref()
-                    .unwrap_or("")
-                    .to_string(),
+                description: e.tool.description.as_deref().unwrap_or("").to_string(),
                 input_schema: serde_json::Value::Object((*e.tool.input_schema).clone()),
             })
             .collect();
-        let tool_map: Arc<
-            std::collections::HashMap<String, Arc<copperclaw_mcp::ToolEntry>>,
-        > = Arc::new(
-            tool_set
-                .into_iter()
-                .map(|e| (e.tool.name.to_string(), Arc::new(e)))
-                .collect(),
-        );
+        let tool_map: Arc<std::collections::HashMap<String, Arc<copperclaw_mcp::ToolEntry>>> =
+            Arc::new(
+                tool_set
+                    .into_iter()
+                    .map(|e| (e.tool.name.to_string(), Arc::new(e)))
+                    .collect(),
+            );
 
         let deps = RunnerDeps {
             provider,
@@ -613,8 +589,8 @@ impl ReplayHarness {
     }
 
     async fn deliver_session(&self, ag: AgentGroupId, sess: SessionId) -> Result<()> {
-        let session = sessions::get(&self.central, sess)
-            .context("load session row for delivery")?;
+        let session =
+            sessions::get(&self.central, sess).context("load session row for delivery")?;
         debug_assert_eq!(session.agent_group_id, ag);
         let _report = self
             .delivery
@@ -666,10 +642,16 @@ impl ReplayHarness {
                     retry_after: entry.retry_after,
                 },
                 "transport" => AdapterError::Transport(
-                    entry.message.clone().unwrap_or_else(|| "transport blip".into()),
+                    entry
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "transport blip".into()),
                 ),
                 "bad_request" => AdapterError::BadRequest(
-                    entry.message.clone().unwrap_or_else(|| "bad request".into()),
+                    entry
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| "bad request".into()),
                 ),
                 other => {
                     return Err(anyhow!(
@@ -867,11 +849,7 @@ fn build_provider_response(
     }
 }
 
-fn lookup_turn(
-    spec: &ProviderResponseSpec,
-    fixture: &Fixture,
-    index: usize,
-) -> Result<ClaudeTurn> {
+fn lookup_turn(spec: &ProviderResponseSpec, fixture: &Fixture, index: usize) -> Result<ClaudeTurn> {
     if let Some(name) = spec.file.as_deref() {
         fixture
             .claude_turns_by_name
@@ -882,17 +860,13 @@ fn lookup_turn(
         // Fall back to the i-th turn file in directory order. This
         // matches the legacy behaviour for a fixture that lists only
         // `success` entries.
-        fixture
-            .claude_turns
-            .get(index)
-            .cloned()
-            .ok_or_else(|| {
-                anyhow!(
-                    "provider_responses[{index}] has kind=success but no \
+        fixture.claude_turns.get(index).cloned().ok_or_else(|| {
+            anyhow!(
+                "provider_responses[{index}] has kind=success but no \
                      `file` and only {} turn files were found",
-                    fixture.claude_turns.len()
-                )
-            })
+                fixture.claude_turns.len()
+            )
+        })
     }
 }
 
@@ -923,10 +897,7 @@ async fn mount_claude_turns(server: &MockServer, turns: &[ClaudeTurn]) {
 fn encode_sse(turn: &ClaudeTurn) -> String {
     let mut out = String::new();
     for ev in &turn.events {
-        let name = ev
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("message");
+        let name = ev.get("type").and_then(|v| v.as_str()).unwrap_or("message");
         out.push_str("event: ");
         out.push_str(name);
         out.push('\n');
@@ -950,8 +921,8 @@ fn read_messages_in(conn: &Connection) -> Result<Vec<serde_json::Value>> {
     )?;
     let rows = stmt.query_map([], |row| {
         let content_str: String = row.get("content")?;
-        let content: serde_json::Value = serde_json::from_str(&content_str)
-            .unwrap_or(serde_json::Value::Null);
+        let content: serde_json::Value =
+            serde_json::from_str(&content_str).unwrap_or(serde_json::Value::Null);
         let trigger: i64 = row.get("trigger")?;
         let on_wake: i64 = row.get("on_wake")?;
         Ok(serde_json::json!({
@@ -989,8 +960,8 @@ fn read_messages_out(conn: &Connection) -> Result<Vec<serde_json::Value>> {
     )?;
     let rows = stmt.query_map([], |row| {
         let content_str: String = row.get("content")?;
-        let content: serde_json::Value = serde_json::from_str(&content_str)
-            .unwrap_or(serde_json::Value::Null);
+        let content: serde_json::Value =
+            serde_json::from_str(&content_str).unwrap_or(serde_json::Value::Null);
         Ok(serde_json::json!({
             "id": row.get::<_, String>("id")?,
             "seq": row.get::<_, i64>("seq")?,

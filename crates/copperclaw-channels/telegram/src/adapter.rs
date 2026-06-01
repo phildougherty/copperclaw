@@ -101,15 +101,12 @@ impl TelegramAdapter {
                 (Some(join), None)
             }
             IngressMode::Webhook(wh) => {
-                let addr = webhook::spawn_server(
-                    wh,
-                    inbound_tx,
-                    api.clone(),
-                    settings,
-                    cancel.clone(),
-                )
-                .await
-                .map_err(|e| AdapterError::Transport(format!("telegram webhook bind: {e}")))?;
+                let addr =
+                    webhook::spawn_server(wh, inbound_tx, api.clone(), settings, cancel.clone())
+                        .await
+                        .map_err(|e| {
+                            AdapterError::Transport(format!("telegram webhook bind: {e}"))
+                        })?;
                 (None, Some(addr))
             }
         };
@@ -200,7 +197,9 @@ impl ChannelAdapter for TelegramAdapter {
         platform_id: &str,
         thread_id: Option<&str>,
     ) -> Result<(), AdapterError> {
-        self.api.send_chat_action(platform_id, thread_id, "typing").await
+        self.api
+            .send_chat_action(platform_id, thread_id, "typing")
+            .await
     }
 
     async fn deliver(
@@ -246,9 +245,7 @@ impl ChannelAdapter for TelegramAdapter {
         // DEFAULT_PARSE_MODE. Empty string means "send as plain text" so
         // we omit the field entirely from the API call rather than passing
         // an empty `parse_mode` that Telegram would reject.
-        let effective_mode = parse_mode
-            .as_deref()
-            .unwrap_or(DEFAULT_PARSE_MODE);
+        let effective_mode = parse_mode.as_deref().unwrap_or(DEFAULT_PARSE_MODE);
         let mode_for_api = if effective_mode.is_empty() {
             None
         } else {
@@ -308,7 +305,11 @@ impl ChannelAdapter for TelegramAdapter {
                 let caption_fits = body.chars().count() <= MAX_PHOTO_CAPTION_CHARS;
                 if caption_fits {
                     // Photo + caption + keyboard all in one message.
-                    let caption = if body.is_empty() { None } else { Some(body.as_str()) };
+                    let caption = if body.is_empty() {
+                        None
+                    } else {
+                        Some(body.as_str())
+                    };
                     let keyboard_ref = if keyboard.is_empty() {
                         None
                     } else {
@@ -543,11 +544,7 @@ impl ChannelAdapter for TelegramAdapter {
         // Unpin when fully completed (pin_hint is also set on this
         // transition by the host's dispatch_todo_list).
         if pin_hint && list.is_fully_completed() && existing_message_id.is_some() {
-            if let Err(err) = self
-                .api
-                .unpin_chat_message(platform_id, &message_id)
-                .await
-            {
+            if let Err(err) = self.api.unpin_chat_message(platform_id, &message_id).await {
                 tracing::debug!(
                     ?err,
                     message_id = %message_id,
@@ -866,7 +863,12 @@ fn render_activity_html(b: &Breadcrumb) -> String {
         Some(d) => summary.push_str(&escape_html(&truncate_chars(d, 80))),
         None => summary.push_str("working"),
     }
-    if let Some(s) = b.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(s) = b
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         summary.push_str(" · ");
         summary.push_str(&escape_html(s));
     }
@@ -931,7 +933,12 @@ fn render_step_line_html(s: &Breadcrumb) -> String {
         out.push_str(&escape_html(&truncate_chars(d, 120)));
         out.push_str("</code>");
     }
-    if let Some(sum) = s.summary.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+    if let Some(sum) = s
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+    {
         if s.status == BreadcrumbStatus::Failed {
             out.push_str(" <i>— failed: ");
         } else {
@@ -1165,7 +1172,11 @@ pub(crate) fn markdown_to_html(input: &str) -> String {
                     .position(|&b| b == b'\n')
                     .map_or(close, |p| i + 3 + p);
                 let lang = input[i + 3..header_end].trim();
-                let body_start = if header_end < close { header_end + 1 } else { header_end };
+                let body_start = if header_end < close {
+                    header_end + 1
+                } else {
+                    header_end
+                };
                 let body = &input[body_start..close];
                 let body_escaped = escape_html(body.trim_end_matches('\n'));
                 let token = if lang.is_empty() {
@@ -1317,9 +1328,7 @@ fn replace_italic_paired(input: &str, delim: char) -> String {
             let mut j = i + 1;
             let mut found_end = None;
             while j < chars.len() {
-                if chars[j] == delim
-                    && (j + 1 == chars.len() || !chars[j + 1].is_alphanumeric())
-                {
+                if chars[j] == delim && (j + 1 == chars.len() || !chars[j + 1].is_alphanumeric()) {
                     found_end = Some(j);
                     break;
                 }
@@ -1493,7 +1502,10 @@ mod tests {
     #[test]
     fn markdown_html_fenced_block_with_language_tag() {
         let out = markdown_to_html("```rust\nfn main() {}\n```");
-        assert!(out.contains("<pre><code class=\"language-rust\">fn main() {}</code></pre>"), "got: {out}");
+        assert!(
+            out.contains("<pre><code class=\"language-rust\">fn main() {}</code></pre>"),
+            "got: {out}"
+        );
     }
 
     #[test]
@@ -1611,14 +1623,10 @@ mod tests {
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let cfg = lp_config(&s.uri());
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            cfg,
-            Some("ironbot".into()),
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(cfg, Some("ironbot".into()), tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
         assert_eq!(adapter.channel_type().as_str(), "telegram");
         assert!(adapter.supports_threads());
         assert_eq!(adapter.bot_username(), Some("ironbot"));
@@ -1634,14 +1642,10 @@ mod tests {
         empty_get_updates(&s).await;
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
         let dbg = format!("{adapter:?}");
         assert!(dbg.contains("TelegramAdapter"));
         adapter.shutdown().await;
@@ -1660,14 +1664,10 @@ mod tests {
             .await;
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
         let id = adapter
             .deliver(
                 "100",
@@ -1697,14 +1697,10 @@ mod tests {
             .await;
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
         adapter
             .deliver(
                 "100",
@@ -1739,14 +1735,10 @@ mod tests {
             .await;
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
         let id = adapter
             .deliver(
                 "100",
@@ -1778,14 +1770,10 @@ mod tests {
         empty_get_updates(&s).await;
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
         let err = adapter
             .deliver(
                 "100",
@@ -1815,14 +1803,10 @@ mod tests {
             .await;
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
         let id = adapter
             .deliver(
                 "100",
@@ -1855,14 +1839,10 @@ mod tests {
             .await;
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
         adapter.set_typing("100", None).await.unwrap();
         adapter.set_typing("100", Some("9")).await.unwrap();
         adapter.shutdown().await;
@@ -1881,14 +1861,10 @@ mod tests {
             .await;
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
         adapter.subscribe("100", None).await.unwrap();
         adapter.shutdown().await;
     }
@@ -1899,14 +1875,10 @@ mod tests {
         empty_get_updates(&s).await;
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
         let handle = adapter.open_dm("user-123").await.unwrap().expect("handle");
         assert_eq!(handle.user_id, "user-123");
         assert_eq!(handle.platform_id, "user-123");
@@ -1919,14 +1891,10 @@ mod tests {
         let s = MockServer::start().await;
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            wh_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(wh_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
         let addr = adapter.webhook_addr().expect("addr");
         assert!(addr.port() > 0);
         adapter.shutdown().await;
@@ -1938,14 +1906,10 @@ mod tests {
         empty_get_updates(&s).await;
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
         adapter.shutdown().await;
         adapter.shutdown().await;
     }
@@ -1998,14 +1962,10 @@ mod tests {
         empty_get_updates(&s).await;
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
 
         let msg = OutboundMessage {
             kind: MessageKind::Chat,
@@ -2038,14 +1998,10 @@ mod tests {
         empty_get_updates(&s).await;
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
 
         let msg = OutboundMessage {
             kind: MessageKind::Chat,
@@ -2066,7 +2022,10 @@ mod tests {
     #[test]
     fn extract_parse_mode_handles_field() {
         assert_eq!(extract_parse_mode(&json!({})), None);
-        assert_eq!(extract_parse_mode(&json!({"parse_mode": "Markdown"})), Some("Markdown".into()));
+        assert_eq!(
+            extract_parse_mode(&json!({"parse_mode": "Markdown"})),
+            Some("Markdown".into())
+        );
         assert_eq!(extract_parse_mode(&json!({"parse_mode": 1})), None);
     }
 
@@ -2093,14 +2052,10 @@ mod tests {
             .await;
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
         adapter
             .edit_message("100", Some("thread-1"), "7", "edited text")
             .await
@@ -2110,8 +2065,7 @@ mod tests {
             .iter()
             .find(|r| r.url.path().ends_with("/editMessageText"))
             .expect("editMessageText request");
-        let body: serde_json::Value =
-            serde_json::from_slice(&edit_req.body).expect("json body");
+        let body: serde_json::Value = serde_json::from_slice(&edit_req.body).expect("json body");
         assert_eq!(body["chat_id"], "100");
         assert_eq!(body["message_id"], 7);
         assert_eq!(body["text"], "edited text");
@@ -2131,14 +2085,10 @@ mod tests {
             .await;
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
         adapter
             .add_reaction("100", None, "7", "\u{1F44D}")
             .await
@@ -2148,8 +2098,7 @@ mod tests {
             .iter()
             .find(|r| r.url.path().ends_with("/setMessageReaction"))
             .expect("setMessageReaction request");
-        let body: serde_json::Value =
-            serde_json::from_slice(&req.body).expect("json body");
+        let body: serde_json::Value = serde_json::from_slice(&req.body).expect("json body");
         assert_eq!(body["chat_id"], "100");
         assert_eq!(body["message_id"], 7);
         assert_eq!(body["reaction"][0]["type"], "emoji");
@@ -2175,14 +2124,10 @@ mod tests {
             .await;
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
         let id = adapter
             .deliver(
                 "100",
@@ -2244,14 +2189,10 @@ mod tests {
             .await;
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
         let err = adapter
             .deliver(
                 "100",
@@ -2284,14 +2225,10 @@ mod tests {
             .await;
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
         let err = adapter
             .deliver(
                 "100",
@@ -2318,14 +2255,10 @@ mod tests {
         empty_get_updates(&s).await;
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
         let err = adapter
             .deliver(
                 "100",
@@ -2374,14 +2307,10 @@ mod tests {
     async fn build_adapter(s: &MockServer) -> Arc<TelegramAdapter> {
         let (tx, _rx) = mpsc::channel::<InboundEvent>(8);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
         // Leak the tempdir so it lives as long as the adapter — the
         // returned Arc owns the path reference indirectly via
         // `data_dir`.
@@ -2461,9 +2390,7 @@ mod tests {
         assert!(text.contains("Espresso"), "got `{text}`");
 
         // Inline keyboard: three buttons → 1 row of 3 (fits within MAX_BUTTONS_PER_ROW=3).
-        let kb = body["reply_markup"]["inline_keyboard"]
-            .as_array()
-            .unwrap();
+        let kb = body["reply_markup"]["inline_keyboard"].as_array().unwrap();
         assert_eq!(kb.len(), 1);
         let row = kb[0].as_array().unwrap();
         assert_eq!(row.len(), 3);
@@ -2529,7 +2456,10 @@ mod tests {
             image_url: Some("https://example.com/latte.png".into()),
             ..Card::default()
         };
-        let id = adapter.deliver_card("c-1", None, &card, None).await.unwrap();
+        let id = adapter
+            .deliver_card("c-1", None, &card, None)
+            .await
+            .unwrap();
         assert_eq!(id.as_deref(), Some("222"));
 
         let reqs = s.received_requests().await.unwrap();
@@ -2542,9 +2472,7 @@ mod tests {
         assert!(body["caption"].as_str().unwrap().contains("*Latte*"));
         assert_eq!(body["parse_mode"], "MarkdownV2");
         // Keyboard rides on the photo message in the single-call path.
-        let kb = body["reply_markup"]["inline_keyboard"]
-            .as_array()
-            .unwrap();
+        let kb = body["reply_markup"]["inline_keyboard"].as_array().unwrap();
         assert_eq!(kb.len(), 1);
         assert_eq!(kb[0][0]["callback_data"], "yes");
         adapter.shutdown().await;
@@ -2572,7 +2500,10 @@ mod tests {
             image_url: Some("https://example.com/x.png".into()),
             ..Card::default()
         };
-        let id = adapter.deliver_card("c-1", None, &card, None).await.unwrap();
+        let id = adapter
+            .deliver_card("c-1", None, &card, None)
+            .await
+            .unwrap();
         assert_eq!(id.as_deref(), Some("1")); // photo id returned, not follow-up
 
         let reqs = s.received_requests().await.unwrap();
@@ -2580,8 +2511,7 @@ mod tests {
             .iter()
             .find(|r| r.url.path().ends_with("/sendPhoto"))
             .expect("sendPhoto request");
-        let photo_body: serde_json::Value =
-            serde_json::from_slice(&photo_req.body).unwrap();
+        let photo_body: serde_json::Value = serde_json::from_slice(&photo_req.body).unwrap();
         // Caption is truncated and ends with the (escaped) overflow suffix.
         let caption = photo_body["caption"].as_str().unwrap();
         assert!(caption.chars().count() <= MAX_PHOTO_CAPTION_CHARS);
@@ -2635,9 +2565,7 @@ mod tests {
             .find(|r| r.url.path().ends_with("/sendMessage"))
             .expect("sendMessage request");
         let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
-        let kb = body["reply_markup"]["inline_keyboard"]
-            .as_array()
-            .unwrap();
+        let kb = body["reply_markup"]["inline_keyboard"].as_array().unwrap();
         assert_eq!(kb.len(), 3, "expected 3 rows, got {}", kb.len());
         assert_eq!(kb[0].as_array().unwrap().len(), 3);
         assert_eq!(kb[1].as_array().unwrap().len(), 3);
@@ -2801,7 +2729,10 @@ mod tests {
             .chars()
             .take(out.chars().count() - "\\(see message below\\)".chars().count() - 1)
             .collect();
-        assert!(!pre_suffix.ends_with('\\'), "stray backslash in `{pre_suffix}`");
+        assert!(
+            !pre_suffix.ends_with('\\'),
+            "stray backslash in `{pre_suffix}`"
+        );
     }
 
     // ---------------------------------------------------------------
@@ -2858,14 +2789,10 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel::<InboundEvent>(8);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
 
         let evt = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
             .await
@@ -2900,14 +2827,10 @@ mod tests {
 
         let (tx, mut rx) = mpsc::channel::<InboundEvent>(8);
         let dir = temp_dir();
-        let adapter = TelegramAdapter::start(
-            lp_config(&s.uri()),
-            None,
-            tx,
-            dir.path().to_path_buf(),
-        )
-        .await
-        .unwrap();
+        let adapter =
+            TelegramAdapter::start(lp_config(&s.uri()), None, tx, dir.path().to_path_buf())
+                .await
+                .unwrap();
 
         // Wait for the inbound event so we know the loop has processed
         // the callback and (per our ordering) already called the ack.
@@ -2934,8 +2857,7 @@ mod tests {
 
     #[test]
     fn render_breadcrumb_running_uses_code_chip_and_ascii_marker() {
-        let bc = copperclaw_channels_core::Breadcrumb::running("shell")
-            .with_detail("cargo check");
+        let bc = copperclaw_channels_core::Breadcrumb::running("shell").with_detail("cargo check");
         let html = super::render_breadcrumb_html(&bc);
         assert!(html.starts_with("[~]"), "running ASCII marker: {html}");
         assert!(html.contains("<code>shell</code>"));
@@ -2964,8 +2886,8 @@ mod tests {
 
     #[test]
     fn render_breadcrumb_escapes_html_in_detail() {
-        let bc = copperclaw_channels_core::Breadcrumb::running("shell")
-            .with_detail("echo <hi> & bye");
+        let bc =
+            copperclaw_channels_core::Breadcrumb::running("shell").with_detail("echo <hi> & bye");
         let html = super::render_breadcrumb_html(&bc);
         assert!(html.contains("echo &lt;hi&gt; &amp; bye"), "got: {html}");
     }
@@ -3032,7 +2954,10 @@ mod tests {
         // Older steps folded behind a "+N earlier" note.
         assert!(html.contains("earlier step(s)"), "cap note: {html}");
         // Newest step is kept (newest-first budget) and HTML is escaped.
-        assert!(html.contains("a &lt;b&gt; &amp; c"), "escaped newest: {html}");
+        assert!(
+            html.contains("a &lt;b&gt; &amp; c"),
+            "escaped newest: {html}"
+        );
     }
 
     #[test]
@@ -3061,7 +2986,10 @@ mod tests {
             truncated: false,
         };
         let out = super::render_diff_markdown_v2(&card);
-        assert!(out.contains("*src/lib\\.rs*"), "path bolded + escaped: {out}");
+        assert!(
+            out.contains("*src/lib\\.rs*"),
+            "path bolded + escaped: {out}"
+        );
         assert!(out.contains("\\+1 / \\-1"), "totals header: {out}");
         assert!(out.contains("```diff\n"));
         assert!(out.contains("@@ -10,1 +10,1 @@"));
@@ -3117,10 +3045,9 @@ mod tests {
         let cfg = lp_config(&s.uri());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let dir = temp_dir();
-        let adapter =
-            TelegramAdapter::start_with_api(api, cfg, None, tx, dir.path().to_path_buf())
-                .await
-                .unwrap();
+        let adapter = TelegramAdapter::start_with_api(api, cfg, None, tx, dir.path().to_path_buf())
+            .await
+            .unwrap();
         let card = copperclaw_channels_core::DiffCard {
             path: "src/main.rs".into(),
             language: Some("rust".into()),
@@ -3177,12 +3104,10 @@ mod tests {
         let cfg = lp_config(&s.uri());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let dir = temp_dir();
-        let adapter =
-            TelegramAdapter::start_with_api(api, cfg, None, tx, dir.path().to_path_buf())
-                .await
-                .unwrap();
-        let bc = copperclaw_channels_core::Breadcrumb::running("shell")
-            .with_detail("cargo check");
+        let adapter = TelegramAdapter::start_with_api(api, cfg, None, tx, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let bc = copperclaw_channels_core::Breadcrumb::running("shell").with_detail("cargo check");
         let id = adapter
             .deliver_breadcrumb("chat-1", None, &bc, None)
             .await
@@ -3217,10 +3142,9 @@ mod tests {
         let cfg = lp_config(&s.uri());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let dir = temp_dir();
-        let adapter =
-            TelegramAdapter::start_with_api(api, cfg, None, tx, dir.path().to_path_buf())
-                .await
-                .unwrap();
+        let adapter = TelegramAdapter::start_with_api(api, cfg, None, tx, dir.path().to_path_buf())
+            .await
+            .unwrap();
         let bc = copperclaw_channels_core::Breadcrumb::running("shell")
             .with_detail("cargo check")
             .finished(true, Some("passed (0.4s)".into()));
@@ -3339,19 +3263,15 @@ mod tests {
         let cfg = lp_config(&s.uri());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let dir = temp_dir();
-        let adapter =
-            TelegramAdapter::start_with_api(api, cfg, None, tx, dir.path().to_path_buf())
-                .await
-                .unwrap();
+        let adapter = TelegramAdapter::start_with_api(api, cfg, None, tx, dir.path().to_path_buf())
+            .await
+            .unwrap();
         let card = copperclaw_channels_core::ErrorCard::new(
             copperclaw_channels_core::ErrorCardKind::Provider,
             "the model failed to produce a complete response after 3 retries",
         )
         .with_details("anthropic 502 bad gateway");
-        let id = adapter
-            .deliver_error("chat-1", None, &card)
-            .await
-            .unwrap();
+        let id = adapter.deliver_error("chat-1", None, &card).await.unwrap();
         assert_eq!(id.as_deref(), Some("9001"));
         let reqs = s.received_requests().await.unwrap();
         let sm = reqs
@@ -3374,10 +3294,16 @@ mod tests {
         // `<blockquote expandable>` (Bot API 7.6+). The summary
         // rides outside the blockquote so the user can see what
         // they'd be expanding before they tap.
-        let body = (0..40).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let body = (0..40)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let html = super::render_collapsible_html(&body, "shell 40 lines (250 B)");
         // Summary shows up in `<i>…</i>` at the top.
-        assert!(html.starts_with("<i>shell 40 lines (250 B)</i>\n"), "got: {html}");
+        assert!(
+            html.starts_with("<i>shell 40 lines (250 B)</i>\n"),
+            "got: {html}"
+        );
         // Full body lives inside the expandable blockquote.
         assert!(html.contains("<blockquote expandable>"), "got: {html}");
         assert!(html.ends_with("</blockquote>"), "got: {html}");
@@ -3392,7 +3318,10 @@ mod tests {
         // entity-encoded or Telegram rejects the parse.
         let body = "<script>alert(\"xss\")</script>\n& <div>";
         let html = super::render_collapsible_html(body, "fetched 1 page");
-        assert!(!html.contains("<script>"), "raw <script> not escaped: {html}");
+        assert!(
+            !html.contains("<script>"),
+            "raw <script> not escaped: {html}"
+        );
         assert!(html.contains("&lt;script&gt;"), "got: {html}");
         assert!(html.contains("&amp;"), "got: {html}");
     }
@@ -3416,19 +3345,19 @@ mod tests {
         let s = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/bottok/sendMessage"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"ok": true, "result": {"message_id": 42}})
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": {"message_id": 42}})),
+            )
             .mount(&s)
             .await;
         let api = TelegramApi::new(s.uri(), "tok");
         let cfg = lp_config(&s.uri());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let dir = temp_dir();
-        let adapter =
-            TelegramAdapter::start_with_api(api, cfg, None, tx, dir.path().to_path_buf())
-                .await
-                .unwrap();
+        let adapter = TelegramAdapter::start_with_api(api, cfg, None, tx, dir.path().to_path_buf())
+            .await
+            .unwrap();
         let body = (0..35)
             .map(|i| format!("out line {i}"))
             .collect::<Vec<_>>()
@@ -3492,7 +3421,10 @@ mod tests {
         // encode them or Telegram rejects the parse.
         let t = ThinkingBlock::visible("<script>alert(\"x\")</script>");
         let html = super::render_thinking_html(&t);
-        assert!(!html.contains("<script>"), "raw <script> not escaped: {html}");
+        assert!(
+            !html.contains("<script>"),
+            "raw <script> not escaped: {html}"
+        );
         assert!(html.contains("&lt;script&gt;"), "got: {html}");
     }
 
@@ -3522,24 +3454,21 @@ mod tests {
         let s = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/bottok/sendMessage"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({"ok": true, "result": {"message_id": 99}}),
-            ))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"ok": true, "result": {"message_id": 99}})),
+            )
             .mount(&s)
             .await;
         let api = TelegramApi::new(s.uri(), "tok");
         let cfg = lp_config(&s.uri());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let dir = temp_dir();
-        let adapter =
-            TelegramAdapter::start_with_api(api, cfg, None, tx, dir.path().to_path_buf())
-                .await
-                .unwrap();
-        let t = ThinkingBlock::visible("a chain of thought").with_model("claude-opus-4-7");
-        let id = adapter
-            .deliver_thinking("100", None, &t)
+        let adapter = TelegramAdapter::start_with_api(api, cfg, None, tx, dir.path().to_path_buf())
             .await
             .unwrap();
+        let t = ThinkingBlock::visible("a chain of thought").with_model("claude-opus-4-7");
+        let id = adapter.deliver_thinking("100", None, &t).await.unwrap();
         assert_eq!(id.as_deref(), Some("99"));
         let reqs = s.received_requests().await.unwrap();
         let sm = reqs
@@ -3549,7 +3478,10 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_slice(&sm.body).unwrap();
         assert_eq!(payload["parse_mode"], "HTML");
         let text = payload["text"].as_str().unwrap();
-        assert!(text.starts_with("<i>reasoning (claude-opus-4-7)</i>"), "got: {text}");
+        assert!(
+            text.starts_with("<i>reasoning (claude-opus-4-7)</i>"),
+            "got: {text}"
+        );
         assert!(text.contains("<blockquote expandable>"), "got: {text}");
         assert!(text.contains("a chain of thought"));
         adapter.shutdown().await;
@@ -3588,7 +3520,10 @@ mod tests {
         // — MarkdownV2 reserves both brackets. Regression caught live
         // 2026-05-24: unescaped `[x]` returned 400 from Telegram and
         // cascaded into endless agent retries.
-        assert!(body.contains(r"\[x\] ~Wash dishes~"), "done strikethrough: {body}");
+        assert!(
+            body.contains(r"\[x\] ~Wash dishes~"),
+            "done strikethrough: {body}"
+        );
         // `~` is also MarkdownV2-reserved (strikethrough marker), so
         // the `[~]` glyph becomes `\[\~\]` after escaping.
         assert!(body.contains(r"\[\~\] Dry dishes"), "in-progress: {body}");
@@ -3634,10 +3569,9 @@ mod tests {
         let cfg = lp_config(&s.uri());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let dir = temp_dir();
-        let adapter =
-            TelegramAdapter::start_with_api(api, cfg, None, tx, dir.path().to_path_buf())
-                .await
-                .unwrap();
+        let adapter = TelegramAdapter::start_with_api(api, cfg, None, tx, dir.path().to_path_buf())
+            .await
+            .unwrap();
         let id = adapter
             .deliver_todo_list("100", None, &todo_list_sample(), None, true)
             .await
@@ -3668,10 +3602,9 @@ mod tests {
         let cfg = lp_config(&s.uri());
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let dir = temp_dir();
-        let adapter =
-            TelegramAdapter::start_with_api(api, cfg, None, tx, dir.path().to_path_buf())
-                .await
-                .unwrap();
+        let adapter = TelegramAdapter::start_with_api(api, cfg, None, tx, dir.path().to_path_buf())
+            .await
+            .unwrap();
         let id = adapter
             .deliver_todo_list("100", None, &todo_list_sample(), Some("555"), false)
             .await
@@ -3679,9 +3612,16 @@ mod tests {
         assert_eq!(id.as_deref(), Some("555"));
         let reqs = s.received_requests().await.unwrap();
         // Edit was called; no new sendMessage / pinChatMessage.
-        assert!(reqs.iter().any(|r| r.url.path().ends_with("/editMessageText")));
+        assert!(
+            reqs.iter()
+                .any(|r| r.url.path().ends_with("/editMessageText"))
+        );
         assert!(!reqs.iter().any(|r| r.url.path().ends_with("/sendMessage")));
-        assert!(!reqs.iter().any(|r| r.url.path().ends_with("/pinChatMessage")));
+        assert!(
+            !reqs
+                .iter()
+                .any(|r| r.url.path().ends_with("/pinChatMessage"))
+        );
         adapter.shutdown().await;
     }
 }

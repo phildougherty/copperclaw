@@ -179,9 +179,7 @@ impl RunnerConfig {
         // Prefer the explicit file field; otherwise pick up
         // `ANTHROPIC_BASE_URL` from the environment so a single env var
         // configures every session (matches how api_key is sourced).
-        let api_base_url = file
-            .api_base_url
-            .or_else(|| env.get("ANTHROPIC_BASE_URL"));
+        let api_base_url = file.api_base_url.or_else(|| env.get("ANTHROPIC_BASE_URL"));
         let provider = match file.provider.as_deref() {
             None | Some("" | "anthropic" | "claude") => "anthropic".to_string(),
             Some("ollama") => "ollama".to_string(),
@@ -265,7 +263,11 @@ impl MapEnv {
         K: Into<String>,
         V: Into<String>,
     {
-        Self(iter.into_iter().map(|(k, v)| (k.into(), v.into())).collect())
+        Self(
+            iter.into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
+        )
     }
 }
 
@@ -367,10 +369,7 @@ mod tests {
             ("ANTHROPIC_BASE_URL", "https://env.example/v1"),
         ]);
         let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
-        assert_eq!(
-            cfg.api_base_url.as_deref(),
-            Some("https://file.example/v1")
-        );
+        assert_eq!(cfg.api_base_url.as_deref(), Some("https://file.example/v1"));
     }
 
     #[test]
@@ -469,8 +468,14 @@ mod tests {
         let env = MapEnv::default();
         let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
         assert_eq!(cfg.effort, Effort::Medium);
-        assert_eq!(cfg.model_input_window, crate::compaction::DEFAULT_INPUT_WINDOW);
-        assert_eq!(cfg.safety_margin_tokens, crate::compaction::DEFAULT_SAFETY_MARGIN);
+        assert_eq!(
+            cfg.model_input_window,
+            crate::compaction::DEFAULT_INPUT_WINDOW
+        );
+        assert_eq!(
+            cfg.safety_margin_tokens,
+            crate::compaction::DEFAULT_SAFETY_MARGIN
+        );
         assert_eq!(cfg.max_tokens, 4096);
     }
 
@@ -516,7 +521,13 @@ mod tests {
         file.session_id = Some("not-a-uuid".into());
         let env = MapEnv::default();
         let err = RunnerConfig::from_file_struct(file, &env).unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidValue { field: "session_id", .. }));
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue {
+                field: "session_id",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -525,7 +536,13 @@ mod tests {
         file.agent_group_id = Some("nope".into());
         let env = MapEnv::default();
         let err = RunnerConfig::from_file_struct(file, &env).unwrap_err();
-        assert!(matches!(err, ConfigError::InvalidValue { field: "agent_group_id", .. }));
+        assert!(matches!(
+            err,
+            ConfigError::InvalidValue {
+                field: "agent_group_id",
+                ..
+            }
+        ));
     }
 
     #[test]

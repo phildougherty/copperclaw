@@ -10,8 +10,8 @@
 use copperclaw_db::tables::destinations;
 use copperclaw_db::tables::session_routing;
 use copperclaw_mcp::Recipient;
-use copperclaw_types::routing::{DestinationKind, DestinationRow, SessionRouting};
 use copperclaw_types::ChannelType;
+use copperclaw_types::routing::{DestinationKind, DestinationRow, SessionRouting};
 use rusqlite::Connection;
 
 /// A successfully resolved route.
@@ -132,7 +132,7 @@ fn resolve_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use copperclaw_db::session::{open_inbound, SessionPaths};
+    use copperclaw_db::session::{SessionPaths, open_inbound};
     use copperclaw_types::routing::DestinationRow;
     use copperclaw_types::{AgentGroupId, SessionId};
 
@@ -170,7 +170,10 @@ mod tests {
         let _ = &mut conn;
         let r = resolve_recipient(&conn, None).unwrap().unwrap();
         assert_eq!(r.kind, DestinationKind::Channel);
-        assert_eq!(r.channel_type.as_ref().map(ChannelType::as_str), Some("cli"));
+        assert_eq!(
+            r.channel_type.as_ref().map(ChannelType::as_str),
+            Some("cli")
+        );
         assert_eq!(r.platform_id.as_deref(), Some("chat-1"));
         assert_eq!(r.thread_id.as_deref(), Some("t-1"));
     }
@@ -200,14 +203,9 @@ mod tests {
     fn channel_resolves_via_destinations_table() {
         let (_tmp, mut conn) = fresh_inbound();
         destinations::replace_all(&mut conn, &[channel_dest("alice")]).unwrap();
-        let r = resolve_recipient(
-            &conn,
-            Some(&Recipient::Channel {
-                id: "alice".into(),
-            }),
-        )
-        .unwrap()
-        .unwrap();
+        let r = resolve_recipient(&conn, Some(&Recipient::Channel { id: "alice".into() }))
+            .unwrap()
+            .unwrap();
         assert_eq!(r.kind, DestinationKind::Channel);
         assert_eq!(r.channel_type.unwrap().as_str(), "telegram");
         assert_eq!(r.platform_id.as_deref(), Some("chat-99"));
@@ -244,18 +242,16 @@ mod tests {
     #[test]
     fn channel_with_empty_halves_is_none() {
         let (_tmp, conn) = fresh_inbound();
-        assert!(resolve_recipient(
-            &conn,
-            Some(&Recipient::Channel { id: ":xyz".into() })
-        )
-        .unwrap()
-        .is_none());
-        assert!(resolve_recipient(
-            &conn,
-            Some(&Recipient::Channel { id: "abc:".into() })
-        )
-        .unwrap()
-        .is_none());
+        assert!(
+            resolve_recipient(&conn, Some(&Recipient::Channel { id: ":xyz".into() }))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            resolve_recipient(&conn, Some(&Recipient::Channel { id: "abc:".into() }))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -277,14 +273,9 @@ mod tests {
     #[test]
     fn user_recipient_passes_through_id() {
         let (_tmp, conn) = fresh_inbound();
-        let r = resolve_recipient(
-            &conn,
-            Some(&Recipient::User {
-                id: "u_42".into(),
-            }),
-        )
-        .unwrap()
-        .unwrap();
+        let r = resolve_recipient(&conn, Some(&Recipient::User { id: "u_42".into() }))
+            .unwrap()
+            .unwrap();
         assert_eq!(r.kind, DestinationKind::Channel);
         assert!(r.channel_type.is_none());
         assert_eq!(r.platform_id.as_deref(), Some("u_42"));
@@ -303,12 +294,9 @@ mod tests {
             agent_group_id: Some(group),
         };
         destinations::replace_all(&mut conn, &[row]).unwrap();
-        let r = resolve_recipient(
-            &conn,
-            Some(&Recipient::Channel { id: "bot".into() }),
-        )
-        .unwrap()
-        .unwrap();
+        let r = resolve_recipient(&conn, Some(&Recipient::Channel { id: "bot".into() }))
+            .unwrap()
+            .unwrap();
         assert_eq!(r.kind, DestinationKind::Agent);
         assert_eq!(r.agent_group_id, Some(group));
     }

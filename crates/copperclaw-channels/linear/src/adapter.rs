@@ -148,7 +148,8 @@ impl LinearAdapter {
                     .and_then(Value::as_str)
                     .ok_or_else(|| {
                         AdapterError::BadRequest(
-                            "linear edit action requires `target_platform_id` (comment uuid)".into(),
+                            "linear edit action requires `target_platform_id` (comment uuid)"
+                                .into(),
                         )
                     })?;
                 let text = content
@@ -638,7 +639,9 @@ mod tests {
 
     #[test]
     fn is_valid_shortcode_accepts_canonical_examples() {
-        for s in ["thumbsup", "tada", "plus-one", "u_score", "100", "ok+", "a-b_c+1"] {
+        for s in [
+            "thumbsup", "tada", "plus-one", "u_score", "100", "ok+", "a-b_c+1",
+        ] {
             assert!(is_valid_shortcode(s), "rejected `{s}` unexpectedly");
         }
     }

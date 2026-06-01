@@ -40,7 +40,10 @@ pub enum SignatureError {
 /// Public so tests (and any replay harness) can build a matching header.
 #[must_use]
 pub fn compute_signature(app_secret: &str, body: &[u8]) -> String {
-    format!("sha256={}", hex::encode(hmac_sha256(app_secret.as_bytes(), body)))
+    format!(
+        "sha256={}",
+        hex::encode(hmac_sha256(app_secret.as_bytes(), body))
+    )
 }
 
 /// Verify a `sha256=<hex>` header against the raw body using the app secret.

@@ -32,7 +32,7 @@
 //!   `.gitignore` doesn't drag the agent through build artefacts.
 
 use crate::error::ToolError;
-use crate::tools::{make_tool, parse_args, success_json, ToolEntry, ToolHandler};
+use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args, success_json};
 use rmcp::model::{CallToolResult, JsonObject, Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -132,14 +132,16 @@ pub async fn handle(
     let mut builder = regex::RegexBuilder::new(&input.pattern);
     builder.case_insensitive(input.case_insensitive);
     let re = builder.build().map_err(|e| {
-        ToolError::Validation(format!(
-            "invalid regex `{pat}`: {e}",
-            pat = input.pattern
-        ))
+        ToolError::Validation(format!("invalid regex `{pat}`: {e}", pat = input.pattern))
     })?;
 
     // Resolve the search root. Empty / unset → current working dir.
-    let root = match input.path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let root = match input
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(p) => PathBuf::from(p),
         None => std::env::current_dir()
             .map_err(|e| ToolError::Internal(format!("cwd unavailable: {e}")))?,
@@ -151,7 +153,12 @@ pub async fn handle(
         )));
     }
 
-    let glob = match input.glob.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let glob = match input
+        .glob
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(g) => Some(
             globset::GlobBuilder::new(g)
                 .literal_separator(false)
@@ -172,7 +179,14 @@ pub async fn handle(
     // The `ignore` walker is blocking; offload it so the tokio
     // runtime isn't held up.
     let result = tokio::task::spawn_blocking(move || {
-        run_grep(&root, &re, glob.as_ref(), max_results, context_lines, no_ignore)
+        run_grep(
+            &root,
+            &re,
+            glob.as_ref(),
+            max_results,
+            context_lines,
+            no_ignore,
+        )
     })
     .await
     .map_err(|e| ToolError::Internal(format!("grep task panicked: {e}")))?;
@@ -232,9 +246,7 @@ fn run_grep(
             // relative to root, so callers can write either
             // `*.rs` or `crates/**/*.rs`.
             let rel = path.strip_prefix(root).unwrap_or(path);
-            let name_match = path
-                .file_name()
-                .is_some_and(|n| g.is_match(Path::new(n)));
+            let name_match = path.file_name().is_some_and(|n| g.is_match(Path::new(n)));
             if !name_match && !g.is_match(rel) {
                 continue;
             }
@@ -314,7 +326,9 @@ fn search_file(
         // or the bytes weren't valid UTF-8 after all. Treat as
         // binary and move on rather than raising — the agent has
         // hundreds of other files to search.
-        let Ok(line) = line else { return Err(SearchAbort::Binary) };
+        let Ok(line) = line else {
+            return Err(SearchAbort::Binary);
+        };
         let capped = cap_line(&line);
 
         // Fill in any pending "context_after" lines for previous
@@ -447,7 +461,11 @@ mod tests {
     async fn happy_path_matches_in_order() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn run_loop() {}\nfn other() {}\n").unwrap();
-        std::fs::write(dir.path().join("b.rs"), "// run_loop reference\nfn main() {}\n").unwrap();
+        std::fs::write(
+            dir.path().join("b.rs"),
+            "// run_loop reference\nfn main() {}\n",
+        )
+        .unwrap();
 
         let res = handle(
             args(json!({
@@ -587,12 +605,9 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_regex_error_names_pattern() {
-        let err = handle(
-            args(json!({"pattern": "(invalid"})),
-            ctx().as_ref(),
-        )
-        .await
-        .unwrap_err();
+        let err = handle(args(json!({"pattern": "(invalid"})), ctx().as_ref())
+            .await
+            .unwrap_err();
         match err {
             ToolError::Validation(msg) => {
                 assert!(

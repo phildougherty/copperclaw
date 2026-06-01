@@ -1,10 +1,10 @@
 //! CRUD for `pending_questions`.
 
-use crate::central::CentralDb;
 use crate::DbError;
+use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
 use copperclaw_types::{ChannelType, MessageId, QuestionId, SessionId};
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{OptionalExtension, Row, params};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingQuestion {
@@ -32,21 +32,27 @@ pub struct InsertPendingQuestion {
 
 fn row_to_pending_question(row: &Row<'_>) -> rusqlite::Result<PendingQuestion> {
     let question_id_str: String = row.get("question_id")?;
-    let question_id = uuid::Uuid::parse_str(&question_id_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let question_id = uuid::Uuid::parse_str(&question_id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let session_id_str: String = row.get("session_id")?;
-    let session_id = uuid::Uuid::parse_str(&session_id_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let session_id = uuid::Uuid::parse_str(&session_id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let message_out_id_str: String = row.get("message_out_id")?;
-    let message_out_id = uuid::Uuid::parse_str(&message_out_id_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let message_out_id = uuid::Uuid::parse_str(&message_out_id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let channel_type: Option<String> = row.get("channel_type")?;
     let options_json: String = row.get("options_json")?;
-    let options: Vec<String> = serde_json::from_str(&options_json)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let options: Vec<String> = serde_json::from_str(&options_json).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let created_at_str: String = row.get("created_at")?;
     let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .with_timezone(&Utc);
     Ok(PendingQuestion {
         question_id: QuestionId(question_id),
@@ -124,8 +130,8 @@ pub fn delete(db: &CentralDb, id: QuestionId) -> Result<(), DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tables::agent_groups::{create as create_ag, CreateAgentGroup};
-    use crate::tables::sessions::{create as create_session, CreateSession};
+    use crate::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+    use crate::tables::sessions::{CreateSession, create as create_session};
 
     fn db_with_session() -> (CentralDb, SessionId) {
         let db = CentralDb::open_in_memory().unwrap();
@@ -173,7 +179,10 @@ mod tests {
         assert_eq!(fetched.title, "Pick one");
         assert_eq!(fetched.options, vec!["yes".to_string(), "no".to_string()]);
         assert_eq!(fetched.session_id, session_id);
-        assert_eq!(fetched.channel_type.as_ref().map(ChannelType::as_str), Some("telegram"));
+        assert_eq!(
+            fetched.channel_type.as_ref().map(ChannelType::as_str),
+            Some("telegram")
+        );
     }
 
     #[test]
@@ -220,7 +229,10 @@ mod tests {
         let (db, session_id) = db_with_session();
         let q = insert(&db, sample(session_id)).unwrap();
         delete(&db, q.question_id).unwrap();
-        assert!(matches!(get(&db, q.question_id).unwrap_err(), DbError::NotFound));
+        assert!(matches!(
+            get(&db, q.question_id).unwrap_err(),
+            DbError::NotFound
+        ));
     }
 
     #[test]

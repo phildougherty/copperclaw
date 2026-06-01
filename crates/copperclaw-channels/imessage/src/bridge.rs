@@ -61,10 +61,7 @@ pub trait IMessageBridge: Send + Sync {
 
     /// Fetch every row from `message` with `ROWID > since_rowid` and
     /// `is_from_me = 0`, in `ROWID` ascending order.
-    async fn query_new_rows(
-        &self,
-        since_rowid: i64,
-    ) -> Result<Vec<MockMessageRow>, AdapterError>;
+    async fn query_new_rows(&self, since_rowid: i64) -> Result<Vec<MockMessageRow>, AdapterError>;
 }
 
 /// In-memory test bridge for unit tests.
@@ -183,8 +180,7 @@ impl IMessageBridge for MockBridge {
                 ));
             }
             let idx = g.applescript_cursor.min(g.applescript_responses.len() - 1);
-            g.applescript_cursor =
-                (g.applescript_cursor + 1).min(g.applescript_responses.len());
+            g.applescript_cursor = (g.applescript_cursor + 1).min(g.applescript_responses.len());
             match &g.applescript_responses[idx] {
                 Ok(s) => Ok(s.clone()),
                 Err(e) => Err(clone_adapter_error(e)),
@@ -193,10 +189,7 @@ impl IMessageBridge for MockBridge {
         result
     }
 
-    async fn query_new_rows(
-        &self,
-        since_rowid: i64,
-    ) -> Result<Vec<MockMessageRow>, AdapterError> {
+    async fn query_new_rows(&self, since_rowid: i64) -> Result<Vec<MockMessageRow>, AdapterError> {
         let mut g = self.state.lock().expect("mock mutex poisoned");
         g.query_calls.push(since_rowid);
         if !g.query_errors.is_empty() {
@@ -372,7 +365,9 @@ mod tests {
         let cases = vec![
             AdapterError::Transport("t".into()),
             AdapterError::Auth("a".into()),
-            AdapterError::Rate { retry_after: Some(7) },
+            AdapterError::Rate {
+                retry_after: Some(7),
+            },
             AdapterError::Rate { retry_after: None },
             AdapterError::BadRequest("b".into()),
             AdapterError::NotImplemented,

@@ -334,10 +334,12 @@ pub fn parse_metrics_addr(raw: &str) -> Result<SocketAddr, AddrParseError> {
     }
     // Try as a bare port number -> bind to loopback.
     let with_host = format!("127.0.0.1:{raw}");
-    with_host.parse::<SocketAddr>().map_err(|source| AddrParseError::Invalid {
-        raw: raw.to_owned(),
-        source,
-    })
+    with_host
+        .parse::<SocketAddr>()
+        .map_err(|source| AddrParseError::Invalid {
+            raw: raw.to_owned(),
+            source,
+        })
 }
 
 // ── Server ─────────────────────────────────────────────────────────────────
@@ -583,7 +585,12 @@ mod tests {
         // when COPPERCLAW_METRICS_ADDR contains garbage.
         let result = parse_metrics_addr("not-a-socket-addr!!!");
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not-a-socket-addr"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("not-a-socket-addr")
+        );
     }
 
     // ---- counter helpers compile and don't panic ----

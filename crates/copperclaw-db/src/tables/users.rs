@@ -6,11 +6,11 @@
 //! database, which makes `get_by_identity` a direct primary-key lookup and
 //! makes `upsert` safe to retry.
 
-use crate::central::CentralDb;
 use crate::DbError;
+use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
 use copperclaw_types::UserId;
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{OptionalExtension, Row, params};
 use uuid::Uuid;
 
 /// Namespace seed for deriving deterministic `UserId`s from `(kind, identity)`.
@@ -39,11 +39,14 @@ fn derive_user_id(kind: &str, identity: &str) -> UserId {
 
 fn row_to_user(row: &Row<'_>) -> rusqlite::Result<User> {
     let id_str: String = row.get("id")?;
-    let id = Uuid::parse_str(&id_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let id = Uuid::parse_str(&id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let created_at_str: String = row.get("created_at")?;
     let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .with_timezone(&Utc);
     Ok(User {
         id: UserId(id),
@@ -79,7 +82,11 @@ pub fn get(db: &CentralDb, id: UserId) -> Result<User, DbError> {
 /// Look up by namespaced identity ("kind", "identity"). Returns `None` if not
 /// found. The lookup is a direct primary-key query because `users.id` is
 /// derived from `(kind, identity)` via `UUIDv5`.
-pub fn get_by_identity(db: &CentralDb, kind: &str, identity: &str) -> Result<Option<User>, DbError> {
+pub fn get_by_identity(
+    db: &CentralDb,
+    kind: &str,
+    identity: &str,
+) -> Result<Option<User>, DbError> {
     let id = derive_user_id(kind, identity);
     let conn = db.conn()?;
     Ok(conn

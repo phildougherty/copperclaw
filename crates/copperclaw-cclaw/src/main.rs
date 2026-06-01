@@ -6,7 +6,7 @@
 use std::process::ExitCode;
 
 use clap::Parser as _;
-use copperclaw_cclaw::{Cli, CclawClient, SocketTransport, run_cli};
+use copperclaw_cclaw::{CclawClient, Cli, SocketTransport, run_cli};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {

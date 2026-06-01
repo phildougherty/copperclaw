@@ -1,0 +1,11 @@
+# Copperclaw house formatting. Stable-rustfmt only — every key here works
+# with `cargo fmt` on the stable toolchain (no `cargo +nightly fmt`
+# required), so `cargo fmt --all -- --check` is safe to gate CI on.
+#
+# Comment wrapping is deliberately NOT enabled (wrap_comments is
+# nightly-only), so the codebase's hand-wrapped doc/comment blocks are
+# preserved as authored.
+edition = "2024"
+max_width = 100
+newline_style = "Unix"
+use_field_init_shorthand = true

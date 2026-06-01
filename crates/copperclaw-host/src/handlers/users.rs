@@ -1,11 +1,11 @@
 //! Handlers for `users.*` commands.
 
 use super::{db_err, opt_str, parse_uuid, req_str};
+use copperclaw_cclaw::ErrorPayload;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::users;
-use copperclaw_cclaw::ErrorPayload;
 use copperclaw_types::UserId;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub fn list(_args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     let rows = users::list(central).map_err(db_err)?;
@@ -24,9 +24,7 @@ pub fn create(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> 
     let identity_full = req_str(args, "identity")?;
     let (kind, identity) = identity_full
         .split_once(':')
-        .ok_or_else(|| {
-            ErrorPayload::new("bad_request", "identity must be `<kind>:<handle>`")
-        })?;
+        .ok_or_else(|| ErrorPayload::new("bad_request", "identity must be `<kind>:<handle>`"))?;
     let display_name = opt_str(args, "display_name");
     let row = users::upsert(
         central,
@@ -124,11 +122,7 @@ mod tests {
     #[test]
     fn get_missing_is_not_found() {
         let db = db();
-        let err = get(
-            &json!({"id": uuid::Uuid::now_v7().to_string()}),
-            &db,
-        )
-        .unwrap_err();
+        let err = get(&json!({"id": uuid::Uuid::now_v7().to_string()}), &db).unwrap_err();
         assert_eq!(err.code, "not_found");
     }
 

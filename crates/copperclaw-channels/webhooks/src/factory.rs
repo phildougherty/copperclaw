@@ -10,7 +10,7 @@
 
 use crate::adapter::WebhooksAdapter;
 use crate::config::{ChannelConfigError, WebhooksConfig};
-use crate::router::{build_router, WebhooksRouterState};
+use crate::router::{WebhooksRouterState, build_router};
 use async_trait::async_trait;
 use copperclaw_channels_core::{
     AdapterError, ChannelAdapter, ChannelFactory, ChannelRegistry, ChannelSetup,
@@ -48,11 +48,11 @@ impl ChannelFactory for WebhooksFactory {
 
     async fn init(&self, setup: ChannelSetup) -> Result<Arc<dyn ChannelAdapter>, AdapterError> {
         let cfg = WebhooksConfig::from_value(&setup.config)?;
-        let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
-            .parse()
-            .map_err(|e: std::net::AddrParseError| {
+        let addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port).parse().map_err(
+            |e: std::net::AddrParseError| {
                 AdapterError::BadRequest(format!("invalid webhook bind address: {e}"))
-            })?;
+            },
+        )?;
         let ct = ChannelType::new(CHANNEL_TYPE_STR);
         let state = WebhooksRouterState::new(ct.clone(), cfg.clone(), setup.inbound_tx);
         let router = build_router(state);
@@ -121,8 +121,7 @@ mod tests {
     async fn factory_init_rejects_bad_bind_host() {
         let f = WebhooksFactory::new();
         let (tx, _rx) = mpsc::channel::<InboundEvent>(8);
-        let setup =
-            ChannelSetup::new(json!({"host": "not a host", "port": 9}), tx, "/tmp");
+        let setup = ChannelSetup::new(json!({"host": "not a host", "port": 9}), tx, "/tmp");
         match f.init(setup).await {
             Err(AdapterError::BadRequest(m)) => assert!(m.contains("invalid webhook bind")),
             Err(other) => panic!("expected BadRequest, got {other:?}"),

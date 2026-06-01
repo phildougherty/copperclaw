@@ -308,9 +308,7 @@ mod tests {
             path: "the-path".into(),
             root: "the-root".into(),
         };
-        assert!(
-            e.to_string().contains("the-path") && e.to_string().contains("the-root")
-        );
+        assert!(e.to_string().contains("the-path") && e.to_string().contains("the-root"));
         let e = MountError::SymlinkInPath("x".into());
         assert!(e.to_string().contains('x'));
         let e = MountError::Empty;

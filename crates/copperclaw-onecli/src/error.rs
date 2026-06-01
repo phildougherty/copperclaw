@@ -150,7 +150,12 @@ mod tests {
     #[test]
     fn is_retryable_rate_limited() {
         assert!(OneCliError::RateLimited { retry_after: None }.is_retryable());
-        assert!(OneCliError::RateLimited { retry_after: Some(1) }.is_retryable());
+        assert!(
+            OneCliError::RateLimited {
+                retry_after: Some(1)
+            }
+            .is_retryable()
+        );
     }
 
     #[test]

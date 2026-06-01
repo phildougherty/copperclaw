@@ -255,8 +255,7 @@ impl Fixture {
 }
 
 fn load_manifest(path: &Path) -> Result<Manifest> {
-    let bytes = fs::read(path)
-        .with_context(|| format!("read manifest at {}", path.display()))?;
+    let bytes = fs::read(path).with_context(|| format!("read manifest at {}", path.display()))?;
     let manifest: Manifest = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse manifest at {}", path.display()))?;
     Ok(manifest)
@@ -266,8 +265,8 @@ fn load_inbound(dir: &Path) -> Result<Vec<InboundEvent>> {
     let entries = sorted_files(dir, &["json"])?;
     let mut events = Vec::with_capacity(entries.len());
     for path in entries {
-        let bytes = fs::read(&path)
-            .with_context(|| format!("read inbound at {}", path.display()))?;
+        let bytes =
+            fs::read(&path).with_context(|| format!("read inbound at {}", path.display()))?;
         let event: InboundEvent = serde_json::from_slice(&bytes)
             .with_context(|| format!("parse inbound at {}", path.display()))?;
         events.push(event);
@@ -283,8 +282,8 @@ fn load_claude(dir: &Path) -> Result<(Vec<ClaudeTurn>, BTreeMap<String, ClaudeTu
     let mut turns = Vec::with_capacity(entries.len());
     let mut by_name: BTreeMap<String, ClaudeTurn> = BTreeMap::new();
     for path in entries {
-        let bytes = fs::read(&path)
-            .with_context(|| format!("read claude turn at {}", path.display()))?;
+        let bytes =
+            fs::read(&path).with_context(|| format!("read claude turn at {}", path.display()))?;
         let turn: ClaudeTurn = serde_json::from_slice(&bytes)
             .with_context(|| format!("parse claude turn at {}", path.display()))?;
         if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
@@ -308,17 +307,16 @@ fn load_jsonl(path: &Path) -> Result<Vec<serde_json::Value>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let text = fs::read_to_string(path)
-        .with_context(|| format!("read jsonl at {}", path.display()))?;
+    let text =
+        fs::read_to_string(path).with_context(|| format!("read jsonl at {}", path.display()))?;
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
-        let v: serde_json::Value = serde_json::from_str(trimmed).with_context(|| {
-            format!("parse jsonl line {} in {}", i + 1, path.display())
-        })?;
+        let v: serde_json::Value = serde_json::from_str(trimmed)
+            .with_context(|| format!("parse jsonl line {} in {}", i + 1, path.display()))?;
         out.push(v);
     }
     Ok(out)
@@ -329,9 +327,7 @@ fn sorted_files(dir: &Path, exts: &[&str]) -> Result<Vec<PathBuf>> {
         return Ok(Vec::new());
     }
     let mut files: Vec<PathBuf> = Vec::new();
-    for entry in fs::read_dir(dir)
-        .with_context(|| format!("read_dir {}", dir.display()))?
-    {
+    for entry in fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
         if !path.is_file() {

@@ -76,7 +76,10 @@ impl WhatsappCloudAdapter {
         }
     }
 
-    fn split_platform_id<'a>(&'a self, platform_id: &'a str) -> Result<(String, &'a str), AdapterError> {
+    fn split_platform_id<'a>(
+        &'a self,
+        platform_id: &'a str,
+    ) -> Result<(String, &'a str), AdapterError> {
         if let Some((pnid, recipient)) = platform_id.split_once(':') {
             if pnid.is_empty() || recipient.is_empty() {
                 return Err(AdapterError::BadRequest(format!(
@@ -187,7 +190,9 @@ impl ChannelAdapter for WhatsappCloudAdapter {
         // System action handling (edit / reaction) — recognised regardless
         // of MessageKind because the content carries the action discriminator.
         if let Some(action) = message.content.get("action").and_then(Value::as_str) {
-            return self.handle_system_action(&pnid, recipient, action, &message.content).await;
+            return self
+                .handle_system_action(&pnid, recipient, action, &message.content)
+                .await;
         }
 
         let text = message
@@ -257,10 +262,7 @@ impl WhatsappCloudAdapter {
                             "reaction action requires `target_message_id` or `message_id`".into(),
                         )
                     })?;
-                let emoji = content
-                    .get("emoji")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                let emoji = content.get("emoji").and_then(Value::as_str).unwrap_or("");
                 let id = self
                     .api
                     .send_reaction(phone_number_id, recipient, target, emoji)
@@ -330,8 +332,7 @@ mod tests {
                 "text":{"body":"hello"}
             })))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"messages":[{"id":"wamid.X"}]})),
+                ResponseTemplate::new(200).set_body_json(json!({"messages":[{"id":"wamid.X"}]})),
             )
             .mount(&server)
             .await;
@@ -352,18 +353,13 @@ mod tests {
                 "context":{"message_id":"wamid.PARENT"}
             })))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"messages":[{"id":"wamid.R"}]})),
+                ResponseTemplate::new(200).set_body_json(json!({"messages":[{"id":"wamid.R"}]})),
             )
             .mount(&server)
             .await;
         let a = adapter_for(&server, None);
         let id = a
-            .deliver(
-                "PNID:+15551234",
-                Some("wamid.PARENT"),
-                &text("threaded"),
-            )
+            .deliver("PNID:+15551234", Some("wamid.PARENT"), &text("threaded"))
             .await
             .unwrap();
         assert_eq!(id.as_deref(), Some("wamid.R"));
@@ -375,8 +371,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/DEFAULT/messages"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"messages":[{"id":"wamid.D"}]})),
+                ResponseTemplate::new(200).set_body_json(json!({"messages":[{"id":"wamid.D"}]})),
             )
             .mount(&server)
             .await;
@@ -414,9 +409,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/PNID/media"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"id":"MEDIA1"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"MEDIA1"})))
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -426,8 +419,7 @@ mod tests {
                 "document":{"id":"MEDIA1","filename":"x.pdf"}
             })))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"messages":[{"id":"wamid.F"}]})),
+                ResponseTemplate::new(200).set_body_json(json!({"messages":[{"id":"wamid.F"}]})),
             )
             .mount(&server)
             .await;
@@ -452,16 +444,13 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/PNID/messages"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"messages":[{"id":"wamid.T"}]})),
+                ResponseTemplate::new(200).set_body_json(json!({"messages":[{"id":"wamid.T"}]})),
             )
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(path("/PNID/media"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"id":"MEDIA1"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"MEDIA1"})))
             .mount(&server)
             .await;
         let a = adapter_for(&server, None);
@@ -506,8 +495,7 @@ mod tests {
                 "reaction":{"message_id":"wamid.TGT","emoji": emoji_for_match}
             })))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"messages":[{"id":"wamid.RXN"}]})),
+                ResponseTemplate::new(200).set_body_json(json!({"messages":[{"id":"wamid.RXN"}]})),
             )
             .mount(&server)
             .await;
@@ -531,8 +519,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/PNID/messages"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"messages":[{"id":"wamid.RXN2"}]})),
+                ResponseTemplate::new(200).set_body_json(json!({"messages":[{"id":"wamid.RXN2"}]})),
             )
             .mount(&server)
             .await;
@@ -594,9 +581,7 @@ mod tests {
                 "status":"read",
                 "message_id":"wamid.LAST"
             })))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"success": true})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"success": true})))
             .mount(&server)
             .await;
         let a = adapter_for(&server, None);

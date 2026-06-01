@@ -20,28 +20,28 @@ use crate::error::ToolError;
 
 pub mod agents;
 pub mod apply_patch;
+pub mod artifact_path;
+pub mod clear_history;
+pub mod compact_now;
 pub mod computer_use;
 pub mod copy_file;
 pub mod core;
 pub(crate) mod diff_util;
 pub mod edit_file;
 pub mod explore;
-pub mod multi_edit;
-pub(crate) mod git_common;
 pub mod git_blame;
+pub(crate) mod git_common;
 pub mod git_diff;
 pub mod git_log;
 pub mod git_status;
 pub mod glob;
 pub mod grep;
-pub mod artifact_path;
-pub mod clear_history;
-pub mod compact_now;
 pub mod interactive;
 pub mod load_skill;
-pub mod sentinel;
+pub mod multi_edit;
 pub mod scheduling;
 pub mod self_mod;
+pub mod sentinel;
 pub mod todo;
 pub mod view_image;
 pub mod web_search;
@@ -128,8 +128,8 @@ pub fn build_tool_map() -> std::collections::HashMap<String, Arc<ToolEntry>> {
 /// Convert an arbitrary serializable value into a `CallToolResult` with a
 /// single text block carrying its pretty-printed JSON.
 pub(crate) fn success_json<T: Serialize>(value: &T) -> CallToolResult {
-    let body = serde_json::to_string_pretty(value)
-        .unwrap_or_else(|e| format!("(serialise error: {e})"));
+    let body =
+        serde_json::to_string_pretty(value).unwrap_or_else(|e| format!("(serialise error: {e})"));
     CallToolResult::success(vec![Content::text(body)])
 }
 
@@ -223,10 +223,7 @@ mod tests {
         ];
         assert_eq!(set.len(), expected.len());
         for tool in &expected {
-            assert!(
-                names.contains(tool),
-                "missing tool: {tool} in {names:?}"
-            );
+            assert!(names.contains(tool), "missing tool: {tool} in {names:?}");
         }
     }
 

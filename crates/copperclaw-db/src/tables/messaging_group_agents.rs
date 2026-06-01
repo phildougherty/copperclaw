@@ -1,11 +1,11 @@
 //! CRUD for `messaging_group_agents` — the wiring table that connects a
 //! messaging group to an agent group.
 
-use crate::central::CentralDb;
 use crate::DbError;
+use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
 use copperclaw_types::{AgentGroupId, EngageMode, MessagingGroupId, SessionMode, WiringId};
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{OptionalExtension, Row, params};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessagingGroupAgent {
@@ -83,19 +83,24 @@ fn parse_session_mode(s: &str) -> rusqlite::Result<SessionMode> {
 
 fn row_to_wiring(row: &Row<'_>) -> rusqlite::Result<MessagingGroupAgent> {
     let id_str: String = row.get("id")?;
-    let id = uuid::Uuid::parse_str(&id_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let id = uuid::Uuid::parse_str(&id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let mg_str: String = row.get("messaging_group_id")?;
-    let mg = uuid::Uuid::parse_str(&mg_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let mg = uuid::Uuid::parse_str(&mg_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let ag_str: String = row.get("agent_group_id")?;
-    let ag = uuid::Uuid::parse_str(&ag_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let ag = uuid::Uuid::parse_str(&ag_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let engage_mode_str: String = row.get("engage_mode")?;
     let session_mode_str: String = row.get("session_mode")?;
     let created_at_str: String = row.get("created_at")?;
     let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .with_timezone(&Utc);
     let priority: i64 = row.get("priority")?;
     let priority = i32::try_from(priority).map_err(|e| {
@@ -116,7 +121,10 @@ fn row_to_wiring(row: &Row<'_>) -> rusqlite::Result<MessagingGroupAgent> {
     })
 }
 
-pub fn list_for_mg(db: &CentralDb, mg: MessagingGroupId) -> Result<Vec<MessagingGroupAgent>, DbError> {
+pub fn list_for_mg(
+    db: &CentralDb,
+    mg: MessagingGroupId,
+) -> Result<Vec<MessagingGroupAgent>, DbError> {
     let conn = db.conn()?;
     let mut stmt = conn.prepare(
         "SELECT id, messaging_group_id, agent_group_id, engage_mode, engage_pattern,
@@ -185,8 +193,9 @@ pub fn upsert(db: &CentralDb, req: UpsertWiring) -> Result<MessagingGroupAgent, 
                 id_str,
             ],
         )?;
-        let id = uuid::Uuid::parse_str(&id_str)
-            .map_err(|e| DbError::Invariant(format!("invalid uuid in messaging_group_agents.id: {e}")))?;
+        let id = uuid::Uuid::parse_str(&id_str).map_err(|e| {
+            DbError::Invariant(format!("invalid uuid in messaging_group_agents.id: {e}"))
+        })?;
         drop(conn);
         return get(db, WiringId(id));
     }
@@ -240,8 +249,8 @@ pub fn delete(db: &CentralDb, id: WiringId) -> Result<(), DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tables::agent_groups::{create as create_ag, CreateAgentGroup};
-    use crate::tables::messaging_groups::{upsert as upsert_mg, UpsertMessagingGroup};
+    use crate::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+    use crate::tables::messaging_groups::{UpsertMessagingGroup, upsert as upsert_mg};
     use copperclaw_types::ChannelType;
 
     fn setup() -> (CentralDb, MessagingGroupId, AgentGroupId) {
@@ -413,7 +422,11 @@ mod tests {
     #[test]
     fn engage_mode_round_trips_all_variants() {
         let (db, mg, ag) = setup();
-        let modes = [EngageMode::Pattern, EngageMode::Mention, EngageMode::MentionSticky];
+        let modes = [
+            EngageMode::Pattern,
+            EngageMode::Mention,
+            EngageMode::MentionSticky,
+        ];
         for m in modes {
             let mut req = sample(mg, ag);
             req.engage_mode = m;
@@ -426,7 +439,11 @@ mod tests {
     #[test]
     fn session_mode_round_trips_all_variants() {
         let (db, mg, ag) = setup();
-        let modes = [SessionMode::Shared, SessionMode::PerThread, SessionMode::AgentShared];
+        let modes = [
+            SessionMode::Shared,
+            SessionMode::PerThread,
+            SessionMode::AgentShared,
+        ];
         for m in modes {
             let mut req = sample(mg, ag);
             req.session_mode = m;

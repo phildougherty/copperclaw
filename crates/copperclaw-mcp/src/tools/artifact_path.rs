@@ -20,7 +20,7 @@ use serde_json::json;
 
 use crate::context::ToolContext;
 use crate::error::ToolError;
-use crate::tools::{make_tool, success_json, ToolEntry, ToolHandler};
+use crate::tools::{ToolEntry, ToolHandler, make_tool, success_json};
 
 /// Default location of the host-path discovery file inside the container.
 const HOST_PATH_FILE_DEFAULT: &str = "/data/.host_path";
@@ -33,13 +33,17 @@ static HOST_PATH_FILE_TEST_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option
 #[cfg(test)]
 pub(super) fn host_path_file_test_override_set(path: PathBuf) {
     let cell = HOST_PATH_FILE_TEST_OVERRIDE.get_or_init(|| std::sync::Mutex::new(None));
-    *cell.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path);
+    *cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path);
 }
 
 #[cfg(test)]
 pub(super) fn host_path_file_test_override_clear() {
     if let Some(cell) = HOST_PATH_FILE_TEST_OVERRIDE.get() {
-        *cell.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 
@@ -112,7 +116,10 @@ impl ToolHandler for Handler {
 }
 
 pub fn entry() -> ToolEntry {
-    ToolEntry { tool: schema(), handler: Box::new(Handler) }
+    ToolEntry {
+        tool: schema(),
+        handler: Box::new(Handler),
+    }
 }
 
 #[cfg(test)]

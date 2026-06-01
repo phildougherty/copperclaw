@@ -6,7 +6,7 @@
 //! rooted at any directory.
 
 use crate::error::RouterError;
-use copperclaw_db::session::{open_inbound, SessionPaths};
+use copperclaw_db::session::{SessionPaths, open_inbound};
 use copperclaw_types::{AgentGroupId, SessionId};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -134,7 +134,7 @@ impl std::fmt::Debug for FsSessionRoot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use copperclaw_db::tables::messages_in::{insert as insert_in, WriteInbound};
+    use copperclaw_db::tables::messages_in::{WriteInbound, insert as insert_in};
     use copperclaw_types::{ChannelType, MessageId, MessageKind};
 
     #[test]

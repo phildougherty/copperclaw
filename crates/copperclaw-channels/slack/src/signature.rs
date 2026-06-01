@@ -36,7 +36,10 @@ pub enum SignatureError {
 /// produce a matching header.
 #[must_use]
 pub fn compute_signature(signing_secret: &str, timestamp: &str, body: &[u8]) -> String {
-    let mac = hmac_sha256(signing_secret.as_bytes(), &assemble(timestamp.as_bytes(), body));
+    let mac = hmac_sha256(
+        signing_secret.as_bytes(),
+        &assemble(timestamp.as_bytes(), body),
+    );
     format!("v0={}", hex::encode(mac))
 }
 

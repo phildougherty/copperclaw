@@ -6,9 +6,7 @@
 use crate::api;
 use crate::config::DeltaChatConfig;
 use crate::factory::CHANNEL_TYPE_STR;
-use crate::parse::{
-    build_send_payload, event_to_inbound, extract_incoming_msg, parse_platform_id,
-};
+use crate::parse::{build_send_payload, event_to_inbound, extract_incoming_msg, parse_platform_id};
 use crate::rpc::RpcTransport;
 use async_trait::async_trait;
 use copperclaw_channels_core::{AdapterError, ChannelAdapter, DmHandle};
@@ -200,7 +198,10 @@ async fn handle_event(
                 msg = api::get_message(transport, refs.account_id, refs.msg_id).await?;
             }
             Err(err) => {
-                tracing::warn!(?err, "deltachat: download_full_msg failed; surfacing fallback");
+                tracing::warn!(
+                    ?err,
+                    "deltachat: download_full_msg failed; surfacing fallback"
+                );
                 partial_download_error = Some(err);
             }
         }
@@ -275,7 +276,12 @@ async fn apply_attachment_download(
 
     let on_disk_len = metadata.len();
     if on_disk_len > settings.max_attachment_bytes {
-        mark_too_large(inbound, msg, Some(on_disk_len), settings.max_attachment_bytes);
+        mark_too_large(
+            inbound,
+            msg,
+            Some(on_disk_len),
+            settings.max_attachment_bytes,
+        );
         return;
     }
 
@@ -328,10 +334,7 @@ fn mark_too_large(
     limit: u64,
 ) {
     let mut obj = base_attachment_metadata(msg);
-    obj.insert(
-        "reason".to_owned(),
-        Value::String("too_large".to_owned()),
-    );
+    obj.insert("reason".to_owned(), Value::String("too_large".to_owned()));
     obj.insert("limit".to_owned(), Value::from(limit));
     if let Some(size) = actual {
         obj.insert("reported_size".to_owned(), Value::from(size));
@@ -340,11 +343,7 @@ fn mark_too_large(
     inbound.message.content = json!({"attachment": Value::Object(obj)});
 }
 
-fn mark_download_failed(
-    inbound: &mut InboundEvent,
-    msg: &api::MessageView,
-    err: &AdapterError,
-) {
+fn mark_download_failed(inbound: &mut InboundEvent, msg: &api::MessageView, err: &AdapterError) {
     let mut obj = base_attachment_metadata(msg);
     obj.insert(
         "reason".to_owned(),
@@ -374,14 +373,10 @@ fn base_attachment_metadata(msg: &api::MessageView) -> serde_json::Map<String, V
         obj.insert("file_bytes".to_owned(), Value::from(size));
     }
     if let Some(state) = msg.download_state.as_ref() {
-        obj.insert(
-            "download_state".to_owned(),
-            Value::String(state.clone()),
-        );
+        obj.insert("download_state".to_owned(), Value::String(state.clone()));
     }
     obj
 }
-
 
 #[async_trait]
 impl ChannelAdapter for DeltaChatAdapter {
@@ -438,11 +433,7 @@ impl ChannelAdapter for DeltaChatAdapter {
         }
 
         // System-action shape: { "action": "reaction"|"delete"|"edit", ... }
-        if let Some(action) = message
-            .content
-            .get("action")
-            .and_then(Value::as_str)
-        {
+        if let Some(action) = message.content.get("action").and_then(Value::as_str) {
             return self
                 .deliver_action(parsed.chat_id, action, &message.content)
                 .await;
@@ -510,17 +501,16 @@ impl DeltaChatAdapter {
     ) -> Result<Option<String>, AdapterError> {
         match action {
             "reaction" => {
-                let target = required_i64(content, "target_msg_id")
-                    .or_else(|_| {
-                        // Support `target_platform_id` as a stringified id, too.
-                        required_str(content, "target_platform_id")?
-                            .parse::<i64>()
-                            .map_err(|_| {
-                                AdapterError::BadRequest(
-                                    "deltachat target_platform_id must parse as an integer".into(),
-                                )
-                            })
-                    })?;
+                let target = required_i64(content, "target_msg_id").or_else(|_| {
+                    // Support `target_platform_id` as a stringified id, too.
+                    required_str(content, "target_platform_id")?
+                        .parse::<i64>()
+                        .map_err(|_| {
+                            AdapterError::BadRequest(
+                                "deltachat target_platform_id must parse as an integer".into(),
+                            )
+                        })
+                })?;
                 let emoji = required_str(content, "emoji")?;
                 let id = api::send_reaction(
                     self.transport.as_ref(),
@@ -541,12 +531,8 @@ impl DeltaChatAdapter {
                             )
                         })
                 })?;
-                api::delete_messages(
-                    self.transport.as_ref(),
-                    self.config.account_id,
-                    &[target],
-                )
-                .await?;
+                api::delete_messages(self.transport.as_ref(), self.config.account_id, &[target])
+                    .await?;
                 // Drop the unused chat id parameter — delete is by message id.
                 let _ = chat_id;
                 Ok(None)
@@ -583,16 +569,9 @@ fn required_i64(value: &Value, key: &str) -> Result<i64, AdapterError> {
         .ok_or_else(|| AdapterError::BadRequest(format!("missing `{key}` in deltachat action")))
 }
 
-async fn persist_outgoing_file(
-    dir: &Path,
-    file: &OutboundFile,
-) -> Result<PathBuf, AdapterError> {
+async fn persist_outgoing_file(dir: &Path, file: &OutboundFile) -> Result<PathBuf, AdapterError> {
     let safe = safe_filename(&file.filename);
-    let unique = format!(
-        "{}-{}",
-        chrono::Utc::now().timestamp_millis(),
-        safe
-    );
+    let unique = format!("{}-{}", chrono::Utc::now().timestamp_millis(), safe);
     let path = dir.join(unique);
     tokio::fs::write(&path, &file.data).await?;
     Ok(path)
@@ -694,7 +673,8 @@ mod tests {
     #[tokio::test]
     async fn deliver_text_routes_to_send_msg() {
         let mock = Arc::new(MockTransport::new());
-        mock.push_response(MockResponse::ok("send_msg", json!(101))).await;
+        mock.push_response(MockResponse::ok("send_msg", json!(101)))
+            .await;
         let m: Arc<dyn RpcTransport> = mock.clone();
         let (adapter, _dir, _rx) = build(m, 1);
         let id = adapter
@@ -719,7 +699,8 @@ mod tests {
     #[tokio::test]
     async fn deliver_with_files_writes_to_data_dir_and_passes_path() {
         let mock = Arc::new(MockTransport::new());
-        mock.push_response(MockResponse::ok("send_msg", json!(7))).await;
+        mock.push_response(MockResponse::ok("send_msg", json!(7)))
+            .await;
         let m: Arc<dyn RpcTransport> = mock.clone();
         let (adapter, dir, _rx) = build(m, 1);
         let id = adapter
@@ -803,7 +784,8 @@ mod tests {
     #[tokio::test]
     async fn deliver_reaction_routes_to_send_reaction() {
         let mock = Arc::new(MockTransport::new());
-        mock.push_response(MockResponse::ok("send_reaction", json!(0))).await;
+        mock.push_response(MockResponse::ok("send_reaction", json!(0)))
+            .await;
         let m: Arc<dyn RpcTransport> = mock.clone();
         let (adapter, _dir, _rx) = build(m, 1);
         adapter
@@ -831,7 +813,8 @@ mod tests {
     #[tokio::test]
     async fn deliver_reaction_accepts_target_platform_id_as_string() {
         let mock = Arc::new(MockTransport::new());
-        mock.push_response(MockResponse::ok("send_reaction", json!(0))).await;
+        mock.push_response(MockResponse::ok("send_reaction", json!(0)))
+            .await;
         let m: Arc<dyn RpcTransport> = mock.clone();
         let (adapter, _dir, _rx) = build(m, 1);
         adapter
@@ -925,7 +908,8 @@ mod tests {
     #[tokio::test]
     async fn deliver_delete_routes_to_delete_messages() {
         let mock = Arc::new(MockTransport::new());
-        mock.push_response(MockResponse::ok("delete_messages", Value::Null)).await;
+        mock.push_response(MockResponse::ok("delete_messages", Value::Null))
+            .await;
         let m: Arc<dyn RpcTransport> = mock.clone();
         let (adapter, _dir, _rx) = build(m, 1);
         let id = adapter
@@ -1084,7 +1068,10 @@ mod tests {
         let m: Arc<dyn RpcTransport> = mock;
         let (adapter, _dir, _rx) = build(m, 1);
         adapter.subscribe("account/1/chat/42", None).await.unwrap();
-        adapter.subscribe("account/1/chat/42", Some("t")).await.unwrap();
+        adapter
+            .subscribe("account/1/chat/42", Some("t"))
+            .await
+            .unwrap();
         adapter.shutdown().await;
     }
 
@@ -1171,7 +1158,10 @@ mod tests {
         let (adapter, _dir, mut rx) = build(m, 1);
         // No matching event arrives; expect a timeout.
         let res = tokio::time::timeout(Duration::from_millis(80), rx.recv()).await;
-        assert!(res.is_err(), "should not have forwarded a foreign-account event");
+        assert!(
+            res.is_err(),
+            "should not have forwarded a foreign-account event"
+        );
         // No get_message call was made.
         let calls = mock.observed().await;
         assert!(calls.iter().all(|c| c.method != "get_message"));
@@ -1213,7 +1203,8 @@ mod tests {
     #[tokio::test]
     async fn forwarder_ignores_non_message_events() {
         let mock = Arc::new(MockTransport::new());
-        mock.push_event(json!({"kind": "Info", "msg": "noise"})).await;
+        mock.push_event(json!({"kind": "Info", "msg": "noise"}))
+            .await;
         let m: Arc<dyn RpcTransport> = mock.clone();
         let (adapter, _dir, mut rx) = build(m, 1);
         let res = tokio::time::timeout(Duration::from_millis(80), rx.recv()).await;
@@ -1225,7 +1216,8 @@ mod tests {
     async fn forwarder_recovers_after_transport_error() {
         let mock = Arc::new(MockTransport::new());
         // First poll fails, then succeeds with a real event.
-        mock.push_event_error(AdapterError::Transport("flake".into())).await;
+        mock.push_event_error(AdapterError::Transport("flake".into()))
+            .await;
         mock.push_event(json!({
             "kind": "IncomingMsg",
             "account_id": 1,
@@ -1292,7 +1284,10 @@ mod tests {
         let m: Arc<dyn RpcTransport> = mock.clone();
         let (adapter, _dir, _rx) = build(m, 1);
         // Two Arcs point at the same transport.
-        assert!(Arc::ptr_eq(adapter.transport(), &(mock as Arc<dyn RpcTransport>)));
+        assert!(Arc::ptr_eq(
+            adapter.transport(),
+            &(mock as Arc<dyn RpcTransport>)
+        ));
         adapter.shutdown().await;
     }
 
@@ -1346,12 +1341,8 @@ mod tests {
     ) -> (Arc<DeltaChatAdapter>, TempDir, mpsc::Receiver<InboundEvent>) {
         let dir = TempDir::new().unwrap();
         let (tx, rx) = mpsc::channel::<InboundEvent>(16);
-        let adapter = DeltaChatAdapter::start_with_transport(
-            transport,
-            cfg,
-            tx,
-            dir.path().to_path_buf(),
-        );
+        let adapter =
+            DeltaChatAdapter::start_with_transport(transport, cfg, tx, dir.path().to_path_buf());
         (adapter, dir, rx)
     }
 
@@ -1377,11 +1368,8 @@ mod tests {
         ])
         .await;
         if let Some((dl_resp, after_view)) = download_chain {
-            mock.push_responses([
-                dl_resp,
-                MockResponse::ok("get_message", after_view),
-            ])
-            .await;
+            mock.push_responses([dl_resp, MockResponse::ok("get_message", after_view)])
+                .await;
         }
     }
 
@@ -1450,8 +1438,7 @@ mod tests {
         )
         .await;
         let m: Arc<dyn RpcTransport> = mock;
-        let (adapter, _dir, mut rx) =
-            build_with_config(m, config_no_download(1));
+        let (adapter, _dir, mut rx) = build_with_config(m, config_no_download(1));
         let evt = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .unwrap()
@@ -1743,8 +1730,7 @@ mod tests {
         )
         .await;
         let m: Arc<dyn RpcTransport> = mock.clone();
-        let (adapter, _dir, mut rx) =
-            build_with_config(m, config_no_download(1));
+        let (adapter, _dir, mut rx) = build_with_config(m, config_no_download(1));
         let evt = tokio::time::timeout(Duration::from_secs(1), rx.recv())
             .await
             .unwrap()
@@ -1779,15 +1765,19 @@ mod tests {
     #[test]
     fn base_attachment_metadata_includes_known_fields() {
         let msg = api::MessageView {
-            id: 1, chat_id: 1, from_id: 1,
-            text: String::new(), is_info: false,
+            id: 1,
+            chat_id: 1,
+            from_id: 1,
+            text: String::new(),
+            is_info: false,
             view_type: "Image".into(),
             file: Some("/blob.bin".into()),
             filename: Some("pic.jpg".into()),
             file_mime: Some("image/jpeg".into()),
             file_bytes: Some(99),
             download_state: Some("Available".into()),
-            timestamp: 0, sender_name: None,
+            timestamp: 0,
+            sender_name: None,
         };
         let obj = base_attachment_metadata(&msg);
         assert_eq!(obj["kind"], "deltachat.image");

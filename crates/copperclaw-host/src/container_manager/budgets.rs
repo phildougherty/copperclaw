@@ -1,7 +1,7 @@
 //! Per-group daily/turn budget gates and the in-channel notice replies.
 
 use super::{ContainerManager, ManagerError};
-use copperclaw_db::session::{open_inbound, open_outbound, SessionPaths};
+use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
 use copperclaw_types::{AgentGroupId, Session};
 use tracing::{info, warn};
 
@@ -12,8 +12,8 @@ impl ContainerManager {
     /// operator setting "daily" cap would naturally expect.
     pub(super) fn is_over_budget(&self, session: &Session) -> Result<bool, ManagerError> {
         use copperclaw_db::tables::{agent_turns, group_budgets};
-        let Some(budget) = group_budgets::get(&self.central, session.agent_group_id)
-            .map_err(ManagerError::Db)?
+        let Some(budget) =
+            group_budgets::get(&self.central, session.agent_group_id).map_err(ManagerError::Db)?
         else {
             return Ok(false);
         };
@@ -96,8 +96,8 @@ Operators can raise the cap with `cclaw groups budget set --agent-group-id <id> 
         session: &Session,
     ) -> Result<Option<(String, &'static str)>, ManagerError> {
         use copperclaw_db::tables::{agent_turns, group_budgets};
-        let Some(budget) = group_budgets::get(&self.central, session.agent_group_id)
-            .map_err(ManagerError::Db)?
+        let Some(budget) =
+            group_budgets::get(&self.central, session.agent_group_id).map_err(ManagerError::Db)?
         else {
             return Ok(None);
         };
@@ -106,8 +106,8 @@ Operators can raise the cap with `cclaw groups budget set --agent-group-id <id> 
 
         if let Some(cap) = budget.agent_turns_per_minute_cap {
             let since = now - chrono::Duration::seconds(60);
-            let count = agent_turns::turns_since(&self.central, &ag_id, since)
-                .map_err(ManagerError::Db)?;
+            let count =
+                agent_turns::turns_since(&self.central, &ag_id, since).map_err(ManagerError::Db)?;
             if count >= cap {
                 return Ok(Some((
                     format!(
@@ -123,8 +123,8 @@ Operators can raise the cap with `cclaw groups budget set --agent-group-id <id> 
 
         if let Some(cap) = budget.agent_turns_per_hour_cap {
             let since = now - chrono::Duration::seconds(3600);
-            let count = agent_turns::turns_since(&self.central, &ag_id, since)
-                .map_err(ManagerError::Db)?;
+            let count =
+                agent_turns::turns_since(&self.central, &ag_id, since).map_err(ManagerError::Db)?;
             if count >= cap {
                 return Ok(Some((
                     format!(
@@ -243,11 +243,9 @@ mod tests {
     };
     use super::*;
     use copperclaw_db::central::CentralDb;
-    use copperclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+    use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
     use copperclaw_db::tables::messages_in;
-    use copperclaw_db::tables::sessions::{
-        self, create as create_session, CreateSession,
-    };
+    use copperclaw_db::tables::sessions::{self, CreateSession, create as create_session};
     use copperclaw_types::{ContainerStatus, SessionId};
     use std::path::PathBuf;
 
@@ -327,7 +325,7 @@ mod tests {
         per_min: Option<i64>,
         per_hour: Option<i64>,
     ) {
-        use copperclaw_db::tables::group_budgets::{upsert, UpsertGroupBudget};
+        use copperclaw_db::tables::group_budgets::{UpsertGroupBudget, upsert};
         upsert(
             db,
             UpsertGroupBudget {
@@ -346,7 +344,7 @@ mod tests {
     /// the last 5 seconds (well inside both the per-minute and
     /// per-hour windows).
     fn seed_turns(db: &CentralDb, ag: AgentGroupId, count: usize) {
-        use copperclaw_db::tables::agent_turns::{insert, NewAgentTurn};
+        use copperclaw_db::tables::agent_turns::{NewAgentTurn, insert};
         let now = chrono::Utc::now();
         for i in 0..count {
             #[allow(clippy::cast_possible_wrap)]
@@ -573,8 +571,7 @@ mod tests {
                     manager_cfg(tmp.path().to_path_buf()),
                 );
                 let session = fixture_session(&db);
-                let paths =
-                    SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+                let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
                 paths.ensure_dirs().unwrap();
                 seed_routing(&paths);
                 seed_pending_chat_inbound(&paths);
@@ -634,8 +631,7 @@ mod tests {
                     manager_cfg(tmp.path().to_path_buf()),
                 );
                 let session = fixture_session(&db);
-                let paths =
-                    SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+                let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
                 paths.ensure_dirs().unwrap();
                 seed_routing(&paths);
                 seed_pending_chat_inbound(&paths);
@@ -675,8 +671,7 @@ mod tests {
                     manager_cfg(tmp.path().to_path_buf()),
                 );
                 let session = fixture_session(&db);
-                let paths =
-                    SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+                let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
                 paths.ensure_dirs().unwrap();
                 seed_routing(&paths);
                 seed_pending_chat_inbound(&paths);
@@ -820,9 +815,12 @@ mod tests {
         seed_routing(&paths);
 
         let text = "rate-limit reply text";
-        mgr.maybe_post_rate_limit_reply(&session, &paths, text).unwrap();
-        mgr.maybe_post_rate_limit_reply(&session, &paths, text).unwrap();
-        mgr.maybe_post_rate_limit_reply(&session, &paths, text).unwrap();
+        mgr.maybe_post_rate_limit_reply(&session, &paths, text)
+            .unwrap();
+        mgr.maybe_post_rate_limit_reply(&session, &paths, text)
+            .unwrap();
+        mgr.maybe_post_rate_limit_reply(&session, &paths, text)
+            .unwrap();
 
         let replies = count_outbound_text_replies(&paths);
         assert_eq!(replies.len(), 1);
@@ -834,7 +832,9 @@ mod tests {
     /// `(channel_type, platform_id, thread_id)`.
     #[test]
     fn degraded_mode_emits_apology_to_pending_inbounds() {
-        use crate::image_health::{enter_degraded_mode, HealthDegradedReason, DEGRADED_APOLOGY_TEXT};
+        use crate::image_health::{
+            DEGRADED_APOLOGY_TEXT, HealthDegradedReason, enter_degraded_mode,
+        };
 
         let tmp = tempfile::tempdir().unwrap();
         let db = CentralDb::open_in_memory().unwrap();

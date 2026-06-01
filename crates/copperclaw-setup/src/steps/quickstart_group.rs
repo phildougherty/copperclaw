@@ -22,9 +22,7 @@ use crate::state::SetupState;
 use crate::steps::telegram::append_env_var;
 use crate::steps::{Step, StepError, StepResult};
 use copperclaw_db::central::CentralDb;
-use copperclaw_db::tables::{
-    agent_groups, messaging_group_agents, messaging_groups, users,
-};
+use copperclaw_db::tables::{agent_groups, messaging_group_agents, messaging_groups, users};
 use copperclaw_types::{ChannelType, EngageMode, SessionMode};
 use std::path::{Path, PathBuf};
 
@@ -141,7 +139,11 @@ impl Step for QuickstartGroupStep {
         // and cli installs benefit from being able to fall back to
         // `cclaw chat` for debugging without re-running setup.
         match ensure_cli_bridge(cfg)? {
-            Some(BridgeOutcome { fifo, log, env_updated }) => {
+            Some(BridgeOutcome {
+                fifo,
+                log,
+                env_updated,
+            }) => {
                 if env_updated {
                     messages.push(format!(
                         "wired cli-chat bridge: fifo={}, log={} (env vars written to .env)",
@@ -157,9 +159,7 @@ impl Step for QuickstartGroupStep {
                 }
             }
             None => {
-                messages.push(
-                    "skipped cli-chat bridge wiring (data_dir unset)".to_string(),
-                );
+                messages.push("skipped cli-chat bridge wiring (data_dir unset)".to_string());
             }
         }
 
@@ -272,9 +272,7 @@ fn update_bridge_env(env_path: &Path, fifo: &Path, log: &Path) -> Result<bool, S
         String::new()
     };
     let already_has = |key: &str, val: &str| -> bool {
-        existing
-            .lines()
-            .any(|line| line == format!("{key}={val}"))
+        existing.lines().any(|line| line == format!("{key}={val}"))
     };
     let need_fifo = !already_has("COPPERCLAW_CLI_FIFO", &fifo_str);
     let need_log = !already_has("COPPERCLAW_CLI_LOG", &log_str);
@@ -299,10 +297,7 @@ fn update_bridge_env(env_path: &Path, fifo: &Path, log: &Path) -> Result<bool, S
 /// gate in [`QuickstartGroupStep::run`] is the operator-facing
 /// contract; this fn is also called from tests that want to seed
 /// known state.)
-pub fn bootstrap_default_cli_group(
-    db: &CentralDb,
-    name: &str,
-) -> Result<BootstrapIds, StepError> {
+pub fn bootstrap_default_cli_group(db: &CentralDb, name: &str) -> Result<BootstrapIds, StepError> {
     let ag = agent_groups::create(
         db,
         agent_groups::CreateAgentGroup {
@@ -407,9 +402,8 @@ pub fn bootstrap_telegram_install(
     //    COPPERCLAW_CHANNELS_CONFIG JSON, not from TELEGRAM_BOT_TOKEN
     //    directly. Single-quote the JSON so dotenvy parses it
     //    literally (otherwise the unquoted `{` confuses the parser).
-    let channels_config = format!(
-        r#"'{{"telegram":{{"bot_token":"{token}","mode":"long_poll"}}}}'"#,
-    );
+    let channels_config =
+        format!(r#"'{{"telegram":{{"bot_token":"{token}","mode":"long_poll"}}}}'"#,);
     append_env_var(&env_path, "COPPERCLAW_CHANNELS_CONFIG", &channels_config)?;
 
     // 3. Create the agent group.
@@ -437,9 +431,7 @@ pub fn bootstrap_telegram_install(
                 unknown_sender_policy: "approval-required".to_string(),
             },
         )
-        .map_err(|e| {
-            StepError::Other(format!("messaging_groups::upsert failed: {e}"))
-        })?;
+        .map_err(|e| StepError::Other(format!("messaging_groups::upsert failed: {e}")))?;
 
         let wiring = messaging_group_agents::upsert(
             db,
@@ -454,9 +446,7 @@ pub fn bootstrap_telegram_install(
                 priority: 0,
             },
         )
-        .map_err(|e| {
-            StepError::Other(format!("messaging_group_agents::upsert failed: {e}"))
-        })?;
+        .map_err(|e| StepError::Other(format!("messaging_group_agents::upsert failed: {e}")))?;
 
         // Approve the captured sender so the very first inbound from
         // their chat skips the unregistered_senders gate.
@@ -592,8 +582,7 @@ mod tests {
         let wiring = messaging_group_agents::list_for_ag(&db, ag[0].id).unwrap();
         assert_eq!(wiring.len(), 1);
         // Sender approval landed.
-        let approved =
-            users::get_by_identity(&db, "telegram", "8929393356").unwrap();
+        let approved = users::get_by_identity(&db, "telegram", "8929393356").unwrap();
         assert!(approved.is_some(), "sender approval must be persisted");
     }
 
@@ -616,10 +605,7 @@ mod tests {
 
         let out = bootstrap_telegram_install(&db, &cfg, "first").unwrap();
         assert_eq!(out.chat_id, None);
-        assert!(
-            out.messaging_group_id.is_none(),
-            "no chat_id ⇒ no mg yet"
-        );
+        assert!(out.messaging_group_id.is_none(), "no chat_id ⇒ no mg yet");
         // Agent group is still created so the runtime auto-registration
         // has somewhere to route the first inbound.
         assert!(agent_groups::list(&db).unwrap().len() == 1);
@@ -663,8 +649,7 @@ mod tests {
         assert_eq!(mg[0].channel_type.as_str(), "cli");
         assert_eq!(mg[0].platform_id, "stdin");
         // Wiring reachable.
-        let wiring =
-            messaging_group_agents::list_for_ag(&db, ids.agent_group_id).unwrap();
+        let wiring = messaging_group_agents::list_for_ag(&db, ids.agent_group_id).unwrap();
         assert_eq!(wiring.len(), 1);
         assert_eq!(wiring[0].id, ids.wiring_id);
         assert_eq!(wiring[0].engage_mode, EngageMode::Pattern);
@@ -675,13 +660,14 @@ mod tests {
     fn step_runs_happy_path_when_db_empty_and_user_agrees() {
         let dir = tempdir().unwrap();
         // Seed an empty DB via CentralDbStep's helper.
-        crate::steps::central_db::open_and_migrate(&dir.path().join("copperclaw.db"))
-            .unwrap();
+        crate::steps::central_db::open_and_migrate(&dir.path().join("copperclaw.db")).unwrap();
         let mut cfg = fresh_cfg(dir.path());
         let mut state = SetupState::new();
         // Scripted prompt defaults to accepting confirms unless told otherwise.
         let prompt = Scripted::new().with("COPPERCLAW_SETUP_QUICKSTART", "yes");
-        let res = QuickstartGroupStep.run(&mut cfg, &prompt, &mut state).unwrap();
+        let res = QuickstartGroupStep
+            .run(&mut cfg, &prompt, &mut state)
+            .unwrap();
         assert!(res.messages.iter().any(|m| m.contains("bootstrapped")));
         let db = CentralDb::open(&cfg.central_db_path).unwrap();
         assert_eq!(agent_groups::list(&db).unwrap().len(), 1);
@@ -691,8 +677,7 @@ mod tests {
     #[test]
     fn step_skips_when_groups_already_exist() {
         let dir = tempdir().unwrap();
-        crate::steps::central_db::open_and_migrate(&dir.path().join("copperclaw.db"))
-            .unwrap();
+        crate::steps::central_db::open_and_migrate(&dir.path().join("copperclaw.db")).unwrap();
         let db = CentralDb::open(dir.path().join("copperclaw.db")).unwrap();
         // Pre-create a group.
         bootstrap_default_cli_group(&db, "already-here").unwrap();
@@ -701,9 +686,13 @@ mod tests {
         let mut cfg = fresh_cfg(dir.path());
         let mut state = SetupState::new();
         let prompt = Scripted::new().with("COPPERCLAW_SETUP_QUICKSTART", "yes");
-        let res = QuickstartGroupStep.run(&mut cfg, &prompt, &mut state).unwrap();
+        let res = QuickstartGroupStep
+            .run(&mut cfg, &prompt, &mut state)
+            .unwrap();
         assert!(
-            res.messages.iter().any(|m| m.contains("already configured")),
+            res.messages
+                .iter()
+                .any(|m| m.contains("already configured")),
             "unexpected: {:?}",
             res.messages
         );
@@ -715,12 +704,13 @@ mod tests {
     #[test]
     fn step_skips_when_user_declines() {
         let dir = tempdir().unwrap();
-        crate::steps::central_db::open_and_migrate(&dir.path().join("copperclaw.db"))
-            .unwrap();
+        crate::steps::central_db::open_and_migrate(&dir.path().join("copperclaw.db")).unwrap();
         let mut cfg = fresh_cfg(dir.path());
         let mut state = SetupState::new();
         let prompt = Scripted::new().with("COPPERCLAW_SETUP_QUICKSTART", "no");
-        let res = QuickstartGroupStep.run(&mut cfg, &prompt, &mut state).unwrap();
+        let res = QuickstartGroupStep
+            .run(&mut cfg, &prompt, &mut state)
+            .unwrap();
         assert!(
             res.messages.iter().any(|m| m.contains("declined")),
             "unexpected: {:?}",
@@ -737,10 +727,7 @@ mod tests {
         // and the step should bail out cleanly.
         for channel in ["slack", "discord"] {
             let dir = tempdir().unwrap();
-            crate::steps::central_db::open_and_migrate(
-                &dir.path().join("copperclaw.db"),
-            )
-            .unwrap();
+            crate::steps::central_db::open_and_migrate(&dir.path().join("copperclaw.db")).unwrap();
             let mut cfg = fresh_cfg(dir.path());
             cfg.first_channel = channel.to_string();
             let mut state = SetupState::new();
@@ -774,9 +761,13 @@ mod tests {
         };
         let mut state = SetupState::new();
         let prompt = Scripted::new().with("COPPERCLAW_SETUP_QUICKSTART", "yes");
-        let res = QuickstartGroupStep.run(&mut cfg, &prompt, &mut state).unwrap();
+        let res = QuickstartGroupStep
+            .run(&mut cfg, &prompt, &mut state)
+            .unwrap();
         assert!(
-            res.messages.iter().any(|m| m.contains("central_db_path not set")),
+            res.messages
+                .iter()
+                .any(|m| m.contains("central_db_path not set")),
             "unexpected: {:?}",
             res.messages
         );
@@ -843,13 +834,14 @@ mod tests {
     #[test]
     fn step_run_writes_bridge_env_lines() {
         let dir = tempdir().unwrap();
-        crate::steps::central_db::open_and_migrate(&dir.path().join("copperclaw.db"))
-            .unwrap();
+        crate::steps::central_db::open_and_migrate(&dir.path().join("copperclaw.db")).unwrap();
         let mut cfg = fresh_cfg(dir.path());
         cfg.env_file = dir.path().join(".env");
         let mut state = SetupState::new();
         let prompt = Scripted::new().with("COPPERCLAW_SETUP_QUICKSTART", "yes");
-        let res = QuickstartGroupStep.run(&mut cfg, &prompt, &mut state).unwrap();
+        let res = QuickstartGroupStep
+            .run(&mut cfg, &prompt, &mut state)
+            .unwrap();
         assert!(
             res.messages.iter().any(|m| m.contains("cli-chat bridge")),
             "messages: {:?}",
@@ -865,8 +857,7 @@ mod tests {
     #[test]
     fn step_honors_quickstart_name_env_var() {
         let dir = tempdir().unwrap();
-        crate::steps::central_db::open_and_migrate(&dir.path().join("copperclaw.db"))
-            .unwrap();
+        crate::steps::central_db::open_and_migrate(&dir.path().join("copperclaw.db")).unwrap();
         let mut cfg = fresh_cfg(dir.path());
         let mut state = SetupState::new();
         let prompt = Scripted::new().with("COPPERCLAW_SETUP_QUICKSTART", "yes");
@@ -879,8 +870,14 @@ mod tests {
         bootstrap_default_cli_group(&db, "ops").unwrap();
         drop(db);
         // Re-running the step should now see the group and skip.
-        let res = QuickstartGroupStep.run(&mut cfg, &prompt, &mut state).unwrap();
-        assert!(res.messages.iter().any(|m| m.contains("already configured")));
+        let res = QuickstartGroupStep
+            .run(&mut cfg, &prompt, &mut state)
+            .unwrap();
+        assert!(
+            res.messages
+                .iter()
+                .any(|m| m.contains("already configured"))
+        );
         let db = CentralDb::open(&cfg.central_db_path).unwrap();
         let groups = agent_groups::list(&db).unwrap();
         assert_eq!(groups.len(), 1);

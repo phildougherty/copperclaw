@@ -69,15 +69,13 @@ mod factory;
 mod sexp;
 
 pub use adapter::{
-    CHANNEL_TYPE_STR, EmacsAdapter, TOKEN_BUFFER_JSON, TOKEN_TEXT_JSON,
-    build_inbound_from_pairs, render_outbound,
+    CHANNEL_TYPE_STR, EmacsAdapter, TOKEN_BUFFER_JSON, TOKEN_TEXT_JSON, build_inbound_from_pairs,
+    render_outbound,
 };
-pub use client::{
-    EmacsClient, EmacsClientCli, EmacsClientPlan, MockEmacsClient, classify_output,
-};
+pub use client::{EmacsClient, EmacsClientCli, EmacsClientPlan, MockEmacsClient, classify_output};
 pub use config::{
-    DEFAULT_BUFFER, DEFAULT_CLIENT_BIN, DEFAULT_INBOUND_QUEUE_SEXP,
-    DEFAULT_OUTBOUND_SEXP_TEMPLATE, DEFAULT_POLL_INTERVAL_MS, EmacsConfig,
+    DEFAULT_BUFFER, DEFAULT_CLIENT_BIN, DEFAULT_INBOUND_QUEUE_SEXP, DEFAULT_OUTBOUND_SEXP_TEMPLATE,
+    DEFAULT_POLL_INTERVAL_MS, EmacsConfig,
 };
 pub use factory::{EmacsFactory, register};
 pub use sexp::{ParseError, SexpValue};

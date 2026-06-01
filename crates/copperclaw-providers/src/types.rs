@@ -164,7 +164,9 @@ mod tests {
 
     #[test]
     fn history_message_user_roundtrip() {
-        let m = HistoryMessage::User { content: "hi".into() };
+        let m = HistoryMessage::User {
+            content: "hi".into(),
+        };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"role\":\"user\""));
         let back: HistoryMessage = serde_json::from_str(&s).unwrap();
@@ -173,7 +175,9 @@ mod tests {
 
     #[test]
     fn history_message_assistant_roundtrip() {
-        let m = HistoryMessage::Assistant { content: "ok".into() };
+        let m = HistoryMessage::Assistant {
+            content: "ok".into(),
+        };
         let s = serde_json::to_string(&m).unwrap();
         assert!(s.contains("\"role\":\"assistant\""));
         let back: HistoryMessage = serde_json::from_str(&s).unwrap();
@@ -213,7 +217,9 @@ mod tests {
             model: "M".into(),
             effort: Effort::High,
             previous_continuation: Some("c1".into()),
-            history: vec![HistoryMessage::User { content: "hi".into() }],
+            history: vec![HistoryMessage::User {
+                content: "hi".into(),
+            }],
             tools: vec![ToolDef {
                 name: "t".into(),
                 description: "d".into(),

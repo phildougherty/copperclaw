@@ -9,10 +9,10 @@
 //! production table — every command in [`copperclaw_cclaw::ALL_COMMANDS`].
 
 use crate::handlers;
-use copperclaw_db::central::CentralDb;
 use copperclaw_cclaw::{
-    read_request, write_response, Caller, ErrorPayload, ProtoError, Request, Response,
+    Caller, ErrorPayload, ProtoError, Request, Response, read_request, write_response,
 };
+use copperclaw_db::central::CentralDb;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -67,7 +67,12 @@ impl HandlerCtx {
 /// synchronous; this keeps the dispatch loop simple. If a future handler
 /// needs to do I/O it can spawn its own task.
 pub trait CommandHandler: Send + Sync {
-    fn handle(&self, args: &Value, caller: &Caller, ctx: &HandlerCtx) -> Result<Value, ErrorPayload>;
+    fn handle(
+        &self,
+        args: &Value,
+        caller: &Caller,
+        ctx: &HandlerCtx,
+    ) -> Result<Value, ErrorPayload>;
 }
 
 /// Type alias for the closure each [`FnHandler`] wraps.
@@ -179,7 +184,11 @@ pub fn build_dispatch_table() -> DispatchTable {
     ins!("groups.delete", handlers::groups::delete, true);
     ins!("groups.restart", handlers::groups::restart, true);
     ins!("groups.config.get", handlers::groups::config_get, false);
-    ins!("groups.config.update", handlers::groups::config_update, true);
+    ins!(
+        "groups.config.update",
+        handlers::groups::config_update,
+        true
+    );
     ins!(
         "groups.config.add-mcp-server",
         handlers::groups::config_add_mcp_server,
@@ -216,11 +225,31 @@ pub fn build_dispatch_table() -> DispatchTable {
         true
     );
 
-    ins!("messaging-groups.list", handlers::messaging_groups::list, false);
-    ins!("messaging-groups.get", handlers::messaging_groups::get, false);
-    ins!("messaging-groups.create", handlers::messaging_groups::create, true);
-    ins!("messaging-groups.update", handlers::messaging_groups::update, true);
-    ins!("messaging-groups.delete", handlers::messaging_groups::delete, true);
+    ins!(
+        "messaging-groups.list",
+        handlers::messaging_groups::list,
+        false
+    );
+    ins!(
+        "messaging-groups.get",
+        handlers::messaging_groups::get,
+        false
+    );
+    ins!(
+        "messaging-groups.create",
+        handlers::messaging_groups::create,
+        true
+    );
+    ins!(
+        "messaging-groups.update",
+        handlers::messaging_groups::update,
+        true
+    );
+    ins!(
+        "messaging-groups.delete",
+        handlers::messaging_groups::delete,
+        true
+    );
 
     ins!("wirings.list", handlers::wirings::list, false);
     ins!("wirings.get", handlers::wirings::get, false);
@@ -250,7 +279,11 @@ pub fn build_dispatch_table() -> DispatchTable {
     ins_ctx!("sessions.delete", handlers::sessions::delete, true);
 
     ins!("user-dms.list", handlers::user_dms::list, false);
-    ins!("dropped-messages.list", handlers::dropped_messages::list, false);
+    ins!(
+        "dropped-messages.list",
+        handlers::dropped_messages::list,
+        false
+    );
     ins!(
         "dropped-messages.outbound-list",
         handlers::dropped_messages::outbound_list,
@@ -481,11 +514,7 @@ fn audit_dispatch(
         // Don't propagate — the request already produced a response.
         // Log loud enough for an operator to notice but not loud
         // enough to spam.
-        warn!(
-            ?err,
-            command,
-            "audit_log insert failed; request proceeded"
-        );
+        warn!(?err, command, "audit_log insert failed; request proceeded");
     }
 }
 
@@ -613,7 +642,9 @@ pub async fn serve_unix_connection(
     // work for legitimate operator UIDs.
     let resp = if let (Some(host), Some(peer)) = (host_uid, peer_uid) {
         let Request::Call {
-            id, caller: wire_claim, ..
+            id,
+            caller: wire_claim,
+            ..
         } = &req;
         if let Some(authoritative) = derive_caller(peer, host, wire_claim) {
             let mut req_fixed = req.clone();
@@ -848,8 +879,14 @@ mod tests {
             }
         });
         let out = redact_sensitive_args("groups.config.set-mcp-servers", &args);
-        assert_eq!(out["mcp_servers"]["github"]["env"]["GITHUB_TOKEN"], REDACTED_PLACEHOLDER);
-        assert_eq!(out["mcp_servers"]["postgres"]["env"]["DATABASE_URL"], REDACTED_PLACEHOLDER);
+        assert_eq!(
+            out["mcp_servers"]["github"]["env"]["GITHUB_TOKEN"],
+            REDACTED_PLACEHOLDER
+        );
+        assert_eq!(
+            out["mcp_servers"]["postgres"]["env"]["DATABASE_URL"],
+            REDACTED_PLACEHOLDER
+        );
         // Non-env fields are preserved.
         assert_eq!(out["mcp_servers"]["github"]["command"], "npx");
         let s = serde_json::to_string(&out).unwrap();
@@ -946,8 +983,8 @@ mod tests {
 
     #[test]
     fn dispatch_sessions_delete_removes_central_row() {
-        use copperclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
-        use copperclaw_db::tables::sessions::{create as create_session, CreateSession};
+        use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+        use copperclaw_db::tables::sessions::{CreateSession, create as create_session};
         let db = central();
         let ag = create_ag(
             &db,
@@ -1000,10 +1037,10 @@ mod tests {
         // End-to-end: a pending `install_packages` row is approved via the
         // generic `approvals.approve` socket command, the side effect
         // lands in container_configs, and the audit_log captures the call.
-        use copperclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+        use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
         use copperclaw_db::tables::container_configs;
         use copperclaw_db::tables::pending_approvals::{
-            upsert as upsert_pa, UpsertPendingApproval,
+            UpsertPendingApproval, upsert as upsert_pa,
         };
         let db = central();
         let ag = create_ag(
@@ -1206,7 +1243,9 @@ mod tests {
         let ctx = HandlerCtx::new(central());
         let (client, mut server) = duplex(64);
         drop(client);
-        let err = serve_connection(&mut server, &table, &ctx).await.unwrap_err();
+        let err = serve_connection(&mut server, &table, &ctx)
+            .await
+            .unwrap_err();
         assert!(matches!(err, copperclaw_cclaw::ProtoError::Closed));
     }
 
@@ -1416,14 +1455,14 @@ mod tests {
         // through MAX+1 bytes without back-pressure deadlock.
         let buf_size = usize::try_from(MAX_REQUEST_FRAME_BYTES).unwrap() + 4096;
         let (mut client, mut server) = duplex(buf_size);
-        let server_task = tokio::spawn(async move {
-            serve_connection(&mut server, &table, &ctx).await
-        });
+        let server_task =
+            tokio::spawn(async move { serve_connection(&mut server, &table, &ctx).await });
         // Write MAX+1 bytes of non-newline garbage. read_until will
         // hit the take() cap before finding a delimiter, and the
         // frame parser will then fail (either parsing the truncated
         // bytes as JSON or returning Closed).
-        let mut payload: Vec<u8> = vec![b'x'; usize::try_from(MAX_REQUEST_FRAME_BYTES).unwrap() + 1];
+        let mut payload: Vec<u8> =
+            vec![b'x'; usize::try_from(MAX_REQUEST_FRAME_BYTES).unwrap() + 1];
         payload.push(b'\n');
         client.write_all(&payload).await.unwrap();
         client.flush().await.unwrap();

@@ -5,10 +5,10 @@
 //! three traits on the same struct** so the data-root directory is a single
 //! source of truth.
 
+use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
 use copperclaw_host_delivery as delivery;
 use copperclaw_host_router as router;
 use copperclaw_host_sweep as sweep;
-use copperclaw_db::session::{open_inbound, open_outbound, SessionPaths};
 use copperclaw_types::{AgentGroupId, SessionId};
 use std::path::{Path, PathBuf};
 
@@ -130,11 +130,7 @@ impl sweep::SessionRoot for FsSessionRoot {
         Ok(sweep::SessionPool::new(conn))
     }
 
-    fn heartbeat_path(
-        &self,
-        agent_group_id: &AgentGroupId,
-        session_id: &SessionId,
-    ) -> PathBuf {
+    fn heartbeat_path(&self, agent_group_id: &AgentGroupId, session_id: &SessionId) -> PathBuf {
         self.paths(*agent_group_id, *session_id).heartbeat
     }
 }

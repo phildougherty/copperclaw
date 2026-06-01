@@ -32,7 +32,9 @@ fn ndjson(frames: &[&str]) -> String {
 
 fn basic_input(model: &str) -> QueryInput {
     let mut q = QueryInput::new("you are helpful", model);
-    q.history.push(HistoryMessage::User { content: "hi".into() });
+    q.history.push(HistoryMessage::User {
+        content: "hi".into(),
+    });
     q
 }
 
@@ -87,9 +89,15 @@ async fn ollama_simple_text_reply() {
     let events = collect_events(p.query(basic_input("llama3.1:8b")).await.unwrap()).await;
 
     assert!(matches!(events.first(), Some(ProviderEvent::Init { .. })));
-    let has_usage = events
-        .iter()
-        .any(|e| matches!(e, ProviderEvent::Usage { input_tokens: 12, output_tokens: 3 }));
+    let has_usage = events.iter().any(|e| {
+        matches!(
+            e,
+            ProviderEvent::Usage {
+                input_tokens: 12,
+                output_tokens: 3
+            }
+        )
+    });
     assert!(has_usage, "expected usage 12/3, got {events:?}");
     let last = events.last().unwrap();
     match last {
@@ -191,7 +199,10 @@ async fn ollama_tool_use_round_trip() {
         is_error: false,
     });
     let _ = collect_events(p2.query(q2).await.unwrap()).await;
-    assert!(*saw_tool_role.lock().await, "wiremock never saw a tool-role message");
+    assert!(
+        *saw_tool_role.lock().await,
+        "wiremock never saw a tool-role message"
+    );
 }
 
 // --------------------------------------------------------------------------
@@ -212,9 +223,7 @@ async fn ollama_streaming_chunks_arrive_individually() {
             r#"{{"model":"m","message":{{"role":"assistant","content":"chunk{i} "}}}}"#
         ));
     }
-    frames.push(
-        r#"{"model":"m","done":true,"prompt_eval_count":1,"eval_count":5}"#.to_string(),
-    );
+    frames.push(r#"{"model":"m","done":true,"prompt_eval_count":1,"eval_count":5}"#.to_string());
     let body = frames
         .iter()
         .map(String::as_str)
@@ -236,7 +245,10 @@ async fn ollama_streaming_chunks_arrive_individually() {
         .iter()
         .filter(|e| matches!(e, ProviderEvent::Activity))
         .count();
-    assert!(activity >= 5, "expected >= 5 Activity heartbeats, got {activity}: {events:?}");
+    assert!(
+        activity >= 5,
+        "expected >= 5 Activity heartbeats, got {activity}: {events:?}"
+    );
 
     match events.last().unwrap() {
         ProviderEvent::Result { text } => {
@@ -255,9 +267,7 @@ async fn ollama_abort_terminates_upstream() {
     let server = MockServer::start().await;
     // Hand the client a long-running NDJSON stream — wiremock holds the
     // response body until the delay elapses. Abort must cut through that.
-    let body = ndjson(&[
-        r#"{"model":"m","message":{"role":"assistant","content":"slow "}}"#,
-    ]);
+    let body = ndjson(&[r#"{"model":"m","message":{"role":"assistant","content":"slow "}}"#]);
     Mock::given(method("POST"))
         .and(path("/api/chat"))
         .respond_with(
@@ -287,9 +297,7 @@ async fn ollama_abort_terminates_upstream() {
         // Re-issue a quick query against a fast mock to prove the client
         // is still functional. (Same provider, same client.)
         let server2 = MockServer::start().await;
-        let body2 = ndjson(&[
-            r#"{"model":"m","done":true,"prompt_eval_count":0,"eval_count":0}"#,
-        ]);
+        let body2 = ndjson(&[r#"{"model":"m","done":true,"prompt_eval_count":0,"eval_count":0}"#]);
         Mock::given(method("POST"))
             .and(path("/api/chat"))
             .respond_with(
@@ -300,7 +308,10 @@ async fn ollama_abort_terminates_upstream() {
             .mount(&server2)
             .await;
         let p2 = OllamaProvider::new(server2.uri(), None);
-        let q2 = p2.query(basic_input("m")).await.expect("post-abort query starts");
+        let q2 = p2
+            .query(basic_input("m"))
+            .await
+            .expect("post-abort query starts");
         let _ = collect_events(q2).await;
     })
     .await;
@@ -330,7 +341,10 @@ async fn ollama_usage_includes_token_counts() {
     let p = OllamaProvider::new(server.uri(), None);
     let events = collect_events(p.query(basic_input("m")).await.unwrap()).await;
     let usage = events.iter().find_map(|e| match e {
-        ProviderEvent::Usage { input_tokens, output_tokens } => Some((*input_tokens, *output_tokens)),
+        ProviderEvent::Usage {
+            input_tokens,
+            output_tokens,
+        } => Some((*input_tokens, *output_tokens)),
         _ => None,
     });
     assert_eq!(usage, Some((42, 7)));
@@ -456,7 +470,10 @@ async fn ollama_tool_result_history_translation() {
     let msgs = observed.lock().await.clone().expect("messages present");
     let arr = msgs.as_array().unwrap();
     // system + user + assistant(with tool_call) + tool
-    let tool_msg = arr.iter().find(|m| m["role"] == "tool").expect("tool role msg");
+    let tool_msg = arr
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .expect("tool role msg");
     assert_eq!(tool_msg["tool_call_id"], "tu_abc");
     assert_eq!(tool_msg["content"], "sunny");
 
@@ -533,7 +550,13 @@ async fn ollama_error_event_classification() {
     match err2 {
         ProviderError::Api { status, .. } => {
             assert_eq!(status, 500);
-            assert!(ProviderError::Api { status: 500, message: "x".into() }.is_retryable());
+            assert!(
+                ProviderError::Api {
+                    status: 500,
+                    message: "x".into()
+                }
+                .is_retryable()
+            );
         }
         other => panic!("expected Api, got {other:?}"),
     }

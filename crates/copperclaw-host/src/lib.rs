@@ -23,12 +23,12 @@ pub mod socket;
 pub mod todo_watcher;
 pub mod typing_ticker;
 
-pub use boot::{run_host, BootError};
-pub use container_manager::{ContainerManager, ManagerConfig, SkillsMode};
+pub use boot::{BootError, run_host};
 pub use config::{ChannelInit, HostConfig, HostConfigError};
+pub use container_manager::{ContainerManager, ManagerConfig, SkillsMode};
 pub use context::HostContext;
 pub use sessions::FsSessionRoot;
-pub use socket::{dispatch_request, CommandHandler, DispatchTable, HandlerCtx};
+pub use socket::{CommandHandler, DispatchTable, HandlerCtx, dispatch_request};
 
 #[cfg(test)]
 pub(crate) mod tests {

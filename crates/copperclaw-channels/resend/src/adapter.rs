@@ -265,9 +265,7 @@ mod tests {
     async fn install_send_ok(server: &MockServer, id: &str) {
         Mock::given(method("POST"))
             .and(path("/emails"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"id": id.to_owned()})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": id.to_owned()})))
             .mount(server)
             .await;
     }
@@ -285,7 +283,10 @@ mod tests {
         let server = MockServer::start().await;
         install_send_ok(&server, "msg_xyz").await;
         let a = adapter_for(&server);
-        let id = a.deliver("alice@e.test", None, &text_msg("hi")).await.unwrap();
+        let id = a
+            .deliver("alice@e.test", None, &text_msg("hi"))
+            .await
+            .unwrap();
         assert_eq!(id.as_deref(), Some("msg_xyz"));
     }
 
@@ -329,7 +330,9 @@ mod tests {
         let server = MockServer::start().await;
         install_send_ok(&server, "id-d").await;
         let a = adapter_for(&server);
-        a.deliver("alice@e.test", None, &text_msg("body")).await.unwrap();
+        a.deliver("alice@e.test", None, &text_msg("body"))
+            .await
+            .unwrap();
         let received = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
         assert_eq!(body["subject"], "(no subject)");
@@ -907,5 +910,4 @@ mod tests {
         }]);
         assert!(matches!(res, Err(AdapterError::BadRequest(_))));
     }
-
 }

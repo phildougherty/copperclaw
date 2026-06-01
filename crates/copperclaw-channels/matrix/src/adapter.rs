@@ -235,7 +235,11 @@ impl ChannelAdapter for MatrixAdapter {
             // If the user supplied HTML the plain-text fallback is either
             // explicit `text` or the html stripped down. Use `text` if
             // present, otherwise the same html.
-            let plain = if text.is_empty() { html.as_str() } else { text.as_str() };
+            let plain = if text.is_empty() {
+                html.as_str()
+            } else {
+                text.as_str()
+            };
             self.api.send_html(&room_id, plain, &html).await?
         } else if let Some(thread) = thread_id {
             self.api.send_threaded(&room_id, thread, &text).await?
@@ -416,10 +420,7 @@ impl ChannelAdapter for MatrixAdapter {
         let room_id = self.resolve_room(platform_id).await?;
         let html = render_thinking_html_matrix(thinking);
         let plain = thinking.to_text_fallback();
-        let resp = self
-            .api
-            .send_notice_html(&room_id, &plain, &html)
-            .await?;
+        let resp = self.api.send_notice_html(&room_id, &plain, &html).await?;
         Ok(Some(resp.event_id))
     }
 
@@ -564,7 +565,12 @@ fn render_activity_html_matrix(b: &Breadcrumb) -> String {
         Some(d) => out.push_str(&escape_html_matrix(d)),
         None => out.push_str("working"),
     }
-    if let Some(s) = b.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(s) = b
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         out.push_str(" · ");
         out.push_str(&escape_html_matrix(s));
     }
@@ -600,7 +606,12 @@ fn render_step_line_html_matrix(s: &Breadcrumb) -> String {
         out.push_str(&escape_html_matrix(d));
         out.push_str("</code>");
     }
-    if let Some(sum) = s.summary.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+    if let Some(sum) = s
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+    {
         if s.status == BreadcrumbStatus::Failed {
             out.push_str(" <i>— failed: ");
         } else {
@@ -625,7 +636,12 @@ fn render_activity_text_matrix(b: &Breadcrumb) -> String {
         Some(d) => out.push_str(d),
         None => out.push_str("working"),
     }
-    if let Some(s) = b.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(s) = b
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         out.push_str(" · ");
         out.push_str(s);
     }
@@ -830,19 +846,17 @@ impl MatrixAdapter {
     ) -> Result<Option<String>, AdapterError> {
         match action {
             "edit" => {
-                let target = required_str(content, "target_event_id").or_else(|_| {
-                    required_str(content, "target_platform_id")
-                })?;
+                let target = required_str(content, "target_event_id")
+                    .or_else(|_| required_str(content, "target_platform_id"))?;
                 let new_text = required_str(content, "text")?;
                 let resp = self.api.edit_message(room_id, target, new_text).await?;
                 Ok(Some(resp.event_id))
             }
             "reaction" => {
-                let target = required_str(content, "target_event_id").or_else(|_| {
-                    required_str(content, "target_platform_id")
-                })?;
-                let key = required_str(content, "emoji")
-                    .or_else(|_| required_str(content, "key"))?;
+                let target = required_str(content, "target_event_id")
+                    .or_else(|_| required_str(content, "target_platform_id"))?;
+                let key =
+                    required_str(content, "emoji").or_else(|_| required_str(content, "key"))?;
                 let resp = self.api.send_reaction(room_id, target, key).await?;
                 Ok(Some(resp.event_id))
             }
@@ -866,10 +880,7 @@ fn extract_text(value: &Value) -> String {
 }
 
 fn extract_html(value: &Value) -> Option<String> {
-    value
-        .get("html")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
+    value.get("html").and_then(Value::as_str).map(str::to_owned)
 }
 
 fn required_str<'a>(value: &'a Value, key: &str) -> Result<&'a str, AdapterError> {
@@ -941,8 +952,8 @@ mod tests {
             txn_prefix: DEFAULT_TXN_PREFIX.to_owned(),
         };
         let (tx, rx) = mpsc::channel::<InboundEvent>(8);
-        let adapter = MatrixAdapter::start_with_api(api, config, tx, dir.path().to_path_buf())
-            .unwrap();
+        let adapter =
+            MatrixAdapter::start_with_api(api, config, tx, dir.path().to_path_buf()).unwrap();
         (adapter, dir, rx)
     }
 
@@ -972,7 +983,9 @@ mod tests {
         let s = MockServer::start().await;
         mount_empty_sync(&s).await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$x:m.org"
             })))
@@ -1000,7 +1013,9 @@ mod tests {
         let s = MockServer::start().await;
         mount_empty_sync(&s).await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .and(wiremock::matchers::body_string_contains("\"m.thread\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$t:m.org"
@@ -1029,8 +1044,12 @@ mod tests {
         let s = MockServer::start().await;
         mount_empty_sync(&s).await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
-            .and(wiremock::matchers::body_string_contains("\"formatted_body\""))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
+            .and(wiremock::matchers::body_string_contains(
+                "\"formatted_body\"",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$h:m.org"
             })))
@@ -1058,8 +1077,12 @@ mod tests {
         let s = MockServer::start().await;
         mount_empty_sync(&s).await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
-            .and(wiremock::matchers::body_string_contains("\"format\":\"org.matrix.custom.html\""))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
+            .and(wiremock::matchers::body_string_contains(
+                "\"format\":\"org.matrix.custom.html\"",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$h2:m.org"
             })))
@@ -1087,7 +1110,9 @@ mod tests {
         let s = MockServer::start().await;
         mount_empty_sync(&s).await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .and(wiremock::matchers::body_string_contains("\"m.replace\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$e:m.org"
@@ -1120,7 +1145,9 @@ mod tests {
         let s = MockServer::start().await;
         mount_empty_sync(&s).await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.reaction/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.reaction/.+",
+            ))
             .and(wiremock::matchers::body_string_contains("\"m.annotation\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$r:m.org"
@@ -1202,7 +1229,9 @@ mod tests {
             .mount(&s)
             .await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$file:m.org"
             })))
@@ -1240,7 +1269,9 @@ mod tests {
             .mount(&s)
             .await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .and(wiremock::matchers::body_string_contains("\"m.image\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$img:m.org"
@@ -1452,7 +1483,10 @@ mod tests {
         assert_eq!(extract_text(&json!({})), "");
         assert_eq!(extract_text(&json!({"text": "x"})), "x");
         assert_eq!(extract_html(&json!({})), None);
-        assert_eq!(extract_html(&json!({"html":"<b>x</b>"})).as_deref(), Some("<b>x</b>"));
+        assert_eq!(
+            extract_html(&json!({"html":"<b>x</b>"})).as_deref(),
+            Some("<b>x</b>")
+        );
         assert_eq!(extract_action(&json!({"action": "edit"})), Some("edit"));
         assert_eq!(extract_action(&json!({})), None);
     }
@@ -1467,8 +1501,7 @@ mod tests {
 
     #[test]
     fn render_breadcrumb_html_matrix_running_uses_code_and_ascii_marker() {
-        let bc = copperclaw_channels_core::Breadcrumb::running("shell")
-            .with_detail("cargo check");
+        let bc = copperclaw_channels_core::Breadcrumb::running("shell").with_detail("cargo check");
         let html = super::render_breadcrumb_html_matrix(&bc);
         assert!(html.starts_with("[~]"), "got: {html}");
         assert!(html.contains("<code>shell</code>"), "got: {html}");
@@ -1487,8 +1520,8 @@ mod tests {
 
     #[test]
     fn render_breadcrumb_html_matrix_escapes_special_chars() {
-        let bc = copperclaw_channels_core::Breadcrumb::running("shell")
-            .with_detail("echo <a> & <b>");
+        let bc =
+            copperclaw_channels_core::Breadcrumb::running("shell").with_detail("echo <a> & <b>");
         let html = super::render_breadcrumb_html_matrix(&bc);
         assert!(html.contains("echo &lt;a&gt; &amp; &lt;b&gt;"));
     }
@@ -1511,7 +1544,10 @@ mod tests {
         };
         let html = super::render_breadcrumb_html_matrix(&agg);
         // Native Matrix collapse primitive: <details>/<summary> wrapper.
-        assert!(html.starts_with("<details><summary>"), "details wrapper: {html}");
+        assert!(
+            html.starts_with("<details><summary>"),
+            "details wrapper: {html}"
+        );
         assert!(html.ends_with("</details>"), "details closed: {html}");
         // Collapsed summary line with ASCII marker + count inside <summary>.
         assert!(
@@ -1566,9 +1602,13 @@ mod tests {
         let s = MockServer::start().await;
         mount_empty_sync(&s).await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .and(wiremock::matchers::body_string_contains("\"m.notice\""))
-            .and(wiremock::matchers::body_string_contains("<details><summary>"))
+            .and(wiremock::matchers::body_string_contains(
+                "<details><summary>",
+            ))
             .and(wiremock::matchers::body_string_contains("<b>read_file</b>"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$agg:m.org"
@@ -1603,10 +1643,14 @@ mod tests {
         mount_empty_sync(&s).await;
         // The m.replace edit path must ALSO carry the <details> aggregate.
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .and(wiremock::matchers::body_string_contains("\"m.replace\""))
             .and(wiremock::matchers::body_string_contains("\"m.notice\""))
-            .and(wiremock::matchers::body_string_contains("<details><summary>"))
+            .and(wiremock::matchers::body_string_contains(
+                "<details><summary>",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$aggedit:m.org"
             })))
@@ -1640,17 +1684,20 @@ mod tests {
         let s = MockServer::start().await;
         mount_empty_sync(&s).await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .and(wiremock::matchers::body_string_contains("\"m.notice\""))
-            .and(wiremock::matchers::body_string_contains("<code>shell</code>"))
+            .and(wiremock::matchers::body_string_contains(
+                "<code>shell</code>",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$chip:m.org"
             })))
             .mount(&s)
             .await;
         let (adapter, _dir, _rx) = build_adapter(&s.uri());
-        let bc = copperclaw_channels_core::Breadcrumb::running("shell")
-            .with_detail("cargo check");
+        let bc = copperclaw_channels_core::Breadcrumb::running("shell").with_detail("cargo check");
         let id = adapter
             .deliver_breadcrumb("!room:m.org", None, &bc, None)
             .await
@@ -1664,7 +1711,9 @@ mod tests {
         let s = MockServer::start().await;
         mount_empty_sync(&s).await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .and(wiremock::matchers::body_string_contains("\"m.replace\""))
             .and(wiremock::matchers::body_string_contains("\"m.notice\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1750,7 +1799,9 @@ mod tests {
         let s = MockServer::start().await;
         mount_empty_sync(&s).await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .and(wiremock::matchers::body_string_contains("\"m.notice\""))
             .and(wiremock::matchers::body_string_contains("language-diff"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -1767,12 +1818,10 @@ mod tests {
                 old_lines: 1,
                 new_start: 1,
                 new_lines: 1,
-                lines: vec![
-                    copperclaw_channels_core::DiffLine {
-                        kind: copperclaw_channels_core::DiffLineKind::Add,
-                        text: "fn main() {}".into(),
-                    },
-                ],
+                lines: vec![copperclaw_channels_core::DiffLine {
+                    kind: copperclaw_channels_core::DiffLineKind::Add,
+                    text: "fn main() {}".into(),
+                }],
             }],
             added: 1,
             removed: 0,
@@ -1851,7 +1900,9 @@ mod tests {
         let s = MockServer::start().await;
         mount_empty_sync(&s).await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .and(wiremock::matchers::body_string_contains("\"m.text\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$err:m.org"
@@ -1877,7 +1928,10 @@ mod tests {
     fn render_collapsible_html_matrix_wraps_in_details_summary() {
         // Native Matrix primitive: `<details><summary>` is the
         // disclosure widget Element renders natively.
-        let body = (0..10).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        let body = (0..10)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let html = super::render_collapsible_html_matrix(&body, "10 lines (40 B)", &[]);
         assert!(html.starts_with("<details>"), "got: {html}");
         assert!(html.ends_with("</details>"), "got: {html}");
@@ -1916,7 +1970,10 @@ mod tests {
             .mount(&s)
             .await;
         let (adapter, _dir, _rx) = build_adapter(&s.uri());
-        let body = (0..40).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        let body = (0..40)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let preview: Vec<String> = (0..3).map(|i| format!("L{i}")).collect();
         let id = adapter
             .deliver_collapsible("!room:m.org", None, &body, "shell 40 lines", &preview)
@@ -1936,7 +1993,10 @@ mod tests {
         let t = ThinkingBlock::visible("Let me work through the question.");
         let html = super::render_thinking_html_matrix(&t);
         assert!(html.starts_with("<details>"), "got: {html}");
-        assert!(html.contains("<summary><em>reasoning</em></summary>"), "got: {html}");
+        assert!(
+            html.contains("<summary><em>reasoning</em></summary>"),
+            "got: {html}"
+        );
         assert!(html.contains("<blockquote>"), "got: {html}");
         assert!(html.contains("Let me work through the question."));
         assert!(html.ends_with("</details>"));
@@ -1995,7 +2055,10 @@ mod tests {
         let html = super::render_todo_list_html_matrix(&matrix_todo_list_sample());
         assert!(html.contains("<h4>Kitchen (1/2)</h4>"), "header: {html}");
         assert!(html.contains("<ul>"));
-        assert!(html.contains("[x] <s>Wash dishes</s>"), "done strike: {html}");
+        assert!(
+            html.contains("[x] <s>Wash dishes</s>"),
+            "done strike: {html}"
+        );
         assert!(html.contains("[ ] Dry dishes"), "pending: {html}");
     }
 }

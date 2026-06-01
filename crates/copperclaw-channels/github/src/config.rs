@@ -131,14 +131,15 @@ impl WebhookConfig {
             }
         };
         let port = match obj.get("port") {
-            Some(Value::Number(n)) => n
-                .as_u64()
-                .and_then(|u| u16::try_from(u).ok())
-                .ok_or_else(|| {
-                    AdapterError::BadRequest(
-                        "github `webhook.port` must be a u16 in range".into(),
-                    )
-                })?,
+            Some(Value::Number(n)) => {
+                n.as_u64()
+                    .and_then(|u| u16::try_from(u).ok())
+                    .ok_or_else(|| {
+                        AdapterError::BadRequest(
+                            "github `webhook.port` must be a u16 in range".into(),
+                        )
+                    })?
+            }
             Some(Value::Null) | None => DEFAULT_PORT,
             Some(_) => {
                 return Err(AdapterError::BadRequest(
@@ -251,8 +252,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_token() {
-        let err =
-            GithubConfig::from_value(&json!({"token":"", "webhook_secret":"s"})).unwrap_err();
+        let err = GithubConfig::from_value(&json!({"token":"", "webhook_secret":"s"})).unwrap_err();
         match err {
             AdapterError::BadRequest(m) => assert!(m.contains("non-empty")),
             other => panic!("expected BadRequest, got {other:?}"),
@@ -261,8 +261,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_webhook_secret() {
-        let err =
-            GithubConfig::from_value(&json!({"token":"x", "webhook_secret":""})).unwrap_err();
+        let err = GithubConfig::from_value(&json!({"token":"x", "webhook_secret":""})).unwrap_err();
         match err {
             AdapterError::BadRequest(m) => assert!(m.contains("non-empty")),
             other => panic!("expected BadRequest, got {other:?}"),
@@ -271,15 +270,13 @@ mod tests {
 
     #[test]
     fn rejects_non_string_token() {
-        let err =
-            GithubConfig::from_value(&json!({"token":42, "webhook_secret":"s"})).unwrap_err();
+        let err = GithubConfig::from_value(&json!({"token":42, "webhook_secret":"s"})).unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 
     #[test]
     fn rejects_non_string_webhook_secret() {
-        let err =
-            GithubConfig::from_value(&json!({"token":"x", "webhook_secret": 1})).unwrap_err();
+        let err = GithubConfig::from_value(&json!({"token":"x", "webhook_secret": 1})).unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 

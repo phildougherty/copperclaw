@@ -65,22 +65,22 @@ mod todo_list;
 
 pub mod testing;
 
-pub use adapter::{render_collapsible_text_fallback, ChannelAdapter, ChannelFactory};
+pub use adapter::{ChannelAdapter, ChannelFactory, render_collapsible_text_fallback};
 pub use breadcrumb::{
     Breadcrumb, BreadcrumbError, BreadcrumbStatus, MAX_DETAIL_CHARS, MAX_SUMMARY_CHARS,
     MAX_TOOL_NAME_CHARS,
 };
 pub use card::{
-    Card, CardButton, CardError, CardField, MAX_BODY_CHARS, MAX_BUTTONS, MAX_BUTTON_LABEL_CHARS,
-    MAX_BUTTON_VALUE_BYTES, MAX_FIELDS, MAX_FIELD_LABEL_CHARS, MAX_FIELD_VALUE_CHARS,
+    Card, CardButton, CardError, CardField, MAX_BODY_CHARS, MAX_BUTTON_LABEL_CHARS,
+    MAX_BUTTON_VALUE_BYTES, MAX_BUTTONS, MAX_FIELD_LABEL_CHARS, MAX_FIELD_VALUE_CHARS, MAX_FIELDS,
     MAX_TITLE_CHARS,
 };
 pub use container::{ContainerContribution, Mount};
 pub use diff::{
-    BlobReplaced, DiffCard, DiffCardError, DiffHunk, DiffLine, DiffLineKind,
-    BLOB_DIFF_CUTOFF_BYTES, MAX_HUNKS as MAX_DIFF_HUNKS,
-    MAX_LANGUAGE_CHARS as MAX_DIFF_LANGUAGE_CHARS, MAX_LINES_PER_HUNK as MAX_DIFF_LINES_PER_HUNK,
-    MAX_LINE_CHARS as MAX_DIFF_LINE_CHARS, MAX_PATH_CHARS as MAX_DIFF_PATH_CHARS,
+    BLOB_DIFF_CUTOFF_BYTES, BlobReplaced, DiffCard, DiffCardError, DiffHunk, DiffLine,
+    DiffLineKind, MAX_HUNKS as MAX_DIFF_HUNKS, MAX_LANGUAGE_CHARS as MAX_DIFF_LANGUAGE_CHARS,
+    MAX_LINE_CHARS as MAX_DIFF_LINE_CHARS, MAX_LINES_PER_HUNK as MAX_DIFF_LINES_PER_HUNK,
+    MAX_PATH_CHARS as MAX_DIFF_PATH_CHARS,
 };
 pub use dm::DmHandle;
 pub use error::AdapterError;
@@ -95,11 +95,11 @@ pub use error_card::{
 pub use registry::ChannelRegistry;
 pub use setup::ChannelSetup;
 pub use thinking::{
-    ThinkingBlock, ThinkingBlockError, MAX_MODEL_CHARS as MAX_THINKING_MODEL_CHARS,
-    MAX_THINKING_CHARS,
+    MAX_MODEL_CHARS as MAX_THINKING_MODEL_CHARS, MAX_THINKING_CHARS, ThinkingBlock,
+    ThinkingBlockError,
 };
 pub use todo_list::{
-    TodoItemStatus, TodoList, TodoListError, TodoListItem, DEFAULT_TITLE as TODO_DEFAULT_TITLE,
-    MAX_ITEMS as TODO_MAX_ITEMS, MAX_ITEM_TEXT_CHARS as TODO_MAX_ITEM_TEXT_CHARS,
-    MAX_TITLE_CHARS as TODO_MAX_TITLE_CHARS,
+    DEFAULT_TITLE as TODO_DEFAULT_TITLE, MAX_ITEM_TEXT_CHARS as TODO_MAX_ITEM_TEXT_CHARS,
+    MAX_ITEMS as TODO_MAX_ITEMS, MAX_TITLE_CHARS as TODO_MAX_TITLE_CHARS, TodoItemStatus, TodoList,
+    TodoListError, TodoListItem,
 };

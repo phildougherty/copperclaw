@@ -123,7 +123,13 @@ impl InteractiveModule {
 
     /// Snapshot all pending questions.
     pub fn pending(&self) -> Vec<PendingQuestion> {
-        self.state.lock().unwrap().pending.values().cloned().collect()
+        self.state
+            .lock()
+            .unwrap()
+            .pending
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// Sweep expired questions. Returns the list of expired ids (removed
@@ -151,10 +157,7 @@ struct AskHandler {
 }
 
 impl DeliveryActionHandler for AskHandler {
-    fn handle(
-        &self,
-        input: DeliveryActionInput,
-    ) -> Result<DeliveryActionOutput, ModuleError> {
+    fn handle(&self, input: DeliveryActionInput) -> Result<DeliveryActionOutput, ModuleError> {
         let id = input
             .payload
             .get("question_id")
@@ -227,18 +230,14 @@ impl DeliveryActionHandler for AskHandler {
 struct EditHandler;
 
 impl DeliveryActionHandler for EditHandler {
-    fn handle(
-        &self,
-        input: DeliveryActionInput,
-    ) -> Result<DeliveryActionOutput, ModuleError> {
+    fn handle(&self, input: DeliveryActionInput) -> Result<DeliveryActionOutput, ModuleError> {
         let text = input
             .payload
             .get("text")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ModuleError::other("interactive", "edit payload missing text"))?
             .to_owned();
-        let dispatch = dispatch_from_payload(&input.payload)
-            .or_else(|| Some(input.target.clone()));
+        let dispatch = dispatch_from_payload(&input.payload).or_else(|| Some(input.target.clone()));
         Ok(DeliveryActionOutput {
             dispatch,
             message: Some(OutboundMessage {
@@ -256,18 +255,14 @@ impl DeliveryActionHandler for EditHandler {
 struct ReactionHandler;
 
 impl DeliveryActionHandler for ReactionHandler {
-    fn handle(
-        &self,
-        input: DeliveryActionInput,
-    ) -> Result<DeliveryActionOutput, ModuleError> {
+    fn handle(&self, input: DeliveryActionInput) -> Result<DeliveryActionOutput, ModuleError> {
         let emoji = input
             .payload
             .get("emoji")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ModuleError::other("interactive", "reaction payload missing emoji"))?
             .to_owned();
-        let dispatch = dispatch_from_payload(&input.payload)
-            .or_else(|| Some(input.target.clone()));
+        let dispatch = dispatch_from_payload(&input.payload).or_else(|| Some(input.target.clone()));
         Ok(DeliveryActionOutput {
             dispatch,
             message: Some(OutboundMessage {
@@ -283,10 +278,7 @@ impl DeliveryActionHandler for ReactionHandler {
 struct CardHandler;
 
 impl DeliveryActionHandler for CardHandler {
-    fn handle(
-        &self,
-        input: DeliveryActionInput,
-    ) -> Result<DeliveryActionOutput, ModuleError> {
+    fn handle(&self, input: DeliveryActionInput) -> Result<DeliveryActionOutput, ModuleError> {
         let card = input
             .payload
             .get("card")
@@ -358,7 +350,12 @@ mod tests {
     fn ask_and_answer() {
         let m = InteractiveModule::default();
         let id = QuestionId::new("q-1");
-        let q = m.ask(id.clone(), "?".into(), vec!["yes".into(), "no".into()], now());
+        let q = m.ask(
+            id.clone(),
+            "?".into(),
+            vec!["yes".into(), "no".into()],
+            now(),
+        );
         assert_eq!(q.options.len(), 2);
         assert!(q.answered.is_none());
         assert!(m.answer(&id, "yes".into()));

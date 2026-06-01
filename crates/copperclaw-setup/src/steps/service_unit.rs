@@ -27,7 +27,7 @@ use crate::config::SetupConfig;
 use crate::prompt::Prompt;
 use crate::state::SetupState;
 use crate::steps::{Step, StepError, StepResult};
-use crate::units::{default_install_path, generate, UnitContext, UnitKind};
+use crate::units::{UnitContext, UnitKind, default_install_path, generate};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -214,10 +214,12 @@ impl Step for ServiceUnitStep {
         // installs (which expect a unit on disk + manual enable) keep
         // their behavior unchanged.
         let scope_default = ServiceScope::Print.as_str();
-        let scope_answer =
-            prompt.input("SERVICE_SCOPE", "Service scope (system|user|print)", Some(scope_default))?;
-        let mut scope =
-            ServiceScope::parse(&scope_answer).map_err(StepError::Other)?;
+        let scope_answer = prompt.input(
+            "SERVICE_SCOPE",
+            "Service scope (system|user|print)",
+            Some(scope_default),
+        )?;
+        let mut scope = ServiceScope::parse(&scope_answer).map_err(StepError::Other)?;
 
         // Fall back to `user` when `system` is requested but we lack
         // privileges. We never silently shell out to sudo.
@@ -398,9 +400,9 @@ pub fn path_for_scope(
         (ServiceScope::System, UnitKind::Systemd) => {
             Ok(PathBuf::from("/etc/systemd/system/copperclaw.service"))
         }
-        (ServiceScope::System, UnitKind::Launchd) => {
-            Ok(PathBuf::from("/Library/LaunchDaemons/com.copperclaw.host.plist"))
-        }
+        (ServiceScope::System, UnitKind::Launchd) => Ok(PathBuf::from(
+            "/Library/LaunchDaemons/com.copperclaw.host.plist",
+        )),
         (ServiceScope::User | ServiceScope::Print, kind) => Ok(default_install_path(kind, home)),
     }
 }
@@ -485,11 +487,7 @@ pub fn build_command_plan(
             let domain = format!("gui/{}", runner.uid());
             vec![PlannedCommand::new(
                 "launchctl",
-                vec![
-                    "bootstrap".into(),
-                    domain,
-                    unit_path.display().to_string(),
-                ],
+                vec!["bootstrap".into(), domain, unit_path.display().to_string()],
             )]
         }
         // `print` scope never produces a command plan — the step short
@@ -769,7 +767,10 @@ mod tests {
     fn service_scope_parses_synonyms() {
         assert_eq!(ServiceScope::parse("ROOT").unwrap(), ServiceScope::System);
         assert_eq!(ServiceScope::parse("manual").unwrap(), ServiceScope::Print);
-        assert_eq!(ServiceScope::parse(" stdout ").unwrap(), ServiceScope::Print);
+        assert_eq!(
+            ServiceScope::parse(" stdout ").unwrap(),
+            ServiceScope::Print
+        );
     }
 
     #[test]
@@ -780,7 +781,11 @@ mod tests {
 
     #[test]
     fn service_scope_as_str_roundtrips() {
-        for s in [ServiceScope::System, ServiceScope::User, ServiceScope::Print] {
+        for s in [
+            ServiceScope::System,
+            ServiceScope::User,
+            ServiceScope::Print,
+        ] {
             assert_eq!(ServiceScope::parse(s.as_str()).unwrap(), s);
         }
     }
@@ -913,10 +918,12 @@ mod tests {
         assert_eq!(plan[0].program, "launchctl");
         assert_eq!(plan[0].argv[0], "bootstrap");
         assert_eq!(plan[0].argv[1], "gui/1000");
-        assert!(plan[0]
-            .argv
-            .iter()
-            .any(|s| s.ends_with("com.copperclaw.host.plist")));
+        assert!(
+            plan[0]
+                .argv
+                .iter()
+                .any(|s| s.ends_with("com.copperclaw.host.plist"))
+        );
     }
 
     #[test]
@@ -962,7 +969,10 @@ mod tests {
     #[test]
     fn diagnostic_hint_systemd_is_journalctl() {
         let runner = FakeRunner::new();
-        assert_eq!(diagnostic_hint(UnitKind::Systemd, &runner), "journalctl -u copperclaw");
+        assert_eq!(
+            diagnostic_hint(UnitKind::Systemd, &runner),
+            "journalctl -u copperclaw"
+        );
     }
 
     #[test]
@@ -1040,7 +1050,11 @@ mod tests {
     #[test]
     fn wait_for_socket_returns_true_when_present_immediately() {
         let runner = FakeRunner::new().with_socket(true);
-        let ok = wait_for_socket(&runner, Path::new("/tmp/whatever"), Duration::from_millis(50));
+        let ok = wait_for_socket(
+            &runner,
+            Path::new("/tmp/whatever"),
+            Duration::from_millis(50),
+        );
         assert!(ok);
     }
 
@@ -1048,7 +1062,11 @@ mod tests {
     fn wait_for_socket_returns_false_on_timeout() {
         let runner = FakeRunner::new();
         let start = Instant::now();
-        let ok = wait_for_socket(&runner, Path::new("/tmp/whatever"), Duration::from_millis(50));
+        let ok = wait_for_socket(
+            &runner,
+            Path::new("/tmp/whatever"),
+            Duration::from_millis(50),
+        );
         assert!(!ok);
         // Confirm we actually waited roughly the budget.
         assert!(start.elapsed() >= Duration::from_millis(50));

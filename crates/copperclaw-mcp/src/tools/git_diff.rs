@@ -4,7 +4,7 @@
 //! `{diff, truncated, files_changed: [{path, additions, deletions}]}`.
 
 use crate::error::ToolError;
-use crate::tools::{make_tool, parse_args, success_json, ToolEntry, ToolHandler};
+use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args, success_json};
 use rmcp::model::{CallToolResult, JsonObject, Tool};
 use serde::Deserialize;
 use serde_json::json;
@@ -73,10 +73,7 @@ fn compute(root: &Path, input: &Input) -> Result<serde_json::Value, ToolError> {
         .max_bytes
         .unwrap_or(DEFAULT_MAX_BYTES)
         .clamp(1, MAX_BYTES_CAP);
-    let context = input
-        .context
-        .unwrap_or(DEFAULT_CONTEXT)
-        .min(MAX_CONTEXT);
+    let context = input.context.unwrap_or(DEFAULT_CONTEXT).min(MAX_CONTEXT);
 
     let mut opts = git2::DiffOptions::new();
     opts.context_lines(context);
@@ -131,8 +128,12 @@ fn build_diff<'r>(
         (Some(from), Some(to)) => {
             let a = super::git_common::resolve_commit(repo, from)?;
             let b = super::git_common::resolve_commit(repo, to)?;
-            repo.diff_tree_to_tree(Some(&a.tree().unwrap()), Some(&b.tree().unwrap()), Some(opts))
-                .map_err(|e| super::git_common::map_err("git_diff: tree-to-tree", &e))
+            repo.diff_tree_to_tree(
+                Some(&a.tree().unwrap()),
+                Some(&b.tree().unwrap()),
+                Some(opts),
+            )
+            .map_err(|e| super::git_common::map_err("git_diff: tree-to-tree", &e))
         }
         (Some(from), None) => {
             let a = super::git_common::resolve_commit(repo, from)?;
@@ -252,7 +253,12 @@ mod tests {
         std::fs::write(td.path().join("a.txt"), "one\ntwo\n").unwrap();
 
         let res = handle(
-            Some(json!({"path": td.path().to_string_lossy()}).as_object().unwrap().clone()),
+            Some(
+                json!({"path": td.path().to_string_lossy()})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
             &ctx(),
         )
         .await
@@ -328,7 +334,12 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         super::super::git_common::tests::init_with_commit(td.path(), "a.txt", "one\n");
         let res = handle(
-            Some(json!({"path": td.path().to_string_lossy()}).as_object().unwrap().clone()),
+            Some(
+                json!({"path": td.path().to_string_lossy()})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
             &ctx(),
         )
         .await

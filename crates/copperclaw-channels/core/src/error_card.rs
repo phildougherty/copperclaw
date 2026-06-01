@@ -381,8 +381,7 @@ mod tests {
 
     #[test]
     fn text_fallback_with_details_quotes_each_line() {
-        let c = internal()
-            .with_details("first line\nsecond line\nthird line");
+        let c = internal().with_details("first line\nsecond line\nthird line");
         let t = c.to_text_fallback();
         assert!(t.contains("> first line"));
         assert!(t.contains("> second line"));
@@ -404,7 +403,10 @@ mod tests {
             (ErrorCardKind::Delivery, "delivery"),
         ] {
             let c = ErrorCard::new(kind, "x");
-            assert!(c.to_text_fallback().starts_with(&format!("[ERROR: {expected}]")));
+            assert!(
+                c.to_text_fallback()
+                    .starts_with(&format!("[ERROR: {expected}]"))
+            );
         }
     }
 
@@ -467,7 +469,10 @@ mod tests {
             ErrorCardError::TitleTooLong { len: 200, max: 120 },
             ErrorCardError::EmptySummary,
             ErrorCardError::SummaryTooLong { len: 600, max: 500 },
-            ErrorCardError::DetailsTooLong { len: 3000, max: 2000 },
+            ErrorCardError::DetailsTooLong {
+                len: 3000,
+                max: 2000,
+            },
         ];
         for err in cases {
             assert!(!format!("{err}").is_empty());

@@ -55,7 +55,9 @@ pub async fn write_since_id(path: &Path, token: &str) -> Result<(), AdapterError
         }
     }
     let tmp = path.with_extension("tmp");
-    tokio::fs::write(&tmp, token).await.map_err(AdapterError::Io)?;
+    tokio::fs::write(&tmp, token)
+        .await
+        .map_err(AdapterError::Io)?;
     tokio::fs::rename(&tmp, path)
         .await
         .map_err(AdapterError::Io)?;

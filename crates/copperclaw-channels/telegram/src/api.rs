@@ -152,7 +152,12 @@ impl TelegramApi {
     /// Call `getMe`. Used by the factory to validate the bot token at init.
     pub async fn get_me(&self) -> Result<User, AdapterError> {
         let url = self.endpoint("getMe");
-        let resp = self.http.get(&url).send().await.map_err(|e| map_send_err(&e))?;
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| map_send_err(&e))?;
         let raw = read_body(resp).await?;
         decode_envelope::<User>(raw)
     }
@@ -206,7 +211,11 @@ impl TelegramApi {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.parse::<u64>().ok());
         let body_text = resp.text().await.unwrap_or_default();
-        Err(map_file_download_error(status, retry_after_header, &body_text))
+        Err(map_file_download_error(
+            status,
+            retry_after_header,
+            &body_text,
+        ))
     }
 
     /// Call `getUpdates` with the given parameters and parse the result.
@@ -384,10 +393,7 @@ impl TelegramApi {
     ) -> Result<(), AdapterError> {
         let url = self.endpoint("answerCallbackQuery");
         let mut body = serde_json::Map::new();
-        body.insert(
-            "callback_query_id".into(),
-            Value::from(callback_query_id),
-        );
+        body.insert("callback_query_id".into(), Value::from(callback_query_id));
         if let Some(t) = text {
             if !t.is_empty() {
                 body.insert("text".into(), Value::from(t));
@@ -448,7 +454,8 @@ impl TelegramApi {
         message_id: &str,
         text: &str,
     ) -> Result<(), AdapterError> {
-        self.edit_message_text_with_mode(chat_id, message_id, text, None).await
+        self.edit_message_text_with_mode(chat_id, message_id, text, None)
+            .await
     }
 
     /// As [`edit_message_text`] but lets the caller pass a `parse_mode`
@@ -674,9 +681,8 @@ fn decode_envelope<T: serde::de::DeserializeOwned>(raw: RawResponse) -> Result<T
             AdapterError::Transport(format!("telegram response decode failed: {e}"))
         })?;
         if resp.ok {
-            resp.result.ok_or_else(|| {
-                AdapterError::Transport("telegram response missing `result`".into())
-            })
+            resp.result
+                .ok_or_else(|| AdapterError::Transport("telegram response missing `result`".into()))
         } else {
             Err(envelope_to_error(&resp))
         }
@@ -688,7 +694,11 @@ fn decode_envelope<T: serde::de::DeserializeOwned>(raw: RawResponse) -> Result<T
         } else {
             serde_json::from_str::<ApiResponse<T>>(&body).ok()
         };
-        Err(map_status_error(status, envelope.as_ref(), retry_after_header))
+        Err(map_status_error(
+            status,
+            envelope.as_ref(),
+            retry_after_header,
+        ))
     }
 }
 
@@ -909,7 +919,12 @@ mod tests {
             .send_message("c", None, "x", None)
             .await
             .unwrap_err();
-        assert!(matches!(err, AdapterError::Rate { retry_after: Some(5) }));
+        assert!(matches!(
+            err,
+            AdapterError::Rate {
+                retry_after: Some(5)
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1035,7 +1050,13 @@ mod tests {
             .mount(&s)
             .await;
         let m = api(&s.uri(), "tok")
-            .send_document("c", Some("99"), "x.bin", vec![1, 2, 3], Some("see attached"))
+            .send_document(
+                "c",
+                Some("99"),
+                "x.bin",
+                vec![1, 2, 3],
+                Some("see attached"),
+            )
             .await
             .unwrap();
         assert_eq!(m.message_id, 42);
@@ -1236,7 +1257,12 @@ mod tests {
             .mount(&s)
             .await;
         let err = api(&s.uri(), "tok").download_file("x").await.unwrap_err();
-        assert!(matches!(err, AdapterError::Rate { retry_after: Some(9) }));
+        assert!(matches!(
+            err,
+            AdapterError::Rate {
+                retry_after: Some(9)
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1292,20 +1318,13 @@ mod tests {
             InlineKeyboardButton::callback("No", "n"),
         ]];
         let m = api(&s.uri(), "tok")
-            .send_message_with_inline_keyboard(
-                "100",
-                Some("12"),
-                "*hi*",
-                Some("MarkdownV2"),
-                &kb,
-            )
+            .send_message_with_inline_keyboard("100", Some("12"), "*hi*", Some("MarkdownV2"), &kb)
             .await
             .unwrap();
         assert_eq!(m.message_id, 9);
 
         let reqs = s.received_requests().await.unwrap();
-        let body: serde_json::Value =
-            serde_json::from_slice(&reqs[0].body).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
         assert_eq!(body["chat_id"], "100");
         assert_eq!(body["message_thread_id"], 12);
         assert_eq!(body["text"], "*hi*");
@@ -1345,8 +1364,7 @@ mod tests {
         assert_eq!(m.message_id, 12);
 
         let reqs = s.received_requests().await.unwrap();
-        let body: serde_json::Value =
-            serde_json::from_slice(&reqs[0].body).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
         assert_eq!(body["photo"], "https://example.com/img.png");
         assert_eq!(body["caption"], "caption");
         assert_eq!(body["parse_mode"], "MarkdownV2");
@@ -1377,8 +1395,7 @@ mod tests {
             .await
             .unwrap();
         let reqs = s.received_requests().await.unwrap();
-        let body: serde_json::Value =
-            serde_json::from_slice(&reqs[0].body).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
         assert!(body.get("reply_markup").is_none());
         assert!(body.get("caption").is_none());
         assert!(body.get("parse_mode").is_none());

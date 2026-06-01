@@ -25,10 +25,10 @@
 //! also expose it as a real handler so the host can serve it to agents.
 
 use super::{db_err, parse_agent_group_id, req_str};
+use copperclaw_cclaw::ErrorPayload;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::container_configs;
 use copperclaw_db::tables::container_configs::{CliScope, SkillsSelector};
-use copperclaw_cclaw::ErrorPayload;
 use copperclaw_types::AgentGroupId;
 use serde_json::{Map, Value, json};
 
@@ -116,7 +116,12 @@ pub const PRESETS: &[McpPreset] = &[
         name: "postgres",
         description: "PostgreSQL read/write access via the official MCP Postgres server.",
         command: "npx",
-        args: &["-y", "@modelcontextprotocol/server-postgres", "--connection-string", "${POSTGRES_CONNECTION_STRING}"],
+        args: &[
+            "-y",
+            "@modelcontextprotocol/server-postgres",
+            "--connection-string",
+            "${POSTGRES_CONNECTION_STRING}",
+        ],
         required_env: &["POSTGRES_CONNECTION_STRING"],
     },
     McpPreset {
@@ -145,7 +150,11 @@ pub const PRESETS: &[McpPreset] = &[
         description: "Local filesystem read/write via the official MCP filesystem server. \
                       Scope is limited to paths listed in args; defaults to /workspace.",
         command: "npx",
-        args: &["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
+        args: &[
+            "-y",
+            "@modelcontextprotocol/server-filesystem",
+            "/workspace",
+        ],
         required_env: &[],
     },
     McpPreset {
@@ -225,8 +234,7 @@ pub fn add(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     if let Some(obj) = current.as_object_mut() {
         obj.insert(preset_name.clone(), server_entry.clone());
     }
-    container_configs::set_mcp_servers(central, agent_group_id, current.clone())
-        .map_err(db_err)?;
+    container_configs::set_mcp_servers(central, agent_group_id, current.clone()).map_err(db_err)?;
 
     Ok(json!({
         "agent_group_id": agent_group_id.as_uuid().to_string(),
@@ -238,7 +246,10 @@ pub fn add(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
 /// Ensure a `container_configs` row exists for `agent_group_id`, creating a
 /// default one if the group hasn't been configured yet.
 fn ensure_config_row(central: &CentralDb, id: AgentGroupId) -> Result<(), ErrorPayload> {
-    if container_configs::get(central, id).map_err(db_err)?.is_none() {
+    if container_configs::get(central, id)
+        .map_err(db_err)?
+        .is_none()
+    {
         container_configs::upsert(
             central,
             container_configs::UpsertContainerConfig {
@@ -295,7 +306,14 @@ mod tests {
     #[test]
     fn all_required_presets_are_present() {
         let names: Vec<&str> = PRESETS.iter().map(|p| p.name).collect();
-        for required in ["postgres", "linear", "github", "notion", "filesystem", "browserbase"] {
+        for required in [
+            "postgres",
+            "linear",
+            "github",
+            "notion",
+            "filesystem",
+            "browserbase",
+        ] {
             assert!(
                 names.contains(&required),
                 "preset `{required}` is missing from the catalog"
@@ -431,8 +449,7 @@ mod tests {
             "postgres://localhost/test"
         );
         // Verify the DB was updated: mcp_servers is an object keyed by name.
-        let servers =
-            copperclaw_db::tables::container_configs::get_mcp_servers(&db, ag).unwrap();
+        let servers = copperclaw_db::tables::container_configs::get_mcp_servers(&db, ag).unwrap();
         let obj = servers.as_object().unwrap();
         assert_eq!(obj.len(), 1);
         assert!(obj.contains_key("postgres"));
@@ -454,12 +471,14 @@ mod tests {
             "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "ghp_second"},
         });
         add(&args2, &db).unwrap();
-        let servers =
-            copperclaw_db::tables::container_configs::get_mcp_servers(&db, ag).unwrap();
+        let servers = copperclaw_db::tables::container_configs::get_mcp_servers(&db, ag).unwrap();
         let obj = servers.as_object().unwrap();
         // Should have only one key (idempotent replace).
         assert_eq!(obj.len(), 1);
-        assert_eq!(obj["github"]["env"]["GITHUB_PERSONAL_ACCESS_TOKEN"], "ghp_second");
+        assert_eq!(
+            obj["github"]["env"]["GITHUB_PERSONAL_ACCESS_TOKEN"],
+            "ghp_second"
+        );
     }
 
     #[test]
@@ -480,8 +499,7 @@ mod tests {
             &db,
         )
         .unwrap();
-        let servers =
-            copperclaw_db::tables::container_configs::get_mcp_servers(&db, ag).unwrap();
+        let servers = copperclaw_db::tables::container_configs::get_mcp_servers(&db, ag).unwrap();
         let obj = servers.as_object().unwrap();
         assert_eq!(obj.len(), 2);
         assert!(obj.contains_key("filesystem"));

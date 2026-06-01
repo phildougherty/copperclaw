@@ -27,15 +27,13 @@
 use std::path::Path;
 
 use copperclaw_db::central::CentralDb;
-use copperclaw_db::migrate::{
-    applied_central_schema_version, expected_central_schema_version,
-};
+use copperclaw_db::migrate::{applied_central_schema_version, expected_central_schema_version};
 use copperclaw_db::tables::{agent_groups, messaging_group_agents, messaging_groups};
 use copperclaw_setup::cli::run_steps;
 use copperclaw_setup::config::SetupConfig;
 use copperclaw_setup::prompt::Scripted;
 use copperclaw_setup::state::SetupState;
-use copperclaw_setup::steps::{all_steps, StepError};
+use copperclaw_setup::steps::{StepError, all_steps};
 use tempfile::TempDir;
 
 /// Steps that hit the network or a container runtime; we skip them in
@@ -88,7 +86,11 @@ fn run_wizard(
 #[cfg(unix)]
 fn file_mode(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path).expect("metadata").permissions().mode() & 0o777
+    std::fs::metadata(path)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777
 }
 
 // =====================================================================
@@ -136,7 +138,11 @@ fn assert_central_db_migrated(dir: &Path) {
 
 fn assert_env_file_contents(dir: &Path) {
     let env_path = dir.join(".env");
-    assert!(env_path.exists(), ".env should exist at {}", env_path.display());
+    assert!(
+        env_path.exists(),
+        ".env should exist at {}",
+        env_path.display()
+    );
     let env_body = std::fs::read_to_string(&env_path).expect("read .env");
     // The auth step prefers the process env var if it's set; only the
     // prompt fallback returns `test-key`. Assert the key line is
@@ -246,8 +252,7 @@ fn assert_db_seeded_with_default_group(dir: &Path) {
     assert_eq!(mg.len(), 1, "expected one messaging group, got {mg:?}");
     assert_eq!(mg[0].channel_type.as_str(), "cli");
     assert_eq!(mg[0].platform_id, "stdin");
-    let wirings =
-        messaging_group_agents::list_for_ag(&db, ag[0].id).expect("list wirings");
+    let wirings = messaging_group_agents::list_for_ag(&db, ag[0].id).expect("list wirings");
     assert_eq!(wirings.len(), 1, "expected one wiring, got {wirings:?}");
     assert_eq!(wirings[0].agent_group_id, ag[0].id);
     assert_eq!(wirings[0].messaging_group_id, mg[0].id);
@@ -270,8 +275,7 @@ fn wizard_is_idempotent_when_rerun_against_same_data_dir() {
     let log_path = dir.join("chat.log");
     let fifo_path = dir.join("chat.fifo");
     std::fs::write(&log_path, b"chat content that must survive").expect("seed log");
-    let fifo_meta_before =
-        std::fs::metadata(&fifo_path).expect("fifo metadata before second run");
+    let fifo_meta_before = std::fs::metadata(&fifo_path).expect("fifo metadata before second run");
     let fifo_inode_before = fifo_inode(&fifo_meta_before);
 
     // Run 2 — same data dir, fresh prompt + state (mimicking a re-run).
@@ -295,8 +299,7 @@ fn wizard_is_idempotent_when_rerun_against_same_data_dir() {
         1,
         "messaging_groups should still have one row after re-run"
     );
-    let wirings =
-        messaging_group_agents::list_for_ag(&db, ag[0].id).expect("list wirings");
+    let wirings = messaging_group_agents::list_for_ag(&db, ag[0].id).expect("list wirings");
     assert_eq!(wirings.len(), 1, "wiring should not duplicate on re-run");
 
     // FIFO not recreated (same inode), log not truncated (content
@@ -472,8 +475,7 @@ fn wizard_recovers_from_partial_failure() {
     // complete the whole loop.
     {
         let mut config = happy_config(dir);
-        let mut state =
-            SetupState::load(dir).expect("reload state for second run");
+        let mut state = SetupState::load(dir).expect("reload state for second run");
         let prompt = happy_prompt(dir);
         run_wizard(&mut config, &prompt, &mut state)
             .expect("re-run should complete after data_dir is writable again");
@@ -486,10 +488,7 @@ fn wizard_recovers_from_partial_failure() {
             "quickstart_group should complete on re-run"
         );
         assert!(dir.join(".env").exists(), ".env should now exist");
-        assert!(
-            dir.join("chat.fifo").exists(),
-            "chat.fifo should now exist"
-        );
+        assert!(dir.join("chat.fifo").exists(), "chat.fifo should now exist");
     }
 }
 
@@ -518,7 +517,10 @@ fn wizard_refuses_to_run_against_future_schema() {
         run_wizard(&mut config, &prompt, &mut state).expect("baseline run");
     }
     let db_path = dir.join("data").join("copperclaw.db");
-    assert!(db_path.exists(), "central DB should exist after baseline run");
+    assert!(
+        db_path.exists(),
+        "central DB should exist after baseline run"
+    );
 
     // Manually insert a "future" migration row so applied > expected.
     inject_future_migration(&db_path);
@@ -550,4 +552,3 @@ fn inject_future_migration(db_path: &Path) {
     .expect("insert future migration row");
     drop(conn);
 }
-

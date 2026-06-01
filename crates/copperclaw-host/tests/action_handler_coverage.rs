@@ -24,9 +24,9 @@ use std::sync::Arc;
 
 use copperclaw_modules::context::MockModuleContext;
 use copperclaw_modules::{
-    create_agent_always_allow, AgentToAgentModule, ApprovalsModule, CreateAgentModule,
-    InteractiveModule, Module, ModuleContext, MountSecurityModule, PermissionsModule,
-    SchedulingModule, SelfModModule, TypingConfig, TypingModule,
+    AgentToAgentModule, ApprovalsModule, CreateAgentModule, InteractiveModule, Module,
+    ModuleContext, MountSecurityModule, PermissionsModule, SchedulingModule, SelfModModule,
+    TypingConfig, TypingModule, create_agent_always_allow,
 };
 
 /// Action names the runner currently emits as `MessageKind::System`
@@ -234,10 +234,7 @@ fn runner_emit_set_matches_source() {
     // Currently nothing to strip — the regex only matches the outer
     // `json!({ "first_key": ... })` form. If new noise appears, prune here.
 
-    let hard_coded: HashSet<String> = runner_emit_set()
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
+    let hard_coded: HashSet<String> = runner_emit_set().iter().map(|s| (*s).to_string()).collect();
 
     let missing_from_hardcoded: Vec<&String> = derived.difference(&hard_coded).collect();
     let missing_from_source: Vec<&String> = hard_coded.difference(&derived).collect();
@@ -267,15 +264,13 @@ fn host_handle_set_matches_inline_arms() {
         .expect("read crates/copperclaw-host-delivery/src/service.rs");
 
     // Top-of-function arms: `if action.name == "<name>"`.
-    let if_re = regex::Regex::new(r#"if\s+action\.name\s*==\s*"([a-z_]+)""#)
-        .expect("compile regex");
+    let if_re =
+        regex::Regex::new(r#"if\s+action\.name\s*==\s*"([a-z_]+)""#).expect("compile regex");
     // The edit/reaction path uses `action.name != "edit" && action.name != "reaction"`.
-    let neq_re = regex::Regex::new(r#"action\.name\s*!=\s*"([a-z_]+)""#)
-        .expect("compile regex");
+    let neq_re = regex::Regex::new(r#"action\.name\s*!=\s*"([a-z_]+)""#).expect("compile regex");
     // The action-by-name match in `try_action_via_adapter` —
     // `"edit" => { ... } "reaction" => { ... }`.
-    let typed_re = regex::Regex::new(r#"^\s*"(edit|reaction)"\s*=>\s*\{"#)
-        .expect("compile regex");
+    let typed_re = regex::Regex::new(r#"^\s*"(edit|reaction)"\s*=>\s*\{"#).expect("compile regex");
 
     let mut derived: HashSet<String> = HashSet::new();
     for cap in if_re.captures_iter(&service_src) {

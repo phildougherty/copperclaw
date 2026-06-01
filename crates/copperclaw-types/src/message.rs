@@ -242,8 +242,7 @@ pub struct OutboundFile {
 /// JSON so it can reach the vision-capable model.
 #[must_use]
 pub fn encode_base64(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity((bytes.len() / 3 + 1) * 4);
     for chunk in bytes.chunks(3) {
         let b0 = chunk[0];
@@ -321,8 +320,10 @@ mod base64_bytes {
             let v1 = val(chunk[1]).map_err(serde::de::Error::custom)?;
             let v2 = val(chunk[2]).map_err(serde::de::Error::custom)?;
             let v3 = val(chunk[3]).map_err(serde::de::Error::custom)?;
-            let n: u32 =
-                (u32::from(v0) << 18) | (u32::from(v1) << 12) | (u32::from(v2) << 6) | u32::from(v3);
+            let n: u32 = (u32::from(v0) << 18)
+                | (u32::from(v1) << 12)
+                | (u32::from(v2) << 6)
+                | u32::from(v3);
             out.push(((n >> 16) & 0xFF) as u8);
             if chunk[2] != b'=' {
                 out.push(((n >> 8) & 0xFF) as u8);

@@ -187,11 +187,7 @@ pub async fn poll_for_chat_id(
     token: &str,
     budget: Duration,
 ) -> Result<Option<i64>, String> {
-    let url = format!(
-        "{}/bot{}/getUpdates",
-        api_base.trim_end_matches('/'),
-        token
-    );
+    let url = format!("{}/bot{}/getUpdates", api_base.trim_end_matches('/'), token);
     let client = reqwest::Client::builder()
         .timeout(VERIFY_TIMEOUT)
         .build()
@@ -330,9 +326,7 @@ pub fn run_pairing(
     }
 
     let Some(token) = capture_token(prompt, out)? else {
-        out.push(
-            "Telegram pairing skipped — wire it later via `cclaw channel ...`.".to_string(),
-        );
+        out.push("Telegram pairing skipped — wire it later via `cclaw channel ...`.".to_string());
         return Ok(None);
     };
 
@@ -364,10 +358,7 @@ pub fn run_pairing(
     }))
 }
 
-fn capture_token(
-    prompt: &dyn Prompt,
-    out: &mut Vec<String>,
-) -> Result<Option<String>, StepError> {
+fn capture_token(prompt: &dyn Prompt, out: &mut Vec<String>) -> Result<Option<String>, StepError> {
     // Track the previous invalid response so we can detect a headless
     // (`EnvBacked`) prompt that keeps returning the same malformed
     // value on every iteration. Without this guard, a malformed
@@ -790,8 +781,7 @@ mod tests {
         let err = run_pairing(&prompt, "http://127.0.0.1:1", &mut out).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("COPPERCLAW_SETUP_TELEGRAM_BOT_TOKEN")
-                && msg.contains("validation"),
+            msg.contains("COPPERCLAW_SETUP_TELEGRAM_BOT_TOKEN") && msg.contains("validation"),
             "error should name the env var and the failure (got: {msg})"
         );
     }
@@ -806,10 +796,7 @@ mod tests {
             .with(HEADLESS_TOKEN_KEY, "rubbish");
         let mut out = Vec::new();
         let err = run_pairing(&prompt, "http://127.0.0.1:1", &mut out).unwrap_err();
-        assert!(
-            err.to_string().contains("validation"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("validation"), "got: {err}");
     }
 
     #[test]

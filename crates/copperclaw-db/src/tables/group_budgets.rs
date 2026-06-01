@@ -10,11 +10,11 @@
 // rewrite all of them; allowed module-wide instead.
 #![allow(clippy::needless_pass_by_value)]
 
-use crate::central::CentralDb;
 use crate::DbError;
+use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
 use copperclaw_types::AgentGroupId;
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{OptionalExtension, Row, params};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GroupBudget {
@@ -39,10 +39,7 @@ pub struct UpsertGroupBudget {
     pub agent_turns_per_hour_cap: Option<i64>,
 }
 
-pub fn get(
-    db: &CentralDb,
-    agent_group_id: AgentGroupId,
-) -> Result<Option<GroupBudget>, DbError> {
+pub fn get(db: &CentralDb, agent_group_id: AgentGroupId) -> Result<Option<GroupBudget>, DbError> {
     let conn = db.conn()?;
     Ok(conn
         .query_row(
@@ -117,11 +114,7 @@ fn row_to_budget(row: &Row<'_>) -> rusqlite::Result<GroupBudget> {
     let ts_str: String = row.get(5)?;
     let ts = DateTime::parse_from_rfc3339(&ts_str)
         .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                0,
-                rusqlite::types::Type::Text,
-                Box::new(e),
-            )
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
         })?
         .with_timezone(&Utc);
     Ok(GroupBudget {

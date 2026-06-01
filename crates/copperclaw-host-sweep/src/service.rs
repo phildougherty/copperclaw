@@ -2,8 +2,8 @@
 //! [`crate::SWEEP_POLL_MS`] tick and produces a [`SweepReport`] describing
 //! sessions that need host attention.
 
-use crate::checks::{apology, heartbeat, processing, recurrence, scheduling, stuck, wake};
 use crate::checks::apology::ApologyEmit;
+use crate::checks::{apology, heartbeat, processing, recurrence, scheduling, stuck, wake};
 use crate::clock::{Clock, SystemClock};
 use crate::error::SweepError;
 use crate::spawn_tracker::SpawnAttemptTracker;
@@ -87,8 +87,11 @@ impl SessionRoot for FilesystemSessionRoot {
         agent_group_id: &AgentGroupId,
         session_id: &SessionId,
     ) -> Result<SessionPool, SweepError> {
-        let paths =
-            copperclaw_db::session::SessionPaths::new(&self.data_root, *agent_group_id, *session_id);
+        let paths = copperclaw_db::session::SessionPaths::new(
+            &self.data_root,
+            *agent_group_id,
+            *session_id,
+        );
         let conn = copperclaw_db::session::open_outbound(&paths)?;
         Ok(SessionPool::new(conn))
     }
@@ -98,8 +101,11 @@ impl SessionRoot for FilesystemSessionRoot {
         agent_group_id: &AgentGroupId,
         session_id: &SessionId,
     ) -> Result<SessionPool, SweepError> {
-        let paths =
-            copperclaw_db::session::SessionPaths::new(&self.data_root, *agent_group_id, *session_id);
+        let paths = copperclaw_db::session::SessionPaths::new(
+            &self.data_root,
+            *agent_group_id,
+            *session_id,
+        );
         let conn = copperclaw_db::session::open_inbound(&paths)?;
         Ok(SessionPool::new(conn))
     }
@@ -364,12 +370,7 @@ impl SweepService {
                 ),
             }
 
-            match wake::check(
-                &self.central,
-                self.session_paths.as_ref(),
-                &session,
-                now,
-            ) {
+            match wake::check(&self.central, self.session_paths.as_ref(), &session, now) {
                 Ok(true) => report.woken_sessions.push(session.id),
                 Ok(false) => {}
                 Err(e) => tracing::warn!(
@@ -405,8 +406,8 @@ mod tests {
     use super::*;
     use crate::clock::MockClock;
     use crate::test_support::{
-        seed_due_message, seed_recurrence, seed_running_session, seed_stale_heartbeat,
-        seed_stuck_tool, seed_stuck_processing_ack, MemSessionRoot,
+        MemSessionRoot, seed_due_message, seed_recurrence, seed_running_session,
+        seed_stale_heartbeat, seed_stuck_processing_ack, seed_stuck_tool,
     };
     use chrono::{Duration as ChDuration, TimeZone};
     use copperclaw_db::tables::sessions as sessions_tbl;

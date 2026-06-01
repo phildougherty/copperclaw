@@ -167,9 +167,7 @@ impl TodoWatcher {
     /// shouldn't pay even the polling cost.
     pub async fn run_loop(self: Arc<Self>, shutdown: CancellationToken) {
         if !enable_from_env() {
-            debug!(
-                "todo_watcher: {ENABLE_ENV_VAR} not set; skipping background watcher",
-            );
+            debug!("todo_watcher: {ENABLE_ENV_VAR} not set; skipping background watcher",);
             return;
         }
         loop {
@@ -214,20 +212,14 @@ fn read_todos(path: &Path) -> std::io::Result<Vec<TodoItem>> {
 /// Pure-function delta producer — easy to unit-test without disk or
 /// a dispatcher. Returns the list of text strings to send (one per
 /// emit), in the order they should be sent.
-pub(crate) fn diff_to_notifications(
-    previous: &[TodoItem],
-    current: &[TodoItem],
-) -> Vec<String> {
+pub(crate) fn diff_to_notifications(previous: &[TodoItem], current: &[TodoItem]) -> Vec<String> {
     use std::collections::HashSet;
     let mut out = Vec::new();
 
     // 1. First-time plan announcement: previous was empty, current
     //    has items. Emit ONE compact rollup listing the plan.
     if previous.is_empty() && !current.is_empty() {
-        let lines: Vec<String> = current
-            .iter()
-            .map(|t| format!("  • {}", t.text))
-            .collect();
+        let lines: Vec<String> = current.iter().map(|t| format!("  • {}", t.text)).collect();
         out.push(format!(
             "[todo] Plan ({} steps):\n{}",
             current.len(),
@@ -236,14 +228,17 @@ pub(crate) fn diff_to_notifications(
         return out;
     }
 
-    let prev_by_id: HashMap<i64, &TodoItem> =
-        previous.iter().map(|t| (t.id, t)).collect();
+    let prev_by_id: HashMap<i64, &TodoItem> = previous.iter().map(|t| (t.id, t)).collect();
 
     // 2. Newly-completed items (status transitions to "completed").
     let completed: Vec<&TodoItem> = current
         .iter()
         .filter(|t| t.status == "completed")
-        .filter(|t| prev_by_id.get(&t.id).is_none_or(|prev| prev.status != "completed"))
+        .filter(|t| {
+            prev_by_id
+                .get(&t.id)
+                .is_none_or(|prev| prev.status != "completed")
+        })
         .collect();
     if !completed.is_empty() {
         let lines: Vec<String> = completed
@@ -268,10 +263,7 @@ pub(crate) fn diff_to_notifications(
     if !added.is_empty() && !prev_ids.is_empty() {
         // Only emit "plan grew" if there WAS a previous plan; the
         // first-time announcement above handles the no-previous case.
-        let lines: Vec<String> = added
-            .iter()
-            .map(|t| format!("  + {}", t.text))
-            .collect();
+        let lines: Vec<String> = added.iter().map(|t| format!("  + {}", t.text)).collect();
         out.push(format!(
             "Plan grew (+{} steps):\n{}",
             added.len(),
@@ -342,7 +334,10 @@ mod tests {
         //   3. "plan grew" line.
         let cases: Vec<(Vec<TodoItem>, Vec<TodoItem>)> = vec![
             // 1. First-time plan.
-            (vec![], vec![t(1, "Research", "pending"), t(2, "Build", "pending")]),
+            (
+                vec![],
+                vec![t(1, "Research", "pending"), t(2, "Build", "pending")],
+            ),
             // 2. Completion.
             (
                 vec![t(1, "Research", "in_progress")],

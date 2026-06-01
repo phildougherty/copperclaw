@@ -10,19 +10,16 @@ use crate::error::RouterError;
 use crate::hooks::HookChain;
 use crate::session::SessionRoot;
 
-use dashmap::DashMap;
 use copperclaw_db::central::CentralDb;
-use copperclaw_db::tables::dropped_messages::{
-    insert as insert_dropped, InsertDroppedMessage,
+use copperclaw_db::tables::dropped_messages::{InsertDroppedMessage, insert as insert_dropped};
+use copperclaw_db::tables::messages_in::{WriteInbound, insert as insert_in};
+use copperclaw_db::tables::messaging_group_agents::{
+    MessagingGroupAgent, list_for_mg as list_wirings,
 };
-use copperclaw_db::tables::messages_in::{insert as insert_in, WriteInbound};
-use copperclaw_db::tables::messaging_group_agents::{list_for_mg as list_wirings, MessagingGroupAgent};
 use copperclaw_db::tables::messaging_groups::get_by_platform;
-use copperclaw_db::tables::sessions::{
-    create as create_session, find_for_agent, CreateSession,
-};
+use copperclaw_db::tables::sessions::{CreateSession, create as create_session, find_for_agent};
 use copperclaw_db::tables::unregistered_senders::{
-    upsert as upsert_unregistered, UpsertUnregisteredSender,
+    UpsertUnregisteredSender, upsert as upsert_unregistered,
 };
 use copperclaw_modules::context::{
     ChannelRequestCtx, GateCtx, GateDecision, SenderScopeCtx, SenderScopeDecision,
@@ -30,8 +27,9 @@ use copperclaw_modules::context::{
 use copperclaw_types::{
     AgentGroupId, InboundEvent, MessageId, MessageKind, MessagingGroupId, SessionId, SessionMode,
 };
-use std::sync::atomic::{AtomicI64, Ordering};
+use dashmap::DashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Instant;
 
 /// Outcome of routing an inbound event. The caller (a channel adapter or
@@ -363,10 +361,7 @@ impl Router {
         // message id matches what the runner's context-block needs to
         // say "in reply to the user's earlier message" without lugging
         // the redundant chat handle into per-session storage.
-        let reply_to_id = event
-            .reply_to
-            .as_ref()
-            .and_then(|r| r.thread_id.clone());
+        let reply_to_id = event.reply_to.as_ref().and_then(|r| r.thread_id.clone());
         let write = WriteInbound {
             id: message_id,
             kind: event.message.kind,
@@ -415,9 +410,12 @@ impl Router {
                 SessionMode::AgentShared => (None, None),
             };
 
-        if let Some(s) =
-            find_for_agent(&self.central, agent_group_id, search_mg, search_thread.as_deref())?
-        {
+        if let Some(s) = find_for_agent(
+            &self.central,
+            agent_group_id,
+            search_mg,
+            search_thread.as_deref(),
+        )? {
             self.session_paths
                 .ensure_session_dir(&s.agent_group_id, &s.id)?;
             return Ok(TargetSession {
@@ -459,10 +457,8 @@ impl Router {
             platform_id: Some(event.platform_id.clone()),
             thread_id: event.thread_id.clone(),
         };
-        pool.with_conn(|conn| {
-            copperclaw_db::tables::session_routing::write(conn, &routing)
-        })
-        .map_err(|e| RouterError::session_create(format!("write session_routing: {e}")))?;
+        pool.with_conn(|conn| copperclaw_db::tables::session_routing::write(conn, &routing))
+            .map_err(|e| RouterError::session_create(format!("write session_routing: {e}")))?;
         Ok(TargetSession {
             agent_group_id: created.agent_group_id,
             id: created.id,
@@ -567,12 +563,10 @@ mod tests {
     use super::*;
     use crate::session::FsSessionRoot;
     use chrono::Utc;
-    use copperclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
-    use copperclaw_db::tables::messaging_group_agents::{upsert as upsert_wire, UpsertWiring};
-    use copperclaw_db::tables::messaging_groups::{upsert as upsert_mg, UpsertMessagingGroup};
-    use copperclaw_modules::context::{
-        GateDecision, InterceptorDecision, SenderScopeDecision,
-    };
+    use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+    use copperclaw_db::tables::messaging_group_agents::{UpsertWiring, upsert as upsert_wire};
+    use copperclaw_db::tables::messaging_groups::{UpsertMessagingGroup, upsert as upsert_mg};
+    use copperclaw_modules::context::{GateDecision, InterceptorDecision, SenderScopeDecision};
     use copperclaw_types::{
         ChannelType, EngageMode, InboundMessage, MessageKind, SenderIdentity, SessionMode, UserId,
     };
@@ -868,8 +862,8 @@ mod tests {
             other => panic!("unexpected: {other:?}"),
         }
         // The unregistered sender was recorded.
-        let rows = copperclaw_db::tables::unregistered_senders::list(fx.router.central(), None)
-            .unwrap();
+        let rows =
+            copperclaw_db::tables::unregistered_senders::list(fx.router.central(), None).unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -903,8 +897,8 @@ mod tests {
         let fx = fixture(SessionMode::Shared);
         // No sender resolver — leaves user_id as None.
         let _ = fx.router.route(event(None, "m1")).await.unwrap();
-        let rows = copperclaw_db::tables::unregistered_senders::list(fx.router.central(), None)
-            .unwrap();
+        let rows =
+            copperclaw_db::tables::unregistered_senders::list(fx.router.central(), None).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].platform_id, "user-1");
     }
@@ -1085,7 +1079,10 @@ mod tests {
         let pending = SenderScopeDecision::Pending("b".into());
         assert_eq!(scope_reason(Some(&deny)), "scope_deny:a");
         assert_eq!(scope_reason(Some(&pending)), "scope_pending:b");
-        assert_eq!(scope_reason(Some(&SenderScopeDecision::Allow)), "scope_allow");
+        assert_eq!(
+            scope_reason(Some(&SenderScopeDecision::Allow)),
+            "scope_allow"
+        );
         assert_eq!(
             scope_reason(Some(&SenderScopeDecision::Defer)),
             "unknown_sender"
@@ -1132,7 +1129,8 @@ mod tests {
         let root: Arc<dyn SessionRoot + Send + Sync> = Arc::new(FsSessionRoot::new(tmp.path()));
         let router = Router::new(db, root);
         let _ = router.route(event(None, "m1")).await.unwrap();
-        let dropped = copperclaw_db::tables::dropped_messages::list(router.central(), None).unwrap();
+        let dropped =
+            copperclaw_db::tables::dropped_messages::list(router.central(), None).unwrap();
         assert_eq!(dropped.len(), 1);
         assert_eq!(dropped[0].reason, "no_messaging_group");
     }

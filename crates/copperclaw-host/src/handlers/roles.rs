@@ -1,11 +1,11 @@
 //! Handlers for `roles.*` commands.
 
 use super::{db_err, opt_str, parse_uuid, req_str};
+use copperclaw_cclaw::ErrorPayload;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::user_roles;
-use copperclaw_cclaw::ErrorPayload;
 use copperclaw_types::{AgentGroupId, UserId};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub fn list(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     // Filter by user_id when supplied; otherwise return globals.
@@ -51,9 +51,8 @@ pub fn revoke(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> 
 }
 
 fn parse_role(s: &str) -> Result<user_roles::Role, ErrorPayload> {
-    user_roles::Role::parse(s).ok_or_else(|| {
-        ErrorPayload::new("bad_request", format!("unknown role `{s}`"))
-    })
+    user_roles::Role::parse(s)
+        .ok_or_else(|| ErrorPayload::new("bad_request", format!("unknown role `{s}`")))
 }
 
 fn role_to_json(r: &user_roles::UserRole) -> Value {
@@ -150,7 +149,7 @@ mod tests {
 
     #[test]
     fn grant_scoped_to_agent_group() {
-        use copperclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+        use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
         let (db, u) = db_with_user("alice");
         let g = create_ag(
             &db,

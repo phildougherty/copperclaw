@@ -71,8 +71,7 @@ pub struct SubagentInputs {
 /// The "you're a focused subagent" preamble bolted onto the parent
 /// system prompt. Kept short on purpose — every byte here is paid by
 /// every subagent call.
-pub const SUBAGENT_PREAMBLE: &str =
-    "You are a focused research subagent. Read the user task carefully, use the \
+pub const SUBAGENT_PREAMBLE: &str = "You are a focused research subagent. Read the user task carefully, use the \
      read-only tools you have to gather what you need, then produce a SINGLE \
      concise final summary as your last assistant turn. Do NOT chat, do NOT \
      ask questions, do NOT speculate beyond what your tool calls confirmed. \
@@ -126,12 +125,7 @@ pub async fn run_inner_loop(
         .filter(|(name, _)| allow.contains(name.as_str()))
         .map(|(_, entry)| ToolDef {
             name: entry.tool.name.to_string(),
-            description: entry
-                .tool
-                .description
-                .as_deref()
-                .unwrap_or("")
-                .to_string(),
+            description: entry.tool.description.as_deref().unwrap_or("").to_string(),
             input_schema: serde_json::Value::Object((*entry.tool.input_schema).clone()),
         })
         .collect();
@@ -195,22 +189,18 @@ pub async fn run_inner_loop(
             display_name: None,
         };
 
-        let mut query = match tokio::time::timeout(
-            deps.provider_deadline,
-            deps.provider.query(input),
-        )
-        .await
-        {
-            Ok(Ok(q)) => q,
-            Ok(Err(err)) => return Err(err),
-            Err(_elapsed) => {
-                return Err(ProviderError::DeadlineExceeded {
-                    deadline_ms: u64::try_from(deps.provider_deadline.as_millis())
-                        .unwrap_or(u64::MAX),
-                    attempts: 1,
-                });
-            }
-        };
+        let mut query =
+            match tokio::time::timeout(deps.provider_deadline, deps.provider.query(input)).await {
+                Ok(Ok(q)) => q,
+                Ok(Err(err)) => return Err(err),
+                Err(_elapsed) => {
+                    return Err(ProviderError::DeadlineExceeded {
+                        deadline_ms: u64::try_from(deps.provider_deadline.as_millis())
+                            .unwrap_or(u64::MAX),
+                        attempts: 1,
+                    });
+                }
+            };
 
         let mut text = String::new();
         let mut pending_calls: Vec<PendingCall> = Vec::new();
@@ -437,7 +427,7 @@ fn short_type(v: &serde_json::Value) -> &'static str {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use copperclaw_mcp::{tools::ToolHandler, SubagentRequest};
+    use copperclaw_mcp::{SubagentRequest, tools::ToolHandler};
     use copperclaw_providers::{AgentProvider, AgentQuery};
     use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
     use std::borrow::Cow;
@@ -463,10 +453,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "scripted"
         }
-        async fn query(
-            &self,
-            _input: QueryInput,
-        ) -> Result<Box<dyn AgentQuery>, ProviderError> {
+        async fn query(&self, _input: QueryInput) -> Result<Box<dyn AgentQuery>, ProviderError> {
             self.observed_queries
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let events = {
@@ -519,8 +506,8 @@ mod tests {
             arguments: Option<JsonObject>,
             _ctx: &dyn ToolContext,
         ) -> Result<CallToolResult, copperclaw_mcp::ToolError> {
-            let body = serde_json::to_string(&arguments)
-                .unwrap_or_else(|_| "<unserialisable>".into());
+            let body =
+                serde_json::to_string(&arguments).unwrap_or_else(|_| "<unserialisable>".into());
             Ok(CallToolResult::success(vec![Content::text(format!(
                 "echo: {body}"
             ))]))

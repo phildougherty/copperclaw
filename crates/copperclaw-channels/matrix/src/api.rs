@@ -63,10 +63,7 @@ pub struct MatrixApi {
 
 impl MatrixApi {
     /// Build a client.
-    pub fn new(
-        homeserver_url: impl Into<String>,
-        access_token: impl Into<String>,
-    ) -> Self {
+    pub fn new(homeserver_url: impl Into<String>, access_token: impl Into<String>) -> Self {
         Self::with_client(
             Client::new(),
             homeserver_url,
@@ -110,11 +107,7 @@ impl MatrixApi {
 
     /// `PUT /_matrix/client/v3/rooms/{roomId}/send/m.room.message/{txnId}`
     /// with a `m.text` body. Returns the new event id.
-    pub async fn send_text(
-        &self,
-        room_id: &str,
-        text: &str,
-    ) -> Result<SendResponse, AdapterError> {
+    pub async fn send_text(&self, room_id: &str, text: &str) -> Result<SendResponse, AdapterError> {
         let body = json!({ "msgtype": "m.text", "body": text });
         self.send_room_event(room_id, "m.room.message", body).await
     }
@@ -481,9 +474,8 @@ async fn read_matrix_json(resp: Response) -> Result<Value, AdapterError> {
     };
 
     if status.is_success() {
-        return parsed.ok_or_else(|| {
-            AdapterError::Transport(format!("matrix response not JSON: {body}"))
-        });
+        return parsed
+            .ok_or_else(|| AdapterError::Transport(format!("matrix response not JSON: {body}")));
     }
 
     Err(classify_error(status, parsed.as_ref(), retry_after_header))
@@ -507,9 +499,7 @@ pub(crate) fn classify_error(
                 .and_then(|v| v.get("retry_after_ms"))
                 .and_then(Value::as_u64);
             return AdapterError::Rate {
-                retry_after: retry_after_ms
-                    .map(ms_to_secs_ceil)
-                    .or(retry_after_header),
+                retry_after: retry_after_ms.map(ms_to_secs_ceil).or(retry_after_header),
             };
         }
         return map_errcode(code, description, retry_after_header);
@@ -538,9 +528,7 @@ pub(crate) fn map_errcode(
     retry_after_header: Option<u64>,
 ) -> AdapterError {
     match code {
-        "M_UNKNOWN_TOKEN" | "M_MISSING_TOKEN" | "M_FORBIDDEN" => {
-            AdapterError::Auth(description)
-        }
+        "M_UNKNOWN_TOKEN" | "M_MISSING_TOKEN" | "M_FORBIDDEN" => AdapterError::Auth(description),
         "M_LIMIT_EXCEEDED" => AdapterError::Rate {
             retry_after: retry_after_header,
         },
@@ -567,7 +555,9 @@ mod tests {
     async fn send_text_returns_event_id() {
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .and(header("authorization", "Bearer tok"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$evt:m.org"
@@ -582,7 +572,9 @@ mod tests {
     async fn send_html_returns_event_id() {
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$h:m.org"
             })))
@@ -599,7 +591,9 @@ mod tests {
     async fn send_threaded_includes_relates_to_thread() {
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .and(wiremock::matchers::body_string_contains("\"m.thread\""))
             .and(wiremock::matchers::body_string_contains("\"$root:m.org\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -618,9 +612,13 @@ mod tests {
     async fn edit_message_uses_m_replace() {
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .and(wiremock::matchers::body_string_contains("\"m.replace\""))
-            .and(wiremock::matchers::body_string_contains("\"m.new_content\""))
+            .and(wiremock::matchers::body_string_contains(
+                "\"m.new_content\"",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$e:m.org"
             })))
@@ -637,7 +635,9 @@ mod tests {
     async fn reaction_uses_m_annotation_event_type() {
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.reaction/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.reaction/.+",
+            ))
             .and(wiremock::matchers::body_string_contains("\"m.annotation\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$r:m.org"
@@ -674,7 +674,9 @@ mod tests {
     async fn send_media_message_references_mxc_uri() {
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .and(wiremock::matchers::body_string_contains("mxc://m.org/abc"))
             .and(wiremock::matchers::body_string_contains("\"m.file\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -701,7 +703,9 @@ mod tests {
     async fn send_media_message_with_thread() {
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .and(wiremock::matchers::body_string_contains("\"m.thread\""))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$f2:m.org"
@@ -845,7 +849,9 @@ mod tests {
     async fn send_text_auth_error_401() {
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .respond_with(ResponseTemplate::new(401).set_body_json(json!({
                 "errcode": "M_MISSING_TOKEN", "error": "missing"
             })))
@@ -859,7 +865,9 @@ mod tests {
     async fn send_text_m_forbidden_is_auth() {
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .respond_with(ResponseTemplate::new(403).set_body_json(json!({
                 "errcode": "M_FORBIDDEN", "error": "no"
             })))
@@ -873,7 +881,9 @@ mod tests {
     async fn send_text_unknown_token_is_auth() {
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .respond_with(ResponseTemplate::new(401).set_body_json(json!({
                 "errcode": "M_UNKNOWN_TOKEN", "error": "expired"
             })))
@@ -887,7 +897,9 @@ mod tests {
     async fn send_text_rate_limit_uses_json_retry_after_ms() {
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .respond_with(ResponseTemplate::new(429).set_body_json(json!({
                 "errcode": "M_LIMIT_EXCEEDED",
                 "error": "slow down",
@@ -906,7 +918,9 @@ mod tests {
     async fn send_text_rate_limit_falls_back_to_retry_after_header() {
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .respond_with(
                 ResponseTemplate::new(429)
                     .insert_header("retry-after", "5")
@@ -915,14 +929,21 @@ mod tests {
             .mount(&s)
             .await;
         let err = api(&s.uri()).send_text("!a:m.org", "x").await.unwrap_err();
-        assert!(matches!(err, AdapterError::Rate { retry_after: Some(5) }));
+        assert!(matches!(
+            err,
+            AdapterError::Rate {
+                retry_after: Some(5)
+            }
+        ));
     }
 
     #[tokio::test]
     async fn send_text_rate_limit_with_no_hint() {
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .respond_with(ResponseTemplate::new(429).set_body_string(""))
             .mount(&s)
             .await;
@@ -934,7 +955,9 @@ mod tests {
     async fn send_text_404_is_bad_request() {
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .respond_with(ResponseTemplate::new(404).set_body_json(json!({
                 "errcode": "M_NOT_FOUND", "error": "no such room"
             })))
@@ -948,7 +971,9 @@ mod tests {
     async fn send_text_5xx_is_transport() {
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .respond_with(ResponseTemplate::new(503).set_body_string("upstream"))
             .mount(&s)
             .await;
@@ -960,7 +985,9 @@ mod tests {
     async fn send_text_3xx_is_transport() {
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .respond_with(ResponseTemplate::new(304).set_body_string(""))
             .mount(&s)
             .await;
@@ -972,7 +999,9 @@ mod tests {
     async fn send_text_other_4xx_no_errcode_is_bad_request() {
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .respond_with(ResponseTemplate::new(418).set_body_string("teapot"))
             .mount(&s)
             .await;
@@ -984,7 +1013,9 @@ mod tests {
     async fn send_text_other_errcode_is_bad_request() {
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .respond_with(ResponseTemplate::new(400).set_body_json(json!({
                 "errcode": "M_INVALID_PARAM", "error": "bad"
             })))
@@ -998,7 +1029,9 @@ mod tests {
     async fn malformed_success_body_is_transport() {
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
             .mount(&s)
             .await;
@@ -1010,7 +1043,9 @@ mod tests {
     async fn success_body_missing_event_id_is_transport() {
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
             .mount(&s)
             .await;
@@ -1030,14 +1065,21 @@ mod tests {
         // 429 status code without an M_LIMIT_EXCEEDED errcode.
         let s = MockServer::start().await;
         Mock::given(method("PUT"))
-            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
             .respond_with(ResponseTemplate::new(429).set_body_json(json!({
                 "retry_after_ms": 1000
             })))
             .mount(&s)
             .await;
         let err = api(&s.uri()).send_text("!a:m.org", "x").await.unwrap_err();
-        assert!(matches!(err, AdapterError::Rate { retry_after: Some(1) }));
+        assert!(matches!(
+            err,
+            AdapterError::Rate {
+                retry_after: Some(1)
+            }
+        ));
     }
 
     #[test]
@@ -1054,7 +1096,9 @@ mod tests {
     fn map_errcode_rate() {
         assert!(matches!(
             map_errcode("M_LIMIT_EXCEEDED", "x".into(), Some(7)),
-            AdapterError::Rate { retry_after: Some(7) }
+            AdapterError::Rate {
+                retry_after: Some(7)
+            }
         ));
     }
 
