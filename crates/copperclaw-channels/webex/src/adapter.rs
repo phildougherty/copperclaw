@@ -1403,6 +1403,7 @@ mod tests {
             detail: Some("cargo test".into()),
             status: BreadcrumbStatus::Done,
             summary: Some("passed (0.4s)".into()),
+            steps: Vec::new(),
         };
         let id = a
             .deliver_breadcrumb("R1", None, &bc, Some("BC-OLD"))

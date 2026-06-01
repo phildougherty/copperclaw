@@ -138,6 +138,10 @@ pub(super) async fn drive_turn(
     context_block: Option<&str>,
 ) -> Result<TurnResult> {
     let mut continuation: Option<String> = previous_continuation.map(str::to_string);
+    // Start a fresh rolling-activity chip for this turn (no-op unless
+    // COPPERCLAW_BREADCRUMB_STYLE=rolling). Subsequent tool starts/finishes
+    // accumulate into the one aggregate chip until the next drive_turn.
+    deps.tool_ctx.begin_activity();
     // Counts consecutive turns whose output included any
     // parse-error-tagged tool call. Reset when a turn produces a
     // parse-error-free output. Bounded by

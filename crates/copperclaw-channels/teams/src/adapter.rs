@@ -1261,6 +1261,7 @@ mod tests {
             detail: Some("cargo test".into()),
             status: BreadcrumbStatus::Done,
             summary: Some("passed (0.4s)".into()),
+            steps: Vec::new(),
         };
         let id = adapter
             .deliver_breadcrumb("team/T1/channel/C1", None, &bc, Some("BC-1"))

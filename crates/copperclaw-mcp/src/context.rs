@@ -472,6 +472,13 @@ pub trait ToolContext: Send + Sync {
         let _ = (tool_name, input);
     }
 
+    /// Mark the start of a new turn for rolling-activity breadcrumbs:
+    /// implementations clear any accumulated tool steps so the next tool
+    /// opens a fresh aggregate chip. Called by the runner at the top of
+    /// each `drive_turn`. Default no-op (legacy per-tool chips and mocks
+    /// don't aggregate).
+    fn begin_activity(&self) {}
+
     /// Finalisation half of [`Self::emit_breadcrumb`] — called once
     /// the tool returns (or fails). `ok` indicates success, `summary`
     /// is the optional post-completion blurb (`"passed (0.4s)"`,

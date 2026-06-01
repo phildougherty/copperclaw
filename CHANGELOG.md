@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (rolling activity breadcrumbs — Telegram — 2026-06-01)
+
+Opt-in low-profile tool-progress UX (`COPPERCLAW_BREADCRUMB_STYLE=rolling`).
+Instead of one chip message per tool call (a long turn stacks up dozens),
+a turn shows a single rolling **activity chip**: a collapsed one-line
+summary (current tool + N/total steps) over a Telegram
+`<blockquote expandable>` whose body lists every step, each styled
+individually — ASCII status marker (`[~]`/`[ok]`/`[x]`), **bold** tool
+name, `<code>` detail, _italic_ result — real HTML, not raw markdown. Tap
+to expand the full tool history; collapsed by default to keep chat quiet.
+
+- `Breadcrumb` gains `steps: Vec<Breadcrumb>` (the expandable list); empty
+  for the legacy per-tool chip. Backward-compatible — other adapters
+  ignore it and still render the collapsed summary line.
+- The runner accumulates a turn's tool steps and edits one chip in place
+  (stable `activity` pseudo-tool so the host's existing breadcrumb
+  correlation targets one message), reset each `drive_turn` via the new
+  `ToolContext::begin_activity` hook. Default stays `chips` — no regression.
+- Telegram renders the aggregate, capped at 40 steps with a `+N earlier`
+  note to stay under the message-size limit.
+- Reuses the existing `<blockquote expandable>` primitive (the same one
+  thinking blocks use). Other channels fall back to the summary line until
+  their adapters gain native expand affordances.
+
 ### Fixed (compaction crash-loop on a tool-pair boundary — 2026-06-01)
 
 `compact()` sliced the transcript at a blind `len/2` midpoint to summarize

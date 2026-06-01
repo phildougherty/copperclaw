@@ -102,6 +102,16 @@ pub struct Breadcrumb {
     /// `timeout`). Only meaningful on `Done` / `Failed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// Sub-steps for a rolling "activity" chip. When non-empty the
+    /// top-level fields are the collapsed one-line summary (current
+    /// activity + count) and these are the individual tool steps shown
+    /// in an expandable region — Telegram `<blockquote expandable>`,
+    /// Slack thread, Discord spoiler. Each step is styled on its own
+    /// (bold tool, monospace detail, status marker) rather than dumped as
+    /// raw text. Empty for an ordinary single-tool chip; steps never nest
+    /// (a step's own `steps` stays empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<Breadcrumb>,
 }
 
 /// Errors raised by [`Breadcrumb::validate`].
@@ -144,6 +154,7 @@ impl Breadcrumb {
             detail: None,
             status: BreadcrumbStatus::Running,
             summary: None,
+            steps: Vec::new(),
         }
     }
 
@@ -152,6 +163,14 @@ impl Breadcrumb {
     #[must_use]
     pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
+        self
+    }
+
+    /// Attach the rolling sub-step list (for the aggregate "activity"
+    /// chip). The top-level fields stay the collapsed summary.
+    #[must_use]
+    pub fn with_steps(mut self, steps: Vec<Breadcrumb>) -> Self {
+        self.steps = steps;
         self
     }
 

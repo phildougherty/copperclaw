@@ -790,16 +790,31 @@ pub(crate) fn render_diff_markdown_v2(diff: &DiffCard) -> String {
     out
 }
 
-pub(crate) fn render_breadcrumb_html(b: &Breadcrumb) -> String {
-    // ASCII-only status markers per the project's no-emoji rule.
-    // Even non-emoji Unicode symbols (U+23F3 hourglass, U+2713 check,
-    // U+2717 cross) get rendered as colourful emoji on iOS Telegram —
-    // user-visible emoji either way. Plain ASCII squarely sidesteps that.
-    let glyph = match b.status {
+/// ASCII-only status marker per the project's no-emoji rule. Even
+/// non-emoji Unicode symbols (U+23F3 hourglass, U+2713 check, U+2717
+/// cross) get rendered as colourful emoji on iOS Telegram — user-visible
+/// emoji either way. Plain ASCII squarely sidesteps that.
+fn breadcrumb_glyph(status: BreadcrumbStatus) -> &'static str {
+    match status {
         BreadcrumbStatus::Running => "[~]",
         BreadcrumbStatus::Done => "[ok]",
         BreadcrumbStatus::Failed => "[x]",
-    };
+    }
+}
+
+/// Cap on steps rendered inside the expandable region — keeps the whole
+/// message well under Telegram's ~4096-char limit on a long turn. Older
+/// steps beyond this are summarised as a `+N earlier` line.
+const ACTIVITY_MAX_STEPS: usize = 40;
+
+pub(crate) fn render_breadcrumb_html(b: &Breadcrumb) -> String {
+    // Aggregate "activity" chip: a collapsed summary line plus an
+    // expandable, per-step-styled list. Each step is real Telegram HTML
+    // (bold tool, <code> detail, italic summary), not raw text.
+    if !b.steps.is_empty() {
+        return render_activity_html(b);
+    }
+    let glyph = breadcrumb_glyph(b.status);
     let mut out = String::with_capacity(64);
     out.push_str(glyph);
     out.push(' ');
@@ -823,6 +838,78 @@ pub(crate) fn render_breadcrumb_html(b: &Breadcrumb) -> String {
             }
             out.push_str(&escape_html(s));
         }
+    }
+    out
+}
+
+/// Render the rolling aggregate "activity" chip: a one-line collapsed
+/// summary (current activity + completed/total count) followed by a
+/// `<blockquote expandable>` whose body is one styled line per tool step.
+///
+/// ```text
+/// [~] edit_file src/HomePage.tsx · 14/20 steps
+/// <blockquote expandable>
+/// [ok] <b>read_file</b> <code>src/App.tsx</code> <i>— 120 lines</i>
+/// [ok] <b>edit_file</b> <code>src/HomePage.tsx</code> <i>— wrote 12 lines</i>
+/// [~] <b>shell</b> <code>npm run build</code>
+/// </blockquote>
+/// ```
+fn render_activity_html(b: &Breadcrumb) -> String {
+    let mut out = String::with_capacity(128 + b.steps.len() * 56);
+    // Collapsed summary line from the top-level fields.
+    out.push_str(breadcrumb_glyph(b.status));
+    out.push(' ');
+    match b.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => out.push_str(&escape_html(d)),
+        None => out.push_str("working"),
+    }
+    if let Some(s) = b.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(" · ");
+        out.push_str(&escape_html(s));
+    }
+    out.push('\n');
+    // Expandable body — one styled line per step, newest-biased when the
+    // turn ran more than ACTIVITY_MAX_STEPS tools.
+    out.push_str("<blockquote expandable>");
+    let total = b.steps.len();
+    let shown = b.steps.iter().skip(total.saturating_sub(ACTIVITY_MAX_STEPS));
+    let hidden = total.saturating_sub(ACTIVITY_MAX_STEPS);
+    if hidden > 0 {
+        out.push_str(&format!("<i>+{hidden} earlier step(s)</i>\n"));
+    }
+    for (i, step) in shown.enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        out.push_str(&render_step_line_html(step));
+    }
+    out.push_str("</blockquote>");
+    out
+}
+
+/// One styled step line for the expandable activity body: status marker,
+/// bold tool name, `<code>` detail, italic summary. Every dynamic field is
+/// HTML-escaped individually so source paths / commands round-trip without
+/// leaking raw markup.
+fn render_step_line_html(s: &Breadcrumb) -> String {
+    let mut out = String::with_capacity(48);
+    out.push_str(breadcrumb_glyph(s.status));
+    out.push_str(" <b>");
+    out.push_str(&escape_html(&s.tool_name));
+    out.push_str("</b>");
+    if let Some(d) = s.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        out.push_str(" <code>");
+        out.push_str(&escape_html(d));
+        out.push_str("</code>");
+    }
+    if let Some(sum) = s.summary.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+        if s.status == BreadcrumbStatus::Failed {
+            out.push_str(" <i>— failed: ");
+        } else {
+            out.push_str(" <i>— ");
+        }
+        out.push_str(&escape_html(sum));
+        out.push_str("</i>");
     }
     out
 }
@@ -2852,6 +2939,63 @@ mod tests {
             .with_detail("echo <hi> & bye");
         let html = super::render_breadcrumb_html(&bc);
         assert!(html.contains("echo &lt;hi&gt; &amp; bye"), "got: {html}");
+    }
+
+    #[test]
+    fn render_breadcrumb_aggregate_renders_styled_expandable_steps() {
+        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
+        let steps = vec![
+            Breadcrumb::running("read_file")
+                .with_detail("src/App.tsx")
+                .finished(true, Some("120 lines".into())),
+            Breadcrumb::running("shell").with_detail("npm run build"),
+        ];
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("shell npm run build".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("1/2 steps".into()),
+            steps,
+        };
+        let html = super::render_breadcrumb_html(&agg);
+        // Collapsed summary line with ASCII marker + count.
+        assert!(
+            html.starts_with("[~] shell npm run build · 1/2 steps"),
+            "summary line: {html}"
+        );
+        // Expandable region present.
+        assert!(html.contains("<blockquote expandable>"));
+        assert!(html.contains("</blockquote>"));
+        // Each step individually styled (bold tool, <code> detail, italic
+        // summary) — not raw markdown.
+        assert!(html.contains("[ok] <b>read_file</b> <code>src/App.tsx</code> <i>— 120 lines</i>"));
+        assert!(html.contains("[~] <b>shell</b> <code>npm run build</code>"));
+        assert!(!html.contains("**"), "no raw markdown: {html}");
+    }
+
+    #[test]
+    fn render_breadcrumb_aggregate_escapes_and_caps_steps() {
+        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
+        let mut steps: Vec<Breadcrumb> = (0..50)
+            .map(|i| {
+                Breadcrumb::running("shell")
+                    .with_detail(format!("step {i}"))
+                    .finished(true, None)
+            })
+            .collect();
+        steps.push(Breadcrumb::running("write_file").with_detail("a <b> & c"));
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("write_file a <b> & c".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("50/51 steps".into()),
+            steps,
+        };
+        let html = super::render_breadcrumb_html(&agg);
+        // Over the cap → "+N earlier step(s)" prefix inside the blockquote.
+        assert!(html.contains("earlier step(s)"), "cap note: {html}");
+        // HTML in a detail is escaped (no raw < > & reaching the client).
+        assert!(html.contains("a &lt;b&gt; &amp; c"), "escaped: {html}");
     }
 
     #[test]

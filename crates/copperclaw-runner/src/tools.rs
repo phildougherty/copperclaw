@@ -187,7 +187,46 @@ pub struct RunnerToolCtx {
     /// Stays `false` forever for root sessions (no `source_session_id`),
     /// so the gate is a no-op for the top-level conversation.
     parent_reply_sent: Arc<std::sync::atomic::AtomicBool>,
+    /// Chip presentation: `Chips` (one chip message per tool, legacy
+    /// default) or `Rolling` (one aggregate "activity" chip per turn that
+    /// accumulates every tool step into an expandable region). Set via
+    /// `COPPERCLAW_BREADCRUMB_STYLE`.
+    breadcrumb_style: BreadcrumbStyle,
+    /// Rolling-mode accumulator for the current turn (the steps shown in
+    /// the aggregate chip's expandable region, plus whether the chip has
+    /// been emitted yet this turn). Reset by [`Self::begin_activity`].
+    activity: Arc<std::sync::Mutex<ActivityState>>,
 }
+
+/// How tool-progress breadcrumbs are presented in chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BreadcrumbStyle {
+    /// One chip message per tool call, edited Running → Done in place.
+    #[default]
+    Chips,
+    /// One aggregate "activity" chip per turn: a collapsed summary line
+    /// plus an expandable, per-step-styled list of every tool the turn
+    /// ran. Far less chat churn for long, tool-heavy turns.
+    Rolling,
+}
+
+/// Per-turn accumulator backing [`BreadcrumbStyle::Rolling`].
+#[derive(Debug, Default)]
+struct ActivityState {
+    /// Tool steps for the current turn, in start order. Each is a
+    /// `Breadcrumb` (tool/detail/status/summary) the renderer styles
+    /// individually inside the expandable region.
+    steps: Vec<copperclaw_channels_core::Breadcrumb>,
+    /// True once the aggregate chip has been emitted this turn, so later
+    /// events edit it (via `update_breadcrumb`) instead of opening a new
+    /// chip. Reset to `false` at the start of each turn.
+    chip_open: bool,
+}
+
+/// Stable pseudo tool-name the aggregate chip rides under so the host's
+/// "most recent Breadcrumb row for this tool/origin" correlation edits
+/// the same chip across a turn's tool events.
+const ACTIVITY_CHIP_TOOL: &str = "activity";
 
 impl RunnerToolCtx {
     /// Build a fresh context around the given outbound DB handle and outbox
@@ -203,6 +242,8 @@ impl RunnerToolCtx {
             source_session_id: None,
             breadcrumbs_enabled: false,
             parent_reply_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            breadcrumb_style: BreadcrumbStyle::default(),
+            activity: Arc::new(std::sync::Mutex::new(ActivityState::default())),
         }
     }
 
@@ -234,6 +275,15 @@ impl RunnerToolCtx {
             std::env::var("COPPERCLAW_TOOL_BREADCRUMBS").ok().as_deref(),
             Some("0" | "false" | "no" | "off")
         );
+        // `rolling` collapses a turn's tools into one expandable activity
+        // chip; anything else (incl. unset) keeps the legacy per-tool chips.
+        self.breadcrumb_style = match std::env::var("COPPERCLAW_BREADCRUMB_STYLE")
+            .ok()
+            .as_deref()
+        {
+            Some("rolling") => BreadcrumbStyle::Rolling,
+            _ => BreadcrumbStyle::Chips,
+        };
         self
     }
 
@@ -243,6 +293,27 @@ impl RunnerToolCtx {
     pub fn with_breadcrumbs_enabled(mut self, enabled: bool) -> Self {
         self.breadcrumbs_enabled = enabled;
         self
+    }
+
+    /// Force the breadcrumb presentation style. Used by tests.
+    #[must_use]
+    pub fn with_breadcrumb_style(mut self, style: BreadcrumbStyle) -> Self {
+        self.breadcrumb_style = style;
+        self
+    }
+
+    /// Start a fresh rolling-activity turn: clear the accumulated steps so
+    /// the next tool opens a new aggregate chip. Called via the
+    /// [`copperclaw_mcp::ToolContext::begin_activity`] trait hook at the
+    /// top of each `drive_turn`. No-op in `Chips` mode.
+    fn reset_activity(&self) {
+        if self.breadcrumb_style != BreadcrumbStyle::Rolling {
+            return;
+        }
+        if let Ok(mut act) = self.activity.lock() {
+            act.steps.clear();
+            act.chip_open = false;
+        }
     }
 
     /// Emit a [`MessageKind::Breadcrumb`] outbound row capturing the
@@ -288,18 +359,61 @@ impl RunnerToolCtx {
         // Falls back to None when extraction fails so the renderer
         // shows just `[tool_name]`.
         let detail = input.and_then(|v| breadcrumb_detail(tool_name, v));
+        if self.breadcrumb_style == BreadcrumbStyle::Rolling {
+            self.emit_rolling_start(tool_name, detail, &origin).await;
+            return;
+        }
         let breadcrumb = copperclaw_channels_core::Breadcrumb {
             tool_name: tool_name.to_owned(),
             detail,
             status: copperclaw_channels_core::BreadcrumbStatus::Running,
             summary: None,
+            steps: Vec::new(),
         };
         // `breadcrumb.validate()` is best-effort: a too-long detail
         // would just cap the renderer's display. Skip validation here
         // (the runner already truncates detail strings to 80 chars).
-        let body = serde_json::json!({
-            "breadcrumb": breadcrumb,
-        });
+        self.insert_breadcrumb_row(&breadcrumb, &origin).await;
+    }
+
+    /// Rolling-mode tool start: append a `Running` step and emit (first
+    /// tool of the turn) or edit (subsequent) the single aggregate chip.
+    async fn emit_rolling_start(
+        &self,
+        tool_name: &str,
+        detail: Option<String>,
+        origin: &OriginatingRouting,
+    ) {
+        let (aggregate, first) = {
+            let Ok(mut act) = self.activity.lock() else {
+                return;
+            };
+            act.steps.push(copperclaw_channels_core::Breadcrumb {
+                tool_name: tool_name.to_owned(),
+                detail,
+                status: copperclaw_channels_core::BreadcrumbStatus::Running,
+                summary: None,
+                steps: Vec::new(),
+            });
+            let first = !act.chip_open;
+            act.chip_open = true;
+            (activity_aggregate(&act.steps), first)
+        };
+        if first {
+            self.insert_breadcrumb_row(&aggregate, origin).await;
+        } else {
+            self.insert_update_breadcrumb_row(ACTIVITY_CHIP_TOOL, &aggregate, origin)
+                .await;
+        }
+    }
+
+    /// Insert a first-emit `MessageKind::Breadcrumb` row (a new chip).
+    async fn insert_breadcrumb_row(
+        &self,
+        breadcrumb: &copperclaw_channels_core::Breadcrumb,
+        origin: &OriginatingRouting,
+    ) {
+        let body = serde_json::json!({ "breadcrumb": breadcrumb });
         let routed = OutboundRouting {
             kind: MessageKind::Breadcrumb,
             body_to: None,
@@ -311,6 +425,33 @@ impl RunnerToolCtx {
         let mut guard = self.outbound.lock().await;
         let conn: &mut Connection = &mut guard;
         let _ = insert_outbound_row(conn, MessageId::new(), body, &routed);
+    }
+
+    /// Insert an `update_breadcrumb` System row that edits the prior chip
+    /// for `tool_name` in place (on adapters with an edit API).
+    async fn insert_update_breadcrumb_row(
+        &self,
+        tool_name: &str,
+        breadcrumb: &copperclaw_channels_core::Breadcrumb,
+        origin: &OriginatingRouting,
+    ) {
+        let payload = serde_json::json!({
+            "update_breadcrumb": {
+                "tool_name": tool_name,
+                "breadcrumb": breadcrumb,
+            }
+        });
+        let routed = OutboundRouting {
+            kind: MessageKind::System,
+            body_to: None,
+            channel_type: origin.channel_type.clone(),
+            platform_id: origin.platform_id.clone(),
+            thread_id: origin.thread_id.clone(),
+            in_reply_to: None,
+        };
+        let mut guard = self.outbound.lock().await;
+        let conn: &mut Connection = &mut guard;
+        let _ = insert_outbound_row(conn, MessageId::new(), payload, &routed);
     }
 
     /// Finalisation half of [`Self::emit_breadcrumb`]. Writes a
@@ -344,6 +485,11 @@ impl RunnerToolCtx {
         }
         let origin = self.current_originating();
         let detail = input.and_then(|v| breadcrumb_detail(tool_name, v));
+        if self.breadcrumb_style == BreadcrumbStyle::Rolling {
+            self.emit_rolling_finish(tool_name, detail, ok, summary, &origin)
+                .await;
+            return;
+        }
         let status = if ok {
             copperclaw_channels_core::BreadcrumbStatus::Done
         } else {
@@ -354,29 +500,64 @@ impl RunnerToolCtx {
             detail,
             status,
             summary: summary.map(str::to_owned),
+            steps: Vec::new(),
         };
-        let payload = serde_json::json!({
-            "update_breadcrumb": {
-                "tool_name": tool_name,
-                "breadcrumb": breadcrumb,
-            }
-        });
         // Update rows ride the System path so the delivery loop's
-        // existing system-action dispatch handles them — we register
-        // the handler in `copperclaw-host-delivery`. The row inherits
-        // the originating inbound's channel routing so the adapter
-        // can look up the prior chip's platform message id.
-        let routed = OutboundRouting {
-            kind: MessageKind::System,
-            body_to: None,
-            channel_type: origin.channel_type.clone(),
-            platform_id: origin.platform_id.clone(),
-            thread_id: origin.thread_id.clone(),
-            in_reply_to: None,
+        // existing system-action dispatch handles them. The row inherits
+        // the originating inbound's channel routing so the adapter can
+        // look up the prior chip's platform message id.
+        self.insert_update_breadcrumb_row(tool_name, &breadcrumb, &origin)
+            .await;
+    }
+
+    /// Rolling-mode tool finish: flip the matching `Running` step to
+    /// `Done`/`Failed` and edit the aggregate chip in place.
+    async fn emit_rolling_finish(
+        &self,
+        tool_name: &str,
+        detail: Option<String>,
+        ok: bool,
+        summary: Option<&str>,
+        origin: &OriginatingRouting,
+    ) {
+        let status = if ok {
+            copperclaw_channels_core::BreadcrumbStatus::Done
+        } else {
+            copperclaw_channels_core::BreadcrumbStatus::Failed
         };
-        let mut guard = self.outbound.lock().await;
-        let conn: &mut Connection = &mut guard;
-        let _ = insert_outbound_row(conn, MessageId::new(), payload, &routed);
+        let aggregate = {
+            let Ok(mut act) = self.activity.lock() else {
+                return;
+            };
+            // Flip the earliest still-running step for this tool. Parallel
+            // calls to the same tool finish in execution order, so the
+            // earliest Running one is the right match.
+            if let Some(step) = act
+                .steps
+                .iter_mut()
+                .find(|s| s.tool_name == tool_name && s.status == copperclaw_channels_core::BreadcrumbStatus::Running)
+            {
+                step.status = status;
+                step.summary = summary.map(str::to_owned);
+                if step.detail.is_none() {
+                    step.detail = detail;
+                }
+            } else {
+                // A finish with no matching start (shouldn't happen, but be
+                // safe): append it so the step is still surfaced.
+                act.steps.push(copperclaw_channels_core::Breadcrumb {
+                    tool_name: tool_name.to_owned(),
+                    detail,
+                    status,
+                    summary: summary.map(str::to_owned),
+                    steps: Vec::new(),
+                });
+                act.chip_open = true;
+            }
+            activity_aggregate(&act.steps)
+        };
+        self.insert_update_breadcrumb_row(ACTIVITY_CHIP_TOOL, &aggregate, origin)
+            .await;
     }
 
     /// Slice-3.5 opt-in emit path. Persists a structured
@@ -704,6 +885,10 @@ impl ToolContext for RunnerToolCtx {
         Self::emit_breadcrumb(self, tool_name, input).await;
     }
 
+    fn begin_activity(&self) {
+        self.reset_activity();
+    }
+
     async fn emit_breadcrumb_finish(
         &self,
         tool_name: &str,
@@ -924,6 +1109,54 @@ fn apply_effect(
 /// verbatim so we never accidentally swallow large chunks of
 /// legitimate prose. Case-insensitive open/close tags, multi-line
 /// content, leaves the surrounding text intact.
+/// Build the collapsed aggregate chip from the current rolling steps.
+/// The top-level fields are the one-line summary (current activity +
+/// completed/total count) shown collapsed; `steps` carries the full
+/// per-step list the renderer styles individually in the expandable
+/// region. The aggregate's `tool_name` is the stable [`ACTIVITY_CHIP_TOOL`]
+/// so the host correlation edits one chip across the turn.
+fn activity_aggregate(
+    steps: &[copperclaw_channels_core::Breadcrumb],
+) -> copperclaw_channels_core::Breadcrumb {
+    use copperclaw_channels_core::BreadcrumbStatus;
+    let total = steps.len();
+    let done = steps
+        .iter()
+        .filter(|s| s.status != BreadcrumbStatus::Running)
+        .count();
+    let any_running = steps.iter().any(|s| s.status == BreadcrumbStatus::Running);
+    let any_failed = steps.iter().any(|s| s.status == BreadcrumbStatus::Failed);
+    // Current activity = the latest still-running step, else the last step.
+    let current = steps
+        .iter()
+        .rev()
+        .find(|s| s.status == BreadcrumbStatus::Running)
+        .or_else(|| steps.last());
+    let detail = current.map(|s| match &s.detail {
+        Some(d) if !d.is_empty() => format!("{} {}", s.tool_name, d),
+        _ => s.tool_name.clone(),
+    });
+    let status = if any_running {
+        BreadcrumbStatus::Running
+    } else if any_failed {
+        BreadcrumbStatus::Failed
+    } else {
+        BreadcrumbStatus::Done
+    };
+    let summary = Some(if total == 1 {
+        "1 step".to_owned()
+    } else {
+        format!("{done}/{total} steps")
+    });
+    copperclaw_channels_core::Breadcrumb {
+        tool_name: ACTIVITY_CHIP_TOOL.to_owned(),
+        detail,
+        status,
+        summary,
+        steps: steps.to_vec(),
+    }
+}
+
 /// Allow-list of tool names that get a chat breadcrumb when
 /// `COPPERCLAW_TOOL_BREADCRUMBS=1`. Limited to tools that (a) take
 /// long enough that the user wants to know about them and (b)
@@ -1699,6 +1932,43 @@ mod tests {
         assert_eq!(
             breadcrumb_detail("shell", &input).as_deref(),
             Some("cargo test --workspace")
+        );
+    }
+
+    #[test]
+    fn activity_aggregate_summarises_steps_and_current() {
+        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
+        let steps = vec![
+            Breadcrumb::running("read_file")
+                .with_detail("a.rs")
+                .finished(true, Some("10 lines".into())),
+            Breadcrumb::running("shell").with_detail("cargo build"),
+        ];
+        let agg = activity_aggregate(&steps);
+        assert_eq!(agg.tool_name, ACTIVITY_CHIP_TOOL);
+        // A still-running step → overall Running.
+        assert_eq!(agg.status, BreadcrumbStatus::Running);
+        assert_eq!(agg.summary.as_deref(), Some("1/2 steps"));
+        // Current activity = the latest running step.
+        assert_eq!(agg.detail.as_deref(), Some("shell cargo build"));
+        assert_eq!(agg.steps.len(), 2);
+    }
+
+    #[test]
+    fn activity_aggregate_status_rolls_up_done_and_failed() {
+        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
+        let all_ok = vec![
+            Breadcrumb::running("a").finished(true, None),
+            Breadcrumb::running("b").finished(true, None),
+        ];
+        assert_eq!(activity_aggregate(&all_ok).status, BreadcrumbStatus::Done);
+        let with_fail = vec![
+            Breadcrumb::running("a").finished(true, None),
+            Breadcrumb::running("b").finished(false, Some("boom".into())),
+        ];
+        assert_eq!(
+            activity_aggregate(&with_fail).status,
+            BreadcrumbStatus::Failed
         );
     }
 
