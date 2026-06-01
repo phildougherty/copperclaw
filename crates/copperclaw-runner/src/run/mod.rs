@@ -147,9 +147,12 @@ pub const MAX_TOOL_TURNS_ENV: &str = "COPPERCLAW_MAX_TOOL_TURNS";
 
 /// Default tool-use cycles per inbound. Sized for autonomous build/
 /// research tasks rather than chat — short conversations finish well
-/// inside this, while a single research+plan+build user request can
-/// burn 30-50 turns before producing the final reply.
-pub const DEFAULT_MAX_TOOL_TURNS: usize = 60;
+/// inside this. Raised from 60: substantial "review the codebase and
+/// implement the fixes" / full-app-build requests routinely run past 60
+/// turns and were getting cut off mid-task. Operators can tune it further
+/// with `COPPERCLAW_MAX_TOOL_TURNS` (clamped to
+/// [`MIN_MAX_TOOL_TURNS`, `MAX_MAX_TOOL_TURNS`]).
+pub const DEFAULT_MAX_TOOL_TURNS: usize = 150;
 
 /// Floor — below this even simple multi-tool chains bail mid-flight.
 pub const MIN_MAX_TOOL_TURNS: usize = 5;
