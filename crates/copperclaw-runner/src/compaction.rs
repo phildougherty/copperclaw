@@ -114,6 +114,28 @@ fn chars_of(m: &HistoryMessage) -> usize {
     }
 }
 
+/// Choose a split point near `len/2` that never bisects a `tool_use` /
+/// `tool_result` group.
+///
+/// The slice before the pivot (`oldest`) is sent to the provider to be
+/// summarised. A slice ending on a dangling `ToolUse` — or a `newest`
+/// slice starting on an orphan `Tool` result — is rejected by strict
+/// providers (minimax: "tool call and result not match"), which fails
+/// compaction and crash-loops the runner. Advance the midpoint forward
+/// past any straddled tool group so both halves are self-contained.
+fn pair_safe_pivot(history: &[HistoryMessage]) -> usize {
+    let mut pivot = history.len() / 2;
+    while pivot < history.len()
+        && (matches!(history[pivot], HistoryMessage::Tool { .. })
+            || pivot
+                .checked_sub(1)
+                .is_some_and(|i| matches!(history[i], HistoryMessage::ToolUse { .. })))
+    {
+        pivot += 1;
+    }
+    pivot
+}
+
 /// Replace the oldest half of `history` with a single summarised user-side
 /// `compact_boundary` entry. Writes the pre-compaction transcript to
 /// `cfg.archive_dir/<RFC3339>.md` as a side effect.
@@ -128,7 +150,12 @@ pub async fn compact(
     if history.len() < 4 {
         return Ok(history);
     }
-    let pivot = history.len() / 2;
+    let pivot = pair_safe_pivot(&history);
+    if pivot == 0 || pivot >= history.len() {
+        // The whole transcript is one unsplittable tool group (rare). Leave
+        // it intact rather than send a half-pair to the provider.
+        return Ok(history);
+    }
     let oldest = history[..pivot].to_vec();
     let newest = history[pivot..].to_vec();
 
@@ -267,6 +294,62 @@ mod tests {
         assert!(!cfg.should_compact(179_904));
         assert!(cfg.should_compact(179_905));
         assert!(cfg.should_compact(1_000_000));
+    }
+
+    fn tu(id: &str) -> HistoryMessage {
+        HistoryMessage::ToolUse {
+            id: id.into(),
+            name: "t".into(),
+            input: serde_json::json!({}),
+        }
+    }
+    fn tr(id: &str) -> HistoryMessage {
+        HistoryMessage::Tool {
+            tool_use_id: id.into(),
+            content: "ok".into(),
+            is_error: false,
+        }
+    }
+    fn txt() -> HistoryMessage {
+        HistoryMessage::User { content: "x".into() }
+    }
+
+    #[test]
+    fn pivot_does_not_split_a_tool_pair() {
+        // Naive len/2 pivot (3) lands on the Tool result of the pair at 2..4.
+        let h = vec![txt(), txt(), tu("a"), tr("a"), txt(), txt()];
+        let p = pair_safe_pivot(&h);
+        assert!(p >= 4, "pivot {p} must clear the tool group");
+        // oldest must not end on a dangling ToolUse...
+        assert!(!matches!(h[p - 1], HistoryMessage::ToolUse { .. }));
+        // ...and newest must not start on an orphan Tool result.
+        assert!(p >= h.len() || !matches!(h[p], HistoryMessage::Tool { .. }));
+    }
+
+    #[test]
+    fn pivot_clears_a_straddled_parallel_tool_group() {
+        // Parallel batch [tu a, tu b, tr a, tr b] straddles the naive
+        // midpoint (4). The pivot must advance to the end of the group (6).
+        let h = vec![
+            txt(),
+            txt(),
+            tu("a"),
+            tu("b"),
+            tr("a"),
+            tr("b"),
+            txt(),
+            txt(),
+        ];
+        let p = pair_safe_pivot(&h); // naive pivot = 4 (history[4] = tr a)
+        assert_eq!(p, 6);
+        assert!(!matches!(h[p - 1], HistoryMessage::ToolUse { .. }));
+        assert!(!matches!(h[p], HistoryMessage::Tool { .. }));
+    }
+
+    #[test]
+    fn pivot_is_plain_midpoint_when_no_pair_straddles() {
+        let h = vec![txt(), txt(), txt(), txt()];
+        assert_eq!(pair_safe_pivot(&h), 2);
     }
 
     #[test]

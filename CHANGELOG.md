@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (compaction crash-loop on a tool-pair boundary — 2026-06-01)
+
+`compact()` sliced the transcript at a blind `len/2` midpoint to summarize
+the oldest half. When that midpoint fell between a `ToolUse` and its
+`Tool` result, the slice sent to the provider ended on a dangling tool
+call, which strict gateways reject (minimax: "tool call and result not
+match") — failing compaction and **crash-looping the runner**: the
+over-threshold history re-loaded and re-crashed on every respawn (~once
+every two minutes, each emitting a "hit a snag" apology). New
+`pair_safe_pivot` advances the split past any straddled tool group so both
+halves are self-contained. Verified on the live 629-message transcript
+that wedged a session — naive pivot 314 dangled a `tool_use`; the
+pair-safe pivot (315) summarizes cleanly on minimax.
+(`crates/copperclaw-runner/src/compaction.rs`)
+
 ### Added (multimodal: inbound photos + view_image tool — 2026-06-01)
 
 Vision support for image-capable models. Verified live that minimax-m3
