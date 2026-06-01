@@ -552,6 +552,15 @@ pub(crate) fn build_diff_blocks(diff: &DiffCard) -> Value {
 /// `:white_check_mark:`, etc.) renders as a colourful emoji in the
 /// Slack client, which violates the project's no-emoji rule.
 pub(crate) fn build_breadcrumb_blocks(b: &Breadcrumb) -> Value {
+    // Rolling "activity" aggregate: top-level fields are a collapsed
+    // one-line summary, `steps` carries the individual tool steps. Render
+    // a muted `context` summary line plus a compact `section` listing each
+    // step styled on its own — NOT raw text. Mirrors Telegram's
+    // `render_activity_html` and reuses the same low-profile `context`
+    // primitive `deliver_thinking` posts.
+    if !b.steps.is_empty() {
+        return build_activity_blocks(b);
+    }
     let marker = match b.status {
         BreadcrumbStatus::Running => "[~]",
         BreadcrumbStatus::Done => "[ok]",
@@ -586,6 +595,106 @@ pub(crate) fn build_breadcrumb_blocks(b: &Breadcrumb) -> Value {
             ]
         }
     ])
+}
+
+/// ASCII-only status marker per the project's no-emoji rule. Even
+/// non-emoji Unicode symbols render as colourful emoji on some clients;
+/// plain ASCII sidesteps that. Mirrors Telegram's `breadcrumb_glyph`.
+fn breadcrumb_marker(status: BreadcrumbStatus) -> &'static str {
+    match status {
+        BreadcrumbStatus::Running => "[~]",
+        BreadcrumbStatus::Done => "[ok]",
+        BreadcrumbStatus::Failed => "[x]",
+    }
+}
+
+/// Cap on steps rendered inside the activity region — keeps the section
+/// mrkdwn well under Slack's per-element char cap on a long turn. Older
+/// steps beyond this are summarised as a `+N earlier step(s)` line.
+/// Mirrors Telegram's `ACTIVITY_MAX_STEPS`.
+const ACTIVITY_MAX_STEPS: usize = 40;
+
+/// Build the Slack Block Kit blocks for the rolling "activity" aggregate
+/// chip. Slack has no inline collapse widget, so we mirror the
+/// low-profile idiom `deliver_thinking` uses:
+///
+/// 1. A muted `context` block carrying the collapsed one-line summary
+///    (`[~] shell npm run build · 1/2 steps`) from the top-level fields.
+/// 2. A compact `section` mrkdwn block listing each step on its own line,
+///    individually styled: ASCII status marker + `*tool*` bold +
+///    `` `detail` `` inline code + the result summary. Newest-biased and
+///    capped at [`ACTIVITY_MAX_STEPS`] with a `+N earlier step(s)` note so
+///    the section stays under Slack's 3000-char element cap.
+///
+/// Every dynamic field is escaped via [`escape_mrkdwn`] so paths /
+/// commands with `&` / `<` / `>` round-trip without leaking raw markup.
+fn build_activity_blocks(b: &Breadcrumb) -> Value {
+    // Collapsed summary line from the top-level fields.
+    let mut summary_line = String::with_capacity(64);
+    summary_line.push_str(breadcrumb_marker(b.status));
+    summary_line.push(' ');
+    match b.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => summary_line.push_str(&escape_mrkdwn(d)),
+        None => summary_line.push_str("working"),
+    }
+    if let Some(s) = b.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        summary_line.push_str(" · ");
+        summary_line.push_str(&escape_mrkdwn(s));
+    }
+
+    // Step list — newest-biased when the turn ran more than the cap.
+    let total = b.steps.len();
+    let hidden = total.saturating_sub(ACTIVITY_MAX_STEPS);
+    let mut steps_body = String::with_capacity(total.min(ACTIVITY_MAX_STEPS) * 48);
+    if hidden > 0 {
+        steps_body.push_str(&format!("_+{hidden} earlier step(s)_"));
+    }
+    for step in b.steps.iter().skip(hidden) {
+        if !steps_body.is_empty() {
+            steps_body.push('\n');
+        }
+        steps_body.push_str(&render_step_line_mrkdwn(step));
+    }
+
+    json!([
+        {
+            "type": "context",
+            "elements": [
+                { "type": "mrkdwn", "text": summary_line },
+            ]
+        },
+        {
+            "type": "section",
+            "text": { "type": "mrkdwn", "text": steps_body },
+        }
+    ])
+}
+
+/// One styled step line for the activity `section` body: ASCII status
+/// marker, `*tool*` bold, `` `detail` `` inline code, result summary.
+/// Every dynamic field is escaped through [`escape_mrkdwn`] individually
+/// so source paths / commands round-trip without leaking raw markup.
+/// Mirrors Telegram's `render_step_line_html`.
+fn render_step_line_mrkdwn(s: &Breadcrumb) -> String {
+    let mut out = String::with_capacity(48);
+    out.push_str(breadcrumb_marker(s.status));
+    out.push_str(" *");
+    out.push_str(&escape_mrkdwn(&s.tool_name));
+    out.push('*');
+    if let Some(d) = s.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        out.push_str(" `");
+        out.push_str(&escape_mrkdwn(d));
+        out.push('`');
+    }
+    if let Some(sum) = s.summary.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+        if s.status == BreadcrumbStatus::Failed {
+            out.push_str(" — failed: ");
+        } else {
+            out.push_str(" — ");
+        }
+        out.push_str(&escape_mrkdwn(sum));
+    }
+    out
 }
 
 /// Build the Slack Block Kit block array for the slice-3.4
@@ -1680,6 +1789,101 @@ mod tests {
         let txt = elements[0]["text"].as_str().unwrap();
         assert!(txt.starts_with("[x]"), "got: {txt}");
         assert!(txt.contains("failed: timeout"));
+    }
+
+    #[test]
+    fn render_breadcrumb_aggregate_renders_styled_expandable_steps() {
+        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
+        let steps = vec![
+            Breadcrumb::running("read_file")
+                .with_detail("src/App.tsx")
+                .finished(true, Some("120 lines".into())),
+            Breadcrumb::running("shell").with_detail("npm run build"),
+        ];
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("shell npm run build".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("1/2 steps".into()),
+            steps,
+        };
+        let blocks = super::build_breadcrumb_blocks(&agg);
+        let arr = blocks.as_array().expect("blocks must be a JSON array");
+        // Two blocks: a muted `context` summary line (the low-profile
+        // collapse primitive, mirroring deliver_thinking) plus a compact
+        // `section` listing each styled step.
+        assert_eq!(arr.len(), 2, "blocks: {blocks}");
+        assert_eq!(arr[0]["type"], "context");
+        let summary = arr[0]["elements"][0]["text"].as_str().unwrap();
+        assert_eq!(arr[0]["elements"][0]["type"], "mrkdwn");
+        // Collapsed summary line with ASCII marker + count.
+        assert_eq!(
+            summary, "[~] shell npm run build · 1/2 steps",
+            "summary line: {summary}"
+        );
+        // Step list rides in a `section` mrkdwn block.
+        assert_eq!(arr[1]["type"], "section");
+        assert_eq!(arr[1]["text"]["type"], "mrkdwn");
+        let steps_body = arr[1]["text"]["text"].as_str().unwrap();
+        // Each step individually styled (ASCII marker, *bold* tool,
+        // `code` detail, result) — not raw markdown dumped as text.
+        assert!(
+            steps_body.contains("[ok] *read_file* `src/App.tsx` — 120 lines"),
+            "step 1 styling: {steps_body}"
+        );
+        assert!(
+            steps_body.contains("[~] *shell* `npm run build`"),
+            "step 2 styling: {steps_body}"
+        );
+        // One line per step.
+        assert_eq!(steps_body.lines().count(), 2, "steps_body: {steps_body}");
+        assert!(!steps_body.contains("**"), "no raw markdown: {steps_body}");
+    }
+
+    #[test]
+    fn render_breadcrumb_aggregate_escapes_and_caps_steps() {
+        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
+        let mut steps: Vec<Breadcrumb> = (0..50)
+            .map(|i| {
+                Breadcrumb::running("shell")
+                    .with_detail(format!("step {i}"))
+                    .finished(true, None)
+            })
+            .collect();
+        steps.push(Breadcrumb::running("write_file").with_detail("a <b> & c"));
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("write_file a <b> & c".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("50/51 steps".into()),
+            steps,
+        };
+        let blocks = super::build_breadcrumb_blocks(&agg);
+        let steps_body = blocks[1]["text"]["text"].as_str().unwrap();
+        // Over the cap (40) → "+N earlier step(s)" prefix line. 51 steps
+        // means 11 earlier.
+        assert!(
+            steps_body.contains("+11 earlier step(s)"),
+            "cap note: {steps_body}"
+        );
+        // Rendered step lines are capped: 1 note line + 40 step lines.
+        assert_eq!(
+            steps_body.lines().count(),
+            41,
+            "expected cap of 40 rendered steps: {steps_body}"
+        );
+        // The Slack control characters in a detail are escaped — no raw
+        // `<` / `>` / `&` reaching the client.
+        assert!(
+            steps_body.contains("a &lt;b&gt; &amp; c"),
+            "escaped: {steps_body}"
+        );
+        // Top-level summary line is escaped too.
+        let summary = blocks[0]["elements"][0]["text"].as_str().unwrap();
+        assert!(
+            summary.contains("a &lt;b&gt; &amp; c"),
+            "summary escaped: {summary}"
+        );
     }
 
     #[tokio::test]

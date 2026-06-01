@@ -428,11 +428,27 @@ pub(crate) fn build_diff_card(diff: &DiffCard) -> Value {
     })
 }
 
+/// Cap on steps rendered inside the aggregate "activity" card's
+/// collapsible region — keeps the card body well-bounded on a long
+/// turn. Older steps beyond this are summarised as a `+N earlier` note.
+const ACTIVITY_MAX_STEPS: usize = 40;
+
 /// Build a Google Chat cards v2 single-section card representing the
 /// breadcrumb. The shape mirrors what Chat clients render as a compact
 /// inline card (one section, one decoratedText widget) so the chip
 /// stays one line on desktop and two lines on mobile.
+///
+/// When `b.steps` is non-empty this is the rolling "activity" aggregate:
+/// the top-level fields are a collapsed one-line summary and each step is
+/// rendered individually inside a native `collapsibleSection` (see
+/// [`build_activity_card`]). Both emit paths — `spaces.messages.create`
+/// on first emit and `spaces.messages.patch` on edit — call this same
+/// builder, so the aggregate renders identically whether it's the first
+/// chip or an in-place update.
 pub(crate) fn build_breadcrumb_card(b: &Breadcrumb) -> Value {
+    if !b.steps.is_empty() {
+        return build_activity_card(b);
+    }
     // ASCII-only status marker per the project's no-emoji rule.
     // Earlier versions used Cards v2 `knownIcon` (CLOCK / STAR /
     // BOOKMARK) but those render as colourful inline pictograms —
@@ -476,6 +492,119 @@ pub(crate) fn build_breadcrumb_card(b: &Breadcrumb) -> Value {
             }]
         }]
     })
+}
+
+/// Build a Google Chat cards v2 card for the rolling "activity"
+/// aggregate breadcrumb — the collapsed top-level summary plus one
+/// individually-styled widget per tool step.
+///
+/// Uses the native `collapsibleSection` primitive (the same disclosure
+/// widget [`build_thinking_card`] / [`build_collapsible_card`] use):
+/// the section `header` is the always-visible collapsed summary line,
+/// `collapsible: true` + `uncollapsibleWidgetsCount: 0` keeps every step
+/// behind the "Show more" fold so the chip stays a single line until the
+/// user expands it.
+///
+/// Shape:
+///
+/// ```json
+/// {
+///   "sections": [{
+///     "header": "[~] shell npm run build · 14/20 steps",
+///     "collapsible": true,
+///     "uncollapsibleWidgetsCount": 0,
+///     "widgets": [
+///       { "textParagraph": { "text": "[ok] <b>read_file</b> <font face=\"monospace\">src/App.tsx</font> <i>— 120 lines</i>" } },
+///       …one per step…
+///     ]
+///   }]
+/// }
+/// ```
+///
+/// Each step widget is styled individually — bold tool, monospace
+/// detail, ASCII status marker, italic result — NOT raw text. Every
+/// dynamic field is run through [`escape_html_gchat`] so source paths /
+/// commands / tracebacks can't inject card markup. Steps are capped at
+/// [`ACTIVITY_MAX_STEPS`] (newest-biased); a `+N earlier step(s)` note
+/// rides as the first widget when the turn ran more tools than the cap.
+pub(crate) fn build_activity_card(b: &Breadcrumb) -> Value {
+    let marker = activity_marker(b.status);
+    // Collapsed summary line (header) from the top-level fields:
+    // `<marker> <current activity> · <N/total steps>`.
+    let mut header = String::with_capacity(64);
+    header.push_str(marker);
+    header.push(' ');
+    match b.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => header.push_str(&escape_html_gchat(d)),
+        None => header.push_str("working"),
+    }
+    if let Some(s) = b.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        header.push_str(" · ");
+        header.push_str(&escape_html_gchat(s));
+    }
+
+    let total = b.steps.len();
+    let hidden = total.saturating_sub(ACTIVITY_MAX_STEPS);
+    let mut widgets: Vec<Value> = Vec::with_capacity(total.min(ACTIVITY_MAX_STEPS) + 1);
+    if hidden > 0 {
+        widgets.push(json!({
+            "textParagraph": { "text": format!("<i>+{hidden} earlier step(s)</i>") },
+        }));
+    }
+    for step in b.steps.iter().skip(hidden) {
+        widgets.push(json!({
+            "textParagraph": { "text": render_activity_step_line(step) },
+        }));
+    }
+    json!({
+        "sections": [{
+            "header": header,
+            "collapsible": true,
+            "uncollapsibleWidgetsCount": 0,
+            "widgets": widgets,
+        }]
+    })
+}
+
+/// ASCII-only status marker per the project's no-emoji rule — shared by
+/// the collapsed summary header and each step line. Cards v2 `knownIcon`
+/// renders as a colourful pictogram (emoji-equivalent to the user), so a
+/// plain-text prefix is used instead.
+fn activity_marker(status: BreadcrumbStatus) -> &'static str {
+    match status {
+        BreadcrumbStatus::Running => "[~]",
+        BreadcrumbStatus::Done => "[ok]",
+        BreadcrumbStatus::Failed => "[x]",
+    }
+}
+
+/// Render one styled step line for the activity card's collapsible body:
+/// `<marker> <b>tool</b> <font face="monospace">detail</font> <i>— result</i>`.
+/// Bold tool name, monospace detail, italic result — Google Chat renders
+/// this limited HTML subset natively inside `textParagraph`. Every
+/// dynamic field is HTML-escaped individually so paths / commands /
+/// summaries round-trip without leaking raw markup.
+fn render_activity_step_line(s: &Breadcrumb) -> String {
+    let mut out = String::with_capacity(64);
+    out.push_str(activity_marker(s.status));
+    out.push_str(" <b>");
+    out.push_str(&escape_html_gchat(&s.tool_name));
+    out.push_str("</b>");
+    if let Some(d) = s.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        out.push_str(" <font face=\"monospace\">");
+        out.push_str(&escape_html_gchat(d));
+        out.push_str("</font>");
+    }
+    if let Some(sum) = s.summary.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+        if s.status == BreadcrumbStatus::Failed {
+            out.push_str(" <i>— failed: ");
+        } else {
+            out.push_str(" <i>— ");
+        }
+        out.push_str(&escape_html_gchat(sum));
+        out.push_str("</i>");
+    }
+    out
 }
 
 /// Build a Google Chat cards v2 card representing an [`ErrorCard`].
@@ -1342,6 +1471,132 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("failed: timeout"));
+    }
+
+    // ── Rolling "activity" aggregate breadcrumb ────────────────────
+
+    #[test]
+    fn build_activity_card_renders_collapsible_with_styled_steps() {
+        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
+        let steps = vec![
+            Breadcrumb::running("read_file")
+                .with_detail("src/App.tsx")
+                .finished(true, Some("120 lines".into())),
+            Breadcrumb::running("shell").with_detail("npm run build"),
+        ];
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("shell npm run build".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("1/2 steps".into()),
+            steps,
+        };
+        let card = super::build_breadcrumb_card(&agg);
+        let section = &card["sections"][0];
+        // Collapsed summary header: ASCII marker + current activity + count.
+        assert_eq!(section["header"], "[~] shell npm run build · 1/2 steps");
+        // Native collapsibleSection: summary always visible, steps collapsed.
+        assert_eq!(section["collapsible"], true);
+        assert_eq!(section["uncollapsibleWidgetsCount"], 0);
+        let widgets = section["widgets"].as_array().unwrap();
+        assert_eq!(widgets.len(), 2);
+        // Each step individually styled (bold tool, monospace detail, ASCII
+        // marker, italic result) — NOT raw text.
+        let first = widgets[0]["textParagraph"]["text"].as_str().unwrap();
+        assert_eq!(
+            first,
+            "[ok] <b>read_file</b> <font face=\"monospace\">src/App.tsx</font> <i>— 120 lines</i>"
+        );
+        let second = widgets[1]["textParagraph"]["text"].as_str().unwrap();
+        assert_eq!(
+            second,
+            "[~] <b>shell</b> <font face=\"monospace\">npm run build</font>"
+        );
+        // Legacy single-tool decoratedText shape is NOT used for aggregates.
+        assert!(section.get("widgets").unwrap()[0].get("decoratedText").is_none());
+    }
+
+    #[test]
+    fn build_activity_card_escapes_and_caps_steps() {
+        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
+        let mut steps: Vec<Breadcrumb> = (0..50)
+            .map(|i| {
+                Breadcrumb::running("shell")
+                    .with_detail(format!("step {i}"))
+                    .finished(true, None)
+            })
+            .collect();
+        steps.push(Breadcrumb::running("write_file").with_detail("a <b> & c"));
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("write_file a <b> & c".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("50/51 steps".into()),
+            steps,
+        };
+        let card = super::build_breadcrumb_card(&agg);
+        let section = &card["sections"][0];
+        let widgets = section["widgets"].as_array().unwrap();
+        // Capped at ACTIVITY_MAX_STEPS (40) + one "+N earlier" note widget.
+        assert_eq!(widgets.len(), super::ACTIVITY_MAX_STEPS + 1);
+        let note = widgets[0]["textParagraph"]["text"].as_str().unwrap();
+        assert_eq!(note, "<i>+11 earlier step(s)</i>");
+        // HTML in a dynamic field is escaped in both header and step body
+        // (no raw < > & reaching the client).
+        assert!(section["header"]
+            .as_str()
+            .unwrap()
+            .contains("a &lt;b&gt; &amp; c"));
+        let last = widgets.last().unwrap()["textParagraph"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(last.contains("a &lt;b&gt; &amp; c"), "step escaped: {last}");
+    }
+
+    #[tokio::test]
+    async fn deliver_breadcrumb_aggregate_patches_collapsible_card() {
+        // The aggregate must render on the edit (spaces.messages.patch) path,
+        // not just first emit.
+        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/v1/spaces/AAA/messages/M1"))
+            .and(query_param("updateMask", "cardsV2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "spaces/AAA/messages/M1"
+            })))
+            .mount(&server)
+            .await;
+        let adapter = adapter_for(&server);
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("shell npm run build".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("1/2 steps".into()),
+            steps: vec![
+                Breadcrumb::running("read_file")
+                    .with_detail("src/App.tsx")
+                    .finished(true, Some("120 lines".into())),
+                Breadcrumb::running("shell").with_detail("npm run build"),
+            ],
+        };
+        let id = adapter
+            .deliver_breadcrumb("spaces/AAA", None, &agg, Some("spaces/AAA/messages/M1"))
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("spaces/AAA/messages/M1"));
+        let req_body: serde_json::Value = serde_json::from_slice(
+            &server.received_requests().await.unwrap().last().unwrap().body,
+        )
+        .unwrap();
+        // The patched card carries the collapsibleSection aggregate.
+        let section = &req_body["cardsV2"][0]["card"]["sections"][0];
+        assert_eq!(section["collapsible"], true);
+        assert_eq!(section["header"], "[~] shell npm run build · 1/2 steps");
+        let first = section["widgets"][0]["textParagraph"]["text"]
+            .as_str()
+            .unwrap();
+        assert!(first.contains("<b>read_file</b>"), "styled step: {first}");
     }
 
     #[tokio::test]

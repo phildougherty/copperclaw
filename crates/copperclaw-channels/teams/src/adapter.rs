@@ -1276,6 +1276,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deliver_breadcrumb_aggregate_first_emit_posts_collapsible_card() {
+        // Rolling-activity aggregate (non-empty `steps`) must render the
+        // collapsed summary + toggled steps Container on the POST (first
+        // emit) path.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/teams/T1/channels/C1/messages"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "ACT-1"})))
+            .mount(&server)
+            .await;
+        let adapter = adapter_for(&server);
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("shell npm run build".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("1/2 steps".into()),
+            steps: vec![
+                Breadcrumb::running("read_file")
+                    .with_detail("src/App.tsx")
+                    .finished(true, Some("120 lines".into())),
+                Breadcrumb::running("shell").with_detail("npm run build"),
+            ],
+        };
+        let id = adapter
+            .deliver_breadcrumb("team/T1/channel/C1", None, &agg, None)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("ACT-1"));
+        let card_json = last_adaptive_card(&server).await;
+        let body = card_json["body"].as_array().unwrap();
+        assert_eq!(body.len(), 2);
+        assert_eq!(
+            body[0]["text"].as_str().unwrap(),
+            "[~] shell npm run build \u{00B7} 1/2 steps"
+        );
+        assert_eq!(body[1]["type"], "Container");
+        assert_eq!(body[1]["isVisible"], false);
+        let items = body[1]["items"].as_array().unwrap();
+        assert_eq!(
+            items[0]["text"].as_str().unwrap(),
+            "[ok] **read_file** `src/App.tsx` — 120 lines"
+        );
+        let actions = card_json["actions"].as_array().unwrap();
+        assert_eq!(actions[0]["type"], "Action.ToggleVisibility");
+        assert_eq!(actions[0]["title"], "Show steps");
+    }
+
+    #[tokio::test]
+    async fn deliver_breadcrumb_aggregate_edit_patches_collapsible_card() {
+        // The same aggregate must also render on the PATCH (edit-in-place)
+        // path so the chip evolves on the same message id.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/teams/T1/channels/C1/messages/ACT-1"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let adapter = adapter_for(&server);
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("shell npm test".into()),
+            status: BreadcrumbStatus::Done,
+            summary: Some("2/2 steps".into()),
+            steps: vec![
+                Breadcrumb::running("read_file")
+                    .with_detail("src/App.tsx")
+                    .finished(true, Some("120 lines".into())),
+                Breadcrumb::running("shell")
+                    .with_detail("npm test")
+                    .finished(true, Some("passed".into())),
+            ],
+        };
+        let id = adapter
+            .deliver_breadcrumb("team/T1/channel/C1", None, &agg, Some("ACT-1"))
+            .await
+            .unwrap();
+        // Edit-in-place returns the original id.
+        assert_eq!(id.as_deref(), Some("ACT-1"));
+        let card_json = last_adaptive_card(&server).await;
+        let body = card_json["body"].as_array().unwrap();
+        // Overall Done → summary line carries the [ok] marker + Good color.
+        assert!(body[0]["text"].as_str().unwrap().starts_with("[ok]"));
+        assert_eq!(body[0]["color"], "Good");
+        assert_eq!(body[1]["type"], "Container");
+        assert_eq!(card_json["actions"][0]["type"], "Action.ToggleVisibility");
+    }
+
+    #[tokio::test]
     async fn deliver_breadcrumb_failed_uses_attention_color() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))

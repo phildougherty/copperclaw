@@ -219,6 +219,10 @@ fn runner_emit_set_matches_source() {
                 // `fn emit_breadcrumb_finish_writes_update_system_row`
                 // that would otherwise share the prefix.
                 "fn emit_breadcrumb_finish(",
+                // The `update_breadcrumb` System action is constructed in
+                // this shared helper (used by both the legacy finish path
+                // and the rolling-activity start/finish emits).
+                "fn insert_update_breadcrumb_row(",
             ],
         ) {
             for cap in re.captures_iter(&fn_body) {

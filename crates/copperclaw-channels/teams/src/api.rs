@@ -545,15 +545,51 @@ fn button_to_action(btn: &CardButton) -> Option<Value> {
     }
 }
 
-/// Render a [`Breadcrumb`] into a small accent-coloured Adaptive Card.
-/// Used by both the initial emit and the edit-in-place PATCH.
-#[must_use]
-pub fn build_adaptive_breadcrumb(b: &Breadcrumb) -> Value {
-    let color = match b.status {
+/// Cap on the number of steps rendered inside the rolling-activity
+/// expander. A turn that ran more tools than this collapses the oldest
+/// into a single `+N earlier step(s)` line so the card body stays well
+/// under Graph's 28 KB ceiling. Mirrors Telegram's `ACTIVITY_MAX_STEPS`.
+const ACTIVITY_MAX_STEPS: usize = 40;
+
+/// Stable element id for the toggled steps `Container` in the
+/// rolling-activity card. Mirrors the `expander_full` / `thinking_full`
+/// ids used by the collapsible / thinking cards.
+const ACTIVITY_STEPS_CONTAINER_ID: &str = "activity_steps";
+
+/// ASCII-only status marker per the project's no-emoji rule (even
+/// non-emoji Unicode check / cross glyphs get rendered as colourful
+/// emoji on some Teams clients). Matches Telegram's `breadcrumb_glyph`.
+fn breadcrumb_marker(status: BreadcrumbStatus) -> &'static str {
+    match status {
+        BreadcrumbStatus::Running => "[~]",
+        BreadcrumbStatus::Done => "[ok]",
+        BreadcrumbStatus::Failed => "[x]",
+    }
+}
+
+/// Adaptive-card colour for a breadcrumb / step status.
+fn breadcrumb_color(status: BreadcrumbStatus) -> &'static str {
+    match status {
         BreadcrumbStatus::Running => "Accent",
         BreadcrumbStatus::Done => "Good",
         BreadcrumbStatus::Failed => "Attention",
-    };
+    }
+}
+
+/// Render a [`Breadcrumb`] into a small accent-coloured Adaptive Card.
+/// Used by both the initial emit and the edit-in-place PATCH.
+///
+/// When `b.steps` is non-empty this is a *rolling-activity* aggregate:
+/// the top-level fields are a collapsed one-line summary and each step
+/// is rendered, individually styled, inside a toggled `Container`. See
+/// [`build_adaptive_activity`]. Empty `steps` keeps the legacy
+/// single-tool chip path unchanged.
+#[must_use]
+pub fn build_adaptive_breadcrumb(b: &Breadcrumb) -> Value {
+    if !b.steps.is_empty() {
+        return build_adaptive_activity(b);
+    }
+    let color = breadcrumb_color(b.status);
     let mut text = format!("`{}`", b.tool_name);
     if let Some(d) = b.detail.as_deref() {
         let d = d.trim();
@@ -585,6 +621,115 @@ pub fn build_adaptive_breadcrumb(b: &Breadcrumb) -> Value {
             "isSubtle": true,
             "wrap": true,
         }],
+    })
+}
+
+/// Render the rolling-activity aggregate breadcrumb into an Adaptive
+/// Card. Used by both the initial emit and the edit-in-place PATCH (the
+/// caller routes both through [`build_adaptive_breadcrumb`]).
+///
+/// Layout mirrors `deliver_thinking` / `build_adaptive_collapsible`: a
+/// low-profile, always-visible summary `TextBlock` (collapsed one-line
+/// state — ASCII marker + current activity + `N/total steps`) followed
+/// by a `Container` of per-step `TextBlock`s that defaults to
+/// `isVisible: false`, toggled by an `Action.ToggleVisibility`
+/// ("Show steps") button — Teams's native disclosure-widget primitive.
+///
+/// Each step is styled on its own line: ASCII status marker, **bold**
+/// tool name, `` `monospace` `` (`Code`-styled) detail, then the result
+/// blurb. Every dynamic field is placed into the card as a JSON string
+/// value (via `json!`) so untrusted tool input is inherently safe — no
+/// raw markup is concatenated onto the wire HTML.
+///
+/// Steps are capped at [`ACTIVITY_MAX_STEPS`] (newest-biased); a turn
+/// that ran more collapses the oldest into a `+N earlier step(s)` line.
+fn build_adaptive_activity(b: &Breadcrumb) -> Value {
+    // Collapsed summary line from the top-level fields: marker + current
+    // activity (detail) + count (summary).
+    let mut summary = breadcrumb_marker(b.status).to_string();
+    summary.push(' ');
+    match b.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => summary.push_str(d),
+        None => summary.push_str("working"),
+    }
+    if let Some(s) = b.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        summary.push_str(" \u{00B7} ");
+        summary.push_str(s);
+    }
+
+    // One styled TextBlock per step inside the toggled container,
+    // newest-biased when the turn ran more than the cap.
+    let total = b.steps.len();
+    let hidden = total.saturating_sub(ACTIVITY_MAX_STEPS);
+    let mut items: Vec<Value> = Vec::with_capacity(total.min(ACTIVITY_MAX_STEPS) + 1);
+    if hidden > 0 {
+        items.push(json!({
+            "type": "TextBlock",
+            "text": format!("+{hidden} earlier step(s)"),
+            "size": "Small",
+            "isSubtle": true,
+            "wrap": true,
+        }));
+    }
+    for step in b.steps.iter().skip(hidden) {
+        items.push(activity_step_textblock(step));
+    }
+
+    json!({
+        "type": "AdaptiveCard",
+        "$schema": ADAPTIVE_CARD_SCHEMA,
+        "version": ADAPTIVE_CARD_VERSION,
+        "body": [
+            {
+                "type": "TextBlock",
+                "text": summary,
+                "size": "Small",
+                "color": breadcrumb_color(b.status),
+                "isSubtle": true,
+                "wrap": true,
+            },
+            {
+                "type": "Container",
+                "id": ACTIVITY_STEPS_CONTAINER_ID,
+                "isVisible": false,
+                "items": items,
+            },
+        ],
+        "actions": [{
+            "type": "Action.ToggleVisibility",
+            "title": "Show steps",
+            "targetElements": [ACTIVITY_STEPS_CONTAINER_ID],
+        }],
+    })
+}
+
+/// One styled step line for the rolling-activity expander: ASCII status
+/// marker + **bold** tool + `` `monospace` `` detail + result blurb,
+/// coloured by the step's own status. Built as a single markdown
+/// `TextBlock`; the dynamic fields are interpolated as a string value so
+/// untrusted tool input never reaches the wire as raw markup.
+fn activity_step_textblock(s: &Breadcrumb) -> Value {
+    let mut text = format!("{} **{}**", breadcrumb_marker(s.status), s.tool_name);
+    if let Some(d) = s.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        text.push_str(" `");
+        text.push_str(d);
+        text.push('`');
+    }
+    if let Some(sum) = s.summary.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+        if s.status == BreadcrumbStatus::Failed {
+            text.push_str(" — failed: ");
+        } else {
+            text.push_str(" — ");
+        }
+        text.push_str(sum);
+    }
+    json!({
+        "type": "TextBlock",
+        "text": text,
+        "size": "Small",
+        "color": breadcrumb_color(s.status),
+        "wrap": true,
+        "spacing": "Small",
     })
 }
 
@@ -1503,5 +1648,131 @@ mod tests {
         assert_eq!(urlencode_segment("a.txt"), "a.txt");
         assert_eq!(urlencode_segment("my file.pdf"), "my%20file.pdf");
         assert_eq!(urlencode_segment("hello/world"), "hello%2Fworld");
+    }
+
+    #[test]
+    fn build_adaptive_breadcrumb_single_tool_keeps_legacy_chip() {
+        // Empty `steps` MUST render exactly as today: a single small,
+        // subtle, accent-coloured TextBlock with a `code`-chip tool name.
+        let bc = Breadcrumb::running("shell").with_detail("cargo check");
+        let card = build_adaptive_breadcrumb(&bc);
+        let body = card["body"].as_array().unwrap();
+        assert_eq!(body.len(), 1);
+        assert_eq!(body[0]["type"], "TextBlock");
+        assert_eq!(body[0]["color"], "Accent");
+        let text = body[0]["text"].as_str().unwrap();
+        assert!(text.contains("`shell`"));
+        assert!(text.contains("cargo check"));
+        // Legacy chip has no toggle action / container.
+        assert!(card.get("actions").is_none());
+    }
+
+    #[test]
+    fn build_adaptive_breadcrumb_aggregate_renders_collapsible_steps() {
+        // Non-empty `steps` → rolling aggregate: a collapsed summary
+        // line plus a toggled Container of individually-styled steps.
+        let steps = vec![
+            Breadcrumb::running("read_file")
+                .with_detail("src/App.tsx")
+                .finished(true, Some("120 lines".into())),
+            Breadcrumb::running("shell").with_detail("npm run build"),
+        ];
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("shell npm run build".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("1/2 steps".into()),
+            steps,
+        };
+        let card = build_adaptive_breadcrumb(&agg);
+        let body = card["body"].as_array().unwrap();
+        // Summary TextBlock + steps Container.
+        assert_eq!(body.len(), 2);
+
+        // (a) Collapsed summary line: ASCII marker + current activity + count.
+        assert_eq!(body[0]["type"], "TextBlock");
+        let summary = body[0]["text"].as_str().unwrap();
+        assert_eq!(summary, "[~] shell npm run build \u{00B7} 1/2 steps");
+        assert_eq!(body[0]["color"], "Accent");
+
+        // (b) Toggled, initially-hidden Container holding the steps.
+        let container = &body[1];
+        assert_eq!(container["type"], "Container");
+        assert_eq!(container["id"], ACTIVITY_STEPS_CONTAINER_ID);
+        assert_eq!(container["isVisible"], false);
+        let items = container["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+
+        // Each step individually styled (ASCII marker, **bold** tool,
+        // `monospace` detail, result) — NOT raw text.
+        assert_eq!(items[0]["type"], "TextBlock");
+        assert_eq!(
+            items[0]["text"],
+            "[ok] **read_file** `src/App.tsx` — 120 lines"
+        );
+        assert_eq!(items[0]["color"], "Good");
+        assert_eq!(items[1]["text"], "[~] **shell** `npm run build`");
+        assert_eq!(items[1]["color"], "Accent");
+
+        // (c) Native collapse primitive: Action.ToggleVisibility targeting
+        // the steps container.
+        let actions = card["actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 1);
+        assert_eq!(actions[0]["type"], "Action.ToggleVisibility");
+        assert_eq!(actions[0]["title"], "Show steps");
+        assert_eq!(actions[0]["targetElements"][0], ACTIVITY_STEPS_CONTAINER_ID);
+    }
+
+    #[test]
+    fn build_adaptive_breadcrumb_aggregate_caps_steps_with_earlier_note() {
+        // A turn that ran more than the cap collapses the oldest into a
+        // single `+N earlier step(s)` line and keeps the newest visible.
+        let mut steps: Vec<Breadcrumb> = (0..50)
+            .map(|i| {
+                Breadcrumb::running("shell")
+                    .with_detail(format!("step {i}"))
+                    .finished(true, None)
+            })
+            .collect();
+        steps.push(Breadcrumb::running("write_file").with_detail("final"));
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("write_file final".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("50/51 steps".into()),
+            steps,
+        };
+        let card = build_adaptive_breadcrumb(&agg);
+        let items = card["body"][1]["items"].as_array().unwrap();
+        // 1 "earlier" note + ACTIVITY_MAX_STEPS rendered steps.
+        assert_eq!(items.len(), ACTIVITY_MAX_STEPS + 1);
+        let note = items[0]["text"].as_str().unwrap();
+        assert!(note.contains("earlier step(s)"), "cap note: {note}");
+        // 51 total, cap 40 → 11 hidden.
+        assert!(note.contains("11"), "hidden count: {note}");
+        // Newest step survives the cap.
+        let last = items.last().unwrap()["text"].as_str().unwrap();
+        assert!(last.contains("**write_file**"), "newest kept: {last}");
+    }
+
+    #[test]
+    fn build_adaptive_breadcrumb_aggregate_detail_goes_in_as_json_string() {
+        // Untrusted tool detail is placed as a JSON string value (never
+        // concatenated into the wire HTML), so `<`/`>`/`&`/`"` round-trip
+        // verbatim inside the card and are escaped at the Graph
+        // serialization boundary, not here.
+        let steps = vec![Breadcrumb::running("write_file").with_detail("a <b> & \"c\"")];
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("write_file a <b> & \"c\"".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("0/1 steps".into()),
+            steps,
+        };
+        let card = build_adaptive_breadcrumb(&agg);
+        let step_text = card["body"][1]["items"][0]["text"].as_str().unwrap();
+        // The raw chars live in the string value untouched — JSON encoding
+        // (and Teams's card sanitiser) handle safety downstream.
+        assert!(step_text.contains("`a <b> & \"c\"`"), "got: {step_text}");
     }
 }

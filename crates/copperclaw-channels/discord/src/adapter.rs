@@ -429,9 +429,14 @@ impl ChannelAdapter for DiscordAdapter {
     /// Native breadcrumb chip — rendered as Discord `content` with the
     /// tool name wrapped in backticks (Discord's inline-code formatting,
     /// the closest aesthetic to a metadata chip the platform supports
-    /// without committing a full embed). When `existing_message_id` is
+    /// without committing a full embed). When `breadcrumb.steps` is
+    /// non-empty the chip becomes a rolling "activity" aggregate: a
+    /// low-profile collapsed summary line plus a click-to-reveal
+    /// `||spoiler||` listing each tool step styled individually (see
+    /// [`render_activity_content`]). When `existing_message_id` is
     /// provided we PATCH the original message in place; otherwise we
-    /// post a fresh one.
+    /// post a fresh one — the aggregate renders identically on both
+    /// paths because the branch lives in [`render_breadcrumb_content`].
     ///
     /// `thread_id` is ignored here for the same reason `deliver_card`
     /// ignores it — Discord models threads as separate channels so the
@@ -774,6 +779,14 @@ pub(crate) fn build_diff_payload(diff: &DiffCard) -> Value {
 }
 
 pub(crate) fn render_breadcrumb_content(b: &Breadcrumb) -> String {
+    // Rolling "activity" aggregate: a low-profile collapsed summary line
+    // (from the top-level fields) followed by a click-to-reveal spoiler
+    // whose body is one styled line per tool step. Each step is real
+    // Discord markdown (bold tool, `code` detail, ASCII marker, result),
+    // never raw text. The single-tool path below is unchanged.
+    if !b.steps.is_empty() {
+        return render_activity_content(b);
+    }
     // ASCII-only markers. Even non-emoji Unicode symbols (U+23F3,
     // U+2713, U+2717) render as colourful emoji on Discord's mobile
     // clients, which violates the project's no-emoji rule.
@@ -816,6 +829,140 @@ pub(crate) fn render_breadcrumb_content(b: &Breadcrumb) -> String {
 /// would defeat the chip aesthetic.
 fn escape_backticks(s: &str) -> String {
     s.replace('`', "'")
+}
+
+/// ASCII-only status marker per the project's no-emoji rule. Mirrors the
+/// inline `match` in [`render_breadcrumb_content`] so the rolling-aggregate
+/// step lines render identical markers.
+fn breadcrumb_glyph(status: BreadcrumbStatus) -> &'static str {
+    match status {
+        BreadcrumbStatus::Running => "[~]",
+        BreadcrumbStatus::Done => "[ok]",
+        BreadcrumbStatus::Failed => "[x]",
+    }
+}
+
+/// Cap on steps rendered inside the spoiler — keeps the whole `content`
+/// field under Discord's 2000-char limit on a long turn. Older steps
+/// beyond this are summarised as a `+N earlier` line.
+const ACTIVITY_MAX_STEPS: usize = 40;
+
+/// Neutralise Discord markdown control characters in a free-form string
+/// that will sit OUTSIDE a code span (the collapsed summary line, a bold
+/// tool name, a step's result summary). Backslash-escaping keeps the text
+/// readable while preventing a stray `*` (emphasis), `~` (strikethrough),
+/// or `` ` `` (code span) from toggling formatting — and, critically, a
+/// `|` from terminating the surrounding `||spoiler||` early. The literal
+/// backslash is escaped first so the escapes we insert aren't reprocessed.
+///
+/// Deliberately NOT escaped:
+/// - `_`: Discord (like `CommonMark`) ignores intra-word underscores, so a
+///   `snake_case` tool name / path renders literally; escaping it would
+///   uglify the overwhelmingly common case for no safety gain.
+/// - `>`: only starts a blockquote at line start; every line here is
+///   prefixed by the `[~]`/`[ok]`/`[x]` marker, so a `>` in a dynamic
+///   field is always mid-line and inert.
+fn escape_discord_markdown(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\\' | '*' | '~' | '`' | '|' => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Render the rolling aggregate "activity" chip for Discord `content`:
+/// a low-profile collapsed summary line (current activity + completed/total
+/// count) followed by a click-to-reveal `||spoiler||` whose body is one
+/// styled line per tool step.
+///
+/// ```text
+/// [~] shell npm run build · 14/20 steps
+/// ||
+/// [ok] **read_file** `src/App.tsx` — 120 lines
+/// [ok] **edit_file** `src/HomePage.tsx` — wrote 12 lines
+/// [~] **shell** `npm run build`
+/// ||
+/// ```
+///
+/// Discord's only native collapse primitive is the spoiler `||…||`
+/// (rendered blurred, click-to-reveal) — the closest analogue to
+/// Telegram's `<blockquote expandable>`. The whole body is capped at
+/// Discord's 2000-char `content` limit; steps beyond [`ACTIVITY_MAX_STEPS`]
+/// collapse into a `+N earlier step(s)` note so a long turn still posts.
+fn render_activity_content(b: &Breadcrumb) -> String {
+    // 1800 leaves headroom under the 2000-char content limit for the
+    // spoiler bars + summary line; over-budget tail steps are dropped.
+    const CONTENT_BUDGET: usize = 1800;
+
+    let mut out = String::with_capacity(128 + b.steps.len() * 56);
+    // Collapsed summary line from the top-level fields — plain text,
+    // outside the spoiler so it reads at a glance.
+    out.push_str(breadcrumb_glyph(b.status));
+    out.push(' ');
+    match b.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => out.push_str(&escape_discord_markdown(d)),
+        None => out.push_str("working"),
+    }
+    if let Some(s) = b.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(" · ");
+        out.push_str(&escape_discord_markdown(s));
+    }
+    // Click-to-reveal spoiler: one styled line per step, newest-biased
+    // when the turn ran more than ACTIVITY_MAX_STEPS tools. Newlines
+    // immediately inside the `||` bars keep the summary line legible.
+    out.push_str("\n||\n");
+    let total = b.steps.len();
+    let hidden = total.saturating_sub(ACTIVITY_MAX_STEPS);
+    let shown = b.steps.iter().skip(hidden);
+    if hidden > 0 {
+        out.push_str(&format!("+{hidden} earlier step(s)\n"));
+    }
+    for step in shown {
+        let line = render_step_line_content(step);
+        // Stop before busting the content limit; the spoiler still
+        // closes cleanly below so the message stays valid.
+        if out.len() + line.len() + "\n||".len() > CONTENT_BUDGET {
+            out.push_str("…(more)\n");
+            break;
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    out.push_str("||");
+    out
+}
+
+/// One styled step line for the spoiler body: ASCII status marker, bold
+/// tool name, `` `code` `` detail, result summary. Every dynamic field is
+/// escaped individually — backticks stripped inside the code span, markdown
+/// control chars (incl. `|`) backslash-escaped elsewhere — so a command or
+/// path can't break the code span or terminate the surrounding spoiler.
+fn render_step_line_content(s: &Breadcrumb) -> String {
+    let mut out = String::with_capacity(48);
+    out.push_str(breadcrumb_glyph(s.status));
+    out.push_str(" **");
+    out.push_str(&escape_discord_markdown(&s.tool_name));
+    out.push_str("**");
+    if let Some(d) = s.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        out.push_str(" `");
+        out.push_str(&escape_backticks(d));
+        out.push('`');
+    }
+    if let Some(sum) = s.summary.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+        if s.status == BreadcrumbStatus::Failed {
+            out.push_str(" — failed: ");
+        } else {
+            out.push_str(" — ");
+        }
+        out.push_str(&escape_discord_markdown(sum));
+    }
+    out
 }
 
 /// Render an `OutboundMessage` to a plain string suitable for Discord's
@@ -2056,6 +2203,178 @@ mod tests {
         let content = body["content"].as_str().unwrap();
         assert!(content.starts_with("[ok]"), "got: {content}");
         assert!(content.contains("passed (0.4s)"));
+    }
+
+    #[test]
+    fn render_breadcrumb_aggregate_renders_styled_expandable_steps() {
+        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
+        let steps = vec![
+            Breadcrumb::running("read_file")
+                .with_detail("src/App.tsx")
+                .finished(true, Some("120 lines".into())),
+            Breadcrumb::running("shell").with_detail("npm run build"),
+        ];
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("shell npm run build".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("1/2 steps".into()),
+            steps,
+        };
+        let content = super::render_breadcrumb_content(&agg);
+        // Collapsed summary line (plain text) with ASCII marker + count.
+        assert!(
+            content.starts_with("[~] shell npm run build · 1/2 steps"),
+            "summary line: {content}"
+        );
+        // Click-to-reveal spoiler wraps the step list.
+        assert!(content.contains("||\n"), "spoiler open: {content}");
+        assert!(content.ends_with("||"), "spoiler close: {content}");
+        // Each step individually styled (bold tool, `code` detail, ASCII
+        // marker, result summary) — not raw text.
+        assert!(
+            content.contains("[ok] **read_file** `src/App.tsx` — 120 lines"),
+            "styled done step: {content}"
+        );
+        assert!(
+            content.contains("[~] **shell** `npm run build`"),
+            "styled running step: {content}"
+        );
+    }
+
+    #[test]
+    fn render_breadcrumb_aggregate_escapes_markdown_and_spoiler_and_caps() {
+        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
+        // 50 filler steps + 1 final step whose fields carry the markdown /
+        // spoiler control chars an agent's command could contain.
+        let mut steps: Vec<Breadcrumb> = (0..50)
+            .map(|i| {
+                Breadcrumb::running("shell")
+                    .with_detail(format!("step {i}"))
+                    .finished(true, None)
+            })
+            .collect();
+        steps.push(
+            // tool name with `*` (bold), detail with a backtick (code span)
+            // and `||` (spoiler terminator), summary with `||` + `*`.
+            Breadcrumb::running("wr*ite")
+                .with_detail("echo `||x` && y")
+                .finished(false, Some("|| boom *bad*".into())),
+        );
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            // top-level detail also carries a spoiler terminator.
+            detail: Some("wr*ite echo || y".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("50/51 steps".into()),
+            steps,
+        };
+        let content = super::render_breadcrumb_content(&agg);
+
+        // Over the cap → "+N earlier step(s)" note inside the spoiler.
+        assert!(content.contains("earlier step(s)"), "cap note: {content}");
+
+        // Structural spoiler: summary line, then `\n||\n` open, then steps,
+        // then a trailing `||` close. The bars are the only spoiler
+        // delimiters; every dynamic `||` outside a code span is escaped so
+        // it cannot terminate the spoiler early.
+        assert!(content.contains("\n||\n"), "spoiler open bar: {content}");
+        assert!(content.ends_with("\n||"), "spoiler close bar: {content}");
+
+        // Top-level detail (collapsed summary line, NOT in a code span) has
+        // its `||` and `*` backslash-escaped so neither toggles formatting
+        // nor closes the spoiler.
+        assert!(
+            content.contains(r"wr\*ite echo \|\| y"),
+            "summary-line markdown escaped: {content}"
+        );
+        // Bold marker in a step's tool name is escaped so it can't toggle
+        // bold and bleed into the rest of the line.
+        assert!(content.contains(r"**wr\*ite**"), "tool `*` escaped: {content}");
+        // Step result summary (outside any code span) has `||` + `*`
+        // escaped too.
+        assert!(
+            content.contains(r"\|\| boom \*bad\*"),
+            "result summary markdown escaped: {content}"
+        );
+        // Backtick in the detail is stripped inside the code span so the
+        // span closes cleanly; the `||` that remains there is inert because
+        // Discord suppresses markdown (incl. spoilers) inside inline code.
+        assert!(
+            content.contains("`echo '||x' && y`"),
+            "detail backtick stripped inside code span: {content}"
+        );
+        // Whole body stays under Discord's 2000-char content limit.
+        assert!(content.len() <= 2000, "len {} > 2000", content.len());
+    }
+
+    #[tokio::test]
+    async fn deliver_breadcrumb_aggregate_posts_spoiler_on_first_emit() {
+        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/channels/c1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "m7"})))
+            .mount(&server)
+            .await;
+        let (a, _rx) = build_adapter(&server);
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("shell npm run build".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("1/2 steps".into()),
+            steps: vec![
+                Breadcrumb::running("read_file")
+                    .with_detail("src/App.tsx")
+                    .finished(true, Some("120 lines".into())),
+                Breadcrumb::running("shell").with_detail("npm run build"),
+            ],
+        };
+        let id = a.deliver_breadcrumb("c1", None, &agg, None).await.unwrap();
+        assert_eq!(id.as_deref(), Some("m7"));
+        let reqs = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&reqs.last().unwrap().body).unwrap();
+        let content = body["content"].as_str().unwrap();
+        assert!(content.contains("||"), "first emit carries spoiler: {content}");
+        assert!(content.contains("[ok] **read_file** `src/App.tsx`"));
+    }
+
+    #[tokio::test]
+    async fn deliver_breadcrumb_aggregate_patches_spoiler_on_edit() {
+        // The rolling aggregate must render on the in-place PATCH path too,
+        // not just the first POST.
+        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/channels/c1/messages/m7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        let (a, _rx) = build_adapter(&server);
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("shell npm run build".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("2/2 steps".into()),
+            steps: vec![
+                Breadcrumb::running("read_file")
+                    .with_detail("src/App.tsx")
+                    .finished(true, Some("120 lines".into())),
+                Breadcrumb::running("shell")
+                    .with_detail("npm run build")
+                    .finished(true, Some("ok".into())),
+            ],
+        };
+        let id = a
+            .deliver_breadcrumb("c1", None, &agg, Some("m7"))
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("m7"));
+        let reqs = server.received_requests().await.unwrap();
+        let body: Value = serde_json::from_slice(&reqs.last().unwrap().body).unwrap();
+        let content = body["content"].as_str().unwrap();
+        assert!(content.starts_with("[~] shell npm run build · 2/2 steps"));
+        assert!(content.contains("||"), "edit path carries spoiler: {content}");
     }
 
     // ── Diff card rendering ────────────────────────────────────────

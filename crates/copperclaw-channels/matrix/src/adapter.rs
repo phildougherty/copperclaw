@@ -251,6 +251,13 @@ impl ChannelAdapter for MatrixAdapter {
     /// aesthetic. When `existing_message_id` is provided we send an
     /// `m.replace` relation so clients show "edited" in place
     /// instead of a new line.
+    ///
+    /// When `breadcrumb.steps` is non-empty this is the rolling
+    /// "activity" aggregate: the HTML carries a `<details>` disclosure
+    /// (collapsed `<summary>` line + one styled line per step inside the
+    /// body) and the plain-text `body` falls back to one step per line.
+    /// Both the first-emit and the `m.replace` edit path render the
+    /// aggregate.
     async fn deliver_breadcrumb(
         &self,
         platform_id: &str,
@@ -260,7 +267,11 @@ impl ChannelAdapter for MatrixAdapter {
     ) -> Result<Option<String>, AdapterError> {
         let room_id = self.resolve_room(platform_id).await?;
         let html = render_breadcrumb_html_matrix(breadcrumb);
-        let plain = breadcrumb.to_text_fallback();
+        let plain = if breadcrumb.steps.is_empty() {
+            breadcrumb.to_text_fallback()
+        } else {
+            render_activity_text_matrix(breadcrumb)
+        };
         if let Some(target) = existing_message_id {
             let resp = self
                 .api
@@ -463,7 +474,30 @@ pub(crate) fn render_diff_html_matrix(diff: &DiffCard) -> String {
     out
 }
 
+/// ASCII-only status marker per the project's no-emoji rule. Element
+/// renders the symbol forms (U+23F3 / U+2713 / U+2717) as colourful
+/// emoji on iOS, so we stay strictly ASCII.
+fn breadcrumb_glyph_matrix(status: BreadcrumbStatus) -> &'static str {
+    match status {
+        BreadcrumbStatus::Running => "[~]",
+        BreadcrumbStatus::Done => "[ok]",
+        BreadcrumbStatus::Failed => "[x]",
+    }
+}
+
+/// Cap on steps rendered inside the `<details>` body — keeps a long
+/// turn's aggregate chip from ballooning the formatted body. Older steps
+/// beyond this are summarised as a `+N earlier` line.
+const ACTIVITY_MAX_STEPS_MATRIX: usize = 40;
+
 pub(crate) fn render_breadcrumb_html_matrix(b: &Breadcrumb) -> String {
+    // Rolling "activity" aggregate: a `<details>` disclosure whose
+    // `<summary>` is the collapsed one-line status and whose body lists
+    // each tool step, individually styled. The legacy single-tool path
+    // below is left byte-for-byte unchanged.
+    if !b.steps.is_empty() {
+        return render_activity_html_matrix(b);
+    }
     // ASCII-only markers. Element renders U+23F3 / U+2713 / U+2717
     // as colourful emoji on iOS, violating the project's no-emoji rule.
     let glyph = match b.status {
@@ -494,6 +528,115 @@ pub(crate) fn render_breadcrumb_html_matrix(b: &Breadcrumb) -> String {
             }
             out.push_str(&escape_html_matrix(s));
         }
+    }
+    out
+}
+
+/// Render the rolling aggregate "activity" chip as Matrix HTML using the
+/// native `<details><summary>…</summary>…</details>` disclosure element
+/// (same primitive the long-output / thinking renderers use). The
+/// `<summary>` carries the collapsed one-line status (current activity +
+/// completed/total count); the body is one styled line per tool step,
+/// each on its own `<div>` so Element lays them out as discrete rows.
+///
+/// Shape:
+///
+/// ```html
+/// <details>
+///   <summary>[~] shell npm run build · 1/2 steps</summary>
+///   <div>[ok] <b>read_file</b> <code>src/App.tsx</code> <i>— 120 lines</i></div>
+///   <div>[~] <b>shell</b> <code>npm run build</code></div>
+/// </details>
+/// ```
+///
+/// Element / `SchildiChat` / Cinny render `<details>` as a clickable
+/// expander natively; legacy clients fall back to the plain-text `body`
+/// (one step per line — see [`render_activity_text_matrix`]). Every
+/// dynamic field is HTML-escaped individually so a path like `src/<x>`
+/// or a bare `&` round-trips without leaking raw markup.
+fn render_activity_html_matrix(b: &Breadcrumb) -> String {
+    let mut out = String::with_capacity(128 + b.steps.len() * 64);
+    out.push_str("<details><summary>");
+    // Collapsed summary line from the top-level fields.
+    out.push_str(breadcrumb_glyph_matrix(b.status));
+    out.push(' ');
+    match b.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => out.push_str(&escape_html_matrix(d)),
+        None => out.push_str("working"),
+    }
+    if let Some(s) = b.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(" · ");
+        out.push_str(&escape_html_matrix(s));
+    }
+    out.push_str("</summary>");
+    // Body — one styled line per step, newest-biased when the turn ran
+    // more than ACTIVITY_MAX_STEPS_MATRIX tools.
+    let total = b.steps.len();
+    let hidden = total.saturating_sub(ACTIVITY_MAX_STEPS_MATRIX);
+    if hidden > 0 {
+        out.push_str(&format!("<div><i>+{hidden} earlier step(s)</i></div>"));
+    }
+    for step in b.steps.iter().skip(hidden) {
+        out.push_str("<div>");
+        out.push_str(&render_step_line_html_matrix(step));
+        out.push_str("</div>");
+    }
+    out.push_str("</details>");
+    out
+}
+
+/// One styled step line for the `<details>` body: status marker, bold
+/// tool name, `<code>` detail, italic summary. Every dynamic field is
+/// HTML-escaped individually so source paths / commands round-trip
+/// without leaking raw markup.
+fn render_step_line_html_matrix(s: &Breadcrumb) -> String {
+    let mut out = String::with_capacity(48);
+    out.push_str(breadcrumb_glyph_matrix(s.status));
+    out.push_str(" <b>");
+    out.push_str(&escape_html_matrix(&s.tool_name));
+    out.push_str("</b>");
+    if let Some(d) = s.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        out.push_str(" <code>");
+        out.push_str(&escape_html_matrix(d));
+        out.push_str("</code>");
+    }
+    if let Some(sum) = s.summary.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+        if s.status == BreadcrumbStatus::Failed {
+            out.push_str(" <i>— failed: ");
+        } else {
+            out.push_str(" <i>— ");
+        }
+        out.push_str(&escape_html_matrix(sum));
+        out.push_str("</i>");
+    }
+    out
+}
+
+/// Plain-text `body` fallback for the rolling aggregate chip — the
+/// collapsed summary line followed by one step per line (reusing each
+/// step's canonical [`Breadcrumb::to_text_fallback`] shape). Non-HTML
+/// Matrix clients (CLI bots, IRC bridges) get a readable rendering. The
+/// step list is capped to match the HTML body, with a `+N earlier` note.
+fn render_activity_text_matrix(b: &Breadcrumb) -> String {
+    let mut out = String::with_capacity(64 + b.steps.len() * 48);
+    out.push_str(breadcrumb_glyph_matrix(b.status));
+    out.push(' ');
+    match b.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => out.push_str(d),
+        None => out.push_str("working"),
+    }
+    if let Some(s) = b.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        out.push_str(" · ");
+        out.push_str(s);
+    }
+    let total = b.steps.len();
+    let hidden = total.saturating_sub(ACTIVITY_MAX_STEPS_MATRIX);
+    if hidden > 0 {
+        out.push_str(&format!("\n+{hidden} earlier step(s)"));
+    }
+    for step in b.steps.iter().skip(hidden) {
+        out.push('\n');
+        out.push_str(&step.to_text_fallback());
     }
     out
 }
@@ -1348,6 +1491,148 @@ mod tests {
             .with_detail("echo <a> & <b>");
         let html = super::render_breadcrumb_html_matrix(&bc);
         assert!(html.contains("echo &lt;a&gt; &amp; &lt;b&gt;"));
+    }
+
+    #[test]
+    fn render_breadcrumb_aggregate_renders_styled_details_steps() {
+        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
+        let steps = vec![
+            Breadcrumb::running("read_file")
+                .with_detail("src/App.tsx")
+                .finished(true, Some("120 lines".into())),
+            Breadcrumb::running("shell").with_detail("npm run build"),
+        ];
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("shell npm run build".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("1/2 steps".into()),
+            steps,
+        };
+        let html = super::render_breadcrumb_html_matrix(&agg);
+        // Native Matrix collapse primitive: <details>/<summary> wrapper.
+        assert!(html.starts_with("<details><summary>"), "details wrapper: {html}");
+        assert!(html.ends_with("</details>"), "details closed: {html}");
+        // Collapsed summary line with ASCII marker + count inside <summary>.
+        assert!(
+            html.contains("<summary>[~] shell npm run build · 1/2 steps</summary>"),
+            "summary line: {html}"
+        );
+        // Each step individually styled (bold tool, <code> detail, italic
+        // summary) — not raw text / markdown.
+        assert!(
+            html.contains("[ok] <b>read_file</b> <code>src/App.tsx</code> <i>— 120 lines</i>"),
+            "step 1: {html}"
+        );
+        assert!(
+            html.contains("[~] <b>shell</b> <code>npm run build</code>"),
+            "step 2: {html}"
+        );
+        assert!(!html.contains("**"), "no raw markdown: {html}");
+    }
+
+    #[test]
+    fn render_breadcrumb_aggregate_escapes_and_caps_steps() {
+        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
+        let mut steps: Vec<Breadcrumb> = (0..50)
+            .map(|i| {
+                Breadcrumb::running("shell")
+                    .with_detail(format!("step {i}"))
+                    .finished(true, None)
+            })
+            .collect();
+        steps.push(Breadcrumb::running("write_file").with_detail("a <b> & c"));
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("write_file a <b> & c".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("50/51 steps".into()),
+            steps,
+        };
+        let html = super::render_breadcrumb_html_matrix(&agg);
+        // Over the cap (40) → "+N earlier step(s)" note inside <details>.
+        assert!(html.contains("earlier step(s)"), "cap note: {html}");
+        // 51 steps, cap 40 → 11 hidden.
+        assert!(html.contains("+11 earlier step(s)"), "cap count: {html}");
+        // HTML in a detail is escaped individually (no raw < > & on the wire)
+        // in BOTH the collapsed summary and the per-step line.
+        assert!(html.contains("a &lt;b&gt; &amp; c"), "escaped: {html}");
+        assert!(!html.contains("<b> &"), "no raw markup leak: {html}");
+    }
+
+    #[tokio::test]
+    async fn deliver_breadcrumb_aggregate_first_emit_sends_details() {
+        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
+        let s = MockServer::start().await;
+        mount_empty_sync(&s).await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(wiremock::matchers::body_string_contains("\"m.notice\""))
+            .and(wiremock::matchers::body_string_contains("<details><summary>"))
+            .and(wiremock::matchers::body_string_contains("<b>read_file</b>"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "event_id": "$agg:m.org"
+            })))
+            .mount(&s)
+            .await;
+        let (adapter, _dir, _rx) = build_adapter(&s.uri());
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("shell npm run build".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("1/2 steps".into()),
+            steps: vec![
+                Breadcrumb::running("read_file")
+                    .with_detail("src/App.tsx")
+                    .finished(true, Some("120 lines".into())),
+                Breadcrumb::running("shell").with_detail("npm run build"),
+            ],
+        };
+        let id = adapter
+            .deliver_breadcrumb("!room:m.org", None, &agg, None)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("$agg:m.org"));
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_breadcrumb_aggregate_edit_path_renders_details() {
+        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
+        let s = MockServer::start().await;
+        mount_empty_sync(&s).await;
+        // The m.replace edit path must ALSO carry the <details> aggregate.
+        Mock::given(method("PUT"))
+            .and(path_regex(r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+"))
+            .and(wiremock::matchers::body_string_contains("\"m.replace\""))
+            .and(wiremock::matchers::body_string_contains("\"m.notice\""))
+            .and(wiremock::matchers::body_string_contains("<details><summary>"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "event_id": "$aggedit:m.org"
+            })))
+            .mount(&s)
+            .await;
+        let (adapter, _dir, _rx) = build_adapter(&s.uri());
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("shell npm run build".into()),
+            status: BreadcrumbStatus::Done,
+            summary: Some("2/2 steps".into()),
+            steps: vec![
+                Breadcrumb::running("read_file")
+                    .with_detail("src/App.tsx")
+                    .finished(true, Some("120 lines".into())),
+                Breadcrumb::running("shell")
+                    .with_detail("npm run build")
+                    .finished(true, Some("ok".into())),
+            ],
+        };
+        let id = adapter
+            .deliver_breadcrumb("!room:m.org", None, &agg, Some("$prev:m.org"))
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("$aggedit:m.org"));
+        adapter.shutdown().await;
     }
 
     #[tokio::test]

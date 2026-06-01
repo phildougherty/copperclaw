@@ -231,6 +231,26 @@ impl Breadcrumb {
     /// - `Done` no summary: `[shell] cargo check ✓`
     /// - `Failed` no summary: `[shell] cargo check ✗`
     pub fn to_text_fallback(&self) -> String {
+        // Rolling aggregate: a summary line plus one plain line per step.
+        // Channels without a native collapse affordance still get the
+        // low-churn rolling view (just not collapsed).
+        if !self.steps.is_empty() {
+            let mut out = String::new();
+            let head = match &self.detail {
+                Some(d) if !d.trim().is_empty() => d.trim().to_string(),
+                _ => "working".to_string(),
+            };
+            out.push_str(&head);
+            if let Some(s) = self.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                out.push_str(" · ");
+                out.push_str(s);
+            }
+            for step in &self.steps {
+                out.push_str("\n  ");
+                out.push_str(&step.to_text_fallback());
+            }
+            return out;
+        }
         let head = match &self.detail {
             Some(d) if !d.trim().is_empty() => format!("[{}] {}", self.tool_name, d.trim()),
             _ => format!("[{}]", self.tool_name),
@@ -364,6 +384,31 @@ mod tests {
     fn text_fallback_failed_no_summary_marks_with_failed_suffix() {
         let b = running_shell().finished(false, None);
         assert_eq!(b.to_text_fallback(), "[shell] cargo check (failed)");
+    }
+
+    #[test]
+    fn text_fallback_aggregate_renders_summary_plus_step_lines() {
+        let steps = vec![
+            Breadcrumb::running("read_file")
+                .with_detail("a.rs")
+                .finished(true, Some("10 lines".into())),
+            Breadcrumb::running("shell").with_detail("cargo build"),
+        ];
+        let agg = Breadcrumb {
+            tool_name: "activity".into(),
+            detail: Some("shell cargo build".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("1/2 steps".into()),
+            steps,
+        };
+        let txt = agg.to_text_fallback();
+        assert!(
+            txt.starts_with("shell cargo build · 1/2 steps"),
+            "summary line: {txt}"
+        );
+        // Each step on its own indented line, reusing the single-chip format.
+        assert!(txt.contains("\n  [read_file] a.rs — 10 lines"), "{txt}");
+        assert!(txt.contains("\n  [shell] cargo build"), "{txt}");
     }
 
     #[test]
