@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (configurable per-turn output-token cap — 2026-06-01)
+
+`COPPERCLAW_DEFAULT_MAX_TOKENS` in `.env` now sets the per-turn output
+token cap. The host writes it into `runner.json`
+(`crates/copperclaw-host/src/container_manager/runner_config.rs` →
+`RunnerConfigForFile.max_tokens`, mirroring the temperature default) and
+the runner already threads it to the provider request. Unset leaves the
+runner's built-in 4096; raise it for large edits and reasoning models
+(minimax-m3, qwen3.6-27b) that burn budget thinking before they write.
+
 ### Added (local-model optimizations — 2026-05-31)
 
 Tuning for self-hosted/local-model (ollama) deployments, surfaced while

@@ -86,6 +86,12 @@ pub(crate) struct RunnerConfigForFile {
     /// so the model/provider default is left untouched.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) temperature: Option<f32>,
+    /// Per-turn output-token cap passed to the provider. Sourced from
+    /// `COPPERCLAW_DEFAULT_MAX_TOKENS` in `.env`; raise it for large
+    /// edits and reasoning models that spend budget thinking. Skipped
+    /// when None, leaving the runner's built-in default (4096).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) max_tokens: Option<u32>,
 }
 
 impl ContainerManager {
@@ -314,6 +320,13 @@ impl ContainerManager {
             .ok()
             .and_then(|s| s.trim().parse::<f32>().ok());
 
+        // Host-wide per-turn output-token cap from
+        // `COPPERCLAW_DEFAULT_MAX_TOKENS` (`.env`). Unset → the runner's
+        // 4096 default; raise it for large edits / reasoning models.
+        let max_tokens = std::env::var("COPPERCLAW_DEFAULT_MAX_TOKENS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok());
+
         RunnerConfigForFile {
             session_id: session.id.as_uuid().to_string(),
             agent_group_id: session.agent_group_id.as_uuid().to_string(),
@@ -336,6 +349,7 @@ impl ContainerManager {
             surface_thinking,
             effort,
             temperature,
+            max_tokens,
         }
     }
 }
