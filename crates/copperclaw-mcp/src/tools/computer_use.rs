@@ -96,12 +96,19 @@ pub mod shell {
         /// running. `cd`/exports from earlier calls are discarded.
         #[serde(default)]
         reset: bool,
+        /// When true, launch the command detached and return immediately
+        /// with its PID and a log path. Output is redirected to a file
+        /// under `/data/.jobs/`; poll it with `read_file`, stop the job
+        /// with `kill <pid>`. The container persists, so the job keeps
+        /// running across later tool calls.
+        #[serde(default)]
+        background: bool,
     }
 
     pub fn schema() -> Tool {
         super::make_tool(
             "shell",
-            "Run a bash command inside the container. Returns stdout, stderr, and exit code. Output is capped at 32 KiB per stream — if you expect more, narrow it first with `tail -n 200`, `head -n 200`, or `grep`. Working directory and exported environment variables persist across calls within a session; pass `reset: true` to wipe that state.\n\nDO NOT use `shell` to create or edit files. Use the dedicated tools instead: `write_file` for new files, `edit_file` / `multi_edit` / `apply_patch` for changes, `copy_file` to duplicate. Heredoc patterns like `cat > foo << 'EOF' ... EOF` and `echo \"content\" > foo` waste tokens twice: the file body travels through history as the shell `command` string, AND the tool result. The dedicated tools take the body as a clean `content` field and don't echo it back. Heredoc-style file writes are REJECTED here with a redirect message.",
+            "Run a bash command inside the container. Returns stdout, stderr, and exit code. Output is capped at 32 KiB per stream — if you expect more, narrow it first with `tail -n 200`, `head -n 200`, or `grep`. Working directory and exported environment variables persist across calls within a session; pass `reset: true` to wipe that state.\n\nFor a long-running command (a dev server, a slow build/test, anything you want to keep running while you do other work), pass `background: true`: the call returns immediately with a `pid` and a `log_path`. Poll progress with `read_file` on the log_path (or `tail -n 50 <log_path>`), check it's alive with `kill -0 <pid>`, and stop it with `kill <pid>`. The container persists, so the job keeps running across later tool calls. Foreground `shell` is capped at 600s — use `background: true` for anything longer.\n\nDO NOT use `shell` to create or edit files. Use the dedicated tools instead: `write_file` for new files, `edit_file` / `multi_edit` / `apply_patch` for changes, `copy_file` to duplicate. Heredoc patterns like `cat > foo << 'EOF' ... EOF` and `echo \"content\" > foo` waste tokens twice: the file body travels through history as the shell `command` string, AND the tool result. The dedicated tools take the body as a clean `content` field and don't echo it back. Heredoc-style file writes are REJECTED here with a redirect message.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -110,7 +117,8 @@ pub mod shell {
                     "command":      { "type": "string", "minLength": 1 },
                     "cwd":          { "type": ["string", "null"] },
                     "timeout_secs": { "type": ["integer", "null"], "minimum": 1, "maximum": 600 },
-                    "reset":        { "type": "boolean" }
+                    "reset":        { "type": "boolean" },
+                    "background":   { "type": "boolean" }
                 }
             }),
         )
@@ -205,6 +213,14 @@ pub mod shell {
             }
         }
 
+        // Background mode: launch the command detached and return the PID
+        // + log path immediately. The job survives into later tool calls
+        // because the container persists; the model polls the log with
+        // `read_file` and stops the job with `kill`.
+        if input.background {
+            return run_background(&input.command, input.cwd.as_deref(), &state_path).await;
+        }
+
         // Build the wrapped command. The leading `source` is guarded by
         // `[ -f ... ]` so the first call (no state yet) is fine. The
         // trailing capture writes `cd $(printf %q "$PWD")` plus the
@@ -289,6 +305,106 @@ pub mod shell {
         )
     }
 
+    /// Launch `command` detached in its own session and return its PID +
+    /// log path immediately. Split out of [`handle`] so that function
+    /// stays within the line budget. See [`build_background_command`].
+    async fn run_background(
+        command: &str,
+        working_dir: Option<&str>,
+        state_path: &std::path::Path,
+    ) -> Result<CallToolResult, ToolError> {
+        let job_dir = state_path.parent().map_or_else(
+            || std::path::PathBuf::from("/data/.jobs"),
+            |p| p.join(".jobs"),
+        );
+        // Nanosecond clock gives a unique-enough log name at human-paced
+        // launch rates without pulling in a uuid dep.
+        let job_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let log_path = job_dir.join(format!("job-{job_id}.log"));
+        let wrapped = build_background_command(command, state_path, &job_dir, &log_path);
+
+        let mut cmd = tokio::process::Command::new("bash");
+        cmd.arg("-c").arg(&wrapped);
+        if let Some(dir) = working_dir {
+            cmd.current_dir(dir);
+        }
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+        let child = cmd
+            .spawn()
+            .map_err(|e| ToolError::Internal(format!("shell spawn failed: {e}")))?;
+        // The launcher returns as soon as it backgrounds the job; a short
+        // timeout guards against a command that fails to detach (e.g. one
+        // that blocks reading stdin despite the redirect).
+        let output =
+            match tokio::time::timeout(Duration::from_secs(15), child.wait_with_output()).await {
+                Ok(Ok(output)) => output,
+                Ok(Err(e)) => return Err(ToolError::Internal(format!("shell wait failed: {e}"))),
+                Err(_) => {
+                    return Ok(success_json(&json!({
+                        "command": command,
+                        "background": true,
+                        "error": "the background launcher did not return within 15s; \
+                                  the command may not have detached cleanly",
+                        "log_path": log_path.display().to_string(),
+                    })));
+                }
+            };
+        let pid = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .last()
+            .and_then(|l| l.trim().parse::<i64>().ok());
+        let (launch_stderr, _) =
+            cap_output(&String::from_utf8_lossy(&output.stderr), SHELL_OUTPUT_CAP);
+        Ok(success_json(&json!({
+            "command": command,
+            "background": true,
+            "pid": pid,
+            "log_path": log_path.display().to_string(),
+            "note": "Running in the background. Poll output with read_file on log_path \
+                     (or shell `tail -n 50 <log_path>`). Check it's alive with \
+                     shell `kill -0 <pid>`. Stop it with shell `kill -- -<pid>` \
+                     (the pid is the process-group leader, so the negative form \
+                     stops the whole job tree, not just the launching shell).",
+            "launch_stderr": launch_stderr,
+        })))
+    }
+
+    /// Compose the launcher for `background: true`. Sources the persisted
+    /// cwd/env so the job runs in the agent's context, then launches it
+    /// fully detached via `setsid` — its own session/process-group with no
+    /// controlling terminal, stdout/stderr to `log_path`, stdin from
+    /// `/dev/null`, and `&` so the launcher returns immediately. With
+    /// `setsid` the reported `$!` PID is the session leader, so it equals
+    /// the process-group id: `kill -- -<pid>` then stops the whole job
+    /// tree (the leader plus every child it spawns), not just the shell.
+    ///
+    /// Unlike [`build_wrapped_command`], the job does NOT write back the
+    /// shell-state file: it runs asynchronously and must not race the
+    /// foreground's cwd/env. The redirect to a file (not the inherited
+    /// pipe) is what lets `wait_with_output` return without blocking on
+    /// the still-running child.
+    fn build_background_command(
+        user_cmd: &str,
+        state_path: &std::path::Path,
+        job_dir: &std::path::Path,
+        log_path: &std::path::Path,
+    ) -> String {
+        format!(
+            "mkdir -p {jobs}; \
+             [ -f {state} ] && source {state}; \
+             setsid bash -c {user} > {log} 2>&1 < /dev/null & \
+             echo $!",
+            jobs = shell_quote(&job_dir.display().to_string()),
+            state = shell_quote(&state_path.display().to_string()),
+            user = shell_quote(user_cmd),
+            log = shell_quote(&log_path.display().to_string()),
+        )
+    }
+
     /// Single-quote a path for safe substitution inside the wrapped
     /// bash command. Inputs are state-file paths we control, so the
     /// minimal `'...'` quoting (with `'` -> `'\''`) is sufficient.
@@ -312,6 +428,16 @@ pub mod shell {
         state_path: &std::path::Path,
     ) -> String {
         build_wrapped_command(user_cmd, state_path)
+    }
+
+    #[cfg(test)]
+    pub(super) fn build_background_command_for_test(
+        user_cmd: &str,
+        state_path: &std::path::Path,
+        job_dir: &std::path::Path,
+        log_path: &std::path::Path,
+    ) -> String {
+        build_background_command(user_cmd, state_path, job_dir, log_path)
     }
 
     struct Handler;
@@ -671,7 +797,7 @@ pub mod write_file {
     pub fn schema() -> Tool {
         super::make_tool(
             "write_file",
-            "Write UTF-8 text to a file inside the container. Creates parent directories by default; pass `append: true` to add to an existing file rather than overwrite.",
+            "Write UTF-8 text to a file inside the container, replacing its entire contents (or pass `append: true` to add to the end instead). Creates parent directories by default.\n\nUse `write_file` to CREATE a new file, or when you deliberately intend to replace a whole file. To change PART of an existing file, prefer `edit_file` / `multi_edit` / `apply_patch`: read the file first, then edit the specific region. Overwriting a file you have not read this session risks silently dropping code that was already there — read before you rewrite.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -1417,6 +1543,25 @@ mod tests {
         assert!(wrapped.contains("_KEY"));
         assert!(wrapped.contains("_SECRET"));
         assert!(wrapped.contains("exit $__ic_status"));
+    }
+
+    #[test]
+    fn shell_background_command_detaches_redirects_and_reports_pid() {
+        let state = std::path::Path::new("/tmp/test-state");
+        let jobs = std::path::Path::new("/tmp/.jobs");
+        let log = std::path::Path::new("/tmp/.jobs/job-1.log");
+        let bg = shell::build_background_command_for_test("npm run dev", state, jobs, log);
+        // Sources persisted state so the job runs in the agent's context.
+        assert!(bg.contains("source '/tmp/test-state'"));
+        // Creates the jobs dir and redirects all output to the log file.
+        assert!(bg.contains("mkdir -p '/tmp/.jobs'"));
+        assert!(bg.contains("> '/tmp/.jobs/job-1.log' 2>&1 < /dev/null"));
+        // Detached in its own session (setsid + &) and reports the PID.
+        assert!(bg.contains("setsid bash -c 'npm run dev'"));
+        assert!(bg.trim_end().ends_with("echo $!"));
+        // Must NOT write back the shared shell-state file (no capture step).
+        assert!(!bg.contains("export -p"));
+        assert!(!bg.contains("__ic_status"));
     }
 
     #[test]

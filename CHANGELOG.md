@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (shell background jobs + write_file overwrite steer — 2026-06-01)
+
+- `shell` gains `background: true`: launches the command detached in its
+  own session (`setsid`) and returns `{pid, log_path}` immediately. The
+  session container persists, so the job keeps running across later tool
+  calls — poll its output with `read_file` on `log_path`, check it's
+  alive with `kill -0 <pid>`, stop the whole job tree with
+  `kill -- -<pid>`. Closes the long-running-task gap (dev servers, slow
+  builds) that the 600s foreground ceiling couldn't cover. Verified
+  end-to-end in the session image: immediate return, detached survival,
+  log capture, group-kill takes down children.
+  (`crates/copperclaw-mcp/src/tools/computer_use.rs`)
+- `write_file`'s description now steers the model to read-then-edit
+  existing files (`edit_file`/`multi_edit`/`apply_patch`) and reserve
+  `write_file` for new files or deliberate full replacement — curbing
+  blind whole-file overwrites that silently drop existing code.
+
 ### Fixed (MiniMax/OpenRouter tool-pairing rejection — 2026-06-01)
 
 minimax-m3 (and other strict OpenAI-compatible models behind OpenRouter)
