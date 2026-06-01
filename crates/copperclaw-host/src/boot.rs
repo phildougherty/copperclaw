@@ -991,6 +991,10 @@ fn collect_forward_env() -> Vec<(String, String)> {
         // operator's `.env` value never reaches the container and the
         // flag silently no-ops.
         "COPPERCLAW_TOOL_BREADCRUMBS",
+        // Breadcrumb presentation style read by the runner: `rolling`
+        // collapses a turn's tools into one expandable activity chip
+        // (else legacy per-tool chips). Same forward-or-no-op caveat.
+        "COPPERCLAW_BREADCRUMB_STYLE",
         // Per-session turn cap override. The runner main reads this
         // to size `max_tool_turns` (default 60); operators bump it for
         // long build/research sessions that would otherwise bail mid-flight.
