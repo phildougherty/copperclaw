@@ -18,6 +18,13 @@ pub const POLL_INTERVAL_MS: u64 = 1000;
 /// Path inside the container where the session dir is mounted.
 pub const CONTAINER_SESSION_DIR: &str = "/data";
 
+/// Path inside a `create_agent` sibling's container where the PARENT
+/// agent's session dir is mounted read-only, so the sibling can review /
+/// audit / search the parent's workspace and code. Read-only: the sibling
+/// can read but never corrupt the parent's files; its own writable
+/// workspace stays at [`CONTAINER_SESSION_DIR`].
+pub const CONTAINER_PARENT_DIR: &str = "/parent";
+
 /// Filename of the runner-config JSON written into the session dir.
 pub const RUNNER_CONFIG_FILENAME: &str = "runner.json";
 
@@ -432,6 +439,28 @@ impl ContainerManager {
             }
         }
 
+        // A `create_agent` sibling (recorded with a parent `source_session_id`)
+        // gets the PARENT agent's session dir mounted READ-ONLY at /parent, so
+        // a spawned reviewer / auditor can read the parent's workspace and code
+        // (the sibling's own /data starts empty). The parent lives under a
+        // different agent group, so we locate it by scanning
+        // `<data>/sessions/*/<parent_session_id>` — session ids are unique
+        // UUIDs. Read-only keeps the sibling from corrupting the parent's
+        // files. Best-effort: if the parent dir can't be located, skip it.
+        if let Some(parent_sid) = session.source_session_id {
+            if let Some(sessions_dir) = paths.root.parent().and_then(|p| p.parent()) {
+                if let Some(parent_root) =
+                    find_session_root(sessions_dir, &parent_sid.as_uuid().to_string())
+                {
+                    spec = spec.with_mount(Mount::Bind {
+                        source: parent_root.to_string_lossy().into_owned(),
+                        target: CONTAINER_PARENT_DIR.to_string(),
+                        read_only: true,
+                    });
+                }
+            }
+        }
+
         // The runner reads its config from this path via the
         // `--config` flag wired into the entrypoint args. ContainerSpec
         // doesn't have a dedicated args field, so we encode the flag
@@ -516,6 +545,23 @@ pub(super) fn host_uid_gid() -> Option<(u32, u32)> {
 
 pub(super) fn container_name(_agent: AgentGroupId, session: copperclaw_types::SessionId) -> String {
     format!("copperclaw-{}", session.as_uuid())
+}
+
+/// Locate a session's on-disk root by scanning `<sessions_dir>/*/<session_id>`.
+/// Session ids are unique UUIDs, so the first agent-group subdir containing
+/// one is the right session. Returns `None` if not found (e.g. the parent
+/// was deleted). Used to mount a `create_agent` sibling's parent workspace.
+fn find_session_root(
+    sessions_dir: &std::path::Path,
+    session_id: &str,
+) -> Option<std::path::PathBuf> {
+    for entry in std::fs::read_dir(sessions_dir).ok()?.flatten() {
+        let candidate = entry.path().join(session_id);
+        if candidate.is_dir() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Choose the base image for a per-group rebuild. Returns the install's
@@ -917,6 +963,59 @@ mod tests {
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
         let spec = mgr.build_spec(&session, &paths, "img", None);
         assert!(spec.env.iter().all(|(k, _)| k != "ANTHROPIC_BASE_URL"));
+    }
+
+    #[test]
+    fn build_spec_mounts_parent_workspace_read_only_for_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        // Parent session dir on disk, under a DIFFERENT agent group.
+        let parent_group = AgentGroupId::new();
+        let parent_sid = copperclaw_types::SessionId::new();
+        let parent_root = SessionPaths::new(tmp.path(), parent_group, parent_sid).root;
+        std::fs::create_dir_all(&parent_root).unwrap();
+        // A sibling session records the parent via source_session_id.
+        let mut sibling = fixture_session(&db);
+        sibling.source_session_id = Some(parent_sid);
+        let paths = SessionPaths::new(tmp.path(), sibling.agent_group_id, sibling.id);
+        let spec = mgr.build_spec(&sibling, &paths, "img", None);
+        let parent_mount = spec.mounts.iter().find_map(|m| match m {
+            Mount::Bind {
+                source,
+                target,
+                read_only,
+            } if target == CONTAINER_PARENT_DIR => Some((source.clone(), *read_only)),
+            _ => None,
+        });
+        let (src, ro) = parent_mount.expect("/parent mount present for sibling");
+        assert_eq!(src, parent_root.to_string_lossy().to_string());
+        assert!(ro, "parent workspace must be mounted read-only");
+    }
+
+    #[test]
+    fn build_spec_no_parent_mount_for_root_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        // fixture_session has source_session_id = None (a root session).
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None);
+        assert!(
+            !spec.mounts.iter().any(
+                |m| matches!(m, Mount::Bind { target, .. } if target == CONTAINER_PARENT_DIR)
+            ),
+            "root session must not get a /parent mount"
+        );
     }
 
     #[test]

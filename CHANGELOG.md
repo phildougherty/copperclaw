@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (sub-agents can review the parent's codebase — 2026-06-01)
+
+`create_agent` siblings run in their own container with an empty `/data`,
+so "spawn sub-agents to review the codebase" produced reviewers with no
+source to look at. Now every sibling gets the PARENT agent's session dir
+bind-mounted **read-only at `/parent`** (`build_spec`, located by scanning
+`<data>/sessions/*/<parent_session_id>`). The sibling can review/audit/
+search the parent's code but can't modify it; its own writable workspace
+stays at `/data`. The `create_agent` / `explore` descriptions and the
+system prompt were reframed: `explore` for quick in-process lookups
+(shares your live `/data`), `create_agent` for substantive parallel
+review/work (reads your code at `/parent`).
+
+### Changed (default max tool turns 60 → 150 — 2026-06-01)
+
+`DEFAULT_MAX_TOOL_TURNS` raised 60 → 150. Substantial "review the codebase
+and implement the fixes" / full-app-build requests routinely ran past 60
+tool-use cycles and were cut off mid-task. Still bounded; tune further with
+`COPPERCLAW_MAX_TOOL_TURNS` (clamped to [5, 500]).
+
 ### Added (rolling activity breadcrumbs — Telegram — 2026-06-01)
 
 Opt-in low-profile tool-progress UX (`COPPERCLAW_BREADCRUMB_STYLE=rolling`).

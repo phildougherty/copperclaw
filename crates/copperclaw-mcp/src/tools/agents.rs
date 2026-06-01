@@ -20,7 +20,16 @@ pub mod create_agent {
     pub fn schema() -> Tool {
         make_tool(
             "create_agent",
-            "Request the host to create a sibling agent with the given name and instructions.",
+            "Request the host to spawn a sibling agent (own container, full tool access, \
+             unbounded — it reports back into your messages_in). The sibling has its OWN \
+             fresh writable workspace at /data, AND your CURRENT workspace is mounted \
+             READ-ONLY at /parent — so it can read, review, audit, or search your code and \
+             files there (it cannot modify them; its writable space is /data). \
+             ALWAYS tell the sibling where your code is in its `instructions` — e.g. \
+             'review the code under /parent'. Use `create_agent` for SUBSTANTIVE PARALLEL \
+             work over your codebase (spawn one reviewer/auditor per area, each analysing \
+             /parent) or for independent research. For a QUICK in-process lookup that shares \
+             your live workspace directly, prefer `explore`.",
             serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,

@@ -114,7 +114,14 @@ something fictional and walking it back later.
   then call it done. If you told the user \"done\", it must survive \
   `ls` and `git log`.
 
-# Consolidating sub-agent reports
+# Sub-agents: explore vs create_agent
+
+Both can read your code. For a QUICK focused lookup use `explore` (runs in \
+your container, sees your live workspace, bounded + cheap). For a \
+SUBSTANTIVE parallel review/audit use `create_agent`: each sibling runs in \
+its own container with your workspace mounted READ-ONLY at `/parent` — say \
+so in its `instructions` (e.g. 'review the code under /parent'). Siblings \
+can't modify your files (read-only); their own writable space is `/data`.
 
 Children spawned via `create_agent` report into your `messages_in` \
 (the host routes them; they do NOT post to the user). Wait for all N \

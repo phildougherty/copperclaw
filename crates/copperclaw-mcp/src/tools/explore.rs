@@ -81,26 +81,29 @@ struct Input {
 pub fn schema() -> Tool {
     make_tool(
         "explore",
-        "Open a lightweight in-process subagent to research a SPECIFIC, NARROW question. \
-         The subagent runs a bounded LLM tool-use loop (default 5 turns, 50_000 \
-         CUMULATIVE input-token budget across all turns, 60s wall-clock, read-only \
-         tools only) and returns a single summary string. It shields the parent's \
-         context from the intermediate exploration. The `task` field must be \
-         self-contained; the subagent does not see the parent's conversation history.\n\n\
-         **When to use `explore` vs `create_agent`:**\n\
-         - `explore` is for QUICK in-process lookups: 'find the function that handles \
-         X in this codebase', 'fetch /api/version and tell me the schema', 'what does \
-         the README say about Y'. Single-focus, 1-3 tool calls expected.\n\
-         - `create_agent` is for SUBSTANTIVE PARALLEL RESEARCH: 'research market trends, \
-         user pain points, and competitive landscape in parallel'. Each child agent gets \
-         its own ~200k token budget, full tool access, and a dedicated container — none \
-         of explore's constraints apply.\n\n\
+        "Open a lightweight in-process subagent that investigates using YOUR workspace. \
+         It runs INSIDE your container, so it SEES YOUR FILES AND CODE (`/data`, the repo \
+         you're working on). It runs a bounded LLM tool-use loop (default 5 turns, 50_000 \
+         CUMULATIVE input-token budget across all turns, 60s wall-clock, read-only tools — \
+         grep, glob, read_file, web_fetch) and returns a single summary string, shielding \
+         the parent's context from the intermediate work. The `task` must be self-contained; \
+         the subagent does not see the parent's conversation history.\n\n\
+         **`explore` vs `create_agent` — both can read your code; pick by SIZE:**\n\
+         - `explore` runs IN-PROCESS in YOUR container (sees your live `/data` directly) \
+         and is bounded + cheap. Use it for QUICK, focused lookups: 'find where X is \
+         handled', 'what does this module do', 'does the build pass'. Run a few in parallel \
+         for a fast multi-angle skim. Returns a summary to you; raise `max_turns` (≤10) / \
+         `max_tokens` (≤200k) for a bit more depth.\n\
+         - `create_agent` spawns a full sibling agent in its OWN container with your \
+         workspace mounted READ-ONLY at `/parent`. It's UNBOUNDED (no turn/token cap) but \
+         heavier. Use it for a SUBSTANTIVE, parallel review/audit of the codebase — spawn \
+         one auditor per area, each told to analyse `/parent` — then synthesise their \
+         reports. (Reads only; it can't modify your files.)\n\n\
          **Budget caveat:** the 50k token budget is CUMULATIVE input tokens across all \
-         subagent turns. Each turn replays the full prior history + tool results, so a \
-         single fetch of a large page (e.g. a JS-heavy SPA homepage) can consume a \
-         disproportionate share of the budget when repeated in subsequent turns' context. \
-         For multi-source research, prefer `create_agent` (each child has its own fresh \
-         budget) over one `explore` with many fetches.",
+         subagent turns; each turn replays prior history + tool results, so one fetch of a \
+         large page can dominate the budget. For broad multi-area review, prefer several \
+         parallel `explore` calls (each with its own budget) over one `explore` doing \
+         everything.",
         serde_json::json!({
             "type": "object",
             "additionalProperties": false,
