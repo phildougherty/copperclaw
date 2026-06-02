@@ -566,24 +566,49 @@ them all before deciding which tool to call.\n",
 /// Used both by `build_skill_system_prompt` (which builds the catalogue
 /// itself) and `runner_config_for` (which reuses the catalogue it
 /// already built for the `skills.json` write).
+/// A tiny set of load-bearing rules kept ALWAYS inline in callable mode,
+/// even though the full bodies are fetched on demand. Some models never
+/// call `load_skill`, so the two behaviours that cause real damage when
+/// missed — not parallelising big work, and destroying uncommitted work
+/// during a merge — are stated up front rather than buried in a skill body
+/// the model may never read. Deliberately short to keep the sprawl win.
+const CALLABLE_CORE_RULES: &str = "\n\
+# Core rules — these ALWAYS apply, even before you load any skill\n\n\
+- **Parallelise substantial multi-part work.** When a task has several \
+independent pieces (build N features, review N areas, research N topics), \
+spawn one `create_agent` sibling PER piece and let them run at once — don't \
+grind through them yourself in series. If the project you're `cd`'d into is \
+a git repo, each sibling gets a writable worktree of it at `/workspace` on \
+its own branch. (`load_skill(\"create-agent\")` for the details, then \
+synthesise their reports into ONE reply.)\n\
+- **Never destroy uncommitted work during git.** Before any `git merge`, \
+branch switch, `reset`, or `checkout -- .` in the working tree, run \
+`git status --porcelain`; if it is NOT empty, `git stash push -u` first and \
+pop after. A \"your local changes would be overwritten\" is a STOP — never \
+force past it with checkout/reset/`-X theirs`. (`load_skill(\"git-commit\")` \
+before committing or merging.)\n";
+
 pub(crate) fn render_callable_skill_index(catalogue: &[SkillCatalogueEntry]) -> String {
     let mut out = String::with_capacity(2 * 1024);
     out.push_str(
-        "Below is your skill catalogue — but only each skill's NAME and \
-one-line description are shown here, NOT its instructions. The description \
-is a pointer, not the procedure. Acting on the description alone WILL get \
-the details wrong: the body carries the real rules (git safety, how to \
-deliver files to the operator, what to verify before claiming done, how to \
-merge sub-agents' work back) that you cannot infer from one line.\n\n\
-So: the moment a task touches an area a skill covers — writing/committing \
-code, merging branches, sending a card or file, scheduling, spawning \
-sub-agents — call `load_skill(\"<name>\")` and READ its body BEFORE you \
-act, not after. Load the relevant skill at the start of that work, and \
-again when you switch into a new kind of work. If two skills might apply, \
-load the closest match rather than guessing. `load_skill` returns the same \
-markdown that would have been inlined; treat reading it as a required \
-first step, not an optional lookup.\n",
+        "You have skills, but ONLY their names + one-line descriptions are \
+listed below — you do NOT yet have their instructions. A description tells \
+you a skill EXISTS; it does not tell you how to do the work. To get the \
+actual steps you MUST call the `load_skill` tool with the skill's name.\n\n\
+This is a hard workflow rule, not a suggestion: when a task enters a \
+skill's area, your FIRST action is to `load_skill` it — before you touch \
+any other tool. Concretely:\n\
+- about to write, edit, or run code → `load_skill(\"coding-task\")`\n\
+- about to commit or merge → `load_skill(\"git-commit\")`\n\
+- spawning sub-agents / parallel work → `load_skill(\"create-agent\")`\n\
+- sending a card or file, scheduling, etc. → load that skill first.\n\n\
+It is one cheap tool call and the body changes how you act (it holds the \
+real rules — git safety, delivery, verification, sub-agent merge-back) that \
+you cannot infer from one line and WILL get wrong otherwise. Load early, \
+and reload when the work shifts to a new kind. Do not start skill-covered \
+work without having loaded its skill this session.\n",
     );
+    out.push_str(CALLABLE_CORE_RULES);
     for entry in catalogue {
         out.push_str("\n<skill name=\"");
         out.push_str(&escape_attr(&entry.name));
@@ -1237,6 +1262,23 @@ mod tests {
         let out = render_callable_skill_index(&entries);
         assert!(out.contains("name=\"kept\""));
         assert!(!out.contains("name=\"dropped\""));
+    }
+
+    #[test]
+    fn render_callable_skill_index_always_inlines_core_rules() {
+        // Even in callable mode the load-bearing behaviours must be present
+        // up front, because some models never call load_skill.
+        let out = render_callable_skill_index(&[SkillCatalogueEntry {
+            name: "x".into(),
+            description: "d".into(),
+            body: "b".into(),
+        }]);
+        assert!(out.contains("Core rules"), "core rules block missing");
+        assert!(
+            out.contains("create_agent` sibling PER piece"),
+            "parallelise rule missing"
+        );
+        assert!(out.contains("git stash push -u"), "git-safety rule missing");
     }
 
     #[test]

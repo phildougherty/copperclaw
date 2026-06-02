@@ -22,6 +22,15 @@ merged sibling branches into the live working tree without stashing first.
   anything a skill covers (code/commit/merge, send card/file, schedule,
   spawn sub-agents), reloading when switching kinds of work. (No effect in
   inline mode, where bodies are already in the prompt.)
+- **Always-inline critical core (hybrid):** because some models never call
+  `load_skill` at all (observed: `minimax-m3`, 0 calls over multiple runs,
+  and it implemented features serially instead of spawning agents), callable
+  mode now also keeps a short `CALLABLE_CORE_RULES` block permanently in the
+  prompt — the two behaviours that do real damage when missed: *parallelise
+  multi-part work via one `create_agent` per piece*, and *never destroy
+  uncommitted work during a git merge* (`git status` → stash → never force).
+  Keeps the sprawl win while guaranteeing the load-bearing rules are present
+  even for a model that won't fetch skill bodies.
 - `skills/git-commit/SKILL.md`: new "Merging branches — clean tree FIRST"
   section — `git status --porcelain` before any working-tree-mutating git
   op; `git stash` if dirty; a "your local changes would be overwritten"
