@@ -158,11 +158,18 @@ struct AskHandler {
 
 impl DeliveryActionHandler for AskHandler {
     fn handle(&self, input: DeliveryActionInput) -> Result<DeliveryActionOutput, ModuleError> {
+        // The runner emits the question id as `id`
+        // (`ask_user_question.id`, see copperclaw-runner tools.rs); accept
+        // that, falling back to `question_id` for any caller using the
+        // internal name. Reading only `question_id` here silently dropped
+        // every real `ask_user_question` (card never rendered, no pending
+        // row) with "missing question_id".
         let id = input
             .payload
-            .get("question_id")
+            .get("id")
+            .or_else(|| input.payload.get("question_id"))
             .and_then(|v| v.as_str())
-            .ok_or_else(|| ModuleError::other("interactive", "missing question_id"))?
+            .ok_or_else(|| ModuleError::other("interactive", "missing question id (`id`)"))?
             .to_owned();
         let title = input
             .payload
@@ -475,6 +482,42 @@ mod tests {
         let msg = out.message.unwrap();
         assert_eq!(msg.content["card"]["question_id"], "q-abc");
         assert!(m.get(&QuestionId::new("q-abc")).is_some());
+    }
+
+    #[tokio::test]
+    async fn ask_handler_accepts_runner_id_field() {
+        // Regression: the runner emits the question id as `id` (not
+        // `question_id`); reading only `question_id` dropped every real
+        // ask_user_question with "missing question_id".
+        let m = InteractiveModule::default();
+        let ctx = MockModuleContext::new();
+        m.install(ctx.clone()).await.unwrap();
+        let handlers = ctx.action_handlers.lock().unwrap();
+        let (_, handler) = handlers
+            .iter()
+            .find(|(n, _)| n == "ask_user_question")
+            .unwrap();
+        let out = handler
+            .handle(DeliveryActionInput {
+                action: "ask_user_question".into(),
+                payload: serde_json::json!({
+                    "id": "q_runner",
+                    "title": "Pick layout?",
+                    "options": ["a", "b"],
+                }),
+                target: DispatchTarget {
+                    channel_type: Some("telegram".into()),
+                    platform_id: Some("chat-1".into()),
+                    thread_id: None,
+                    agent_group_id: None,
+                },
+                session_id: None,
+                row_id: None,
+            })
+            .unwrap();
+        let msg = out.message.expect("question card must be built");
+        assert_eq!(msg.content["card"]["question_id"], "q_runner");
+        assert!(m.get(&QuestionId::new("q_runner")).is_some());
     }
 
     #[tokio::test]
