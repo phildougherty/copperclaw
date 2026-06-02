@@ -296,7 +296,7 @@ pub mod shell {
             "[ -f {state} ] && source {state}; \
              {user_cmd}; \
              __ic_status=$?; \
-             {{ echo \"cd $(printf %q \\\"$PWD\\\")\"; \
+             {{ echo \"cd $(printf %q \"$PWD\")\"; \
                 export -p | grep -vE '^declare -x (ANTHROPIC_|[A-Za-z_][A-Za-z0-9_]*(_TOKEN|_KEY|_SECRET))='; \
              }} > {state} 2>/dev/null; \
              exit $__ic_status",
@@ -1343,6 +1343,17 @@ mod tests {
         .unwrap();
         let body = result_text(&res);
         assert!(body.contains("/tmp"), "got: {body}");
+        // Regression: the cwd-capture line must be a *runnable* `cd`. A
+        // previous bug emitted `cd \"/tmp\"` with literal quotes (from
+        // over-escaped `printf %q \"$PWD\"`), so re-sourcing the state
+        // failed with `<state>: line 1: cd: ...: No such file or directory`
+        // on every subsequent command — the real cwd was never restored
+        // (only the `$PWD` env var was, which `pwd` happens to echo, hiding
+        // the breakage). Assert the sourcing produced no `cd` error.
+        assert!(
+            !body.contains("cd:"),
+            "sourcing .shell_state must not error on cd; got: {body}"
+        );
     }
 
     #[tokio::test]
