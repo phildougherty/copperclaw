@@ -51,6 +51,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # cargo-llvm-cov needs the LLVM coverage tools (llvm-profdata,
+          # llvm-cov); without this component it errors out immediately.
+          components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-llvm-cov --locked
       - run: cargo llvm-cov --workspace --fail-under-lines 85

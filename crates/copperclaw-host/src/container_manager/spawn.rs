@@ -1128,7 +1128,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
+    // Linux-only: asserts the `/proc/self`-based uid detection in
+    // `host_uid_gid`. On macOS (also `unix`) there's no `/proc`, so the
+    // function returns `None` by design and `spec.user` is unset — nothing
+    // to assert. Gating to `linux` keeps the macOS CI runner green.
+    #[cfg(target_os = "linux")]
     fn build_spec_runs_container_as_host_user() {
         use std::os::unix::fs::MetadataExt;
         // Regression: containers used to inherit the image's default
