@@ -8,11 +8,13 @@ use crate::error::DeliveryError;
 use crate::system_actions::{ParsedAction, parse_system_content};
 use copperclaw_channels_core::{
     AdapterError, Breadcrumb, Card, ChannelAdapter, DiffCard, ErrorCard, ErrorCardKind,
-    ThinkingBlock, TodoList,
+    ThinkingBlock, TodoItemStatus, TodoList, TodoListItem,
 };
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
-use copperclaw_db::tables::{delivered, messages_in, messages_out, session_routing};
+use copperclaw_db::tables::{
+    agent_groups, delivered, messages_in, messages_out, session_routing, sessions,
+};
 use copperclaw_modules::{
     DeliveryActionHandler, DeliveryActionInput, DeliveryDispatcher, DispatchTarget,
 };
@@ -240,6 +242,20 @@ pub struct DeliveryService {
     /// construct time; an `AtomicBool` so tests can flip it without
     /// touching the process env. Default off.
     selfmod_hard_fail: AtomicBool,
+    /// Per-root-session locks serialising `TodoList` delivery across a
+    /// whole `create_agent` family. The parent and its sibling agents all
+    /// render into ONE pinned plan card (rolled up); two family members
+    /// emitting concurrently would otherwise both "first-emit pin" and
+    /// produce duplicate pins. Keyed by the family ROOT session id.
+    todo_locks: DashMap<SessionId, Arc<tokio::sync::Mutex<()>>>,
+    /// In-memory cache of the rolled-up plan's pinned-message external id,
+    /// keyed by family ROOT session id. Makes the single-anchor robust to
+    /// emit ordering (a child rendering before the parent has pinned would
+    /// otherwise miss the root's DB records and pin a second card). Falls
+    /// back to the root's persisted `delivered` records on a cache miss
+    /// (e.g. after a host restart); cleared when the plan fully completes
+    /// so a later fresh plan re-pins.
+    todo_anchors: DashMap<SessionId, String>,
 }
 
 impl DeliveryService {
@@ -272,6 +288,8 @@ impl DeliveryService {
             retries: DashMap::new(),
             dispatcher,
             selfmod_hard_fail: AtomicBool::new(selfmod_hard_fail_from_env()),
+            todo_locks: DashMap::new(),
+            todo_anchors: DashMap::new(),
         })
     }
 
@@ -310,6 +328,8 @@ impl DeliveryService {
             retries: DashMap::new(),
             dispatcher,
             selfmod_hard_fail: AtomicBool::new(selfmod_hard_fail_from_env()),
+            todo_locks: DashMap::new(),
+            todo_anchors: DashMap::new(),
         })
     }
 
@@ -1431,6 +1451,15 @@ impl DeliveryService {
         inbound_pool: &SessionPool,
         sess: &Session,
     ) -> Result<(), DeliveryError> {
+        // Validate the triggering row up front (corrupt row → fail fast
+        // so the retry loop doesn't bang on it). The card itself is
+        // rebuilt from the whole family below, so this is only a guard.
+        if row.content.get("todo_list").is_none() {
+            return Err(DeliveryError::SystemAction(
+                "todo_list row missing content.todo_list".into(),
+            ));
+        }
+
         let channel_type = target
             .channel_type
             .clone()
@@ -1445,48 +1474,72 @@ impl DeliveryService {
             .map(|r| r.clone())
             .ok_or_else(|| DeliveryError::NoAdapter(channel_type.clone()))?;
 
-        // Pull the canonical TodoList out of `content.todo_list`. A
-        // parse failure is a host bug (corrupted row) — surface as
-        // SystemAction so the retry loop doesn't bang on it forever.
-        let list: TodoList = match row.content.get("todo_list") {
-            Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
-                DeliveryError::SystemAction(format!(
-                    "todo_list row content.todo_list failed to deserialise: {e}"
-                ))
-            })?,
-            None => {
-                return Err(DeliveryError::SystemAction(
-                    "todo_list row missing content.todo_list".into(),
-                ));
-            }
-        };
+        // Roll the whole `create_agent` family into ONE pinned card owned
+        // by the family ROOT: each child's plan becomes a labeled, indented
+        // section under the parent's, and a child never pins its own
+        // message. Serialise per-root so two members emitting concurrently
+        // don't both "first-emit pin" and produce duplicate pinned cards.
+        let root = resolve_root(&self.central, sess);
+        let lock = self
+            .todo_locks
+            .entry(root.id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
 
-        // Look up the prior list's platform message id (when one
-        // exists). The predicate is "always true" because the
-        // most-recent TodoList row in the session IS the prior chip
-        // — there's only ever one logical list per session, so we
-        // don't need a tool_name-style scope filter.
-        let prior_external_id = lookup_prior_kind_external_id(
-            &self
-                .session_paths
-                .outbound_pool(&sess.agent_group_id, &sess.id)?
-                .connect()?,
-            &inbound_pool.connect()?,
-            MessageKind::TodoList,
-            |_| true,
-        )?;
+        let root_list = self.latest_todo_list(&root.agent_group_id, &root.id);
+        let mut child_lists: Vec<(String, TodoList)> = Vec::new();
+        for child in family_children(&self.central, root.id) {
+            match self.latest_todo_list(&child.agent_group_id, &child.id) {
+                Some(list) if !list.items.is_empty() => {
+                    let name = agent_groups::get(&self.central, child.agent_group_id)
+                        .map_or_else(|_| "sub-agent".to_string(), |g| g.name);
+                    child_lists.push((name, list));
+                }
+                _ => {}
+            }
+        }
+        let combined = build_combined(root_list, &child_lists);
+
+        let in_conn = inbound_pool.connect()?;
+        if combined.items.is_empty() {
+            // Nothing to render yet — mark the row delivered (so the loop
+            // doesn't retry) and leave any existing pin alone.
+            delivered::insert(&in_conn, row.id, None, "ok")?;
+            return Ok(());
+        }
+
+        // The single pinned anchor is keyed by the ROOT session. Prefer the
+        // in-memory cache (robust to emit ordering across the family); fall
+        // back to the root's persisted `delivered` records (e.g. after a
+        // host restart, where the parent's pinned card survives).
+        let prior_external_id = match self.todo_anchors.get(&root.id) {
+            Some(id) => Some(id.clone()),
+            None => lookup_prior_kind_external_id(
+                &self
+                    .session_paths
+                    .outbound_pool(&root.agent_group_id, &root.id)?
+                    .connect()?,
+                &self
+                    .session_paths
+                    .inbound_pool(&root.agent_group_id, &root.id)?
+                    .connect()?,
+                MessageKind::TodoList,
+                |_| true,
+            )?,
+        };
 
         // pin_hint:
         // - First emit (no prior chip yet) → true so the adapter pins.
         // - All-completed transition → true so the adapter can unpin.
         // - Otherwise → false (leave existing pin state alone).
-        let pin_hint = prior_external_id.is_none() || list.is_fully_completed();
+        let pin_hint = prior_external_id.is_none() || combined.is_fully_completed();
 
         let platform_message_id = match adapter
             .deliver_todo_list(
                 &platform_id,
                 target.thread_id.as_deref(),
-                &list,
+                &combined,
                 prior_external_id.as_deref(),
                 pin_hint,
             )
@@ -1500,7 +1553,7 @@ impl DeliveryService {
                 );
                 let outbound = OutboundMessage {
                     kind: MessageKind::Chat,
-                    content: serde_json::json!({ "text": list.to_text_fallback() }),
+                    content: serde_json::json!({ "text": combined.to_text_fallback() }),
                     files: vec![],
                 };
                 call_adapter(
@@ -1513,9 +1566,44 @@ impl DeliveryService {
             }
             Err(other) => return Err(DeliveryError::Adapter(other)),
         };
-        let in_conn = inbound_pool.connect()?;
+        // Track the family's single anchor for subsequent edits. Drop it
+        // once the whole plan is done so a later fresh plan re-pins rather
+        // than editing a stale (unpinned) card.
+        match (&platform_message_id, combined.is_fully_completed()) {
+            (Some(id), false) => {
+                self.todo_anchors.insert(root.id, id.clone());
+            }
+            (_, true) => {
+                self.todo_anchors.remove(&root.id);
+            }
+            (None, false) => {}
+        }
         delivered::insert(&in_conn, row.id, platform_message_id.as_deref(), "ok")?;
         Ok(())
+    }
+
+    /// Read a session's most-recent `TodoList` payload from its outbound
+    /// DB (the canonical post-mutation list the runner emitted). `None`
+    /// when the session has no todo list yet or its DB can't be opened.
+    fn latest_todo_list(
+        &self,
+        agent_group_id: &AgentGroupId,
+        session_id: &SessionId,
+    ) -> Option<TodoList> {
+        let conn = self
+            .session_paths
+            .outbound_pool(agent_group_id, session_id)
+            .ok()?
+            .connect()
+            .ok()?;
+        let mut stmt = conn
+            .prepare("SELECT content FROM messages_out WHERE kind = ?1 ORDER BY seq DESC LIMIT 1")
+            .ok()?;
+        let content: String = stmt
+            .query_row([MessageKind::TodoList.as_str()], |r| r.get(0))
+            .ok()?;
+        let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+        serde_json::from_value(value.get("todo_list")?.clone()).ok()
     }
 
     /// Dispatch a `MessageKind::Error` row — the slice-3.3
@@ -2322,6 +2410,85 @@ fn platform_message_id_for(
         .optional()
         .map_err(copperclaw_db::DbError::from)?;
     Ok(row.flatten())
+}
+
+/// Walk `source_session_id` to the family ROOT — the top-most ancestor,
+/// which owns the single pinned plan card. Bounded to defend against a
+/// cycle / very deep chain; returns the last reachable session.
+fn resolve_root(central: &CentralDb, sess: &Session) -> Session {
+    let mut current = sess.clone();
+    for _ in 0..32 {
+        let Some(parent_id) = current.source_session_id else {
+            return current;
+        };
+        match sessions::get(central, parent_id) {
+            Ok(parent) => current = parent,
+            // Parent gone (deleted) — treat the current node as the root.
+            Err(_) => return current,
+        }
+    }
+    current
+}
+
+/// Active `create_agent` children of `root_id` (siblings record the
+/// parent as their `source_session_id`). Direct children only — a
+/// grandchild rolls up under its own parent's card.
+fn family_children(central: &CentralDb, root_id: SessionId) -> Vec<Session> {
+    sessions::list_active(central)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|s| s.source_session_id == Some(root_id))
+        .collect()
+}
+
+/// Collapse a child's per-item statuses into one header status:
+/// `Completed` iff every item is; `InProgress` once any work has started
+/// (an item in progress, or some-but-not-all completed); else `Pending`.
+fn aggregate_status(items: &[TodoListItem]) -> TodoItemStatus {
+    if !items.is_empty() && items.iter().all(|i| i.status == TodoItemStatus::Completed) {
+        return TodoItemStatus::Completed;
+    }
+    if items.iter().any(|i| {
+        matches!(
+            i.status,
+            TodoItemStatus::InProgress | TodoItemStatus::Completed
+        )
+    }) {
+        return TodoItemStatus::InProgress;
+    }
+    TodoItemStatus::Pending
+}
+
+/// Build the single rolled-up card: the root's items, then one labeled,
+/// indented section per child (`↳ <name>` header carrying the child's
+/// aggregate status, followed by its items indented). Item ids are
+/// renumbered so they stay unique across the combined list — renderers
+/// key per-item state on `id`.
+fn build_combined(root: Option<TodoList>, children: &[(String, TodoList)]) -> TodoList {
+    let title = root.as_ref().and_then(|l| l.title.clone());
+    let mut items: Vec<TodoListItem> = root.map(|l| l.items).unwrap_or_default();
+    let mut next_id: u32 = items
+        .iter()
+        .map(|i| i.id)
+        .max()
+        .map_or(0, |m| m.wrapping_add(1));
+    for (name, child) in children {
+        items.push(TodoListItem {
+            id: next_id,
+            text: format!("↳ {name}"),
+            status: aggregate_status(&child.items),
+        });
+        next_id = next_id.wrapping_add(1);
+        for it in &child.items {
+            items.push(TodoListItem {
+                id: next_id,
+                text: format!("    {}", it.text),
+                status: it.status,
+            });
+            next_id = next_id.wrapping_add(1);
+        }
+    }
+    TodoList { items, title }
 }
 
 /// Translate a `usage_report` system payload into an `agent_turns`
@@ -4910,6 +5077,176 @@ mod tests {
         assert_eq!(rpt.failed, 1);
         assert_eq!(rpt.delivered, 0);
         assert!(mock.deliveries().is_empty());
+    }
+
+    #[test]
+    fn aggregate_status_rolls_up_child_items() {
+        use copperclaw_channels_core::{TodoItemStatus as S, TodoListItem as Item};
+        let it = |s| Item {
+            id: 0,
+            text: "x".into(),
+            status: s,
+        };
+        assert_eq!(aggregate_status(&[]), S::Pending);
+        assert_eq!(
+            aggregate_status(&[it(S::Pending), it(S::Pending)]),
+            S::Pending
+        );
+        assert_eq!(
+            aggregate_status(&[it(S::Completed), it(S::Completed)]),
+            S::Completed
+        );
+        // Mixed (some done, some not) and any-in-progress both read as work
+        // underway.
+        assert_eq!(
+            aggregate_status(&[it(S::Completed), it(S::Pending)]),
+            S::InProgress
+        );
+        assert_eq!(aggregate_status(&[it(S::InProgress)]), S::InProgress);
+    }
+
+    #[test]
+    fn build_combined_nests_children_with_unique_ids() {
+        use copperclaw_channels_core::{TodoItemStatus as S, TodoList, TodoListItem as Item};
+        let root = TodoList {
+            title: Some("Plan".into()),
+            items: vec![Item {
+                id: 1,
+                text: "Spawn A".into(),
+                status: S::InProgress,
+            }],
+        };
+        let child = TodoList {
+            title: None,
+            items: vec![
+                Item {
+                    id: 1,
+                    text: "Read".into(),
+                    status: S::Completed,
+                },
+                Item {
+                    id: 2,
+                    text: "Write".into(),
+                    status: S::InProgress,
+                },
+            ],
+        };
+        let out = build_combined(Some(root), &[("builder-A".to_string(), child)]);
+        // Root title is preserved; child folds in as a labeled, indented section.
+        assert_eq!(out.title.as_deref(), Some("Plan"));
+        let texts: Vec<&str> = out.items.iter().map(|i| i.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["Spawn A", "↳ builder-A", "    Read", "    Write"]
+        );
+        // The header carries the child's aggregate status (mixed → InProgress).
+        assert_eq!(out.items[1].status, S::InProgress);
+        // Ids stay unique across the combined list (renderers key on id).
+        let ids: std::collections::HashSet<u32> = out.items.iter().map(|i| i.id).collect();
+        assert_eq!(ids.len(), out.items.len());
+    }
+
+    #[test]
+    fn build_combined_empty_when_nothing_to_show() {
+        assert!(build_combined(None, &[]).items.is_empty());
+    }
+
+    /// End-to-end: a parent's TodoList row renders ONE card that folds each
+    /// live `create_agent` child's plan in as a labeled section — the
+    /// "single pinned plan, children rolled up" behaviour.
+    #[tokio::test]
+    async fn todo_list_rolls_up_child_plans_into_one_card() {
+        use copperclaw_channels_core::{TodoItemStatus, TodoList, TodoListItem};
+        let (service, _root, parent, mock) = make_service().await;
+        let central = service.central();
+
+        // A create_agent child: its own agent group, recording the parent.
+        let child_ag = copperclaw_db::tables::agent_groups::create(
+            central,
+            copperclaw_db::tables::agent_groups::CreateAgentGroup {
+                name: "builder-A".into(),
+                folder: "builder-a".into(),
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        let child_sess = copperclaw_db::tables::sessions::create(
+            central,
+            copperclaw_db::tables::sessions::CreateSession {
+                agent_group_id: child_ag.id,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+                source_session_id: Some(parent.id),
+            },
+        )
+        .unwrap();
+
+        let to_content =
+            |list: &TodoList| json!({ "todo_list": serde_json::to_value(list).unwrap() });
+
+        // Child emits its plan into its own outbound.
+        let child_list = TodoList {
+            title: None,
+            items: vec![TodoListItem {
+                id: 1,
+                text: "Implement feature".into(),
+                status: TodoItemStatus::InProgress,
+            }],
+        };
+        let child_pool = service
+            .session_paths()
+            .outbound_pool(&child_ag.id, &child_sess.id)
+            .unwrap();
+        write_row(
+            &child_pool,
+            &make_row(MessageKind::TodoList, to_content(&child_list)),
+        );
+
+        // Parent emits its plan and is processed.
+        let parent_list = TodoList {
+            title: None,
+            items: vec![TodoListItem {
+                id: 1,
+                text: "Spawn builder".into(),
+                status: TodoItemStatus::InProgress,
+            }],
+        };
+        let parent_pool = service
+            .session_paths()
+            .outbound_pool(&parent.agent_group_id, &parent.id)
+            .unwrap();
+        write_row(
+            &parent_pool,
+            &make_row(MessageKind::TodoList, to_content(&parent_list)),
+        );
+
+        let rpt = service.process_session_once(&parent).await.unwrap();
+        assert_eq!(rpt.delivered, 1);
+        assert_eq!(rpt.failed, 0);
+
+        // One delivered card containing the parent step AND the child section.
+        let deliveries = mock.deliveries();
+        let text = deliveries
+            .last()
+            .unwrap()
+            .message
+            .content
+            .get("text")
+            .and_then(|v| v.as_str())
+            .expect("text fallback");
+        assert!(
+            text.contains("Spawn builder"),
+            "parent step missing: {text}"
+        );
+        assert!(
+            text.contains("\u{21b3} builder-A"),
+            "child section header missing: {text}"
+        );
+        assert!(
+            text.contains("Implement feature"),
+            "child item missing: {text}"
+        );
     }
 
     // ----------------------------------------------------------------------
