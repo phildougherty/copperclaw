@@ -122,8 +122,10 @@ inbound. You don't have to tell children "send to agent:<your-name>"
 
 ## Notes
 
-- New agent inherits the caller's image / MCP servers / skills /
-  packages; boots cold (first-reply latency includes spawn time).
+- New agent inherits the caller's model / provider / effort / image /
+  MCP servers / skills / packages; boots cold (first-reply latency
+  includes spawn time). So a sibling runs on the same model you do —
+  spawn builders from a capable model and they'll be capable too.
 - Permissions are the new agent's own group's, not the caller's.
 - Recursive spawning is allowed but expensive — each container costs
   memory and disk.
