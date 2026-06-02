@@ -20,12 +20,28 @@ the host shares your workspace automatically:
   gets a WRITABLE `git worktree` of that repo at `/workspace`, on its own
   branch `sib/<session-id>`. It edits and commits there in isolation; the
   commits land in your repo's object store, so after it reports back you
-  review and merge its branch from inside that project:
-  `git diff main..sib/<id>` → `git merge sib/<id>` → `git worktree remove
-  .copperclaw/wt/<id>`. Your checked-out files are never touched until you
-  merge.
+  review and merge its branch from inside that project (see merge-back
+  below). Your checked-out files are never touched until you merge.
 - **If you're not in a git repo**, your whole workspace is mounted
   READ-ONLY at `/parent` (the sibling can review/audit, not modify).
+
+### Merging the siblings' work back (clean tree FIRST)
+
+You merge in your OWN live working tree, where uncommitted work can live.
+A previous run **destroyed the user's WIP** by merging into a dirty tree —
+do not repeat it. For each sibling branch:
+
+1. `git status --porcelain` — if it's **not empty**, there's uncommitted
+   work you didn't make: `git stash push -u` before you merge, and
+   `git stash pop` after (stop and ask if the pop conflicts; never drop
+   the stash).
+2. Review then merge: `git diff main..sib/<id>` → `git merge --no-ff
+   sib/<id>` (only after it builds clean).
+3. A merge that reports "your local changes would be overwritten" is a
+   **STOP** — never `checkout`/`reset`/`-X theirs` past it. Stash or ask.
+4. Tidy: `git worktree remove .copperclaw/wt/<id>`.
+
+See [[git-commit]] for the full discipline.
 
 So before spawning builders: `cd` into the project and make sure it's a git
 repo (`git init` if new — see [[coding-task]]). Then point the sibling at

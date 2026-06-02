@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (push agents to actually `load_skill`; harden git merge-back — 2026-06-02)
+
+Two issues a live Telegram run surfaced. (1) With `COPPERCLAW_SKILLS_MODE=callable`
+the system prompt only carries a compact name+description skill index and
+the body is fetched on demand — but the model never called `load_skill`
+(0 calls across a 116-tool-call run), so it acted off one-line
+descriptions and never saw the skills' real rules. (2) A sub-agent
+merge-back **destroyed the user's uncommitted WIP** because the parent
+merged sibling branches into the live working tree without stashing first.
+
+- `render_callable_skill_index` (`container_manager::prompt`): the index
+  intro is now a firm directive — the description is a *pointer, not the
+  procedure*; `load_skill("<name>")` and read the body BEFORE acting on
+  anything a skill covers (code/commit/merge, send card/file, schedule,
+  spawn sub-agents), reloading when switching kinds of work. (No effect in
+  inline mode, where bodies are already in the prompt.)
+- `skills/git-commit/SKILL.md`: new "Merging branches — clean tree FIRST"
+  section — `git status --porcelain` before any working-tree-mutating git
+  op; `git stash` if dirty; a "your local changes would be overwritten"
+  merge is a STOP, never `checkout`/`reset`/`-X theirs` past it. Broadened
+  the reset/checkout rule to cover `git checkout <branch> -- .`.
+- `skills/create-agent/SKILL.md`: merge-back guidance now mandates the
+  clean-tree/stash check before merging each `sib/<id>` branch, citing the
+  WIP-loss it prevents.
+
 ### Added (sub-agents work on the parent's codebase — writable git worktrees — 2026-06-01)
 
 `create_agent` siblings run in their own container with an empty `/data`,

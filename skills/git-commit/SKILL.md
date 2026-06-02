@@ -49,11 +49,32 @@ feature. Don't mix these.
 - **Never `git push --force` without explicit permission.** Same
   reasoning as amend. If you have to overwrite a remote branch,
   confirm first.
-- **Never `git reset --hard` or `git checkout --` on a tree with
-  uncommitted work.** That's unrecoverable. If you need a clean slate,
-  stash first.
+- **Never `git reset --hard`, `git checkout -- .`, or `git checkout
+  <branch> -- .` on a tree with uncommitted work.** That's
+  unrecoverable. If you need a clean slate, `git stash` first.
 - **Never `git clean -f` without showing the user what it would
   delete.** Untracked files are often the user's in-progress work.
+
+## Merging branches — clean tree FIRST (not optional)
+
+This is the rule a sub-agent run already broke: it merged sibling
+branches into the live working tree and **silently destroyed the user's
+uncommitted WIP**. Before ANY `git merge` / `git rebase` / branch
+switch that touches the working tree:
+
+1. **Check the tree is clean.** Run `git status --porcelain`. Empty →
+   proceed. Non-empty → there is uncommitted work you did NOT make;
+   treat it as the user's and do NOT blow it away.
+2. **If it's dirty, stash before you merge** — `git stash push -u -m
+   "pre-merge <branch>"` — do the merge, then `git stash pop` and
+   resolve. If a pop would conflict with the merged change, stop and
+   tell the user; don't drop the stash.
+3. **A merge that would overwrite uncommitted files is a STOP, not a
+   force.** Never `git checkout`/`reset`/`-X theirs` your way past
+   "your local changes would be overwritten" — that's the exact move
+   that ate the WIP. Stash or ask.
+4. Merge `--no-ff` so the feature stays a reviewable unit, and only
+   after its branch builds/tests clean.
 
 ## When the hook fails
 

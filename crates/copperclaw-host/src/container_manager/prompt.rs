@@ -569,11 +569,20 @@ them all before deciding which tool to call.\n",
 pub(crate) fn render_callable_skill_index(catalogue: &[SkillCatalogueEntry]) -> String {
     let mut out = String::with_capacity(2 * 1024);
     out.push_str(
-        "The following is the catalogue of skills available to you. Each \
-<skill> entry shows only the skill's name and one-line description — the full \
-SKILL.md body is not inlined. To read a skill's body before acting on it, call \
-the `load_skill` tool with that skill's `name`; the tool returns the same \
-markdown that would have been inlined.\n",
+        "Below is your skill catalogue — but only each skill's NAME and \
+one-line description are shown here, NOT its instructions. The description \
+is a pointer, not the procedure. Acting on the description alone WILL get \
+the details wrong: the body carries the real rules (git safety, how to \
+deliver files to the operator, what to verify before claiming done, how to \
+merge sub-agents' work back) that you cannot infer from one line.\n\n\
+So: the moment a task touches an area a skill covers — writing/committing \
+code, merging branches, sending a card or file, scheduling, spawning \
+sub-agents — call `load_skill(\"<name>\")` and READ its body BEFORE you \
+act, not after. Load the relevant skill at the start of that work, and \
+again when you switch into a new kind of work. If two skills might apply, \
+load the closest match rather than guessing. `load_skill` returns the same \
+markdown that would have been inlined; treat reading it as a required \
+first step, not an optional lookup.\n",
     );
     for entry in catalogue {
         out.push_str("\n<skill name=\"");
