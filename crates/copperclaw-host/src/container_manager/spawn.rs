@@ -536,15 +536,22 @@ impl ContainerManager {
 /// ids are unique UUIDs. Best-effort: if the parent can't be located, the
 /// spec is returned unchanged.
 ///
-/// If the parent workspace is a GIT REPO, the sibling gets a WRITABLE
-/// worktree on its own branch (`sib/<id>`) at `/workspace` — it can edit
-/// and commit, and the parent reviews/merges the branch from its own
-/// `/data` (the worktree shares the parent repo's object store). The
-/// parent's `.git` is mounted at its IDENTICAL host-absolute path so the
-/// worktree's `gitdir:` pointer resolves inside the container with no
+/// If the parent is currently working inside a GIT REPO, the sibling gets
+/// a WRITABLE worktree of THAT repo on its own branch (`sib/<id>`) at
+/// `/workspace` — it can edit and commit, and the parent reviews/merges the
+/// branch from its own checkout (the worktree shares the repo's object
+/// store). The repo's `.git` is mounted at its IDENTICAL host-absolute path
+/// so the worktree's `gitdir:` pointer resolves inside the container with no
 /// rewriting; the parent's checked-out files are never mounted, so they
-/// stay physically untouched. Otherwise (no repo) we fall back to the
-/// legacy READ-ONLY `/parent` mount so the sibling can still review.
+/// stay physically untouched.
+///
+/// "The repo the parent is working in" is resolved from the parent's
+/// persisted shell cwd (see [`resolve_parent_repo_root`]) — a single session
+/// commonly holds several projects (each its own subdir repo) across
+/// `/clear`, so we worktree whichever one the parent is cd'd into rather
+/// than assuming `/data` itself is the repo. Otherwise (no repo at/above the
+/// cwd, and none at the workspace root) we fall back to the READ-ONLY
+/// `/parent` mount of the whole workspace so the sibling can still review.
 fn apply_parent_workspace(
     mut spec: ContainerSpec,
     session: &Session,
@@ -562,7 +569,9 @@ fn apply_parent_workspace(
     };
 
     let sibling_sid = session.id.as_uuid().to_string();
-    if let Some(wt) = provision_parent_worktree(&parent_root, &sibling_sid) {
+    let worktree = resolve_parent_repo_root(&parent_root)
+        .and_then(|repo_root| provision_parent_worktree(&repo_root, &sibling_sid));
+    if let Some(wt) = worktree {
         let git_dir = wt.git_dir.to_string_lossy().into_owned();
         spec = spec
             // Shared `.git` at its host-absolute path (RW: the worktree's
@@ -588,6 +597,82 @@ fn apply_parent_workspace(
         });
     }
     spec
+}
+
+/// Resolve which git repo a `create_agent` sibling's worktree should be cut
+/// from, given the parent's on-disk session root (`/data` on the host side).
+///
+/// A single session is reused for many projects over time (the operator
+/// `/clear`s context between them, but `/data` persists), so "the repo" is
+/// whichever project the parent is *currently working in*: we read the
+/// parent's persisted shell cwd from `.shell_state`, map the container path
+/// (`/data/<proj>`) back to the host, and walk UP to the nearest enclosing
+/// `.git` — bounded at `parent_root` so we never escape the session dir.
+/// Falls back to a repo at the workspace root, then `None` (no repo →
+/// read-only `/parent`).
+fn resolve_parent_repo_root(parent_root: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Some(rel) = parent_shell_cwd_relative(parent_root) {
+        let start = if rel.as_os_str().is_empty() {
+            parent_root.to_path_buf()
+        } else {
+            parent_root.join(rel)
+        };
+        let mut dir: &std::path::Path = &start;
+        loop {
+            if dir.join(".git").is_dir() {
+                return Some(dir.to_path_buf());
+            }
+            if dir == parent_root {
+                break;
+            }
+            match dir.parent() {
+                // Stay within the session dir; never walk above `/data`.
+                Some(p) if p.starts_with(parent_root) => dir = p,
+                _ => break,
+            }
+        }
+    }
+    // No cwd signal (or its repo wasn't found): a repo at the workspace root.
+    if parent_root.join(".git").is_dir() {
+        return Some(parent_root.to_path_buf());
+    }
+    None
+}
+
+/// The parent's current shell working directory, expressed RELATIVE to the
+/// session root (so `/data/fairway-focus` → `fairway-focus`, and `/data`
+/// itself → the empty path). Returns `None` when there's no `.shell_state`,
+/// no parseable cwd, or the cwd isn't under the container session dir (e.g.
+/// the agent `cd`'d to `/tmp`). The `shell` tool persists this after each
+/// command.
+fn parent_shell_cwd_relative(parent_root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let state = std::fs::read_to_string(parent_root.join(".shell_state")).ok()?;
+    let cwd = parse_shell_pwd(&state)?;
+    let rel = cwd
+        .strip_prefix(CONTAINER_SESSION_DIR)?
+        .trim_start_matches('/');
+    Some(std::path::PathBuf::from(rel))
+}
+
+/// Extract `$PWD` from a dumped bash environment (`.shell_state`). Matches
+/// the `... PWD="<value>"` declaration while skipping `OLDPWD` (the `PWD`
+/// substring there is preceded by an alphanumeric, so it's rejected).
+fn parse_shell_pwd(state: &str) -> Option<String> {
+    for line in state.lines() {
+        let Some(idx) = line.find("PWD=") else {
+            continue;
+        };
+        // Reject `OLDPWD=` (and any other `*PWD=`): the real var name is
+        // bounded by a non-alphanumeric (the `declare -x ` space) on its left.
+        if idx > 0 && line.as_bytes()[idx - 1].is_ascii_alphanumeric() {
+            continue;
+        }
+        let val = line[idx + 4..].trim().trim_matches('"');
+        if !val.is_empty() {
+            return Some(val.to_string());
+        }
+    }
+    None
 }
 
 /// Container name format. Uses the session id (which is a UUID) so
@@ -652,31 +737,33 @@ fn git_ok(repo: &std::path::Path, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-/// Provision (or reuse) a git worktree of the parent repo for a sibling.
+/// Provision (or reuse) a git worktree of `repo_root` for a sibling.
 ///
-/// Returns `None` when the parent workspace is not a usable git repo (no
-/// top-level `.git` dir, no commit yet, or git is unavailable), in which
-/// case the caller falls back to the legacy read-only `/parent` mount.
+/// `repo_root` is the project repo resolved by [`resolve_parent_repo_root`]
+/// (the workspace root, or a project subdir the parent is working in).
+/// Returns `None` when it isn't a usable git repo (no `.git` dir, no commit
+/// yet, or git is unavailable), in which case the caller falls back to the
+/// read-only `/parent` mount.
 ///
 /// Idempotent: a container can re-spawn within a session (crash/restart),
 /// so an existing worktree dir is reused rather than re-created.
 fn provision_parent_worktree(
-    parent_root: &std::path::Path,
+    repo_root: &std::path::Path,
     sibling_sid: &str,
 ) -> Option<ParentWorktree> {
-    let git_dir = parent_root.join(".git");
-    // Only a top-level repo with at least one commit can seed a worktree.
-    if !git_dir.is_dir() || !git_ok(parent_root, &["rev-parse", "--verify", "HEAD"]) {
+    let git_dir = repo_root.join(".git");
+    // Needs a real repo with at least one commit to seed a worktree from.
+    if !git_dir.is_dir() || !git_ok(repo_root, &["rev-parse", "--verify", "HEAD"]) {
         return None;
     }
 
-    // Keep the worktree scratch dir out of the parent's `git status` — it
-    // lives inside the parent working tree, so without this every parent
+    // Keep the worktree scratch dir out of the repo's `git status` — it
+    // lives inside the repo's working tree, so without this every parent
     // status call would show `.copperclaw/` as untracked. Best-effort;
     // worktrees share `info/exclude` via the common dir.
     exclude_copperclaw_dir(&git_dir);
 
-    let worktree_dir = parent_root.join(".copperclaw").join("wt").join(sibling_sid);
+    let worktree_dir = repo_root.join(".copperclaw").join("wt").join(sibling_sid);
     let branch = format!("sib/{sibling_sid}");
 
     if !worktree_dir.exists() {
@@ -686,8 +773,8 @@ fn provision_parent_worktree(
         let wt = worktree_dir.to_str()?;
         // Fresh branch off HEAD; if the branch already exists (dir was
         // removed but the branch lingered) attach to it instead.
-        let added = git_ok(parent_root, &["worktree", "add", "-b", &branch, wt, "HEAD"])
-            || git_ok(parent_root, &["worktree", "add", wt, &branch]);
+        let added = git_ok(repo_root, &["worktree", "add", "-b", &branch, wt, "HEAD"])
+            || git_ok(repo_root, &["worktree", "add", wt, &branch]);
         if !added {
             return None;
         }
@@ -1357,6 +1444,108 @@ mod tests {
         let exclude =
             std::fs::read_to_string(parent_root.join(".git/info/exclude")).unwrap_or_default();
         assert!(exclude.lines().any(|l| l.trim() == ".copperclaw/"));
+    }
+
+    #[test]
+    fn build_spec_worktree_sourced_from_parent_current_project_subdir() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let parent_group = AgentGroupId::new();
+        let parent_sid = copperclaw_types::SessionId::new();
+        let parent_root = SessionPaths::new(tmp.path(), parent_group, parent_sid).root;
+        std::fs::create_dir_all(&parent_root).unwrap();
+        // /data is NOT a repo; the project lives in a subdir that IS — the
+        // multi-project-per-session shape (several projects under /data).
+        let project = parent_root.join("fairway-focus");
+        std::fs::create_dir_all(&project).unwrap();
+        init_repo_with_commit(&project);
+        // The parent's shell is cd'd into the project (container path).
+        std::fs::write(
+            parent_root.join(".shell_state"),
+            "declare -x OLDPWD=\"/data\"\ndeclare -x PWD=\"/data/fairway-focus\"\n",
+        )
+        .unwrap();
+
+        let mut sibling = fixture_session(&db);
+        sibling.source_session_id = Some(parent_sid);
+        let paths = SessionPaths::new(tmp.path(), sibling.agent_group_id, sibling.id);
+        let spec = mgr.build_spec(&sibling, &paths, "img", None);
+
+        // Shared .git + worktree come from the SUBDIR repo, not /data root.
+        let git_src = project.join(".git").to_string_lossy().into_owned();
+        assert!(
+            spec.mounts.iter().any(|m| matches!(m,
+                Mount::Bind { source, target, .. } if *source == git_src && *target == git_src)),
+            "shared .git must be the current project's repo"
+        );
+        let ws = spec
+            .mounts
+            .iter()
+            .find_map(|m| match m {
+                Mount::Bind { source, target, .. } if target == CONTAINER_WORKSPACE_DIR => {
+                    Some(source.clone())
+                }
+                _ => None,
+            })
+            .expect("/workspace mount present");
+        assert!(
+            ws.starts_with(&*project.to_string_lossy()),
+            "worktree must live under the project repo: {ws}"
+        );
+        // A writable repo was found, so no read-only /parent fallback.
+        assert!(
+            !spec
+                .mounts
+                .iter()
+                .any(|m| matches!(m, Mount::Bind { target, .. } if target == CONTAINER_PARENT_DIR))
+        );
+        // The branch lives in the SUBDIR repo.
+        let branch = format!("sib/{}", sibling.id.as_uuid());
+        assert!(super::git_ok(&project, &["rev-parse", "--verify", &branch]));
+    }
+
+    #[test]
+    fn parse_shell_pwd_picks_pwd_not_oldpwd() {
+        let state = "declare -x OLDPWD=\"/data\"\n\
+                     declare -x PWD=\"/data/proj\"\n\
+                     declare -x HOME=\"/data\"\n";
+        assert_eq!(super::parse_shell_pwd(state).as_deref(), Some("/data/proj"));
+        assert_eq!(super::parse_shell_pwd("declare -x HOME=\"/data\"\n"), None);
+    }
+
+    #[test]
+    fn resolve_parent_repo_root_walks_up_from_cwd() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("data");
+        let proj = root.join("proj");
+        std::fs::create_dir_all(proj.join("src/deep")).unwrap();
+        init_repo_with_commit(&proj);
+        // cwd deep inside the repo resolves to the repo root.
+        std::fs::write(
+            root.join(".shell_state"),
+            "declare -x PWD=\"/data/proj/src/deep\"\n",
+        )
+        .unwrap();
+        assert_eq!(super::resolve_parent_repo_root(&root), Some(proj));
+        // cwd in a non-repo subdir, and /data isn't a repo -> None (read-only).
+        std::fs::create_dir_all(root.join("other")).unwrap();
+        std::fs::write(
+            root.join(".shell_state"),
+            "declare -x PWD=\"/data/other\"\n",
+        )
+        .unwrap();
+        assert_eq!(super::resolve_parent_repo_root(&root), None);
     }
 
     #[test]

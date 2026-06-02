@@ -14,26 +14,35 @@ with no source to work on. Now `build_spec` locates the PARENT agent's
 session dir (scanning `<data>/sessions/*/<parent_session_id>`) and shares
 it with the sibling, Claude-Code-style:
 
-- **Git-repo parent** → the sibling gets a **writable `git worktree`** of
-  the parent repo at `/workspace` on its own branch `sib/<session-id>`
-  (`git worktree add -b`, idempotent across container restarts). It can
-  edit AND commit there in isolation; the parent's checked-out files are
-  never mounted, so they stay physically untouched. The parent's `.git` is
-  bind-mounted **read-write at its identical host-absolute path** so the
-  worktree's `gitdir:` pointer resolves in-container with no rewriting, and
-  commits land in the shared object store — the parent sees branch
-  `sib/<id>` immediately and reviews/merges it from its own `/data`
-  (`git diff main..sib/<id>`, `git merge sib/<id>`, then `git worktree
-  remove .copperclaw/wt/<id>`). `.copperclaw/` is appended to the parent's
-  `.git/info/exclude` so worktree scratch never pollutes its `git status`.
-- **Non-git parent** → falls back to the prior behaviour: the parent
-  workspace mounted **read-only at `/parent`** (review/audit only).
+- **Parent working in a git repo** → the sibling gets a **writable `git
+  worktree`** of THAT repo at `/workspace` on its own branch
+  `sib/<session-id>` (`git worktree add -b`, idempotent across container
+  restarts). It can edit AND commit there in isolation; the parent's
+  checked-out files are never mounted, so they stay physically untouched.
+  The repo's `.git` is bind-mounted **read-write at its identical
+  host-absolute path** so the worktree's `gitdir:` pointer resolves
+  in-container with no rewriting, and commits land in the shared object
+  store — the parent sees branch `sib/<id>` immediately and reviews/merges
+  it from inside that project (`git diff main..sib/<id>`, `git merge
+  sib/<id>`, then `git worktree remove .copperclaw/wt/<id>`). `.copperclaw/`
+  is appended to the repo's `.git/info/exclude` so worktree scratch never
+  pollutes `git status`.
+- **Which repo:** a single session is reused for many projects over time
+  (the operator `/clear`s context between them, but `/data` persists), so
+  the worktree is cut from **whichever project the parent is currently
+  working in** — `resolve_parent_repo_root` reads the parent's persisted
+  shell cwd from `.shell_state` (`PWD=/data/<proj>`), maps it back to the
+  host, and walks up to the nearest enclosing `.git` (bounded at the session
+  dir). Falls back to a repo at the workspace root, then to a **read-only
+  `/parent`** mount of the whole workspace (review/audit only) when there's
+  no repo.
 
 `COPPERCLAW_WORKSPACE` / `COPPERCLAW_WORKSPACE_BRANCH` env vars are set in
-the sibling for tooling. The `create_agent` / `explore` descriptions and
-the system prompt were reframed accordingly (quick in-process `explore` vs
-substantive parallel `create_agent` that can implement-and-commit on a
-branch or review read-only). Trade-off: sharing `.git` read-write means a
+the sibling for tooling. The `create_agent` / `explore` descriptions, the
+system prompt, and the `coding-task` / `create-agent` skills were reframed
+accordingly: keep one git repo per project dir under `/data`, `cd` into the
+one you're working on, and `git init` new projects at creation so siblings
+can build (not just review). Trade-off: sharing `.git` read-write means a
 sibling *could* write to the shared object store; the parent's working
 tree is the safety boundary that stays untouched.
 

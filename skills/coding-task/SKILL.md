@@ -18,6 +18,36 @@ https://go.dev/dl/go1.23.0.linux-amd64.tar.gz | tar -C /data -xz`
 `export PATH=/data/go/bin:$PATH` — no root, no apt. See
 [[install-packages]].
 
+## Every project is a git repo (do this first)
+
+The moment you start a new coding project, make it a git repo before you
+write code:
+
+```bash
+mkdir -p /data/<project> && cd /data/<project>
+git init && git add -A && git commit -m "init: scaffold"
+```
+
+One repo **per project directory**, each under `/data`. Your session is
+reused across many projects (the operator clears the chat between them but
+`/data` persists), so never pile everything into one repo at `/data` root
+— give each project its own `/data/<project>` dir, and `cd` into the one
+you're working on. Commit after each working increment, not just at the end.
+
+Why this is mandatory, not housekeeping:
+
+- **Sub-agents can only *build* on a repo.** `create_agent` siblings get a
+  WRITABLE git worktree of the project you're *currently `cd`'d into* (their
+  own branch at `/workspace`) — that's how you parallelise real work and
+  review/merge their commits. If you're not in a git repo, siblings drop to
+  read-only: they can look but can't help build. See [[create-agent]].
+- **Recoverable progress.** A commit per increment means a crash or a bad
+  edit costs one step, not the whole session.
+- **Reviewable diffs.** You and the operator can see exactly what changed
+  (`git_diff` / `git_log`) instead of guessing.
+
+If the operator points you at an existing checkout, use that repo as-is.
+
 ## Doing the task
 
 - **Read before you write.** Match the surrounding style.
