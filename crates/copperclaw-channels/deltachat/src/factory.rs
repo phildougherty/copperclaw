@@ -104,10 +104,7 @@ mod tests {
             ChannelType::new(CHANNEL_TYPE_STR)
         }
 
-        async fn init(
-            &self,
-            setup: ChannelSetup,
-        ) -> Result<Arc<dyn ChannelAdapter>, AdapterError> {
+        async fn init(&self, setup: ChannelSetup) -> Result<Arc<dyn ChannelAdapter>, AdapterError> {
             let config = DeltaChatConfig::from_value(&setup.config)?;
             let transport: Arc<dyn RpcTransport> = self.transport.clone();
             let accounts = api::get_all_account_ids(transport.as_ref()).await?;
@@ -211,7 +208,8 @@ mod tests {
     #[tokio::test]
     async fn test_factory_inits_with_existing_account() {
         let mock = Arc::new(MockTransport::new());
-        mock.push_response(MockResponse::ok("get_all_account_ids", json!([1, 2]))).await;
+        mock.push_response(MockResponse::ok("get_all_account_ids", json!([1, 2])))
+            .await;
         let f = TestFactory { transport: mock };
         let dir = TempDir::new().unwrap();
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
@@ -223,7 +221,8 @@ mod tests {
     #[tokio::test]
     async fn test_factory_errors_when_account_missing() {
         let mock = Arc::new(MockTransport::new());
-        mock.push_response(MockResponse::ok("get_all_account_ids", json!([1]))).await;
+        mock.push_response(MockResponse::ok("get_all_account_ids", json!([1])))
+            .await;
         let f = TestFactory { transport: mock };
         let dir = TempDir::new().unwrap();
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);

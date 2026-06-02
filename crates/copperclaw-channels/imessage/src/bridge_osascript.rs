@@ -85,10 +85,7 @@ impl IMessageBridge for OsaScriptBridge {
         classify_osascript_output(&output.status, &output.stdout, &output.stderr)
     }
 
-    async fn query_new_rows(
-        &self,
-        since_rowid: i64,
-    ) -> Result<Vec<MockMessageRow>, AdapterError> {
+    async fn query_new_rows(&self, since_rowid: i64) -> Result<Vec<MockMessageRow>, AdapterError> {
         let args = self.plan_sqlite3_args(since_rowid);
         let mut cmd = Command::new(&self.sqlite3_bin);
         for arg in &args {

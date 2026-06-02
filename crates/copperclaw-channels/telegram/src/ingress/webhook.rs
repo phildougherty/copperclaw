@@ -167,7 +167,9 @@ mod tests {
             .method("POST")
             .uri("/hook")
             .header("content-type", "application/json")
-            .body(axum::body::Body::from(serde_json::to_vec(&update_body()).unwrap()))
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&update_body()).unwrap(),
+            ))
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -194,7 +196,9 @@ mod tests {
             .uri("/hook")
             .header("content-type", "application/json")
             .header(SECRET_TOKEN_HEADER, "shh")
-            .body(axum::body::Body::from(serde_json::to_vec(&update_body()).unwrap()))
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&update_body()).unwrap(),
+            ))
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -217,7 +221,9 @@ mod tests {
             .method("POST")
             .uri("/hook")
             .header("content-type", "application/json")
-            .body(axum::body::Body::from(serde_json::to_vec(&update_body()).unwrap()))
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&update_body()).unwrap(),
+            ))
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -243,7 +249,9 @@ mod tests {
             .uri("/hook")
             .header("content-type", "application/json")
             .header(SECRET_TOKEN_HEADER, "wrong")
-            .body(axum::body::Body::from(serde_json::to_vec(&update_body()).unwrap()))
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&update_body()).unwrap(),
+            ))
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -260,7 +268,9 @@ mod tests {
             .method("POST")
             .uri("/hook")
             .header("content-type", "application/json")
-            .body(axum::body::Body::from(serde_json::to_vec(&update_body()).unwrap()))
+            .body(axum::body::Body::from(
+                serde_json::to_vec(&update_body()).unwrap(),
+            ))
             .unwrap();
         let resp = router.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);

@@ -57,8 +57,7 @@ struct PendingStore {
 /// Pending). Sourced from the central `users` table by the host;
 /// kept as a closure here so the modules crate doesn't take a
 /// circular dep on `copperclaw-db`.
-pub type SenderLookup =
-    Arc<dyn Fn(&SenderIdentity) -> bool + Send + Sync>;
+pub type SenderLookup = Arc<dyn Fn(&SenderIdentity) -> bool + Send + Sync>;
 
 /// Context passed to [`NewPendingNotifier`] when a new sender lands in the
 /// pending queue for the first time.
@@ -80,8 +79,7 @@ pub struct NewPendingCtx {
 /// The closure is called synchronously inside the gate (which itself runs
 /// on the router's hot path), so it must be fast. Any I/O should be
 /// dispatched asynchronously via the [`DeliveryDispatcher`].
-pub type NewPendingNotifier =
-    Arc<dyn Fn(NewPendingCtx, Arc<dyn DeliveryDispatcher>) + Send + Sync>;
+pub type NewPendingNotifier = Arc<dyn Fn(NewPendingCtx, Arc<dyn DeliveryDispatcher>) + Send + Sync>;
 
 /// Approvals module.
 pub struct ApprovalsModule {
@@ -197,10 +195,7 @@ impl ApprovalsModule {
 pub struct ApprovalCardHandler;
 
 impl DeliveryActionHandler for ApprovalCardHandler {
-    fn handle(
-        &self,
-        input: DeliveryActionInput,
-    ) -> Result<DeliveryActionOutput, ModuleError> {
+    fn handle(&self, input: DeliveryActionInput) -> Result<DeliveryActionOutput, ModuleError> {
         let approval_id = input
             .payload
             .get("approval_id")
@@ -265,10 +260,10 @@ impl Module for ApprovalsModule {
             // Fast path: in-memory pre-approved list.
             {
                 let known = known.lock().unwrap();
-                if known.iter().any(|k| {
-                    k.channel_type == sender.channel_type
-                        && k.identity == sender.identity
-                }) {
+                if known
+                    .iter()
+                    .any(|k| k.channel_type == sender.channel_type && k.identity == sender.identity)
+                {
                     return SenderScopeDecision::Defer;
                 }
             }
@@ -350,7 +345,8 @@ mod tests {
         m.record_pending(summary(ApprovalKind::InstallPackages));
         m.record_pending(summary(ApprovalKind::AddMcpServer));
         assert_eq!(
-            m.pending_approvals_summary(Some(ApprovalKind::Sender)).len(),
+            m.pending_approvals_summary(Some(ApprovalKind::Sender))
+                .len(),
             1
         );
         assert_eq!(
@@ -382,7 +378,10 @@ mod tests {
         let regs = ctx.registered();
         assert!(regs.contains(&"sender_scope_gate"));
         assert!(regs.contains(&"delivery_action"));
-        assert!(regs.contains(&"delivery_ready"), "approvals must register on_delivery_adapter_ready");
+        assert!(
+            regs.contains(&"delivery_ready"),
+            "approvals must register on_delivery_adapter_ready"
+        );
         assert_eq!(ctx.delivery_actions(), vec!["approval_card"]);
     }
 
@@ -587,8 +586,16 @@ mod tests {
             resolved_user: None,
         });
         assert!(decision.is_pending());
-        assert_eq!(call_count.load(Ordering::SeqCst), 1, "notifier must fire once");
-        assert_eq!(mock_dispatcher.dispatched_count(), 1, "dispatch must have been called");
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "notifier must fire once"
+        );
+        assert_eq!(
+            mock_dispatcher.dispatched_count(),
+            1,
+            "dispatch must have been called"
+        );
     }
 
     #[tokio::test]
@@ -627,12 +634,12 @@ mod tests {
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count2 = Arc::clone(&call_count);
 
-        let notifier: NewPendingNotifier =
-            Arc::new(move |_ctx, _d| { call_count2.fetch_add(1, Ordering::SeqCst); });
+        let notifier: NewPendingNotifier = Arc::new(move |_ctx, _d| {
+            call_count2.fetch_add(1, Ordering::SeqCst);
+        });
 
         let sender = unknown_sender("discord", "D-1");
-        let m = ApprovalsModule::new()
-            .with_new_pending_notifier(notifier);
+        let m = ApprovalsModule::new().with_new_pending_notifier(notifier);
         m.approve_sender(sender.clone());
 
         let ctx = MockModuleContext::new();

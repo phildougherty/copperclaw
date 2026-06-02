@@ -19,8 +19,8 @@ use crate::context::{
 use crate::error::ModuleError;
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Duration, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
-use croner::Cron;
 use copperclaw_types::{AgentGroupId, MessageKind, OutboundMessage, SessionId};
+use croner::Cron;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -518,10 +518,7 @@ impl ScheduleHandler {
         Ok(DeliveryActionOutput::default())
     }
 
-    fn op_list(
-        &self,
-        input: &DeliveryActionInput,
-    ) -> Result<DeliveryActionOutput, ModuleError> {
+    fn op_list(&self, input: &DeliveryActionInput) -> Result<DeliveryActionOutput, ModuleError> {
         let (session_id, _) = Self::target_session_and_group(input)?;
         let tasks = self.store.list_for_session(session_id)?;
         // Hand the list back to the agent via a `Chat`-kind outbound
@@ -566,10 +563,7 @@ impl ScheduleHandler {
         Ok(DeliveryActionOutput::default())
     }
 
-    fn op_update(
-        &self,
-        payload: &serde_json::Value,
-    ) -> Result<DeliveryActionOutput, ModuleError> {
+    fn op_update(&self, payload: &serde_json::Value) -> Result<DeliveryActionOutput, ModuleError> {
         let id = payload
             .get("id")
             .and_then(|v| v.as_str())
@@ -624,7 +618,10 @@ impl DeliveryActionHandler for ScheduleHandler {
             .get("op")
             .and_then(|v| v.as_str())
             .ok_or_else(|| ModuleError::other("scheduling", "schedule: missing op"))?;
-        let inner = payload.get("payload").cloned().unwrap_or(serde_json::json!({}));
+        let inner = payload
+            .get("payload")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
         match op {
             "create" => self.op_create(&input, &inner),
             "list" => self.op_list(&input),
@@ -722,7 +719,13 @@ mod tests {
     #[test]
     fn parse_daily_at_works() {
         let w = parse_when("daily at 09:30").unwrap();
-        assert_eq!(w, When::DailyAt { hour: 9, minute: 30 });
+        assert_eq!(
+            w,
+            When::DailyAt {
+                hour: 9,
+                minute: 30
+            }
+        );
     }
 
     #[test]
@@ -810,7 +813,10 @@ mod tests {
     #[test]
     fn compute_next_daily_today_if_future() {
         let now = Utc.with_ymd_and_hms(2026, 5, 21, 8, 0, 0).unwrap();
-        let w = When::DailyAt { hour: 9, minute: 30 };
+        let w = When::DailyAt {
+            hour: 9,
+            minute: 30,
+        };
         let next = compute_next_fire(&w, now, None).unwrap();
         assert_eq!(next.year(), 2026);
         assert_eq!(next.month(), 5);
@@ -822,7 +828,10 @@ mod tests {
     #[test]
     fn compute_next_daily_tomorrow_if_past() {
         let now = Utc.with_ymd_and_hms(2026, 5, 21, 10, 0, 0).unwrap();
-        let w = When::DailyAt { hour: 9, minute: 30 };
+        let w = When::DailyAt {
+            hour: 9,
+            minute: 30,
+        };
         let next = compute_next_fire(&w, now, None).unwrap();
         assert_eq!(next.day(), 22);
         assert_eq!(next.hour(), 9);
@@ -1023,7 +1032,10 @@ mod tests {
                 sess,
             ))
             .unwrap();
-        assert_eq!(store.get(&id).unwrap().unwrap().status, TaskStatus::Cancelled);
+        assert_eq!(
+            store.get(&id).unwrap().unwrap().status,
+            TaskStatus::Cancelled
+        );
     }
 
     #[test]

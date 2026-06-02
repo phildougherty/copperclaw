@@ -8,7 +8,7 @@ pub mod install_packages {
 
     use crate::context::{InstallSpec, OutboundToolEffect, ToolContext};
     use crate::error::ToolError;
-    use crate::tools::{ack_to_result, make_tool, parse_args, ToolEntry, ToolHandler};
+    use crate::tools::{ToolEntry, ToolHandler, ack_to_result, make_tool, parse_args};
     use rmcp::model::{CallToolResult, JsonObject, Tool};
     use serde::Deserialize;
 
@@ -100,7 +100,7 @@ pub mod add_mcp_server {
 
     use crate::context::{AddMcpServerSpec, OutboundToolEffect, ToolContext};
     use crate::error::ToolError;
-    use crate::tools::{ack_to_result, make_tool, parse_args, ToolEntry, ToolHandler};
+    use crate::tools::{ToolEntry, ToolHandler, ack_to_result, make_tool, parse_args};
     use rmcp::model::{CallToolResult, JsonObject, Tool};
     use serde::Deserialize;
 

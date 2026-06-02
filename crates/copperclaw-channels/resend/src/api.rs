@@ -129,9 +129,10 @@ impl ResendApi {
             let body = resp.text().await.unwrap_or_default();
             return Err(AdapterError::Transport(format!("{status}: {body}")));
         }
-        let parsed: SendEmailResponse = resp.json().await.map_err(|e| {
-            AdapterError::Transport(format!("resend response not JSON: {e}"))
-        })?;
+        let parsed: SendEmailResponse = resp
+            .json()
+            .await
+            .map_err(|e| AdapterError::Transport(format!("resend response not JSON: {e}")))?;
         Ok(parsed)
     }
 }
@@ -242,9 +243,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/emails"))
             .and(header("authorization", "Bearer re_test"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"id": "msg_123"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "msg_123"})))
             .mount(&server)
             .await;
         let api = ResendApi::new(server.uri(), "re_test");
@@ -257,9 +256,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/emails"))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(json!({"id": "msg_201"})),
-            )
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "msg_201"})))
             .mount(&server)
             .await;
         let api = ResendApi::new(server.uri(), "re_test");
@@ -477,9 +474,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/emails"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"id": "id-1"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "id-1"})))
             .mount(&server)
             .await;
         let api = ResendApi::new(server.uri(), "re_test");
@@ -508,9 +503,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/emails"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"id": "id-h"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "id-h"})))
             .mount(&server)
             .await;
         let api = ResendApi::new(server.uri(), "re_test");
@@ -538,9 +531,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/emails"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"id": "id-m"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "id-m"})))
             .mount(&server)
             .await;
         let api = ResendApi::new(server.uri(), "re_test");
@@ -567,9 +558,7 @@ mod tests {
         let custom_base = format!("{}/api/v2", server.uri());
         Mock::given(method("POST"))
             .and(path("/api/v2/emails"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"id": "custom"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "custom"})))
             .mount(&server)
             .await;
         let api = ResendApi::new(custom_base, "re_test");

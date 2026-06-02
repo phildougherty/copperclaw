@@ -72,7 +72,10 @@ pub fn default_data_dir() -> Option<PathBuf> {
 #[must_use]
 pub fn default_data_dir_for(home: &Path, os: &str) -> PathBuf {
     match os {
-        "macos" => home.join("Library").join("Application Support").join("copperclaw"),
+        "macos" => home
+            .join("Library")
+            .join("Application Support")
+            .join("copperclaw"),
         "linux" => {
             if let Some(xdg) = std::env::var_os("XDG_DATA_HOME") {
                 let xdg = PathBuf::from(xdg);

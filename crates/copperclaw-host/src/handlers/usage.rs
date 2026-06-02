@@ -4,10 +4,10 @@
 
 use super::{db_err, opt_str};
 use chrono::{DateTime, Duration, Utc};
+use copperclaw_cclaw::ErrorPayload;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::agent_turns;
-use copperclaw_cclaw::ErrorPayload;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// `usage.rollup` — list per-group token counts since `since`.
 pub fn rollup(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
@@ -66,11 +66,7 @@ mod tests {
     #[test]
     fn rollup_returns_per_group_sums() {
         let db = CentralDb::open_in_memory().unwrap();
-        for (ag, input, output) in [
-            ("ag-a", 100, 200),
-            ("ag-a", 50, 50),
-            ("ag-b", 10, 20),
-        ] {
+        for (ag, input, output) in [("ag-a", 100, 200), ("ag-a", 50, 50), ("ag-b", 10, 20)] {
             agent_turns::insert(
                 &db,
                 &NewAgentTurn {

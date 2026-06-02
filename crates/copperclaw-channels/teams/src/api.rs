@@ -107,14 +107,8 @@ impl TeamsApi {
         content: &str,
         content_type: &str,
     ) -> Result<ChatMessageResponse, AdapterError> {
-        self.post_channel_message_with_attachments(
-            team_id,
-            channel_id,
-            content,
-            content_type,
-            &[],
-        )
-        .await
+        self.post_channel_message_with_attachments(team_id, channel_id, content, content_type, &[])
+            .await
     }
 
     /// `POST /teams/{teamId}/channels/{channelId}/messages` with optional
@@ -128,9 +122,7 @@ impl TeamsApi {
         content_type: &str,
         attachments: &[GraphAttachment],
     ) -> Result<ChatMessageResponse, AdapterError> {
-        let url = self.url(&format!(
-            "teams/{team_id}/channels/{channel_id}/messages"
-        ));
+        let url = self.url(&format!("teams/{team_id}/channels/{channel_id}/messages"));
         let body = build_message_body(content, content_type, attachments);
         let resp = self.send_json(Method::POST, &url, &body).await?;
         decode_message(resp).await
@@ -162,9 +154,7 @@ impl TeamsApi {
         let item_id = value
             .get("id")
             .and_then(Value::as_str)
-            .ok_or_else(|| {
-                AdapterError::Transport("filesFolder response missing id".into())
-            })?
+            .ok_or_else(|| AdapterError::Transport("filesFolder response missing id".into()))?
             .to_string();
         Ok(DriveItemRef { drive_id, item_id })
     }
@@ -200,10 +190,7 @@ impl TeamsApi {
             .client
             .put(&url)
             .bearer_auth(&self.bot_token)
-            .header(
-                reqwest::header::CONTENT_TYPE,
-                "application/octet-stream",
-            )
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
             .body(bytes)
             .send()
             .await
@@ -498,11 +485,7 @@ pub fn build_adaptive_card(card: &Card) -> Value {
             "facts": facts,
         }));
     }
-    let actions: Vec<Value> = card
-        .buttons
-        .iter()
-        .filter_map(button_to_action)
-        .collect();
+    let actions: Vec<Value> = card.buttons.iter().filter_map(button_to_action).collect();
     let mut out = json!({
         "type": "AdaptiveCard",
         "$schema": ADAPTIVE_CARD_SCHEMA,
@@ -652,7 +635,12 @@ fn build_adaptive_activity(b: &Breadcrumb) -> Value {
         Some(d) => summary.push_str(d),
         None => summary.push_str("working"),
     }
-    if let Some(s) = b.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(s) = b
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         summary.push_str(" \u{00B7} ");
         summary.push_str(s);
     }
@@ -715,7 +703,12 @@ fn activity_step_textblock(s: &Breadcrumb) -> Value {
         text.push_str(d);
         text.push('`');
     }
-    if let Some(sum) = s.summary.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+    if let Some(sum) = s
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+    {
         if s.status == BreadcrumbStatus::Failed {
             text.push_str(" — failed: ");
         } else {
@@ -1310,9 +1303,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/teams/T1/channels/C1/messages"))
             .and(header("authorization", "Bearer tok-123"))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(json!({"id": "1700000000000"})),
-            )
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "1700000000000"})))
             .mount(&server)
             .await;
         let api = api_for(&server);
@@ -1361,7 +1352,9 @@ mod tests {
             .mount(&server)
             .await;
         let api = api_for(&server);
-        api.edit_channel_message("T1", "C1", "MID", "new").await.unwrap();
+        api.edit_channel_message("T1", "C1", "MID", "new")
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1441,9 +1434,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/chats/CHAT1"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"chatType": "oneOnOne"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"chatType": "oneOnOne"})))
             .mount(&server)
             .await;
         let api = api_for(&server);
@@ -1456,9 +1447,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/teams/T1/channels/C1/messages"))
-            .respond_with(
-                ResponseTemplate::new(401).set_body_string("Unauthorized"),
-            )
+            .respond_with(ResponseTemplate::new(401).set_body_string("Unauthorized"))
             .mount(&server)
             .await;
         let api = api_for(&server);

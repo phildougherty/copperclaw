@@ -1,10 +1,10 @@
 //! Handlers for `budgets.*` commands.
 
 use super::{db_err, parse_agent_group_id, req_str};
+use copperclaw_cclaw::ErrorPayload;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::group_budgets;
-use copperclaw_cclaw::ErrorPayload;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// `budgets.list` — every configured budget.
 pub fn list(_args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
@@ -55,9 +55,7 @@ pub fn set(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
         Some(other) => {
             return Err(ErrorPayload::new(
                 "bad_request",
-                format!(
-                    "daily_tokens must be a non-negative integer or null, got {other}"
-                ),
+                format!("daily_tokens must be a non-negative integer or null, got {other}"),
             ));
         }
         None => {
@@ -173,11 +171,7 @@ mod tests {
     fn set_missing_field_is_bad_request() {
         let db = CentralDb::open_in_memory().unwrap();
         let ag = AgentGroupId::new();
-        let err = set(
-            &json!({"agent_group_id": ag.as_uuid().to_string()}),
-            &db,
-        )
-        .unwrap_err();
+        let err = set(&json!({"agent_group_id": ag.as_uuid().to_string()}), &db).unwrap_err();
         assert_eq!(err.code, "bad_request");
     }
 

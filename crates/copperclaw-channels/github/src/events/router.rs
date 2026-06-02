@@ -234,11 +234,7 @@ fn comment_to_event(
     }
 }
 
-fn issue_to_event(
-    state: &GithubEventsState,
-    platform_id: &str,
-    issue: &IssueRef,
-) -> InboundEvent {
+fn issue_to_event(state: &GithubEventsState, platform_id: &str, issue: &IssueRef) -> InboundEvent {
     let title = issue.title.clone().unwrap_or_default();
     let body = issue.body.clone().unwrap_or_default();
     let text = if body.is_empty() {

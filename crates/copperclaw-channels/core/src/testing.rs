@@ -174,11 +174,7 @@ impl ChannelAdapter for MockAdapter {
             thread_id: thread_id.map(str::to_owned),
             message: message.clone(),
         });
-        Ok(Some(format!(
-            "{}-{}",
-            self.delivery_id_prefix,
-            guard.len()
-        )))
+        Ok(Some(format!("{}-{}", self.delivery_id_prefix, guard.len())))
     }
 
     async fn open_dm(&self, _user_id: &str) -> Result<Option<DmHandle>, AdapterError> {
@@ -242,10 +238,7 @@ impl ChannelAdapter for MockAdapter {
                 .unwrap_or("")
                 .to_owned();
             let downgraded = format!("[reduced formatting] {text}");
-            obj.insert(
-                "text".to_owned(),
-                serde_json::Value::String(downgraded),
-            );
+            obj.insert("text".to_owned(), serde_json::Value::String(downgraded));
         }
         Some(OutboundMessage {
             kind: msg.kind,
@@ -340,9 +333,16 @@ mod tests {
     #[tokio::test]
     async fn mock_adapter_can_fail_next_deliver() {
         let a = MockAdapter::new("ch");
-        a.fail_next_deliver(AdapterError::Rate { retry_after: Some(5) });
+        a.fail_next_deliver(AdapterError::Rate {
+            retry_after: Some(5),
+        });
         let err = a.deliver("p", None, &outbound("x")).await.unwrap_err();
-        assert!(matches!(err, AdapterError::Rate { retry_after: Some(5) }));
+        assert!(matches!(
+            err,
+            AdapterError::Rate {
+                retry_after: Some(5)
+            }
+        ));
         // Next call succeeds; failure was consumed.
         a.deliver("p", None, &outbound("y")).await.unwrap();
     }

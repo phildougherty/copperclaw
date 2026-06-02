@@ -169,7 +169,10 @@ impl SkillsMode {
             None | Some("" | "inline") => Self::Inline,
             Some("callable") => Self::Callable,
             Some(other) => {
-                warn!(value = other, "unknown COPPERCLAW_SKILLS_MODE; falling back to inline");
+                warn!(
+                    value = other,
+                    "unknown COPPERCLAW_SKILLS_MODE; falling back to inline"
+                );
                 Self::Inline
             }
         }
@@ -260,10 +263,7 @@ mod tests {
             SkillsMode::Callable
         );
         // Unknown falls back without panicking.
-        assert_eq!(
-            SkillsMode::parse_or_default(Some("on")),
-            SkillsMode::Inline
-        );
+        assert_eq!(SkillsMode::parse_or_default(Some("on")), SkillsMode::Inline);
     }
 
     #[test]
@@ -281,7 +281,10 @@ NOT_A_PAIR_LINE
         let map = parse_dotenv_content(raw);
         assert_eq!(map.get("ANTHROPIC_API_KEY"), Some(&"sk-plain".to_string()));
         assert_eq!(map.get("TAVILY_API_KEY"), Some(&"tav-quoted".to_string()));
-        assert_eq!(map.get("BRAVE_SEARCH_API_KEY"), Some(&"br-single".to_string()));
+        assert_eq!(
+            map.get("BRAVE_SEARCH_API_KEY"),
+            Some(&"br-single".to_string())
+        );
         assert_eq!(map.get("SERPAPI_API_KEY"), Some(&String::new()));
         assert!(!map.contains_key("NOT_A_PAIR_LINE"));
     }
@@ -294,8 +297,14 @@ NOT_A_PAIR_LINE
         m.insert("TAVILY_API_KEY".into(), "tav-1".into());
         let cfg = RotatableConfig::from_env_map(&m);
         assert_eq!(cfg.anthropic_api_key.as_deref(), Some("sk-1"));
-        assert!(cfg.anthropic_base_url.is_none(), "empty value must be dropped");
+        assert!(
+            cfg.anthropic_base_url.is_none(),
+            "empty value must be dropped"
+        );
         assert_eq!(cfg.forward_env.len(), 1);
-        assert_eq!(cfg.forward_env[0], ("TAVILY_API_KEY".into(), "tav-1".into()));
+        assert_eq!(
+            cfg.forward_env[0],
+            ("TAVILY_API_KEY".into(), "tav-1".into())
+        );
     }
 }

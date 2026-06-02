@@ -13,7 +13,7 @@ use serde_json::json;
 use crate::context::ToolContext;
 use crate::error::ToolError;
 use crate::tools::sentinel::{drop_sentinel, sentinel_path};
-use crate::tools::{make_tool, ToolEntry, ToolHandler};
+use crate::tools::{ToolEntry, ToolHandler, make_tool};
 
 /// Sentinel filename (without the leading dot) the runner polls for.
 pub const SENTINEL_NAME: &str = "history_compact_pending";
@@ -55,14 +55,19 @@ impl ToolHandler for Handler {
 }
 
 pub fn entry() -> ToolEntry {
-    ToolEntry { tool: schema(), handler: Box::new(Handler) }
+    ToolEntry {
+        tool: schema(),
+        handler: Box::new(Handler),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::context::MockToolContext;
-    use crate::tools::sentinel::{sentinel_dir_test_override_clear, sentinel_dir_test_override_set};
+    use crate::tools::sentinel::{
+        sentinel_dir_test_override_clear, sentinel_dir_test_override_set,
+    };
 
     #[tokio::test]
     async fn writes_sentinel_file() {

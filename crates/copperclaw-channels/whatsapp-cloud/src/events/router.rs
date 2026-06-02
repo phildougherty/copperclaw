@@ -34,7 +34,9 @@ use axum::{
     routing::get,
 };
 use chrono::{TimeZone, Utc};
-use copperclaw_types::{ChannelType, InboundEvent, InboundMessage, MessageKind, ReplyTo, SenderIdentity};
+use copperclaw_types::{
+    ChannelType, InboundEvent, InboundMessage, MessageKind, ReplyTo, SenderIdentity,
+};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -144,11 +146,7 @@ async fn handle_verify(
     // one char at a time via response timing.
     {
         use subtle::ConstantTimeEq;
-        if !bool::from(
-            token
-                .as_bytes()
-                .ct_eq(state.verify_token.as_bytes()),
-        ) {
+        if !bool::from(token.as_bytes().ct_eq(state.verify_token.as_bytes())) {
             return StatusCode::FORBIDDEN.into_response();
         }
     }
@@ -160,9 +158,7 @@ async fn handle_notification(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let sig = headers
-        .get(SIGNATURE_HEADER)
-        .and_then(|v| v.to_str().ok());
+    let sig = headers.get(SIGNATURE_HEADER).and_then(|v| v.to_str().ok());
     if verify_signature(&state.app_secret, sig, &body).is_err() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
@@ -208,9 +204,7 @@ async fn process_value(state: &WhatsappCloudEventsState, value: &Value) {
     };
 
     for msg in messages {
-        if let Some(event) =
-            convert_message(state, &phone_number_id, &contacts, msg).await
-        {
+        if let Some(event) = convert_message(state, &phone_number_id, &contacts, msg).await {
             if let Err(err) = state.inbound_tx.send(event).await {
                 tracing::warn!(error=%err, "whatsapp-cloud inbound channel closed");
             }
@@ -340,20 +334,12 @@ mod tests {
 
     fn make_state() -> (WhatsappCloudEventsState, mpsc::Receiver<InboundEvent>) {
         let (tx, rx) = mpsc::channel::<InboundEvent>(16);
-        let state = WhatsappCloudEventsState::new(
-            SECRET,
-            VERIFY,
-            tx,
-            ChannelType::new("whatsapp-cloud"),
-        );
+        let state =
+            WhatsappCloudEventsState::new(SECRET, VERIFY, tx, ChannelType::new("whatsapp-cloud"));
         (state, rx)
     }
 
-    fn signed_post(
-        state: &WhatsappCloudEventsState,
-        path_str: &str,
-        body: &[u8],
-    ) -> Request<Body> {
+    fn signed_post(state: &WhatsappCloudEventsState, path_str: &str, body: &[u8]) -> Request<Body> {
         let sig = compute_signature(&state.app_secret, body);
         Request::builder()
             .method("POST")
@@ -961,7 +947,9 @@ mod tests {
         let req = signed_post(&state, "/wh", &body);
         let _ = app.oneshot(req).await.unwrap();
         let evt = rx.recv().await.unwrap();
-        let rt = evt.reply_to.expect("reply_to populated from context.message_id");
+        let rt = evt
+            .reply_to
+            .expect("reply_to populated from context.message_id");
         assert_eq!(rt.channel_type.as_str(), "whatsapp-cloud");
         assert_eq!(rt.platform_id, "PNID:15551234");
         assert_eq!(rt.thread_id.as_deref(), Some("wamid.PARENT"));

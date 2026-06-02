@@ -48,6 +48,6 @@ pub mod signature;
 
 pub use adapter::WebhooksAdapter;
 pub use config::{ChannelConfigError, WebhooksConfig};
-pub use factory::{register, WebhooksFactory, CHANNEL_TYPE_STR};
-pub use router::{build_router, WebhooksRouterState};
-pub use signature::{compute_hex, verify, SignatureOutcome};
+pub use factory::{CHANNEL_TYPE_STR, WebhooksFactory, register};
+pub use router::{WebhooksRouterState, build_router};
+pub use signature::{SignatureOutcome, compute_hex, verify};

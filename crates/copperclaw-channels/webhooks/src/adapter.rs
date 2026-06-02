@@ -28,9 +28,10 @@ pub struct WebhooksAdapter {
 
 impl std::fmt::Debug for WebhooksAdapter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let server_state = self.server.lock().map_or("poisoned", |g| {
-            g.as_ref().map_or("stopped", |_| "running")
-        });
+        let server_state = self
+            .server
+            .lock()
+            .map_or("poisoned", |g| g.as_ref().map_or("stopped", |_| "running"));
         f.debug_struct("WebhooksAdapter")
             .field("channel_type", &self.channel_type)
             .field("server", &server_state)
@@ -103,7 +104,7 @@ mod tests {
     use super::*;
     use copperclaw_types::MessageKind;
     use serde_json::json;
-    use tokio::time::{sleep, Duration};
+    use tokio::time::{Duration, sleep};
 
     fn msg() -> OutboundMessage {
         OutboundMessage {

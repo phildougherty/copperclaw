@@ -57,8 +57,7 @@ pub const DEFAULT_INBOUND_QUEUE_SEXP: &str = "(copperclaw-pop-inbound)";
 ///     (goto-char (point-max))
 ///     (insert text "\n")))
 /// ```
-pub const DEFAULT_OUTBOUND_SEXP_TEMPLATE: &str =
-    "(copperclaw-deliver ${BUFFER_JSON} ${TEXT_JSON})";
+pub const DEFAULT_OUTBOUND_SEXP_TEMPLATE: &str = "(copperclaw-deliver ${BUFFER_JSON} ${TEXT_JSON})";
 
 /// Default Emacs buffer that receives outbound messages when the host does
 /// not specify a `platform_id`.
@@ -107,9 +106,9 @@ impl EmacsConfig {
         if value.is_null() {
             return Ok(Self::default());
         }
-        let obj = value.as_object().ok_or_else(|| {
-            AdapterError::BadRequest("emacs config must be a JSON object".into())
-        })?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| AdapterError::BadRequest("emacs config must be a JSON object".into()))?;
         let mut cfg = Self::default();
         for (key, val) in obj {
             match key.as_str() {
@@ -165,11 +164,11 @@ fn take_opt_string(key: &str, value: &Value) -> Result<Option<String>, AdapterEr
 }
 
 fn take_u64(key: &str, value: &Value) -> Result<u64, AdapterError> {
-    value
-        .as_u64()
-        .ok_or_else(|| AdapterError::BadRequest(format!(
+    value.as_u64().ok_or_else(|| {
+        AdapterError::BadRequest(format!(
             "emacs config: field `{key}` must be a non-negative integer"
-        )))
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -206,7 +205,10 @@ mod tests {
         assert_eq!(c.socket_dir, Some(PathBuf::from("/run/user/1000/emacs")));
         assert_eq!(c.poll_interval_ms, 250);
         assert_eq!(c.inbound_queue_sexp, "(my-pop)");
-        assert_eq!(c.outbound_sexp_template, "(my-send ${BUFFER_JSON} ${TEXT_JSON})");
+        assert_eq!(
+            c.outbound_sexp_template,
+            "(my-send ${BUFFER_JSON} ${TEXT_JSON})"
+        );
         assert_eq!(c.default_buffer, "*work*");
     }
 

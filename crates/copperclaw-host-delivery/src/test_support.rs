@@ -3,19 +3,19 @@
 use crate::dispatch::{AdapterResolver, HostDispatcher};
 use crate::service::{DeliveryService, FsSessionRoot, SessionPool, SessionRoot};
 use chrono::Utc;
-use dashmap::DashMap;
-use copperclaw_channels_core::testing::MockAdapter;
 use copperclaw_channels_core::ChannelAdapter;
+use copperclaw_channels_core::testing::MockAdapter;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::session::SessionPaths;
-use copperclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
-use copperclaw_db::tables::messages_out::{insert as insert_msg, WriteOutbound};
-use copperclaw_db::tables::sessions::{create as create_session, CreateSession};
+use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+use copperclaw_db::tables::messages_out::{WriteOutbound, insert as insert_msg};
+use copperclaw_db::tables::sessions::{CreateSession, create as create_session};
 use copperclaw_modules::DeliveryDispatcher;
 use copperclaw_types::{
     AgentGroupId, ChannelType, ContainerStatus, MessageId, MessageKind, Session, SessionId,
     SessionStatus,
 };
+use dashmap::DashMap;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -87,7 +87,10 @@ pub async fn make_service() -> (
     .unwrap();
     let mock = Arc::new(MockAdapter::new("mock"));
     let adapters: DashMap<ChannelType, Arc<dyn ChannelAdapter>> = DashMap::new();
-    adapters.insert(ChannelType::new("mock"), mock.clone() as Arc<dyn ChannelAdapter>);
+    adapters.insert(
+        ChannelType::new("mock"),
+        mock.clone() as Arc<dyn ChannelAdapter>,
+    );
 
     // Resolver reads the same adapters map.
     let resolver_map = Arc::new(adapters.clone());

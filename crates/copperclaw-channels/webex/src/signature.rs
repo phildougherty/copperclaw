@@ -240,8 +240,7 @@ mod tests {
     fn verify_rejects_wrong_length_signature() {
         // SHA-256 length value with SHA-1 algorithm selected.
         let too_long = "a".repeat(64);
-        let err =
-            verify_signature(SignatureAlgo::Sha1, SECRET, BODY, Some(&too_long)).unwrap_err();
+        let err = verify_signature(SignatureAlgo::Sha1, SECRET, BODY, Some(&too_long)).unwrap_err();
         assert_eq!(err, SignatureError::BadSignatureFormat);
     }
 

@@ -18,11 +18,20 @@ pub enum Effort {
 pub enum ProviderEvent {
     /// Emitted once at the start. Contains the opaque continuation token
     /// the runner will persist to `session_state` and pass back next turn.
-    Init { continuation: String },
+    Init {
+        continuation: String,
+    },
     /// Final assistant text for the turn (may be empty).
-    Result { text: Option<String> },
-    Error { message: String, retryable: bool },
-    Progress { message: String },
+    Result {
+        text: Option<String>,
+    },
+    Error {
+        message: String,
+        retryable: bool,
+    },
+    Progress {
+        message: String,
+    },
     /// Heartbeat — used to detect long-running tools.
     Activity,
     ToolStart {
@@ -120,7 +129,9 @@ mod tests {
 
     #[test]
     fn provider_event_serde() {
-        let e = ProviderEvent::Init { continuation: "abc".into() };
+        let e = ProviderEvent::Init {
+            continuation: "abc".into(),
+        };
         let json = serde_json::to_string(&e).unwrap();
         assert!(json.contains("\"type\":\"init\""));
         let back: ProviderEvent = serde_json::from_str(&json).unwrap();

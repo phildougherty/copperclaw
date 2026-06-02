@@ -1,11 +1,11 @@
 //! Handlers for `messaging-groups.*` commands.
 
 use super::{db_err, opt_str, parse_uuid, req_str};
+use copperclaw_cclaw::ErrorPayload;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::messaging_groups;
-use copperclaw_cclaw::ErrorPayload;
 use copperclaw_types::{ChannelType, MessagingGroupId};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub fn list(_args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     let rows = messaging_groups::list(central).map_err(db_err)?;
@@ -22,9 +22,12 @@ pub fn create(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> 
     let channel_type = req_str(args, "channel_type")?;
     let platform_id = req_str(args, "platform_id")?;
     let name = opt_str(args, "name");
-    let is_group = args.get("is_group").and_then(Value::as_bool).unwrap_or(false);
-    let unknown_sender_policy = opt_str(args, "unknown_sender_policy")
-        .unwrap_or_else(|| "strict".to_owned());
+    let is_group = args
+        .get("is_group")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let unknown_sender_policy =
+        opt_str(args, "unknown_sender_policy").unwrap_or_else(|| "strict".to_owned());
     let row = messaging_groups::upsert(
         central,
         messaging_groups::UpsertMessagingGroup {
@@ -51,8 +54,8 @@ pub fn update(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> 
         .get("is_group")
         .and_then(Value::as_bool)
         .unwrap_or(existing.is_group);
-    let unknown_sender_policy = opt_str(args, "unknown_sender_policy")
-        .unwrap_or(existing.unknown_sender_policy.clone());
+    let unknown_sender_policy =
+        opt_str(args, "unknown_sender_policy").unwrap_or(existing.unknown_sender_policy.clone());
     let row = messaging_groups::upsert(
         central,
         messaging_groups::UpsertMessagingGroup {
@@ -102,12 +105,14 @@ mod tests {
     #[test]
     fn list_get_create_roundtrip() {
         let db = db();
-        assert!(list(&Value::Null, &db).unwrap().as_array().unwrap().is_empty());
-        let created = create(
-            &json!({"channel_type": "cli", "platform_id": "p1"}),
-            &db,
-        )
-        .unwrap();
+        assert!(
+            list(&Value::Null, &db)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        let created = create(&json!({"channel_type": "cli", "platform_id": "p1"}), &db).unwrap();
         let id = created["id"].as_str().unwrap();
         let got = get(&json!({"id": id}), &db).unwrap();
         assert_eq!(got["platform_id"], "p1");
@@ -131,11 +136,7 @@ mod tests {
         )
         .unwrap();
         let id = created["id"].as_str().unwrap();
-        let updated = update(
-            &json!({"id": id, "name": "Renamed"}),
-            &db,
-        )
-        .unwrap();
+        let updated = update(&json!({"id": id, "name": "Renamed"}), &db).unwrap();
         assert_eq!(updated["name"], "Renamed");
         assert_eq!(updated["is_group"], true);
     }
@@ -143,22 +144,14 @@ mod tests {
     #[test]
     fn update_unknown_id_errors() {
         let db = db();
-        let err = update(
-            &json!({"id": uuid::Uuid::now_v7().to_string()}),
-            &db,
-        )
-        .unwrap_err();
+        let err = update(&json!({"id": uuid::Uuid::now_v7().to_string()}), &db).unwrap_err();
         assert_eq!(err.code, "not_found");
     }
 
     #[test]
     fn delete_removes_row() {
         let db = db();
-        let created = create(
-            &json!({"channel_type": "cli", "platform_id": "p2"}),
-            &db,
-        )
-        .unwrap();
+        let created = create(&json!({"channel_type": "cli", "platform_id": "p2"}), &db).unwrap();
         let id = created["id"].as_str().unwrap();
         delete(&json!({"id": id}), &db).unwrap();
         let err = get(&json!({"id": id}), &db).unwrap_err();

@@ -220,7 +220,9 @@ mod tests {
 
     #[test]
     fn validate_happy_path() {
-        ThinkingBlock::visible("a chain of thought").validate().unwrap();
+        ThinkingBlock::visible("a chain of thought")
+            .validate()
+            .unwrap();
     }
 
     #[test]
@@ -257,8 +259,7 @@ mod tests {
 
     #[test]
     fn validate_rejects_model_too_long() {
-        let t = ThinkingBlock::visible("ok")
-            .with_model("m".repeat(MAX_MODEL_CHARS + 1));
+        let t = ThinkingBlock::visible("ok").with_model("m".repeat(MAX_MODEL_CHARS + 1));
         assert!(matches!(
             t.validate(),
             Err(ThinkingBlockError::ModelTooLong { .. })

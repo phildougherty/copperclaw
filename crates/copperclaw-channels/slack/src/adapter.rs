@@ -7,7 +7,7 @@ use copperclaw_channels_core::{
     ErrorCard, ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList,
 };
 use copperclaw_types::{ChannelType, OutboundFile, OutboundMessage};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Mutex;
 use tokio::task::JoinHandle;
 
@@ -150,10 +150,7 @@ impl ChannelAdapter for SlackAdapter {
             .unwrap_or("")
             .to_owned();
         let blocks = message.content.get("blocks").cloned();
-        let ephemeral_to = message
-            .content
-            .get("ephemeral_to")
-            .and_then(Value::as_str);
+        let ephemeral_to = message.content.get("ephemeral_to").and_then(Value::as_str);
 
         let ts = if let Some(user) = ephemeral_to {
             self.api
@@ -184,7 +181,9 @@ impl ChannelAdapter for SlackAdapter {
     ) -> Result<(), AdapterError> {
         // Slack's `chat.update` is addressed by (channel, ts); thread context
         // is implicit via the original ts so we discard the thread_id.
-        self.api.chat_update(platform_id, external_id, new_text).await?;
+        self.api
+            .chat_update(platform_id, external_id, new_text)
+            .await?;
         Ok(())
     }
 
@@ -363,7 +362,9 @@ impl ChannelAdapter for SlackAdapter {
                 .api
                 .chat_update_with_blocks(platform_id, existing, &fallback_text, Some(&blocks))
                 .await?;
-            resp.ts.or_else(|| Some(existing.to_owned())).unwrap_or_else(|| existing.to_owned())
+            resp.ts
+                .or_else(|| Some(existing.to_owned()))
+                .unwrap_or_else(|| existing.to_owned())
         } else {
             let resp = self
                 .api
@@ -470,10 +471,7 @@ impl ChannelAdapter for SlackAdapter {
         if !obj.contains_key("blocks") {
             return None;
         }
-        let text = obj
-            .get("text")
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let text = obj.get("text").and_then(Value::as_str).unwrap_or("");
         let mut new_obj = obj.clone();
         new_obj.remove("blocks");
         new_obj.insert(
@@ -637,7 +635,12 @@ fn build_activity_blocks(b: &Breadcrumb) -> Value {
         Some(d) => summary_line.push_str(&escape_mrkdwn(d)),
         None => summary_line.push_str("working"),
     }
-    if let Some(s) = b.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(s) = b
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         summary_line.push_str(" · ");
         summary_line.push_str(&escape_mrkdwn(s));
     }
@@ -686,7 +689,12 @@ fn render_step_line_mrkdwn(s: &Breadcrumb) -> String {
         out.push_str(&escape_mrkdwn(d));
         out.push('`');
     }
-    if let Some(sum) = s.summary.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+    if let Some(sum) = s
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+    {
         if s.status == BreadcrumbStatus::Failed {
             out.push_str(" — failed: ");
         } else {
@@ -1035,10 +1043,7 @@ mod tests {
             .mount(&server)
             .await;
         let adapter = adapter_for(&server);
-        let id = adapter
-            .deliver("C1", None, &text("hello"))
-            .await
-            .unwrap();
+        let id = adapter.deliver("C1", None, &text("hello")).await.unwrap();
         assert_eq!(id.as_deref(), Some("100.000"));
     }
 
@@ -1323,8 +1328,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/auth.test"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"ok": true, "user_id": "UBOT123"})),
+                ResponseTemplate::new(200).set_body_json(json!({"ok": true, "user_id": "UBOT123"})),
             )
             .mount(&server)
             .await;
@@ -1399,9 +1403,7 @@ mod tests {
             }),
             files: vec![],
         };
-        let fallback = adapter
-            .plain_text_fallback(&msg)
-            .expect("slack fallback");
+        let fallback = adapter.plain_text_fallback(&msg).expect("slack fallback");
         // blocks must be removed entirely.
         assert!(fallback.content.get("blocks").is_none());
         // text is preserved and prepended with the reduced-formatting marker.
@@ -1433,8 +1435,7 @@ mod tests {
             .iter()
             .find(|r| r.url.path().ends_with("/chat.update"))
             .expect("chat.update request");
-        let body: serde_json::Value =
-            serde_json::from_slice(&req.body).expect("json body");
+        let body: serde_json::Value = serde_json::from_slice(&req.body).expect("json body");
         assert_eq!(body["channel"], "C1");
         assert_eq!(body["ts"], "100.000");
         assert_eq!(body["text"], "updated body");
@@ -1461,8 +1462,7 @@ mod tests {
             .iter()
             .find(|r| r.url.path().ends_with("/reactions.add"))
             .expect("reactions.add request");
-        let body: serde_json::Value =
-            serde_json::from_slice(&req.body).expect("json body");
+        let body: serde_json::Value = serde_json::from_slice(&req.body).expect("json body");
         assert_eq!(body["channel"], "C1");
         assert_eq!(body["timestamp"], "100.000");
         assert_eq!(body["name"], "thumbsup");
@@ -1534,8 +1534,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/chat.postMessage"))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"ok": true, "ts": "999.111"})),
+                ResponseTemplate::new(200).set_body_json(json!({"ok": true, "ts": "999.111"})),
             )
             .mount(&server)
             .await;
@@ -1570,8 +1569,7 @@ mod tests {
             .iter()
             .find(|r| r.url.path().ends_with("/chat.postMessage"))
             .expect("postMessage request");
-        let body: serde_json::Value =
-            serde_json::from_slice(&req.body).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
         assert_eq!(body["channel"], "C123");
         assert_eq!(body["thread_ts"], "100.1");
         // Block Kit payload shape verified more thoroughly in api.rs tests;
@@ -1704,13 +1702,11 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/chat.postMessage"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "ok": true,
-                    "ts": "9999.0001",
-                    "channel": "C1",
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "ts": "9999.0001",
+                "channel": "C1",
+            })))
             .mount(&server)
             .await;
         let adapter = adapter_for(&server);
@@ -1751,8 +1747,7 @@ mod tests {
 
     #[test]
     fn build_breadcrumb_blocks_running_uses_ascii_marker_and_code_chip() {
-        let bc = copperclaw_channels_core::Breadcrumb::running("shell")
-            .with_detail("cargo check");
+        let bc = copperclaw_channels_core::Breadcrumb::running("shell").with_detail("cargo check");
         let blocks = super::build_breadcrumb_blocks(&bc);
         let arr = blocks.as_array().expect("blocks must be a JSON array");
         assert_eq!(arr.len(), 1);
@@ -1900,8 +1895,7 @@ mod tests {
             .mount(&server)
             .await;
         let adapter = adapter_for(&server);
-        let bc = copperclaw_channels_core::Breadcrumb::running("shell")
-            .with_detail("cargo check");
+        let bc = copperclaw_channels_core::Breadcrumb::running("shell").with_detail("cargo check");
         let id = adapter
             .deliver_breadcrumb("C1", None, &bc, None)
             .await
@@ -2058,10 +2052,7 @@ mod tests {
             "anthropic returned 502 after retry exhaustion",
         )
         .with_title("Provider failed");
-        let id = adapter
-            .deliver_error("C1", None, &card)
-            .await
-            .unwrap();
+        let id = adapter.deliver_error("C1", None, &card).await.unwrap();
         assert_eq!(id.as_deref(), Some("1700000000.999999"));
         let reqs = server.received_requests().await.unwrap();
         let last = reqs.last().unwrap();
@@ -2084,20 +2075,22 @@ mod tests {
         // `rich_text_preformatted`, full body in a second
         // `rich_text_preformatted` — Slack natively collapses the
         // oversized preformatted block behind "Show more".
-        let body = (0..30).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        let body = (0..30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let preview: Vec<String> = (0..4).map(|i| format!("line {i}")).collect();
         let blocks = super::build_collapsible_blocks(&body, "shell 30 lines", &preview);
         let arr = blocks.as_array().expect("blocks must be an array");
         assert_eq!(arr.len(), 3, "summary + preview + full body");
         assert_eq!(arr[0]["type"], "section");
-        assert_eq!(
-            arr[0]["text"]["text"].as_str().unwrap(),
-            "shell 30 lines",
-        );
+        assert_eq!(arr[0]["text"]["text"].as_str().unwrap(), "shell 30 lines",);
         assert_eq!(arr[1]["type"], "rich_text");
         assert_eq!(arr[1]["elements"][0]["type"], "rich_text_preformatted");
         assert_eq!(arr[2]["type"], "rich_text");
-        let full = arr[2]["elements"][0]["elements"][0]["text"].as_str().unwrap();
+        let full = arr[2]["elements"][0]["elements"][0]["text"]
+            .as_str()
+            .unwrap();
         assert_eq!(full, body);
     }
 
@@ -2127,7 +2120,10 @@ mod tests {
             .mount(&server)
             .await;
         let adapter = adapter_for(&server);
-        let body = (0..40).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        let body = (0..40)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let preview: Vec<String> = (0..3).map(|i| format!("L{i}")).collect();
         let id = adapter
             .deliver_collapsible("C1", None, &body, "shell 40 lines", &preview)
@@ -2235,7 +2231,10 @@ mod tests {
         let post: Value = serde_json::from_slice(&last.body).unwrap();
         // The notification-text fallback is the canonical text rendering.
         let text = post["text"].as_str().unwrap();
-        assert!(text.starts_with("[reasoning: claude-opus-4-7]"), "got: {text}");
+        assert!(
+            text.starts_with("[reasoning: claude-opus-4-7]"),
+            "got: {text}"
+        );
         let blocks = post["blocks"].as_array().expect("blocks");
         assert_eq!(blocks[0]["type"], "context");
         assert_eq!(blocks[0]["elements"][0]["name"], "thought_balloon");
@@ -2330,6 +2329,10 @@ mod tests {
         let reqs = server.received_requests().await.unwrap();
         assert!(reqs.iter().any(|r| r.url.path().ends_with("/chat.update")));
         assert!(!reqs.iter().any(|r| r.url.path().ends_with("/pins.add")));
-        assert!(!reqs.iter().any(|r| r.url.path().ends_with("/chat.postMessage")));
+        assert!(
+            !reqs
+                .iter()
+                .any(|r| r.url.path().ends_with("/chat.postMessage"))
+        );
     }
 }

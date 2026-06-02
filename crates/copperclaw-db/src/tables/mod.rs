@@ -6,31 +6,31 @@
 //! Most table modules are stubs to be implemented by parallel teams; see
 //! [`agent_groups`] for the exemplar pattern.
 
+pub mod agent_destinations;
 pub mod agent_group_members;
 pub mod agent_groups;
 pub mod agent_turns;
 pub mod audit_log;
+pub mod container_configs;
+pub mod container_state;
+pub mod delivered;
+pub mod destinations;
+pub mod dropped_messages;
 pub mod group_budgets;
 pub mod messages_in;
 pub mod messages_out;
 pub mod messaging_group_agents;
 pub mod messaging_groups;
+pub mod outbound_dropped_messages;
+pub mod pending_approvals;
+pub mod pending_channel_approvals;
+pub mod pending_questions;
+pub mod processing_ack;
+pub mod session_routing;
+pub mod session_state;
 pub mod sessions;
+pub mod tasks;
+pub mod unregistered_senders;
 pub mod user_dms;
 pub mod user_roles;
 pub mod users;
-pub mod pending_questions;
-pub mod pending_approvals;
-pub mod pending_channel_approvals;
-pub mod delivered;
-pub mod destinations;
-pub mod session_routing;
-pub mod processing_ack;
-pub mod session_state;
-pub mod container_state;
-pub mod agent_destinations;
-pub mod unregistered_senders;
-pub mod dropped_messages;
-pub mod outbound_dropped_messages;
-pub mod container_configs;
-pub mod tasks;

@@ -5,8 +5,8 @@
 //! concurrent fanouts of the same `(messaging_group, thread)` from
 //! interleaving.
 
-use dashmap::DashMap;
 use copperclaw_types::ChannelType;
+use dashmap::DashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

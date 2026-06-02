@@ -271,9 +271,7 @@ impl WhatsappCloudApi {
             .next()
             .map(|m| m.id)
             .ok_or_else(|| {
-                AdapterError::Transport(
-                    "whatsapp-cloud message send returned no message id".into(),
-                )
+                AdapterError::Transport("whatsapp-cloud message send returned no message id".into())
             })
     }
 }
@@ -307,17 +305,18 @@ pub(crate) fn classify_response(
     };
 
     // Pull error sub-object code, if any.
-    let (err_code, err_message) = parsed
-        .as_ref()
-        .and_then(|v| v.get("error"))
-        .map_or((None, None), |err| {
-            let code = err.get("code").and_then(Value::as_i64);
-            let msg = err
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            (code, msg)
-        });
+    let (err_code, err_message) =
+        parsed
+            .as_ref()
+            .and_then(|v| v.get("error"))
+            .map_or((None, None), |err| {
+                let code = err.get("code").and_then(Value::as_i64);
+                let msg = err
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                (code, msg)
+            });
 
     if status == StatusCode::TOO_MANY_REQUESTS {
         return Err(AdapterError::Rate { retry_after });
@@ -400,12 +399,8 @@ mod tests {
 
     #[test]
     fn classify_returns_value_on_2xx() {
-        let v = classify_response(
-            StatusCode::OK,
-            None,
-            r#"{"messages":[{"id":"wamid.1"}]}"#,
-        )
-        .unwrap();
+        let v =
+            classify_response(StatusCode::OK, None, r#"{"messages":[{"id":"wamid.1"}]}"#).unwrap();
         assert_eq!(v["messages"][0]["id"], "wamid.1");
     }
 
@@ -515,11 +510,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/PNID/messages"))
             .and(header("authorization", "Bearer EAAG-test"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "messages": [{"id": "wamid.ABC"}]
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "messages": [{"id": "wamid.ABC"}]
+            })))
             .mount(&server)
             .await;
         let api = api_for(&server);
@@ -536,11 +529,9 @@ mod tests {
                 "context": {"message_id": "wamid.PARENT"},
                 "type": "text",
             })))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "messages": [{"id": "wamid.REPLY"}]
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "messages": [{"id": "wamid.REPLY"}]
+            })))
             .mount(&server)
             .await;
         let api = api_for(&server);
@@ -561,8 +552,7 @@ mod tests {
                 "document": {"link": "https://example.test/x.pdf", "filename": "x.pdf"}
             })))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"messages":[{"id":"wamid.DOC"}]})),
+                ResponseTemplate::new(200).set_body_json(json!({"messages":[{"id":"wamid.DOC"}]})),
             )
             .mount(&server)
             .await;
@@ -589,8 +579,7 @@ mod tests {
                 "context": {"message_id": "wamid.PARENT"}
             })))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"messages":[{"id":"wamid.DOC2"}]})),
+                ResponseTemplate::new(200).set_body_json(json!({"messages":[{"id":"wamid.DOC2"}]})),
             )
             .mount(&server)
             .await;
@@ -617,8 +606,7 @@ mod tests {
                 "document": {"id": "MEDIA1", "filename": "x.pdf"}
             })))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"messages":[{"id":"wamid.DOC3"}]})),
+                ResponseTemplate::new(200).set_body_json(json!({"messages":[{"id":"wamid.DOC3"}]})),
             )
             .mount(&server)
             .await;
@@ -640,8 +628,7 @@ mod tests {
                 "document": {"id": "MEDIA1"}
             })))
             .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({"messages":[{"id":"wamid.DOC4"}]})),
+                ResponseTemplate::new(200).set_body_json(json!({"messages":[{"id":"wamid.DOC4"}]})),
             )
             .mount(&server)
             .await;
@@ -659,9 +646,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/PNID/media"))
             .and(header("authorization", "Bearer EAAG-test"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"id": "MEDIA-42"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "MEDIA-42"})))
             .mount(&server)
             .await;
         let api = api_for(&server);
@@ -697,9 +682,7 @@ mod tests {
                 "status":"read",
                 "message_id":"wamid.READ"
             })))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"success": true})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"success": true})))
             .mount(&server)
             .await;
         let api = api_for(&server);
@@ -855,7 +838,10 @@ mod tests {
     #[test]
     fn url_helpers_trim_trailing_slash() {
         let a = WhatsappCloudApi::new("https://example.test/v18.0/", "t");
-        assert_eq!(a.messages_url("PNID"), "https://example.test/v18.0/PNID/messages");
+        assert_eq!(
+            a.messages_url("PNID"),
+            "https://example.test/v18.0/PNID/messages"
+        );
         assert_eq!(a.media_url("PNID"), "https://example.test/v18.0/PNID/media");
     }
 

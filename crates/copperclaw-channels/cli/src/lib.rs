@@ -226,10 +226,7 @@ impl CliAdapter {
                 )));
             }
         } else {
-            tokio::spawn(read_loop(
-                BufReader::new(tokio::io::stdin()),
-                inbound_tx,
-            ))
+            tokio::spawn(read_loop(BufReader::new(tokio::io::stdin()), inbound_tx))
         };
 
         let writer: Box<dyn AsyncWrite + Send + Unpin> = if let Some(log_path) = log {
@@ -505,13 +502,8 @@ impl ChannelFactory for CliFactory {
                 config.label,
             ))),
             (fifo, log) => {
-                let adapter = CliAdapter::new_with_paths(
-                    fifo,
-                    log,
-                    setup.inbound_tx,
-                    config.label,
-                )
-                .await?;
+                let adapter =
+                    CliAdapter::new_with_paths(fifo, log, setup.inbound_tx, config.label).await?;
                 Ok(Arc::new(adapter))
             }
         }
@@ -901,8 +893,7 @@ mod tests {
     #[test]
     fn cli_config_reads_fifo_and_log_paths() {
         let c =
-            CliConfig::from_value(&json!({"fifo": "/tmp/x.fifo", "log": "/tmp/x.log"}))
-                .unwrap();
+            CliConfig::from_value(&json!({"fifo": "/tmp/x.fifo", "log": "/tmp/x.log"})).unwrap();
         assert_eq!(c.fifo.as_deref(), Some(Path::new("/tmp/x.fifo")));
         assert_eq!(c.log.as_deref(), Some(Path::new("/tmp/x.log")));
     }

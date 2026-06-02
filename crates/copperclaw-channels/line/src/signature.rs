@@ -10,8 +10,8 @@
 //! All comparisons go through `hmac::Mac::verify_slice` for
 //! constant-time equality.
 
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
@@ -32,11 +32,7 @@ pub enum SignatureOutcome {
 /// value. `header_value` is the raw string the request carried in
 /// `X-Line-Signature` (or `None` if absent).
 #[must_use]
-pub fn verify(
-    body: &[u8],
-    channel_secret: &str,
-    header_value: Option<&str>,
-) -> SignatureOutcome {
+pub fn verify(body: &[u8], channel_secret: &str, header_value: Option<&str>) -> SignatureOutcome {
     let Some(raw) = header_value else {
         return SignatureOutcome::HeaderMissing;
     };
@@ -73,10 +69,7 @@ mod tests {
     fn ok_when_digest_matches() {
         let body = b"{\"events\":[]}";
         let sig = compute_base64("topsecret", body);
-        assert_eq!(
-            verify(body, "topsecret", Some(&sig)),
-            SignatureOutcome::Ok
-        );
+        assert_eq!(verify(body, "topsecret", Some(&sig)), SignatureOutcome::Ok);
     }
 
     #[test]

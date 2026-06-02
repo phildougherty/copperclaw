@@ -6,7 +6,7 @@
 //! existing migrations.
 
 use crate::DbError;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 /// Discriminator for which migration set to apply.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -124,16 +124,14 @@ pub fn run_migrations(conn: &mut Connection, set: MigrationSet) -> Result<(), Db
             continue;
         }
         let tx = conn.transaction()?;
-        tx.execute_batch(migration.sql).map_err(|source| DbError::Migration {
-            name: migration.name.to_string(),
-            source,
-        })?;
+        tx.execute_batch(migration.sql)
+            .map_err(|source| DbError::Migration {
+                name: migration.name.to_string(),
+                source,
+            })?;
         tx.execute(
             "INSERT INTO schema_version (name, applied) VALUES (?1, ?2)",
-            params![
-                migration.name,
-                chrono::Utc::now().to_rfc3339(),
-            ],
+            params![migration.name, chrono::Utc::now().to_rfc3339(),],
         )?;
         tx.commit()?;
         tracing::info!(target: "copperclaw_db::migrate", migration = migration.name, "applied");
@@ -171,11 +169,13 @@ pub fn expected_central_schema_version() -> usize {
 /// otherwise.
 pub fn applied_central_schema_version(conn: &Connection) -> Result<Option<usize>, DbError> {
     // Check whether the table exists at all first (fresh DB, pre-migrate).
-    let table_exists: bool = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_version'",
-        [],
-        |r| r.get::<_, i64>(0),
-    ).map(|n| n > 0)?;
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_version'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map(|n| n > 0)?;
     if !table_exists {
         return Ok(None);
     }
@@ -254,7 +254,12 @@ mod tests {
     fn session_inbound_migrations_apply() {
         let mut conn = fresh();
         run_migrations(&mut conn, MigrationSet::SessionInbound).unwrap();
-        for table in ["messages_in", "delivered", "destinations", "session_routing"] {
+        for table in [
+            "messages_in",
+            "delivered",
+            "destinations",
+            "session_routing",
+        ] {
             let exists: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",

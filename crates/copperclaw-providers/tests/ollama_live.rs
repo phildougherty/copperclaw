@@ -33,7 +33,10 @@ async fn ollama_live_simple_prompt_round_trip() {
     });
     input.max_tokens = 64;
 
-    let mut q = p.query(input).await.expect("query starts; is ollama running?");
+    let mut q = p
+        .query(input)
+        .await
+        .expect("query starts; is ollama running?");
     let mut final_text: Option<String> = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     loop {

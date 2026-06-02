@@ -1,11 +1,11 @@
 //! Handlers for `members.*` commands.
 
 use super::{db_err, parse_uuid, req_str};
+use copperclaw_cclaw::ErrorPayload;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::agent_group_members;
-use copperclaw_cclaw::ErrorPayload;
 use copperclaw_types::{AgentGroupId, UserId};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub fn list(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     let ag = AgentGroupId(parse_uuid(&req_str(args, "agent_group_id")?)?);
@@ -39,7 +39,7 @@ fn member_to_json(m: &agent_group_members::Member) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use copperclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+    use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
     use copperclaw_db::tables::users::{self, UpsertUser};
 
     fn db_with_user_group() -> (CentralDb, UserId, AgentGroupId) {
@@ -76,11 +76,7 @@ mod tests {
             &db,
         )
         .unwrap();
-        let v = list(
-            &json!({"agent_group_id": g.as_uuid().to_string()}),
-            &db,
-        )
-        .unwrap();
+        let v = list(&json!({"agent_group_id": g.as_uuid().to_string()}), &db).unwrap();
         assert_eq!(v.as_array().unwrap().len(), 1);
     }
 
@@ -103,11 +99,7 @@ mod tests {
             &db,
         )
         .unwrap();
-        let v = list(
-            &json!({"agent_group_id": g.as_uuid().to_string()}),
-            &db,
-        )
-        .unwrap();
+        let v = list(&json!({"agent_group_id": g.as_uuid().to_string()}), &db).unwrap();
         assert!(v.as_array().unwrap().is_empty());
     }
 

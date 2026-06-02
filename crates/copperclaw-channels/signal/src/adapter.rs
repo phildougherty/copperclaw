@@ -75,11 +75,7 @@ impl SignalAdapter {
     ) -> Self {
         let cancel = CancellationToken::new();
         let notif_rx = transport.take_notifications().await;
-        let handle = tokio::spawn(forwarder_loop(
-            notif_rx,
-            inbound_tx,
-            cancel.clone(),
-        ));
+        let handle = tokio::spawn(forwarder_loop(notif_rx, inbound_tx, cancel.clone()));
         Self {
             channel_type: ChannelType::new(CHANNEL_TYPE_STR),
             transport,
@@ -357,15 +353,7 @@ impl SignalAdapter {
                     .get("remove")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                api::send_reaction(
-                    &self.transport,
-                    target,
-                    &emoji,
-                    author,
-                    ts,
-                    remove,
-                )
-                .await
+                api::send_reaction(&self.transport, target, &emoji, author, ts, remove).await
             }
             "delete" => {
                 let ts = required_timestamp(content, "target_id")?;
@@ -388,7 +376,12 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio::time::{Duration, timeout};
 
-    async fn build_adapter() -> (Arc<SignalAdapter>, MockHandle, TempDir, mpsc::Receiver<InboundEvent>) {
+    async fn build_adapter() -> (
+        Arc<SignalAdapter>,
+        MockHandle,
+        TempDir,
+        mpsc::Receiver<InboundEvent>,
+    ) {
         let (mock, ctl) = MockTransport::new();
         let dir = TempDir::new().unwrap();
         let (tx, rx) = mpsc::channel::<InboundEvent>(8);
@@ -487,7 +480,8 @@ mod tests {
     #[tokio::test]
     async fn deliver_edit_calls_send_edit_message() {
         let (adapter, ctl, _dir, _rx) = build_adapter().await;
-        ctl.expect_ok("sendEditMessage", json!({"timestamp": 88})).await;
+        ctl.expect_ok("sendEditMessage", json!({"timestamp": 88}))
+            .await;
         let id = adapter
             .deliver(
                 "user:+1",
@@ -515,7 +509,8 @@ mod tests {
     #[tokio::test]
     async fn deliver_edit_accepts_string_target_id() {
         let (adapter, ctl, _dir, _rx) = build_adapter().await;
-        ctl.expect_ok("sendEditMessage", json!({"timestamp": 88})).await;
+        ctl.expect_ok("sendEditMessage", json!({"timestamp": 88}))
+            .await;
         let _ = adapter
             .deliver(
                 "user:+1",
@@ -627,7 +622,8 @@ mod tests {
     #[tokio::test]
     async fn deliver_delete_calls_remote_delete() {
         let (adapter, ctl, _dir, _rx) = build_adapter().await;
-        ctl.expect_ok("remoteDelete", json!({"timestamp": 99})).await;
+        ctl.expect_ok("remoteDelete", json!({"timestamp": 99}))
+            .await;
         let id = adapter
             .deliver(
                 "user:+1",

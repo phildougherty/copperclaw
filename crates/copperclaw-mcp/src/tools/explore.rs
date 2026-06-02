@@ -43,11 +43,11 @@ use rmcp::model::{CallToolResult, JsonObject, Tool};
 use serde::Deserialize;
 
 use crate::context::{
-    SubagentRequest, SubagentResult, ToolContext, SUBAGENT_MAX_TOKENS_LIMIT,
-    SUBAGENT_MAX_TURNS_LIMIT, SUBAGENT_WALL_CLOCK_SECS,
+    SUBAGENT_MAX_TOKENS_LIMIT, SUBAGENT_MAX_TURNS_LIMIT, SUBAGENT_WALL_CLOCK_SECS, SubagentRequest,
+    SubagentResult, ToolContext,
 };
 use crate::error::ToolError;
-use crate::tools::{make_tool, parse_args, success_json, ToolEntry, ToolHandler};
+use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args, success_json};
 
 /// Default `max_turns` when the caller omits it.
 pub const DEFAULT_MAX_TURNS: u32 = 5;
@@ -94,11 +94,13 @@ pub fn schema() -> Tool {
          handled', 'what does this module do', 'does the build pass'. Run a few in parallel \
          for a fast multi-angle skim. Returns a summary to you; raise `max_turns` (≤10) / \
          `max_tokens` (≤200k) for a bit more depth.\n\
-         - `create_agent` spawns a full sibling agent in its OWN container with your \
-         workspace mounted READ-ONLY at `/parent`. It's UNBOUNDED (no turn/token cap) but \
-         heavier. Use it for a SUBSTANTIVE, parallel review/audit of the codebase — spawn \
-         one auditor per area, each told to analyse `/parent` — then synthesise their \
-         reports. (Reads only; it can't modify your files.)\n\n\
+         - `create_agent` spawns a full sibling agent in its OWN container. If your \
+         workspace is a git repo it gets a WRITABLE worktree at `/workspace` (its own \
+         branch — it can edit AND commit, and you review/merge the branch afterwards); \
+         otherwise your code is READ-ONLY at `/parent`. It's UNBOUNDED (no turn/token cap) \
+         but heavier. Use it for SUBSTANTIVE parallel work — a review/audit (one auditor \
+         per area, each analysing `/parent` or `/workspace`) or parallel implementation \
+         (one sibling per area, each committing on its branch) — then synthesise/merge.\n\n\
          **Budget caveat:** the 50k token budget is CUMULATIVE input tokens across all \
          subagent turns; each turn replays prior history + tool results, so one fetch of a \
          large page can dominate the budget. For broad multi-area review, prefer several \
@@ -294,7 +296,9 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, ToolError::Validation(s) if s.contains("nested") || s.contains("inside")));
+        assert!(
+            matches!(err, ToolError::Validation(s) if s.contains("nested") || s.contains("inside"))
+        );
         assert!(ctx.subagent_calls().is_empty());
     }
 

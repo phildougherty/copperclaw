@@ -17,8 +17,8 @@
 
 use crate::config::DiscordConfig;
 use crate::events::{self, CHANNEL_TYPE_STR};
-use crate::gateway::lifecycle::{NextAction, SessionState, decide_resume_or_identify};
 use crate::gateway::lifecycle::is_fatal_close;
+use crate::gateway::lifecycle::{NextAction, SessionState, decide_resume_or_identify};
 use crate::gateway::{self, Frame, codec};
 use crate::rest::DiscordRest;
 use async_trait::async_trait;
@@ -132,7 +132,10 @@ impl DiscordAdapter {
                     attempt = 0;
                 }
                 Err(GatewayExit::Fatal(code)) => {
-                    tracing::error!(close_code = code, "discord gateway fatal close; not reconnecting");
+                    tracing::error!(
+                        close_code = code,
+                        "discord gateway fatal close; not reconnecting"
+                    );
                     return;
                 }
                 Err(GatewayExit::Transient(e)) => {
@@ -162,10 +165,12 @@ impl DiscordAdapter {
             }
             Err(e) => return Err(GatewayExit::Transient(format!("{e}"))),
         };
-        let frame = codec::parse_frame(&first)
-            .map_err(|e| GatewayExit::Transient(format!("{e}")))?;
+        let frame =
+            codec::parse_frame(&first).map_err(|e| GatewayExit::Transient(format!("{e}")))?;
         let _interval = match frame {
-            codec::GatewayFrame::Hello { heartbeat_interval_ms } => heartbeat_interval_ms,
+            codec::GatewayFrame::Hello {
+                heartbeat_interval_ms,
+            } => heartbeat_interval_ms,
             other => {
                 return Err(GatewayExit::Transient(format!(
                     "expected HELLO, got {other:?}"
@@ -240,7 +245,11 @@ impl DiscordAdapter {
                 }
                 Some(Ok(()))
             }
-            F::Dispatch { event, sequence, data } => {
+            F::Dispatch {
+                event,
+                sequence,
+                data,
+            } => {
                 self.session.lock().await.record_sequence(sequence);
                 self.dispatch(&event, &data).await;
                 None
@@ -422,7 +431,10 @@ impl ChannelAdapter for DiscordAdapter {
         _to: Option<&str>,
     ) -> Result<Option<String>, AdapterError> {
         let payload = build_card_payload(card);
-        let id = self.rest.post_message_payload(platform_id, &payload).await?;
+        let id = self
+            .rest
+            .post_message_payload(platform_id, &payload)
+            .await?;
         Ok(Some(id))
     }
 
@@ -488,7 +500,10 @@ impl ChannelAdapter for DiscordAdapter {
         diff: &DiffCard,
     ) -> Result<Option<String>, AdapterError> {
         let payload = build_diff_payload(diff);
-        let id = self.rest.post_message_payload(platform_id, &payload).await?;
+        let id = self
+            .rest
+            .post_message_payload(platform_id, &payload)
+            .await?;
         Ok(Some(id))
     }
 
@@ -525,7 +540,10 @@ impl ChannelAdapter for DiscordAdapter {
         preview_lines: &[String],
     ) -> Result<Option<String>, AdapterError> {
         let payload = build_collapsible_payload(text, summary, preview_lines);
-        let id = self.rest.post_message_payload(platform_id, &payload).await?;
+        let id = self
+            .rest
+            .post_message_payload(platform_id, &payload)
+            .await?;
         Ok(Some(id))
     }
 
@@ -605,7 +623,10 @@ impl ChannelAdapter for DiscordAdapter {
         err: &ErrorCard,
     ) -> Result<Option<String>, AdapterError> {
         let payload = build_error_payload(err);
-        let id = self.rest.post_message_payload(platform_id, &payload).await?;
+        let id = self
+            .rest
+            .post_message_payload(platform_id, &payload)
+            .await?;
         Ok(Some(id))
     }
 
@@ -625,7 +646,10 @@ impl ChannelAdapter for DiscordAdapter {
         thinking: &ThinkingBlock,
     ) -> Result<Option<String>, AdapterError> {
         let payload = build_thinking_payload(thinking);
-        let id = self.rest.post_message_payload(platform_id, &payload).await?;
+        let id = self
+            .rest
+            .post_message_payload(platform_id, &payload)
+            .await?;
         Ok(Some(id))
     }
 
@@ -662,10 +686,7 @@ impl ChannelAdapter for DiscordAdapter {
         if !obj.contains_key("embeds") {
             return None;
         }
-        let text = obj
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let text = obj.get("text").and_then(|v| v.as_str()).unwrap_or("");
         let mut new_obj = obj.clone();
         new_obj.remove("embeds");
         new_obj.insert(
@@ -909,7 +930,12 @@ fn render_activity_content(b: &Breadcrumb) -> String {
         Some(d) => out.push_str(&escape_discord_markdown(d)),
         None => out.push_str("working"),
     }
-    if let Some(s) = b.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(s) = b
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         out.push_str(" · ");
         out.push_str(&escape_discord_markdown(s));
     }
@@ -954,7 +980,12 @@ fn render_step_line_content(s: &Breadcrumb) -> String {
         out.push_str(&escape_backticks(d));
         out.push('`');
     }
-    if let Some(sum) = s.summary.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+    if let Some(sum) = s
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+    {
         if s.status == BreadcrumbStatus::Failed {
             out.push_str(" — failed: ");
         } else {
@@ -1057,7 +1088,10 @@ pub fn build_card_payload(card: &Card) -> Value {
 
     let mut payload = serde_json::Map::new();
     if !embed.is_empty() {
-        payload.insert("embeds".to_owned(), Value::Array(vec![Value::Object(embed)]));
+        payload.insert(
+            "embeds".to_owned(),
+            Value::Array(vec![Value::Object(embed)]),
+        );
     }
     if !card.buttons.is_empty() {
         payload.insert("components".to_owned(), build_components(&card.buttons));
@@ -1141,9 +1175,7 @@ pub(crate) fn build_collapsible_payload(
     description.push_str(separator);
     description.push_str(&body_block);
     if truncated_bytes > 0 {
-        description.push_str(&format!(
-            "\n…(truncated; {truncated_bytes} more bytes)"
-        ));
+        description.push_str(&format!("\n…(truncated; {truncated_bytes} more bytes)"));
     }
     if description.chars().count() > 4096 {
         description = description.chars().take(4093).collect::<String>() + "...";
@@ -1175,7 +1207,9 @@ pub fn build_error_payload(err: &ErrorCard) -> Value {
         let d = d.trim();
         if !d.is_empty() {
             // Reserve room for the ``` fences + newline padding.
-            let detail_budget = DESC_BUDGET.saturating_sub(description.len()).saturating_sub(16);
+            let detail_budget = DESC_BUDGET
+                .saturating_sub(description.len())
+                .saturating_sub(16);
             let trimmed_details: String = d.chars().take(detail_budget).collect();
             // Strip any embedded backticks so the user's stderr
             // can't break out of the code fence.
@@ -1360,10 +1394,7 @@ fn build_components(buttons: &[CardButton]) -> Value {
     let mut rows: Vec<Value> = Vec::new();
     let chunks: Vec<&[CardButton]> = buttons.chunks(DISCORD_BUTTONS_PER_ROW).collect();
     for chunk in chunks.into_iter().take(DISCORD_ACTION_ROWS) {
-        let elements: Vec<Value> = chunk
-            .iter()
-            .filter_map(button_to_discord)
-            .collect();
+        let elements: Vec<Value> = chunk.iter().filter_map(button_to_discord).collect();
         if !elements.is_empty() {
             rows.push(json!({
                 "type": 1, // ActionRow
@@ -1706,7 +1737,10 @@ mod tests {
             .mount(&server)
             .await;
         let (a, _rx) = build_adapter(&server);
-        let err = a.deliver("c1", None, &outbound_text("hi")).await.unwrap_err();
+        let err = a
+            .deliver("c1", None, &outbound_text("hi"))
+            .await
+            .unwrap_err();
         assert!(matches!(err, AdapterError::Auth(_)));
     }
 
@@ -1730,9 +1764,7 @@ mod tests {
             }),
             files: vec![],
         };
-        let fallback = a
-            .plain_text_fallback(&msg)
-            .expect("discord fallback");
+        let fallback = a.plain_text_fallback(&msg).expect("discord fallback");
         assert!(fallback.content.get("embeds").is_none());
         assert_eq!(
             fallback.content["text"].as_str().unwrap(),
@@ -1761,8 +1793,7 @@ mod tests {
                     && r.url.path() == "/channels/c1/messages/m9"
             })
             .expect("PATCH /channels/c1/messages/m9");
-        let body: serde_json::Value =
-            serde_json::from_slice(&req.body).expect("json body");
+        let body: serde_json::Value = serde_json::from_slice(&req.body).expect("json body");
         assert_eq!(body["content"], "updated body");
     }
 
@@ -1776,9 +1807,7 @@ mod tests {
             .mount(&server)
             .await;
         let (a, _rx) = build_adapter(&server);
-        a.add_reaction("c1", None, "m9", "\u{1F600}")
-            .await
-            .unwrap();
+        a.add_reaction("c1", None, "m9", "\u{1F600}").await.unwrap();
     }
 
     #[tokio::test]
@@ -1853,9 +1882,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/channels/c1/messages"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"id": "card-msg-1"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "card-msg-1"})))
             .mount(&server)
             .await;
         let (a, _rx) = build_adapter(&server);
@@ -1894,8 +1921,7 @@ mod tests {
                     && r.url.path() == "/channels/c1/messages"
             })
             .expect("post_message request");
-        let body: serde_json::Value =
-            serde_json::from_slice(&req.body).unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
         // No `content` line — embed carries title + body.
         assert!(body.get("content").is_none());
         // Embed shape.
@@ -1977,7 +2003,10 @@ mod tests {
             .unwrap();
         assert_eq!(evt.platform_id, "c1");
         assert_eq!(evt.message.content["text"], "deploy:no");
-        assert_eq!(evt.message.content["callback"]["original_message_id"], "m-99");
+        assert_eq!(
+            evt.message.content["callback"]["original_message_id"],
+            "m-99"
+        );
 
         // Give the fire-and-forget ACK task a moment to land.
         for _ in 0..20 {
@@ -1992,7 +2021,9 @@ mod tests {
             reqs.iter()
                 .any(|r| r.url.path() == "/interactions/int-7/tok-7/callback"),
             "expected ACK call to be made; got requests: {:?}",
-            reqs.iter().map(|r| r.url.path().to_owned()).collect::<Vec<_>>()
+            reqs.iter()
+                .map(|r| r.url.path().to_owned())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -2122,7 +2153,10 @@ mod tests {
             .mount(&server)
             .await;
         let (a, _rx) = build_adapter(&server);
-        let err = a.deliver("c1", None, &outbound_text("hi")).await.unwrap_err();
+        let err = a
+            .deliver("c1", None, &outbound_text("hi"))
+            .await
+            .unwrap_err();
         match err {
             AdapterError::Rate { retry_after } => assert_eq!(retry_after, Some(7)),
             other => panic!("expected Rate, got {other:?}"),
@@ -2133,8 +2167,7 @@ mod tests {
 
     #[test]
     fn render_breadcrumb_content_running_uses_ascii_marker_and_inline_code() {
-        let bc = copperclaw_channels_core::Breadcrumb::running("shell")
-            .with_detail("cargo check");
+        let bc = copperclaw_channels_core::Breadcrumb::running("shell").with_detail("cargo check");
         let content = super::render_breadcrumb_content(&bc);
         assert!(content.starts_with("[~]"), "got: {content}");
         assert!(content.contains("`shell`"), "got: {content}");
@@ -2154,8 +2187,7 @@ mod tests {
     fn render_breadcrumb_content_strips_backticks_in_detail() {
         // Discord's inline-code span terminates on `, so any agent-
         // supplied backtick must be neutralised or the chip breaks.
-        let bc = copperclaw_channels_core::Breadcrumb::running("shell")
-            .with_detail("echo `pwn`");
+        let bc = copperclaw_channels_core::Breadcrumb::running("shell").with_detail("echo `pwn`");
         let content = super::render_breadcrumb_content(&bc);
         // Only the wrapping backticks around the tool name remain.
         assert_eq!(content.matches('`').count(), 2);
@@ -2166,14 +2198,11 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/channels/c1/messages"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"id": "m42"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "m42"})))
             .mount(&server)
             .await;
         let (a, _rx) = build_adapter(&server);
-        let bc = copperclaw_channels_core::Breadcrumb::running("shell")
-            .with_detail("cargo check");
+        let bc = copperclaw_channels_core::Breadcrumb::running("shell").with_detail("cargo check");
         let id = a.deliver_breadcrumb("c1", None, &bc, None).await.unwrap();
         assert_eq!(id.as_deref(), Some("m42"));
         let reqs = server.received_requests().await.unwrap();
@@ -2196,7 +2225,10 @@ mod tests {
         let bc = copperclaw_channels_core::Breadcrumb::running("shell")
             .with_detail("cargo check")
             .finished(true, Some("passed (0.4s)".into()));
-        let id = a.deliver_breadcrumb("c1", None, &bc, Some("m42")).await.unwrap();
+        let id = a
+            .deliver_breadcrumb("c1", None, &bc, Some("m42"))
+            .await
+            .unwrap();
         assert_eq!(id.as_deref(), Some("m42"));
         let reqs = server.received_requests().await.unwrap();
         let body: Value = serde_json::from_slice(&reqs.last().unwrap().body).unwrap();
@@ -2290,7 +2322,10 @@ mod tests {
         );
         // Bold marker in a step's tool name is escaped so it can't toggle
         // bold and bleed into the rest of the line.
-        assert!(content.contains(r"**wr\*ite**"), "tool `*` escaped: {content}");
+        assert!(
+            content.contains(r"**wr\*ite**"),
+            "tool `*` escaped: {content}"
+        );
         // Step result summary (outside any code span) has `||` + `*`
         // escaped too.
         assert!(
@@ -2335,7 +2370,10 @@ mod tests {
         let reqs = server.received_requests().await.unwrap();
         let body: Value = serde_json::from_slice(&reqs.last().unwrap().body).unwrap();
         let content = body["content"].as_str().unwrap();
-        assert!(content.contains("||"), "first emit carries spoiler: {content}");
+        assert!(
+            content.contains("||"),
+            "first emit carries spoiler: {content}"
+        );
         assert!(content.contains("[ok] **read_file** `src/App.tsx`"));
     }
 
@@ -2374,7 +2412,10 @@ mod tests {
         let body: Value = serde_json::from_slice(&reqs.last().unwrap().body).unwrap();
         let content = body["content"].as_str().unwrap();
         assert!(content.starts_with("[~] shell npm run build · 2/2 steps"));
-        assert!(content.contains("||"), "edit path carries spoiler: {content}");
+        assert!(
+            content.contains("||"),
+            "edit path carries spoiler: {content}"
+        );
     }
 
     // ── Diff card rendering ────────────────────────────────────────
@@ -2416,7 +2457,10 @@ mod tests {
         assert!(desc.contains("+let x = 2;"));
         // Balanced add/remove → yellow.
         let color = embeds[0]["color"].as_u64().unwrap();
-        assert_eq!(color, 0x00FE_E75C, "balanced should be yellow, got: {color:x}");
+        assert_eq!(
+            color, 0x00FE_E75C,
+            "balanced should be yellow, got: {color:x}"
+        );
     }
 
     #[test]
@@ -2453,9 +2497,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/channels/c1/messages"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"id": "m777"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "m777"})))
             .mount(&server)
             .await;
         let (a, _rx) = build_adapter(&server);
@@ -2492,8 +2534,8 @@ mod tests {
             copperclaw_channels_core::ErrorCardKind::Provider,
             copperclaw_channels_core::ErrorCardKind::Delivery,
         ] {
-            let card = copperclaw_channels_core::ErrorCard::new(kind, "boom")
-                .with_title("Tool failed");
+            let card =
+                copperclaw_channels_core::ErrorCard::new(kind, "boom").with_title("Tool failed");
             let payload = super::build_error_payload(&card);
             let embeds = payload["embeds"].as_array().unwrap();
             assert_eq!(embeds.len(), 1);
@@ -2554,9 +2596,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/channels/c1/messages"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"id": "err-99"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "err-99"})))
             .mount(&server)
             .await;
         let (a, _rx) = build_adapter(&server);
@@ -2581,7 +2621,10 @@ mod tests {
         // Shape contract: single embed with `author.name = "long
         // output"`, `title = <summary>`, description containing the
         // preview block + separator + full body in code fences.
-        let body = (0..15).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        let body = (0..15)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let preview: Vec<String> = (0..3).map(|i| format!("L{i}")).collect();
         let payload = super::build_collapsible_payload(&body, "shell 15 lines", &preview);
         let embed = &payload["embeds"][0];
@@ -2614,7 +2657,11 @@ mod tests {
         let body = "x".repeat(10_000);
         let payload = super::build_collapsible_payload(&body, "huge", &[]);
         let desc = payload["embeds"][0]["description"].as_str().unwrap();
-        assert!(desc.contains("more bytes"), "got: {}", &desc[..120.min(desc.len())]);
+        assert!(
+            desc.contains("more bytes"),
+            "got: {}",
+            &desc[..120.min(desc.len())]
+        );
     }
 
     #[tokio::test]
@@ -2622,13 +2669,14 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/channels/c1/messages"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"id": "long-7"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "long-7"})))
             .mount(&server)
             .await;
         let (a, _rx) = build_adapter(&server);
-        let body = (0..25).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        let body = (0..25)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let preview: Vec<String> = (0..3).map(|i| format!("L{i}")).collect();
         let id = a
             .deliver_collapsible("c1", None, &body, "shell 25 lines", &preview)
@@ -2664,7 +2712,10 @@ mod tests {
     fn build_thinking_payload_includes_provenance_in_author_name() {
         let t = ThinkingBlock::visible("ok").with_model("claude-opus-4-7");
         let p = super::build_thinking_payload(&t);
-        assert_eq!(p["embeds"][0]["author"]["name"], "reasoning (claude-opus-4-7)");
+        assert_eq!(
+            p["embeds"][0]["author"]["name"],
+            "reasoning (claude-opus-4-7)"
+        );
     }
 
     #[test]
@@ -2806,8 +2857,7 @@ mod tests {
         assert_eq!(id.as_deref(), Some("todo-1"));
         let reqs = server.received_requests().await.unwrap();
         assert!(reqs.iter().any(|r| {
-            r.method == wiremock::http::Method::PUT
-                && r.url.path() == "/channels/c1/pins/todo-1"
+            r.method == wiremock::http::Method::PUT && r.url.path() == "/channels/c1/pins/todo-1"
         }));
     }
 
@@ -2821,7 +2871,13 @@ mod tests {
             .await;
         let (a, _rx) = build_adapter(&server);
         let id = a
-            .deliver_todo_list("c1", None, &discord_todo_list_sample(), Some("todo-1"), false)
+            .deliver_todo_list(
+                "c1",
+                None,
+                &discord_todo_list_sample(),
+                Some("todo-1"),
+                false,
+            )
             .await
             .unwrap();
         assert_eq!(id.as_deref(), Some("todo-1"));

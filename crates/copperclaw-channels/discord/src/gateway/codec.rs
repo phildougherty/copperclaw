@@ -84,15 +84,11 @@ pub fn parse_value(v: &Value) -> Result<GatewayFrame, AdapterError> {
         .get("op")
         .and_then(Value::as_u64)
         .ok_or_else(|| AdapterError::Transport("gateway: missing `op`".into()))?;
-    let op_u8 = u8::try_from(op_raw).map_err(|_| {
-        AdapterError::Transport(format!("gateway: op {op_raw} out of u8 range"))
-    })?;
+    let op_u8 = u8::try_from(op_raw)
+        .map_err(|_| AdapterError::Transport(format!("gateway: op {op_raw} out of u8 range")))?;
     let data = v.get("d").cloned().unwrap_or(Value::Null);
     let sequence = v.get("s").and_then(Value::as_u64);
-    let event = v
-        .get("t")
-        .and_then(Value::as_str)
-        .map(str::to_owned);
+    let event = v.get("t").and_then(Value::as_str).map(str::to_owned);
 
     let Some(op) = Opcode::from_u8(op_u8) else {
         return Ok(GatewayFrame::Other { op: op_u8, data });
@@ -119,12 +115,10 @@ pub fn parse_value(v: &Value) -> Result<GatewayFrame, AdapterError> {
             resumable: data.as_bool().unwrap_or(false),
         }),
         Opcode::Dispatch => {
-            let seq = sequence.ok_or_else(|| {
-                AdapterError::Transport("DISPATCH frame missing `s`".into())
-            })?;
-            let name = event.ok_or_else(|| {
-                AdapterError::Transport("DISPATCH frame missing `t`".into())
-            })?;
+            let seq = sequence
+                .ok_or_else(|| AdapterError::Transport("DISPATCH frame missing `s`".into()))?;
+            let name = event
+                .ok_or_else(|| AdapterError::Transport("DISPATCH frame missing `t`".into()))?;
             Ok(GatewayFrame::Dispatch {
                 event: name,
                 sequence: seq,
@@ -272,12 +266,13 @@ mod tests {
 
     #[test]
     fn parses_message_create_dispatch() {
-        let f = parse_frame(
-            r#"{"op":0,"t":"MESSAGE_CREATE","s":7,"d":{"id":"m1","channel_id":"c1"}}"#,
-        )
-        .unwrap();
+        let f =
+            parse_frame(r#"{"op":0,"t":"MESSAGE_CREATE","s":7,"d":{"id":"m1","channel_id":"c1"}}"#)
+                .unwrap();
         match f {
-            GatewayFrame::Dispatch { event, sequence, .. } => {
+            GatewayFrame::Dispatch {
+                event, sequence, ..
+            } => {
                 assert_eq!(event, "MESSAGE_CREATE");
                 assert_eq!(sequence, 7);
             }

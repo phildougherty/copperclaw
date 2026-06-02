@@ -11,10 +11,10 @@ fn validate_to(input: Option<RecipientInput>) -> Result<Option<Recipient>, ToolE
 pub mod ask_user_question {
     //! `ask_user_question`: present a titled multiple-choice question.
 
-    use super::{validate_to, RecipientInput};
+    use super::{RecipientInput, validate_to};
     use crate::context::{AskUserQuestionSpec, OutboundToolEffect, ToolContext};
     use crate::error::ToolError;
-    use crate::tools::{ack_to_result, make_tool, parse_args, ToolEntry, ToolHandler};
+    use crate::tools::{ToolEntry, ToolHandler, ack_to_result, make_tool, parse_args};
     use rmcp::model::{CallToolResult, JsonObject, Tool};
     use serde::Deserialize;
 
@@ -29,19 +29,27 @@ pub mod ask_user_question {
     pub fn schema() -> Tool {
         make_tool(
             "ask_user_question",
-            "Ask the user a titled question with a fixed list of allowed answers.",
+            "Ask the user a titled question with a fixed list of allowed answers. \
+             The user's pick comes back as an inbound message on a later turn (you \
+             don't block). In almost all cases OMIT `to` — the question is sent to the \
+             user/channel you're already talking to. Only set `to` to redirect the \
+             question somewhere else.",
             serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["title", "options"],
                 "properties": {
-                    "title": { "type": "string", "minLength": 1 },
+                    "title": { "type": "string", "minLength": 1, "description": "Question text shown above the choices." },
                     "options": {
                         "type": "array",
                         "items": { "type": "string", "minLength": 1 },
-                        "minItems": 1
+                        "minItems": 1,
+                        "description": "The allowed answers; the user picks exactly one."
                     },
-                    "to": { "type": ["string", "object", "null"] }
+                    "to": {
+                        "type": ["string", "object", "null"],
+                        "description": "OPTIONAL — leave it out to ask the user on the current channel (this is what you want almost every time). Only to redirect elsewhere: pass a fully-qualified channel-id STRING like \"telegram:chat-123\", OR an object with an explicit kind — {\"kind\":\"user\",\"id\":\"<user-id>\"}, {\"kind\":\"channel\",\"id\":\"<channel-id>\"}, or {\"kind\":\"agent\",\"session_id\":\"<session-id>\"}. Any other object shape is rejected."
+                    }
                 }
             }),
         )
@@ -109,10 +117,10 @@ pub mod send_card {
     //! `send_card` from any agent on any channel produces a usable
     //! result.
 
-    use super::{validate_to, RecipientInput};
+    use super::{RecipientInput, validate_to};
     use crate::context::{OutboundToolEffect, SendCardSpec, ToolContext};
     use crate::error::ToolError;
-    use crate::tools::{ack_to_result, make_tool, parse_args, ToolEntry, ToolHandler};
+    use crate::tools::{ToolEntry, ToolHandler, ack_to_result, make_tool, parse_args};
     use copperclaw_channels_core::Card;
     use rmcp::model::{CallToolResult, JsonObject, Tool};
     use serde::Deserialize;
@@ -227,7 +235,9 @@ pub mod send_card {
             to,
             card: input.card,
         };
-        let ack = ctx.emit_outbound(OutboundToolEffect::SendCard(spec)).await?;
+        let ack = ctx
+            .emit_outbound(OutboundToolEffect::SendCard(spec))
+            .await?;
         Ok(ack_to_result(&ack))
     }
 
@@ -316,6 +326,83 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, ToolError::Validation(_)));
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_to_string_is_channel() {
+        // A bare channel-id string is the convenience form.
+        let ctx = MockToolContext::new();
+        ask_user_question::handle(
+            args_from(serde_json::json!({
+                "title": "Pick", "options": ["a"], "to": "telegram:chat-9"
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        match &ctx.calls()[0] {
+            OutboundToolEffect::AskUserQuestion(s) => assert_eq!(
+                s.to,
+                Some(crate::context::Recipient::Channel {
+                    id: "telegram:chat-9".into()
+                })
+            ),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_to_tagged_object_ok() {
+        // The explicit `kind`-tagged object form.
+        let ctx = MockToolContext::new();
+        ask_user_question::handle(
+            args_from(serde_json::json!({
+                "title": "Pick", "options": ["a"], "to": {"kind": "user", "id": "u1"}
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        match &ctx.calls()[0] {
+            OutboundToolEffect::AskUserQuestion(s) => {
+                assert_eq!(
+                    s.to,
+                    Some(crate::context::Recipient::User { id: "u1".into() })
+                );
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_to_object_without_kind_is_rejected() {
+        // The #1 agent mistake: an object without an explicit `kind`. This
+        // must fail (rather than silently mis-route) — the schema/skill now
+        // steer the model to omit `to` or use the tagged form.
+        let ctx = MockToolContext::new();
+        let err = ask_user_question::handle(
+            args_from(serde_json::json!({
+                "title": "Pick", "options": ["a"], "to": {"user": "u1"}
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        // Parse-layer rejection (untagged enum miss) surfaces as a tool error.
+        let _ = err;
+        assert!(ctx.calls().is_empty(), "no outbound emitted for a bad `to`");
+    }
+
+    #[test]
+    fn ask_user_question_schema_documents_to() {
+        // Guard the guidance: the `to` field must tell the model it's
+        // optional (omit) and how to shape it. Lost descriptions are how the
+        // original "every form of `to` is rejected" flailing happened.
+        let s = ask_user_question::schema();
+        let v: Value = serde_json::to_value(&*s.input_schema).unwrap();
+        let to_desc = v["properties"]["to"]["description"].as_str().unwrap_or("");
+        assert!(to_desc.contains("OPTIONAL"), "to.description: {to_desc}");
+        assert!(to_desc.contains("kind"), "to.description: {to_desc}");
     }
 
     #[tokio::test]

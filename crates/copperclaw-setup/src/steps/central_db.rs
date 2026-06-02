@@ -74,11 +74,9 @@ pub fn check_schema_version(path: &std::path::Path) -> Result<(), StepError> {
     // don't go through `CentralDb::open` here because that path runs
     // migrations as a side-effect — the whole point of this check is to
     // catch the downgrade before we touch the schema.
-    let conn = rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-    )
-    .map_err(|e| StepError::Other(format!("open central DB for schema check: {e}")))?;
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .map_err(|e| StepError::Other(format!("open central DB for schema check: {e}")))?;
     let expected = expected_central_schema_version();
     let applied = applied_central_schema_version(&conn)
         .map_err(|e| StepError::Other(format!("read schema version: {e}")))?

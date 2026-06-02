@@ -134,14 +134,15 @@ impl WebhookConfig {
             }
         };
         let port = match obj.get("port") {
-            Some(Value::Number(n)) => n
-                .as_u64()
-                .and_then(|u| u16::try_from(u).ok())
-                .ok_or_else(|| {
-                    AdapterError::BadRequest(
-                        "whatsapp-cloud `webhook.port` must be a u16 in range".into(),
-                    )
-                })?,
+            Some(Value::Number(n)) => {
+                n.as_u64()
+                    .and_then(|u| u16::try_from(u).ok())
+                    .ok_or_else(|| {
+                        AdapterError::BadRequest(
+                            "whatsapp-cloud `webhook.port` must be a u16 in range".into(),
+                        )
+                    })?
+            }
             Some(Value::Null) | None => DEFAULT_PORT,
             Some(_) => {
                 return Err(AdapterError::BadRequest(
@@ -249,10 +250,8 @@ mod tests {
 
     #[test]
     fn rejects_missing_access_token() {
-        let err = WhatsappCloudConfig::from_value(
-            &json!({"app_secret": "s", "verify_token": "v"}),
-        )
-        .unwrap_err();
+        let err = WhatsappCloudConfig::from_value(&json!({"app_secret": "s", "verify_token": "v"}))
+            .unwrap_err();
         match err {
             AdapterError::BadRequest(m) => assert!(m.contains("access_token")),
             other => panic!("expected BadRequest, got {other:?}"),
@@ -261,10 +260,9 @@ mod tests {
 
     #[test]
     fn rejects_missing_app_secret() {
-        let err = WhatsappCloudConfig::from_value(
-            &json!({"access_token": "t", "verify_token": "v"}),
-        )
-        .unwrap_err();
+        let err =
+            WhatsappCloudConfig::from_value(&json!({"access_token": "t", "verify_token": "v"}))
+                .unwrap_err();
         match err {
             AdapterError::BadRequest(m) => assert!(m.contains("app_secret")),
             other => panic!("expected BadRequest, got {other:?}"),
@@ -273,10 +271,8 @@ mod tests {
 
     #[test]
     fn rejects_missing_verify_token() {
-        let err = WhatsappCloudConfig::from_value(
-            &json!({"access_token": "t", "app_secret": "s"}),
-        )
-        .unwrap_err();
+        let err = WhatsappCloudConfig::from_value(&json!({"access_token": "t", "app_secret": "s"}))
+            .unwrap_err();
         match err {
             AdapterError::BadRequest(m) => assert!(m.contains("verify_token")),
             other => panic!("expected BadRequest, got {other:?}"),

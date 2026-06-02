@@ -42,7 +42,7 @@ use serde_json::json;
 
 use crate::error::ToolError;
 use crate::tools::diff_util::{build_blob_card, build_diff_card, over_blob_cutoff};
-use crate::tools::{make_tool, parse_args, success_json, ToolEntry, ToolHandler};
+use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args, success_json};
 
 #[derive(Debug, Deserialize)]
 struct Input {
@@ -249,11 +249,7 @@ fn parse_patch(patch: &str) -> Result<Vec<Hunk>, ToolError> {
 /// Accepted shapes (leading/trailing whitespace tolerated):
 ///   ` -50,5 +50,7 @@ optional trailing context`
 ///   ` -50 +50 @@`
-fn parse_hunk_header(
-    rest: &str,
-    full: &str,
-    idx: usize,
-) -> Result<(usize, String), ToolError> {
+fn parse_hunk_header(rest: &str, full: &str, idx: usize) -> Result<(usize, String), ToolError> {
     let body = rest.trim_start();
     let close = body.find("@@").ok_or_else(|| {
         ToolError::Validation(format!(
@@ -299,9 +295,8 @@ fn do_apply(path: &Path, patch: &str) -> Result<ApplyOutcome, ToolError> {
 
     // Stat first — same rules as edit_file. Follow symlinks; reject
     // non-regular targets.
-    let lmeta = std::fs::symlink_metadata(path).map_err(|e| {
-        ToolError::Internal(format!("apply_patch({}): stat: {e}", path.display()))
-    })?;
+    let lmeta = std::fs::symlink_metadata(path)
+        .map_err(|e| ToolError::Internal(format!("apply_patch({}): stat: {e}", path.display())))?;
     let meta = if lmeta.file_type().is_symlink() {
         std::fs::metadata(path).map_err(|e| {
             ToolError::Internal(format!(
@@ -319,9 +314,8 @@ fn do_apply(path: &Path, patch: &str) -> Result<ApplyOutcome, ToolError> {
         )));
     }
 
-    let original = std::fs::read_to_string(path).map_err(|e| {
-        ToolError::Internal(format!("apply_patch({}): read: {e}", path.display()))
-    })?;
+    let original = std::fs::read_to_string(path)
+        .map_err(|e| ToolError::Internal(format!("apply_patch({}): read: {e}", path.display())))?;
 
     // Track whether the original ended in a newline so we can
     // reproduce that exactly. `split('\n')` gives us N+1 elements
@@ -372,7 +366,11 @@ fn do_apply(path: &Path, patch: &str) -> Result<ApplyOutcome, ToolError> {
         }
 
         // Copy unchanged lines up to the hunk's start.
-        out.extend(src_lines[cursor..target_idx].iter().map(|s| (*s).to_string()));
+        out.extend(
+            src_lines[cursor..target_idx]
+                .iter()
+                .map(|s| (*s).to_string()),
+        );
         cursor = target_idx;
 
         // Walk the hunk body.
@@ -449,11 +447,7 @@ fn do_apply(path: &Path, patch: &str) -> Result<ApplyOutcome, ToolError> {
 /// rename. See `edit_file::atomic_write` for the rationale; kept
 /// duplicated here so the two tools can evolve independently and
 /// because the existing helper is private to that module.
-fn atomic_write(
-    path: &Path,
-    bytes: &[u8],
-    orig_meta: &std::fs::Metadata,
-) -> Result<(), ToolError> {
+fn atomic_write(path: &Path, bytes: &[u8], orig_meta: &std::fs::Metadata) -> Result<(), ToolError> {
     use std::io::Write;
 
     struct TmpGuard<'a>(&'a Path, bool);
@@ -502,16 +496,10 @@ fn atomic_write(
                 ))
             })?;
         f.write_all(bytes).map_err(|e| {
-            ToolError::Internal(format!(
-                "apply_patch({}): write tmp: {e}",
-                path.display()
-            ))
+            ToolError::Internal(format!("apply_patch({}): write tmp: {e}", path.display()))
         })?;
         f.sync_all().map_err(|e| {
-            ToolError::Internal(format!(
-                "apply_patch({}): fsync tmp: {e}",
-                path.display()
-            ))
+            ToolError::Internal(format!("apply_patch({}): fsync tmp: {e}", path.display()))
         })?;
     }
 
@@ -519,14 +507,9 @@ fn atomic_write(
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = orig_meta.permissions().mode();
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).map_err(
-            |e| {
-                ToolError::Internal(format!(
-                    "apply_patch({}): chmod tmp: {e}",
-                    path.display()
-                ))
-            },
-        )?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode)).map_err(|e| {
+            ToolError::Internal(format!("apply_patch({}): chmod tmp: {e}", path.display()))
+        })?;
     }
     #[cfg(not(unix))]
     let _ = orig_meta;
@@ -593,11 +576,7 @@ mod tests {
     fn happy_path_single_hunk() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.txt");
-        std::fs::write(
-            &path,
-            "line1\nline2\nline3\nline4\nline5\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "line1\nline2\nline3\nline4\nline5\n").unwrap();
 
         let patch = "\
 @@ -1,5 +1,5 @@
@@ -626,11 +605,7 @@ mod tests {
     fn multi_hunk_patch() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.txt");
-        std::fs::write(
-            &path,
-            "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n",
-        )
-        .unwrap();
+        std::fs::write(&path, "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
 
         let patch = "\
 @@ -1,3 +1,3 @@
@@ -784,7 +759,10 @@ mod tests {
         match err {
             ToolError::Validation(msg) => {
                 assert!(msg.contains("@@"), "error should quote hunk header: {msg}");
-                assert!(msg.contains("WRONG"), "error should mention expected: {msg}");
+                assert!(
+                    msg.contains("WRONG"),
+                    "error should mention expected: {msg}"
+                );
                 assert!(msg.contains("second"), "error should mention actual: {msg}");
             }
             other => panic!("expected Validation, got {other:?}"),

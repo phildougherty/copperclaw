@@ -1,11 +1,11 @@
 //! Handlers for `wirings.*` commands.
 
 use super::{db_err, opt_str, parse_uuid, req_str};
+use copperclaw_cclaw::ErrorPayload;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::messaging_group_agents;
-use copperclaw_cclaw::ErrorPayload;
 use copperclaw_types::{AgentGroupId, EngageMode, MessagingGroupId, SessionMode, WiringId};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 #[allow(clippy::similar_names)]
 pub fn list(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
@@ -26,8 +26,7 @@ pub fn list(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
             let mgs = copperclaw_db::tables::messaging_groups::list(central).map_err(db_err)?;
             let mut combined = Vec::new();
             for mg in mgs {
-                let chunk =
-                    messaging_group_agents::list_for_mg(central, mg.id).map_err(db_err)?;
+                let chunk = messaging_group_agents::list_for_mg(central, mg.id).map_err(db_err)?;
                 combined.extend(chunk);
             }
             combined
@@ -52,8 +51,8 @@ pub fn create(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> 
         Some(s) => parse_session_mode(&s)?,
         None => SessionMode::Shared,
     };
-    let ignored_message_policy = opt_str(args, "ignored_message_policy")
-        .unwrap_or_else(|| "drop".to_owned());
+    let ignored_message_policy =
+        opt_str(args, "ignored_message_policy").unwrap_or_else(|| "drop".to_owned());
     let priority = args
         .get("priority")
         .and_then(Value::as_i64)
@@ -94,12 +93,14 @@ pub fn update(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> 
     } else {
         existing.session_mode
     };
-    let ignored_message_policy = opt_str(args, "ignored_message_policy")
-        .unwrap_or(existing.ignored_message_policy.clone());
+    let ignored_message_policy =
+        opt_str(args, "ignored_message_policy").unwrap_or(existing.ignored_message_policy.clone());
     let priority = args
         .get("priority")
         .and_then(Value::as_i64)
-        .map_or(existing.priority, |n| i32::try_from(n).unwrap_or(existing.priority));
+        .map_or(existing.priority, |n| {
+            i32::try_from(n).unwrap_or(existing.priority)
+        });
     let row = messaging_group_agents::upsert(
         central,
         messaging_group_agents::UpsertWiring {
@@ -186,8 +187,8 @@ fn wiring_to_json(w: &messaging_group_agents::MessagingGroupAgent) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use copperclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
-    use copperclaw_db::tables::messaging_groups::{upsert as upsert_mg, UpsertMessagingGroup};
+    use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+    use copperclaw_db::tables::messaging_groups::{UpsertMessagingGroup, upsert as upsert_mg};
     use copperclaw_types::ChannelType;
 
     fn db_with_mg_ag() -> (CentralDb, MessagingGroupId, AgentGroupId) {
@@ -306,11 +307,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(only_mg.as_array().unwrap().len(), 1);
-        let only_ag = list(
-            &json!({"agent_group_id": ag.as_uuid().to_string()}),
-            &db,
-        )
-        .unwrap();
+        let only_ag = list(&json!({"agent_group_id": ag.as_uuid().to_string()}), &db).unwrap();
         assert_eq!(only_ag.as_array().unwrap().len(), 1);
     }
 
@@ -352,11 +349,7 @@ mod tests {
     #[test]
     fn update_unknown_id_errors() {
         let db = CentralDb::open_in_memory().unwrap();
-        let err = update(
-            &json!({"id": uuid::Uuid::now_v7().to_string()}),
-            &db,
-        )
-        .unwrap_err();
+        let err = update(&json!({"id": uuid::Uuid::now_v7().to_string()}), &db).unwrap_err();
         assert_eq!(err.code, "not_found");
     }
 

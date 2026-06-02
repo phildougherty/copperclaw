@@ -156,10 +156,7 @@ impl PermissionsModule {
 
     /// Convenience constructor that uses a static `HashMap` of users to
     /// roles plus a default for unknown users.
-    pub fn from_table(
-        table: HashMap<copperclaw_types::UserId, Role>,
-        default_role: Role,
-    ) -> Self {
+    pub fn from_table(table: HashMap<copperclaw_types::UserId, Role>, default_role: Role) -> Self {
         Self::new(
             move |ctx: &GateCtx| ctx.user.and_then(|u| table.get(&u).copied()),
             default_role,
@@ -302,7 +299,10 @@ mod tests {
             PermissionOp::AddMcpServer,
             PermissionOp::CancelOtherTask,
         ] {
-            assert!(!check(Role::Member, op), "member should NOT be allowed for {op:?}");
+            assert!(
+                !check(Role::Member, op),
+                "member should NOT be allowed for {op:?}"
+            );
         }
     }
 
@@ -319,7 +319,10 @@ mod tests {
             PermissionOp::ScheduleTask,
             PermissionOp::CancelOtherTask,
         ] {
-            assert!(!check(Role::Guest, op), "guest should NOT be allowed for {op:?}");
+            assert!(
+                !check(Role::Guest, op),
+                "guest should NOT be allowed for {op:?}"
+            );
         }
     }
 

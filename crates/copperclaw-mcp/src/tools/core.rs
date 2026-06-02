@@ -51,10 +51,10 @@ pub mod send_message {
     //! `send_message`: emit a plain text message to the originating channel
     //! or an explicit recipient.
 
-    use super::{validate_to, RecipientInput};
+    use super::{RecipientInput, validate_to};
     use crate::context::{OutboundToolEffect, SendMessageSpec, ToolContext};
     use crate::error::ToolError;
-    use crate::tools::{ack_to_result, make_tool, parse_args, ToolEntry, ToolHandler};
+    use crate::tools::{ToolEntry, ToolHandler, ack_to_result, make_tool, parse_args};
     use rmcp::model::{CallToolResult, JsonObject, Tool};
     use serde::Deserialize;
 
@@ -97,7 +97,9 @@ pub mod send_message {
             to,
             text: input.text,
         };
-        let ack = ctx.emit_outbound(OutboundToolEffect::SendMessage(spec)).await?;
+        let ack = ctx
+            .emit_outbound(OutboundToolEffect::SendMessage(spec))
+            .await?;
         Ok(ack_to_result(&ack))
     }
 
@@ -125,10 +127,10 @@ pub mod send_message {
 pub mod send_file {
     //! `send_file`: emit a file (optionally with caption).
 
-    use super::{validate_to, RecipientInput};
+    use super::{RecipientInput, validate_to};
     use crate::context::{OutboundToolEffect, SendFileSpec, ToolContext};
     use crate::error::ToolError;
-    use crate::tools::{ack_to_result, make_tool, parse_args, ToolEntry, ToolHandler};
+    use crate::tools::{ToolEntry, ToolHandler, ack_to_result, make_tool, parse_args};
     use rmcp::model::{CallToolResult, JsonObject, Tool};
     use serde::Deserialize;
 
@@ -202,12 +204,12 @@ pub mod send_file {
             (Some(_), Some(_)) => {
                 return Err(ToolError::Validation(
                     "send_file: provide either `path` or `data`, not both".into(),
-                ))
+                ));
             }
             (None, None) => {
                 return Err(ToolError::Validation(
                     "send_file: must provide either `path` (preferred) or `data`".into(),
-                ))
+                ));
             }
             (Some(path), None) => {
                 let metadata = std::fs::metadata(path).map_err(|e| {
@@ -254,7 +256,9 @@ pub mod send_file {
             data,
             text: input.text,
         };
-        let ack = ctx.emit_outbound(OutboundToolEffect::SendFile(spec)).await?;
+        let ack = ctx
+            .emit_outbound(OutboundToolEffect::SendFile(spec))
+            .await?;
         Ok(ack_to_result(&ack))
     }
 
@@ -283,7 +287,7 @@ pub mod edit_message {
 
     use crate::context::{EditMessageSpec, OutboundToolEffect, ToolContext};
     use crate::error::ToolError;
-    use crate::tools::{ack_to_result, make_tool, parse_args, ToolEntry, ToolHandler};
+    use crate::tools::{ToolEntry, ToolHandler, ack_to_result, make_tool, parse_args};
     use rmcp::model::{CallToolResult, JsonObject, Tool};
     use serde::Deserialize;
 
@@ -326,7 +330,9 @@ pub mod edit_message {
             message_seq: input.message_id,
             text: input.text,
         };
-        let ack = ctx.emit_outbound(OutboundToolEffect::EditMessage(spec)).await?;
+        let ack = ctx
+            .emit_outbound(OutboundToolEffect::EditMessage(spec))
+            .await?;
         Ok(ack_to_result(&ack))
     }
 
@@ -354,7 +360,7 @@ pub mod add_reaction {
 
     use crate::context::{AddReactionSpec, OutboundToolEffect, ToolContext};
     use crate::error::ToolError;
-    use crate::tools::{ack_to_result, make_tool, parse_args, ToolEntry, ToolHandler};
+    use crate::tools::{ToolEntry, ToolHandler, ack_to_result, make_tool, parse_args};
     use rmcp::model::{CallToolResult, JsonObject, Tool};
     use serde::Deserialize;
 
@@ -397,7 +403,9 @@ pub mod add_reaction {
             message_seq: input.message_id,
             emoji: input.emoji,
         };
-        let ack = ctx.emit_outbound(OutboundToolEffect::AddReaction(spec)).await?;
+        let ack = ctx
+            .emit_outbound(OutboundToolEffect::AddReaction(spec))
+            .await?;
         Ok(ack_to_result(&ack))
     }
 
@@ -423,9 +431,7 @@ pub mod add_reaction {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{
-        MockToolContext, OutboundToolEffect, SendMessageSpec, ToolEffectAck,
-    };
+    use crate::context::{MockToolContext, OutboundToolEffect, SendMessageSpec, ToolEffectAck};
     use rmcp::model::JsonObject;
     use serde_json::Value;
 
@@ -440,12 +446,9 @@ mod tests {
     async fn send_message_happy() {
         let ctx = MockToolContext::new();
         ctx.set_next_ack(ToolEffectAck::Message { seq: 1 });
-        let res = send_message::handle(
-            args_from(serde_json::json!({"text": "hi"})),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        let res = send_message::handle(args_from(serde_json::json!({"text": "hi"})), &ctx)
+            .await
+            .unwrap();
         assert_eq!(res.is_error, Some(false));
         let calls = ctx.calls();
         assert_eq!(calls.len(), 1);
@@ -708,4 +711,3 @@ mod tests {
         );
     }
 }
-

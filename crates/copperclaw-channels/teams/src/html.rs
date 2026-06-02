@@ -111,10 +111,7 @@ fn find_byte(bytes: &[u8], from: usize, target: u8) -> Option<usize> {
 /// portion of a `<...>` element, e.g. `p class="x"` -> `"p"`.
 fn tag_name_lower(raw: &str) -> String {
     let trimmed = raw.trim();
-    let name: String = trimmed
-        .chars()
-        .take_while(|c| !c.is_whitespace())
-        .collect();
+    let name: String = trimmed.chars().take_while(|c| !c.is_whitespace()).collect();
     name.to_ascii_lowercase()
 }
 

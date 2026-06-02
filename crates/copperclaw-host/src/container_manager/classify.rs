@@ -2,13 +2,13 @@
 
 use super::spawn::container_name;
 use super::{ContainerManager, ManagerError};
-use copperclaw_db::session::{open_inbound, open_outbound, SessionPaths};
-use copperclaw_db::tables::messages_out::{insert as insert_outbound, WriteOutbound};
+use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
+use copperclaw_db::tables::messages_out::{WriteOutbound, insert as insert_outbound};
 use copperclaw_db::tables::processing_ack::{self, ProcessingStatus};
 use copperclaw_db::tables::{messages_in, sessions};
 use copperclaw_host_sweep::APOLOGY_TRIES_MARKER;
 use copperclaw_types::{ChannelType, ContainerStatus, MessageId, MessageKind, Session};
-use rusqlite::{params, OptionalExtension};
+use rusqlite::{OptionalExtension, params};
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -18,8 +18,7 @@ use tracing::{info, warn};
 /// operator scanning chat logs can tell which path fired. The tone is
 /// deliberately concrete ("restart the agent container") so the user
 /// understands the bot didn't ghost them.
-pub(crate) const CRASH_RESTART_APOLOGY_TEXT: &str =
-    "Hit a snag mid-task and need to restart the agent container. \
+pub(crate) const CRASH_RESTART_APOLOGY_TEXT: &str = "Hit a snag mid-task and need to restart the agent container. \
      Some progress may have been lost. I'll pick back up — try sending \
      a follow-up if I don't continue on my own.";
 
@@ -56,11 +55,7 @@ impl ContainerManager {
     /// async work and no DB writes so the state machine is unit-
     /// testable.
     pub(super) fn classify(&self, session: &Session) -> ReconcileAction {
-        let paths = SessionPaths::new(
-            &self.cfg.data_dir,
-            session.agent_group_id,
-            session.id,
-        );
+        let paths = SessionPaths::new(&self.cfg.data_dir, session.agent_group_id, session.id);
         let pending = Self::has_pending_inbound(&paths).unwrap_or(false);
         match session.container_status {
             ContainerStatus::Stopped => {
@@ -78,8 +73,7 @@ impl ContainerManager {
                 }
             }
             ContainerStatus::Running => {
-                if Self::heartbeat_stale(&paths, self.cfg.heartbeat_stale_secs)
-                    .unwrap_or(false)
+                if Self::heartbeat_stale(&paths, self.cfg.heartbeat_stale_secs).unwrap_or(false)
                     || Self::heartbeat_missing_and_session_old(
                         &paths,
                         session,
@@ -88,8 +82,7 @@ impl ContainerManager {
                 {
                     ReconcileAction::CrashRestart
                 } else if Self::session_idle(session, self.cfg.idle_timeout_secs)
-                    && Self::heartbeat_stale(&paths, self.cfg.idle_timeout_secs)
-                        .unwrap_or(false)
+                    && Self::heartbeat_stale(&paths, self.cfg.idle_timeout_secs).unwrap_or(false)
                 {
                     // Only idle when BOTH the session shows no recent
                     // inbound activity AND the runner's heartbeat says
@@ -168,16 +161,9 @@ impl ContainerManager {
     /// `processing` status (the first pass marked them `Failed`) and
     /// the inbound rows are at `tries=99`, so no duplicate apology is
     /// emitted.
-    pub(super) async fn apply_crash_restart(
-        &self,
-        session: &Session,
-    ) -> Result<(), ManagerError> {
+    pub(super) async fn apply_crash_restart(&self, session: &Session) -> Result<(), ManagerError> {
         let name = container_name(session.agent_group_id, session.id);
-        let paths = SessionPaths::new(
-            &self.cfg.data_dir,
-            session.agent_group_id,
-            session.id,
-        );
+        let paths = SessionPaths::new(&self.cfg.data_dir, session.agent_group_id, session.id);
 
         // 1. Capture last few hundred lines of stdout/stderr BEFORE the
         //    container disappears. Best-effort: any failure here is
@@ -208,8 +194,7 @@ impl ContainerManager {
         }
 
         // 4. Existing behaviour: flip the session row + metric + warn.
-        sessions::mark_container_stopped(&self.central, session.id)
-            .map_err(ManagerError::Db)?;
+        sessions::mark_container_stopped(&self.central, session.id).map_err(ManagerError::Db)?;
         copperclaw_metrics::inc_containers_crashed();
         warn!(
             session = %session.id.as_uuid(),
@@ -436,9 +421,7 @@ fn emit_crash_restart_apologies(
 /// Returns just the `MessageId`s; downstream code does the inbound
 /// lookup. Sorted by `status_changed ASC` to keep ordering
 /// deterministic for tests.
-fn list_processing_acks(
-    outbound: &rusqlite::Connection,
-) -> Result<Vec<MessageId>, ManagerError> {
+fn list_processing_acks(outbound: &rusqlite::Connection) -> Result<Vec<MessageId>, ManagerError> {
     let mut stmt = outbound
         .prepare(
             "SELECT message_id FROM processing_ack
@@ -499,14 +482,12 @@ fn lookup_inbound_routing(
     };
 
     match (channel_type, platform_id) {
-        (Some(ct), Some(pid)) if !ct.is_empty() && !pid.is_empty() => {
-            Ok(Some(InFlightRouting {
-                message_id,
-                channel_type: ChannelType::from(ct),
-                platform_id: pid,
-                thread_id,
-            }))
-        }
+        (Some(ct), Some(pid)) if !ct.is_empty() && !pid.is_empty() => Ok(Some(InFlightRouting {
+            message_id,
+            channel_type: ChannelType::from(ct),
+            platform_id: pid,
+            thread_id,
+        })),
         _ => Ok(None),
     }
 }
@@ -534,8 +515,8 @@ mod tests {
     };
     use super::*;
     use copperclaw_db::central::CentralDb;
-    use copperclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
-    use copperclaw_db::tables::sessions::{create as create_session, CreateSession};
+    use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+    use copperclaw_db::tables::sessions::{CreateSession, create as create_session};
     use std::path::PathBuf;
 
     fn manager_cfg(data_dir: PathBuf) -> ManagerConfig {
@@ -663,13 +644,9 @@ mod tests {
         // see spawn.rs::DEFAULT_HEARTBEAT_STALE_SECS). 240s puts us
         // comfortably past the threshold with margin for test wall-clock
         // jitter instead of sitting right at the boundary.
-        let old =
-            std::time::SystemTime::now() - std::time::Duration::from_secs(240);
-        filetime::set_file_mtime(
-            &paths.heartbeat,
-            filetime::FileTime::from_system_time(old),
-        )
-        .unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(240);
+        filetime::set_file_mtime(&paths.heartbeat, filetime::FileTime::from_system_time(old))
+            .unwrap();
         assert_eq!(mgr.classify(&session), ReconcileAction::CrashRestart);
     }
 
@@ -683,9 +660,7 @@ mod tests {
         sessions::mark_container_running(&db, session.id).unwrap();
         session.container_status = ContainerStatus::Running;
         session.last_active = chrono::Utc::now()
-            - chrono::Duration::seconds(
-                i64::try_from(DEFAULT_IDLE_TIMEOUT_SECS).unwrap() + 10,
-            );
+            - chrono::Duration::seconds(i64::try_from(DEFAULT_IDLE_TIMEOUT_SECS).unwrap() + 10);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
         paths.ensure_dirs().unwrap();
         std::fs::write(&paths.heartbeat, b"").unwrap();
@@ -705,8 +680,7 @@ mod tests {
             std::sync::Arc::new(crate::tests::NoopRuntime::default()),
             wide_cfg,
         );
-        let backdated =
-            std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        let backdated = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
         filetime::set_file_mtime(
             &paths.heartbeat,
             filetime::FileTime::from_system_time(backdated),
@@ -731,9 +705,7 @@ mod tests {
         session.container_status = ContainerStatus::Running;
         // last_active is older than heartbeat_stale_secs (120s default).
         session.last_active = chrono::Utc::now()
-            - chrono::Duration::seconds(
-                i64::try_from(DEFAULT_HEARTBEAT_STALE_SECS).unwrap() + 30,
-            );
+            - chrono::Duration::seconds(i64::try_from(DEFAULT_HEARTBEAT_STALE_SECS).unwrap() + 30);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
         paths.ensure_dirs().unwrap();
         // Heartbeat file deliberately NOT created — this is the bug
@@ -776,9 +748,7 @@ mod tests {
         session.container_status = ContainerStatus::Running;
         // No recent inbound: backdate last_active past the idle window.
         session.last_active = chrono::Utc::now()
-            - chrono::Duration::seconds(
-                i64::try_from(DEFAULT_IDLE_TIMEOUT_SECS).unwrap() + 10,
-            );
+            - chrono::Duration::seconds(i64::try_from(DEFAULT_IDLE_TIMEOUT_SECS).unwrap() + 10);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
         paths.ensure_dirs().unwrap();
         std::fs::write(&paths.heartbeat, b"").unwrap();
@@ -837,7 +807,9 @@ mod tests {
         let mut session = fixture_session(&db);
         sessions::mark_container_idle(&db, session.id).unwrap();
         session.container_status = ContainerStatus::Idle;
-        mgr.apply(&session, ReconcileAction::WakeFromIdle).await.unwrap();
+        mgr.apply(&session, ReconcileAction::WakeFromIdle)
+            .await
+            .unwrap();
         let updated = sessions::get(&db, session.id).unwrap();
         assert!(matches!(updated.container_status, ContainerStatus::Stopped));
     }
@@ -855,7 +827,9 @@ mod tests {
         let mut session = fixture_session(&db);
         sessions::mark_container_running(&db, session.id).unwrap();
         session.container_status = ContainerStatus::Running;
-        mgr.apply(&session, ReconcileAction::IdleStop).await.unwrap();
+        mgr.apply(&session, ReconcileAction::IdleStop)
+            .await
+            .unwrap();
         let updated = sessions::get(&db, session.id).unwrap();
         assert!(matches!(updated.container_status, ContainerStatus::Idle));
     }

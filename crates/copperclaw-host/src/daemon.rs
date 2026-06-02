@@ -87,10 +87,7 @@ pub enum DaemonError {
         "copperclaw start: host did not become ready within {timeout:?}; \
          check {log}"
     )]
-    StartTimeout {
-        timeout: Duration,
-        log: PathBuf,
-    },
+    StartTimeout { timeout: Duration, log: PathBuf },
     /// I/O error while reading/writing PID file or log.
     #[error("{context}: {source}")]
     Io {
@@ -188,10 +185,7 @@ pub fn send_signal(pid: i32, sig: &str) -> bool {
 /// (when set) so that env-based config resolution sees the same values
 /// the foreground parent did. `main` checks the marker and calls
 /// `boot::run_host` directly instead of recursing through this fn.
-fn spawn_detached(
-    paths: &DaemonPaths,
-    extra_args: &[String],
-) -> Result<u32, DaemonError> {
+fn spawn_detached(paths: &DaemonPaths, extra_args: &[String]) -> Result<u32, DaemonError> {
     use std::os::unix::process::CommandExt as _;
 
     // Ensure data dir + log dir exist before redirecting child stdio
@@ -209,8 +203,7 @@ fn spawn_detached(
         .try_clone()
         .map_err(|e| DaemonError::io("dup log fd", e))?;
 
-    let exe = std::env::current_exe()
-        .map_err(|e| DaemonError::io("current_exe", e))?;
+    let exe = std::env::current_exe().map_err(|e| DaemonError::io("current_exe", e))?;
 
     let mut cmd = Command::new(exe);
     cmd.arg("run");
@@ -256,10 +249,7 @@ pub fn wait_for_socket(socket: &Path, timeout: Duration) -> Result<(), DaemonErr
 ///
 /// `extra_args` are passed through to the child's `copperclaw run`
 /// invocation (e.g. `--env-file`).
-pub fn cmd_start(
-    cfg: &HostConfig,
-    extra_args: &[String],
-) -> Result<StartOutcome, DaemonError> {
+pub fn cmd_start(cfg: &HostConfig, extra_args: &[String]) -> Result<StartOutcome, DaemonError> {
     let paths = DaemonPaths::from_config(cfg);
 
     // Refuse if an alive PID is recorded.
@@ -528,8 +518,8 @@ pub fn cmd_logs(cfg: &HostConfig, tail: usize, follow: bool) -> Result<(), Daemo
         .map_err(|e| DaemonError::io("seek log", e))?;
     let stdout = io::stdout();
     loop {
-        let meta = std::fs::metadata(&paths.log_file)
-            .map_err(|e| DaemonError::io("stat log", e))?;
+        let meta =
+            std::fs::metadata(&paths.log_file).map_err(|e| DaemonError::io("stat log", e))?;
         if meta.len() < pos {
             // File got rotated/truncated — rewind.
             pos = 0;

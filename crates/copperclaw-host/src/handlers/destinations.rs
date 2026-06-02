@@ -1,11 +1,11 @@
 //! Handlers for `destinations.*` commands.
 
 use super::{db_err, opt_str, parse_uuid, req_str};
+use copperclaw_cclaw::ErrorPayload;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::agent_destinations;
-use copperclaw_cclaw::ErrorPayload;
 use copperclaw_types::{AgentGroupId, DestinationKind};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub fn list(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     let ag = AgentGroupId(parse_uuid(&req_str(args, "agent_group_id")?)?);
@@ -31,7 +31,10 @@ pub fn add(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
         DestinationKind::Agent => opt_str(args, "target_agent_group_id")
             .or_else(|| opt_str(args, "target_id"))
             .ok_or_else(|| {
-                ErrorPayload::new("bad_request", "agent destination needs `target_agent_group_id`")
+                ErrorPayload::new(
+                    "bad_request",
+                    "agent destination needs `target_agent_group_id`",
+                )
             })?,
     };
     let row = agent_destinations::add(central, ag, name, kind, target_id).map_err(db_err)?;
@@ -72,7 +75,7 @@ fn dest_to_json(d: &agent_destinations::AgentDestination) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use copperclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+    use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
 
     fn db_with_group() -> (CentralDb, AgentGroupId) {
         let db = CentralDb::open_in_memory().unwrap();
@@ -188,22 +191,14 @@ mod tests {
             &db,
         )
         .unwrap();
-        let v = list(
-            &json!({"agent_group_id": g.as_uuid().to_string()}),
-            &db,
-        )
-        .unwrap();
+        let v = list(&json!({"agent_group_id": g.as_uuid().to_string()}), &db).unwrap();
         assert_eq!(v.as_array().unwrap().len(), 1);
         remove(
             &json!({"agent_group_id": g.as_uuid().to_string(), "name": "n"}),
             &db,
         )
         .unwrap();
-        let v = list(
-            &json!({"agent_group_id": g.as_uuid().to_string()}),
-            &db,
-        )
-        .unwrap();
+        let v = list(&json!({"agent_group_id": g.as_uuid().to_string()}), &db).unwrap();
         assert!(v.as_array().unwrap().is_empty());
     }
 

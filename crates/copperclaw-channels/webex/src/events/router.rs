@@ -192,7 +192,10 @@ async fn handle_message_created(
         .get("personId")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    if let (Some(actor), Some(bot)) = (actor_person.as_deref(), state.bot_person_id.as_ref().as_deref()) {
+    if let (Some(actor), Some(bot)) = (
+        actor_person.as_deref(),
+        state.bot_person_id.as_ref().as_deref(),
+    ) {
         if actor == bot {
             // The bot's own message — skip to avoid feedback loops.
             return Ok(None);
@@ -277,8 +280,7 @@ fn build_message_event(state: &WebexEventsState, view: &MessageView) -> InboundE
         .as_deref()
         .map(|t| matches!(t, "group" | "team"));
     let is_mention = state.bot_person_id.as_ref().as_deref().map(|bot| {
-        view.mentioned_people.iter().any(|p| p == bot)
-            || text.contains(&format!("<@{bot}>"))
+        view.mentioned_people.iter().any(|p| p == bot) || text.contains(&format!("<@{bot}>"))
     });
     let sender = view.person_id.as_ref().map(|pid| SenderIdentity {
         channel_type: state.channel_type.clone(),
@@ -341,11 +343,7 @@ mod tests {
         (state, rx)
     }
 
-    fn signed_request(
-        algo: SignatureAlgo,
-        path_str: &str,
-        body: &[u8],
-    ) -> Request<Body> {
+    fn signed_request(algo: SignatureAlgo, path_str: &str, body: &[u8]) -> Request<Body> {
         let sig = compute_signature(algo, SECRET, body);
         Request::builder()
             .method("POST")
@@ -401,8 +399,7 @@ mod tests {
         // We do NOT mount a GET /messages mock — the handler must NOT call
         // it because the actor matches the bot id.
         let api = WebexApi::new(server.uri(), "tok");
-        let (state, mut rx) =
-            make_state(api, Some("PBOT".into()), SignatureAlgo::Sha1);
+        let (state, mut rx) = make_state(api, Some("PBOT".into()), SignatureAlgo::Sha1);
         let app = build_events_router("/webex/webhook", state.clone());
         let body = serde_json::to_vec(&json!({
             "id":"WHOOK_SELF",
@@ -433,8 +430,7 @@ mod tests {
             .mount(&server)
             .await;
         let api = WebexApi::new(server.uri(), "tok");
-        let (state, mut rx) =
-            make_state(api, Some("PBOT".into()), SignatureAlgo::Sha1);
+        let (state, mut rx) = make_state(api, Some("PBOT".into()), SignatureAlgo::Sha1);
         let app = build_events_router("/webex/webhook", state.clone());
         // Actor id is missing from the webhook envelope; only the fetched
         // body reveals the author.
@@ -539,8 +535,7 @@ mod tests {
             .mount(&server)
             .await;
         let api = WebexApi::new(server.uri(), "tok");
-        let (state, mut rx) =
-            make_state(api, Some("PBOT".into()), SignatureAlgo::Sha1);
+        let (state, mut rx) = make_state(api, Some("PBOT".into()), SignatureAlgo::Sha1);
         let app = build_events_router("/webex/webhook", state.clone());
         let body = serde_json::to_vec(&json!({
             "id":"WHOOK_A3",
@@ -824,8 +819,7 @@ mod tests {
             .mount(&server)
             .await;
         let api = WebexApi::new(server.uri(), "tok");
-        let (state, mut rx) =
-            make_state(api, Some("PBOT".into()), SignatureAlgo::Sha1);
+        let (state, mut rx) = make_state(api, Some("PBOT".into()), SignatureAlgo::Sha1);
         let app = build_events_router("/webex/webhook", state.clone());
         let body = serde_json::to_vec(&json!({
             "id":"WHOOK_MENTION",
@@ -850,8 +844,7 @@ mod tests {
             .mount(&server)
             .await;
         let api = WebexApi::new(server.uri(), "tok");
-        let (state, mut rx) =
-            make_state(api, Some("PBOT".into()), SignatureAlgo::Sha1);
+        let (state, mut rx) = make_state(api, Some("PBOT".into()), SignatureAlgo::Sha1);
         let app = build_events_router("/webex/webhook", state.clone());
         let body = serde_json::to_vec(&json!({
             "id":"WHOOK_TEXT_MENTION",

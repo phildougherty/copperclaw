@@ -62,7 +62,7 @@ pub use adapter::{CHANNEL_TYPE_STR, DEFAULT_PARSE_MODE, TelegramAdapter};
 pub use api::TelegramApi;
 pub use config::{
     DEFAULT_API_BASE, DEFAULT_LONG_POLL_LIMIT, DEFAULT_LONG_POLL_TIMEOUT_SECS,
-    DEFAULT_MAX_ATTACHMENT_BYTES, DEFAULT_WEBHOOK_HOST, DEFAULT_WEBHOOK_PATH,
-    DEFAULT_WEBHOOK_PORT, IngressMode, LongPollConfig, TelegramConfig, WebhookConfig,
+    DEFAULT_MAX_ATTACHMENT_BYTES, DEFAULT_WEBHOOK_HOST, DEFAULT_WEBHOOK_PATH, DEFAULT_WEBHOOK_PORT,
+    IngressMode, LongPollConfig, TelegramConfig, WebhookConfig,
 };
 pub use factory::{TelegramFactory, register};

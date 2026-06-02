@@ -35,6 +35,6 @@ pub mod name;
 pub mod registry;
 
 pub use error::SkillError;
-pub use frontmatter::{skip_frontmatter, Frontmatter};
-pub use materialize::{materialize, MaterializeOutcome, MaterializeReport};
-pub use registry::{read_skill_body, Skill, SkillId, SkillRegistry, SkillSource, SkillsSelector};
+pub use frontmatter::{Frontmatter, skip_frontmatter};
+pub use materialize::{MaterializeOutcome, MaterializeReport, materialize};
+pub use registry::{Skill, SkillId, SkillRegistry, SkillSource, SkillsSelector, read_skill_body};

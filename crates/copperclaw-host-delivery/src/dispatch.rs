@@ -48,7 +48,10 @@ impl HostDispatcher {
     }
 
     fn resolve(&self, target: &DispatchTarget) -> Option<Arc<dyn ChannelAdapter>> {
-        target.channel_type.as_ref().and_then(|ct| (self.resolver)(ct))
+        target
+            .channel_type
+            .as_ref()
+            .and_then(|ct| (self.resolver)(ct))
     }
 }
 
@@ -62,10 +65,7 @@ impl DeliveryDispatcher for HostDispatcher {
         };
         let thread_id = target.thread_id.clone();
         self.runtime.spawn(async move {
-            if let Err(err) = adapter
-                .set_typing(&platform_id, thread_id.as_deref())
-                .await
-            {
+            if let Err(err) = adapter.set_typing(&platform_id, thread_id.as_deref()).await {
                 warn!(?err, "dispatcher: set_typing failed");
             }
         });
@@ -99,8 +99,8 @@ impl DeliveryDispatcher for HostDispatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use copperclaw_channels_core::testing::MockAdapter;
     use copperclaw_channels_core::AdapterError;
+    use copperclaw_channels_core::testing::MockAdapter;
     use copperclaw_types::{MessageKind, OutboundMessage};
     use serde_json::json;
     use std::sync::Mutex;

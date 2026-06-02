@@ -127,10 +127,10 @@ pub fn diff_stream(
             (Some(e), Some(a)) => {
                 let exp_norm = subs.apply(&e);
                 let act_norm = subs.apply(&a);
-                let exp_v: serde_json::Value = serde_json::from_str(&exp_norm)
-                    .expect("reparse substituted expected");
-                let act_v: serde_json::Value = serde_json::from_str(&act_norm)
-                    .expect("reparse substituted actual");
+                let exp_v: serde_json::Value =
+                    serde_json::from_str(&exp_norm).expect("reparse substituted expected");
+                let act_v: serde_json::Value =
+                    serde_json::from_str(&act_norm).expect("reparse substituted actual");
                 walk(stream, &format!("[{i}]"), &exp_v, &act_v, &mut report);
             }
             (None, None) => unreachable!(),

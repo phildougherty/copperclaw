@@ -90,9 +90,7 @@ impl LineConfig {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| ConfigError::Invalid("channel_access_token is required".into()))?;
 
-        let api_base = raw
-            .api_base
-            .unwrap_or_else(|| DEFAULT_API_BASE.to_string());
+        let api_base = raw.api_base.unwrap_or_else(|| DEFAULT_API_BASE.to_string());
         let api_base = canonical_url(&api_base)?;
 
         let webhook_raw = raw.webhook.unwrap_or_default();

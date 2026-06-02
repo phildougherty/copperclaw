@@ -108,10 +108,7 @@ pub fn build_card_blocks(card: &Card) -> Value {
     }
 
     // Image-only card (no body): standalone image block.
-    let body_carries_image = card
-        .body
-        .as_deref()
-        .is_some_and(|b| !b.trim().is_empty());
+    let body_carries_image = card.body.as_deref().is_some_and(|b| !b.trim().is_empty());
     if !body_carries_image {
         if let Some(img) = card.image_url.as_deref() {
             let img = img.trim();
@@ -308,9 +305,7 @@ impl SlackApi {
             .map_err(|e| transport(&e))?;
         let value = read_slack_json(resp).await?;
         let parsed: PostMessageResponse = serde_json::from_value(value).map_err(|e| {
-            AdapterError::Transport(format!(
-                "chat.postMessage (attachments) decode: {e}"
-            ))
+            AdapterError::Transport(format!("chat.postMessage (attachments) decode: {e}"))
         })?;
         Ok(parsed)
     }
@@ -405,11 +400,7 @@ impl SlackApi {
     /// pins. Best-effort: the bot may lack the `pins:write` scope
     /// (legacy workspaces), in which case Slack returns
     /// `not_authed` and the caller swallows.
-    pub async fn pins_add(
-        &self,
-        channel: &str,
-        timestamp: &str,
-    ) -> Result<(), AdapterError> {
+    pub async fn pins_add(&self, channel: &str, timestamp: &str) -> Result<(), AdapterError> {
         let body = json!({"channel": channel, "timestamp": timestamp});
         let resp = self
             .client
@@ -427,11 +418,7 @@ impl SlackApi {
     /// when a [`TodoList`](copperclaw_channels_core::TodoList) transitions
     /// to fully-completed so the channel pin list doesn't fill with
     /// stale finished plans.
-    pub async fn pins_remove(
-        &self,
-        channel: &str,
-        timestamp: &str,
-    ) -> Result<(), AdapterError> {
+    pub async fn pins_remove(&self, channel: &str, timestamp: &str) -> Result<(), AdapterError> {
         let body = json!({"channel": channel, "timestamp": timestamp});
         let resp = self
             .client
@@ -611,7 +598,12 @@ mod tests {
 
     #[test]
     fn map_slack_error_auth_codes() {
-        for code in ["not_authed", "invalid_auth", "token_revoked", "account_inactive"] {
+        for code in [
+            "not_authed",
+            "invalid_auth",
+            "token_revoked",
+            "account_inactive",
+        ] {
             match map_slack_error(code, None) {
                 AdapterError::Auth(c) => assert_eq!(c, code),
                 other => panic!("expected Auth for {code}, got {other:?}"),
@@ -665,9 +657,15 @@ mod tests {
     #[test]
     fn slack_api_builds_url_correctly() {
         let api = SlackApi::new("https://example.test/api/", "xoxb-x");
-        assert_eq!(api.url("chat.postMessage"), "https://example.test/api/chat.postMessage");
+        assert_eq!(
+            api.url("chat.postMessage"),
+            "https://example.test/api/chat.postMessage"
+        );
         let api = SlackApi::new("https://example.test/api", "xoxb-x");
-        assert_eq!(api.url("chat.postMessage"), "https://example.test/api/chat.postMessage");
+        assert_eq!(
+            api.url("chat.postMessage"),
+            "https://example.test/api/chat.postMessage"
+        );
     }
 
     #[test]
@@ -736,7 +734,10 @@ mod tests {
         assert_eq!(arr[1]["type"], "section");
         assert_eq!(arr[1]["text"]["text"], "Push green to prod-canary?");
         assert_eq!(arr[1]["accessory"]["type"], "image");
-        assert_eq!(arr[1]["accessory"]["image_url"], "https://example.com/x.png");
+        assert_eq!(
+            arr[1]["accessory"]["image_url"],
+            "https://example.com/x.png"
+        );
         assert_eq!(arr[2]["type"], "section");
         assert_eq!(arr[2]["fields"].as_array().unwrap().len(), 2);
         assert_eq!(arr[3]["type"], "actions");
@@ -779,10 +780,7 @@ mod tests {
             }],
             ..Card::default()
         };
-        let arr = build_card_blocks(&card)
-            .as_array()
-            .cloned()
-            .unwrap();
+        let arr = build_card_blocks(&card).as_array().cloned().unwrap();
         let btn = &arr.last().unwrap()["elements"][0];
         assert!(btn.get("style").is_none());
     }

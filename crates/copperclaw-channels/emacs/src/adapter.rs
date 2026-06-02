@@ -358,7 +358,10 @@ mod tests {
         let mut cfg = EmacsConfig::default();
         cfg.default_buffer = "*fallback*".into();
         let (adapter, _rx) = make_adapter(mock.clone(), cfg);
-        adapter.deliver("", None, &outbound_text("hi")).await.unwrap();
+        adapter
+            .deliver("", None, &outbound_text("hi"))
+            .await
+            .unwrap();
         let calls = mock.calls();
         let deliver = calls
             .iter()
@@ -469,9 +472,11 @@ mod tests {
         };
         adapter.deliver("*chat*", None, &msg).await.unwrap();
         let calls = mock.calls();
-        assert!(calls
-            .iter()
-            .any(|s| s.starts_with("(copperclaw-deliver") && s.contains("\"\"")));
+        assert!(
+            calls
+                .iter()
+                .any(|s| s.starts_with("(copperclaw-deliver") && s.contains("\"\""))
+        );
         adapter.shutdown().await;
     }
 
@@ -504,9 +509,7 @@ mod tests {
     async fn poll_emits_inbound_event_when_alist_returned() {
         let mock = Arc::new(MockEmacsClient::new());
         // First poll returns a message, then nil forever.
-        mock.push_ok(
-            "((\"buffer\" . \"*chat*\") (\"text\" . \"hi\") (\"sender\" . \"alice\"))\n",
-        );
+        mock.push_ok("((\"buffer\" . \"*chat*\") (\"text\" . \"hi\") (\"sender\" . \"alice\"))\n");
         mock.push_ok("nil\n");
         let mut cfg = EmacsConfig::default();
         cfg.poll_interval_ms = 5;
@@ -540,9 +543,7 @@ mod tests {
     async fn poll_tolerates_malformed_sexp() {
         let mock = Arc::new(MockEmacsClient::new());
         mock.push_ok("garbage\n");
-        mock.push_ok(
-            "((\"buffer\" . \"*chat*\") (\"text\" . \"after-recovery\"))\n",
-        );
+        mock.push_ok("((\"buffer\" . \"*chat*\") (\"text\" . \"after-recovery\"))\n");
         mock.push_ok("nil\n");
         let mut cfg = EmacsConfig::default();
         cfg.poll_interval_ms = 5;
@@ -559,9 +560,7 @@ mod tests {
     async fn poll_tolerates_client_error() {
         let mock = Arc::new(MockEmacsClient::new());
         mock.push_err(AdapterError::Transport("transient".into()));
-        mock.push_ok(
-            "((\"buffer\" . \"*chat*\") (\"text\" . \"recovered\"))\n",
-        );
+        mock.push_ok("((\"buffer\" . \"*chat*\") (\"text\" . \"recovered\"))\n");
         mock.push_ok("nil\n");
         let mut cfg = EmacsConfig::default();
         cfg.poll_interval_ms = 5;
@@ -590,9 +589,7 @@ mod tests {
     #[tokio::test]
     async fn poll_passes_through_id_when_present() {
         let mock = Arc::new(MockEmacsClient::new());
-        mock.push_ok(
-            "((\"id\" . \"abc-123\") (\"buffer\" . \"*chat*\") (\"text\" . \"hi\"))\n",
-        );
+        mock.push_ok("((\"id\" . \"abc-123\") (\"buffer\" . \"*chat*\") (\"text\" . \"hi\"))\n");
         mock.push_ok("nil\n");
         let mut cfg = EmacsConfig::default();
         cfg.poll_interval_ms = 5;
@@ -650,11 +647,7 @@ mod tests {
 
     #[test]
     fn render_outbound_substitutes_both_tokens() {
-        let s = render_outbound(
-            "(d ${BUFFER_JSON} ${TEXT_JSON})",
-            "*chat*",
-            "hi",
-        );
+        let s = render_outbound("(d ${BUFFER_JSON} ${TEXT_JSON})", "*chat*", "hi");
         assert_eq!(s, "(d \"*chat*\" \"hi\")");
     }
 

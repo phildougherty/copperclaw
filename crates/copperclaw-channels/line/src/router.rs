@@ -18,16 +18,14 @@
 
 use crate::adapter::ReplyTokenCache;
 use crate::config::LineConfig;
-use crate::signature::{verify, SignatureOutcome};
+use crate::signature::{SignatureOutcome, verify};
+use axum::Router;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::post;
-use axum::Router;
 use chrono::Utc;
-use copperclaw_types::{
-    ChannelType, InboundEvent, InboundMessage, MessageKind, SenderIdentity,
-};
+use copperclaw_types::{ChannelType, InboundEvent, InboundMessage, MessageKind, SenderIdentity};
 use serde::Deserialize;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
@@ -63,9 +61,7 @@ impl RouterState {
 /// the configured path.
 pub fn build_router(state: RouterState) -> Router {
     let path = state.config.webhook.path.clone();
-    Router::new()
-        .route(&path, post(handle))
-        .with_state(state)
+    Router::new().route(&path, post(handle)).with_state(state)
 }
 
 #[derive(Debug, Deserialize)]

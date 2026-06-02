@@ -434,7 +434,10 @@ mod tests {
     fn validate_rejects_path_too_long() {
         let mut c = sample();
         c.path = "a".repeat(MAX_PATH_CHARS + 1);
-        assert!(matches!(c.validate(), Err(DiffCardError::PathTooLong { .. })));
+        assert!(matches!(
+            c.validate(),
+            Err(DiffCardError::PathTooLong { .. })
+        ));
     }
 
     #[test]
@@ -538,7 +541,11 @@ mod tests {
 
     #[test]
     fn diff_line_kind_round_trips_through_str() {
-        for k in [DiffLineKind::Context, DiffLineKind::Add, DiffLineKind::Remove] {
+        for k in [
+            DiffLineKind::Context,
+            DiffLineKind::Add,
+            DiffLineKind::Remove,
+        ] {
             assert_eq!(DiffLineKind::parse_str(k.as_str()), Some(k));
         }
         assert_eq!(DiffLineKind::parse_str("nope"), None);
@@ -623,7 +630,11 @@ mod tests {
 
     #[test]
     fn diff_line_kind_display_matches_as_str() {
-        for k in [DiffLineKind::Context, DiffLineKind::Add, DiffLineKind::Remove] {
+        for k in [
+            DiffLineKind::Context,
+            DiffLineKind::Add,
+            DiffLineKind::Remove,
+        ] {
             assert_eq!(format!("{k}"), k.as_str());
         }
     }

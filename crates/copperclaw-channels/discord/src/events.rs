@@ -48,9 +48,8 @@ pub fn message_create_to_inbound(
     let id = extract_string(obj, "id")
         .ok_or_else(|| AdapterError::BadRequest("MESSAGE_CREATE.d.id missing".into()))?;
 
-    let channel_id = extract_string(obj, "channel_id").ok_or_else(|| {
-        AdapterError::BadRequest("MESSAGE_CREATE.d.channel_id missing".into())
-    })?;
+    let channel_id = extract_string(obj, "channel_id")
+        .ok_or_else(|| AdapterError::BadRequest("MESSAGE_CREATE.d.channel_id missing".into()))?;
 
     let guild_id = extract_string(obj, "guild_id");
     let is_group = Some(guild_id.is_some());
@@ -166,12 +165,10 @@ pub fn interaction_create_to_inbound(
         .as_object()
         .ok_or_else(|| AdapterError::BadRequest("INTERACTION_CREATE.d is not an object".into()))?;
 
-    let interaction_id = extract_string(obj, "id").ok_or_else(|| {
-        AdapterError::BadRequest("INTERACTION_CREATE.d.id missing".into())
-    })?;
-    let interaction_token = extract_string(obj, "token").ok_or_else(|| {
-        AdapterError::BadRequest("INTERACTION_CREATE.d.token missing".into())
-    })?;
+    let interaction_id = extract_string(obj, "id")
+        .ok_or_else(|| AdapterError::BadRequest("INTERACTION_CREATE.d.id missing".into()))?;
+    let interaction_token = extract_string(obj, "token")
+        .ok_or_else(|| AdapterError::BadRequest("INTERACTION_CREATE.d.token missing".into()))?;
     let kind = obj.get("type").and_then(Value::as_i64).unwrap_or(0);
     if kind != INTERACTION_TYPE_MESSAGE_COMPONENT {
         // Not a card-tap. Caller decides whether to ACK or ignore.
@@ -446,7 +443,9 @@ mod tests {
         let mut payload = sample_payload();
         payload["message_reference"] = json!({ "message_id": "parent-99" });
         let evt = message_create_to_inbound(&payload, None).unwrap();
-        let rt = evt.reply_to.expect("reply_to populated from message_reference");
+        let rt = evt
+            .reply_to
+            .expect("reply_to populated from message_reference");
         assert_eq!(rt.channel_type.as_str(), "discord");
         assert_eq!(rt.platform_id, "c1");
         assert_eq!(rt.thread_id.as_deref(), Some("parent-99"));

@@ -7,20 +7,17 @@
 //!
 //! This is a read-only introspection command available to any caller.
 
-use copperclaw_db::migrate::{applied_central_schema_version, expected_central_schema_version};
 use copperclaw_cclaw::ErrorPayload;
 use copperclaw_db::central::CentralDb;
+use copperclaw_db::migrate::{applied_central_schema_version, expected_central_schema_version};
 use serde_json::{Value, json};
 
 /// Handler: `cclaw schema-version` → `{ expected, applied, status }`.
-pub fn version(
-    _args: &Value,
-    central: &CentralDb,
-) -> Result<Value, ErrorPayload> {
+pub fn version(_args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     let expected = expected_central_schema_version();
-    let conn = central.conn().map_err(|e| {
-        ErrorPayload::new("db_error", format!("could not open central db: {e}"))
-    })?;
+    let conn = central
+        .conn()
+        .map_err(|e| ErrorPayload::new("db_error", format!("could not open central db: {e}")))?;
     let applied = applied_central_schema_version(&conn)
         .map_err(|e| ErrorPayload::new("db_error", format!("schema_version query failed: {e}")))?
         .unwrap_or(0);

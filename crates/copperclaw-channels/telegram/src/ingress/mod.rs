@@ -9,7 +9,9 @@ use crate::types::{
 };
 use chrono::{DateTime, TimeZone, Utc};
 use copperclaw_channels_core::AdapterError;
-use copperclaw_types::{ChannelType, InboundEvent, InboundMessage, MessageKind, ReplyTo, SenderIdentity};
+use copperclaw_types::{
+    ChannelType, InboundEvent, InboundMessage, MessageKind, ReplyTo, SenderIdentity,
+};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
@@ -100,10 +102,7 @@ pub async fn updates_to_events(
 /// Returns `None` when the callback is unroutable — no `data` field,
 /// or no chat id to route by. The ack is still attempted in those
 /// cases so Telegram's spinner clears.
-async fn callback_query_to_event(
-    cb: &CallbackQuery,
-    api: &TelegramApi,
-) -> Option<InboundEvent> {
+async fn callback_query_to_event(cb: &CallbackQuery, api: &TelegramApi) -> Option<InboundEvent> {
     // Best-effort ack — never block the event on it. Pass `None` so no
     // toast pops up over the chat input (the value is already arriving
     // as a normal chat message; an extra toast would be noise).
@@ -417,9 +416,7 @@ fn legacy_metadata_value(att: &AttachmentDescriptor) -> Value {
     );
     obj.insert(
         "mime_type".to_owned(),
-        att.mime_type
-            .clone()
-            .map_or(Value::Null, Value::String),
+        att.mime_type.clone().map_or(Value::Null, Value::String),
     );
     obj.insert(
         "file_size".to_owned(),
@@ -447,9 +444,7 @@ fn attachment_json(
     );
     obj.insert(
         "mime_type".to_owned(),
-        att.mime_type
-            .clone()
-            .map_or(Value::Null, Value::String),
+        att.mime_type.clone().map_or(Value::Null, Value::String),
     );
     obj.insert("size".to_owned(), Value::from(actual_size));
     obj
@@ -531,9 +526,7 @@ async fn download_one(
     }
     let Some(file_path) = meta.file_path.as_deref() else {
         return DownloadOutcome::Failed {
-            error: AdapterError::Transport(
-                "telegram getFile returned no file_path".to_owned(),
-            ),
+            error: AdapterError::Transport("telegram getFile returned no file_path".to_owned()),
         };
     };
     let bytes = match api.download_file(file_path).await {
@@ -545,14 +538,7 @@ async fn download_one(
             reported: Some(bytes.len() as u64),
         };
     }
-    match write_attachment(
-        &settings.data_dir,
-        message_id,
-        &descriptor.filename,
-        &bytes,
-    )
-    .await
-    {
+    match write_attachment(&settings.data_dir, message_id, &descriptor.filename, &bytes).await {
         Ok(path) => DownloadOutcome::Ok {
             path,
             size: bytes.len() as u64,
@@ -626,9 +612,10 @@ fn message_mentions(msg: &Message, bot_username: &str) -> bool {
     for entity in &msg.entities {
         match entity.kind.as_str() {
             "mention" => {
-                if let (Some(start), Some(len)) =
-                    (usize::try_from(entity.offset).ok(), usize::try_from(entity.length).ok())
-                {
+                if let (Some(start), Some(len)) = (
+                    usize::try_from(entity.offset).ok(),
+                    usize::try_from(entity.length).ok(),
+                ) {
                     if let Some(slice) = slice_utf16(text, start, len) {
                         if slice.eq_ignore_ascii_case(&target) {
                             return true;
@@ -804,7 +791,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
-            callback_query: None,
+                callback_query: None,
             },
             &api,
             &default_settings(dir.path()),
@@ -825,7 +812,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
-            callback_query: None,
+                callback_query: None,
             },
             &api,
             &default_settings(dir.path()),
@@ -846,7 +833,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
-            callback_query: None,
+                callback_query: None,
             },
             &api,
             &default_settings(dir.path()),
@@ -866,9 +853,11 @@ mod tests {
         };
         let dir = TempDir::new().unwrap();
         let (api, _s) = dummy_api().await;
-        assert!(updates_to_events(&update, &api, &default_settings(dir.path()))
-            .await
-            .is_empty());
+        assert!(
+            updates_to_events(&update, &api, &default_settings(dir.path()))
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -884,7 +873,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
-            callback_query: None,
+                callback_query: None,
             },
             &api,
             &default_settings(dir.path()),
@@ -912,7 +901,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
-            callback_query: None,
+                callback_query: None,
             },
             &api,
             &settings,
@@ -940,7 +929,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
-            callback_query: None,
+                callback_query: None,
             },
             &api,
             &settings,
@@ -974,7 +963,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
-            callback_query: None,
+                callback_query: None,
             },
             &api,
             &settings,
@@ -1002,7 +991,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
-            callback_query: None,
+                callback_query: None,
             },
             &api,
             &settings,
@@ -1022,7 +1011,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
-            callback_query: None,
+                callback_query: None,
             },
             &api,
             &default_settings(dir.path()),
@@ -1050,7 +1039,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
-            callback_query: None,
+                callback_query: None,
             },
             &api,
             &settings,
@@ -1148,7 +1137,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
-            callback_query: None,
+                callback_query: None,
             },
             &api,
             &default_settings(dir.path()),
@@ -1322,7 +1311,10 @@ mod tests {
         assert_eq!(e.message.kind, Mk::System);
         assert_eq!(e.message.content["reason"], "download_failed");
         let err = e.message.content["error"].as_str().unwrap();
-        assert!(err.contains("auth") || err.contains("Unauthorized"), "got `{err}`");
+        assert!(
+            err.contains("auth") || err.contains("Unauthorized"),
+            "got `{err}`"
+        );
     }
 
     #[tokio::test]
@@ -1812,8 +1804,7 @@ mod tests {
                 data: Some("approve:42".into()),
             }),
         };
-        let evts =
-            updates_to_events(&update, &api, &default_settings(dir.path())).await;
+        let evts = updates_to_events(&update, &api, &default_settings(dir.path())).await;
         assert_eq!(evts.len(), 1);
         let e = &evts[0];
         assert_eq!(e.channel_type.as_str(), "telegram");
@@ -1855,13 +1846,15 @@ mod tests {
                 data: Some("x".into()),
             }),
         };
-        let evts =
-            updates_to_events(&update, &api, &default_settings(dir.path())).await;
+        let evts = updates_to_events(&update, &api, &default_settings(dir.path())).await;
         assert_eq!(evts.len(), 1);
         // Platform id falls back to the user id.
         assert_eq!(evts[0].platform_id, "555");
         assert_eq!(evts[0].message.content["text"], "x");
-        assert_eq!(evts[0].message.content["callback"]["original_message_id"], 0);
+        assert_eq!(
+            evts[0].message.content["callback"]["original_message_id"],
+            0
+        );
     }
 
     #[tokio::test]
@@ -1889,8 +1882,7 @@ mod tests {
                 data: None,
             }),
         };
-        let evts =
-            updates_to_events(&update, &api, &default_settings(dir.path())).await;
+        let evts = updates_to_events(&update, &api, &default_settings(dir.path())).await;
         assert!(evts.is_empty());
         // The ack endpoint must still have been hit.
         let reqs = server.received_requests().await.unwrap();
@@ -1933,8 +1925,7 @@ mod tests {
                 data: Some("payload".into()),
             }),
         };
-        let evts =
-            updates_to_events(&update, &api, &default_settings(dir.path())).await;
+        let evts = updates_to_events(&update, &api, &default_settings(dir.path())).await;
         assert_eq!(evts.len(), 1);
         assert_eq!(evts[0].message.content["text"], "payload");
     }

@@ -13,7 +13,7 @@
 //! [`COPY_FILE_MAX_BYTES`].
 
 use crate::error::ToolError;
-use crate::tools::{make_tool, parse_args, success_json, ToolEntry, ToolHandler};
+use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args, success_json};
 use rmcp::model::{CallToolResult, JsonObject, Tool};
 use serde::Deserialize;
 use serde_json::json;
@@ -80,10 +80,7 @@ pub async fn handle(
     //    depending on platform, and "ambiguous" is worse than "say
     //    no" for a tool the model invokes blind.
     let src_meta = tokio::fs::symlink_metadata(&src).await.map_err(|e| {
-        ToolError::Validation(format!(
-            "copy_file: stat `{}` failed: {e}",
-            src.display()
-        ))
+        ToolError::Validation(format!("copy_file: stat `{}` failed: {e}", src.display()))
     })?;
     if !src_meta.file_type().is_file() {
         return Err(ToolError::Validation(format!(

@@ -1,10 +1,10 @@
 //! CRUD for `pending_channel_approvals`.
 
-use crate::central::CentralDb;
 use crate::DbError;
+use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
 use copperclaw_types::{AgentGroupId, MessagingGroupId, UserId};
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{OptionalExtension, Row, params};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingChannelApproval {
@@ -29,24 +29,31 @@ pub struct UpsertChannelApproval {
 
 fn row_to_pending_channel_approval(row: &Row<'_>) -> rusqlite::Result<PendingChannelApproval> {
     let mg_str: String = row.get("messaging_group_id")?;
-    let mg = uuid::Uuid::parse_str(&mg_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let mg = uuid::Uuid::parse_str(&mg_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let ag_str: String = row.get("agent_group_id")?;
-    let ag = uuid::Uuid::parse_str(&ag_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let ag = uuid::Uuid::parse_str(&ag_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let approver_str: String = row.get("approver_user_id")?;
-    let approver = uuid::Uuid::parse_str(&approver_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let approver = uuid::Uuid::parse_str(&approver_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let original_str: String = row.get("original_message")?;
-    let original_message: serde_json::Value = serde_json::from_str(&original_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let original_message: serde_json::Value = serde_json::from_str(&original_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let created_at_str: String = row.get("created_at")?;
     let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .with_timezone(&Utc);
     let options_json: String = row.get("options_json")?;
-    let options: Vec<String> = serde_json::from_str(&options_json)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let options: Vec<String> = serde_json::from_str(&options_json).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     Ok(PendingChannelApproval {
         messaging_group_id: MessagingGroupId(mg),
         agent_group_id: AgentGroupId(ag),
@@ -83,7 +90,10 @@ pub fn get(db: &CentralDb, mg: MessagingGroupId) -> Result<PendingChannelApprova
     .ok_or(DbError::NotFound)
 }
 
-pub fn upsert(db: &CentralDb, req: UpsertChannelApproval) -> Result<PendingChannelApproval, DbError> {
+pub fn upsert(
+    db: &CentralDb,
+    req: UpsertChannelApproval,
+) -> Result<PendingChannelApproval, DbError> {
     let conn = db.conn()?;
     let existing: Option<String> = conn
         .query_row(
@@ -160,8 +170,8 @@ pub fn delete(db: &CentralDb, mg: MessagingGroupId) -> Result<(), DbError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tables::agent_groups::{create as create_ag, CreateAgentGroup};
-    use crate::tables::messaging_groups::{upsert as upsert_mg, UpsertMessagingGroup};
+    use crate::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+    use crate::tables::messaging_groups::{UpsertMessagingGroup, upsert as upsert_mg};
     use copperclaw_types::ChannelType;
     use serde_json::json;
 
@@ -244,7 +254,10 @@ mod tests {
         let fetched = get(&fx.db, a.messaging_group_id).unwrap();
         assert_eq!(a, fetched);
         assert_eq!(fetched.title, "Approve channel?");
-        assert_eq!(fetched.options, vec!["approve".to_string(), "deny".to_string()]);
+        assert_eq!(
+            fetched.options,
+            vec!["approve".to_string(), "deny".to_string()]
+        );
         assert_eq!(fetched.original_message, json!({"text":"hi"}));
     }
 
@@ -303,7 +316,10 @@ mod tests {
         let fx = fixture();
         let a = upsert(&fx.db, sample(&fx)).unwrap();
         delete(&fx.db, a.messaging_group_id).unwrap();
-        assert!(matches!(get(&fx.db, a.messaging_group_id).unwrap_err(), DbError::NotFound));
+        assert!(matches!(
+            get(&fx.db, a.messaging_group_id).unwrap_err(),
+            DbError::NotFound
+        ));
     }
 
     #[test]

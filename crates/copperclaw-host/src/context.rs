@@ -131,11 +131,11 @@ mod tests {
     use copperclaw_db::central::CentralDb;
     use copperclaw_host_delivery::FsSessionRoot as DelivFsSessionRoot;
     use copperclaw_host_router::{FsSessionRoot as RouterFsSessionRoot, Router, SessionRoot};
+    use copperclaw_modules::ModuleError;
     use copperclaw_modules::context::{
         DeliveryActionInput, DeliveryActionOutput, GateCtx, GateDecision, InterceptorCtx,
         InterceptorDecision, SenderScopeCtx, SenderScopeDecision,
     };
-    use copperclaw_modules::ModuleError;
     use copperclaw_types::{
         AgentGroupId, ChannelType, InboundEvent, InboundMessage, MessageKind, OutboundMessage,
         UserId,
@@ -143,10 +143,7 @@ mod tests {
 
     struct CapturingAction;
     impl DeliveryActionHandler for CapturingAction {
-        fn handle(
-            &self,
-            _input: DeliveryActionInput,
-        ) -> Result<DeliveryActionOutput, ModuleError> {
+        fn handle(&self, _input: DeliveryActionInput) -> Result<DeliveryActionOutput, ModuleError> {
             Ok(DeliveryActionOutput::default())
         }
     }
@@ -202,8 +199,7 @@ mod tests {
     async fn sender_resolver_propagates_via_router() {
         let (router, _tmp1) = router();
         let (delivery, _tmp2) = delivery_service();
-        let ctx: Arc<dyn ModuleContext> =
-            HostContext::for_router(Arc::clone(&router), delivery);
+        let ctx: Arc<dyn ModuleContext> = HostContext::for_router(Arc::clone(&router), delivery);
         let known = UserId::new();
         ctx.set_sender_resolver(Arc::new(move |_| Some(known)));
         assert!(router.hooks().has_sender_resolver());

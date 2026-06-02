@@ -41,7 +41,8 @@ pub enum PromptError {
 /// to `COPPERCLAW_SETUP_<KEY>`. Keys must be `SCREAMING_SNAKE_CASE`.
 pub trait Prompt {
     /// Free-form string question with an optional default.
-    fn input(&self, key: &str, message: &str, default: Option<&str>) -> Result<String, PromptError>;
+    fn input(&self, key: &str, message: &str, default: Option<&str>)
+    -> Result<String, PromptError>;
 
     /// Yes/no question with a default. Returns the boolean answer.
     fn confirm(&self, key: &str, message: &str, default: bool) -> Result<bool, PromptError>;
@@ -63,7 +64,12 @@ impl Interactive {
 }
 
 impl Prompt for Interactive {
-    fn input(&self, _key: &str, message: &str, default: Option<&str>) -> Result<String, PromptError> {
+    fn input(
+        &self,
+        _key: &str,
+        message: &str,
+        default: Option<&str>,
+    ) -> Result<String, PromptError> {
         let mut input: dialoguer::Input<String> = dialoguer::Input::new();
         input = input.with_prompt(message);
         if let Some(default) = default {
@@ -128,7 +134,12 @@ impl EnvBacked {
 }
 
 impl Prompt for EnvBacked {
-    fn input(&self, key: &str, _message: &str, default: Option<&str>) -> Result<String, PromptError> {
+    fn input(
+        &self,
+        key: &str,
+        _message: &str,
+        default: Option<&str>,
+    ) -> Result<String, PromptError> {
         if let Some(value) = self.get(key) {
             return Ok(value.clone());
         }
@@ -191,13 +202,12 @@ impl Scripted {
     }
 
     fn pop(&self, key: &str) -> Result<String, PromptError> {
-        let mut map = self
-            .answers
-            .lock()
-            .expect("scripted prompt poisoned");
-        let queue = map.get_mut(key).ok_or_else(|| PromptError::ScriptExhausted {
-            key: key.to_string(),
-        })?;
+        let mut map = self.answers.lock().expect("scripted prompt poisoned");
+        let queue = map
+            .get_mut(key)
+            .ok_or_else(|| PromptError::ScriptExhausted {
+                key: key.to_string(),
+            })?;
         if queue.is_empty() {
             return Err(PromptError::ScriptExhausted {
                 key: key.to_string(),
@@ -208,7 +218,12 @@ impl Scripted {
 }
 
 impl Prompt for Scripted {
-    fn input(&self, key: &str, _message: &str, default: Option<&str>) -> Result<String, PromptError> {
+    fn input(
+        &self,
+        key: &str,
+        _message: &str,
+        default: Option<&str>,
+    ) -> Result<String, PromptError> {
         match self.pop(key) {
             Ok(v) => Ok(v),
             Err(PromptError::ScriptExhausted { .. }) if default.is_some() => {
@@ -429,7 +444,10 @@ mod tests {
         env.insert("COPPERCLAW_SETUP_DATA_DIR".into(), "/srv/x".into());
         env.insert("COPPERCLAW_SETUP_BUILD_IMAGE".into(), "no".into());
         env.insert("COPPERCLAW_SETUP_USE_ONECLI".into(), "no".into());
-        env.insert("COPPERCLAW_SETUP_ANTHROPIC_API_KEY".into(), "sk-test".into());
+        env.insert(
+            "COPPERCLAW_SETUP_ANTHROPIC_API_KEY".into(),
+            "sk-test".into(),
+        );
         env.insert("COPPERCLAW_SETUP_MOUNTS".into(), String::new());
         env.insert("COPPERCLAW_SETUP_WRITE_SERVICE_UNIT".into(), "no".into());
         env.insert("COPPERCLAW_SETUP_TIMEZONE".into(), "Etc/UTC".into());

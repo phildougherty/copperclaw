@@ -15,13 +15,13 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use bollard::Docker;
 use bollard::container::{
     Config, CreateContainerOptions, ListContainersOptions, LogsOptions, RemoveContainerOptions,
     StopContainerOptions,
 };
 use bollard::image::BuildImageOptions;
 use bollard::models::{DeviceRequest, HostConfig, Mount as DockerMount, MountTypeEnum};
-use bollard::Docker;
 use bytes::Bytes;
 use futures::stream::StreamExt;
 
@@ -151,12 +151,9 @@ impl ContainerRuntime for DockerRuntime {
         match res {
             Ok(())
             | Err(bollard::errors::Error::DockerResponseServerError {
-                status_code: 404,
-                ..
+                status_code: 404, ..
             }) => Ok(()),
-            Err(e) => Err(RtError::Container(format!(
-                "remove container {name}: {e}"
-            ))),
+            Err(e) => Err(RtError::Container(format!("remove container {name}: {e}"))),
         }
     }
 
@@ -213,9 +210,7 @@ impl ContainerRuntime for DockerRuntime {
                     buf.push_str(&String::from_utf8_lossy(chunk.as_ref()));
                 }
                 Err(e) => {
-                    return Err(RtError::Container(format!(
-                        "fetch logs {name}: {e}"
-                    )));
+                    return Err(RtError::Container(format!("fetch logs {name}: {e}")));
                 }
             }
         }
@@ -248,7 +243,12 @@ pub(crate) fn container_config(spec: &ContainerSpec) -> Config<String> {
         .map(|(host, ip)| format!("{host}:{ip}"))
         .collect();
 
-    let host_config = host_config_with_limits(&spec.resource_limits, mounts, extra_hosts, spec.gpu_passthrough);
+    let host_config = host_config_with_limits(
+        &spec.resource_limits,
+        mounts,
+        extra_hosts,
+        spec.gpu_passthrough,
+    );
 
     Config {
         image: Some(spec.image.clone()),
@@ -260,7 +260,11 @@ pub(crate) fn container_config(spec: &ContainerSpec) -> Config<String> {
         },
         user: spec.user.clone(),
         working_dir: spec.working_dir.clone(),
-        labels: if labels.is_empty() { None } else { Some(labels) },
+        labels: if labels.is_empty() {
+            None
+        } else {
+            Some(labels)
+        },
         host_config: Some(host_config),
         ..Default::default()
     }
@@ -277,14 +281,10 @@ pub(crate) fn host_config_with_limits(
     // The f64->i64 truncation is intentional: fractional nano-CPUs are meaningless.
     // Wrap for memory_mb and pids_limit: practical values are well below i64::MAX.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let nano_cpus = limits
-        .cpus
-        .map(|c| (c * 1_000_000_000.0) as i64);
+    let nano_cpus = limits.cpus.map(|c| (c * 1_000_000_000.0) as i64);
     // Memory is in bytes.
     #[allow(clippy::cast_possible_wrap)]
-    let memory = limits
-        .memory_mb
-        .map(|mb| (mb * 1024 * 1024) as i64);
+    let memory = limits.memory_mb.map(|mb| (mb * 1024 * 1024) as i64);
     #[allow(clippy::cast_possible_wrap)]
     let pids_limit = limits.pids_limit.map(|p| p as i64);
 
@@ -405,10 +405,9 @@ mod tar {
     impl std::fmt::Display for TarError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                Self::PathTooLong { path, len } => write!(
-                    f,
-                    "USTAR path exceeds 256 bytes (got {len}): {path}"
-                ),
+                Self::PathTooLong { path, len } => {
+                    write!(f, "USTAR path exceeds 256 bytes (got {len}): {path}")
+                }
                 Self::NoValidSplit { path } => write!(
                     f,
                     "USTAR path cannot be split into name (<=100) + prefix (<=155): {path}"
@@ -463,12 +462,7 @@ mod tar {
     /// limit (256 bytes split as 155 prefix + `/` + 100 name) instead
     /// of silently truncating, which previously produced opaque
     /// build failures or path collisions.
-    pub fn append(
-        out: &mut Vec<u8>,
-        name: &str,
-        mode: u32,
-        body: &[u8],
-    ) -> Result<(), TarError> {
+    pub fn append(out: &mut Vec<u8>, name: &str, mode: u32, body: &[u8]) -> Result<(), TarError> {
         let mut header = [0u8; BLOCK];
 
         let nbytes = name.as_bytes();
@@ -802,7 +796,10 @@ mod tests {
         let cfg = container_config(&spec);
         assert_eq!(cfg.user.as_deref(), Some("nobody"));
         assert_eq!(cfg.working_dir.as_deref(), Some("/data"));
-        assert_eq!(cfg.env.as_deref(), Some(&["A=1".to_string(), "B=2".to_string()][..]));
+        assert_eq!(
+            cfg.env.as_deref(),
+            Some(&["A=1".to_string(), "B=2".to_string()][..])
+        );
         assert_eq!(cfg.entrypoint.as_deref(), Some(&["sh".to_string()][..]));
         let labels = cfg.labels.expect("labels");
         assert_eq!(labels.get("k").map(String::as_str), Some("v"));
@@ -887,6 +884,8 @@ mod tests {
     #[tokio::test]
     async fn cleanup_orphans_against_daemon_is_idempotent() {
         let rt = DockerRuntime::connect().expect("connect");
-        rt.cleanup_orphans("copperclaw-tests-no-such-slug").await.unwrap();
+        rt.cleanup_orphans("copperclaw-tests-no-such-slug")
+            .await
+            .unwrap();
     }
 }

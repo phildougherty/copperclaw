@@ -8,13 +8,13 @@
 //! The same `tasks` table is read directly by [`crate::checks::scheduling`]
 //! during the sweep loop's due-task fan-out.
 
+use copperclaw_db::DbError;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::tasks::{self, NewTask, TaskStatus as DbTaskStatus, UpdateFields};
-use copperclaw_db::DbError;
+use copperclaw_modules::ModuleError;
 use copperclaw_modules::scheduling::{
     CreateTaskSpec, TaskRecord, TaskStatus, TaskStore, UpdateTaskFields,
 };
-use copperclaw_modules::ModuleError;
 
 /// Production [`TaskStore`] backed by the central sqlite database.
 pub struct SqliteTaskStore {
@@ -122,7 +122,7 @@ impl TaskStore for SqliteTaskStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use copperclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+    use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
     use copperclaw_types::{AgentGroupId, SessionId};
 
     fn fresh() -> (SqliteTaskStore, AgentGroupId, SessionId) {

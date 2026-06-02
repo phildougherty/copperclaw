@@ -4,9 +4,9 @@
 
 use crate::disallowed::is_disallowed;
 
+use super::RunnerDeps;
 use super::drive_turn::PendingToolCall;
 use super::provider_call::HeartbeatTicker;
-use super::RunnerDeps;
 
 /// Execute one tool call against the runner's tool map. Returns
 /// `(content, images, is_error)`: the text for the `HistoryMessage::Tool`
@@ -71,7 +71,11 @@ pub(super) async fn invoke_tool(
             extract_tool_images(&result),
             false,
         ),
-        Ok(Err(err)) => (format!("Tool `{}` failed: {err}", call.name), Vec::new(), true),
+        Ok(Err(err)) => (
+            format!("Tool `{}` failed: {err}", call.name),
+            Vec::new(),
+            true,
+        ),
         Err(_) => (
             format!(
                 "Tool `{}` did not return within {}s (per-tool deadline); the runner aborted it. Consider breaking the work into smaller steps.",
@@ -94,9 +98,7 @@ pub(super) fn extract_tool_images(result: &rmcp::model::CallToolResult) -> Vec<T
         .content
         .iter()
         .filter_map(|block| match &block.raw {
-            rmcp::model::RawContent::Image(img) => {
-                Some((img.mime_type.clone(), img.data.clone()))
-            }
+            rmcp::model::RawContent::Image(img) => Some((img.mime_type.clone(), img.data.clone())),
             _ => None,
         })
         .collect()

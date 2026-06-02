@@ -92,7 +92,14 @@ mod tests {
     #[test]
     fn parse_mount_list_comma() {
         let v = parse_mount_list("/a , /b,/c");
-        assert_eq!(v, vec![PathBuf::from("/a"), PathBuf::from("/b"), PathBuf::from("/c")]);
+        assert_eq!(
+            v,
+            vec![
+                PathBuf::from("/a"),
+                PathBuf::from("/b"),
+                PathBuf::from("/c")
+            ]
+        );
     }
 
     #[test]
@@ -128,7 +135,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let present = dir.path().join("present");
         std::fs::create_dir(&present).unwrap();
-        assert!(!all_exist(&[present, PathBuf::from("/definitely/missing/xyz")]));
+        assert!(!all_exist(&[
+            present,
+            PathBuf::from("/definitely/missing/xyz")
+        ]));
     }
 
     #[test]
@@ -152,10 +162,7 @@ mod tests {
         std::fs::create_dir(&p2).unwrap();
         let mut cfg = SetupConfig::default();
         let mut state = SetupState::new();
-        let prompt = Scripted::new().with(
-            "MOUNTS",
-            format!("{},{}", p1.display(), p2.display()),
-        );
+        let prompt = Scripted::new().with("MOUNTS", format!("{},{}", p1.display(), p2.display()));
         let res = s.run(&mut cfg, &prompt, &mut state).unwrap();
         assert!(res.config_changed);
         assert_eq!(cfg.mount_paths, vec![p1, p2]);

@@ -225,11 +225,7 @@ pub fn apply_template(template: &str, ctx: &UnitContext) -> String {
 /// Loads a template from the matching subdirectory of `template_root` when
 /// available, else falls back to the inline renderer.
 #[must_use]
-pub fn generate(
-    kind: UnitKind,
-    ctx: &UnitContext,
-    template_root: Option<&Path>,
-) -> String {
+pub fn generate(kind: UnitKind, ctx: &UnitContext, template_root: Option<&Path>) -> String {
     let template_path = template_root.map(|root| match kind {
         UnitKind::Systemd => root.join("systemd").join("copperclaw.service"),
         UnitKind::Launchd => root.join("launchd").join("com.copperclaw.host.plist"),
@@ -270,7 +266,11 @@ mod tests {
     use super::*;
 
     fn ctx() -> UnitContext {
-        UnitContext::new("/usr/local/bin/copperclaw", "/srv/copperclaw", "/srv/copperclaw/.env")
+        UnitContext::new(
+            "/usr/local/bin/copperclaw",
+            "/srv/copperclaw",
+            "/srv/copperclaw/.env",
+        )
     }
 
     #[test]
@@ -454,8 +454,7 @@ mod tests {
 
     #[test]
     fn apply_template_substitutes_all_placeholders() {
-        let tmpl =
-            "EXEC=${EXEC}\nDATA=${DATA_DIR}\nENV=${ENV_FILE}\n";
+        let tmpl = "EXEC=${EXEC}\nDATA=${DATA_DIR}\nENV=${ENV_FILE}\n";
         let out = apply_template(tmpl, &ctx());
         assert_eq!(
             out,

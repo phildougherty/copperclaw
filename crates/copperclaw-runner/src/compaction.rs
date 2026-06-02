@@ -34,8 +34,7 @@ pub const DEFAULT_SAFETY_MARGIN: usize = 16_000;
 /// runner's default `max_tokens` so the two move together.
 pub const DEFAULT_OUTPUT_RESERVE: usize = 4_096;
 /// System prompt the runner sends to the provider when asking for a summary.
-pub const SUMMARY_SYSTEM_PROMPT: &str =
-    "Summarize the following conversation succinctly. Preserve any decisions, \
+pub const SUMMARY_SYSTEM_PROMPT: &str = "Summarize the following conversation succinctly. Preserve any decisions, \
 open questions, identifiers, and unresolved tool requests. Be terse.";
 
 /// Tuning knobs for compaction. Defaults match the constants above.
@@ -104,7 +103,10 @@ fn chars_of(m: &HistoryMessage) -> usize {
             content,
             is_error: _,
         } => tool_use_id.chars().count() + content.chars().count(),
-        HistoryMessage::Image { media_type, data: _ } => {
+        HistoryMessage::Image {
+            media_type,
+            data: _,
+        } => {
             // An image's token cost is tile-based, not its base64 length —
             // counting `data` would massively overestimate and trigger
             // needless compaction. Use a flat ~1500-token estimate
@@ -311,7 +313,9 @@ mod tests {
         }
     }
     fn txt() -> HistoryMessage {
-        HistoryMessage::User { content: "x".into() }
+        HistoryMessage::User {
+            content: "x".into(),
+        }
     }
 
     #[test]
@@ -400,8 +404,12 @@ mod tests {
     #[test]
     fn estimate_tokens_handles_all_variants() {
         let h = vec![
-            HistoryMessage::User { content: "abcd".into() },
-            HistoryMessage::Assistant { content: "wxyz".into() },
+            HistoryMessage::User {
+                content: "abcd".into(),
+            },
+            HistoryMessage::Assistant {
+                content: "wxyz".into(),
+            },
             HistoryMessage::ToolUse {
                 id: "tu_1".into(),
                 name: "tool".into(),
@@ -432,10 +440,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "stub"
         }
-        async fn query(
-            &self,
-            _input: QueryInput,
-        ) -> Result<Box<dyn AgentQuery>, ProviderError> {
+        async fn query(&self, _input: QueryInput) -> Result<Box<dyn AgentQuery>, ProviderError> {
             Ok(Box::new(StubQuery {
                 events: Mutex::new(vec![
                     ProviderEvent::Init {
@@ -460,10 +465,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "err"
         }
-        async fn query(
-            &self,
-            _input: QueryInput,
-        ) -> Result<Box<dyn AgentQuery>, ProviderError> {
+        async fn query(&self, _input: QueryInput) -> Result<Box<dyn AgentQuery>, ProviderError> {
             Ok(Box::new(StubQuery {
                 events: Mutex::new(vec![ProviderEvent::Error {
                     message: "synthetic".into(),
@@ -562,9 +564,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = cfg_with_dir(tmp.path().to_path_buf());
         let provider = ErrorProvider;
-        let err = compact(long_history(8), &provider, &cfg)
-            .await
-            .unwrap_err();
+        let err = compact(long_history(8), &provider, &cfg).await.unwrap_err();
         assert!(err.to_string().contains("synthetic"));
     }
 

@@ -17,7 +17,7 @@
 //! - `before == after`: silently skip — nothing changed.
 
 use copperclaw_channels_core::{
-    BlobReplaced, DiffCard, DiffHunk, DiffLine, DiffLineKind, BLOB_DIFF_CUTOFF_BYTES,
+    BLOB_DIFF_CUTOFF_BYTES, BlobReplaced, DiffCard, DiffHunk, DiffLine, DiffLineKind,
     MAX_DIFF_HUNKS as MAX_HUNKS,
 };
 use similar::{ChangeTag, TextDiff};
@@ -86,10 +86,7 @@ pub fn build_diff_card(path: &str, before: &str, after: &str) -> Option<DiffCard
                 // `similar` keeps the trailing `\n` on each line for
                 // `from_lines`; strip it so renderers don't put a
                 // blank between every line.
-                let text = value
-                    .strip_suffix('\n')
-                    .unwrap_or(value)
-                    .to_owned();
+                let text = value.strip_suffix('\n').unwrap_or(value).to_owned();
                 match change.tag() {
                     ChangeTag::Equal => {
                         lines.push(DiffLine {
@@ -131,12 +128,20 @@ pub fn build_diff_card(path: &str, before: &str, after: &str) -> Option<DiffCard
         let old_start = if old_len == 0 {
             // pure insertion: header reads `@@ -<start>,0 +… @@`
             // (0-based start), so map 0 → 0; otherwise +1 to convert.
-            if old_start_zero == 0 { 0 } else { to_u32(old_start_zero) }
+            if old_start_zero == 0 {
+                0
+            } else {
+                to_u32(old_start_zero)
+            }
         } else {
             to_u32(old_start_zero + 1)
         };
         let new_start = if new_len == 0 {
-            if new_start_zero == 0 { 0 } else { to_u32(new_start_zero) }
+            if new_start_zero == 0 {
+                0
+            } else {
+                to_u32(new_start_zero)
+            }
         } else {
             to_u32(new_start_zero + 1)
         };

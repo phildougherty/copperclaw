@@ -172,13 +172,13 @@ pub fn render_env_file(spec: &EnvFileSpec) -> String {
     let mut out = String::new();
     out.push_str(&format!("ANTHROPIC_API_KEY={}\n", spec.anthropic_api_key));
     if !spec.anthropic_base_url.is_empty() {
-        out.push_str(&format!(
-            "ANTHROPIC_BASE_URL={}\n",
-            spec.anthropic_base_url
-        ));
+        out.push_str(&format!("ANTHROPIC_BASE_URL={}\n", spec.anthropic_base_url));
     }
     if !spec.data_dir.as_os_str().is_empty() {
-        out.push_str(&format!("COPPERCLAW_DATA_DIR={}\n", spec.data_dir.display()));
+        out.push_str(&format!(
+            "COPPERCLAW_DATA_DIR={}\n",
+            spec.data_dir.display()
+        ));
     }
     if !spec.cclaw_socket.as_os_str().is_empty() {
         out.push_str(&format!("CCLAW_SOCKET={}\n", spec.cclaw_socket.display()));
@@ -369,7 +369,10 @@ mod tests {
     fn expand_openrouter_shortcut() {
         assert_eq!(expand_provider_shortcut("openrouter"), OPENROUTER_BASE_URL);
         assert_eq!(expand_provider_shortcut("OpenRouter"), OPENROUTER_BASE_URL);
-        assert_eq!(expand_provider_shortcut("  openrouter  "), OPENROUTER_BASE_URL);
+        assert_eq!(
+            expand_provider_shortcut("  openrouter  "),
+            OPENROUTER_BASE_URL
+        );
         assert_eq!(expand_provider_shortcut("or"), OPENROUTER_BASE_URL);
     }
 

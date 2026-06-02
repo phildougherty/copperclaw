@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn render_json_pretty_handles_non_object() {
-        let out = render_json_pretty(&json!([1,2,3]));
+        let out = render_json_pretty(&json!([1, 2, 3]));
         assert!(out.contains('1'));
     }
 

@@ -1,10 +1,10 @@
 //! CRUD for `messaging_groups`.
 
-use crate::central::CentralDb;
 use crate::DbError;
+use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
 use copperclaw_types::{ChannelType, MessagingGroupId};
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{OptionalExtension, Row, params};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessagingGroup {
@@ -29,19 +29,24 @@ pub struct UpsertMessagingGroup {
 
 fn row_to_messaging_group(row: &Row<'_>) -> rusqlite::Result<MessagingGroup> {
     let id_str: String = row.get("id")?;
-    let id = uuid::Uuid::parse_str(&id_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let id = uuid::Uuid::parse_str(&id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let channel_type_str: String = row.get("channel_type")?;
     let created_at_str: String = row.get("created_at")?;
     let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .with_timezone(&Utc);
     let denied_at_str: Option<String> = row.get("denied_at")?;
     let denied_at = denied_at_str
         .as_deref()
         .map(|s| DateTime::parse_from_rfc3339(s).map(|d| d.with_timezone(&Utc)))
         .transpose()
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?;
     let is_group_int: i64 = row.get("is_group")?;
     Ok(MessagingGroup {
         id: MessagingGroupId(id),
@@ -287,7 +292,7 @@ mod tests {
 
     #[test]
     fn get_with_agent_count_reflects_wiring_count() {
-        use crate::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+        use crate::tables::agent_groups::{CreateAgentGroup, create as create_ag};
         let db = db();
         let mg = upsert(&db, sample("p1")).unwrap();
         let ag = create_ag(

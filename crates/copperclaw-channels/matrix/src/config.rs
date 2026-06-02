@@ -145,7 +145,9 @@ fn required_nonempty_string(
         Some(_) => Err(AdapterError::BadRequest(format!(
             "matrix {key} must be a string"
         ))),
-        None => Err(AdapterError::BadRequest(format!("matrix {key} is required"))),
+        None => Err(AdapterError::BadRequest(format!(
+            "matrix {key} is required"
+        ))),
     }
 }
 

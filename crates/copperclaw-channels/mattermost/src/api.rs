@@ -135,21 +135,14 @@ impl MattermostApi {
 
     /// `PUT /api/v4/posts/{post_id}/patch` — edit an existing post's
     /// text.
-    pub async fn update_post(
-        &self,
-        post_id: &str,
-        message: &str,
-    ) -> Result<(), AdapterError> {
+    pub async fn update_post(&self, post_id: &str, message: &str) -> Result<(), AdapterError> {
         #[derive(Serialize)]
         struct Patch<'a> {
             message: &'a str,
         }
         let res = self
             .client
-            .put(format!(
-                "{}/api/v4/posts/{post_id}/patch",
-                self.base_url
-            ))
+            .put(format!("{}/api/v4/posts/{post_id}/patch", self.base_url))
             .bearer_auth(&self.token)
             .json(&Patch { message })
             .send()
@@ -388,7 +381,9 @@ mod tests {
         let mock = server().await;
         Mock::given(method("POST"))
             .and(path("/api/v4/reactions"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"emoji_name":"thumbsup"})))
+            .respond_with(
+                ResponseTemplate::new(201).set_body_json(json!({"emoji_name":"thumbsup"})),
+            )
             .mount(&mock)
             .await;
         let api = MattermostApi::new(&mock.uri(), "t");
@@ -434,9 +429,7 @@ mod tests {
         let mock = server().await;
         Mock::given(method("POST"))
             .and(path("/api/v4/files"))
-            .respond_with(
-                ResponseTemplate::new(201).set_body_json(json!({ "file_infos": [] })),
-            )
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "file_infos": [] })))
             .mount(&mock)
             .await;
         let api = MattermostApi::new(&mock.uri(), "t");

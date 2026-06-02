@@ -16,7 +16,7 @@ pub mod schedule_task {
 
     use crate::context::{OutboundToolEffect, ScheduleSpec, ToolContext};
     use crate::error::ToolError;
-    use crate::tools::{ack_to_result, make_tool, parse_args, ToolEntry, ToolHandler};
+    use crate::tools::{ToolEntry, ToolHandler, ack_to_result, make_tool, parse_args};
     use chrono::{DateTime, Utc};
     use rmcp::model::{CallToolResult, JsonObject, Tool};
     use serde::Deserialize;
@@ -108,7 +108,7 @@ pub mod list_tasks {
 
     use crate::context::ToolContext;
     use crate::error::ToolError;
-    use crate::tools::{make_tool, success_json, ToolEntry, ToolHandler};
+    use crate::tools::{ToolEntry, ToolHandler, make_tool, success_json};
     use rmcp::model::{CallToolResult, JsonObject, Tool};
 
     pub fn schema() -> Tool {
@@ -156,7 +156,7 @@ pub mod cancel_task {
     use super::validate_task_id;
     use crate::context::{OutboundToolEffect, ToolContext};
     use crate::error::ToolError;
-    use crate::tools::{ack_to_result, make_tool, parse_args, ToolEntry, ToolHandler};
+    use crate::tools::{ToolEntry, ToolHandler, ack_to_result, make_tool, parse_args};
     use rmcp::model::{CallToolResult, JsonObject, Tool};
     use serde::Deserialize;
 
@@ -215,7 +215,7 @@ pub mod pause_task {
     use super::validate_task_id;
     use crate::context::{OutboundToolEffect, ToolContext};
     use crate::error::ToolError;
-    use crate::tools::{ack_to_result, make_tool, parse_args, ToolEntry, ToolHandler};
+    use crate::tools::{ToolEntry, ToolHandler, ack_to_result, make_tool, parse_args};
     use rmcp::model::{CallToolResult, JsonObject, Tool};
     use serde::Deserialize;
 
@@ -274,7 +274,7 @@ pub mod resume_task {
     use super::validate_task_id;
     use crate::context::{OutboundToolEffect, ToolContext};
     use crate::error::ToolError;
-    use crate::tools::{ack_to_result, make_tool, parse_args, ToolEntry, ToolHandler};
+    use crate::tools::{ToolEntry, ToolHandler, ack_to_result, make_tool, parse_args};
     use rmcp::model::{CallToolResult, JsonObject, Tool};
     use serde::Deserialize;
 
@@ -334,7 +334,7 @@ pub mod update_task {
     use super::validate_task_id;
     use crate::context::{OutboundToolEffect, ToolContext, UpdateTaskSpec};
     use crate::error::ToolError;
-    use crate::tools::{ack_to_result, make_tool, parse_args, ToolEntry, ToolHandler};
+    use crate::tools::{ToolEntry, ToolHandler, ack_to_result, make_tool, parse_args};
     use chrono::{DateTime, Utc};
     use rmcp::model::{CallToolResult, JsonObject, Tool};
     use serde::Deserialize;
@@ -559,11 +559,7 @@ mod tests {
         }]);
         let res = super::list_tasks::handle(None, &ctx).await.unwrap();
         assert_eq!(res.is_error, Some(false));
-        let text = res.content[0]
-            .as_text()
-            .expect("text content")
-            .text
-            .clone();
+        let text = res.content[0].as_text().expect("text content").text.clone();
         assert!(text.contains("task_1"), "got: {text}");
     }
 
@@ -578,12 +574,9 @@ mod tests {
     #[tokio::test]
     async fn cancel_happy() {
         let ctx = MockToolContext::new();
-        super::cancel_task::handle(
-            args_from(serde_json::json!({"id": "task_1"})),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        super::cancel_task::handle(args_from(serde_json::json!({"id": "task_1"})), &ctx)
+            .await
+            .unwrap();
         assert!(matches!(
             &ctx.calls()[0],
             OutboundToolEffect::CancelTask { id } if id == "task_1"
@@ -688,12 +681,9 @@ mod tests {
     #[tokio::test]
     async fn update_task_requires_at_least_one_field() {
         let ctx = MockToolContext::new();
-        let err = super::update_task::handle(
-            args_from(serde_json::json!({"id": "task_1"})),
-            &ctx,
-        )
-        .await
-        .unwrap_err();
+        let err = super::update_task::handle(args_from(serde_json::json!({"id": "task_1"})), &ctx)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::Validation(_)));
     }
 

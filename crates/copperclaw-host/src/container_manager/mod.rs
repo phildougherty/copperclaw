@@ -42,14 +42,17 @@ pub mod runner_config;
 pub mod spawn;
 pub mod tasks_snapshot;
 
-pub use config::{ManagerConfig, RotatableConfig, SkillsMode, ROTATABLE_ENV_KEYS};
-pub use prompt::{BASE_PREAMBLE, MEMORY_UNAVAILABLE_FILENAME, PROJECT_BRIEFING_FILENAME, SKILLS_CATALOGUE_FILENAME};
-pub use tasks_snapshot::TASKS_SNAPSHOT_FILENAME;
-pub use spawn::{
-    resolve_rebuild_base, RebuildBackoff, CODING_SKILL_NAMES, CONTAINER_RUNNER_PATH,
-    CONTAINER_SESSION_DIR, DEFAULT_HEARTBEAT_STALE_SECS, DEFAULT_IDLE_TIMEOUT_SECS,
-    DEFAULT_STOP_GRACE_SECS, POLL_INTERVAL_MS, RUNNER_CONFIG_FILENAME,
+pub use config::{ManagerConfig, ROTATABLE_ENV_KEYS, RotatableConfig, SkillsMode};
+pub use prompt::{
+    BASE_PREAMBLE, MEMORY_UNAVAILABLE_FILENAME, PROJECT_BRIEFING_FILENAME,
+    SKILLS_CATALOGUE_FILENAME,
 };
+pub use spawn::{
+    CODING_SKILL_NAMES, CONTAINER_RUNNER_PATH, CONTAINER_SESSION_DIR, DEFAULT_HEARTBEAT_STALE_SECS,
+    DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_STOP_GRACE_SECS, POLL_INTERVAL_MS, RUNNER_CONFIG_FILENAME,
+    RebuildBackoff, resolve_rebuild_base,
+};
+pub use tasks_snapshot::TASKS_SNAPSHOT_FILENAME;
 
 pub use classify::ReconcileAction;
 
@@ -84,7 +87,9 @@ pub enum ManagerError {
     /// The host entered degraded mode at boot (e.g. session image is
     /// missing or stale). Sessions cannot be spawned until the
     /// operator runs `./rebuild.sh` and restarts the host.
-    #[error("host degraded; refusing to spawn sessions until the operator restarts after `./rebuild.sh`")]
+    #[error(
+        "host degraded; refusing to spawn sessions until the operator restarts after `./rebuild.sh`"
+    )]
     HostDegraded,
 }
 
@@ -98,16 +103,14 @@ pub struct ContainerManager {
     /// sends ten messages while over the cap gets one explanation,
     /// not ten. Process-local — a host restart re-notifies once,
     /// which is acceptable.
-    pub(crate) last_budget_notice: std::sync::Mutex<
-        std::collections::HashMap<AgentGroupId, chrono::DateTime<chrono::Utc>>,
-    >,
+    pub(crate) last_budget_notice:
+        std::sync::Mutex<std::collections::HashMap<AgentGroupId, chrono::DateTime<chrono::Utc>>>,
     /// Same shape as `last_budget_notice` but for per-minute /
     /// per-hour LLM rate-limit notifications. Keyed by
     /// `AgentGroupId`; value is the UTC time of the last
     /// notification sent (minute OR hour cap, whichever fired).
-    pub(crate) rate_limit_notified: std::sync::Mutex<
-        std::collections::HashMap<AgentGroupId, chrono::DateTime<chrono::Utc>>,
-    >,
+    pub(crate) rate_limit_notified:
+        std::sync::Mutex<std::collections::HashMap<AgentGroupId, chrono::DateTime<chrono::Utc>>>,
     /// Hot-swappable subset of the config (provider API keys + base
     /// URL + forwarded provider keys). Initialized from `cfg` at
     /// construction; updated by [`Self::reload_env`] on SIGHUP. Reads
@@ -147,11 +150,7 @@ pub struct ContainerManager {
 impl ContainerManager {
     /// Build a new manager.
     #[must_use]
-    pub fn new(
-        central: CentralDb,
-        runtime: Arc<dyn ContainerRuntime>,
-        cfg: ManagerConfig,
-    ) -> Self {
+    pub fn new(central: CentralDb, runtime: Arc<dyn ContainerRuntime>, cfg: ManagerConfig) -> Self {
         Self {
             central,
             runtime,
@@ -309,11 +308,7 @@ impl ContainerManager {
                     session.agent_group_id,
                     session.id,
                 );
-                tasks_snapshot::write_tasks_snapshot(
-                    &self.central,
-                    session.id,
-                    &paths.root,
-                );
+                tasks_snapshot::write_tasks_snapshot(&self.central, session.id, &paths.root);
             }
             let action = self.classify(&session);
             if let Err(err) = self.apply(&session, action).await {

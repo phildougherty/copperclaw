@@ -98,10 +98,7 @@ mod tests {
 
     #[test]
     fn multiple_double_quotes_each_escaped() {
-        assert_eq!(
-            applescript_escape("a\"b\"c").unwrap(),
-            "a\\\"b\\\"c",
-        );
+        assert_eq!(applescript_escape("a\"b\"c").unwrap(), "a\\\"b\\\"c",);
     }
 
     #[test]
@@ -222,18 +219,12 @@ mod tests {
 
     #[test]
     fn many_consecutive_quotes() {
-        assert_eq!(
-            applescript_escape("\"\"\"").unwrap(),
-            "\\\"\\\"\\\""
-        );
+        assert_eq!(applescript_escape("\"\"\"").unwrap(), "\\\"\\\"\\\"");
     }
 
     #[test]
     fn many_consecutive_backslashes() {
-        assert_eq!(
-            applescript_escape("\\\\\\").unwrap(),
-            "\\\\\\\\\\\\"
-        );
+        assert_eq!(applescript_escape("\\\\\\").unwrap(), "\\\\\\\\\\\\");
     }
 
     #[test]

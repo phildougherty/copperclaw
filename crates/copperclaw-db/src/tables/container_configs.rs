@@ -1,10 +1,10 @@
 //! CRUD for `container_configs`.
 
-use crate::central::CentralDb;
 use crate::DbError;
+use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
 use copperclaw_types::{AgentGroupId, Effort};
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{OptionalExtension, Row, params};
 use serde::de::{self, Deserializer};
 use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
@@ -61,11 +61,9 @@ impl<'de> Deserialize<'de> for SkillsSelector {
             serde_json::Value::String(other) => Err(de::Error::custom(format!(
                 "expected \"all\", got \"{other}\""
             ))),
-            serde_json::Value::Array(_) => {
-                serde_json::from_value::<Vec<String>>(v)
-                    .map(SkillsSelector::Explicit)
-                    .map_err(de::Error::custom)
-            }
+            serde_json::Value::Array(_) => serde_json::from_value::<Vec<String>>(v)
+                .map(SkillsSelector::Explicit)
+                .map_err(de::Error::custom),
             other => Err(de::Error::custom(format!(
                 "expected \"all\" or a JSON array, got {other}"
             ))),
@@ -193,31 +191,44 @@ fn parse_effort(s: &str) -> rusqlite::Result<Effort> {
 
 fn row_to_container_config(row: &Row<'_>) -> rusqlite::Result<ContainerConfig> {
     let agent_group_id_str: String = row.get("agent_group_id")?;
-    let agent_group_uuid = uuid::Uuid::parse_str(&agent_group_id_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let agent_group_uuid = uuid::Uuid::parse_str(&agent_group_id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let effort_str: Option<String> = row.get("effort")?;
     let effort = effort_str.as_deref().map(parse_effort).transpose()?;
     let max_messages: Option<i64> = row.get("max_messages_per_prompt")?;
     let max_messages_per_prompt = max_messages
-        .map(|v| u32::try_from(v).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Integer, Box::new(e))
-        }))
+        .map(|v| {
+            u32::try_from(v).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    Box::new(e),
+                )
+            })
+        })
         .transpose()?;
     let skills_str: String = row.get("skills")?;
-    let skills = SkillsSelector::from_json_str(&skills_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let skills = SkillsSelector::from_json_str(&skills_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let mcp_servers_str: String = row.get("mcp_servers")?;
-    let mcp_servers: serde_json::Value = serde_json::from_str(&mcp_servers_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let mcp_servers: serde_json::Value = serde_json::from_str(&mcp_servers_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let packages_apt_str: String = row.get("packages_apt")?;
-    let packages_apt: Vec<String> = serde_json::from_str(&packages_apt_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let packages_apt: Vec<String> = serde_json::from_str(&packages_apt_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let packages_npm_str: String = row.get("packages_npm")?;
-    let packages_npm: Vec<String> = serde_json::from_str(&packages_npm_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let packages_npm: Vec<String> = serde_json::from_str(&packages_npm_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let additional_mounts_str: String = row.get("additional_mounts")?;
     let additional_mounts: serde_json::Value = serde_json::from_str(&additional_mounts_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?;
     let cli_scope_str: String = row.get("cli_scope")?;
     let cli_scope = CliScope::parse(&cli_scope_str).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -228,18 +239,23 @@ fn row_to_container_config(row: &Row<'_>) -> rusqlite::Result<ContainerConfig> {
     })?;
     let config_fingerprint: Option<String> = row.get("config_fingerprint")?;
     let egress_allow_str: String = row.get("egress_allow")?;
-    let egress_allow: Vec<String> = serde_json::from_str(&egress_allow_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let egress_allow: Vec<String> = serde_json::from_str(&egress_allow_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let resource_limits_str: String = row.get("resource_limits")?;
-    let resource_limits: serde_json::Value = serde_json::from_str(&resource_limits_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let resource_limits: serde_json::Value =
+        serde_json::from_str(&resource_limits_str).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?;
     let coding_enabled_int: i64 = row.get("coding_enabled")?;
     let coding_enabled = coding_enabled_int != 0;
     let surface_thinking_int: i64 = row.get("surface_thinking")?;
     let surface_thinking = surface_thinking_int != 0;
     let updated_at_str: String = row.get("updated_at")?;
     let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .with_timezone(&Utc);
     Ok(ContainerConfig {
         agent_group_id: AgentGroupId(agent_group_uuid),
@@ -264,7 +280,10 @@ fn row_to_container_config(row: &Row<'_>) -> rusqlite::Result<ContainerConfig> {
     })
 }
 
-pub fn get(db: &CentralDb, agent_group_id: AgentGroupId) -> Result<Option<ContainerConfig>, DbError> {
+pub fn get(
+    db: &CentralDb,
+    agent_group_id: AgentGroupId,
+) -> Result<Option<ContainerConfig>, DbError> {
     let conn = db.conn()?;
     Ok(conn
         .query_row(
@@ -387,7 +406,11 @@ pub fn set_skills(
         "UPDATE container_configs
          SET skills = ?1, updated_at = ?2
          WHERE agent_group_id = ?3",
-        params![json, Utc::now().to_rfc3339(), agent_group_id.as_uuid().to_string()],
+        params![
+            json,
+            Utc::now().to_rfc3339(),
+            agent_group_id.as_uuid().to_string()
+        ],
     )?;
     if n == 0 {
         return Err(DbError::NotFound);
@@ -423,7 +446,11 @@ pub fn set_mcp_servers(
         "UPDATE container_configs
          SET mcp_servers = ?1, updated_at = ?2
          WHERE agent_group_id = ?3",
-        params![json, Utc::now().to_rfc3339(), agent_group_id.as_uuid().to_string()],
+        params![
+            json,
+            Utc::now().to_rfc3339(),
+            agent_group_id.as_uuid().to_string()
+        ],
     )?;
     if n == 0 {
         return Err(DbError::NotFound);
@@ -458,7 +485,11 @@ where
              SET {column} = ?1, updated_at = ?2
              WHERE agent_group_id = ?3"
         ),
-        params![updated, Utc::now().to_rfc3339(), agent_group_id.as_uuid().to_string()],
+        params![
+            updated,
+            Utc::now().to_rfc3339(),
+            agent_group_id.as_uuid().to_string()
+        ],
     )?;
     if n == 0 {
         return Err(DbError::NotFound);
@@ -602,7 +633,11 @@ pub fn set_egress_allow(
         "UPDATE container_configs
          SET egress_allow = ?1, updated_at = ?2
          WHERE agent_group_id = ?3",
-        params![json, Utc::now().to_rfc3339(), agent_group_id.as_uuid().to_string()],
+        params![
+            json,
+            Utc::now().to_rfc3339(),
+            agent_group_id.as_uuid().to_string()
+        ],
     )?;
     if n == 0 {
         return Err(DbError::NotFound);
@@ -707,7 +742,11 @@ pub fn set_resource_limits(
         "UPDATE container_configs
          SET resource_limits = ?1, updated_at = ?2
          WHERE agent_group_id = ?3",
-        params![json, Utc::now().to_rfc3339(), agent_group_id.as_uuid().to_string()],
+        params![
+            json,
+            Utc::now().to_rfc3339(),
+            agent_group_id.as_uuid().to_string()
+        ],
     )?;
     if n == 0 {
         return Err(DbError::NotFound);
@@ -718,7 +757,7 @@ pub fn set_resource_limits(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+    use crate::tables::agent_groups::{CreateAgentGroup, create as create_ag};
     use serde_json::json;
 
     fn db() -> CentralDb {
@@ -771,16 +810,28 @@ mod tests {
 
     #[test]
     fn cli_scope_serde_lowercase() {
-        assert_eq!(serde_json::to_string(&CliScope::Disabled).unwrap(), "\"disabled\"");
-        assert_eq!(serde_json::to_string(&CliScope::Group).unwrap(), "\"group\"");
-        assert_eq!(serde_json::to_string(&CliScope::Global).unwrap(), "\"global\"");
+        assert_eq!(
+            serde_json::to_string(&CliScope::Disabled).unwrap(),
+            "\"disabled\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CliScope::Group).unwrap(),
+            "\"group\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CliScope::Global).unwrap(),
+            "\"global\""
+        );
     }
 
     #[test]
     fn skills_selector_serde_all() {
         let s: SkillsSelector = serde_json::from_str("\"all\"").unwrap();
         assert_eq!(s, SkillsSelector::All);
-        assert_eq!(serde_json::to_string(&SkillsSelector::All).unwrap(), "\"all\"");
+        assert_eq!(
+            serde_json::to_string(&SkillsSelector::All).unwrap(),
+            "\"all\""
+        );
     }
 
     #[test]
@@ -851,7 +902,10 @@ mod tests {
         assert_eq!(fetched.additional_mounts, json!([{"src": "/x"}]));
         assert_eq!(fetched.cli_scope, CliScope::Global);
         assert_eq!(fetched.config_fingerprint.as_deref(), Some("abc123"));
-        assert_eq!(fetched.egress_allow, vec!["api.example.com:443".to_string()]);
+        assert_eq!(
+            fetched.egress_allow,
+            vec!["api.example.com:443".to_string()]
+        );
         assert_eq!(fetched.resource_limits["cpus"], "1.5");
         assert_eq!(fetched.resource_limits["memory_mb"], 512);
         assert!(fetched.coding_enabled);
@@ -1185,7 +1239,10 @@ mod tests {
         upsert(&db, minimal_req(ag)).unwrap();
         set_image_tag_and_fingerprint(&db, ag, "copperclaw/session:sha256-abc", "abc").unwrap();
         let cfg = get(&db, ag).unwrap().unwrap();
-        assert_eq!(cfg.image_tag.as_deref(), Some("copperclaw/session:sha256-abc"));
+        assert_eq!(
+            cfg.image_tag.as_deref(),
+            Some("copperclaw/session:sha256-abc")
+        );
         assert_eq!(cfg.config_fingerprint.as_deref(), Some("abc"));
     }
 
@@ -1203,7 +1260,10 @@ mod tests {
         upsert(&db, minimal_req(ag)).unwrap();
         let initial = get_egress_allow(&db, ag).unwrap();
         assert!(initial.is_empty());
-        let hosts = vec!["api.example.com:443".to_string(), "db.local:5432".to_string()];
+        let hosts = vec![
+            "api.example.com:443".to_string(),
+            "db.local:5432".to_string(),
+        ];
         set_egress_allow(&db, ag, &hosts).unwrap();
         let fetched = get_egress_allow(&db, ag).unwrap();
         assert_eq!(fetched, hosts);

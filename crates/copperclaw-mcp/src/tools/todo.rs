@@ -28,14 +28,14 @@
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
-use copperclaw_channels_core::{TodoItemStatus, TodoList, TodoListItem, TODO_MAX_ITEMS};
+use copperclaw_channels_core::{TODO_MAX_ITEMS, TodoItemStatus, TodoList, TodoListItem};
 use rmcp::model::{CallToolResult, JsonObject, Tool};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::context::{EmitTodoListSpec, OutboundToolEffect, ToolContext};
 use crate::error::ToolError;
-use crate::tools::{make_tool, parse_args, success_json, ToolEntry, ToolHandler};
+use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args, success_json};
 
 /// Default location of the per-session todo file. The session dir is
 /// bind-mounted to `/data`, so todos persist across runner restarts of
@@ -187,7 +187,12 @@ async fn write_all(items: &[TodoItem]) -> Result<(), ToolError> {
 }
 
 fn next_id(items: &[TodoItem]) -> u32 {
-    items.iter().map(|i| i.id).max().unwrap_or(0).saturating_add(1)
+    items
+        .iter()
+        .map(|i| i.id)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
 }
 
 /// Map a storage-side `TodoStatus` onto the canonical wire-shape
@@ -220,16 +225,15 @@ fn build_wire_list(items: &[TodoItem]) -> Option<TodoList> {
             // Truncate at the schema cap. Cap > 200 chars by
             // dropping the tail with an ellipsis so the adapter
             // doesn't reject the row.
-            let text = if trimmed.chars().count()
-                > copperclaw_channels_core::TODO_MAX_ITEM_TEXT_CHARS
-            {
-                let cap = copperclaw_channels_core::TODO_MAX_ITEM_TEXT_CHARS - 1;
-                let mut out: String = trimmed.chars().take(cap).collect();
-                out.push('…');
-                out
-            } else {
-                trimmed.to_owned()
-            };
+            let text =
+                if trimmed.chars().count() > copperclaw_channels_core::TODO_MAX_ITEM_TEXT_CHARS {
+                    let cap = copperclaw_channels_core::TODO_MAX_ITEM_TEXT_CHARS - 1;
+                    let mut out: String = trimmed.chars().take(cap).collect();
+                    out.push('…');
+                    out
+                } else {
+                    trimmed.to_owned()
+                };
             TodoListItem {
                 id: it.id,
                 text,
@@ -282,9 +286,9 @@ pub mod add {
     //! `todo_add`: append a new pending item.
 
     use super::{
-        emit_after_mutation, json, make_tool, next_id, parse_args, read_all, success_json,
-        write_all, CallToolResult, Deserialize, JsonObject, ToolEntry, ToolError, ToolHandler,
-        TodoItem, TodoStatus, Utc,
+        CallToolResult, Deserialize, JsonObject, TodoItem, TodoStatus, ToolEntry, ToolError,
+        ToolHandler, Utc, emit_after_mutation, json, make_tool, next_id, parse_args, read_all,
+        success_json, write_all,
     };
 
     #[derive(Debug, Deserialize)]
@@ -364,8 +368,8 @@ pub mod list {
     //! `todo_list`: return every item with id + status + text.
 
     use super::{
-        json, make_tool, parse_args, read_all, success_json, CallToolResult, Deserialize,
-        JsonObject, ToolEntry, ToolError, ToolHandler,
+        CallToolResult, Deserialize, JsonObject, ToolEntry, ToolError, ToolHandler, json,
+        make_tool, parse_args, read_all, success_json,
     };
 
     #[derive(Debug, Deserialize, Default)]
@@ -416,9 +420,8 @@ pub mod update {
     //! `todo_update`: change an item's text and/or status.
 
     use super::{
-        emit_after_mutation, json, make_tool, parse_args, read_all, success_json, write_all,
-        CallToolResult, Deserialize, JsonObject, ToolEntry, ToolError, ToolHandler, TodoStatus,
-        Utc,
+        CallToolResult, Deserialize, JsonObject, TodoStatus, ToolEntry, ToolError, ToolHandler,
+        Utc, emit_after_mutation, json, make_tool, parse_args, read_all, success_json, write_all,
     };
 
     #[derive(Debug, Deserialize)]
@@ -604,7 +607,8 @@ pub mod update {
                      returned 200`, `verified server starts on port 3000`). Pure delivery \
                      claims without verification (`wrote 5 files`, `done`, `finished`) are \
                      rejected for non-write items. If you can't cite a verification step, \
-                     leave the todo `in_progress`.".into(),
+                     leave the todo `in_progress`."
+                        .into(),
                 ));
             }
         }
@@ -653,8 +657,8 @@ pub mod delete {
     //! `todo_delete`: drop an item.
 
     use super::{
-        emit_after_mutation, json, make_tool, parse_args, read_all, success_json, write_all,
         CallToolResult, Deserialize, JsonObject, ToolEntry, ToolError, ToolHandler,
+        emit_after_mutation, json, make_tool, parse_args, read_all, success_json, write_all,
     };
 
     #[derive(Debug, Deserialize)]
@@ -740,7 +744,10 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let dir = tempfile::tempdir().expect("tempdir");
             todo_test_override_set(dir.path().join("agent_todos.json"));
-            Self { _dir: dir, _lock: lock }
+            Self {
+                _dir: dir,
+                _lock: lock,
+            }
         }
     }
 
@@ -790,9 +797,21 @@ mod tests {
     async fn add_assigns_monotonic_ids() {
         let _g = TodoGuard::new();
         let ctx = MockToolContext::new();
-        let a = body_json(&add::handle(obj(json!({"text": "one"})), &ctx).await.unwrap());
-        let b = body_json(&add::handle(obj(json!({"text": "two"})), &ctx).await.unwrap());
-        let c = body_json(&add::handle(obj(json!({"text": "three"})), &ctx).await.unwrap());
+        let a = body_json(
+            &add::handle(obj(json!({"text": "one"})), &ctx)
+                .await
+                .unwrap(),
+        );
+        let b = body_json(
+            &add::handle(obj(json!({"text": "two"})), &ctx)
+                .await
+                .unwrap(),
+        );
+        let c = body_json(
+            &add::handle(obj(json!({"text": "three"})), &ctx)
+                .await
+                .unwrap(),
+        );
         let a_id = a["id"].as_u64().unwrap();
         let b_id = b["id"].as_u64().unwrap();
         let c_id = c["id"].as_u64().unwrap();
@@ -803,7 +822,9 @@ mod tests {
     async fn add_rejects_empty_text() {
         let _g = TodoGuard::new();
         let ctx = MockToolContext::new();
-        let err = add::handle(obj(json!({"text": "   "})), &ctx).await.unwrap_err();
+        let err = add::handle(obj(json!({"text": "   "})), &ctx)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::Validation(_)));
     }
 
@@ -821,7 +842,9 @@ mod tests {
         let _g = TodoGuard::new();
         let ctx = MockToolContext::new();
         let added = body_json(
-            &add::handle(obj(json!({"text": "original"})), &ctx).await.unwrap(),
+            &add::handle(obj(json!({"text": "original"})), &ctx)
+                .await
+                .unwrap(),
         );
         let id = added["id"].as_u64().unwrap();
         let updated = body_json(
@@ -847,15 +870,14 @@ mod tests {
         let _g = TodoGuard::new();
         let ctx = MockToolContext::new();
         let added = body_json(
-            &add::handle(obj(json!({"text": "build backend"})), &ctx).await.unwrap(),
+            &add::handle(obj(json!({"text": "build backend"})), &ctx)
+                .await
+                .unwrap(),
         );
         let id = added["id"].as_u64().unwrap();
-        let err = update::handle(
-            obj(json!({"id": id, "status": "completed"})),
-            &ctx,
-        )
-        .await
-        .unwrap_err();
+        let err = update::handle(obj(json!({"id": id, "status": "completed"})), &ctx)
+            .await
+            .unwrap_err();
         match err {
             ToolError::Validation(msg) => assert!(
                 msg.contains("evidence"),
@@ -869,9 +891,7 @@ mod tests {
     async fn update_completed_with_generic_evidence_is_rejected() {
         let _g = TodoGuard::new();
         let ctx = MockToolContext::new();
-        let added = body_json(
-            &add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap(),
-        );
+        let added = body_json(&add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap());
         let id = added["id"].as_u64().unwrap();
         for generic in &["done", "complete", "finished", "all set", "ok"] {
             let err = update::handle(
@@ -891,9 +911,7 @@ mod tests {
     async fn update_completed_with_substantive_evidence_succeeds() {
         let _g = TodoGuard::new();
         let ctx = MockToolContext::new();
-        let added = body_json(
-            &add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap(),
-        );
+        let added = body_json(&add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap());
         let id = added["id"].as_u64().unwrap();
         let updated = body_json(
             &update::handle(
@@ -917,9 +935,7 @@ mod tests {
         // "wrote 2 files" (13 chars passed old gate, fails new).
         let _g = TodoGuard::new();
         let ctx = MockToolContext::new();
-        let added = body_json(
-            &add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap(),
-        );
+        let added = body_json(&add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap());
         let id = added["id"].as_u64().unwrap();
         // 39 chars — just under the new threshold, even with a path.
         let err = update::handle(
@@ -1003,27 +1019,22 @@ mod tests {
         // pending updates are uninhibited.
         let _g = TodoGuard::new();
         let ctx = MockToolContext::new();
-        let added = body_json(
-            &add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap(),
-        );
+        let added = body_json(&add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap());
         let id = added["id"].as_u64().unwrap();
-        update::handle(
-            obj(json!({"id": id, "status": "in_progress"})),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        update::handle(obj(json!({"id": id, "status": "in_progress"})), &ctx)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
     async fn update_requires_at_least_one_field() {
         let _g = TodoGuard::new();
         let ctx = MockToolContext::new();
-        let added = body_json(
-            &add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap(),
-        );
+        let added = body_json(&add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap());
         let id = added["id"].as_u64().unwrap();
-        let err = update::handle(obj(json!({"id": id})), &ctx).await.unwrap_err();
+        let err = update::handle(obj(json!({"id": id})), &ctx)
+            .await
+            .unwrap_err();
         assert!(matches!(err, ToolError::Validation(msg) if msg.contains("at least one")));
     }
 
@@ -1031,12 +1042,9 @@ mod tests {
     async fn update_errors_on_unknown_id() {
         let _g = TodoGuard::new();
         let ctx = MockToolContext::new();
-        let err = update::handle(
-            obj(json!({"id": 999, "status": "completed"})),
-            &ctx,
-        )
-        .await
-        .unwrap_err();
+        let err = update::handle(obj(json!({"id": 999, "status": "completed"})), &ctx)
+            .await
+            .unwrap_err();
         match err {
             ToolError::Validation(msg) => assert!(msg.contains("999")),
             other => panic!("expected Validation, got {other:?}"),
@@ -1048,7 +1056,9 @@ mod tests {
         let _g = TodoGuard::new();
         let ctx = MockToolContext::new();
         let added = body_json(
-            &add::handle(obj(json!({"text": "drop me"})), &ctx).await.unwrap(),
+            &add::handle(obj(json!({"text": "drop me"})), &ctx)
+                .await
+                .unwrap(),
         );
         let id = added["id"].as_u64().unwrap();
         delete::handle(obj(json!({"id": id})), &ctx).await.unwrap();
@@ -1060,7 +1070,9 @@ mod tests {
     async fn delete_errors_on_unknown_id() {
         let _g = TodoGuard::new();
         let ctx = MockToolContext::new();
-        let err = delete::handle(obj(json!({"id": 42})), &ctx).await.unwrap_err();
+        let err = delete::handle(obj(json!({"id": 42})), &ctx)
+            .await
+            .unwrap_err();
         match err {
             ToolError::Validation(msg) => assert!(msg.contains("42")),
             other => panic!("expected Validation, got {other:?}"),
@@ -1075,7 +1087,10 @@ mod tests {
             update::entry().tool.name.to_string(),
             delete::entry().tool.name.to_string(),
         ];
-        assert_eq!(names, ["todo_add", "todo_list", "todo_update", "todo_delete"]);
+        assert_eq!(
+            names,
+            ["todo_add", "todo_list", "todo_update", "todo_delete"]
+        );
     }
 
     // ── TodoList emit pipeline ────────────────────────────────────
@@ -1106,16 +1121,11 @@ mod tests {
     async fn update_emits_full_post_mutation_todo_list() {
         let _g = TodoGuard::new();
         let ctx = MockToolContext::new();
-        let added = body_json(
-            &add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap(),
-        );
+        let added = body_json(&add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap());
         let id = added["id"].as_u64().unwrap();
-        update::handle(
-            obj(json!({"id": id, "status": "in_progress"})),
-            &ctx,
-        )
-        .await
-        .unwrap();
+        update::handle(obj(json!({"id": id, "status": "in_progress"})), &ctx)
+            .await
+            .unwrap();
         let calls = ctx.calls();
         let emits: Vec<_> = calls
             .iter()
@@ -1138,24 +1148,36 @@ mod tests {
         let _g = TodoGuard::new();
         let ctx = MockToolContext::new();
         let a = body_json(
-            &add::handle(obj(json!({"text": "one"})), &ctx).await.unwrap(),
+            &add::handle(obj(json!({"text": "one"})), &ctx)
+                .await
+                .unwrap(),
         );
         let b = body_json(
-            &add::handle(obj(json!({"text": "two"})), &ctx).await.unwrap(),
+            &add::handle(obj(json!({"text": "two"})), &ctx)
+                .await
+                .unwrap(),
         );
         let a_id = a["id"].as_u64().unwrap();
         let b_id = b["id"].as_u64().unwrap();
         // 2 adds → 2 emits so far.
-        delete::handle(obj(json!({"id": a_id})), &ctx).await.unwrap();
+        delete::handle(obj(json!({"id": a_id})), &ctx)
+            .await
+            .unwrap();
         // 1 item left → emit.
-        delete::handle(obj(json!({"id": b_id})), &ctx).await.unwrap();
+        delete::handle(obj(json!({"id": b_id})), &ctx)
+            .await
+            .unwrap();
         // 0 items left → NO emit.
         let emits: Vec<_> = ctx
             .calls()
             .into_iter()
             .filter(|c| matches!(c, OutboundToolEffect::EmitTodoList(_)))
             .collect();
-        assert_eq!(emits.len(), 3, "expected 3 emits: 2 adds + 1 non-empty delete");
+        assert_eq!(
+            emits.len(),
+            3,
+            "expected 3 emits: 2 adds + 1 non-empty delete"
+        );
     }
 
     #[tokio::test]
@@ -1176,9 +1198,7 @@ mod tests {
 
     #[test]
     fn build_wire_list_truncates_overlong_item_text() {
-        let long_text = "a".repeat(
-            copperclaw_channels_core::TODO_MAX_ITEM_TEXT_CHARS + 50,
-        );
+        let long_text = "a".repeat(copperclaw_channels_core::TODO_MAX_ITEM_TEXT_CHARS + 50);
         let items = vec![TodoItem {
             id: 1,
             text: long_text,
@@ -1208,7 +1228,9 @@ mod tests {
         // Pre-seed garbage at the temp path; write_all must overwrite
         // and then rename it away.
         tokio::fs::write(&tmp_path, b"garbage").await.unwrap();
-        add::handle(obj(json!({"text": "atomic"})), &ctx).await.unwrap();
+        add::handle(obj(json!({"text": "atomic"})), &ctx)
+            .await
+            .unwrap();
         assert!(
             !tokio::fs::try_exists(&tmp_path).await.unwrap(),
             "{} should have been renamed away after write_all",
@@ -1240,7 +1262,11 @@ mod tests {
                 break;
             }
         }
-        assert!(found, "expected a *.corrupt-* quarantine file in {}", parent.display());
+        assert!(
+            found,
+            "expected a *.corrupt-* quarantine file in {}",
+            parent.display()
+        );
     }
 
     #[tokio::test]
@@ -1248,7 +1274,9 @@ mod tests {
         let _g = TodoGuard::new();
         let ctx = MockToolContext::new();
         let path = todo_path();
-        tokio::fs::write(&path, b"[{\"id\":1,\"text\":\"foo\"").await.unwrap();
+        tokio::fs::write(&path, b"[{\"id\":1,\"text\":\"foo\"")
+            .await
+            .unwrap();
         let listed = list::handle(obj(json!({})), &ctx).await.unwrap();
         let arr = body_json(&listed);
         assert_eq!(arr.as_array().unwrap().len(), 0);
@@ -1270,8 +1298,12 @@ mod tests {
         let _g = TodoGuard::new();
         let ctx = MockToolContext::new();
         let path = todo_path();
-        tokio::fs::write(&path, b"definitely not json").await.unwrap();
-        let added = add::handle(obj(json!({"text": "new"})), &ctx).await.unwrap();
+        tokio::fs::write(&path, b"definitely not json")
+            .await
+            .unwrap();
+        let added = add::handle(obj(json!({"text": "new"})), &ctx)
+            .await
+            .unwrap();
         let added_json = body_json(&added);
         assert_eq!(added_json["text"], "new");
         let listed = body_json(&list::handle(obj(json!({})), &ctx).await.unwrap());

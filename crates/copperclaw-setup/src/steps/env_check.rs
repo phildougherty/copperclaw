@@ -6,7 +6,7 @@
 use crate::config::{EnvReport, SetupConfig};
 use crate::prompt::Prompt;
 use crate::state::SetupState;
-use crate::steps::{binary_on_path, Step, StepError, StepResult};
+use crate::steps::{Step, StepError, StepResult, binary_on_path};
 
 /// Step implementation.
 #[derive(Debug, Default)]

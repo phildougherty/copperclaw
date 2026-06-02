@@ -1,13 +1,13 @@
 //! Host-side mirror of the runner's `runner.json` schema, plus the assembler
 //! that builds one for a given session.
 
+use super::ContainerManager;
 use super::config::SkillsMode;
 use super::prompt::{
-    assemble_system_prompt_with_catalogue, db_selector_to_skills_selector, remove_stale_catalogue,
-    select_callable_skills, SkillCatalogueEntry, SKILLS_CATALOGUE_FILENAME,
+    SKILLS_CATALOGUE_FILENAME, SkillCatalogueEntry, assemble_system_prompt_with_catalogue,
+    db_selector_to_skills_selector, remove_stale_catalogue, select_callable_skills,
 };
 use super::spawn::{CODING_SKILL_NAMES, CONTAINER_SESSION_DIR};
-use super::ContainerManager;
 use copperclaw_db::tables::container_configs;
 use copperclaw_types::Session;
 use std::path::Path;
@@ -135,7 +135,11 @@ impl ContainerManager {
         let coding_enabled = cc.is_some_and(|c| c.coding_enabled);
         let exclude_coding =
             !coding_enabled && matches!(selector, copperclaw_skills::SkillsSelector::All);
-        let exclude_names: &[&str] = if exclude_coding { CODING_SKILL_NAMES } else { &[] };
+        let exclude_names: &[&str] = if exclude_coding {
+            CODING_SKILL_NAMES
+        } else {
+            &[]
+        };
         let now = chrono::Utc::now();
 
         // Build the Callable-mode catalogue first (if applicable) so we
@@ -206,8 +210,7 @@ impl ContainerManager {
             // this, every "I built X" turn dead-ends because the user
             // can't actually reach the artifacts.
             let host_path_marker = root.join(".host_path");
-            if let Err(err) = std::fs::write(&host_path_marker, root.to_string_lossy().as_bytes())
-            {
+            if let Err(err) = std::fs::write(&host_path_marker, root.to_string_lossy().as_bytes()) {
                 warn!(
                     ?err,
                     path = %host_path_marker.display(),
@@ -343,9 +346,7 @@ impl ContainerManager {
             max_messages_per_prompt: max_messages,
             codex_binary,
             codex_args,
-            source_session_id: session
-                .source_session_id
-                .map(|s| s.as_uuid().to_string()),
+            source_session_id: session.source_session_id.map(|s| s.as_uuid().to_string()),
             surface_thinking,
             effort,
             temperature,
@@ -363,8 +364,8 @@ mod tests {
     };
     use super::*;
     use copperclaw_db::central::CentralDb;
-    use copperclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
-    use copperclaw_db::tables::sessions::{create as create_session, CreateSession};
+    use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+    use copperclaw_db::tables::sessions::{CreateSession, create as create_session};
     use copperclaw_types::AgentGroupId;
     use std::path::PathBuf;
 
@@ -415,9 +416,7 @@ mod tests {
     fn write_skill_md(parent: &std::path::Path, name: &str, body: &str) {
         let dir = parent.join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        let content = format!(
-            "---\nname: {name}\ndescription: desc-of-{name}\n---\n\n{body}"
-        );
+        let content = format!("---\nname: {name}\ndescription: desc-of-{name}\n---\n\n{body}");
         std::fs::write(dir.join("SKILL.md"), content).unwrap();
     }
 
@@ -503,10 +502,8 @@ mod tests {
             "COPPERCLAW_CODEX_BINARY".into(),
             "/opt/codex/bin/codex".into(),
         ));
-        mc.forward_env.push((
-            "COPPERCLAW_CODEX_ARGS".into(),
-            "--json,--quiet".into(),
-        ));
+        mc.forward_env
+            .push(("COPPERCLAW_CODEX_ARGS".into(), "--json,--quiet".into()));
         let mgr = ContainerManager::new(
             db.clone(),
             std::sync::Arc::new(crate::tests::NoopRuntime::default()),
@@ -956,8 +953,7 @@ mod tests {
             "fallback prompt must inline skill bodies"
         );
         assert!(
-            !rc.system
-                .contains("catalogue of skills available to you"),
+            !rc.system.contains("catalogue of skills available to you"),
             "fallback prompt must not include the callable-mode skill catalogue header"
         );
     }

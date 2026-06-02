@@ -79,8 +79,8 @@ pub mod poll;
 pub use adapter::IMessageAdapter;
 pub use bridge::IMessageBridge;
 pub use config::{
-    DEFAULT_CHAT_DB_PATH, DEFAULT_POLL_INTERVAL_MS, DEFAULT_SERVICE_NAME,
-    DEFAULT_SINCE_ROWID_FILE, IMessageConfig,
+    DEFAULT_CHAT_DB_PATH, DEFAULT_POLL_INTERVAL_MS, DEFAULT_SERVICE_NAME, DEFAULT_SINCE_ROWID_FILE,
+    IMessageConfig,
 };
 pub use factory::{CHANNEL_TYPE_STR, IMessageFactory, register};
 

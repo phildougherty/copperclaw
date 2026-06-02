@@ -7,7 +7,10 @@ use thiserror::Error;
 pub enum ModuleError {
     /// A module's configuration was invalid.
     #[error("invalid configuration for module `{module}`: {reason}")]
-    InvalidConfig { module: &'static str, reason: String },
+    InvalidConfig {
+        module: &'static str,
+        reason: String,
+    },
 
     /// A required hook was already registered by another module and the host
     /// does not allow more than one provider for that hook.
@@ -25,7 +28,10 @@ pub enum ModuleError {
     /// A free-form error condition with a static label, used by modules whose
     /// failure modes don't merit a dedicated variant.
     #[error("module `{module}` failed: {reason}")]
-    Other { module: &'static str, reason: String },
+    Other {
+        module: &'static str,
+        reason: String,
+    },
 }
 
 impl ModuleError {
@@ -67,7 +73,9 @@ mod tests {
 
     #[test]
     fn hook_conflict_formats() {
-        let err = ModuleError::HookConflict { hook: "access_gate" };
+        let err = ModuleError::HookConflict {
+            hook: "access_gate",
+        };
         assert!(err.to_string().contains("access_gate"));
         assert_eq!(err.module(), "<hook-conflict>");
     }

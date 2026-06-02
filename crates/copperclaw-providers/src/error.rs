@@ -97,12 +97,18 @@ mod tests {
 
     #[test]
     fn display_session_invalid() {
-        assert_eq!(ProviderError::SessionInvalid.to_string(), "session invalidated");
+        assert_eq!(
+            ProviderError::SessionInvalid.to_string(),
+            "session invalidated"
+        );
     }
 
     #[test]
     fn display_api() {
-        let e = ProviderError::Api { status: 503, message: "service down".into() };
+        let e = ProviderError::Api {
+            status: 503,
+            message: "service down".into(),
+        };
         assert_eq!(e.to_string(), "api error 503: service down");
     }
 
@@ -140,17 +146,59 @@ mod tests {
 
     #[test]
     fn retryable_api_5xx() {
-        assert!(ProviderError::Api { status: 500, message: "x".into() }.is_retryable());
-        assert!(ProviderError::Api { status: 502, message: "x".into() }.is_retryable());
-        assert!(ProviderError::Api { status: 599, message: "x".into() }.is_retryable());
+        assert!(
+            ProviderError::Api {
+                status: 500,
+                message: "x".into()
+            }
+            .is_retryable()
+        );
+        assert!(
+            ProviderError::Api {
+                status: 502,
+                message: "x".into()
+            }
+            .is_retryable()
+        );
+        assert!(
+            ProviderError::Api {
+                status: 599,
+                message: "x".into()
+            }
+            .is_retryable()
+        );
     }
 
     #[test]
     fn not_retryable_api_4xx() {
-        assert!(!ProviderError::Api { status: 400, message: "x".into() }.is_retryable());
-        assert!(!ProviderError::Api { status: 401, message: "x".into() }.is_retryable());
-        assert!(!ProviderError::Api { status: 404, message: "x".into() }.is_retryable());
-        assert!(!ProviderError::Api { status: 499, message: "x".into() }.is_retryable());
+        assert!(
+            !ProviderError::Api {
+                status: 400,
+                message: "x".into()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !ProviderError::Api {
+                status: 401,
+                message: "x".into()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !ProviderError::Api {
+                status: 404,
+                message: "x".into()
+            }
+            .is_retryable()
+        );
+        assert!(
+            !ProviderError::Api {
+                status: 499,
+                message: "x".into()
+            }
+            .is_retryable()
+        );
     }
 
     #[test]
@@ -175,7 +223,10 @@ mod tests {
 
     #[test]
     fn display_deadline_exceeded() {
-        let e = ProviderError::DeadlineExceeded { deadline_ms: 1000, attempts: 3 };
+        let e = ProviderError::DeadlineExceeded {
+            deadline_ms: 1000,
+            attempts: 3,
+        };
         assert_eq!(
             e.to_string(),
             "provider deadline exceeded after 3 attempt(s) (1000 ms each)"
@@ -184,7 +235,10 @@ mod tests {
 
     #[test]
     fn not_retryable_deadline_exceeded() {
-        let e = ProviderError::DeadlineExceeded { deadline_ms: 1000, attempts: 3 };
+        let e = ProviderError::DeadlineExceeded {
+            deadline_ms: 1000,
+            attempts: 3,
+        };
         assert!(!e.is_retryable());
     }
 }

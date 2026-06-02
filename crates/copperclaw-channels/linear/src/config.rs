@@ -130,14 +130,15 @@ impl WebhookConfig {
             }
         };
         let port = match obj.get("port") {
-            Some(Value::Number(n)) => n
-                .as_u64()
-                .and_then(|u| u16::try_from(u).ok())
-                .ok_or_else(|| {
-                    AdapterError::BadRequest(
-                        "linear `webhook.port` must be a u16 in range".into(),
-                    )
-                })?,
+            Some(Value::Number(n)) => {
+                n.as_u64()
+                    .and_then(|u| u16::try_from(u).ok())
+                    .ok_or_else(|| {
+                        AdapterError::BadRequest(
+                            "linear `webhook.port` must be a u16 in range".into(),
+                        )
+                    })?
+            }
             Some(Value::Null) | None => DEFAULT_PORT,
             Some(_) => {
                 return Err(AdapterError::BadRequest(
@@ -272,8 +273,8 @@ mod tests {
 
     #[test]
     fn rejects_non_string_api_key() {
-        let err = LinearConfig::from_value(&json!({"api_key": 42, "webhook_secret":"s"}))
-            .unwrap_err();
+        let err =
+            LinearConfig::from_value(&json!({"api_key": 42, "webhook_secret":"s"})).unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 

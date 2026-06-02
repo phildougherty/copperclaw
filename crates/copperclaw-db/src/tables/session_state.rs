@@ -6,7 +6,7 @@
 
 use crate::DbError;
 use chrono::Utc;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 /// Fetch the value for `key`. Returns `Ok(None)` if no row exists.
 pub fn get(conn: &Connection, key: &str) -> Result<Option<String>, DbError> {
@@ -43,14 +43,16 @@ pub fn delete(conn: &Connection, key: &str) -> Result<(), DbError> {
 /// List every `(key, value)` pair, ordered by `key`.
 pub fn list(conn: &Connection) -> Result<Vec<(String, String)>, DbError> {
     let mut stmt = conn.prepare("SELECT key, value FROM session_state ORDER BY key")?;
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{open_outbound, SessionPaths};
+    use crate::session::{SessionPaths, open_outbound};
     use copperclaw_types::{AgentGroupId, SessionId};
 
     fn fresh_outbound() -> (tempfile::TempDir, Connection) {

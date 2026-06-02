@@ -6,7 +6,7 @@
 
 use crate::DbError;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContainerState {
@@ -106,7 +106,7 @@ fn row_to_state(row: &Row<'_>) -> rusqlite::Result<ContainerState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{open_outbound, SessionPaths};
+    use crate::session::{SessionPaths, open_outbound};
     use copperclaw_types::{AgentGroupId, SessionId};
 
     fn fresh_outbound() -> (tempfile::TempDir, Connection) {

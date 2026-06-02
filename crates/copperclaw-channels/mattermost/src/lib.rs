@@ -43,5 +43,5 @@ pub mod router;
 pub use adapter::MattermostAdapter;
 pub use api::MattermostApi;
 pub use config::{ConfigError, MattermostConfig, WebhookBind};
-pub use factory::{register, MattermostFactory, CHANNEL_TYPE_STR};
-pub use router::{build_router, RouterState};
+pub use factory::{CHANNEL_TYPE_STR, MattermostFactory, register};
+pub use router::{RouterState, build_router};

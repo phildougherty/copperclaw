@@ -5,9 +5,9 @@
 //! doesn't carry an explicit destination.
 
 use crate::DbError;
-use copperclaw_types::routing::SessionRouting;
 use copperclaw_types::ChannelType;
-use rusqlite::{params, Connection, OptionalExtension};
+use copperclaw_types::routing::SessionRouting;
+use rusqlite::{Connection, OptionalExtension, params};
 
 /// Read the current routing row, or `None` if it has never been written.
 pub fn read(conn: &Connection) -> Result<Option<SessionRouting>, DbError> {
@@ -48,7 +48,7 @@ pub fn write(conn: &Connection, routing: &SessionRouting) -> Result<(), DbError>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{open_inbound, SessionPaths};
+    use crate::session::{SessionPaths, open_inbound};
     use copperclaw_types::{AgentGroupId, SessionId};
 
     fn fresh_inbound() -> (tempfile::TempDir, Connection) {

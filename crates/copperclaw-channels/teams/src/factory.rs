@@ -159,11 +159,7 @@ mod tests {
     async fn factory_init_rejects_missing_token() {
         let f = TeamsFactory::new();
         let (tx, _rx) = mpsc::channel::<InboundEvent>(8);
-        let setup = ChannelSetup::new(
-            json!({"client_state_secret": "s"}),
-            tx,
-            "/tmp",
-        );
+        let setup = ChannelSetup::new(json!({"client_state_secret": "s"}), tx, "/tmp");
         match f.init(setup).await {
             Err(AdapterError::BadRequest(_)) => {}
             Err(other) => panic!("expected BadRequest, got {other:?}"),

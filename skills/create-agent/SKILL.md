@@ -11,6 +11,28 @@ the current one. The new agent has its own session, its own
 shares the calling agent's group config (skills, MCP servers, packages)
 unless an admin moves it to a different group later.
 
+## Workspace the sibling sees
+
+A sibling boots with its own empty `/data`. To let it work on *your* code,
+the host shares your workspace automatically:
+
+- **If the project you're currently `cd`'d into is a git repo**, the sibling
+  gets a WRITABLE `git worktree` of that repo at `/workspace`, on its own
+  branch `sib/<session-id>`. It edits and commits there in isolation; the
+  commits land in your repo's object store, so after it reports back you
+  review and merge its branch from inside that project:
+  `git diff main..sib/<id>` → `git merge sib/<id>` → `git worktree remove
+  .copperclaw/wt/<id>`. Your checked-out files are never touched until you
+  merge.
+- **If you're not in a git repo**, your whole workspace is mounted
+  READ-ONLY at `/parent` (the sibling can review/audit, not modify).
+
+So before spawning builders: `cd` into the project and make sure it's a git
+repo (`git init` if new — see [[coding-task]]). Then point the sibling at
+its workspace in `instructions`, e.g. "implement X under `/workspace` and
+commit on your branch" (writable) or "review the code under `/parent`"
+(read-only).
+
 ## Schema
 
 ```json

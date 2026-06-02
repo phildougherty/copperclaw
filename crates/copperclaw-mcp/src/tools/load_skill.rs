@@ -24,11 +24,11 @@ use std::path::PathBuf;
 
 use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::context::ToolContext;
 use crate::error::ToolError;
-use crate::tools::{make_tool, parse_args, ToolEntry, ToolHandler};
+use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args};
 
 /// Default location of the per-session skills catalogue. Matches
 /// `copperclaw_host::container_manager::SKILLS_CATALOGUE_FILENAME` and
@@ -39,14 +39,12 @@ const SKILLS_CATALOGUE_DEFAULT_PATH: &str = "/data/skills.json";
 /// the default path; tests install their own tempfile so we avoid
 /// `unsafe` env-var mutation (forbidden by the workspace lint).
 #[cfg(test)]
-static SKILLS_CATALOGUE_TEST_OVERRIDE: std::sync::OnceLock<
-    std::sync::Mutex<Option<PathBuf>>,
-> = std::sync::OnceLock::new();
+static SKILLS_CATALOGUE_TEST_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<PathBuf>>> =
+    std::sync::OnceLock::new();
 
 #[cfg(test)]
 fn skills_catalogue_test_override_set(path: PathBuf) {
-    let cell = SKILLS_CATALOGUE_TEST_OVERRIDE
-        .get_or_init(|| std::sync::Mutex::new(None));
+    let cell = SKILLS_CATALOGUE_TEST_OVERRIDE.get_or_init(|| std::sync::Mutex::new(None));
     *cell
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path);
@@ -234,7 +232,10 @@ mod tests {
             let path = dir.path().join("skills.json");
             std::fs::write(&path, json_body).unwrap();
             skills_catalogue_test_override_set(path);
-            Self { _dir: dir, _lock: lock }
+            Self {
+                _dir: dir,
+                _lock: lock,
+            }
         }
 
         /// Point the override at a deliberately-missing path. Used for
@@ -246,7 +247,10 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join("missing.json");
             skills_catalogue_test_override_set(path);
-            Self { _dir: dir, _lock: lock }
+            Self {
+                _dir: dir,
+                _lock: lock,
+            }
         }
     }
 
@@ -356,13 +360,15 @@ mod tests {
     async fn name_special_chars_are_escaped_in_response() {
         // kebab-case validation upstream prevents these names in practice,
         // but the rendering layer should escape symmetrically with `description`.
-        let _g = CatalogueGuard::new(
-            r#"[{"name": "weird\"&name", "description": "d", "body": "b"}]"#,
-        );
+        let _g =
+            CatalogueGuard::new(r#"[{"name": "weird\"&name", "description": "d", "body": "b"}]"#);
         let ctx = MockToolContext::new();
         let result = handle(arg("weird\"&name"), &ctx).await.unwrap();
         let text = extract_text(&result);
-        assert!(text.contains("name=\"weird&quot;&amp;name\""), "got: {text}");
+        assert!(
+            text.contains("name=\"weird&quot;&amp;name\""),
+            "got: {text}"
+        );
         assert!(!text.contains("name=\"weird\"&name\""), "got: {text}");
     }
 

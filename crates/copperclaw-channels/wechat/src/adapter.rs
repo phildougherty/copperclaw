@@ -685,7 +685,10 @@ mod tests {
     fn infer_media_kind_image_extensions() {
         for ext in ["png", "jpg", "jpeg", "gif", "bmp", "webp"] {
             assert_eq!(infer_media_kind(&format!("f.{ext}")), "image");
-            assert_eq!(infer_media_kind(&format!("f.{}", ext.to_uppercase())), "image");
+            assert_eq!(
+                infer_media_kind(&format!("f.{}", ext.to_uppercase())),
+                "image"
+            );
         }
     }
 

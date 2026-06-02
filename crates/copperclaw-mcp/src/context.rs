@@ -389,10 +389,7 @@ pub trait ToolContext: Send + Sync {
     /// Emit a side effect. The runner converts this into an outbound DB row
     /// (or a scheduler mutation) and returns an ack the tool surfaces back
     /// to the caller as a `CallToolResult`.
-    async fn emit_outbound(
-        &self,
-        effect: OutboundToolEffect,
-    ) -> Result<ToolEffectAck, ToolError>;
+    async fn emit_outbound(&self, effect: OutboundToolEffect) -> Result<ToolEffectAck, ToolError>;
 
     /// Convenience hook so `list_tasks` does not need a separate request/ack
     /// pathway. Implementors may delegate to whatever scheduler state they
@@ -412,10 +409,7 @@ pub trait ToolContext: Send + Sync {
     /// Nested calls (a subagent itself calling `explore`) are refused
     /// at the tool layer by checking `req.nested == true` and
     /// returning `ToolError::Validation`.
-    async fn spawn_subagent(
-        &self,
-        req: SubagentRequest,
-    ) -> Result<SubagentResult, ToolError> {
+    async fn spawn_subagent(&self, req: SubagentRequest) -> Result<SubagentResult, ToolError> {
         let _ = req;
         Err(ToolError::Context(
             "subagent not supported in this context".into(),
@@ -432,7 +426,13 @@ pub trait ToolContext: Send + Sync {
     /// subagent adapters) continue to compile unchanged. The
     /// runner's `RunnerToolCtx` overrides this with the real
     /// implementation.
-    fn set_originating(&self, channel_type: Option<&str>, platform_id: Option<&str>, thread_id: Option<&str>, in_reply_to: Option<&str>) {
+    fn set_originating(
+        &self,
+        channel_type: Option<&str>,
+        platform_id: Option<&str>,
+        thread_id: Option<&str>,
+        in_reply_to: Option<&str>,
+    ) {
         let _ = (channel_type, platform_id, thread_id, in_reply_to);
     }
 
@@ -518,12 +518,7 @@ pub trait ToolContext: Send + Sync {
     /// receive only events the operator has consented to surface.
     /// Default no-op so contexts that don't speak to a user channel
     /// (mocks, subagent adapters) compile unchanged.
-    async fn emit_thinking(
-        &self,
-        text: &str,
-        redacted: bool,
-        model: Option<&str>,
-    ) {
+    async fn emit_thinking(&self, text: &str, redacted: bool, model: Option<&str>) {
         let _ = (text, redacted, model);
     }
 
@@ -697,10 +692,7 @@ impl MockToolContext {
 
 #[async_trait]
 impl ToolContext for MockToolContext {
-    async fn emit_outbound(
-        &self,
-        effect: OutboundToolEffect,
-    ) -> Result<ToolEffectAck, ToolError> {
+    async fn emit_outbound(&self, effect: OutboundToolEffect) -> Result<ToolEffectAck, ToolError> {
         let mut g = self.inner.lock().expect("MockToolContext mutex poisoned");
         if let Some(err) = g.next_emit_err.take() {
             return Err(err);
@@ -718,10 +710,7 @@ impl ToolContext for MockToolContext {
         Ok(g.task_summaries.clone())
     }
 
-    async fn spawn_subagent(
-        &self,
-        req: SubagentRequest,
-    ) -> Result<SubagentResult, ToolError> {
+    async fn spawn_subagent(&self, req: SubagentRequest) -> Result<SubagentResult, ToolError> {
         let mut g = self.inner.lock().expect("MockToolContext mutex poisoned");
         if let Some(err) = g.next_subagent_err.take() {
             return Err(err);
@@ -749,8 +738,7 @@ impl ToolContext for MockToolContext {
 pub(crate) mod bytes_b64 {
     use serde::{Deserialize, Deserializer, Serializer};
 
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
     /// Encode bytes as standard base64 (with `=` padding, no line breaks).
     /// Shared by the serde `serialize` below and by tools that need a
@@ -829,9 +817,7 @@ pub(crate) mod bytes_b64_optional {
     use super::bytes_b64;
     use serde::{Deserialize, Deserializer};
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        d: D,
-    ) -> Result<Option<Vec<u8>>, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
         let opt = Option::<String>::deserialize(d)?;
         match opt {
             None => Ok(None),
@@ -937,15 +923,21 @@ mod tests {
             ),
             (OutboundToolEffect::ListTasks, "list_tasks"),
             (
-                OutboundToolEffect::CancelTask { id: "task_1".into() },
+                OutboundToolEffect::CancelTask {
+                    id: "task_1".into(),
+                },
                 "cancel_task",
             ),
             (
-                OutboundToolEffect::PauseTask { id: "task_1".into() },
+                OutboundToolEffect::PauseTask {
+                    id: "task_1".into(),
+                },
                 "pause_task",
             ),
             (
-                OutboundToolEffect::ResumeTask { id: "task_1".into() },
+                OutboundToolEffect::ResumeTask {
+                    id: "task_1".into(),
+                },
                 "resume_task",
             ),
             (
@@ -1036,7 +1028,9 @@ mod tests {
         let acks = vec![
             ToolEffectAck::Accepted,
             ToolEffectAck::Message { seq: 7 },
-            ToolEffectAck::Task { id: "task_1".into() },
+            ToolEffectAck::Task {
+                id: "task_1".into(),
+            },
             ToolEffectAck::Question { id: "q_1".into() },
             ToolEffectAck::Agent {
                 session_id: "sess_1".into(),
@@ -1052,8 +1046,12 @@ mod tests {
     #[test]
     fn recipient_serde_roundtrip() {
         let recipients = vec![
-            Recipient::Channel { id: "telegram:1".into() },
-            Recipient::Agent { session_id: "sess_1".into() },
+            Recipient::Channel {
+                id: "telegram:1".into(),
+            },
+            Recipient::Agent {
+                session_id: "sess_1".into(),
+            },
             Recipient::User { id: "u_1".into() },
         ];
         for r in recipients {

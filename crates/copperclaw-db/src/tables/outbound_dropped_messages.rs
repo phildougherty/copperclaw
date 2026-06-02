@@ -8,11 +8,11 @@
 //! The table lives in the **central** DB so an operator can query it without
 //! knowing which session the failure came from.
 
-use crate::central::CentralDb;
 use crate::DbError;
+use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
 use copperclaw_types::{AgentGroupId, ChannelType, MessageId, MessageKind, SessionId};
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{OptionalExtension, Row, params};
 use uuid::Uuid;
 
 /// A single outbound dead-letter record.
@@ -98,11 +98,7 @@ fn row_to_record(row: &Row<'_>) -> rusqlite::Result<OutboundDroppedMessage> {
     let dropped_at = DateTime::parse_from_rfc3339(&dropped_at_str)
         .map(|d| d.with_timezone(&Utc))
         .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                0,
-                rusqlite::types::Type::Text,
-                Box::new(e),
-            )
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
         })?;
     Ok(OutboundDroppedMessage {
         id,
@@ -121,7 +117,10 @@ fn row_to_record(row: &Row<'_>) -> rusqlite::Result<OutboundDroppedMessage> {
 
 /// Insert a new outbound dead-letter row. Returns the inserted record with
 /// its generated id and timestamp.
-pub fn insert(db: &CentralDb, req: InsertOutboundDropped) -> Result<OutboundDroppedMessage, DbError> {
+pub fn insert(
+    db: &CentralDb,
+    req: InsertOutboundDropped,
+) -> Result<OutboundDroppedMessage, DbError> {
     let id = Uuid::now_v7();
     let now = Utc::now();
     let content_json = serde_json::to_string(&req.content)?;

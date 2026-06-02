@@ -39,12 +39,8 @@ impl ChannelFactory for IMessageFactory {
     async fn init(&self, setup: ChannelSetup) -> Result<Arc<dyn ChannelAdapter>, AdapterError> {
         let cfg = IMessageConfig::from_value(&setup.config)?;
         let bridge: Arc<dyn IMessageBridge> = Arc::new(OsaScriptBridge::from_config(&cfg));
-        let adapter = IMessageAdapter::start_with_bridge(
-            bridge,
-            cfg,
-            setup.inbound_tx,
-            setup.data_dir,
-        );
+        let adapter =
+            IMessageAdapter::start_with_bridge(bridge, cfg, setup.inbound_tx, setup.data_dir);
         Ok(adapter as Arc<dyn ChannelAdapter>)
     }
 

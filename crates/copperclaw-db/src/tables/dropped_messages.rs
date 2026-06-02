@@ -2,11 +2,11 @@
 //!
 //! Append-only audit log of inbound messages the router refused to deliver.
 
-use crate::central::CentralDb;
 use crate::DbError;
+use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
 use copperclaw_types::{AgentGroupId, ChannelType, MessagingGroupId, UserId};
-use rusqlite::{params, Row};
+use rusqlite::{Row, params};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,20 +36,23 @@ pub struct InsertDroppedMessage {
 fn parse_uuid_opt(s: Option<String>) -> rusqlite::Result<Option<Uuid>> {
     match s {
         None => Ok(None),
-        Some(s) => Uuid::parse_str(&s)
-            .map(Some)
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))),
+        Some(s) => Uuid::parse_str(&s).map(Some).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        }),
     }
 }
 
 fn row_to_dropped_message(row: &Row<'_>) -> rusqlite::Result<DroppedMessage> {
     let id_str: String = row.get("id")?;
-    let id = Uuid::parse_str(&id_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let id = Uuid::parse_str(&id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let channel_type_str: String = row.get("channel_type")?;
     let created_at_str: String = row.get("created_at")?;
     let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .with_timezone(&Utc);
     let user_id_str: Option<String> = row.get("user_id")?;
     let user_id = parse_uuid_opt(user_id_str)?.map(UserId);
@@ -171,8 +174,8 @@ mod tests {
 
     #[test]
     fn insert_stores_optional_ids() {
-        use crate::tables::agent_groups::{create as create_ag, CreateAgentGroup};
-        use crate::tables::messaging_groups::{upsert as upsert_mg, UpsertMessagingGroup};
+        use crate::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+        use crate::tables::messaging_groups::{UpsertMessagingGroup, upsert as upsert_mg};
         let db = db();
         let ag = create_ag(
             &db,

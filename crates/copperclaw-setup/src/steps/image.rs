@@ -113,7 +113,11 @@ impl Step for ImageBuildStep {
 
         let outcome = run_build(&spec)?;
         cfg.image_tag.clone_from(&outcome.tag);
-        let verb = if outcome.was_cached { "reused" } else { "built" };
+        let verb = if outcome.was_cached {
+            "reused"
+        } else {
+            "built"
+        };
         messages.push(format!("{verb} image: {}", outcome.tag));
         Ok(StepResult {
             messages,
@@ -153,7 +157,11 @@ pub fn default_spec() -> Result<ImageBuildSpec, StepError> {
     // there's no python3, no node, no curl, no git. Adds ~500MB to
     // the image but the alternative is per-spawn `install_packages`
     // churn that takes minutes per cold start.
-    spec.apt_packages = DEFAULT_BASE_APT_PACKAGES.iter().copied().map(String::from).collect();
+    spec.apt_packages = DEFAULT_BASE_APT_PACKAGES
+        .iter()
+        .copied()
+        .map(String::from)
+        .collect();
     let runner_path = locate_runner_binary()?;
     let bytes = std::fs::read(&runner_path).map_err(|e| {
         StepError::Other(format!(
@@ -161,9 +169,8 @@ pub fn default_spec() -> Result<ImageBuildSpec, StepError> {
             runner_path.display()
         ))
     })?;
-    spec.extra_files.push(
-        ExtraFile::new(PathBuf::from(RUNNER_PATH_IN_IMAGE), bytes).with_mode(0o755),
-    );
+    spec.extra_files
+        .push(ExtraFile::new(PathBuf::from(RUNNER_PATH_IN_IMAGE), bytes).with_mode(0o755));
     Ok(spec)
 }
 
@@ -570,7 +577,11 @@ mod tests {
         let prompt = Scripted::new().with("BUILD_IMAGE", "yes");
         let res = s.run(&mut cfg, &prompt, &mut state).unwrap();
         assert!(!res.config_changed);
-        assert!(res.messages.iter().any(|m| m.contains("no container runtime")));
+        assert!(
+            res.messages
+                .iter()
+                .any(|m| m.contains("no container runtime"))
+        );
     }
 
     #[test]
@@ -588,8 +599,7 @@ mod tests {
     fn try_pull_adopts_on_matching_fingerprint() {
         let fp = "abc123";
         let target = "copperclaw/session:sha256-abc123";
-        let docker =
-            StubDocker::new().with_label(Ok(Some(fp.to_string())));
+        let docker = StubDocker::new().with_label(Ok(Some(fp.to_string())));
         let outcome = try_pull(&docker, fp, target, "ghcr.io/example/session");
         assert_eq!(outcome, PullOutcome::Adopted);
         let calls = docker.calls();
@@ -634,7 +644,10 @@ mod tests {
         let outcome = try_pull(&docker, "fp", "target", "reg");
         match outcome {
             PullOutcome::Failed(msg) => {
-                assert!(msg.contains("missing the copperclaw.fingerprint label"), "got: {msg}");
+                assert!(
+                    msg.contains("missing the copperclaw.fingerprint label"),
+                    "got: {msg}"
+                );
             }
             other => panic!("expected Failed, got {other:?}"),
         }

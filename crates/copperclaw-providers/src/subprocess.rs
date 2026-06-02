@@ -44,11 +44,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use copperclaw_types::ProviderEvent;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::error::ProviderError;
@@ -157,7 +157,9 @@ impl SubprocessProvider {
     /// Build a provider from a fully-formed config.
     #[must_use]
     pub fn new(cfg: SubprocessConfig) -> Self {
-        Self { inner: Arc::new(cfg) }
+        Self {
+            inner: Arc::new(cfg),
+        }
     }
 
     /// Accessor — the inner config.
@@ -190,9 +192,9 @@ impl AgentProvider for SubprocessProvider {
             .stderr(Stdio::null())
             .kill_on_drop(true);
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| ProviderError::Transport(format!("spawn {}: {e}", self.inner.binary.display())))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            ProviderError::Transport(format!("spawn {}: {e}", self.inner.binary.display()))
+        })?;
 
         let stdin = child
             .stdin
@@ -245,7 +247,9 @@ impl AgentQuery for SubprocessQuery {
             )),
             PushPolicy::Accept => {
                 let Some(stdin) = self.stdin.as_ref() else {
-                    return Err(ProviderError::BadRequest("stdin already closed".to_string()));
+                    return Err(ProviderError::BadRequest(
+                        "stdin already closed".to_string(),
+                    ));
                 };
                 let line = json!({ "type": "push", "content": message });
                 let mut guard = stdin.lock().await;
@@ -321,7 +325,11 @@ fn history_message_to_json(m: &HistoryMessage) -> Value {
             "name": name,
             "input": input,
         }),
-        HistoryMessage::Tool { tool_use_id, content, is_error } => json!({
+        HistoryMessage::Tool {
+            tool_use_id,
+            content,
+            is_error,
+        } => json!({
             "role": "tool",
             "tool_use_id": tool_use_id,
             "content": content,
@@ -354,8 +362,12 @@ async fn write_line<W: AsyncWriteExt + Unpin>(w: &mut W, line: &Value) -> std::i
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WireEvent {
-    Init { continuation: String },
-    Progress { message: String },
+    Init {
+        continuation: String,
+    },
+    Progress {
+        message: String,
+    },
     Activity,
     ToolStart {
         name: String,
@@ -367,7 +379,10 @@ enum WireEvent {
         #[serde(default)]
         text: Option<String>,
     },
-    Error { message: String, retryable: bool },
+    Error {
+        message: String,
+        retryable: bool,
+    },
 }
 
 impl WireEvent {
@@ -376,7 +391,10 @@ impl WireEvent {
             Self::Init { continuation } => ProviderEvent::Init { continuation },
             Self::Progress { message } => ProviderEvent::Progress { message },
             Self::Activity => ProviderEvent::Activity,
-            Self::ToolStart { name, declared_timeout_ms } => ProviderEvent::ToolStart {
+            Self::ToolStart {
+                name,
+                declared_timeout_ms,
+            } => ProviderEvent::ToolStart {
                 name,
                 declared_timeout_ms,
             },
@@ -452,8 +470,7 @@ mod tests {
         // it sees the query line and any pushes) and emits a JSON-Lines
         // response on its stdout.
         SubprocessProvider::new(
-            SubprocessConfig::new("sh-test", PathBuf::from("/bin/sh"))
-                .with_args(["-c", script]),
+            SubprocessConfig::new("sh-test", PathBuf::from("/bin/sh")).with_args(["-c", script]),
         )
     }
 
@@ -481,8 +498,12 @@ mod tests {
     #[test]
     fn build_query_line_includes_history_tools_temperature() {
         let mut q = QueryInput::new("sys", "m");
-        q.history.push(HistoryMessage::User { content: "hi".into() });
-        q.history.push(HistoryMessage::Assistant { content: "ok".into() });
+        q.history.push(HistoryMessage::User {
+            content: "hi".into(),
+        });
+        q.history.push(HistoryMessage::Assistant {
+            content: "ok".into(),
+        });
         q.history.push(HistoryMessage::ToolUse {
             id: "tu_1".into(),
             name: "weather".into(),
@@ -535,27 +556,53 @@ mod tests {
     #[test]
     fn wire_event_terminal_classification() {
         assert!(WireEvent::Result { text: None }.is_terminal());
-        assert!(WireEvent::Error { message: "x".into(), retryable: false }.is_terminal());
+        assert!(
+            WireEvent::Error {
+                message: "x".into(),
+                retryable: false
+            }
+            .is_terminal()
+        );
         assert!(!WireEvent::Activity.is_terminal());
-        assert!(!WireEvent::Init { continuation: "c".into() }.is_terminal());
-        assert!(!WireEvent::Progress { message: "p".into() }.is_terminal());
-        assert!(!WireEvent::ToolStart {
-            name: "t".into(),
-            declared_timeout_ms: Some(1)
-        }
-        .is_terminal());
+        assert!(
+            !WireEvent::Init {
+                continuation: "c".into()
+            }
+            .is_terminal()
+        );
+        assert!(
+            !WireEvent::Progress {
+                message: "p".into()
+            }
+            .is_terminal()
+        );
+        assert!(
+            !WireEvent::ToolStart {
+                name: "t".into(),
+                declared_timeout_ms: Some(1)
+            }
+            .is_terminal()
+        );
         assert!(!WireEvent::ToolEnd.is_terminal());
     }
 
     #[test]
     fn wire_event_into_provider_event_maps_every_variant() {
         // Init.
-        match (WireEvent::Init { continuation: "c".into() }).into_provider_event() {
+        match (WireEvent::Init {
+            continuation: "c".into(),
+        })
+        .into_provider_event()
+        {
             ProviderEvent::Init { continuation } => assert_eq!(continuation, "c"),
             other => panic!("expected init, got {other:?}"),
         }
         // Progress.
-        match (WireEvent::Progress { message: "p".into() }).into_provider_event() {
+        match (WireEvent::Progress {
+            message: "p".into(),
+        })
+        .into_provider_event()
+        {
             ProviderEvent::Progress { message } => assert_eq!(message, "p"),
             other => panic!("expected progress, got {other:?}"),
         }
@@ -571,7 +618,10 @@ mod tests {
         })
         .into_provider_event()
         {
-            ProviderEvent::ToolStart { name, declared_timeout_ms } => {
+            ProviderEvent::ToolStart {
+                name,
+                declared_timeout_ms,
+            } => {
                 assert_eq!(name, "t");
                 assert_eq!(declared_timeout_ms, Some(10));
             }
@@ -583,7 +633,11 @@ mod tests {
             ProviderEvent::ToolEnd
         ));
         // Result.
-        match (WireEvent::Result { text: Some("ok".into()) }).into_provider_event() {
+        match (WireEvent::Result {
+            text: Some("ok".into()),
+        })
+        .into_provider_event()
+        {
             ProviderEvent::Result { text } => assert_eq!(text.as_deref(), Some("ok")),
             other => panic!("expected result, got {other:?}"),
         }

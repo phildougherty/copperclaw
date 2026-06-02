@@ -35,8 +35,7 @@ pub struct CreateAgentPermissionCtx {
 /// In production the host wires this to a check against the `users` /
 /// `user_roles` table via [`users_table_check`]. Tests can use
 /// [`always_allow`] / [`always_deny`].
-pub type CreateAgentPermissionCheck =
-    Arc<dyn Fn(&CreateAgentPermissionCtx) -> bool + Send + Sync>;
+pub type CreateAgentPermissionCheck = Arc<dyn Fn(&CreateAgentPermissionCtx) -> bool + Send + Sync>;
 
 /// Convenience permission closure that always allows. Useful for tests and
 /// non-multi-user deployments where every agent is trusted.
@@ -213,6 +212,9 @@ mod tests {
             parent_session_id: None,
             requested_name: "x".into(),
         };
-        assert!(!check(&orphan), "no parent scope → cannot match scoped grant");
+        assert!(
+            !check(&orphan),
+            "no parent scope → cannot match scoped grant"
+        );
     }
 }

@@ -174,10 +174,7 @@ impl WebexApi {
 
     /// `GET /attachment/actions/{id}` — fetch the inputs an adaptive-card
     /// submitter chose.
-    pub async fn get_attachment_action(
-        &self,
-        id: &str,
-    ) -> Result<AttachmentAction, AdapterError> {
+    pub async fn get_attachment_action(&self, id: &str) -> Result<AttachmentAction, AdapterError> {
         let resp = self
             .client
             .get(self.url(&format!("attachment/actions/{id}")))
@@ -433,11 +430,7 @@ pub fn build_adaptive_card(card: &Card) -> Value {
             "facts": facts,
         }));
     }
-    let actions: Vec<Value> = card
-        .buttons
-        .iter()
-        .filter_map(button_to_action)
-        .collect();
+    let actions: Vec<Value> = card.buttons.iter().filter_map(button_to_action).collect();
     let mut out = json!({
         "type": "AdaptiveCard",
         "$schema": ADAPTIVE_CARD_SCHEMA,
@@ -593,7 +586,12 @@ fn build_adaptive_activity(b: &Breadcrumb) -> Value {
         Some(d) => summary.push_str(d),
         None => summary.push_str("working"),
     }
-    if let Some(s) = b.summary.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(s) = b
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         summary.push_str(" \u{00B7} ");
         summary.push_str(s);
     }
@@ -656,7 +654,12 @@ fn activity_step_textblock(s: &Breadcrumb) -> Value {
         text.push_str(d);
         text.push('`');
     }
-    if let Some(sum) = s.summary.as_deref().map(str::trim).filter(|x| !x.is_empty()) {
+    if let Some(sum) = s
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+    {
         if s.status == BreadcrumbStatus::Failed {
             text.push_str(" — failed: ");
         } else {
@@ -975,11 +978,7 @@ fn extract_error_message(body: &str) -> String {
     }
     serde_json::from_str::<Value>(body)
         .ok()
-        .and_then(|v| {
-            v.get("message")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
+        .and_then(|v| v.get("message").and_then(Value::as_str).map(str::to_owned))
         .unwrap_or_else(|| body.to_owned())
 }
 
@@ -1583,7 +1582,11 @@ mod tests {
             .respond_with(ResponseTemplate::new(404).set_body_string(""))
             .mount(&server)
             .await;
-        match api(&server).post_reaction("M1", "thumbsup").await.unwrap_err() {
+        match api(&server)
+            .post_reaction("M1", "thumbsup")
+            .await
+            .unwrap_err()
+        {
             AdapterError::Unsupported(m) => assert!(m.contains("404")),
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -1597,7 +1600,11 @@ mod tests {
             .respond_with(ResponseTemplate::new(501).set_body_string(""))
             .mount(&server)
             .await;
-        match api(&server).post_reaction("M1", "thumbsup").await.unwrap_err() {
+        match api(&server)
+            .post_reaction("M1", "thumbsup")
+            .await
+            .unwrap_err()
+        {
             AdapterError::Unsupported(_) => {}
             other => panic!("expected Unsupported, got {other:?}"),
         }
@@ -1613,7 +1620,11 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        match api(&server).post_reaction("M1", "thumbsup").await.unwrap_err() {
+        match api(&server)
+            .post_reaction("M1", "thumbsup")
+            .await
+            .unwrap_err()
+        {
             AdapterError::Auth(_) => {}
             other => panic!("expected Auth, got {other:?}"),
         }
@@ -1627,7 +1638,11 @@ mod tests {
             .respond_with(ResponseTemplate::new(500).set_body_string("err"))
             .mount(&server)
             .await;
-        match api(&server).post_reaction("M1", "thumbsup").await.unwrap_err() {
+        match api(&server)
+            .post_reaction("M1", "thumbsup")
+            .await
+            .unwrap_err()
+        {
             AdapterError::Transport(_) => {}
             other => panic!("expected Transport, got {other:?}"),
         }
@@ -1679,7 +1694,12 @@ mod tests {
         let err = map_status_error(StatusCode::NOT_FOUND, "{\"message\":\"x\"}", None);
         assert!(matches!(err, AdapterError::BadRequest(_)));
         let err = map_status_error(StatusCode::TOO_MANY_REQUESTS, "", Some(2));
-        assert!(matches!(err, AdapterError::Rate { retry_after: Some(2) }));
+        assert!(matches!(
+            err,
+            AdapterError::Rate {
+                retry_after: Some(2)
+            }
+        ));
         let err = map_status_error(StatusCode::BAD_REQUEST, "{\"message\":\"x\"}", None);
         assert!(matches!(err, AdapterError::BadRequest(_)));
         let err = map_status_error(StatusCode::INTERNAL_SERVER_ERROR, "", None);

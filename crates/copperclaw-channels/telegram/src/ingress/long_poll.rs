@@ -94,8 +94,8 @@ mod tests {
     use crate::config::{DEFAULT_MAX_ATTACHMENT_BYTES, LongPollConfig};
     use serde_json::json;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration as StdDuration;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
@@ -217,7 +217,9 @@ mod tests {
         let s = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/bottok/getUpdates"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": []})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"ok": true, "result": []})),
+            )
             .mount(&s)
             .await;
         let api = TelegramApi::new(s.uri(), "tok");

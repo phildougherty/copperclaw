@@ -80,9 +80,7 @@ pub use config::{
     DEFAULT_API_BASE, DEFAULT_HOST, DEFAULT_PATH, DEFAULT_PORT, GithubConfig, WebhookConfig,
 };
 pub use emoji::{VALID_REACTION_SLUGS, to_reaction_slug};
-pub use events::router::{
-    DEDUP_CAPACITY, DeliveryDedup, GithubEventsState, build_events_router,
-};
+pub use events::router::{DEDUP_CAPACITY, DeliveryDedup, GithubEventsState, build_events_router};
 pub use events::types::{
     Comment, IssueCommentEvent, IssueRef, IssuesEvent, PullRequestRef,
     PullRequestReviewCommentEvent, Repository, User,

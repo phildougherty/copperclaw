@@ -96,8 +96,11 @@ mod tests {
     #[test]
     fn migrate_from_missing_source_errors() {
         let dest = tempdir().unwrap();
-        let err =
-            migrate_from(Path::new("/definitely/does/not/exist/copperclaw"), dest.path()).unwrap_err();
+        let err = migrate_from(
+            Path::new("/definitely/does/not/exist/copperclaw"),
+            dest.path(),
+        )
+        .unwrap_err();
         assert!(matches!(err, MigratorError::SourceMissing { .. }));
     }
 

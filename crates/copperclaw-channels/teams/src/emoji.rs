@@ -6,9 +6,7 @@
 //! [`copperclaw_channels_core::AdapterError::Unsupported`].
 
 /// The six reaction types Microsoft Teams accepts on a chat message.
-pub const TEAMS_REACTION_TYPES: &[&str] = &[
-    "like", "heart", "laugh", "surprised", "sad", "angry",
-];
+pub const TEAMS_REACTION_TYPES: &[&str] = &["like", "heart", "laugh", "surprised", "sad", "angry"];
 
 /// Translate a common emoji shortcode into the `reactionType` Teams expects.
 ///

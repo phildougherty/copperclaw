@@ -14,12 +14,12 @@
 //! `WHERE status = 'active'` predicate in `tasks::list_due`.
 
 use crate::error::SweepError;
-use crate::service::{SessionRoot, SeriesFanout};
+use crate::service::{SeriesFanout, SessionRoot};
 use chrono::{DateTime, Utc};
 use copperclaw_db::central::CentralDb;
-use copperclaw_db::tables::messages_in::{insert as insert_in, WriteInbound};
+use copperclaw_db::tables::messages_in::{WriteInbound, insert as insert_in};
 use copperclaw_db::tables::tasks::{self, TaskStatus};
-use copperclaw_modules::scheduling::{compute_next_fire, parse_when, When};
+use copperclaw_modules::scheduling::{When, compute_next_fire, parse_when};
 use copperclaw_types::{MessageId, MessageKind};
 
 /// Run one sweep over `tasks`. For every row with `status='active'` and
@@ -67,10 +67,10 @@ pub fn check(
         // Re-arm or complete. Recurring tasks always re-arm using the
         // recurrence expression; one-shot tasks transition to
         // `completed` and clear `next_fire` so they never fire again.
-        let next_fire =
-            task.recurrence
-                .as_deref()
-                .and_then(|rec| next_fire_for(&task.when_spec, Some(rec), now));
+        let next_fire = task
+            .recurrence
+            .as_deref()
+            .and_then(|rec| next_fire_for(&task.when_spec, Some(rec), now));
         if let Some(next) = next_fire {
             tasks::set_next_fire(central, &task.id, Some(next))?;
         } else {
@@ -114,12 +114,17 @@ fn next_fire_for(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{seed_running_session, MemSessionRoot};
+    use crate::test_support::{MemSessionRoot, seed_running_session};
     use chrono::{Duration as ChDuration, TimeZone};
     use copperclaw_db::central::CentralDb;
     use copperclaw_db::tables::tasks::NewTask;
 
-    fn fixture() -> (CentralDb, MemSessionRoot, copperclaw_types::Session, DateTime<Utc>) {
+    fn fixture() -> (
+        CentralDb,
+        MemSessionRoot,
+        copperclaw_types::Session,
+        DateTime<Utc>,
+    ) {
         let central = CentralDb::open_in_memory().unwrap();
         let root = MemSessionRoot::new();
         let session = seed_running_session(&central);
@@ -187,11 +192,9 @@ mod tests {
         let mut pool = root.inbound_pool(&sess.agent_group_id, &sess.id).unwrap();
         let (kind, on_wake): (String, i64) = pool
             .conn_mut()
-            .query_row(
-                "SELECT kind, on_wake FROM messages_in LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
+            .query_row("SELECT kind, on_wake FROM messages_in LIMIT 1", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
             .unwrap();
         assert_eq!(kind, "task");
         assert_eq!(on_wake, 1);

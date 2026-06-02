@@ -56,9 +56,9 @@ fn tasks_snapshot_path() -> PathBuf {
 
 use async_trait::async_trait;
 use chrono::Utc;
+use copperclaw_db::DbError;
 use copperclaw_db::attachments::safe_attachment_name;
 use copperclaw_db::tables::messages_out::{self, WriteOutbound};
-use copperclaw_db::DbError;
 use copperclaw_mcp::{
     AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec, EditMessageSpec,
     EmitTodoListSpec, InstallSpec, OutboundToolEffect, Recipient, ScheduleSpec, SendCardSpec,
@@ -71,7 +71,7 @@ use rusqlite::Connection;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::subagent::{run_inner_loop, SubagentDeps, SubagentInputs};
+use crate::subagent::{SubagentDeps, SubagentInputs, run_inner_loop};
 
 /// Shared, async-safe handle to the runner's `outbound.db` connection.
 pub type SharedOutbound = Arc<Mutex<Connection>>;
@@ -277,10 +277,7 @@ impl RunnerToolCtx {
         );
         // `rolling` collapses a turn's tools into one expandable activity
         // chip; anything else (incl. unset) keeps the legacy per-tool chips.
-        self.breadcrumb_style = match std::env::var("COPPERCLAW_BREADCRUMB_STYLE")
-            .ok()
-            .as_deref()
-        {
+        self.breadcrumb_style = match std::env::var("COPPERCLAW_BREADCRUMB_STYLE").ok().as_deref() {
             Some("rolling") => BreadcrumbStyle::Rolling,
             _ => BreadcrumbStyle::Chips,
         };
@@ -532,11 +529,10 @@ impl RunnerToolCtx {
             // Flip the earliest still-running step for this tool. Parallel
             // calls to the same tool finish in execution order, so the
             // earliest Running one is the right match.
-            if let Some(step) = act
-                .steps
-                .iter_mut()
-                .find(|s| s.tool_name == tool_name && s.status == copperclaw_channels_core::BreadcrumbStatus::Running)
-            {
+            if let Some(step) = act.steps.iter_mut().find(|s| {
+                s.tool_name == tool_name
+                    && s.status == copperclaw_channels_core::BreadcrumbStatus::Running
+            }) {
                 step.status = status;
                 step.summary = summary.map(str::to_owned);
                 if step.detail.is_none() {
@@ -577,12 +573,7 @@ impl RunnerToolCtx {
     /// the runner has verified the per-group `surface_thinking` flag
     /// is on. Errors are swallowed; thinking is best-effort UX
     /// observability, not load-bearing.
-    pub async fn emit_thinking(
-        &self,
-        text: &str,
-        redacted: bool,
-        model: Option<&str>,
-    ) {
+    pub async fn emit_thinking(&self, text: &str, redacted: bool, model: Option<&str>) {
         // Mirror `emit_status`'s relaxation — see
         // [`should_skip_user_facing_emit`] for rationale.
         if self.should_skip_user_facing_emit() {
@@ -788,10 +779,7 @@ impl RunnerToolCtx {
 
 #[async_trait]
 impl ToolContext for RunnerToolCtx {
-    async fn emit_outbound(
-        &self,
-        effect: OutboundToolEffect,
-    ) -> Result<ToolEffectAck, ToolError> {
+    async fn emit_outbound(&self, effect: OutboundToolEffect) -> Result<ToolEffectAck, ToolError> {
         let outbox = self.outbox_root.clone();
         let origin = self.current_originating();
         // One-shot gate for child agents: refuse second send_message.
@@ -846,10 +834,7 @@ impl ToolContext for RunnerToolCtx {
             }
         };
         let tasks: Vec<TaskSummary> = serde_json::from_slice(&bytes).map_err(|err| {
-            ToolError::Internal(format!(
-                "list_tasks: parse {}: {err}",
-                path.display()
-            ))
+            ToolError::Internal(format!("list_tasks: parse {}: {err}", path.display()))
         })?;
         Ok(tasks)
     }
@@ -865,9 +850,7 @@ impl ToolContext for RunnerToolCtx {
             channel_type: channel_type.map(str::to_string),
             platform_id: platform_id.map(str::to_string),
             thread_id: thread_id.map(str::to_string),
-            in_reply_to: in_reply_to.and_then(|s| {
-                Uuid::parse_str(s).ok().map(MessageId::from)
-            }),
+            in_reply_to: in_reply_to.and_then(|s| Uuid::parse_str(s).ok().map(MessageId::from)),
             source_session_id: self.source_session_id,
         };
         Self::set_originating(self, routing);
@@ -899,12 +882,7 @@ impl ToolContext for RunnerToolCtx {
         Self::emit_breadcrumb_finish(self, tool_name, input, ok, summary).await;
     }
 
-    async fn emit_thinking(
-        &self,
-        text: &str,
-        redacted: bool,
-        model: Option<&str>,
-    ) {
+    async fn emit_thinking(&self, text: &str, redacted: bool, model: Option<&str>) {
         Self::emit_thinking(self, text, redacted, model).await;
     }
 
@@ -916,10 +894,7 @@ impl ToolContext for RunnerToolCtx {
         Self::emit_diff(self, diff).await;
     }
 
-    async fn spawn_subagent(
-        &self,
-        req: SubagentRequest,
-    ) -> Result<SubagentResult, ToolError> {
+    async fn spawn_subagent(&self, req: SubagentRequest) -> Result<SubagentResult, ToolError> {
         let Some(deps) = self.subagent.as_ref() else {
             return Err(ToolError::Context(
                 "subagent deps not wired into RunnerToolCtx".into(),
@@ -930,11 +905,7 @@ impl ToolContext for RunnerToolCtx {
         // the context with `nested = true` set on the request, but
         // doing the check here too means we still refuse even if a
         // future caller forgets to set it.
-        if req.nested
-            || self
-                .in_subagent
-                .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if req.nested || self.in_subagent.load(std::sync::atomic::Ordering::Relaxed) {
             return Err(ToolError::Validation(
                 "nested `explore` calls are not allowed".into(),
             ));
@@ -1016,10 +987,7 @@ struct SubagentCtxAdapter {
 
 #[async_trait]
 impl ToolContext for SubagentCtxAdapter {
-    async fn emit_outbound(
-        &self,
-        effect: OutboundToolEffect,
-    ) -> Result<ToolEffectAck, ToolError> {
+    async fn emit_outbound(&self, effect: OutboundToolEffect) -> Result<ToolEffectAck, ToolError> {
         let outbox = self.outbox_root.clone();
         let mut guard = self.inner.lock().await;
         let conn: &mut Connection = &mut guard;
@@ -1028,10 +996,7 @@ impl ToolContext for SubagentCtxAdapter {
     async fn list_tasks(&self) -> Result<Vec<TaskSummary>, ToolError> {
         Ok(Vec::new())
     }
-    async fn spawn_subagent(
-        &self,
-        _req: SubagentRequest,
-    ) -> Result<SubagentResult, ToolError> {
+    async fn spawn_subagent(&self, _req: SubagentRequest) -> Result<SubagentResult, ToolError> {
         Err(ToolError::Validation(
             "nested `explore` calls are not allowed".into(),
         ))
@@ -1200,9 +1165,7 @@ fn breadcrumb_detail(name: &str, input: &serde_json::Value) -> Option<String> {
         "shell" => field("command"),
         "web_search" | "explore" => field("query"),
         "web_fetch" => field("url"),
-        "read_file" | "write_file" | "edit_file" | "multi_edit" | "apply_patch" => {
-            field("path")
-        }
+        "read_file" | "write_file" | "edit_file" | "multi_edit" | "apply_patch" => field("path"),
         "copy_file" => {
             // Show "src → dst" so the user sees both ends of the copy
             // in one glance.
@@ -1392,10 +1355,18 @@ fn apply_send_message(
     // parent's inbound row.
     if matches!(routed.kind, MessageKind::Agent) {
         if let Some(thread) = &routed.thread_id {
-            body.insert("thread_id".into(), serde_json::Value::String(thread.clone()));
+            body.insert(
+                "thread_id".into(),
+                serde_json::Value::String(thread.clone()),
+            );
         }
     }
-    let seq = insert_outbound_row(conn, MessageId::new(), serde_json::Value::Object(body), &routed)?;
+    let seq = insert_outbound_row(
+        conn,
+        MessageId::new(),
+        serde_json::Value::Object(body),
+        &routed,
+    )?;
     Ok(ToolEffectAck::Message { seq })
 }
 
@@ -1413,8 +1384,7 @@ fn apply_send_file(
         text,
     } = spec;
     let text = text.map(|t| strip_reasoning_blocks(&t));
-    safe_attachment_name(&filename)
-        .map_err(|e| ToolApplyError::Validation(e.to_string()))?;
+    safe_attachment_name(&filename).map_err(|e| ToolApplyError::Validation(e.to_string()))?;
     let msg_id = MessageId::new();
     let msg_id_str = msg_id.as_uuid().to_string();
     let target_dir = outbox_root.join(&msg_id_str);
@@ -1468,12 +1438,7 @@ fn apply_send_file(
         "files".into(),
         serde_json::json!([{ "filename": filename }]),
     );
-    let seq = insert_outbound_row(
-        conn,
-        msg_id,
-        serde_json::Value::Object(body),
-        &routed,
-    )?;
+    let seq = insert_outbound_row(conn, msg_id, serde_json::Value::Object(body), &routed)?;
     Ok(ToolEffectAck::Message { seq })
 }
 
@@ -1825,10 +1790,7 @@ struct OutboundRouting {
 ///    message landed on it (per-thread wirings, operator-added wiring
 ///    pointing at the child's `agent_group`). In those cases the user
 ///    expects a reply, not silent siphoning up to the parent.
-fn resolve_outbound_routing(
-    to: Option<Recipient>,
-    origin: &OriginatingRouting,
-) -> OutboundRouting {
+fn resolve_outbound_routing(to: Option<Recipient>, origin: &OriginatingRouting) -> OutboundRouting {
     use copperclaw_mcp::Recipient as R;
     let inbound_came_from_parent = origin.channel_type.is_none()
         && origin.platform_id.is_none()
@@ -1846,9 +1808,9 @@ fn resolve_outbound_routing(
     };
     let body_to = match to {
         Some(r) => Some(r),
-        None if inbound_came_from_parent => origin
-            .source_session_id
-            .map(|sid| R::Agent { session_id: sid.as_uuid().to_string() }),
+        None if inbound_came_from_parent => origin.source_session_id.map(|sid| R::Agent {
+            session_id: sid.as_uuid().to_string(),
+        }),
         None => None,
     };
     // For Agent-kind rows, the dispatcher receives channel routing
@@ -1922,7 +1884,7 @@ fn insert_outbound_row(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use copperclaw_db::session::{open_outbound, SessionPaths};
+    use copperclaw_db::session::{SessionPaths, open_outbound};
     use copperclaw_mcp::Recipient;
     use copperclaw_types::{AgentGroupId, SessionId};
 
@@ -2093,7 +2055,11 @@ mod tests {
             .await;
         let guard = ctx.outbound.lock().await;
         let rows = copperclaw_db::tables::messages_out::list_due(&guard).unwrap();
-        assert_eq!(rows.len(), 1, "root-session breadcrumb must land even with NULL routing");
+        assert_eq!(
+            rows.len(),
+            1,
+            "root-session breadcrumb must land even with NULL routing"
+        );
         assert_eq!(rows[0].kind, MessageKind::Breadcrumb);
         // Routing fields on the row stay NULL; delivery's
         // session_routing fallback resolves them at dispatch time.
@@ -2176,14 +2142,9 @@ mod tests {
         .await;
         let row = last_row(&ctx).await;
         assert_eq!(row.kind, MessageKind::System);
-        let bc: copperclaw_channels_core::Breadcrumb = serde_json::from_value(
-            row.content["update_breadcrumb"]["breadcrumb"].clone(),
-        )
-        .unwrap();
-        assert_eq!(
-            bc.status,
-            copperclaw_channels_core::BreadcrumbStatus::Done
-        );
+        let bc: copperclaw_channels_core::Breadcrumb =
+            serde_json::from_value(row.content["update_breadcrumb"]["breadcrumb"].clone()).unwrap();
+        assert_eq!(bc.status, copperclaw_channels_core::BreadcrumbStatus::Done);
         assert_eq!(bc.summary.as_deref(), Some("passed (0.4s)"));
         assert_eq!(
             row.content["update_breadcrumb"]["tool_name"], "shell",
@@ -2210,10 +2171,8 @@ mod tests {
         ctx.emit_breadcrumb_finish("shell", None, false, Some("ENOENT"))
             .await;
         let row = last_row(&ctx).await;
-        let bc: copperclaw_channels_core::Breadcrumb = serde_json::from_value(
-            row.content["update_breadcrumb"]["breadcrumb"].clone(),
-        )
-        .unwrap();
+        let bc: copperclaw_channels_core::Breadcrumb =
+            serde_json::from_value(row.content["update_breadcrumb"]["breadcrumb"].clone()).unwrap();
         assert_eq!(
             bc.status,
             copperclaw_channels_core::BreadcrumbStatus::Failed
@@ -2259,10 +2218,7 @@ mod tests {
         ctx.emit_outbound(OutboundToolEffect::SendMessage(spec))
             .await
             .expect("first send_message accepted");
-        assert!(
-            ctx.parent_reply_sent(),
-            "gate flips after first child-send"
-        );
+        assert!(ctx.parent_reply_sent(), "gate flips after first child-send");
     }
 
     #[tokio::test]
@@ -2481,7 +2437,8 @@ mod tests {
             in_reply_to: None,
             source_session_id: Some(parent_session),
         });
-        ctx.emit_status("Still working — should not fire for child").await;
+        ctx.emit_status("Still working — should not fire for child")
+            .await;
         let guard = ctx.outbound.lock().await;
         let rows = copperclaw_db::tables::messages_out::list_due(&guard).unwrap();
         assert!(rows.is_empty(), "child-session status must skip");
@@ -2518,7 +2475,10 @@ mod tests {
     #[test]
     fn expander_triggers_on_line_count_alone() {
         // 31 short lines — under the byte cap but over the line cap.
-        let text = (0..31).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n");
+        let text = (0..31)
+            .map(|i| format!("l{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(text.len() < EXPANDER_BYTE_THRESHOLD);
         let v = build_expander_decorator(&text).expect("31 lines must trigger");
         assert_eq!(v["summary_kind"], "lines");
@@ -2554,7 +2514,10 @@ mod tests {
         // the byte total clears any future bump of `EXPANDER_BYTE_THRESHOLD`
         // up to ~80 KB.
         let line: String = "x".repeat(80);
-        let text = (0..1000).map(|_| line.clone()).collect::<Vec<_>>().join("\n");
+        let text = (0..1000)
+            .map(|_| line.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(text.len() > EXPANDER_BYTE_THRESHOLD);
         assert!(text.lines().count() > EXPANDER_LINE_THRESHOLD);
         let v = build_expander_decorator(&text).expect("both triggers fire");
@@ -2585,7 +2548,10 @@ mod tests {
         // `summary_kind` (string), and `preview_lines` (array of
         // strings) so the host-delivery service can read it back
         // without a defensive decode loop.
-        let text = (0..40).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        let text = (0..40)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let v = build_expander_decorator(&text).unwrap();
         assert!(v.get("summary").and_then(|s| s.as_str()).is_some());
         assert!(v.get("summary_kind").and_then(|s| s.as_str()).is_some());
@@ -2652,7 +2618,11 @@ mod tests {
         .await
         .unwrap();
         let row = last_row(&ctx).await;
-        assert!(row.content.get("expander").is_none(), "got: {:?}", row.content);
+        assert!(
+            row.content.get("expander").is_none(),
+            "got: {:?}",
+            row.content
+        );
     }
 
     #[tokio::test]
@@ -2689,7 +2659,8 @@ mod tests {
 
     #[test]
     fn strip_reasoning_drops_thinking_blocks() {
-        let raw = "<thinking>\nThe user wants X.\nI should do Y.\n</thinking>\n\nHere is the answer.";
+        let raw =
+            "<thinking>\nThe user wants X.\nI should do Y.\n</thinking>\n\nHere is the answer.";
         assert_eq!(strip_reasoning_blocks(raw), "Here is the answer.");
     }
 
@@ -3139,7 +3110,10 @@ mod tests {
             .unwrap();
         assert_eq!(ack, ToolEffectAck::Accepted);
         let row = last_row(&ctx).await;
-        assert_eq!(row.content["install_packages"]["apt"], serde_json::json!(["jq"]));
+        assert_eq!(
+            row.content["install_packages"]["apt"],
+            serde_json::json!(["jq"])
+        );
         assert_eq!(
             row.content["install_packages"]["npm"],
             serde_json::json!(["zod"])
@@ -3273,10 +3247,7 @@ mod tests {
         fn name(&self) -> &'static str {
             "oneshot"
         }
-        async fn query(
-            &self,
-            _input: QueryInput,
-        ) -> Result<Box<dyn AgentQuery>, ProviderError> {
+        async fn query(&self, _input: QueryInput) -> Result<Box<dyn AgentQuery>, ProviderError> {
             let events = self.events.lock().unwrap().take().unwrap_or_default();
             Ok(Box::new(OneShotQuery {
                 events: StdMutex::new(events),
@@ -3314,11 +3285,7 @@ mod tests {
         provider_events: Vec<ProviderEvent>,
     ) -> (tempfile::TempDir, RunnerToolCtx) {
         let tmp = tempfile::tempdir().unwrap();
-        let paths = SessionPaths::new(
-            tmp.path(),
-            AgentGroupId::new(),
-            SessionId::new(),
-        );
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
         let conn = open_outbound(&paths).unwrap();
         let outbound = Arc::new(Mutex::new(conn));
         let provider: Arc<dyn AgentProvider> = OneShotProvider::new(provider_events);
@@ -3334,8 +3301,7 @@ mod tests {
             assistant_name: None,
             provider_deadline: Duration::from_secs(5),
         };
-        let ctx = RunnerToolCtx::new(outbound, paths.outbox.clone())
-            .with_subagent(deps);
+        let ctx = RunnerToolCtx::new(outbound, paths.outbox.clone()).with_subagent(deps);
         (tmp, ctx)
     }
 

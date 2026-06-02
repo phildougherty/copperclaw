@@ -36,7 +36,13 @@ mod tests {
 
     #[test]
     fn destination_kind_serde() {
-        assert_eq!(serde_json::to_string(&DestinationKind::Channel).unwrap(), "\"channel\"");
-        assert_eq!(serde_json::to_string(&DestinationKind::Agent).unwrap(), "\"agent\"");
+        assert_eq!(
+            serde_json::to_string(&DestinationKind::Channel).unwrap(),
+            "\"channel\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DestinationKind::Agent).unwrap(),
+            "\"agent\""
+        );
     }
 }

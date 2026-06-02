@@ -11,9 +11,9 @@
 //! it for screenshots, charts, diagrams, or any image already on disk
 //! (one fetched with `web_fetch`/`curl`, generated, or in a repo).
 
-use crate::context::{bytes_b64, ToolContext};
+use crate::context::{ToolContext, bytes_b64};
 use crate::error::ToolError;
-use crate::tools::{make_tool, parse_args, ToolEntry, ToolHandler};
+use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args};
 use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
 use serde::Deserialize;
 use serde_json::json;
@@ -47,7 +47,11 @@ pub fn schema() -> Tool {
 /// Map a file extension to an image MIME type. `None` for anything we
 /// don't recognise as an image the vision models accept.
 fn mime_for(path: &str) -> Option<&'static str> {
-    let ext = path.rsplit('.').next().unwrap_or_default().to_ascii_lowercase();
+    let ext = path
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     Some(match ext.as_str() {
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",

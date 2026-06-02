@@ -95,11 +95,7 @@ pub fn materialize(
     Ok(report)
 }
 
-fn link_one(
-    skill: &Skill,
-    link: &Path,
-    allowed_roots: &[PathBuf],
-) -> Result<(), SkillError> {
+fn link_one(skill: &Skill, link: &Path, allowed_roots: &[PathBuf]) -> Result<(), SkillError> {
     let canonical = skill
         .dir
         .canonicalize()
@@ -115,9 +111,7 @@ fn link_one(
                 let current = fs::read_link(link).map_err(|e| SkillError::io(link, e))?;
                 // Compare canonical targets so a relative or stale link is
                 // detected.
-                let current_canon = current
-                    .canonicalize()
-                    .unwrap_or_else(|_| current.clone());
+                let current_canon = current.canonicalize().unwrap_or_else(|_| current.clone());
                 if current_canon == canonical {
                     return Ok(());
                 }
@@ -196,9 +190,22 @@ mod tests {
 
         let link_a = dest.join("alpha");
         let link_b = dest.join("beta");
-        assert!(fs::symlink_metadata(&link_a).unwrap().file_type().is_symlink());
-        assert!(fs::symlink_metadata(&link_b).unwrap().file_type().is_symlink());
-        assert_eq!(fs::read_link(&link_a).unwrap(), a_dir.canonicalize().unwrap());
+        assert!(
+            fs::symlink_metadata(&link_a)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::symlink_metadata(&link_b)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_link(&link_a).unwrap(),
+            a_dir.canonicalize().unwrap()
+        );
     }
 
     #[test]
@@ -268,25 +275,14 @@ mod tests {
         let bad_dir = td.path().join("missing-dir");
 
         let dest = td.path().join("dest");
-        let skills = vec![
-            mk_skill("bad", &bad_dir),
-            mk_skill("good", &good),
-        ];
+        let skills = vec![mk_skill("bad", &bad_dir), mk_skill("good", &good)];
         let report = materialize(&skills, &dest, &[]).unwrap();
         assert_eq!(report.outcomes.len(), 2);
         // Good one succeeded.
-        let good_outcome = report
-            .outcomes
-            .iter()
-            .find(|o| o.skill == "good")
-            .unwrap();
+        let good_outcome = report.outcomes.iter().find(|o| o.skill == "good").unwrap();
         assert!(good_outcome.error.is_none());
         // Bad one errored.
-        let bad_outcome = report
-            .outcomes
-            .iter()
-            .find(|o| o.skill == "bad")
-            .unwrap();
+        let bad_outcome = report.outcomes.iter().find(|o| o.skill == "bad").unwrap();
         assert!(bad_outcome.error.is_some());
         assert!(!report.is_ok());
     }

@@ -22,25 +22,25 @@ pub mod state;
 pub mod subagent;
 pub mod tools;
 
-pub use compaction::{compact, estimate_tokens, CompactionCfg};
+pub use compaction::{CompactionCfg, compact, estimate_tokens};
 pub use config::{RunnerConfig, RunnerConfigFile};
-pub use destinations::{resolve_recipient, ResolvedRoute};
-pub use disallowed::{is_disallowed, DISALLOWED_TOOLS};
-pub use formatter::{format_messages, FormattedTurn};
+pub use destinations::{ResolvedRoute, resolve_recipient};
+pub use disallowed::{DISALLOWED_TOOLS, is_disallowed};
+pub use formatter::{FormattedTurn, format_messages};
 pub use run::{
-    resolve_max_tool_turns, resolve_provider_deadline, resolve_tool_deadline_secs, run_loop,
-    RunnerDeps, ACTIVE_POLL_INTERVAL_MS, DEFAULT_MAX_TOOL_TURNS, DEFAULT_PROVIDER_DEADLINE_MS,
+    ACTIVE_POLL_INTERVAL_MS, DEFAULT_MAX_TOOL_TURNS, DEFAULT_PROVIDER_DEADLINE_MS,
     DEFAULT_TOOL_DEADLINE_SECS, MAX_MAX_TOOL_TURNS, MAX_PROVIDER_DEADLINE_MS,
     MAX_TOOL_DEADLINE_SECS, MAX_TOOL_TURNS_ENV, MIN_MAX_TOOL_TURNS, MIN_PROVIDER_DEADLINE_MS,
-    MIN_TOOL_DEADLINE_SECS, POLL_INTERVAL_MS, PROVIDER_DEADLINE_ENV, TOOL_DEADLINE_ENV,
+    MIN_TOOL_DEADLINE_SECS, POLL_INTERVAL_MS, PROVIDER_DEADLINE_ENV, RunnerDeps, TOOL_DEADLINE_ENV,
+    resolve_max_tool_turns, resolve_provider_deadline, resolve_tool_deadline_secs, run_loop,
 };
 // Production wiring for the typing-indicator-keepalive path: the
 // runner binary constructs a HeartbeatPinger so each LLM stream
 // refreshes the heartbeat file (and thus the host's typing-ticker
 // stays willing to fire) across long provider calls.
 pub use run::provider_call::{HeartbeatPinger, NoopPinger, ProviderActivityPinger};
-pub use state::{load_state, save_state, PersistedState};
+pub use state::{PersistedState, load_state, save_state};
 pub use subagent::{
-    build_subagent_system, run_inner_loop, SubagentDeps, SubagentInputs, SUBAGENT_PREAMBLE,
+    SUBAGENT_PREAMBLE, SubagentDeps, SubagentInputs, build_subagent_system, run_inner_loop,
 };
 pub use tools::{RunnerToolCtx, SubagentRunnerDeps};

@@ -148,8 +148,7 @@ impl ChannelAdapter for IMessageAdapter {
         if !message.files.is_empty() {
             for file in &message.files {
                 let path = write_outbound_file(&self.data_dir, file)?;
-                let script =
-                    render_file_script(&self.config.service_name, &target, &path)?;
+                let script = render_file_script(&self.config.service_name, &target, &path)?;
                 self.bridge.run_applescript(&script).await?;
             }
         }
@@ -200,8 +199,8 @@ pub fn render_file_script(
     target: &ParsedPlatformId,
     path: &std::path::Path,
 ) -> Result<String, AdapterError> {
-    let escaped_path = applescript_escape(&path.to_string_lossy())
-        .map_err(escape_to_bad_request)?;
+    let escaped_path =
+        applescript_escape(&path.to_string_lossy()).map_err(escape_to_bad_request)?;
     let escaped_service = applescript_escape(service_name).map_err(escape_to_bad_request)?;
     Ok(match target {
         ParsedPlatformId::Handle(h) => {
@@ -300,12 +299,7 @@ mod tests {
     ) -> (Arc<IMessageAdapter>, mpsc::Receiver<InboundEvent>, TempDir) {
         let (tx, rx) = mpsc::channel::<InboundEvent>(16);
         let dir = TempDir::new().unwrap();
-        let adapter = IMessageAdapter::start_with_bridge(
-            mock,
-            cfg,
-            tx,
-            dir.path().to_path_buf(),
-        );
+        let adapter = IMessageAdapter::start_with_bridge(mock, cfg, tx, dir.path().to_path_buf());
         (adapter, rx, dir)
     }
 
@@ -360,13 +354,9 @@ mod tests {
     async fn deliver_with_quotes_in_text_is_escaped() {
         let m = Arc::new(MockBridge::always_applescript_ok(""));
         let (a, _rx, _d) = make_adapter(m.clone(), polling_off());
-        a.deliver(
-            "handle:+1",
-            None,
-            &outbound_text("she said \"hi\""),
-        )
-        .await
-        .unwrap();
+        a.deliver("handle:+1", None, &outbound_text("she said \"hi\""))
+            .await
+            .unwrap();
         let s = &m.applescript_calls()[0];
         // Escaped quote pair shows up as backslash-quote.
         assert!(s.contains("send \"she said \\\"hi\\\"\""));
@@ -387,13 +377,9 @@ mod tests {
     async fn deliver_with_backslash_is_escaped() {
         let m = Arc::new(MockBridge::always_applescript_ok(""));
         let (a, _rx, _d) = make_adapter(m.clone(), polling_off());
-        a.deliver(
-            "handle:+1",
-            None,
-            &outbound_text("c:\\path\\to\\file"),
-        )
-        .await
-        .unwrap();
+        a.deliver("handle:+1", None, &outbound_text("c:\\path\\to\\file"))
+            .await
+            .unwrap();
         let s = &m.applescript_calls()[0];
         assert!(s.contains("c:\\\\path\\\\to\\\\file"));
     }
@@ -619,8 +605,14 @@ mod tests {
             kind: MessageKind::Chat,
             content: json!({}),
             files: vec![
-                OutboundFile { filename: "a.txt".into(), data: vec![1] },
-                OutboundFile { filename: "b.txt".into(), data: vec![2] },
+                OutboundFile {
+                    filename: "a.txt".into(),
+                    data: vec![1],
+                },
+                OutboundFile {
+                    filename: "b.txt".into(),
+                    data: vec![2],
+                },
             ],
         };
         a.deliver("handle:+1", None, &msg).await.unwrap();
@@ -685,12 +677,7 @@ mod tests {
         let cfg = polling_off();
         let (tx, mut rx) = mpsc::channel::<InboundEvent>(8);
         let dir = TempDir::new().unwrap();
-        let _a = IMessageAdapter::start_with_bridge(
-            m,
-            cfg,
-            tx,
-            dir.path().to_path_buf(),
-        );
+        let _a = IMessageAdapter::start_with_bridge(m, cfg, tx, dir.path().to_path_buf());
         // Confirm no events appear.
         let r = timeout(Duration::from_millis(80), rx.recv()).await;
         match r {
@@ -716,12 +703,7 @@ mod tests {
         cfg.since_rowid_file = "rowid.txt".into();
         let (tx, mut rx) = mpsc::channel::<InboundEvent>(8);
         let dir = TempDir::new().unwrap();
-        let a = IMessageAdapter::start_with_bridge(
-            m,
-            cfg,
-            tx,
-            dir.path().to_path_buf(),
-        );
+        let a = IMessageAdapter::start_with_bridge(m, cfg, tx, dir.path().to_path_buf());
         let evt = timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("event")
@@ -764,12 +746,8 @@ mod tests {
 
     #[test]
     fn render_text_script_handle_branch_uses_buddy() {
-        let s = render_text_script(
-            "iMessage",
-            &ParsedPlatformId::Handle("+1".into()),
-            "hi",
-        )
-        .unwrap();
+        let s =
+            render_text_script("iMessage", &ParsedPlatformId::Handle("+1".into()), "hi").unwrap();
         assert!(s.contains("buddy \"+1\""));
         assert!(s.contains("service type = iMessage"));
         assert!(s.contains("send \"hi\""));
@@ -777,58 +755,35 @@ mod tests {
 
     #[test]
     fn render_text_script_chat_branch_uses_chat_id() {
-        let s = render_text_script(
-            "iMessage",
-            &ParsedPlatformId::Chat("g".into()),
-            "yo",
-        )
-        .unwrap();
+        let s = render_text_script("iMessage", &ParsedPlatformId::Chat("g".into()), "yo").unwrap();
         assert!(s.contains("chat id \"g\""));
         assert!(s.contains("send \"yo\""));
     }
 
     #[test]
     fn render_text_script_sms_service_uses_bare_identifier() {
-        let s = render_text_script(
-            "SMS",
-            &ParsedPlatformId::Handle("+1".into()),
-            "hi",
-        )
-        .unwrap();
+        let s = render_text_script("SMS", &ParsedPlatformId::Handle("+1".into()), "hi").unwrap();
         assert!(s.contains("service type = SMS"));
     }
 
     #[test]
     fn render_text_script_unknown_service_quotes_it() {
-        let s = render_text_script(
-            "Custom",
-            &ParsedPlatformId::Handle("+1".into()),
-            "hi",
-        )
-        .unwrap();
+        let s = render_text_script("Custom", &ParsedPlatformId::Handle("+1".into()), "hi").unwrap();
         assert!(s.contains("service type = \"Custom\""));
     }
 
     #[test]
     fn render_text_script_escapes_handle_and_text() {
-        let s = render_text_script(
-            "iMessage",
-            &ParsedPlatformId::Handle("a\"b".into()),
-            "c\"d",
-        )
-        .unwrap();
+        let s = render_text_script("iMessage", &ParsedPlatformId::Handle("a\"b".into()), "c\"d")
+            .unwrap();
         assert!(s.contains("buddy \"a\\\"b\""));
         assert!(s.contains("send \"c\\\"d\""));
     }
 
     #[test]
     fn render_text_script_rejects_null_text() {
-        let err = render_text_script(
-            "iMessage",
-            &ParsedPlatformId::Handle("+1".into()),
-            "\0",
-        )
-        .unwrap_err();
+        let err = render_text_script("iMessage", &ParsedPlatformId::Handle("+1".into()), "\0")
+            .unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 
@@ -872,7 +827,10 @@ mod tests {
         let d = TempDir::new().unwrap();
         let p = write_outbound_file(
             d.path(),
-            &OutboundFile { filename: "x.txt".into(), data: b"hi".to_vec() },
+            &OutboundFile {
+                filename: "x.txt".into(),
+                data: b"hi".to_vec(),
+            },
         )
         .unwrap();
         assert!(p.exists());
@@ -905,7 +863,10 @@ mod tests {
         let d = TempDir::new().unwrap();
         let err = write_outbound_file(
             d.path(),
-            &OutboundFile { filename: "/".into(), data: vec![] },
+            &OutboundFile {
+                filename: "/".into(),
+                data: vec![],
+            },
         )
         .unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));

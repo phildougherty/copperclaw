@@ -87,9 +87,9 @@ impl XConfig {
     /// }
     /// ```
     pub fn from_value(value: &Value) -> Result<Self, AdapterError> {
-        let obj = value.as_object().ok_or_else(|| {
-            AdapterError::BadRequest("x config must be a JSON object".into())
-        })?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| AdapterError::BadRequest("x config must be a JSON object".into()))?;
 
         let bearer_token = required_nonempty_string(obj, "bearer_token")?;
         let user_id = required_nonempty_string(obj, "user_id")?;
@@ -142,9 +142,7 @@ impl XConfig {
         let poll_interval_ms = match obj.get("poll_interval_ms") {
             None | Some(Value::Null) => DEFAULT_POLL_INTERVAL_MS,
             Some(Value::Number(n)) => n.as_u64().ok_or_else(|| {
-                AdapterError::BadRequest(
-                    "x poll_interval_ms must be a non-negative integer".into(),
-                )
+                AdapterError::BadRequest("x poll_interval_ms must be a non-negative integer".into())
             })?,
             Some(_) => {
                 return Err(AdapterError::BadRequest(

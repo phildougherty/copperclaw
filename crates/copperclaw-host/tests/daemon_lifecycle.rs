@@ -66,8 +66,8 @@ fn status_json_when_not_running_has_running_false() {
     let out = run(tmp.path(), &["status", "--json"]);
     assert!(!out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(&stdout)
-        .unwrap_or_else(|_| panic!("not json: {stdout}"));
+    let v: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|_| panic!("not json: {stdout}"));
     assert_eq!(v["running"], false);
     assert_eq!(v["pid"], serde_json::Value::Null);
 }
@@ -126,8 +126,7 @@ fn start_then_stop_round_trip() {
         // typically because container runtime detection failed).
         // Skip the test in that case.
         if out.status.code() == Some(1)
-            && (stderr.contains("did not become ready")
-                || stderr.contains("runtime"))
+            && (stderr.contains("did not become ready") || stderr.contains("runtime"))
         {
             eprintln!("skipping: start timeout (no container runtime?); {stderr}");
             return;

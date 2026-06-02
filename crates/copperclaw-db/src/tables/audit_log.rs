@@ -8,10 +8,10 @@
 //! Read-only commands are deliberately not logged — there are 100x as
 //! many of them as mutations and they have no security relevance.
 
-use crate::central::CentralDb;
 use crate::DbError;
+use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{OptionalExtension, Row, params};
 
 /// One row inserted per mutating command.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,11 +93,7 @@ fn row_to_entry(row: &Row<'_>) -> rusqlite::Result<AuditEntry> {
     let ts_str: String = row.get(0)?;
     let ts = DateTime::parse_from_rfc3339(&ts_str)
         .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                0,
-                rusqlite::types::Type::Text,
-                Box::new(e),
-            )
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
         })?
         .with_timezone(&Utc);
     Ok(AuditEntry {

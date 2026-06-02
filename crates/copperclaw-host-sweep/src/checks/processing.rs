@@ -11,14 +11,14 @@
 //! `messages_in` and reset its `status` to `pending`. The container-side
 //! `processing_ack` row is deleted so the next poll can re-acquire.
 
+use crate::CLAIM_STUCK_MS;
 use crate::error::SweepError;
 use crate::service::{MessageReset, SessionRoot};
-use crate::CLAIM_STUCK_MS;
 use chrono::{DateTime, Utc};
 use copperclaw_db::tables::processing_ack;
 use copperclaw_db::tables::processing_ack::ProcessingStatus;
 use copperclaw_types::{AgentGroupId, SessionId};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 /// Walk every claim on this session's `processing_ack`. Returns one
 /// [`MessageReset`] per row that was reset.
@@ -90,12 +90,7 @@ pub fn check_with_hook(
         // require both this UPDATE and a new INSERT into
         // processing_ack — and no path in the system synthesises that
         // for an inbound whose status is still Processing.
-        let deleted = atomic_reclaim_claim(
-            outbound.conn_mut(),
-            message_id,
-            now,
-            threshold_ms,
-        )?;
+        let deleted = atomic_reclaim_claim(outbound.conn_mut(), message_id, now, threshold_ms)?;
         if !deleted {
             tracing::debug!(
                 target: "copperclaw_host_sweep::processing",
@@ -224,7 +219,7 @@ fn reset_message_in(
 mod tests {
     use super::*;
     use crate::test_support::{
-        insert_inbound_message, insert_outbound_reply, seed_running_session, MemSessionRoot,
+        MemSessionRoot, insert_inbound_message, insert_outbound_reply, seed_running_session,
     };
     use chrono::{Duration as ChDuration, TimeZone};
     use copperclaw_db::central::CentralDb;
@@ -245,9 +240,7 @@ mod tests {
         status: ProcessingStatus,
         when: DateTime<Utc>,
     ) {
-        let mut pool = root
-            .outbound_pool(&sess.agent_group_id, &sess.id)
-            .unwrap();
+        let mut pool = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
         let conn = pool.conn_mut();
         conn.execute(
             "INSERT INTO processing_ack (message_id, status, status_changed) VALUES (?1, ?2, ?3)",
@@ -259,9 +252,7 @@ mod tests {
     #[test]
     fn empty_processing_ack_returns_empty() {
         let (root, sess, now) = fixture();
-        let _ = root
-            .outbound_pool(&sess.agent_group_id, &sess.id)
-            .unwrap();
+        let _ = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
         let r = check(&root, &sess.agent_group_id, &sess.id, now).unwrap();
         assert!(r.is_empty());
     }

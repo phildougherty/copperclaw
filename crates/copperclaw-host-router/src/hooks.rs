@@ -14,8 +14,8 @@
 
 use copperclaw_modules::context::{
     AccessGate, ChannelRequestCtx, ChannelRequestGate, GateCtx, GateDecision, InterceptorCtx,
-    InterceptorDecision, MessageInterceptor, SenderResolver, SenderScopeCtx,
-    SenderScopeDecision, SenderScopeGate,
+    InterceptorDecision, MessageInterceptor, SenderResolver, SenderScopeCtx, SenderScopeDecision,
+    SenderScopeGate,
 };
 use copperclaw_types::{InboundEvent, UserId};
 use std::sync::Mutex;
@@ -87,7 +87,10 @@ impl HookChain {
 
     /// True if any access-gate is currently registered.
     pub fn has_access_gate(&self) -> bool {
-        self.access_gate.lock().expect("access_gate mutex").is_some()
+        self.access_gate
+            .lock()
+            .expect("access_gate mutex")
+            .is_some()
     }
 
     /// True if any sender-scope-gate is currently registered.

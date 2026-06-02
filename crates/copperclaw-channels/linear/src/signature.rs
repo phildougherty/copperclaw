@@ -77,7 +77,10 @@ mod tests {
     fn compute_is_64_hex_chars() {
         let sig = compute_signature(SECRET, BODY);
         assert_eq!(sig.len(), 64);
-        assert!(sig.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(
+            sig.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
     }
 
     #[test]

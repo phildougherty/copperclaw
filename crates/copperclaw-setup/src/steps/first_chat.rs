@@ -58,14 +58,12 @@ pub fn instructions(cfg: &SetupConfig) -> Vec<String> {
                 out.push("  cclaw chat".to_string());
                 out.push(String::new());
                 out.push(
-                    "A default cli agent group is already wired up — `cclaw chat`"
-                        .to_string(),
+                    "A default cli agent group is already wired up — `cclaw chat`".to_string(),
                 );
                 out.push("will start a REPL against it.".to_string());
                 out.push(String::new());
                 out.push(
-                    "First-run sanity check: `cclaw doctor` walks every check and"
-                        .to_string(),
+                    "First-run sanity check: `cclaw doctor` walks every check and".to_string(),
                 );
                 out.push("prints a `fix:` line on each non-OK row.".to_string());
             } else {
@@ -74,8 +72,7 @@ pub fn instructions(cfg: &SetupConfig) -> Vec<String> {
                 out.push("  cclaw chat".to_string());
                 out.push(String::new());
                 out.push(
-                    "(Or run `cclaw doctor` if anything looks off — it walks every"
-                        .to_string(),
+                    "(Or run `cclaw doctor` if anything looks off — it walks every".to_string(),
                 );
                 out.push("check and prints a `fix:` line on each non-OK row.)".to_string());
             }

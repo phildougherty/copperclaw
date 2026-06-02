@@ -19,12 +19,12 @@ pub mod commands;
 pub mod output;
 pub mod protocol;
 
-pub use client::{ClientError, CclawClient, DEFAULT_TIMEOUT};
-pub use commands::{default_user_socket, Cli, ParsedCall, TopCommand, ALL_COMMANDS};
+pub use client::{CclawClient, ClientError, DEFAULT_TIMEOUT};
+pub use commands::{ALL_COMMANDS, Cli, ParsedCall, TopCommand, default_user_socket};
 pub use output::{render, render_json_pretty};
 pub use protocol::{
-    Caller, ErrorPayload, ProtoError, Request, Response, read_frame, read_request,
-    read_response, write_frame, write_request, write_response,
+    Caller, ErrorPayload, ProtoError, Request, Response, read_frame, read_request, read_response,
+    write_frame, write_request, write_response,
 };
 
 use std::process::ExitCode;
@@ -217,10 +217,9 @@ where
             }
             RunOutput::success(out)
         }
-        Err(ClientError::Remote(e)) => RunOutput::failure(format!(
-            "remote error: {} ({})\n",
-            e.message, e.code
-        )),
+        Err(ClientError::Remote(e)) => {
+            RunOutput::failure(format!("remote error: {} ({})\n", e.message, e.code))
+        }
         Err(other) => RunOutput::failure(format!("{other}\n")),
     }
 }
@@ -272,24 +271,17 @@ async fn run_chat(args: &serde_json::Value) -> RunOutput {
 
     let Some(install_root) = resolve_install_root() else {
         return RunOutput::failure(
-            "cclaw chat: could not resolve install root; pass --fifo / --log\n"
-                .to_string(),
+            "cclaw chat: could not resolve install root; pass --fifo / --log\n".to_string(),
         );
     };
     let fifo_path: PathBuf = args
         .get("fifo")
         .and_then(serde_json::Value::as_str)
-        .map_or_else(
-            || install_root.join("chat.fifo"),
-            PathBuf::from,
-        );
+        .map_or_else(|| install_root.join("chat.fifo"), PathBuf::from);
     let log_path: PathBuf = args
         .get("log")
         .and_then(serde_json::Value::as_str)
-        .map_or_else(
-            || install_root.join("chat.log"),
-            PathBuf::from,
-        );
+        .map_or_else(|| install_root.join("chat.log"), PathBuf::from);
     let no_autostart = args
         .get("no_autostart")
         .and_then(serde_json::Value::as_bool)
@@ -322,10 +314,7 @@ async fn run_chat(args: &serde_json::Value) -> RunOutput {
         }
     }
     if !log_path.exists() {
-        return RunOutput::failure(format!(
-            "cclaw chat: no log at {}\n",
-            log_path.display()
-        ));
+        return RunOutput::failure(format!("cclaw chat: no log at {}\n", log_path.display()));
     }
 
     let mut fifo = match OpenOptions::new().write(true).open(&fifo_path).await {
@@ -425,11 +414,12 @@ enum AutostartResult {
 ///   didn't appear within the start grace window.
 async fn try_autostart_host(fifo_path: &std::path::Path) -> AutostartResult {
     let Some(exe) = which_copperclaw() else {
-        return AutostartResult::NotFeasible(
-            "copperclaw not on PATH".to_string(),
-        );
+        return AutostartResult::NotFeasible("copperclaw not on PATH".to_string());
     };
-    eprintln!("cclaw chat: host not running; starting it via `{}`...", exe.display());
+    eprintln!(
+        "cclaw chat: host not running; starting it via `{}`...",
+        exe.display()
+    );
     let out = tokio::process::Command::new(&exe)
         .arg("start")
         .output()
@@ -440,13 +430,11 @@ async fn try_autostart_host(fifo_path: &std::path::Path) -> AutostartResult {
     };
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        return AutostartResult::FailedToBoot(
-            if stderr.is_empty() {
-                format!("`copperclaw start` exited {}", out.status)
-            } else {
-                stderr.trim().to_string()
-            },
-        );
+        return AutostartResult::FailedToBoot(if stderr.is_empty() {
+            format!("`copperclaw start` exited {}", out.status)
+        } else {
+            stderr.trim().to_string()
+        });
     }
     // `copperclaw start` returns once the *admin* socket is up, but the
     // chat FIFO is created by the cli channel during boot — usually
@@ -594,10 +582,7 @@ where
     out.push_str(&format!("  running:         {running}\n"));
     out.push_str(&format!("  idle:            {idle}\n"));
     out.push_str(&format!("  stopped:         {stopped}\n"));
-    out.push_str(&format!(
-        "dropped messages:  {}\n",
-        array_len(&dropped)
-    ));
+    out.push_str(&format!("dropped messages:  {}\n", array_len(&dropped)));
     out.push('\n');
     if array_len(&audit) > 0 {
         out.push_str("recent mutations (24h, up to 5)\n");
@@ -647,7 +632,12 @@ struct Check {
 
 impl Check {
     fn ok(name: &'static str, detail: impl Into<String>) -> Self {
-        Self { name, level: CheckLevel::Ok, detail: detail.into(), fix: None }
+        Self {
+            name,
+            level: CheckLevel::Ok,
+            detail: detail.into(),
+            fix: None,
+        }
     }
     fn warn(name: &'static str, detail: impl Into<String>, fix: Option<&str>) -> Self {
         Self {
@@ -672,7 +662,10 @@ impl Check {
             "level".into(),
             serde_json::Value::String(self.level.as_str().into()),
         );
-        o.insert("detail".into(), serde_json::Value::String(self.detail.clone()));
+        o.insert(
+            "detail".into(),
+            serde_json::Value::String(self.detail.clone()),
+        );
         if let Some(f) = &self.fix {
             o.insert("fix".into(), serde_json::Value::String(f.clone()));
         }
@@ -805,14 +798,16 @@ where
             .map(|rows| {
                 rows.iter()
                     .filter(|r| {
-                        r.get("result").and_then(serde_json::Value::as_str)
-                            == Some("error")
+                        r.get("result").and_then(serde_json::Value::as_str) == Some("error")
                     })
                     .collect()
             })
             .unwrap_or_default();
         if bad.is_empty() {
-            checks.push(Check::ok("audit-errors", "no failed mutations in the last hour"));
+            checks.push(Check::ok(
+                "audit-errors",
+                "no failed mutations in the last hour",
+            ));
         } else {
             let sample: Vec<String> = bad
                 .iter()
@@ -831,7 +826,11 @@ where
                 .collect();
             checks.push(Check::warn(
                 "audit-errors",
-                format!("{} failed mutation(s) in the last hour: {}", bad.len(), sample.join(", ")),
+                format!(
+                    "{} failed mutation(s) in the last hour: {}",
+                    bad.len(),
+                    sample.join(", ")
+                ),
                 Some("`cclaw audit list --since 1h` to see the full set"),
             ));
         }
@@ -839,7 +838,11 @@ where
 
     // 6. Dropped-message backlog.
     if let Ok(dropped) = transport
-        .call("dropped-messages.list", serde_json::json!({}), caller.clone())
+        .call(
+            "dropped-messages.list",
+            serde_json::json!({}),
+            caller.clone(),
+        )
         .await
     {
         let n = array_len(&dropped);
@@ -859,7 +862,10 @@ where
     //    the host inherits the same env when launched from a
     //    setup-written `.env` file, so a missing var here is almost
     //    certainly the same one the host saw on boot.
-    if std::env::var("ANTHROPIC_API_KEY").map(|s| !s.is_empty()).unwrap_or(false) {
+    if std::env::var("ANTHROPIC_API_KEY")
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
+    {
         checks.push(Check::ok(
             "anthropic-key",
             "ANTHROPIC_API_KEY is set in this shell's env",
@@ -882,7 +888,10 @@ where
     ]
     .iter()
     .filter_map(|(var, name)| {
-        std::env::var(var).ok().filter(|s| !s.is_empty()).map(|_| *name)
+        std::env::var(var)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|_| *name)
     })
     .collect();
     if providers.is_empty() {
@@ -893,7 +902,11 @@ where
     } else {
         checks.push(Check::ok(
             "web-search",
-            format!("{} provider(s) configured: {}", providers.len(), providers.join(", ")),
+            format!(
+                "{} provider(s) configured: {}",
+                providers.len(),
+                providers.join(", ")
+            ),
         ));
     }
 
@@ -920,7 +933,12 @@ fn finalise_doctor(checks: &[Check], as_json: bool) -> RunOutput {
     }
     let mut out = String::new();
     for c in checks {
-        out.push_str(&format!("[{}] {:<18} {}\n", c.level.tag(), c.name, c.detail));
+        out.push_str(&format!(
+            "[{}] {:<18} {}\n",
+            c.level.tag(),
+            c.name,
+            c.detail
+        ));
         if c.level != CheckLevel::Ok {
             if let Some(fix) = &c.fix {
                 out.push_str(&format!("       fix: {fix}\n"));
@@ -974,7 +992,11 @@ where
         Err(e) => return RunOutput::failure(format_step_error("groups.list", &e)),
     };
     let mgs = match transport
-        .call("messaging-groups.list", serde_json::json!({}), caller.clone())
+        .call(
+            "messaging-groups.list",
+            serde_json::json!({}),
+            caller.clone(),
+        )
         .await
     {
         Ok(v) => v,
@@ -1014,19 +1036,10 @@ where
     }
 
     let mut out = String::new();
-    out.push_str(&format!(
-        "agent groups:      {}\n",
-        array_len(&groups)
-    ));
-    out.push_str(&format!(
-        "messaging groups:  {}\n",
-        array_len(&mgs)
-    ));
+    out.push_str(&format!("agent groups:      {}\n", array_len(&groups)));
+    out.push_str(&format!("messaging groups:  {}\n", array_len(&mgs)));
     out.push_str(&format!("wirings:           {}\n", array_len(&wirings)));
-    out.push_str(&format!(
-        "active sessions:   {}\n",
-        array_len(&sessions)
-    ));
+    out.push_str(&format!("active sessions:   {}\n", array_len(&sessions)));
     out.push('\n');
     if array_len(&groups) > 0 {
         out.push_str("agent groups\n");
@@ -1090,16 +1103,18 @@ where
         group_args.insert("provider".into(), p.into());
     }
     let group = match transport
-        .call("groups.create", serde_json::Value::Object(group_args), caller.clone())
+        .call(
+            "groups.create",
+            serde_json::Value::Object(group_args),
+            caller.clone(),
+        )
         .await
     {
         Ok(v) => v,
         Err(e) => return RunOutput::failure(format_step_error("groups.create", &e)),
     };
     let Some(ag_id) = group.get("id").and_then(serde_json::Value::as_str) else {
-        return RunOutput::failure(
-            "quickstart.cli: groups.create returned no id\n".to_string(),
-        );
+        return RunOutput::failure("quickstart.cli: groups.create returned no id\n".to_string());
     };
 
     // 2) Create a messaging group bound to the cli/stdin channel.
@@ -1172,7 +1187,10 @@ where
 fn format_step_error(step: &str, e: &ClientError) -> String {
     match e {
         ClientError::Remote(p) => {
-            format!("quickstart.cli: {step} failed: {} ({})\n", p.message, p.code)
+            format!(
+                "quickstart.cli: {step} failed: {} ({})\n",
+                p.message, p.code
+            )
         }
         other => format!("quickstart.cli: {step} failed: {other}\n"),
     }
@@ -1259,8 +1277,7 @@ where
         || "(unknown)".to_string(),
         |p| p.to_string_lossy().into_owned(),
     );
-    let suggestions =
-        dashboard_suggestions(&groups, &audit, &dropped, &sessions);
+    let suggestions = dashboard_suggestions(&groups, &audit, &dropped, &sessions);
 
     if as_json {
         let payload = serde_json::json!({
@@ -1310,17 +1327,15 @@ fn dashboard_suggestions(
     let active_sessions = array_len(sessions);
 
     if group_count == 0 {
-        out.push(
-            "cclaw quickstart cli --name first   # create your first agent group".into(),
-        );
+        out.push("cclaw quickstart cli --name first   # create your first agent group".into());
     }
     if drop_count > 0 {
-        out.push(
-            "cclaw dropped-messages list --since 1h   # investigate dropped traffic".into(),
-        );
+        out.push("cclaw dropped-messages list --since 1h   # investigate dropped traffic".into());
     }
     if group_count >= 1 && active_audit == 0 && active_sessions == 0 {
-        out.push("cclaw chat                          # open a REPL against the cli channel".into());
+        out.push(
+            "cclaw chat                          # open a REPL against the cli channel".into(),
+        );
     }
     // Always finish with the diagnostic / overview pointer so users
     // know where to go for more detail.
@@ -1358,9 +1373,7 @@ fn render_dashboard_text(
                 let name = json_str(g, "name");
                 let provider = json_str(g, "agent_provider");
                 let provider = if provider.is_empty() { "—" } else { provider };
-                out.push_str(&format!(
-                    "  {id:24}  {name:24}  provider={provider}\n",
-                ));
+                out.push_str(&format!("  {id:24}  {name:24}  provider={provider}\n",));
             }
         }
     }
@@ -1376,9 +1389,7 @@ fn render_dashboard_text(
                 let mg = json_str(w, "messaging_group_id");
                 let ag = json_str(w, "agent_group_id");
                 let engage = json_str(w, "engage");
-                out.push_str(&format!(
-                    "  {id:24}  mg={mg}  ag={ag}  engage={engage}\n",
-                ));
+                out.push_str(&format!("  {id:24}  mg={mg}  ag={ag}  engage={engage}\n",));
             }
         }
     }
@@ -1418,9 +1429,7 @@ fn render_dashboard_text(
                     .get("total_tokens")
                     .and_then(serde_json::Value::as_i64)
                     .unwrap_or(0);
-                out.push_str(&format!(
-                    "  budget:   {ag} {total} tokens (24h)\n",
-                ));
+                out.push_str(&format!("  budget:   {ag} {total} tokens (24h)\n",));
             }
         }
     }
@@ -1495,7 +1504,11 @@ where
         );
 
     let current = match transport
-        .call("groups.config.get", serde_json::json!({"id": id}), caller.clone())
+        .call(
+            "groups.config.get",
+            serde_json::json!({"id": id}),
+            caller.clone(),
+        )
         .await
     {
         Ok(v) => v,
@@ -1508,9 +1521,7 @@ where
     let current_obj = match current.as_object() {
         Some(o) => o.clone(),
         None => {
-            return RunOutput::failure(format!(
-                "groups.config.edit: no config exists for {id}\n"
-            ));
+            return RunOutput::failure(format!("groups.config.edit: no config exists for {id}\n"));
         }
     };
 
@@ -1581,8 +1592,14 @@ where
     let mut packages_npm_change: Option<Vec<String>> = None;
 
     for key in EDITABLE_SCALAR_FIELDS {
-        let old = current_obj.get(*key).cloned().unwrap_or(serde_json::Value::Null);
-        let new = edited_obj.get(*key).cloned().unwrap_or(serde_json::Value::Null);
+        let old = current_obj
+            .get(*key)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let new = edited_obj
+            .get(*key)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         if old != new {
             updates.push(((*key).to_string(), new));
         }
@@ -1664,8 +1681,8 @@ where
     }
 
     if let Some(new_mcp) = mcp_servers_change {
-        if let Err(e) = update_mcp_servers(transport, id, &current_obj, &new_mcp, caller.clone())
-            .await
+        if let Err(e) =
+            update_mcp_servers(transport, id, &current_obj, &new_mcp, caller.clone()).await
         {
             return RunOutput::failure(e);
         }
@@ -1675,15 +1692,8 @@ where
             .get("packages_apt")
             .and_then(value_string_list)
             .unwrap_or_default();
-        if let Err(e) = update_packages(
-            transport,
-            id,
-            "apt",
-            &old_apt,
-            &new_apt,
-            caller.clone(),
-        )
-        .await
+        if let Err(e) =
+            update_packages(transport, id, "apt", &old_apt, &new_apt, caller.clone()).await
         {
             return RunOutput::failure(e);
         }
@@ -1701,7 +1711,11 @@ where
     RunOutput::success(format!(
         "updated {} field{}: {}\n",
         changed_field_names.len(),
-        if changed_field_names.len() == 1 { "" } else { "s" },
+        if changed_field_names.len() == 1 {
+            ""
+        } else {
+            "s"
+        },
         changed_field_names.join(", "),
     ))
 }
@@ -1785,7 +1799,9 @@ where
                 )
                 .await
             {
-                return Err(format!("groups.config.edit: remove-package {kind} {name}: {e}\n"));
+                return Err(format!(
+                    "groups.config.edit: remove-package {kind} {name}: {e}\n"
+                ));
             }
         }
     }
@@ -1799,7 +1815,9 @@ where
                 )
                 .await
             {
-                return Err(format!("groups.config.edit: add-package {kind} {name}: {e}\n"));
+                return Err(format!(
+                    "groups.config.edit: add-package {kind} {name}: {e}\n"
+                ));
             }
         }
     }
@@ -1844,16 +1862,10 @@ fn render_config_toml(obj: &serde_json::Map<String, serde_json::Value>) -> Strin
 
     // Packages — render as arrays of strings.
     if let Some(arr) = obj.get("packages_apt").and_then(value_string_list) {
-        out.push_str(&format!(
-            "packages_apt = {}\n",
-            toml_string_array(&arr)
-        ));
+        out.push_str(&format!("packages_apt = {}\n", toml_string_array(&arr)));
     }
     if let Some(arr) = obj.get("packages_npm").and_then(value_string_list) {
-        out.push_str(&format!(
-            "packages_npm = {}\n",
-            toml_string_array(&arr)
-        ));
+        out.push_str(&format!("packages_npm = {}\n", toml_string_array(&arr)));
     }
     out.push('\n');
 
@@ -1940,15 +1952,12 @@ fn json_to_toml_inline(v: &serde_json::Value) -> String {
 }
 
 /// Parse the post-edit TOML buffer back into a JSON object.
-fn parse_config_toml(
-    text: &str,
-) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+fn parse_config_toml(text: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     let table: toml::Value = toml::from_str(text).map_err(|e| e.to_string())?;
-    let json: serde_json::Value =
-        serde_json::to_value(&table).map_err(|e| e.to_string())?;
-    json.as_object().cloned().ok_or_else(|| {
-        "TOML root must be a table".to_string()
-    })
+    let json: serde_json::Value = serde_json::to_value(&table).map_err(|e| e.to_string())?;
+    json.as_object()
+        .cloned()
+        .ok_or_else(|| "TOML root must be a table".to_string())
 }
 
 fn annotate_with_parse_error(text: &str, err: &str) -> String {
@@ -2005,10 +2014,7 @@ fn prompt_retry_or_abort() -> RetryChoice {
 /// Splits the editor string on ASCII whitespace so callers can pass
 /// values like `EDITOR='code --wait'`. Non-zero exit codes are
 /// reported as errors so the workflow aborts cleanly.
-async fn spawn_editor(
-    editor: &str,
-    path: &std::path::Path,
-) -> Result<(), String> {
+async fn spawn_editor(editor: &str, path: &std::path::Path) -> Result<(), String> {
     let mut parts = editor.split_whitespace();
     let Some(program) = parts.next() else {
         return Err("EDITOR is empty".into());
@@ -2025,7 +2031,6 @@ async fn spawn_editor(
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -2253,11 +2258,7 @@ mod tests {
             Ok(json!({"id": "mg-1", "channel_type": "cli", "platform_id": "stdin"})),
             Ok(json!({"id": "w-1"})),
         ]);
-        let out = run_cli(
-            ["cclaw", "quickstart", "cli", "--name", "demo"],
-            &t,
-        )
-        .await;
+        let out = run_cli(["cclaw", "quickstart", "cli", "--name", "demo"], &t).await;
         assert!(out.stderr.is_empty(), "stderr={:?}", out.stderr);
         let calls = t.calls.lock().unwrap();
         assert_eq!(calls[0].0, "groups.create");
@@ -2352,11 +2353,7 @@ mod tests {
             retryable: false,
             data: None,
         }))]);
-        let out = run_cli(
-            ["cclaw", "quickstart", "cli", "--name", "demo"],
-            &t,
-        )
-        .await;
+        let out = run_cli(["cclaw", "quickstart", "cli", "--name", "demo"], &t).await;
         assert!(!out.stderr.is_empty());
         assert!(out.stderr.contains("groups.create"));
         let calls = t.calls.lock().unwrap();
@@ -2371,7 +2368,11 @@ mod tests {
         // pointing at `copperclaw run`.
         let t = SequencedTransport::new(vec![Err(ClientError::Timeout)]);
         let out = run_cli(["cclaw", "doctor"], &t).await;
-        assert!(out.stdout.is_empty(), "doctor must use stderr for fail: stdout={:?}", out.stdout);
+        assert!(
+            out.stdout.is_empty(),
+            "doctor must use stderr for fail: stdout={:?}",
+            out.stdout
+        );
         assert!(out.stderr.contains("FAIL"));
         assert!(out.stderr.contains("host-reachable"));
         assert!(out.stderr.contains("copperclaw run"));
@@ -2393,7 +2394,10 @@ mod tests {
         ]);
         let out = run_cli(["cclaw", "doctor"], &t).await;
         let combined = format!("{}{}", out.stdout, out.stderr);
-        assert!(combined.contains("FAIL"), "must include FAIL for missing agent group");
+        assert!(
+            combined.contains("FAIL"),
+            "must include FAIL for missing agent group"
+        );
         assert!(combined.contains("agent-group"));
         assert!(combined.contains("cclaw quickstart cli"));
         // Wirings is gated on group existence; with zero groups the
@@ -2487,8 +2491,8 @@ mod tests {
             Ok(json!([])),
         ]);
         let out = run_cli(["cclaw", "--json", "doctor"], &t).await;
-        let payload: serde_json::Value = serde_json::from_str(out.stdout.trim())
-            .expect("doctor --json must be parseable JSON");
+        let payload: serde_json::Value =
+            serde_json::from_str(out.stdout.trim()).expect("doctor --json must be parseable JSON");
         assert_eq!(payload["status"], "ok");
         let checks = payload["checks"].as_array().unwrap();
         assert!(checks.iter().any(|c| c["name"] == "host-reachable"));
@@ -2508,8 +2512,8 @@ mod tests {
         let t = SequencedTransport::new(vec![Err(ClientError::Timeout)]);
         let out = run_cli(["cclaw", "--json", "doctor"], &t).await;
         // FAIL paths go to stderr per RunOutput::failure convention.
-        let payload: serde_json::Value = serde_json::from_str(out.stderr.trim())
-            .expect("--json fail must still emit JSON");
+        let payload: serde_json::Value =
+            serde_json::from_str(out.stderr.trim()).expect("--json fail must still emit JSON");
         assert_eq!(payload["status"], "fail");
     }
 
@@ -2592,15 +2596,12 @@ mod tests {
     /// the dashboard fans calls out via `tokio::join!`, which polls in
     /// declaration order but recording them by name is robust either way.
     struct MapTransport {
-        responses:
-            std::collections::HashMap<String, Result<serde_json::Value, ClientError>>,
+        responses: std::collections::HashMap<String, Result<serde_json::Value, ClientError>>,
         calls: Mutex<Vec<(String, serde_json::Value)>>,
     }
 
     impl MapTransport {
-        fn new(
-            pairs: Vec<(&str, Result<serde_json::Value, ClientError>)>,
-        ) -> Self {
+        fn new(pairs: Vec<(&str, Result<serde_json::Value, ClientError>)>) -> Self {
             Self {
                 responses: pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
                 calls: Mutex::new(Vec::new()),
@@ -2623,7 +2624,8 @@ mod tests {
                     // ClientError isn't Clone; rebuild a representative one
                     // for each repeated lookup.
                     Err(ClientError::Remote(ErrorPayload::new(
-                        "stub-err", "stubbed error",
+                        "stub-err",
+                        "stubbed error",
                     )))
                 }
                 None => Err(ClientError::Remote(ErrorPayload::new(
@@ -2641,11 +2643,19 @@ mod tests {
                 "groups.list",
                 Ok(json!([{"id": "ag-1", "name": "first", "agent_provider": "anthropic"}])),
             ),
-            ("wirings.list", Ok(json!([{"id": "w-1", "messaging_group_id": "mg-1", "agent_group_id": "ag-1", "engage": "pattern"}]))),
+            (
+                "wirings.list",
+                Ok(
+                    json!([{"id": "w-1", "messaging_group_id": "mg-1", "agent_group_id": "ag-1", "engage": "pattern"}]),
+                ),
+            ),
             ("sessions.list", Ok(json!([]))),
             ("audit.list", Ok(json!([{"id":"a-1"}, {"id":"a-2"}]))),
             ("dropped-messages.list", Ok(json!([]))),
-            ("usage.rollup", Ok(json!([{"agent_group_id": "ag-1", "total_tokens": 1234}]))),
+            (
+                "usage.rollup",
+                Ok(json!([{"agent_group_id": "ag-1", "total_tokens": 1234}])),
+            ),
         ]);
         let out = run_cli(["cclaw"], &t).await;
         assert!(out.stderr.is_empty(), "stderr={:?}", out.stderr);
@@ -2717,7 +2727,12 @@ mod tests {
             "directory_removed": true,
         }));
         let out = run_cli(
-            ["cclaw", "sessions", "delete", "00000000-0000-0000-0000-000000000001"],
+            [
+                "cclaw",
+                "sessions",
+                "delete",
+                "00000000-0000-0000-0000-000000000001",
+            ],
             &t,
         )
         .await;
@@ -2734,11 +2749,7 @@ mod tests {
     #[tokio::test]
     async fn sessions_delete_force_flag_carries_through() {
         let t = StubTransport::ok(json!({"deleted": "x"}));
-        let out = run_cli(
-            ["cclaw", "sessions", "delete", "sess-1", "--force"],
-            &t,
-        )
-        .await;
+        let out = run_cli(["cclaw", "sessions", "delete", "sess-1", "--force"], &t).await;
         assert!(out.stderr.is_empty(), "stderr={:?}", out.stderr);
         let captured = t.last_call.lock().unwrap();
         let (cmd, args, _caller) = captured.as_ref().unwrap();
@@ -2790,7 +2801,10 @@ mod tests {
             ("wirings.list", Ok(json!([]))),
             ("sessions.list", Ok(json!([]))),
             ("audit.list", Ok(json!([]))),
-            ("dropped-messages.list", Ok(json!([{"id":"d-1"},{"id":"d-2"}]))),
+            (
+                "dropped-messages.list",
+                Ok(json!([{"id":"d-1"},{"id":"d-2"}])),
+            ),
             ("usage.rollup", Ok(json!([]))),
         ]);
         let out = run_cli(["cclaw"], &t).await;
@@ -2916,7 +2930,9 @@ mod tests {
             ),
             (
                 "groups.config.update",
-                Ok(json!({"agent_group_id": "00000000-0000-0000-0000-000000000003", "provider":"replaced"})),
+                Ok(
+                    json!({"agent_group_id": "00000000-0000-0000-0000-000000000003", "provider":"replaced"}),
+                ),
             ),
         ]);
         let out = run_groups_config_edit(

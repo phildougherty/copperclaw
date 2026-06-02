@@ -172,8 +172,7 @@ mod tests {
 
     #[test]
     fn rejects_empty_from() {
-        let err =
-            ResendConfig::from_value(&json!({"api_key": "re_x", "from": ""})).unwrap_err();
+        let err = ResendConfig::from_value(&json!({"api_key": "re_x", "from": ""})).unwrap_err();
         match err {
             AdapterError::BadRequest(m) => assert!(m.contains("non-empty")),
             other => panic!("expected BadRequest, got {other:?}"),
@@ -182,8 +181,7 @@ mod tests {
 
     #[test]
     fn rejects_non_string_api_key() {
-        let err = ResendConfig::from_value(&json!({"api_key": 9, "from": "a@b.test"}))
-            .unwrap_err();
+        let err = ResendConfig::from_value(&json!({"api_key": 9, "from": "a@b.test"})).unwrap_err();
         match err {
             AdapterError::BadRequest(m) => assert!(m.contains("api_key")),
             other => panic!("expected BadRequest, got {other:?}"),
@@ -192,8 +190,7 @@ mod tests {
 
     #[test]
     fn rejects_non_string_from() {
-        let err = ResendConfig::from_value(&json!({"api_key": "re_x", "from": 42}))
-            .unwrap_err();
+        let err = ResendConfig::from_value(&json!({"api_key": "re_x", "from": 42})).unwrap_err();
         match err {
             AdapterError::BadRequest(m) => assert!(m.contains("from")),
             other => panic!("expected BadRequest, got {other:?}"),

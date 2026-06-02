@@ -280,11 +280,13 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let tools_yaml = format!(
             "[{}]",
-            tools.iter().map(|t| format!("{t:?}")).collect::<Vec<_>>().join(", ")
+            tools
+                .iter()
+                .map(|t| format!("{t:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
-        let body = format!(
-            "---\nname: {name}\ndescription: d\nallowed-tools: {tools_yaml}\n---\n"
-        );
+        let body = format!("---\nname: {name}\ndescription: d\nallowed-tools: {tools_yaml}\n---\n");
         fs::write(dir.join("SKILL.md"), body).unwrap();
     }
 
@@ -412,10 +414,7 @@ mod tests {
         let td = TempDir::new().unwrap();
         write_skill_with_tools(td.path(), "tools-skill", &["Read", "Bash"]);
         let s = load_skill(&td.path().join("tools-skill"), SkillSource::Global).unwrap();
-        assert_eq!(
-            s.allowed_tools,
-            Some(vec!["Read".into(), "Bash".into()])
-        );
+        assert_eq!(s.allowed_tools, Some(vec!["Read".into(), "Bash".into()]));
         assert_eq!(s.id.as_str(), "tools-skill");
     }
 
@@ -510,11 +509,7 @@ mod tests {
         write_skill(&global, "c", "c", "C");
         let reg = SkillRegistry::scan(&global, None).unwrap();
 
-        let sel = SkillsSelector::Explicit(vec![
-            "c".into(),
-            "missing".into(),
-            "a".into(),
-        ]);
+        let sel = SkillsSelector::Explicit(vec!["c".into(), "missing".into(), "a".into()]);
         let listed = reg.list_for_group(AgentGroupId::new(), &sel);
         let names: Vec<_> = listed.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["c", "a"]);
@@ -551,7 +546,11 @@ mod tests {
         let td = TempDir::new().unwrap();
         let dir = td.path().join("hello");
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("SKILL.md"), "---\nname: hello\ndescription: d\n---\nb\n").unwrap();
+        fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: hello\ndescription: d\n---\nb\n",
+        )
+        .unwrap();
         let skill = load_skill(&dir, SkillSource::Global).unwrap();
         // Remove the file after loading to force an IO error on body read.
         fs::remove_file(dir.join("SKILL.md")).unwrap();

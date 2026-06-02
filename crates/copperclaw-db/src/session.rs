@@ -7,8 +7,8 @@
 //! - `inbox/<msg_id>/<filename>` — host-extracted attachment files.
 //! - `outbox/<msg_id>/<filename>` — container-written attachment files.
 
-use crate::migrate::{run_migrations, MigrationSet};
 use crate::DbError;
+use crate::migrate::{MigrationSet, run_migrations};
 use copperclaw_types::{AgentGroupId, SessionId};
 use rusqlite::{Connection, OpenFlags};
 use std::path::{Path, PathBuf};
@@ -102,10 +102,7 @@ pub fn open_outbound(paths: &SessionPaths) -> Result<Connection, DbError> {
 /// poll loop to ensure host-written rows become visible promptly across the
 /// bind-mount.
 pub fn open_inbound_ro_no_mmap(paths: &SessionPaths) -> Result<Connection, DbError> {
-    let conn = Connection::open_with_flags(
-        &paths.inbound_db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )?;
+    let conn = Connection::open_with_flags(&paths.inbound_db, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     conn.execute_batch(
         "PRAGMA mmap_size=0;
          PRAGMA busy_timeout=5000;",
@@ -119,10 +116,7 @@ pub fn open_inbound_ro_no_mmap(paths: &SessionPaths) -> Result<Connection, DbErr
 /// gymnastics as [`open_inbound_ro_no_mmap`] — WAL + mmap doesn't
 /// propagate writes across a bind mount, so we stay in DELETE mode.
 pub fn open_inbound_rw_no_mmap(paths: &SessionPaths) -> Result<Connection, DbError> {
-    let conn = Connection::open_with_flags(
-        &paths.inbound_db,
-        OpenFlags::SQLITE_OPEN_READ_WRITE,
-    )?;
+    let conn = Connection::open_with_flags(&paths.inbound_db, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     conn.execute_batch(
         "PRAGMA mmap_size=0;
          PRAGMA busy_timeout=5000;",

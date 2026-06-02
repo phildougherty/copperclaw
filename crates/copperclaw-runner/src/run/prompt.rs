@@ -105,18 +105,14 @@ pub(super) fn render_conversation_context(
     // knows it's replying to N things at once.
     let batch_len = rows.len();
     if batch_len > 1 {
-        block.push_str(&format!(
-            "; this turn coalesces {batch_len} new messages"
-        ));
+        block.push_str(&format!("; this turn coalesces {batch_len} new messages"));
     }
 
     // Sub-agent context: when the runner is a child session spawned
     // by another agent, source_session_id is populated. Surface that so
     // the model knows it's not talking to a human directly.
     if let Some(src) = origin.source_session_id.as_deref() {
-        block.push_str(&format!(
-            "; relayed from parent agent session {src}"
-        ));
+        block.push_str(&format!("; relayed from parent agent session {src}"));
     }
 
     // History depth — capped phrasing so we don't lie when the count
@@ -127,9 +123,7 @@ pub(super) fn render_conversation_context(
     } else if history_len == 1 {
         block.push_str("; 1 prior entry in session history");
     } else {
-        block.push_str(&format!(
-            "; {history_len} prior entries in session history"
-        ));
+        block.push_str(&format!("; {history_len} prior entries in session history"));
     }
 
     block.push('.');
@@ -209,7 +203,10 @@ mod tests {
         assert!(block.contains("telegram"), "got: {block}");
         assert!(block.contains("8929393356"), "got: {block}");
         // No "thread" phrasing for a DM.
-        assert!(!block.contains(", thread "), "DM must not say 'thread': {block}");
+        assert!(
+            !block.contains(", thread "),
+            "DM must not say 'thread': {block}"
+        );
         assert!(block.contains("no prior history"), "got: {block}");
     }
 
@@ -245,10 +242,7 @@ mod tests {
             row(MessageKind::Chat, Some("slack"), Some("C123"), None),
         ];
         let block = render_conversation_context(&rows, 4).expect("expected a block");
-        assert!(
-            block.contains("coalesces 3 new messages"),
-            "got: {block}"
-        );
+        assert!(block.contains("coalesces 3 new messages"), "got: {block}");
     }
 
     #[test]
@@ -260,7 +254,10 @@ mod tests {
             block.contains("relayed from parent agent session"),
             "got: {block}"
         );
-        assert!(block.contains("11111111-1111-1111-1111-111111111111"), "got: {block}");
+        assert!(
+            block.contains("11111111-1111-1111-1111-111111111111"),
+            "got: {block}"
+        );
     }
 
     #[test]
@@ -277,7 +274,10 @@ mod tests {
     fn singular_history_entry_uses_singular_phrasing() {
         let rows = vec![row(MessageKind::Chat, Some("cli"), Some("p1"), None)];
         let block = render_conversation_context(&rows, 1).expect("expected a block");
-        assert!(block.contains("1 prior entry in session history"), "got: {block}");
+        assert!(
+            block.contains("1 prior entry in session history"),
+            "got: {block}"
+        );
     }
 
     #[test]
@@ -307,7 +307,12 @@ mod tests {
         // Both signals must land in the rendered block: DM phrasing
         // wins over the thread_id-derived fallback, and the reply clause
         // appears immediately after the venue/channel run.
-        let mut r = row(MessageKind::Chat, Some("telegram"), Some("8929393356"), None);
+        let mut r = row(
+            MessageKind::Chat,
+            Some("telegram"),
+            Some("8929393356"),
+            None,
+        );
         r.is_group = Some(false);
         r.reply_to = Some("parent-msg-42".into());
         let block = render_conversation_context(&[r], 3).expect("expected a block");

@@ -47,8 +47,8 @@ pub use create_agent::{CreateAgentHandler, CreateAgentModule};
 pub use depth::{DEFAULT_MAX_SUBAGENT_DEPTH, MAX_SUBAGENT_DEPTH_CEILING};
 pub use dispatch::AgentDispatchModule;
 pub use permissions::{
-    always_allow, always_deny, users_table_check, CreateAgentPermissionCheck,
-    CreateAgentPermissionCtx,
+    CreateAgentPermissionCheck, CreateAgentPermissionCtx, always_allow, always_deny,
+    users_table_check,
 };
 
 /// The `agent:` URL prefix.
@@ -123,8 +123,7 @@ impl Module for AgentToAgentModule {
             // delivery loop already routes by `agent_group_id`. We pass it
             // through unchanged. The interceptor exists so the host has a hook
             // to log or rewrite agent-bound messages.
-            if i
-                .channel_type
+            if i.channel_type
                 .as_ref()
                 .is_some_and(|c| c.as_str() == ChannelType::AGENT)
             {
@@ -159,7 +158,10 @@ mod tests {
 
     #[test]
     fn allows_dash_underscore_dot_in_name() {
-        assert_eq!(parse("agent:foo-bar_baz.42").unwrap().name, "foo-bar_baz.42");
+        assert_eq!(
+            parse("agent:foo-bar_baz.42").unwrap().name,
+            "foo-bar_baz.42"
+        );
     }
 
     #[test]

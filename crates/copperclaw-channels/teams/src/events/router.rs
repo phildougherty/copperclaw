@@ -226,10 +226,7 @@ fn validation_response(token: &str) -> Response {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResourceShape {
     /// `teams/{teamId}/channels/{channelId}/messages` (optionally `/.../{id}`).
-    Channel {
-        team_id: String,
-        channel_id: String,
-    },
+    Channel { team_id: String, channel_id: String },
     /// `chats/{chatId}/messages` (optionally `/.../{id}`).
     Chat { chat_id: String },
 }
@@ -276,7 +273,12 @@ async fn dispatch_entry(
             // Decide is_group by querying the chat metadata.
             let chat_info = state.api.get_chat(&chat_id).await.ok();
             let chat_type = chat_info.and_then(|i| i.chat_type);
-            Ok(build_chat_event(state, &chat_id, chat_type.as_deref(), &raw))
+            Ok(build_chat_event(
+                state,
+                &chat_id,
+                chat_type.as_deref(),
+                &raw,
+            ))
         }
     }
 }
@@ -295,10 +297,7 @@ fn build_channel_event(
         .get("replyToId")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let is_mention = Some(detect_mention(
-        raw,
-        state.bot_user_id.as_ref().as_deref(),
-    ));
+    let is_mention = Some(detect_mention(raw, state.bot_user_id.as_ref().as_deref()));
     let is_group = Some(true);
     Some(build_event(
         state,
@@ -324,10 +323,7 @@ fn build_chat_event(
         .get("replyToId")
         .and_then(Value::as_str)
         .map(ToOwned::to_owned);
-    let is_mention = Some(detect_mention(
-        raw,
-        state.bot_user_id.as_ref().as_deref(),
-    ));
+    let is_mention = Some(detect_mention(raw, state.bot_user_id.as_ref().as_deref()));
     let is_group = Some(matches!(chat_type, Some(t) if t != "oneOnOne"));
     Some(build_event(
         state,
@@ -375,21 +371,18 @@ fn build_event(
         .unwrap_or("")
         .to_owned();
     let timestamp = parse_created_datetime(raw);
-    let sender = raw
-        .get("from")
-        .and_then(|f| f.get("user"))
-        .and_then(|u| {
-            let user_id = u.get("id").and_then(Value::as_str)?;
-            let display = u
-                .get("displayName")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned);
-            Some(SenderIdentity {
-                channel_type: state.channel_type.clone(),
-                identity: user_id.to_owned(),
-                display_name: display,
-            })
-        });
+    let sender = raw.get("from").and_then(|f| f.get("user")).and_then(|u| {
+        let user_id = u.get("id").and_then(Value::as_str)?;
+        let display = u
+            .get("displayName")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        Some(SenderIdentity {
+            channel_type: state.channel_type.clone(),
+            identity: user_id.to_owned(),
+            display_name: display,
+        })
+    });
     InboundEvent {
         channel_type: state.channel_type.clone(),
         platform_id,
@@ -412,8 +405,7 @@ fn parse_created_datetime(raw: &Value) -> DateTime<Utc> {
         .get("createdDateTime")
         .and_then(Value::as_str)
         .unwrap_or("");
-    DateTime::parse_from_rfc3339(s)
-        .map_or_else(|_| Utc::now(), |d| d.with_timezone(&Utc))
+    DateTime::parse_from_rfc3339(s).map_or_else(|_| Utc::now(), |d| d.with_timezone(&Utc))
 }
 
 fn message_is_from_bot(raw: &Value, bot_user_id: Option<&str>) -> bool {
@@ -501,13 +493,8 @@ mod tests {
     ) -> (TeamsWebhookState, mpsc::Receiver<InboundEvent>) {
         let (tx, rx) = mpsc::channel::<InboundEvent>(16);
         let api = TeamsApi::new(server.uri(), "tok");
-        let state = TeamsWebhookState::new(
-            "shared-secret",
-            tx,
-            bot,
-            ChannelType::new("teams"),
-            api,
-        );
+        let state =
+            TeamsWebhookState::new("shared-secret", tx, bot, ChannelType::new("teams"), api);
         (state, rx)
     }
 
@@ -703,9 +690,7 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/chats/CHAT1"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"chatType": "oneOnOne"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"chatType": "oneOnOne"})))
             .mount(&server)
             .await;
         let (state, mut rx) = make_state(&server, None);
@@ -740,9 +725,7 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/chats/CHAT2"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"chatType": "group"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"chatType": "group"})))
             .mount(&server)
             .await;
         let (state, mut rx) = make_state(&server, None);

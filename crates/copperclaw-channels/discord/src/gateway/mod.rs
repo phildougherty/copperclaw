@@ -9,8 +9,8 @@
 pub mod codec;
 pub mod lifecycle;
 
-use futures::{SinkExt, StreamExt};
 use copperclaw_channels_core::AdapterError;
+use futures::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::Message;
@@ -53,7 +53,9 @@ pub async fn recv_text(socket: &mut GatewaySocket) -> Result<Frame, AdapterError
         match socket.next().await {
             None => return Ok(Frame::Closed(None)),
             Some(Ok(Message::Text(t))) => return Ok(Frame::Text(t)),
-            Some(Ok(Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => {
+            Some(Ok(
+                Message::Binary(_) | Message::Ping(_) | Message::Pong(_) | Message::Frame(_),
+            )) => {
                 continue;
             }
             Some(Ok(Message::Close(cf))) => {

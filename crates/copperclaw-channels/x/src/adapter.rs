@@ -153,16 +153,18 @@ impl XAdapter {
             // with base64 form field); v2 is the GA-track endpoint at
             // api.twitter.com/2/media/upload that uses multipart.
             let media_id = match self.config.media_api_version {
-                MediaApiVersion::V1 => self
-                    .api
-                    .upload_media(&file.data, category)
-                    .await?
-                    .media_id_string,
-                MediaApiVersion::V2 => self
-                    .api
-                    .upload_media_v2(&file.filename, &file.data, category)
-                    .await?
-                    .media_id_string,
+                MediaApiVersion::V1 => {
+                    self.api
+                        .upload_media(&file.data, category)
+                        .await?
+                        .media_id_string
+                }
+                MediaApiVersion::V2 => {
+                    self.api
+                        .upload_media_v2(&file.filename, &file.data, category)
+                        .await?
+                        .media_id_string
+                }
             };
             ids.push(media_id);
         }
@@ -178,7 +180,9 @@ impl XAdapter {
         let resp = match target {
             Target::User(id) => self.api.dm_send_to_user(id, text, media_ids).await?,
             Target::Conversation(id) => {
-                self.api.dm_send_to_conversation(id, text, media_ids).await?
+                self.api
+                    .dm_send_to_conversation(id, text, media_ids)
+                    .await?
             }
         };
         Ok(resp.dm_event_id)
@@ -304,9 +308,7 @@ mod tests {
     use wiremock::matchers::{method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn build_adapter(
-        server_url: &str,
-    ) -> (Arc<XAdapter>, TempDir, mpsc::Receiver<InboundEvent>) {
+    fn build_adapter(server_url: &str) -> (Arc<XAdapter>, TempDir, mpsc::Receiver<InboundEvent>) {
         let dir = TempDir::new().unwrap();
         let api = Arc::new(XApi::with_client(
             reqwest::Client::new(),
@@ -324,8 +326,7 @@ mod tests {
             poll_interval_ms: 50_000,
         };
         let (tx, rx) = mpsc::channel::<InboundEvent>(8);
-        let adapter =
-            XAdapter::start_with_api(api, config, tx, dir.path().to_path_buf()).unwrap();
+        let adapter = XAdapter::start_with_api(api, config, tx, dir.path().to_path_buf()).unwrap();
         (adapter, dir, rx)
     }
 
@@ -621,7 +622,10 @@ mod tests {
         mount_empty_poll(&s).await;
         let (adapter, _dir, _rx) = build_adapter(&s.uri());
         adapter.set_typing("user:1", None).await.unwrap();
-        adapter.set_typing("conversation:c", Some("t")).await.unwrap();
+        adapter
+            .set_typing("conversation:c", Some("t"))
+            .await
+            .unwrap();
         adapter.shutdown().await;
     }
 

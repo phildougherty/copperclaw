@@ -375,8 +375,7 @@ mod tests {
         let nonce = "n";
         let sig = compute_msg_signature(TOKEN, ts, nonce, &echo);
         let echo_q = url_encode(&echo);
-        let uri =
-            format!("/wc?msg_signature={sig}&timestamp={ts}&nonce={nonce}&echostr={echo_q}");
+        let uri = format!("/wc?msg_signature={sig}&timestamp={ts}&nonce={nonce}&echostr={echo_q}");
         let req = Request::builder()
             .method("GET")
             .uri(uri)
@@ -423,8 +422,7 @@ mod tests {
         let app = build_events_router("/wc", state);
         let echo = "ZZZZ";
         let bad_sig = "0".repeat(40);
-        let uri =
-            format!("/wc?msg_signature={bad_sig}&timestamp=1&nonce=n&echostr={echo}");
+        let uri = format!("/wc?msg_signature={bad_sig}&timestamp=1&nonce=n&echostr={echo}");
         let req = Request::builder()
             .method("GET")
             .uri(uri)

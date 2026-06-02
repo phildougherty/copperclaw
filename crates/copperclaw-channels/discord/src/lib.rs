@@ -43,9 +43,7 @@ pub mod gateway;
 pub mod rest;
 
 pub use adapter::DiscordAdapter;
-pub use config::{
-    DEFAULT_API_BASE, DEFAULT_GATEWAY_URL, DEFAULT_INTENTS, DiscordConfig,
-};
+pub use config::{DEFAULT_API_BASE, DEFAULT_GATEWAY_URL, DEFAULT_INTENTS, DiscordConfig};
 pub use events::{CHANNEL_TYPE_STR, message_create_to_inbound};
 pub use factory::{DiscordFactory, register};
 pub use rest::DiscordRest;

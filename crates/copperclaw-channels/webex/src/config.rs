@@ -147,14 +147,15 @@ impl WebhookConfig {
             }
         };
         let port = match obj.get("port") {
-            Some(Value::Number(n)) => n
-                .as_u64()
-                .and_then(|u| u16::try_from(u).ok())
-                .ok_or_else(|| {
-                    AdapterError::BadRequest(
-                        "webex `webhook.port` must be a u16 in range".into(),
-                    )
-                })?,
+            Some(Value::Number(n)) => {
+                n.as_u64()
+                    .and_then(|u| u16::try_from(u).ok())
+                    .ok_or_else(|| {
+                        AdapterError::BadRequest(
+                            "webex `webhook.port` must be a u16 in range".into(),
+                        )
+                    })?
+            }
             Some(Value::Null) | None => DEFAULT_PORT,
             Some(_) => {
                 return Err(AdapterError::BadRequest(

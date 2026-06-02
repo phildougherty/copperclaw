@@ -42,11 +42,7 @@ pub fn sync_to_events(sync: &Value, bot_user_id: &str) -> Vec<InboundEvent> {
 
 /// Build an [`InboundEvent`] from a single timeline event JSON object.
 /// Returns `None` for unsupported event types or events authored by the bot.
-pub fn event_to_inbound(
-    room_id: &str,
-    event: &Value,
-    bot_user_id: &str,
-) -> Option<InboundEvent> {
+pub fn event_to_inbound(room_id: &str, event: &Value, bot_user_id: &str) -> Option<InboundEvent> {
     let event_type = event.get("type").and_then(Value::as_str)?;
     if event_type != "m.room.message" {
         return None;
@@ -106,16 +102,14 @@ pub fn event_to_inbound(
         _ => return None,
     };
 
-    let thread_id = content
-        .get("m.relates_to")
-        .and_then(|r| {
-            let rel_type = r.get("rel_type").and_then(Value::as_str)?;
-            if rel_type == "m.thread" {
-                r.get("event_id").and_then(Value::as_str).map(str::to_owned)
-            } else {
-                None
-            }
-        });
+    let thread_id = content.get("m.relates_to").and_then(|r| {
+        let rel_type = r.get("rel_type").and_then(Value::as_str)?;
+        if rel_type == "m.thread" {
+            r.get("event_id").and_then(Value::as_str).map(str::to_owned)
+        } else {
+            None
+        }
+    });
 
     // Matrix surfaces direct replies via the (legacy-but-universal)
     // `m.relates_to."m.in_reply_to".event_id`. This lives alongside any
@@ -200,11 +194,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn message_event(
-        sender: &str,
-        body: &str,
-        extra: Option<Value>,
-    ) -> Value {
+    fn message_event(sender: &str, body: &str, extra: Option<Value>) -> Value {
         let mut content = json!({
             "msgtype": "m.text",
             "body": body,
@@ -308,8 +298,14 @@ mod tests {
         assert_eq!(evts.len(), 1);
         assert_eq!(evts[0].message.kind, MessageKind::Chat);
         assert_eq!(evts[0].message.content["text"], "doc.txt");
-        assert_eq!(evts[0].message.content["attachment"]["url"], "mxc://m.org/abc");
-        assert_eq!(evts[0].message.content["attachment"]["mimetype"], "text/plain");
+        assert_eq!(
+            evts[0].message.content["attachment"]["url"],
+            "mxc://m.org/abc"
+        );
+        assert_eq!(
+            evts[0].message.content["attachment"]["mimetype"],
+            "text/plain"
+        );
         assert_eq!(evts[0].message.content["attachment"]["msgtype"], "m.file");
     }
 

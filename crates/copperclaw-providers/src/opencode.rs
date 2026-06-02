@@ -132,10 +132,7 @@ mod tests {
         let script = "read q; read p; \
              printf '%s\\n' '{\"type\":\"init\",\"continuation\":\"oc_p\"}'; \
              printf '%s\\n' '{\"type\":\"result\",\"text\":\"pushed\"}'";
-        let p = OpenCodeProvider::new(
-            PathBuf::from("/bin/sh"),
-            vec!["-c".into(), script.into()],
-        );
+        let p = OpenCodeProvider::new(PathBuf::from("/bin/sh"), vec!["-c".into(), script.into()]);
         let mut q = p.query(QueryInput::new("s", "m")).await.unwrap();
         q.push("hello".into()).await.unwrap();
         q.end().await.unwrap();

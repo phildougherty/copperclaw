@@ -9,10 +9,10 @@
 //! See `docs/replay-fixtures.md` for the fixture format and capture
 //! workflow. This file is the M11 acceptance gate.
 
-#[path = "replay/fixture.rs"]
-mod fixture;
 #[path = "replay/diff.rs"]
 mod diff;
+#[path = "replay/fixture.rs"]
+mod fixture;
 #[path = "replay/harness.rs"]
 mod harness;
 
@@ -233,7 +233,10 @@ async fn slack_long_message_split_paragraph_boundary() {
             .and_then(|v| v.as_str())
             .unwrap_or_else(|| panic!("chunk {i} missing text"));
         assert_eq!(text.chars().count(), 25_000, "slack chunk {i} length");
-        assert!(text.chars().count() <= 40_000, "slack chunk {i} exceeds cap");
+        assert!(
+            text.chars().count() <= 40_000,
+            "slack chunk {i} exceeds cap"
+        );
     }
 }
 
@@ -259,7 +262,10 @@ async fn discord_long_message_split_paragraph_boundary() {
             .and_then(|v| v.as_str())
             .unwrap_or_else(|| panic!("chunk {i} missing text"));
         assert_eq!(text.chars().count(), 1200, "discord chunk {i} length");
-        assert!(text.chars().count() <= 2000, "discord chunk {i} exceeds cap");
+        assert!(
+            text.chars().count() <= 2000,
+            "discord chunk {i} exceeds cap"
+        );
     }
 }
 
@@ -277,8 +283,7 @@ async fn discord_long_message_split_paragraph_boundary() {
 #[tokio::test]
 async fn telegram_rate_limited_retry_honours_retry_after() {
     let started = std::time::Instant::now();
-    let harness =
-        run_fixture_into_harness("telegram", "rate-limited-retry").await;
+    let harness = run_fixture_into_harness("telegram", "rate-limited-retry").await;
     let elapsed = started.elapsed();
     let mock = mock_for(&harness, "telegram");
     let deliveries = mock.deliveries();

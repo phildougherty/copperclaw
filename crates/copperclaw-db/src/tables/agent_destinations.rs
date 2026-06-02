@@ -1,10 +1,10 @@
 //! CRUD for `agent_destinations`.
 
-use crate::central::CentralDb;
 use crate::DbError;
+use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
 use copperclaw_types::{AgentGroupId, DestinationKind};
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{OptionalExtension, Row, params};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDestination {
@@ -36,13 +36,16 @@ fn parse_destination_kind(s: &str) -> rusqlite::Result<DestinationKind> {
 
 fn row_to_agent_destination(row: &Row<'_>) -> rusqlite::Result<AgentDestination> {
     let agent_group_id_str: String = row.get("agent_group_id")?;
-    let agent_group_uuid = uuid::Uuid::parse_str(&agent_group_id_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+    let agent_group_uuid = uuid::Uuid::parse_str(&agent_group_id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let target_type_str: String = row.get("target_type")?;
     let target_type = parse_destination_kind(&target_type_str)?;
     let created_at_str: String = row.get("created_at")?;
     let created_at = DateTime::parse_from_rfc3339(&created_at_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .with_timezone(&Utc);
     Ok(AgentDestination {
         agent_group_id: AgentGroupId(agent_group_uuid),
@@ -53,7 +56,10 @@ fn row_to_agent_destination(row: &Row<'_>) -> rusqlite::Result<AgentDestination>
     })
 }
 
-pub fn list(db: &CentralDb, agent_group_id: AgentGroupId) -> Result<Vec<AgentDestination>, DbError> {
+pub fn list(
+    db: &CentralDb,
+    agent_group_id: AgentGroupId,
+) -> Result<Vec<AgentDestination>, DbError> {
     let conn = db.conn()?;
     let mut stmt = conn.prepare(
         "SELECT agent_group_id, local_name, target_type, target_id, created_at
@@ -156,7 +162,7 @@ pub fn lookup_by_target(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tables::agent_groups::{create as create_ag, CreateAgentGroup};
+    use crate::tables::agent_groups::{CreateAgentGroup, create as create_ag};
 
     fn db() -> CentralDb {
         CentralDb::open_in_memory().unwrap()
@@ -269,7 +275,10 @@ mod tests {
         add(&db, a, "z".into(), DestinationKind::Agent, "mg-1".into()).unwrap();
         let rows = lookup_by_target(&db, DestinationKind::Channel, "mg-1").unwrap();
         assert_eq!(rows.len(), 2);
-        assert!(rows.iter().all(|r| r.target_type == DestinationKind::Channel));
+        assert!(
+            rows.iter()
+                .all(|r| r.target_type == DestinationKind::Channel)
+        );
         assert!(rows.iter().all(|r| r.target_id == "mg-1"));
     }
 

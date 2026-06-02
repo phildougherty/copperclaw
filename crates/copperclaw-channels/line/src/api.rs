@@ -42,11 +42,7 @@ impl LineApi {
 
     /// `POST /v2/bot/message/reply`. Returns Ok(()) on success — LINE
     /// does not surface a message id for replies.
-    pub async fn reply(
-        &self,
-        reply_token: &str,
-        text: &str,
-    ) -> Result<(), AdapterError> {
+    pub async fn reply(&self, reply_token: &str, text: &str) -> Result<(), AdapterError> {
         #[derive(Serialize)]
         struct Body<'a> {
             #[serde(rename = "replyToken")]

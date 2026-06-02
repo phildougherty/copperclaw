@@ -8,11 +8,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use rmcp::RoleClient;
 use rmcp::model::{CallToolRequestParam, JsonObject};
 use rmcp::service::{RunningService, ServiceExt};
 use rmcp::transport::sse_client::{SseClientConfig, SseClientTransport};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
-use rmcp::RoleClient;
 
 use crate::error::McpError;
 
@@ -46,17 +46,15 @@ impl McpClient {
             .into_iter()
             .map(|a| a.as_ref().to_os_string())
             .collect();
-        let transport = TokioChildProcess::new(tokio::process::Command::new(cmd).configure(
-            |c| {
-                for a in &arg_vec {
-                    c.arg(a);
-                }
-                c.env_clear();
-                for (k, v) in &env {
-                    c.env(k, v);
-                }
-            },
-        ))
+        let transport = TokioChildProcess::new(tokio::process::Command::new(cmd).configure(|c| {
+            for a in &arg_vec {
+                c.arg(a);
+            }
+            c.env_clear();
+            for (k, v) in &env {
+                c.env(k, v);
+            }
+        }))
         .map_err(|e| McpError::Transport(format!("spawning {cmd}: {e}")))?;
         let inner = ().serve(transport).await.map_err(io_err_to_mcp_error)?;
         Ok(Self { inner })
@@ -211,9 +209,7 @@ fn service_err_to_mcp_error(e: rmcp::ServiceError) -> McpError {
         },
         rmcp::ServiceError::Timeout { .. } => McpError::Timeout,
         rmcp::ServiceError::TransportSend(err) => McpError::Transport(err.to_string()),
-        rmcp::ServiceError::TransportClosed => {
-            McpError::Transport("transport closed".to_owned())
-        }
+        rmcp::ServiceError::TransportClosed => McpError::Transport("transport closed".to_owned()),
         other => McpError::Protocol(other.to_string()),
     }
 }
@@ -413,7 +409,10 @@ mod tests {
 
     #[test]
     fn io_err_classification() {
-        assert!(matches!(map_io_error_for_test("timed out"), McpError::Timeout));
+        assert!(matches!(
+            map_io_error_for_test("timed out"),
+            McpError::Timeout
+        ));
         assert!(matches!(
             map_io_error_for_test("protocol mismatch"),
             McpError::Protocol(_)
@@ -427,10 +426,7 @@ mod tests {
     #[test]
     fn remote_error_constructor() {
         let e = map_service_error_for_test(-32601, "method not found");
-        assert!(matches!(
-            e,
-            McpError::RemoteError { code: -32601, .. }
-        ));
+        assert!(matches!(e, McpError::RemoteError { code: -32601, .. }));
     }
 
     #[test]

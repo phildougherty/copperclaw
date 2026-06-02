@@ -24,9 +24,9 @@
 //! a short timer, so the new agent's container will spawn on its next
 //! tick without any explicit notification from the handler.
 
+use super::SPAWN_PLATFORM_PREFIX;
 use super::depth::{DEFAULT_MAX_SUBAGENT_DEPTH, MAX_SUBAGENT_DEPTH_CEILING};
 use super::permissions::{CreateAgentPermissionCheck, CreateAgentPermissionCtx};
-use super::SPAWN_PLATFORM_PREFIX;
 use crate::context::{
     DeliveryActionHandler, DeliveryActionInput, DeliveryActionOutput, Module, ModuleContext,
 };
@@ -241,10 +241,7 @@ impl CreateAgentPayload {
 
 impl DeliveryActionHandler for CreateAgentHandler {
     #[allow(clippy::too_many_lines)] // single linear flow; splitting hurts clarity.
-    fn handle(
-        &self,
-        input: DeliveryActionInput,
-    ) -> Result<DeliveryActionOutput, ModuleError> {
+    fn handle(&self, input: DeliveryActionInput) -> Result<DeliveryActionOutput, ModuleError> {
         // 1. Parse the payload up-front. A malformed payload is a usage error;
         //    we surface it back to the parent (if we can resolve one) with
         //    `status="invalid"`.
@@ -579,25 +576,18 @@ impl CreateAgentHandler {
         }
         let channel_type = input.target.channel_type.as_ref()?;
         let platform_id = input.target.platform_id.as_deref()?;
-        let mg = messaging_groups::get_by_platform(
-            &self.deps.central,
-            channel_type,
-            platform_id,
-        )
-        .ok()
-        .flatten()?;
+        let mg = messaging_groups::get_by_platform(&self.deps.central, channel_type, platform_id)
+            .ok()
+            .flatten()?;
         let thread = input.target.thread_id.as_deref();
         // Multiple agent groups may share one messaging_group; pick the most
         // recently active session for any agent wired to this mg. This is a
         // best-effort match; the TODO above is the real fix.
         let wirings = messaging_group_agents::list_for_mg(&self.deps.central, mg.id).ok()?;
         for w in wirings {
-            if let Ok(Some(s)) = sessions::find_for_agent(
-                &self.deps.central,
-                w.agent_group_id,
-                Some(mg.id),
-                thread,
-            ) {
+            if let Ok(Some(s)) =
+                sessions::find_for_agent(&self.deps.central, w.agent_group_id, Some(mg.id), thread)
+            {
                 return Some(ParentSession {
                     session_id: s.id,
                     agent_group_id: s.agent_group_id,
@@ -749,22 +739,14 @@ mod tests {
         let paths = SessionPaths::new(tmp.path(), parent_ag.id, parent_session.id);
         copperclaw_db::session::open_inbound(&paths).unwrap();
 
-        let module = CreateAgentModule::new(
-            central.clone(),
-            tmp.path().to_path_buf(),
-            permission,
-        );
+        let module = CreateAgentModule::new(central.clone(), tmp.path().to_path_buf(), permission);
         let deps = module.deps().clone();
         let handler = CreateAgentHandler { deps };
         let parent = ParentSession {
             session_id: parent_session.id,
             agent_group_id: parent_ag.id,
         };
-        let target = DispatchTarget::channel(
-            ChannelType::new("cli"),
-            "stdin".into(),
-            None,
-        );
+        let target = DispatchTarget::channel(ChannelType::new("cli"), "stdin".into(), None);
         (handler, central, tmp, parent, target)
     }
 
@@ -856,11 +838,7 @@ mod tests {
                     .unwrap_or(false)
             })
             .expect("child session exists");
-        let paths = SessionPaths::new(
-            tmp.path(),
-            child_session.agent_group_id,
-            child_session.id,
-        );
+        let paths = SessionPaths::new(tmp.path(), child_session.agent_group_id, child_session.id);
         let conn = copperclaw_db::session::open_inbound(&paths).unwrap();
         let pending = messages_in_read::get_pending(&conn, true, 10).unwrap();
         assert_eq!(
@@ -894,11 +872,7 @@ mod tests {
         // Seed parent's session_routing — the production code path
         // writes this on inbound arrival; the test fixture doesn't go
         // through that path, so we write it directly.
-        let parent_paths = SessionPaths::new(
-            tmp.path(),
-            parent.agent_group_id,
-            parent.session_id,
-        );
+        let parent_paths = SessionPaths::new(tmp.path(), parent.agent_group_id, parent.session_id);
         let parent_conn = copperclaw_db::session::open_inbound(&parent_paths).unwrap();
         let parent_routing = copperclaw_types::routing::SessionRouting {
             channel_type: Some(ChannelType::new("telegram")),
@@ -907,8 +881,11 @@ mod tests {
         };
         session_routing::write(&parent_conn, &parent_routing).unwrap();
         // Spawn the child.
-        let before_sessions: std::collections::HashSet<SessionId> =
-            sessions::list_active(&central).unwrap().iter().map(|s| s.id).collect();
+        let before_sessions: std::collections::HashSet<SessionId> = sessions::list_active(&central)
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
         handler
             .handle(DeliveryActionInput {
                 action: "create_agent".into(),
@@ -926,11 +903,8 @@ mod tests {
             .into_iter()
             .find(|s| !before_sessions.contains(&s.id))
             .expect("child created");
-        let child_paths = SessionPaths::new(
-            tmp.path(),
-            child_session.agent_group_id,
-            child_session.id,
-        );
+        let child_paths =
+            SessionPaths::new(tmp.path(), child_session.agent_group_id, child_session.id);
         let child_conn = copperclaw_db::session::open_inbound(&child_paths).unwrap();
         let child_routing = session_routing::read(&child_conn)
             .unwrap()
@@ -947,8 +921,11 @@ mod tests {
         // from the child had no return path. Now create_agent copies
         // the parent session's routing onto the new session.
         let (handler, central, _tmp, parent, target) = make_handler(always_allow());
-        let before_sessions: std::collections::HashSet<SessionId> =
-            sessions::list_active(&central).unwrap().iter().map(|s| s.id).collect();
+        let before_sessions: std::collections::HashSet<SessionId> = sessions::list_active(&central)
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
         handler
             .handle(DeliveryActionInput {
                 action: "create_agent".into(),
@@ -990,8 +967,11 @@ mod tests {
         // session so the runtime can route default `send_message`
         // calls up to the parent instead of the user's chat.
         let (handler, central, _tmp, parent, target) = make_handler(always_allow());
-        let before_sessions: std::collections::HashSet<SessionId> =
-            sessions::list_active(&central).unwrap().iter().map(|s| s.id).collect();
+        let before_sessions: std::collections::HashSet<SessionId> = sessions::list_active(&central)
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
         handler
             .handle(DeliveryActionInput {
                 action: "create_agent".into(),
@@ -1038,7 +1018,10 @@ mod tests {
         let r = &results[0]["create_agent_result"];
         assert_eq!(r["status"], "created");
         assert!(r["session_id"].is_string(), "real session id present");
-        assert!(r["agent_group_id"].is_string(), "real agent group id present");
+        assert!(
+            r["agent_group_id"].is_string(),
+            "real agent group id present"
+        );
     }
 
     #[test]
@@ -1292,11 +1275,8 @@ mod tests {
         // any more; the gate reads the DB on every call so this
         // assertion is now structural — the freshly-built handler
         // exposes nothing per-agent to inspect, by design.
-        let module = CreateAgentModule::new(
-            central.clone(),
-            tmp.path().to_path_buf(),
-            always_allow(),
-        );
+        let module =
+            CreateAgentModule::new(central.clone(), tmp.path().to_path_buf(), always_allow());
         let fresh = CreateAgentHandler {
             deps: module.deps().clone(),
         };

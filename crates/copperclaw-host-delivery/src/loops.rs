@@ -5,11 +5,11 @@
 //! and the set of sessions they consider.
 
 use crate::service::{
-    is_container_running, is_session_active, DeliveryService, ACTIVE_POLL_MS, SWEEP_POLL_MS,
+    ACTIVE_POLL_MS, DeliveryService, SWEEP_POLL_MS, is_container_running, is_session_active,
 };
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 

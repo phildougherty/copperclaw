@@ -4,9 +4,9 @@
 //! mtime is older than [`crate::HEARTBEAT_STALE_MS`], the session is
 //! marked for restart.
 
+use crate::HEARTBEAT_STALE_MS;
 use crate::error::SweepError;
 use crate::service::SessionRoot;
-use crate::HEARTBEAT_STALE_MS;
 use chrono::{DateTime, Utc};
 use copperclaw_types::{AgentGroupId, SessionId};
 use std::time::SystemTime;

@@ -46,7 +46,10 @@ pub fn build_registry() -> ChannelRegistry {
         ("gchat", copperclaw_channels_gchat::register),
         ("imessage", copperclaw_channels_imessage::register),
         ("wechat", copperclaw_channels_wechat::register),
-        ("whatsapp-cloud", copperclaw_channels_whatsapp_cloud::register),
+        (
+            "whatsapp-cloud",
+            copperclaw_channels_whatsapp_cloud::register,
+        ),
         ("webhooks", copperclaw_channels_webhooks::register),
         ("signal", copperclaw_channels_signal::register),
         ("deltachat", copperclaw_channels_deltachat::register),

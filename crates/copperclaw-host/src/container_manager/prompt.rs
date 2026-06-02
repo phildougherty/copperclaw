@@ -117,11 +117,19 @@ something fictional and walking it back later.
 # Sub-agents: explore vs create_agent
 
 Both can read your code. For a QUICK focused lookup use `explore` (runs in \
-your container, sees your live workspace, bounded + cheap). For a \
-SUBSTANTIVE parallel review/audit use `create_agent`: each sibling runs in \
-its own container with your workspace mounted READ-ONLY at `/parent` — say \
-so in its `instructions` (e.g. 'review the code under /parent'). Siblings \
-can't modify your files (read-only); their own writable space is `/data`.
+your container, sees your live workspace, bounded + cheap). For \
+SUBSTANTIVE parallel work use `create_agent`: each sibling runs in its own \
+container. If the project you're CURRENTLY IN (your shell's working dir) is \
+a GIT REPO, the sibling gets a WRITABLE worktree of THAT repo at \
+`/workspace` on branch `sib/<id>` — it can edit AND commit there without \
+touching your files; afterwards you review and merge its branch from inside \
+that project (`git diff main..sib/<id>`, `git merge sib/<id>`, then \
+`git worktree remove .copperclaw/wt/<id>` to tidy up). So `cd` into the \
+project before spawning builders — and keep every project a git repo (one \
+repo per project dir; `git init` new ones at creation). If you're not in a \
+repo, your whole workspace is mounted READ-ONLY at `/parent` (review/audit \
+only). Tell each sibling where to work in its `instructions` (e.g. \
+'implement X under /workspace and commit' or 'review the code under /parent').
 
 Children spawned via `create_agent` report into your `messages_in` \
 (the host routes them; they do NOT post to the user). Wait for all N \
@@ -249,7 +257,10 @@ pub(crate) fn read_project_briefing(
              authoritative context for this deployment.\n",
         );
         for (source, body) in sections {
-            out.push_str(&format!("\n<briefing source=\"{}\">\n", escape_attr(&source)));
+            out.push_str(&format!(
+                "\n<briefing source=\"{}\">\n",
+                escape_attr(&source)
+            ));
             out.push_str(body.trim_end_matches('\n'));
             out.push_str("\n</briefing>\n");
         }
@@ -330,7 +341,12 @@ pub(crate) fn assemble_system_prompt_with_catalogue(
 ) -> String {
     let mut out = String::with_capacity(16 * 1024);
     out.push_str(BASE_PREAMBLE);
-    out.push_str(&environment_block(session_id, agent_group_id, now, assistant_name));
+    out.push_str(&environment_block(
+        session_id,
+        agent_group_id,
+        now,
+        assistant_name,
+    ));
     if let Some(brief) = read_project_briefing(session_root, groups_dir, agent_group_id) {
         out.push_str(&brief);
     }
@@ -384,7 +400,10 @@ pub(crate) fn select_callable_skills(
         return Vec::new();
     };
     let group_override = groups_dir
-        .map(|root| root.join(agent_group_id.as_uuid().to_string()).join("skills"))
+        .map(|root| {
+            root.join(agent_group_id.as_uuid().to_string())
+                .join("skills")
+        })
         .filter(|p| p.is_dir())
         .map(|p| (agent_group_id, p));
     let registry = match copperclaw_skills::SkillRegistry::scan(
@@ -428,8 +447,7 @@ pub(crate) fn build_skills_catalogue(
     agent_group_id: AgentGroupId,
     selector: &copperclaw_skills::SkillsSelector,
 ) -> Option<Vec<SkillCatalogueEntry>> {
-    let entries =
-        select_callable_skills(skills_dir, groups_dir, agent_group_id, selector, &[]);
+    let entries = select_callable_skills(skills_dir, groups_dir, agent_group_id, selector, &[]);
     if entries.is_empty() {
         None
     } else {
@@ -470,9 +488,7 @@ pub(crate) fn build_skill_system_prompt(
 
     let registry = match copperclaw_skills::SkillRegistry::scan(
         global,
-        group_override
-            .as_ref()
-            .map(|(id, p)| (*id, p.as_path())),
+        group_override.as_ref().map(|(id, p)| (*id, p.as_path())),
     ) {
         Ok(r) => r,
         Err(err) => {
@@ -674,9 +690,7 @@ mod tests {
     fn write_skill_md(parent: &std::path::Path, name: &str, body: &str) {
         let dir = parent.join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        let content = format!(
-            "---\nname: {name}\ndescription: desc-of-{name}\n---\n\n{body}"
-        );
+        let content = format!("---\nname: {name}\ndescription: desc-of-{name}\n---\n\n{body}");
         std::fs::write(dir.join("SKILL.md"), content).unwrap();
     }
 
@@ -764,9 +778,7 @@ mod tests {
 
         let ag = AgentGroupId::new();
         let groups = td.path().join("groups");
-        let group_skills = groups
-            .join(ag.as_uuid().to_string())
-            .join("skills");
+        let group_skills = groups.join(ag.as_uuid().to_string()).join("skills");
         std::fs::create_dir_all(&group_skills).unwrap();
         write_skill_md(&group_skills, "send-message", "group override body\n");
 
@@ -829,7 +841,11 @@ mod tests {
         let td = tempfile::tempdir().unwrap();
         let skills = td.path().join("skills");
         std::fs::create_dir_all(&skills).unwrap();
-        write_skill_md(&skills, "alpha", "Alpha body line one\nAlpha body line two\n");
+        write_skill_md(
+            &skills,
+            "alpha",
+            "Alpha body line one\nAlpha body line two\n",
+        );
         write_skill_md(&skills, "beta", "Beta body\n");
         let entries = build_skills_catalogue(
             Some(&skills),
@@ -842,7 +858,11 @@ mod tests {
         assert!(entries.iter().any(|e| e.name == "alpha"
             && e.description == "desc-of-alpha"
             && e.body.contains("Alpha body line one")));
-        assert!(entries.iter().any(|e| e.name == "beta" && e.body.contains("Beta body")));
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.name == "beta" && e.body.contains("Beta body"))
+        );
     }
 
     #[test]
@@ -1024,7 +1044,11 @@ mod tests {
         std::fs::write(group_dir.join(PROJECT_BRIEFING_FILENAME), "GROUP-LEVEL\n").unwrap();
         let session_dir = td.path().join("sess");
         std::fs::create_dir_all(&session_dir).unwrap();
-        std::fs::write(session_dir.join(PROJECT_BRIEFING_FILENAME), "SESSION-LEVEL\n").unwrap();
+        std::fs::write(
+            session_dir.join(PROJECT_BRIEFING_FILENAME),
+            "SESSION-LEVEL\n",
+        )
+        .unwrap();
         let prompt = assemble_system_prompt(
             None,
             Some(&td.path().join("groups")),
@@ -1037,8 +1061,13 @@ mod tests {
             SkillsMode::Inline,
         );
         let g_pos = prompt.find("GROUP-LEVEL").expect("group briefing present");
-        let s_pos = prompt.find("SESSION-LEVEL").expect("session briefing present");
-        assert!(g_pos < s_pos, "group briefing must precede session briefing");
+        let s_pos = prompt
+            .find("SESSION-LEVEL")
+            .expect("session briefing present");
+        assert!(
+            g_pos < s_pos,
+            "group briefing must precede session briefing"
+        );
     }
 
     #[test]
@@ -1078,9 +1107,7 @@ mod tests {
             SkillsMode::Inline,
         );
         let brief_pos = prompt.find("BRIEF").expect("brief present");
-        let skill_pos = prompt
-            .find("<skill name=\"alpha\"")
-            .expect("skill present");
+        let skill_pos = prompt.find("<skill name=\"alpha\"").expect("skill present");
         assert!(brief_pos < skill_pos, "briefing must precede skills");
     }
 
@@ -1106,11 +1133,7 @@ mod tests {
     #[test]
     fn read_project_briefing_returns_none_when_neither_source_present() {
         let td = tempfile::tempdir().unwrap();
-        let out = read_project_briefing(
-            Some(td.path()),
-            Some(td.path()),
-            AgentGroupId::new(),
-        );
+        let out = read_project_briefing(Some(td.path()), Some(td.path()), AgentGroupId::new());
         assert!(out.is_none());
     }
 

@@ -26,27 +26,27 @@
 
 #![forbid(unsafe_code)]
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use copperclaw_cclaw::{CallTransport, Caller, ClientError, RunOutput, run_cli};
 use copperclaw_container_rt::{
     ContainerHandle, ContainerRuntime, ContainerSpec, ImageBuildSpec, RtError,
 };
 use copperclaw_db::central::CentralDb;
-use copperclaw_db::session::{open_inbound, open_inbound_rw_no_mmap, open_outbound, SessionPaths};
+use copperclaw_db::session::{SessionPaths, open_inbound, open_inbound_rw_no_mmap, open_outbound};
 use copperclaw_db::tables::{messages_in, session_routing, sessions};
 use copperclaw_host::config::ChannelInit;
-use copperclaw_host::{run_host, HostConfig};
-use copperclaw_cclaw::{run_cli, CallTransport, Caller, ClientError, RunOutput};
+use copperclaw_host::{HostConfig, run_host};
 use copperclaw_providers::AnthropicProvider;
-use copperclaw_runner::{compaction::CompactionCfg, run_loop, RunnerDeps, RunnerToolCtx};
-use copperclaw_types::{routing::SessionRouting, AgentGroupId, ChannelType, Effort, SessionId};
+use copperclaw_runner::{RunnerDeps, RunnerToolCtx, compaction::CompactionCfg, run_loop};
+use copperclaw_types::{AgentGroupId, ChannelType, Effort, SessionId, routing::SessionRouting};
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
-use tokio::time::{sleep, timeout, Instant};
+use tokio::time::{Instant, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -74,10 +74,7 @@ fn anthropic_sse_body(reply_text: &str) -> String {
     ];
     let mut out = String::new();
     for ev in events {
-        let name = ev
-            .get("type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("message");
+        let name = ev.get("type").and_then(|v| v.as_str()).unwrap_or("message");
         out.push_str("event: ");
         out.push_str(name);
         out.push('\n');
@@ -235,7 +232,10 @@ async fn runner_driver(cfg: RunnerDriverCfg) {
     }
 }
 
-fn ensure_session_routing(data_dir: &std::path::Path, session: &copperclaw_types::Session) -> Result<()> {
+fn ensure_session_routing(
+    data_dir: &std::path::Path,
+    session: &copperclaw_types::Session,
+) -> Result<()> {
     let paths = SessionPaths::new(data_dir, session.agent_group_id, session.id);
     paths.ensure_dirs()?;
     let conn = open_inbound(&paths)?;
@@ -278,7 +278,9 @@ async fn run_one_turn(
             break;
         }
         if Instant::now() > deadline {
-            return Err(anyhow!("no inbound rows landed within 5s for session {sess:?}"));
+            return Err(anyhow!(
+                "no inbound rows landed within 5s for session {sess:?}"
+            ));
         }
         sleep(Duration::from_millis(25)).await;
     }
@@ -292,21 +294,14 @@ async fn run_one_turn(
         "e2e-test-key",
         provider_base_url.to_string(),
     ));
-    let tool_ctx: Arc<dyn copperclaw_mcp::ToolContext> = Arc::new(RunnerToolCtx::new(
-        outbound.clone(),
-        paths.outbox.clone(),
-    ));
+    let tool_ctx: Arc<dyn copperclaw_mcp::ToolContext> =
+        Arc::new(RunnerToolCtx::new(outbound.clone(), paths.outbox.clone()));
     let tool_set = copperclaw_mcp::build_tool_set();
     let tool_defs: Vec<copperclaw_providers::ToolDef> = tool_set
         .iter()
         .map(|e| copperclaw_providers::ToolDef {
             name: e.tool.name.to_string(),
-            description: e
-                .tool
-                .description
-                .as_deref()
-                .unwrap_or("")
-                .to_string(),
+            description: e.tool.description.as_deref().unwrap_or("").to_string(),
             input_schema: serde_json::Value::Object((*e.tool.input_schema).clone()),
         })
         .collect();
@@ -375,7 +370,9 @@ async fn wait_for_log_contains(
 ) -> Result<String> {
     let stop = Instant::now() + deadline;
     loop {
-        let body = tokio::fs::read_to_string(log_path).await.unwrap_or_default();
+        let body = tokio::fs::read_to_string(log_path)
+            .await
+            .unwrap_or_default();
         if body.contains(needle) {
             return Ok(body);
         }
@@ -505,40 +502,39 @@ async fn e2e_chat_round_trip_via_fifo_and_log() {
     }
 
     // 8. Tail the log until the mocked reply appears.
-    let body = match wait_for_log_contains(&log_path, "hi from the mock", Duration::from_secs(25))
-        .await
-    {
-        Ok(b) => b,
-        Err(e) => {
-            // Snapshot what was actually persisted so a CI failure is
-            // diagnosable from the test output alone.
-            let central = CentralDb::open(cfg.central_db_path()).ok();
-            if let Some(db) = central {
-                let active = sessions::list_active(&db).unwrap_or_default();
-                eprintln!("debug: {} active sessions", active.len());
-                for s in active {
-                    eprintln!(
-                        "  session {} agent_group {} status={:?} cstatus={:?}",
-                        s.id.as_uuid(),
-                        s.agent_group_id.as_uuid(),
-                        s.status,
-                        s.container_status,
-                    );
-                    let paths = SessionPaths::new(&data_dir, s.agent_group_id, s.id);
-                    if let Ok(conn) = open_inbound(&paths) {
-                        if let Ok(n) = messages_in::count_due(&conn) {
-                            eprintln!("    inbound pending={n}");
+    let body =
+        match wait_for_log_contains(&log_path, "hi from the mock", Duration::from_secs(25)).await {
+            Ok(b) => b,
+            Err(e) => {
+                // Snapshot what was actually persisted so a CI failure is
+                // diagnosable from the test output alone.
+                let central = CentralDb::open(cfg.central_db_path()).ok();
+                if let Some(db) = central {
+                    let active = sessions::list_active(&db).unwrap_or_default();
+                    eprintln!("debug: {} active sessions", active.len());
+                    for s in active {
+                        eprintln!(
+                            "  session {} agent_group {} status={:?} cstatus={:?}",
+                            s.id.as_uuid(),
+                            s.agent_group_id.as_uuid(),
+                            s.status,
+                            s.container_status,
+                        );
+                        let paths = SessionPaths::new(&data_dir, s.agent_group_id, s.id);
+                        if let Ok(conn) = open_inbound(&paths) {
+                            if let Ok(n) = messages_in::count_due(&conn) {
+                                eprintln!("    inbound pending={n}");
+                            }
                         }
                     }
                 }
+                // Dump wiremock received requests so we know whether the
+                // runner even attempted a provider call.
+                let received = server.received_requests().await.unwrap_or_default();
+                eprintln!("debug: {} wiremock requests received", received.len());
+                panic!("expected reply in log: {e}");
             }
-            // Dump wiremock received requests so we know whether the
-            // runner even attempted a provider call.
-            let received = server.received_requests().await.unwrap_or_default();
-            eprintln!("debug: {} wiremock requests received", received.len());
-            panic!("expected reply in log: {e}");
-        }
-    };
+        };
     // Sanity: the cli adapter prefixes outbound with its label
     // (`"agent> "` by default). Anchor the assert on that to catch
     // regressions in the cli renderer too.
@@ -578,12 +574,10 @@ impl CallTransport for UnreachableTransport {
         _args: serde_json::Value,
         _caller: Caller,
     ) -> Result<serde_json::Value, ClientError> {
-        Err(ClientError::Remote(
-            copperclaw_cclaw::ErrorPayload::new(
-                "unreachable",
-                format!("test transport should never be called; got {command}"),
-            ),
-        ))
+        Err(ClientError::Remote(copperclaw_cclaw::ErrorPayload::new(
+            "unreachable",
+            format!("test transport should never be called; got {command}"),
+        )))
     }
 }
 
@@ -610,7 +604,11 @@ async fn chat_no_autostart_friendly_error_when_host_not_running() {
     )
     .await;
 
-    assert!(out.stdout.is_empty(), "stdout unexpectedly populated: {:?}", out.stdout);
+    assert!(
+        out.stdout.is_empty(),
+        "stdout unexpectedly populated: {:?}",
+        out.stdout
+    );
     assert!(
         out.stderr.contains("no FIFO"),
         "stderr should mention missing FIFO, got: {:?}",

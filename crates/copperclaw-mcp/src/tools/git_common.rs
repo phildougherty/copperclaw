@@ -11,9 +11,8 @@ use std::path::{Path, PathBuf};
 pub(super) fn resolve_path(path: Option<&str>) -> Result<PathBuf, ToolError> {
     let p = match path {
         Some(s) if !s.trim().is_empty() => PathBuf::from(s),
-        _ => std::env::current_dir().map_err(|e| {
-            ToolError::Internal(format!("git: read cwd failed: {e}"))
-        })?,
+        _ => std::env::current_dir()
+            .map_err(|e| ToolError::Internal(format!("git: read cwd failed: {e}")))?,
     };
     Ok(p)
 }
@@ -106,11 +105,7 @@ pub(crate) mod tests {
 
     /// Stage `file` (already on disk) and commit with `message`.
     /// Returns `(oid, short)`.
-    pub fn commit_existing(
-        repo: &Repository,
-        file: &str,
-        message: &str,
-    ) -> (git2::Oid, String) {
+    pub fn commit_existing(repo: &Repository, file: &str, message: &str) -> (git2::Oid, String) {
         let mut index = repo.index().unwrap();
         index.add_path(Path::new(file)).unwrap();
         index.write().unwrap();

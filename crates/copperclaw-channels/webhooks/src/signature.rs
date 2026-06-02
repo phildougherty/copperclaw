@@ -105,10 +105,7 @@ mod tests {
         let body = b"x";
         let sig = compute_hex("s", body);
         let padded = format!("  {sig}  ");
-        assert_eq!(
-            verify(body, "s", "", Some(&padded)),
-            SignatureOutcome::Ok
-        );
+        assert_eq!(verify(body, "s", "", Some(&padded)), SignatureOutcome::Ok);
     }
 
     #[test]

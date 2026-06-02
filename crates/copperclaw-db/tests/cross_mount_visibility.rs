@@ -10,7 +10,7 @@
 //! check that the pragma stays in place.
 
 use chrono::Utc;
-use copperclaw_db::session::{open_inbound, open_inbound_ro_no_mmap, SessionPaths};
+use copperclaw_db::session::{SessionPaths, open_inbound, open_inbound_ro_no_mmap};
 use copperclaw_db::tables::messages_in;
 use copperclaw_types::{AgentGroupId, ChannelType, MessageId, MessageKind, SessionId};
 use serde_json::json;

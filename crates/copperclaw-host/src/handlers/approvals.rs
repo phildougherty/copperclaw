@@ -33,14 +33,12 @@
 //!   to reverse course.
 
 use super::{db_err, opt_str, parse_uuid, req_str};
+use copperclaw_cclaw::ErrorPayload;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::pending_approvals::ApprovalStatus;
-use copperclaw_db::tables::{
-    container_configs, messaging_groups, pending_approvals, users,
-};
-use copperclaw_cclaw::ErrorPayload;
+use copperclaw_db::tables::{container_configs, messaging_groups, pending_approvals, users};
 use copperclaw_types::{AgentGroupId, ApprovalId};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub fn list(_args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     let rows = pending_approvals::list(central, None, None).map_err(db_err)?;
@@ -131,8 +129,7 @@ pub fn approve(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload>
         }
     };
 
-    pending_approvals::update_status(central, id, ApprovalStatus::Approved)
-        .map_err(db_err)?;
+    pending_approvals::update_status(central, id, ApprovalStatus::Approved).map_err(db_err)?;
     let after = pending_approvals::get(central, id).map_err(db_err)?;
     Ok(json!({
         "approval": approval_to_json(&after),
@@ -168,8 +165,7 @@ pub fn deny(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
         }
         ApprovalStatus::Pending => {}
     }
-    pending_approvals::update_status(central, id, ApprovalStatus::Denied)
-        .map_err(db_err)?;
+    pending_approvals::update_status(central, id, ApprovalStatus::Denied).map_err(db_err)?;
     let after = pending_approvals::get(central, id).map_err(db_err)?;
     Ok(json!({
         "approval": approval_to_json(&after),
@@ -407,9 +403,7 @@ fn json_str_array(payload: &Value, key: &str) -> Vec<String> {
 /// the approvals module doesn't reach into a sibling handler's private
 /// surface. Inserts a defaults-only row when missing.
 fn ensure_config_row(central: &CentralDb, ag_id: AgentGroupId) -> Result<(), ErrorPayload> {
-    use container_configs::{
-        CliScope, SkillsSelector, UpsertContainerConfig,
-    };
+    use container_configs::{CliScope, SkillsSelector, UpsertContainerConfig};
     if container_configs::get(central, ag_id)
         .map_err(db_err)?
         .is_some()
@@ -465,7 +459,7 @@ fn approval_to_json(a: &pending_approvals::PendingApproval) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use copperclaw_db::tables::pending_approvals::{upsert, UpsertPendingApproval};
+    use copperclaw_db::tables::pending_approvals::{UpsertPendingApproval, upsert};
 
     fn db() -> CentralDb {
         CentralDb::open_in_memory().unwrap()
@@ -512,22 +506,14 @@ mod tests {
             },
         )
         .unwrap();
-        let v = get(
-            &json!({"id": a.approval_id.as_uuid().to_string()}),
-            &db,
-        )
-        .unwrap();
+        let v = get(&json!({"id": a.approval_id.as_uuid().to_string()}), &db).unwrap();
         assert_eq!(v["request_id"], "r1");
     }
 
     #[test]
     fn get_missing_is_not_found() {
         let db = db();
-        let err = get(
-            &json!({"id": uuid::Uuid::now_v7().to_string()}),
-            &db,
-        )
-        .unwrap_err();
+        let err = get(&json!({"id": uuid::Uuid::now_v7().to_string()}), &db).unwrap_err();
         assert_eq!(err.code, "not_found");
     }
 
@@ -535,10 +521,8 @@ mod tests {
     // Generic approve / deny per-family tests
     // -----------------------------------------------------------------------
 
-    use copperclaw_db::tables::agent_groups::{create as create_ag, CreateAgentGroup};
-    use copperclaw_db::tables::pending_approvals::{
-        get as get_row, ApprovalStatus,
-    };
+    use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+    use copperclaw_db::tables::pending_approvals::{ApprovalStatus, get as get_row};
     use copperclaw_types::ChannelType;
 
     fn seed_ag(db: &CentralDb) -> copperclaw_types::AgentGroupId {
@@ -573,22 +557,14 @@ mod tests {
     #[test]
     fn approve_unknown_id_is_not_found() {
         let db = db();
-        let err = approve(
-            &json!({"id": uuid::Uuid::now_v7().to_string()}),
-            &db,
-        )
-        .unwrap_err();
+        let err = approve(&json!({"id": uuid::Uuid::now_v7().to_string()}), &db).unwrap_err();
         assert_eq!(err.code, "not_found");
     }
 
     #[test]
     fn deny_unknown_id_is_not_found() {
         let db = db();
-        let err = deny(
-            &json!({"id": uuid::Uuid::now_v7().to_string()}),
-            &db,
-        )
-        .unwrap_err();
+        let err = deny(&json!({"id": uuid::Uuid::now_v7().to_string()}), &db).unwrap_err();
         assert_eq!(err.code, "not_found");
     }
 
@@ -667,10 +643,12 @@ mod tests {
         assert_eq!(v["applied"], true);
         assert_eq!(v["side_effect"]["kind"], "channel");
         let mg_id = v["side_effect"]["messaging_group_id"].as_str().unwrap();
-        assert!(v["side_effect"]["wiring_hint"]
-            .as_str()
-            .unwrap()
-            .contains("cclaw wirings create"));
+        assert!(
+            v["side_effect"]["wiring_hint"]
+                .as_str()
+                .unwrap()
+                .contains("cclaw wirings create")
+        );
         // The messaging_groups row exists with the right shape.
         let ct = ChannelType::new("slack");
         let mg = messaging_groups::get_by_platform(&db, &ct, "C-DEMO")
@@ -817,7 +795,10 @@ mod tests {
         // Even if we called add_package_apt twice, it dedups, so we have to
         // check by counting occurrences explicitly.
         let count = cfg.packages_apt.iter().filter(|p| *p == "jq").count();
-        assert_eq!(count, 1, "double approve must not duplicate the package entry");
+        assert_eq!(
+            count, 1,
+            "double approve must not duplicate the package entry"
+        );
     }
 
     #[test]
@@ -842,9 +823,11 @@ mod tests {
         let after = get_row(&db, id).unwrap();
         assert_eq!(after.status, ApprovalStatus::Denied);
         // Crucially: no user row was created.
-        assert!(users::get_by_identity(&db, "slack", "U-DENY")
-            .unwrap()
-            .is_none());
+        assert!(
+            users::get_by_identity(&db, "slack", "U-DENY")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -932,9 +915,11 @@ mod tests {
         );
         let v = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap();
         assert_eq!(v["side_effect"]["kind"], "sender");
-        assert!(users::get_by_identity(&db, "discord", "D-7")
-            .unwrap()
-            .is_some());
+        assert!(
+            users::get_by_identity(&db, "discord", "D-7")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

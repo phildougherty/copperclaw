@@ -14,4 +14,4 @@
 //! that downstream crates already depend on.
 
 #[allow(unused_imports)]
-pub(super) use crate::formatter::{format_messages, FormattedTurn};
+pub(super) use crate::formatter::{FormattedTurn, format_messages};

@@ -115,7 +115,12 @@ impl EmacsClient for EmacsClientCli {
                 program = self.plan.program,
             ))
         })?;
-        classify_output(&output.status, &output.stdout, &output.stderr, &self.plan.program)
+        classify_output(
+            &output.status,
+            &output.stdout,
+            &output.stderr,
+            &self.plan.program,
+        )
     }
 }
 
@@ -138,7 +143,8 @@ pub fn classify_output(
     // running. Treat that family of messages as Auth-class: the channel
     // can't reach the platform.
     let lc = stderr_str.to_lowercase();
-    if lc.contains("can't find socket") || lc.contains("can not find socket")
+    if lc.contains("can't find socket")
+        || lc.contains("can not find socket")
         || lc.contains("no socket")
     {
         return Err(AdapterError::Auth(format!(
@@ -397,9 +403,8 @@ mod tests {
     #[test]
     fn classify_output_no_socket_variant() {
         let s = fake_status(1);
-        let err =
-            classify_output(&s, b"", b"emacsclient: no socket name set\n", "emacsclient")
-                .unwrap_err();
+        let err = classify_output(&s, b"", b"emacsclient: no socket name set\n", "emacsclient")
+            .unwrap_err();
         assert!(matches!(err, AdapterError::Auth(_)));
     }
 
@@ -488,7 +493,9 @@ mod tests {
         let cases = vec![
             AdapterError::Transport("t".into()),
             AdapterError::Auth("a".into()),
-            AdapterError::Rate { retry_after: Some(5) },
+            AdapterError::Rate {
+                retry_after: Some(5),
+            },
             AdapterError::Rate { retry_after: None },
             AdapterError::BadRequest("b".into()),
             AdapterError::NotImplemented,

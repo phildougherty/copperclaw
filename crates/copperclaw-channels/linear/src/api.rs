@@ -148,10 +148,7 @@ impl LinearApi {
     }
 
     /// `reactionCreate` — add an emoji reaction to a comment. Returns `()`.
-    pub async fn create_reaction(
-        &self,
-        input: &ReactionCreateInput,
-    ) -> Result<(), AdapterError> {
+    pub async fn create_reaction(&self, input: &ReactionCreateInput) -> Result<(), AdapterError> {
         let value = self
             .post_graphql(
                 queries::CREATE_REACTION,
@@ -185,9 +182,8 @@ fn decode_comment_ref(value: &Value, op: &str) -> Result<CommentRef, AdapterErro
     let comment = value.get("comment").ok_or_else(|| {
         AdapterError::BadRequest(format!("linear {op} response missing `comment`: {value}"))
     })?;
-    let parsed: CommentRef = serde_json::from_value(comment.clone()).map_err(|e| {
-        AdapterError::Transport(format!("linear {op} comment decode failed: {e}"))
-    })?;
+    let parsed: CommentRef = serde_json::from_value(comment.clone())
+        .map_err(|e| AdapterError::Transport(format!("linear {op} comment decode failed: {e}")))?;
     Ok(parsed)
 }
 
@@ -210,7 +206,9 @@ async fn read_linear_json(resp: reqwest::Response) -> Result<Value, AdapterError
     }
     if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
         let body = resp.text().await.unwrap_or_default();
-        return Err(AdapterError::Auth(format!("linear returned {status}: {body}")));
+        return Err(AdapterError::Auth(format!(
+            "linear returned {status}: {body}"
+        )));
     }
     if status.is_server_error() {
         let body = resp.text().await.unwrap_or_default();
@@ -260,10 +258,7 @@ pub(crate) fn classify_linear_payload(
 /// Choose the right `AdapterError` variant for a Linear `errors[]` message.
 pub(crate) fn map_linear_error(message: &str, retry_after: Option<u64>) -> AdapterError {
     let lc = message.to_ascii_lowercase();
-    if lc.contains("rate limit")
-        || lc.contains("ratelimit")
-        || lc.contains("too many requests")
-    {
+    if lc.contains("rate limit") || lc.contains("ratelimit") || lc.contains("too many requests") {
         return AdapterError::Rate { retry_after };
     }
     if lc.contains("authentication")
@@ -821,12 +816,7 @@ mod tests {
             .await;
         let api = api_for(&server);
         match api
-            .update_comment(
-                "x",
-                &CommentUpdateInput {
-                    body: "x".into(),
-                },
-            )
+            .update_comment("x", &CommentUpdateInput { body: "x".into() })
             .await
         {
             Err(AdapterError::BadRequest(_)) => {}

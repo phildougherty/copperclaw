@@ -29,13 +29,17 @@ static SENTINEL_DIR_TEST_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<P
 #[cfg(test)]
 pub fn sentinel_dir_test_override_set(dir: PathBuf) {
     let cell = SENTINEL_DIR_TEST_OVERRIDE.get_or_init(|| std::sync::Mutex::new(None));
-    *cell.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dir);
+    *cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dir);
 }
 
 #[cfg(test)]
 pub fn sentinel_dir_test_override_clear() {
     if let Some(cell) = SENTINEL_DIR_TEST_OVERRIDE.get() {
-        *cell.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 
@@ -114,7 +118,10 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let dir = tempfile::tempdir().expect("tempdir");
             sentinel_dir_test_override_set(dir.path().to_path_buf());
-            Self { _dir: dir, _lock: lock }
+            Self {
+                _dir: dir,
+                _lock: lock,
+            }
         }
     }
 

@@ -16,7 +16,7 @@ use rmcp::service::{RequestContext, RoleServer};
 
 use crate::context::ToolContext;
 use crate::error::ToolError;
-use crate::tools::{build_tool_set, ToolEntry};
+use crate::tools::{ToolEntry, build_tool_set};
 
 /// rmcp `ServerHandler` exposing the 15 copperclaw tools.
 #[derive(Clone)]
@@ -113,8 +113,7 @@ impl ServerHandler for CopperclawServer {
         &self,
         _request: Option<PaginatedRequestParam>,
         _context: RequestContext<RoleServer>,
-    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpModelError>> + Send + '_
-    {
+    ) -> impl std::future::Future<Output = Result<ListToolsResult, McpModelError>> + Send + '_ {
         let descriptors = self.tool_descriptors();
         std::future::ready(Ok(ListToolsResult::with_all_items(descriptors)))
     }
@@ -125,7 +124,10 @@ impl ServerHandler for CopperclawServer {
         _context: RequestContext<RoleServer>,
     ) -> impl std::future::Future<Output = Result<CallToolResult, McpModelError>> + Send + '_ {
         let this = self.clone();
-        async move { this.dispatch(request.name.as_ref(), request.arguments).await }
+        async move {
+            this.dispatch(request.name.as_ref(), request.arguments)
+                .await
+        }
     }
 }
 

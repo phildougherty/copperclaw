@@ -16,7 +16,7 @@
 use crate::error::SweepError;
 use crate::service::{SeriesFanout, SessionRoot};
 use chrono::{DateTime, Utc};
-use copperclaw_db::tables::messages_in::{insert, WriteInbound};
+use copperclaw_db::tables::messages_in::{WriteInbound, insert};
 use copperclaw_modules::scheduling::{compute_next_fire, parse_when};
 use copperclaw_types::{AgentGroupId, ChannelType, MessageId, MessageKind, SessionId};
 use rusqlite::Connection;
@@ -103,10 +103,7 @@ pub fn check(
     Ok(out)
 }
 
-fn compute_next(
-    recurrence: &str,
-    now: DateTime<Utc>,
-) -> Result<Option<DateTime<Utc>>, SweepError> {
+fn compute_next(recurrence: &str, now: DateTime<Utc>) -> Result<Option<DateTime<Utc>>, SweepError> {
     let when = parse_when(recurrence).map_err(|e| SweepError::ScheduleParse(e.to_string()))?;
     Ok(compute_next_fire(&when, now, Some(recurrence)))
 }
@@ -166,9 +163,8 @@ fn newest_per_series(
         // the whole session's recurrence sweep with an
         // `unknown kind` error — strictly worse than letting the row
         // ride for one pass.
-        let kind = MessageKind::parse_str(&kind_str).ok_or_else(|| {
-            SweepError::ScheduleParse(format!("unknown kind `{kind_str}`"))
-        })?;
+        let kind = MessageKind::parse_str(&kind_str)
+            .ok_or_else(|| SweepError::ScheduleParse(format!("unknown kind `{kind_str}`")))?;
         let recurrence: String = row.get("recurrence")?;
         let series_id: Option<String> = row.get("series_id")?;
         let trigger_i: i64 = row.get("trigger")?;
@@ -208,9 +204,7 @@ fn newest_per_series(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{
-        insert_recurring_inbound, seed_running_session, MemSessionRoot,
-    };
+    use crate::test_support::{MemSessionRoot, insert_recurring_inbound, seed_running_session};
     use chrono::{Duration as ChDuration, TimeZone};
     use copperclaw_db::central::CentralDb;
 

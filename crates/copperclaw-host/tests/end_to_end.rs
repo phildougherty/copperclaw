@@ -1,9 +1,9 @@
 //! End-to-end integration: spin up the socket server against an in-memory
 //! central DB and drive it via the `cclaw` Unix-socket client.
 
+use copperclaw_cclaw::{Caller, CclawClient};
 use copperclaw_db::central::CentralDb;
 use copperclaw_host::socket::run_server;
-use copperclaw_cclaw::{Caller, CclawClient};
 use serde_json::json;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;

@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use copperclaw_db::central::CentralDb;
-use copperclaw_db::session::{open_inbound, open_outbound, SessionPaths};
+use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
 use copperclaw_db::tables::{messages_in, messages_out, sessions};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -114,9 +114,7 @@ impl HealthDegradedReason {
     #[must_use]
     pub fn metric_label(&self) -> &'static str {
         match self {
-            Self::ImageNotFound { .. } => {
-                copperclaw_metrics::DEGRADED_REASON_IMAGE_NOT_FOUND
-            }
+            Self::ImageNotFound { .. } => copperclaw_metrics::DEGRADED_REASON_IMAGE_NOT_FOUND,
             Self::RunnerBinaryMissing { .. } => {
                 copperclaw_metrics::DEGRADED_REASON_RUNNER_BINARY_MISSING
             }
@@ -337,7 +335,10 @@ pub fn default_host_runner_path() -> Option<PathBuf> {
             }
         }
     }
-    for candidate in ["/usr/local/bin/copperclaw-runner", "/usr/bin/copperclaw-runner"] {
+    for candidate in [
+        "/usr/local/bin/copperclaw-runner",
+        "/usr/bin/copperclaw-runner",
+    ] {
         let p = Path::new(candidate);
         if p.is_file() {
             return Some(p.to_path_buf());
@@ -456,8 +457,7 @@ pub async fn check_image_health(
 /// Per-session apology text written to every session with a pending
 /// chat inbound when the host enters degraded mode. Plain ASCII, no
 /// emojis — matches the project's "no emojis" rule.
-pub const DEGRADED_APOLOGY_TEXT: &str =
-    "The agent is temporarily degraded \
+pub const DEGRADED_APOLOGY_TEXT: &str = "The agent is temporarily degraded \
      — the container image is missing or out of date. \
      The operator has been notified.";
 
@@ -499,7 +499,10 @@ pub fn enter_degraded_mode(
     let sessions_list = match sessions::list_active(central) {
         Ok(s) => s,
         Err(err) => {
-            warn!(?err, "degraded-mode: could not list active sessions; skipping apology fan-out");
+            warn!(
+                ?err,
+                "degraded-mode: could not list active sessions; skipping apology fan-out"
+            );
             return 0;
         }
     };
@@ -738,8 +741,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn image_health_fails_on_probe_transport_error() {
-        let probe =
-            StubProbe::default().with_image_exists(Err("daemon down".to_string()));
+        let probe = StubProbe::default().with_image_exists(Err("daemon down".to_string()));
         let res = check_image_health(&probe, "tag:test", None).await;
         match res {
             Err(HealthDegradedReason::Failed(msg)) => {
@@ -752,9 +754,7 @@ pub(crate) mod tests {
     #[test]
     fn metric_label_covers_every_variant() {
         let cases = [
-            HealthDegradedReason::ImageNotFound {
-                tag: "x".into(),
-            },
+            HealthDegradedReason::ImageNotFound { tag: "x".into() },
             HealthDegradedReason::RunnerBinaryMissing {
                 tag: "x".into(),
                 path: "p".into(),
@@ -771,8 +771,7 @@ pub(crate) mod tests {
             let lbl = c.metric_label();
             assert!(!lbl.is_empty());
             assert!(
-                lbl.chars()
-                    .all(|ch| ch.is_ascii_lowercase() || ch == '_'),
+                lbl.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_'),
                 "label {lbl:?} must be snake_case ASCII"
             );
         }

@@ -7,12 +7,12 @@
 
 use super::{db_err, opt_str};
 use chrono::DateTime;
-use copperclaw_db::central::CentralDb;
-use copperclaw_db::session::{open_outbound, SessionPaths};
-use copperclaw_db::tables::{dropped_messages, messages_out, outbound_dropped_messages};
 use copperclaw_cclaw::ErrorPayload;
+use copperclaw_db::central::CentralDb;
+use copperclaw_db::session::{SessionPaths, open_outbound};
+use copperclaw_db::tables::{dropped_messages, messages_out, outbound_dropped_messages};
 use copperclaw_types::MessageId;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use uuid::Uuid;
 
 pub fn list(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
@@ -59,7 +59,9 @@ fn parse_since(s: &str) -> Result<DateTime<chrono::Utc>, ErrorPayload> {
     let bad = || {
         ErrorPayload::new(
             "bad_request",
-            format!("invalid `since` value `{s}`; use an ISO-8601 timestamp or a shorthand like `24h`, `30m`, `7d`"),
+            format!(
+                "invalid `since` value `{s}`; use an ISO-8601 timestamp or a shorthand like `24h`, `30m`, `7d`"
+            ),
         )
     };
     let unit_char = s.chars().next_back().ok_or_else(bad)?;
@@ -127,22 +129,22 @@ pub fn replay_with_data_dir(
         .map_err(|e| ErrorPayload::new("bad_request", format!("invalid dead-letter id: {e}")))?;
 
     let record = outbound_dropped_messages::get(central, id).map_err(|e| match e {
-        copperclaw_db::DbError::NotFound => {
-            ErrorPayload::new("not_found", format!("no outbound dead-letter row with id {id}"))
-        }
+        copperclaw_db::DbError::NotFound => ErrorPayload::new(
+            "not_found",
+            format!("no outbound dead-letter row with id {id}"),
+        ),
         other => db_err(other),
     })?;
 
     // Open the session's outbound DB and insert a fresh copy of the message.
-    let paths = SessionPaths::new(
-        data_dir,
-        record.agent_group_id,
-        record.session_id,
-    );
+    let paths = SessionPaths::new(data_dir, record.agent_group_id, record.session_id);
     let conn = open_outbound(&paths).map_err(|e| {
         ErrorPayload::new(
             "io_error",
-            format!("could not open outbound DB for session {}: {e}", record.session_id.as_uuid()),
+            format!(
+                "could not open outbound DB for session {}: {e}",
+                record.session_id.as_uuid()
+            ),
         )
     })?;
     let new_id = MessageId::new();
@@ -158,9 +160,8 @@ pub fn replay_with_data_dir(
         thread_id: record.thread_id.clone(),
         content: record.content.clone(),
     };
-    messages_out::insert(&conn, &msg).map_err(|e| {
-        ErrorPayload::new("db_error", format!("failed to re-insert message: {e}"))
-    })?;
+    messages_out::insert(&conn, &msg)
+        .map_err(|e| ErrorPayload::new("db_error", format!("failed to re-insert message: {e}")))?;
 
     // Delete the dead-letter row so it doesn't show up in outbound-list again.
     outbound_dropped_messages::delete(central, id).map_err(db_err)?;
@@ -177,7 +178,7 @@ pub fn replay_with_data_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use copperclaw_db::tables::dropped_messages::{insert, InsertDroppedMessage};
+    use copperclaw_db::tables::dropped_messages::{InsertDroppedMessage, insert};
     use copperclaw_types::ChannelType;
 
     fn db() -> CentralDb {
@@ -229,11 +230,7 @@ mod tests {
         .unwrap();
         // Use a future timestamp so the filter rejects every row.
         let future = chrono::Utc::now() + chrono::Duration::hours(1);
-        let v = list(
-            &json!({"since": future.to_rfc3339()}),
-            &db,
-        )
-        .unwrap();
+        let v = list(&json!({"since": future.to_rfc3339()}), &db).unwrap();
         assert!(v.as_array().unwrap().is_empty());
     }
 

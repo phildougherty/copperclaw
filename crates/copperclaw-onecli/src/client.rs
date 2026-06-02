@@ -5,7 +5,7 @@
 //! and centralizes status-to-error mapping in [`map_status`].
 
 use chrono::{DateTime, Utc};
-use reqwest::header::{HeaderValue, ACCEPT, AUTHORIZATION, RETRY_AFTER};
+use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderValue, RETRY_AFTER};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -193,11 +193,7 @@ impl OneCliClient {
     /// Deny a pending approval by id with an optional human reason. POSTs
     /// `/v1/approvals/{id}/deny` with `{ reason?: string }`; success is `204
     /// No Content`.
-    pub async fn deny(
-        &self,
-        approval_id: &str,
-        reason: Option<&str>,
-    ) -> Result<(), OneCliError> {
+    pub async fn deny(&self, approval_id: &str, reason: Option<&str>) -> Result<(), OneCliError> {
         let path = format!("v1/approvals/{}/deny", urlencoding(approval_id));
         let url = self.endpoint(&path)?;
         let body = DenyRequest { reason };
@@ -271,11 +267,7 @@ fn truncate_body(body: &str) -> String {
 /// Map an HTTP `status` + body + optional `Retry-After` header into the
 /// closest matching [`OneCliError`] variant. Centralized so every endpoint
 /// call site is a one-line `Err(self.error_for_response(resp).await)`.
-fn map_status(
-    status: StatusCode,
-    body: &str,
-    retry_after: Option<&HeaderValue>,
-) -> OneCliError {
+fn map_status(status: StatusCode, body: &str, retry_after: Option<&HeaderValue>) -> OneCliError {
     match status.as_u16() {
         401 => OneCliError::Unauthorized,
         404 => OneCliError::NotFound,
@@ -416,10 +408,7 @@ mod tests {
     #[test]
     fn map_status_429_without_header() {
         let e = map_status(StatusCode::TOO_MANY_REQUESTS, "", None);
-        assert!(matches!(
-            e,
-            OneCliError::RateLimited { retry_after: None }
-        ));
+        assert!(matches!(e, OneCliError::RateLimited { retry_after: None }));
     }
 
     #[test]
@@ -620,16 +609,16 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/agents"))
-            .respond_with(
-                ResponseTemplate::new(429).insert_header("retry-after", "30"),
-            )
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "30"))
             .mount(&server)
             .await;
         let c = client_for(&server);
         let err = c.ensure_agent("demo", None).await.unwrap_err();
         assert!(matches!(
             err,
-            OneCliError::RateLimited { retry_after: Some(30) }
+            OneCliError::RateLimited {
+                retry_after: Some(30)
+            }
         ));
     }
 
@@ -790,9 +779,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
             .and(path("/v1/agents/ag_1/provisioning"))
-            .respond_with(
-                ResponseTemplate::new(429).insert_header("retry-after", "12"),
-            )
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "12"))
             .mount(&server)
             .await;
         let c = client_for(&server);
@@ -802,7 +789,9 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            OneCliError::RateLimited { retry_after: Some(12) }
+            OneCliError::RateLimited {
+                retry_after: Some(12)
+            }
         ));
     }
 
@@ -990,15 +979,15 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/v1/approvals/apr_1/approve"))
-            .respond_with(
-                ResponseTemplate::new(429).insert_header("retry-after", "5"),
-            )
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "5"))
             .mount(&server)
             .await;
         let c = client_for(&server);
         assert!(matches!(
             c.approve("apr_1").await.unwrap_err(),
-            OneCliError::RateLimited { retry_after: Some(5) }
+            OneCliError::RateLimited {
+                retry_after: Some(5)
+            }
         ));
     }
 

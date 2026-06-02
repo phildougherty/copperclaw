@@ -180,9 +180,7 @@ impl JsonRpcClient {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| {
-                AdapterError::Transport(format!("signal: failed to spawn {bin}: {e}"))
-            })?;
+            .map_err(|e| AdapterError::Transport(format!("signal: failed to spawn {bin}: {e}")))?;
 
         let stdin = child.stdin.take().ok_or_else(|| {
             AdapterError::Transport("signal: subprocess stdin unavailable".into())
@@ -319,11 +317,7 @@ async fn reader_loop(
 
 /// Dispatch a parsed JSON-RPC frame to either the response or notification
 /// path. Frames missing both an `id` and a `method` are logged and dropped.
-async fn dispatch_frame(
-    value: Value,
-    pending: &PendingMap,
-    notif_tx: &mpsc::Sender<Notification>,
-) {
+async fn dispatch_frame(value: Value, pending: &PendingMap, notif_tx: &mpsc::Sender<Notification>) {
     let id = value.get("id").and_then(Value::as_u64);
     let method = value.get("method").and_then(Value::as_str);
 
@@ -343,7 +337,10 @@ async fn dispatch_frame(
                     let _ = sender.send(Err(rpc_err));
                 }
                 Err(e) => {
-                    tracing::warn!(?e, "signal: failed to parse error field; treating as bad request");
+                    tracing::warn!(
+                        ?e,
+                        "signal: failed to parse error field; treating as bad request"
+                    );
                     let _ = sender.send(Err(RpcError {
                         code: 0,
                         message: format!("malformed error field: {e}"),
@@ -436,7 +433,9 @@ impl MockTransport {
             notif_tx,
         });
         (
-            Self { inner: inner.clone() },
+            Self {
+                inner: inner.clone(),
+            },
             MockHandle { inner },
         )
     }
@@ -498,15 +497,10 @@ impl RpcTransport for MockTransport {
     }
 
     async fn take_notifications(&self) -> mpsc::Receiver<Notification> {
-        self.inner
-            .notif_rx
-            .lock()
-            .await
-            .take()
-            .unwrap_or_else(|| {
-                let (_, rx) = mpsc::channel::<Notification>(1);
-                rx
-            })
+        self.inner.notif_rx.lock().await.take().unwrap_or_else(|| {
+            let (_, rx) = mpsc::channel::<Notification>(1);
+            rx
+        })
     }
 }
 
@@ -616,14 +610,9 @@ async fn watchdog_loop(supervisor: Arc<SignalSupervisor>) {
         while current.is_alive() {
             // The supervisor itself may be the only owner of `current`
             // — keep our copy alive until we observe death, then drop.
-            tokio::time::sleep(std::time::Duration::from_millis(
-                WATCHDOG_POLL_INTERVAL_MS,
-            ))
-            .await;
+            tokio::time::sleep(std::time::Duration::from_millis(WATCHDOG_POLL_INTERVAL_MS)).await;
         }
-        tracing::warn!(
-            "signal: signal-cli daemon exited; respawning with backoff"
-        );
+        tracing::warn!("signal: signal-cli daemon exited; respawning with backoff");
         drop(current);
 
         // Respawn with exponential backoff. Tries forever — the
@@ -650,8 +639,7 @@ async fn watchdog_loop(supervisor: Arc<SignalSupervisor>) {
                         backoff_ms,
                         "signal: respawn attempt failed; backing off"
                     );
-                    backoff_ms =
-                        (backoff_ms.saturating_mul(2)).min(RESPAWN_BACKOFF_CEILING_MS);
+                    backoff_ms = (backoff_ms.saturating_mul(2)).min(RESPAWN_BACKOFF_CEILING_MS);
                 }
             }
         }
@@ -726,7 +714,10 @@ mod tests {
     async fn mock_returns_queued_response() {
         let (mock, ctl) = MockTransport::new();
         ctl.expect_ok("send", json!({"timestamp": 1700})).await;
-        let v = mock.call("send", json!({"recipient": ["+1"]})).await.unwrap();
+        let v = mock
+            .call("send", json!({"recipient": ["+1"]}))
+            .await
+            .unwrap();
         assert_eq!(v["timestamp"], 1700);
     }
 
@@ -813,7 +804,10 @@ mod tests {
             params: json!({"hello": "world"}),
         })
         .await;
-        let n = timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
+        let n = timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(n.method, "receive");
         assert_eq!(n.params["hello"], "world");
     }
@@ -845,8 +839,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_frame_response_with_result_resolves_pending() {
-        let pending: PendingMap =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (tx, rx) = oneshot::channel();
         pending.lock().await.insert(1, tx);
         let (notif_tx, _notif_rx) = mpsc::channel::<Notification>(4);
@@ -862,8 +855,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_frame_response_with_error_resolves_pending() {
-        let pending: PendingMap =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (tx, rx) = oneshot::channel();
         pending.lock().await.insert(2, tx);
         let (notif_tx, _notif_rx) = mpsc::channel::<Notification>(4);
@@ -884,8 +876,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_frame_response_unknown_id_is_dropped() {
-        let pending: PendingMap =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (notif_tx, _rx) = mpsc::channel::<Notification>(4);
         // No pending entry for id=99: handler should log and drop.
         dispatch_frame(
@@ -899,8 +890,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_frame_notification_is_forwarded() {
-        let pending: PendingMap =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (notif_tx, mut notif_rx) = mpsc::channel::<Notification>(4);
         dispatch_frame(
             json!({
@@ -919,8 +909,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_frame_without_id_or_method_is_dropped() {
-        let pending: PendingMap =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (notif_tx, mut notif_rx) = mpsc::channel::<Notification>(4);
         dispatch_frame(json!({"jsonrpc": "2.0"}), &pending, &notif_tx).await;
         let v = timeout(Duration::from_millis(20), notif_rx.recv()).await;
@@ -932,8 +921,7 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_frame_malformed_error_still_resolves_pending() {
-        let pending: PendingMap =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let (tx, rx) = oneshot::channel();
         pending.lock().await.insert(3, tx);
         let (notif_tx, _rx) = mpsc::channel::<Notification>(4);

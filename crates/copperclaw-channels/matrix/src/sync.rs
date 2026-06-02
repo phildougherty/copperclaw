@@ -64,7 +64,9 @@ pub async fn write_next_batch(path: &Path, token: &str) -> Result<(), AdapterErr
         }
     }
     let tmp = path.with_extension("tmp");
-    tokio::fs::write(&tmp, token).await.map_err(AdapterError::Io)?;
+    tokio::fs::write(&tmp, token)
+        .await
+        .map_err(AdapterError::Io)?;
     tokio::fs::rename(&tmp, path)
         .await
         .map_err(AdapterError::Io)?;
@@ -231,7 +233,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("subdir/next.txt");
         write_next_batch(&path, "abc").await.unwrap();
-        assert_eq!(read_next_batch(&path).await.unwrap().as_deref(), Some("abc"));
+        assert_eq!(
+            read_next_batch(&path).await.unwrap().as_deref(),
+            Some("abc")
+        );
     }
 
     #[test]
@@ -279,8 +284,7 @@ mod tests {
         let state = dir.path().join("nb.txt");
         let api = Arc::new(MatrixApi::new(s.uri(), "tok"));
         let (tx, mut rx) = mpsc::channel::<InboundEvent>(8);
-        let (cancel, handle) =
-            run_with(api, state.clone(), tx, "@bot:m.org", &rooms_default());
+        let (cancel, handle) = run_with(api, state.clone(), tx, "@bot:m.org", &rooms_default());
 
         let evt = tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
@@ -337,8 +341,7 @@ mod tests {
 
         let api = Arc::new(MatrixApi::new(s.uri(), "tok"));
         let (tx, _rx) = mpsc::channel::<InboundEvent>(8);
-        let (cancel, handle) =
-            run_with(api, state.clone(), tx, "@bot:m.org", &rooms_default());
+        let (cancel, handle) = run_with(api, state.clone(), tx, "@bot:m.org", &rooms_default());
 
         // Wait until at least one request has been served.
         for _ in 0..50 {
@@ -364,8 +367,7 @@ mod tests {
         let state = dir.path().join("nb.txt");
         let api = Arc::new(MatrixApi::new(s.uri(), "tok"));
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
-        let (cancel, handle) =
-            run_with(api, state, tx, "@bot:m.org", &rooms_default());
+        let (cancel, handle) = run_with(api, state, tx, "@bot:m.org", &rooms_default());
         // Let one failure happen and the loop enter backoff.
         tokio::time::sleep(Duration::from_millis(50)).await;
         cancel.cancel();
@@ -389,8 +391,7 @@ mod tests {
         let state = dir.path().join("nb.txt");
         let api = Arc::new(MatrixApi::new(s.uri(), "tok"));
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
-        let (_cancel, handle) =
-            run_with(api, state, tx, "@bot:m.org", &rooms_default());
+        let (_cancel, handle) = run_with(api, state, tx, "@bot:m.org", &rooms_default());
         tokio::time::timeout(Duration::from_secs(2), handle)
             .await
             .unwrap()
@@ -423,8 +424,7 @@ mod tests {
         let api = Arc::new(MatrixApi::new(s.uri(), "tok"));
         let (tx, rx) = mpsc::channel::<InboundEvent>(1);
         drop(rx);
-        let (_cancel, handle) =
-            run_with(api, state, tx, "@bot:m.org", &rooms_default());
+        let (_cancel, handle) = run_with(api, state, tx, "@bot:m.org", &rooms_default());
         tokio::time::timeout(Duration::from_secs(2), handle)
             .await
             .unwrap()
@@ -447,8 +447,7 @@ mod tests {
         let state = dir.path().join("nb.txt");
         let api = Arc::new(MatrixApi::new(s.uri(), "tok"));
         let (tx, _rx) = mpsc::channel::<InboundEvent>(1);
-        let (cancel, handle) =
-            run_with(api, state, tx, "@bot:m.org", &rooms_default());
+        let (cancel, handle) = run_with(api, state, tx, "@bot:m.org", &rooms_default());
         // Give one cycle to fail.
         tokio::time::sleep(Duration::from_millis(30)).await;
         cancel.cancel();

@@ -314,7 +314,10 @@ mod tests {
         assert_eq!(msg.chat.id, 100);
         assert_eq!(msg.chat.kind, "private");
         assert_eq!(msg.text.as_deref(), Some("hi bot"));
-        assert_eq!(msg.from.as_ref().and_then(|u| u.username.as_deref()), Some("alice"));
+        assert_eq!(
+            msg.from.as_ref().and_then(|u| u.username.as_deref()),
+            Some("alice")
+        );
     }
 
     #[test]

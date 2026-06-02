@@ -213,12 +213,13 @@ impl XApi {
             .and_then(Value::as_str)
             .map(str::to_owned)
         {
-            return Ok(UploadMediaResponse { media_id_string: id });
+            return Ok(UploadMediaResponse {
+                media_id_string: id,
+            });
         }
         // Some early v2 responses surface the id at the top level; tolerate.
-        serde_json::from_value(value).map_err(|e| {
-            AdapterError::Transport(format!("x v2 media upload decode: {e}"))
-        })
+        serde_json::from_value(value)
+            .map_err(|e| AdapterError::Transport(format!("x v2 media upload decode: {e}")))
     }
 
     /// `GET /2/dm_events?dm_event_types=MessageCreate&...` — fetch the latest
@@ -270,9 +271,10 @@ impl XApi {
             .await
             .map_err(|e| map_send_err(&e))?;
         let value = read_x_json(resp).await?;
-        let data = value.get("data").cloned().ok_or_else(|| {
-            AdapterError::Transport("x dm response missing `data`".into())
-        })?;
+        let data = value
+            .get("data")
+            .cloned()
+            .ok_or_else(|| AdapterError::Transport("x dm response missing `data`".into()))?;
         serde_json::from_value(data)
             .map_err(|e| AdapterError::Transport(format!("x dm send decode: {e}")))
     }
@@ -323,9 +325,8 @@ async fn read_x_json(resp: Response) -> Result<Value, AdapterError> {
     };
 
     if status.is_success() {
-        return parsed.ok_or_else(|| {
-            AdapterError::Transport(format!("x response not JSON: {body}"))
-        });
+        return parsed
+            .ok_or_else(|| AdapterError::Transport(format!("x response not JSON: {body}")));
     }
 
     Err(classify_error(
@@ -466,9 +467,7 @@ mod tests {
     async fn dm_send_to_user_returns_event_id() {
         let s = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path_regex(
-                r"^/2/dm_conversations/with/.+/messages$",
-            ))
+            .and(path_regex(r"^/2/dm_conversations/with/.+/messages$"))
             .and(header("authorization", "Bearer tok"))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "data": {
@@ -490,10 +489,10 @@ mod tests {
     async fn dm_send_to_user_includes_attachments_when_media_present() {
         let s = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path_regex(
-                r"^/2/dm_conversations/with/.+/messages$",
+            .and(path_regex(r"^/2/dm_conversations/with/.+/messages$"))
+            .and(wiremock::matchers::body_string_contains(
+                "\"media_id\":\"mid1\"",
             ))
-            .and(wiremock::matchers::body_string_contains("\"media_id\":\"mid1\""))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "data": { "dm_conversation_id": "c", "dm_event_id": "e" }
             })))
@@ -530,7 +529,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/2/dm_conversations"))
             .and(wiremock::matchers::body_string_contains("\"Group\""))
-            .and(wiremock::matchers::body_string_contains("\"participant_ids\""))
+            .and(wiremock::matchers::body_string_contains(
+                "\"participant_ids\"",
+            ))
             .respond_with(ResponseTemplate::new(201).set_body_json(json!({
                 "data": { "dm_conversation_id": "grp-1", "dm_event_id": "e3" }
             })))
@@ -551,7 +552,9 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/1.1/media/upload.json"))
             .and(wiremock::matchers::body_string_contains("media_data="))
-            .and(wiremock::matchers::body_string_contains("media_category=dm_image"))
+            .and(wiremock::matchers::body_string_contains(
+                "media_category=dm_image",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "media_id_string": "mid-7"
             })))
@@ -723,7 +726,9 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            AdapterError::Rate { retry_after: Some(secs) } => {
+            AdapterError::Rate {
+                retry_after: Some(secs),
+            } => {
                 assert!(secs > 0 && secs <= 60);
             }
             other => panic!("expected Rate, got {other:?}"),
@@ -746,7 +751,12 @@ mod tests {
             .dm_send_to_user("u", "x", &[])
             .await
             .unwrap_err();
-        assert!(matches!(err, AdapterError::Rate { retry_after: Some(11) }));
+        assert!(matches!(
+            err,
+            AdapterError::Rate {
+                retry_after: Some(11)
+            }
+        ));
     }
 
     #[tokio::test]
@@ -895,26 +905,24 @@ mod tests {
 
     #[test]
     fn classify_error_429_uses_rate_limit_reset_when_in_future() {
-        let err = classify_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            None,
-            None,
-            Some(110),
-            100,
-        );
-        assert!(matches!(err, AdapterError::Rate { retry_after: Some(10) }));
+        let err = classify_error(StatusCode::TOO_MANY_REQUESTS, None, None, Some(110), 100);
+        assert!(matches!(
+            err,
+            AdapterError::Rate {
+                retry_after: Some(10)
+            }
+        ));
     }
 
     #[test]
     fn classify_error_429_uses_retry_after_header_when_no_reset() {
-        let err = classify_error(
-            StatusCode::TOO_MANY_REQUESTS,
-            None,
-            Some(7),
-            None,
-            0,
-        );
-        assert!(matches!(err, AdapterError::Rate { retry_after: Some(7) }));
+        let err = classify_error(StatusCode::TOO_MANY_REQUESTS, None, Some(7), None, 0);
+        assert!(matches!(
+            err,
+            AdapterError::Rate {
+                retry_after: Some(7)
+            }
+        ));
     }
 
     #[test]
@@ -965,7 +973,10 @@ mod tests {
 
     #[test]
     fn rate_retry_seconds_default_when_no_hint() {
-        assert_eq!(rate_retry_seconds(None, None, 100), DEFAULT_RATE_RETRY_SECONDS);
+        assert_eq!(
+            rate_retry_seconds(None, None, 100),
+            DEFAULT_RATE_RETRY_SECONDS
+        );
     }
 
     #[test]

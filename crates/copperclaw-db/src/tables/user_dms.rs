@@ -3,11 +3,11 @@
 //! Records the resolved messaging-group used for direct messages between the
 //! system and a given user on a given channel type.
 
-use crate::central::CentralDb;
 use crate::DbError;
+use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
 use copperclaw_types::{ChannelType, MessagingGroupId, UserId};
-use rusqlite::{params, OptionalExtension, Row};
+use rusqlite::{OptionalExtension, Row, params};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,8 +19,9 @@ pub struct UserDm {
 }
 
 fn parse_uuid_col(s: &str) -> rusqlite::Result<Uuid> {
-    Uuid::parse_str(s)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))
+    Uuid::parse_str(s).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })
 }
 
 fn row_to_user_dm(row: &Row<'_>) -> rusqlite::Result<UserDm> {
@@ -31,7 +32,9 @@ fn row_to_user_dm(row: &Row<'_>) -> rusqlite::Result<UserDm> {
     let messaging_group_id = MessagingGroupId(parse_uuid_col(&mg_str)?);
     let resolved_at_str: String = row.get("resolved_at")?;
     let resolved_at = DateTime::parse_from_rfc3339(&resolved_at_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .with_timezone(&Utc);
     Ok(UserDm {
         user_id,

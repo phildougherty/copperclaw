@@ -194,7 +194,10 @@ impl TodoList {
     /// `pins.remove`).
     pub fn is_fully_completed(&self) -> bool {
         !self.items.is_empty()
-            && self.items.iter().all(|i| i.status == TodoItemStatus::Completed)
+            && self
+                .items
+                .iter()
+                .all(|i| i.status == TodoItemStatus::Completed)
     }
 
     /// Count of items still [`TodoItemStatus::Pending`]. Used by the
@@ -335,7 +338,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_empty_list() {
-        assert_eq!(TodoList::new().validate().unwrap_err(), TodoListError::EmptyList);
+        assert_eq!(
+            TodoList::new().validate().unwrap_err(),
+            TodoListError::EmptyList
+        );
     }
 
     #[test]
@@ -528,7 +534,11 @@ mod tests {
             TodoListError::TooManyItems { len: 99, max: 50 },
             TodoListError::DuplicateId { id: 3 },
             TodoListError::EmptyItemText { id: 4 },
-            TodoListError::ItemTextTooLong { id: 5, len: 999, max: 200 },
+            TodoListError::ItemTextTooLong {
+                id: 5,
+                len: 999,
+                max: 200,
+            },
             TodoListError::TitleTooLong { len: 99, max: 64 },
         ];
         for err in cases {

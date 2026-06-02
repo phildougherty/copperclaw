@@ -399,15 +399,15 @@ mod tests {
 
     #[test]
     fn empty_token_errors() {
-        let err = TelegramConfig::from_value(&json!({"bot_token": "", "long_poll": {}}))
-            .unwrap_err();
+        let err =
+            TelegramConfig::from_value(&json!({"bot_token": "", "long_poll": {}})).unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 
     #[test]
     fn non_string_token_errors() {
-        let err = TelegramConfig::from_value(&json!({"bot_token": 42, "long_poll": {}}))
-            .unwrap_err();
+        let err =
+            TelegramConfig::from_value(&json!({"bot_token": 42, "long_poll": {}})).unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
     }
 

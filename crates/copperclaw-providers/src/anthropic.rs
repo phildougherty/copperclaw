@@ -11,11 +11,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use copperclaw_types::ProviderEvent;
 use eventsource_stream::Eventsource;
 use futures::stream::StreamExt;
-use copperclaw_types::ProviderEvent;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -108,7 +108,10 @@ impl AgentProvider for AnthropicProvider {
 
         let status = resp.status();
         if !status.is_success() {
-            return Err(map_http_error(status.as_u16(), resp.text().await.unwrap_or_default()));
+            return Err(map_http_error(
+                status.as_u16(),
+                resp.text().await.unwrap_or_default(),
+            ));
         }
 
         let (tx, rx) = mpsc::channel(32);
@@ -250,7 +253,11 @@ fn history_to_messages(history: &[HistoryMessage]) -> Vec<Value> {
                     "input": if input.is_null() { json!({}) } else { input.clone() },
                 }),
             ),
-            HistoryMessage::Tool { tool_use_id, content, is_error } => (
+            HistoryMessage::Tool {
+                tool_use_id,
+                content,
+                is_error,
+            } => (
                 "user",
                 json!({
                     "type": "tool_result",
@@ -316,7 +323,10 @@ fn map_http_error(status: u16, body: String) -> ProviderError {
         400 => ProviderError::BadRequest(body),
         401 | 403 => ProviderError::SessionInvalid,
         429 | 529 => ProviderError::Overloaded,
-        _ => ProviderError::Api { status, message: body },
+        _ => ProviderError::Api {
+            status,
+            message: body,
+        },
     }
 }
 
@@ -410,7 +420,12 @@ struct ApiError {
 
 async fn pump_sse<S>(mut stream: S, tx: mpsc::Sender<ProviderEvent>)
 where
-    S: futures::Stream<Item = Result<eventsource_stream::Event, eventsource_stream::EventStreamError<reqwest::Error>>> + Unpin,
+    S: futures::Stream<
+            Item = Result<
+                eventsource_stream::Event,
+                eventsource_stream::EventStreamError<reqwest::Error>,
+            >,
+        > + Unpin,
 {
     let mut state = SseState::default();
 
@@ -669,7 +684,10 @@ async fn handle_sse_event(
         }
         "error" => {
             let (msg, retryable) = if let Some(err) = env.error {
-                let retry = matches!(err.error_type.as_str(), "overloaded_error" | "rate_limit_error");
+                let retry = matches!(
+                    err.error_type.as_str(),
+                    "overloaded_error" | "rate_limit_error"
+                );
                 (err.message, retry)
             } else {
                 ("unknown error".to_string(), false)
@@ -713,7 +731,9 @@ mod tests {
     #[test]
     fn build_request_body_minimal() {
         let mut q = QueryInput::new("you are helpful", "claude-sonnet-4-6");
-        q.history.push(HistoryMessage::User { content: "hi".into() });
+        q.history.push(HistoryMessage::User {
+            content: "hi".into(),
+        });
         let body = build_request_body(&q);
         assert_eq!(body["model"], "claude-sonnet-4-6");
         assert_eq!(body["stream"], true);
@@ -729,7 +749,9 @@ mod tests {
     #[test]
     fn build_request_body_omits_empty_system() {
         let mut q = QueryInput::new("", "m");
-        q.history.push(HistoryMessage::User { content: "hi".into() });
+        q.history.push(HistoryMessage::User {
+            content: "hi".into(),
+        });
         let body = build_request_body(&q);
         assert!(body.get("system").is_none());
     }
@@ -737,7 +759,9 @@ mod tests {
     #[test]
     fn build_request_body_includes_temperature_and_tools() {
         let mut q = QueryInput::new("s", "m");
-        q.history.push(HistoryMessage::User { content: "hi".into() });
+        q.history.push(HistoryMessage::User {
+            content: "hi".into(),
+        });
         q.temperature = Some(0.3);
         q.tools.push(ToolDef {
             name: "t".into(),
@@ -755,9 +779,15 @@ mod tests {
     #[test]
     fn history_collapses_consecutive_same_role() {
         let hist = vec![
-            HistoryMessage::User { content: "a".into() },
-            HistoryMessage::User { content: "b".into() },
-            HistoryMessage::Assistant { content: "c".into() },
+            HistoryMessage::User {
+                content: "a".into(),
+            },
+            HistoryMessage::User {
+                content: "b".into(),
+            },
+            HistoryMessage::Assistant {
+                content: "c".into(),
+            },
         ];
         let out = history_to_messages(&hist);
         assert_eq!(out.len(), 2);
@@ -769,7 +799,9 @@ mod tests {
     #[test]
     fn history_tool_use_goes_to_assistant() {
         let hist = vec![
-            HistoryMessage::Assistant { content: "let me check".into() },
+            HistoryMessage::Assistant {
+                content: "let me check".into(),
+            },
             HistoryMessage::ToolUse {
                 id: "tu_1".into(),
                 name: "weather".into(),
@@ -811,7 +843,9 @@ mod tests {
                 content: "boom".into(),
                 is_error: true,
             },
-            HistoryMessage::User { content: "what happened?".into() },
+            HistoryMessage::User {
+                content: "what happened?".into(),
+            },
         ];
         let out = history_to_messages(&hist);
         // assistant[tool_use], user[tool_result], user[text]
@@ -831,10 +865,26 @@ mod tests {
         // Multiple tool_results from one parallel batch DO still share a user
         // message (valid everywhere); only the tool_result/text mix splits.
         let hist = vec![
-            HistoryMessage::ToolUse { id: "a".into(), name: "t".into(), input: json!({}) },
-            HistoryMessage::ToolUse { id: "b".into(), name: "t".into(), input: json!({}) },
-            HistoryMessage::Tool { tool_use_id: "a".into(), content: "1".into(), is_error: false },
-            HistoryMessage::Tool { tool_use_id: "b".into(), content: "2".into(), is_error: false },
+            HistoryMessage::ToolUse {
+                id: "a".into(),
+                name: "t".into(),
+                input: json!({}),
+            },
+            HistoryMessage::ToolUse {
+                id: "b".into(),
+                name: "t".into(),
+                input: json!({}),
+            },
+            HistoryMessage::Tool {
+                tool_use_id: "a".into(),
+                content: "1".into(),
+                is_error: false,
+            },
+            HistoryMessage::Tool {
+                tool_use_id: "b".into(),
+                content: "2".into(),
+                is_error: false,
+            },
         ];
         let out = history_to_messages(&hist);
         assert_eq!(out.len(), 2);
@@ -846,7 +896,9 @@ mod tests {
     fn image_serializes_as_base64_image_block_on_user_role() {
         // The exact shape verified live against minimax-m3 via OpenRouter.
         let hist = vec![
-            HistoryMessage::User { content: "what is this?".into() },
+            HistoryMessage::User {
+                content: "what is this?".into(),
+            },
             HistoryMessage::Image {
                 media_type: "image/png".into(),
                 data: "QUJD".into(),
@@ -936,14 +988,28 @@ mod tests {
         let mut state = SseState::default();
 
         for ev in [
-            sse(r#"{"type":"message_start","message":{"id":"gen_1","usage":{"input_tokens":10,"output_tokens":0}}}"#),
-            sse(r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#),
-            sse(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"The user said hi."}}"#),
-            sse(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":" I should reply briefly."}}"#),
-            sse(r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-xyz"}}"#),
+            sse(
+                r#"{"type":"message_start","message":{"id":"gen_1","usage":{"input_tokens":10,"output_tokens":0}}}"#,
+            ),
+            sse(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            ),
+            sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"The user said hi."}}"#,
+            ),
+            sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":" I should reply briefly."}}"#,
+            ),
+            sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-xyz"}}"#,
+            ),
             sse(r#"{"type":"content_block_stop","index":0}"#),
-            sse(r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#),
-            sse(r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hi!"}}"#),
+            sse(
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            ),
+            sse(
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hi!"}}"#,
+            ),
             sse(r#"{"type":"content_block_stop","index":1}"#),
             sse(r#"{"type":"message_stop"}"#),
         ] {
@@ -993,10 +1059,16 @@ mod tests {
         let mut state = SseState::default();
         for ev in [
             sse(r#"{"type":"message_start","message":{"id":"gen_2"}}"#),
-            sse(r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque-blob"}}"#),
+            sse(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque-blob"}}"#,
+            ),
             sse(r#"{"type":"content_block_stop","index":0}"#),
-            sse(r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#),
-            sse(r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"ok"}}"#),
+            sse(
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            ),
+            sse(
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"ok"}}"#,
+            ),
             sse(r#"{"type":"content_block_stop","index":1}"#),
             sse(r#"{"type":"message_stop"}"#),
         ] {
@@ -1022,13 +1094,25 @@ mod tests {
         let mut state = SseState::default();
         for ev in [
             sse(r#"{"type":"message_start","message":{"id":"gen_t1"}}"#),
-            sse(r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#),
-            sse(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"The user is asking"}}"#),
-            sse(r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":" a simple greeting."}}"#),
-            sse(r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-abc"}}"#),
+            sse(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":"","signature":""}}"#,
+            ),
+            sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"The user is asking"}}"#,
+            ),
+            sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":" a simple greeting."}}"#,
+            ),
+            sse(
+                r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-abc"}}"#,
+            ),
             sse(r#"{"type":"content_block_stop","index":0}"#),
-            sse(r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#),
-            sse(r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hi!"}}"#),
+            sse(
+                r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            ),
+            sse(
+                r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hi!"}}"#,
+            ),
             sse(r#"{"type":"content_block_stop","index":1}"#),
             sse(r#"{"type":"message_stop"}"#),
         ] {
@@ -1041,7 +1125,10 @@ mod tests {
         });
         let (text, redacted) = thinking.expect("expected ProviderEvent::Thinking to be emitted");
         assert_eq!(text, "The user is asking a simple greeting.");
-        assert!(!redacted, "regular `thinking` block must have redacted=false");
+        assert!(
+            !redacted,
+            "regular `thinking` block must have redacted=false"
+        );
     }
 
     #[tokio::test]
@@ -1054,7 +1141,9 @@ mod tests {
         let mut state = SseState::default();
         for ev in [
             sse(r#"{"type":"message_start","message":{"id":"gen_r1"}}"#),
-            sse(r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque-secret-blob"}}"#),
+            sse(
+                r#"{"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"opaque-secret-blob"}}"#,
+            ),
             sse(r#"{"type":"content_block_stop","index":0}"#),
             sse(r#"{"type":"message_stop"}"#),
         ] {
@@ -1079,11 +1168,26 @@ mod tests {
 
     #[test]
     fn map_http_error_variants() {
-        assert!(matches!(map_http_error(400, "bad".into()), ProviderError::BadRequest(_)));
-        assert!(matches!(map_http_error(401, "x".into()), ProviderError::SessionInvalid));
-        assert!(matches!(map_http_error(403, "x".into()), ProviderError::SessionInvalid));
-        assert!(matches!(map_http_error(429, "x".into()), ProviderError::Overloaded));
-        assert!(matches!(map_http_error(529, "x".into()), ProviderError::Overloaded));
+        assert!(matches!(
+            map_http_error(400, "bad".into()),
+            ProviderError::BadRequest(_)
+        ));
+        assert!(matches!(
+            map_http_error(401, "x".into()),
+            ProviderError::SessionInvalid
+        ));
+        assert!(matches!(
+            map_http_error(403, "x".into()),
+            ProviderError::SessionInvalid
+        ));
+        assert!(matches!(
+            map_http_error(429, "x".into()),
+            ProviderError::Overloaded
+        ));
+        assert!(matches!(
+            map_http_error(529, "x".into()),
+            ProviderError::Overloaded
+        ));
         assert!(matches!(
             map_http_error(500, "boom".into()),
             ProviderError::Api { status: 500, .. }
@@ -1110,7 +1214,10 @@ mod tests {
         assert!(!p.is_session_invalid(&ProviderError::BadRequest("x".into())));
         assert!(!p.is_session_invalid(&ProviderError::Cancelled));
         assert!(!p.is_session_invalid(&ProviderError::Decode("x".into())));
-        assert!(!p.is_session_invalid(&ProviderError::Api { status: 500, message: "x".into() }));
+        assert!(!p.is_session_invalid(&ProviderError::Api {
+            status: 500,
+            message: "x".into()
+        }));
     }
 
     #[test]
