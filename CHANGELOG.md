@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (one pinned plan per family — child todos roll up into the parent's — 2026-06-02)
+
+`create_agent` siblings inherit the parent's messaging group, and the
+todo-list surface pins one editable card *per session*, so a parent plus N
+builders produced N+1 separate pinned "Plan" cards in the chat. Now the
+delivery service rolls the whole family into **one** pinned card owned by
+the family ROOT: each live child's plan is appended as a labeled, indented
+section (`↳ <agent-name>` header carrying the child's aggregate status,
+then its items), and a child never pins its own card.
+
+- `dispatch_todo_list` (`copperclaw-host-delivery::service`) now resolves
+  the family root (`resolve_root` walks `source_session_id`), gathers the
+  root + each active child's latest `TodoList` from their outbound DBs, and
+  renders a combined list via `build_combined` (child item ids renumbered
+  to stay unique; child header status via `aggregate_status`).
+- The single pinned anchor is keyed by the root session — cached in-memory
+  (`todo_anchors`, robust to which family member emits first) with a
+  fallback to the root's persisted `delivered` records after a restart,
+  and a per-root `tokio::Mutex` (`todo_locks`) serialising concurrent
+  family emits so two members can't both first-emit-pin. The anchor is
+  dropped when the whole plan completes so a later fresh plan re-pins.
+- Pure-function + end-to-end tests (`aggregate_status`, `build_combined`,
+  and a parent+child `process_session_once` rollup); 127 delivery tests
+  green.
+
 ### Added (sub-agents work on the parent's codebase — writable git worktrees — 2026-06-01)
 
 `create_agent` siblings run in their own container with an empty `/data`,
