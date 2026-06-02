@@ -6,6 +6,32 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (`create_agent` children inherit the parent's model — 2026-06-02)
+
+A child spawned via `create_agent` was created with an `agent_groups` row and
+a session but **no `container_configs` row**, so the container manager fell
+back to the host's `COPPERCLAW_DEFAULT_MODEL` for every sibling. This silently
+downgraded sub-agents: a parent running a capable model (e.g. `qwen/qwen3.7-max`
+on OpenRouter) spawned builders that all booted on the weak host-default local
+model and produced nothing — branches created, zero commits — while the parent
+sat waiting to consolidate work that never arrived.
+
+- `CreateAgentHandler` (`copperclaw-modules::agent_to_agent::create_agent`)
+  now copies the parent group's `container_configs` row onto the freshly
+  created child group via a new `inherit_parent_container_config` helper:
+  provider, model, effort, skills, packages, mounts, cli_scope, egress,
+  resource limits, coding flag, and `image_tag` + `config_fingerprint` are
+  all inherited. Because `compute_fingerprint` hashes only image-relevant
+  fields (packages / skills / mcp), copying the fingerprint verbatim lets the
+  child adopt the parent's existing image with **no rebuild**.
+- `assistant_name` is deliberately NOT inherited (that's the parent's own
+  identity; the child uses its own group name).
+- Best-effort and non-fatal: if the parent has no config row (it too runs on
+  host defaults) or the copy fails, the child falls back to host defaults —
+  the pre-fix behaviour — so the spawn still succeeds.
+- New tests `child_inherits_parent_container_config` and
+  `child_without_parent_config_uses_host_defaults`.
+
 ### Changed (one pinned plan per family — child todos roll up into the parent's — 2026-06-02)
 
 `create_agent` siblings inherit the parent's messaging group, and the

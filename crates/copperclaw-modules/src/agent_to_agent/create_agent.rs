@@ -35,6 +35,7 @@ use async_trait::async_trait;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::{
     agent_groups::{self, CreateAgentGroup},
+    container_configs::{self, UpsertContainerConfig},
     messaging_group_agents::{self, UpsertWiring},
     messaging_groups::{self, UpsertMessagingGroup},
     sessions::{self, CreateSession},
@@ -413,6 +414,21 @@ impl DeliveryActionHandler for CreateAgentHandler {
             );
         }
 
+        // Inherit the parent group's container config (model, provider,
+        // effort, skills, packages, image) onto the child. Without this the
+        // child group has no `container_configs` row, so the container
+        // manager falls back to the host's `COPPERCLAW_DEFAULT_MODEL` — which
+        // silently downgrades every sibling to the host default regardless of
+        // what model the spawning parent runs on. Surfaced live: a parent on
+        // a capable model (qwen) spawned six builders that all booted on the
+        // weak host-default local model and produced nothing. No-op when
+        // there's no resolvable parent (scripted calls) or the parent itself
+        // has no config row (then the child shares the parent's host-default
+        // behaviour, which is correct).
+        if let Some(parent) = parent_session.as_ref() {
+            self.inherit_parent_container_config(parent.agent_group_id, group.id);
+        }
+
         // The instructions are not stored as a column on `agent_groups` —
         // production hosts persist them as `container_configs` or skill
         // files. TODO(team-ca): plumb instructions into container_configs
@@ -553,6 +569,73 @@ impl CreateAgentHandler {
         match agent_groups::get_subagent_depth(&self.deps.central, parent.agent_group_id) {
             Ok(Some(d)) if d > 0 => Some(d),
             _ => None,
+        }
+    }
+
+    /// Copy the parent group's `container_configs` row onto the freshly
+    /// created child group so the child inherits the parent's model,
+    /// provider, effort, skills, packages, and image instead of silently
+    /// falling back to the host's `COPPERCLAW_DEFAULT_MODEL`.
+    ///
+    /// `config_fingerprint` only hashes image-relevant fields (packages /
+    /// skills / mcp — see [`container_configs::compute_fingerprint`]), so
+    /// copying it verbatim alongside `image_tag` lets the child adopt the
+    /// parent's existing image with no rebuild. `assistant_name` is the one
+    /// field deliberately NOT inherited — that's the parent's own identity;
+    /// the child uses its own group name.
+    ///
+    /// Best-effort: a failure to read or write is logged, not fatal. The
+    /// child then falls back to host defaults — the pre-fix behaviour — so
+    /// the spawn still succeeds.
+    fn inherit_parent_container_config(
+        &self,
+        parent_group: AgentGroupId,
+        child_group: AgentGroupId,
+    ) {
+        let central = &self.deps.central;
+        let cfg = match container_configs::get(central, parent_group) {
+            Ok(Some(cfg)) => cfg,
+            // Parent runs on host defaults — nothing to copy; the child
+            // inherits the same default behaviour, which is correct.
+            Ok(None) => return,
+            Err(err) => {
+                warn!(
+                    parent_group = %parent_group.as_uuid(),
+                    child_group = %child_group.as_uuid(),
+                    ?err,
+                    "create_agent: read parent container config failed; child falls back to host defaults",
+                );
+                return;
+            }
+        };
+        let req = UpsertContainerConfig {
+            agent_group_id: child_group,
+            provider: cfg.provider,
+            model: cfg.model,
+            effort: cfg.effort,
+            image_tag: cfg.image_tag,
+            // Deliberately not inherited: the child has its own identity.
+            assistant_name: None,
+            max_messages_per_prompt: cfg.max_messages_per_prompt,
+            skills: cfg.skills,
+            mcp_servers: cfg.mcp_servers,
+            packages_apt: cfg.packages_apt,
+            packages_npm: cfg.packages_npm,
+            additional_mounts: cfg.additional_mounts,
+            cli_scope: cfg.cli_scope,
+            config_fingerprint: cfg.config_fingerprint,
+            egress_allow: cfg.egress_allow,
+            resource_limits: cfg.resource_limits,
+            coding_enabled: cfg.coding_enabled,
+            surface_thinking: cfg.surface_thinking,
+        };
+        if let Err(err) = container_configs::upsert(central, req) {
+            warn!(
+                parent_group = %parent_group.as_uuid(),
+                child_group = %child_group.as_uuid(),
+                ?err,
+                "create_agent: copy parent container config to child failed; child falls back to host defaults",
+            );
         }
     }
 
@@ -802,6 +885,114 @@ mod tests {
             new_group.folder.starts_with("research-bot-"),
             "folder slug derived from name (got {})",
             new_group.folder,
+        );
+    }
+
+    #[test]
+    fn child_inherits_parent_container_config() {
+        // Regression for the silent model-downgrade: a child spawned by
+        // create_agent must inherit the parent group's model / provider /
+        // effort / skills / packages / image, not fall back to the host's
+        // COPPERCLAW_DEFAULT_MODEL. Surfaced live as a parent on a capable
+        // model spawning six builders that all booted on the weak
+        // host-default local model and produced nothing.
+        let (handler, central, _tmp, parent, target) = make_handler(always_allow());
+
+        // Seed the parent group with a distinctive container config.
+        container_configs::upsert(
+            &central,
+            UpsertContainerConfig {
+                agent_group_id: parent.agent_group_id,
+                provider: Some("anthropic".into()),
+                model: Some("qwen/qwen3.7-max".into()),
+                effort: Some(copperclaw_types::Effort::High),
+                image_tag: Some("copperclaw/session:test-tag".into()),
+                assistant_name: Some("ParentName".into()),
+                max_messages_per_prompt: Some(7),
+                skills: container_configs::SkillsSelector::All,
+                mcp_servers: serde_json::json!({}),
+                packages_apt: vec!["jq".into()],
+                packages_npm: vec!["typescript".into()],
+                additional_mounts: serde_json::json!([]),
+                cli_scope: container_configs::CliScope::Group,
+                config_fingerprint: Some("deadbeef".into()),
+                egress_allow: vec![],
+                resource_limits: serde_json::json!({}),
+                coding_enabled: true,
+                surface_thinking: false,
+            },
+        )
+        .unwrap();
+
+        handler
+            .handle(DeliveryActionInput {
+                action: "create_agent".into(),
+                payload: serde_json::json!({
+                    "name": "builder-bot",
+                    "instructions": "Implement the feature under /workspace.",
+                }),
+                target,
+                session_id: None,
+                row_id: None,
+            })
+            .unwrap();
+
+        let child = agent_groups::list(&central)
+            .unwrap()
+            .into_iter()
+            .find(|g| g.name == "builder-bot")
+            .expect("child group present");
+        let child_cfg = container_configs::get(&central, child.id)
+            .unwrap()
+            .expect("child inherited a container config row");
+
+        assert_eq!(child_cfg.model.as_deref(), Some("qwen/qwen3.7-max"));
+        assert_eq!(child_cfg.provider.as_deref(), Some("anthropic"));
+        assert_eq!(child_cfg.effort, Some(copperclaw_types::Effort::High));
+        assert_eq!(
+            child_cfg.image_tag.as_deref(),
+            Some("copperclaw/session:test-tag"),
+        );
+        // image_tag + matching fingerprint => child adopts the parent's
+        // image with no rebuild.
+        assert_eq!(child_cfg.config_fingerprint.as_deref(), Some("deadbeef"));
+        assert_eq!(child_cfg.packages_apt, vec!["jq".to_string()]);
+        assert_eq!(child_cfg.packages_npm, vec!["typescript".to_string()]);
+        assert!(child_cfg.coding_enabled);
+        // The parent's identity name is deliberately NOT inherited.
+        assert_eq!(child_cfg.assistant_name, None);
+    }
+
+    #[test]
+    fn child_without_parent_config_uses_host_defaults() {
+        // When the parent has no container_configs row it runs on host
+        // defaults; the child must too (no row, no panic) — the inheritance
+        // copy is a no-op rather than writing an empty config.
+        let (handler, central, _tmp, _parent, target) = make_handler(always_allow());
+
+        handler
+            .handle(DeliveryActionInput {
+                action: "create_agent".into(),
+                payload: serde_json::json!({
+                    "name": "builder-bot",
+                    "instructions": "Implement the feature under /workspace.",
+                }),
+                target,
+                session_id: None,
+                row_id: None,
+            })
+            .unwrap();
+
+        let child = agent_groups::list(&central)
+            .unwrap()
+            .into_iter()
+            .find(|g| g.name == "builder-bot")
+            .expect("child group present");
+        assert!(
+            container_configs::get(&central, child.id)
+                .unwrap()
+                .is_none(),
+            "no parent config => no child config row (falls back to host defaults)",
         );
     }
 
