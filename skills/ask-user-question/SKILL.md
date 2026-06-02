@@ -13,19 +13,26 @@ an ordinary inbound message you process on the next turn.
 
 ## Schema
 
+The normal call — no `to`, which asks the user you're already talking to:
+
 ```json
 {
   "title": "Approve the deploy?",
-  "options": ["yes", "no", "later"],
-  "to": "slack:C01ABCD"
+  "options": ["yes", "no", "later"]
 }
 ```
 
 - `title` (required, non-blank). The text rendered above the choices.
 - `options` (required, at least one non-blank entry). Plain strings;
   the user can pick exactly one.
-- `to` (optional). Same forms as `send_message`. Omit to ask on the
-  originating channel.
+- `to` (optional — **omit it** unless you're redirecting the question to
+  a different channel/user than the one you're talking to). When you do
+  set it, use the *same forms as `send_message`*: a fully-qualified
+  channel-id **string** (`"slack:C01ABCD"`), or an object with an explicit
+  `kind` — `{"kind":"user","id":"..."}`, `{"kind":"channel","id":"..."}`,
+  or `{"kind":"agent","session_id":"..."}`. A bare object without `kind`
+  (e.g. `{"user":"..."}`) is rejected — that's the #1 mistake. When in
+  doubt, leave `to` out.
 
 ## How the reply round-trips
 
