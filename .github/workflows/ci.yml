@@ -56,7 +56,10 @@ jobs:
           # llvm-cov); without this component it errors out immediately.
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
-      - run: cargo install cargo-llvm-cov --locked
+      # Pinned: the workspace is on the 1.85 MSRV (rust-toolchain.toml), but
+      # cargo-llvm-cov 0.6.22+ requires rustc 1.87+. 0.6.21 is the newest
+      # release that still builds on 1.85. Bump this when the MSRV moves.
+      - run: cargo install cargo-llvm-cov --version 0.6.21 --locked
       - run: cargo llvm-cov --workspace --fail-under-lines 85
 
   install-sh:
