@@ -225,6 +225,11 @@ pub fn build_dispatch_table() -> DispatchTable {
         true
     );
 
+    // Egress posture report (Phase 0a v1 / Top 10 #6). Read-only; consumed
+    // by `cclaw doctor` to surface the host egress mode + each group's
+    // effective allow-list (configured + auto-injected model endpoint).
+    ins!("egress.status", handlers::egress::status, false);
+
     ins!(
         "messaging-groups.list",
         handlers::messaging_groups::list,

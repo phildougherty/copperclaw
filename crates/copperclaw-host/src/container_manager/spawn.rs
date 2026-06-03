@@ -1,6 +1,8 @@
 //! Container spawn pipeline: `maybe_spawn`, `build_spec`, image rebuild + backoff.
 
-use super::prompt::{set_memory_dir_perms, write_memory_unavailable_marker};
+use super::prompt::{
+    set_memory_dir_perms, write_memory_unavailable_marker, write_memory_unavailable_marker_str,
+};
 use super::{ContainerManager, ManagerError};
 use copperclaw_container_rt::{ContainerSpec, ImageBuildSpec, Mount, ResourceLimits, RtError};
 use copperclaw_db::session::SessionPaths;
@@ -323,7 +325,7 @@ impl ContainerManager {
             self.cfg.default_image_tag.clone()
         };
 
-        let spec = self.build_spec(session, &paths, &image_tag, cfg_row.as_ref());
+        let spec = self.build_spec(session, &paths, &image_tag, cfg_row.as_ref())?;
         // Defensive: if a previous container with this name lingered
         // (e.g. host crashed mid-cycle, orphan cleanup missed it,
         // crash-restart's remove() raced the spawn) the create call
@@ -427,7 +429,17 @@ impl ContainerManager {
         paths: &SessionPaths,
         image_tag: &str,
         cfg: Option<&container_configs::ContainerConfig>,
-    ) -> ContainerSpec {
+    ) -> Result<ContainerSpec, ManagerError> {
+        // toctou redux: validate the session-root source against the live
+        // sessions root before mounting. If a path component was swapped for
+        // a symlink that escapes the sessions dir (or the source otherwise
+        // leaves it), the spawn is refused — the agent's `/data` is the one
+        // mount it cannot run without, so a compromised source must fail the
+        // spawn outright rather than degrade.
+        let sessions_root = self.sessions_root();
+        super::mount_guard::validate_source(&paths.root, sessions_root)
+            .map_err(ManagerError::UnsafeMount)?;
+
         let mut spec = ContainerSpec::new(
             container_name(session.agent_group_id, session.id),
             image_tag,
@@ -483,12 +495,31 @@ impl ContainerManager {
                 .join("memory");
             match std::fs::create_dir_all(&mem_src) {
                 Ok(()) => {
-                    set_memory_dir_perms(&mem_src);
-                    spec = spec.with_mount(Mount::Bind {
-                        source: mem_src.to_string_lossy().into_owned(),
-                        target: format!("{CONTAINER_SESSION_DIR}/memory"),
-                        read_only: false,
-                    });
+                    // toctou redux: validate the memory source against the
+                    // per-group root (its own root, distinct from the
+                    // sessions root). A symlink swap here would let a
+                    // group's `/data/memory` escape `groups_dir`. Memory is
+                    // optional, so a failed check drops the mount + leaves
+                    // the UNAVAILABLE marker rather than failing the spawn.
+                    if let Err(err) = super::mount_guard::validate_source(&mem_src, groups) {
+                        warn!(
+                            %err,
+                            path = %mem_src.display(),
+                            "per-group memory source failed mount validation; skipping memory mount"
+                        );
+                        write_memory_unavailable_marker_str(
+                            &paths.root,
+                            &mem_src,
+                            &err.to_string(),
+                        );
+                    } else {
+                        set_memory_dir_perms(&mem_src);
+                        spec = spec.with_mount(Mount::Bind {
+                            source: mem_src.to_string_lossy().into_owned(),
+                            target: format!("{CONTAINER_SESSION_DIR}/memory"),
+                            read_only: false,
+                        });
+                    }
                 }
                 Err(err) => {
                     warn!(
@@ -503,8 +534,11 @@ impl ContainerManager {
 
         // A `create_agent` sibling gets access to the PARENT agent's
         // workspace (writable git worktree, or read-only fallback). See
-        // [`apply_parent_workspace`].
-        spec = apply_parent_workspace(spec, session, paths);
+        // [`apply_parent_workspace`]. Each parent-derived bind source is
+        // validated against the live sessions root before mounting; a
+        // compromised parent source drops the workspace mount rather than
+        // failing the sibling spawn (it can still run with an empty `/data`).
+        spec = apply_parent_workspace(spec, session, paths, sessions_root);
 
         // The runner reads its config from this path via the
         // `--config` flag wired into the entrypoint args. ContainerSpec
@@ -555,11 +589,22 @@ impl ContainerManager {
                     );
                 }
             }
-            // Egress allow-list (Top 10 #6 / M13).
-            if !c.egress_allow.is_empty() {
-                spec = spec.with_egress_allow(c.egress_allow.clone());
-            }
         }
+
+        // Egress allow-list (Phase 0a v1 / Top 10 #6). Resolve the effective
+        // list = operator-configured per-group entries UNIONed with the
+        // auto-injected model endpoint (derived from ANTHROPIC_BASE_URL) so
+        // deny-default can never blackhole model traffic. The posture is
+        // carried regardless of mode so `cclaw doctor` / logs can report it;
+        // the container runtime decides what (if anything) is enforced. See
+        // [`super::egress`] and `copperclaw_container_rt::EgressMode`.
+        let group_allow = cfg.map_or(&[][..], |c| c.egress_allow.as_slice());
+        let resolved_allow =
+            super::egress::resolve_allow_list(group_allow, rotatable.anthropic_base_url.as_deref());
+        if !resolved_allow.is_empty() {
+            spec = spec.with_egress_allow(resolved_allow);
+        }
+        spec = spec.with_egress_mode(self.cfg.egress_mode);
 
         // Host-wide Nvidia GPU passthrough. Gated by `COPPERCLAW_CONTAINER_GPU`
         // at boot so a default install never asks Docker for a device the
@@ -571,7 +616,7 @@ impl ContainerManager {
             spec = spec.with_gpu_passthrough(true);
         }
 
-        spec
+        Ok(spec)
     }
 }
 
@@ -603,6 +648,7 @@ fn apply_parent_workspace(
     mut spec: ContainerSpec,
     session: &Session,
     paths: &SessionPaths,
+    sessions_root: &std::path::Path,
 ) -> ContainerSpec {
     let Some(parent_sid) = session.source_session_id else {
         return spec;
@@ -619,6 +665,19 @@ fn apply_parent_workspace(
     let worktree = resolve_parent_repo_root(&parent_root)
         .and_then(|repo_root| provision_parent_worktree(&repo_root, &sibling_sid));
     if let Some(wt) = worktree {
+        // toctou redux: both parent-derived sources are host-controlled
+        // paths under the sessions root. Validate each before mounting; a
+        // swapped-symlink component (or an escape) drops the whole writable
+        // workspace rather than handing dockerd a compromised source. The
+        // sibling can still run with an empty `/data`.
+        if let Err(err) = super::mount_guard::validate_source(&wt.git_dir, sessions_root) {
+            warn!(%err, path = %wt.git_dir.display(), "parent .git source failed mount validation; skipping workspace");
+            return spec;
+        }
+        if let Err(err) = super::mount_guard::validate_source(&wt.worktree_dir, sessions_root) {
+            warn!(%err, path = %wt.worktree_dir.display(), "parent worktree source failed mount validation; skipping workspace");
+            return spec;
+        }
         let git_dir = wt.git_dir.to_string_lossy().into_owned();
         spec = spec
             // Shared `.git` at its host-absolute path (RW: the worktree's
@@ -637,6 +696,13 @@ fn apply_parent_workspace(
             .with_env("COPPERCLAW_WORKSPACE", CONTAINER_WORKSPACE_DIR)
             .with_env("COPPERCLAW_WORKSPACE_BRANCH", &wt.branch);
     } else {
+        // Read-only `/parent` fallback. Still validate the source: a
+        // read-only bind of a symlink-swapped path can still leak the
+        // contents of an escaped target into the container.
+        if let Err(err) = super::mount_guard::validate_source(&parent_root, sessions_root) {
+            warn!(%err, path = %parent_root.display(), "parent workspace source failed mount validation; skipping /parent mount");
+            return spec;
+        }
         spec = spec.with_mount(Mount::Bind {
             source: parent_root.to_string_lossy().into_owned(),
             target: CONTAINER_PARENT_DIR.to_string(),
@@ -1125,6 +1191,7 @@ mod tests {
             skills_mode: SkillsMode::Inline,
             gpu_passthrough: false,
             forward_env: Vec::new(),
+            egress_mode: copperclaw_container_rt::EgressMode::AllowAll,
         }
     }
 
@@ -1170,7 +1237,9 @@ mod tests {
         );
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        let spec = mgr.build_spec(&session, &paths, "copperclaw/session:abc", None);
+        let spec = mgr
+            .build_spec(&session, &paths, "copperclaw/session:abc", None)
+            .unwrap();
         // Image
         assert_eq!(spec.image, "copperclaw/session:abc");
         // Entrypoint includes the runner path + --config arg
@@ -1235,7 +1304,7 @@ mod tests {
         );
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        let spec = mgr.build_spec(&session, &paths, "img", None);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
         let user = spec.user.as_deref().expect("spec.user should be set");
         let (uid_str, gid_str) = user.split_once(':').expect("user is uid:gid");
         let uid: u32 = uid_str.parse().expect("uid is numeric");
@@ -1262,7 +1331,7 @@ mod tests {
         );
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        let spec = mgr.build_spec(&session, &paths, "img", None);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
         assert_eq!(spec.working_dir.as_deref(), Some(CONTAINER_SESSION_DIR));
         assert!(
             spec.env
@@ -1291,7 +1360,7 @@ mod tests {
         );
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        let spec = mgr.build_spec(&session, &paths, "img", None);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
         assert!(
             spec.env
                 .iter()
@@ -1321,7 +1390,7 @@ mod tests {
         );
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        let spec = mgr.build_spec(&session, &paths, "img", None);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
         assert!(spec.env.iter().all(|(k, _)| k != "ANTHROPIC_BASE_URL"));
     }
 
@@ -1344,7 +1413,7 @@ mod tests {
         let mut sibling = fixture_session(&db);
         sibling.source_session_id = Some(parent_sid);
         let paths = SessionPaths::new(tmp.path(), sibling.agent_group_id, sibling.id);
-        let spec = mgr.build_spec(&sibling, &paths, "img", None);
+        let spec = mgr.build_spec(&sibling, &paths, "img", None).unwrap();
         let parent_mount = spec.mounts.iter().find_map(|m| match m {
             Mount::Bind {
                 source,
@@ -1370,7 +1439,7 @@ mod tests {
         // fixture_session has source_session_id = None (a root session).
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        let spec = mgr.build_spec(&session, &paths, "img", None);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
         assert!(
             !spec
                 .mounts
@@ -1430,7 +1499,7 @@ mod tests {
         let mut sibling = fixture_session(&db);
         sibling.source_session_id = Some(parent_sid);
         let paths = SessionPaths::new(tmp.path(), sibling.agent_group_id, sibling.id);
-        let spec = mgr.build_spec(&sibling, &paths, "img", None);
+        let spec = mgr.build_spec(&sibling, &paths, "img", None).unwrap();
 
         // No read-only /parent — the writable worktree replaces it.
         assert!(
@@ -1520,8 +1589,8 @@ mod tests {
 
         // A second spawn (container restart within a session) must reuse the
         // existing worktree, not error out.
-        let spec1 = mgr.build_spec(&sibling, &paths, "img", None);
-        let spec2 = mgr.build_spec(&sibling, &paths, "img", None);
+        let spec1 = mgr.build_spec(&sibling, &paths, "img", None).unwrap();
+        let spec2 = mgr.build_spec(&sibling, &paths, "img", None).unwrap();
         let has_workspace = |s: &ContainerSpec| {
             s.mounts.iter().any(
                 |m| matches!(m, Mount::Bind { target, .. } if target == CONTAINER_WORKSPACE_DIR),
@@ -1566,7 +1635,7 @@ mod tests {
         let mut sibling = fixture_session(&db);
         sibling.source_session_id = Some(parent_sid);
         let paths = SessionPaths::new(tmp.path(), sibling.agent_group_id, sibling.id);
-        let spec = mgr.build_spec(&sibling, &paths, "img", None);
+        let spec = mgr.build_spec(&sibling, &paths, "img", None).unwrap();
 
         // Shared .git + worktree come from the SUBDIR repo, not /data root.
         let git_src = project.join(".git").to_string_lossy().into_owned();
@@ -1652,7 +1721,7 @@ mod tests {
         );
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        let spec = mgr.build_spec(&session, &paths, "img", None);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
         let memory_mount = spec.mounts.iter().find_map(|m| match m {
             Mount::Bind {
                 source,
@@ -1686,7 +1755,7 @@ mod tests {
         );
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        let spec = mgr.build_spec(&session, &paths, "img", None);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
         let has_memory = spec.mounts.iter().any(|m| match m {
             Mount::Bind { target, .. } => target == &format!("{CONTAINER_SESSION_DIR}/memory"),
             _ => false,
@@ -1730,7 +1799,7 @@ mod tests {
             surface_thinking: false,
             updated_at: chrono::Utc::now(),
         };
-        let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg));
+        let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg)).unwrap();
         assert!(!spec.resource_limits.is_empty());
         assert!((spec.resource_limits.cpus.unwrap() - 1.5).abs() < f64::EPSILON);
         assert_eq!(spec.resource_limits.memory_mb, Some(512));
@@ -1768,15 +1837,22 @@ mod tests {
             surface_thinking: false,
             updated_at: chrono::Utc::now(),
         };
-        let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg));
+        let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg)).unwrap();
+        // The model endpoint (derived from the cfg's openrouter base URL) is
+        // auto-injected FIRST so deny-default can't blackhole model traffic,
+        // then the operator's per-group entries are unioned on top.
         assert_eq!(
             spec.egress_allow,
-            vec!["api.example.com:443", "db.local:5432"]
+            vec!["openrouter.ai:443", "api.example.com:443", "db.local:5432"]
         );
     }
 
+    /// Auto-injection (migration safety): even with an empty per-group
+    /// allow-list, the resolved list carries the model endpoint derived from
+    /// the base URL so a deny-default spawn can never blackhole the agent's
+    /// own provider traffic.
     #[test]
-    fn build_spec_empty_egress_allow_stays_empty() {
+    fn build_spec_auto_injects_model_endpoint_when_group_allow_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let db = CentralDb::open_in_memory().unwrap();
         let mgr = ContainerManager::new(
@@ -1807,8 +1883,119 @@ mod tests {
             surface_thinking: false,
             updated_at: chrono::Utc::now(),
         };
-        let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg));
-        assert!(spec.egress_allow.is_empty());
+        let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg)).unwrap();
+        // manager_cfg's base URL is https://openrouter.ai/api/v1.
+        assert_eq!(spec.egress_allow, vec!["openrouter.ai:443"]);
+    }
+
+    /// Opt-in default: the host ships allow-all, so an unconfigured manager
+    /// stamps `EgressMode::AllowAll` on the spec and the legacy spawn path
+    /// (default bridge, advisory allow-list) is unchanged.
+    #[test]
+    fn build_spec_egress_mode_defaults_to_allow_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
+        assert_eq!(
+            spec.egress_mode,
+            copperclaw_container_rt::EgressMode::AllowAll
+        );
+    }
+
+    /// When the operator opts in to deny-default, the spec carries the
+    /// posture AND the auto-injected model endpoint — together these are
+    /// what the runtime + the later nftables pass enforce against.
+    #[test]
+    fn build_spec_deny_default_mode_carries_posture_and_model_endpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.egress_mode = copperclaw_container_rt::EgressMode::DenyDefault;
+        cfg.anthropic_base_url = Some("https://api.anthropic.com".into());
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
+        assert_eq!(
+            spec.egress_mode,
+            copperclaw_container_rt::EgressMode::DenyDefault
+        );
+        assert_eq!(spec.egress_allow, vec!["api.anthropic.com:443"]);
+    }
+
+    /// toctou redux: if a component of the session-root mount source is
+    /// swapped for a symlink between the host computing the path and the
+    /// mount, `build_spec` must REFUSE (return `ManagerError::UnsafeMount`)
+    /// rather than hand dockerd a source that resolves outside the data dir.
+    ///
+    /// Residual (documented, not testable here): dockerd re-resolves the
+    /// source path in its own process when it performs the bind, so this
+    /// closes the host-side TOCTOU window but cannot eliminate a swap that
+    /// races dockerd's own resolution.
+    #[cfg(unix)]
+    #[test]
+    fn build_spec_refuses_session_mount_with_swapped_symlink_component() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Canonicalize so the tmp prefix carries no incidental symlink that
+        // would trip the scan before we plant ours (macOS /tmp etc.).
+        let data_dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(data_dir.clone()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(&data_dir, session.agent_group_id, session.id);
+
+        // Plant the attack: replace the agent-group dir component of the
+        // session-root path with a symlink pointing OUTSIDE the data dir.
+        // The real session dir would be data_dir/sessions/<ag>/<sess>; we
+        // make data_dir/sessions/<ag> a symlink to an unrelated dir.
+        let sessions = data_dir.join("sessions");
+        let ag_component = sessions.join(session.agent_group_id.as_uuid().to_string());
+        std::fs::create_dir_all(&sessions).unwrap();
+        let escape_target = data_dir.join("escape-target");
+        std::fs::create_dir_all(&escape_target).unwrap();
+        std::os::unix::fs::symlink(&escape_target, &ag_component).unwrap();
+
+        let err = mgr
+            .build_spec(&session, &paths, "img", None)
+            .expect_err("a symlink-swapped mount source component must be refused");
+        assert!(
+            matches!(err, ManagerError::UnsafeMount(_)),
+            "expected UnsafeMount, got {err:?}"
+        );
+    }
+
+    /// Sanity counterpart: a clean session-root source (no swapped symlink)
+    /// validates and `build_spec` succeeds — the new gate doesn't reject
+    /// the normal spawn path.
+    #[test]
+    fn build_spec_accepts_clean_session_mount_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(data_dir.clone()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(&data_dir, session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        assert!(mgr.build_spec(&session, &paths, "img", None).is_ok());
     }
 
     #[tokio::test]
@@ -1906,7 +2093,7 @@ mod tests {
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
         paths.ensure_dirs().unwrap();
-        let spec = mgr.build_spec(&session, &paths, "img", None);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
         // The bind mount is skipped (no source could be prepared).
         let has_memory_mount = spec.mounts.iter().any(|m| match m {
             Mount::Bind { target, .. } => target == &format!("{CONTAINER_SESSION_DIR}/memory"),
@@ -1948,7 +2135,7 @@ mod tests {
         );
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        let _spec = mgr.build_spec(&session, &paths, "img", None);
+        let _spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
         let mem = groups
             .join(session.agent_group_id.as_uuid().to_string())
             .join("memory");

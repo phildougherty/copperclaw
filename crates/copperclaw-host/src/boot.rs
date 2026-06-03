@@ -21,8 +21,9 @@ use copperclaw_host_router::Router;
 use copperclaw_host_sweep::{SqliteTaskStore, SweepService};
 use copperclaw_modules::{
     AgentDispatchModule, AgentToAgentModule, ApprovalsModule, CreateAgentModule, InteractiveModule,
-    Module, MountSecurityModule, NewPendingCtx, NewPendingNotifier, PermissionsModule,
-    SchedulingModule, SelfModModule, TypingConfig, TypingModule, create_agent_users_table_check,
+    Module, MountHostContext, MountSecurityModule, NewPendingCtx, NewPendingNotifier,
+    PermissionsModule, SchedulingModule, SelfModModule, TypingConfig, TypingModule,
+    create_agent_users_table_check,
 };
 use dashmap::DashMap;
 use std::path::PathBuf;
@@ -385,7 +386,17 @@ pub fn assemble(
 pub async fn install_modules(host_ctx: Arc<HostContext>, data_root: PathBuf) {
     let modules: Vec<Box<dyn Module>> = vec![
         Box::new(TypingModule::new(TypingConfig::default())),
-        Box::new(MountSecurityModule::new()),
+        // Register with a LIVE host root (the sessions dir all per-session
+        // bind sources live under) so the module's `validate` enforces
+        // against the real on-disk tree instead of the `host: None`
+        // placeholder it shipped with — which made `validate` a no-op that
+        // always returned `MountError::Empty`. The container manager's spawn
+        // path holds its own equivalently-rooted validator; this registration
+        // is what surfaces the module in `cclaw modules list` with a real
+        // root and keeps the two in sync.
+        Box::new(MountSecurityModule::with_host(MountHostContext {
+            session_root: data_root.join("sessions"),
+        })),
         Box::new(PermissionsModule::deny_all()),
         // Pre-approve the cli channel's deterministic `local` sender.
         // The cli channel reads the host's own stdin — the only
@@ -833,6 +844,14 @@ fn spawn_container_manager(
         skills_mode: cfg.skills_mode,
         gpu_passthrough: parse_truthy_env("COPPERCLAW_CONTAINER_GPU"),
         forward_env: collect_forward_env(),
+        // Phase 0a v1 egress posture (Top 10 #6). Opt-in: default allow-all
+        // keeps the spawn path unchanged; an operator sets
+        // `COPPERCLAW_EGRESS_MODE=deny-default` to enable. The model endpoint
+        // is always auto-injected into the resolved allow-list at spawn so
+        // deny-default can never blackhole model traffic.
+        egress_mode: crate::container_manager::parse_egress_mode(
+            std::env::var("COPPERCLAW_EGRESS_MODE").ok().as_deref(),
+        ),
     };
 
     // Startup safety check: the host's heartbeat-staleness threshold

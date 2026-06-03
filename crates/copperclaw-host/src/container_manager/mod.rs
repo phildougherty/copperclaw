@@ -37,12 +37,15 @@
 pub mod budgets;
 pub mod classify;
 pub mod config;
+pub mod egress;
+pub mod mount_guard;
 pub mod prompt;
 pub mod runner_config;
 pub mod spawn;
 pub mod tasks_snapshot;
 
 pub use config::{ManagerConfig, ROTATABLE_ENV_KEYS, RotatableConfig, SkillsMode};
+pub use egress::{model_endpoint_entry, parse_egress_mode, resolve_allow_list};
 pub use prompt::{
     BASE_PREAMBLE, MEMORY_UNAVAILABLE_FILENAME, PROJECT_BRIEFING_FILENAME,
     SKILLS_CATALOGUE_FILENAME,
@@ -61,6 +64,7 @@ use copperclaw_container_rt::{ContainerRuntime, RtError};
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::sessions;
 use copperclaw_host_sweep::SpawnAttemptTracker;
+use copperclaw_modules::{MountHostContext, MountSecurityModule};
 use copperclaw_types::{AgentGroupId, SessionStatus};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -84,6 +88,13 @@ pub enum ManagerError {
     /// Container runtime spawn failed.
     #[error("spawn: {0}")]
     Spawn(#[source] RtError),
+    /// A host-controlled bind-mount source failed validation at spawn
+    /// time — e.g. a path component became a symlink between the host
+    /// computing the path and the mount (a TOCTOU swap), or the source
+    /// escaped its session root. The spawn is refused rather than handing
+    /// dockerd a source that resolves outside the agent's data dir.
+    #[error("unsafe mount source: {0}")]
+    UnsafeMount(#[source] copperclaw_modules::MountError),
     /// The host entered degraded mode at boot (e.g. session image is
     /// missing or stale). Sessions cannot be spawned until the
     /// operator runs `./rebuild.sh` and restarts the host.
@@ -145,6 +156,20 @@ pub struct ContainerManager {
     /// Stored as an `AtomicBool` so the read-side on the spawn hot
     /// path is lock-free.
     pub(crate) degraded: AtomicBool,
+    /// Built with a LIVE host root (`<data_dir>/sessions`) — the dir all
+    /// per-session bind sources live under. Two roles: (1) it is the
+    /// enumerable [`MountSecurityModule`] the host registers (with the same
+    /// live root) so `cclaw modules list` reflects a real root rather than
+    /// the `host: None` placeholder it shipped with; (2) it is the canonical
+    /// source of [`Self::sessions_root`], which the spawn-time mount guard
+    /// ([`mount_guard::validate_source`]) validates each host-controlled
+    /// bind source against immediately before mounting (toctou redux). The
+    /// guard canonicalizes the source and refuses it if a component was
+    /// swapped for a symlink that escapes the sessions root. Residual:
+    /// dockerd re-resolves the source path in its own process when it
+    /// performs the bind, so this closes the host-side TOCTOU window but
+    /// cannot eliminate a swap that races dockerd's own resolution.
+    pub(crate) mount_security: MountSecurityModule,
 }
 
 impl ContainerManager {
@@ -164,6 +189,11 @@ impl ContainerManager {
             spawn_tracker: Arc::new(SpawnAttemptTracker::new()),
             rebuild_backoff: Arc::new(RebuildBackoff::new()),
             degraded: AtomicBool::new(false),
+            // LIVE host root: the sessions dir all per-session bind sources
+            // (session root, parent worktree, shared `.git`) live under.
+            mount_security: MountSecurityModule::with_host(MountHostContext {
+                session_root: cfg.data_dir.join("sessions"),
+            }),
             cfg,
         }
     }
@@ -183,6 +213,17 @@ impl ContainerManager {
     /// sweep service.
     pub fn spawn_tracker(&self) -> &Arc<SpawnAttemptTracker> {
         &self.spawn_tracker
+    }
+
+    /// The live sessions root all per-session bind sources live under
+    /// (`<data_dir>/sessions`). Taken from the registered
+    /// [`MountSecurityModule`]'s host context so the spawn-time mount guard
+    /// and the enumerable module never drift. Falls back to recomputing from
+    /// `cfg.data_dir` if the module was somehow registered without a host.
+    pub(crate) fn sessions_root(&self) -> &Path {
+        self.mount_security
+            .host()
+            .map_or(self.cfg.data_dir.as_path(), |h| h.session_root.as_path())
     }
 
     /// Flag the manager as degraded — subsequent

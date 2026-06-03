@@ -671,6 +671,18 @@ pub(crate) fn write_memory_unavailable_marker(
     intended_src: &Path,
     err: &std::io::Error,
 ) {
+    write_memory_unavailable_marker_str(session_root, intended_src, &err.kind().to_string());
+}
+
+/// Same as [`write_memory_unavailable_marker`] but takes an already-formatted
+/// `reason` string. Used when the memory mount was skipped for a non-IO
+/// reason (e.g. the source failed bind-mount security validation), where
+/// there's no `std::io::Error` to read a `.kind()` from.
+pub(crate) fn write_memory_unavailable_marker_str(
+    session_root: &Path,
+    intended_src: &Path,
+    reason: &str,
+) {
     let dir = session_root.join("memory");
     if let Err(e) = std::fs::create_dir_all(&dir) {
         warn!(
@@ -683,14 +695,13 @@ pub(crate) fn write_memory_unavailable_marker(
     let body = format!(
         "# Memory mount unavailable\n\n\
          The per-group memory mount at `{intended}` could not be configured \
-         for this session (host error: {err_kind}). Files you write under \
+         for this session (host reason: {reason}). Files you write under \
          `/data/memory/` will land in this session's own directory and will \
          **not** persist or be visible to other sessions of this agent group.\n\n\
          If a user references a memory the agent should have, mention that \
          the persistent memory mount is currently unavailable so the operator \
          can investigate.\n",
         intended = intended_src.display(),
-        err_kind = err.kind(),
     );
     let marker = dir.join(MEMORY_UNAVAILABLE_FILENAME);
     if let Err(e) = std::fs::write(&marker, body) {

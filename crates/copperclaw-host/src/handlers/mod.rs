@@ -27,6 +27,7 @@ pub mod budgets;
 pub mod db;
 pub mod destinations;
 pub mod dropped_messages;
+pub mod egress;
 pub mod groups;
 pub mod mcp;
 pub mod members;

@@ -172,6 +172,11 @@ pub enum TopCommand {
     /// Returns a non-zero exit when any check is in FAIL state so CI
     /// and pre-flight scripts can branch on it.
     Doctor,
+    /// Report the host egress posture: the global mode (allow-all vs.
+    /// opt-in deny-default) and, per agent group, the effective outbound
+    /// allow-list (operator-configured entries plus the auto-injected
+    /// model endpoint). The same report `cclaw doctor` folds in.
+    Egress,
     /// Per-group daily budget caps.
     Budgets {
         #[command(subcommand)]
@@ -1027,6 +1032,7 @@ impl TopCommand {
             Self::Status => ParsedCall::new("composite.status", json!({})),
             Self::Health => ParsedCall::new("composite.health", json!({})),
             Self::Doctor => ParsedCall::new("composite.doctor", json!({})),
+            Self::Egress => ParsedCall::new("egress.status", json!({})),
             Self::Usage { since } => ParsedCall::new("usage.rollup", json!({"since": since})),
             Self::Chat {
                 fifo,
@@ -1641,6 +1647,7 @@ pub const ALL_COMMANDS: &[&str] = &[
     "budgets.set",
     "usage.rollup",
     "schema.version",
+    "egress.status",
 ];
 
 #[cfg(test)]
@@ -2618,6 +2625,7 @@ mod tests {
             ],
             &["cclaw", "usage"],
             &["cclaw", "schema-version"],
+            &["cclaw", "egress"],
             // Note: composite-only commands (`cclaw status`,
             // `cclaw health`, `cclaw quickstart`, `cclaw chat`,
             // `cclaw completions`) intentionally produce
