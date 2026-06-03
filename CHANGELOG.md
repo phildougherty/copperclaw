@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security (M16 close-the-gaps — web_search provenance + egress PID handoff — 2026-06-03)
+
+Two of the previously-deferred runtime gaps closed (full workspace gate clean,
+6,661 tests). The third (per-server MCP tool filter) stays deferred — see note.
+
+- **`web_search` results tagged untrusted-provenance.** `web_search`'s handler
+  now calls the `ToolContext` untrusted-marking path (mirroring `web_fetch` /
+  `memory_search`), so a turn that ran `web_search` trips the coarse
+  provenance approval gate before any credentialed external action — closing
+  the wave-4 gap where attacker-influenceable search results could steer a
+  later action without tripping the gate.
+- **Egress nftables apply now has a target.** `DockerRuntime::spawn` inspects
+  the started container (`State.Pid`) and surfaces the host PID on
+  `ContainerHandle`; the host wires it into the egress apply path so the
+  per-session nftables ruleset can target the container's netns under opt-in
+  `DenyDefault`. The privileged apply itself is still gated behind the opt-in
+  flag and remains CAP_NET_ADMIN-dependent at runtime (honestly reported, not
+  faked when unavailable).
+- **Still deferred — per-server MCP tool filter.** Held: the runner does not
+  consume external MCP tools yet (it loads only the first-party tool set), so
+  there is no model-facing path for the filter to enforce on. Closing this
+  needs the runner-side external-MCP consumer built first — a feature, not a
+  gap-patch — so the filter logic is left unmerged rather than shipped as dead
+  code.
+
 ### Performance (LLM token-cost reduction — 2026-06-03)
 
 The agent loop was paying full input price to re-send a near-identical,
