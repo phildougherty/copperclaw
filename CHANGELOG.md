@@ -6,6 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security (M16 hardening wave 2 — egress v1, mount TOCTOU, tool policy engine — 2026-06-02)
+
+Second wave of the M16 roadmap. Two units landed on `feat/security-hardening`
+(full workspace gate clean, 6,156 tests); two more (DM pairing, mention
+gating) were rejected in review and are deferred to a rework pass.
+
+- **Egress v1 (opt-in default-deny scaffolding).** New
+  `crates/copperclaw-host/src/container_manager/egress.rs` +
+  `handlers/egress.rs` + `copperclaw-container-rt` wiring. `EgressMode`
+  defaults to `AllowAll` (legacy path unchanged); operators flip
+  `COPPERCLAW_EGRESS_MODE=deny-default` to restrict a session to the model
+  endpoint + an allow-list. The host auto-injects the model endpoint so
+  deny-default cannot black-hole model traffic, and `cclaw doctor` reports
+  egress mode + effective allow-list per group. (Known follow-up: verify the
+  auto-injection covers every default deployment's base URL before
+  recommending deny-default in production.)
+- **Mount-bind TOCTOU fix (wired for real).** The Wave-1 attempt was dead
+  code; this wires validation into the actual `spawn.rs` `Mount::Bind` sites
+  via `container_manager/mount_guard.rs`, with `MountSecurityModule` given a
+  live session root, rejecting a mount source whose path component became a
+  symlink after validation. Documented residual: dockerd re-resolves the
+  path in its own process.
+- **Layered tool-authorization engine.** New
+  `crates/copperclaw-runner/src/policy.rs` evaluates every tool dispatch
+  against a host-owned floor, a guest read-only floor, the active skill's
+  `allowed-tools`, and a group tool-profile (minimal/messaging/coding/full),
+  plus `copperclaw-skills` name-normalization (`Read`/`Bash` -> MCP names).
+  NOTE: the engine + tests are in place but **dormant** in production until
+  the host write-half lands (no `tool_profile` is written into
+  `runner.json` yet, sender role is not plumbed, and `load_skill` does not
+  yet narrow the policy) — wired in a follow-up. Defaults to `Full` so
+  current behavior is unchanged.
+
 ### Security (M16 hardening wave 1 — make the advertised controls real — 2026-06-02)
 
 First wave of the M16 security-hardening roadmap (see `PLAN.md`). Closes the
