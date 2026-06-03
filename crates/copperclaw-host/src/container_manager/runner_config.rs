@@ -270,14 +270,38 @@ impl ContainerManager {
         // container env). For native ollama, api_base_url is irrelevant
         // — the runner reads OLLAMA_BASE_URL directly. Codex spawns a
         // subprocess and has no HTTP base URL at all.
+        //
+        // For the Anthropic-envelope providers (anthropic / claude /
+        // ollama-shim-via-ANTHROPIC) the endpoint is the single source of
+        // truth shared with `build_spec`: when the credential broker is
+        // enabled for this session, the runner MUST hit the host-side broker
+        // loopback (not the operator's real `ANTHROPIC_BASE_URL`). The runner
+        // prefers `runner.json`'s `api_base_url` over the `ANTHROPIC_BASE_URL`
+        // env var, so writing the operator URL here would silently bypass the
+        // broker (the runner would talk straight to the real endpoint with the
+        // capability token, which the real endpoint rejects). The real
+        // upstream URL lives in the broker config and is what the broker
+        // forwards to host-side with the real key. When the broker is disabled
+        // (the default) we keep the historical behaviour: the rotatable real
+        // base URL.
         let api_base_url = match provider.as_deref() {
             Some("ollama" | "ollama-shim" | "codex") => None,
+            // Mirror `build_spec`'s broker gate exactly: the broker is "enabled"
+            // only when both the broker state AND its loopback base URL are
+            // wired in (they are set together by `with_broker`). Gating on both
+            // means this path and the env-var path in `build_spec` can never
+            // disagree about which endpoint the runner hits.
             _ => self
-                .rotatable
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .anthropic_base_url
-                .clone(),
+                .broker
+                .as_ref()
+                .and(self.broker_base_url.clone())
+                .or_else(|| {
+                    self.rotatable
+                        .read()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .anthropic_base_url
+                        .clone()
+                }),
         };
 
         // Codex binary + args. Sourced from the rotatable forward_env
@@ -767,6 +791,135 @@ mod tests {
         assert_eq!(cfg.provider.as_deref(), Some("anthropic"));
         assert_eq!(cfg.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
         assert!(cfg.api_base_url.is_some());
+    }
+
+    // ----- Credential broker: runner.json endpoint redirection ----------------
+
+    /// HIGH-bug regression: when the credential broker is ENABLED and the
+    /// operator has set `ANTHROPIC_BASE_URL` (the common `OpenRouter`
+    /// deployment — `manager_cfg` sets it to `https://openrouter.ai/api/v1`),
+    /// `runner.json`'s `api_base_url` MUST point at the broker loopback, not
+    /// the operator's real URL. The runner prefers `runner.json`'s
+    /// `api_base_url` over the `ANTHROPIC_BASE_URL` env var, so writing the
+    /// operator URL here silently bypassed the broker: the runner talked
+    /// straight to the real endpoint with the capability token (which the real
+    /// endpoint rejects). This pins the redirection that closes the bypass.
+    #[test]
+    fn runner_config_with_broker_enabled_points_api_base_url_at_broker_loopback() {
+        use super::super::broker::{BrokerConfig, BrokerState};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        // Real upstream key + a non-default upstream base — exactly the
+        // deployment the bug fired on. The broker holds these host-side.
+        let broker_cfg = BrokerConfig::resolve(
+            true,
+            Some("sk-test"),
+            Some("https://openrouter.ai/api/v1"),
+            None,
+        )
+        .unwrap();
+        let broker = std::sync::Arc::new(BrokerState::new(broker_cfg));
+        let loopback = "http://127.0.0.1:48080";
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        )
+        .with_broker(std::sync::Arc::clone(&broker), loopback.into());
+
+        let session = fixture_session(&db);
+        let cfg = mgr.runner_config_for(&session, None, None);
+        // The endpoint the runner hits is the broker loopback, NOT the
+        // operator's configured `ANTHROPIC_BASE_URL`.
+        assert_eq!(
+            cfg.api_base_url.as_deref(),
+            Some(loopback),
+            "broker enabled: runner.json api_base_url must be the broker loopback"
+        );
+        assert_ne!(
+            cfg.api_base_url.as_deref(),
+            Some("https://openrouter.ai/api/v1"),
+            "broker enabled: runner.json api_base_url must NOT be the operator's real URL"
+        );
+        // The runner still reads the ANTHROPIC_API_KEY slot — which build_spec
+        // fills with the capability token, NOT the real key.
+        assert_eq!(cfg.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+    }
+
+    /// Default path (broker DISABLED): behaviour is unchanged — the runner
+    /// hits the operator's real `ANTHROPIC_BASE_URL` with the real key as
+    /// before. Regression guard so the fix can't break the common no-broker
+    /// install.
+    #[test]
+    fn runner_config_with_broker_disabled_uses_real_base_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let cfg = mgr.runner_config_for(&session, None, None);
+        assert_eq!(
+            cfg.api_base_url.as_deref(),
+            Some("https://openrouter.ai/api/v1"),
+            "broker disabled: runner.json api_base_url must be the operator's real URL"
+        );
+        assert_eq!(cfg.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
+    }
+
+    /// The broker redirect only applies to the Anthropic-envelope providers.
+    /// A native-ollama group must still get `api_base_url: None` even with the
+    /// broker enabled (its model traffic goes via `OLLAMA_BASE_URL`, not the
+    /// Anthropic broker), so the broker never accidentally captures it.
+    #[test]
+    fn runner_config_with_broker_enabled_leaves_ollama_base_url_none() {
+        use super::super::broker::{BrokerConfig, BrokerState};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let broker_cfg = BrokerConfig::resolve(true, Some("sk-test"), None, None).unwrap();
+        let broker = std::sync::Arc::new(BrokerState::new(broker_cfg));
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        )
+        .with_broker(
+            std::sync::Arc::clone(&broker),
+            "http://127.0.0.1:48080".into(),
+        );
+
+        let session = fixture_session(&db);
+        let cc = container_configs::ContainerConfig {
+            agent_group_id: session.agent_group_id,
+            provider: Some("ollama".into()),
+            model: Some("llama3.1:8b".into()),
+            effort: None,
+            image_tag: None,
+            assistant_name: None,
+            max_messages_per_prompt: None,
+            skills: container_configs::SkillsSelector::All,
+            mcp_servers: serde_json::json!({}),
+            packages_apt: vec![],
+            packages_npm: vec![],
+            additional_mounts: serde_json::json!([]),
+            cli_scope: container_configs::CliScope::Group,
+            config_fingerprint: None,
+            egress_allow: vec![],
+            resource_limits: serde_json::json!({}),
+            coding_enabled: false,
+            surface_thinking: false,
+            tool_profile: None,
+            updated_at: chrono::Utc::now(),
+        };
+        let cfg = mgr.runner_config_for(&session, Some(&cc), None);
+        assert!(
+            cfg.api_base_url.is_none(),
+            "ollama provider must not be redirected at the Anthropic broker"
+        );
     }
 
     /// Helper: build a `ContainerConfig` populated with the four coding

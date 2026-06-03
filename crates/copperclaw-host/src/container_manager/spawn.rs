@@ -1444,6 +1444,74 @@ mod tests {
     }
 
     #[test]
+    fn build_spec_and_runner_config_agree_on_broker_endpoint() {
+        // HIGH-bug regression (end-to-end coherence): the container ENV
+        // (`ANTHROPIC_BASE_URL`, written by build_spec) and the on-disk
+        // `runner.json` (`api_base_url`, written by runner_config_for) MUST
+        // name the SAME endpoint when the broker is enabled — the broker
+        // loopback. The runner prefers runner.json's `api_base_url`, so if the
+        // two ever disagree the file silently wins and the broker is bypassed.
+        // This pins the single source of truth across both writers.
+        use super::super::broker::{BrokerConfig, BrokerState};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        // Operator base URL is set (the OpenRouter deployment the bug fired on)
+        // via manager_cfg; the broker holds the real upstream host-side.
+        let broker_cfg = BrokerConfig::resolve(true, Some("sk-test"), None, Some(3600)).unwrap();
+        let broker = std::sync::Arc::new(BrokerState::new(broker_cfg));
+        let loopback = "http://127.0.0.1:48080";
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        )
+        .with_broker(std::sync::Arc::clone(&broker), loopback.into());
+
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr
+            .build_spec(&session, &paths, "copperclaw/session:abc", None)
+            .unwrap();
+        let env_base = spec
+            .env
+            .iter()
+            .find(|(k, _)| k == "ANTHROPIC_BASE_URL")
+            .map(|(_, v)| v.clone())
+            .expect("ANTHROPIC_BASE_URL must be set");
+
+        let rc = mgr.runner_config_for(&session, None, None);
+        let file_base = rc
+            .api_base_url
+            .expect("runner.json api_base_url must be set");
+
+        assert_eq!(env_base, loopback, "container env base must be the broker");
+        assert_eq!(
+            file_base, loopback,
+            "runner.json base must be the broker (not the operator URL)"
+        );
+        assert_eq!(
+            env_base, file_base,
+            "env ANTHROPIC_BASE_URL and runner.json api_base_url must agree"
+        );
+
+        // And the key slot in the container env is a capability token, not the
+        // real key — so the runner authenticates to the broker, which swaps in
+        // the real key host-side.
+        let api_key = spec
+            .env
+            .iter()
+            .find(|(k, _)| k == "ANTHROPIC_API_KEY")
+            .map(|(_, v)| v.clone())
+            .expect("ANTHROPIC_API_KEY must be set");
+        assert!(api_key.starts_with("cct1."), "expected a capability token");
+        assert!(
+            !spec.env.iter().any(|(_, v)| v == "sk-test"),
+            "real key must not appear in any container env var"
+        );
+    }
+
+    #[test]
     // Linux-only: asserts the `/proc/self`-based uid detection in
     // `host_uid_gid`. On macOS (also `unix`) there's no `/proc`, so the
     // function returns `None` by design and `spec.user` is unset — nothing
