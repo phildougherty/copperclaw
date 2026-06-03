@@ -266,19 +266,20 @@ impl Router {
         wiring: &MessagingGroupAgent,
         user_id: Option<copperclaw_types::UserId>,
     ) -> Result<FanoutOutcome, RouterError> {
-        // Access gate per agent group.
-        if self.hooks.has_access_gate() {
+        // Access gate per agent group. `resolve_access_gate` applies the
+        // host default policy: privileged ops close-fail (a missing or
+        // deferred decision denies), while non-privileged routing ops like
+        // `deliver_message` keep open-fail. We still run it unconditionally so
+        // that policy is uniform whether or not a gate is registered.
+        {
             let ctx = GateCtx {
                 user: user_id,
                 agent_group_id: Some(wiring.agent_group_id),
                 messaging_group_id: Some(*mg_id),
                 op: "deliver_message".into(),
             };
-            match self.hooks.run_access_gate(ctx) {
-                Some(GateDecision::Deny(reason)) => {
-                    return Ok(FanoutOutcome::Dropped(DropReason::AccessDenied(reason)));
-                }
-                Some(GateDecision::Defer | GateDecision::Allow) | None => {}
+            if let GateDecision::Deny(reason) = self.hooks.resolve_access_gate(ctx) {
+                return Ok(FanoutOutcome::Dropped(DropReason::AccessDenied(reason)));
             }
         }
 
