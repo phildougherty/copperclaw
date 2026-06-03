@@ -8,6 +8,7 @@
 use crate::debounce::{DebounceKey, Debouncer, InflightKey, InflightSet};
 use crate::error::RouterError;
 use crate::hooks::HookChain;
+use crate::mention::{MentionDecision, MentionGate};
 use crate::session::SessionRoot;
 
 use copperclaw_db::central::CentralDb;
@@ -74,6 +75,10 @@ pub enum DropReason {
     /// The router refused to write the row because the target session is
     /// the same one that produced the event (re-entry guard).
     ReentryGuard,
+    /// The event was ambient group-chat text that did not engage the agent
+    /// (no mention, no reply-to-self, no pattern match) and the wiring's
+    /// venue requires a mention. See [`crate::mention`].
+    MentionGated,
 }
 
 /// Reasons the router deferred the event without writing a row.
@@ -96,12 +101,19 @@ pub struct Router {
     debounce: Debouncer,
     inflight: InflightSet,
     fanout_seq: AtomicI64,
+    mention_gate: MentionGate,
 }
 
 impl Router {
-    /// Construct a router. Modules wire their hooks via [`Self::hooks`] /
-    /// [`Self::hooks_mut`] after construction; the router stays usable while
-    /// no hooks are wired (defaults to allow-all).
+    /// Construct a router with the default mention policy (require a mention
+    /// in group chats; never in DMs). Modules wire their hooks via
+    /// [`Self::hooks`] / [`Self::hooks_mut`] after construction; the router
+    /// stays usable while no hooks are wired (defaults to allow-all).
+    ///
+    /// To override the mention policy at boot, chain
+    /// [`Self::with_mention_gate`] BEFORE wrapping the router in an `Arc`:
+    /// the gate is construction-time config, never a `&mut self` setter on
+    /// the shared `Arc<Router>`.
     pub fn new(central: CentralDb, session_paths: Arc<dyn SessionRoot + Send + Sync>) -> Self {
         Self {
             central,
@@ -110,7 +122,23 @@ impl Router {
             debounce: Debouncer::new(),
             inflight: InflightSet::new(),
             fanout_seq: AtomicI64::new(0),
+            mention_gate: MentionGate::default(),
         }
+    }
+
+    /// Set the mention-gating policy at construction time. Consumes and
+    /// returns `self` so the host can write
+    /// `Arc::new(Router::new(..).with_mention_gate(gate))` — the gate is
+    /// fixed before the router is shared, never mutated through the `Arc`.
+    #[must_use]
+    pub fn with_mention_gate(mut self, gate: MentionGate) -> Self {
+        self.mention_gate = gate;
+        self
+    }
+
+    /// Borrow the configured mention-gating policy.
+    pub fn mention_gate(&self) -> &MentionGate {
+        &self.mention_gate
     }
 
     /// Borrow the router's hook chain.
@@ -223,7 +251,7 @@ impl Router {
         let mut last_pending: Option<PendingReason> = None;
         for wiring in wirings {
             self.fanout_seq.fetch_add(1, Ordering::Relaxed);
-            match self.route_one(&event, &mg.id, &wiring, user_id)? {
+            match self.route_one(&event, &mg.id, mg.is_group, &wiring, user_id)? {
                 FanoutOutcome::Delivered(d) => sessions.push(d),
                 FanoutOutcome::Dropped(reason) => {
                     self.record_drop(
@@ -263,6 +291,7 @@ impl Router {
         &self,
         event: &InboundEvent,
         mg_id: &MessagingGroupId,
+        mg_is_group: bool,
         wiring: &MessagingGroupAgent,
         user_id: Option<copperclaw_types::UserId>,
     ) -> Result<FanoutOutcome, RouterError> {
@@ -325,6 +354,28 @@ impl Router {
                 return Ok(FanoutOutcome::Pending(PendingReason::SenderUnregistered));
             }
             Some(SenderScopeDecision::Allow | SenderScopeDecision::Defer) | None => {}
+        }
+
+        // Mention gate. Ambient group-chat text that doesn't engage the agent
+        // (no @-mention, no reply-to-the-agent's-own-message, no pattern
+        // match) is dropped per the wiring's venue policy. Non-text events
+        // (callbacks, commands, tasks, agent-to-agent, …) and DMs are never
+        // gated — that filtering lives entirely in `MentionGate::decide`.
+        //
+        // The venue is a group when EITHER the messaging-group row says so OR
+        // the inbound event itself reports `is_group == Some(true)`; the OR
+        // keeps a stale `messaging_groups.is_group` from silently un-gating a
+        // real group chat.
+        let is_group = mg_is_group || event.message.is_group == Some(true);
+        if let MentionDecision::Drop(_label) = self.mention_gate.decide(
+            event,
+            is_group,
+            wiring.engage_mode,
+            wiring.engage_pattern.as_deref(),
+        ) {
+            // The caller records a `dropped_messages` row from the returned
+            // `FanoutOutcome::Dropped` via `drop_reason_label` ("mention_gated").
+            return Ok(FanoutOutcome::Dropped(DropReason::MentionGated));
         }
 
         // Resolve the target session for this wiring.
@@ -529,6 +580,7 @@ fn drop_reason_label(reason: &DropReason) -> String {
         DropReason::InterceptorDropped(r) => format!("interceptor_drop:{r}"),
         DropReason::Debounced => "debounced".to_owned(),
         DropReason::ReentryGuard => "reentry_guard".to_owned(),
+        DropReason::MentionGated => "mention_gated".to_owned(),
     }
 }
 
@@ -652,6 +704,279 @@ mod tests {
         }
     }
 
+    /// Fixture whose messaging group is a GROUP chat (`is_group = true`),
+    /// wired with the given engage mode/pattern. Used by the mention-gating
+    /// tests. The router uses the supplied gate (default if `None`).
+    fn group_fixture(
+        engage_mode: EngageMode,
+        engage_pattern: Option<&str>,
+        gate: Option<MentionGate>,
+    ) -> Fixture {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let root: Arc<dyn SessionRoot + Send + Sync> = Arc::new(FsSessionRoot::new(tmp.path()));
+        let ag = create_ag(
+            &db,
+            CreateAgentGroup {
+                name: "g".into(),
+                folder: "g".into(),
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        let mg = upsert_mg(
+            &db,
+            UpsertMessagingGroup {
+                channel_type: ChannelType::new("cli"),
+                platform_id: "chat-1".into(),
+                name: None,
+                is_group: true,
+                unknown_sender_policy: "strict".into(),
+            },
+        )
+        .unwrap();
+        upsert_wire(
+            &db,
+            UpsertWiring {
+                messaging_group_id: mg.id,
+                agent_group_id: ag.id,
+                engage_mode,
+                engage_pattern: engage_pattern.map(std::borrow::ToOwned::to_owned),
+                sender_scope: "all".into(),
+                ignored_message_policy: "drop".into(),
+                session_mode: SessionMode::Shared,
+                priority: 0,
+            },
+        )
+        .unwrap();
+        let mut router = Router::new(db, root);
+        if let Some(g) = gate {
+            router = router.with_mention_gate(g);
+        }
+        Fixture {
+            router,
+            _tmp: tmp,
+            mg_id: mg.id,
+            ag_id: ag.id,
+        }
+    }
+
+    /// A group-chat chat event (the channel reports `is_group = Some(true)`).
+    fn group_event(message_id: &str) -> InboundEvent {
+        let mut ev = event(None, message_id);
+        ev.message.is_group = Some(true);
+        ev
+    }
+
+    #[tokio::test]
+    async fn mention_gate_drops_unmentioned_group_text() {
+        // Default policy + Mention wiring: ambient group chatter with no
+        // mention, no reply-to-self, no pattern is dropped.
+        let fx = group_fixture(EngageMode::Mention, None, None);
+        let out = fx.router.route(group_event("g1")).await.unwrap();
+        match out {
+            RouteOutcome::Dropped {
+                reason: DropReason::MentionGated,
+            } => {}
+            other => panic!("unexpected: {other:?}"),
+        }
+        // And the drop is recorded with the canonical label.
+        let dropped =
+            copperclaw_db::tables::dropped_messages::list(fx.router.central(), None).unwrap();
+        assert!(dropped.iter().any(|d| d.reason == "mention_gated"));
+        let _ = fx.ag_id;
+    }
+
+    #[tokio::test]
+    async fn mention_gate_processes_native_mention_in_group() {
+        let fx = group_fixture(EngageMode::Mention, None, None);
+        let mut ev = group_event("g2");
+        ev.message.is_mention = Some(true);
+        let out = fx.router.route(ev).await.unwrap();
+        assert!(
+            matches!(out, RouteOutcome::Delivered { .. }),
+            "native @-mention must engage: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mention_gate_processes_reply_to_agent_in_group() {
+        let fx = group_fixture(EngageMode::Mention, None, None);
+        let mut ev = group_event("g3");
+        ev.reply_to = Some(copperclaw_types::ReplyTo {
+            channel_type: ChannelType::new("cli"),
+            platform_id: "chat-1".into(),
+            thread_id: Some("parent-7".into()),
+            replying_to_self: Some(true),
+        });
+        let out = fx.router.route(ev).await.unwrap();
+        assert!(
+            matches!(out, RouteOutcome::Delivered { .. }),
+            "reply to the agent's own message must engage: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mention_gate_drops_reply_to_other_user_in_group() {
+        // A reply whose parent was NOT the agent (or is unresolved) must not
+        // count as a mention — the core fix vs. "treat any reply_to as a
+        // mention".
+        let fx = group_fixture(EngageMode::Mention, None, None);
+        let mut ev = group_event("g3b");
+        ev.reply_to = Some(copperclaw_types::ReplyTo {
+            channel_type: ChannelType::new("cli"),
+            platform_id: "chat-1".into(),
+            thread_id: Some("parent-7".into()),
+            replying_to_self: Some(false),
+        });
+        let out = fx.router.route(ev).await.unwrap();
+        match out {
+            RouteOutcome::Dropped {
+                reason: DropReason::MentionGated,
+            } => {}
+            other => panic!("reply to another user must be gated: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mention_gate_drops_reply_with_unknown_parent_author_in_group() {
+        // `replying_to_self = None` (adapter could not resolve the parent
+        // author) must NOT count as a mention.
+        let fx = group_fixture(EngageMode::Mention, None, None);
+        let mut ev = group_event("g3c");
+        ev.reply_to = Some(copperclaw_types::ReplyTo {
+            channel_type: ChannelType::new("cli"),
+            platform_id: "chat-1".into(),
+            thread_id: Some("parent-7".into()),
+            replying_to_self: None,
+        });
+        let out = fx.router.route(ev).await.unwrap();
+        match out {
+            RouteOutcome::Dropped {
+                reason: DropReason::MentionGated,
+            } => {}
+            other => panic!("unresolved-author reply must be gated: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mention_gate_processes_pattern_match_in_group() {
+        // Pattern wiring engages on a regex match instead of a mention.
+        let fx = group_fixture(EngageMode::Pattern, Some("(?i)deploy"), None);
+        let mut ev = group_event("g4");
+        ev.message.content = serde_json::json!({"text":"please DEPLOY the build"});
+        let out = fx.router.route(ev).await.unwrap();
+        assert!(
+            matches!(out, RouteOutcome::Delivered { .. }),
+            "pattern match must engage: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mention_gate_drops_pattern_miss_in_group() {
+        // Pattern wirings still gate text that does not match — but via the
+        // pattern, not a mention requirement.
+        let fx = group_fixture(EngageMode::Pattern, Some("(?i)deploy"), None);
+        let mut ev = group_event("g4b");
+        ev.message.content = serde_json::json!({"text":"good morning everyone"});
+        let out = fx.router.route(ev).await.unwrap();
+        match out {
+            RouteOutcome::Dropped {
+                reason: DropReason::MentionGated,
+            } => {}
+            other => panic!("pattern miss must be gated: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mention_gate_processes_callback_query_in_group() {
+        // A button tap / callback query in a group must reach the agent even
+        // with no mention — the content carries a `callback` marker.
+        let fx = group_fixture(EngageMode::Mention, None, None);
+        let mut ev = group_event("g5");
+        ev.message.is_mention = None;
+        ev.message.content = serde_json::json!({
+            "text": "approve",
+            "callback": {"id": "cb-1", "data": "approve"},
+        });
+        let out = fx.router.route(ev).await.unwrap();
+        assert!(
+            matches!(out, RouteOutcome::Delivered { .. }),
+            "callback query in a group must be processed: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mention_gate_processes_command_in_group() {
+        let fx = group_fixture(EngageMode::Mention, None, None);
+        let mut ev = group_event("g5b");
+        ev.message.content = serde_json::json!({
+            "text": "/status",
+            "command": "status",
+        });
+        let out = fx.router.route(ev).await.unwrap();
+        assert!(
+            matches!(out, RouteOutcome::Delivered { .. }),
+            "slash command in a group must be processed: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mention_gate_processes_non_chat_kind_in_group() {
+        // A scheduled task / webhook / system event is never gated.
+        let fx = group_fixture(EngageMode::Mention, None, None);
+        let mut ev = group_event("g6");
+        ev.message.kind = MessageKind::Task;
+        let out = fx.router.route(ev).await.unwrap();
+        assert!(
+            matches!(out, RouteOutcome::Delivered { .. }),
+            "non-chat kind must bypass the gate: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mention_gate_always_processes_dm() {
+        // DM venue (`is_group = false`) is never gated, even unmentioned.
+        let fx = fixture(SessionMode::Shared); // mg.is_group = false
+        let mut ev = event(None, "dm1");
+        ev.message.is_group = Some(false);
+        ev.message.is_mention = None;
+        let out = fx.router.route(ev).await.unwrap();
+        assert!(
+            matches!(out, RouteOutcome::Delivered { .. }),
+            "DM must always be processed: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mention_gate_per_group_override_pattern_processes_unmentioned() {
+        // Per-group override: a Pattern wiring with a catch-all pattern keeps
+        // the group ungated even under the default require-in-groups policy.
+        let fx = group_fixture(EngageMode::Pattern, Some(".*"), None);
+        let out = fx.router.route(group_event("g7")).await.unwrap();
+        assert!(
+            matches!(out, RouteOutcome::Delivered { .. }),
+            "per-group Pattern override must process unmentioned text: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mention_gate_construction_override_disables_group_gating() {
+        // Construction-time policy with require_in_groups=false un-gates
+        // groups host-wide even for a Mention wiring.
+        let gate = MentionGate {
+            require_in_groups: false,
+            require_in_dms: false,
+        };
+        let fx = group_fixture(EngageMode::Mention, None, Some(gate));
+        let out = fx.router.route(group_event("g8")).await.unwrap();
+        assert!(
+            matches!(out, RouteOutcome::Delivered { .. }),
+            "require_in_groups=false must process unmentioned group text: {out:?}"
+        );
+        assert!(!fx.router.mention_gate().require_in_groups);
+    }
+
     #[tokio::test]
     async fn route_no_messaging_group_drops() {
         let tmp = tempfile::tempdir().unwrap();
@@ -711,6 +1036,9 @@ mod tests {
             // The parent's platform-side message id — this is what the
             // router persists onto messages_in.reply_to.
             thread_id: Some("parent-msg-77".into()),
+            // A reply to the agent's own message — engages the mention gate
+            // so the group event is processed (and we can assert persistence).
+            replying_to_self: Some(true),
         });
         let out = fx.router.route(ev).await.unwrap();
         let RouteOutcome::Delivered { sessions } = out else {
@@ -1068,6 +1396,7 @@ mod tests {
             DropReason::InterceptorDropped("y".into()),
             DropReason::Debounced,
             DropReason::ReentryGuard,
+            DropReason::MentionGated,
         ] {
             let s = drop_reason_label(&r);
             assert!(!s.is_empty());

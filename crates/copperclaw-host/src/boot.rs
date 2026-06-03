@@ -350,7 +350,18 @@ pub fn assemble(
 
     let router_root: Arc<dyn copperclaw_host_router::SessionRoot + Send + Sync> =
         Arc::new(FsSessionRoot::new(cfg.sessions_root()));
-    let router = Arc::new(Router::new(central.clone(), router_root));
+    // Mention gating policy is construction-time config on the Router (fixed
+    // before it's shared behind an `Arc`, never mutated through it). The
+    // secure default — require a mention in group chats, never in DMs — can
+    // be overridden host-wide via env; per-group overrides come off each
+    // wiring's `engage_mode` (Pattern engages on a regex match instead of a
+    // mention; Mention / MentionSticky require one).
+    let mention_gate = copperclaw_host_router::MentionGate {
+        require_in_groups: parse_truthy_env_default("COPPERCLAW_REQUIRE_MENTION_GROUPS", true),
+        require_in_dms: parse_truthy_env_default("COPPERCLAW_REQUIRE_MENTION_DMS", false),
+    };
+    let router =
+        Arc::new(Router::new(central.clone(), router_root).with_mention_gate(mention_gate));
 
     let delivery_root: Arc<dyn copperclaw_host_delivery::SessionRoot> =
         Arc::new(FsSessionRoot::new(cfg.sessions_root()));
@@ -960,6 +971,20 @@ fn parse_truthy_env(name: &str) -> bool {
                 | "ALL"
         )
     )
+}
+
+/// Like [`parse_truthy_env`] but with an explicit default when the variable
+/// is unset/empty, and recognising falsey spellings so an operator can turn a
+/// default-on knob OFF. Unrecognised non-empty values keep `default`.
+fn parse_truthy_env_default(name: &str, default: bool) -> bool {
+    match std::env::var(name).ok().as_deref() {
+        Some("1" | "true" | "True" | "TRUE" | "yes" | "Yes" | "YES" | "on" | "On" | "ON") => true,
+        Some("0" | "false" | "False" | "FALSE" | "no" | "No" | "NO" | "off" | "Off" | "OFF") => {
+            false
+        }
+        // Unset, empty, or an unrecognised value keeps the default.
+        None | Some(_) => default,
+    }
 }
 
 /// Parse `COPPERCLAW_DEFAULT_EFFORT` env var into an `Effort` tier.

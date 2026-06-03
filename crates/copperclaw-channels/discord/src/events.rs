@@ -71,6 +71,8 @@ pub fn message_create_to_inbound(
         channel_type: ChannelType::new(CHANNEL_TYPE_STR),
         platform_id: channel_id.clone(),
         thread_id: Some(parent.to_owned()),
+        // Parent author not resolved here — must not count as a mention.
+        replying_to_self: None,
     });
 
     let content_text = extract_string(obj, "content").unwrap_or_default();
