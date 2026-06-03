@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M16 wave 4 — searchable cross-session memory + provenance gate — 2026-06-03)
+
+Replaces the flat bind-mounted `/data/memory/` with a per-group searchable
+store. Full workspace gate clean (6,375 tests). (Provider fallback/multi-key,
+the other wave-4 unit, was rejected in review for a dead live-path failover
+and is being reworked — not yet landed.)
+
+- **Per-group memory store + tools.** Migration `021_memory_store.sql` +
+  `copperclaw-db/src/memory.rs`: a per-group SQLite store with FTS5
+  full-text search (and vector similarity where wired). New
+  `memory_search` / `memory_get` MCP tools (`copperclaw-mcp/src/tools/memory.rs`).
+  Per-group isolation preserved.
+- **Provenance approval gate (coarse, by design).** Memory entries and tool
+  outputs are tagged trusted/untrusted (`TurnTrust` /
+  `is_credentialed_external` in `copperclaw-runner`); any turn whose context
+  contains untrusted-provenance content requires fresh approval for
+  credentialed external actions, and autonomous/heartbeat turns read-then-
+  propose rather than act. **Honest limitation: taint cannot propagate
+  through an LLM**, so this gate is necessarily coarse — it bounds, not
+  eliminates, memory-poisoning / delayed-execution risk. Known follow-up:
+  `web_search` results are not yet tagged as an untrusted *source*.
+
 ### Security (M16 hardening wave 3 — DNS filter + nftables egress, credential broker — 2026-06-02)
 
 The hardest greenfield units. Both opt-in and default-unchanged; what is
