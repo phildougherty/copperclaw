@@ -89,6 +89,10 @@ const CENTRAL: &[Migration] = &[
         name: "019_container_config_tool_profile",
         sql: include_str!("../migrations/019_container_config_tool_profile.sql"),
     },
+    Migration {
+        name: "020_provider_profiles",
+        sql: include_str!("../migrations/020_provider_profiles.sql"),
+    },
 ];
 
 const SESSION_INBOUND: &[Migration] = &[
@@ -260,6 +264,8 @@ mod tests {
             "outbound_dropped_messages",
             "container_configs",
             "tasks",
+            "provider_profiles",
+            "provider_health",
         ] {
             let exists: i64 = conn
                 .query_row(

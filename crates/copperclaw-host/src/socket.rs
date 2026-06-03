@@ -225,6 +225,22 @@ pub fn build_dispatch_table() -> DispatchTable {
         true
     );
 
+    // Provider resilience (M16 Phase 4): per-group fallback chains,
+    // per-channel model pins, and live health inspection.
+    ins!(
+        "groups.provider.set-chain",
+        handlers::provider::set_chain,
+        true
+    );
+    ins!(
+        "groups.provider.set-pins",
+        handlers::provider::set_pins,
+        true
+    );
+    ins!("groups.provider.clear", handlers::provider::clear, true);
+    ins!("groups.provider.get", handlers::provider::get, false);
+    ins!("groups.provider.status", handlers::provider::status, false);
+
     // Egress posture report (Phase 0a v1 / Top 10 #6). Read-only; consumed
     // by `cclaw doctor` to surface the host egress mode + each group's
     // effective allow-list (configured + auto-injected model endpoint).

@@ -388,6 +388,52 @@ pub enum GroupsCmd {
         #[command(subcommand)]
         action: GroupConfigCmd,
     },
+    /// Provider-resilience subcommands (fallback chains, multi-key
+    /// rotation, per-channel model pins, health inspection).
+    Provider {
+        #[command(subcommand)]
+        action: GroupProviderCmd,
+    },
+}
+
+/// `groups provider …` — configure + inspect the per-group provider
+/// fallback chain, multi-key rotation, and per-channel model pins.
+#[derive(Debug, Subcommand)]
+pub enum GroupProviderCmd {
+    /// Show the configured fallback chain + pins for a group.
+    Get { id: String },
+    /// Show the chain alongside live per-`(provider, model, key)` health.
+    Status { id: String },
+    /// Set the ordered fallback chain (position 0 is the primary).
+    ///
+    /// `--chain` is a JSON array of `{provider, model, keys?}` entries, e.g.
+    /// `'[{"provider":"anthropic","model":"claude-sonnet-4-6","keys":[{"id":"primary","api_key_env":"ANTHROPIC_API_KEY"}]},{"provider":"ollama","model":"qwen3.6:27b"}]'`.
+    /// `--pins` is an optional `{channel: model}` JSON object.
+    #[command(name = "set-chain")]
+    SetChain {
+        id: String,
+        /// JSON array of `{provider, model, keys?}` chain entries.
+        #[arg(long)]
+        chain: String,
+        /// Optional `{channel: model}` JSON object for per-channel pinning.
+        #[arg(long)]
+        pins: Option<String>,
+        /// Optional re-probe cool-down override, in seconds.
+        #[arg(long = "reprobe-after-secs")]
+        reprobe_after_secs: Option<u64>,
+    },
+    /// Replace the per-channel model pin map (requires an existing chain).
+    ///
+    /// `--pins` is a `{channel: model}` JSON object.
+    #[command(name = "set-pins")]
+    SetPins {
+        id: String,
+        /// `{channel: model}` JSON object.
+        #[arg(long)]
+        pins: String,
+    },
+    /// Remove the provider chain + pins + health (revert to single-provider).
+    Clear { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1213,6 +1259,49 @@ impl GroupsCmd {
                 json!({"id": id, "enabled": false}),
             ),
             Self::Config { action } => action.to_call(),
+            Self::Provider { action } => action.to_call(),
+        }
+    }
+}
+
+impl GroupProviderCmd {
+    pub fn to_call(&self) -> ParsedCall {
+        match self {
+            Self::Get { id } => ParsedCall::new("groups.provider.get", json!({"id": id})),
+            Self::Status { id } => ParsedCall::new("groups.provider.status", json!({"id": id})),
+            Self::SetChain {
+                id,
+                chain,
+                pins,
+                reprobe_after_secs,
+            } => {
+                // Parse the chain JSON here so a malformed blob fails the CLI
+                // early; on parse failure pass the raw string through so the
+                // host returns the precise `bad_request`.
+                let chain_val = serde_json::from_str::<Value>(chain)
+                    .unwrap_or_else(|_| Value::String(chain.clone()));
+                let mut o = Map::new();
+                o.insert("id".into(), id.clone().into());
+                o.insert("chain".into(), chain_val);
+                if let Some(p) = pins {
+                    let pins_val = serde_json::from_str::<Value>(p)
+                        .unwrap_or_else(|_| Value::String(p.clone()));
+                    o.insert("model_by_channel".into(), pins_val);
+                }
+                if let Some(secs) = reprobe_after_secs {
+                    o.insert("reprobe_after_secs".into(), (*secs).into());
+                }
+                ParsedCall::new("groups.provider.set-chain", Value::Object(o))
+            }
+            Self::SetPins { id, pins } => {
+                let pins_val = serde_json::from_str::<Value>(pins)
+                    .unwrap_or_else(|_| Value::String(pins.clone()));
+                ParsedCall::new(
+                    "groups.provider.set-pins",
+                    json!({"id": id, "model_by_channel": pins_val}),
+                )
+            }
+            Self::Clear { id } => ParsedCall::new("groups.provider.clear", json!({"id": id})),
         }
     }
 }
@@ -1642,6 +1731,11 @@ pub const ALL_COMMANDS: &[&str] = &[
     "groups.config.set-egress-allow",
     "groups.config.set-resource-limits",
     "groups.config.set-coding-enabled",
+    "groups.provider.get",
+    "groups.provider.status",
+    "groups.provider.set-chain",
+    "groups.provider.set-pins",
+    "groups.provider.clear",
     "messaging-groups.list",
     "messaging-groups.get",
     "messaging-groups.create",
@@ -1867,6 +1961,81 @@ mod tests {
         let cli = Cli::try_parse_from(["cclaw"]).unwrap();
         let p = cli.to_call();
         assert_eq!(p.command, "composite.dashboard");
+    }
+
+    // --- groups provider (resilience) -------------------------------------
+
+    #[test]
+    fn groups_provider_get_and_status() {
+        let p = parse(&["cclaw", "groups", "provider", "get", "g1"]);
+        assert_eq!(p.command, "groups.provider.get");
+        assert_eq!(p.args, json!({"id": "g1"}));
+
+        let p = parse(&["cclaw", "groups", "provider", "status", "g1"]);
+        assert_eq!(p.command, "groups.provider.status");
+        assert_eq!(p.args, json!({"id": "g1"}));
+    }
+
+    #[test]
+    fn groups_provider_set_chain_parses_json() {
+        let chain = r#"[{"provider":"anthropic","model":"claude-sonnet-4-6","keys":[{"id":"primary","api_key_env":"ANTHROPIC_API_KEY"}]},{"provider":"ollama","model":"qwen3.6:27b"}]"#;
+        let p = parse(&[
+            "cclaw",
+            "groups",
+            "provider",
+            "set-chain",
+            "g1",
+            "--chain",
+            chain,
+            "--pins",
+            r#"{"telegram":"claude-opus-4-1"}"#,
+            "--reprobe-after-secs",
+            "90",
+        ]);
+        assert_eq!(p.command, "groups.provider.set-chain");
+        assert_eq!(p.args["id"], "g1");
+        assert_eq!(p.args["chain"][0]["provider"], "anthropic");
+        assert_eq!(p.args["chain"][1]["provider"], "ollama");
+        assert_eq!(p.args["model_by_channel"]["telegram"], "claude-opus-4-1");
+        assert_eq!(p.args["reprobe_after_secs"], 90);
+    }
+
+    #[test]
+    fn groups_provider_set_chain_without_optional_flags() {
+        let p = parse(&[
+            "cclaw",
+            "groups",
+            "provider",
+            "set-chain",
+            "g1",
+            "--chain",
+            r#"[{"provider":"anthropic","model":"m"}]"#,
+        ]);
+        assert_eq!(p.command, "groups.provider.set-chain");
+        assert!(p.args.get("model_by_channel").is_none());
+        assert!(p.args.get("reprobe_after_secs").is_none());
+    }
+
+    #[test]
+    fn groups_provider_set_pins() {
+        let p = parse(&[
+            "cclaw",
+            "groups",
+            "provider",
+            "set-pins",
+            "g1",
+            "--pins",
+            r#"{"cli":"m-cli"}"#,
+        ]);
+        assert_eq!(p.command, "groups.provider.set-pins");
+        assert_eq!(p.args["model_by_channel"]["cli"], "m-cli");
+    }
+
+    #[test]
+    fn groups_provider_clear() {
+        let p = parse(&["cclaw", "groups", "provider", "clear", "g1"]);
+        assert_eq!(p.command, "groups.provider.clear");
+        assert_eq!(p.args, json!({"id": "g1"}));
     }
 
     #[test]
@@ -2584,6 +2753,27 @@ mod tests {
             &["cclaw", "groups", "config", "set-resource-limits", "x"],
             &["cclaw", "groups", "enable-coding", "x"],
             &["cclaw", "groups", "disable-coding", "x"],
+            &["cclaw", "groups", "provider", "get", "x"],
+            &["cclaw", "groups", "provider", "status", "x"],
+            &[
+                "cclaw",
+                "groups",
+                "provider",
+                "set-chain",
+                "x",
+                "--chain",
+                r#"[{"provider":"anthropic","model":"m"}]"#,
+            ],
+            &[
+                "cclaw",
+                "groups",
+                "provider",
+                "set-pins",
+                "x",
+                "--pins",
+                r#"{"cli":"m"}"#,
+            ],
+            &["cclaw", "groups", "provider", "clear", "x"],
             &["cclaw", "messaging-groups", "list"],
             &["cclaw", "messaging-groups", "get", "x"],
             &[

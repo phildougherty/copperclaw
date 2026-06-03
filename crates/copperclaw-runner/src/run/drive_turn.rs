@@ -28,8 +28,13 @@ pub(super) struct TurnResult {
     pub(super) outcome: TurnOutcome,
 }
 
+/// Outcome of one per-inbound drive. Public because the host's
+/// provider-resilience integration test (`copperclaw-host`) drives the real
+/// emit→record→fold path and needs to construct the same `Failed(reason)` the
+/// runner reports, so the `build_usage_report_payload` mapping is exercised
+/// end-to-end rather than re-implemented in the test.
 #[derive(Debug, Clone)]
-pub(super) enum TurnOutcome {
+pub enum TurnOutcome {
     /// Model produced a final response.
     Done,
     /// Turn could not complete. The wrapped string is a short

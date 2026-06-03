@@ -645,6 +645,37 @@ impl ContainerManager {
             }
         }
 
+        // Multi-key provider rotation (M16 Phase 4): when the group's fallback
+        // chain selected a chain-entry key whose `api_key_env` is a NON-default
+        // name (e.g. `ANTHROPIC_API_KEY_B`), `runner.json` names that var but
+        // the runner can only read it if its *value* is actually in the
+        // container env. Resolution is the pure [`resolve_multi_key_secret`]
+        // (testable under `forbid(unsafe_code)`); the host process env is the
+        // injected fallback lookup. A `None` result means nothing to inject
+        // (default key, no-auth provider, already-forwarded, or unset). Read-
+        // only re-select — no fold/audit (those ran when `runner.json` was
+        // assembled).
+        let selected_key_env = self.selected_api_key_env(session, chrono::Utc::now());
+        match resolve_multi_key_secret(
+            selected_key_env.as_deref(),
+            &rotatable.forward_env,
+            |name| std::env::var(name).ok(),
+        ) {
+            MultiKeySecret::Inject { name, value } => {
+                spec = spec.with_env(&name, &value);
+            }
+            MultiKeySecret::Missing { name } => {
+                warn!(
+                    agent_group = %session.agent_group_id.as_uuid(),
+                    key_env = %name,
+                    "provider failover selected a multi-key api_key_env that is unset \
+                     or empty in the host env; the runner will have the var name but \
+                     no value — set it in the install .env"
+                );
+            }
+            MultiKeySecret::None => {}
+        }
+
         // Per-group resource limits (Top 10 #8 / M13).
         if let Some(c) = cfg {
             match ResourceLimits::from_json(&c.resource_limits) {
@@ -1092,6 +1123,56 @@ pub(super) fn host_uid_gid() -> Option<(u32, u32)> {
 
 pub(super) fn container_name(_agent: AgentGroupId, session: copperclaw_types::SessionId) -> String {
     format!("copperclaw-{}", session.as_uuid())
+}
+
+/// Outcome of resolving the secret value for a provider-failover-selected
+/// multi-key `api_key_env`.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum MultiKeySecret {
+    /// Inject `name=value` into the container env.
+    Inject { name: String, value: String },
+    /// The key was selected but has no resolvable value — warn; the runner
+    /// will have the name but no secret.
+    Missing { name: String },
+    /// Nothing to do (no selection, the default `ANTHROPIC_API_KEY` slot which
+    /// is wired elsewhere, or a key already present in `forward_env`).
+    None,
+}
+
+/// Pure resolver for the multi-key rotation secret (M16 Phase 4). Decides what
+/// (if anything) `build_spec` must inject for a chain-selected `api_key_env`.
+///
+/// Env-free so it is testable under the workspace's `forbid(unsafe_code)`
+/// (which makes `std::env::set_var` unavailable): `lookup` is the injected
+/// process-env reader, supplied by `build_spec` as `std::env::var`.
+///
+/// Rules:
+/// * `None` selection / the default `ANTHROPIC_API_KEY` name ⇒ `None` (the
+///   default slot is wired by `build_spec` directly, possibly as a broker
+///   token — never clobber it here).
+/// * a name already in `forward_env` ⇒ `None` (the forward loop injected it).
+/// * otherwise resolve the value via `lookup`; non-empty ⇒ `Inject`,
+///   unset/empty ⇒ `Missing`.
+pub(super) fn resolve_multi_key_secret(
+    selected: Option<&str>,
+    forward_env: &[(String, String)],
+    lookup: impl Fn(&str) -> Option<String>,
+) -> MultiKeySecret {
+    let Some(name) = selected else {
+        return MultiKeySecret::None;
+    };
+    if name == "ANTHROPIC_API_KEY" || forward_env.iter().any(|(k, _)| k == name) {
+        return MultiKeySecret::None;
+    }
+    match lookup(name).filter(|v| !v.is_empty()) {
+        Some(value) => MultiKeySecret::Inject {
+            name: name.to_string(),
+            value,
+        },
+        None => MultiKeySecret::Missing {
+            name: name.to_string(),
+        },
+    }
 }
 
 /// Locate a session's on-disk root by scanning `<sessions_dir>/*/<session_id>`.
@@ -3006,5 +3087,106 @@ mod tests {
         // A more realistic extreme: the validator-capped 300s
         // deadline against a tiny heartbeat — must Err, not panic.
         assert!(check_heartbeat_deadline_alignment(10, 300_000).is_err());
+    }
+
+    // ---- M16 Phase 4: multi-key secret injection (MEDIUM 3) ----
+
+    #[test]
+    fn resolve_multi_key_secret_rules() {
+        let fwd = vec![("TAVILY_API_KEY".to_string(), "tv".to_string())];
+        // No selection -> nothing to inject.
+        assert_eq!(
+            resolve_multi_key_secret(None, &fwd, |_| None),
+            MultiKeySecret::None
+        );
+        // The default slot is wired elsewhere (and may be a broker token) —
+        // never inject it here even if a chain pins it by name.
+        assert_eq!(
+            resolve_multi_key_secret(Some("ANTHROPIC_API_KEY"), &fwd, |_| Some("x".into())),
+            MultiKeySecret::None
+        );
+        // Already forwarded by the operator -> the forward loop handles it.
+        assert_eq!(
+            resolve_multi_key_secret(Some("TAVILY_API_KEY"), &fwd, |_| Some("x".into())),
+            MultiKeySecret::None
+        );
+        // A non-default selected key whose value resolves -> inject name+value.
+        assert_eq!(
+            resolve_multi_key_secret(Some("ANTHROPIC_API_KEY_B"), &fwd, |n| {
+                (n == "ANTHROPIC_API_KEY_B").then(|| "sk-secondary".to_string())
+            }),
+            MultiKeySecret::Inject {
+                name: "ANTHROPIC_API_KEY_B".into(),
+                value: "sk-secondary".into(),
+            }
+        );
+        // Selected but unset/empty in the host env -> Missing (warn at spawn).
+        assert_eq!(
+            resolve_multi_key_secret(Some("ANTHROPIC_API_KEY_B"), &fwd, |_| None),
+            MultiKeySecret::Missing {
+                name: "ANTHROPIC_API_KEY_B".into(),
+            }
+        );
+        assert_eq!(
+            resolve_multi_key_secret(Some("ANTHROPIC_API_KEY_B"), &fwd, |_| Some(String::new())),
+            MultiKeySecret::Missing {
+                name: "ANTHROPIC_API_KEY_B".into(),
+            }
+        );
+    }
+
+    /// End-to-end: a chain that selects a NON-default key env (`api_key_env =
+    /// ANTHROPIC_API_KEY_B`) must produce a container env that actually carries
+    /// that var's *value* — `runner.json` names it, so without the value the
+    /// runner has a name pointing at nothing. The value here is sourced via the
+    /// rotatable `forward_env` (the SIGHUP-rotatable surface), which is what an
+    /// operator sets the secondary key through; that exercises the same
+    /// `selected_api_key_env` selection the live path runs.
+    #[test]
+    fn build_spec_injects_selected_multi_key_secret_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        // Carry the secondary key's value the way an operator would (.env ->
+        // rotatable forward_env). build_spec must surface it for the container.
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.forward_env = vec![(
+            "ANTHROPIC_API_KEY_B".to_string(),
+            "sk-secondary".to_string(),
+        )];
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        // Single-entry chain whose only key names the secondary env var, so the
+        // selector picks ANTHROPIC_API_KEY_B with no degrade needed.
+        copperclaw_db::tables::provider_profiles::set_chain(
+            &db,
+            session.agent_group_id,
+            &serde_json::json!([
+                {"provider": "anthropic", "model": "claude-sonnet-4-6",
+                 "keys": [{"id": "k2", "api_key_env": "ANTHROPIC_API_KEY_B"}]}
+            ]),
+            &serde_json::json!({}),
+            None,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        // Confirm the selection actually resolves to the secondary key env.
+        assert_eq!(
+            mgr.selected_api_key_env(&session, chrono::Utc::now())
+                .as_deref(),
+            Some("ANTHROPIC_API_KEY_B"),
+        );
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
+        assert!(
+            spec.env
+                .iter()
+                .any(|(k, v)| k == "ANTHROPIC_API_KEY_B" && v == "sk-secondary"),
+            "selected multi-key api_key_env value must reach the container env: {:?}",
+            spec.env
+        );
     }
 }

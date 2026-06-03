@@ -43,6 +43,13 @@ copperclaw-channels-deltachat = { workspace = true }
 copperclaw-channels-emacs    = { workspace = true }
 copperclaw-channels-x        = { workspace = true }
 copperclaw-modules       = { workspace = true }
+# Provider resilience (M16 Phase 4): the fallback-chain / multi-key-rotation
+# / health state machine lives in `copperclaw-providers::failover`. The host
+# bridges the persisted chain + health (central DB) into a `FallbackChain`
+# and calls `select` when assembling `runner.json`. Already a transitive dep
+# via `copperclaw-runner`; promoting it to a direct dep adds no new code
+# (providers depends only on `copperclaw-types`, so no cycle).
+copperclaw-providers     = { workspace = true }
 copperclaw-skills        = { workspace = true }
 copperclaw-onecli        = { workspace = true }
 copperclaw-metrics       = { workspace = true }
@@ -80,7 +87,6 @@ tempfile = "3"
 filetime = "0.2"
 copperclaw-cclaw = { path = "../copperclaw-cclaw" }
 copperclaw-runner = { workspace = true }
-copperclaw-providers = { workspace = true }
 copperclaw-mcp = { workspace = true }
 tokio = { workspace = true }
 wiremock = "=0.6.2"

@@ -17,6 +17,7 @@ use copperclaw_types::ProviderEvent;
 pub mod anthropic;
 pub mod codex;
 pub mod error;
+pub mod failover;
 pub mod ollama;
 pub mod opencode;
 pub mod subprocess;
@@ -25,6 +26,10 @@ pub mod types;
 pub use anthropic::AnthropicProvider;
 pub use codex::CodexProvider;
 pub use error::ProviderError;
+pub use failover::{
+    AMBIENT_KEY_ID, ChainEntry, DegradeReason, FallbackChain, HealthEntry, HealthKey, HealthMap,
+    HealthStatus, ProviderKey, Selection,
+};
 pub use ollama::OllamaProvider;
 pub use opencode::OpenCodeProvider;
 pub use subprocess::{PushPolicy, SubprocessConfig, SubprocessProvider};

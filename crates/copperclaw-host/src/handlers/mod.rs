@@ -33,6 +33,7 @@ pub mod mcp;
 pub mod members;
 pub mod messaging_groups;
 pub mod pairing;
+pub mod provider;
 pub mod roles;
 pub mod schema;
 pub mod sessions;
@@ -59,6 +60,9 @@ pub const HOST_ONLY_COMMANDS: &[&str] = &[
     "groups.config.set-egress-allow",
     "groups.config.set-resource-limits",
     "groups.config.set-coding-enabled",
+    "groups.provider.set-chain",
+    "groups.provider.set-pins",
+    "groups.provider.clear",
     "messaging-groups.create",
     "messaging-groups.update",
     "messaging-groups.delete",
