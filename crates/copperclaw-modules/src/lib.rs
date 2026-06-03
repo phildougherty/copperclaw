@@ -39,7 +39,7 @@ pub use agent_to_agent::{
 };
 pub use approvals::{
     ApprovalSummary, ApprovalsModule, DecisionOutcome, DecisionRecord, NewPendingCtx,
-    NewPendingNotifier,
+    NewPendingNotifier, PairingNotifier,
 };
 pub use context::{
     ChannelRequestCtx, DeliveryActionHandler, DeliveryActionInput, DeliveryActionOutput,

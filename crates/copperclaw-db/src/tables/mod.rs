@@ -15,6 +15,7 @@ pub mod container_configs;
 pub mod container_state;
 pub mod delivered;
 pub mod destinations;
+pub mod dm_pairing_codes;
 pub mod dropped_messages;
 pub mod group_budgets;
 pub mod messages_in;

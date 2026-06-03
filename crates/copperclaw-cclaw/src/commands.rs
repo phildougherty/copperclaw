@@ -150,6 +150,11 @@ pub enum TopCommand {
         #[command(subcommand)]
         action: ApprovalsCmd,
     },
+    /// DM pairing codes (unknown-sender onboarding).
+    Pairing {
+        #[command(subcommand)]
+        action: PairingCmd,
+    },
     /// Mutation audit log.
     Audit {
         #[command(subcommand)]
@@ -933,6 +938,32 @@ pub enum ApprovalsCmd {
     },
 }
 
+// --- pairing ---------------------------------------------------------------
+
+/// `cclaw pairing ...` — DM pairing codes for onboarding unknown senders.
+///
+/// When an unknown sender first DMs the bot, the host mints a single-use
+/// 8-char code (1h TTL, rate-limited per channel) and delivers it back to
+/// that sender through the normal outbound path. The user relays the code to
+/// the operator, who promotes them with `cclaw pairing approve <code>`.
+#[derive(Debug, Subcommand)]
+pub enum PairingCmd {
+    /// List active (unexpired) pairing codes. `--all` includes consumed and
+    /// expired rows.
+    List {
+        /// Include consumed / expired codes, not just active ones.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Approve a pairing code: promote the bound sender into `users` and mark
+    /// the code consumed. The sender-scope gate honours the approval on the
+    /// next inbound — no host restart needed.
+    Approve {
+        /// The 8-char pairing code the sender relayed.
+        code: String,
+    },
+}
+
 /// `cclaw budgets ...` — per-agent-group daily and rate-limit caps.
 #[derive(Debug, Subcommand)]
 pub enum BudgetsCmd {
@@ -1024,6 +1055,7 @@ impl TopCommand {
             Self::UserDms { action } => action.to_call(),
             Self::DroppedMessages { action } => action.to_call(),
             Self::Approvals { action } => action.to_call(),
+            Self::Pairing { action } => action.to_call(),
             Self::Audit { action } => action.to_call(),
             Self::Budgets { action } => action.to_call(),
             Self::Quickstart { action } => action.to_call(),
@@ -1542,6 +1574,15 @@ impl ApprovalsCmd {
     }
 }
 
+impl PairingCmd {
+    pub fn to_call(&self) -> ParsedCall {
+        match self {
+            Self::List { all } => ParsedCall::new("pairing.list", json!({ "all": all })),
+            Self::Approve { code } => ParsedCall::new("pairing.approve", json!({ "code": code })),
+        }
+    }
+}
+
 impl AuditCmd {
     pub fn to_call(&self) -> ParsedCall {
         match self {
@@ -1642,6 +1683,8 @@ pub const ALL_COMMANDS: &[&str] = &[
     "approvals.deny",
     "approvals.revoke",
     "approvals.decisions",
+    "pairing.list",
+    "pairing.approve",
     "audit.list",
     "budgets.list",
     "budgets.set",
@@ -2462,6 +2505,19 @@ mod tests {
         assert_eq!(p.args, json!({"id": "appr_6", "limit": 10}));
     }
 
+    #[test]
+    fn pairing_list_and_approve() {
+        let p = parse(&["cclaw", "pairing", "list"]);
+        assert_eq!(p.command, "pairing.list");
+        assert_eq!(p.args, json!({"all": false}));
+        let p = parse(&["cclaw", "pairing", "list", "--all"]);
+        assert_eq!(p.command, "pairing.list");
+        assert_eq!(p.args, json!({"all": true}));
+        let p = parse(&["cclaw", "pairing", "approve", "ABCDEFGH"]);
+        assert_eq!(p.command, "pairing.approve");
+        assert_eq!(p.args, json!({"code": "ABCDEFGH"}));
+    }
+
     // --- meta --------------------------------------------------------------
 
     #[test]
@@ -2608,6 +2664,8 @@ mod tests {
             &["cclaw", "approvals", "deny", "appr-1"],
             &["cclaw", "approvals", "revoke", "appr-1"],
             &["cclaw", "approvals", "decisions"],
+            &["cclaw", "pairing", "list"],
+            &["cclaw", "pairing", "approve", "ABCDEFGH"],
             &["cclaw", "audit", "list"],
             &["cclaw", "budgets", "list"],
             &[

@@ -32,6 +32,7 @@ pub mod groups;
 pub mod mcp;
 pub mod members;
 pub mod messaging_groups;
+pub mod pairing;
 pub mod roles;
 pub mod schema;
 pub mod sessions;
@@ -77,6 +78,7 @@ pub const HOST_ONLY_COMMANDS: &[&str] = &[
     "approvals.approve",
     "approvals.deny",
     "approvals.revoke",
+    "pairing.approve",
     "budgets.set",
     "db.backup",
     "db.restore",
