@@ -401,11 +401,32 @@ pub fn schema() -> Tool {
 
 pub async fn handle(
     arguments: Option<JsonObject>,
-    _ctx: &dyn crate::context::ToolContext,
+    ctx: &dyn crate::context::ToolContext,
+) -> Result<CallToolResult, ToolError> {
+    handle_with_env(arguments, ctx, &SystemEnv).await
+}
+
+/// Inner entry point parameterised over the env lookup so tests can inject a
+/// key-free [`MapEnv`] and exercise the provenance-taint hook deterministically
+/// without mutating process-wide environment (which would need `unsafe` under
+/// the workspace's `unsafe_code = "forbid"`).
+async fn handle_with_env(
+    arguments: Option<JsonObject>,
+    ctx: &dyn crate::context::ToolContext,
+    env: &dyn EnvLookup,
 ) -> Result<CallToolResult, ToolError> {
     let input: Input = parse_args(arguments)?;
-    let env = SystemEnv;
-    let output = search(input, &env).await?;
+    // PROVENANCE: search results are external, attacker-influenceable
+    // content — titles, urls, and snippets all come straight off the open
+    // web (SEO-poisoned pages, prompt-injection payloads in result text).
+    // Tag the turn untrusted up front (before any result lands in history),
+    // mirroring `web_fetch` / `browser_render`, so the runner's coarse
+    // provenance gate blocks credentialed external actions for the rest of
+    // this turn absent fresh approval. Done with the raw query (not the
+    // normalised one) so the audit label still reflects what the model
+    // asked even if validation later rejects the call.
+    ctx.mark_untrusted_context(&format!("web_search:{}", input.query.trim()));
+    let output = search(input, env).await?;
     Ok(success_json(&output))
 }
 
@@ -897,6 +918,69 @@ mod tests {
     use super::*;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A ctx that records every `mark_untrusted_context(source)` call so the
+    /// `web_search` provenance test can assert the turn was tainted. Mirrors
+    /// the `web_fetch` provenance test's recorder.
+    #[derive(Default)]
+    struct TaintRecordingCtx {
+        sources: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::context::ToolContext for TaintRecordingCtx {
+        async fn emit_outbound(
+            &self,
+            _e: crate::context::OutboundToolEffect,
+        ) -> Result<crate::context::ToolEffectAck, ToolError> {
+            Ok(crate::context::ToolEffectAck::Accepted)
+        }
+        async fn list_tasks(&self) -> Result<Vec<crate::context::TaskSummary>, ToolError> {
+            Ok(Vec::new())
+        }
+        fn mark_untrusted_context(&self, source: &str) {
+            self.sources.lock().unwrap().push(source.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn web_search_taints_turn_with_untrusted_provenance() {
+        // PROVENANCE: search results (titles/urls/snippets) are external,
+        // attacker-influenceable content. The handler must flag the turn
+        // untrusted up front so the runner's coarse gate blocks credentialed
+        // external actions. The taint fires BEFORE the provider request, so
+        // the no-provider validation-error path proves it cleanly: with a
+        // key-free env the search itself errors, but the turn is still tainted
+        // exactly once with a `web_search:<query>` source label. Injecting the
+        // env (rather than mutating `std::env`) keeps this deterministic and
+        // `unsafe`-free under the workspace's `unsafe_code = "forbid"`.
+        let ctx = std::sync::Arc::new(TaintRecordingCtx::default());
+        let env = env_with(&[]); // no provider keys → search() validation error
+        let res = handle_with_env(
+            Some(
+                json!({"query": "  attacker-controlled query  "})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            ctx.as_ref(),
+            &env,
+        )
+        .await;
+        // The search errored (no provider), but the taint must have fired
+        // regardless — the provenance hook runs before the provider lookup.
+        assert!(res.is_err(), "no provider configured → validation error");
+        let sources = ctx.sources.lock().unwrap();
+        assert_eq!(
+            sources.len(),
+            1,
+            "web_search must taint the turn exactly once"
+        );
+        assert_eq!(
+            sources[0], "web_search:attacker-controlled query",
+            "taint source should name the tool + trimmed query; got: {}",
+            sources[0]
+        );
+    }
 
     fn env_with(pairs: &[(&str, &str)]) -> MapEnv {
         MapEnv::from_pairs(

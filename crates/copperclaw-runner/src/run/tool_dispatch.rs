@@ -379,6 +379,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn web_search_run_taints_turn_then_blocks_credentialed_external() {
+        // END-TO-END headline case for this change: running `web_search`
+        // through the real dispatch path must mark the turn untrusted-
+        // provenance (its results are attacker-influenceable), after which a
+        // subsequent credentialed external action trips the coarse gate absent
+        // fresh approval — even under the Full profile.
+        //
+        // No provider key is configured in the test env, so the web_search
+        // handler's downstream provider lookup errors — but the taint hook
+        // fires BEFORE that, which is the whole point: the turn is tainted the
+        // moment the tool ran, regardless of the network outcome.
+        let (_tmp, deps, ctx) = deps_with_runner_ctx();
+        assert!(!ctx.is_context_tainted(), "fresh turn must start untainted");
+        // A credentialed external action on the still-clean turn is NOT gated
+        // (it'll fail downstream without a network stub, but not with a policy
+        // deny — that's what we assert).
+        let (clean, _i, _e) = invoke_tool(&deps, &call("install_packages")).await;
+        assert!(
+            !clean.contains("untrusted-provenance"),
+            "clean turn must not be gated; got: {clean}"
+        );
+        // Run web_search itself. The handler taints the turn up front.
+        let (_searched, _i, _e) = invoke_tool(
+            &deps,
+            &call_with("web_search", serde_json::json!({"query": "anything"})),
+        )
+        .await;
+        assert!(
+            ctx.is_context_tainted(),
+            "running web_search must taint the turn untrusted-provenance"
+        );
+        // Now a subsequent credentialed external action trips the gate.
+        let (blocked, _i, is_error) = invoke_tool(&deps, &call("install_packages")).await;
+        assert!(is_error);
+        assert!(
+            blocked.contains("untrusted-provenance"),
+            "tainted turn must block credentialed external action; got: {blocked}"
+        );
+        // A second web_search is likewise blocked now (it is itself a
+        // credentialed external action, and the turn is tainted).
+        let (blocked2, _i, is_error2) = invoke_tool(
+            &deps,
+            &call_with("web_search", serde_json::json!({"query": "again"})),
+        )
+        .await;
+        assert!(is_error2);
+        assert!(
+            blocked2.contains("untrusted-provenance"),
+            "a tainted turn must block a follow-up web_search too; got: {blocked2}"
+        );
+        // Non-credentialed tools stay reachable on the tainted turn.
+        let (mem, _i, _e) = invoke_tool(
+            &deps,
+            &call_with("memory_search", serde_json::json!({"query": "x"})),
+        )
+        .await;
+        assert!(
+            !mem.contains("untrusted-provenance"),
+            "memory_search must stay reachable on a tainted turn; got: {mem}"
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_with_only_trusted_tools_does_not_trip_gate() {
+        // Control for the headline case: a turn that runs only trusted tools
+        // (here a local read_file) must NOT taint, so a subsequent credentialed
+        // external action is permitted by the provenance gate.
+        let (tmp, deps, ctx) = deps_with_runner_ctx();
+        // Create a file the read_file tool can actually read so the call
+        // succeeds end-to-end (a trusted, local read).
+        let file = tmp.path().join("note.txt");
+        std::fs::write(&file, "local trusted content").unwrap();
+        let (read, _i, read_err) = invoke_tool(
+            &deps,
+            &call_with(
+                "read_file",
+                serde_json::json!({"path": file.to_string_lossy()}),
+            ),
+        )
+        .await;
+        assert!(
+            !read_err,
+            "read_file of a local file should succeed: {read}"
+        );
+        assert!(
+            !ctx.is_context_tainted(),
+            "a trusted local read must not taint the turn"
+        );
+        // The credentialed external action is NOT gated by provenance (it may
+        // still fail downstream for lack of a network stub, but must not carry
+        // the untrusted-provenance deny).
+        let (after, _i, _e) = invoke_tool(&deps, &call("install_packages")).await;
+        assert!(
+            !after.contains("untrusted-provenance"),
+            "trusted-only turn must not trip the provenance gate; got: {after}"
+        );
+    }
+
+    #[tokio::test]
     async fn autonomous_turn_blocks_credentialed_external_at_dispatch() {
         let (_tmp, deps, ctx) = deps_with_runner_ctx();
         ctx.set_turn_provenance(true, false); // autonomous, no approval
