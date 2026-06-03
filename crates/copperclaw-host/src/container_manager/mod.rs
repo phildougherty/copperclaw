@@ -42,6 +42,7 @@ pub mod config;
 pub mod egress;
 pub mod mount_guard;
 pub mod prompt;
+pub mod provider_failover;
 pub mod runner_config;
 pub mod spawn;
 pub mod tasks_snapshot;

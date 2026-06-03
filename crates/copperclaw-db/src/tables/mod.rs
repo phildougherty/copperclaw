@@ -27,6 +27,7 @@ pub mod pending_approvals;
 pub mod pending_channel_approvals;
 pub mod pending_questions;
 pub mod processing_ack;
+pub mod provider_profiles;
 pub mod session_routing;
 pub mod session_state;
 pub mod sessions;

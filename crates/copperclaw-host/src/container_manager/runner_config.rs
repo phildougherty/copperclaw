@@ -138,6 +138,26 @@ impl ContainerManager {
         let model = cc
             .and_then(|c| c.model.clone())
             .unwrap_or_else(|| self.cfg.default_model.clone());
+
+        // Provider resilience (M16 Phase 4): when the group has a configured
+        // fallback chain, resolve the active provider/model/key against live
+        // health (degrading off a rate-limited / down primary, re-probing it
+        // back on recovery, honouring per-channel model pins). A degrade is
+        // audited as `provider.degrade`. Groups with no chain configured fall
+        // through with `None` and keep the single-provider selection above.
+        let failover = self.resolve_provider_selection(session, chrono::Utc::now());
+        // The chain entry's provider overrides the single-provider resolution.
+        // Apply the same `claude` -> `anthropic` alias normalisation the
+        // single-provider path uses so the runner sees a canonical name.
+        let provider = failover
+            .as_ref()
+            .map_or(provider, |sel| match sel.provider.as_str() {
+                "" => None,
+                "claude" => Some("anthropic".to_string()),
+                other => Some(other.to_string()),
+            });
+        let model = failover.as_ref().map_or(model, |sel| sel.model.clone());
+
         let assistant_name = cc.and_then(|c| c.assistant_name.clone());
         let max_messages = cc.and_then(|c| c.max_messages_per_prompt);
         let selector = cc.map_or(copperclaw_skills::SkillsSelector::All, |c| {
@@ -263,6 +283,17 @@ impl ContainerManager {
         let api_key_env: Option<String> = match provider.as_deref() {
             Some("ollama" | "codex") => None,
             _ => Some("ANTHROPIC_API_KEY".to_string()),
+        };
+        // Multi-key rotation: when the active chain entry declared an explicit
+        // key with its own `api_key_env`, that overrides the provider default
+        // — but never for the no-auth providers (ollama / codex), which must
+        // keep `None`.
+        let api_key_env = match (
+            &api_key_env,
+            failover.as_ref().and_then(|s| s.api_key_env.clone()),
+        ) {
+            (Some(_), Some(key_env)) => Some(key_env),
+            (existing, _) => existing.clone(),
         };
 
         // For ollama-shim we route api_base_url to OLLAMA_BASE_URL (or
