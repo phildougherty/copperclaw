@@ -40,6 +40,16 @@ pub const CONTAINER_WORKSPACE_DIR: &str = "/workspace";
 /// Filename of the runner-config JSON written into the session dir.
 pub const RUNNER_CONFIG_FILENAME: &str = "runner.json";
 
+/// Filename of the external-MCP tool manifest written into the session dir.
+///
+/// Holds the tool descriptors for every configured external MCP server, AFTER
+/// the per-server include/exclude filter has stripped denied / not-allowed
+/// tools (see [`super::mcp_tools::assemble_mcp_tools`]). A denied tool is
+/// simply absent from this file, so it is never advertised to the model. The
+/// host owns the live connections to those servers; this manifest is the
+/// filtered view the session is permitted to see.
+pub const MCP_TOOLS_FILENAME: &str = "mcp_tools.json";
+
 /// Path inside the container where the runner binary lives. Must
 /// match the path baked into the session image at build time.
 pub const CONTAINER_RUNNER_PATH: &str = "/usr/local/bin/copperclaw-runner";
@@ -251,6 +261,16 @@ impl ContainerManager {
         // umask, so a permissive default can't leave it group/world-readable.
         harden_file_0600(&runner_cfg_path);
 
+        // External MCP tool assembly + per-server filter enforcement (Phase 6
+        // supply-chain). Connect every configured external MCP server, list its
+        // tools THROUGH the per-server include/exclude filter, and write the
+        // filter-stripped manifest to the session dir. A denied tool is never
+        // written here, so it can't be advertised to the model; the same
+        // `FilteredMcpClient` also refuses a denied call before it reaches the
+        // remote. A group with no configured external servers writes an empty
+        // manifest (behaviour unchanged from before this seam existed).
+        self.write_mcp_tools_manifest(session, &paths).await;
+
         // Image rebuild gate (Top 10 #1 / M13).  Compute the fingerprint of
         // the rebuild-relevant config fields.  If the stored fingerprint
         // differs from the current config (or is absent), rebuild the image
@@ -409,6 +429,63 @@ impl ContainerManager {
             "spawned session container"
         );
         Ok(true)
+    }
+
+    /// Assemble this group's external MCP tool set through the per-server
+    /// include/exclude filter and persist the filter-stripped manifest to the
+    /// session dir.
+    ///
+    /// This is the **live enforcement seam**: it connects every configured
+    /// external MCP server (`container_configs.mcp_servers`), wraps each in a
+    /// [`copperclaw_mcp::FilteredMcpClient`], and lists its tools *through that
+    /// filter* — so a denied / not-allowed tool is never written to
+    /// [`MCP_TOOLS_FILENAME`] and therefore never advertised to the model. The
+    /// same `FilteredMcpClient` refuses a denied call before it reaches the
+    /// remote.
+    ///
+    /// Best-effort: connect / list / write failures are logged, never fatal —
+    /// a broken external server must not wedge the session spawn. A group with
+    /// no configured external servers writes an empty manifest (which the
+    /// pre-seam install effectively had).
+    async fn write_mcp_tools_manifest(&self, session: &Session, paths: &SessionPaths) {
+        let assembled =
+            super::mcp_tools::assemble_mcp_tools(&self.central, session.agent_group_id).await;
+        let advertised = assembled.advertised_tools();
+        if assembled.server_count() > 0 {
+            info!(
+                session = %session.id.as_uuid(),
+                agent_group = %session.agent_group_id.as_uuid(),
+                servers = assembled.server_count(),
+                advertised_tools = advertised.len(),
+                "assembled external MCP tools through per-server filter"
+            );
+        }
+        let manifest: Vec<serde_json::Value> = advertised
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.input_schema,
+                })
+            })
+            .collect();
+        let path = paths.root.join(MCP_TOOLS_FILENAME);
+        match serde_json::to_vec_pretty(&manifest) {
+            Ok(bytes) => {
+                if let Err(err) = std::fs::write(&path, bytes) {
+                    warn!(
+                        session = %session.id.as_uuid(),
+                        ?err,
+                        path = %path.display(),
+                        "could not write external MCP tool manifest"
+                    );
+                } else {
+                    harden_file_0600(&path);
+                }
+            }
+            Err(err) => warn!(?err, "could not serialise external MCP tool manifest"),
+        }
     }
 
     /// Build the image for an agent group whose config has changed.

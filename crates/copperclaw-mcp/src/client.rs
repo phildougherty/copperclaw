@@ -178,6 +178,50 @@ impl McpClient {
     }
 }
 
+/// The minimal tool-surface a live MCP connection exposes to
+/// [`FilteredMcpClient`].
+///
+/// Pulling this out as a trait lets the filter wrapper sit over the real
+/// [`McpClient`] on the live path *and* over an in-process fake in tests, so
+/// the enforcement (list-strip + call-refuse) can be proven end-to-end without
+/// spawning a child process or standing up an SSE server. The real
+/// [`McpClient`] is the only production implementor; the host's session-spawn
+/// seam builds one per configured server and hands it here.
+#[async_trait::async_trait]
+pub trait McpToolTransport: Send + Sync {
+    /// List the tools the remote advertises (single page).
+    async fn list_tools(&self) -> Result<Vec<RemoteTool>, McpError>;
+
+    /// List every tool the remote advertises, walking pagination.
+    async fn list_all_tools(&self) -> Result<Vec<RemoteTool>, McpError>;
+
+    /// Invoke a tool by name with JSON arguments.
+    async fn call_tool(
+        &self,
+        name: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, McpError>;
+}
+
+#[async_trait::async_trait]
+impl McpToolTransport for McpClient {
+    async fn list_tools(&self) -> Result<Vec<RemoteTool>, McpError> {
+        McpClient::list_tools(self).await
+    }
+
+    async fn list_all_tools(&self) -> Result<Vec<RemoteTool>, McpError> {
+        McpClient::list_all_tools(self).await
+    }
+
+    async fn call_tool(
+        &self,
+        name: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, McpError> {
+        McpClient::call_tool(self, name, input).await
+    }
+}
+
 /// Description of a remote tool, normalised to plain Rust strings + JSON so
 /// runner code never sees rmcp types.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,16 +323,36 @@ pub type SharedMcpClient = Arc<McpClient>;
 ///
 /// A default (open) filter makes this a transparent pass-through, so wiring
 /// it in unconditionally costs nothing for servers without a declared filter.
-#[derive(Debug)]
 pub struct FilteredMcpClient {
-    inner: McpClient,
+    inner: Box<dyn McpToolTransport>,
     filter: ToolFilter,
 }
 
+impl std::fmt::Debug for FilteredMcpClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FilteredMcpClient")
+            .field("filter", &self.filter)
+            .finish_non_exhaustive()
+    }
+}
+
 impl FilteredMcpClient {
-    /// Pair a live client with the filter parsed from its server entry.
+    /// Pair a live [`McpClient`] with the filter parsed from its server entry.
+    ///
+    /// This is the production constructor used by the host's session-spawn
+    /// seam after it connects to a configured external server.
     #[must_use]
     pub fn new(inner: McpClient, filter: ToolFilter) -> Self {
+        Self::from_transport(Box::new(inner), filter)
+    }
+
+    /// Pair an arbitrary [`McpToolTransport`] with a filter.
+    ///
+    /// Used by the live path (via [`Self::new`]) and by tests that inject an
+    /// in-process fake server so the strip/refuse behaviour can be proven
+    /// without a real transport.
+    #[must_use]
+    pub fn from_transport(inner: Box<dyn McpToolTransport>, filter: ToolFilter) -> Self {
         Self { inner, filter }
     }
 
@@ -311,8 +375,8 @@ impl FilteredMcpClient {
     /// Call a tool, refusing it up front when the filter rejects the name.
     ///
     /// The remote is never contacted for a denied call — the gate runs
-    /// host-side (in the runner process), so a denied tool can't be reached
-    /// even if the model fabricates the call.
+    /// host-side, so a denied tool can't be reached even if the model
+    /// fabricates the call.
     pub async fn call_tool(
         &self,
         name: &str,
@@ -325,11 +389,6 @@ impl FilteredMcpClient {
             });
         }
         self.inner.call_tool(name, input).await
-    }
-
-    /// Gracefully cancel the underlying service.
-    pub async fn close(self) -> Result<(), McpError> {
-        self.inner.close().await
     }
 }
 
