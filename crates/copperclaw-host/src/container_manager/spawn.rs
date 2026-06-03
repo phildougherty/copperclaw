@@ -423,6 +423,30 @@ impl ContainerManager {
         Ok(tag)
     }
 
+    /// Resolve a group's effective provider string using the same
+    /// precedence + alias normalisation the runner config applies
+    /// (`session.agent_provider` → per-group `container_config.provider` →
+    /// host `default_provider`, with `"claude"` ⇒ `"anthropic"` and an empty
+    /// value ⇒ `None`). Shared by the runner-config builder and the egress
+    /// resolver so the auto-injected model endpoint can never disagree with
+    /// the provider the runner actually drives.
+    pub(super) fn resolved_provider(
+        &self,
+        session: &Session,
+        cfg: Option<&container_configs::ContainerConfig>,
+    ) -> Option<String> {
+        let raw = session
+            .agent_provider
+            .clone()
+            .or_else(|| cfg.and_then(|c| c.provider.clone()))
+            .unwrap_or_else(|| self.cfg.default_provider.clone());
+        match raw.as_str() {
+            "" => None,
+            "claude" => Some("anthropic".to_string()),
+            other => Some(other.to_string()),
+        }
+    }
+
     pub(super) fn build_spec(
         &self,
         session: &Session,
@@ -593,14 +617,29 @@ impl ContainerManager {
 
         // Egress allow-list (Phase 0a v1 / Top 10 #6). Resolve the effective
         // list = operator-configured per-group entries UNIONed with the
-        // auto-injected model endpoint (derived from ANTHROPIC_BASE_URL) so
-        // deny-default can never blackhole model traffic. The posture is
-        // carried regardless of mode so `cclaw doctor` / logs can report it;
-        // the container runtime decides what (if anything) is enforced. See
-        // [`super::egress`] and `copperclaw_container_rt::EgressMode`.
+        // auto-injected REAL model endpoint. The injected endpoint is
+        // provider-aware (anthropic/openrouter via ANTHROPIC_BASE_URL,
+        // native ollama via OLLAMA_BASE_URL, each with its real default
+        // applied when the env var is unset) so deny-default can never
+        // blackhole model traffic — including the common single-provider
+        // Anthropic deployment with no ANTHROPIC_BASE_URL override. The
+        // posture is carried regardless of mode so `cclaw doctor` / logs can
+        // report it; the container runtime decides what (if anything) is
+        // enforced. See [`super::egress`] and
+        // `copperclaw_container_rt::EgressMode`.
         let group_allow = cfg.map_or(&[][..], |c| c.egress_allow.as_slice());
-        let resolved_allow =
-            super::egress::resolve_allow_list(group_allow, rotatable.anthropic_base_url.as_deref());
+        let provider = self.resolved_provider(session, cfg);
+        let ollama_base_url = rotatable
+            .forward_env
+            .iter()
+            .find(|(k, _)| k == "OLLAMA_BASE_URL")
+            .map(|(_, v)| v.as_str());
+        let resolved_allow = super::egress::resolve_allow_list_for_provider(
+            group_allow,
+            provider.as_deref(),
+            rotatable.anthropic_base_url.as_deref(),
+            ollama_base_url,
+        );
         if !resolved_allow.is_empty() {
             spec = spec.with_egress_allow(resolved_allow);
         }
@@ -1886,6 +1925,86 @@ mod tests {
         let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg)).unwrap();
         // manager_cfg's base URL is https://openrouter.ai/api/v1.
         assert_eq!(spec.egress_allow, vec!["openrouter.ai:443"]);
+    }
+
+    /// Migration-safety: a deny-default group with the DEFAULT (unset)
+    /// Anthropic base URL and an empty per-group allow-list must STILL reach
+    /// `api.anthropic.com` — the common single-provider deployment was the one
+    /// the old "only inject when `ANTHROPIC_BASE_URL` is set" code black-holed.
+    #[test]
+    fn build_spec_deny_default_with_unset_anthropic_base_injects_api_anthropic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.egress_mode = copperclaw_container_rt::EgressMode::DenyDefault;
+        // No ANTHROPIC_BASE_URL override; default provider stays "anthropic".
+        cfg.anthropic_base_url = None;
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
+        assert_eq!(
+            spec.egress_mode,
+            copperclaw_container_rt::EgressMode::DenyDefault
+        );
+        // The empty group allow-list does NOT black-hole the model: the
+        // real default Anthropic endpoint is auto-injected.
+        assert_eq!(spec.egress_allow, vec!["api.anthropic.com:443"]);
+    }
+
+    /// Migration-safety (ollama path): a group pinned to `provider=ollama`
+    /// gets the `OLLAMA_BASE_URL` host injected — NOT `api.anthropic.com` — so
+    /// deny-default reaches the local model endpoint. Exercises the real
+    /// spawn path reading `OLLAMA_BASE_URL` from the rotatable `forward_env`.
+    #[test]
+    fn build_spec_deny_default_ollama_group_injects_ollama_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.egress_mode = copperclaw_container_rt::EgressMode::DenyDefault;
+        // ANTHROPIC_BASE_URL is set but must be IGNORED for an ollama group.
+        cfg.anthropic_base_url = Some("https://api.anthropic.com".into());
+        // OLLAMA_BASE_URL is forwarded the same way boot.rs wires it.
+        cfg.forward_env = vec![(
+            "OLLAMA_BASE_URL".to_string(),
+            "http://172.17.0.1:11434".to_string(),
+        )];
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let group_cfg = container_configs::ContainerConfig {
+            agent_group_id: session.agent_group_id,
+            provider: Some("ollama".into()),
+            model: None,
+            effort: None,
+            image_tag: None,
+            assistant_name: None,
+            max_messages_per_prompt: None,
+            skills: container_configs::SkillsSelector::All,
+            mcp_servers: serde_json::json!({}),
+            packages_apt: vec![],
+            packages_npm: vec![],
+            additional_mounts: serde_json::json!([]),
+            cli_scope: container_configs::CliScope::Group,
+            config_fingerprint: None,
+            egress_allow: vec![],
+            resource_limits: serde_json::json!({}),
+            coding_enabled: false,
+            surface_thinking: false,
+            updated_at: chrono::Utc::now(),
+        };
+        let spec = mgr
+            .build_spec(&session, &paths, "img", Some(&group_cfg))
+            .unwrap();
+        assert_eq!(spec.egress_allow, vec!["172.17.0.1:11434"]);
     }
 
     /// Opt-in default: the host ships allow-all, so an unconfigured manager
