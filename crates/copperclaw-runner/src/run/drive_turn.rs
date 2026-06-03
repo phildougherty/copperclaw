@@ -115,6 +115,142 @@ async fn persist_mid_message(
 /// regression pin.
 const MAX_TOOL_PARSE_ERROR_ATTEMPTS: u32 = 3;
 
+/// Content-loop circuit-breaker threshold. Once the model has emitted
+/// this many tool calls in a degenerate pattern — either the same
+/// `(tool, args)` call N times in a row, or an A,B,A,B oscillation
+/// between two distinct calls — the runner concludes it is spinning
+/// without making progress and bails. Four is deliberately low: a
+/// legitimate workflow that genuinely needs to call the same tool with
+/// identical args four times in a row is vanishingly rare (a re-read of
+/// the same file with no edit between, say), whereas a wedged local
+/// model loops on the same call dozens of times.
+///
+/// This is a *content* breaker that complements — and does not replace —
+/// the consecutive-turn DEPTH cap (`max_tool_turns`) and the token
+/// budget. The depth cap and budget bound how *long* the agent runs;
+/// this bounds a loop that never advances regardless of how many turns
+/// remain. See `identical_tool_call_loop_trips_breaker`.
+const TOOL_LOOP_BREAKER_THRESHOLD: usize = 4;
+
+/// Which degenerate tool-call pattern tripped the breaker. Carries the
+/// `copperclaw-metrics` `pattern` label value so the call site can't
+/// drift from the recorded label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopPattern {
+    /// `TOOL_LOOP_BREAKER_THRESHOLD` consecutive identical calls
+    /// (same name + identical args).
+    Identical,
+    /// A,B,A,B alternation between two distinct calls long enough that
+    /// the last `TOOL_LOOP_BREAKER_THRESHOLD` calls form the pattern.
+    PingPong,
+}
+
+impl LoopPattern {
+    /// Metric label value (see `copperclaw_metrics::LOOP_PATTERN_*`).
+    fn metric_label(self) -> &'static str {
+        match self {
+            LoopPattern::Identical => copperclaw_metrics::LOOP_PATTERN_IDENTICAL,
+            LoopPattern::PingPong => copperclaw_metrics::LOOP_PATTERN_PING_PONG,
+        }
+    }
+}
+
+/// Recursively rewrite `v` so every object's keys are in a stable
+/// (sorted) order. The workspace builds `serde_json` with
+/// `preserve_order`, so `Value`'s map is insertion-ordered and
+/// `to_string()` is key-order-sensitive by default — without this a
+/// model that re-emits the same arguments with shuffled keys would
+/// fingerprint differently each turn and slip the breaker. Sorting
+/// makes `{"a":1,"b":2}` and `{"b":2,"a":1}` serialise identically.
+fn canonicalize_json(v: &serde_json::Value) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(map) => {
+            let mut sorted: std::collections::BTreeMap<String, serde_json::Value> =
+                std::collections::BTreeMap::new();
+            for (k, val) in map {
+                sorted.insert(k.clone(), canonicalize_json(val));
+            }
+            serde_json::to_value(sorted).unwrap_or_else(|_| v.clone())
+        }
+        serde_json::Value::Array(items) => {
+            // Array element order is semantically meaningful (it's not a
+            // set), so preserve it — only canonicalise each element.
+            serde_json::Value::Array(items.iter().map(canonicalize_json).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Rolling fingerprint history for the content-loop breaker. A
+/// fingerprint is `name` + canonicalised args JSON (see
+/// [`canonicalize_json`]), so two calls match iff the model asked for
+/// the same tool with the same arguments regardless of object key order
+/// — `{"a":1,"b":2}` and `{"b":2,"a":1}` fingerprint identically.
+///
+/// Only the trailing window needed to decide either pattern is retained
+/// (`TOOL_LOOP_BREAKER_THRESHOLD` entries), so memory is O(threshold)
+/// regardless of how many tool calls a long-running turn makes.
+#[derive(Debug, Default)]
+struct ToolLoopGuard {
+    recent: Vec<String>,
+}
+
+impl ToolLoopGuard {
+    /// Fingerprint one model-requested call. `args` is canonicalised so
+    /// semantically identical inputs collapse to one string.
+    fn fingerprint(name: &str, args: &serde_json::Value) -> String {
+        format!("{name}\u{1f}{}", canonicalize_json(args))
+    }
+
+    /// Record one tool call and report the pattern if the trailing
+    /// window has degenerated into a loop. `None` means "keep going".
+    ///
+    /// Detection runs on the model-requested `(name, args)` pairs — it
+    /// is intentionally independent of whether each tool *succeeded*, so
+    /// a model that re-issues a failing call (unknown tool, repeated
+    /// error result) is caught just as a model re-issuing a succeeding
+    /// no-op would be.
+    fn observe(&mut self, name: &str, args: &serde_json::Value) -> Option<LoopPattern> {
+        self.recent.push(Self::fingerprint(name, args));
+        // Keep only the window we need to evaluate either pattern.
+        let window = TOOL_LOOP_BREAKER_THRESHOLD;
+        if self.recent.len() > window {
+            let excess = self.recent.len() - window;
+            self.recent.drain(0..excess);
+        }
+        if self.recent.len() < window {
+            return None;
+        }
+
+        // (a) N identical consecutive calls: every entry in the window
+        // is the same fingerprint.
+        let first = &self.recent[0];
+        if self.recent.iter().all(|fp| fp == first) {
+            return Some(LoopPattern::Identical);
+        }
+
+        // (b) Ping-pong A,B,A,B: exactly two distinct fingerprints,
+        // strictly alternating across the whole window, and not all the
+        // same (already excluded above). Requires window >= 4 to be a
+        // genuine A,B,A,B rather than a single A,B pair.
+        if window >= 4 {
+            let a = &self.recent[0];
+            let b = &self.recent[1];
+            if a != b
+                && self
+                    .recent
+                    .iter()
+                    .enumerate()
+                    .all(|(i, fp)| fp == if i % 2 == 0 { a } else { b })
+            {
+                return Some(LoopPattern::PingPong);
+            }
+        }
+
+        None
+    }
+}
+
 /// Drive one inbound through to a final assistant response. Loops
 /// LLM-turn → execute-tools → LLM-turn until the model produces a
 /// turn with no `tool_use` blocks (or we hit `max_tool_turns`).
@@ -158,6 +294,11 @@ pub(super) async fn drive_turn(
     let mut last_status_emit_at = drive_turn_started_at;
     let mut cumulative_tool_runs: usize = 0;
     let mut last_tool_name: Option<String> = None;
+    // Content-loop circuit breaker (complements the depth cap below and
+    // the token budget). Tracks the trailing window of model-requested
+    // `(tool, args)` fingerprints and trips on N-identical or A,B,A,B
+    // patterns — see `ToolLoopGuard`.
+    let mut loop_guard = ToolLoopGuard::default();
 
     for tool_turn in 0..deps.max_tool_turns.max(1) {
         let output = run_llm_turn(deps, history, continuation.as_deref(), context_block).await?;
@@ -263,7 +404,17 @@ pub(super) async fn drive_turn(
             n = output.tool_calls.len(),
             "executing tool calls"
         );
+        // Set when the content-loop breaker trips while executing this
+        // turn's calls. We finish executing + persisting the current
+        // batch (so the audit history is complete) before bailing.
+        let mut tripped_loop: Option<LoopPattern> = None;
         for call in &output.tool_calls {
+            // Feed the model-requested call into the content-loop guard.
+            // Skip parse-error synthetic calls: their `input` is Null and
+            // they're already bounded by the parse-error cap below.
+            if call.parse_error.is_none() && tripped_loop.is_none() {
+                tripped_loop = loop_guard.observe(&call.name, &call.input);
+            }
             let (content, images, is_error) = if let Some(parse_err) = call.parse_error.as_deref() {
                 // Synthetic call from `ProviderEvent::ToolInputParseError`:
                 // we never actually invoke the tool — instead we hand the
@@ -303,6 +454,40 @@ pub(super) async fn drive_turn(
         // Failure to save is warn-and-continue — the next iteration or
         // the end-of-message save_state in run_loop will retry.
         persist_mid_message(deps, history, continuation.as_deref(), tool_turn).await;
+
+        // Content-loop circuit breaker. After persisting this turn's
+        // tool_results (so the audit history shows the full degenerate
+        // run), bail if the model has spun on the same call or
+        // oscillated between two. Emits a metric + an audit-grade
+        // tracing::error! and surfaces a clear apology reason.
+        if let Some(pattern) = tripped_loop {
+            copperclaw_metrics::inc_tool_loop_breaker(
+                &deps.agent_group_id.as_uuid().to_string(),
+                pattern.metric_label(),
+            );
+            tracing::error!(
+                target: "copperclaw_runner",
+                agent_group_id = %deps.agent_group_id,
+                session_id = %deps.session_id,
+                pattern = pattern.metric_label(),
+                threshold = TOOL_LOOP_BREAKER_THRESHOLD,
+                last_tool = last_tool_name.as_deref().unwrap_or("?"),
+                "tool-call loop breaker tripped; terminating inbound",
+            );
+            let reason = match pattern {
+                LoopPattern::Identical => format!(
+                    "the agent got stuck repeating the same `{}` tool call {TOOL_LOOP_BREAKER_THRESHOLD} times in a row without making progress",
+                    last_tool_name.as_deref().unwrap_or("tool"),
+                ),
+                LoopPattern::PingPong => format!(
+                    "the agent got stuck alternating between two tool calls {TOOL_LOOP_BREAKER_THRESHOLD} times without making progress"
+                ),
+            };
+            return Ok(TurnResult {
+                continuation,
+                outcome: TurnOutcome::Failed(reason),
+            });
+        }
 
         // "Still working" heartbeat. Emitted only when the runner is
         // about to loop again (we have tool calls + we're past the
@@ -510,5 +695,107 @@ mod first_line_truncated_tests {
         // breadcrumb chip should fall back to status-only.
         assert_eq!(first_line_truncated("{}", 200), None);
         assert_eq!(first_line_truncated("{\n}", 200), None);
+    }
+}
+
+#[cfg(test)]
+mod tool_loop_guard_tests {
+    use super::{LoopPattern, TOOL_LOOP_BREAKER_THRESHOLD, ToolLoopGuard};
+    use serde_json::json;
+
+    /// The threshold this suite is written against. If someone retunes
+    /// the constant the alternation/identity arithmetic below needs a
+    /// fresh look, so pin it.
+    #[test]
+    fn threshold_is_four() {
+        assert_eq!(TOOL_LOOP_BREAKER_THRESHOLD, 4);
+    }
+
+    #[test]
+    fn identical_calls_trip_at_threshold() {
+        let mut g = ToolLoopGuard::default();
+        let args = json!({"path": "/data/x"});
+        // First THRESHOLD-1 observations must not trip.
+        for _ in 0..TOOL_LOOP_BREAKER_THRESHOLD - 1 {
+            assert_eq!(g.observe("read_file", &args), None);
+        }
+        // The THRESHOLD-th identical call trips the breaker.
+        assert_eq!(g.observe("read_file", &args), Some(LoopPattern::Identical));
+    }
+
+    #[test]
+    fn arg_key_order_does_not_matter() {
+        // Two JSON objects with the same fields in different key order
+        // must fingerprint identically (serde_json normalises key order
+        // on a map), so a model that re-emits the same call with shuffled
+        // keys still counts as identical.
+        let mut g = ToolLoopGuard::default();
+        let a = json!({"a": 1, "b": 2});
+        let b = json!({"b": 2, "a": 1});
+        assert_eq!(g.observe("t", &a), None);
+        assert_eq!(g.observe("t", &b), None);
+        assert_eq!(g.observe("t", &a), None);
+        assert_eq!(g.observe("t", &b), Some(LoopPattern::Identical));
+    }
+
+    #[test]
+    fn different_args_do_not_trip_identical() {
+        // Same tool, marching args — legitimate progress, never trips.
+        let mut g = ToolLoopGuard::default();
+        for i in 0..(TOOL_LOOP_BREAKER_THRESHOLD * 3) {
+            assert_eq!(
+                g.observe("read_file", &json!({"line": i})),
+                None,
+                "distinct args must not trip at i={i}"
+            );
+        }
+    }
+
+    #[test]
+    fn ping_pong_trips() {
+        // A,B,A,B alternation between two distinct calls.
+        let mut g = ToolLoopGuard::default();
+        let a = json!({"cmd": "ls"});
+        let b = json!({"cmd": "pwd"});
+        assert_eq!(g.observe("shell", &a), None); // A
+        assert_eq!(g.observe("shell", &b), None); // A,B
+        assert_eq!(g.observe("shell", &a), None); // A,B,A
+        assert_eq!(g.observe("shell", &b), Some(LoopPattern::PingPong)); // A,B,A,B
+    }
+
+    #[test]
+    fn ping_pong_distinguishes_tool_name() {
+        // Same args but alternating tool *names* is still a ping-pong.
+        let mut g = ToolLoopGuard::default();
+        let args = json!({});
+        assert_eq!(g.observe("alpha", &args), None);
+        assert_eq!(g.observe("beta", &args), None);
+        assert_eq!(g.observe("alpha", &args), None);
+        assert_eq!(g.observe("beta", &args), Some(LoopPattern::PingPong));
+    }
+
+    #[test]
+    fn three_way_rotation_does_not_trip() {
+        // A,B,C,A,B,C is genuine multi-step work, not a 2-state loop.
+        let mut g = ToolLoopGuard::default();
+        let names = ["a", "b", "c"];
+        for i in 0..12 {
+            let res = g.observe(names[i % 3], &json!({}));
+            assert_eq!(res, None, "3-way rotation tripped at i={i}");
+        }
+    }
+
+    #[test]
+    fn identical_takes_precedence_over_ping_pong() {
+        // Once a run goes fully identical it reports Identical, not
+        // PingPong (the all-equal check runs first).
+        let mut g = ToolLoopGuard::default();
+        let a = json!({"x": 1});
+        for _ in 0..TOOL_LOOP_BREAKER_THRESHOLD {
+            g.observe("t", &a);
+        }
+        // Window is now all-A; the most recent observation reported
+        // Identical (verified in `identical_calls_trip_at_threshold`).
+        assert_eq!(g.observe("t", &a), Some(LoopPattern::Identical));
     }
 }

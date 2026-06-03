@@ -1760,6 +1760,75 @@ mod tests {
         );
     }
 
+    /// Content-loop breaker: the model emits the SAME `(tool, args)`
+    /// call on every turn. After `TOOL_LOOP_BREAKER_THRESHOLD` identical
+    /// calls the runner trips the circuit breaker, terminates the
+    /// inbound as `failed`, and surfaces a loop-specific apology — well
+    /// before the `max_tool_turns` depth cap (still 150 here) would
+    /// fire. Pins the depth-cap-vs-content-cap distinction.
+    #[tokio::test]
+    async fn identical_tool_call_loop_trips_breaker() {
+        // Script many more identical turns than the breaker threshold so
+        // we prove the breaker — not the turn count — is what stops it.
+        let identical = || {
+            vec![ProviderEvent::ToolCall {
+                id: "tu_loop".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "/data/stuck"}),
+            }]
+        };
+        let scripts: Vec<Vec<ProviderEvent>> = (0..20).map(|_| identical()).collect();
+        let mut setup = build_setup(scripts);
+        let id = {
+            let g = setup.deps.inbound.lock().await;
+            insert_pending(&g, "do the thing")
+        };
+        // Leave max_tool_turns at the default (150) so the ONLY thing
+        // that can stop this loop is the content breaker.
+        setup.deps.max_turns = Some(1);
+        run_loop(setup.deps).await.unwrap();
+
+        let inbound = open_inbound(&setup.paths).unwrap();
+        let status: String = inbound
+            .query_row(
+                "SELECT status FROM messages_in WHERE id = ?1",
+                rusqlite::params![id.as_uuid().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "failed",
+            "an identical-call loop must terminally fail the inbound"
+        );
+
+        // The apology should name the loop, not the depth cap.
+        let outbound = open_outbound(&setup.paths).unwrap();
+        let rows = messages_out::list_due(&outbound).unwrap();
+        let error_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == copperclaw_types::MessageKind::Error)
+            .collect();
+        assert_eq!(
+            error_rows.len(),
+            1,
+            "expected exactly one Error apology row, got: {error_rows:?}"
+        );
+
+        // Crucially, the breaker must fire well before 150 turns: the
+        // history should hold ~threshold tool_use cycles, not 150.
+        let st = load_state(&outbound).unwrap();
+        let read_file_calls = st
+            .history
+            .iter()
+            .filter(|m| matches!(m, HistoryMessage::ToolUse { name, .. } if name == "read_file"))
+            .count();
+        assert!(
+            read_file_calls <= 6,
+            "breaker should trip near the threshold, not run to the depth cap; \
+             saw {read_file_calls} read_file calls"
+        );
+    }
+
     /// Mixed-batch path: when one turn emits both a clean ToolCall
     /// (`shell`) and a malformed `send_file`, the real tool path
     /// still runs for `shell` and the synthetic-error path runs for
