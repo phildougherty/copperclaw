@@ -196,6 +196,14 @@ pub struct RunnerToolCtx {
     /// the aggregate chip's expandable region, plus whether the chip has
     /// been emitted yet this turn). Reset by [`Self::begin_activity`].
     activity: Arc<std::sync::Mutex<ActivityState>>,
+    /// Active skill's `allowed-tools` (set by the `load_skill` tool when
+    /// the loaded skill declared an `allowed-tools` frontmatter list).
+    /// `None` means no tool-scoping skill is active. The runner's
+    /// dispatch gate reads this each call and feeds it into
+    /// [`crate::policy::ToolPolicy::with_active_skill`] so a read-only
+    /// skill narrows the live policy. `Arc<Mutex<...>>` so it survives
+    /// `Arc<dyn ToolContext>` erasure and is mutable from the shared ref.
+    active_skill_allowed: Arc<std::sync::Mutex<Option<Vec<String>>>>,
 }
 
 /// How tool-progress breadcrumbs are presented in chat.
@@ -244,6 +252,7 @@ impl RunnerToolCtx {
             parent_reply_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             breadcrumb_style: BreadcrumbStyle::default(),
             activity: Arc::new(std::sync::Mutex::new(ActivityState::default())),
+            active_skill_allowed: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -858,6 +867,19 @@ impl ToolContext for RunnerToolCtx {
 
     fn clear_originating(&self) {
         Self::clear_originating(self);
+    }
+
+    fn set_active_skill_allowed_tools(&self, allowed: Option<Vec<String>>) {
+        if let Ok(mut guard) = self.active_skill_allowed.lock() {
+            *guard = allowed;
+        }
+    }
+
+    fn active_skill_allowed_tools(&self) -> Option<Vec<String>> {
+        self.active_skill_allowed
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     fn parent_reply_sent(&self) -> bool {

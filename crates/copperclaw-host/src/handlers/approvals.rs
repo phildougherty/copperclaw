@@ -534,6 +534,7 @@ fn ensure_config_row(central: &CentralDb, ag_id: AgentGroupId) -> Result<(), Err
             resource_limits: Value::Object(serde_json::Map::new()),
             coding_enabled: false,
             surface_thinking: false,
+            tool_profile: None,
         },
     )
     .map_err(db_err)?;

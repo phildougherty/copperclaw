@@ -169,10 +169,10 @@ async fn main() -> Result<()> {
         // historical "drop on the floor" behaviour for existing groups.
         surface_thinking: cfg.surface_thinking,
         // Tool authorization: scope every dispatch to the group's
-        // tool-profile (over the host-owned DISALLOWED_TOOLS floor).
-        // Sender role is not yet plumbed per-session, so the role floor
-        // is left unset here; the profile + floor are enforced today.
-        policy: copperclaw_runner::ToolPolicy::new(cfg.tool_profile, None),
+        // tool-profile and the triggering sender's resolved RBAC role,
+        // over the host-owned DISALLOWED_TOOLS floor. The active-skill
+        // layer is applied per-call at dispatch from the ToolContext.
+        policy: copperclaw_runner::ToolPolicy::new(cfg.tool_profile, cfg.sender_role),
     };
 
     tracing::info!(
@@ -290,6 +290,7 @@ mod build_provider_tests {
             source_session_id: None,
             surface_thinking: false,
             tool_profile: copperclaw_runner::ToolProfile::Full,
+            sender_role: None,
         }
     }
 

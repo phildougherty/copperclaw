@@ -103,6 +103,7 @@ mod tests {
                 resource_limits: serde_json::json!({}),
                 coding_enabled: false,
                 surface_thinking: false,
+                tool_profile: None,
             },
         )
         .unwrap();

@@ -2690,6 +2690,7 @@ fn ensure_config_row(
             resource_limits: serde_json::json!({}),
             coding_enabled: false,
             surface_thinking: false,
+            tool_profile: None,
         },
     )?;
     Ok(())
@@ -3906,6 +3907,7 @@ mod tests {
                 resource_limits: json!({}),
                 coding_enabled: false,
                 surface_thinking: false,
+                tool_profile: None,
             },
         )
         .unwrap();
@@ -3943,6 +3945,7 @@ mod tests {
                 resource_limits: json!({}),
                 coding_enabled: false,
                 surface_thinking: false,
+                tool_profile: None,
             },
         )
         .unwrap();

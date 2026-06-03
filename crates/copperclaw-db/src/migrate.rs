@@ -78,6 +78,10 @@ const CENTRAL: &[Migration] = &[
         name: "017_approval_decisions",
         sql: include_str!("../migrations/017_approval_decisions.sql"),
     },
+    Migration {
+        name: "018_container_config_tool_profile",
+        sql: include_str!("../migrations/018_container_config_tool_profile.sql"),
+    },
 ];
 
 const SESSION_INBOUND: &[Migration] = &[

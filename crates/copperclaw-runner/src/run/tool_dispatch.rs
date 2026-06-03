@@ -22,7 +22,17 @@ pub(super) async fn invoke_tool(
     // `DISALLOWED_TOOLS`) is the innermost layer and can never be
     // re-granted by a looser profile. A deny synthesises a model-facing
     // `tool_result { is_error: true }` so the model can self-correct.
-    if let PolicyDecision::Deny(reason) = deps.policy.evaluate(&call.name) {
+    //
+    // The active-skill layer is dynamic: a `load_skill` call earlier in
+    // the conversation may have narrowed the scope to the loaded skill's
+    // `allowed-tools`. The base policy (profile + sender role) is fixed at
+    // spawn; we clone it and apply the live skill scope per call so a
+    // read-only skill blocks `shell` for as long as it's loaded.
+    let policy = deps
+        .policy
+        .clone()
+        .with_active_skill(deps.tool_ctx.active_skill_allowed_tools());
+    if let PolicyDecision::Deny(reason) = policy.evaluate(&call.name) {
         tracing::info!(tool = %call.name, %reason, "tool call denied by policy");
         return (reason, Vec::new(), true);
     }
@@ -189,16 +199,24 @@ mod tests {
         async fn abort(&mut self) {}
     }
 
-    /// Build a `RunnerDeps` with a real `shell` + `read_file` tool map
-    /// and the supplied policy. Only the fields `invoke_tool` reads are
-    /// load-bearing here.
-    fn deps_with_policy(policy: ToolPolicy) -> (tempfile::TempDir, RunnerDeps) {
+    /// Build a `RunnerDeps` with a real `shell` + `read_file` tool map,
+    /// the supplied base policy, and an optional active-skill scope set on
+    /// the `ToolContext` (the way `load_skill` sets it in production). Only
+    /// the fields `invoke_tool` reads are load-bearing here.
+    fn deps_with_policy_and_skill(
+        policy: ToolPolicy,
+        active_skill: Option<Vec<String>>,
+    ) -> (tempfile::TempDir, RunnerDeps) {
         let tmp = tempfile::tempdir().unwrap();
         let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
         let inbound = Arc::new(Mutex::new(open_inbound(&paths).unwrap()));
         let outbound = Arc::new(Mutex::new(open_outbound(&paths).unwrap()));
-        let tool_ctx: Arc<dyn ToolContext> =
-            Arc::new(RunnerToolCtx::new(outbound.clone(), paths.outbox.clone()));
+        let ctx = RunnerToolCtx::new(outbound.clone(), paths.outbox.clone());
+        // Mirror `load_skill`: stash the loaded skill's allowed-tools on the
+        // context so the dispatch gate reads it live (NOT pre-baked into
+        // the policy — that's the whole point of the per-call narrowing).
+        ctx.set_active_skill_allowed_tools(active_skill);
+        let tool_ctx: Arc<dyn ToolContext> = Arc::new(ctx);
         let provider: Arc<dyn AgentProvider> = Arc::new(NoopProvider);
         let archive_dir = paths.outbox.join("_compactions");
         let mut deps = RunnerDeps::minimal(provider, tool_ctx, inbound, outbound, archive_dir);
@@ -212,6 +230,11 @@ mod tests {
         deps.tool_map = Arc::new(map);
         deps.policy = policy;
         (tmp, deps)
+    }
+
+    /// Convenience: deps with the given base policy and no active skill.
+    fn deps_with_policy(policy: ToolPolicy) -> (tempfile::TempDir, RunnerDeps) {
+        deps_with_policy_and_skill(policy, None)
     }
 
     fn call(name: &str) -> PendingToolCall {
@@ -242,14 +265,35 @@ mod tests {
 
     #[tokio::test]
     async fn skill_allowed_read_blocks_shell_at_dispatch() {
-        // Headline Phase 1.1 case: `allowed-tools: [Read]` (→ read_file)
-        // blocks shell at the dispatch gate even under a Coding profile.
-        let policy = ToolPolicy::new(ToolProfile::Coding, None)
-            .with_active_skill(Some(vec!["read_file".into()]));
-        let (_tmp, deps) = deps_with_policy(policy);
+        // Headline Phase 1.1 case: a loaded skill with `allowed-tools:
+        // [Read]` (→ read_file) — set on the ToolContext the way
+        // `load_skill` does — blocks shell at the dispatch gate even under
+        // a Coding profile. The base policy carries NO skill scope; the
+        // dispatch gate reads it live from the context per call.
+        let base = ToolPolicy::new(ToolProfile::Coding, None);
+        let (_tmp, deps) = deps_with_policy_and_skill(base, Some(vec!["read_file".into()]));
         let (content, _imgs, is_error) = invoke_tool(&deps, &call("shell")).await;
         assert!(is_error);
         assert!(content.contains("active skill"), "got: {content}");
+        // …and the one allowed tool still dispatches (no policy deny).
+        let (allowed_content, _imgs, _err) = invoke_tool(&deps, &call("read_file")).await;
+        assert!(
+            !allowed_content.contains("active skill"),
+            "read_file must survive the active-skill layer; got: {allowed_content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_active_skill_leaves_dispatch_unscoped() {
+        // With no skill loaded, the context reports no scope and a Coding
+        // profile permits shell at dispatch.
+        let base = ToolPolicy::new(ToolProfile::Coding, None);
+        let (_tmp, deps) = deps_with_policy_and_skill(base, None);
+        let (content, _imgs, _is_error) = invoke_tool(&deps, &call("shell")).await;
+        assert!(
+            !content.contains("active skill"),
+            "no skill loaded must not narrow dispatch; got: {content}"
+        );
     }
 
     #[tokio::test]

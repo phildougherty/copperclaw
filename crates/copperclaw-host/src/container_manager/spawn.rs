@@ -1797,6 +1797,7 @@ mod tests {
             resource_limits: serde_json::json!({"cpus": "1.5", "memory_mb": 512u64}),
             coding_enabled: false,
             surface_thinking: false,
+            tool_profile: None,
             updated_at: chrono::Utc::now(),
         };
         let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg)).unwrap();
@@ -1835,6 +1836,7 @@ mod tests {
             resource_limits: serde_json::json!({}),
             coding_enabled: false,
             surface_thinking: false,
+            tool_profile: None,
             updated_at: chrono::Utc::now(),
         };
         let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg)).unwrap();
@@ -1881,6 +1883,7 @@ mod tests {
             resource_limits: serde_json::json!({}),
             coding_enabled: false,
             surface_thinking: false,
+            tool_profile: None,
             updated_at: chrono::Utc::now(),
         };
         let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg)).unwrap();

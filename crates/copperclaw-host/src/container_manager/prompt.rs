@@ -377,6 +377,15 @@ pub(crate) struct SkillCatalogueEntry {
     pub(crate) name: String,
     pub(crate) description: String,
     pub(crate) body: String,
+    /// The skill's `allowed-tools` frontmatter, normalized to copperclaw
+    /// MCP tool names (e.g. `Read` → `read_file`). `None` when the skill
+    /// declared no `allowed-tools`. The runner-side `load_skill` tool
+    /// reads this and narrows the live `ToolPolicy` to the named tools so
+    /// a read-only skill blocks `shell` at dispatch. Skipped from the
+    /// serialized catalogue when `None` so the skills.json shape stays
+    /// stable for skills that impose no tool scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) allowed_tools: Option<Vec<String>>,
 }
 
 /// Single source of truth for which skills make it into a Callable-mode
@@ -433,6 +442,11 @@ pub(crate) fn select_callable_skills(
             name: skill.name.clone(),
             description: skill.description.clone(),
             body: body.trim_end().to_string(),
+            // Normalize the frontmatter `allowed-tools` (PascalCase Claude
+            // names) into the snake_case MCP names the runner dispatches
+            // against, so the loaded-skill policy layer actually matches
+            // the `tool_use` names the model emits.
+            allowed_tools: skill.allowed_tool_names(),
         });
     }
     out
@@ -1269,6 +1283,7 @@ mod tests {
             name: "kept".into(),
             description: "the only one".into(),
             body: "body".into(),
+            allowed_tools: None,
         }];
         let out = render_callable_skill_index(&entries);
         assert!(out.contains("name=\"kept\""));
@@ -1283,6 +1298,7 @@ mod tests {
             name: "x".into(),
             description: "d".into(),
             body: "b".into(),
+            allowed_tools: None,
         }]);
         assert!(out.contains("Core rules"), "core rules block missing");
         assert!(
@@ -1308,6 +1324,7 @@ mod tests {
             name: weird.name.clone(),
             description: weird.description.clone(),
             body: "body".into(),
+            allowed_tools: None,
         };
         let callable_out = render_callable_skill_index(std::slice::from_ref(&entry));
         assert!(
