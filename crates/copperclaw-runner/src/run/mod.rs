@@ -3131,6 +3131,8 @@ mod tests {
             ProviderEvent::Usage {
                 input_tokens: in_tok,
                 output_tokens: out_tok,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
             },
         ]
     }
