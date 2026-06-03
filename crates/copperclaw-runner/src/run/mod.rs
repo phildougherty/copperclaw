@@ -523,6 +523,20 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
             deps.tool_ctx.set_originating(None, None, None, None);
         }
 
+        // PROVENANCE / autonomy gate (Phase 3): classify this turn as
+        // autonomous when nothing in the batch is a human channel message
+        // (Chat) — i.e. it was driven by a scheduled `Task` fire or a wake.
+        // Autonomous turns may search memory and propose but may NOT take a
+        // credentialed external action (read-then-propose). `approved` is
+        // wired `false` here: the live fresh-approval grant is a host
+        // follow-up (see the policy / memory module docs) — until then a
+        // tainted turn stays blocked, which is the safe default.
+        let autonomous = !formatted
+            .rows
+            .iter()
+            .any(|r| r.kind == copperclaw_types::MessageKind::Chat);
+        deps.tool_ctx.set_turn_provenance(autonomous, false);
+
         // Surface child-agent failure notices to the user channel
         // BEFORE the parent's LLM picks them up. Without this the
         // parent can spend minutes silently digesting the failure +

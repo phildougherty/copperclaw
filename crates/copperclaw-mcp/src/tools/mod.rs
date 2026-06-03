@@ -38,6 +38,7 @@ pub mod glob;
 pub mod grep;
 pub mod interactive;
 pub mod load_skill;
+pub mod memory;
 pub mod multi_edit;
 pub mod net_guard;
 pub mod scheduling;
@@ -108,6 +109,8 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         web_search::entry(),
         explore::entry(),
         load_skill::entry(),
+        memory::memory_search::entry(),
+        memory::memory_get::entry(),
         todo::add::entry(),
         todo::list::entry(),
         todo::update::entry(),
@@ -214,6 +217,8 @@ mod tests {
             "web_search",
             "explore",
             "load_skill",
+            "memory_search",
+            "memory_get",
             "todo_add",
             "todo_list",
             "todo_update",

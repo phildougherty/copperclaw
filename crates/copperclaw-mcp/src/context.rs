@@ -129,6 +129,38 @@ pub struct UpdateTaskSpec {
     pub recurrence: Option<Option<String>>,
 }
 
+/// One memory hit surfaced to the `memory_search` / `memory_get` tools.
+///
+/// `provenance` is the wire form (`"trusted"` / `"untrusted"`) of the stored
+/// entry's tag (see `copperclaw_db::memory::Provenance`). The runner marks the
+/// turn tainted when any returned hit is untrusted, so the coarse approval gate
+/// blocks credentialed external actions until fresh approval.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryHitView {
+    /// Logical key of the entry.
+    pub key: String,
+    /// Stored text body.
+    pub body: String,
+    /// `"trusted"` | `"untrusted"`.
+    pub provenance: String,
+    /// Optional source label (e.g. `"web_fetch:https://..."`).
+    pub source: Option<String>,
+    /// Blended relevance score (FTS5 + cosine), higher is better. `None` for a
+    /// direct `memory_get` (no ranking).
+    pub score: Option<f64>,
+    /// RFC3339 last-updated timestamp.
+    pub updated_at: String,
+}
+
+/// Spec for the `memory_search` tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySearchSpec {
+    /// Free-text query matched against the FTS5 index.
+    pub query: String,
+    /// Maximum hits to return (the context clamps to a sane ceiling).
+    pub limit: Option<usize>,
+}
+
 /// Spec for `send_message`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendMessageSpec {
@@ -466,6 +498,80 @@ pub trait ToolContext: Send + Sync {
     /// Default `None` so non-gating contexts compile unchanged.
     fn active_skill_allowed_tools(&self) -> Option<Vec<String>> {
         None
+    }
+
+    /// Hybrid search of this group's searchable memory store (FTS5 +
+    /// cosine over stored embeddings). Returns ranked hits.
+    ///
+    /// Default impl returns `ToolError::Context("memory store not configured
+    /// in this context")` so mock / subagent contexts compile unchanged — only
+    /// the runner's `RunnerToolCtx` (which knows the per-group `memory.db`
+    /// path) overrides it. The runner-side impl ALSO marks the current turn
+    /// tainted when any returned hit is untrusted, wiring the coarse
+    /// provenance gate.
+    async fn memory_search(&self, spec: MemorySearchSpec) -> Result<Vec<MemoryHitView>, ToolError> {
+        let _ = spec;
+        Err(ToolError::Context(
+            "memory store not configured in this context".into(),
+        ))
+    }
+
+    /// Fetch one memory entry by its logical key. `Ok(None)` when absent.
+    /// Same default + taint semantics as [`Self::memory_search`].
+    async fn memory_get(&self, key: &str) -> Result<Option<MemoryHitView>, ToolError> {
+        let _ = key;
+        Err(ToolError::Context(
+            "memory store not configured in this context".into(),
+        ))
+    }
+
+    /// Mark the current turn's context as carrying **untrusted-provenance**
+    /// content, e.g. the body of a `web_fetch` or a third-party tool output.
+    /// `source` is a short label for audit/logging (e.g. the fetched URL).
+    ///
+    /// The runner's `ToolContext` impl flips a per-turn taint flag that its
+    /// dispatch gate then consults: once a turn is tainted, credentialed
+    /// external actions are blocked until fresh approval (the coarse
+    /// provenance gate). Default no-op so mock / subagent contexts compile
+    /// unchanged — they simply don't enforce the gate.
+    ///
+    /// This is necessarily COARSE: taint cannot propagate through the model,
+    /// so the runner treats *any* untrusted content in the turn as tainting
+    /// the *whole* turn rather than attempting per-value tracking.
+    fn mark_untrusted_context(&self, source: &str) {
+        let _ = source;
+    }
+
+    /// Whether the current turn's context has been tainted by
+    /// untrusted-provenance content (see [`Self::mark_untrusted_context`]).
+    /// The runner's dispatch gate reads this to build the per-call provenance
+    /// gate. Default `false` (no taint tracking) so non-gating contexts
+    /// compile unchanged.
+    fn is_context_tainted(&self) -> bool {
+        false
+    }
+
+    /// Whether the current turn is an autonomous one (heartbeat / scheduled
+    /// wake) with no triggering human message. Autonomous turns may search
+    /// memory and propose, but may NOT take a credentialed external action
+    /// (read-then-propose). Default `false` so non-gating contexts treat every
+    /// turn as human-driven (no extra restriction).
+    fn is_autonomous_turn(&self) -> bool {
+        false
+    }
+
+    /// Whether a fresh operator approval has cleared the provenance taint for
+    /// credentialed external actions on this turn. Default `false`: absent an
+    /// explicit grant, a tainted turn stays blocked.
+    fn external_action_approved(&self) -> bool {
+        false
+    }
+
+    /// Set the per-turn provenance signals (`autonomous`, `approved`) the
+    /// dispatch gate consults. Called by the runner's main loop before driving
+    /// each turn. Default no-op so mock / subagent contexts compile unchanged.
+    fn set_turn_provenance(&self, autonomous: bool, approved: bool) {
+        let _ = (autonomous, approved);
     }
 
     /// True when this context represents a child agent session that

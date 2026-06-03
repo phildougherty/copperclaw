@@ -131,6 +131,38 @@ const CODING_TOOLS: &[&str] = &[
 /// MCP servers) and are the most privileged class.
 const SELF_MOD_TOOLS: &[&str] = &["install_packages", "add_mcp_server"];
 
+/// Tools that take a **credentialed external action** — they reach outside the
+/// container over the network (the egress path the credential broker meters)
+/// to fetch data, run a search, install packages, or attach a remote MCP
+/// server. These are exactly the actions the coarse provenance gate guards:
+///
+///   - On a turn whose context contains ANY untrusted-provenance content (a
+///     `web_fetch` body, an untrusted memory hit), these are blocked until a
+///     fresh approval clears the taint — the "confused-deputy" defence against
+///     prompt injection routing the agent's credentials at an attacker target.
+///   - On an autonomous / heartbeat turn (no human in the loop), these are
+///     blocked outright: an autonomous turn may *search memory and propose* but
+///     may not *take* a credentialed external action without a human turn to
+///     approve it (read-then-propose).
+///
+/// `web_search` and `web_fetch` are the egress-bearing read tools; the self-mod
+/// tools fetch remote packages / attach remote servers. This list is the
+/// runner's policy view — it does NOT need to enumerate every future MCP tool,
+/// only the in-tree ones that egress on the broker's dime.
+const CREDENTIALED_EXTERNAL_TOOLS: &[&str] = &[
+    "web_fetch",
+    "web_search",
+    "install_packages",
+    "add_mcp_server",
+];
+
+/// True when `tool` takes a credentialed external action (see
+/// [`CREDENTIALED_EXTERNAL_TOOLS`]).
+#[must_use]
+pub fn is_credentialed_external(tool: &str) -> bool {
+    CREDENTIALED_EXTERNAL_TOOLS.contains(&tool)
+}
+
 /// A group's tool profile: the positive allow-list the agent is scoped
 /// to. Profiles are cumulative — each tier adds to the one below it.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
@@ -305,6 +337,28 @@ pub struct ToolPolicy {
     /// driving this turn. `None` means "no skill scope". When `Some`,
     /// only these names (plus [`ALWAYS_TOOLS`]) pass the skill layer.
     skill_allowed: Option<Vec<String>>,
+    /// Coarse provenance gate (M16 Phase 3). Set per-call by the dispatch
+    /// gate from the live turn state. See [`TurnTrust`].
+    trust: TurnTrust,
+}
+
+/// Per-turn trust state feeding the coarse provenance gate (Phase 3).
+///
+/// Built fresh per dispatch from the live turn: whether the context has been
+/// tainted by untrusted-provenance content this turn, whether a fresh approval
+/// has cleared that taint, and whether this is an autonomous (heartbeat /
+/// scheduled) turn with no human in the loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TurnTrust {
+    /// True once any untrusted-provenance content (a `web_fetch` body, an
+    /// untrusted memory hit) has entered this turn's context.
+    pub tainted: bool,
+    /// True when the operator has granted a fresh approval for credentialed
+    /// external actions on this (tainted) turn. Clears the taint block.
+    pub approved: bool,
+    /// True when this is an autonomous turn (heartbeat / scheduled wake) with
+    /// no triggering human message — read-then-propose only.
+    pub autonomous: bool,
 }
 
 impl Default for ToolPolicy {
@@ -313,6 +367,7 @@ impl Default for ToolPolicy {
             profile: ToolProfile::Full,
             sender_role: None,
             skill_allowed: None,
+            trust: TurnTrust::default(),
         }
     }
 }
@@ -325,6 +380,7 @@ impl ToolPolicy {
             profile,
             sender_role,
             skill_allowed: None,
+            trust: TurnTrust::default(),
         }
     }
 
@@ -346,6 +402,16 @@ impl ToolPolicy {
     #[must_use]
     pub fn with_active_skill(mut self, allowed_tools: Option<Vec<String>>) -> Self {
         self.skill_allowed = allowed_tools;
+        self
+    }
+
+    /// Apply the per-turn [`TurnTrust`] for the coarse provenance gate
+    /// (Phase 3). Returns a new policy; the original is untouched (the
+    /// dispatch gate clones the base policy per call and stamps the live
+    /// trust state, exactly like [`Self::with_active_skill`]).
+    #[must_use]
+    pub fn with_trust(mut self, trust: TurnTrust) -> Self {
+        self.trust = trust;
         self
     }
 
@@ -391,7 +457,36 @@ impl ToolPolicy {
             ));
         }
 
+        // Layer 5: coarse provenance / autonomy gate (Phase 3). Only
+        // credentialed external actions are gated here — memory search,
+        // messaging, and local tools always pass so an autonomous turn can
+        // still read-then-propose.
+        if is_credentialed_external(tool) {
+            // Autonomous (heartbeat / scheduled) turns may NOT take a
+            // credentialed external action at all — no human is present to
+            // authorise it. They may still search memory and propose.
+            if self.trust.autonomous {
+                return PolicyDecision::Deny(format!(
+                    "Tool `{tool}` takes a credentialed external action, which is not permitted on an autonomous (heartbeat/scheduled) turn. Search memory and propose the action for a human turn to approve instead."
+                ));
+            }
+            // A tainted turn (context touched untrusted-provenance content,
+            // e.g. a web_fetch body or an untrusted memory hit) blocks
+            // credentialed external actions until a FRESH approval clears it.
+            if self.trust.tainted && !self.trust.approved {
+                return PolicyDecision::Deny(format!(
+                    "Tool `{tool}` takes a credentialed external action, but this turn's context contains untrusted-provenance content (e.g. a fetched page or an untrusted memory entry). Fresh approval is required before a credentialed external action can run on a tainted turn."
+                ));
+            }
+        }
+
         PolicyDecision::Allow
+    }
+
+    /// The per-turn trust state this policy enforces.
+    #[must_use]
+    pub fn trust(&self) -> TurnTrust {
+        self.trust
     }
 }
 
@@ -663,6 +758,121 @@ mod tests {
         ] {
             assert!(p.allows(verb), "messaging profile should allow {verb}");
         }
+    }
+
+    // ── coarse provenance / autonomy gate (Phase 3) ──────────────────────
+
+    #[test]
+    fn credentialed_external_set_is_what_we_expect() {
+        for t in [
+            "web_fetch",
+            "web_search",
+            "install_packages",
+            "add_mcp_server",
+        ] {
+            assert!(
+                is_credentialed_external(t),
+                "{t} should be credentialed-external"
+            );
+        }
+        for t in [
+            "read_file",
+            "send_message",
+            "memory_search",
+            "memory_get",
+            "shell",
+        ] {
+            assert!(
+                !is_credentialed_external(t),
+                "{t} must not be credentialed-external"
+            );
+        }
+    }
+
+    #[test]
+    fn untrusted_context_blocks_credentialed_external_without_approval() {
+        // Headline Phase 3 case: a turn whose context touched untrusted
+        // content blocks a credentialed external action absent fresh approval.
+        let tainted = ToolPolicy::new(ToolProfile::Full, None).with_trust(TurnTrust {
+            tainted: true,
+            approved: false,
+            autonomous: false,
+        });
+        let d = tainted.evaluate("web_fetch");
+        assert!(!d.is_allow());
+        assert!(d.deny_reason().unwrap().contains("untrusted-provenance"));
+        // Non-credentialed tools still pass on a tainted turn — the agent can
+        // read memory and propose.
+        assert!(tainted.evaluate("memory_search").is_allow());
+        assert!(tainted.evaluate("read_file").is_allow());
+        assert!(tainted.evaluate("send_message").is_allow());
+    }
+
+    #[test]
+    fn fresh_approval_clears_taint_for_credentialed_external() {
+        let approved = ToolPolicy::new(ToolProfile::Full, None).with_trust(TurnTrust {
+            tainted: true,
+            approved: true,
+            autonomous: false,
+        });
+        assert!(
+            approved.evaluate("web_fetch").is_allow(),
+            "a fresh approval must clear the taint block"
+        );
+        assert!(approved.evaluate("install_packages").is_allow());
+    }
+
+    #[test]
+    fn untainted_turn_allows_credentialed_external() {
+        let clean = ToolPolicy::new(ToolProfile::Full, None);
+        assert!(clean.evaluate("web_fetch").is_allow());
+        assert!(clean.evaluate("web_search").is_allow());
+        assert!(clean.evaluate("add_mcp_server").is_allow());
+    }
+
+    #[test]
+    fn autonomous_turn_blocks_credentialed_external_even_when_clean() {
+        // An autonomous (heartbeat) turn may search memory and propose, but
+        // never *take* a credentialed external action — even with no taint.
+        let auto = ToolPolicy::new(ToolProfile::Full, None).with_trust(TurnTrust {
+            tainted: false,
+            approved: false,
+            autonomous: true,
+        });
+        let d = auto.evaluate("web_fetch");
+        assert!(!d.is_allow());
+        assert!(d.deny_reason().unwrap().contains("autonomous"));
+        assert!(!auto.evaluate("web_search").is_allow());
+        assert!(!auto.evaluate("install_packages").is_allow());
+        // Memory + messaging stay reachable (read-then-propose).
+        assert!(auto.evaluate("memory_search").is_allow());
+        assert!(auto.evaluate("memory_get").is_allow());
+        assert!(auto.evaluate("send_message").is_allow());
+    }
+
+    #[test]
+    fn autonomous_block_is_not_cleared_by_approval_field() {
+        // The autonomous block is unconditional — `approved` only clears the
+        // taint block, not the autonomous one (no human turn to approve on).
+        let auto = ToolPolicy::new(ToolProfile::Full, None).with_trust(TurnTrust {
+            tainted: true,
+            approved: true,
+            autonomous: true,
+        });
+        assert!(!auto.evaluate("web_fetch").is_allow());
+        assert!(
+            auto.evaluate("web_fetch")
+                .deny_reason()
+                .unwrap()
+                .contains("autonomous")
+        );
+    }
+
+    #[test]
+    fn default_policy_has_clean_trust() {
+        assert_eq!(ToolPolicy::default().trust(), TurnTrust::default());
+        assert!(!TurnTrust::default().tainted);
+        assert!(!TurnTrust::default().autonomous);
     }
 
     #[test]
