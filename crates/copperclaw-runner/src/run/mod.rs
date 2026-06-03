@@ -3394,8 +3394,26 @@ mod tests {
         // turn billing more than any sane ceiling must not abort on
         // budget. It runs until the (small) turn cap instead, proving
         // the two breakers are independent.
+        // DISTINCT tool calls each turn (varying args) so the content-loop
+        // breaker does NOT trip — with the budget disabled we want the TURN
+        // CAP to be the stopper, proving the two breakers are independent.
+        // (Identical calls here would now trip the loop breaker first.)
         let scripts: Vec<Vec<ProviderEvent>> = (0..10)
-            .map(|_| looping_turn_with_usage(5_000_000, 5_000_000))
+            .map(|i| {
+                vec![
+                    ProviderEvent::ToolCall {
+                        id: format!("tu_{i}"),
+                        name: "noop_loop".into(),
+                        input: serde_json::json!({ "i": i }),
+                    },
+                    ProviderEvent::Usage {
+                        input_tokens: 5_000_000,
+                        output_tokens: 5_000_000,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                    },
+                ]
+            })
             .collect();
         let mut setup = build_setup(scripts);
         setup.deps.max_task_tokens = 0; // disabled
