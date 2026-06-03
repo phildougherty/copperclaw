@@ -6,6 +6,42 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security (M16 hardening wave 2b — DM pairing, per-group mention gating, tool policy LIVE — 2026-06-02)
+
+Rework of the two units rejected in wave 2, plus wiring the tool-policy
+engine's inputs and fixing the egress auto-injection. All four landed on
+`feat/security-hardening` (full workspace gate clean, 6,249 tests).
+
+- **DM pairing codes (landed for real).** An unknown DM sender's first
+  message mints an 8-char, 1h-TTL, rate-limited (3/channel) code
+  (`crates/copperclaw-db/migrations/018_dm_pairing_codes.sql` +
+  `dm_pairing_codes.rs`), delivered back to the sender over the existing
+  adapter delivery path (a plain `Chat` message every adapter renders) and
+  wired in `boot.rs`. `cclaw pairing list/approve` (new host-only
+  `pairing.approve` + agent-readable `pairing.list` socket actions);
+  approve promotes the sender into `users`. Default messaging-group policy
+  is now `request_approval`. NOTE: `unknown_sender_policy` is currently
+  advisory/stored-only — the sender gate holds every non-`users` sender
+  pending unconditionally; the field does not yet branch behavior.
+- **Per-group mention gating.** New `copperclaw-host-router/src/mention.rs`:
+  per-group `require_mention` (default on for group chats, off for DMs),
+  native-mention + regex detection, reply-to-the-agent (not arbitrary
+  replies) as implicit mention; callback-query / button-tap interactions are
+  never dropped. Passed in at `Router` construction (not a setter on an
+  `Arc`).
+- **Tool authorization is now LIVE.** The wave-2 policy engine is no longer
+  dormant: `tool_profile` is a `container_configs` column
+  (`migrations/019_container_config_tool_profile.sql`), written into
+  `runner.json` via `RunnerConfigForFile`, exposed through `cclaw groups
+  config`; the resolved sender role is plumbed through; and `load_skill`
+  narrows the live policy via a `ToolContext` hook. Mutating scheduler verbs
+  were moved out of the guest read-only set.
+- **Egress auto-injection fixed.** Under `deny-default`, the host now derives
+  the model endpoint from the actual provider base URL (Anthropic /
+  OpenRouter via `ANTHROPIC_BASE_URL`, ollama via `OLLAMA_BASE_URL`) and
+  always injects it, so an empty allow-list can never black-hole model
+  traffic.
+
 ### Security (M16 hardening wave 2 — egress v1, mount TOCTOU, tool policy engine — 2026-06-02)
 
 Second wave of the M16 roadmap. Two units landed on `feat/security-hardening`
