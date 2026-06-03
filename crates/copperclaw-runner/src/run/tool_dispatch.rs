@@ -28,10 +28,23 @@ pub(super) async fn invoke_tool(
     // `allowed-tools`. The base policy (profile + sender role) is fixed at
     // spawn; we clone it and apply the live skill scope per call so a
     // read-only skill blocks `shell` for as long as it's loaded.
+    // The coarse provenance / autonomy gate (Phase 3) is also dynamic: a
+    // `web_fetch` or an untrusted `memory_search` hit earlier in THIS turn
+    // taints the context, after which a credentialed external action
+    // (`web_fetch` / `web_search` / `install_packages` / `add_mcp_server`)
+    // is blocked until fresh approval. An autonomous (heartbeat) turn blocks
+    // those actions outright. We read the live signals off the context and
+    // stamp them onto the per-call policy alongside the active-skill scope.
+    let trust = crate::policy::TurnTrust {
+        tainted: deps.tool_ctx.is_context_tainted(),
+        approved: deps.tool_ctx.external_action_approved(),
+        autonomous: deps.tool_ctx.is_autonomous_turn(),
+    };
     let policy = deps
         .policy
         .clone()
-        .with_active_skill(deps.tool_ctx.active_skill_allowed_tools());
+        .with_active_skill(deps.tool_ctx.active_skill_allowed_tools())
+        .with_trust(trust);
     if let PolicyDecision::Deny(reason) = policy.evaluate(&call.name) {
         tracing::info!(tool = %call.name, %reason, "tool call denied by policy");
         return (reason, Vec::new(), true);
@@ -303,5 +316,158 @@ mod tests {
         let (content, _imgs, is_error) = invoke_tool(&deps, &call("shell")).await;
         assert!(is_error);
         assert!(content.contains("messaging"), "got: {content}");
+    }
+
+    /// Build deps whose `ToolContext` is a *real* `RunnerToolCtx` (so the
+    /// provenance signals — taint / autonomous — are honoured by the dispatch
+    /// gate) backed by a temp memory store. Returns the ctx separately so the
+    /// test can poke `mark_untrusted_context` / `set_turn_provenance`.
+    fn deps_with_runner_ctx() -> (tempfile::TempDir, RunnerDeps, Arc<RunnerToolCtx>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let inbound = Arc::new(Mutex::new(open_inbound(&paths).unwrap()));
+        let outbound = Arc::new(Mutex::new(open_outbound(&paths).unwrap()));
+        let mem_db = paths.root.join("memory").join("memory.db");
+        let ctx = Arc::new(
+            RunnerToolCtx::new(outbound.clone(), paths.outbox.clone()).with_memory_db(mem_db),
+        );
+        let tool_ctx: Arc<dyn ToolContext> = ctx.clone();
+        let provider: Arc<dyn AgentProvider> = Arc::new(NoopProvider);
+        let archive_dir = paths.outbox.join("_compactions");
+        let mut deps = RunnerDeps::minimal(provider, tool_ctx, inbound, outbound, archive_dir);
+        let mut map: HashMap<String, Arc<copperclaw_mcp::ToolEntry>> = HashMap::new();
+        for e in copperclaw_mcp::build_tool_set() {
+            map.insert(e.tool.name.to_string(), Arc::new(e));
+        }
+        deps.tool_map = Arc::new(map);
+        deps.policy = ToolPolicy::new(ToolProfile::Full, None);
+        (tmp, deps, ctx)
+    }
+
+    #[tokio::test]
+    async fn untrusted_context_blocks_credentialed_external_at_dispatch() {
+        // Headline Phase 3 case wired end-to-end through the dispatch gate:
+        // once the turn is tainted (as a web_fetch body would), a credentialed
+        // external action (web_search) is blocked absent fresh approval — even
+        // though the Full profile would otherwise allow it.
+        let (_tmp, deps, ctx) = deps_with_runner_ctx();
+        // Clean turn: web_search dispatches (it'll fail downstream without a
+        // network stub, but NOT with a policy deny — that's what we assert).
+        let (clean, _i, _e) = invoke_tool(&deps, &call("web_search")).await;
+        assert!(
+            !clean.contains("untrusted-provenance"),
+            "a clean turn must not be gated; got: {clean}"
+        );
+        // Taint the turn the way a web_fetch body does.
+        ctx.mark_untrusted_context("web_fetch:https://evil.example");
+        let (blocked, _i, is_error) = invoke_tool(&deps, &call("web_search")).await;
+        assert!(is_error);
+        assert!(
+            blocked.contains("untrusted-provenance"),
+            "tainted turn must block credentialed external action; got: {blocked}"
+        );
+        // Non-credentialed tools still pass on a tainted turn.
+        let (mem, _i, _e) = invoke_tool(
+            &deps,
+            &call_with("memory_search", serde_json::json!({"query":"x"})),
+        )
+        .await;
+        assert!(
+            !mem.contains("untrusted-provenance"),
+            "memory_search must stay reachable on a tainted turn; got: {mem}"
+        );
+    }
+
+    #[tokio::test]
+    async fn autonomous_turn_blocks_credentialed_external_at_dispatch() {
+        let (_tmp, deps, ctx) = deps_with_runner_ctx();
+        ctx.set_turn_provenance(true, false); // autonomous, no approval
+        let (blocked, _i, is_error) = invoke_tool(&deps, &call("web_fetch")).await;
+        assert!(is_error);
+        assert!(
+            blocked.contains("autonomous"),
+            "autonomous turn must block credentialed external action; got: {blocked}"
+        );
+        // But it can still search memory and propose.
+        let (mem, _i, _e) = invoke_tool(
+            &deps,
+            &call_with("memory_search", serde_json::json!({"query": "x"})),
+        )
+        .await;
+        assert!(
+            !mem.contains("autonomous"),
+            "memory search must stay reachable; got: {mem}"
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_search_get_roundtrip_through_runner_ctx() {
+        // memory_search / memory_get resolve against the per-group store the
+        // runner ctx opens, and an untrusted hit taints the turn.
+        let (_tmp, deps, ctx) = deps_with_runner_ctx();
+        // Seed the store directly (the write side lives host/runner-side; this
+        // mirrors what an agent-authored note + a fetched-and-stored snippet
+        // would produce).
+        {
+            let store =
+                copperclaw_db::memory::MemoryStore::open(ctx.memory_db_path_for_test().unwrap())
+                    .unwrap();
+            store
+                .upsert(&copperclaw_db::memory::MemoryWrite {
+                    key: "runbook",
+                    body: "telegram deploy steps",
+                    provenance: copperclaw_db::memory::Provenance::Trusted,
+                    source: None,
+                    embedding: &[],
+                })
+                .unwrap();
+            store
+                .upsert(&copperclaw_db::memory::MemoryWrite {
+                    key: "scraped",
+                    body: "telegram untrusted scraped content",
+                    provenance: copperclaw_db::memory::Provenance::Untrusted,
+                    source: Some("web_fetch:https://x"),
+                    embedding: &[],
+                })
+                .unwrap();
+        }
+        // memory_get of the trusted entry does NOT taint the turn.
+        let (got, _i, err) = invoke_tool(
+            &deps,
+            &call_with("memory_get", serde_json::json!({"key": "runbook"})),
+        )
+        .await;
+        assert!(!err, "memory_get should succeed; got: {got}");
+        assert!(got.contains("telegram deploy steps"), "got: {got}");
+        assert!(!ctx.is_context_tainted(), "a trusted hit must not taint");
+        // A search that surfaces the untrusted entry taints the turn.
+        let (found, _i, _e) = invoke_tool(
+            &deps,
+            &call_with("memory_search", serde_json::json!({"query": "telegram"})),
+        )
+        .await;
+        assert!(
+            found.contains("untrusted"),
+            "search should surface the untrusted hit; got: {found}"
+        );
+        assert!(
+            ctx.is_context_tainted(),
+            "an untrusted hit must taint the turn for the coarse gate"
+        );
+        // …and a credentialed external action is now blocked.
+        let (blocked, _i, is_error) = invoke_tool(&deps, &call("web_fetch")).await;
+        assert!(
+            is_error && blocked.contains("untrusted-provenance"),
+            "got: {blocked}"
+        );
+    }
+
+    fn call_with(name: &str, input: serde_json::Value) -> PendingToolCall {
+        PendingToolCall {
+            id: "tu_1".into(),
+            name: name.into(),
+            input,
+            parse_error: None,
+        }
     }
 }

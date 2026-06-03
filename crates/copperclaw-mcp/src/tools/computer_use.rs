@@ -950,9 +950,16 @@ pub mod web_fetch {
 
     pub async fn handle(
         arguments: Option<JsonObject>,
-        _ctx: &dyn crate::context::ToolContext,
+        ctx: &dyn crate::context::ToolContext,
     ) -> Result<CallToolResult, ToolError> {
         let input: Input = parse_args(arguments)?;
+        // PROVENANCE: a fetched body is external, attacker-influenceable
+        // content. Tag the turn untrusted up front (before the body even
+        // lands in history) so the runner's coarse gate blocks credentialed
+        // external actions for the rest of this turn absent fresh approval.
+        // Done regardless of HTTP outcome — even a redirect/error response
+        // body is untrusted content the model now sees.
+        ctx.mark_untrusted_context(&format!("web_fetch:{}", input.url));
         let timeout = Duration::from_secs(
             input
                 .timeout_secs
@@ -1567,6 +1574,64 @@ mod tests {
         assert!(web_fetch::is_html_content_type("application/xhtml+xml"));
         assert!(!web_fetch::is_html_content_type("application/json"));
         assert!(!web_fetch::is_html_content_type("text/plain"));
+    }
+
+    /// A ctx that records every `mark_untrusted_context(source)` call so the
+    /// `web_fetch` provenance test can assert the turn was tainted.
+    #[derive(Default)]
+    struct TaintRecordingCtx {
+        sources: std::sync::Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl crate::context::ToolContext for TaintRecordingCtx {
+        async fn emit_outbound(
+            &self,
+            _e: crate::context::OutboundToolEffect,
+        ) -> Result<crate::context::ToolEffectAck, ToolError> {
+            Ok(crate::context::ToolEffectAck::Accepted)
+        }
+        async fn list_tasks(&self) -> Result<Vec<crate::context::TaskSummary>, ToolError> {
+            Ok(Vec::new())
+        }
+        fn mark_untrusted_context(&self, source: &str) {
+            self.sources.lock().unwrap().push(source.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn web_fetch_taints_turn_with_untrusted_provenance() {
+        // PROVENANCE: a successful fetch must flag the turn untrusted so the
+        // runner's coarse gate blocks credentialed external actions.
+        let _lb = crate::tools::net_guard::LoopbackTestGuard::enable();
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_raw("{\"k\":1}".as_bytes(), "application/json"),
+            )
+            .mount(&server)
+            .await;
+        let ctx = Arc::new(TaintRecordingCtx::default());
+        let url = format!("{}/", server.uri());
+        web_fetch::handle(
+            Some(json!({"url": url}).as_object().unwrap().clone()),
+            ctx.as_ref(),
+        )
+        .await
+        .unwrap();
+        let sources = ctx.sources.lock().unwrap();
+        assert_eq!(
+            sources.len(),
+            1,
+            "web_fetch must taint the turn exactly once"
+        );
+        assert!(
+            sources[0].starts_with("web_fetch:"),
+            "taint source should name the tool + url; got: {}",
+            sources[0]
+        );
     }
 
     #[tokio::test]

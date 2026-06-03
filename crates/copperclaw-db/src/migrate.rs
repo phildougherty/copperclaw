@@ -14,6 +14,9 @@ pub enum MigrationSet {
     Central,
     SessionInbound,
     SessionOutbound,
+    /// Per-agent-group searchable memory store (`memory.db`). One file per
+    /// agent group, applied by [`crate::memory::MemoryStore::open`].
+    Memory,
 }
 
 struct Migration {
@@ -104,12 +107,18 @@ const SESSION_OUTBOUND: &[Migration] = &[Migration {
     sql: include_str!("../migrations/003_session_outbound.sql"),
 }];
 
+const MEMORY: &[Migration] = &[Migration {
+    name: "021_memory_store",
+    sql: include_str!("../migrations/021_memory_store.sql"),
+}];
+
 impl MigrationSet {
     fn migrations(self) -> &'static [Migration] {
         match self {
             Self::Central => CENTRAL,
             Self::SessionInbound => SESSION_INBOUND,
             Self::SessionOutbound => SESSION_OUTBOUND,
+            Self::Memory => MEMORY,
         }
     }
 }
@@ -316,6 +325,42 @@ mod tests {
         ).unwrap();
         let applied = applied_central_schema_version(&conn).unwrap();
         assert_eq!(applied, Some(expected_central_schema_version() + 1));
+    }
+
+    #[test]
+    fn memory_migrations_apply_and_create_fts() {
+        let mut conn = fresh();
+        run_migrations(&mut conn, MigrationSet::Memory).unwrap();
+        for (kind, name) in [
+            ("table", "memory_entries"),
+            ("table", "memory_fts"),
+            ("trigger", "memory_entries_ai"),
+            ("trigger", "memory_entries_ad"),
+            ("trigger", "memory_entries_au"),
+        ] {
+            let exists: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type=?1 AND name=?2",
+                    params![kind, name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(exists, 1, "missing {kind} `{name}`");
+        }
+        // FTS5 is compiled into the bundled SQLite — a MATCH must work.
+        conn.execute_batch(
+            "INSERT INTO memory_entries (mem_key, body, created_at, updated_at)
+             VALUES ('k', 'hello world', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_fts WHERE memory_fts MATCH 'hello'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "FTS5 MATCH should find the inserted row");
     }
 
     #[test]

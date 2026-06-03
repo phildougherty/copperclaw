@@ -126,7 +126,13 @@ async fn main() -> Result<()> {
     };
     let mut tool_ctx_inner = RunnerToolCtx::new(outbound.clone(), paths.outbox.clone())
         .with_subagent(subagent_deps)
-        .with_breadcrumbs_from_env();
+        .with_breadcrumbs_from_env()
+        // Per-group searchable memory store: the host bind-mounts the group's
+        // `memory/` dir at `/data/memory`, so the store lives at
+        // `<session_dir>/memory/memory.db`. `MemoryStore::open` creates +
+        // migrates it lazily on first `memory_search` / `memory_get`. A child
+        // (subagent) session shares the same group store.
+        .with_memory_db(paths.root.join("memory").join("memory.db"));
     if let Some(parent) = cfg.source_session_id {
         tool_ctx_inner = tool_ctx_inner.with_source_session_id(parent);
     }

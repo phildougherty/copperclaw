@@ -247,6 +247,45 @@ impl ApprovalsModule {
         self.store.lock().unwrap().pending.push(summary);
     }
 
+    /// Build + record a pending approval for a **credentialed external
+    /// action** blocked by the runner's coarse provenance gate (M16 Phase 3).
+    ///
+    /// This is the reuse seam for the gate: when the runner refuses a
+    /// credentialed external action on a tainted turn, the host surfaces the
+    /// request through *this* module — the same Wave-2 approvals mechanism
+    /// (`record_pending` → operator `resolve` / `resolve_with`) that gates
+    /// unknown senders, channels, and self-mod installs. No parallel approval
+    /// path is introduced. Returns the assigned [`ApprovalId`] so the caller
+    /// can correlate the eventual decision.
+    ///
+    /// `tool` is the blocked tool name, `taint_source` a short label for the
+    /// untrusted content that tainted the turn (e.g. the fetched URL). Both are
+    /// folded into the human-readable `description` the approver sees.
+    pub fn record_credentialed_external_action(
+        &self,
+        agent_group_id: AgentGroupId,
+        messaging_group_id: Option<MessagingGroupId>,
+        requester: Option<UserId>,
+        tool: &str,
+        taint_source: &str,
+    ) -> ApprovalId {
+        let id = ApprovalId::new();
+        let summary = ApprovalSummary {
+            id,
+            kind: ApprovalKind::CredentialedExternalAction,
+            messaging_group_id,
+            agent_group_id: Some(agent_group_id),
+            requester,
+            created_at: Utc::now(),
+            expires_at: None,
+            description: format!(
+                "Agent requested credentialed external action `{tool}` on a turn whose context was tainted by untrusted-provenance content ({taint_source}). Approve to clear the taint for this action."
+            ),
+        };
+        self.record_pending(summary);
+        id
+    }
+
     /// Remove a pending approval by id, recording an `approve` decision.
     /// Called once an admin approves the entry.
     pub fn resolve(&self, id: ApprovalId) {
@@ -492,6 +531,47 @@ mod tests {
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0].outcome, DecisionOutcome::Approve);
         assert_eq!(decisions[0].id, id);
+    }
+
+    #[test]
+    fn credentialed_external_action_reuses_approvals_module() {
+        // The Phase-3 coarse gate reuses the Wave-2 approvals mechanism: the
+        // blocked credentialed external action is surfaced as a pending
+        // approval of the new kind, then cleared by the same resolve() path.
+        let m = ApprovalsModule::new();
+        let group = AgentGroupId::new();
+        let id = m.record_credentialed_external_action(
+            group,
+            None,
+            None,
+            "web_fetch",
+            "web_fetch:https://evil.example",
+        );
+        // It lands in the queue, filterable by the dedicated kind.
+        let by_kind = m.pending_approvals_summary(Some(ApprovalKind::CredentialedExternalAction));
+        assert_eq!(by_kind.len(), 1);
+        assert_eq!(by_kind[0].id, id);
+        assert_eq!(by_kind[0].agent_group_id, Some(group));
+        assert!(by_kind[0].description.contains("web_fetch"));
+        assert!(by_kind[0].description.contains("untrusted-provenance"));
+        // A default TTL is stamped (it lapses rather than lingering).
+        assert!(by_kind[0].expires_at.is_some());
+        // It does NOT show up under a different kind's filter.
+        assert!(
+            m.pending_approvals_summary(Some(ApprovalKind::Sender))
+                .is_empty()
+        );
+        // Operator approves it via the same resolve() path; an approve
+        // decision is logged.
+        m.resolve(id);
+        assert!(
+            m.pending_approvals_summary(Some(ApprovalKind::CredentialedExternalAction))
+                .is_empty()
+        );
+        assert_eq!(
+            m.decisions().last().unwrap().outcome,
+            DecisionOutcome::Approve
+        );
     }
 
     #[test]
