@@ -17,6 +17,7 @@ pub mod config;
 pub mod destinations;
 pub mod disallowed;
 pub mod formatter;
+pub mod policy;
 pub mod redact;
 pub mod run;
 pub mod state;
@@ -28,6 +29,7 @@ pub use config::{RunnerConfig, RunnerConfigFile};
 pub use destinations::{ResolvedRoute, resolve_recipient};
 pub use disallowed::{DISALLOWED_TOOLS, is_disallowed};
 pub use formatter::{FormattedTurn, format_messages};
+pub use policy::{PolicyDecision, SenderRole, ToolPolicy, ToolProfile};
 pub use redact::{REDACTED, redact_secrets};
 pub use run::{
     ACTIVE_POLL_INTERVAL_MS, DEFAULT_MAX_TOOL_TURNS, DEFAULT_PROVIDER_DEADLINE_MS,

@@ -11,8 +11,6 @@ use copperclaw_providers::{AgentQuery, ProviderError, QueryInput};
 use copperclaw_types::ProviderEvent;
 use tokio::time::{sleep, timeout};
 
-use crate::disallowed::is_disallowed;
-
 use super::drive_turn::{LlmTurnOutput, PendingToolCall, TurnOutcome};
 use super::prompt::system_with_context;
 use super::{RunnerDeps, clear_current_tool, emit_usage_report, set_current_tool};
@@ -313,12 +311,11 @@ pub(super) async fn pump_events(
                 // hasn't been reassembled from streaming deltas yet.
             }
             ProviderEvent::ToolCall { id, name, input } => {
-                // `is_disallowed` is checked here AND inside
-                // `invoke_tool`; the second check is the one that
-                // synthesises the refusal text. We still push the
-                // PendingToolCall either way so the model sees a
-                // matching `tool_result` on the next turn.
-                let _ = is_disallowed(&name);
+                // Authorization is enforced authoritatively in
+                // `invoke_tool` (via `deps.policy.evaluate`), which
+                // synthesises the model-facing refusal. We always push
+                // the PendingToolCall here so the model sees a matching
+                // `tool_result` on the next turn even when it's denied.
                 // Optional `[tool detail]` chat breadcrumb for
                 // user-visible observability during long agent turns.
                 // Default no-op via the trait; the RunnerToolCtx impl

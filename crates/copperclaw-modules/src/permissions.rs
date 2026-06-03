@@ -142,6 +142,66 @@ impl PermissionOp {
     }
 }
 
+/// Per-group tool authorization profile — the positive allow-list a
+/// group's agent is scoped to at tool-dispatch time. Mirrors
+/// `copperclaw_runner::policy::ToolProfile` (the runner owns the
+/// enforcement; this enum is the host-side surface for selecting a
+/// profile per group). The two share the same lower-case wire form.
+///
+/// Kept in `copperclaw-modules` (rather than importing the runner type)
+/// so the host's access-control surface doesn't take a dependency on the
+/// container-runner crate.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolProfile {
+    /// Conversation + housekeeping only.
+    Minimal,
+    /// Read-only / informational tools (read files, search, inspect git).
+    Messaging,
+    /// Filesystem mutation, shell, and agent spawning.
+    Coding,
+    /// Everything, including self-modification. Historical default.
+    #[default]
+    Full,
+}
+
+impl ToolProfile {
+    /// Stable lower-case identifier (matches the serde representation and
+    /// the runner-side profile).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Messaging => "messaging",
+            Self::Coding => "coding",
+            Self::Full => "full",
+        }
+    }
+
+    /// Parse a profile identifier. `None` for unknown values.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "minimal" => Some(Self::Minimal),
+            "messaging" => Some(Self::Messaging),
+            "coding" => Some(Self::Coding),
+            "full" => Some(Self::Full),
+            _ => None,
+        }
+    }
+}
+
+/// The sensible default tool-profile for a sender role, used when a group
+/// hasn't pinned an explicit profile. Admins get the full surface,
+/// members a coding surface, guests a read-only messaging surface. The
+/// runner still enforces the host-owned floor beneath whatever profile
+/// is selected.
+pub fn default_profile_for_role(role: Role) -> ToolProfile {
+    match role {
+        Role::Admin => ToolProfile::Full,
+        Role::Member => ToolProfile::Coding,
+        Role::Guest => ToolProfile::Messaging,
+    }
+}
+
 /// Returns `true` if `role` may perform `op` under the default policy.
 pub fn check(role: Role, op: PermissionOp) -> bool {
     match op {
@@ -346,6 +406,42 @@ mod tests {
                 "member should NOT be allowed for {op:?}"
             );
         }
+    }
+
+    #[test]
+    fn tool_profile_str_and_parse_roundtrip() {
+        for p in [
+            ToolProfile::Minimal,
+            ToolProfile::Messaging,
+            ToolProfile::Coding,
+            ToolProfile::Full,
+        ] {
+            assert_eq!(ToolProfile::parse(p.as_str()), Some(p));
+        }
+        assert!(ToolProfile::parse("nope").is_none());
+    }
+
+    #[test]
+    fn tool_profile_default_is_full() {
+        assert_eq!(ToolProfile::default(), ToolProfile::Full);
+    }
+
+    #[test]
+    fn tool_profile_serde_is_lowercase() {
+        let json = serde_json::to_string(&ToolProfile::Coding).unwrap();
+        assert_eq!(json, "\"coding\"");
+        let back: ToolProfile = serde_json::from_str("\"messaging\"").unwrap();
+        assert_eq!(back, ToolProfile::Messaging);
+    }
+
+    #[test]
+    fn default_profile_for_role_scales_with_privilege() {
+        assert_eq!(default_profile_for_role(Role::Admin), ToolProfile::Full);
+        assert_eq!(default_profile_for_role(Role::Member), ToolProfile::Coding);
+        assert_eq!(
+            default_profile_for_role(Role::Guest),
+            ToolProfile::Messaging
+        );
     }
 
     #[test]

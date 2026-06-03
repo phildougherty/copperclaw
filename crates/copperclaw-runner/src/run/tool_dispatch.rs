@@ -2,7 +2,7 @@
 //! runner's tool map, wrap it in a heartbeat ticker + deadline, and render
 //! the result into the `Tool` history block the model sees next turn.
 
-use crate::disallowed::is_disallowed;
+use crate::policy::PolicyDecision;
 
 use super::RunnerDeps;
 use super::drive_turn::PendingToolCall;
@@ -17,15 +17,14 @@ pub(super) async fn invoke_tool(
     deps: &RunnerDeps,
     call: &PendingToolCall,
 ) -> (String, Vec<ToolImage>, bool) {
-    if is_disallowed(&call.name) {
-        return (
-            format!(
-                "Tool `{}` is disallowed inside the copperclaw container.",
-                call.name
-            ),
-            Vec::new(),
-            true,
-        );
+    // Layered authorization: host-owned floor + sender role + active
+    // skill `allowed-tools` + group tool-profile. The floor (the old
+    // `DISALLOWED_TOOLS`) is the innermost layer and can never be
+    // re-granted by a looser profile. A deny synthesises a model-facing
+    // `tool_result { is_error: true }` so the model can self-correct.
+    if let PolicyDecision::Deny(reason) = deps.policy.evaluate(&call.name) {
+        tracing::info!(tool = %call.name, %reason, "tool call denied by policy");
+        return (reason, Vec::new(), true);
     }
     let Some(entry) = deps.tool_map.get(&call.name) else {
         return (
@@ -137,5 +136,128 @@ pub(super) fn short_type(v: &serde_json::Value) -> &'static str {
         serde_json::Value::String(_) => "string",
         serde_json::Value::Array(_) => "array",
         serde_json::Value::Object(_) => "object",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
+    use copperclaw_mcp::ToolContext;
+    use copperclaw_providers::{AgentProvider, AgentQuery, ProviderError, QueryInput};
+    use copperclaw_types::{AgentGroupId, ProviderEvent, SessionId};
+    use tokio::sync::Mutex;
+
+    use super::*;
+    use crate::policy::{SenderRole, ToolPolicy, ToolProfile};
+    use crate::run::RunnerDeps;
+    use crate::tools::RunnerToolCtx;
+
+    /// Minimal provider stub — never queried on the deny path under test.
+    struct NoopProvider;
+
+    #[async_trait]
+    impl AgentProvider for NoopProvider {
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn name(&self) -> &str {
+            "noop"
+        }
+        async fn query(&self, _input: QueryInput) -> Result<Box<dyn AgentQuery>, ProviderError> {
+            Ok(Box::new(NoopQuery))
+        }
+        fn is_session_invalid(&self, _err: &ProviderError) -> bool {
+            false
+        }
+    }
+
+    struct NoopQuery;
+
+    #[async_trait]
+    impl AgentQuery for NoopQuery {
+        async fn push(&mut self, _message: String) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<ProviderEvent> {
+            None
+        }
+        async fn abort(&mut self) {}
+    }
+
+    /// Build a `RunnerDeps` with a real `shell` + `read_file` tool map
+    /// and the supplied policy. Only the fields `invoke_tool` reads are
+    /// load-bearing here.
+    fn deps_with_policy(policy: ToolPolicy) -> (tempfile::TempDir, RunnerDeps) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let inbound = Arc::new(Mutex::new(open_inbound(&paths).unwrap()));
+        let outbound = Arc::new(Mutex::new(open_outbound(&paths).unwrap()));
+        let tool_ctx: Arc<dyn ToolContext> =
+            Arc::new(RunnerToolCtx::new(outbound.clone(), paths.outbox.clone()));
+        let provider: Arc<dyn AgentProvider> = Arc::new(NoopProvider);
+        let archive_dir = paths.outbox.join("_compactions");
+        let mut deps = RunnerDeps::minimal(provider, tool_ctx, inbound, outbound, archive_dir);
+        // Real handlers so an *allowed* call would actually dispatch
+        // (we only assert the deny path; the map presence proves the
+        // policy gate fires *before* dispatch).
+        let mut map: HashMap<String, Arc<copperclaw_mcp::ToolEntry>> = HashMap::new();
+        for e in copperclaw_mcp::build_tool_set() {
+            map.insert(e.tool.name.to_string(), Arc::new(e));
+        }
+        deps.tool_map = Arc::new(map);
+        deps.policy = policy;
+        (tmp, deps)
+    }
+
+    fn call(name: &str) -> PendingToolCall {
+        PendingToolCall {
+            id: "tu_1".into(),
+            name: name.into(),
+            input: serde_json::json!({}),
+            parse_error: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn floor_tool_is_denied_before_dispatch() {
+        let (_tmp, deps) = deps_with_policy(ToolPolicy::default());
+        let (content, _imgs, is_error) = invoke_tool(&deps, &call("CronCreate")).await;
+        assert!(is_error);
+        assert!(content.contains("host-owned"), "got: {content}");
+    }
+
+    #[tokio::test]
+    async fn guest_sender_cannot_invoke_shell() {
+        let policy = ToolPolicy::new(ToolProfile::Full, Some(SenderRole::Guest));
+        let (_tmp, deps) = deps_with_policy(policy);
+        let (content, _imgs, is_error) = invoke_tool(&deps, &call("shell")).await;
+        assert!(is_error);
+        assert!(content.contains("guest"), "got: {content}");
+    }
+
+    #[tokio::test]
+    async fn skill_allowed_read_blocks_shell_at_dispatch() {
+        // Headline Phase 1.1 case: `allowed-tools: [Read]` (→ read_file)
+        // blocks shell at the dispatch gate even under a Coding profile.
+        let policy = ToolPolicy::new(ToolProfile::Coding, None)
+            .with_active_skill(Some(vec!["read_file".into()]));
+        let (_tmp, deps) = deps_with_policy(policy);
+        let (content, _imgs, is_error) = invoke_tool(&deps, &call("shell")).await;
+        assert!(is_error);
+        assert!(content.contains("active skill"), "got: {content}");
+    }
+
+    #[tokio::test]
+    async fn messaging_profile_blocks_shell_at_dispatch() {
+        let policy = ToolPolicy::new(ToolProfile::Messaging, None);
+        let (_tmp, deps) = deps_with_policy(policy);
+        let (content, _imgs, is_error) = invoke_tool(&deps, &call("shell")).await;
+        assert!(is_error);
+        assert!(content.contains("messaging"), "got: {content}");
     }
 }
