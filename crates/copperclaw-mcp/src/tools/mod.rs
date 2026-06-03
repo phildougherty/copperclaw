@@ -39,6 +39,7 @@ pub mod grep;
 pub mod interactive;
 pub mod load_skill;
 pub mod multi_edit;
+pub mod net_guard;
 pub mod scheduling;
 pub mod self_mod;
 pub mod sentinel;

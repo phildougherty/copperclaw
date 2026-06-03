@@ -310,10 +310,29 @@ pub async fn search(input: Input, env: &dyn EnvLookup) -> Result<SearchOutput, T
         ))
     })?;
 
+    // SSRF guard: re-check every redirect hop against the same
+    // loopback / link-local / RFC1918 / unique-local classifier the
+    // web_fetch tool uses, so a search backend that 302s into the
+    // cloud metadata endpoint (or a maliciously configured provider
+    // URL) cannot be followed. The provider base URLs are guarded
+    // below, after we know which one we're hitting.
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+        .redirect(crate::tools::net_guard::redirect_policy())
         .build()
         .map_err(|e| ToolError::Internal(format!("web_search client build: {e}")))?;
+
+    // Pre-flight the provider's base URL: an operator can override the
+    // endpoint via the DEFAULT_*_URL constants (and tests inject their
+    // own), so a misconfigured or attacker-influenced URL pointing at
+    // an internal address is rejected before the request goes out.
+    let provider_url = match provider {
+        Provider::Tavily => DEFAULT_TAVILY_URL,
+        Provider::Exa => DEFAULT_EXA_URL,
+        Provider::Brave => DEFAULT_BRAVE_URL,
+        Provider::SerpApi => DEFAULT_SERPAPI_URL,
+    };
+    crate::tools::net_guard::guard_url(provider_url).await?;
 
     let started = Instant::now();
     let results = match provider {

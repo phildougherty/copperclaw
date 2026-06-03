@@ -959,8 +959,16 @@ pub mod web_fetch {
                 .unwrap_or(WEB_FETCH_DEFAULT_TIMEOUT_SECS)
                 .min(120),
         );
+        // SSRF guard: reject the target before we ever open a socket if
+        // its host resolves to a loopback / link-local (incl. the cloud
+        // metadata endpoint) / RFC1918 / unique-local / unspecified
+        // address. Every redirect hop is re-checked by the client's
+        // redirect policy below — a public URL that 302s to an internal
+        // one is the more dangerous vector.
+        crate::tools::net_guard::guard_url(&input.url).await?;
         let client = reqwest::Client::builder()
             .timeout(timeout)
+            .redirect(crate::tools::net_guard::redirect_policy())
             .build()
             .map_err(|e| ToolError::Internal(format!("web_fetch client build: {e}")))?;
         let method = input
@@ -1563,6 +1571,7 @@ mod tests {
 
     #[tokio::test]
     async fn web_fetch_converts_html_to_markdown() {
+        let _lb = crate::tools::net_guard::LoopbackTestGuard::enable();
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/"))
@@ -1599,6 +1608,7 @@ mod tests {
 
     #[tokio::test]
     async fn web_fetch_passes_through_json_unchanged() {
+        let _lb = crate::tools::net_guard::LoopbackTestGuard::enable();
         let server = wiremock::MockServer::start().await;
         let payload = r#"{"items":[1,2,3]}"#;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -1629,6 +1639,7 @@ mod tests {
 
     #[tokio::test]
     async fn web_fetch_raw_flag_returns_html_unmodified() {
+        let _lb = crate::tools::net_guard::LoopbackTestGuard::enable();
         let server = wiremock::MockServer::start().await;
         let html = "<html><body><h1>Hi</h1></body></html>";
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -1661,6 +1672,7 @@ mod tests {
         // header can be tens of KiB, so the full headers map must NOT
         // appear in the tool output. Status + content_type as scalars
         // are the supported surface area.
+        let _lb = crate::tools::net_guard::LoopbackTestGuard::enable();
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/api"))
@@ -1703,6 +1715,7 @@ mod tests {
         // Regression guard: the cap is 16 KiB (lowered from 32 on
         // 2026-05-24 — see `WEB_FETCH_CAP` rationale). A 32 KiB JSON
         // payload must come back truncated.
+        let _lb = crate::tools::net_guard::LoopbackTestGuard::enable();
         let server = wiremock::MockServer::start().await;
         let big = "x".repeat(32 * 1024);
         wiremock::Mock::given(wiremock::matchers::method("GET"))
@@ -1731,6 +1744,7 @@ mod tests {
 
     #[tokio::test]
     async fn web_fetch_html_with_charset_param_triggers_conversion() {
+        let _lb = crate::tools::net_guard::LoopbackTestGuard::enable();
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("GET"))
             .and(wiremock::matchers::path("/"))
