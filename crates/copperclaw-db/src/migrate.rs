@@ -89,6 +89,10 @@ const CENTRAL: &[Migration] = &[
         name: "019_container_config_tool_profile",
         sql: include_str!("../migrations/019_container_config_tool_profile.sql"),
     },
+    Migration {
+        name: "022_mcp_oauth_tokens",
+        sql: include_str!("../migrations/022_mcp_oauth_tokens.sql"),
+    },
 ];
 
 const SESSION_INBOUND: &[Migration] = &[
@@ -260,6 +264,7 @@ mod tests {
             "outbound_dropped_messages",
             "container_configs",
             "tasks",
+            "mcp_oauth_tokens",
         ] {
             let exists: i64 = conn
                 .query_row(

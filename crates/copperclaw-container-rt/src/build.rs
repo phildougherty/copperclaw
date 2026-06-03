@@ -42,6 +42,68 @@ impl ExtraFile {
     }
 }
 
+/// Networking mode for the `RUN` steps of an image build (apt / npm install
+/// and any package postinstall scripts).
+///
+/// The default (`Bridge`) is Docker's normal build networking — package
+/// registries are reachable, which `apt-get install` / `npm install` need.
+/// `None` cuts the build off the network entirely (a real, daemon-enforced
+/// deny — useful for builds that copy in pre-fetched artifacts and must run no
+/// network during install). The host's `install_packages` containment uses
+/// `Bridge` (real registries needed) but pairs it with the broker-token denial
+/// below, so a malicious postinstall has constrained — not unrestricted —
+/// network and no broker capability.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BuildNetwork {
+    /// Docker's default build networking (bridge). Registries reachable.
+    #[default]
+    Bridge,
+    /// No network during `RUN` steps (`--network=none`). A real deny.
+    None,
+    /// Host networking during build (`--network=host`). Reserved; not used by
+    /// the default install — present so an operator with a private registry on
+    /// the host loopback can opt in deliberately.
+    Host,
+}
+
+impl BuildNetwork {
+    /// The bollard `networkmode` string for this mode, or `None` to leave the
+    /// daemon default (which is `Bridge`).
+    #[must_use]
+    pub fn networkmode(self) -> Option<&'static str> {
+        match self {
+            BuildNetwork::Bridge => None,
+            BuildNetwork::None => Some("none"),
+            BuildNetwork::Host => Some("host"),
+        }
+    }
+}
+
+/// Containment posture for an image build. The defaults keep the historical
+/// behaviour (bridge network, no credentials in build-args). The host sets
+/// `deny_broker_token` for `install_packages` builds so a malicious package
+/// postinstall can never receive the per-session broker capability token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BuildContainment {
+    /// Network mode for build `RUN` steps.
+    pub network: BuildNetwork,
+    /// When true, [`assert_no_credentials`] is enforced before the build is
+    /// dispatched: the spec must carry NO build-arg or label that looks like a
+    /// credential (broker token, provider API key, etc.). This is the
+    /// structural guarantee that the broker token never reaches a package
+    /// postinstall. Default true.
+    pub deny_broker_token: bool,
+}
+
+impl Default for BuildContainment {
+    fn default() -> Self {
+        Self {
+            network: BuildNetwork::Bridge,
+            deny_broker_token: true,
+        }
+    }
+}
+
 /// Everything needed to render and tag a built image.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImageBuildSpec {
@@ -58,7 +120,60 @@ pub struct ImageBuildSpec {
     pub extra_files: Vec<ExtraFile>,
     /// Extra labels to apply (in addition to `copperclaw.fingerprint`).
     pub labels: Vec<(String, String)>,
+    /// Build-args passed to the build. Deliberately NOT a credential channel:
+    /// [`BuildContainment::deny_broker_token`] rejects any credential-shaped
+    /// entry here. Kept so legitimate non-secret build-args (e.g. a mirror
+    /// URL) remain possible.
+    pub build_args: Vec<(String, String)>,
+    /// Containment posture: build network mode + broker-token denial. NOT part
+    /// of the [`Self::fingerprint`] (it's a runtime build posture, not
+    /// Dockerfile content — two specs that differ only in containment still
+    /// produce the same image), so adding it leaves existing tags unchanged.
+    pub containment: BuildContainment,
 }
+
+/// Whether a build-arg / label name looks like a credential that must never be
+/// threaded into an image build's environment (where a package postinstall
+/// could read it). Case-insensitive substring match on the well-known secret
+/// markers plus the copperclaw broker prefix.
+#[must_use]
+pub fn looks_like_credential(name: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "broker",
+        "token",
+        "api_key",
+        "apikey",
+        "secret",
+        "password",
+        "passwd",
+        "anthropic",
+        "credential",
+        "bearer",
+        "private_key",
+    ];
+    let lower = name.to_ascii_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// Error returned when a build spec violates its containment policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainmentViolation {
+    /// The offending build-arg / label name.
+    pub name: String,
+}
+
+impl std::fmt::Display for ContainmentViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "credential-shaped build input `{}` is not permitted in a contained image build \
+             (a package postinstall could read it); the broker token must never reach a build",
+            self.name
+        )
+    }
+}
+
+impl std::error::Error for ContainmentViolation {}
 
 impl ImageBuildSpec {
     /// Start a new spec.
@@ -115,6 +230,40 @@ impl ImageBuildSpec {
     #[must_use]
     pub fn image_tag(&self) -> String {
         format!("{}:sha256-{}", self.repo, self.fingerprint())
+    }
+
+    /// Builder: apply a containment posture (network mode + broker-token
+    /// denial). Used by the host's `install_packages` path.
+    #[must_use]
+    pub fn with_containment(mut self, containment: BuildContainment) -> Self {
+        self.containment = containment;
+        self
+    }
+
+    /// Enforce the spec's containment policy. When
+    /// [`BuildContainment::deny_broker_token`] is set, every build-arg name and
+    /// label name is checked against [`looks_like_credential`]; the first match
+    /// is a [`ContainmentViolation`]. This is the structural guarantee that the
+    /// broker token / provider key never rides into a package build's env where
+    /// a malicious postinstall could read it.
+    ///
+    /// Returns `Ok(())` when the spec is clean (the default install always is —
+    /// the host never threads credentials into a build).
+    pub fn assert_no_credentials(&self) -> Result<(), ContainmentViolation> {
+        if !self.containment.deny_broker_token {
+            return Ok(());
+        }
+        for (k, _) in &self.build_args {
+            if looks_like_credential(k) {
+                return Err(ContainmentViolation { name: k.clone() });
+            }
+        }
+        for (k, _) in &self.labels {
+            if looks_like_credential(k) {
+                return Err(ContainmentViolation { name: k.clone() });
+            }
+        }
+        Ok(())
     }
 
     /// Render the Dockerfile text.
@@ -244,6 +393,109 @@ mod tests {
         let tag = spec.image_tag();
         assert!(tag.starts_with("copperclaw/session:sha256-"));
         assert!(tag.ends_with(&spec.fingerprint()));
+    }
+
+    // ── install_packages containment ───────────────────────────────
+
+    #[test]
+    fn default_containment_denies_broker_token_and_uses_bridge() {
+        let c = BuildContainment::default();
+        assert!(c.deny_broker_token);
+        assert_eq!(c.network, BuildNetwork::Bridge);
+        assert_eq!(c.network.networkmode(), None);
+    }
+
+    #[test]
+    fn build_network_modes_map_to_docker_strings() {
+        assert_eq!(BuildNetwork::Bridge.networkmode(), None);
+        assert_eq!(BuildNetwork::None.networkmode(), Some("none"));
+        assert_eq!(BuildNetwork::Host.networkmode(), Some("host"));
+    }
+
+    #[test]
+    fn looks_like_credential_catches_secret_markers() {
+        for name in [
+            "ANTHROPIC_API_KEY",
+            "BROKER_TOKEN",
+            "X_TOKEN",
+            "my_secret",
+            "DB_PASSWORD",
+            "Bearer",
+            "service_credential",
+            "PRIVATE_KEY",
+            "apikey",
+        ] {
+            assert!(looks_like_credential(name), "{name} should be flagged");
+        }
+        for name in ["MIRROR_URL", "DEBIAN_FRONTEND", "TZ", "LANG", "PROXY_HOST"] {
+            assert!(!looks_like_credential(name), "{name} should be allowed");
+        }
+    }
+
+    #[test]
+    fn assert_no_credentials_passes_for_clean_spec() {
+        let spec = ImageBuildSpec::new("r", "debian:12-slim");
+        // Default containment denies broker token; a clean spec is fine.
+        assert!(spec.assert_no_credentials().is_ok());
+    }
+
+    #[test]
+    fn assert_no_credentials_rejects_credential_build_arg() {
+        let mut spec = ImageBuildSpec::new("r", "debian:12-slim");
+        spec.build_args = vec![("BROKER_TOKEN".into(), "cct1.abc".into())];
+        let err = spec.assert_no_credentials().unwrap_err();
+        assert_eq!(err.name, "BROKER_TOKEN");
+        assert!(
+            err.to_string()
+                .contains("broker token must never reach a build")
+        );
+    }
+
+    #[test]
+    fn assert_no_credentials_rejects_credential_label() {
+        let mut spec = ImageBuildSpec::new("r", "debian:12-slim");
+        spec.labels = vec![("anthropic_api_key".into(), "sk-x".into())];
+        assert!(spec.assert_no_credentials().is_err());
+    }
+
+    #[test]
+    fn assert_no_credentials_allows_non_secret_build_arg() {
+        let mut spec = ImageBuildSpec::new("r", "debian:12-slim");
+        spec.build_args = vec![("MIRROR_URL".into(), "http://mirror".into())];
+        assert!(spec.assert_no_credentials().is_ok());
+    }
+
+    #[test]
+    fn disabling_deny_broker_token_skips_the_guard() {
+        // Opt-out is possible but deliberate — the default never disables it.
+        let mut spec = ImageBuildSpec::new("r", "debian:12-slim");
+        spec.build_args = vec![("BROKER_TOKEN".into(), "x".into())];
+        spec.containment.deny_broker_token = false;
+        assert!(spec.assert_no_credentials().is_ok());
+    }
+
+    #[test]
+    fn containment_does_not_change_fingerprint_or_tag() {
+        // Containment is a runtime build posture, not Dockerfile content — two
+        // specs differing only in containment must map to the same image tag.
+        let mut a = ImageBuildSpec::new("r", "debian:12-slim");
+        a.apt_packages = vec!["git".into()];
+        let mut b = a.clone();
+        b.containment = BuildContainment {
+            network: BuildNetwork::None,
+            deny_broker_token: true,
+        };
+        assert_eq!(a.fingerprint(), b.fingerprint());
+        assert_eq!(a.image_tag(), b.image_tag());
+    }
+
+    #[test]
+    fn with_containment_builder_sets_posture() {
+        let spec = ImageBuildSpec::new("r", "b").with_containment(BuildContainment {
+            network: BuildNetwork::None,
+            deny_broker_token: true,
+        });
+        assert_eq!(spec.containment.network, BuildNetwork::None);
     }
 
     #[test]

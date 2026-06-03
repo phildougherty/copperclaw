@@ -303,6 +303,9 @@ pub fn build_dispatch_table() -> DispatchTable {
     ins!("db.restore", handlers::db::restore, true);
     ins!("mcp.list-presets", handlers::mcp::list_presets, false);
     ins!("mcp.add", handlers::mcp::add, true);
+    ins!("mcp.inspect-filter", handlers::mcp::inspect_filter, false);
+    ins!("mcp.oauth-list", handlers::mcp::oauth_list, false);
+    ins!("attestation.list", handlers::attestation::list, false);
     ins!("approvals.list", handlers::approvals::list, false);
     ins!("approvals.get", handlers::approvals::get, false);
     ins!(

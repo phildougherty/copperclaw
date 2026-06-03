@@ -52,6 +52,12 @@ copperclaw-metrics       = { workspace = true }
 # value the runner will actually be configured with. Read-only — no
 # runtime coupling to the runner's poll loop.
 copperclaw-runner        = { workspace = true }
+# Promoted from dev-dependency: the Phase 6 supply-chain MCP tool-filter
+# inspect handler (`handlers::mcp::inspect_filter`) uses
+# `copperclaw_mcp::ToolFilter` to report the EFFECTIVE per-server filter.
+# `copperclaw-runner` (above) already pulls `copperclaw-mcp` into the host's
+# build graph, so this adds no new transitive crates.
+copperclaw-mcp           = { workspace = true }
 copperclaw-cclaw           = { path = "../copperclaw-cclaw" }
 tokio                  = { workspace = true }
 tokio-util             = "0.7"
@@ -81,7 +87,6 @@ filetime = "0.2"
 copperclaw-cclaw = { path = "../copperclaw-cclaw" }
 copperclaw-runner = { workspace = true }
 copperclaw-providers = { workspace = true }
-copperclaw-mcp = { workspace = true }
 tokio = { workspace = true }
 wiremock = "=0.6.2"
 regex = "1"

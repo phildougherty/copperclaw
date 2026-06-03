@@ -21,10 +21,11 @@
 pub mod client;
 pub mod context;
 pub mod error;
+pub mod filter;
 pub mod server;
 pub mod tools;
 
-pub use client::{McpClient, RemoteTool, SharedMcpClient};
+pub use client::{FilteredMcpClient, McpClient, RemoteTool, SharedMcpClient};
 pub use context::{
     AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec, EditMessageSpec,
     EmitTodoListSpec, InstallSpec, MemoryHitView, MemorySearchSpec, MockToolContext,
@@ -34,6 +35,7 @@ pub use context::{
     UpdateTaskSpec,
 };
 pub use error::{McpError, ToolError};
+pub use filter::{ALLOWED_TOOLS_KEY, DENIED_TOOLS_KEY, FilterRejection, ToolFilter};
 
 pub use server::{CopperclawServer, build_server};
 /// Sentinel file the `clear_history` tool drops to ask the runner to

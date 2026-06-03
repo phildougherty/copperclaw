@@ -158,12 +158,34 @@ impl ContainerRuntime for DockerRuntime {
     }
 
     async fn build_image(&self, spec: ImageBuildSpec) -> Result<String, RtError> {
+        // install_packages containment: refuse to dispatch a build whose
+        // build-args / labels carry a credential-shaped name. This is the
+        // structural guarantee that the broker token / provider key never
+        // rides into a package build's env (where a malicious postinstall
+        // could read it). Clean specs (the default install always produces
+        // one) pass through unchanged.
+        spec.assert_no_credentials()
+            .map_err(|v| RtError::Container(v.to_string()))?;
         let image_tag = spec.image_tag();
         let context_bytes = build_context_tar(&spec)?;
+        // Apply the containment network mode to the build's RUN steps. Bridge
+        // (the default) leaves the daemon default; None is a real `--network=none`
+        // cut (no postinstall egress at all).
+        let networkmode: String = spec
+            .containment
+            .network
+            .networkmode()
+            .unwrap_or("")
+            .to_string();
+        // Non-secret build-args only — the credential guard above already
+        // rejected anything credential-shaped.
+        let buildargs: HashMap<String, String> = spec.build_args.iter().cloned().collect();
         let opts = BuildImageOptions::<String> {
             dockerfile: "Dockerfile".into(),
             t: image_tag.clone(),
             rm: true,
+            networkmode,
+            buildargs,
             ..Default::default()
         };
         let mut stream = self
@@ -187,6 +209,21 @@ impl ContainerRuntime for DockerRuntime {
                 status_code: 404, ..
             }) => Ok(false),
             Err(e) => Err(RtError::Container(format!("inspect image {tag}: {e}"))),
+        }
+    }
+
+    async fn image_digest(&self, tag: &str) -> Result<Option<String>, RtError> {
+        // `.Id` is the content-addressable digest (sha256:<hex>) computed from
+        // the image config + layer digests — the exact thing attestation wants
+        // to pin. A 404 means the image isn't present locally ⇒ `None`.
+        match self.docker.inspect_image(tag).await {
+            Ok(info) => Ok(info.id),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(None),
+            Err(e) => Err(RtError::Container(format!(
+                "inspect image {tag} for digest: {e}"
+            ))),
         }
     }
 
