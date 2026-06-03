@@ -600,6 +600,9 @@ async fn emit_terminal(
             .send(ProviderEvent::Usage {
                 input_tokens: p,
                 output_tokens: e,
+                // Ollama is a local backend with no prompt cache.
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
             })
             .await;
     }

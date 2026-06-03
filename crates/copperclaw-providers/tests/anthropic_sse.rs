@@ -424,6 +424,138 @@ async fn abort_drops_pending_stream() {
 }
 
 #[tokio::test]
+async fn caching_request_body_carries_cache_control_for_anthropic_model() {
+    // Wiremock captures the outbound request so we can assert the serialized
+    // JSON body carries `cache_control` on the system prompt and the tools
+    // tail for a Claude-family model.
+    let server = MockServer::start().await;
+    let body = sse_body(&[
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_c1"}}"#,
+        ),
+        ("message_stop", r#"{"type":"message_stop"}"#),
+    ]);
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    let mut q = QueryInput::new("a stable system prompt", "claude-sonnet-4-6");
+    q.tools.push(copperclaw_providers::ToolDef {
+        name: "t".into(),
+        description: "d".into(),
+        input_schema: serde_json::json!({ "type": "object" }),
+    });
+    q.history.push(HistoryMessage::User {
+        content: "hi".into(),
+    });
+    let mut query = p.query(q).await.expect("query starts");
+    while query.next_event().await.is_some() {}
+
+    // Inspect the recorded request body.
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let sent: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(sent["system"][0]["cache_control"]["type"], "ephemeral");
+    let tools = sent["tools"].as_array().unwrap();
+    assert_eq!(tools.last().unwrap()["cache_control"]["type"], "ephemeral");
+    let messages = sent["messages"].as_array().unwrap();
+    let last = messages.last().unwrap();
+    let blocks = last["content"].as_array().unwrap();
+    assert_eq!(blocks.last().unwrap()["cache_control"]["type"], "ephemeral");
+}
+
+#[tokio::test]
+async fn no_cache_control_in_request_body_for_non_anthropic_model() {
+    let server = MockServer::start().await;
+    let body = sse_body(&[
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_c2"}}"#,
+        ),
+        ("message_stop", r#"{"type":"message_stop"}"#),
+    ]);
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    let mut q = QueryInput::new("a stable system prompt", "deepseek/deepseek-r1");
+    q.tools.push(copperclaw_providers::ToolDef {
+        name: "t".into(),
+        description: "d".into(),
+        input_schema: serde_json::json!({ "type": "object" }),
+    });
+    q.history.push(HistoryMessage::User {
+        content: "hi".into(),
+    });
+    let mut query = p.query(q).await.expect("query starts");
+    while query.next_event().await.is_some() {}
+
+    let requests = server.received_requests().await.unwrap();
+    let raw = String::from_utf8(requests[0].body.clone()).unwrap();
+    assert!(
+        !raw.contains("cache_control"),
+        "non-Anthropic model must send NO cache_control; body was: {raw}"
+    );
+    let sent: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    // System stays a plain string in the pre-caching shape.
+    assert!(sent["system"].is_string());
+}
+
+#[tokio::test]
+async fn cache_usage_tokens_surface_from_usage_event() {
+    // The `message_start.usage` block carries Anthropic's prompt-caching
+    // counters; the provider must forward them on `ProviderEvent::Usage`.
+    let server = MockServer::start().await;
+    let body = sse_body(&[
+        (
+            "message_start",
+            r#"{"type":"message_start","message":{"id":"msg_c3","usage":{"input_tokens":12,"output_tokens":0,"cache_read_input_tokens":4000,"cache_creation_input_tokens":50}}}"#,
+        ),
+        ("message_stop", r#"{"type":"message_stop"}"#),
+    ]);
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let p = provider(&server);
+    let mut q = p.query(basic_input()).await.unwrap();
+    let mut found = None;
+    while let Some(ev) = q.next_event().await {
+        if let ProviderEvent::Usage {
+            input_tokens,
+            cache_read_tokens,
+            cache_creation_tokens,
+            ..
+        } = ev
+        {
+            found = Some((input_tokens, cache_read_tokens, cache_creation_tokens));
+        }
+    }
+    assert_eq!(found, Some((12, 4000, 50)));
+}
+
+#[tokio::test]
 async fn transport_error_when_server_down() {
     // Bind a port, drop the listener -> connection refused.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

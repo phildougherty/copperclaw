@@ -226,12 +226,28 @@ pub(super) async fn pump_events(
             ProviderEvent::Usage {
                 input_tokens: it,
                 output_tokens: ot,
+                cache_read_tokens: cr,
+                cache_creation_tokens: cc,
             } => {
                 if it > 0 {
                     input_tokens = it;
                 }
                 if ot > 0 {
                     output_tokens = ot;
+                }
+                // Surface cache hits/writes for cost observability. A
+                // non-zero `cr` means the prompt-caching prefix HIT this
+                // turn (cached input billed at ~10% of the base rate);
+                // `cc` is the premium-billed write that primes later hits.
+                // Logged at debug so a single `RUST_LOG=…=debug` run can
+                // confirm the breakpoints are landing without a schema
+                // change.
+                if cr > 0 || cc > 0 {
+                    tracing::debug!(
+                        cache_read_tokens = cr,
+                        cache_creation_tokens = cc,
+                        "prompt cache usage"
+                    );
                 }
             }
             ProviderEvent::Result { text } => {
@@ -906,6 +922,8 @@ mod tests {
             ProviderEvent::Usage {
                 input_tokens: 5,
                 output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
             },
             ProviderEvent::Result {
                 text: Some("hello".into()),

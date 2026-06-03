@@ -222,6 +222,7 @@ pub async fn run_inner_loop(
                 ProviderEvent::Usage {
                     input_tokens,
                     output_tokens,
+                    ..
                 } => {
                     if input_tokens > 0 {
                         input_tokens_sum = input_tokens_sum.saturating_add(input_tokens);
@@ -567,6 +568,8 @@ mod tests {
             ProviderEvent::Usage {
                 input_tokens: 100,
                 output_tokens: 20,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
             },
             ProviderEvent::Result {
                 text: Some("the answer is 42".into()),
@@ -685,6 +688,8 @@ mod tests {
                 ProviderEvent::Usage {
                     input_tokens: 10_000,
                     output_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
                 },
                 ProviderEvent::ToolCall {
                     id: "tu_1".into(),
