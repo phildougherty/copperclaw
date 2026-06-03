@@ -34,6 +34,8 @@
 //! than the table currently exposes. The runner writes a heartbeat
 //! file under the session dir so a future sweep can read it.
 
+pub mod broker;
+pub mod broker_server;
 pub mod budgets;
 pub mod classify;
 pub mod config;
@@ -44,6 +46,11 @@ pub mod runner_config;
 pub mod spawn;
 pub mod tasks_snapshot;
 
+pub use broker::{
+    AuthScheme, AuthzDecision, BrokerConfig, BrokerKeyring, BrokerState, BudgetVerdict,
+    DEFAULT_TOKEN_TTL_SECS, Revocations, TokenClaims, TokenError, UpstreamRequest,
+    auth_scheme_for_provider, authorize,
+};
 pub use config::{ManagerConfig, ROTATABLE_ENV_KEYS, RotatableConfig, SkillsMode};
 pub use egress::{
     DNSMASQ_CONF_FILENAME, DnsFilterPlan, RESOLV_CONF_FILENAME, build_dns_filter_plan,
@@ -175,6 +182,20 @@ pub struct ContainerManager {
     /// performs the bind, so this closes the host-side TOCTOU window but
     /// cannot eliminate a swap that races dockerd's own resolution.
     pub(crate) mount_security: MountSecurityModule,
+    /// Credential broker (Phase 0b). `None` (the default) keeps the legacy
+    /// spawn path: the real `ANTHROPIC_API_KEY` is forwarded into the
+    /// container env. When `Some`, the broker is enabled: `build_spec` stops
+    /// forwarding the master key and instead mints a per-session capability
+    /// token (in the `ANTHROPIC_API_KEY` slot) and points `ANTHROPIC_BASE_URL`
+    /// at [`Self::broker_base_url`]. Set via [`Self::with_broker`] at boot
+    /// when `COPPERCLAW_CREDENTIAL_BROKER` is enabled and a real key exists.
+    pub(crate) broker: Option<Arc<broker::BrokerState>>,
+    /// The loopback base URL the container reaches the broker at (e.g.
+    /// `http://127.0.0.1:NNNNN`). Only meaningful when [`Self::broker`] is
+    /// `Some`. The container's reachability of this loopback address is the
+    /// deployment's responsibility (host networking / docker bridge); see the
+    /// module docs.
+    pub(crate) broker_base_url: Option<String>,
 }
 
 impl ContainerManager {
@@ -199,8 +220,23 @@ impl ContainerManager {
             mount_security: MountSecurityModule::with_host(MountHostContext {
                 session_root: cfg.data_dir.join("sessions"),
             }),
+            broker: None,
+            broker_base_url: None,
             cfg,
         }
+    }
+
+    /// Wire an enabled credential broker into the manager. Stores the broker
+    /// state (used to mint per-session tokens at spawn) and the loopback base
+    /// URL the container reaches it at. Mutates `self` so the boot sequence
+    /// can attach it after building the manager. With this set, the spawn path
+    /// stops forwarding the real provider key — see [`spawn::ContainerManager`]
+    /// `build_spec`.
+    #[must_use]
+    pub fn with_broker(mut self, broker: Arc<broker::BrokerState>, base_url: String) -> Self {
+        self.broker = Some(broker);
+        self.broker_base_url = Some(base_url);
+        self
     }
 
     /// Wire a shared spawn-attempt tracker (typically owned by

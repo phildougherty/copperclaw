@@ -740,12 +740,29 @@ pub async fn run_host(
     ));
     let todo_task = tokio::spawn(Arc::clone(&todo_watcher).run_loop(shutdown.clone()));
 
+    // 13b. Credential broker (Phase 0b). Opt-in via
+    // `COPPERCLAW_CREDENTIAL_BROKER`. When enabled, this binds a loopback
+    // model proxy holding the real key, and the container manager stops
+    // forwarding the master key into containers (it mints per-session tokens
+    // instead). Default-off, so the legacy spawn path is unchanged.
+    let broker_default_provider = cfg
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "anthropic".into());
+    let broker = maybe_start_broker(
+        state.central.clone(),
+        &broker_default_provider,
+        shutdown.clone(),
+    )
+    .await;
+
     let spawned = spawn_container_manager(
         &cfg,
         state.central.clone(),
         Arc::clone(&runtime),
         shutdown.clone(),
         Arc::clone(state.sweep.spawn_tracker()),
+        broker,
     );
     let (manager_task, manager_handle): (
         Option<tokio::task::JoinHandle<()>>,
@@ -924,6 +941,7 @@ fn spawn_container_manager(
     runtime: Arc<dyn ContainerRuntime>,
     shutdown: CancellationToken,
     spawn_tracker: Arc<copperclaw_host_sweep::SpawnAttemptTracker>,
+    broker: Option<(Arc<crate::container_manager::broker::BrokerState>, String)>,
 ) -> Option<SpawnedManager> {
     let Some(image_tag) = cfg.default_image_tag.clone() else {
         warn!(
@@ -998,10 +1016,13 @@ fn spawn_container_manager(
             );
         }
     }
-    let manager = Arc::new(
+    let mut manager =
         crate::container_manager::ContainerManager::new(central, runtime, manager_cfg)
-            .with_spawn_tracker(spawn_tracker),
-    );
+            .with_spawn_tracker(spawn_tracker);
+    if let Some((broker_state, broker_base_url)) = broker {
+        manager = manager.with_broker(broker_state, broker_base_url);
+    }
+    let manager = Arc::new(manager);
     let task = tokio::spawn(Arc::clone(&manager).run_loop(shutdown));
     Some((task, manager))
 }
@@ -1159,6 +1180,79 @@ fn collect_forward_env() -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Resolve the credential broker (Phase 0b) from the process env and, when
+/// enabled, bind the loopback listener and start its server task.
+///
+/// Returns `Some((state, base_url))` only when `COPPERCLAW_CREDENTIAL_BROKER`
+/// is truthy AND a real `ANTHROPIC_API_KEY` is present (without a key there is
+/// nothing to broker). The returned pair is handed to the container manager
+/// via [`crate::container_manager::ContainerManager::with_broker`]; the spawn
+/// path then stops forwarding the master key and mints per-session tokens
+/// instead. Returns `None` (default, behaviour unchanged) otherwise.
+///
+/// Binds on loopback only. The bound port is dynamic (`:0`) so multiple hosts
+/// on one box don't collide. A bind failure logs a warning and disables the
+/// broker rather than killing boot — the host falls back to the default path.
+async fn maybe_start_broker(
+    central: copperclaw_db::central::CentralDb,
+    default_provider: &str,
+    shutdown: CancellationToken,
+) -> Option<(Arc<crate::container_manager::broker::BrokerState>, String)> {
+    use crate::container_manager::broker::{BrokerConfig, BrokerState};
+
+    let enabled = BrokerConfig::parse_enabled(
+        std::env::var("COPPERCLAW_CREDENTIAL_BROKER")
+            .ok()
+            .as_deref(),
+    );
+    let upstream_key = std::env::var("ANTHROPIC_API_KEY").ok();
+    let upstream_base = std::env::var("ANTHROPIC_BASE_URL").ok();
+    let ttl_override = std::env::var("COPPERCLAW_BROKER_TOKEN_TTL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+
+    let config = BrokerConfig::resolve(
+        enabled,
+        upstream_key.as_deref(),
+        upstream_base.as_deref(),
+        ttl_override,
+    )?;
+    if enabled && upstream_key.as_deref().filter(|k| !k.is_empty()).is_none() {
+        warn!(
+            "COPPERCLAW_CREDENTIAL_BROKER is set but ANTHROPIC_API_KEY is empty; \
+             broker disabled, falling back to default behaviour"
+        );
+        return None;
+    }
+
+    let broker = Arc::new(BrokerState::new(config));
+    let server_state = crate::container_manager::broker_server::production_state(
+        Arc::clone(&broker),
+        Some(default_provider),
+        central,
+    );
+
+    // Bind loopback with a dynamic port so collisions never block boot.
+    let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("loopback addr is valid");
+    match crate::container_manager::broker_server::serve(bind_addr, server_state, shutdown).await {
+        Ok(local) => {
+            let base_url = format!("http://{local}");
+            info!(
+                addr = %local,
+                "credential broker enabled; the master provider key will NOT be forwarded into containers"
+            );
+            Some((broker, base_url))
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "credential broker failed to bind loopback listener; falling back to default key forwarding"
+            );
+            None
+        }
+    }
 }
 
 /// Print a one-screen summary of the running host so an operator can see

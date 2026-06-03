@@ -48,6 +48,8 @@
 //! | Counter   | `copperclaw_provider_retry_total`    | `provider`     |
 //! | Counter   | `copperclaw_stuck_inbound_apology_total` | `agent_group_id`, `reason` |
 //! | Counter   | `copperclaw_tool_loop_breaker_total` | `agent_group_id`, `pattern` |
+//! | Counter   | `copperclaw_broker_requests_total`   | `agent_group_id`, `outcome` |
+//! | Counter   | `copperclaw_broker_egress_bytes_total` | `agent_group_id` |
 //! | Gauge     | `copperclaw_degraded_state`          | `reason`       |
 
 use metrics::{counter, gauge, histogram};
@@ -125,6 +127,23 @@ pub const BUDGET_GATE_DAILY_TOKENS: &str = "daily_tokens";
 pub const BUDGET_GATE_TURNS_PER_MINUTE: &str = "turns_per_minute";
 pub const BUDGET_GATE_TURNS_PER_HOUR: &str = "turns_per_hour";
 
+// ── Credential-broker metrics (Phase 0b). The host-side model proxy that
+// holds the real provider key and forwards model calls per session, so the
+// long-lived key never enters the container. See
+// `copperclaw-host/src/container_manager/broker.rs`.
+pub const BROKER_REQUESTS_TOTAL: &str = "copperclaw_broker_requests_total";
+pub const BROKER_EGRESS_BYTES_TOTAL: &str = "copperclaw_broker_egress_bytes_total";
+
+// ── Outcome label values for the `outcome` label of
+// `copperclaw_broker_requests_total`. Use these constants instead of
+// stringly-typed literals at call sites so a typo is a compile error.
+/// Token validated, budget clear: the request was forwarded upstream.
+pub const BROKER_OUTCOME_FORWARDED: &str = "forwarded";
+/// Token failed validation (bad signature, malformed, expired, revoked).
+pub const BROKER_OUTCOME_UNAUTHORIZED: &str = "unauthorized";
+/// Token valid but the group is over its budget — request refused.
+pub const BROKER_OUTCOME_OVER_BUDGET: &str = "over_budget";
+
 // ── Counter helpers ────────────────────────────────────────────────────────
 
 /// Increment `copperclaw_messages_inbound_total{channel_type=<ct>}`.
@@ -161,6 +180,33 @@ pub fn inc_image_rebuild_failed() {
 /// changed — the metric measures rotation *attempts*, not deltas.
 pub fn inc_secrets_rotated() {
     counter!(SECRETS_ROTATED_TOTAL).increment(1);
+}
+
+/// Increment `copperclaw_broker_requests_total{agent_group_id, outcome}`.
+/// Fired by the credential broker for every model request it handles.
+/// `outcome` should be one of [`BROKER_OUTCOME_FORWARDED`],
+/// [`BROKER_OUTCOME_UNAUTHORIZED`], or [`BROKER_OUTCOME_OVER_BUDGET`].
+/// The `agent_group_id` is `"unknown"` when the token failed to validate
+/// (so the request could not be attributed to a group).
+pub fn inc_broker_request(agent_group_id: &str, outcome: &str) {
+    counter!(
+        BROKER_REQUESTS_TOTAL,
+        "agent_group_id" => agent_group_id.to_owned(),
+        "outcome" => outcome.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Add `bytes` to `copperclaw_broker_egress_bytes_total{agent_group_id}`.
+/// Meters the volume of request bodies the broker forwarded upstream on
+/// behalf of a group, so an operator can see egress volume per agent group
+/// alongside the token-based budget.
+pub fn add_broker_egress_bytes(agent_group_id: &str, bytes: u64) {
+    counter!(
+        BROKER_EGRESS_BYTES_TOTAL,
+        "agent_group_id" => agent_group_id.to_owned(),
+    )
+    .increment(bytes);
 }
 
 /// Increment `copperclaw_delivery_failed_total{channel_type=<ct>}`.

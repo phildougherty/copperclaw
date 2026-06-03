@@ -595,11 +595,45 @@ impl ContainerManager {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        if let Some(key) = rotatable.anthropic_api_key.as_deref() {
-            spec = spec.with_env("ANTHROPIC_API_KEY", key);
-        }
-        if let Some(base) = rotatable.anthropic_base_url.as_deref() {
-            spec = spec.with_env("ANTHROPIC_BASE_URL", base);
+        // Credential broker (Phase 0b). When the broker is enabled we MUST NOT
+        // forward the real provider key into the container env — a shell inside
+        // the container could `printenv ANTHROPIC_API_KEY` and exfiltrate it.
+        // Instead we mint a per-session, group-scoped, TTL-bounded, revocable
+        // capability TOKEN and put it in the `ANTHROPIC_API_KEY` slot (the
+        // runner reads that slot verbatim), and point `ANTHROPIC_BASE_URL` at
+        // the host-side broker loopback. The broker validates the token,
+        // injects the real key host-side, and forwards upstream.
+        //
+        // When the broker is disabled (the default), behaviour is unchanged:
+        // the real key + base URL are forwarded exactly as before.
+        let broker_mint = self
+            .broker
+            .as_ref()
+            .zip(self.broker_base_url.as_deref())
+            .map(|(broker, base_url)| {
+                let token = broker.mint_for(
+                    session.id,
+                    session.agent_group_id,
+                    super::broker::now_epoch_secs(),
+                );
+                (token, base_url)
+            });
+        if let Some((token, base_url)) = broker_mint {
+            // Broker enabled: the token rides the ANTHROPIC_API_KEY slot and
+            // the base URL points at the host-side broker loopback. The real
+            // key never enters the container env.
+            spec = spec
+                .with_env("ANTHROPIC_API_KEY", &token)
+                .with_env("ANTHROPIC_BASE_URL", base_url);
+        } else {
+            // Default (broker disabled): forward the real key + base URL
+            // exactly as before.
+            if let Some(key) = rotatable.anthropic_api_key.as_deref() {
+                spec = spec.with_env("ANTHROPIC_API_KEY", key);
+            }
+            if let Some(base) = rotatable.anthropic_base_url.as_deref() {
+                spec = spec.with_env("ANTHROPIC_BASE_URL", base);
+            }
         }
         // Operator-configured forwards (search API keys, etc.). Skip
         // empty values — an unset env var should not appear in the
@@ -1532,6 +1566,163 @@ mod tests {
         );
         assert!(spec.labels.contains_key("copperclaw.session"));
         assert!(spec.labels.contains_key("copperclaw.agent_group"));
+    }
+
+    #[test]
+    fn build_spec_with_broker_disabled_still_forwards_real_key() {
+        // Default path (no broker): behaviour is unchanged — the real key is
+        // forwarded. This is the regression guard for "default still works".
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
+        assert!(
+            spec.env
+                .iter()
+                .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == "sk-test"),
+            "broker disabled must forward the real key"
+        );
+    }
+
+    #[test]
+    fn build_spec_with_broker_enabled_emits_token_not_master_key() {
+        // Phase 0b core security assertion: when the broker is enabled,
+        // build_spec must NOT put the master key in the container env. The
+        // ANTHROPIC_API_KEY slot must hold a per-session capability TOKEN, and
+        // ANTHROPIC_BASE_URL must point at the broker loopback.
+        use super::super::broker::{BrokerConfig, BrokerState, Revocations};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let cfg = BrokerConfig::resolve(true, Some("sk-test"), None, Some(3600)).unwrap();
+        let broker = std::sync::Arc::new(BrokerState::new(cfg));
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        )
+        .with_broker(
+            std::sync::Arc::clone(&broker),
+            "http://127.0.0.1:48080".into(),
+        );
+
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr
+            .build_spec(&session, &paths, "copperclaw/session:abc", None)
+            .unwrap();
+
+        let api_key = spec
+            .env
+            .iter()
+            .find(|(k, _)| k == "ANTHROPIC_API_KEY")
+            .map(|(_, v)| v.clone())
+            .expect("ANTHROPIC_API_KEY must be set");
+        // The master key must NEVER appear in the container env.
+        assert_ne!(
+            api_key, "sk-test",
+            "broker enabled: master key must not be forwarded into the container"
+        );
+        assert!(
+            !spec.env.iter().any(|(_, v)| v == "sk-test"),
+            "master key must not appear in ANY env var"
+        );
+        // The slot holds a real capability token shaped `cct1.payload.sig`.
+        assert!(
+            api_key.starts_with("cct1."),
+            "expected a capability token, got {api_key}"
+        );
+        // And the token validates against the broker's keyring with the right
+        // session + group claims.
+        let revs = Revocations::new();
+        let claims = broker
+            .keyring
+            .validate(&api_key, super::super::broker::now_epoch_secs(), &revs)
+            .expect("minted token must validate");
+        assert_eq!(claims.session_id, session.id);
+        assert_eq!(claims.agent_group_id, session.agent_group_id);
+
+        // Base URL points at the broker loopback, not the operator upstream.
+        assert!(
+            spec.env
+                .iter()
+                .any(|(k, v)| k == "ANTHROPIC_BASE_URL" && v == "http://127.0.0.1:48080"),
+            "ANTHROPIC_BASE_URL must point at the broker loopback"
+        );
+    }
+
+    #[test]
+    fn build_spec_and_runner_config_agree_on_broker_endpoint() {
+        // HIGH-bug regression (end-to-end coherence): the container ENV
+        // (`ANTHROPIC_BASE_URL`, written by build_spec) and the on-disk
+        // `runner.json` (`api_base_url`, written by runner_config_for) MUST
+        // name the SAME endpoint when the broker is enabled — the broker
+        // loopback. The runner prefers runner.json's `api_base_url`, so if the
+        // two ever disagree the file silently wins and the broker is bypassed.
+        // This pins the single source of truth across both writers.
+        use super::super::broker::{BrokerConfig, BrokerState};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        // Operator base URL is set (the OpenRouter deployment the bug fired on)
+        // via manager_cfg; the broker holds the real upstream host-side.
+        let broker_cfg = BrokerConfig::resolve(true, Some("sk-test"), None, Some(3600)).unwrap();
+        let broker = std::sync::Arc::new(BrokerState::new(broker_cfg));
+        let loopback = "http://127.0.0.1:48080";
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        )
+        .with_broker(std::sync::Arc::clone(&broker), loopback.into());
+
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr
+            .build_spec(&session, &paths, "copperclaw/session:abc", None)
+            .unwrap();
+        let env_base = spec
+            .env
+            .iter()
+            .find(|(k, _)| k == "ANTHROPIC_BASE_URL")
+            .map(|(_, v)| v.clone())
+            .expect("ANTHROPIC_BASE_URL must be set");
+
+        let rc = mgr.runner_config_for(&session, None, None);
+        let file_base = rc
+            .api_base_url
+            .expect("runner.json api_base_url must be set");
+
+        assert_eq!(env_base, loopback, "container env base must be the broker");
+        assert_eq!(
+            file_base, loopback,
+            "runner.json base must be the broker (not the operator URL)"
+        );
+        assert_eq!(
+            env_base, file_base,
+            "env ANTHROPIC_BASE_URL and runner.json api_base_url must agree"
+        );
+
+        // And the key slot in the container env is a capability token, not the
+        // real key — so the runner authenticates to the broker, which swaps in
+        // the real key host-side.
+        let api_key = spec
+            .env
+            .iter()
+            .find(|(k, _)| k == "ANTHROPIC_API_KEY")
+            .map(|(_, v)| v.clone())
+            .expect("ANTHROPIC_API_KEY must be set");
+        assert!(api_key.starts_with("cct1."), "expected a capability token");
+        assert!(
+            !spec.env.iter().any(|(_, v)| v == "sk-test"),
+            "real key must not appear in any container env var"
+        );
     }
 
     #[test]
