@@ -47,6 +47,7 @@
 //! | Counter   | `copperclaw_provider_deadline_total` | `provider`     |
 //! | Counter   | `copperclaw_provider_retry_total`    | `provider`     |
 //! | Counter   | `copperclaw_stuck_inbound_apology_total` | `agent_group_id`, `reason` |
+//! | Counter   | `copperclaw_tool_loop_breaker_total` | `agent_group_id`, `pattern` |
 //! | Gauge     | `copperclaw_degraded_state`          | `reason`       |
 
 use metrics::{counter, gauge, histogram};
@@ -81,6 +82,7 @@ pub const CONTAINER_SPAWN_SECONDS: &str = "copperclaw_container_spawn_seconds";
 pub const PROVIDER_DEADLINE_TOTAL: &str = "copperclaw_provider_deadline_total";
 pub const PROVIDER_RETRY_TOTAL: &str = "copperclaw_provider_retry_total";
 pub const STUCK_INBOUND_APOLOGY_TOTAL: &str = "copperclaw_stuck_inbound_apology_total";
+pub const TOOL_LOOP_BREAKER_TOTAL: &str = "copperclaw_tool_loop_breaker_total";
 pub const DEGRADED_STATE: &str = "copperclaw_degraded_state";
 
 // ── Reason label values for the `reason` label of
@@ -94,6 +96,18 @@ pub const STUCK_REASON_PENDING_TOO_LONG: &str = "pending_too_long";
 /// The session's `container_status='stopped'` with a pending inbound
 /// and the container manager has exhausted its spawn-retry budget.
 pub const STUCK_REASON_CONTAINER_SPAWN_FAILED: &str = "container_spawn_failed";
+
+// ── Pattern label values for the `pattern` label of
+// `copperclaw_tool_loop_breaker_total`. Use these constants instead of
+// stringly-typed literals at call sites so a typo is a compile error.
+
+/// The runner observed N consecutive tool calls with the same tool name
+/// AND identical arguments — the model is stuck re-issuing one call.
+pub const LOOP_PATTERN_IDENTICAL: &str = "identical";
+
+/// The runner observed an A,B,A,B alternation between two distinct tool
+/// calls — the model is oscillating between two states without progress.
+pub const LOOP_PATTERN_PING_PONG: &str = "ping_pong";
 
 // ── Degraded-state reason label values for `copperclaw_degraded_state`.
 // Use these constants instead of stringly-typed literals at call sites
@@ -262,6 +276,24 @@ pub fn inc_stuck_inbound_apology(agent_group_id: &str, reason: &str) {
         STUCK_INBOUND_APOLOGY_TOTAL,
         "agent_group_id" => agent_group_id.to_owned(),
         "reason" => reason.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Increment `copperclaw_tool_loop_breaker_total{agent_group_id, pattern}`.
+/// Fired by the runner's `drive_turn` circuit breaker when it detects a
+/// content-level tool-call loop (the model re-issuing the same call, or
+/// oscillating between two) and terminates the inbound to stop the spin.
+/// Complements the consecutive-turn depth cap and the token budget — those
+/// bound *how long* a loop runs; this bounds a loop that never advances.
+///
+/// `pattern` should be one of [`LOOP_PATTERN_IDENTICAL`] or
+/// [`LOOP_PATTERN_PING_PONG`].
+pub fn inc_tool_loop_breaker(agent_group_id: &str, pattern: &str) {
+    counter!(
+        TOOL_LOOP_BREAKER_TOTAL,
+        "agent_group_id" => agent_group_id.to_owned(),
+        "pattern" => pattern.to_owned(),
     )
     .increment(1);
 }
@@ -617,6 +649,8 @@ mod tests {
         inc_budget_exhausted_suppressed("ag-test");
         inc_stuck_inbound_apology("ag-test", STUCK_REASON_PENDING_TOO_LONG);
         inc_stuck_inbound_apology("ag-test", STUCK_REASON_CONTAINER_SPAWN_FAILED);
+        inc_tool_loop_breaker("ag-test", LOOP_PATTERN_IDENTICAL);
+        inc_tool_loop_breaker("ag-test", LOOP_PATTERN_PING_PONG);
     }
 
     #[test]
@@ -715,6 +749,7 @@ mod tests {
             PROVIDER_DEADLINE_TOTAL,
             PROVIDER_RETRY_TOTAL,
             STUCK_INBOUND_APOLOGY_TOTAL,
+            TOOL_LOOP_BREAKER_TOTAL,
             DEGRADED_STATE,
         ];
         for name in names {
@@ -746,6 +781,7 @@ mod tests {
             BUDGET_EXHAUSTED_REPLIES_TOTAL,
             BUDGET_EXHAUSTED_SUPPRESSED_TOTAL,
             STUCK_INBOUND_APOLOGY_TOTAL,
+            TOOL_LOOP_BREAKER_TOTAL,
         ];
         for name in counters {
             assert!(
@@ -781,5 +817,49 @@ mod tests {
             body.contains("agent_group_id=\"ag-stuck-1\""),
             "missing agent_group_id label:\n{body}"
         );
+    }
+
+    #[test]
+    fn tool_loop_breaker_counter_renders_with_labels() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            inc_tool_loop_breaker("ag-loop-1", LOOP_PATTERN_IDENTICAL);
+            inc_tool_loop_breaker("ag-loop-1", LOOP_PATTERN_PING_PONG);
+            inc_tool_loop_breaker("ag-loop-1", LOOP_PATTERN_IDENTICAL);
+        });
+        let body = handle.render();
+        assert!(
+            body.contains(TOOL_LOOP_BREAKER_TOTAL),
+            "missing loop-breaker counter:\n{body}"
+        );
+        assert!(
+            body.contains("pattern=\"identical\""),
+            "missing identical pattern label:\n{body}"
+        );
+        assert!(
+            body.contains("pattern=\"ping_pong\""),
+            "missing ping_pong pattern label:\n{body}"
+        );
+        assert!(
+            body.contains("agent_group_id=\"ag-loop-1\""),
+            "missing agent_group_id label:\n{body}"
+        );
+    }
+
+    #[test]
+    fn loop_pattern_label_constants_are_snake_case() {
+        for label in [LOOP_PATTERN_IDENTICAL, LOOP_PATTERN_PING_PONG] {
+            assert!(
+                !label.contains("__"),
+                "label {label:?} must not contain double underscores"
+            );
+            assert!(
+                label
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()),
+                "label {label:?} must be snake_case ASCII"
+            );
+        }
     }
 }
