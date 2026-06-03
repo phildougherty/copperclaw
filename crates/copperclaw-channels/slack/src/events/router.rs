@@ -418,6 +418,9 @@ fn convert_message(
             channel_type: state.channel_type.clone(),
             platform_id: m.channel.clone(),
             thread_id: Some(parent.to_owned()),
+            // Thread-root author not resolved here — must not count as a
+            // mention. Native @-mentions are detected separately.
+            replying_to_self: None,
         });
     InboundEvent {
         channel_type: state.channel_type.clone(),

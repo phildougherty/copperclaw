@@ -281,6 +281,8 @@ async fn convert_message(
             channel_type: state.channel_type.clone(),
             platform_id: platform_id.clone(),
             thread_id: Some(parent_id.to_owned()),
+            // Parent author not resolved here — must not count as a mention.
+            replying_to_self: None,
         });
 
     Some(InboundEvent {

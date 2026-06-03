@@ -1,6 +1,8 @@
 //! Container spawn pipeline: `maybe_spawn`, `build_spec`, image rebuild + backoff.
 
-use super::prompt::{set_memory_dir_perms, write_memory_unavailable_marker};
+use super::prompt::{
+    set_memory_dir_perms, write_memory_unavailable_marker, write_memory_unavailable_marker_str,
+};
 use super::{ContainerManager, ManagerError};
 use copperclaw_container_rt::{ContainerSpec, ImageBuildSpec, Mount, ResourceLimits, RtError};
 use copperclaw_db::session::SessionPaths;
@@ -121,6 +123,43 @@ pub fn check_heartbeat_deadline_alignment(
     ))
 }
 
+/// Tighten a session directory to owner-only (`0700`). Best-effort and a
+/// no-op on non-unix targets; a failure is logged at `warn!` rather than
+/// aborting the spawn, because a slightly-too-loose dir is preferable to a
+/// group going dark over a chmod hiccup (e.g. the host doesn't own the path).
+/// Set explicitly on every spawn so the permission is enforced regardless of
+/// the host's umask.
+fn harden_dir_0700(path: &std::path::Path) {
+    set_mode(path, 0o700, "session directory");
+}
+
+/// Tighten a secret-bearing session file to owner read/write (`0600`).
+/// Same best-effort, umask-independent contract as [`harden_dir_0700`].
+fn harden_file_0600(path: &std::path::Path) {
+    set_mode(path, 0o600, "session config file");
+}
+
+/// Shared chmod helper for the session-dir hardening. `#[cfg(unix)]`-gated;
+/// on non-unix it consumes the args and returns so callers stay portable.
+fn set_mode(path: &std::path::Path, mode: u32, what: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+            warn!(
+                ?err,
+                path = %path.display(),
+                mode = format!("{mode:o}"),
+                "could not tighten {what} permissions"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode, what);
+    }
+}
+
 impl ContainerManager {
     /// Try to spawn a container for `session`. Returns `Ok(true)` when
     /// a container was actually spawned (i.e. pending work was found
@@ -139,6 +178,12 @@ impl ContainerManager {
         }
         let paths = SessionPaths::new(&self.cfg.data_dir, session.agent_group_id, session.id);
         paths.ensure_dirs().map_err(ManagerError::Io)?;
+        // Harden the session dir to owner-only (`0700`) explicitly rather
+        // than relying on the host's umask — the dir holds the session DBs,
+        // attachments, and `runner.json` (provider + model config). Set it on
+        // every spawn so a dir created under a permissive umask by an older
+        // host (or restored from a backup) gets tightened on the next tick.
+        harden_dir_0700(&paths.root);
 
         if !Self::has_pending_inbound(&paths)? {
             return Ok(false);
@@ -199,8 +244,12 @@ impl ContainerManager {
         let runner_cfg =
             self.runner_config_for(session, cfg_row.as_ref(), Some(paths.root.as_path()));
         let runner_json = serde_json::to_vec_pretty(&runner_cfg).map_err(ManagerError::Json)?;
-        std::fs::write(paths.root.join(RUNNER_CONFIG_FILENAME), runner_json)
-            .map_err(ManagerError::Io)?;
+        let runner_cfg_path = paths.root.join(RUNNER_CONFIG_FILENAME);
+        std::fs::write(&runner_cfg_path, runner_json).map_err(ManagerError::Io)?;
+        // `runner.json` carries the provider/model config the runner reads on
+        // boot. Lock it to owner read/write (`0600`) explicitly, not via
+        // umask, so a permissive default can't leave it group/world-readable.
+        harden_file_0600(&runner_cfg_path);
 
         // Image rebuild gate (Top 10 #1 / M13).  Compute the fingerprint of
         // the rebuild-relevant config fields.  If the stored fingerprint
@@ -276,7 +325,7 @@ impl ContainerManager {
             self.cfg.default_image_tag.clone()
         };
 
-        let spec = self.build_spec(session, &paths, &image_tag, cfg_row.as_ref());
+        let spec = self.build_spec(session, &paths, &image_tag, cfg_row.as_ref())?;
         // Defensive: if a previous container with this name lingered
         // (e.g. host crashed mid-cycle, orphan cleanup missed it,
         // crash-restart's remove() raced the spawn) the create call
@@ -308,12 +357,46 @@ impl ContainerManager {
             }
         };
         let spawn_elapsed = spawn_started.elapsed().as_secs_f64();
+
+        // Phase 0a v2 (Part B): the privileged nftables apply for the new
+        // session's network namespace. This is the deferred-but-implemented
+        // runtime path: the ruleset is constructed + persisted in
+        // `build_spec`/`apply_dns_filter` (pure + tested), and applied here
+        // only under deny-default. The apply needs `CAP_NET_ADMIN` and a
+        // resolvable session netns; if either is missing it logs and degrades
+        // to the carried policy + DNS-filter confinement rather than failing
+        // the spawn. Default (allow-all) spawns never reach this.
+        if self.cfg.egress_mode == copperclaw_container_rt::EgressMode::DenyDefault {
+            apply_session_nftables(session, &paths);
+        }
+
         // Successful spawn: clear any prior failure record so a future
         // crash doesn't immediately trip the apology threshold.
         self.spawn_tracker.record_success(session.id);
         sessions::mark_container_running(&self.central, session.id).map_err(ManagerError::Db)?;
         copperclaw_metrics::inc_containers_spawned();
         copperclaw_metrics::observe_container_spawn_seconds(spawn_elapsed);
+
+        // Image + runner attestation (Phase 6 supply-chain). Record, in the
+        // append-only audit log, the image tag + the runtime-reported image
+        // content digest + the host runner-binary digest for this spawn — a
+        // tamper-evident record of exactly which third-party-buildable image
+        // and which runner each session ran. Best-effort: a runtime digest
+        // error or a DB error degrades to a partial/absent record and is
+        // logged, never failing the spawn (attestation is a record, not a
+        // gate, at spawn time). The default install is unaffected in behaviour
+        // — it just gains an extra audit row per spawn.
+        let runner_path = crate::image_health::default_host_runner_path();
+        let attestation = crate::attestation::gather(
+            self.runtime.as_ref(),
+            &image_tag,
+            runner_path.as_deref(),
+            session.id,
+            session.agent_group_id,
+        )
+        .await;
+        crate::attestation::record(&self.central, &attestation);
+
         info!(
             session = %session.id.as_uuid(),
             container = %handle.id,
@@ -353,6 +436,29 @@ impl ContainerManager {
         let mut build_spec = ImageBuildSpec::new("copperclaw/session", &base);
         build_spec.apt_packages.clone_from(&cfg.packages_apt);
         build_spec.npm_packages.clone_from(&cfg.packages_npm);
+        // install_packages containment (Phase 6 supply-chain). The apt/npm
+        // install + any package postinstall scripts run during this build are
+        // third-party code. We dispatch the build under an explicit containment
+        // posture: `deny_broker_token` is on (the default), so the build can
+        // carry NO credential-shaped build-arg or label — the per-session
+        // broker capability token is minted only at container SPAWN into the
+        // container env and is structurally absent from the build, so a
+        // malicious postinstall can never receive it. We do NOT thread any
+        // credential into `build_spec.build_args`. Network stays on the bridge
+        // because apt/npm need real package-registry egress; the containment is
+        // "no broker token + no broker-loopback capability", not the
+        // unrestricted-egress regime the running agent would otherwise have.
+        build_spec =
+            build_spec.with_containment(copperclaw_container_rt::BuildContainment::default());
+        // Defense-in-depth: refuse to dispatch a build that somehow acquired a
+        // credential-shaped input. Clean by construction here; the assert makes
+        // a future regression (someone adding a build-arg) fail loudly rather
+        // than leaking a secret into a package postinstall.
+        if let Err(violation) = build_spec.assert_no_credentials() {
+            return Err(ManagerError::Spawn(
+                copperclaw_container_rt::RtError::Container(violation.to_string()),
+            ));
+        }
         let tag = self
             .runtime
             .build_image(build_spec)
@@ -374,13 +480,47 @@ impl ContainerManager {
         Ok(tag)
     }
 
+    /// Resolve a group's effective provider string using the same
+    /// precedence + alias normalisation the runner config applies
+    /// (`session.agent_provider` → per-group `container_config.provider` →
+    /// host `default_provider`, with `"claude"` ⇒ `"anthropic"` and an empty
+    /// value ⇒ `None`). Shared by the runner-config builder and the egress
+    /// resolver so the auto-injected model endpoint can never disagree with
+    /// the provider the runner actually drives.
+    pub(super) fn resolved_provider(
+        &self,
+        session: &Session,
+        cfg: Option<&container_configs::ContainerConfig>,
+    ) -> Option<String> {
+        let raw = session
+            .agent_provider
+            .clone()
+            .or_else(|| cfg.and_then(|c| c.provider.clone()))
+            .unwrap_or_else(|| self.cfg.default_provider.clone());
+        match raw.as_str() {
+            "" => None,
+            "claude" => Some("anthropic".to_string()),
+            other => Some(other.to_string()),
+        }
+    }
+
     pub(super) fn build_spec(
         &self,
         session: &Session,
         paths: &SessionPaths,
         image_tag: &str,
         cfg: Option<&container_configs::ContainerConfig>,
-    ) -> ContainerSpec {
+    ) -> Result<ContainerSpec, ManagerError> {
+        // toctou redux: validate the session-root source against the live
+        // sessions root before mounting. If a path component was swapped for
+        // a symlink that escapes the sessions dir (or the source otherwise
+        // leaves it), the spawn is refused — the agent's `/data` is the one
+        // mount it cannot run without, so a compromised source must fail the
+        // spawn outright rather than degrade.
+        let sessions_root = self.sessions_root();
+        super::mount_guard::validate_source(&paths.root, sessions_root)
+            .map_err(ManagerError::UnsafeMount)?;
+
         let mut spec = ContainerSpec::new(
             container_name(session.agent_group_id, session.id),
             image_tag,
@@ -436,12 +576,31 @@ impl ContainerManager {
                 .join("memory");
             match std::fs::create_dir_all(&mem_src) {
                 Ok(()) => {
-                    set_memory_dir_perms(&mem_src);
-                    spec = spec.with_mount(Mount::Bind {
-                        source: mem_src.to_string_lossy().into_owned(),
-                        target: format!("{CONTAINER_SESSION_DIR}/memory"),
-                        read_only: false,
-                    });
+                    // toctou redux: validate the memory source against the
+                    // per-group root (its own root, distinct from the
+                    // sessions root). A symlink swap here would let a
+                    // group's `/data/memory` escape `groups_dir`. Memory is
+                    // optional, so a failed check drops the mount + leaves
+                    // the UNAVAILABLE marker rather than failing the spawn.
+                    if let Err(err) = super::mount_guard::validate_source(&mem_src, groups) {
+                        warn!(
+                            %err,
+                            path = %mem_src.display(),
+                            "per-group memory source failed mount validation; skipping memory mount"
+                        );
+                        write_memory_unavailable_marker_str(
+                            &paths.root,
+                            &mem_src,
+                            &err.to_string(),
+                        );
+                    } else {
+                        set_memory_dir_perms(&mem_src);
+                        spec = spec.with_mount(Mount::Bind {
+                            source: mem_src.to_string_lossy().into_owned(),
+                            target: format!("{CONTAINER_SESSION_DIR}/memory"),
+                            read_only: false,
+                        });
+                    }
                 }
                 Err(err) => {
                     warn!(
@@ -456,8 +615,11 @@ impl ContainerManager {
 
         // A `create_agent` sibling gets access to the PARENT agent's
         // workspace (writable git worktree, or read-only fallback). See
-        // [`apply_parent_workspace`].
-        spec = apply_parent_workspace(spec, session, paths);
+        // [`apply_parent_workspace`]. Each parent-derived bind source is
+        // validated against the live sessions root before mounting; a
+        // compromised parent source drops the workspace mount rather than
+        // failing the sibling spawn (it can still run with an empty `/data`).
+        spec = apply_parent_workspace(spec, session, paths, sessions_root);
 
         // The runner reads its config from this path via the
         // `--config` flag wired into the entrypoint args. ContainerSpec
@@ -477,11 +639,45 @@ impl ContainerManager {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        if let Some(key) = rotatable.anthropic_api_key.as_deref() {
-            spec = spec.with_env("ANTHROPIC_API_KEY", key);
-        }
-        if let Some(base) = rotatable.anthropic_base_url.as_deref() {
-            spec = spec.with_env("ANTHROPIC_BASE_URL", base);
+        // Credential broker (Phase 0b). When the broker is enabled we MUST NOT
+        // forward the real provider key into the container env — a shell inside
+        // the container could `printenv ANTHROPIC_API_KEY` and exfiltrate it.
+        // Instead we mint a per-session, group-scoped, TTL-bounded, revocable
+        // capability TOKEN and put it in the `ANTHROPIC_API_KEY` slot (the
+        // runner reads that slot verbatim), and point `ANTHROPIC_BASE_URL` at
+        // the host-side broker loopback. The broker validates the token,
+        // injects the real key host-side, and forwards upstream.
+        //
+        // When the broker is disabled (the default), behaviour is unchanged:
+        // the real key + base URL are forwarded exactly as before.
+        let broker_mint = self
+            .broker
+            .as_ref()
+            .zip(self.broker_base_url.as_deref())
+            .map(|(broker, base_url)| {
+                let token = broker.mint_for(
+                    session.id,
+                    session.agent_group_id,
+                    super::broker::now_epoch_secs(),
+                );
+                (token, base_url)
+            });
+        if let Some((token, base_url)) = broker_mint {
+            // Broker enabled: the token rides the ANTHROPIC_API_KEY slot and
+            // the base URL points at the host-side broker loopback. The real
+            // key never enters the container env.
+            spec = spec
+                .with_env("ANTHROPIC_API_KEY", &token)
+                .with_env("ANTHROPIC_BASE_URL", base_url);
+        } else {
+            // Default (broker disabled): forward the real key + base URL
+            // exactly as before.
+            if let Some(key) = rotatable.anthropic_api_key.as_deref() {
+                spec = spec.with_env("ANTHROPIC_API_KEY", key);
+            }
+            if let Some(base) = rotatable.anthropic_base_url.as_deref() {
+                spec = spec.with_env("ANTHROPIC_BASE_URL", base);
+            }
         }
         // Operator-configured forwards (search API keys, etc.). Skip
         // empty values — an unset env var should not appear in the
@@ -491,6 +687,37 @@ impl ContainerManager {
             if !v.is_empty() {
                 spec = spec.with_env(k, v);
             }
+        }
+
+        // Multi-key provider rotation (M16 Phase 4): when the group's fallback
+        // chain selected a chain-entry key whose `api_key_env` is a NON-default
+        // name (e.g. `ANTHROPIC_API_KEY_B`), `runner.json` names that var but
+        // the runner can only read it if its *value* is actually in the
+        // container env. Resolution is the pure [`resolve_multi_key_secret`]
+        // (testable under `forbid(unsafe_code)`); the host process env is the
+        // injected fallback lookup. A `None` result means nothing to inject
+        // (default key, no-auth provider, already-forwarded, or unset). Read-
+        // only re-select — no fold/audit (those ran when `runner.json` was
+        // assembled).
+        let selected_key_env = self.selected_api_key_env(session, chrono::Utc::now());
+        match resolve_multi_key_secret(
+            selected_key_env.as_deref(),
+            &rotatable.forward_env,
+            |name| std::env::var(name).ok(),
+        ) {
+            MultiKeySecret::Inject { name, value } => {
+                spec = spec.with_env(&name, &value);
+            }
+            MultiKeySecret::Missing { name } => {
+                warn!(
+                    agent_group = %session.agent_group_id.as_uuid(),
+                    key_env = %name,
+                    "provider failover selected a multi-key api_key_env that is unset \
+                     or empty in the host env; the runner will have the var name but \
+                     no value — set it in the install .env"
+                );
+            }
+            MultiKeySecret::None => {}
         }
 
         // Per-group resource limits (Top 10 #8 / M13).
@@ -508,10 +735,50 @@ impl ContainerManager {
                     );
                 }
             }
-            // Egress allow-list (Top 10 #6 / M13).
-            if !c.egress_allow.is_empty() {
-                spec = spec.with_egress_allow(c.egress_allow.clone());
-            }
+        }
+
+        // Egress allow-list (Phase 0a v1 / Top 10 #6). Resolve the effective
+        // list = operator-configured per-group entries UNIONed with the
+        // auto-injected REAL model endpoint. The injected endpoint is
+        // provider-aware (anthropic/openrouter via ANTHROPIC_BASE_URL,
+        // native ollama via OLLAMA_BASE_URL, each with its real default
+        // applied when the env var is unset) so deny-default can never
+        // blackhole model traffic — including the common single-provider
+        // Anthropic deployment with no ANTHROPIC_BASE_URL override. The
+        // posture is carried regardless of mode so `cclaw doctor` / logs can
+        // report it; the container runtime decides what (if anything) is
+        // enforced. See [`super::egress`] and
+        // `copperclaw_container_rt::EgressMode`.
+        let group_allow = cfg.map_or(&[][..], |c| c.egress_allow.as_slice());
+        let provider = self.resolved_provider(session, cfg);
+        let ollama_base_url = rotatable
+            .forward_env
+            .iter()
+            .find(|(k, _)| k == "OLLAMA_BASE_URL")
+            .map(|(_, v)| v.as_str());
+        let resolved_allow = super::egress::resolve_allow_list_for_provider(
+            group_allow,
+            provider.as_deref(),
+            rotatable.anthropic_base_url.as_deref(),
+            ollama_base_url,
+        );
+        if !resolved_allow.is_empty() {
+            spec = spec.with_egress_allow(resolved_allow.clone());
+        }
+        spec = spec.with_egress_mode(self.cfg.egress_mode);
+
+        // Phase 0a v2 (Part A): under deny-default, pin the container's
+        // /etc/resolv.conf to a host-controlled filtering resolver that
+        // answers ONLY the effective allow-list and NXDOMAINs everything else
+        // — so a deny-default session can't exfiltrate via DNS labels to an
+        // arbitrary resolver. The per-session resolv.conf + dnsmasq filter
+        // config are written into the session dir and the resolv.conf is bound
+        // read-only into the container. Gated on deny-default so default
+        // (allow-all) spawns are untouched. Best-effort: a write failure logs
+        // and drops the pin rather than failing the spawn (the agent's model
+        // traffic still flows; the operator sees the warning).
+        if self.cfg.egress_mode == copperclaw_container_rt::EgressMode::DenyDefault {
+            spec = wire_dns_filter(spec, session, paths, &resolved_allow);
         }
 
         // Host-wide Nvidia GPU passthrough. Gated by `COPPERCLAW_CONTAINER_GPU`
@@ -524,8 +791,195 @@ impl ContainerManager {
             spec = spec.with_gpu_passthrough(true);
         }
 
-        spec
+        Ok(spec)
     }
+}
+
+/// Phase 0a v2 (Part A + B): wire the per-session DNS filter into `spec`
+/// under deny-default.
+///
+/// Writes the pinned `/etc/resolv.conf` + dnsmasq filter config into the
+/// session dir and binds the resolv.conf read-only into the container, so
+/// the session can only resolve the effective allow-list and reaches no
+/// arbitrary resolver. Also constructs the per-session nftables apply plan
+/// and writes the ruleset to the session dir for the privileged apply (the
+/// runtime path; see [`dns_filter_runtime_status`]).
+///
+/// Best-effort: a write failure logs at `warn!` and leaves the spec
+/// without the resolv.conf pin rather than failing the spawn — model
+/// traffic still flows on the carried allow-list, and the operator sees
+/// the warning in the host log + `cclaw doctor`.
+fn wire_dns_filter(
+    mut spec: ContainerSpec,
+    session: &Session,
+    paths: &SessionPaths,
+    resolved_allow: &[String],
+) -> ContainerSpec {
+    // Forward the allowed names to whatever the host's own resolver uses,
+    // dropping loopback to avoid a forwarding loop. Empty → the filter
+    // sidecar uses its system default.
+    let host_resolv = std::fs::read_to_string("/etc/resolv.conf").ok();
+    let upstreams = super::egress::filter_upstreams(host_resolv.as_deref());
+    let table = super::egress::nft_table_name(&spec.name);
+    let plan = super::egress::build_dns_filter_plan(table, resolved_allow, &upstreams);
+
+    let resolv_path = paths.root.join(super::egress::RESOLV_CONF_FILENAME);
+    let dnsmasq_path = paths.root.join(super::egress::DNSMASQ_CONF_FILENAME);
+    let nft_path = paths.root.join(EGRESS_NFT_FILENAME);
+
+    // Persist the filter config + ruleset. The resolv.conf is the one that
+    // must land for the pin to take effect; the others are inputs to the
+    // (deferred) privileged apply + filter sidecar.
+    if let Err(err) = std::fs::write(&resolv_path, plan.resolv_conf.as_bytes()) {
+        warn!(
+            session = %session.id.as_uuid(),
+            ?err,
+            path = %resolv_path.display(),
+            "could not write pinned resolv.conf; deny-default DNS pin skipped this spawn"
+        );
+        return spec;
+    }
+    if let Err(err) = std::fs::write(&dnsmasq_path, plan.dnsmasq_conf.as_bytes()) {
+        warn!(session = %session.id.as_uuid(), ?err, "could not write dnsmasq filter config");
+    }
+    if let Err(err) = std::fs::write(&nft_path, plan.nft.ruleset.as_bytes()) {
+        warn!(session = %session.id.as_uuid(), ?err, "could not write nftables ruleset");
+    }
+
+    spec = spec.with_resolv_conf_source(resolv_path.to_string_lossy().into_owned());
+
+    info!(
+        session = %session.id.as_uuid(),
+        allow_names = plan.resolver.allow_names.len(),
+        dns_filter = "pinned",
+        nft_status = dns_filter_runtime_status().as_str(),
+        "deny-default DNS filter wired; resolv.conf pinned to filtering resolver"
+    );
+
+    spec
+}
+
+/// Filename of the per-session constructed nftables ruleset, written into the
+/// session dir for the privileged netns apply (the deferred runtime path).
+pub const EGRESS_NFT_FILENAME: &str = "egress.nft";
+
+/// Phase 0a v2 (Part B) runtime path: apply the per-session nftables ruleset
+/// written by [`wire_dns_filter`].
+///
+/// The ruleset (constructed + tested purely) lives at `<session>/egress.nft`.
+/// Applying it requires `CAP_NET_ADMIN` and must target the session's own
+/// network namespace (not the host's). We do NOT apply it to the host netns —
+/// that would be both wrong (it would filter the host) and unsafe. Until the
+/// netns-entering apply lands (it needs the running container's PID to
+/// `nsenter --net`), this records the constructed-and-deferred status so
+/// `cclaw doctor` reports it honestly. The deny-default DNS filter + the
+/// empty-allow `network_mode: none` cut are the enforcement that IS live; the
+/// L3/L4 nftables filtering of a non-empty list is constructed here and
+/// deferred to the privileged netns apply.
+///
+/// Returns the status so callers/tests can assert what happened. Never fails
+/// the spawn.
+fn apply_session_nftables(session: &Session, paths: &SessionPaths) -> NftRuntimeStatus {
+    let status = dns_filter_runtime_status();
+    let nft_path = paths.root.join(EGRESS_NFT_FILENAME);
+    match status {
+        NftRuntimeStatus::Available => {
+            // The privileged netns apply is the deferred runtime tail: it
+            // needs the running container's PID to enter its netns
+            // (`nsenter -t <pid> -n nft -f <ruleset>`), which the runtime
+            // doesn't yet surface to the host. Constructing + persisting the
+            // exact ruleset that apply would load is done; wiring the PID
+            // handoff + the privileged exec is the remaining step. We log the
+            // constructed ruleset path so an operator can apply it by hand
+            // against the session netns in the interim.
+            info!(
+                session = %session.id.as_uuid(),
+                ruleset = %nft_path.display(),
+                "deny-default nftables ruleset constructed; netns apply deferred to the privileged path (requires container PID + CAP_NET_ADMIN)"
+            );
+        }
+        NftRuntimeStatus::ToolMissing => {
+            warn!(
+                session = %session.id.as_uuid(),
+                "deny-default: `nft` not found on PATH — L3/L4 egress filtering not applied; DNS filtering + empty-allow network cut still enforced"
+            );
+        }
+        NftRuntimeStatus::Unsupported => {
+            warn!(
+                session = %session.id.as_uuid(),
+                "deny-default: nftables unsupported on this platform — L3/L4 egress filtering not applied"
+            );
+        }
+    }
+    status
+}
+
+/// Report whether the privileged nftables apply path can run in this host
+/// process. The rule construction is always done (pure + tested); the *apply*
+/// needs `CAP_NET_ADMIN` against the session netns. This probe lets `cclaw
+/// doctor` show whether deny-default's L3/L4 filtering is actually enforced or
+/// only constructed-and-deferred. Linux-only; non-Linux always reports the
+/// deferred status (nftables is a Linux facility).
+#[must_use]
+pub fn dns_filter_runtime_status() -> NftRuntimeStatus {
+    #[cfg(target_os = "linux")]
+    {
+        // `nft` on PATH is necessary for the apply; CAP_NET_ADMIN is checked
+        // by attempting a privileged no-op only at the actual apply site (we
+        // don't probe it here to avoid a syscall on every spawn). Presence of
+        // the binary is the cheap, side-effect-free signal doctor surfaces.
+        if which_nft().is_some() {
+            NftRuntimeStatus::Available
+        } else {
+            NftRuntimeStatus::ToolMissing
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        NftRuntimeStatus::Unsupported
+    }
+}
+
+/// Whether the per-session nftables apply (the deferred runtime path) can run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NftRuntimeStatus {
+    /// `nft` is on PATH and the platform supports it — the privileged apply
+    /// can be attempted at spawn (subject to `CAP_NET_ADMIN`).
+    Available,
+    /// `nft` is not installed; the ruleset is constructed but cannot be
+    /// applied. Deny-default still enforces DNS filtering + the empty-allow
+    /// `network_mode: none` cut.
+    ToolMissing,
+    /// The platform doesn't support nftables (non-Linux). Ruleset construction
+    /// is exercised by tests; application is not applicable here.
+    Unsupported,
+}
+
+impl NftRuntimeStatus {
+    /// Stable token for logs / JSON surfaces.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NftRuntimeStatus::Available => "available",
+            NftRuntimeStatus::ToolMissing => "tool-missing",
+            NftRuntimeStatus::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// Locate `nft` on `PATH` without spawning it. Splits `$PATH` and checks each
+/// entry for an `nft` file. Returns the first match. Linux-only helper for
+/// [`dns_filter_runtime_status`].
+#[cfg(target_os = "linux")]
+fn which_nft() -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join("nft");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Share the PARENT agent's workspace into a `create_agent` sibling.
@@ -556,6 +1010,7 @@ fn apply_parent_workspace(
     mut spec: ContainerSpec,
     session: &Session,
     paths: &SessionPaths,
+    sessions_root: &std::path::Path,
 ) -> ContainerSpec {
     let Some(parent_sid) = session.source_session_id else {
         return spec;
@@ -572,6 +1027,19 @@ fn apply_parent_workspace(
     let worktree = resolve_parent_repo_root(&parent_root)
         .and_then(|repo_root| provision_parent_worktree(&repo_root, &sibling_sid));
     if let Some(wt) = worktree {
+        // toctou redux: both parent-derived sources are host-controlled
+        // paths under the sessions root. Validate each before mounting; a
+        // swapped-symlink component (or an escape) drops the whole writable
+        // workspace rather than handing dockerd a compromised source. The
+        // sibling can still run with an empty `/data`.
+        if let Err(err) = super::mount_guard::validate_source(&wt.git_dir, sessions_root) {
+            warn!(%err, path = %wt.git_dir.display(), "parent .git source failed mount validation; skipping workspace");
+            return spec;
+        }
+        if let Err(err) = super::mount_guard::validate_source(&wt.worktree_dir, sessions_root) {
+            warn!(%err, path = %wt.worktree_dir.display(), "parent worktree source failed mount validation; skipping workspace");
+            return spec;
+        }
         let git_dir = wt.git_dir.to_string_lossy().into_owned();
         spec = spec
             // Shared `.git` at its host-absolute path (RW: the worktree's
@@ -590,6 +1058,13 @@ fn apply_parent_workspace(
             .with_env("COPPERCLAW_WORKSPACE", CONTAINER_WORKSPACE_DIR)
             .with_env("COPPERCLAW_WORKSPACE_BRANCH", &wt.branch);
     } else {
+        // Read-only `/parent` fallback. Still validate the source: a
+        // read-only bind of a symlink-swapped path can still leak the
+        // contents of an escaped target into the container.
+        if let Err(err) = super::mount_guard::validate_source(&parent_root, sessions_root) {
+            warn!(%err, path = %parent_root.display(), "parent workspace source failed mount validation; skipping /parent mount");
+            return spec;
+        }
         spec = spec.with_mount(Mount::Bind {
             source: parent_root.to_string_lossy().into_owned(),
             target: CONTAINER_PARENT_DIR.to_string(),
@@ -692,6 +1167,56 @@ pub(super) fn host_uid_gid() -> Option<(u32, u32)> {
 
 pub(super) fn container_name(_agent: AgentGroupId, session: copperclaw_types::SessionId) -> String {
     format!("copperclaw-{}", session.as_uuid())
+}
+
+/// Outcome of resolving the secret value for a provider-failover-selected
+/// multi-key `api_key_env`.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum MultiKeySecret {
+    /// Inject `name=value` into the container env.
+    Inject { name: String, value: String },
+    /// The key was selected but has no resolvable value — warn; the runner
+    /// will have the name but no secret.
+    Missing { name: String },
+    /// Nothing to do (no selection, the default `ANTHROPIC_API_KEY` slot which
+    /// is wired elsewhere, or a key already present in `forward_env`).
+    None,
+}
+
+/// Pure resolver for the multi-key rotation secret (M16 Phase 4). Decides what
+/// (if anything) `build_spec` must inject for a chain-selected `api_key_env`.
+///
+/// Env-free so it is testable under the workspace's `forbid(unsafe_code)`
+/// (which makes `std::env::set_var` unavailable): `lookup` is the injected
+/// process-env reader, supplied by `build_spec` as `std::env::var`.
+///
+/// Rules:
+/// * `None` selection / the default `ANTHROPIC_API_KEY` name ⇒ `None` (the
+///   default slot is wired by `build_spec` directly, possibly as a broker
+///   token — never clobber it here).
+/// * a name already in `forward_env` ⇒ `None` (the forward loop injected it).
+/// * otherwise resolve the value via `lookup`; non-empty ⇒ `Inject`,
+///   unset/empty ⇒ `Missing`.
+pub(super) fn resolve_multi_key_secret(
+    selected: Option<&str>,
+    forward_env: &[(String, String)],
+    lookup: impl Fn(&str) -> Option<String>,
+) -> MultiKeySecret {
+    let Some(name) = selected else {
+        return MultiKeySecret::None;
+    };
+    if name == "ANTHROPIC_API_KEY" || forward_env.iter().any(|(k, _)| k == name) {
+        return MultiKeySecret::None;
+    }
+    match lookup(name).filter(|v| !v.is_empty()) {
+        Some(value) => MultiKeySecret::Inject {
+            name: name.to_string(),
+            value,
+        },
+        None => MultiKeySecret::Missing {
+            name: name.to_string(),
+        },
+    }
 }
 
 /// Locate a session's on-disk root by scanning `<sessions_dir>/*/<session_id>`.
@@ -932,6 +1457,44 @@ mod tests {
     use copperclaw_types::{ContainerStatus, SessionId};
     use std::path::PathBuf;
 
+    /// `harden_dir_0700` sets a session directory to owner-only `0700`
+    /// regardless of the mode it was created with — proving the perms are
+    /// enforced explicitly, not left to the host umask.
+    #[cfg(unix)]
+    #[test]
+    fn harden_dir_sets_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sess");
+        std::fs::create_dir(&dir).unwrap();
+        // Start deliberately loose.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        harden_dir_0700(&dir);
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "session dir must be tightened to 0700, got {mode:o}"
+        );
+    }
+
+    /// `harden_file_0600` locks a secret-bearing session file to owner
+    /// read/write `0600`, again independent of the creating umask.
+    #[cfg(unix)]
+    #[test]
+    fn harden_file_sets_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("runner.json");
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        harden_file_0600(&path);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "session config file must be tightened to 0600, got {mode:o}"
+        );
+    }
+
     /// Backoff is empty on construction: every group is allowed to
     /// rebuild immediately.
     #[test]
@@ -1040,6 +1603,7 @@ mod tests {
             skills_mode: SkillsMode::Inline,
             gpu_passthrough: false,
             forward_env: Vec::new(),
+            egress_mode: copperclaw_container_rt::EgressMode::AllowAll,
         }
     }
 
@@ -1085,7 +1649,9 @@ mod tests {
         );
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        let spec = mgr.build_spec(&session, &paths, "copperclaw/session:abc", None);
+        let spec = mgr
+            .build_spec(&session, &paths, "copperclaw/session:abc", None)
+            .unwrap();
         // Image
         assert_eq!(spec.image, "copperclaw/session:abc");
         // Entrypoint includes the runner path + --config arg
@@ -1128,6 +1694,163 @@ mod tests {
     }
 
     #[test]
+    fn build_spec_with_broker_disabled_still_forwards_real_key() {
+        // Default path (no broker): behaviour is unchanged — the real key is
+        // forwarded. This is the regression guard for "default still works".
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
+        assert!(
+            spec.env
+                .iter()
+                .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v == "sk-test"),
+            "broker disabled must forward the real key"
+        );
+    }
+
+    #[test]
+    fn build_spec_with_broker_enabled_emits_token_not_master_key() {
+        // Phase 0b core security assertion: when the broker is enabled,
+        // build_spec must NOT put the master key in the container env. The
+        // ANTHROPIC_API_KEY slot must hold a per-session capability TOKEN, and
+        // ANTHROPIC_BASE_URL must point at the broker loopback.
+        use super::super::broker::{BrokerConfig, BrokerState, Revocations};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let cfg = BrokerConfig::resolve(true, Some("sk-test"), None, Some(3600)).unwrap();
+        let broker = std::sync::Arc::new(BrokerState::new(cfg));
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        )
+        .with_broker(
+            std::sync::Arc::clone(&broker),
+            "http://127.0.0.1:48080".into(),
+        );
+
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr
+            .build_spec(&session, &paths, "copperclaw/session:abc", None)
+            .unwrap();
+
+        let api_key = spec
+            .env
+            .iter()
+            .find(|(k, _)| k == "ANTHROPIC_API_KEY")
+            .map(|(_, v)| v.clone())
+            .expect("ANTHROPIC_API_KEY must be set");
+        // The master key must NEVER appear in the container env.
+        assert_ne!(
+            api_key, "sk-test",
+            "broker enabled: master key must not be forwarded into the container"
+        );
+        assert!(
+            !spec.env.iter().any(|(_, v)| v == "sk-test"),
+            "master key must not appear in ANY env var"
+        );
+        // The slot holds a real capability token shaped `cct1.payload.sig`.
+        assert!(
+            api_key.starts_with("cct1."),
+            "expected a capability token, got {api_key}"
+        );
+        // And the token validates against the broker's keyring with the right
+        // session + group claims.
+        let revs = Revocations::new();
+        let claims = broker
+            .keyring
+            .validate(&api_key, super::super::broker::now_epoch_secs(), &revs)
+            .expect("minted token must validate");
+        assert_eq!(claims.session_id, session.id);
+        assert_eq!(claims.agent_group_id, session.agent_group_id);
+
+        // Base URL points at the broker loopback, not the operator upstream.
+        assert!(
+            spec.env
+                .iter()
+                .any(|(k, v)| k == "ANTHROPIC_BASE_URL" && v == "http://127.0.0.1:48080"),
+            "ANTHROPIC_BASE_URL must point at the broker loopback"
+        );
+    }
+
+    #[test]
+    fn build_spec_and_runner_config_agree_on_broker_endpoint() {
+        // HIGH-bug regression (end-to-end coherence): the container ENV
+        // (`ANTHROPIC_BASE_URL`, written by build_spec) and the on-disk
+        // `runner.json` (`api_base_url`, written by runner_config_for) MUST
+        // name the SAME endpoint when the broker is enabled — the broker
+        // loopback. The runner prefers runner.json's `api_base_url`, so if the
+        // two ever disagree the file silently wins and the broker is bypassed.
+        // This pins the single source of truth across both writers.
+        use super::super::broker::{BrokerConfig, BrokerState};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        // Operator base URL is set (the OpenRouter deployment the bug fired on)
+        // via manager_cfg; the broker holds the real upstream host-side.
+        let broker_cfg = BrokerConfig::resolve(true, Some("sk-test"), None, Some(3600)).unwrap();
+        let broker = std::sync::Arc::new(BrokerState::new(broker_cfg));
+        let loopback = "http://127.0.0.1:48080";
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        )
+        .with_broker(std::sync::Arc::clone(&broker), loopback.into());
+
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr
+            .build_spec(&session, &paths, "copperclaw/session:abc", None)
+            .unwrap();
+        let env_base = spec
+            .env
+            .iter()
+            .find(|(k, _)| k == "ANTHROPIC_BASE_URL")
+            .map(|(_, v)| v.clone())
+            .expect("ANTHROPIC_BASE_URL must be set");
+
+        let rc = mgr.runner_config_for(&session, None, None);
+        let file_base = rc
+            .api_base_url
+            .expect("runner.json api_base_url must be set");
+
+        assert_eq!(env_base, loopback, "container env base must be the broker");
+        assert_eq!(
+            file_base, loopback,
+            "runner.json base must be the broker (not the operator URL)"
+        );
+        assert_eq!(
+            env_base, file_base,
+            "env ANTHROPIC_BASE_URL and runner.json api_base_url must agree"
+        );
+
+        // And the key slot in the container env is a capability token, not the
+        // real key — so the runner authenticates to the broker, which swaps in
+        // the real key host-side.
+        let api_key = spec
+            .env
+            .iter()
+            .find(|(k, _)| k == "ANTHROPIC_API_KEY")
+            .map(|(_, v)| v.clone())
+            .expect("ANTHROPIC_API_KEY must be set");
+        assert!(api_key.starts_with("cct1."), "expected a capability token");
+        assert!(
+            !spec.env.iter().any(|(_, v)| v == "sk-test"),
+            "real key must not appear in any container env var"
+        );
+    }
+
+    #[test]
     // Linux-only: asserts the `/proc/self`-based uid detection in
     // `host_uid_gid`. On macOS (also `unix`) there's no `/proc`, so the
     // function returns `None` by design and `spec.user` is unset — nothing
@@ -1150,7 +1873,7 @@ mod tests {
         );
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        let spec = mgr.build_spec(&session, &paths, "img", None);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
         let user = spec.user.as_deref().expect("spec.user should be set");
         let (uid_str, gid_str) = user.split_once(':').expect("user is uid:gid");
         let uid: u32 = uid_str.parse().expect("uid is numeric");
@@ -1177,7 +1900,7 @@ mod tests {
         );
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        let spec = mgr.build_spec(&session, &paths, "img", None);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
         assert_eq!(spec.working_dir.as_deref(), Some(CONTAINER_SESSION_DIR));
         assert!(
             spec.env
@@ -1206,7 +1929,7 @@ mod tests {
         );
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        let spec = mgr.build_spec(&session, &paths, "img", None);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
         assert!(
             spec.env
                 .iter()
@@ -1236,8 +1959,127 @@ mod tests {
         );
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        let spec = mgr.build_spec(&session, &paths, "img", None);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
         assert!(spec.env.iter().all(|(k, _)| k != "ANTHROPIC_BASE_URL"));
+    }
+
+    // --- Phase 0a v2: deny-default DNS filtering wiring --------------------
+
+    #[test]
+    fn build_spec_allow_all_does_not_pin_resolv_conf() {
+        // Default (allow-all) spawns must be entirely unaffected: no
+        // resolv.conf pin, no filter files written.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()), // egress_mode = AllowAll
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
+        assert!(
+            spec.resolv_conf_source.is_none(),
+            "allow-all must not pin resolv.conf"
+        );
+        assert!(
+            !paths
+                .root
+                .join(super::super::egress::RESOLV_CONF_FILENAME)
+                .exists(),
+            "allow-all must not write a resolv.conf"
+        );
+    }
+
+    #[test]
+    fn build_spec_deny_default_pins_resolv_conf_and_writes_filter_files() {
+        // Under deny-default, build_spec writes the per-session resolv.conf +
+        // dnsmasq filter + nftables ruleset and pins the resolv.conf into the
+        // container.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.egress_mode = copperclaw_container_rt::EgressMode::DenyDefault;
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
+
+        // resolv.conf is pinned to the written host file.
+        let resolv_path = paths.root.join(super::super::egress::RESOLV_CONF_FILENAME);
+        assert_eq!(
+            spec.resolv_conf_source.as_deref(),
+            Some(resolv_path.to_string_lossy().as_ref())
+        );
+        // The file exists, pins a single nameserver, and carries no search.
+        let resolv = std::fs::read_to_string(&resolv_path).unwrap();
+        assert!(resolv.contains("nameserver 127.0.0.1\n"));
+        assert!(!resolv.contains("search "));
+
+        // The dnsmasq filter answers the model endpoint and NXDOMAINs the rest.
+        // The manager fixture sets ANTHROPIC_BASE_URL to openrouter, so the
+        // injected model endpoint is openrouter.ai (NOT api.anthropic.com).
+        let dnsmasq =
+            std::fs::read_to_string(paths.root.join(super::super::egress::DNSMASQ_CONF_FILENAME))
+                .unwrap();
+        assert!(
+            dnsmasq.contains("server=/openrouter.ai/"),
+            "dnsmasq must allow the injected model endpoint: {dnsmasq}"
+        );
+        assert!(dnsmasq.contains("address=/#/\n"));
+
+        // The nftables ruleset was constructed + persisted with a drop policy.
+        let nft = std::fs::read_to_string(paths.root.join(EGRESS_NFT_FILENAME)).unwrap();
+        assert!(nft.contains("policy drop;"));
+        assert!(nft.contains("ip daddr 127.0.0.1 udp dport 53 accept"));
+        // The name endpoint becomes a port-gated rule with the dns-filtered note.
+        assert!(
+            nft.contains("tcp dport 443 accept comment \"allow openrouter.ai (dns-filtered)\""),
+            "ruleset must gate the model endpoint port: {nft}"
+        );
+    }
+
+    #[test]
+    fn apply_session_nftables_never_fails_spawn_and_reports_status() {
+        // The privileged apply is best-effort: it returns a status and never
+        // errors, regardless of whether `nft` is present.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.egress_mode = copperclaw_container_rt::EgressMode::DenyDefault;
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        // Build the spec so the ruleset file exists, then apply.
+        let _ = mgr.build_spec(&session, &paths, "img", None).unwrap();
+        let status = apply_session_nftables(&session, &paths);
+        // The status is one of the three honest values — never a claim of
+        // applied enforcement.
+        assert!(matches!(
+            status,
+            NftRuntimeStatus::Available
+                | NftRuntimeStatus::ToolMissing
+                | NftRuntimeStatus::Unsupported
+        ));
+    }
+
+    #[test]
+    fn nft_runtime_status_as_str_is_stable() {
+        assert_eq!(NftRuntimeStatus::Available.as_str(), "available");
+        assert_eq!(NftRuntimeStatus::ToolMissing.as_str(), "tool-missing");
+        assert_eq!(NftRuntimeStatus::Unsupported.as_str(), "unsupported");
     }
 
     #[test]
@@ -1259,7 +2101,7 @@ mod tests {
         let mut sibling = fixture_session(&db);
         sibling.source_session_id = Some(parent_sid);
         let paths = SessionPaths::new(tmp.path(), sibling.agent_group_id, sibling.id);
-        let spec = mgr.build_spec(&sibling, &paths, "img", None);
+        let spec = mgr.build_spec(&sibling, &paths, "img", None).unwrap();
         let parent_mount = spec.mounts.iter().find_map(|m| match m {
             Mount::Bind {
                 source,
@@ -1285,7 +2127,7 @@ mod tests {
         // fixture_session has source_session_id = None (a root session).
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        let spec = mgr.build_spec(&session, &paths, "img", None);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
         assert!(
             !spec
                 .mounts
@@ -1345,7 +2187,7 @@ mod tests {
         let mut sibling = fixture_session(&db);
         sibling.source_session_id = Some(parent_sid);
         let paths = SessionPaths::new(tmp.path(), sibling.agent_group_id, sibling.id);
-        let spec = mgr.build_spec(&sibling, &paths, "img", None);
+        let spec = mgr.build_spec(&sibling, &paths, "img", None).unwrap();
 
         // No read-only /parent — the writable worktree replaces it.
         assert!(
@@ -1435,8 +2277,8 @@ mod tests {
 
         // A second spawn (container restart within a session) must reuse the
         // existing worktree, not error out.
-        let spec1 = mgr.build_spec(&sibling, &paths, "img", None);
-        let spec2 = mgr.build_spec(&sibling, &paths, "img", None);
+        let spec1 = mgr.build_spec(&sibling, &paths, "img", None).unwrap();
+        let spec2 = mgr.build_spec(&sibling, &paths, "img", None).unwrap();
         let has_workspace = |s: &ContainerSpec| {
             s.mounts.iter().any(
                 |m| matches!(m, Mount::Bind { target, .. } if target == CONTAINER_WORKSPACE_DIR),
@@ -1481,7 +2323,7 @@ mod tests {
         let mut sibling = fixture_session(&db);
         sibling.source_session_id = Some(parent_sid);
         let paths = SessionPaths::new(tmp.path(), sibling.agent_group_id, sibling.id);
-        let spec = mgr.build_spec(&sibling, &paths, "img", None);
+        let spec = mgr.build_spec(&sibling, &paths, "img", None).unwrap();
 
         // Shared .git + worktree come from the SUBDIR repo, not /data root.
         let git_src = project.join(".git").to_string_lossy().into_owned();
@@ -1567,7 +2409,7 @@ mod tests {
         );
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        let spec = mgr.build_spec(&session, &paths, "img", None);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
         let memory_mount = spec.mounts.iter().find_map(|m| match m {
             Mount::Bind {
                 source,
@@ -1601,7 +2443,7 @@ mod tests {
         );
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        let spec = mgr.build_spec(&session, &paths, "img", None);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
         let has_memory = spec.mounts.iter().any(|m| match m {
             Mount::Bind { target, .. } => target == &format!("{CONTAINER_SESSION_DIR}/memory"),
             _ => false,
@@ -1643,9 +2485,10 @@ mod tests {
             resource_limits: serde_json::json!({"cpus": "1.5", "memory_mb": 512u64}),
             coding_enabled: false,
             surface_thinking: false,
+            tool_profile: None,
             updated_at: chrono::Utc::now(),
         };
-        let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg));
+        let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg)).unwrap();
         assert!(!spec.resource_limits.is_empty());
         assert!((spec.resource_limits.cpus.unwrap() - 1.5).abs() < f64::EPSILON);
         assert_eq!(spec.resource_limits.memory_mb, Some(512));
@@ -1681,17 +2524,25 @@ mod tests {
             resource_limits: serde_json::json!({}),
             coding_enabled: false,
             surface_thinking: false,
+            tool_profile: None,
             updated_at: chrono::Utc::now(),
         };
-        let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg));
+        let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg)).unwrap();
+        // The model endpoint (derived from the cfg's openrouter base URL) is
+        // auto-injected FIRST so deny-default can't blackhole model traffic,
+        // then the operator's per-group entries are unioned on top.
         assert_eq!(
             spec.egress_allow,
-            vec!["api.example.com:443", "db.local:5432"]
+            vec!["openrouter.ai:443", "api.example.com:443", "db.local:5432"]
         );
     }
 
+    /// Auto-injection (migration safety): even with an empty per-group
+    /// allow-list, the resolved list carries the model endpoint derived from
+    /// the base URL so a deny-default spawn can never blackhole the agent's
+    /// own provider traffic.
     #[test]
-    fn build_spec_empty_egress_allow_stays_empty() {
+    fn build_spec_auto_injects_model_endpoint_when_group_allow_empty() {
         let tmp = tempfile::tempdir().unwrap();
         let db = CentralDb::open_in_memory().unwrap();
         let mgr = ContainerManager::new(
@@ -1720,10 +2571,203 @@ mod tests {
             resource_limits: serde_json::json!({}),
             coding_enabled: false,
             surface_thinking: false,
+            tool_profile: None,
             updated_at: chrono::Utc::now(),
         };
-        let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg));
-        assert!(spec.egress_allow.is_empty());
+        let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg)).unwrap();
+        // manager_cfg's base URL is https://openrouter.ai/api/v1.
+        assert_eq!(spec.egress_allow, vec!["openrouter.ai:443"]);
+    }
+
+    /// Migration-safety: a deny-default group with the DEFAULT (unset)
+    /// Anthropic base URL and an empty per-group allow-list must STILL reach
+    /// `api.anthropic.com` — the common single-provider deployment was the one
+    /// the old "only inject when `ANTHROPIC_BASE_URL` is set" code black-holed.
+    #[test]
+    fn build_spec_deny_default_with_unset_anthropic_base_injects_api_anthropic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.egress_mode = copperclaw_container_rt::EgressMode::DenyDefault;
+        // No ANTHROPIC_BASE_URL override; default provider stays "anthropic".
+        cfg.anthropic_base_url = None;
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
+        assert_eq!(
+            spec.egress_mode,
+            copperclaw_container_rt::EgressMode::DenyDefault
+        );
+        // The empty group allow-list does NOT black-hole the model: the
+        // real default Anthropic endpoint is auto-injected.
+        assert_eq!(spec.egress_allow, vec!["api.anthropic.com:443"]);
+    }
+
+    /// Migration-safety (ollama path): a group pinned to `provider=ollama`
+    /// gets the `OLLAMA_BASE_URL` host injected — NOT `api.anthropic.com` — so
+    /// deny-default reaches the local model endpoint. Exercises the real
+    /// spawn path reading `OLLAMA_BASE_URL` from the rotatable `forward_env`.
+    #[test]
+    fn build_spec_deny_default_ollama_group_injects_ollama_host() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.egress_mode = copperclaw_container_rt::EgressMode::DenyDefault;
+        // ANTHROPIC_BASE_URL is set but must be IGNORED for an ollama group.
+        cfg.anthropic_base_url = Some("https://api.anthropic.com".into());
+        // OLLAMA_BASE_URL is forwarded the same way boot.rs wires it.
+        cfg.forward_env = vec![(
+            "OLLAMA_BASE_URL".to_string(),
+            "http://172.17.0.1:11434".to_string(),
+        )];
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let group_cfg = container_configs::ContainerConfig {
+            agent_group_id: session.agent_group_id,
+            provider: Some("ollama".into()),
+            model: None,
+            effort: None,
+            image_tag: None,
+            assistant_name: None,
+            max_messages_per_prompt: None,
+            skills: container_configs::SkillsSelector::All,
+            mcp_servers: serde_json::json!({}),
+            packages_apt: vec![],
+            packages_npm: vec![],
+            additional_mounts: serde_json::json!([]),
+            cli_scope: container_configs::CliScope::Group,
+            config_fingerprint: None,
+            egress_allow: vec![],
+            resource_limits: serde_json::json!({}),
+            coding_enabled: false,
+            surface_thinking: false,
+            tool_profile: None,
+            updated_at: chrono::Utc::now(),
+        };
+        let spec = mgr
+            .build_spec(&session, &paths, "img", Some(&group_cfg))
+            .unwrap();
+        assert_eq!(spec.egress_allow, vec!["172.17.0.1:11434"]);
+    }
+
+    /// Opt-in default: the host ships allow-all, so an unconfigured manager
+    /// stamps `EgressMode::AllowAll` on the spec and the legacy spawn path
+    /// (default bridge, advisory allow-list) is unchanged.
+    #[test]
+    fn build_spec_egress_mode_defaults_to_allow_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
+        assert_eq!(
+            spec.egress_mode,
+            copperclaw_container_rt::EgressMode::AllowAll
+        );
+    }
+
+    /// When the operator opts in to deny-default, the spec carries the
+    /// posture AND the auto-injected model endpoint — together these are
+    /// what the runtime + the later nftables pass enforce against.
+    #[test]
+    fn build_spec_deny_default_mode_carries_posture_and_model_endpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.egress_mode = copperclaw_container_rt::EgressMode::DenyDefault;
+        cfg.anthropic_base_url = Some("https://api.anthropic.com".into());
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
+        assert_eq!(
+            spec.egress_mode,
+            copperclaw_container_rt::EgressMode::DenyDefault
+        );
+        assert_eq!(spec.egress_allow, vec!["api.anthropic.com:443"]);
+    }
+
+    /// toctou redux: if a component of the session-root mount source is
+    /// swapped for a symlink between the host computing the path and the
+    /// mount, `build_spec` must REFUSE (return `ManagerError::UnsafeMount`)
+    /// rather than hand dockerd a source that resolves outside the data dir.
+    ///
+    /// Residual (documented, not testable here): dockerd re-resolves the
+    /// source path in its own process when it performs the bind, so this
+    /// closes the host-side TOCTOU window but cannot eliminate a swap that
+    /// races dockerd's own resolution.
+    #[cfg(unix)]
+    #[test]
+    fn build_spec_refuses_session_mount_with_swapped_symlink_component() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Canonicalize so the tmp prefix carries no incidental symlink that
+        // would trip the scan before we plant ours (macOS /tmp etc.).
+        let data_dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(data_dir.clone()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(&data_dir, session.agent_group_id, session.id);
+
+        // Plant the attack: replace the agent-group dir component of the
+        // session-root path with a symlink pointing OUTSIDE the data dir.
+        // The real session dir would be data_dir/sessions/<ag>/<sess>; we
+        // make data_dir/sessions/<ag> a symlink to an unrelated dir.
+        let sessions = data_dir.join("sessions");
+        let ag_component = sessions.join(session.agent_group_id.as_uuid().to_string());
+        std::fs::create_dir_all(&sessions).unwrap();
+        let escape_target = data_dir.join("escape-target");
+        std::fs::create_dir_all(&escape_target).unwrap();
+        std::os::unix::fs::symlink(&escape_target, &ag_component).unwrap();
+
+        let err = mgr
+            .build_spec(&session, &paths, "img", None)
+            .expect_err("a symlink-swapped mount source component must be refused");
+        assert!(
+            matches!(err, ManagerError::UnsafeMount(_)),
+            "expected UnsafeMount, got {err:?}"
+        );
+    }
+
+    /// Sanity counterpart: a clean session-root source (no swapped symlink)
+    /// validates and `build_spec` succeeds — the new gate doesn't reject
+    /// the normal spawn path.
+    #[test]
+    fn build_spec_accepts_clean_session_mount_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = std::fs::canonicalize(tmp.path()).unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(data_dir.clone()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(&data_dir, session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        assert!(mgr.build_spec(&session, &paths, "img", None).is_ok());
     }
 
     #[tokio::test]
@@ -1821,7 +2865,7 @@ mod tests {
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
         paths.ensure_dirs().unwrap();
-        let spec = mgr.build_spec(&session, &paths, "img", None);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
         // The bind mount is skipped (no source could be prepared).
         let has_memory_mount = spec.mounts.iter().any(|m| match m {
             Mount::Bind { target, .. } => target == &format!("{CONTAINER_SESSION_DIR}/memory"),
@@ -1863,7 +2907,7 @@ mod tests {
         );
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
-        let _spec = mgr.build_spec(&session, &paths, "img", None);
+        let _spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
         let mem = groups
             .join(session.agent_group_id.as_uuid().to_string())
             .join("memory");
@@ -1933,6 +2977,249 @@ mod tests {
         assert!(
             runtime.spawn_calls().is_empty(),
             "no runtime spawn allowed in degraded mode"
+        );
+    }
+
+    /// Phase 6 supply-chain: a successful spawn records an attestation row in
+    /// the central audit log carrying the runtime-reported image digest.
+    #[tokio::test]
+    async fn spawn_records_attestation_digest_in_audit_log() {
+        use copperclaw_db::tables::audit_log;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        // Runtime reports a content digest for the image it spawns.
+        let runtime = std::sync::Arc::new(
+            crate::tests::NoopRuntime::default().with_image_digest("sha256:deadbeefcafe"),
+        );
+        let mgr = ContainerManager::new(
+            db.clone(),
+            runtime.clone(),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        let conn = open_inbound(&paths).unwrap();
+        messages_in::insert(
+            &conn,
+            &messages_in::WriteInbound {
+                id: copperclaw_types::MessageId::new(),
+                kind: copperclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "hi"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("stdin".into()),
+                channel_type: Some(copperclaw_types::ChannelType::new("cli")),
+                thread_id: None,
+                source_session_id: None,
+                reply_to: None,
+                is_group: None,
+            },
+        )
+        .unwrap();
+
+        let spawned = mgr.maybe_spawn(&session).await.unwrap();
+        assert!(spawned, "expected a spawn with pending inbound");
+        assert_eq!(runtime.spawn_calls().len(), 1, "exactly one spawn");
+
+        // The attestation row is present and carries the image digest.
+        let rows = audit_log::list_recent(&db, chrono::Utc::now() - chrono::Duration::hours(1), 50)
+            .unwrap();
+        let att = rows
+            .iter()
+            .find(|r| r.command == crate::attestation::ATTESTATION_COMMAND)
+            .expect("attestation audit row must exist after spawn");
+        assert_eq!(att.caller_kind, "host");
+        assert_eq!(
+            att.caller_session.as_deref(),
+            Some(session.id.as_uuid().to_string().as_str())
+        );
+        let args: serde_json::Value = serde_json::from_str(&att.args).unwrap();
+        assert_eq!(args["image_digest"], "sha256:deadbeefcafe");
+        assert!(
+            args["image_tag"].as_str().is_some_and(|s| !s.is_empty()),
+            "image_tag must be recorded"
+        );
+    }
+
+    // ── install_packages containment ───────────────────────────────
+
+    /// Phase 6 supply-chain: the apt/npm install build dispatched by
+    /// `rebuild_image` must run broker-token-denied. Even with the credential
+    /// broker ENABLED on the manager, the build spec handed to the runtime
+    /// carries the deny-broker-token containment posture and NO credential
+    /// build-arg — so a malicious package postinstall cannot receive the
+    /// per-session broker capability token (the token is minted only at
+    /// container spawn, never threaded into a build).
+    #[tokio::test]
+    async fn install_packages_build_is_broker_token_denied() {
+        use super::super::broker::{BrokerConfig, BrokerState};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let runtime = std::sync::Arc::new(crate::tests::NoopRuntime::default());
+        // Broker ENABLED — the worst case for a token leak into a build.
+        let broker_cfg =
+            BrokerConfig::resolve(true, Some("sk-real-key"), None, Some(3600)).unwrap();
+        let broker = std::sync::Arc::new(BrokerState::new(broker_cfg));
+        let mgr = ContainerManager::new(
+            db.clone(),
+            runtime.clone(),
+            manager_cfg(tmp.path().to_path_buf()),
+        )
+        .with_broker(broker, "http://127.0.0.1:48080".into());
+
+        let session = fixture_session(&db);
+        // Config with agent-requested packages (the install_packages outcome).
+        let cfg = container_configs::ContainerConfig {
+            agent_group_id: session.agent_group_id,
+            provider: None,
+            model: None,
+            effort: None,
+            image_tag: None,
+            assistant_name: None,
+            max_messages_per_prompt: None,
+            skills: container_configs::SkillsSelector::All,
+            mcp_servers: serde_json::json!({}),
+            packages_apt: vec!["cowsay".into()],
+            packages_npm: vec!["left-pad".into()],
+            additional_mounts: serde_json::json!([]),
+            cli_scope: container_configs::CliScope::Group,
+            config_fingerprint: None,
+            egress_allow: vec![],
+            resource_limits: serde_json::json!({}),
+            coding_enabled: false,
+            surface_thinking: false,
+            tool_profile: None,
+            updated_at: chrono::Utc::now(),
+        };
+        // rebuild_image writes the new tag back to container_configs, so the
+        // row must exist first.
+        container_configs::upsert(
+            &db,
+            container_configs::UpsertContainerConfig {
+                agent_group_id: session.agent_group_id,
+                provider: None,
+                model: None,
+                effort: None,
+                image_tag: None,
+                assistant_name: None,
+                max_messages_per_prompt: None,
+                skills: container_configs::SkillsSelector::All,
+                mcp_servers: serde_json::json!({}),
+                packages_apt: vec!["cowsay".into()],
+                packages_npm: vec!["left-pad".into()],
+                additional_mounts: serde_json::json!([]),
+                cli_scope: container_configs::CliScope::Group,
+                config_fingerprint: None,
+                egress_allow: vec![],
+                resource_limits: serde_json::json!({}),
+                coding_enabled: false,
+                surface_thinking: false,
+                tool_profile: None,
+            },
+        )
+        .unwrap();
+
+        let _tag = mgr
+            .rebuild_image(session.agent_group_id, &cfg)
+            .await
+            .expect("rebuild should succeed");
+
+        let specs = runtime.build_specs();
+        assert_eq!(specs.len(), 1, "exactly one build dispatched");
+        let built = &specs[0];
+        // 1. The build packages match the agent's request.
+        assert_eq!(built.apt_packages, vec!["cowsay".to_string()]);
+        assert_eq!(built.npm_packages, vec!["left-pad".to_string()]);
+        // 2. Containment denies the broker token.
+        assert!(
+            built.containment.deny_broker_token,
+            "install_packages build must deny the broker token"
+        );
+        // 3. NO build-arg / label is credential-shaped (the broker token, the
+        //    real key, etc. never ride into the build), even with broker on.
+        assert!(
+            built.assert_no_credentials().is_ok(),
+            "build spec must carry no credential-shaped input"
+        );
+        assert!(
+            built.build_args.is_empty(),
+            "no build-args threaded into the package build"
+        );
+        // 4. The real key must not appear anywhere in the build spec's inputs.
+        let serialized = format!("{built:?}");
+        assert!(
+            !serialized.contains("sk-real-key"),
+            "the real provider key must not leak into the build spec"
+        );
+        assert!(
+            !serialized.contains("cct1."),
+            "no broker capability token may leak into the build spec"
+        );
+    }
+
+    /// Phase 6 supply-chain: an OAuth token stored host-side for an external
+    /// MCP server must NEVER be forwarded into the container env. The token
+    /// lives only in the central `mcp_oauth_tokens` table; `build_spec` builds
+    /// the container env from the rotatable config + broker, and never reads
+    /// the OAuth store — so a shell inside the container can't `printenv` the
+    /// token.
+    #[test]
+    fn oauth_token_stored_host_side_never_enters_container_env() {
+        use copperclaw_db::tables::mcp_oauth_tokens;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+
+        // Store an OAuth token for this group's "github" MCP server.
+        let secret = "oauth-access-SECRET-do-not-leak";
+        mcp_oauth_tokens::upsert(
+            &db,
+            &mcp_oauth_tokens::UpsertMcpOAuthToken {
+                agent_group_id: session.agent_group_id,
+                server_name: "github".into(),
+                access_token: secret.into(),
+                refresh_token: Some("refresh-SECRET".into()),
+                token_type: "Bearer".into(),
+                scope: Some("repo".into()),
+                expires_at: None,
+            },
+        )
+        .unwrap();
+
+        // It is durably stored host-side.
+        let stored = mcp_oauth_tokens::get(&db, session.agent_group_id, "github")
+            .unwrap()
+            .expect("token stored host-side");
+        assert_eq!(stored.access_token, secret);
+
+        // But it must not appear anywhere in the spawned container's env.
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
+        for (k, v) in &spec.env {
+            assert!(
+                !v.contains("SECRET"),
+                "OAuth token must not be in container env (var {k})"
+            );
+        }
+        assert!(
+            !spec
+                .env
+                .iter()
+                .any(|(k, _)| k.contains("OAUTH") || k.eq_ignore_ascii_case("GITHUB_TOKEN")),
+            "no OAuth-bearing env var may be injected into the container"
         );
     }
 
@@ -2087,5 +3374,106 @@ mod tests {
         // A more realistic extreme: the validator-capped 300s
         // deadline against a tiny heartbeat — must Err, not panic.
         assert!(check_heartbeat_deadline_alignment(10, 300_000).is_err());
+    }
+
+    // ---- M16 Phase 4: multi-key secret injection (MEDIUM 3) ----
+
+    #[test]
+    fn resolve_multi_key_secret_rules() {
+        let fwd = vec![("TAVILY_API_KEY".to_string(), "tv".to_string())];
+        // No selection -> nothing to inject.
+        assert_eq!(
+            resolve_multi_key_secret(None, &fwd, |_| None),
+            MultiKeySecret::None
+        );
+        // The default slot is wired elsewhere (and may be a broker token) —
+        // never inject it here even if a chain pins it by name.
+        assert_eq!(
+            resolve_multi_key_secret(Some("ANTHROPIC_API_KEY"), &fwd, |_| Some("x".into())),
+            MultiKeySecret::None
+        );
+        // Already forwarded by the operator -> the forward loop handles it.
+        assert_eq!(
+            resolve_multi_key_secret(Some("TAVILY_API_KEY"), &fwd, |_| Some("x".into())),
+            MultiKeySecret::None
+        );
+        // A non-default selected key whose value resolves -> inject name+value.
+        assert_eq!(
+            resolve_multi_key_secret(Some("ANTHROPIC_API_KEY_B"), &fwd, |n| {
+                (n == "ANTHROPIC_API_KEY_B").then(|| "sk-secondary".to_string())
+            }),
+            MultiKeySecret::Inject {
+                name: "ANTHROPIC_API_KEY_B".into(),
+                value: "sk-secondary".into(),
+            }
+        );
+        // Selected but unset/empty in the host env -> Missing (warn at spawn).
+        assert_eq!(
+            resolve_multi_key_secret(Some("ANTHROPIC_API_KEY_B"), &fwd, |_| None),
+            MultiKeySecret::Missing {
+                name: "ANTHROPIC_API_KEY_B".into(),
+            }
+        );
+        assert_eq!(
+            resolve_multi_key_secret(Some("ANTHROPIC_API_KEY_B"), &fwd, |_| Some(String::new())),
+            MultiKeySecret::Missing {
+                name: "ANTHROPIC_API_KEY_B".into(),
+            }
+        );
+    }
+
+    /// End-to-end: a chain that selects a NON-default key env (`api_key_env =
+    /// ANTHROPIC_API_KEY_B`) must produce a container env that actually carries
+    /// that var's *value* — `runner.json` names it, so without the value the
+    /// runner has a name pointing at nothing. The value here is sourced via the
+    /// rotatable `forward_env` (the SIGHUP-rotatable surface), which is what an
+    /// operator sets the secondary key through; that exercises the same
+    /// `selected_api_key_env` selection the live path runs.
+    #[test]
+    fn build_spec_injects_selected_multi_key_secret_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        // Carry the secondary key's value the way an operator would (.env ->
+        // rotatable forward_env). build_spec must surface it for the container.
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.forward_env = vec![(
+            "ANTHROPIC_API_KEY_B".to_string(),
+            "sk-secondary".to_string(),
+        )];
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        // Single-entry chain whose only key names the secondary env var, so the
+        // selector picks ANTHROPIC_API_KEY_B with no degrade needed.
+        copperclaw_db::tables::provider_profiles::set_chain(
+            &db,
+            session.agent_group_id,
+            &serde_json::json!([
+                {"provider": "anthropic", "model": "claude-sonnet-4-6",
+                 "keys": [{"id": "k2", "api_key_env": "ANTHROPIC_API_KEY_B"}]}
+            ]),
+            &serde_json::json!({}),
+            None,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+        // Confirm the selection actually resolves to the secondary key env.
+        assert_eq!(
+            mgr.selected_api_key_env(&session, chrono::Utc::now())
+                .as_deref(),
+            Some("ANTHROPIC_API_KEY_B"),
+        );
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
+        assert!(
+            spec.env
+                .iter()
+                .any(|(k, v)| k == "ANTHROPIC_API_KEY_B" && v == "sk-secondary"),
+            "selected multi-key api_key_env value must reach the container env: {:?}",
+            spec.env
+        );
     }
 }

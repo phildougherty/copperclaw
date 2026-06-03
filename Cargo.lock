@@ -426,6 +426,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "copperclaw-browser"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "copperclaw-container-rt",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "copperclaw-cclaw"
 version = "0.1.0"
 dependencies = [
@@ -979,6 +993,7 @@ dependencies = [
  "libc",
  "r2d2",
  "r2d2_sqlite",
+ "rand 0.8.6",
  "rusqlite",
  "serde",
  "serde_json",
@@ -996,6 +1011,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "chrono",
  "clap",
  "copperclaw-cclaw",
@@ -1037,9 +1053,12 @@ dependencies = [
  "dashmap",
  "dotenvy",
  "filetime",
+ "hex",
  "metrics",
  "metrics-exporter-prometheus",
+ "rand 0.8.6",
  "regex",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1048,6 +1067,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "tower",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -1090,6 +1110,7 @@ dependencies = [
  "copperclaw-modules",
  "copperclaw-types",
  "dashmap",
+ "regex",
  "rusqlite",
  "serde_json",
  "tempfile",
@@ -1125,7 +1146,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "copperclaw-browser",
  "copperclaw-channels-core",
+ "copperclaw-container-rt",
  "copperclaw-db",
  "copperclaw-types",
  "git2",

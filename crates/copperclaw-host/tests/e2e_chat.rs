@@ -314,6 +314,7 @@ async fn run_one_turn(
 
     let deps = RunnerDeps {
         provider,
+        policy: copperclaw_runner::ToolPolicy::default(),
         tool_ctx,
         inbound,
         outbound,

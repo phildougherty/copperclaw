@@ -3,6 +3,7 @@
 //! the [`crate::SweepReport`].
 
 pub mod apology;
+pub mod condition_checkin;
 pub mod heartbeat;
 pub mod processing;
 pub mod recurrence;

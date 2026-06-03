@@ -6,6 +6,208 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security (M16 wave 5 — browser 5a, MCP supply-chain, security-audit; provider failover live — 2026-06-03)
+
+Final hardening wave + the provider-failover rework. All opt-in / default-
+unchanged where new capability is added; enforced-vs-deferred stated precisely.
+Full workspace gate clean (6,604 tests).
+
+- **Provider fallback (now live).** Automatic provider/model fallback chains +
+  multi-key health-based rotation + per-channel model pinning (migration 020,
+  `copperclaw-providers/src/failover.rs`). The earlier rework made the live
+  path real: the runner now emits the failure reason, `record_usage_report`
+  persists it to `agent_turns.error`, and the fold degrades the primary on a
+  genuine provider failure and re-promotes it on recovery (proven by a
+  cross-crate integration test; also fixed a latent `ag_`/`sess_` id-prefix
+  bug that had kept the fold dead). Default single-provider behaviour
+  unchanged.
+- **Browser 5a (read-only, opt-in).** New `copperclaw-browser` crate +
+  `browser_render` MCP tool (render / screenshot / read-only DOM), OFF by
+  default. SSRF-guarded on navigation AND every redirect (reuses
+  `net_guard`); output tagged untrusted provenance; runs in a dedicated child
+  container with NO broker token, egress deny-default narrowed to the target,
+  an unprivileged user, and a hardened sandbox profile requesting a stronger
+  runtime. **Deferred runtime (honest, not stubbed): the live Chromium/CDP
+  driver and the privileged microVM/gVisor child spawn** — the spec
+  construction, runtime-selection (with a hardened-runc floor, no silent
+  downgrade), and SSRF/provenance logic are all implemented + unit-tested;
+  `handle()` reports the driver is unprovisioned rather than fabricating
+  content.
+- **MCP / supply-chain.** Host-side OAuth token store for MCP servers
+  (migration 022 — tokens on the host, not in the container); `install_packages`
+  subprocess containment (denied the broker token + egress); image + runner
+  digest attestation recorded in the audit log at spawn. **Note: the
+  per-server MCP tool include/exclude FILTER is a host-side primitive that is
+  NOT yet wired into a live path (dormant; follow-up to enforce that a denied
+  MCP tool is never advertised to the model).**
+- **Operability.** `cclaw security audit [--fix]` on the doctor framework —
+  reports open posture (egress allow-all, default-allow approvals, loose
+  perms) and `--fix` only TIGHTENS (never loosens), each change audited. A
+  heartbeat condition-check-in (`copperclaw-host-sweep`) that fires only when
+  its stored condition holds, distinct from time-based scheduling.
+
+### Added (M16 wave 4 — searchable cross-session memory + provenance gate — 2026-06-03)
+
+Replaces the flat bind-mounted `/data/memory/` with a per-group searchable
+store. Full workspace gate clean (6,375 tests). (Provider fallback/multi-key,
+the other wave-4 unit, was rejected in review for a dead live-path failover
+and is being reworked — not yet landed.)
+
+- **Per-group memory store + tools.** Migration `021_memory_store.sql` +
+  `copperclaw-db/src/memory.rs`: a per-group SQLite store with FTS5
+  full-text search (and vector similarity where wired). New
+  `memory_search` / `memory_get` MCP tools (`copperclaw-mcp/src/tools/memory.rs`).
+  Per-group isolation preserved.
+- **Provenance approval gate (coarse, by design).** Memory entries and tool
+  outputs are tagged trusted/untrusted (`TurnTrust` /
+  `is_credentialed_external` in `copperclaw-runner`); any turn whose context
+  contains untrusted-provenance content requires fresh approval for
+  credentialed external actions, and autonomous/heartbeat turns read-then-
+  propose rather than act. **Honest limitation: taint cannot propagate
+  through an LLM**, so this gate is necessarily coarse — it bounds, not
+  eliminates, memory-poisoning / delayed-execution risk. Known follow-up:
+  `web_search` results are not yet tagged as an untrusted *source*.
+
+### Security (M16 hardening wave 3 — DNS filter + nftables egress, credential broker — 2026-06-02)
+
+The hardest greenfield units. Both opt-in and default-unchanged; what is
+enforced vs. deferred is stated precisely (no overclaiming). Full workspace
+gate clean (6,340 tests).
+
+- **Egress v2 — DNS filtering + nftables (`copperclaw-container-rt/src/{dns,nftables}.rs`).**
+  Under opt-in `DenyDefault`: the host writes a per-session `resolv.conf`
+  pinning the container's resolver to a single host-controlled filter
+  address (no search domains) and binds it read-only, and constructs a
+  per-session nftables ruleset (drop-all egress except established/related +
+  loopback + the resolver + each allow-listed `host:port`). The name-set
+  resolution, dnsmasq filter config, `resolv.conf` content, and the full
+  nftables ruleset + apply/teardown argv are pure and unit-tested.
+  **Deferred (constructed + reported, not stubbed): the privileged netns
+  `nft` apply** (needs `CAP_NET_ADMIN` + the container PID, which the runtime
+  doesn't yet surface) and **the DNS filter-resolver sidecar** (the
+  `resolv.conf` pin is live; the answering daemon is the runtime piece).
+  `cclaw doctor` reports DNS-filter + nft status honestly.
+- **Credential broker v1 (`container_manager/{broker,broker_server,budgets}.rs`).**
+  A host-side loopback model proxy holds the real provider key; the
+  long-lived `ANTHROPIC_API_KEY` is no longer forwarded into the container
+  (verified: `build_spec`'s container env carries a per-session, group-scoped,
+  TTL-bounded, **revocable** capability token, not the master key). The
+  broker validates the token, enforces the per-group daily budget at request
+  time, and forwards upstream with the real key host-side. `runner.json`'s
+  `api_base_url` points at the broker loopback when enabled (closes the
+  `ANTHROPIC_BASE_URL`-override bypass). Opt-in; default path forwards the
+  real key as before. **Honest residual: brokering stops key THEFT, not key
+  MISUSE** — an injected agent still spends the group's budget through the
+  broker until its token expires/revokes.
+
+### Security (M16 hardening wave 2b — DM pairing, per-group mention gating, tool policy LIVE — 2026-06-02)
+
+Rework of the two units rejected in wave 2, plus wiring the tool-policy
+engine's inputs and fixing the egress auto-injection. All four landed on
+`feat/security-hardening` (full workspace gate clean, 6,249 tests).
+
+- **DM pairing codes (landed for real).** An unknown DM sender's first
+  message mints an 8-char, 1h-TTL, rate-limited (3/channel) code
+  (`crates/copperclaw-db/migrations/018_dm_pairing_codes.sql` +
+  `dm_pairing_codes.rs`), delivered back to the sender over the existing
+  adapter delivery path (a plain `Chat` message every adapter renders) and
+  wired in `boot.rs`. `cclaw pairing list/approve` (new host-only
+  `pairing.approve` + agent-readable `pairing.list` socket actions);
+  approve promotes the sender into `users`. Default messaging-group policy
+  is now `request_approval`. NOTE: `unknown_sender_policy` is currently
+  advisory/stored-only — the sender gate holds every non-`users` sender
+  pending unconditionally; the field does not yet branch behavior.
+- **Per-group mention gating.** New `copperclaw-host-router/src/mention.rs`:
+  per-group `require_mention` (default on for group chats, off for DMs),
+  native-mention + regex detection, reply-to-the-agent (not arbitrary
+  replies) as implicit mention; callback-query / button-tap interactions are
+  never dropped. Passed in at `Router` construction (not a setter on an
+  `Arc`).
+- **Tool authorization is now LIVE.** The wave-2 policy engine is no longer
+  dormant: `tool_profile` is a `container_configs` column
+  (`migrations/019_container_config_tool_profile.sql`), written into
+  `runner.json` via `RunnerConfigForFile`, exposed through `cclaw groups
+  config`; the resolved sender role is plumbed through; and `load_skill`
+  narrows the live policy via a `ToolContext` hook. Mutating scheduler verbs
+  were moved out of the guest read-only set.
+- **Egress auto-injection fixed.** Under `deny-default`, the host now derives
+  the model endpoint from the actual provider base URL (Anthropic /
+  OpenRouter via `ANTHROPIC_BASE_URL`, ollama via `OLLAMA_BASE_URL`) and
+  always injects it, so an empty allow-list can never black-hole model
+  traffic.
+
+### Security (M16 hardening wave 2 — egress v1, mount TOCTOU, tool policy engine — 2026-06-02)
+
+Second wave of the M16 roadmap. Two units landed on `feat/security-hardening`
+(full workspace gate clean, 6,156 tests); two more (DM pairing, mention
+gating) were rejected in review and are deferred to a rework pass.
+
+- **Egress v1 (opt-in default-deny scaffolding).** New
+  `crates/copperclaw-host/src/container_manager/egress.rs` +
+  `handlers/egress.rs` + `copperclaw-container-rt` wiring. `EgressMode`
+  defaults to `AllowAll` (legacy path unchanged); operators flip
+  `COPPERCLAW_EGRESS_MODE=deny-default` to restrict a session to the model
+  endpoint + an allow-list. The host auto-injects the model endpoint so
+  deny-default cannot black-hole model traffic, and `cclaw doctor` reports
+  egress mode + effective allow-list per group. (Known follow-up: verify the
+  auto-injection covers every default deployment's base URL before
+  recommending deny-default in production.)
+- **Mount-bind TOCTOU fix (wired for real).** The Wave-1 attempt was dead
+  code; this wires validation into the actual `spawn.rs` `Mount::Bind` sites
+  via `container_manager/mount_guard.rs`, with `MountSecurityModule` given a
+  live session root, rejecting a mount source whose path component became a
+  symlink after validation. Documented residual: dockerd re-resolves the
+  path in its own process.
+- **Layered tool-authorization engine.** New
+  `crates/copperclaw-runner/src/policy.rs` evaluates every tool dispatch
+  against a host-owned floor, a guest read-only floor, the active skill's
+  `allowed-tools`, and a group tool-profile (minimal/messaging/coding/full),
+  plus `copperclaw-skills` name-normalization (`Read`/`Bash` -> MCP names).
+  NOTE: the engine + tests are in place but **dormant** in production until
+  the host write-half lands (no `tool_profile` is written into
+  `runner.json` yet, sender role is not plumbed, and `load_skill` does not
+  yet narrow the policy) — wired in a follow-up. Defaults to `Full` so
+  current behavior is unchanged.
+
+### Security (M16 hardening wave 1 — make the advertised controls real — 2026-06-02)
+
+First wave of the M16 security-hardening roadmap (see `PLAN.md`). Closes the
+inert/open-fail controls found in tree; all five landed gate-clean (6,078
+workspace tests pass).
+
+- **SSRF guard on `web_fetch` / `web_search`.** New
+  `crates/copperclaw-mcp/src/tools/net_guard.rs` resolves a target host and
+  rejects loopback, link-local (incl. the `169.254.169.254` metadata
+  endpoint), RFC1918, IPv6 ULA (`fc00::/7`), CGNAT (`100.64/10`), and
+  unspecified addresses, and installs a `reqwest::redirect::Policy` that
+  re-classifies **every** redirect hop (the default blindly followed up to
+  10). Non-HTTP(S) schemes are rejected. Previously both tools issued
+  `client.get(url)` with no checks, reachable to internal addresses.
+  Documented residual: DNS-rebinding TOCTOU (guard resolves, reqwest
+  re-resolves at connect) — closed later by pinning the validated IP.
+- **Permission gate fails closed.** `crates/copperclaw-modules/src/permissions.rs`
+  now returns `Deny` (with an audit line naming the op) instead of `Defer`
+  for an op that fails `PermissionOp::parse()`, and host gate resolution
+  treats a missing decision as deny for privileged ops — previously an
+  unknown op open-failed even with the permissions module installed.
+- **Secret redaction in logs + tighter perms.** New redaction helpers
+  (`copperclaw-host/src/log_redact.rs`, `copperclaw-runner/src/redact.rs`)
+  scrub `sk-…` / `sk-or-v1-…` / `Bearer` token shapes from host and runner
+  log output; the per-session `runner.json` is written `0600`.
+- **Repeated-tool-call circuit breakers.** `copperclaw-runner`'s turn loop
+  now detects N identical consecutive tool calls and ping-pong A/B/A/B
+  alternation, ends the loop with a surfaced message, and emits a
+  `copperclaw-metrics` event — complementing (not replacing) the existing
+  tool-turn depth cap and token budget.
+- **Approval lifecycle: TTL, revocation, decision audit.** Migration
+  `017_approval_decisions.sql` adds an append-only `approval_decisions`
+  receipt table (`ON DELETE CASCADE` so `sessions::delete` still works) and
+  expiry/revocation state on `pending_approvals`; approvals default to a ~1h
+  TTL, can be revoked, and every approve/deny/expire/revoke is recorded.
+  `sweep_expired` runs in a single `IMMEDIATE` transaction and only logs an
+  expire decision when it actually flips a row (no duplicate receipts under
+  concurrent sweeps). New `cclaw` revoke + decision-audit commands.
+
 ### Fixed (`create_agent` children inherit the parent's model — 2026-06-02)
 
 A child spawned via `create_agent` was created with an `agent_groups` row and

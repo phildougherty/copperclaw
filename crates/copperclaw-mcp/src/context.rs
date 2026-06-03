@@ -129,6 +129,38 @@ pub struct UpdateTaskSpec {
     pub recurrence: Option<Option<String>>,
 }
 
+/// One memory hit surfaced to the `memory_search` / `memory_get` tools.
+///
+/// `provenance` is the wire form (`"trusted"` / `"untrusted"`) of the stored
+/// entry's tag (see `copperclaw_db::memory::Provenance`). The runner marks the
+/// turn tainted when any returned hit is untrusted, so the coarse approval gate
+/// blocks credentialed external actions until fresh approval.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryHitView {
+    /// Logical key of the entry.
+    pub key: String,
+    /// Stored text body.
+    pub body: String,
+    /// `"trusted"` | `"untrusted"`.
+    pub provenance: String,
+    /// Optional source label (e.g. `"web_fetch:https://..."`).
+    pub source: Option<String>,
+    /// Blended relevance score (FTS5 + cosine), higher is better. `None` for a
+    /// direct `memory_get` (no ranking).
+    pub score: Option<f64>,
+    /// RFC3339 last-updated timestamp.
+    pub updated_at: String,
+}
+
+/// Spec for the `memory_search` tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySearchSpec {
+    /// Free-text query matched against the FTS5 index.
+    pub query: String,
+    /// Maximum hits to return (the context clamps to a sane ceiling).
+    pub limit: Option<usize>,
+}
+
 /// Spec for `send_message`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendMessageSpec {
@@ -442,6 +474,106 @@ pub trait ToolContext: Send + Sync {
     /// routing.
     fn clear_originating(&self) {}
 
+    /// Record the `allowed-tools` of the skill the agent just loaded via
+    /// the `load_skill` tool (the FUEL for the runner's
+    /// `ToolPolicy::with_active_skill` layer). `Some(names)` narrows the
+    /// live dispatch policy so a skill declaring `allowed-tools: [Read]`
+    /// blocks `shell`; `None` (a skill with no declared `allowed-tools`)
+    /// leaves the policy unscoped. Names are already normalized to
+    /// copperclaw MCP tool names by the host's catalogue writer.
+    ///
+    /// Default no-op so contexts that don't gate tools (mocks, subagent
+    /// adapters) compile unchanged. The runner's `RunnerToolCtx`
+    /// overrides this to stash the value for [`Self::active_skill_allowed_tools`].
+    fn set_active_skill_allowed_tools(&self, allowed: Option<Vec<String>>) {
+        let _ = allowed;
+    }
+
+    /// The active skill's `allowed-tools` (set by the most recent
+    /// `load_skill` that declared one), or `None` when no tool-scoping
+    /// skill is active. The runner reads this at every dispatch and feeds
+    /// it into `ToolPolicy::with_active_skill` so the loaded skill's
+    /// scope narrows the live policy.
+    ///
+    /// Default `None` so non-gating contexts compile unchanged.
+    fn active_skill_allowed_tools(&self) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Hybrid search of this group's searchable memory store (FTS5 +
+    /// cosine over stored embeddings). Returns ranked hits.
+    ///
+    /// Default impl returns `ToolError::Context("memory store not configured
+    /// in this context")` so mock / subagent contexts compile unchanged — only
+    /// the runner's `RunnerToolCtx` (which knows the per-group `memory.db`
+    /// path) overrides it. The runner-side impl ALSO marks the current turn
+    /// tainted when any returned hit is untrusted, wiring the coarse
+    /// provenance gate.
+    async fn memory_search(&self, spec: MemorySearchSpec) -> Result<Vec<MemoryHitView>, ToolError> {
+        let _ = spec;
+        Err(ToolError::Context(
+            "memory store not configured in this context".into(),
+        ))
+    }
+
+    /// Fetch one memory entry by its logical key. `Ok(None)` when absent.
+    /// Same default + taint semantics as [`Self::memory_search`].
+    async fn memory_get(&self, key: &str) -> Result<Option<MemoryHitView>, ToolError> {
+        let _ = key;
+        Err(ToolError::Context(
+            "memory store not configured in this context".into(),
+        ))
+    }
+
+    /// Mark the current turn's context as carrying **untrusted-provenance**
+    /// content, e.g. the body of a `web_fetch` or a third-party tool output.
+    /// `source` is a short label for audit/logging (e.g. the fetched URL).
+    ///
+    /// The runner's `ToolContext` impl flips a per-turn taint flag that its
+    /// dispatch gate then consults: once a turn is tainted, credentialed
+    /// external actions are blocked until fresh approval (the coarse
+    /// provenance gate). Default no-op so mock / subagent contexts compile
+    /// unchanged — they simply don't enforce the gate.
+    ///
+    /// This is necessarily COARSE: taint cannot propagate through the model,
+    /// so the runner treats *any* untrusted content in the turn as tainting
+    /// the *whole* turn rather than attempting per-value tracking.
+    fn mark_untrusted_context(&self, source: &str) {
+        let _ = source;
+    }
+
+    /// Whether the current turn's context has been tainted by
+    /// untrusted-provenance content (see [`Self::mark_untrusted_context`]).
+    /// The runner's dispatch gate reads this to build the per-call provenance
+    /// gate. Default `false` (no taint tracking) so non-gating contexts
+    /// compile unchanged.
+    fn is_context_tainted(&self) -> bool {
+        false
+    }
+
+    /// Whether the current turn is an autonomous one (heartbeat / scheduled
+    /// wake) with no triggering human message. Autonomous turns may search
+    /// memory and propose, but may NOT take a credentialed external action
+    /// (read-then-propose). Default `false` so non-gating contexts treat every
+    /// turn as human-driven (no extra restriction).
+    fn is_autonomous_turn(&self) -> bool {
+        false
+    }
+
+    /// Whether a fresh operator approval has cleared the provenance taint for
+    /// credentialed external actions on this turn. Default `false`: absent an
+    /// explicit grant, a tainted turn stays blocked.
+    fn external_action_approved(&self) -> bool {
+        false
+    }
+
+    /// Set the per-turn provenance signals (`autonomous`, `approved`) the
+    /// dispatch gate consults. Called by the runner's main loop before driving
+    /// each turn. Default no-op so mock / subagent contexts compile unchanged.
+    fn set_turn_provenance(&self, autonomous: bool, approved: bool) {
+        let _ = (autonomous, approved);
+    }
+
     /// True when this context represents a child agent session that
     /// has already emitted its first `send_message` to the parent.
     /// The runner's main loop checks this after every turn and exits
@@ -597,6 +729,15 @@ struct MockInner {
     /// MCP slice-3.1 surface). Lets file-edit tool tests assert the
     /// runner-side diff card emit fired with the expected payload.
     diff_calls: Vec<copperclaw_channels_core::DiffCard>,
+    /// Last value passed to `set_active_skill_allowed_tools`. Lets the
+    /// `load_skill` tool tests assert the active-skill policy hook fired
+    /// with the catalogue's normalized `allowed-tools`. The three states
+    /// are all meaningful, so the double `Option` is deliberate: `None` =
+    /// the hook was never called; `Some(None)` = called with no scope (a
+    /// skill that declared no `allowed-tools`); `Some(Some(_))` = called
+    /// with an explicit scope.
+    #[allow(clippy::option_option)]
+    active_skill_allowed: Option<Option<Vec<String>>>,
 }
 
 impl MockToolContext {
@@ -688,6 +829,18 @@ impl MockToolContext {
             .diff_calls
             .clone()
     }
+
+    /// The last value passed to `set_active_skill_allowed_tools`, or
+    /// `None` if the hook was never called. `Some(None)` means it was
+    /// called with no tool scope (a skill that declared no `allowed-tools`).
+    #[allow(clippy::option_option)]
+    pub fn active_skill_allowed_recorded(&self) -> Option<Option<Vec<String>>> {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .active_skill_allowed
+            .clone()
+    }
 }
 
 #[async_trait]
@@ -729,6 +882,20 @@ impl ToolContext for MockToolContext {
     async fn emit_diff(&self, diff: copperclaw_channels_core::DiffCard) {
         let mut g = self.inner.lock().expect("MockToolContext mutex poisoned");
         g.diff_calls.push(diff);
+    }
+
+    fn set_active_skill_allowed_tools(&self, allowed: Option<Vec<String>>) {
+        let mut g = self.inner.lock().expect("MockToolContext mutex poisoned");
+        g.active_skill_allowed = Some(allowed);
+    }
+
+    fn active_skill_allowed_tools(&self) -> Option<Vec<String>> {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .active_skill_allowed
+            .clone()
+            .flatten()
     }
 }
 

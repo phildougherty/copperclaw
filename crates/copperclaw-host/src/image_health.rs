@@ -148,6 +148,16 @@ pub trait ImageProbe: Send + Sync {
     /// not executable, Ok(BinaryCheck::Missing) when absent, and Err
     /// on a transport / daemon error.
     async fn check_binary(&self, tag: &str, path: &str) -> Result<BinaryCheck, String>;
+
+    /// Return the image's content digest (Docker's `.Id`, a `sha256:<hex>`
+    /// string) for `tag`, `None` when the image is absent, or `Err` on a
+    /// transport error. Used by the boot-time attestation digest check. The
+    /// default impl returns `Ok(None)` so a probe that can't surface a digest
+    /// degrades to "unknown" rather than a false mismatch.
+    async fn image_digest(&self, tag: &str) -> Result<Option<String>, String> {
+        let _ = tag;
+        Ok(None)
+    }
 }
 
 /// Outcome of the runner-binary probe.
@@ -303,6 +313,35 @@ impl ImageProbe for DockerImageProbe {
             Ok(BinaryCheck::NotExecutable)
         }
     }
+
+    async fn image_digest(&self, tag: &str) -> Result<Option<String>, String> {
+        // `.Id` is the content-addressable digest (sha256:<hex>) — the same
+        // value `docker image inspect` reports and the runtime backend reads.
+        let mut cmd = Command::new("docker");
+        cmd.arg("image")
+            .arg("inspect")
+            .arg(tag)
+            .arg("--format")
+            .arg("{{.Id}}")
+            .stderr(Stdio::piped())
+            .stdout(Stdio::piped());
+        let out = cmd
+            .output()
+            .await
+            .map_err(|e| format!("spawn docker image inspect for digest: {e}"))?;
+        if out.status.success() {
+            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            return Ok(if s.is_empty() { None } else { Some(s) });
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if stderr.contains("No such image") {
+            return Ok(None);
+        }
+        Err(format!(
+            "docker image inspect {tag} for digest failed: {}",
+            stderr.trim()
+        ))
+    }
 }
 
 /// Compute the sha256 of the host's runner binary, in lowercase hex.
@@ -454,6 +493,64 @@ pub async fn check_image_health(
     }
 }
 
+/// Env var an operator pins with the EXPECTED image content digest
+/// (`sha256:<hex>` or bare hex) so the boot-time attestation digest check has
+/// a baseline to compare the live image against. Unset (the default) ⇒ no
+/// baseline ⇒ the check reports `no-baseline` and does nothing — behaviour is
+/// unchanged until an operator opts in.
+pub const EXPECTED_IMAGE_DIGEST_ENV: &str = "COPPERCLAW_EXPECTED_IMAGE_DIGEST";
+
+/// Boot-time attestation digest check (real comparison, opt-in baseline).
+///
+/// Fetches the live content digest the daemon reports for `image_tag` via the
+/// [`ImageProbe`] and compares it against `expected_digest` using the pure
+/// [`copperclaw_container_rt::compare_digests`] core. A
+/// [`copperclaw_container_rt::DigestComparison::Mismatch`] is the security
+/// signal — the image behind the tag changed from the recorded baseline; it is
+/// logged loudly. `NoBaseline` / `Unknown` are reported quietly and are not
+/// failures, so the default install (no pinned digest) is unaffected.
+///
+/// Returns the comparison so the boot path / tests can assert on it. Never
+/// fails boot.
+pub async fn check_boot_image_digest(
+    probe: &dyn ImageProbe,
+    image_tag: &str,
+    expected_digest: Option<&str>,
+) -> copperclaw_container_rt::DigestComparison {
+    use copperclaw_container_rt::{DigestComparison, compare_digests};
+    let observed = match probe.image_digest(image_tag).await {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(tag = %image_tag, error = %e, "boot attestation: could not read live image digest");
+            None
+        }
+    };
+    let comparison = compare_digests(observed.as_deref(), expected_digest);
+    match comparison {
+        DigestComparison::Match => {
+            info!(tag = %image_tag, "boot attestation: image digest matches pinned baseline");
+        }
+        DigestComparison::Mismatch => {
+            warn!(
+                tag = %image_tag,
+                observed = observed.as_deref().unwrap_or("none"),
+                expected = expected_digest.unwrap_or("none"),
+                "BOOT ATTESTATION MISMATCH: image content digest behind the tag changed from the pinned baseline ({EXPECTED_IMAGE_DIGEST_ENV})"
+            );
+        }
+        DigestComparison::NoBaseline => {
+            info!(
+                tag = %image_tag,
+                "boot attestation: no pinned baseline digest ({EXPECTED_IMAGE_DIGEST_ENV} unset); skipping digest comparison"
+            );
+        }
+        DigestComparison::Unknown => {
+            info!(tag = %image_tag, "boot attestation: daemon reported no image digest; skipping comparison");
+        }
+    }
+    comparison
+}
+
 /// Per-session apology text written to every session with a pending
 /// chat inbound when the host enters degraded mode. Plain ASCII, no
 /// emojis — matches the project's "no emojis" rule.
@@ -601,6 +698,7 @@ pub(crate) mod tests {
         pub image_exists_result: Mutex<Result<bool, String>>,
         pub label_result: Mutex<Result<Option<String>, String>>,
         pub binary_result: Mutex<Result<BinaryCheck, String>>,
+        pub digest_result: Mutex<Result<Option<String>, String>>,
         pub calls: Mutex<Vec<String>>,
     }
 
@@ -610,6 +708,7 @@ pub(crate) mod tests {
                 image_exists_result: Mutex::new(Ok(true)),
                 label_result: Mutex::new(Ok(Some("fp-test".to_string()))),
                 binary_result: Mutex::new(Ok(BinaryCheck::Executable)),
+                digest_result: Mutex::new(Ok(Some("sha256:basedigest".to_string()))),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -626,6 +725,10 @@ pub(crate) mod tests {
         }
         pub fn with_binary(self, r: Result<BinaryCheck, String>) -> Self {
             *self.binary_result.lock().unwrap() = r;
+            self
+        }
+        pub fn with_digest(self, r: Result<Option<String>, String>) -> Self {
+            *self.digest_result.lock().unwrap() = r;
             self
         }
         pub fn calls(&self) -> Vec<String> {
@@ -656,6 +759,49 @@ pub(crate) mod tests {
                 .push(format!("check_binary {tag} {path}"));
             self.binary_result.lock().unwrap().clone()
         }
+        async fn image_digest(&self, tag: &str) -> Result<Option<String>, String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("image_digest {tag}"));
+            self.digest_result.lock().unwrap().clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn boot_digest_check_matches_pinned_baseline() {
+        use copperclaw_container_rt::DigestComparison;
+        let probe = StubProbe::default().with_digest(Ok(Some("sha256:abc".into())));
+        // Pinned baseline uses the dash spelling; comparison normalises.
+        let c = check_boot_image_digest(&probe, "tag", Some("sha256-ABC")).await;
+        assert_eq!(c, DigestComparison::Match);
+    }
+
+    #[tokio::test]
+    async fn boot_digest_check_flags_mismatch() {
+        use copperclaw_container_rt::DigestComparison;
+        let probe = StubProbe::default().with_digest(Ok(Some("sha256:abc".into())));
+        let c = check_boot_image_digest(&probe, "tag", Some("sha256:def")).await;
+        assert_eq!(c, DigestComparison::Mismatch);
+        assert!(c.is_failure());
+    }
+
+    #[tokio::test]
+    async fn boot_digest_check_no_baseline_is_default_safe() {
+        use copperclaw_container_rt::DigestComparison;
+        let probe = StubProbe::default();
+        // The default install pins no digest ⇒ NoBaseline, not a failure.
+        let c = check_boot_image_digest(&probe, "tag", None).await;
+        assert_eq!(c, DigestComparison::NoBaseline);
+        assert!(!c.is_failure());
+    }
+
+    #[tokio::test]
+    async fn boot_digest_check_unknown_when_daemon_has_no_digest() {
+        use copperclaw_container_rt::DigestComparison;
+        let probe = StubProbe::default().with_digest(Ok(None));
+        let c = check_boot_image_digest(&probe, "tag", Some("sha256:abc")).await;
+        assert_eq!(c, DigestComparison::Unknown);
     }
 
     #[tokio::test]

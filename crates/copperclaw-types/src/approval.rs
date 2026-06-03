@@ -10,6 +10,13 @@ pub enum ApprovalKind {
     InstallPackages,
     AddMcpServer,
     OneCli,
+    /// A credentialed external action (web fetch/search, package install,
+    /// remote MCP attach) requested on a turn whose context contains
+    /// untrusted-provenance content (M16 Phase 3 coarse provenance gate). The
+    /// runner blocks the action at dispatch and the operator clears the taint
+    /// via a fresh approval of this kind. Reuses the Wave-2 approvals
+    /// mechanism (`ApprovalsModule`).
+    CredentialedExternalAction,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

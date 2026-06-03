@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod attestation;
 pub mod boot;
 pub mod channels_init;
 pub mod config;
@@ -17,6 +18,7 @@ pub mod context;
 pub mod daemon;
 pub mod handlers;
 pub mod image_health;
+pub mod log_redact;
 pub mod orphans;
 pub mod sessions;
 pub mod socket;
@@ -51,6 +53,14 @@ pub(crate) mod tests {
         pub last_orphan_slug: Mutex<Option<String>>,
         pub fail_next: Mutex<Option<RtError>>,
         pub spawn_log: Mutex<Vec<String>>,
+        /// Optional image digest the runtime reports for any tag. `None` (the
+        /// default) exercises the "runtime can't surface a digest" path; set
+        /// it to assert spawn-time attestation captures a real digest.
+        pub image_digest: Mutex<Option<String>>,
+        /// Every `build_image` spec the runtime received, in order. Lets
+        /// install_packages-containment tests assert the build carried no
+        /// broker token and the expected containment posture.
+        pub build_specs: Mutex<Vec<ImageBuildSpec>>,
     }
 
     impl NoopRuntime {
@@ -58,6 +68,14 @@ pub(crate) mod tests {
         #[must_use]
         pub fn fail_with(self, err: RtError) -> Self {
             *self.fail_next.lock().unwrap() = Some(err);
+            self
+        }
+
+        /// Pre-load the image digest the runtime reports (for attestation
+        /// tests).
+        #[must_use]
+        pub fn with_image_digest(self, digest: impl Into<String>) -> Self {
+            *self.image_digest.lock().unwrap() = Some(digest.into());
             self
         }
 
@@ -69,6 +87,11 @@ pub(crate) mod tests {
         /// Snapshot of every spawn call's container name, in order.
         pub fn spawn_calls(&self) -> Vec<String> {
             self.spawn_log.lock().unwrap().clone()
+        }
+
+        /// Snapshot of every `build_image` spec the runtime received.
+        pub fn build_specs(&self) -> Vec<ImageBuildSpec> {
+            self.build_specs.lock().unwrap().clone()
         }
     }
 
@@ -114,10 +137,15 @@ pub(crate) mod tests {
         }
 
         async fn build_image(&self, spec: ImageBuildSpec) -> Result<String, RtError> {
+            self.build_specs.lock().unwrap().push(spec.clone());
             if let Some(err) = self.fail_next.lock().unwrap().take() {
                 return Err(err);
             }
             Ok(spec.image_tag())
+        }
+
+        async fn image_digest(&self, _tag: &str) -> Result<Option<String>, RtError> {
+            Ok(self.image_digest.lock().unwrap().clone())
         }
     }
 

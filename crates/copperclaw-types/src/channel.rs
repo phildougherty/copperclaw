@@ -62,12 +62,41 @@ pub struct SenderIdentity {
 }
 
 /// Optional reply-routing override for inbound events. Used when the host's
-/// admin CLI synthesizes an event on behalf of a user.
+/// admin CLI synthesizes an event on behalf of a user, and when a channel
+/// adapter surfaces that an inbound message is a reply/quote of an earlier
+/// message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReplyTo {
     pub channel_type: ChannelType,
     pub platform_id: String,
     pub thread_id: Option<String>,
+    /// Whether the message this is a reply/quote of was authored by the
+    /// agent (this bot) itself.
+    ///
+    /// Only the channel adapter can answer this — it alone knows its own
+    /// platform identity (bot user id / username). The mention gate treats
+    /// `Some(true)` as an implicit mention (a user replying to the agent's
+    /// own message is engaging it). `Some(false)` (reply to *another*
+    /// user's message) and `None` (parent author could not be resolved)
+    /// are deliberately NOT treated as a mention — an arbitrary reply must
+    /// never count as engaging the agent.
+    #[serde(default)]
+    pub replying_to_self: Option<bool>,
+}
+
+impl ReplyTo {
+    /// Construct a `ReplyTo` whose parent author is unknown
+    /// (`replying_to_self = None`). Adapters that can resolve the parent's
+    /// author set [`Self::replying_to_self`] afterwards.
+    #[must_use]
+    pub fn new(channel_type: ChannelType, platform_id: String, thread_id: Option<String>) -> Self {
+        Self {
+            channel_type,
+            platform_id,
+            thread_id,
+            replying_to_self: None,
+        }
+    }
 }
 
 /// Handle for an open DM thread on a platform.

@@ -12,12 +12,14 @@
 pub mod debounce;
 pub mod error;
 pub mod hooks;
+pub mod mention;
 pub mod route;
 pub mod session;
 
 pub use debounce::{DEBOUNCE_WINDOW, DebounceKey, Debouncer, InflightKey, InflightSet};
 pub use error::RouterError;
 pub use hooks::HookChain;
+pub use mention::{MentionDecision, MentionGate};
 pub use route::{DeliveredTo, DropReason, PendingReason, RouteOutcome, Router};
 pub use session::{FsSessionRoot, SessionPool, SessionRoot};
 

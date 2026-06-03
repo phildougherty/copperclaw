@@ -8,6 +8,7 @@ members = [
     "crates/copperclaw-host-delivery",
     "crates/copperclaw-host-sweep",
     "crates/copperclaw-container-rt",
+    "crates/copperclaw-browser",
     "crates/copperclaw-runner",
     "crates/copperclaw-providers",
     "crates/copperclaw-mcp",
@@ -53,6 +54,7 @@ repository = "https://github.com/phildougherty/copperclaw"
 copperclaw-types          = { path = "crates/copperclaw-types" }
 copperclaw-db             = { path = "crates/copperclaw-db" }
 copperclaw-container-rt   = { path = "crates/copperclaw-container-rt" }
+copperclaw-browser        = { path = "crates/copperclaw-browser" }
 copperclaw-providers      = { path = "crates/copperclaw-providers" }
 copperclaw-mcp            = { path = "crates/copperclaw-mcp" }
 copperclaw-channels-core  = { path = "crates/copperclaw-channels/core" }

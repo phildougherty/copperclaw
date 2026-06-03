@@ -137,6 +137,32 @@ pub fn config_update(args: &Value, central: &CentralDb) -> Result<Value, ErrorPa
                 }
             };
         }
+        // Group tool-profile: the FUEL for the runner's layered ToolPolicy.
+        // Validate against the known profile names so a typo can't reach
+        // the runner (which would silently fall back to `full`); `null`
+        // clears the override (→ runner default `full`).
+        "tool_profile" => {
+            existing.tool_profile = match &value {
+                Value::Null => None,
+                Value::String(s) => {
+                    if copperclaw_modules::permissions::ToolProfile::parse(s).is_none() {
+                        return Err(ErrorPayload::new(
+                            "bad_request",
+                            format!(
+                                "unknown tool_profile `{s}` (expected one of: minimal, messaging, coding, full, or null to clear)"
+                            ),
+                        ));
+                    }
+                    Some(s.clone())
+                }
+                _ => {
+                    return Err(ErrorPayload::new(
+                        "bad_request",
+                        "`tool_profile` must be a profile name string or null",
+                    ));
+                }
+            };
+        }
         other => {
             return Err(ErrorPayload::new(
                 "bad_request",
@@ -165,6 +191,7 @@ pub fn config_update(args: &Value, central: &CentralDb) -> Result<Value, ErrorPa
             resource_limits: existing.resource_limits,
             coding_enabled: existing.coding_enabled,
             surface_thinking: existing.surface_thinking,
+            tool_profile: existing.tool_profile,
         },
     )
     .map_err(db_err)?;
@@ -358,6 +385,7 @@ fn default_config(id: AgentGroupId) -> container_configs::ContainerConfig {
         resource_limits: Value::Object(serde_json::Map::new()),
         coding_enabled: false,
         surface_thinking: false,
+        tool_profile: None,
         updated_at: chrono::Utc::now(),
     }
 }
@@ -389,6 +417,7 @@ fn ensure_config_row(central: &CentralDb, id: AgentGroupId) -> Result<(), ErrorP
                 resource_limits: row.resource_limits,
                 coding_enabled: row.coding_enabled,
                 surface_thinking: row.surface_thinking,
+                tool_profile: row.tool_profile,
             },
         )
         .map_err(db_err)?;
@@ -424,6 +453,7 @@ fn container_config_to_json(c: &container_configs::ContainerConfig) -> Value {
         "egress_allow": c.egress_allow,
         "resource_limits": c.resource_limits,
         "coding_enabled": c.coding_enabled,
+        "tool_profile": c.tool_profile,
         "updated_at": c.updated_at.to_rfc3339(),
     })
 }
@@ -651,6 +681,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(v["max_messages_per_prompt"], 32);
+    }
+
+    #[test]
+    fn config_update_sets_tool_profile() {
+        // FUEL exposure: `cclaw groups config update --field
+        // 'tool_profile="messaging"'` lands the profile and surfaces it in
+        // the config JSON the assembler reads.
+        let db = db();
+        let g = make_group(&db, "g");
+        let v = config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "tool_profile", "value": "messaging"}),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["tool_profile"], "messaging");
+        let stored = container_configs::get(&db, g.id).unwrap().unwrap();
+        assert_eq!(stored.tool_profile.as_deref(), Some("messaging"));
+    }
+
+    #[test]
+    fn config_update_tool_profile_null_clears() {
+        let db = db();
+        let g = make_group(&db, "g");
+        config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "tool_profile", "value": "coding"}),
+            &db,
+        )
+        .unwrap();
+        let v = config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "tool_profile", "value": null}),
+            &db,
+        )
+        .unwrap();
+        assert!(v["tool_profile"].is_null());
+    }
+
+    #[test]
+    fn config_update_tool_profile_rejects_unknown_name() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let err = config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "tool_profile", "value": "wizard"}),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("unknown tool_profile"));
+    }
+
+    #[test]
+    fn config_update_tool_profile_rejects_non_string() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let err = config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "tool_profile", "value": 7}),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
     }
 
     #[test]

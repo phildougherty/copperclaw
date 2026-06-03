@@ -225,6 +225,27 @@ pub fn build_dispatch_table() -> DispatchTable {
         true
     );
 
+    // Provider resilience (M16 Phase 4): per-group fallback chains,
+    // per-channel model pins, and live health inspection.
+    ins!(
+        "groups.provider.set-chain",
+        handlers::provider::set_chain,
+        true
+    );
+    ins!(
+        "groups.provider.set-pins",
+        handlers::provider::set_pins,
+        true
+    );
+    ins!("groups.provider.clear", handlers::provider::clear, true);
+    ins!("groups.provider.get", handlers::provider::get, false);
+    ins!("groups.provider.status", handlers::provider::status, false);
+
+    // Egress posture report (Phase 0a v1 / Top 10 #6). Read-only; consumed
+    // by `cclaw doctor` to surface the host egress mode + each group's
+    // effective allow-list (configured + auto-injected model endpoint).
+    ins!("egress.status", handlers::egress::status, false);
+
     ins!(
         "messaging-groups.list",
         handlers::messaging_groups::list,
@@ -298,6 +319,9 @@ pub fn build_dispatch_table() -> DispatchTable {
     ins!("db.restore", handlers::db::restore, true);
     ins!("mcp.list-presets", handlers::mcp::list_presets, false);
     ins!("mcp.add", handlers::mcp::add, true);
+    ins!("mcp.inspect-filter", handlers::mcp::inspect_filter, false);
+    ins!("mcp.oauth-list", handlers::mcp::oauth_list, false);
+    ins!("attestation.list", handlers::attestation::list, false);
     ins!("approvals.list", handlers::approvals::list, false);
     ins!("approvals.get", handlers::approvals::get, false);
     ins!(
@@ -307,6 +331,10 @@ pub fn build_dispatch_table() -> DispatchTable {
     );
     ins!("approvals.approve", handlers::approvals::approve, true);
     ins!("approvals.deny", handlers::approvals::deny, true);
+    ins!("approvals.revoke", handlers::approvals::revoke, true);
+    ins!("approvals.decisions", handlers::approvals::decisions, false);
+    ins!("pairing.list", handlers::pairing::list, false);
+    ins!("pairing.approve", handlers::pairing::approve, true);
     ins!("audit.list", handlers::audit::list, false);
     ins!("budgets.list", handlers::budgets::list, false);
     ins!("budgets.set", handlers::budgets::set, true);
@@ -1113,6 +1141,100 @@ mod tests {
         match r {
             Response::Err { error, .. } => assert_eq!(error.code, "permission_denied"),
             Response::Ok { .. } => panic!("unexpected Ok"),
+        }
+    }
+
+    #[test]
+    fn dispatch_pairing_approve_promotes_sender_and_audits() {
+        use copperclaw_db::tables::dm_pairing_codes::{MintPairingCode, mint};
+        let db = central();
+        // Mint a real pairing code, then push it through the dispatcher.
+        let code = mint(
+            &db,
+            MintPairingCode {
+                channel_type: copperclaw_types::ChannelType::new("telegram"),
+                identity: "u-dispatch".into(),
+                display_name: Some("Bob".into()),
+                agent_group_id: None,
+                messaging_group_id: None,
+            },
+            chrono::Utc::now(),
+        )
+        .unwrap()
+        .code;
+
+        let ctx = HandlerCtx::new(db.clone());
+        let table = build_dispatch_table();
+        let req = Request::Call {
+            id: "1".into(),
+            command: "pairing.approve".into(),
+            args: json!({"code": code}),
+            caller: Caller::Host,
+        };
+        let r = dispatch_request(&table, &ctx, &req);
+        match r {
+            Response::Ok { data, .. } => {
+                assert_eq!(data["paired"], true);
+                assert_eq!(data["identity"], "u-dispatch");
+            }
+            Response::Err { error, .. } => panic!("unexpected error: {error:?}"),
+        }
+        // Side effect: the sender is now a known user — the trust surface
+        // the sender-scope gate consults on every inbound.
+        let user = copperclaw_db::tables::users::get_by_identity(&db, "telegram", "u-dispatch")
+            .unwrap()
+            .unwrap();
+        assert_eq!(user.display_name.as_deref(), Some("Bob"));
+        // Audit row recorded — pairing.approve is host-only.
+        let audit_rows = copperclaw_db::tables::audit_log::list_recent(
+            &db,
+            chrono::Utc::now() - chrono::Duration::hours(1),
+            50,
+        )
+        .unwrap();
+        assert!(audit_rows.iter().any(|r| r.command == "pairing.approve"));
+    }
+
+    #[test]
+    fn dispatch_pairing_approve_blocked_for_agent_caller() {
+        let table = build_dispatch_table();
+        let ctx = HandlerCtx::new(central());
+        let req = Request::Call {
+            id: "1".into(),
+            command: "pairing.approve".into(),
+            args: json!({"code": "ABCDEFGH"}),
+            caller: Caller::Agent {
+                session_id: SessionId::nil(),
+                agent_group_id: AgentGroupId::nil(),
+                messaging_group_id: None,
+            },
+        };
+        let r = dispatch_request(&table, &ctx, &req);
+        match r {
+            Response::Err { error, .. } => assert_eq!(error.code, "permission_denied"),
+            Response::Ok { .. } => panic!("unexpected Ok"),
+        }
+    }
+
+    #[test]
+    fn dispatch_pairing_list_is_agent_readable() {
+        // Reads are allowed for either caller kind.
+        let table = build_dispatch_table();
+        let ctx = HandlerCtx::new(central());
+        let req = Request::Call {
+            id: "1".into(),
+            command: "pairing.list".into(),
+            args: json!({}),
+            caller: Caller::Agent {
+                session_id: SessionId::nil(),
+                agent_group_id: AgentGroupId::nil(),
+                messaging_group_id: None,
+            },
+        };
+        let r = dispatch_request(&table, &ctx, &req);
+        match r {
+            Response::Ok { data, .. } => assert!(data.is_array()),
+            Response::Err { error, .. } => panic!("unexpected error: {error:?}"),
         }
     }
 

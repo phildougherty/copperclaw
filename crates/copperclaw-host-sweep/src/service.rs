@@ -3,6 +3,7 @@
 //! sessions that need host attention.
 
 use crate::checks::apology::ApologyEmit;
+use crate::checks::condition_checkin::{self, ConditionContext, ConditionStore};
 use crate::checks::{apology, heartbeat, processing, recurrence, scheduling, stuck, wake};
 use crate::clock::{Clock, SystemClock};
 use crate::error::SweepError;
@@ -145,6 +146,11 @@ pub struct SweepReport {
     pub processing_acks_reset: Vec<MessageReset>,
     pub woken_sessions: Vec<SessionId>,
     pub heartbeat_stale: Vec<SessionId>,
+    /// One [`SeriesFanout`] per condition-check-in that fired this pass
+    /// (a stored HEARTBEAT-style condition that just became true). The
+    /// series id is the condition id. Empty in the common case where no
+    /// conditions are registered or none transitioned to true.
+    pub condition_checkins_fired: Vec<SeriesFanout>,
     /// One entry per stuck-inbound apology written by the apology
     /// check during this pass. Empty in the common case where every
     /// session is healthy.
@@ -160,6 +166,7 @@ impl SweepReport {
             && self.woken_sessions.is_empty()
             && self.heartbeat_stale.is_empty()
             && self.apologies_emitted.is_empty()
+            && self.condition_checkins_fired.is_empty()
     }
 
     /// Total number of items across all check categories.
@@ -170,6 +177,7 @@ impl SweepReport {
             + self.woken_sessions.len()
             + self.heartbeat_stale.len()
             + self.apologies_emitted.len()
+            + self.condition_checkins_fired.len()
     }
 }
 
@@ -184,6 +192,11 @@ pub struct SweepService {
     /// `container_spawn_failed` reason. A default-empty tracker keeps
     /// the test path simple.
     spawn_tracker: Arc<SpawnAttemptTracker>,
+    /// Registry of HEARTBEAT-style conditions evaluated each tick.
+    /// Shared with the host (which registers conditions). Default-empty,
+    /// so the condition-check-in is a strict no-op until populated and
+    /// the sweep's existing behaviour is unchanged.
+    condition_store: Arc<ConditionStore>,
 }
 
 impl SweepService {
@@ -194,6 +207,7 @@ impl SweepService {
             session_paths,
             clock: Arc::new(SystemClock),
             spawn_tracker: Arc::new(SpawnAttemptTracker::new()),
+            condition_store: Arc::new(ConditionStore::new()),
         }
     }
 
@@ -209,6 +223,7 @@ impl SweepService {
             session_paths,
             clock,
             spawn_tracker: Arc::new(SpawnAttemptTracker::new()),
+            condition_store: Arc::new(ConditionStore::new()),
         }
     }
 
@@ -219,6 +234,21 @@ impl SweepService {
     pub fn with_spawn_tracker(mut self, tracker: Arc<SpawnAttemptTracker>) -> Self {
         self.spawn_tracker = tracker;
         self
+    }
+
+    /// Replace the in-memory condition store with one shared between the
+    /// sweep and the host (the host registers conditions; the sweep
+    /// evaluates + fires). Composes with the constructors.
+    #[must_use]
+    pub fn with_condition_store(mut self, store: Arc<ConditionStore>) -> Self {
+        self.condition_store = store;
+        self
+    }
+
+    /// Access the shared condition store. The host calls `register` /
+    /// `remove` on this; the sweep's condition check reads it.
+    pub fn condition_store(&self) -> &Arc<ConditionStore> {
+        &self.condition_store
     }
 
     /// Access the configured clock (mostly for tests).
@@ -262,6 +292,7 @@ impl SweepService {
                                     woken = report.woken_sessions.len(),
                                     heartbeat_stale = report.heartbeat_stale.len(),
                                     apologies = report.apologies_emitted.len(),
+                                    condition_checkins = report.condition_checkins_fired.len(),
                                     "sweep pass produced report",
                                 );
                             }
@@ -276,6 +307,40 @@ impl SweepService {
                     }
                 }
             }
+        }
+    }
+
+    /// Sample the observable [`ConditionContext`] for one session: the
+    /// count of pending, due inbound messages waiting on its queue. A
+    /// failure to open the per-session inbound DB degrades to a quiet
+    /// context (no signal) rather than aborting the pass — a condition
+    /// simply will not fire for a session we cannot sample, which is the
+    /// safe default. `idle_secs` / operator flags are left unset here;
+    /// the host can layer those in via a richer sampler if it wires one.
+    fn sample_condition_context(&self, session_id: &SessionId) -> ConditionContext {
+        // We need the agent_group_id to open the per-session DB. The
+        // condition store carries it, so look it up there.
+        let Some(cond) = self
+            .condition_store
+            .for_session(session_id)
+            .into_iter()
+            .next()
+        else {
+            return ConditionContext::quiet();
+        };
+        let pending = self
+            .session_paths
+            .inbound_pool(&cond.agent_group_id, session_id)
+            .ok()
+            .and_then(|mut pool| {
+                copperclaw_db::tables::messages_in::count_pending_for_typing(pool.conn_mut()).ok()
+            })
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(0);
+        ConditionContext {
+            pending_inbound: pending,
+            idle_secs: None,
+            flags_set: Vec::new(),
         }
     }
 
@@ -301,6 +366,29 @@ impl SweepService {
                 target: "copperclaw_host_sweep",
                 error = %e,
                 "scheduled-task fan-out failed",
+            ),
+        }
+
+        // Global: HEARTBEAT-style condition check-ins. Distinct from the
+        // time-based scheduling above — these fire when a *stored
+        // condition currently holds*, not when a clock deadline elapses.
+        // The sampler builds each session's observable context (pending
+        // inbound count) from its per-session DB; the check fires a wake
+        // inbound only on a condition's rising edge and audits each fire.
+        // Default-empty store => zero conditions => no-op.
+        let sampler = |sid: &SessionId| self.sample_condition_context(sid);
+        match condition_checkin::check(
+            self.condition_store.as_ref(),
+            &self.central,
+            self.session_paths.as_ref(),
+            &sampler,
+            now,
+        ) {
+            Ok(mut fan) => report.condition_checkins_fired.append(&mut fan),
+            Err(e) => tracing::warn!(
+                target: "copperclaw_host_sweep",
+                error = %e,
+                "condition-check-in fan-out failed",
             ),
         }
 

@@ -244,10 +244,26 @@ async fn message_to_event(
     // inbound is a reply. We surface its `message_id` (formatted to match
     // our own `message.id` shape) on `InboundEvent.reply_to`. Replies stay
     // in the same chat, so the parent routes via the same `chat.id`.
-    let reply_to = msg.reply_to_message.as_deref().map(|parent| ReplyTo {
-        channel_type: channel_type.clone(),
-        platform_id: msg.chat.id.to_string(),
-        thread_id: Some(parent.message_id.to_string()),
+    //
+    // `replying_to_self` resolves whether the parent message was authored by
+    // THIS bot: the parent's `from` must be a bot whose username matches our
+    // configured `bot_username`. The mention gate treats a reply to the
+    // agent's own message as an implicit mention; an arbitrary reply to
+    // another user does not count. When the bot username is unknown we leave
+    // it `None` (undeterminable), so it never counts as a mention.
+    let reply_to = msg.reply_to_message.as_deref().map(|parent| {
+        let replying_to_self = settings.bot_username.as_deref().map(|bot| {
+            parent
+                .from
+                .as_ref()
+                .is_some_and(|u| u.is_bot && u.username.as_deref() == Some(bot))
+        });
+        ReplyTo {
+            channel_type: channel_type.clone(),
+            platform_id: msg.chat.id.to_string(),
+            thread_id: Some(parent.message_id.to_string()),
+            replying_to_self,
+        }
     });
 
     Some(InboundEvent {
@@ -1075,6 +1091,78 @@ mod tests {
         assert_eq!(rt.channel_type.as_str(), "telegram");
         assert_eq!(rt.platform_id, "100");
         assert_eq!(rt.thread_id.as_deref(), Some("42"));
+        // Bot username unconfigured in default_settings — parent author is
+        // undeterminable, so this must NOT count as a reply-to-self.
+        assert_eq!(rt.replying_to_self, None);
+    }
+
+    #[tokio::test]
+    async fn reply_to_own_message_marks_replying_to_self_true() {
+        // Parent message authored by the bot (is_bot + matching username) →
+        // replying_to_self = Some(true), which the router's mention gate
+        // treats as an implicit mention.
+        let mut m = text_msg("yes");
+        let mut parent = text_msg("should we ship?");
+        parent.message_id = 42;
+        parent.from = Some(User {
+            id: 999,
+            is_bot: true,
+            first_name: Some("Copperclaw".into()),
+            last_name: None,
+            username: Some("copperclaw_bot".into()),
+        });
+        m.reply_to_message = Some(Box::new(parent));
+        let dir = TempDir::new().unwrap();
+        let (api, _s) = dummy_api().await;
+        let mut settings = default_settings(dir.path());
+        settings.bot_username = Some("copperclaw_bot".into());
+        let evts = updates_to_events(
+            &Update {
+                update_id: 1,
+                message: Some(m),
+                edited_message: None,
+                channel_post: None,
+                callback_query: None,
+            },
+            &api,
+            &settings,
+        )
+        .await;
+        assert_eq!(
+            evts[0].reply_to.as_ref().unwrap().replying_to_self,
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_to_other_user_marks_replying_to_self_false() {
+        // Parent authored by a different user → replying_to_self = Some(false),
+        // which must NOT count as a mention.
+        let mut m = text_msg("agreed");
+        let mut parent = text_msg("anyone here?");
+        parent.message_id = 42;
+        // text_msg's default `from` is Alice (is_bot=false, username "alice").
+        m.reply_to_message = Some(Box::new(parent));
+        let dir = TempDir::new().unwrap();
+        let (api, _s) = dummy_api().await;
+        let mut settings = default_settings(dir.path());
+        settings.bot_username = Some("copperclaw_bot".into());
+        let evts = updates_to_events(
+            &Update {
+                update_id: 1,
+                message: Some(m),
+                edited_message: None,
+                channel_post: None,
+                callback_query: None,
+            },
+            &api,
+            &settings,
+        )
+        .await;
+        assert_eq!(
+            evts[0].reply_to.as_ref().unwrap().replying_to_self,
+            Some(false)
+        );
     }
 
     #[tokio::test]

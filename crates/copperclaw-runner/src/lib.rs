@@ -17,6 +17,8 @@ pub mod config;
 pub mod destinations;
 pub mod disallowed;
 pub mod formatter;
+pub mod policy;
+pub mod redact;
 pub mod run;
 pub mod state;
 pub mod subagent;
@@ -27,6 +29,10 @@ pub use config::{RunnerConfig, RunnerConfigFile};
 pub use destinations::{ResolvedRoute, resolve_recipient};
 pub use disallowed::{DISALLOWED_TOOLS, is_disallowed};
 pub use formatter::{FormattedTurn, format_messages};
+pub use policy::{
+    PolicyDecision, SenderRole, ToolPolicy, ToolProfile, TurnTrust, is_credentialed_external,
+};
+pub use redact::{REDACTED, redact_secrets};
 pub use run::{
     ACTIVE_POLL_INTERVAL_MS, DEFAULT_MAX_TOOL_TURNS, DEFAULT_PROVIDER_DEADLINE_MS,
     DEFAULT_TOOL_DEADLINE_SECS, MAX_MAX_TOOL_TURNS, MAX_PROVIDER_DEADLINE_MS,
@@ -34,6 +40,13 @@ pub use run::{
     MIN_TOOL_DEADLINE_SECS, POLL_INTERVAL_MS, PROVIDER_DEADLINE_ENV, RunnerDeps, TOOL_DEADLINE_ENV,
     resolve_max_tool_turns, resolve_provider_deadline, resolve_tool_deadline_secs, run_loop,
 };
+// Provider resilience (M16 Phase 4): the runner builds the per-turn
+// `usage_report` payload (carrying the failure reason that drives the host's
+// degrade/restore fold) via `build_usage_report_payload`. `TurnOutcome` is
+// the input enum. Both are public so the host's emit→record→fold integration
+// test exercises the same payload-construction code the live path runs.
+pub use run::drive_turn::TurnOutcome;
+pub use run::{UsageReportInputs, build_usage_report_payload};
 // Production wiring for the typing-indicator-keepalive path: the
 // runner binary constructs a HeartbeatPinger so each LLM stream
 // refreshes the heartbeat file (and thus the host's typing-ticker

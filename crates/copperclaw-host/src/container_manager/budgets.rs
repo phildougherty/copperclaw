@@ -1,9 +1,44 @@
 //! Per-group daily/turn budget gates and the in-channel notice replies.
 
+use super::broker::BudgetVerdict;
 use super::{ContainerManager, ManagerError};
+use copperclaw_db::central::CentralDb;
 use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
 use copperclaw_types::{AgentGroupId, Session};
 use tracing::{info, warn};
+
+/// Standalone group-scoped budget verdict for the credential broker's
+/// request-time gate. Mirrors [`ContainerManager::group_over_daily_budget`]
+/// but takes a bare [`CentralDb`] so the broker server (which has no
+/// `ContainerManager` back-reference) can call it. Returns
+/// [`BudgetVerdict::OverBudget`] when the group has a `daily_token_cap` set and
+/// today's accumulated tokens meet or exceed it; otherwise
+/// [`BudgetVerdict::WithinBudget`].
+pub(super) fn broker_budget_verdict(
+    central: &CentralDb,
+    agent_group_id: AgentGroupId,
+) -> Result<BudgetVerdict, ManagerError> {
+    use copperclaw_db::tables::{agent_turns, group_budgets};
+    let Some(budget) = group_budgets::get(central, agent_group_id).map_err(ManagerError::Db)?
+    else {
+        return Ok(BudgetVerdict::WithinBudget);
+    };
+    let Some(cap) = budget.daily_token_cap else {
+        return Ok(BudgetVerdict::WithinBudget);
+    };
+    let midnight = chrono::Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("00:00:00 is a valid time")
+        .and_utc();
+    let used = agent_turns::tokens_since(central, &agent_group_id.as_uuid().to_string(), midnight)
+        .map_err(ManagerError::Db)?;
+    if used >= cap {
+        Ok(BudgetVerdict::OverBudget)
+    } else {
+        Ok(BudgetVerdict::WithinBudget)
+    }
+}
 
 impl ContainerManager {
     /// Returns true when the group's `daily_token_cap` is set AND
@@ -267,6 +302,7 @@ mod tests {
             skills_mode: SkillsMode::Inline,
             gpu_passthrough: false,
             forward_env: Vec::new(),
+            egress_mode: copperclaw_container_rt::EgressMode::AllowAll,
         }
     }
 
@@ -721,6 +757,46 @@ mod tests {
     }
 
     // ---- rate-limit gate (per-minute / per-hour) -------------------------
+
+    // ---- credential-broker budget verdict --------------------------------
+
+    #[test]
+    fn broker_budget_verdict_within_when_no_cap_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        // No group_budgets row at all.
+        assert_eq!(
+            broker_budget_verdict(&db, session.agent_group_id).unwrap(),
+            BudgetVerdict::WithinBudget
+        );
+        // Row exists but daily_token_cap is None.
+        set_rate_caps(&db, session.agent_group_id, Some(5), None);
+        assert_eq!(
+            broker_budget_verdict(&db, session.agent_group_id).unwrap(),
+            BudgetVerdict::WithinBudget
+        );
+    }
+
+    #[test]
+    fn broker_budget_verdict_within_under_cap_over_at_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (_mgr, db) = make_mgr(&tmp);
+        let session = fixture_session(&db);
+        set_daily_cap(&db, session.agent_group_id, 100);
+        // 30 in + 30 out = 60 < 100 → within.
+        record_today_tokens(&db, session.agent_group_id, 30, 30);
+        assert_eq!(
+            broker_budget_verdict(&db, session.agent_group_id).unwrap(),
+            BudgetVerdict::WithinBudget
+        );
+        // Push to 120 >= 100 → over.
+        record_today_tokens(&db, session.agent_group_id, 40, 20);
+        assert_eq!(
+            broker_budget_verdict(&db, session.agent_group_id).unwrap(),
+            BudgetVerdict::OverBudget
+        );
+    }
 
     #[test]
     fn rate_limit_message_none_when_caps_unset() {

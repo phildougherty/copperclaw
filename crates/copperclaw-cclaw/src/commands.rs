@@ -150,10 +150,21 @@ pub enum TopCommand {
         #[command(subcommand)]
         action: ApprovalsCmd,
     },
+    /// DM pairing codes (unknown-sender onboarding).
+    Pairing {
+        #[command(subcommand)]
+        action: PairingCmd,
+    },
     /// Mutation audit log.
     Audit {
         #[command(subcommand)]
         action: AuditCmd,
+    },
+    /// Image + runner attestation: which image content digest and runner
+    /// binary each container spawn ran (recorded in the append-only audit log).
+    Attestation {
+        #[command(subcommand)]
+        action: AttestationCmd,
     },
     /// One-shot composite installers for getting a fresh host chatable.
     Quickstart {
@@ -172,6 +183,24 @@ pub enum TopCommand {
     /// Returns a non-zero exit when any check is in FAIL state so CI
     /// and pre-flight scripts can branch on it.
     Doctor,
+    /// Security-posture audit. Flags open policies (egress allow-all,
+    /// default-allow approvals, missing tool profiles, world-readable
+    /// session files, broker disabled while sensitive) and, with `--fix`,
+    /// remediates the safe ones (scaffolds an allow-list, tightens an open
+    /// approval policy, chmods loose session files to 0600/0700). Every
+    /// host-side fix is audited; the audit never auto-loosens anything.
+    ///
+    /// Returns a non-zero exit when an open policy remains so CI /
+    /// pre-flight scripts can gate on it.
+    Security {
+        #[command(subcommand)]
+        action: SecurityCmd,
+    },
+    /// Report the host egress posture: the global mode (allow-all vs.
+    /// opt-in deny-default) and, per agent group, the effective outbound
+    /// allow-list (operator-configured entries plus the auto-injected
+    /// model endpoint). The same report `cclaw doctor` folds in.
+    Egress,
     /// Per-group daily budget caps.
     Budgets {
         #[command(subcommand)]
@@ -245,6 +274,51 @@ pub enum TopCommand {
     SchemaVersion,
 }
 
+// --- security --------------------------------------------------------------
+
+/// `cclaw security ...` — security-posture audit and safe remediation.
+#[derive(Debug, Subcommand)]
+pub enum SecurityCmd {
+    /// One-shot posture report. Reads the host's egress mode, per-group
+    /// allow-lists + tool profiles, messaging-group approval policies, the
+    /// credential-broker toggle, and local session-file permissions, then
+    /// flags every open policy. With `--fix`, applies the safe, tightening
+    /// remediations and re-reports.
+    Audit {
+        /// Remediate the safe findings: scaffold an allow-list for groups
+        /// that have none, tighten an `open` approval policy to
+        /// `request_approval`, and chmod loose session files to 0600/0700.
+        /// Each host-side fix is audited. Never loosens anything.
+        #[arg(long)]
+        fix: bool,
+        /// Override the data dir whose `sessions/` tree is scanned for
+        /// loose file permissions. Defaults to the resolved install data
+        /// dir. Mainly for tests / non-default installs.
+        #[arg(long)]
+        data_dir: Option<std::path::PathBuf>,
+    },
+}
+
+impl SecurityCmd {
+    /// Build the marker `ParsedCall` for the security composite. Like the
+    /// other composites this never reaches the transport directly —
+    /// `run_cli` recognises the `composite.security-audit` prefix.
+    pub fn to_call(&self) -> ParsedCall {
+        match self {
+            Self::Audit { fix, data_dir } => {
+                let mut o = Map::new();
+                if *fix {
+                    o.insert("fix".into(), Value::Bool(true));
+                }
+                if let Some(p) = data_dir {
+                    o.insert("data_dir".into(), p.to_string_lossy().into_owned().into());
+                }
+                ParsedCall::new("composite.security-audit", Value::Object(o))
+            }
+        }
+    }
+}
+
 // --- db --------------------------------------------------------------------
 
 /// `cclaw db ...` — central database backup / restore.
@@ -300,6 +374,28 @@ pub enum McpCmd {
         /// May be specified multiple times.
         #[arg(long)]
         env: Vec<String>,
+    },
+    /// Inspect the effective per-server tool include/exclude FILTER for a
+    /// group's configured external MCP servers. Shows the declared
+    /// `allowed_tools` / `denied_tools` and a posture summary so you can
+    /// verify a denied MCP tool is filtered out before it reaches the model.
+    #[command(name = "inspect-filter")]
+    InspectFilter {
+        /// Agent group to inspect.
+        #[arg(long = "agent-group-id")]
+        agent_group_id: String,
+        /// Inspect only this server (omit for all configured servers).
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// List host-side OAuth tokens stored for a group's external MCP servers.
+    /// Metadata only — the access/refresh secrets are never displayed and
+    /// never leave the host.
+    #[command(name = "oauth-list")]
+    OauthList {
+        /// Agent group whose OAuth tokens to list.
+        #[arg(long = "agent-group-id")]
+        agent_group_id: String,
     },
 }
 
@@ -378,6 +474,52 @@ pub enum GroupsCmd {
         #[command(subcommand)]
         action: GroupConfigCmd,
     },
+    /// Provider-resilience subcommands (fallback chains, multi-key
+    /// rotation, per-channel model pins, health inspection).
+    Provider {
+        #[command(subcommand)]
+        action: GroupProviderCmd,
+    },
+}
+
+/// `groups provider …` — configure + inspect the per-group provider
+/// fallback chain, multi-key rotation, and per-channel model pins.
+#[derive(Debug, Subcommand)]
+pub enum GroupProviderCmd {
+    /// Show the configured fallback chain + pins for a group.
+    Get { id: String },
+    /// Show the chain alongside live per-`(provider, model, key)` health.
+    Status { id: String },
+    /// Set the ordered fallback chain (position 0 is the primary).
+    ///
+    /// `--chain` is a JSON array of `{provider, model, keys?}` entries, e.g.
+    /// `'[{"provider":"anthropic","model":"claude-sonnet-4-6","keys":[{"id":"primary","api_key_env":"ANTHROPIC_API_KEY"}]},{"provider":"ollama","model":"qwen3.6:27b"}]'`.
+    /// `--pins` is an optional `{channel: model}` JSON object.
+    #[command(name = "set-chain")]
+    SetChain {
+        id: String,
+        /// JSON array of `{provider, model, keys?}` chain entries.
+        #[arg(long)]
+        chain: String,
+        /// Optional `{channel: model}` JSON object for per-channel pinning.
+        #[arg(long)]
+        pins: Option<String>,
+        /// Optional re-probe cool-down override, in seconds.
+        #[arg(long = "reprobe-after-secs")]
+        reprobe_after_secs: Option<u64>,
+    },
+    /// Replace the per-channel model pin map (requires an existing chain).
+    ///
+    /// `--pins` is a `{channel: model}` JSON object.
+    #[command(name = "set-pins")]
+    SetPins {
+        id: String,
+        /// `{channel: model}` JSON object.
+        #[arg(long)]
+        pins: String,
+    },
+    /// Remove the provider chain + pins + health (revert to single-provider).
+    Clear { id: String },
 }
 
 #[derive(Debug, Subcommand)]
@@ -887,6 +1029,29 @@ pub enum ApprovalsCmd {
         /// Pending-approval row id (UUID).
         id: String,
     },
+    /// Revoke a pending row by id: withdraw the request without approving
+    /// or denying it. Marks the row `status = 'revoked'`, applies no side
+    /// effects, and lands a `revoke` entry in the decision audit log.
+    /// Idempotent; conflicts with already-settled (approved / denied /
+    /// expired) rows.
+    Revoke {
+        /// Pending-approval row id (UUID).
+        id: String,
+        /// Optional rationale recorded on the decision log.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Show the append-only approval-decision audit log (who / what / when /
+    /// outcome). With `--id`, scopes to one approval's history; otherwise
+    /// returns the global log newest-first.
+    Decisions {
+        /// Optional approval id (UUID) to scope the history to.
+        #[arg(long)]
+        id: Option<String>,
+        /// Max rows returned. Default 50.
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
     /// Approve a sender by `(channel_type, identity)`. Persists a
     /// `users` row keyed on that pair; the host's sender-scope
     /// gate consults `users` on every inbound, so the approval
@@ -902,6 +1067,32 @@ pub enum ApprovalsCmd {
         /// Optional display name to attach to the new `users` row.
         #[arg(long)]
         display_name: Option<String>,
+    },
+}
+
+// --- pairing ---------------------------------------------------------------
+
+/// `cclaw pairing ...` — DM pairing codes for onboarding unknown senders.
+///
+/// When an unknown sender first DMs the bot, the host mints a single-use
+/// 8-char code (1h TTL, rate-limited per channel) and delivers it back to
+/// that sender through the normal outbound path. The user relays the code to
+/// the operator, who promotes them with `cclaw pairing approve <code>`.
+#[derive(Debug, Subcommand)]
+pub enum PairingCmd {
+    /// List active (unexpired) pairing codes. `--all` includes consumed and
+    /// expired rows.
+    List {
+        /// Include consumed / expired codes, not just active ones.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Approve a pairing code: promote the bound sender into `users` and mark
+    /// the code consumed. The sender-scope gate honours the approval on the
+    /// next inbound — no host restart needed.
+    Approve {
+        /// The 8-char pairing code the sender relayed.
+        code: String,
     },
 }
 
@@ -935,6 +1126,22 @@ pub enum BudgetsCmd {
 #[derive(Debug, Subcommand)]
 pub enum AuditCmd {
     /// List recent audit entries.
+    List {
+        /// Window to look back. Accepts plain seconds (`3600`) or
+        /// `Ns`/`Nm`/`Nh`/`Nd` shorthand. Default 24h.
+        #[arg(long, default_value = "24h")]
+        since: String,
+        /// Max rows returned. Default 50.
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+}
+
+/// `cclaw attestation ...` — read the spawn-time image+runner attestation log.
+#[derive(Debug, Subcommand)]
+pub enum AttestationCmd {
+    /// List recent spawn attestation rows (image tag + image content digest +
+    /// runner-binary digest per container spawn).
     List {
         /// Window to look back. Accepts plain seconds (`3600`) or
         /// `Ns`/`Nm`/`Nh`/`Nd` shorthand. Default 24h.
@@ -996,7 +1203,9 @@ impl TopCommand {
             Self::UserDms { action } => action.to_call(),
             Self::DroppedMessages { action } => action.to_call(),
             Self::Approvals { action } => action.to_call(),
+            Self::Pairing { action } => action.to_call(),
             Self::Audit { action } => action.to_call(),
+            Self::Attestation { action } => action.to_call(),
             Self::Budgets { action } => action.to_call(),
             Self::Quickstart { action } => action.to_call(),
             Self::Db { action } => action.to_call(),
@@ -1004,6 +1213,8 @@ impl TopCommand {
             Self::Status => ParsedCall::new("composite.status", json!({})),
             Self::Health => ParsedCall::new("composite.health", json!({})),
             Self::Doctor => ParsedCall::new("composite.doctor", json!({})),
+            Self::Security { action } => action.to_call(),
+            Self::Egress => ParsedCall::new("egress.status", json!({})),
             Self::Usage { since } => ParsedCall::new("usage.rollup", json!({"since": since})),
             Self::Chat {
                 fifo,
@@ -1110,6 +1321,20 @@ impl McpCmd {
                     }),
                 )
             }
+            Self::InspectFilter {
+                agent_group_id,
+                server,
+            } => ParsedCall::new(
+                "mcp.inspect-filter",
+                json!({
+                    "agent_group_id": agent_group_id,
+                    "server": server,
+                }),
+            ),
+            Self::OauthList { agent_group_id } => ParsedCall::new(
+                "mcp.oauth-list",
+                json!({ "agent_group_id": agent_group_id }),
+            ),
         }
     }
 }
@@ -1152,6 +1377,49 @@ impl GroupsCmd {
                 json!({"id": id, "enabled": false}),
             ),
             Self::Config { action } => action.to_call(),
+            Self::Provider { action } => action.to_call(),
+        }
+    }
+}
+
+impl GroupProviderCmd {
+    pub fn to_call(&self) -> ParsedCall {
+        match self {
+            Self::Get { id } => ParsedCall::new("groups.provider.get", json!({"id": id})),
+            Self::Status { id } => ParsedCall::new("groups.provider.status", json!({"id": id})),
+            Self::SetChain {
+                id,
+                chain,
+                pins,
+                reprobe_after_secs,
+            } => {
+                // Parse the chain JSON here so a malformed blob fails the CLI
+                // early; on parse failure pass the raw string through so the
+                // host returns the precise `bad_request`.
+                let chain_val = serde_json::from_str::<Value>(chain)
+                    .unwrap_or_else(|_| Value::String(chain.clone()));
+                let mut o = Map::new();
+                o.insert("id".into(), id.clone().into());
+                o.insert("chain".into(), chain_val);
+                if let Some(p) = pins {
+                    let pins_val = serde_json::from_str::<Value>(p)
+                        .unwrap_or_else(|_| Value::String(p.clone()));
+                    o.insert("model_by_channel".into(), pins_val);
+                }
+                if let Some(secs) = reprobe_after_secs {
+                    o.insert("reprobe_after_secs".into(), (*secs).into());
+                }
+                ParsedCall::new("groups.provider.set-chain", Value::Object(o))
+            }
+            Self::SetPins { id, pins } => {
+                let pins_val = serde_json::from_str::<Value>(pins)
+                    .unwrap_or_else(|_| Value::String(pins.clone()));
+                ParsedCall::new(
+                    "groups.provider.set-pins",
+                    json!({"id": id, "model_by_channel": pins_val}),
+                )
+            }
+            Self::Clear { id } => ParsedCall::new("groups.provider.clear", json!({"id": id})),
         }
     }
 }
@@ -1486,6 +1754,18 @@ impl ApprovalsCmd {
             Self::Get { id } => ParsedCall::new("approvals.get", json!({"id": id})),
             Self::ApproveById { id } => ParsedCall::new("approvals.approve", json!({"id": id})),
             Self::Deny { id } => ParsedCall::new("approvals.deny", json!({"id": id})),
+            Self::Revoke { id, reason } => {
+                let mut o = Map::new();
+                o.insert("id".into(), id.clone().into());
+                insert_opt(&mut o, "reason", reason.clone());
+                ParsedCall::new("approvals.revoke", Value::Object(o))
+            }
+            Self::Decisions { id, limit } => {
+                let mut o = Map::new();
+                insert_opt(&mut o, "id", id.clone());
+                o.insert("limit".into(), (*limit).into());
+                ParsedCall::new("approvals.decisions", Value::Object(o))
+            }
             Self::Approve {
                 channel,
                 identity,
@@ -1501,12 +1781,32 @@ impl ApprovalsCmd {
     }
 }
 
+impl PairingCmd {
+    pub fn to_call(&self) -> ParsedCall {
+        match self {
+            Self::List { all } => ParsedCall::new("pairing.list", json!({ "all": all })),
+            Self::Approve { code } => ParsedCall::new("pairing.approve", json!({ "code": code })),
+        }
+    }
+}
+
 impl AuditCmd {
     pub fn to_call(&self) -> ParsedCall {
         match self {
             Self::List { since, limit } => {
                 ParsedCall::new("audit.list", json!({ "since": since, "limit": limit }))
             }
+        }
+    }
+}
+
+impl AttestationCmd {
+    pub fn to_call(&self) -> ParsedCall {
+        match self {
+            Self::List { since, limit } => ParsedCall::new(
+                "attestation.list",
+                json!({ "since": since, "limit": limit }),
+            ),
         }
     }
 }
@@ -1560,6 +1860,11 @@ pub const ALL_COMMANDS: &[&str] = &[
     "groups.config.set-egress-allow",
     "groups.config.set-resource-limits",
     "groups.config.set-coding-enabled",
+    "groups.provider.get",
+    "groups.provider.status",
+    "groups.provider.set-chain",
+    "groups.provider.set-pins",
+    "groups.provider.clear",
     "messaging-groups.list",
     "messaging-groups.get",
     "messaging-groups.create",
@@ -1594,16 +1899,24 @@ pub const ALL_COMMANDS: &[&str] = &[
     "db.restore",
     "mcp.list-presets",
     "mcp.add",
+    "mcp.inspect-filter",
+    "mcp.oauth-list",
     "approvals.list",
     "approvals.get",
     "approvals.approve_sender",
     "approvals.approve",
     "approvals.deny",
+    "approvals.revoke",
+    "approvals.decisions",
+    "pairing.list",
+    "pairing.approve",
     "audit.list",
+    "attestation.list",
     "budgets.list",
     "budgets.set",
     "usage.rollup",
     "schema.version",
+    "egress.status",
 ];
 
 #[cfg(test)]
@@ -1780,6 +2093,81 @@ mod tests {
         let cli = Cli::try_parse_from(["cclaw"]).unwrap();
         let p = cli.to_call();
         assert_eq!(p.command, "composite.dashboard");
+    }
+
+    // --- groups provider (resilience) -------------------------------------
+
+    #[test]
+    fn groups_provider_get_and_status() {
+        let p = parse(&["cclaw", "groups", "provider", "get", "g1"]);
+        assert_eq!(p.command, "groups.provider.get");
+        assert_eq!(p.args, json!({"id": "g1"}));
+
+        let p = parse(&["cclaw", "groups", "provider", "status", "g1"]);
+        assert_eq!(p.command, "groups.provider.status");
+        assert_eq!(p.args, json!({"id": "g1"}));
+    }
+
+    #[test]
+    fn groups_provider_set_chain_parses_json() {
+        let chain = r#"[{"provider":"anthropic","model":"claude-sonnet-4-6","keys":[{"id":"primary","api_key_env":"ANTHROPIC_API_KEY"}]},{"provider":"ollama","model":"qwen3.6:27b"}]"#;
+        let p = parse(&[
+            "cclaw",
+            "groups",
+            "provider",
+            "set-chain",
+            "g1",
+            "--chain",
+            chain,
+            "--pins",
+            r#"{"telegram":"claude-opus-4-1"}"#,
+            "--reprobe-after-secs",
+            "90",
+        ]);
+        assert_eq!(p.command, "groups.provider.set-chain");
+        assert_eq!(p.args["id"], "g1");
+        assert_eq!(p.args["chain"][0]["provider"], "anthropic");
+        assert_eq!(p.args["chain"][1]["provider"], "ollama");
+        assert_eq!(p.args["model_by_channel"]["telegram"], "claude-opus-4-1");
+        assert_eq!(p.args["reprobe_after_secs"], 90);
+    }
+
+    #[test]
+    fn groups_provider_set_chain_without_optional_flags() {
+        let p = parse(&[
+            "cclaw",
+            "groups",
+            "provider",
+            "set-chain",
+            "g1",
+            "--chain",
+            r#"[{"provider":"anthropic","model":"m"}]"#,
+        ]);
+        assert_eq!(p.command, "groups.provider.set-chain");
+        assert!(p.args.get("model_by_channel").is_none());
+        assert!(p.args.get("reprobe_after_secs").is_none());
+    }
+
+    #[test]
+    fn groups_provider_set_pins() {
+        let p = parse(&[
+            "cclaw",
+            "groups",
+            "provider",
+            "set-pins",
+            "g1",
+            "--pins",
+            r#"{"cli":"m-cli"}"#,
+        ]);
+        assert_eq!(p.command, "groups.provider.set-pins");
+        assert_eq!(p.args["model_by_channel"]["cli"], "m-cli");
+    }
+
+    #[test]
+    fn groups_provider_clear() {
+        let p = parse(&["cclaw", "groups", "provider", "clear", "g1"]);
+        assert_eq!(p.command, "groups.provider.clear");
+        assert_eq!(p.args, json!({"id": "g1"}));
     }
 
     #[test]
@@ -2383,6 +2771,54 @@ mod tests {
         assert_eq!(p.args, json!({"id": "appr_3"}));
     }
 
+    #[test]
+    fn approvals_revoke_emits_revoke_with_id_and_reason() {
+        let p = parse(&["cclaw", "approvals", "revoke", "appr_4"]);
+        assert_eq!(p.command, "approvals.revoke");
+        assert_eq!(p.args, json!({"id": "appr_4"}));
+        let p = parse(&[
+            "cclaw",
+            "approvals",
+            "revoke",
+            "appr_5",
+            "--reason",
+            "withdrew",
+        ]);
+        assert_eq!(p.command, "approvals.revoke");
+        assert_eq!(p.args, json!({"id": "appr_5", "reason": "withdrew"}));
+    }
+
+    #[test]
+    fn approvals_decisions_emits_decisions_view() {
+        let p = parse(&["cclaw", "approvals", "decisions"]);
+        assert_eq!(p.command, "approvals.decisions");
+        assert_eq!(p.args, json!({"limit": 50}));
+        let p = parse(&[
+            "cclaw",
+            "approvals",
+            "decisions",
+            "--id",
+            "appr_6",
+            "--limit",
+            "10",
+        ]);
+        assert_eq!(p.command, "approvals.decisions");
+        assert_eq!(p.args, json!({"id": "appr_6", "limit": 10}));
+    }
+
+    #[test]
+    fn pairing_list_and_approve() {
+        let p = parse(&["cclaw", "pairing", "list"]);
+        assert_eq!(p.command, "pairing.list");
+        assert_eq!(p.args, json!({"all": false}));
+        let p = parse(&["cclaw", "pairing", "list", "--all"]);
+        assert_eq!(p.command, "pairing.list");
+        assert_eq!(p.args, json!({"all": true}));
+        let p = parse(&["cclaw", "pairing", "approve", "ABCDEFGH"]);
+        assert_eq!(p.command, "pairing.approve");
+        assert_eq!(p.args, json!({"code": "ABCDEFGH"}));
+    }
+
     // --- meta --------------------------------------------------------------
 
     #[test]
@@ -2449,6 +2885,27 @@ mod tests {
             &["cclaw", "groups", "config", "set-resource-limits", "x"],
             &["cclaw", "groups", "enable-coding", "x"],
             &["cclaw", "groups", "disable-coding", "x"],
+            &["cclaw", "groups", "provider", "get", "x"],
+            &["cclaw", "groups", "provider", "status", "x"],
+            &[
+                "cclaw",
+                "groups",
+                "provider",
+                "set-chain",
+                "x",
+                "--chain",
+                r#"[{"provider":"anthropic","model":"m"}]"#,
+            ],
+            &[
+                "cclaw",
+                "groups",
+                "provider",
+                "set-pins",
+                "x",
+                "--pins",
+                r#"{"cli":"m"}"#,
+            ],
+            &["cclaw", "groups", "provider", "clear", "x"],
             &["cclaw", "messaging-groups", "list"],
             &["cclaw", "messaging-groups", "get", "x"],
             &[
@@ -2527,7 +2984,14 @@ mod tests {
             ],
             &["cclaw", "approvals", "approve-id", "appr-1"],
             &["cclaw", "approvals", "deny", "appr-1"],
+            &["cclaw", "approvals", "revoke", "appr-1"],
+            &["cclaw", "approvals", "decisions"],
+            &["cclaw", "pairing", "list"],
+            &["cclaw", "pairing", "approve", "ABCDEFGH"],
             &["cclaw", "audit", "list"],
+            &["cclaw", "attestation", "list"],
+            &["cclaw", "mcp", "inspect-filter", "--agent-group-id", "ag-1"],
+            &["cclaw", "mcp", "oauth-list", "--agent-group-id", "ag-1"],
             &["cclaw", "budgets", "list"],
             &[
                 "cclaw",
@@ -2544,6 +3008,7 @@ mod tests {
             ],
             &["cclaw", "usage"],
             &["cclaw", "schema-version"],
+            &["cclaw", "egress"],
             // Note: composite-only commands (`cclaw status`,
             // `cclaw health`, `cclaw quickstart`, `cclaw chat`,
             // `cclaw completions`) intentionally produce
@@ -2571,6 +3036,52 @@ mod tests {
                 "ALL_COMMANDS lists {c:?} but no invocation here produces it",
             );
         }
+    }
+
+    #[test]
+    fn attestation_list_parses() {
+        let call = parse(&[
+            "cclaw",
+            "attestation",
+            "list",
+            "--since",
+            "1h",
+            "--limit",
+            "5",
+        ]);
+        assert_eq!(call.command, "attestation.list");
+        assert_eq!(call.args["since"], "1h");
+        assert_eq!(call.args["limit"], 5);
+    }
+
+    #[test]
+    fn mcp_inspect_filter_parses_with_optional_server() {
+        let call = parse(&[
+            "cclaw",
+            "mcp",
+            "inspect-filter",
+            "--agent-group-id",
+            "ag-1",
+            "--server",
+            "github",
+        ]);
+        assert_eq!(call.command, "mcp.inspect-filter");
+        assert_eq!(call.args["agent_group_id"], "ag-1");
+        assert_eq!(call.args["server"], "github");
+    }
+
+    #[test]
+    fn mcp_inspect_filter_server_is_null_when_omitted() {
+        let call = parse(&["cclaw", "mcp", "inspect-filter", "--agent-group-id", "ag-1"]);
+        assert_eq!(call.command, "mcp.inspect-filter");
+        assert!(call.args["server"].is_null());
+    }
+
+    #[test]
+    fn mcp_oauth_list_parses() {
+        let call = parse(&["cclaw", "mcp", "oauth-list", "--agent-group-id", "ag-1"]);
+        assert_eq!(call.command, "mcp.oauth-list");
+        assert_eq!(call.args["agent_group_id"], "ag-1");
     }
 
     #[test]

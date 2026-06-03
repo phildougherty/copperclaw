@@ -22,15 +22,19 @@ use copperclaw_types::AgentGroupId;
 use serde_json::Value;
 
 pub mod approvals;
+pub mod attestation;
 pub mod audit;
 pub mod budgets;
 pub mod db;
 pub mod destinations;
 pub mod dropped_messages;
+pub mod egress;
 pub mod groups;
 pub mod mcp;
 pub mod members;
 pub mod messaging_groups;
+pub mod pairing;
+pub mod provider;
 pub mod roles;
 pub mod schema;
 pub mod sessions;
@@ -57,6 +61,9 @@ pub const HOST_ONLY_COMMANDS: &[&str] = &[
     "groups.config.set-egress-allow",
     "groups.config.set-resource-limits",
     "groups.config.set-coding-enabled",
+    "groups.provider.set-chain",
+    "groups.provider.set-pins",
+    "groups.provider.clear",
     "messaging-groups.create",
     "messaging-groups.update",
     "messaging-groups.delete",
@@ -75,6 +82,8 @@ pub const HOST_ONLY_COMMANDS: &[&str] = &[
     "approvals.approve_sender",
     "approvals.approve",
     "approvals.deny",
+    "approvals.revoke",
+    "pairing.approve",
     "budgets.set",
     "db.backup",
     "db.restore",

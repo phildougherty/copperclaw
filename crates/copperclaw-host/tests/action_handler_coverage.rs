@@ -25,8 +25,8 @@ use std::sync::Arc;
 use copperclaw_modules::context::MockModuleContext;
 use copperclaw_modules::{
     AgentToAgentModule, ApprovalsModule, CreateAgentModule, InteractiveModule, Module,
-    ModuleContext, MountSecurityModule, PermissionsModule, SchedulingModule, SelfModModule,
-    TypingConfig, TypingModule, create_agent_always_allow,
+    ModuleContext, MountHostContext, MountSecurityModule, PermissionsModule, SchedulingModule,
+    SelfModModule, TypingConfig, TypingModule, create_agent_always_allow,
 };
 
 /// Action names the runner currently emits as `MessageKind::System`
@@ -110,7 +110,9 @@ async fn install_built_in_modules_mock(ctx: Arc<MockModuleContext>) {
     // Order mirrors `crates/copperclaw-host/src/boot.rs::install_modules`.
     let modules: Vec<Box<dyn Module>> = vec![
         Box::new(TypingModule::new(TypingConfig::default())),
-        Box::new(MountSecurityModule::new()),
+        Box::new(MountSecurityModule::with_host(MountHostContext {
+            session_root: std::env::temp_dir().join("copperclaw-action-coverage-sessions"),
+        })),
         Box::new(PermissionsModule::deny_all()),
         Box::new(ApprovalsModule::new()),
         Box::new(InteractiveModule::default()),
@@ -214,6 +216,12 @@ fn runner_emit_set_matches_source() {
             &[
                 "fn apply_",
                 "fn emit_usage_report",
+                // The `usage_report` payload literal moved out of
+                // `emit_usage_report` into this shared builder (so the live
+                // emit path and the host's emit->record->fold integration test
+                // construct it identically). Scan its body for the same
+                // `json!({ "usage_report": ... })` first-key pattern.
+                "fn build_usage_report_payload",
                 // Trailing `(` pins this to the function definition,
                 // not the unit-test names like
                 // `fn emit_breadcrumb_finish_writes_update_system_row`

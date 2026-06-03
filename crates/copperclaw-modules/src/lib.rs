@@ -37,7 +37,10 @@ pub use agent_to_agent::{
     always_allow as create_agent_always_allow, always_deny as create_agent_always_deny,
     users_table_check as create_agent_users_table_check,
 };
-pub use approvals::{ApprovalSummary, ApprovalsModule, NewPendingCtx, NewPendingNotifier};
+pub use approvals::{
+    ApprovalSummary, ApprovalsModule, DecisionOutcome, DecisionRecord, NewPendingCtx,
+    NewPendingNotifier, PairingNotifier,
+};
 pub use context::{
     ChannelRequestCtx, DeliveryActionHandler, DeliveryActionInput, DeliveryActionOutput,
     DeliveryDispatcher, DispatchTarget, GateCtx, GateDecision, InterceptorCtx, InterceptorDecision,
@@ -46,7 +49,10 @@ pub use context::{
 pub use error::ModuleError;
 pub use interactive::{InteractiveModule, PendingQuestion, QuestionId};
 pub use mount_security::{MountError, MountSecurityModule, validate_mount_target};
-pub use permissions::{PermissionOp, PermissionsModule, Role, check as permissions_check};
+pub use permissions::{
+    PermissionOp, PermissionsModule, Role, ToolProfile, check as permissions_check,
+    default_profile_for_role,
+};
 pub use scheduling::{
     CreateTaskSpec, InMemoryTaskStore, ScheduleError, ScheduleHandler, SchedulingModule,
     TaskRecord, TaskStatus as ScheduledTaskStatus, TaskStore, UpdateTaskFields, When,

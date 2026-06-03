@@ -76,6 +76,272 @@ impl Mount {
     }
 }
 
+/// Egress posture for a spawned container.
+///
+/// `AllowAll` (the default) preserves the legacy behaviour: the container
+/// joins Docker's default bridge with full outbound NAT and the
+/// [`ContainerSpec::egress_allow`] list is purely advisory.
+///
+/// `DenyDefault` is the opt-in first cut of a default-deny network posture.
+/// What the Docker runtime **genuinely enforces** for `DenyDefault` today:
+///
+/// * When the resolved allow-list is **empty**, the container is spawned
+///   with `network_mode: "none"` — a real, bollard-enforced full network
+///   cut (no interfaces beyond loopback). This is the only posture in which
+///   bollard alone can guarantee egress is blocked.
+/// * When the allow-list is **non-empty** (the normal production case, since
+///   the host auto-injects the model endpoint so the agent can always reach
+///   its provider), bollard cannot express per-host L3/L4 filtering through
+///   `create_container`. The container therefore keeps its default-bridge
+///   networking, and the allow-list is recorded on the spec + surfaced to
+///   the operator (`cclaw doctor`, host log) so the gap is visible.
+///
+/// Phase 0a **v2** strengthens this with two opt-in layers, both gated on
+/// `DenyDefault` so default spawns are unaffected:
+///
+/// * **DNS filtering** ([`crate::dns`]): the container's `/etc/resolv.conf` is
+///   pinned ([`ContainerSpec::resolv_conf_source`]) to a host-controlled
+///   filtering resolver that answers ONLY the effective allow-listed names and
+///   NXDOMAINs everything else — so a deny-default session can't exfiltrate via
+///   DNS labels to an arbitrary resolver.
+/// * **nftables** ([`crate::nftables`]): a per-session ruleset (drop-all egress
+///   except the allow-listed `host:port` set + the filtering resolver) is
+///   constructed for application to the session's network namespace. The rule
+///   *construction* is pure + tested; the *application* needs `CAP_NET_ADMIN`
+///   at spawn and is the runtime path.
+///
+/// What remains **deferred to the runtime** (constructed + tested here, but
+/// requiring `CAP_NET_ADMIN` / a live netns to actually apply): the privileged
+/// `nft -f` load against the session netns, and standing up the filter-resolver
+/// sidecar. Callers must not treat a non-empty-allow-list `DenyDefault` spawn
+/// as a hard L3/L4 boundary unless the host confirms the nftables apply
+/// succeeded — until then the carried ruleset + pinned resolv.conf are the
+/// policy and the DNS-level confinement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EgressMode {
+    /// Full outbound networking on the default bridge. The allow-list is
+    /// advisory only.
+    #[default]
+    AllowAll,
+    /// Opt-in default-deny posture. See the type-level docs for exactly
+    /// what bollard enforces vs. what is deferred.
+    DenyDefault,
+}
+
+impl EgressMode {
+    /// Stable lower-case token for logs / JSON surfaces.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EgressMode::AllowAll => "allow-all",
+            EgressMode::DenyDefault => "deny-default",
+        }
+    }
+}
+
+/// Stronger-sandbox runtime requested for a container.
+///
+/// The default Docker spawn uses the host's default OCI runtime (`runc`),
+/// which shares the host kernel directly. For containers that run
+/// attacker-influenceable code — the headless-browser child container is the
+/// motivating case (Phase 5a): it renders arbitrary, possibly-malicious web
+/// pages — a *stronger* isolation boundary is wanted so a Chromium/renderer
+/// RCE does not land directly on the host kernel.
+///
+/// This enum names the runtime the spawn should *request*. Whether the host
+/// can actually honour it is **environment-dependent** and decided at runtime
+/// by [`select_sandbox_runtime`]:
+///
+/// * [`SandboxRuntime::Runsc`] (gVisor), [`SandboxRuntime::Kata`], and
+///   [`SandboxRuntime::Firecracker`] interpose a user-space kernel or a
+///   microVM between the container and the host kernel. They require the
+///   corresponding OCI runtime binary (`runsc` / `kata-runtime` /
+///   `firecracker`-backed runtime) to be installed and registered with the
+///   container engine. None of these is guaranteed present in CI or on a
+///   stock host, so requesting one is **best-effort**: the selection logic
+///   falls back to the next-strongest available option rather than failing
+///   the spawn outright.
+/// * [`SandboxRuntime::HardenedRunc`] is the always-available floor: the
+///   default `runc` runtime, but spawned with a hardened seccomp profile,
+///   a user-namespace remap (root-in-container ≠ root-on-host), all
+///   capabilities dropped, and `no-new-privileges`. This needs no extra
+///   binary, so it is the guaranteed fallback.
+///
+/// `Default` is the legacy posture (whatever the engine's default runtime is,
+/// no extra hardening) — used only when no sandbox profile is attached, so
+/// existing spawns are unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SandboxRuntime {
+    /// Engine default runtime (`runc`), no extra hardening. Legacy posture.
+    #[default]
+    Default,
+    /// gVisor (`runsc`): a user-space kernel intercepts syscalls. Strong
+    /// isolation without a full VM. Requires the `runsc` OCI runtime.
+    Runsc,
+    /// Kata Containers: each container runs in a lightweight VM. Requires the
+    /// `kata-runtime` OCI runtime + hardware virtualisation.
+    Kata,
+    /// Firecracker microVM (via a Firecracker-backed OCI runtime). Requires
+    /// `/dev/kvm` + the runtime shim.
+    Firecracker,
+    /// Default `runc`, but hardened: seccomp + userns remap + cap-drop +
+    /// no-new-privileges. The always-available floor — no extra binary.
+    HardenedRunc,
+}
+
+impl SandboxRuntime {
+    /// Stable lower-case token for logs / JSON / labels.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SandboxRuntime::Default => "default",
+            SandboxRuntime::Runsc => "runsc",
+            SandboxRuntime::Kata => "kata",
+            SandboxRuntime::Firecracker => "firecracker",
+            SandboxRuntime::HardenedRunc => "hardened-runc",
+        }
+    }
+
+    /// The OCI runtime name the container engine must have registered for
+    /// this sandbox to be honoured, if any. `None` means "the engine
+    /// default runtime" (`Default` / `HardenedRunc` — the latter hardens the
+    /// default runtime via security options rather than swapping it).
+    #[must_use]
+    pub fn oci_runtime_name(self) -> Option<&'static str> {
+        match self {
+            SandboxRuntime::Default | SandboxRuntime::HardenedRunc => None,
+            SandboxRuntime::Runsc => Some("runsc"),
+            SandboxRuntime::Kata => Some("kata-runtime"),
+            SandboxRuntime::Firecracker => Some("io.containerd.firecracker.v1"),
+        }
+    }
+
+    /// Whether honouring this runtime requires a binary/feature beyond the
+    /// engine default. `HardenedRunc` only layers security-options onto the
+    /// default runtime, so it is always available; the microVM/gVisor
+    /// runtimes need their shim installed.
+    #[must_use]
+    pub fn needs_external_runtime(self) -> bool {
+        self.oci_runtime_name().is_some()
+    }
+
+    /// Relative isolation strength, higher is stronger. Used by
+    /// [`select_sandbox_runtime`] to pick the strongest *available* option no
+    /// weaker than what was requested.
+    #[must_use]
+    pub fn strength(self) -> u8 {
+        match self {
+            SandboxRuntime::Default => 0,
+            SandboxRuntime::HardenedRunc => 1,
+            SandboxRuntime::Runsc => 2,
+            // Kata and Firecracker both interpose a (micro)VM; equal strength.
+            SandboxRuntime::Kata | SandboxRuntime::Firecracker => 3,
+        }
+    }
+}
+
+/// Hardening knobs applied on top of the chosen [`SandboxRuntime`].
+///
+/// These are the seccomp / userns / capability / privilege controls the
+/// runtime translates into engine security-options. They are the *floor*:
+/// even when a microVM runtime is selected, applying them costs nothing and
+/// closes host-kernel attack surface for the in-VM process.
+///
+/// The default ([`SandboxProfile::hardened`]) is what the browser child
+/// container uses: drop all caps, no-new-privileges, a userns remap, and the
+/// engine's default (or a named stricter) seccomp profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxProfile {
+    /// The sandbox runtime requested. Selection at spawn picks the strongest
+    /// *available* runtime no weaker than this (see [`select_sandbox_runtime`]).
+    pub runtime: SandboxRuntime,
+    /// Drop ALL Linux capabilities (`--cap-drop=ALL`). A renderer needs none.
+    pub cap_drop_all: bool,
+    /// Set `no-new-privileges` so a setuid binary inside can't escalate.
+    pub no_new_privileges: bool,
+    /// Remap the container's user namespace so root-in-container maps to an
+    /// unprivileged host uid (`--userns-remap` / `userns_mode`). `None` leaves
+    /// the engine default; `Some(label)` requests a named remap range.
+    pub userns_remap: Option<String>,
+    /// Named seccomp profile to request. `None` uses the engine's *default*
+    /// seccomp profile (already restrictive); `Some(name)` names a stricter
+    /// host-supplied profile (e.g. a browser-specific allow-list).
+    pub seccomp_profile: Option<String>,
+}
+
+impl Default for SandboxProfile {
+    fn default() -> Self {
+        Self {
+            runtime: SandboxRuntime::Default,
+            cap_drop_all: false,
+            no_new_privileges: false,
+            userns_remap: None,
+            seccomp_profile: None,
+        }
+    }
+}
+
+impl SandboxProfile {
+    /// The hardened profile used for attacker-influenceable workloads (the
+    /// browser child container). Requests the named `runtime`, drops all
+    /// caps, sets no-new-privileges, and remaps the user namespace to the
+    /// `copperclaw-browser` range.
+    #[must_use]
+    pub fn hardened(runtime: SandboxRuntime) -> Self {
+        Self {
+            runtime,
+            cap_drop_all: true,
+            no_new_privileges: true,
+            userns_remap: Some("copperclaw-browser".to_string()),
+            seccomp_profile: None,
+        }
+    }
+
+    /// Override the requested seccomp profile name.
+    #[must_use]
+    pub fn with_seccomp_profile(mut self, name: impl Into<String>) -> Self {
+        self.seccomp_profile = Some(name.into());
+        self
+    }
+}
+
+/// Pick the sandbox runtime to actually spawn with, given what the operator
+/// requested and which external runtimes are installed on this host.
+///
+/// `available` is the set of [`SandboxRuntime`] variants whose backing binary
+/// the host probed and found present (the [`SandboxRuntime::HardenedRunc`]
+/// floor is *always* implicitly available and need not be listed). The
+/// returned runtime is the **strongest available option no weaker than the
+/// request**, with the hardened-`runc` floor as the guaranteed fallback.
+///
+/// This is the honest core of the "microVM availability is
+/// environment-dependent" story: the *selection* is pure and fully tested
+/// here; the privileged spawn that consumes the result is the runtime path,
+/// gated behind the opt-in flag.
+#[must_use]
+pub fn select_sandbox_runtime(
+    requested: SandboxRuntime,
+    available: &[SandboxRuntime],
+) -> SandboxRuntime {
+    // The default posture is never "upgraded" — if the caller didn't ask for
+    // hardening, leave the legacy runtime alone.
+    if requested == SandboxRuntime::Default {
+        return SandboxRuntime::Default;
+    }
+    // If the exact request is available (or needs no external runtime), honour
+    // it. Otherwise fall back to the strongest *available* external runtime
+    // that is at least as strong as the request, else the hardened-runc floor.
+    if !requested.needs_external_runtime() || available.contains(&requested) {
+        return requested;
+    }
+    available
+        .iter()
+        .copied()
+        .filter(|r| r.needs_external_runtime() && r.strength() >= requested.strength())
+        .max_by_key(|r| r.strength())
+        .unwrap_or(SandboxRuntime::HardenedRunc)
+}
+
 /// Per-group resource caps forwarded to the container runtime at spawn.
 ///
 /// All fields are optional. The Docker runtime translates present fields
@@ -175,11 +441,43 @@ pub struct ContainerSpec {
     /// device-request against a host without the toolkit fails the
     /// spawn outright.
     pub gpu_passthrough: bool,
-    /// Egress allow-list.  Empty means allow-all.  Non-empty restricts
-    /// outbound traffic to the listed `"host:port"` pairs.  Docker:
-    /// enforced via iptables inside the container network namespace.
-    /// Apple: returns `RtError::Unsupported`.
+    /// Resolved egress allow-list as `"host:port"` pairs.
+    ///
+    /// This is the *policy*, not a guarantee of enforcement — see
+    /// [`EgressMode`] for exactly what the Docker runtime enforces today
+    /// (a `network_mode: "none"` cut only when this list is empty under
+    /// [`EgressMode::DenyDefault`]) and what is deferred to a future
+    /// netns + nftables pass (per-host filtering of a non-empty list).
+    /// Under [`EgressMode::AllowAll`] this list is advisory only.
     pub egress_allow: Vec<String>,
+    /// Egress posture. See [`EgressMode`]. Defaults to
+    /// [`EgressMode::AllowAll`] so the legacy spawn path is unchanged.
+    pub egress_mode: EgressMode,
+    /// Host path to a pinned `/etc/resolv.conf` to bind read-only into the
+    /// container (Phase 0a v2, DNS filtering). When `Some`, the runtime adds a
+    /// read-only bind mount of this file at `/etc/resolv.conf` so the
+    /// container's stub resolver can only reach the host-controlled filtering
+    /// resolver (which answers ONLY the effective allow-list and NXDOMAINs
+    /// everything else). `None` (the default) leaves the image's resolv.conf
+    /// untouched — the legacy behaviour. Set only under
+    /// [`EgressMode::DenyDefault`] so default spawns are unaffected.
+    pub resolv_conf_source: Option<String>,
+    /// Optional stronger-sandbox profile (Phase 5a). `None` (the default)
+    /// leaves the legacy spawn posture entirely unchanged — the engine
+    /// default runtime, no extra security options. `Some(profile)` requests
+    /// a stronger isolation runtime (gVisor / Kata / Firecracker, falling
+    /// back to a hardened `runc` with seccomp + userns remap + cap-drop +
+    /// no-new-privileges). Set only for attacker-influenceable workloads
+    /// such as the headless-browser child container.
+    ///
+    /// What the Docker runtime genuinely applies from this today: the
+    /// security-options floor (`cap_drop=ALL`, `no-new-privileges`, userns
+    /// remap, seccomp) plus selecting the requested OCI runtime *if it is
+    /// installed*. Whether a microVM/gVisor runtime is actually present is
+    /// environment-dependent; [`select_sandbox_runtime`] resolves the request
+    /// against what the host probed, and the privileged spawn is gated behind
+    /// the browser tool's opt-in flag.
+    pub sandbox: Option<SandboxProfile>,
 }
 
 impl ContainerSpec {
@@ -256,10 +554,34 @@ impl ContainerSpec {
         self
     }
 
-    /// Set the egress allow-list.  An empty slice means allow-all.
+    /// Set the egress allow-list (the resolved `host:port` policy). Under
+    /// [`EgressMode::AllowAll`] this is advisory; under
+    /// [`EgressMode::DenyDefault`] see [`EgressMode`] for enforcement.
     #[must_use]
     pub fn with_egress_allow(mut self, allow: Vec<String>) -> Self {
         self.egress_allow = allow;
+        self
+    }
+
+    /// Set the egress posture. See [`EgressMode`].
+    #[must_use]
+    pub fn with_egress_mode(mut self, mode: EgressMode) -> Self {
+        self.egress_mode = mode;
+        self
+    }
+
+    /// Pin the container's `/etc/resolv.conf` to a host-controlled file
+    /// (Phase 0a v2 DNS filtering). See [`Self::resolv_conf_source`].
+    #[must_use]
+    pub fn with_resolv_conf_source(mut self, source: impl Into<String>) -> Self {
+        self.resolv_conf_source = Some(source.into());
+        self
+    }
+
+    /// Attach a stronger-sandbox profile (Phase 5a). See [`Self::sandbox`].
+    #[must_use]
+    pub fn with_sandbox(mut self, profile: SandboxProfile) -> Self {
+        self.sandbox = Some(profile);
         self
     }
 }
@@ -365,6 +687,161 @@ mod tests {
         assert!(spec.extra_hosts.is_empty());
         assert!(spec.resource_limits.is_empty());
         assert!(spec.egress_allow.is_empty());
+        assert_eq!(spec.egress_mode, EgressMode::AllowAll);
+        assert!(spec.resolv_conf_source.is_none());
+        assert!(spec.sandbox.is_none());
+    }
+
+    // ── SandboxRuntime / SandboxProfile / selection ──────────────────────
+
+    #[test]
+    fn sandbox_runtime_as_str_stable() {
+        assert_eq!(SandboxRuntime::Default.as_str(), "default");
+        assert_eq!(SandboxRuntime::Runsc.as_str(), "runsc");
+        assert_eq!(SandboxRuntime::Kata.as_str(), "kata");
+        assert_eq!(SandboxRuntime::Firecracker.as_str(), "firecracker");
+        assert_eq!(SandboxRuntime::HardenedRunc.as_str(), "hardened-runc");
+    }
+
+    #[test]
+    fn sandbox_runtime_oci_name_and_external_flag() {
+        // Default + hardened-runc layer on the default runtime — no external
+        // binary, so no OCI runtime name.
+        assert_eq!(SandboxRuntime::Default.oci_runtime_name(), None);
+        assert!(!SandboxRuntime::Default.needs_external_runtime());
+        assert_eq!(SandboxRuntime::HardenedRunc.oci_runtime_name(), None);
+        assert!(!SandboxRuntime::HardenedRunc.needs_external_runtime());
+        // The stronger runtimes each name a distinct OCI runtime and need it
+        // installed.
+        assert_eq!(SandboxRuntime::Runsc.oci_runtime_name(), Some("runsc"));
+        assert!(SandboxRuntime::Runsc.needs_external_runtime());
+        assert_eq!(
+            SandboxRuntime::Kata.oci_runtime_name(),
+            Some("kata-runtime")
+        );
+        assert!(SandboxRuntime::Kata.needs_external_runtime());
+        assert!(SandboxRuntime::Firecracker.needs_external_runtime());
+    }
+
+    #[test]
+    fn sandbox_runtime_strength_ordering() {
+        assert!(SandboxRuntime::HardenedRunc.strength() > SandboxRuntime::Default.strength());
+        assert!(SandboxRuntime::Runsc.strength() > SandboxRuntime::HardenedRunc.strength());
+        assert!(SandboxRuntime::Kata.strength() > SandboxRuntime::Runsc.strength());
+        assert_eq!(
+            SandboxRuntime::Firecracker.strength(),
+            SandboxRuntime::Kata.strength()
+        );
+    }
+
+    #[test]
+    fn sandbox_profile_hardened_sets_floor() {
+        let p = SandboxProfile::hardened(SandboxRuntime::Runsc);
+        assert_eq!(p.runtime, SandboxRuntime::Runsc);
+        assert!(p.cap_drop_all);
+        assert!(p.no_new_privileges);
+        assert_eq!(p.userns_remap.as_deref(), Some("copperclaw-browser"));
+        // Default seccomp (engine default) unless explicitly overridden.
+        assert!(p.seccomp_profile.is_none());
+    }
+
+    #[test]
+    fn sandbox_profile_with_seccomp_profile() {
+        let p =
+            SandboxProfile::hardened(SandboxRuntime::HardenedRunc).with_seccomp_profile("browser");
+        assert_eq!(p.seccomp_profile.as_deref(), Some("browser"));
+    }
+
+    #[test]
+    fn sandbox_profile_default_is_inert() {
+        let p = SandboxProfile::default();
+        assert_eq!(p.runtime, SandboxRuntime::Default);
+        assert!(!p.cap_drop_all);
+        assert!(!p.no_new_privileges);
+        assert!(p.userns_remap.is_none());
+        assert!(p.seccomp_profile.is_none());
+    }
+
+    #[test]
+    fn select_default_request_never_upgrades() {
+        // A Default request stays Default even if stronger runtimes exist.
+        assert_eq!(
+            select_sandbox_runtime(
+                SandboxRuntime::Default,
+                &[SandboxRuntime::Runsc, SandboxRuntime::Kata]
+            ),
+            SandboxRuntime::Default
+        );
+    }
+
+    #[test]
+    fn select_exact_request_honoured_when_available() {
+        assert_eq!(
+            select_sandbox_runtime(SandboxRuntime::Runsc, &[SandboxRuntime::Runsc]),
+            SandboxRuntime::Runsc
+        );
+        assert_eq!(
+            select_sandbox_runtime(
+                SandboxRuntime::Kata,
+                &[SandboxRuntime::Runsc, SandboxRuntime::Kata]
+            ),
+            SandboxRuntime::Kata
+        );
+    }
+
+    #[test]
+    fn select_falls_back_to_strongest_available() {
+        // Asked for gVisor, only Kata installed (stronger): use Kata.
+        assert_eq!(
+            select_sandbox_runtime(SandboxRuntime::Runsc, &[SandboxRuntime::Kata]),
+            SandboxRuntime::Kata
+        );
+    }
+
+    #[test]
+    fn select_falls_back_to_hardened_runc_when_nothing_external() {
+        // Asked for a microVM, nothing installed: hardened-runc floor.
+        assert_eq!(
+            select_sandbox_runtime(SandboxRuntime::Firecracker, &[]),
+            SandboxRuntime::HardenedRunc
+        );
+        assert_eq!(
+            select_sandbox_runtime(SandboxRuntime::Runsc, &[]),
+            SandboxRuntime::HardenedRunc
+        );
+    }
+
+    #[test]
+    fn select_does_not_downgrade_below_request_strength() {
+        // Asked for Kata (strength 3); only Runsc (strength 2) available —
+        // Runsc is weaker than the request, so do NOT silently use it; fall
+        // to the hardened-runc floor and let the operator see the gap.
+        assert_eq!(
+            select_sandbox_runtime(SandboxRuntime::Kata, &[SandboxRuntime::Runsc]),
+            SandboxRuntime::HardenedRunc
+        );
+    }
+
+    #[test]
+    fn select_hardened_runc_request_always_satisfiable() {
+        // HardenedRunc needs no external binary, so the request is always met.
+        assert_eq!(
+            select_sandbox_runtime(SandboxRuntime::HardenedRunc, &[]),
+            SandboxRuntime::HardenedRunc
+        );
+    }
+
+    #[test]
+    fn spec_with_sandbox_round_trips() {
+        let profile = SandboxProfile::hardened(SandboxRuntime::Runsc);
+        let spec = ContainerSpec::new("c", "img").with_sandbox(profile.clone());
+        assert_eq!(spec.sandbox, Some(profile));
+    }
+
+    #[test]
+    fn spec_with_resolv_conf_source() {
+        let spec = ContainerSpec::new("c", "img").with_resolv_conf_source("/h/resolv.conf");
+        assert_eq!(spec.resolv_conf_source.as_deref(), Some("/h/resolv.conf"));
     }
 
     #[test]
@@ -386,6 +863,24 @@ mod tests {
         let spec =
             ContainerSpec::new("c", "img").with_egress_allow(vec!["api.example.com:443".into()]);
         assert_eq!(spec.egress_allow, vec!["api.example.com:443".to_string()]);
+    }
+
+    #[test]
+    fn spec_egress_mode_defaults_to_allow_all() {
+        let spec = ContainerSpec::new("c", "img");
+        assert_eq!(spec.egress_mode, EgressMode::AllowAll);
+    }
+
+    #[test]
+    fn spec_with_egress_mode() {
+        let spec = ContainerSpec::new("c", "img").with_egress_mode(EgressMode::DenyDefault);
+        assert_eq!(spec.egress_mode, EgressMode::DenyDefault);
+    }
+
+    #[test]
+    fn egress_mode_as_str_is_stable() {
+        assert_eq!(EgressMode::AllowAll.as_str(), "allow-all");
+        assert_eq!(EgressMode::DenyDefault.as_str(), "deny-default");
     }
 
     #[test]
