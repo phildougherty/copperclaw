@@ -6,6 +6,38 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security (M16 hardening wave 3 — DNS filter + nftables egress, credential broker — 2026-06-02)
+
+The hardest greenfield units. Both opt-in and default-unchanged; what is
+enforced vs. deferred is stated precisely (no overclaiming). Full workspace
+gate clean (6,340 tests).
+
+- **Egress v2 — DNS filtering + nftables (`copperclaw-container-rt/src/{dns,nftables}.rs`).**
+  Under opt-in `DenyDefault`: the host writes a per-session `resolv.conf`
+  pinning the container's resolver to a single host-controlled filter
+  address (no search domains) and binds it read-only, and constructs a
+  per-session nftables ruleset (drop-all egress except established/related +
+  loopback + the resolver + each allow-listed `host:port`). The name-set
+  resolution, dnsmasq filter config, `resolv.conf` content, and the full
+  nftables ruleset + apply/teardown argv are pure and unit-tested.
+  **Deferred (constructed + reported, not stubbed): the privileged netns
+  `nft` apply** (needs `CAP_NET_ADMIN` + the container PID, which the runtime
+  doesn't yet surface) and **the DNS filter-resolver sidecar** (the
+  `resolv.conf` pin is live; the answering daemon is the runtime piece).
+  `cclaw doctor` reports DNS-filter + nft status honestly.
+- **Credential broker v1 (`container_manager/{broker,broker_server,budgets}.rs`).**
+  A host-side loopback model proxy holds the real provider key; the
+  long-lived `ANTHROPIC_API_KEY` is no longer forwarded into the container
+  (verified: `build_spec`'s container env carries a per-session, group-scoped,
+  TTL-bounded, **revocable** capability token, not the master key). The
+  broker validates the token, enforces the per-group daily budget at request
+  time, and forwards upstream with the real key host-side. `runner.json`'s
+  `api_base_url` points at the broker loopback when enabled (closes the
+  `ANTHROPIC_BASE_URL`-override bypass). Opt-in; default path forwards the
+  real key as before. **Honest residual: brokering stops key THEFT, not key
+  MISUSE** — an injected agent still spends the group's budget through the
+  broker until its token expires/revokes.
+
 ### Security (M16 hardening wave 2b — DM pairing, per-group mention gating, tool policy LIVE — 2026-06-02)
 
 Rework of the two units rejected in wave 2, plus wiring the tool-policy
