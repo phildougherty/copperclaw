@@ -20,7 +20,7 @@
 -- single `users` row.
 CREATE TABLE approval_decisions (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  approval_id TEXT NOT NULL REFERENCES pending_approvals(approval_id),
+  approval_id TEXT NOT NULL REFERENCES pending_approvals(approval_id) ON DELETE CASCADE,
   action      TEXT NOT NULL,   -- the pending approval's `action` family, copied for query convenience
   outcome     TEXT NOT NULL,   -- 'approve' | 'deny' | 'expire' | 'revoke'
   decided_by  TEXT NOT NULL,   -- actor label: 'host', 'system:expiry', 'agent:<session>', ...

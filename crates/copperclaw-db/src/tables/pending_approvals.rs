@@ -480,14 +480,21 @@ pub fn list_decisions(
 /// them to `expired` and appending an `expire` decision (`decided_by =
 /// "system:expiry"`) for each. Returns the ids that were swept.
 ///
-/// Idempotent: only rows still `status = 'pending'` are touched, so a
-/// second sweep over the same window is a no-op.
+/// Idempotent and race-safe: the SELECT + UPDATE + decision INSERT run in a
+/// single `IMMEDIATE` transaction, and the `expire` decision is recorded only
+/// when the guarded `UPDATE ... WHERE status = 'pending'` actually flips a row.
+/// `IMMEDIATE` takes the write lock up front so a second concurrent sweep
+/// blocks on `busy_timeout` until the first commits (rather than deadlocking
+/// into `SQLITE_BUSY` mid-transaction); by then the rows read `expired`, its
+/// SELECT returns nothing, and it does no work. Either way at most one `expire`
+/// decision lands per row.
 pub fn sweep_expired(db: &CentralDb, now: DateTime<Utc>) -> Result<Vec<ApprovalId>, DbError> {
-    let conn = db.conn()?;
+    let mut conn = db.conn()?;
     let now_str = now.to_rfc3339();
-    let mut swept = Vec::new();
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut candidates = Vec::new();
     {
-        let mut stmt = conn.prepare(
+        let mut stmt = tx.prepare(
             "SELECT approval_id, action FROM pending_approvals
              WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?1",
         )?;
@@ -503,23 +510,31 @@ pub fn sweep_expired(db: &CentralDb, now: DateTime<Utc>) -> Result<Vec<ApprovalI
                     "invalid uuid in pending_approvals.approval_id: {e}"
                 ))
             })?;
-            swept.push((ApprovalId(parsed), action));
+            candidates.push((ApprovalId(parsed), action));
         }
     }
-    for (id, action) in &swept {
-        conn.execute(
+    let mut swept = Vec::new();
+    for (id, action) in candidates {
+        let flipped = tx.execute(
             "UPDATE pending_approvals SET status = 'expired'
              WHERE approval_id = ?1 AND status = 'pending'",
             params![id.as_uuid().to_string()],
         )?;
-        conn.execute(
-            "INSERT INTO approval_decisions
-               (approval_id, action, outcome, decided_by, reason, decided_at)
-             VALUES (?1, ?2, 'expire', 'system:expiry', NULL, ?3)",
-            params![id.as_uuid().to_string(), action, now_str],
-        )?;
+        // Only log the expire decision when this transaction is the one that
+        // flipped the row. A concurrent sweep that won the UPDATE leaves us at
+        // zero rows-affected, so we skip the INSERT and avoid a duplicate.
+        if flipped == 1 {
+            tx.execute(
+                "INSERT INTO approval_decisions
+                   (approval_id, action, outcome, decided_by, reason, decided_at)
+                 VALUES (?1, ?2, 'expire', 'system:expiry', NULL, ?3)",
+                params![id.as_uuid().to_string(), action, now_str],
+            )?;
+            swept.push(id);
+        }
     }
-    Ok(swept.into_iter().map(|(id, _)| id).collect())
+    tx.commit()?;
+    Ok(swept)
 }
 
 #[cfg(test)]
@@ -881,5 +896,86 @@ mod tests {
         );
         assert_eq!(pending[0].request_id, "shared-request");
         assert_eq!(pending[0].action, "send_message");
+    }
+
+    /// Race regression: two concurrent sweeps over the same window of
+    /// genuinely-expired rows must land *exactly one* `expire` decision per
+    /// row. Pre-fix `sweep_expired` was non-transactional and INSERTed the
+    /// decision unconditionally, so the loser of the guarded UPDATE (zero
+    /// rows-affected) still logged a duplicate `expire` receipt.
+    ///
+    /// We hammer the race: each trial seeds a batch of already-expired rows on
+    /// a fresh file-backed pool, then fires two sweeps that rendezvous on a
+    /// `Barrier` so both run their candidate SELECT before either writes. A
+    /// generous row count widens the per-row UPDATE/INSERT loop so the slower
+    /// sweep is still inside it when the faster one starts flipping. Several
+    /// trials make the interleave near-certain. The invariant — one decision
+    /// per row, every row terminal — must hold on every trial.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_sweeps_log_one_decision_per_expired_row() {
+        use std::sync::Barrier;
+
+        for trial in 0..8 {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("copperclaw.db");
+            let db = CentralDb::open(&path).unwrap();
+
+            // Seed many rows already past their TTL.
+            let past = Utc::now() - chrono::Duration::minutes(1);
+            let row_count: usize = 64;
+            let mut ids = Vec::new();
+            for i in 0..row_count {
+                let mut req = sample(&format!("r-race-{trial}-{i}"));
+                req.expires_at = Some(past);
+                ids.push(upsert(&db, req).unwrap().approval_id);
+            }
+
+            // Two sweeps over the same window, released together by the barrier.
+            let now = Utc::now();
+            let barrier = std::sync::Arc::new(Barrier::new(2));
+            let mut handles = Vec::new();
+            for _ in 0..2 {
+                let db = db.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                handles.push(tokio::task::spawn_blocking(move || {
+                    barrier.wait();
+                    sweep_expired(&db, now)
+                }));
+            }
+            let mut total_swept = 0usize;
+            for h in handles {
+                let swept = h
+                    .await
+                    .expect("spawn_blocking task panicked")
+                    .expect("sweep_expired returned a DB error under contention");
+                total_swept += swept.len();
+            }
+
+            // Across both sweeps, each row is reported swept exactly once.
+            assert_eq!(
+                total_swept, row_count,
+                "trial {trial}: each expired row should be reported swept by exactly one sweep"
+            );
+
+            // Every row is terminal, with precisely one expire decision logged.
+            for id in &ids {
+                assert_eq!(get(&db, *id).unwrap().status, ApprovalStatus::Expired);
+                let decisions = list_decisions(&db, Some(*id), 10).unwrap();
+                assert_eq!(
+                    decisions.len(),
+                    1,
+                    "trial {trial}: exactly one expire decision must exist per row \
+                     despite the double sweep"
+                );
+                assert_eq!(decisions[0].outcome, DecisionOutcome::Expire);
+            }
+            // Global decision count matches the seeded row count — no duplicates.
+            let all = list_decisions(&db, None, 10_000).unwrap();
+            assert_eq!(
+                all.len(),
+                row_count,
+                "trial {trial}: no duplicate expire decisions"
+            );
+        }
     }
 }

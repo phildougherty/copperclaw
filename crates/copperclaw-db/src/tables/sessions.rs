@@ -793,6 +793,73 @@ mod tests {
     }
 
     #[test]
+    fn delete_clears_pending_approvals_with_logged_decisions() {
+        use rusqlite::params;
+        let (db, ag) = db_with_agent();
+        let s = create(
+            &db,
+            CreateSession {
+                agent_group_id: ag,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
+        // A pending_approvals row for this session that has *already logged a
+        // terminal decision*. The `approval_decisions.approval_id` FK back to
+        // `pending_approvals(approval_id)` must carry ON DELETE CASCADE, or the
+        // single-transaction `DELETE FROM pending_approvals WHERE session_id`
+        // inside `delete` is refused and the whole session delete fails.
+        {
+            let conn = db.conn().unwrap();
+            conn.execute(
+                "INSERT INTO pending_approvals
+                   (approval_id, session_id, request_id, action, payload,
+                    created_at, status, title)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'approved', '')",
+                params![
+                    "appr-dec-1",
+                    s.id.as_uuid().to_string(),
+                    "req-dec-1",
+                    "install_packages",
+                    "{}",
+                    Utc::now().to_rfc3339(),
+                ],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO approval_decisions
+                   (approval_id, action, outcome, decided_by, reason, decided_at)
+                 VALUES (?1, ?2, 'approve', 'host', NULL, ?3)",
+                params!["appr-dec-1", "install_packages", Utc::now().to_rfc3339(),],
+            )
+            .unwrap();
+        }
+        // Pre-fix this errored with a FOREIGN KEY constraint failure.
+        delete(&db, s.id).unwrap();
+        // Both the approval and its decision receipt went with the session.
+        let conn = db.conn().unwrap();
+        let approvals: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_approvals WHERE approval_id = 'appr-dec-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let decisions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM approval_decisions WHERE approval_id = 'appr-dec-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(approvals, 0, "parent approval should be deleted");
+        assert_eq!(decisions, 0, "child decision should cascade-delete");
+    }
+
+    #[test]
     fn touch_last_active_updates_time() {
         let (db, ag) = db_with_agent();
         let s = create(
