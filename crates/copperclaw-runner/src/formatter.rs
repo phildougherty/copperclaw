@@ -1,10 +1,54 @@
-//! Format `messages_in` rows into the text body of one provider turn.
+//! Format `messages_in` rows into the text body of one provider turn,
+//! and shrink the replayed transcript before it goes back to the model.
 //!
 //! When multiple pending rows are picked up in a single poll we coalesce
 //! them into a single user-side message. The format is human-readable and
 //! deterministic so the model can rely on it.
+//!
+//! [`elide_stale_tool_results`] is the per-turn transcript shrinker: old,
+//! already-acted-on tool outputs (file reads, command stdout, large diffs)
+//! are otherwise re-sent verbatim every single turn, forever. Once a
+//! result is outside the recent-results window it is replaced with a
+//! one-line stub (`[elided: …]`) while its tool-use/tool-result pairing
+//! stays byte-for-byte intact, so strict providers (Anthropic, minimax)
+//! still accept the transcript.
 
+use copperclaw_providers::HistoryMessage;
 use copperclaw_types::MessageInRow;
+
+/// Default number of most-recent tool results kept full (never elided).
+/// The current turn's results are always inside this window, so the model
+/// always sees fresh tool output verbatim. Six covers a typical
+/// read → edit → run → re-read working set while still capping the tail.
+pub const DEFAULT_RECENT_TOOL_RESULTS: usize = 6;
+/// Default byte cap above which a *stale* tool-result body is elided to a
+/// stub. ~2 KB keeps short results (exit codes, "ok", small JSON) intact —
+/// stubbing those saves nothing — while collapsing the file reads, command
+/// stdout, and large diffs that dominate a long transcript.
+pub const DEFAULT_TOOL_RESULT_ELIDE_BYTES: usize = 2_048;
+
+/// Knobs for [`elide_stale_tool_results`]. Build from `RunnerConfig`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElisionCfg {
+    /// Keep this many of the most-recent tool results full. Everything
+    /// older is *eligible* for elision. `0` makes every tool result
+    /// eligible (the current turn included), which is rarely what you
+    /// want; the runner defaults to [`DEFAULT_RECENT_TOOL_RESULTS`].
+    pub recent_results_kept: usize,
+    /// Elide an eligible (stale) tool-result body only when it exceeds
+    /// this many bytes. `0` elides every eligible result regardless of
+    /// size. Defaults to [`DEFAULT_TOOL_RESULT_ELIDE_BYTES`].
+    pub max_result_bytes: usize,
+}
+
+impl Default for ElisionCfg {
+    fn default() -> Self {
+        Self {
+            recent_results_kept: DEFAULT_RECENT_TOOL_RESULTS,
+            max_result_bytes: DEFAULT_TOOL_RESULT_ELIDE_BYTES,
+        }
+    }
+}
 
 /// Output of [`format_messages`] — the user-side prompt plus the picked
 /// rows in stable order. The caller persists `rows` (e.g. to ack each one).
@@ -80,6 +124,104 @@ pub fn extract_inbound_images(rows: &[MessageInRow]) -> Vec<(String, String)> {
         out.push((media_type, data.to_string()));
     }
     out
+}
+
+/// Shrink the replayed transcript by stubbing out stale, oversized
+/// tool-result bodies.
+///
+/// The model has already read and acted on old tool output; re-sending a
+/// 4 KB file read or a screenful of command stdout on every subsequent
+/// turn is pure waste. This walks `history`, finds the [`HistoryMessage::Tool`]
+/// results, keeps the most-recent `cfg.recent_results_kept` of them full
+/// (so the current turn and recent context are always intact), and
+/// replaces the body of any older result that exceeds
+/// `cfg.max_result_bytes` with a compact stub such as:
+///
+/// ```text
+/// [elided: stale tool result, 4.2 KB, 142 lines — re-run the tool if you need it again]
+/// ```
+///
+/// Crucially, only the `content` *string* of a `Tool` entry is rewritten.
+/// No entry is added, removed, or reordered, and `tool_use_id` is never
+/// touched — so the `tool_use` ↔ `tool_result` pairing that strict
+/// providers require is preserved exactly. Already-errored results
+/// (`is_error == true`) are left full: they're usually short and the
+/// model may still be reasoning about the failure.
+///
+/// Returns the input untouched when `recent_results_kept` is large enough
+/// to cover every result, when no eligible result exceeds the cap, or
+/// when the history has no tool results at all — so the common short
+/// transcript pays only one cheap pass.
+#[must_use]
+pub fn elide_stale_tool_results(
+    history: Vec<HistoryMessage>,
+    cfg: &ElisionCfg,
+) -> Vec<HistoryMessage> {
+    // Index every tool result so we can tell "recent" from "stale" by
+    // position among results (a stable, provider-agnostic notion of
+    // "turns old" — each result corresponds to one executed tool call).
+    let result_indices: Vec<usize> = history
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| matches!(m, HistoryMessage::Tool { .. }).then_some(i))
+        .collect();
+
+    // Nothing to do if everything is within the protected recent window.
+    if result_indices.len() <= cfg.recent_results_kept {
+        return history;
+    }
+    // History positions `< stale_cutoff_idx` are "stale" and eligible;
+    // positions `>=` it are recent and kept full. `recent_results_kept == 0`
+    // protects nothing, so the cutoff is the end of the history (every
+    // result eligible). Otherwise it's the position of the
+    // `recent_results_kept`-th-from-last result.
+    let keep_from = result_indices.len() - cfg.recent_results_kept;
+    let stale_cutoff_idx = result_indices
+        .get(keep_from)
+        .copied()
+        .unwrap_or(history.len());
+
+    let mut out = history;
+    for (i, m) in out.iter_mut().enumerate() {
+        if i >= stale_cutoff_idx {
+            // Recent result (or anything after the cutoff) — leave full.
+            break;
+        }
+        if let HistoryMessage::Tool {
+            content, is_error, ..
+        } = m
+        {
+            if *is_error {
+                continue; // keep failures legible
+            }
+            if already_elided(content) {
+                continue; // idempotent across turns
+            }
+            if content.len() > cfg.max_result_bytes {
+                *content = elision_stub(content);
+            }
+        }
+    }
+    out
+}
+
+/// Marker prefix the stub carries so a second pass over an
+/// already-elided transcript is a no-op (the runner re-elides every turn).
+const ELISION_MARKER: &str = "[elided: stale tool result";
+
+fn already_elided(content: &str) -> bool {
+    content.starts_with(ELISION_MARKER)
+}
+
+/// Build the one-line replacement body for a stale tool result, recording
+/// its original size so the model knows what it's missing and can re-run
+/// the tool if it genuinely needs the output again.
+fn elision_stub(original: &str) -> String {
+    let bytes = original.len();
+    let lines = original.lines().count().max(1);
+    format!(
+        "{ELISION_MARKER}, {bytes} bytes, {lines} lines — re-run the tool if you need this output again]"
+    )
 }
 
 /// Best-effort extraction of a text body from a stored JSON content blob.
@@ -247,5 +389,220 @@ mod tests {
         m.kind = MessageKind::System;
         let ft = format_messages(vec![m]);
         assert!(ft.prompt.starts_with("[system"));
+    }
+
+    // ---- tool-result elision ----
+
+    fn tu(id: &str) -> HistoryMessage {
+        HistoryMessage::ToolUse {
+            id: id.into(),
+            name: "read_file".into(),
+            input: json!({"path": "src/x.rs"}),
+        }
+    }
+    fn tr(id: &str, body: &str) -> HistoryMessage {
+        HistoryMessage::Tool {
+            tool_use_id: id.into(),
+            content: body.into(),
+            is_error: false,
+        }
+    }
+    fn big(n: usize) -> String {
+        "x".repeat(n)
+    }
+    fn is_stub(m: &HistoryMessage) -> bool {
+        matches!(m, HistoryMessage::Tool { content, .. } if content.starts_with("[elided: stale tool result"))
+    }
+
+    #[test]
+    fn stale_large_result_is_elided_recent_stays_full() {
+        // Two tool turns. Keep the most-recent 1 result full; the older
+        // (large) one must be stubbed.
+        let cfg = ElisionCfg {
+            recent_results_kept: 1,
+            max_result_bytes: 1_024,
+        };
+        let history = vec![
+            HistoryMessage::User {
+                content: "do it".into(),
+            },
+            tu("a"),
+            tr("a", &big(4_096)), // stale + large → elide
+            HistoryMessage::Assistant {
+                content: "read it".into(),
+            },
+            tu("b"),
+            tr("b", &big(4_096)), // most-recent result → keep full
+        ];
+        let out = elide_stale_tool_results(history, &cfg);
+        // Structure preserved: same length, same kinds, ids untouched.
+        assert_eq!(out.len(), 6);
+        assert!(is_stub(&out[2]), "stale large result should be a stub");
+        // Stub mentions the original size so the model knows what's gone.
+        if let HistoryMessage::Tool { content, .. } = &out[2] {
+            assert!(content.contains("4096 bytes"));
+            assert!(content.contains("re-run the tool"));
+        } else {
+            panic!("expected Tool at 2");
+        }
+        // Recent (current-turn) result is untouched.
+        assert!(!is_stub(&out[5]));
+        if let HistoryMessage::Tool { content, .. } = &out[5] {
+            assert_eq!(content.len(), 4_096);
+        }
+        // Pairing intact: every tool_use_id still has a matching result.
+        assert_pairing_valid(&out);
+    }
+
+    #[test]
+    fn small_stale_result_is_not_elided() {
+        // Stale, but under the byte cap — stubbing it would save nothing.
+        let cfg = ElisionCfg {
+            recent_results_kept: 1,
+            max_result_bytes: 1_024,
+        };
+        let history = vec![
+            tu("a"),
+            tr("a", "exit code 0"), // stale + small → keep
+            tu("b"),
+            tr("b", &big(4_096)),
+        ];
+        let out = elide_stale_tool_results(history, &cfg);
+        assert!(!is_stub(&out[1]), "small stale result must stay full");
+        if let HistoryMessage::Tool { content, .. } = &out[1] {
+            assert_eq!(content, "exit code 0");
+        }
+    }
+
+    #[test]
+    fn errored_results_are_kept_full() {
+        let cfg = ElisionCfg {
+            recent_results_kept: 0,
+            max_result_bytes: 16,
+        };
+        let history = vec![
+            tu("a"),
+            HistoryMessage::Tool {
+                tool_use_id: "a".into(),
+                content: big(4_096),
+                is_error: true, // failures stay legible
+            },
+            tu("b"),
+            tr("b", &big(4_096)),
+        ];
+        let out = elide_stale_tool_results(history, &cfg);
+        assert!(!is_stub(&out[1]), "errored result must stay full");
+    }
+
+    #[test]
+    fn nothing_elided_when_all_within_recent_window() {
+        // recent_results_kept covers every result → input returned as-is.
+        let cfg = ElisionCfg {
+            recent_results_kept: 8,
+            max_result_bytes: 0,
+        };
+        let history = vec![tu("a"), tr("a", &big(4_096)), tu("b"), tr("b", &big(4_096))];
+        let out = elide_stale_tool_results(history.clone(), &cfg);
+        assert_eq!(out, history);
+    }
+
+    #[test]
+    fn no_tool_results_is_a_noop() {
+        let cfg = ElisionCfg::default();
+        let history = vec![
+            HistoryMessage::User {
+                content: big(10_000),
+            },
+            HistoryMessage::Assistant {
+                content: big(10_000),
+            },
+        ];
+        let out = elide_stale_tool_results(history.clone(), &cfg);
+        assert_eq!(out, history, "non-Tool entries are never touched");
+    }
+
+    #[test]
+    fn elision_is_idempotent_across_turns() {
+        // The runner re-runs elision every turn; a second pass over an
+        // already-stubbed transcript must not double-stub or change sizes.
+        let cfg = ElisionCfg {
+            recent_results_kept: 1,
+            max_result_bytes: 1_024,
+        };
+        let history = vec![tu("a"), tr("a", &big(4_096)), tu("b"), tr("b", &big(4_096))];
+        let once = elide_stale_tool_results(history, &cfg);
+        let twice = elide_stale_tool_results(once.clone(), &cfg);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn parallel_batch_stale_results_elide_without_breaking_pairs() {
+        // A parallel tool batch: tu a, tu b, tr a, tr b, then a newer
+        // batch. The older batch's large results elide; pairing holds.
+        let cfg = ElisionCfg {
+            recent_results_kept: 2,
+            max_result_bytes: 1_024,
+        };
+        let history = vec![
+            tu("a"),
+            tu("b"),
+            tr("a", &big(4_096)),
+            tr("b", &big(4_096)),
+            tu("c"),
+            tu("d"),
+            tr("c", &big(4_096)),
+            tr("d", &big(4_096)),
+        ];
+        let out = elide_stale_tool_results(history, &cfg);
+        // Oldest two results (a, b) elide; newest two (c, d) stay full.
+        assert!(is_stub(&out[2]));
+        assert!(is_stub(&out[3]));
+        assert!(!is_stub(&out[6]));
+        assert!(!is_stub(&out[7]));
+        assert_pairing_valid(&out);
+    }
+
+    #[test]
+    fn zero_byte_cap_elides_every_stale_result() {
+        // max_result_bytes == 0 means "elide all eligible regardless of
+        // size", protecting only the recent window.
+        let cfg = ElisionCfg {
+            recent_results_kept: 1,
+            max_result_bytes: 0,
+        };
+        let history = vec![tu("a"), tr("a", "tiny"), tu("b"), tr("b", "also tiny")];
+        let out = elide_stale_tool_results(history, &cfg);
+        assert!(is_stub(&out[1]), "even a tiny stale result elides at cap 0");
+        assert!(!is_stub(&out[3]), "the recent result is protected");
+    }
+
+    /// Every `tool_use_id` on a `Tool` result must correspond to a
+    /// `ToolUse` id that appears earlier — the invariant strict providers
+    /// enforce.
+    /// Elision must never disturb this.
+    fn assert_pairing_valid(history: &[HistoryMessage]) {
+        use std::collections::HashSet;
+        let mut seen_uses: HashSet<&str> = HashSet::new();
+        for m in history {
+            match m {
+                HistoryMessage::ToolUse { id, .. } => {
+                    seen_uses.insert(id.as_str());
+                }
+                HistoryMessage::Tool { tool_use_id, .. } => {
+                    assert!(
+                        seen_uses.contains(tool_use_id.as_str()),
+                        "tool_result {tool_use_id} has no preceding tool_use"
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[test]
+    fn elision_cfg_default_matches_documented_constants() {
+        let d = ElisionCfg::default();
+        assert_eq!(d.recent_results_kept, DEFAULT_RECENT_TOOL_RESULTS);
+        assert_eq!(d.max_result_bytes, DEFAULT_TOOL_RESULT_ELIDE_BYTES);
     }
 }

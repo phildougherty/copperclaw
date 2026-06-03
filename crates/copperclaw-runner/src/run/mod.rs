@@ -327,6 +327,14 @@ pub struct RunnerDeps {
     pub assistant_name: Option<String>,
     /// Compaction configuration.
     pub compaction: CompactionCfg,
+    /// Per-turn transcript-shrink configuration. Stale, oversized
+    /// tool-result bodies are replaced with a one-line stub before the
+    /// transcript is replayed to the provider (see
+    /// [`crate::formatter::elide_stale_tool_results`]); recent results —
+    /// including the current turn's — are left full. The persisted
+    /// `state.history` is NOT mutated, so the elision is a pure send-time
+    /// view and a later compaction still summarises the real bodies.
+    pub elision: crate::formatter::ElisionCfg,
     /// How many turns to run before exiting cleanly. `None` means loop forever.
     pub max_turns: Option<usize>,
     /// Per-iteration sleep when the inbox is empty.
@@ -450,10 +458,20 @@ impl RunnerDeps {
                 model_input_window: 200_000,
                 safety_margin_tokens: 8_000,
                 output_reserve_tokens: 4_096,
+                // Test default: soft trigger off so the existing
+                // hard-window compaction fixtures behave unchanged.
+                soft_target_tokens: 0,
                 summary_model: "claude-sonnet-4-6".into(),
                 summary_effort: Effort::Low,
                 summary_max_tokens: 1024,
                 archive_dir,
+            },
+            // Test default: elision effectively off (no result body can
+            // exceed `usize::MAX`), so transcript/replay fixtures see the
+            // full history. Production wires real knobs from RunnerConfig.
+            elision: crate::formatter::ElisionCfg {
+                recent_results_kept: 0,
+                max_result_bytes: usize::MAX,
             },
             max_turns: None,
             idle_sleep: Duration::from_millis(POLL_INTERVAL_MS),

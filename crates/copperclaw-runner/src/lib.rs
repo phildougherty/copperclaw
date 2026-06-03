@@ -26,7 +26,7 @@ pub use compaction::{CompactionCfg, compact, estimate_tokens};
 pub use config::{RunnerConfig, RunnerConfigFile};
 pub use destinations::{ResolvedRoute, resolve_recipient};
 pub use disallowed::{DISALLOWED_TOOLS, is_disallowed};
-pub use formatter::{FormattedTurn, format_messages};
+pub use formatter::{ElisionCfg, FormattedTurn, elide_stale_tool_results, format_messages};
 pub use run::{
     ACTIVE_POLL_INTERVAL_MS, DEFAULT_MAX_TASK_TOKENS, DEFAULT_MAX_TOOL_TURNS,
     DEFAULT_PROVIDER_DEADLINE_MS, DEFAULT_TOOL_DEADLINE_SECS, MAX_MAX_TASK_TOKENS,
