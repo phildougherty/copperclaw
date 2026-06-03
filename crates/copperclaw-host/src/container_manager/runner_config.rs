@@ -102,20 +102,13 @@ impl ContainerManager {
         cc: Option<&container_configs::ContainerConfig>,
         session_root: Option<&Path>,
     ) -> RunnerConfigForFile {
-        let provider_raw = session
-            .agent_provider
-            .clone()
-            .or_else(|| cc.and_then(|c| c.provider.clone()))
-            .unwrap_or_else(|| self.cfg.default_provider.clone());
-        // Normalize aliases for the runner; unknown values pass through
-        // (the runner logs + falls back to anthropic). Empty string is
-        // treated as "use the default" so an empty default_provider doesn't
-        // leak into the JSON file.
-        let provider = match provider_raw.as_str() {
-            "" => None,
-            "claude" => Some("anthropic".to_string()),
-            other => Some(other.to_string()),
-        };
+        // Resolve the provider (precedence + alias normalisation) via the
+        // shared helper so the runner config and the egress auto-inject can
+        // never disagree about which endpoint the group talks to. Unknown
+        // values pass through (the runner logs + falls back to anthropic);
+        // an empty value is treated as "use the default" so an empty
+        // default_provider doesn't leak into the JSON file.
+        let provider = self.resolved_provider(session, cc);
 
         let model = cc
             .and_then(|c| c.model.clone())

@@ -45,7 +45,10 @@ pub mod spawn;
 pub mod tasks_snapshot;
 
 pub use config::{ManagerConfig, ROTATABLE_ENV_KEYS, RotatableConfig, SkillsMode};
-pub use egress::{model_endpoint_entry, parse_egress_mode, resolve_allow_list};
+pub use egress::{
+    model_base_url_for_provider, model_endpoint_entry, parse_egress_mode, resolve_allow_list,
+    resolve_allow_list_for_provider,
+};
 pub use prompt::{
     BASE_PREAMBLE, MEMORY_UNAVAILABLE_FILENAME, PROJECT_BRIEFING_FILENAME,
     SKILLS_CATALOGUE_FILENAME,

@@ -8,9 +8,29 @@
 //! ## Migration safety
 //!
 //! Deny-default must never blackhole the agent's own model traffic. So the
-//! host **auto-injects** the model endpoint — derived from the spawning
-//! container's `ANTHROPIC_BASE_URL` — into every group's effective
-//! allow-list. The per-group `egress_allow` configured by the operator
+//! host **auto-injects** the *real* model endpoint into every group's
+//! effective allow-list — derived from whichever base URL the group's
+//! resolved provider actually talks to, not a hardcoded
+//! `api.anthropic.com` assumption:
+//!
+//!   - **anthropic / openrouter / ollama-shim** (and any unknown provider
+//!     that speaks the Anthropic envelope) use `ANTHROPIC_BASE_URL`,
+//!     defaulting to `https://api.anthropic.com` when unset — matching
+//!     [`copperclaw_providers::anthropic::DEFAULT_BASE_URL`].
+//!   - **ollama** (native) uses `OLLAMA_BASE_URL`, defaulting to
+//!     `http://localhost:11434` when unset — matching the runner's own
+//!     ollama-provider fallback.
+//!   - **codex** has no HTTP endpoint (it brokers a local subprocess), so
+//!     nothing is injected.
+//!
+//! Crucially the default is applied even when the env var is *unset*, so
+//! the common single-provider deployment (Anthropic with no
+//! `ANTHROPIC_BASE_URL` override) still reaches `api.anthropic.com:443`
+//! under deny-default. The earlier code only injected when
+//! `ANTHROPIC_BASE_URL` was explicitly set, which black-holed exactly that
+//! default deployment.
+//!
+//! The per-group `egress_allow` configured by the operator
 //! (`cclaw groups config set-egress-allow`) is unioned on top. The result is
 //! the *resolved* allow-list handed to the container runtime.
 //!
@@ -36,6 +56,66 @@ pub fn parse_egress_mode(raw: Option<&str>) -> EgressMode {
             "deny-default" | "deny_default" | "deny" | "1" | "true" | "yes" | "on" | "enforce",
         ) => EgressMode::DenyDefault,
         _ => EgressMode::AllowAll,
+    }
+}
+
+/// The Anthropic-shaped provider's default base URL, mirrored from
+/// [`copperclaw_providers::anthropic::DEFAULT_BASE_URL`]. Used as the
+/// fallback when `ANTHROPIC_BASE_URL` is unset so the common
+/// single-provider Anthropic deployment still reaches `api.anthropic.com`
+/// under deny-default.
+pub const DEFAULT_ANTHROPIC_BASE_URL: &str = "https://api.anthropic.com";
+
+/// The native-ollama provider's default base URL, mirrored from the
+/// runner's `build_provider` ollama arm. The host injects this when
+/// `OLLAMA_BASE_URL` is unset so a deny-default ollama group still reaches
+/// its model endpoint. (In a typical Docker deployment the operator
+/// overrides this to `http://172.17.0.1:11434` or `host.docker.internal`;
+/// either way we inject whatever they configured.)
+pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434";
+
+/// Resolve the *actual* model-endpoint base URL a group's provider talks
+/// to, so deny-default injects the real host:port rather than a hardcoded
+/// `api.anthropic.com`.
+///
+/// `provider` is the group's already-resolved provider string (after the
+/// same precedence + alias normalisation the runner config applies:
+/// `session.agent_provider` → per-group config → host default, with
+/// `"claude"` ⇒ `"anthropic"`). `anthropic_base_url` is the current
+/// rotatable `ANTHROPIC_BASE_URL`; `ollama_base_url` is the forwarded
+/// `OLLAMA_BASE_URL`. Both are the post-`.env` values (empty strings are
+/// already filtered to `None` upstream).
+///
+/// Returns the base URL string to parse into a host:port entry, or `None`
+/// when the provider has no HTTP model endpoint (`codex`).
+#[must_use]
+pub fn model_base_url_for_provider(
+    provider: Option<&str>,
+    anthropic_base_url: Option<&str>,
+    ollama_base_url: Option<&str>,
+) -> Option<String> {
+    match provider {
+        // Native ollama talks to OLLAMA_BASE_URL, falling back to the
+        // runner's own localhost default when unset.
+        Some("ollama") => Some(
+            ollama_base_url
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(DEFAULT_OLLAMA_BASE_URL)
+                .to_string(),
+        ),
+        // Codex brokers a local subprocess — no HTTP endpoint to allow.
+        Some("codex") => None,
+        // Everything else speaks the Anthropic envelope (anthropic,
+        // openrouter via ANTHROPIC_BASE_URL, ollama-shim, and any unknown
+        // provider the runner falls back to anthropic for). Default to the
+        // canonical Anthropic endpoint when ANTHROPIC_BASE_URL is unset so
+        // the common no-override deployment is never black-holed.
+        _ => Some(
+            anthropic_base_url
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(DEFAULT_ANTHROPIC_BASE_URL)
+                .to_string(),
+        ),
     }
 }
 
@@ -111,13 +191,38 @@ fn split_host_port(host_port: &str, default_port: u16) -> Option<(String, u16)> 
     }
 }
 
-/// Resolve the effective egress allow-list for a spawn.
+/// Resolve the effective egress allow-list for a spawn, given the group's
+/// resolved provider and the host's current model-endpoint env.
+///
+/// Derives the real model base URL via [`model_base_url_for_provider`]
+/// (provider-aware: Anthropic/OpenRouter from `ANTHROPIC_BASE_URL`, ollama
+/// from `OLLAMA_BASE_URL`, each with its real default when unset), parses
+/// it into a `host:port` entry, and unions it with the operator-configured
+/// per-group `group_allow`. The model entry is prepended (and deduplicated)
+/// so deny-default can never blackhole model traffic even if the operator
+/// forgot to list it — and even when the group's allow-list is empty. Order
+/// is otherwise preserved and duplicates are removed.
+#[must_use]
+pub fn resolve_allow_list_for_provider(
+    group_allow: &[String],
+    provider: Option<&str>,
+    anthropic_base_url: Option<&str>,
+    ollama_base_url: Option<&str>,
+) -> Vec<String> {
+    let base_url = model_base_url_for_provider(provider, anthropic_base_url, ollama_base_url);
+    resolve_allow_list(group_allow, base_url.as_deref())
+}
+
+/// Resolve the effective egress allow-list for a spawn from an
+/// already-derived model `base_url`.
 ///
 /// Unions the operator-configured per-group `group_allow` with the
-/// auto-injected model endpoint (from `base_url`). The model entry is
+/// auto-injected model endpoint (parsed from `base_url`). The model entry is
 /// prepended (and deduplicated) so deny-default can never blackhole model
 /// traffic even if the operator forgot to list it. Order is otherwise
-/// preserved and duplicates are removed.
+/// preserved and duplicates are removed. Prefer
+/// [`resolve_allow_list_for_provider`] on the spawn path so the injected
+/// endpoint is provider-correct.
 #[must_use]
 pub fn resolve_allow_list(group_allow: &[String], base_url: Option<&str>) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(group_allow.len() + 1);
@@ -272,6 +377,182 @@ mod tests {
     fn resolve_with_unparseable_base_url_keeps_group_only() {
         let group = vec!["db.local:5432".to_string()];
         let resolved = resolve_allow_list(&group, Some(""));
+        assert_eq!(resolved, group);
+    }
+
+    // --- Provider-aware model-endpoint derivation (migration-safety fix) ---
+
+    #[test]
+    fn model_base_url_anthropic_default_when_base_unset() {
+        // The core migration-safety case: an Anthropic group with NO
+        // ANTHROPIC_BASE_URL override must still resolve to the real
+        // api.anthropic.com endpoint, not None.
+        assert_eq!(
+            model_base_url_for_provider(Some("anthropic"), None, None).as_deref(),
+            Some("https://api.anthropic.com")
+        );
+        // The "claude" alias is normalised to "anthropic" upstream, so a
+        // None/empty provider (default) also takes the Anthropic path.
+        assert_eq!(
+            model_base_url_for_provider(None, None, None).as_deref(),
+            Some("https://api.anthropic.com")
+        );
+        // An empty-string ANTHROPIC_BASE_URL is treated as unset.
+        assert_eq!(
+            model_base_url_for_provider(Some("anthropic"), Some("   "), None).as_deref(),
+            Some("https://api.anthropic.com")
+        );
+    }
+
+    #[test]
+    fn model_base_url_openrouter_uses_anthropic_base() {
+        // OpenRouter rides the Anthropic envelope via ANTHROPIC_BASE_URL.
+        assert_eq!(
+            model_base_url_for_provider(
+                Some("anthropic"),
+                Some("https://openrouter.ai/api/v1"),
+                None,
+            )
+            .as_deref(),
+            Some("https://openrouter.ai/api/v1")
+        );
+        // ollama-shim also speaks the Anthropic envelope at a proxy URL.
+        assert_eq!(
+            model_base_url_for_provider(
+                Some("ollama-shim"),
+                Some("https://proxy.internal:8443"),
+                Some("http://ignored:11434"),
+            )
+            .as_deref(),
+            Some("https://proxy.internal:8443")
+        );
+    }
+
+    #[test]
+    fn model_base_url_ollama_uses_ollama_base_with_localhost_default() {
+        // Native ollama reads OLLAMA_BASE_URL — NOT ANTHROPIC_BASE_URL.
+        assert_eq!(
+            model_base_url_for_provider(
+                Some("ollama"),
+                Some("https://api.anthropic.com"),
+                Some("http://172.17.0.1:11434"),
+            )
+            .as_deref(),
+            Some("http://172.17.0.1:11434")
+        );
+        // Unset OLLAMA_BASE_URL → runner's localhost fallback, never the
+        // Anthropic endpoint and never None.
+        assert_eq!(
+            model_base_url_for_provider(Some("ollama"), Some("https://api.anthropic.com"), None)
+                .as_deref(),
+            Some("http://localhost:11434")
+        );
+    }
+
+    #[test]
+    fn model_base_url_codex_has_no_endpoint() {
+        // Codex brokers a local subprocess — nothing to inject.
+        assert_eq!(
+            model_base_url_for_provider(Some("codex"), Some("https://api.anthropic.com"), None),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_for_provider_openrouter_injects_openrouter() {
+        let resolved = resolve_allow_list_for_provider(
+            &[],
+            Some("anthropic"),
+            Some("https://openrouter.ai/api/v1"),
+            None,
+        );
+        assert_eq!(resolved, vec!["openrouter.ai:443".to_string()]);
+    }
+
+    #[test]
+    fn resolve_for_provider_default_anthropic_injects_api_anthropic() {
+        // Default/unset Anthropic base + empty group allow-list → the model
+        // endpoint is STILL injected (no black-hole), defaulting to
+        // api.anthropic.com:443.
+        let resolved = resolve_allow_list_for_provider(&[], Some("anthropic"), None, None);
+        assert_eq!(resolved, vec!["api.anthropic.com:443".to_string()]);
+        // Same for the unset/default provider.
+        let resolved_default = resolve_allow_list_for_provider(&[], None, None, None);
+        assert_eq!(resolved_default, vec!["api.anthropic.com:443".to_string()]);
+    }
+
+    #[test]
+    fn resolve_for_provider_ollama_injects_ollama_host() {
+        let resolved = resolve_allow_list_for_provider(
+            &[],
+            Some("ollama"),
+            Some("https://api.anthropic.com"),
+            Some("http://host.docker.internal:11434"),
+        );
+        assert_eq!(resolved, vec!["host.docker.internal:11434".to_string()]);
+    }
+
+    #[test]
+    fn resolve_for_provider_empty_group_under_deny_default_still_reaches_model() {
+        // The headline guarantee: an empty per-group allow-list under
+        // deny-default never produces an empty resolved list for an
+        // HTTP-backed provider — the model endpoint is always present.
+        for (provider, anth, olla, expect) in [
+            (Some("anthropic"), None, None, "api.anthropic.com:443"),
+            (None, None, None, "api.anthropic.com:443"),
+            (
+                Some("anthropic"),
+                Some("https://openrouter.ai/api/v1"),
+                None,
+                "openrouter.ai:443",
+            ),
+            (Some("ollama"), None, None, "localhost:11434"),
+            (
+                Some("ollama"),
+                None,
+                Some("http://172.17.0.1:11434"),
+                "172.17.0.1:11434",
+            ),
+        ] {
+            let resolved = resolve_allow_list_for_provider(&[], provider, anth, olla);
+            assert!(
+                !resolved.is_empty(),
+                "empty resolved list would black-hole {provider:?}"
+            );
+            assert_eq!(resolved[0], expect, "wrong endpoint for {provider:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_for_provider_unions_group_after_model_endpoint() {
+        let group = vec![
+            "db.local:5432".to_string(),
+            // Operator already listed the model endpoint — must not double.
+            "openrouter.ai:443".to_string(),
+        ];
+        let resolved = resolve_allow_list_for_provider(
+            &group,
+            Some("anthropic"),
+            Some("https://openrouter.ai/api/v1"),
+            None,
+        );
+        assert_eq!(
+            resolved,
+            vec!["openrouter.ai:443".to_string(), "db.local:5432".to_string(),]
+        );
+    }
+
+    #[test]
+    fn resolve_for_provider_codex_keeps_group_only() {
+        // Codex has no HTTP endpoint, so nothing is injected; the group's
+        // own list passes through unchanged.
+        let group = vec!["db.local:5432".to_string()];
+        let resolved = resolve_allow_list_for_provider(
+            &group,
+            Some("codex"),
+            Some("https://api.anthropic.com"),
+            Some("http://localhost:11434"),
+        );
         assert_eq!(resolved, group);
     }
 }
