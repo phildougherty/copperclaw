@@ -1090,6 +1090,7 @@ dependencies = [
  "copperclaw-modules",
  "copperclaw-types",
  "dashmap",
+ "regex",
  "rusqlite",
  "serde_json",
  "tempfile",

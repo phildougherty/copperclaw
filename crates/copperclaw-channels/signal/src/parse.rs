@@ -128,6 +128,8 @@ pub fn envelope_to_inbound(envelope: &Value) -> Option<InboundEvent> {
             channel_type: channel_type.clone(),
             platform_id: platform_id.clone(),
             thread_id: Some(qid.to_string()),
+            // Quote author not resolved here — must not count as a mention.
+            replying_to_self: None,
         });
 
     let sender_identity = if source.is_empty() {

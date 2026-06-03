@@ -124,6 +124,11 @@ pub fn event_to_inbound(room_id: &str, event: &Value, bot_user_id: &str) -> Opti
             channel_type: ChannelType::new(CHANNEL_TYPE_STR),
             platform_id: room_id.to_owned(),
             thread_id: Some(parent.to_owned()),
+            // The reply relation carries the parent event id but not its
+            // sender, so we cannot tell if the parent was the bot's own
+            // message — leave None so it does not count as a mention. Native
+            // mentions are still detected via `is_mention` below.
+            replying_to_self: None,
         });
 
     let is_mention = Some(detect_mention(content, bot_user_id));
