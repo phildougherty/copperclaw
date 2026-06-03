@@ -160,6 +160,12 @@ pub enum TopCommand {
         #[command(subcommand)]
         action: AuditCmd,
     },
+    /// Image + runner attestation: which image content digest and runner
+    /// binary each container spawn ran (recorded in the append-only audit log).
+    Attestation {
+        #[command(subcommand)]
+        action: AttestationCmd,
+    },
     /// One-shot composite installers for getting a fresh host chatable.
     Quickstart {
         #[command(subcommand)]
@@ -368,6 +374,28 @@ pub enum McpCmd {
         /// May be specified multiple times.
         #[arg(long)]
         env: Vec<String>,
+    },
+    /// Inspect the effective per-server tool include/exclude FILTER for a
+    /// group's configured external MCP servers. Shows the declared
+    /// `allowed_tools` / `denied_tools` and a posture summary so you can
+    /// verify a denied MCP tool is filtered out before it reaches the model.
+    #[command(name = "inspect-filter")]
+    InspectFilter {
+        /// Agent group to inspect.
+        #[arg(long = "agent-group-id")]
+        agent_group_id: String,
+        /// Inspect only this server (omit for all configured servers).
+        #[arg(long)]
+        server: Option<String>,
+    },
+    /// List host-side OAuth tokens stored for a group's external MCP servers.
+    /// Metadata only — the access/refresh secrets are never displayed and
+    /// never leave the host.
+    #[command(name = "oauth-list")]
+    OauthList {
+        /// Agent group whose OAuth tokens to list.
+        #[arg(long = "agent-group-id")]
+        agent_group_id: String,
     },
 }
 
@@ -1109,6 +1137,22 @@ pub enum AuditCmd {
     },
 }
 
+/// `cclaw attestation ...` — read the spawn-time image+runner attestation log.
+#[derive(Debug, Subcommand)]
+pub enum AttestationCmd {
+    /// List recent spawn attestation rows (image tag + image content digest +
+    /// runner-binary digest per container spawn).
+    List {
+        /// Window to look back. Accepts plain seconds (`3600`) or
+        /// `Ns`/`Nm`/`Nh`/`Nd` shorthand. Default 24h.
+        #[arg(long, default_value = "24h")]
+        since: String,
+        /// Max rows returned. Default 50.
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
+}
+
 // ---------------------------------------------------------------------------
 // Conversion from clap structures to `(command, args)` pairs.
 // ---------------------------------------------------------------------------
@@ -1161,6 +1205,7 @@ impl TopCommand {
             Self::Approvals { action } => action.to_call(),
             Self::Pairing { action } => action.to_call(),
             Self::Audit { action } => action.to_call(),
+            Self::Attestation { action } => action.to_call(),
             Self::Budgets { action } => action.to_call(),
             Self::Quickstart { action } => action.to_call(),
             Self::Db { action } => action.to_call(),
@@ -1276,6 +1321,20 @@ impl McpCmd {
                     }),
                 )
             }
+            Self::InspectFilter {
+                agent_group_id,
+                server,
+            } => ParsedCall::new(
+                "mcp.inspect-filter",
+                json!({
+                    "agent_group_id": agent_group_id,
+                    "server": server,
+                }),
+            ),
+            Self::OauthList { agent_group_id } => ParsedCall::new(
+                "mcp.oauth-list",
+                json!({ "agent_group_id": agent_group_id }),
+            ),
         }
     }
 }
@@ -1741,6 +1800,17 @@ impl AuditCmd {
     }
 }
 
+impl AttestationCmd {
+    pub fn to_call(&self) -> ParsedCall {
+        match self {
+            Self::List { since, limit } => ParsedCall::new(
+                "attestation.list",
+                json!({ "since": since, "limit": limit }),
+            ),
+        }
+    }
+}
+
 impl BudgetsCmd {
     pub fn to_call(&self) -> ParsedCall {
         match self {
@@ -1829,6 +1899,8 @@ pub const ALL_COMMANDS: &[&str] = &[
     "db.restore",
     "mcp.list-presets",
     "mcp.add",
+    "mcp.inspect-filter",
+    "mcp.oauth-list",
     "approvals.list",
     "approvals.get",
     "approvals.approve_sender",
@@ -1839,6 +1911,7 @@ pub const ALL_COMMANDS: &[&str] = &[
     "pairing.list",
     "pairing.approve",
     "audit.list",
+    "attestation.list",
     "budgets.list",
     "budgets.set",
     "usage.rollup",
@@ -2916,6 +2989,9 @@ mod tests {
             &["cclaw", "pairing", "list"],
             &["cclaw", "pairing", "approve", "ABCDEFGH"],
             &["cclaw", "audit", "list"],
+            &["cclaw", "attestation", "list"],
+            &["cclaw", "mcp", "inspect-filter", "--agent-group-id", "ag-1"],
+            &["cclaw", "mcp", "oauth-list", "--agent-group-id", "ag-1"],
             &["cclaw", "budgets", "list"],
             &[
                 "cclaw",
@@ -2960,6 +3036,52 @@ mod tests {
                 "ALL_COMMANDS lists {c:?} but no invocation here produces it",
             );
         }
+    }
+
+    #[test]
+    fn attestation_list_parses() {
+        let call = parse(&[
+            "cclaw",
+            "attestation",
+            "list",
+            "--since",
+            "1h",
+            "--limit",
+            "5",
+        ]);
+        assert_eq!(call.command, "attestation.list");
+        assert_eq!(call.args["since"], "1h");
+        assert_eq!(call.args["limit"], 5);
+    }
+
+    #[test]
+    fn mcp_inspect_filter_parses_with_optional_server() {
+        let call = parse(&[
+            "cclaw",
+            "mcp",
+            "inspect-filter",
+            "--agent-group-id",
+            "ag-1",
+            "--server",
+            "github",
+        ]);
+        assert_eq!(call.command, "mcp.inspect-filter");
+        assert_eq!(call.args["agent_group_id"], "ag-1");
+        assert_eq!(call.args["server"], "github");
+    }
+
+    #[test]
+    fn mcp_inspect_filter_server_is_null_when_omitted() {
+        let call = parse(&["cclaw", "mcp", "inspect-filter", "--agent-group-id", "ag-1"]);
+        assert_eq!(call.command, "mcp.inspect-filter");
+        assert!(call.args["server"].is_null());
+    }
+
+    #[test]
+    fn mcp_oauth_list_parses() {
+        let call = parse(&["cclaw", "mcp", "oauth-list", "--agent-group-id", "ag-1"]);
+        assert_eq!(call.command, "mcp.oauth-list");
+        assert_eq!(call.args["agent_group_id"], "ag-1");
     }
 
     #[test]

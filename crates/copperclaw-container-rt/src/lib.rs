@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 
 pub mod apple;
+pub mod attest;
 pub mod build;
 pub mod dns;
 pub mod docker;
@@ -27,7 +28,11 @@ pub mod nftables;
 pub mod spec;
 
 pub use crate::apple::AppleContainerRuntime;
-pub use crate::build::{ExtraFile, ImageBuildSpec};
+pub use crate::attest::{DigestComparison, compare_digests, normalize_digest};
+pub use crate::build::{
+    BuildContainment, BuildNetwork, ContainmentViolation, ExtraFile, ImageBuildSpec,
+    looks_like_credential,
+};
 pub use crate::dns::{FilterResolverConfig, dnsmasq_conf, resolv_conf_contents};
 pub use crate::docker::DockerRuntime;
 pub use crate::nftables::{NftApplyPlan, NftPlan, build_ruleset};
@@ -99,6 +104,21 @@ pub trait ContainerRuntime: Send + Sync {
     async fn image_exists(&self, tag: &str) -> Result<bool, RtError> {
         let _ = tag;
         Ok(false)
+    }
+
+    /// Return the content digest the runtime records for the image behind
+    /// `tag` (Docker's `.Id`, a `sha256:<hex>` string), or `Ok(None)` when the
+    /// image isn't present locally. Used by the host's spawn-time attestation
+    /// to record the digest in the audit log and by the boot-time digest check
+    /// to detect an image that changed behind a tag.
+    ///
+    /// The default impl returns `Ok(None)` — backends that can't surface a
+    /// digest (the in-process test stub, `AppleContainerRuntime` today) report
+    /// "no digest" rather than failing; the host treats a missing digest as
+    /// [`crate::attest::DigestComparison::Unknown`], not a mismatch.
+    async fn image_digest(&self, tag: &str) -> Result<Option<String>, RtError> {
+        let _ = tag;
+        Ok(None)
     }
 
     /// Capture up to `tail` lines from the named container's combined

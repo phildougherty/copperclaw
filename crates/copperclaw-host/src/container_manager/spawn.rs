@@ -376,6 +376,27 @@ impl ContainerManager {
         sessions::mark_container_running(&self.central, session.id).map_err(ManagerError::Db)?;
         copperclaw_metrics::inc_containers_spawned();
         copperclaw_metrics::observe_container_spawn_seconds(spawn_elapsed);
+
+        // Image + runner attestation (Phase 6 supply-chain). Record, in the
+        // append-only audit log, the image tag + the runtime-reported image
+        // content digest + the host runner-binary digest for this spawn — a
+        // tamper-evident record of exactly which third-party-buildable image
+        // and which runner each session ran. Best-effort: a runtime digest
+        // error or a DB error degrades to a partial/absent record and is
+        // logged, never failing the spawn (attestation is a record, not a
+        // gate, at spawn time). The default install is unaffected in behaviour
+        // — it just gains an extra audit row per spawn.
+        let runner_path = crate::image_health::default_host_runner_path();
+        let attestation = crate::attestation::gather(
+            self.runtime.as_ref(),
+            &image_tag,
+            runner_path.as_deref(),
+            session.id,
+            session.agent_group_id,
+        )
+        .await;
+        crate::attestation::record(&self.central, &attestation);
+
         info!(
             session = %session.id.as_uuid(),
             container = %handle.id,
@@ -415,6 +436,29 @@ impl ContainerManager {
         let mut build_spec = ImageBuildSpec::new("copperclaw/session", &base);
         build_spec.apt_packages.clone_from(&cfg.packages_apt);
         build_spec.npm_packages.clone_from(&cfg.packages_npm);
+        // install_packages containment (Phase 6 supply-chain). The apt/npm
+        // install + any package postinstall scripts run during this build are
+        // third-party code. We dispatch the build under an explicit containment
+        // posture: `deny_broker_token` is on (the default), so the build can
+        // carry NO credential-shaped build-arg or label — the per-session
+        // broker capability token is minted only at container SPAWN into the
+        // container env and is structurally absent from the build, so a
+        // malicious postinstall can never receive it. We do NOT thread any
+        // credential into `build_spec.build_args`. Network stays on the bridge
+        // because apt/npm need real package-registry egress; the containment is
+        // "no broker token + no broker-loopback capability", not the
+        // unrestricted-egress regime the running agent would otherwise have.
+        build_spec =
+            build_spec.with_containment(copperclaw_container_rt::BuildContainment::default());
+        // Defense-in-depth: refuse to dispatch a build that somehow acquired a
+        // credential-shaped input. Clean by construction here; the assert makes
+        // a future regression (someone adding a build-arg) fail loudly rather
+        // than leaking a secret into a package postinstall.
+        if let Err(violation) = build_spec.assert_no_credentials() {
+            return Err(ManagerError::Spawn(
+                copperclaw_container_rt::RtError::Container(violation.to_string()),
+            ));
+        }
         let tag = self
             .runtime
             .build_image(build_spec)
@@ -2933,6 +2977,249 @@ mod tests {
         assert!(
             runtime.spawn_calls().is_empty(),
             "no runtime spawn allowed in degraded mode"
+        );
+    }
+
+    /// Phase 6 supply-chain: a successful spawn records an attestation row in
+    /// the central audit log carrying the runtime-reported image digest.
+    #[tokio::test]
+    async fn spawn_records_attestation_digest_in_audit_log() {
+        use copperclaw_db::tables::audit_log;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        // Runtime reports a content digest for the image it spawns.
+        let runtime = std::sync::Arc::new(
+            crate::tests::NoopRuntime::default().with_image_digest("sha256:deadbeefcafe"),
+        );
+        let mgr = ContainerManager::new(
+            db.clone(),
+            runtime.clone(),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        let conn = open_inbound(&paths).unwrap();
+        messages_in::insert(
+            &conn,
+            &messages_in::WriteInbound {
+                id: copperclaw_types::MessageId::new(),
+                kind: copperclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "hi"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("stdin".into()),
+                channel_type: Some(copperclaw_types::ChannelType::new("cli")),
+                thread_id: None,
+                source_session_id: None,
+                reply_to: None,
+                is_group: None,
+            },
+        )
+        .unwrap();
+
+        let spawned = mgr.maybe_spawn(&session).await.unwrap();
+        assert!(spawned, "expected a spawn with pending inbound");
+        assert_eq!(runtime.spawn_calls().len(), 1, "exactly one spawn");
+
+        // The attestation row is present and carries the image digest.
+        let rows = audit_log::list_recent(&db, chrono::Utc::now() - chrono::Duration::hours(1), 50)
+            .unwrap();
+        let att = rows
+            .iter()
+            .find(|r| r.command == crate::attestation::ATTESTATION_COMMAND)
+            .expect("attestation audit row must exist after spawn");
+        assert_eq!(att.caller_kind, "host");
+        assert_eq!(
+            att.caller_session.as_deref(),
+            Some(session.id.as_uuid().to_string().as_str())
+        );
+        let args: serde_json::Value = serde_json::from_str(&att.args).unwrap();
+        assert_eq!(args["image_digest"], "sha256:deadbeefcafe");
+        assert!(
+            args["image_tag"].as_str().is_some_and(|s| !s.is_empty()),
+            "image_tag must be recorded"
+        );
+    }
+
+    // ── install_packages containment ───────────────────────────────
+
+    /// Phase 6 supply-chain: the apt/npm install build dispatched by
+    /// `rebuild_image` must run broker-token-denied. Even with the credential
+    /// broker ENABLED on the manager, the build spec handed to the runtime
+    /// carries the deny-broker-token containment posture and NO credential
+    /// build-arg — so a malicious package postinstall cannot receive the
+    /// per-session broker capability token (the token is minted only at
+    /// container spawn, never threaded into a build).
+    #[tokio::test]
+    async fn install_packages_build_is_broker_token_denied() {
+        use super::super::broker::{BrokerConfig, BrokerState};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let runtime = std::sync::Arc::new(crate::tests::NoopRuntime::default());
+        // Broker ENABLED — the worst case for a token leak into a build.
+        let broker_cfg =
+            BrokerConfig::resolve(true, Some("sk-real-key"), None, Some(3600)).unwrap();
+        let broker = std::sync::Arc::new(BrokerState::new(broker_cfg));
+        let mgr = ContainerManager::new(
+            db.clone(),
+            runtime.clone(),
+            manager_cfg(tmp.path().to_path_buf()),
+        )
+        .with_broker(broker, "http://127.0.0.1:48080".into());
+
+        let session = fixture_session(&db);
+        // Config with agent-requested packages (the install_packages outcome).
+        let cfg = container_configs::ContainerConfig {
+            agent_group_id: session.agent_group_id,
+            provider: None,
+            model: None,
+            effort: None,
+            image_tag: None,
+            assistant_name: None,
+            max_messages_per_prompt: None,
+            skills: container_configs::SkillsSelector::All,
+            mcp_servers: serde_json::json!({}),
+            packages_apt: vec!["cowsay".into()],
+            packages_npm: vec!["left-pad".into()],
+            additional_mounts: serde_json::json!([]),
+            cli_scope: container_configs::CliScope::Group,
+            config_fingerprint: None,
+            egress_allow: vec![],
+            resource_limits: serde_json::json!({}),
+            coding_enabled: false,
+            surface_thinking: false,
+            tool_profile: None,
+            updated_at: chrono::Utc::now(),
+        };
+        // rebuild_image writes the new tag back to container_configs, so the
+        // row must exist first.
+        container_configs::upsert(
+            &db,
+            container_configs::UpsertContainerConfig {
+                agent_group_id: session.agent_group_id,
+                provider: None,
+                model: None,
+                effort: None,
+                image_tag: None,
+                assistant_name: None,
+                max_messages_per_prompt: None,
+                skills: container_configs::SkillsSelector::All,
+                mcp_servers: serde_json::json!({}),
+                packages_apt: vec!["cowsay".into()],
+                packages_npm: vec!["left-pad".into()],
+                additional_mounts: serde_json::json!([]),
+                cli_scope: container_configs::CliScope::Group,
+                config_fingerprint: None,
+                egress_allow: vec![],
+                resource_limits: serde_json::json!({}),
+                coding_enabled: false,
+                surface_thinking: false,
+                tool_profile: None,
+            },
+        )
+        .unwrap();
+
+        let _tag = mgr
+            .rebuild_image(session.agent_group_id, &cfg)
+            .await
+            .expect("rebuild should succeed");
+
+        let specs = runtime.build_specs();
+        assert_eq!(specs.len(), 1, "exactly one build dispatched");
+        let built = &specs[0];
+        // 1. The build packages match the agent's request.
+        assert_eq!(built.apt_packages, vec!["cowsay".to_string()]);
+        assert_eq!(built.npm_packages, vec!["left-pad".to_string()]);
+        // 2. Containment denies the broker token.
+        assert!(
+            built.containment.deny_broker_token,
+            "install_packages build must deny the broker token"
+        );
+        // 3. NO build-arg / label is credential-shaped (the broker token, the
+        //    real key, etc. never ride into the build), even with broker on.
+        assert!(
+            built.assert_no_credentials().is_ok(),
+            "build spec must carry no credential-shaped input"
+        );
+        assert!(
+            built.build_args.is_empty(),
+            "no build-args threaded into the package build"
+        );
+        // 4. The real key must not appear anywhere in the build spec's inputs.
+        let serialized = format!("{built:?}");
+        assert!(
+            !serialized.contains("sk-real-key"),
+            "the real provider key must not leak into the build spec"
+        );
+        assert!(
+            !serialized.contains("cct1."),
+            "no broker capability token may leak into the build spec"
+        );
+    }
+
+    /// Phase 6 supply-chain: an OAuth token stored host-side for an external
+    /// MCP server must NEVER be forwarded into the container env. The token
+    /// lives only in the central `mcp_oauth_tokens` table; `build_spec` builds
+    /// the container env from the rotatable config + broker, and never reads
+    /// the OAuth store — so a shell inside the container can't `printenv` the
+    /// token.
+    #[test]
+    fn oauth_token_stored_host_side_never_enters_container_env() {
+        use copperclaw_db::tables::mcp_oauth_tokens;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+
+        // Store an OAuth token for this group's "github" MCP server.
+        let secret = "oauth-access-SECRET-do-not-leak";
+        mcp_oauth_tokens::upsert(
+            &db,
+            &mcp_oauth_tokens::UpsertMcpOAuthToken {
+                agent_group_id: session.agent_group_id,
+                server_name: "github".into(),
+                access_token: secret.into(),
+                refresh_token: Some("refresh-SECRET".into()),
+                token_type: "Bearer".into(),
+                scope: Some("repo".into()),
+                expires_at: None,
+            },
+        )
+        .unwrap();
+
+        // It is durably stored host-side.
+        let stored = mcp_oauth_tokens::get(&db, session.agent_group_id, "github")
+            .unwrap()
+            .expect("token stored host-side");
+        assert_eq!(stored.access_token, secret);
+
+        // But it must not appear anywhere in the spawned container's env.
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
+        for (k, v) in &spec.env {
+            assert!(
+                !v.contains("SECRET"),
+                "OAuth token must not be in container env (var {k})"
+            );
+        }
+        assert!(
+            !spec
+                .env
+                .iter()
+                .any(|(k, _)| k.contains("OAUTH") || k.eq_ignore_ascii_case("GITHUB_TOKEN")),
+            "no OAuth-bearing env var may be injected into the container"
         );
     }
 

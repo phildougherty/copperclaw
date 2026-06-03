@@ -1053,6 +1053,16 @@ async fn run_boot_image_health_check(
     match crate::image_health::check_image_health(&probe, image_tag, host_fp.as_deref()).await {
         Ok(()) => {
             info!(image_tag = %image_tag, "boot image health check passed");
+            // Phase 6 supply-chain: boot-time attestation digest check. Opt-in
+            // via COPPERCLAW_EXPECTED_IMAGE_DIGEST — when an operator pins the
+            // expected image content digest, compare the live digest against it
+            // (a real comparison, not a stub). Default install pins nothing, so
+            // this reports `no-baseline` and changes nothing. The result is
+            // logged inside the helper; a mismatch is loud but does NOT degrade
+            // boot (the image health check above already gates spawnability).
+            let expected = std::env::var(crate::image_health::EXPECTED_IMAGE_DIGEST_ENV).ok();
+            crate::image_health::check_boot_image_digest(&probe, image_tag, expected.as_deref())
+                .await;
             None
         }
         Err(reason) => {

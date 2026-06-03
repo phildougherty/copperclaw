@@ -93,6 +93,10 @@ const CENTRAL: &[Migration] = &[
         name: "020_provider_profiles",
         sql: include_str!("../migrations/020_provider_profiles.sql"),
     },
+    Migration {
+        name: "022_mcp_oauth_tokens",
+        sql: include_str!("../migrations/022_mcp_oauth_tokens.sql"),
+    },
 ];
 
 const SESSION_INBOUND: &[Migration] = &[
@@ -266,6 +270,7 @@ mod tests {
             "tasks",
             "provider_profiles",
             "provider_health",
+            "mcp_oauth_tokens",
         ] {
             let exists: i64 = conn
                 .query_row(

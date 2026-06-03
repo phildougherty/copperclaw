@@ -29,6 +29,8 @@ use copperclaw_cclaw::ErrorPayload;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::container_configs;
 use copperclaw_db::tables::container_configs::{CliScope, SkillsSelector};
+use copperclaw_db::tables::mcp_oauth_tokens;
+use copperclaw_mcp::ToolFilter;
 use copperclaw_types::AgentGroupId;
 use serde_json::{Map, Value, json};
 
@@ -240,6 +242,114 @@ pub fn add(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
         "agent_group_id": agent_group_id.as_uuid().to_string(),
         "preset": preset_name,
         "server": server_entry,
+    }))
+}
+
+/// `mcp.inspect-filter` — report the EFFECTIVE per-server tool include/exclude
+/// filter for a group's configured external MCP servers.
+///
+/// Arguments:
+/// - `agent_group_id` (string, required).
+/// - `server` (string, optional): inspect just this server; omit for all.
+///
+/// For each server, returns the declared `allowed_tools` / `denied_tools` and a
+/// human summary (`open` / `deny-list` / `allow-list` / `permit-nothing`) so an
+/// operator can verify a denied MCP tool really is filtered out before it ever
+/// reaches the model. Read-only; safe for agent callers to introspect their
+/// own group.
+pub fn inspect_filter(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
+    let agent_group_id = parse_agent_group_id(args, "agent_group_id")?;
+    let only = args.get("server").and_then(Value::as_str);
+    let servers = container_configs::get_mcp_servers(central, agent_group_id)
+        .map_err(db_err)
+        .unwrap_or(Value::Object(Map::new()));
+    let obj = servers.as_object().cloned().unwrap_or_default();
+
+    let mut out = Vec::new();
+    for (name, entry) in &obj {
+        if let Some(only) = only {
+            if only != name {
+                continue;
+            }
+        }
+        let filter = ToolFilter::from_server_entry(entry);
+        let allowed = entry
+            .get(copperclaw_mcp::ALLOWED_TOOLS_KEY)
+            .cloned()
+            .unwrap_or(Value::Null);
+        let denied = entry
+            .get(copperclaw_mcp::DENIED_TOOLS_KEY)
+            .cloned()
+            .unwrap_or(Value::Null);
+        out.push(json!({
+            "server": name,
+            "summary": filter_summary(&filter, &allowed),
+            "allowed_tools": allowed,
+            "denied_tools": denied,
+            "allow_count": filter.allow_len(),
+            "deny_count": filter.deny_len(),
+            "is_open": filter.is_open(),
+        }));
+    }
+    if let Some(only) = only {
+        if out.is_empty() {
+            return Err(ErrorPayload::new(
+                "not_found",
+                format!("no MCP server named `{only}` is configured for this group"),
+            ));
+        }
+    }
+    Ok(json!({
+        "agent_group_id": agent_group_id.as_uuid().to_string(),
+        "servers": out,
+    }))
+}
+
+/// One-word summary of a filter's posture for operator-facing output.
+fn filter_summary(filter: &ToolFilter, allowed_raw: &Value) -> &'static str {
+    if filter.is_open() {
+        return "open";
+    }
+    // An allow-list was declared. If it parsed to zero names it permits
+    // nothing (a deliberate kill switch); otherwise it's a positive gate.
+    let allow_declared = !allowed_raw.is_null();
+    if allow_declared && filter.allow_len() == 0 {
+        "permit-nothing"
+    } else if allow_declared {
+        "allow-list"
+    } else {
+        "deny-list"
+    }
+}
+
+/// `mcp.oauth-list` — list host-side OAuth tokens stored for a group's external
+/// MCP servers, METADATA ONLY (the access/refresh tokens are never returned).
+///
+/// This is the operator's window into the host-side OAuth store
+/// (`mcp_oauth_tokens`): which servers have a token, its type/scope/expiry, and
+/// when it was last refreshed — without ever surfacing the secret. The tokens
+/// live on the host and are never forwarded into the container env.
+pub fn oauth_list(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
+    let agent_group_id = parse_agent_group_id(args, "agent_group_id")?;
+    let rows = mcp_oauth_tokens::list_for_group(central, agent_group_id).map_err(db_err)?;
+    let tokens: Vec<Value> = rows
+        .iter()
+        .map(|t| {
+            json!({
+                "server": t.server_name,
+                "token_type": t.token_type,
+                "scope": t.scope,
+                "has_refresh_token": t.refresh_token.is_some(),
+                "expires_at": t.expires_at.map(|d| d.to_rfc3339()),
+                "updated_at": t.updated_at.to_rfc3339(),
+                // NB: access_token / refresh_token are intentionally omitted —
+                // this is a metadata view; the secrets never leave the host.
+            })
+        })
+        .collect();
+    Ok(json!({
+        "agent_group_id": agent_group_id.as_uuid().to_string(),
+        "tokens": tokens,
     }))
 }
 
@@ -505,5 +615,146 @@ mod tests {
         assert_eq!(obj.len(), 2);
         assert!(obj.contains_key("filesystem"));
         assert!(obj.contains_key("linear"));
+    }
+
+    // --- mcp.inspect-filter handler ---
+
+    fn seed_servers(db: &CentralDb, ag: AgentGroupId, servers: Value) {
+        // mcp.add only writes presets; for filter tests we set the raw
+        // mcp_servers object directly (an operator could declare filters via
+        // `groups config add-mcp-server` with a custom config).
+        super::ensure_config_row(db, ag).unwrap();
+        container_configs::set_mcp_servers(db, ag, servers).unwrap();
+    }
+
+    #[test]
+    fn inspect_filter_reports_deny_list_posture() {
+        let db = db();
+        let ag = make_group(&db);
+        seed_servers(
+            &db,
+            ag,
+            json!({
+                "github": {
+                    "command": "npx",
+                    "denied_tools": ["delete_repo", "force_push"],
+                },
+            }),
+        );
+        let v = inspect_filter(&json!({"agent_group_id": ag.as_uuid().to_string()}), &db).unwrap();
+        let servers = v["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 1);
+        let s = &servers[0];
+        assert_eq!(s["server"], "github");
+        assert_eq!(s["summary"], "deny-list");
+        assert_eq!(s["deny_count"], 2);
+        assert_eq!(s["is_open"], false);
+    }
+
+    #[test]
+    fn inspect_filter_reports_allow_list_and_permit_nothing() {
+        let db = db();
+        let ag = make_group(&db);
+        seed_servers(
+            &db,
+            ag,
+            json!({
+                "gated": { "allowed_tools": ["read"] },
+                "locked": { "allowed_tools": [] },
+                "wide":  { "command": "npx" },
+            }),
+        );
+        let v = inspect_filter(&json!({"agent_group_id": ag.as_uuid().to_string()}), &db).unwrap();
+        let servers = v["servers"].as_array().unwrap();
+        let by_name = |name: &str| {
+            servers
+                .iter()
+                .find(|s| s["server"] == name)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_name("gated")["summary"], "allow-list");
+        assert_eq!(by_name("locked")["summary"], "permit-nothing");
+        assert_eq!(by_name("wide")["summary"], "open");
+        assert_eq!(by_name("wide")["is_open"], true);
+    }
+
+    #[test]
+    fn inspect_filter_single_server_filter() {
+        let db = db();
+        let ag = make_group(&db);
+        seed_servers(
+            &db,
+            ag,
+            json!({
+                "a": { "denied_tools": ["x"] },
+                "b": { "denied_tools": ["y"] },
+            }),
+        );
+        let v = inspect_filter(
+            &json!({"agent_group_id": ag.as_uuid().to_string(), "server": "b"}),
+            &db,
+        )
+        .unwrap();
+        let servers = v["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["server"], "b");
+    }
+
+    #[test]
+    fn inspect_filter_unknown_server_is_not_found() {
+        let db = db();
+        let ag = make_group(&db);
+        seed_servers(&db, ag, json!({"a": {"denied_tools": ["x"]}}));
+        let err = inspect_filter(
+            &json!({"agent_group_id": ag.as_uuid().to_string(), "server": "nope"}),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "not_found");
+    }
+
+    // --- mcp.oauth-list handler ---
+
+    #[test]
+    fn oauth_list_returns_metadata_only_never_secrets() {
+        use copperclaw_db::tables::mcp_oauth_tokens;
+        let db = db();
+        let ag = make_group(&db);
+        mcp_oauth_tokens::upsert(
+            &db,
+            &mcp_oauth_tokens::UpsertMcpOAuthToken {
+                agent_group_id: ag,
+                server_name: "github".into(),
+                access_token: "SECRET-access".into(),
+                refresh_token: Some("SECRET-refresh".into()),
+                token_type: "Bearer".into(),
+                scope: Some("repo".into()),
+                expires_at: None,
+            },
+        )
+        .unwrap();
+        let v = oauth_list(&json!({"agent_group_id": ag.as_uuid().to_string()}), &db).unwrap();
+        let tokens = v["tokens"].as_array().unwrap();
+        assert_eq!(tokens.len(), 1);
+        let t = &tokens[0];
+        assert_eq!(t["server"], "github");
+        assert_eq!(t["token_type"], "Bearer");
+        assert_eq!(t["scope"], "repo");
+        assert_eq!(t["has_refresh_token"], true);
+        // The secrets must NOT be present anywhere in the response.
+        let serialized = serde_json::to_string(&v).unwrap();
+        assert!(
+            !serialized.contains("SECRET"),
+            "oauth-list must never surface the token secret: {serialized}"
+        );
+    }
+
+    #[test]
+    fn oauth_list_empty_for_group_without_tokens() {
+        let db = db();
+        let ag = make_group(&db);
+        let v = oauth_list(&json!({"agent_group_id": ag.as_uuid().to_string()}), &db).unwrap();
+        assert!(v["tokens"].as_array().unwrap().is_empty());
     }
 }

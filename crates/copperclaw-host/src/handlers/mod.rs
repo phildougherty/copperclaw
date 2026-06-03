@@ -22,6 +22,7 @@ use copperclaw_types::AgentGroupId;
 use serde_json::Value;
 
 pub mod approvals;
+pub mod attestation;
 pub mod audit;
 pub mod budgets;
 pub mod db;
