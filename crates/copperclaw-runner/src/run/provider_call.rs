@@ -71,12 +71,18 @@ pub(super) async fn run_llm_turn(
     context_block: Option<&str>,
 ) -> Result<LlmTurnOutput> {
     let system = system_with_context(&deps.system, context_block);
+    // Shrink the replayed transcript: stub stale, oversized tool-result
+    // bodies (old file reads, command stdout, diffs) so they aren't
+    // re-sent verbatim every turn. Recent results — including this turn's
+    // — stay full, and the tool_use/tool_result pairing is preserved. The
+    // persisted `state.history` is untouched (this is a send-time view).
+    let history = crate::formatter::elide_stale_tool_results(history.to_vec(), &deps.elision);
     let input = QueryInput {
         system,
         model: deps.model.clone(),
         effort: deps.effort,
         previous_continuation: previous_continuation.map(str::to_string),
-        history: history.to_vec(),
+        history,
         tools: deps.tools.clone(),
         max_tokens: deps.max_tokens,
         temperature: deps.temperature,

@@ -70,6 +70,27 @@ pub struct RunnerConfigFile {
     pub model_input_window: Option<usize>,
     /// Override compaction safety margin in tokens.
     pub safety_margin_tokens: Option<usize>,
+    /// Soft compaction target in tokens. Compaction fires once the
+    /// estimated transcript exceeds this many tokens — long before the
+    /// hard `model_input_window` ceiling — so a steady ~50K context isn't
+    /// replayed verbatim 100+ times across a long session. Defaults to
+    /// `compaction::DEFAULT_SOFT_TARGET`. Set to `0` to disable the soft
+    /// trigger and fall back to the historical hard-window-only behaviour.
+    pub soft_compaction_target_tokens: Option<usize>,
+    /// Tool-result elision: keep this many of the most-recent tool
+    /// results full; older ones whose body exceeds
+    /// `tool_result_elide_bytes` are replaced with a one-line stub in the
+    /// replayed transcript. Defaults to
+    /// `formatter::DEFAULT_RECENT_TOOL_RESULTS`. The current turn's
+    /// results are always within this window, so they stay intact.
+    pub recent_tool_results_kept: Option<usize>,
+    /// Size cap (in bytes) above which a *stale* tool result's body is
+    /// elided to a stub. Recent results (see `recent_tool_results_kept`)
+    /// are never elided regardless of size. Defaults to
+    /// `formatter::DEFAULT_TOOL_RESULT_ELIDE_BYTES`. Set to `0` together
+    /// with a non-zero `recent_tool_results_kept` to elide *every* stale
+    /// result, or leave both at defaults for the standard behaviour.
+    pub tool_result_elide_bytes: Option<usize>,
     /// Max output tokens per turn.
     pub max_tokens: Option<u32>,
     /// Display name of the assistant.
@@ -129,6 +150,17 @@ pub struct RunnerConfig {
     pub model_input_window: usize,
     /// Safety margin.
     pub safety_margin_tokens: usize,
+    /// Soft compaction target in tokens. `0` disables the soft trigger
+    /// (hard-window-only behaviour). See
+    /// [`RunnerConfigFile::soft_compaction_target_tokens`].
+    pub soft_compaction_target_tokens: usize,
+    /// How many of the most-recent tool results are kept full when
+    /// eliding stale tool-result bodies. See
+    /// [`RunnerConfigFile::recent_tool_results_kept`].
+    pub recent_tool_results_kept: usize,
+    /// Byte cap above which a stale tool-result body is elided. See
+    /// [`RunnerConfigFile::tool_result_elide_bytes`].
+    pub tool_result_elide_bytes: usize,
     /// Max output tokens per turn.
     pub max_tokens: u32,
     /// Display name of the assistant.
@@ -214,6 +246,25 @@ impl RunnerConfig {
             safety_margin_tokens: file
                 .safety_margin_tokens
                 .unwrap_or(crate::compaction::DEFAULT_SAFETY_MARGIN),
+            // The soft target and elision knobs follow the same
+            // "file field, else env var, else hard-coded default"
+            // precedence as the rest of the config: the JSON wins when
+            // present, otherwise an operator env var configures every
+            // session at once, otherwise the documented default applies.
+            soft_compaction_target_tokens: file.soft_compaction_target_tokens.unwrap_or_else(
+                || {
+                    env_usize(env, "COPPERCLAW_SOFT_COMPACTION_TARGET")
+                        .unwrap_or(crate::compaction::DEFAULT_SOFT_TARGET)
+                },
+            ),
+            recent_tool_results_kept: file.recent_tool_results_kept.unwrap_or_else(|| {
+                env_usize(env, "COPPERCLAW_RECENT_TOOL_RESULTS")
+                    .unwrap_or(crate::formatter::DEFAULT_RECENT_TOOL_RESULTS)
+            }),
+            tool_result_elide_bytes: file.tool_result_elide_bytes.unwrap_or_else(|| {
+                env_usize(env, "COPPERCLAW_TOOL_RESULT_ELIDE_BYTES")
+                    .unwrap_or(crate::formatter::DEFAULT_TOOL_RESULT_ELIDE_BYTES)
+            }),
             max_tokens: file.max_tokens.unwrap_or(4096),
             assistant_name: file.assistant_name,
             temperature: file.temperature,
@@ -277,6 +328,14 @@ impl EnvLookup for MapEnv {
     }
 }
 
+/// Read a non-negative integer knob from the environment. A present-but-
+/// unparseable value is ignored (falls through to the caller's default)
+/// rather than failing startup — a typo'd tuning knob shouldn't wedge a
+/// session that would otherwise run fine on defaults.
+fn env_usize(env: &dyn EnvLookup, name: &str) -> Option<usize> {
+    env.get(name).and_then(|v| v.trim().parse::<usize>().ok())
+}
+
 fn parse_uuid<T>(input: Option<&str>, field: &'static str) -> Result<T, ConfigError>
 where
     T: From<uuid::Uuid>,
@@ -306,6 +365,9 @@ mod tests {
             api_base_url: None,
             model_input_window: Some(200_000),
             safety_margin_tokens: Some(8_000),
+            soft_compaction_target_tokens: None,
+            recent_tool_results_kept: None,
+            tool_result_elide_bytes: None,
             max_tokens: Some(4096),
             assistant_name: Some("Claude".into()),
             temperature: Some(0.7),
@@ -477,6 +539,82 @@ mod tests {
             crate::compaction::DEFAULT_SAFETY_MARGIN
         );
         assert_eq!(cfg.max_tokens, 4096);
+    }
+
+    #[test]
+    fn soft_and_elision_knobs_default_when_omitted() {
+        // Unconfigured behaviour: the resolved config carries the
+        // documented defaults from compaction/formatter, so existing
+        // installs get the new soft target + elision without touching
+        // their JSON.
+        let env = MapEnv::default();
+        let cfg = RunnerConfig::from_file_struct(good_file(), &env).unwrap();
+        assert_eq!(
+            cfg.soft_compaction_target_tokens,
+            crate::compaction::DEFAULT_SOFT_TARGET
+        );
+        assert_eq!(
+            cfg.recent_tool_results_kept,
+            crate::formatter::DEFAULT_RECENT_TOOL_RESULTS
+        );
+        assert_eq!(
+            cfg.tool_result_elide_bytes,
+            crate::formatter::DEFAULT_TOOL_RESULT_ELIDE_BYTES
+        );
+    }
+
+    #[test]
+    fn soft_and_elision_knobs_from_file_override_defaults() {
+        let mut file = good_file();
+        file.soft_compaction_target_tokens = Some(12_345);
+        file.recent_tool_results_kept = Some(3);
+        file.tool_result_elide_bytes = Some(999);
+        let env = MapEnv::default();
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert_eq!(cfg.soft_compaction_target_tokens, 12_345);
+        assert_eq!(cfg.recent_tool_results_kept, 3);
+        assert_eq!(cfg.tool_result_elide_bytes, 999);
+    }
+
+    #[test]
+    fn soft_and_elision_knobs_from_env_when_file_silent() {
+        let env = MapEnv::from_pairs([
+            ("COPPERCLAW_SOFT_COMPACTION_TARGET", "30000"),
+            ("COPPERCLAW_RECENT_TOOL_RESULTS", "4"),
+            ("COPPERCLAW_TOOL_RESULT_ELIDE_BYTES", "1500"),
+        ]);
+        let cfg = RunnerConfig::from_file_struct(good_file(), &env).unwrap();
+        assert_eq!(cfg.soft_compaction_target_tokens, 30_000);
+        assert_eq!(cfg.recent_tool_results_kept, 4);
+        assert_eq!(cfg.tool_result_elide_bytes, 1500);
+    }
+
+    #[test]
+    fn elision_file_field_overrides_env() {
+        let mut file = good_file();
+        file.tool_result_elide_bytes = Some(42);
+        let env = MapEnv::from_pairs([("COPPERCLAW_TOOL_RESULT_ELIDE_BYTES", "9999")]);
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert_eq!(cfg.tool_result_elide_bytes, 42);
+    }
+
+    #[test]
+    fn unparseable_env_knob_falls_through_to_default() {
+        let env = MapEnv::from_pairs([("COPPERCLAW_SOFT_COMPACTION_TARGET", "not-a-number")]);
+        let cfg = RunnerConfig::from_file_struct(good_file(), &env).unwrap();
+        assert_eq!(
+            cfg.soft_compaction_target_tokens,
+            crate::compaction::DEFAULT_SOFT_TARGET
+        );
+    }
+
+    #[test]
+    fn soft_target_can_be_disabled_with_zero() {
+        let mut file = good_file();
+        file.soft_compaction_target_tokens = Some(0);
+        let env = MapEnv::default();
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert_eq!(cfg.soft_compaction_target_tokens, 0);
     }
 
     #[test]
