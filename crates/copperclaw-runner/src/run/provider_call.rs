@@ -97,7 +97,7 @@ pub(super) async fn run_llm_turn(
     // Both layers cap at the same `MAX_PROVIDER_ATTEMPTS` budget so the
     // worst-case wall time stays bounded.
     let mut stream_attempts: u32 = 0;
-    let (out, input_tokens, output_tokens) = loop {
+    let (mut out, input_tokens, output_tokens) = loop {
         stream_attempts += 1;
         // Keep the typing-indicator path (and the heartbeat-stale
         // supervisor) refreshed for the entire `query + pump_events`
@@ -194,6 +194,13 @@ pub(super) async fn run_llm_turn(
     if output_tokens > 0 {
         copperclaw_metrics::observe_llm_tokens_output(output_tokens);
     }
+
+    // Surface the per-call token counts on the returned output so
+    // `drive_turn` can accumulate them across the tool loop and enforce
+    // the per-task token ceiling. Independent of the histogram observes
+    // above (those feed Prometheus; these feed the abort decision).
+    out.input_tokens = input_tokens;
+    out.output_tokens = output_tokens;
 
     emit_usage_report(deps, input_tokens, output_tokens, turn_started_at, &outcome).await;
     Ok(out)

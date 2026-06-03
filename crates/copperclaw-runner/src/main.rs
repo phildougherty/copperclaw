@@ -15,7 +15,8 @@ use copperclaw_db::session::{SessionPaths, open_inbound_rw_no_mmap, open_outboun
 use copperclaw_providers::{AnthropicProvider, CodexProvider, OllamaProvider};
 use copperclaw_runner::{
     RunnerConfig, RunnerDeps, RunnerToolCtx, SubagentRunnerDeps, compaction::CompactionCfg,
-    resolve_max_tool_turns, resolve_provider_deadline, resolve_tool_deadline_secs, run_loop,
+    resolve_max_task_tokens, resolve_max_tool_turns, resolve_provider_deadline,
+    resolve_tool_deadline_secs, run_loop,
 };
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
@@ -153,6 +154,7 @@ async fn main() -> Result<()> {
         turn_seq: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         tool_map,
         max_tool_turns: resolve_max_tool_turns(&env),
+        max_task_tokens: resolve_max_task_tokens(&env),
         provider_deadline,
         tool_deadline_secs: resolve_tool_deadline_secs(&env),
         // Keep the typing indicator alive across long LLM streams by

@@ -569,6 +569,10 @@ impl ReplayHarness {
             turn_seq: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             tool_map,
             max_tool_turns: 5,
+            // Replay fixtures bound the run via the tool-turn cap; the
+            // per-task token ceiling is disabled (0) so deterministic
+            // replays never trip the cost backstop.
+            max_task_tokens: 0,
             // Short replay-side deadline so the `provider-timeout`
             // fixture (which sets a deliberately long wiremock delay)
             // trips quickly and the retry budget runs to completion
