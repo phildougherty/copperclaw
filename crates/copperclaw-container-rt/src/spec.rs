@@ -591,21 +591,50 @@ impl ContainerSpec {
 /// `id` is the runtime-assigned container id (full or short — backends
 /// return whichever they natively expose). `name` matches the spec name
 /// and is what the host uses for subsequent `stop` calls.
+///
+/// `host_pid` is the **host-visible** PID of the container's main process
+/// (Docker's `State.Pid`), when the backend can surface it. This is the
+/// target the privileged deny-default egress apply needs: entering the
+/// session's own network namespace is `nsenter -t <host_pid> -n nft -f -`.
+/// It is `None` when the backend cannot report a PID (the Apple Container
+/// runtime today, the in-process test stub) or when the container reported
+/// PID 0 (created-but-not-running — Docker uses 0 for a non-running
+/// container, which can never be a netns target). Callers MUST treat
+/// `None` as "no netns target available" and degrade honestly rather than
+/// guessing a PID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerHandle {
     /// Runtime-assigned container identifier.
     pub id: String,
     /// Container name (same as `ContainerSpec.name`).
     pub name: String,
+    /// Host-visible PID of the container's main process, when known. See the
+    /// type-level docs — the privileged netns apply targets this PID.
+    pub host_pid: Option<i32>,
 }
 
 impl ContainerHandle {
-    /// Construct a handle from id + name.
+    /// Construct a handle from id + name, with no host PID surfaced.
+    ///
+    /// Backends that can resolve the host-visible PID should chain
+    /// [`Self::with_host_pid`].
     pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
         Self {
             id: id.into(),
             name: name.into(),
+            host_pid: None,
         }
+    }
+
+    /// Attach the host-visible PID of the container's main process.
+    ///
+    /// A `Some(0)` is normalised to `None`: Docker reports PID 0 for a
+    /// container that is created but not running, which is never a valid
+    /// `nsenter` target. Likewise any non-positive PID is rejected.
+    #[must_use]
+    pub fn with_host_pid(mut self, pid: Option<i32>) -> Self {
+        self.host_pid = pid.filter(|p| *p > 0);
+        self
     }
 }
 
@@ -941,5 +970,35 @@ mod tests {
         let h = ContainerHandle::new("abc123", "session-1");
         assert_eq!(h.id, "abc123");
         assert_eq!(h.name, "session-1");
+        // No PID surfaced by the bare constructor — backends opt in.
+        assert_eq!(h.host_pid, None);
+    }
+
+    #[test]
+    fn handle_with_host_pid_keeps_positive() {
+        let h = ContainerHandle::new("id", "n").with_host_pid(Some(4242));
+        assert_eq!(h.host_pid, Some(4242));
+    }
+
+    #[test]
+    fn handle_with_host_pid_normalises_zero_and_negatives_to_none() {
+        // Docker reports PID 0 for a created-but-not-running container — never
+        // a valid netns target, so it must surface as None.
+        assert_eq!(
+            ContainerHandle::new("id", "n")
+                .with_host_pid(Some(0))
+                .host_pid,
+            None
+        );
+        assert_eq!(
+            ContainerHandle::new("id", "n")
+                .with_host_pid(Some(-1))
+                .host_pid,
+            None
+        );
+        assert_eq!(
+            ContainerHandle::new("id", "n").with_host_pid(None).host_pid,
+            None
+        );
     }
 }

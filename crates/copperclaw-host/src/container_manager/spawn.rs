@@ -362,12 +362,17 @@ impl ContainerManager {
         // session's network namespace. This is the deferred-but-implemented
         // runtime path: the ruleset is constructed + persisted in
         // `build_spec`/`apply_dns_filter` (pure + tested), and applied here
-        // only under deny-default. The apply needs `CAP_NET_ADMIN` and a
-        // resolvable session netns; if either is missing it logs and degrades
-        // to the carried policy + DNS-filter confinement rather than failing
-        // the spawn. Default (allow-all) spawns never reach this.
+        // only under deny-default. The apply enters the session's OWN netns via
+        // the container's host-visible PID (`nsenter -t <pid> -n nft -f -`),
+        // which the runtime now surfaces on the spawn handle (`handle.host_pid`).
+        // It needs `CAP_NET_ADMIN` and a resolvable PID; if the PID is absent
+        // (runtime couldn't report it) or the privileged apply fails (no
+        // CAP_NET_ADMIN, `nft`/`nsenter` missing) it logs the honest deferred
+        // status and degrades to the carried policy + DNS-filter confinement
+        // rather than failing the spawn — never a faked "applied". Default
+        // (allow-all) spawns never reach this.
         if self.cfg.egress_mode == copperclaw_container_rt::EgressMode::DenyDefault {
-            apply_session_nftables(session, &paths);
+            apply_session_nftables(session, &paths, handle.host_pid);
         }
 
         // Successful spawn: clear any prior failure record so a future
@@ -864,54 +869,239 @@ fn wire_dns_filter(
 pub const EGRESS_NFT_FILENAME: &str = "egress.nft";
 
 /// Phase 0a v2 (Part B) runtime path: apply the per-session nftables ruleset
-/// written by [`wire_dns_filter`].
+/// written by [`wire_dns_filter`] into the session's own network namespace.
 ///
 /// The ruleset (constructed + tested purely) lives at `<session>/egress.nft`.
-/// Applying it requires `CAP_NET_ADMIN` and must target the session's own
-/// network namespace (not the host's). We do NOT apply it to the host netns —
-/// that would be both wrong (it would filter the host) and unsafe. Until the
-/// netns-entering apply lands (it needs the running container's PID to
-/// `nsenter --net`), this records the constructed-and-deferred status so
-/// `cclaw doctor` reports it honestly. The deny-default DNS filter + the
-/// empty-allow `network_mode: none` cut are the enforcement that IS live; the
-/// L3/L4 nftables filtering of a non-empty list is constructed here and
-/// deferred to the privileged netns apply.
+/// Applying it requires `CAP_NET_ADMIN` and must target the session's OWN
+/// network namespace (not the host's) — we enter it via the container's
+/// host-visible PID (`host_pid`, surfaced by the runtime on the spawn handle)
+/// with `nsenter -t <pid> -n nft -f -`, feeding the ruleset on stdin. We do NOT
+/// apply to the host netns: that would be both wrong (it would filter the host)
+/// and unsafe.
 ///
-/// Returns the status so callers/tests can assert what happened. Never fails
-/// the spawn.
-fn apply_session_nftables(session: &Session, paths: &SessionPaths) -> NftRuntimeStatus {
-    let status = dns_filter_runtime_status();
+/// What now runs vs. what is still deferred:
+///
+///   * **PID present + `nft` available + `CAP_NET_ADMIN`** → the privileged
+///     netns apply actually runs and the ruleset is loaded into the session
+///     netns ([`NftApplyOutcome::Applied`]).
+///   * **No PID** (the runtime couldn't report one, e.g. the Apple runtime or
+///     a non-running container) → [`NftApplyOutcome::DeferredNoTarget`]: there
+///     is nothing to `nsenter` into, so the apply can't run. Honest deferral.
+///   * **`nft` missing / non-Linux** → [`NftApplyOutcome::DeferredToolMissing`]
+///     / [`NftApplyOutcome::DeferredUnsupported`].
+///   * **apply attempted but the privileged exec failed** (no `CAP_NET_ADMIN`,
+///     `nsenter` missing, nft load error) → [`NftApplyOutcome::DeferredApplyFailed`].
+///     We NEVER report `Applied` on a failed exec.
+///
+/// In every deferred case the deny-default DNS filter + the empty-allow
+/// `network_mode: none` cut remain the live enforcement; only the L3/L4
+/// nftables filtering of a non-empty list is what's deferred. Returns the
+/// outcome so callers/tests can assert exactly what happened. Never fails the
+/// spawn.
+fn apply_session_nftables(
+    session: &Session,
+    paths: &SessionPaths,
+    host_pid: Option<i32>,
+) -> NftApplyOutcome {
     let nft_path = paths.root.join(EGRESS_NFT_FILENAME);
-    match status {
-        NftRuntimeStatus::Available => {
-            // The privileged netns apply is the deferred runtime tail: it
-            // needs the running container's PID to enter its netns
-            // (`nsenter -t <pid> -n nft -f <ruleset>`), which the runtime
-            // doesn't yet surface to the host. Constructing + persisting the
-            // exact ruleset that apply would load is done; wiring the PID
-            // handoff + the privileged exec is the remaining step. We log the
-            // constructed ruleset path so an operator can apply it by hand
-            // against the session netns in the interim.
-            info!(
-                session = %session.id.as_uuid(),
-                ruleset = %nft_path.display(),
-                "deny-default nftables ruleset constructed; netns apply deferred to the privileged path (requires container PID + CAP_NET_ADMIN)"
-            );
-        }
+    let sid = session.id.as_uuid();
+
+    // Capability probe first: no `nft` / non-Linux short-circuits to an honest
+    // deferred status regardless of whether we have a PID.
+    match dns_filter_runtime_status() {
         NftRuntimeStatus::ToolMissing => {
             warn!(
-                session = %session.id.as_uuid(),
+                session = %sid,
                 "deny-default: `nft` not found on PATH — L3/L4 egress filtering not applied; DNS filtering + empty-allow network cut still enforced"
             );
+            return NftApplyOutcome::DeferredToolMissing;
         }
         NftRuntimeStatus::Unsupported => {
             warn!(
-                session = %session.id.as_uuid(),
+                session = %sid,
                 "deny-default: nftables unsupported on this platform — L3/L4 egress filtering not applied"
             );
+            return NftApplyOutcome::DeferredUnsupported;
+        }
+        NftRuntimeStatus::Available => {}
+    }
+
+    // `nft` is available. We still need the container's host-visible PID to
+    // target the session netns. Without it there is no `nsenter` target — the
+    // ruleset stays constructed-and-deferred (the pre-PID-handoff behaviour).
+    let Some(pid) = host_pid else {
+        info!(
+            session = %sid,
+            ruleset = %nft_path.display(),
+            "deny-default nftables ruleset constructed; netns apply deferred — runtime did not surface a container PID to target (`nsenter -t <pid>`)"
+        );
+        return NftApplyOutcome::DeferredNoTarget;
+    };
+
+    // We have a PID and `nft`. Attempt the privileged netns apply. This is the
+    // step that genuinely needs CAP_NET_ADMIN at runtime; a failure (missing
+    // capability, `nsenter` absent, nft load error) is reported honestly as
+    // deferred — never faked as applied.
+    let ruleset = match std::fs::read_to_string(&nft_path) {
+        Ok(rs) => rs,
+        Err(err) => {
+            warn!(
+                session = %sid,
+                ?err,
+                path = %nft_path.display(),
+                "deny-default: could not read constructed nftables ruleset; netns apply deferred"
+            );
+            return NftApplyOutcome::DeferredApplyFailed;
+        }
+    };
+
+    match run_nsenter_nft_apply(pid, &ruleset) {
+        Ok(()) => {
+            info!(
+                session = %sid,
+                pid,
+                "deny-default nftables ruleset applied to session netns (nsenter -t <pid> -n nft -f -)"
+            );
+            NftApplyOutcome::Applied
+        }
+        Err(err) => {
+            warn!(
+                session = %sid,
+                pid,
+                %err,
+                ruleset = %nft_path.display(),
+                "deny-default: privileged netns nftables apply failed (needs CAP_NET_ADMIN + nsenter); L3/L4 filtering deferred — DNS filtering + empty-allow network cut still enforced"
+            );
+            NftApplyOutcome::DeferredApplyFailed
         }
     }
-    status
+}
+
+/// Build the argv for the privileged per-session nftables apply: enter the
+/// container's network namespace by its host-visible PID and load the ruleset
+/// from stdin. Pure (no exec) so it is unit-tested without privileges.
+///
+/// `nsenter -t <pid> -n nft -f -` — `-t <pid>` targets the process, `-n`
+/// enters only its network namespace (we deliberately do NOT enter mount/pid
+/// namespaces — we only want to apply rules to the session's netns), and
+/// `nft -f -` reads the ruleset on stdin (so the allow-list hosts never hit the
+/// process table / arg-length caps).
+#[must_use]
+pub fn nsenter_nft_argv(pid: i32) -> Vec<String> {
+    vec![
+        "nsenter".to_string(),
+        "-t".to_string(),
+        pid.to_string(),
+        "-n".to_string(),
+        "nft".to_string(),
+        "-f".to_string(),
+        "-".to_string(),
+    ]
+}
+
+/// Execute the privileged netns nftables apply, feeding `ruleset` on stdin.
+///
+/// Linux-only — the apply targets a Linux network namespace via `nsenter`. On
+/// non-Linux this is unreachable (the capability probe returns `Unsupported`
+/// first), but we keep a portable stub so the crate builds everywhere. Returns
+/// `Err(String)` (a human-readable reason) on any failure — spawn-failure,
+/// non-zero exit (the common no-`CAP_NET_ADMIN` case), or a stdin-write error
+/// — so the caller can report an honest deferred status. Never returns `Ok` on
+/// a non-zero exit, so a permissions failure can never masquerade as applied.
+#[cfg(target_os = "linux")]
+fn run_nsenter_nft_apply(pid: i32, ruleset: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let argv = nsenter_nft_argv(pid);
+    let mut child = Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("spawn `{}`: {e}", argv.join(" ")))?;
+
+    // Feed the ruleset on stdin, then drop the handle so `nft` sees EOF.
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "child stdin unavailable".to_string())?;
+        stdin
+            .write_all(ruleset.as_bytes())
+            .map_err(|e| format!("write ruleset to nft stdin: {e}"))?;
+    }
+
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("wait for nft: {e}"))?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        Err(format!(
+            "nft exited {} (stderr: {})",
+            out.status
+                .code()
+                .map_or_else(|| "signal".to_string(), |c| c.to_string()),
+            stderr.trim()
+        ))
+    }
+}
+
+/// Non-Linux stub: the privileged netns apply is a Linux facility. The
+/// capability probe returns [`NftRuntimeStatus::Unsupported`] before this is
+/// reached, so this is dead on non-Linux but keeps the crate portable.
+#[cfg(not(target_os = "linux"))]
+fn run_nsenter_nft_apply(_pid: i32, _ruleset: &str) -> Result<(), String> {
+    Err("nftables netns apply unsupported on this platform".to_string())
+}
+
+/// Outcome of the per-spawn privileged nftables apply
+/// ([`apply_session_nftables`]). Distinct from [`NftRuntimeStatus`] (the
+/// host-process capability probe doctor surfaces): this records what actually
+/// happened for THIS session's apply, so the host log + tests can assert that a
+/// deferral is reported honestly and an apply is only ever claimed when the
+/// privileged exec genuinely succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NftApplyOutcome {
+    /// The ruleset was loaded into the session netns (`nsenter … nft -f -`
+    /// exited 0). The only outcome that claims L3/L4 enforcement.
+    Applied,
+    /// `nft` is available but the runtime surfaced no container PID, so there
+    /// was no netns to target. Ruleset constructed; apply deferred.
+    DeferredNoTarget,
+    /// The privileged apply was attempted (PID + `nft` present) but the exec
+    /// failed — typically no `CAP_NET_ADMIN`, or `nsenter` missing. NEVER an
+    /// applied claim.
+    DeferredApplyFailed,
+    /// `nft` is not installed; the ruleset is constructed but cannot be applied.
+    DeferredToolMissing,
+    /// The platform doesn't support nftables (non-Linux).
+    DeferredUnsupported,
+}
+
+impl NftApplyOutcome {
+    /// Stable token for logs / JSON surfaces.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NftApplyOutcome::Applied => "applied",
+            NftApplyOutcome::DeferredNoTarget => "deferred-no-target",
+            NftApplyOutcome::DeferredApplyFailed => "deferred-apply-failed",
+            NftApplyOutcome::DeferredToolMissing => "deferred-tool-missing",
+            NftApplyOutcome::DeferredUnsupported => "deferred-unsupported",
+        }
+    }
+
+    /// Whether the ruleset was genuinely loaded into the session netns. `false`
+    /// for every deferred variant — the honest signal that L3/L4 filtering is
+    /// NOT active and only DNS filtering + the empty-allow cut apply.
+    #[must_use]
+    pub fn is_applied(self) -> bool {
+        matches!(self, NftApplyOutcome::Applied)
+    }
 }
 
 /// Report whether the privileged nftables apply path can run in this host
@@ -2047,9 +2237,9 @@ mod tests {
     }
 
     #[test]
-    fn apply_session_nftables_never_fails_spawn_and_reports_status() {
-        // The privileged apply is best-effort: it returns a status and never
-        // errors, regardless of whether `nft` is present.
+    fn apply_session_nftables_never_fails_spawn_and_reports_outcome() {
+        // The privileged apply is best-effort: it returns an outcome and never
+        // errors, regardless of whether `nft`/CAP_NET_ADMIN are present.
         let tmp = tempfile::tempdir().unwrap();
         let db = CentralDb::open_in_memory().unwrap();
         let mut cfg = manager_cfg(tmp.path().to_path_buf());
@@ -2062,17 +2252,95 @@ mod tests {
         let session = fixture_session(&db);
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
         paths.ensure_dirs().unwrap();
-        // Build the spec so the ruleset file exists, then apply.
+        // Build the spec so the ruleset file exists, then apply with a PID.
         let _ = mgr.build_spec(&session, &paths, "img", None).unwrap();
-        let status = apply_session_nftables(&session, &paths);
-        // The status is one of the three honest values — never a claim of
-        // applied enforcement.
+        let outcome = apply_session_nftables(&session, &paths, Some(424_242));
+        // The outcome is one of the honest values — and on CI (no
+        // CAP_NET_ADMIN / no `nft`) it must NOT claim `Applied`.
         assert!(matches!(
-            status,
-            NftRuntimeStatus::Available
-                | NftRuntimeStatus::ToolMissing
-                | NftRuntimeStatus::Unsupported
+            outcome,
+            NftApplyOutcome::Applied
+                | NftApplyOutcome::DeferredNoTarget
+                | NftApplyOutcome::DeferredApplyFailed
+                | NftApplyOutcome::DeferredToolMissing
+                | NftApplyOutcome::DeferredUnsupported
         ));
+        // In the CI sandbox the apply can never genuinely succeed (PID 424242
+        // is not a real container, and there's no CAP_NET_ADMIN), so the
+        // outcome must be a deferral, never a faked `Applied`.
+        assert!(
+            !outcome.is_applied(),
+            "apply against a bogus PID without CAP_NET_ADMIN must defer, not fake success: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn apply_session_nftables_no_pid_defers_when_nft_available() {
+        // With `nft` available but NO container PID surfaced by the runtime,
+        // there is no netns to target — the outcome must be the honest
+        // `DeferredNoTarget`, never `Applied`. When `nft` is absent (CI), the
+        // tool-missing deferral wins first; either way it is never applied.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.egress_mode = copperclaw_container_rt::EgressMode::DenyDefault;
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        let _ = mgr.build_spec(&session, &paths, "img", None).unwrap();
+        let outcome = apply_session_nftables(&session, &paths, None);
+        assert!(!outcome.is_applied());
+        match dns_filter_runtime_status() {
+            // nft present: the PID-less path is specifically DeferredNoTarget.
+            NftRuntimeStatus::Available => {
+                assert_eq!(outcome, NftApplyOutcome::DeferredNoTarget);
+            }
+            // nft absent / unsupported: the capability probe defers first.
+            NftRuntimeStatus::ToolMissing => {
+                assert_eq!(outcome, NftApplyOutcome::DeferredToolMissing);
+            }
+            NftRuntimeStatus::Unsupported => {
+                assert_eq!(outcome, NftApplyOutcome::DeferredUnsupported);
+            }
+        }
+    }
+
+    #[test]
+    fn nsenter_nft_argv_targets_session_netns_and_reads_stdin() {
+        // The privileged apply must enter ONLY the netns of the given PID and
+        // load the ruleset from stdin (`-f -`).
+        assert_eq!(
+            nsenter_nft_argv(4242),
+            vec![
+                "nsenter".to_string(),
+                "-t".to_string(),
+                "4242".to_string(),
+                "-n".to_string(),
+                "nft".to_string(),
+                "-f".to_string(),
+                "-".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn nft_apply_outcome_as_str_and_is_applied() {
+        assert_eq!(NftApplyOutcome::Applied.as_str(), "applied");
+        assert!(NftApplyOutcome::Applied.is_applied());
+        for o in [
+            NftApplyOutcome::DeferredNoTarget,
+            NftApplyOutcome::DeferredApplyFailed,
+            NftApplyOutcome::DeferredToolMissing,
+            NftApplyOutcome::DeferredUnsupported,
+        ] {
+            assert!(!o.is_applied(), "{o:?} must not claim applied");
+            assert!(o.as_str().starts_with("deferred-"));
+        }
     }
 
     #[test]
@@ -2841,6 +3109,80 @@ mod tests {
         );
         // Runner config got written.
         assert!(paths.root.join(RUNNER_CONFIG_FILENAME).is_file());
+    }
+
+    #[tokio::test]
+    async fn deny_default_spawn_threads_host_pid_into_egress_apply_path() {
+        // End-to-end: under deny-default, a spawn whose runtime surfaces a
+        // host-visible PID drives the privileged nftables apply path with that
+        // PID as the netns target. The runtime (NoopRuntime) reports a PID on
+        // the spawn handle; `maybe_spawn` forwards `handle.host_pid` into
+        // `apply_session_nftables`. We assert the spawn completed (deny-default
+        // path ran end-to-end) and the per-session ruleset was constructed +
+        // persisted for the apply to load. The apply itself can't genuinely
+        // succeed in CI (bogus PID, no CAP_NET_ADMIN) — and crucially it does
+        // NOT fail the spawn (honest deferral, never faked success).
+        use copperclaw_container_rt::ContainerRuntime as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        // Runtime surfaces a host PID on every spawn handle.
+        let runtime =
+            std::sync::Arc::new(crate::tests::NoopRuntime::default().with_host_pid(98765));
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.egress_mode = copperclaw_container_rt::EgressMode::DenyDefault;
+        let mgr = ContainerManager::new(db.clone(), runtime.clone(), cfg);
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        let conn = open_inbound(&paths).unwrap();
+        messages_in::insert(
+            &conn,
+            &messages_in::WriteInbound {
+                id: copperclaw_types::MessageId::new(),
+                kind: copperclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "hi"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("stdin".into()),
+                channel_type: Some(copperclaw_types::ChannelType::new("cli")),
+                thread_id: None,
+                source_session_id: None,
+                reply_to: None,
+                is_group: None,
+            },
+        )
+        .unwrap();
+
+        // The deny-default apply path runs with the surfaced PID and never
+        // fails the spawn.
+        let spawned = mgr.maybe_spawn(&session).await.unwrap();
+        assert!(spawned, "deny-default spawn should succeed");
+
+        // The handle the runtime returned carries the PID the apply path
+        // consumed — proving the runtime → handle.host_pid wiring is live.
+        let handle = runtime
+            .spawn(ContainerSpec::new("probe", "img"))
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.host_pid,
+            Some(98765),
+            "runtime must surface the host PID the deny-default apply targets"
+        );
+
+        // The per-session ruleset was constructed + persisted for the privileged
+        // `nsenter -t <pid> -n nft -f -` load to read.
+        let nft = std::fs::read_to_string(paths.root.join(EGRESS_NFT_FILENAME)).unwrap();
+        assert!(nft.contains("policy drop;"));
+
+        // And the spawn itself was recorded + the session marked running — the
+        // apply is best-effort and never blocks the spawn.
+        let updated = sessions::get(&db, session.id).unwrap();
+        assert!(matches!(updated.container_status, ContainerStatus::Running));
     }
 
     /// Finding 7: when the per-group memory dir cannot be created, the

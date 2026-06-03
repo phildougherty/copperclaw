@@ -61,6 +61,11 @@ pub(crate) mod tests {
         /// install_packages-containment tests assert the build carried no
         /// broker token and the expected containment posture.
         pub build_specs: Mutex<Vec<ImageBuildSpec>>,
+        /// Host-visible PID the runtime surfaces on every spawn handle (and via
+        /// `container_pid`). `None` (the default) exercises the "runtime can't
+        /// report a PID" path that defers the egress apply with no target; set
+        /// it to assert the PID is threaded into the deny-default apply path.
+        pub host_pid: Mutex<Option<i32>>,
     }
 
     impl NoopRuntime {
@@ -76,6 +81,14 @@ pub(crate) mod tests {
         #[must_use]
         pub fn with_image_digest(self, digest: impl Into<String>) -> Self {
             *self.image_digest.lock().unwrap() = Some(digest.into());
+            self
+        }
+
+        /// Pre-load the host-visible PID the runtime surfaces on every spawn
+        /// handle (deny-default egress netns-target tests).
+        #[must_use]
+        pub fn with_host_pid(self, pid: i32) -> Self {
+            *self.host_pid.lock().unwrap() = Some(pid);
             self
         }
 
@@ -123,10 +136,11 @@ pub(crate) mod tests {
             if let Some(err) = self.fail_next.lock().unwrap().take() {
                 return Err(err);
             }
-            Ok(ContainerHandle::new(
-                format!("noop-{}-id", spec.name),
-                spec.name,
-            ))
+            let pid = *self.host_pid.lock().unwrap();
+            Ok(
+                ContainerHandle::new(format!("noop-{}-id", spec.name), spec.name)
+                    .with_host_pid(pid),
+            )
         }
 
         async fn stop(&self, _name: &str, _grace: Duration) -> Result<(), RtError> {
@@ -146,6 +160,10 @@ pub(crate) mod tests {
 
         async fn image_digest(&self, _tag: &str) -> Result<Option<String>, RtError> {
             Ok(self.image_digest.lock().unwrap().clone())
+        }
+
+        async fn container_pid(&self, _name: &str) -> Result<Option<i32>, RtError> {
+            Ok(*self.host_pid.lock().unwrap())
         }
     }
 
@@ -180,5 +198,21 @@ pub(crate) mod tests {
     fn noop_runtime_debug_renders() {
         let rt = NoopRuntime::default();
         assert!(format!("{rt:?}").contains("NoopRuntime"));
+    }
+
+    #[tokio::test]
+    async fn noop_runtime_surfaces_configured_host_pid() {
+        // Default: no PID surfaced (the runtime-can't-report-PID path).
+        let rt = NoopRuntime::default();
+        let h = rt.spawn(ContainerSpec::new("c", "img")).await.unwrap();
+        assert_eq!(h.host_pid, None);
+        assert_eq!(rt.container_pid("c").await.unwrap(), None);
+
+        // Configured: the PID rides the spawn handle AND container_pid — this
+        // is the netns target the deny-default egress apply consumes.
+        let rt = NoopRuntime::default().with_host_pid(54321);
+        let h = rt.spawn(ContainerSpec::new("c", "img")).await.unwrap();
+        assert_eq!(h.host_pid, Some(54321));
+        assert_eq!(rt.container_pid("c").await.unwrap(), Some(54321));
     }
 }

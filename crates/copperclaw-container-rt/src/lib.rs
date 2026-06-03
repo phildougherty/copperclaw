@@ -134,6 +134,26 @@ pub trait ContainerRuntime: Send + Sync {
         let _ = (name, tail);
         Ok(String::new())
     }
+
+    /// Resolve the **host-visible** PID of the named container's main process
+    /// (Docker's `State.Pid`), or `Ok(None)` when the backend can't report one
+    /// or the container isn't running (Docker reports PID 0 then, which is
+    /// never a valid netns target and is normalised to `None`).
+    ///
+    /// This is the target the deny-default egress apply needs to enter the
+    /// session's own network namespace (`nsenter -t <pid> -n nft -f -`).
+    /// [`spawn`](ContainerRuntime::spawn) already surfaces it on the returned
+    /// [`ContainerHandle::host_pid`] for backends that can; this method lets a
+    /// caller re-resolve it later (e.g. after a warm-container reuse where the
+    /// original handle is gone).
+    ///
+    /// Default impl returns `Ok(None)` — backends that can't inspect a PID
+    /// (`AppleContainerRuntime` today, in-process test stubs) report "no PID"
+    /// rather than failing. Concrete runtimes (Docker) override.
+    async fn container_pid(&self, name: &str) -> Result<Option<i32>, RtError> {
+        let _ = name;
+        Ok(None)
+    }
 }
 
 /// Picker for [`detect`] / explicit selection.
