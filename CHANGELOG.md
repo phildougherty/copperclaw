@@ -6,6 +6,46 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security (M16 wave 5 — browser 5a, MCP supply-chain, security-audit; provider failover live — 2026-06-03)
+
+Final hardening wave + the provider-failover rework. All opt-in / default-
+unchanged where new capability is added; enforced-vs-deferred stated precisely.
+Full workspace gate clean (6,604 tests).
+
+- **Provider fallback (now live).** Automatic provider/model fallback chains +
+  multi-key health-based rotation + per-channel model pinning (migration 020,
+  `copperclaw-providers/src/failover.rs`). The earlier rework made the live
+  path real: the runner now emits the failure reason, `record_usage_report`
+  persists it to `agent_turns.error`, and the fold degrades the primary on a
+  genuine provider failure and re-promotes it on recovery (proven by a
+  cross-crate integration test; also fixed a latent `ag_`/`sess_` id-prefix
+  bug that had kept the fold dead). Default single-provider behaviour
+  unchanged.
+- **Browser 5a (read-only, opt-in).** New `copperclaw-browser` crate +
+  `browser_render` MCP tool (render / screenshot / read-only DOM), OFF by
+  default. SSRF-guarded on navigation AND every redirect (reuses
+  `net_guard`); output tagged untrusted provenance; runs in a dedicated child
+  container with NO broker token, egress deny-default narrowed to the target,
+  an unprivileged user, and a hardened sandbox profile requesting a stronger
+  runtime. **Deferred runtime (honest, not stubbed): the live Chromium/CDP
+  driver and the privileged microVM/gVisor child spawn** — the spec
+  construction, runtime-selection (with a hardened-runc floor, no silent
+  downgrade), and SSRF/provenance logic are all implemented + unit-tested;
+  `handle()` reports the driver is unprovisioned rather than fabricating
+  content.
+- **MCP / supply-chain.** Host-side OAuth token store for MCP servers
+  (migration 022 — tokens on the host, not in the container); `install_packages`
+  subprocess containment (denied the broker token + egress); image + runner
+  digest attestation recorded in the audit log at spawn. **Note: the
+  per-server MCP tool include/exclude FILTER is a host-side primitive that is
+  NOT yet wired into a live path (dormant; follow-up to enforce that a denied
+  MCP tool is never advertised to the model).**
+- **Operability.** `cclaw security audit [--fix]` on the doctor framework —
+  reports open posture (egress allow-all, default-allow approvals, loose
+  perms) and `--fix` only TIGHTENS (never loosens), each change audited. A
+  heartbeat condition-check-in (`copperclaw-host-sweep`) that fires only when
+  its stored condition holds, distinct from time-based scheduling.
+
 ### Added (M16 wave 4 — searchable cross-session memory + provenance gate — 2026-06-03)
 
 Replaces the flat bind-mounted `/data/memory/` with a per-group searchable
