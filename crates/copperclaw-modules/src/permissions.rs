@@ -104,9 +104,41 @@ impl PermissionOp {
             "add_mcp_server" => Some(Self::AddMcpServer),
             "schedule_task" => Some(Self::ScheduleTask),
             "cancel_other_task" => Some(Self::CancelOtherTask),
-            "send_message" => Some(Self::SendMessage),
+            // `deliver_message` is the op the router gates every inbound turn
+            // with; it is the runtime alias for `SendMessage` (a routine,
+            // everyone-allowed delivery). Recognizing it here keeps the
+            // unknown-op close-fail from denying ordinary message routing.
+            "send_message" | "deliver_message" => Some(Self::SendMessage),
             _ => None,
         }
+    }
+
+    /// True if this op mutates host state or grants elevated capability, and
+    /// so must close-fail: if no gate produces an explicit `Allow`, the host
+    /// denies it. Routine, non-mutating ops (e.g. `send_message`) are not
+    /// privileged and fall through to the host's default-allow.
+    pub fn is_privileged(self) -> bool {
+        match self {
+            Self::CreateAgent
+            | Self::EditWiring
+            | Self::ApproveSender
+            | Self::ApproveChannel
+            | Self::InstallPackages
+            | Self::AddMcpServer
+            | Self::ScheduleTask
+            | Self::CancelOtherTask => true,
+            Self::SendMessage => false,
+        }
+    }
+
+    /// Classify an op string by privilege. Returns `true` for a recognized
+    /// privileged [`PermissionOp`]. Unrecognized ops return `false` here:
+    /// unknown-op denial is the access-gate closure's job (it close-fails an
+    /// op no installed gate claims), whereas this helper is for the host's
+    /// gate-resolution fallthrough, which must not start denying routine
+    /// routing ops (e.g. `deliver_message`) that are not in `PermissionOp`.
+    pub fn op_is_privileged(op: &str) -> bool {
+        Self::parse(op).is_some_and(Self::is_privileged)
     }
 }
 
@@ -192,7 +224,17 @@ impl Module for PermissionsModule {
         ctx.set_access_gate(Arc::new(move |g: GateCtx| {
             let role = (access_lookup)(&g).unwrap_or(default_role);
             let Some(op) = PermissionOp::parse(&g.op) else {
-                return GateDecision::Defer;
+                // Open-fail is a security hole: an op the permissions module
+                // doesn't recognize must not slip through to the host's
+                // default-allow. Deny it and name the op so the operator can
+                // see what was rejected (and add it to `PermissionOp` if it's
+                // legitimate).
+                tracing::warn!(
+                    op = %g.op,
+                    role = role.as_str(),
+                    "permissions: denying unknown access-gate op"
+                );
+                return GateDecision::Deny(format!("unknown operation `{}` denied", g.op));
             };
             if check(role, op) {
                 GateDecision::Allow
@@ -409,7 +451,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn access_gate_defers_on_unknown_op() {
+    async fn access_gate_denies_unknown_op_and_names_it() {
+        // An op the permissions module doesn't recognize must close-fail to
+        // `Deny` (was previously an open-fail `Defer`), and the deny reason
+        // must name the offending op for the operator/audit trail.
         let m = PermissionsModule::deny_all();
         let ctx = MockModuleContext::new();
         m.install(ctx.clone()).await.unwrap();
@@ -420,7 +465,41 @@ mod tests {
             messaging_group_id: None,
             op: "made_up_op".into(),
         });
-        assert!(decision.is_defer());
+        assert!(decision.is_deny(), "unknown op must deny, not defer");
+        if let GateDecision::Deny(reason) = decision {
+            assert!(
+                reason.contains("made_up_op"),
+                "deny reason must name the unknown op, got: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn privileged_classification_matches_known_ops() {
+        for op in [
+            PermissionOp::CreateAgent,
+            PermissionOp::EditWiring,
+            PermissionOp::ApproveSender,
+            PermissionOp::ApproveChannel,
+            PermissionOp::InstallPackages,
+            PermissionOp::AddMcpServer,
+            PermissionOp::ScheduleTask,
+            PermissionOp::CancelOtherTask,
+        ] {
+            assert!(op.is_privileged(), "{op:?} should be privileged");
+            assert!(PermissionOp::op_is_privileged(op.as_str()));
+        }
+        assert!(!PermissionOp::SendMessage.is_privileged());
+        assert!(!PermissionOp::op_is_privileged("send_message"));
+    }
+
+    #[test]
+    fn unknown_and_routing_ops_are_not_host_privileged() {
+        // Unknown ops are denied by the gate closure itself, not by the
+        // host's privileged-op fallthrough; and routine routing ops like
+        // `deliver_message` (not a `PermissionOp`) must keep flowing.
+        assert!(!PermissionOp::op_is_privileged("made_up_op"));
+        assert!(!PermissionOp::op_is_privileged("deliver_message"));
     }
 
     #[tokio::test]

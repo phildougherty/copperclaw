@@ -136,6 +136,37 @@ impl HookChain {
         Some(cb(ctx))
     }
 
+    /// Resolve an access-gate decision into a concrete `Allow`/`Deny`,
+    /// applying the host's default policy to a *missing* decision.
+    ///
+    /// For privileged ops (host-state mutations / capability grants — see
+    /// [`copperclaw_modules::PermissionOp::op_is_privileged`]) this
+    /// close-fails: if no gate is registered (`None`) or every gate defers
+    /// (`Defer`), the op is denied rather than allowed. Non-privileged ops
+    /// keep the historical open-fail default (`Allow`) so routine routing
+    /// (e.g. `deliver_message`) is unaffected.
+    pub fn resolve_access_gate(&self, ctx: GateCtx) -> GateDecision {
+        let privileged = copperclaw_modules::PermissionOp::op_is_privileged(&ctx.op);
+        let op = ctx.op.clone();
+        match self.run_access_gate(ctx) {
+            Some(GateDecision::Allow) => GateDecision::Allow,
+            Some(GateDecision::Deny(reason)) => GateDecision::Deny(reason),
+            Some(GateDecision::Defer) | None => {
+                if privileged {
+                    tracing::warn!(
+                        op = %op,
+                        "access gate: no decision for privileged op — denying (close-fail)"
+                    );
+                    GateDecision::Deny(format!(
+                        "privileged operation `{op}` denied: no gate granted access"
+                    ))
+                } else {
+                    GateDecision::Allow
+                }
+            }
+        }
+    }
+
     /// Run the sender-scope-gate hook (if any). `None` => no policy
     /// registered; the caller falls back to allow-by-default.
     pub fn run_sender_scope_gate(&self, ctx: SenderScopeCtx) -> Option<SenderScopeDecision> {
@@ -247,6 +278,59 @@ mod tests {
             op: "deliver_message".into(),
         };
         assert_eq!(h.run_access_gate(ctx), Some(GateDecision::Allow));
+    }
+
+    fn gctx(op: &str) -> GateCtx {
+        GateCtx {
+            user: None,
+            agent_group_id: Some(AgentGroupId::new()),
+            messaging_group_id: None,
+            op: op.into(),
+        }
+    }
+
+    #[test]
+    fn resolve_privileged_op_with_no_gate_denies() {
+        // No gate registered => `None`. A privileged op must close-fail to
+        // Deny rather than fall through to the host's default-allow.
+        let h = HookChain::new();
+        let decision = h.resolve_access_gate(gctx("create_agent"));
+        assert!(decision.is_deny(), "privileged op with no gate must deny");
+        if let GateDecision::Deny(reason) = decision {
+            assert!(reason.contains("create_agent"));
+        }
+    }
+
+    #[test]
+    fn resolve_privileged_op_with_deferring_gate_denies() {
+        // A gate that defers leaves no decision; privileged ops still deny.
+        let h = HookChain::new();
+        h.set_access_gate(Arc::new(|_| GateDecision::Defer));
+        let decision = h.resolve_access_gate(gctx("install_packages"));
+        assert!(decision.is_deny());
+    }
+
+    #[test]
+    fn resolve_non_privileged_op_with_no_gate_allows() {
+        // Routine routing op (`deliver_message`, not a `PermissionOp`) keeps
+        // the open-fail default so message flow is unaffected.
+        let h = HookChain::new();
+        assert!(h.resolve_access_gate(gctx("deliver_message")).is_allow());
+    }
+
+    #[test]
+    fn resolve_passes_through_explicit_allow_and_deny() {
+        let h = HookChain::new();
+        h.set_access_gate(Arc::new(|_| GateDecision::Allow));
+        assert!(h.resolve_access_gate(gctx("create_agent")).is_allow());
+
+        let h2 = HookChain::new();
+        h2.set_access_gate(Arc::new(|_| GateDecision::Deny("nope".into())));
+        let d = h2.resolve_access_gate(gctx("deliver_message"));
+        assert!(d.is_deny());
+        if let GateDecision::Deny(reason) = d {
+            assert_eq!(reason, "nope");
+        }
     }
 
     #[test]
