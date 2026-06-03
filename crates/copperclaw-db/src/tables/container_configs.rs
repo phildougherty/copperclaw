@@ -143,6 +143,22 @@ pub struct ContainerConfig {
     /// scrubs prose contamination from the chat reply; this flag gates
     /// the structured-reasoning surface.
     pub surface_thinking: bool,
+    /// Per-group tool-authorization profile (`minimal` / `messaging` /
+    /// `coding` / `full`). `None` means "no explicit profile"; the
+    /// container runner falls back to its permissive `full` default,
+    /// preserving the historical full tool surface for existing groups.
+    ///
+    /// This is the host-side FUEL for the runner's layered `ToolPolicy`
+    /// (`copperclaw-runner::policy`): the runner-config assembler writes
+    /// it into `runner.json`, the runner parses it into the positive
+    /// allow-list ceiling for every tool dispatch (beneath the host-owned
+    /// `DISALLOWED_TOOLS` floor). A `messaging`-profile group has shell /
+    /// file-mutation / self-mod tools denied at the runner.
+    ///
+    /// Runner-config-only (mirrors `surface_thinking`): changing it
+    /// rewrites `runner.json` but not the image, so it stays OUTSIDE
+    /// `compute_fingerprint`.
+    pub tool_profile: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -166,6 +182,7 @@ pub struct UpsertContainerConfig {
     pub resource_limits: serde_json::Value,
     pub coding_enabled: bool,
     pub surface_thinking: bool,
+    pub tool_profile: Option<String>,
 }
 
 fn effort_as_str(e: Effort) -> &'static str {
@@ -251,6 +268,7 @@ fn row_to_container_config(row: &Row<'_>) -> rusqlite::Result<ContainerConfig> {
     let coding_enabled = coding_enabled_int != 0;
     let surface_thinking_int: i64 = row.get("surface_thinking")?;
     let surface_thinking = surface_thinking_int != 0;
+    let tool_profile: Option<String> = row.get("tool_profile")?;
     let updated_at_str: String = row.get("updated_at")?;
     let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
         .map_err(|e| {
@@ -276,6 +294,7 @@ fn row_to_container_config(row: &Row<'_>) -> rusqlite::Result<ContainerConfig> {
         resource_limits,
         coding_enabled,
         surface_thinking,
+        tool_profile,
         updated_at,
     })
 }
@@ -291,7 +310,7 @@ pub fn get(
                     max_messages_per_prompt, skills, mcp_servers, packages_apt,
                     packages_npm, additional_mounts, cli_scope,
                     config_fingerprint, egress_allow, resource_limits,
-                    coding_enabled, surface_thinking, updated_at
+                    coding_enabled, surface_thinking, tool_profile, updated_at
              FROM container_configs
              WHERE agent_group_id = ?1",
             params![agent_group_id.as_uuid().to_string()],
@@ -316,8 +335,8 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
             max_messages_per_prompt, skills, mcp_servers, packages_apt,
             packages_npm, additional_mounts, cli_scope,
             config_fingerprint, egress_allow, resource_limits,
-            coding_enabled, surface_thinking, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+            coding_enabled, surface_thinking, tool_profile, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
          ON CONFLICT(agent_group_id) DO UPDATE SET
              provider = excluded.provider,
              model = excluded.model,
@@ -336,6 +355,7 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
              resource_limits = excluded.resource_limits,
              coding_enabled = excluded.coding_enabled,
              surface_thinking = excluded.surface_thinking,
+             tool_profile = excluded.tool_profile,
              updated_at = excluded.updated_at",
         params![
             req.agent_group_id.as_uuid().to_string(),
@@ -356,6 +376,7 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
             resource_limits_json,
             i64::from(req.coding_enabled),
             i64::from(req.surface_thinking),
+            req.tool_profile.clone(),
             now.to_rfc3339(),
         ],
     )?;
@@ -378,6 +399,7 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
         resource_limits: req.resource_limits,
         coding_enabled: req.coding_enabled,
         surface_thinking: req.surface_thinking,
+        tool_profile: req.tool_profile,
         updated_at: now,
     })
 }
@@ -726,6 +748,35 @@ pub fn set_surface_thinking(
     Ok(())
 }
 
+/// Narrow setter for the per-group `tool_profile`.
+///
+/// `Some("messaging")` etc. pins the container runner's tool-dispatch
+/// policy to that profile; `None` clears the override so the runner
+/// falls back to its permissive `full` default. The value is stored
+/// verbatim — validation (rejecting unknown profile names) lives in the
+/// `cclaw groups config` handler so a bad value can't reach the runner.
+pub fn set_tool_profile(
+    db: &CentralDb,
+    agent_group_id: AgentGroupId,
+    profile: Option<&str>,
+) -> Result<(), DbError> {
+    let conn = db.conn()?;
+    let n = conn.execute(
+        "UPDATE container_configs
+         SET tool_profile = ?1, updated_at = ?2
+         WHERE agent_group_id = ?3",
+        params![
+            profile,
+            Utc::now().to_rfc3339(),
+            agent_group_id.as_uuid().to_string()
+        ],
+    )?;
+    if n == 0 {
+        return Err(DbError::NotFound);
+    }
+    Ok(())
+}
+
 /// Overwrite the resource limits JSON for an agent group.
 ///
 /// Accepted keys: `"cpus"` (string), `"memory_mb"` (integer),
@@ -797,6 +848,7 @@ mod tests {
             resource_limits: json!({}),
             coding_enabled: false,
             surface_thinking: false,
+            tool_profile: None,
         }
     }
 
@@ -885,6 +937,7 @@ mod tests {
             resource_limits: json!({"cpus": "1.5", "memory_mb": 512}),
             coding_enabled: true,
             surface_thinking: true,
+            tool_profile: Some("messaging".into()),
         };
         let saved = upsert(&db, req.clone()).unwrap();
         let fetched = get(&db, ag).unwrap().unwrap();
@@ -910,6 +963,7 @@ mod tests {
         assert_eq!(fetched.resource_limits["memory_mb"], 512);
         assert!(fetched.coding_enabled);
         assert!(fetched.surface_thinking);
+        assert_eq!(fetched.tool_profile.as_deref(), Some("messaging"));
     }
 
     #[test]
@@ -1180,6 +1234,8 @@ mod tests {
         assert!(!cfg.coding_enabled);
         // Slice-3.5 surface defaults to off — secure-by-default tenet.
         assert!(!cfg.surface_thinking);
+        // No explicit tool-profile column → runner falls back to `full`.
+        assert!(cfg.tool_profile.is_none());
     }
 
     #[test]
@@ -1386,5 +1442,61 @@ mod tests {
         drop(conn);
         let cfg = get(&db, ag).unwrap().unwrap();
         assert!(!cfg.surface_thinking);
+    }
+
+    #[test]
+    fn set_tool_profile_roundtrips_some_then_none() {
+        let db = db();
+        let ag = make_agent_group(&db, "g");
+        upsert(&db, minimal_req(ag)).unwrap();
+        // Default from minimal_req is None (runner falls back to `full`).
+        assert!(get(&db, ag).unwrap().unwrap().tool_profile.is_none());
+        set_tool_profile(&db, ag, Some("messaging")).unwrap();
+        assert_eq!(
+            get(&db, ag).unwrap().unwrap().tool_profile.as_deref(),
+            Some("messaging")
+        );
+        set_tool_profile(&db, ag, None).unwrap();
+        assert!(get(&db, ag).unwrap().unwrap().tool_profile.is_none());
+    }
+
+    #[test]
+    fn set_tool_profile_not_found_when_no_row() {
+        let db = db();
+        let err = set_tool_profile(&db, AgentGroupId::new(), Some("coding")).unwrap_err();
+        assert!(matches!(err, DbError::NotFound));
+    }
+
+    #[test]
+    fn tool_profile_defaults_to_null_via_sql_default() {
+        // Existing installs that upgrade past migration 018 must default to
+        // NULL tool_profile — the runner then falls back to its permissive
+        // `full` default, so no group loses its tool surface on upgrade.
+        let db = db();
+        let ag = make_agent_group(&db, "g");
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "INSERT INTO container_configs (agent_group_id, updated_at)
+             VALUES (?1, ?2)",
+            params![ag.as_uuid().to_string(), Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        drop(conn);
+        let cfg = get(&db, ag).unwrap().unwrap();
+        assert!(cfg.tool_profile.is_none());
+    }
+
+    #[test]
+    fn tool_profile_does_not_affect_fingerprint() {
+        // tool_profile is runner-config-only (rewrites runner.json, not the
+        // image), so switching it must NOT change the rebuild fingerprint.
+        let db = db();
+        let ag = make_agent_group(&db, "g");
+        let cfg = upsert(&db, minimal_req(ag)).unwrap();
+        let fp_before = compute_fingerprint(&cfg);
+        set_tool_profile(&db, ag, Some("messaging")).unwrap();
+        let cfg2 = get(&db, ag).unwrap().unwrap();
+        let fp_after = compute_fingerprint(&cfg2);
+        assert_eq!(fp_before, fp_after);
     }
 }

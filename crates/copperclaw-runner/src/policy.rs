@@ -79,7 +79,10 @@ const ALWAYS_TOOLS: &[&str] = &[
 
 /// Read-only / informational tools layered on top of [`ALWAYS_TOOLS`] by
 /// the `messaging` profile (and inherited by richer profiles). Safe for a
-/// guest sender: they observe but never mutate the filesystem or shell.
+/// guest sender: they observe but never mutate the filesystem, shell, or
+/// scheduler. `list_tasks` is the only scheduling tool here — it reads the
+/// task list without changing it. The mutating scheduling verbs live in
+/// [`SCHEDULING_MUTATION_TOOLS`] so the guest role floor denies them.
 const READONLY_TOOLS: &[&str] = &[
     "read_file",
     "view_image",
@@ -92,6 +95,16 @@ const READONLY_TOOLS: &[&str] = &[
     "web_search",
     "web_fetch",
     "list_tasks",
+];
+
+/// Scheduler-mutation verbs layered on top of [`READONLY_TOOLS`] by the
+/// `messaging` profile (and inherited by richer profiles). These create,
+/// cancel, pause, resume, or edit scheduled tasks — they mutate scheduler
+/// state, so they are classified as mutating (see [`is_mutating`]) and a
+/// [`SenderRole::Guest`] sender is denied them even though the messaging
+/// profile would otherwise admit them. (Wave-2 nit: previously these sat
+/// in `READONLY_TOOLS`, which let a guest mutate the scheduler.)
+const SCHEDULING_MUTATION_TOOLS: &[&str] = &[
     "schedule_task",
     "cancel_task",
     "pause_task",
@@ -177,8 +190,14 @@ impl ToolProfile {
         }
         match self {
             Self::Minimal => false,
-            Self::Messaging => READONLY_TOOLS.contains(&tool),
-            Self::Coding => READONLY_TOOLS.contains(&tool) || CODING_TOOLS.contains(&tool),
+            Self::Messaging => {
+                READONLY_TOOLS.contains(&tool) || SCHEDULING_MUTATION_TOOLS.contains(&tool)
+            }
+            Self::Coding => {
+                READONLY_TOOLS.contains(&tool)
+                    || SCHEDULING_MUTATION_TOOLS.contains(&tool)
+                    || CODING_TOOLS.contains(&tool)
+            }
             // `Full` is an open allow-list: anything that isn't on the
             // host-owned floor is permitted (new MCP tools are usable
             // without touching the profile table).
@@ -234,9 +253,12 @@ impl SenderRole {
 
 /// Tool names a guest sender is never allowed to invoke — the read-only
 /// floor. A guest may use [`ALWAYS_TOOLS`] + [`READONLY_TOOLS`] but never
-/// the mutating / self-mod classes.
+/// the mutating classes: scheduler-mutation verbs, filesystem/shell
+/// (`CODING_TOOLS`), or self-modification (`SELF_MOD_TOOLS`).
 fn is_mutating(tool: &str) -> bool {
-    CODING_TOOLS.contains(&tool) || SELF_MOD_TOOLS.contains(&tool)
+    SCHEDULING_MUTATION_TOOLS.contains(&tool)
+        || CODING_TOOLS.contains(&tool)
+        || SELF_MOD_TOOLS.contains(&tool)
 }
 
 /// Outcome of a policy evaluation.
@@ -580,6 +602,67 @@ mod tests {
         let d = p.evaluate("shell");
         assert!(!d.is_allow());
         assert!(d.deny_reason().unwrap().contains("messaging"));
+    }
+
+    #[test]
+    fn guest_cannot_mutate_scheduler() {
+        // Wave-2 nit: scheduling-mutation verbs must be denied to a guest
+        // even under a messaging profile (which admits them for higher
+        // roles). `list_tasks` (read-only) stays reachable.
+        let p = ToolPolicy::new(ToolProfile::Messaging, Some(SenderRole::Guest));
+        for verb in [
+            "schedule_task",
+            "cancel_task",
+            "pause_task",
+            "resume_task",
+            "update_task",
+        ] {
+            let d = p.evaluate(verb);
+            assert!(!d.is_allow(), "guest should be denied {verb}");
+            assert!(d.deny_reason().unwrap().contains("guest"), "{verb}");
+        }
+        assert!(
+            p.evaluate("list_tasks").is_allow(),
+            "list_tasks is read-only and stays reachable for a guest"
+        );
+    }
+
+    #[test]
+    fn member_can_mutate_scheduler_under_messaging() {
+        // The scheduling verbs are still available to a non-guest sender on
+        // a messaging-profile group — the Wave-2 fix only closes the guest
+        // hole, it does not remove the capability for members/admins.
+        let p = ToolPolicy::new(ToolProfile::Messaging, Some(SenderRole::Member));
+        for verb in [
+            "schedule_task",
+            "cancel_task",
+            "pause_task",
+            "resume_task",
+            "update_task",
+            "list_tasks",
+        ] {
+            assert!(p.evaluate(verb).is_allow(), "member should allow {verb}");
+        }
+        // …but shell is still blocked by the messaging profile ceiling.
+        assert!(!p.evaluate("shell").is_allow());
+    }
+
+    #[test]
+    fn scheduling_verbs_still_allowed_by_messaging_profile() {
+        // Profile-layer check (no role floor): the messaging profile admits
+        // the scheduling verbs (moving them out of READONLY_TOOLS must not
+        // drop them from the profile's allow-list).
+        let p = ToolProfile::Messaging;
+        for verb in [
+            "schedule_task",
+            "cancel_task",
+            "pause_task",
+            "resume_task",
+            "update_task",
+            "list_tasks",
+        ] {
+            assert!(p.allows(verb), "messaging profile should allow {verb}");
+        }
     }
 
     #[test]

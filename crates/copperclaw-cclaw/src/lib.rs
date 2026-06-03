@@ -1511,6 +1511,7 @@ const EDITABLE_SCALAR_FIELDS: &[&str] = &[
     "image_tag",
     "assistant_name",
     "max_messages_per_prompt",
+    "tool_profile",
 ];
 
 /// Fields the host returns but does not accept on update. They are

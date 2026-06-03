@@ -107,6 +107,15 @@ pub struct RunnerConfigFile {
     /// unknown value) so existing groups keep their full tool surface.
     #[serde(default)]
     pub tool_profile: Option<String>,
+    /// Resolved RBAC role of the sender that triggered this session
+    /// (`"admin"` / `"member"` / `"guest"`). Plumbed in from the host's
+    /// permissions resolution. Applies the sender-role floor in the
+    /// runner's [`crate::policy::ToolPolicy`]: a `"guest"` sender is held
+    /// to a read-only floor regardless of the group profile. Absent /
+    /// unknown means "no role floor" — the profile + host-owned floor
+    /// still apply.
+    #[serde(default)]
+    pub sender_role: Option<String>,
 }
 
 /// Fully-resolved runner config.
@@ -167,6 +176,11 @@ pub struct RunnerConfig {
     /// `tool_profile` (or carries an unknown value) so existing groups
     /// keep their historical full tool surface.
     pub tool_profile: crate::policy::ToolProfile,
+    /// Resolved sender role for the triggering sender, if the host
+    /// supplied one. `None` means "do not apply the role floor" (the
+    /// group profile + host-owned floor still apply). An unknown role
+    /// string also resolves to `None` (a WARN is logged).
+    pub sender_role: Option<crate::policy::SenderRole>,
 }
 
 impl RunnerConfig {
@@ -221,6 +235,19 @@ impl RunnerConfig {
                 crate::policy::ToolProfile::Full
             }),
         };
+        let sender_role = match file.sender_role.as_deref() {
+            None | Some("") => None,
+            Some(s) => {
+                let role = crate::policy::SenderRole::parse(s);
+                if role.is_none() {
+                    tracing::warn!(
+                        sender_role = s,
+                        "unknown sender_role in runner config; ignoring (no role floor applied)"
+                    );
+                }
+                role
+            }
+        };
         Ok(Self {
             session_id,
             agent_group_id,
@@ -245,6 +272,7 @@ impl RunnerConfig {
             source_session_id,
             surface_thinking: file.surface_thinking.unwrap_or(false),
             tool_profile,
+            sender_role,
         })
     }
 
@@ -338,6 +366,7 @@ mod tests {
             source_session_id: None,
             surface_thinking: None,
             tool_profile: None,
+            sender_role: None,
         }
     }
 
@@ -376,6 +405,68 @@ mod tests {
         let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "k")]);
         let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
         assert_eq!(cfg.tool_profile, crate::policy::ToolProfile::Full);
+    }
+
+    #[test]
+    fn sender_role_defaults_to_none_when_unset() {
+        let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "k")]);
+        let cfg = RunnerConfig::from_file_struct(good_file(), &env).unwrap();
+        assert!(cfg.sender_role.is_none());
+    }
+
+    #[test]
+    fn sender_role_parsed_from_file() {
+        let mut file = good_file();
+        file.sender_role = Some("guest".into());
+        let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "k")]);
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert_eq!(cfg.sender_role, Some(crate::policy::SenderRole::Guest));
+    }
+
+    #[test]
+    fn sender_role_unknown_resolves_to_none() {
+        let mut file = good_file();
+        file.sender_role = Some("superuser".into());
+        let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "k")]);
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert!(cfg.sender_role.is_none());
+    }
+
+    #[test]
+    fn config_fuel_builds_a_policy_that_blocks_shell() {
+        // End-to-end on the runner side: a runner.json carrying
+        // `tool_profile: "messaging"` + `sender_role: "guest"` must
+        // resolve into a `ToolPolicy` that denies `shell` (both layers
+        // independently block it). This is the tail of the host's plumbing
+        // — the host writes those fields, the runner parses them here, and
+        // main.rs feeds them into the dispatch policy.
+        let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "k")]);
+
+        let mut messaging = good_file();
+        messaging.tool_profile = Some("messaging".into());
+        let cfg = RunnerConfig::from_file_struct(messaging, &env).unwrap();
+        let policy = crate::policy::ToolPolicy::new(cfg.tool_profile, cfg.sender_role);
+        assert!(
+            !policy.evaluate("shell").is_allow(),
+            "messaging profile must block shell"
+        );
+        assert!(
+            policy.evaluate("read_file").is_allow(),
+            "messaging profile still allows read_file"
+        );
+
+        let mut guest = good_file();
+        guest.sender_role = Some("guest".into());
+        let cfg = RunnerConfig::from_file_struct(guest, &env).unwrap();
+        let policy = crate::policy::ToolPolicy::new(cfg.tool_profile, cfg.sender_role);
+        assert!(
+            !policy.evaluate("shell").is_allow(),
+            "guest sender must block shell even under the default full profile"
+        );
+        assert!(
+            policy.evaluate("send_message").is_allow(),
+            "guest may still send messages"
+        );
     }
 
     #[test]

@@ -82,6 +82,10 @@ const CENTRAL: &[Migration] = &[
         name: "018_dm_pairing_codes",
         sql: include_str!("../migrations/018_dm_pairing_codes.sql"),
     },
+    Migration {
+        name: "019_container_config_tool_profile",
+        sql: include_str!("../migrations/019_container_config_tool_profile.sql"),
+    },
 ];
 
 const SESSION_INBOUND: &[Migration] = &[

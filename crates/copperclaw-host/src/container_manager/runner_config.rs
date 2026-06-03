@@ -8,7 +8,11 @@ use super::prompt::{
     db_selector_to_skills_selector, remove_stale_catalogue, select_callable_skills,
 };
 use super::spawn::{CODING_SKILL_NAMES, CONTAINER_SESSION_DIR};
-use copperclaw_db::tables::container_configs;
+use copperclaw_db::session::{SessionPaths, open_inbound};
+use copperclaw_db::tables::{
+    agent_group_members, container_configs, messages_in, user_roles, users,
+};
+use copperclaw_modules::permissions::Role;
 use copperclaw_types::Session;
 use std::path::Path;
 use tracing::warn;
@@ -67,6 +71,27 @@ pub(crate) struct RunnerConfigForFile {
     /// always-present field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) surface_thinking: Option<bool>,
+    /// Per-group tool-authorization profile (`minimal` / `messaging` /
+    /// `coding` / `full`). The FUEL for the runner's layered `ToolPolicy`:
+    /// plumbed in from `container_configs.tool_profile`, parsed by the
+    /// runner into the positive allow-list ceiling enforced at every tool
+    /// dispatch (beneath the host-owned `DISALLOWED_TOOLS` floor). Skipped
+    /// when None / unset so an unconfigured group's `runner.json` shape
+    /// stays bit-identical to the pre-fuel shape — the runner then falls
+    /// back to its permissive `full` default, preserving the historical
+    /// full tool surface.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_profile: Option<String>,
+    /// Resolved RBAC role of the sender that triggered this session
+    /// (`minimal` taxonomy: `admin` / `member` / `guest`). Plumbed in
+    /// from the host's permissions resolution (see
+    /// [`ContainerManager::resolve_sender_role`]). The runner applies the
+    /// per-role floor on top of the group profile: a `guest` sender is
+    /// held to a read-only floor (no shell / file-mutation / self-mod)
+    /// regardless of profile. Skipped when None (no resolvable sender /
+    /// unconfigured deployment) so the runner applies no role floor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) sender_role: Option<String>,
     /// Reasoning-effort tier (`low`/`medium`/`high`). Mapped onto each
     /// provider's native knob: `OpenRouter`'s unified API takes it as
     /// `reasoning: { effort: ... }` (forwarded to any underlying
@@ -297,6 +322,38 @@ impl ContainerManager {
             .filter(|on| *on)
             .map(|_| true);
 
+        // Plumb the per-group tool-profile (the FUEL for the runner's
+        // layered ToolPolicy) into `runner.json`. Only emit a recognised
+        // profile name; an unknown / malformed value is dropped so the
+        // runner falls back to its permissive `full` default rather than
+        // mis-parsing. Skip emitting when unset for the same reason
+        // `surface_thinking` is skipped: keep the unconfigured-group
+        // `runner.json` shape stable.
+        let tool_profile = cc.and_then(|c| c.tool_profile.as_deref()).and_then(|p| {
+            let parsed = copperclaw_modules::permissions::ToolProfile::parse(p);
+            if parsed.is_none() {
+                warn!(
+                    agent_group = %session.agent_group_id.as_uuid(),
+                    tool_profile = p,
+                    "unknown tool_profile in container config; runner will fall back to `full`"
+                );
+            }
+            parsed.map(|profile| profile.as_str().to_string())
+        });
+
+        // Resolve the triggering sender's RBAC role and plumb it into
+        // `runner.json` so the runner applies the per-role floor (a guest
+        // is held read-only regardless of profile). Only attempted on the
+        // real spawn path (`session_root.is_some()`); test callers that
+        // pass `None` skip it (→ no role floor). Best-effort: an
+        // unresolvable sender (unknown channel / no `users` row) yields
+        // `None` so unconfigured deployments keep their historical
+        // behaviour.
+        let sender_role = session_root
+            .is_some()
+            .then(|| self.resolve_sender_role(session))
+            .flatten();
+
         // Effort precedence: per-group `container_configs.effort` (when
         // present) wins over the host-wide `default_effort` (which the
         // operator sets via `COPPERCLAW_DEFAULT_EFFORT` in `.env`).
@@ -341,10 +398,98 @@ impl ContainerManager {
             codex_args,
             source_session_id: session.source_session_id.map(|s| s.as_uuid().to_string()),
             surface_thinking,
+            tool_profile,
+            sender_role,
             effort,
             temperature,
             max_tokens,
         }
+    }
+
+    /// Resolve the RBAC role of the sender that triggered this session,
+    /// for the runner's tool-policy role floor.
+    ///
+    /// Reads the session's most-recent pending inbound to find the
+    /// triggering sender's `(channel_type, platform_id)`, derives the
+    /// canonical `UserId`, then maps the host's RBAC tables onto the
+    /// runner-side role taxonomy:
+    ///
+    /// - an Owner/Admin grant in `user_roles` (global or scoped to this
+    ///   group) → [`Role::Admin`]
+    /// - else a member of this agent group (`agent_group_members`) →
+    ///   [`Role::Member`]
+    /// - else a sender that maps to a known `users` row → [`Role::Guest`]
+    /// - else (no triggering sender resolvable / no `users` row) → `None`
+    ///
+    /// Returning `None` means "no role floor": the group profile + the
+    /// host-owned tool floor still apply. This keeps an unconfigured
+    /// deployment (no roles, no members) running exactly as before —
+    /// the floor only narrows once an operator actually grants roles or
+    /// adds members.
+    ///
+    /// Best-effort: any DB error along the way logs a WARN and resolves
+    /// to `None` rather than blocking the spawn.
+    fn resolve_sender_role(&self, session: &Session) -> Option<String> {
+        let paths = SessionPaths::new(&self.cfg.data_dir, session.agent_group_id, session.id);
+        let conn = match open_inbound(&paths) {
+            Ok(c) => c,
+            Err(err) => {
+                warn!(session = %session.id.as_uuid(), ?err, "sender-role: open inbound failed");
+                return None;
+            }
+        };
+        // `first_poll = true` so a wake-only inbound is considered; the
+        // newest pending row (seq DESC) is the sender that triggered this
+        // spawn. Agent-to-agent rows carry no channel sender, so they
+        // resolve to `None` (no role floor) — correct for inter-agent
+        // traffic, which the parent's own profile already bounds.
+        let pending = match messages_in::get_pending(&conn, true, 1) {
+            Ok(rows) => rows,
+            Err(err) => {
+                warn!(session = %session.id.as_uuid(), ?err, "sender-role: read pending failed");
+                return None;
+            }
+        };
+        let row = pending.first()?;
+        let channel_type = row.channel_type.as_ref()?;
+        let platform_id = row.platform_id.as_deref()?;
+        let user = match users::get_by_identity(&self.central, channel_type.as_str(), platform_id) {
+            Ok(Some(u)) => u,
+            Ok(None) => return None,
+            Err(err) => {
+                warn!(session = %session.id.as_uuid(), ?err, "sender-role: user lookup failed");
+                return None;
+            }
+        };
+        let role = self.role_for_user(user.id, session.agent_group_id);
+        Some(role.as_str().to_string())
+    }
+
+    /// Map the host RBAC tables onto the runner-side [`Role`] taxonomy for
+    /// a resolved user. See [`Self::resolve_sender_role`] for the ladder.
+    fn role_for_user(
+        &self,
+        user_id: copperclaw_types::UserId,
+        agent_group_id: copperclaw_types::AgentGroupId,
+    ) -> Role {
+        // Owner/Admin grant (any scope) maps to module Admin.
+        if let Ok(grants) = user_roles::list_for_user(&self.central, user_id) {
+            let is_admin = grants.iter().any(|g| {
+                matches!(g.role, user_roles::Role::Owner | user_roles::Role::Admin)
+                    && (g.agent_group_id.is_none() || g.agent_group_id == Some(agent_group_id))
+            });
+            if is_admin {
+                return Role::Admin;
+            }
+        }
+        // Member of this agent group → Member.
+        if let Ok(members) = agent_group_members::list(&self.central, agent_group_id) {
+            if members.iter().any(|m| m.user_id == user_id) {
+                return Role::Member;
+            }
+        }
+        // Known sender with no elevated grant / membership → Guest.
+        Role::Guest
     }
 }
 
@@ -468,6 +613,7 @@ mod tests {
             resource_limits: serde_json::json!({}),
             coding_enabled: false,
             surface_thinking: false,
+            tool_profile: None,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -523,6 +669,7 @@ mod tests {
             resource_limits: serde_json::json!({}),
             coding_enabled: false,
             surface_thinking: false,
+            tool_profile: None,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -571,6 +718,7 @@ mod tests {
             resource_limits: serde_json::json!({}),
             coding_enabled: false,
             surface_thinking: false,
+            tool_profile: None,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -612,6 +760,7 @@ mod tests {
             resource_limits: serde_json::json!({}),
             coding_enabled: false,
             surface_thinking: false,
+            tool_profile: None,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -646,6 +795,7 @@ mod tests {
             resource_limits: serde_json::json!({}),
             coding_enabled,
             surface_thinking: false,
+            tool_profile: None,
             updated_at: chrono::Utc::now(),
         }
     }
@@ -999,5 +1149,344 @@ mod tests {
                 "{candidate}: catalogue/prompt disagreement (cat={in_cat}, prompt={in_prompt})"
             );
         }
+    }
+
+    // ----- Input 1: group tool-profile FUEL ---------------------------------
+
+    /// Build a `ContainerConfig` for a session's group with the given
+    /// `tool_profile` (all other fields default). Helper for the
+    /// tool-profile plumbing tests.
+    fn cc_with_tool_profile(
+        agent_group_id: AgentGroupId,
+        tool_profile: Option<&str>,
+    ) -> container_configs::ContainerConfig {
+        container_configs::ContainerConfig {
+            agent_group_id,
+            provider: None,
+            model: None,
+            effort: None,
+            image_tag: None,
+            assistant_name: None,
+            max_messages_per_prompt: None,
+            skills: container_configs::SkillsSelector::All,
+            mcp_servers: serde_json::json!({}),
+            packages_apt: vec![],
+            packages_npm: vec![],
+            additional_mounts: serde_json::json!([]),
+            cli_scope: container_configs::CliScope::Group,
+            config_fingerprint: None,
+            egress_allow: vec![],
+            resource_limits: serde_json::json!({}),
+            coding_enabled: false,
+            surface_thinking: false,
+            tool_profile: tool_profile.map(str::to_string),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn runner_config_plumbs_messaging_tool_profile() {
+        // End-to-end input #1: a group on the `messaging` profile must
+        // emit `tool_profile: "messaging"` into runner.json. The runner's
+        // policy tests prove that value blocks `shell` at dispatch.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let cc = cc_with_tool_profile(session.agent_group_id, Some("messaging"));
+        let rc = mgr.runner_config_for(&session, Some(&cc), None);
+        assert_eq!(rc.tool_profile.as_deref(), Some("messaging"));
+        // And it survives JSON serialization the runner will parse.
+        let json = serde_json::to_value(&rc).unwrap();
+        assert_eq!(json["tool_profile"], "messaging");
+    }
+
+    #[test]
+    fn runner_config_omits_tool_profile_when_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let cc = cc_with_tool_profile(session.agent_group_id, None);
+        let rc = mgr.runner_config_for(&session, Some(&cc), None);
+        assert!(rc.tool_profile.is_none());
+        // Skipped from the serialized shape (skip_serializing_if).
+        let json = serde_json::to_value(&rc).unwrap();
+        assert!(json.get("tool_profile").is_none());
+    }
+
+    #[test]
+    fn runner_config_drops_unknown_tool_profile() {
+        // A malformed profile name must not reach the runner (it would
+        // silently fall back to `full` there); the host drops it so the
+        // field is simply absent.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let cc = cc_with_tool_profile(session.agent_group_id, Some("bogus"));
+        let rc = mgr.runner_config_for(&session, Some(&cc), None);
+        assert!(rc.tool_profile.is_none());
+    }
+
+    // ----- Input 2: resolved sender-role FUEL -------------------------------
+
+    /// Write one pending inbound row carrying the given channel sender into
+    /// the session's real inbound DB (under `data_dir`), so
+    /// `resolve_sender_role` can find the triggering sender.
+    fn seed_triggering_inbound(
+        data_dir: &std::path::Path,
+        session: &Session,
+        channel: &str,
+        platform_id: &str,
+    ) {
+        use copperclaw_db::tables::messages_in::{WriteInbound, insert};
+        use copperclaw_types::{ChannelType, MessageId, MessageKind};
+        let paths = SessionPaths::new(data_dir, session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        let conn = open_inbound(&paths).unwrap();
+        let row = WriteInbound {
+            id: MessageId::new(),
+            kind: MessageKind::Chat,
+            timestamp: chrono::Utc::now(),
+            content: serde_json::json!({"text": "hi"}),
+            trigger: true,
+            on_wake: false,
+            process_after: None,
+            recurrence: None,
+            series_id: None,
+            platform_id: Some(platform_id.to_string()),
+            channel_type: Some(ChannelType::new(channel)),
+            thread_id: None,
+            source_session_id: None,
+            reply_to: None,
+            is_group: None,
+        };
+        insert(&conn, &row).unwrap();
+    }
+
+    #[test]
+    fn runner_config_resolves_guest_sender_role() {
+        // End-to-end input #2: a known sender who holds no elevated grant
+        // and isn't a member resolves to `guest` and that role lands in
+        // runner.json. The runner's policy tests prove a guest blocks
+        // `shell`.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        // The sender is a known user (has a `users` row) but no role / not
+        // a member → guest.
+        users::upsert(
+            &db,
+            users::UpsertUser {
+                kind: "telegram".into(),
+                identity: "user-42".into(),
+                display_name: Some("Guest User".into()),
+            },
+        )
+        .unwrap();
+        seed_triggering_inbound(tmp.path(), &session, "telegram", "user-42");
+        // session_root must be Some for the real-spawn resolution path.
+        let session_root = SessionPaths::new(tmp.path(), session.agent_group_id, session.id).root;
+        let rc = mgr.runner_config_for(&session, None, Some(&session_root));
+        assert_eq!(rc.sender_role.as_deref(), Some("guest"));
+    }
+
+    #[test]
+    fn runner_config_resolves_admin_sender_role() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let user = users::upsert(
+            &db,
+            users::UpsertUser {
+                kind: "telegram".into(),
+                identity: "boss".into(),
+                display_name: None,
+            },
+        )
+        .unwrap();
+        // A global Admin grant maps to module Admin.
+        user_roles::grant(&db, user.id, user_roles::Role::Admin, None, None).unwrap();
+        seed_triggering_inbound(tmp.path(), &session, "telegram", "boss");
+        let session_root = SessionPaths::new(tmp.path(), session.agent_group_id, session.id).root;
+        let rc = mgr.runner_config_for(&session, None, Some(&session_root));
+        assert_eq!(rc.sender_role.as_deref(), Some("admin"));
+    }
+
+    #[test]
+    fn runner_config_resolves_member_sender_role() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let user = users::upsert(
+            &db,
+            users::UpsertUser {
+                kind: "telegram".into(),
+                identity: "teammate".into(),
+                display_name: None,
+            },
+        )
+        .unwrap();
+        agent_group_members::add(&db, user.id, session.agent_group_id, None).unwrap();
+        seed_triggering_inbound(tmp.path(), &session, "telegram", "teammate");
+        let session_root = SessionPaths::new(tmp.path(), session.agent_group_id, session.id).root;
+        let rc = mgr.runner_config_for(&session, None, Some(&session_root));
+        assert_eq!(rc.sender_role.as_deref(), Some("member"));
+    }
+
+    #[test]
+    fn runner_config_omits_sender_role_for_unknown_sender() {
+        // No `users` row for the triggering sender → no role floor, so the
+        // field is absent and an unconfigured deployment behaves as before.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        seed_triggering_inbound(tmp.path(), &session, "telegram", "never-seen");
+        let session_root = SessionPaths::new(tmp.path(), session.agent_group_id, session.id).root;
+        let rc = mgr.runner_config_for(&session, None, Some(&session_root));
+        assert!(rc.sender_role.is_none());
+        let json = serde_json::to_value(&rc).unwrap();
+        assert!(json.get("sender_role").is_none());
+    }
+
+    #[test]
+    fn runner_config_skips_sender_role_without_session_root() {
+        // Test callers that pass `session_root = None` must not trigger
+        // role resolution (and must not create an inbound DB).
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let rc = mgr.runner_config_for(&session, None, None);
+        assert!(rc.sender_role.is_none());
+    }
+
+    // ----- Input 3: active-skill allowed-tools catalogue --------------------
+
+    fn write_skill_md_with_allowed(
+        parent: &std::path::Path,
+        name: &str,
+        allowed: &str,
+        body: &str,
+    ) {
+        let dir = parent.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let content = format!(
+            "---\nname: {name}\ndescription: desc-of-{name}\nallowed-tools: {allowed}\n---\n\n{body}"
+        );
+        std::fs::write(dir.join("SKILL.md"), content).unwrap();
+    }
+
+    #[test]
+    fn callable_catalogue_carries_normalized_allowed_tools() {
+        // End-to-end input #3: a skill declaring `allowed-tools: [Read]`
+        // must land in skills.json with the normalized MCP name
+        // (`read_file`), which the runner's load_skill feeds into the
+        // active-skill policy layer to block shell.
+        let td = tempfile::tempdir().unwrap();
+        let skills = td.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write_skill_md_with_allowed(&skills, "reader", "[Read]", "read-only skill body\n");
+        let session_root = td.path().join("session");
+        std::fs::create_dir_all(&session_root).unwrap();
+        let mut cfg = manager_cfg(td.path().to_path_buf());
+        cfg.skills_dir = Some(skills);
+        cfg.skills_mode = SkillsMode::Callable;
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let _rc = mgr.runner_config_for(&session, None, Some(&session_root));
+        let bytes = std::fs::read(session_root.join(SKILLS_CATALOGUE_FILENAME)).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        let reader = parsed
+            .iter()
+            .find(|e| e.get("name").and_then(|v| v.as_str()) == Some("reader"))
+            .expect("reader skill in catalogue");
+        let allowed: Vec<String> = reader
+            .get("allowed_tools")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .expect("allowed_tools present");
+        assert_eq!(allowed, vec!["read_file".to_string()]);
+        assert!(
+            !allowed.contains(&"shell".to_string()),
+            "read-only skill must not authorize shell"
+        );
+    }
+
+    #[test]
+    fn callable_catalogue_omits_allowed_tools_when_skill_declares_none() {
+        let td = tempfile::tempdir().unwrap();
+        let skills = td.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        write_skill_md(&skills, "open", "no scope body\n");
+        let session_root = td.path().join("session");
+        std::fs::create_dir_all(&session_root).unwrap();
+        let mut cfg = manager_cfg(td.path().to_path_buf());
+        cfg.skills_dir = Some(skills);
+        cfg.skills_mode = SkillsMode::Callable;
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let _rc = mgr.runner_config_for(&session, None, Some(&session_root));
+        let bytes = std::fs::read(session_root.join(SKILLS_CATALOGUE_FILENAME)).unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_slice(&bytes).unwrap();
+        let open = parsed
+            .iter()
+            .find(|e| e.get("name").and_then(|v| v.as_str()) == Some("open"))
+            .expect("open skill in catalogue");
+        assert!(
+            open.get("allowed_tools").is_none(),
+            "a skill with no allowed-tools must omit the field (skip_serializing_if)"
+        );
     }
 }

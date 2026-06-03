@@ -442,6 +442,32 @@ pub trait ToolContext: Send + Sync {
     /// routing.
     fn clear_originating(&self) {}
 
+    /// Record the `allowed-tools` of the skill the agent just loaded via
+    /// the `load_skill` tool (the FUEL for the runner's
+    /// `ToolPolicy::with_active_skill` layer). `Some(names)` narrows the
+    /// live dispatch policy so a skill declaring `allowed-tools: [Read]`
+    /// blocks `shell`; `None` (a skill with no declared `allowed-tools`)
+    /// leaves the policy unscoped. Names are already normalized to
+    /// copperclaw MCP tool names by the host's catalogue writer.
+    ///
+    /// Default no-op so contexts that don't gate tools (mocks, subagent
+    /// adapters) compile unchanged. The runner's `RunnerToolCtx`
+    /// overrides this to stash the value for [`Self::active_skill_allowed_tools`].
+    fn set_active_skill_allowed_tools(&self, allowed: Option<Vec<String>>) {
+        let _ = allowed;
+    }
+
+    /// The active skill's `allowed-tools` (set by the most recent
+    /// `load_skill` that declared one), or `None` when no tool-scoping
+    /// skill is active. The runner reads this at every dispatch and feeds
+    /// it into `ToolPolicy::with_active_skill` so the loaded skill's
+    /// scope narrows the live policy.
+    ///
+    /// Default `None` so non-gating contexts compile unchanged.
+    fn active_skill_allowed_tools(&self) -> Option<Vec<String>> {
+        None
+    }
+
     /// True when this context represents a child agent session that
     /// has already emitted its first `send_message` to the parent.
     /// The runner's main loop checks this after every turn and exits
@@ -597,6 +623,15 @@ struct MockInner {
     /// MCP slice-3.1 surface). Lets file-edit tool tests assert the
     /// runner-side diff card emit fired with the expected payload.
     diff_calls: Vec<copperclaw_channels_core::DiffCard>,
+    /// Last value passed to `set_active_skill_allowed_tools`. Lets the
+    /// `load_skill` tool tests assert the active-skill policy hook fired
+    /// with the catalogue's normalized `allowed-tools`. The three states
+    /// are all meaningful, so the double `Option` is deliberate: `None` =
+    /// the hook was never called; `Some(None)` = called with no scope (a
+    /// skill that declared no `allowed-tools`); `Some(Some(_))` = called
+    /// with an explicit scope.
+    #[allow(clippy::option_option)]
+    active_skill_allowed: Option<Option<Vec<String>>>,
 }
 
 impl MockToolContext {
@@ -688,6 +723,18 @@ impl MockToolContext {
             .diff_calls
             .clone()
     }
+
+    /// The last value passed to `set_active_skill_allowed_tools`, or
+    /// `None` if the hook was never called. `Some(None)` means it was
+    /// called with no tool scope (a skill that declared no `allowed-tools`).
+    #[allow(clippy::option_option)]
+    pub fn active_skill_allowed_recorded(&self) -> Option<Option<Vec<String>>> {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .active_skill_allowed
+            .clone()
+    }
 }
 
 #[async_trait]
@@ -729,6 +776,20 @@ impl ToolContext for MockToolContext {
     async fn emit_diff(&self, diff: copperclaw_channels_core::DiffCard) {
         let mut g = self.inner.lock().expect("MockToolContext mutex poisoned");
         g.diff_calls.push(diff);
+    }
+
+    fn set_active_skill_allowed_tools(&self, allowed: Option<Vec<String>>) {
+        let mut g = self.inner.lock().expect("MockToolContext mutex poisoned");
+        g.active_skill_allowed = Some(allowed);
+    }
+
+    fn active_skill_allowed_tools(&self) -> Option<Vec<String>> {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .active_skill_allowed
+            .clone()
+            .flatten()
     }
 }
 
