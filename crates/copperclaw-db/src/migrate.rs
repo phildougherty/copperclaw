@@ -74,6 +74,10 @@ const CENTRAL: &[Migration] = &[
         name: "016_pending_approvals_unique",
         sql: include_str!("../migrations/016_pending_approvals_unique.sql"),
     },
+    Migration {
+        name: "017_approval_decisions",
+        sql: include_str!("../migrations/017_approval_decisions.sql"),
+    },
 ];
 
 const SESSION_INBOUND: &[Migration] = &[
@@ -231,6 +235,7 @@ mod tests {
             "sessions",
             "pending_questions",
             "pending_approvals",
+            "approval_decisions",
             "pending_channel_approvals",
             "agent_destinations",
             "unregistered_senders",

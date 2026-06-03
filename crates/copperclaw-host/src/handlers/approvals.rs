@@ -35,12 +35,15 @@
 use super::{db_err, opt_str, parse_uuid, req_str};
 use copperclaw_cclaw::ErrorPayload;
 use copperclaw_db::central::CentralDb;
-use copperclaw_db::tables::pending_approvals::ApprovalStatus;
+use copperclaw_db::tables::pending_approvals::{ApprovalStatus, DecisionOutcome};
 use copperclaw_db::tables::{container_configs, messaging_groups, pending_approvals, users};
 use copperclaw_types::{AgentGroupId, ApprovalId};
 use serde_json::{Value, json};
 
 pub fn list(_args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
+    // Lapse any overdue pending rows first so the live list never includes
+    // an approval that has already passed its TTL.
+    pending_approvals::sweep_expired(central, chrono::Utc::now()).map_err(db_err)?;
     let rows = pending_approvals::list(central, None, None).map_err(db_err)?;
     Ok(json!(rows.iter().map(approval_to_json).collect::<Vec<_>>()))
 }
@@ -88,6 +91,10 @@ pub fn approve_sender(args: &Value, central: &CentralDb) -> Result<Value, ErrorP
 /// (returns the resolved row unchanged).
 pub fn approve(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     let id = ApprovalId(parse_uuid(&req_str(args, "id")?)?);
+    // Lapse any overdue pending rows first; this both keeps the audit log
+    // honest and turns an expired-but-still-`pending` row into a deterministic
+    // `expired` conflict below rather than a silently honoured late approval.
+    pending_approvals::sweep_expired(central, chrono::Utc::now()).map_err(db_err)?;
     let row = pending_approvals::get(central, id).map_err(db_err)?;
     match row.status {
         ApprovalStatus::Approved => {
@@ -112,6 +119,12 @@ pub fn approve(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload>
                 "row is expired; refusing to approve",
             ));
         }
+        ApprovalStatus::Revoked => {
+            return Err(ErrorPayload::new(
+                "conflict",
+                "row is revoked; refusing to approve",
+            ));
+        }
         ApprovalStatus::Pending => {}
     }
 
@@ -130,6 +143,8 @@ pub fn approve(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload>
     };
 
     pending_approvals::update_status(central, id, ApprovalStatus::Approved).map_err(db_err)?;
+    pending_approvals::record_decision(central, id, action, DecisionOutcome::Approve, "host", None)
+        .map_err(db_err)?;
     let after = pending_approvals::get(central, id).map_err(db_err)?;
     Ok(json!({
         "approval": approval_to_json(&after),
@@ -142,6 +157,7 @@ pub fn approve(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload>
 /// Idempotent for already-denied rows. Conflicts with `approved`.
 pub fn deny(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     let id = ApprovalId(parse_uuid(&req_str(args, "id")?)?);
+    pending_approvals::sweep_expired(central, chrono::Utc::now()).map_err(db_err)?;
     let row = pending_approvals::get(central, id).map_err(db_err)?;
     match row.status {
         ApprovalStatus::Denied => {
@@ -163,14 +179,101 @@ pub fn deny(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
                 "row is expired; refusing to deny",
             ));
         }
+        ApprovalStatus::Revoked => {
+            return Err(ErrorPayload::new(
+                "conflict",
+                "row is revoked; refusing to deny",
+            ));
+        }
         ApprovalStatus::Pending => {}
     }
     pending_approvals::update_status(central, id, ApprovalStatus::Denied).map_err(db_err)?;
+    pending_approvals::record_decision(
+        central,
+        id,
+        row.action.as_str(),
+        DecisionOutcome::Deny,
+        "host",
+        None,
+    )
+    .map_err(db_err)?;
     let after = pending_approvals::get(central, id).map_err(db_err)?;
     Ok(json!({
         "approval": approval_to_json(&after),
         "applied": true,
     }))
+}
+
+/// Revoke a pending row: withdraw the request without approving or denying
+/// it. Marks the row `status = 'revoked'`, applies no side effects, and
+/// appends a `revoke` decision (with the optional `reason`). Idempotent for
+/// already-revoked rows. Conflicts with approved / denied / expired rows —
+/// a settled decision cannot be revoked, only a live pending one.
+pub fn revoke(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
+    let id = ApprovalId(parse_uuid(&req_str(args, "id")?)?);
+    let reason = opt_str(args, "reason");
+    pending_approvals::sweep_expired(central, chrono::Utc::now()).map_err(db_err)?;
+    let row = pending_approvals::get(central, id).map_err(db_err)?;
+    match row.status {
+        ApprovalStatus::Revoked => {
+            return Ok(json!({
+                "approval": approval_to_json(&row),
+                "applied": false,
+                "reason": "already_revoked",
+            }));
+        }
+        ApprovalStatus::Approved => {
+            return Err(ErrorPayload::new(
+                "conflict",
+                "row is approved; refusing to revoke",
+            ));
+        }
+        ApprovalStatus::Denied => {
+            return Err(ErrorPayload::new(
+                "conflict",
+                "row is denied; refusing to revoke",
+            ));
+        }
+        ApprovalStatus::Expired => {
+            return Err(ErrorPayload::new(
+                "conflict",
+                "row is expired; refusing to revoke",
+            ));
+        }
+        ApprovalStatus::Pending => {}
+    }
+    pending_approvals::update_status(central, id, ApprovalStatus::Revoked).map_err(db_err)?;
+    pending_approvals::record_decision(
+        central,
+        id,
+        row.action.as_str(),
+        DecisionOutcome::Revoke,
+        "host",
+        reason.as_deref(),
+    )
+    .map_err(db_err)?;
+    let after = pending_approvals::get(central, id).map_err(db_err)?;
+    Ok(json!({
+        "approval": approval_to_json(&after),
+        "applied": true,
+    }))
+}
+
+/// Read the append-only approval-decision audit log. `id` scopes to one
+/// approval's history; absent, returns the global log newest-first capped
+/// by `limit` (default 50).
+pub fn decisions(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
+    let approval_id = match opt_str(args, "id") {
+        Some(s) => Some(ApprovalId(parse_uuid(&s)?)),
+        None => None,
+    };
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_i64)
+        .filter(|n| *n > 0)
+        .unwrap_or(50);
+    let rows = pending_approvals::list_decisions(central, approval_id, limit).map_err(db_err)?;
+    Ok(json!(rows.iter().map(decision_to_json).collect::<Vec<_>>()))
 }
 
 // --- Per-family side-effect appliers ---------------------------------------
@@ -435,6 +538,18 @@ fn ensure_config_row(central: &CentralDb, ag_id: AgentGroupId) -> Result<(), Err
     )
     .map_err(db_err)?;
     Ok(())
+}
+
+fn decision_to_json(d: &pending_approvals::ApprovalDecision) -> Value {
+    json!({
+        "id": d.id,
+        "approval_id": d.approval_id.as_uuid().to_string(),
+        "action": d.action,
+        "outcome": d.outcome.as_str(),
+        "decided_by": d.decided_by,
+        "reason": d.reason,
+        "decided_at": d.decided_at.to_rfc3339(),
+    })
 }
 
 fn approval_to_json(a: &pending_approvals::PendingApproval) -> Value {
@@ -920,6 +1035,211 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Lifecycle: expiry, revocation, decision audit
+    // -----------------------------------------------------------------------
+
+    use copperclaw_db::tables::pending_approvals::DecisionOutcome;
+
+    #[test]
+    fn approve_expired_row_is_conflict_and_logs_expire() {
+        let db = db();
+        let id = insert_pending(
+            &db,
+            "sender",
+            UpsertPendingApproval {
+                request_id: "r-exp".into(),
+                payload: json!({}),
+                channel_type: Some(ChannelType::new("telegram")),
+                platform_id: Some("u-exp".into()),
+                // Already past its deadline.
+                expires_at: Some(chrono::Utc::now() - chrono::Duration::minutes(5)),
+                title: "x".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        // approve() sweeps overdue rows first, so this lapses then conflicts.
+        let err = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap_err();
+        assert_eq!(err.code, "conflict");
+        let after = get_row(&db, id).unwrap();
+        assert_eq!(after.status, ApprovalStatus::Expired);
+        // The sweep recorded an `expire` decision.
+        let decs = pending_approvals::list_decisions(&db, Some(id), 10).unwrap();
+        assert_eq!(decs.len(), 1);
+        assert_eq!(decs[0].outcome, DecisionOutcome::Expire);
+        assert_eq!(decs[0].decided_by, "system:expiry");
+    }
+
+    #[test]
+    fn list_sweeps_expired_rows_out_of_the_live_set() {
+        let db = db();
+        insert_pending(
+            &db,
+            "sender",
+            UpsertPendingApproval {
+                request_id: "r-stale".into(),
+                payload: json!({}),
+                channel_type: Some(ChannelType::new("slack")),
+                platform_id: Some("U-stale".into()),
+                expires_at: Some(chrono::Utc::now() - chrono::Duration::minutes(1)),
+                title: "x".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        let v = list(&Value::Null, &db).unwrap();
+        let arr = v.as_array().unwrap();
+        // The stale row was swept to `expired`; it's no longer pending.
+        assert!(arr.iter().all(|r| r["status"] != "pending"));
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["status"], "expired");
+    }
+
+    #[test]
+    fn approve_then_record_decision_is_logged() {
+        let db = db();
+        let id = insert_pending(
+            &db,
+            "sender",
+            UpsertPendingApproval {
+                request_id: "r-aud".into(),
+                payload: json!({}),
+                channel_type: Some(ChannelType::new("telegram")),
+                platform_id: Some("u-aud".into()),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                title: "x".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap();
+        let decs = pending_approvals::list_decisions(&db, Some(id), 10).unwrap();
+        assert_eq!(decs.len(), 1);
+        assert_eq!(decs[0].outcome, DecisionOutcome::Approve);
+        assert_eq!(decs[0].decided_by, "host");
+    }
+
+    #[test]
+    fn revoke_marks_revoked_and_logs_decision() {
+        let db = db();
+        let id = insert_pending(
+            &db,
+            "sender",
+            UpsertPendingApproval {
+                request_id: "r-rev".into(),
+                payload: json!({}),
+                channel_type: Some(ChannelType::new("slack")),
+                platform_id: Some("U-rev".into()),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                title: "x".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        let v = revoke(
+            &json!({"id": id.as_uuid().to_string(), "reason": "operator withdrew"}),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["applied"], true);
+        let after = get_row(&db, id).unwrap();
+        assert_eq!(after.status, ApprovalStatus::Revoked);
+        let decs = pending_approvals::list_decisions(&db, Some(id), 10).unwrap();
+        assert_eq!(decs.len(), 1);
+        assert_eq!(decs[0].outcome, DecisionOutcome::Revoke);
+        assert_eq!(decs[0].reason.as_deref(), Some("operator withdrew"));
+        // No side effect: no user row created.
+        assert!(
+            users::get_by_identity(&db, "slack", "U-rev")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn double_revoke_is_idempotent() {
+        let db = db();
+        let id = insert_pending(
+            &db,
+            "sender",
+            UpsertPendingApproval {
+                request_id: "r-rev-idem".into(),
+                payload: json!({}),
+                channel_type: Some(ChannelType::new("slack")),
+                platform_id: Some("U-x".into()),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                title: "x".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        revoke(&json!({"id": id.as_uuid().to_string()}), &db).unwrap();
+        let second = revoke(&json!({"id": id.as_uuid().to_string()}), &db).unwrap();
+        assert_eq!(second["applied"], false);
+        assert_eq!(second["reason"], "already_revoked");
+        // Only one revoke decision logged.
+        let decs = pending_approvals::list_decisions(&db, Some(id), 10).unwrap();
+        assert_eq!(decs.len(), 1);
+    }
+
+    #[test]
+    fn revoke_after_approve_is_conflict() {
+        let db = db();
+        let id = insert_pending(
+            &db,
+            "sender",
+            UpsertPendingApproval {
+                request_id: "r-rev-conflict".into(),
+                payload: json!({}),
+                channel_type: Some(ChannelType::new("telegram")),
+                platform_id: Some("u-rc".into()),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                title: "x".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap();
+        let err = revoke(&json!({"id": id.as_uuid().to_string()}), &db).unwrap_err();
+        assert_eq!(err.code, "conflict");
+    }
+
+    #[test]
+    fn revoke_unknown_id_is_not_found() {
+        let db = db();
+        let err = revoke(&json!({"id": uuid::Uuid::now_v7().to_string()}), &db).unwrap_err();
+        assert_eq!(err.code, "not_found");
+    }
+
+    #[test]
+    fn decisions_handler_lists_global_and_scoped() {
+        let db = db();
+        let id = insert_pending(
+            &db,
+            "sender",
+            UpsertPendingApproval {
+                request_id: "r-dec-h".into(),
+                payload: json!({}),
+                channel_type: Some(ChannelType::new("slack")),
+                platform_id: Some("U-dec".into()),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                title: "x".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        deny(&json!({"id": id.as_uuid().to_string()}), &db).unwrap();
+        // Global log.
+        let global = decisions(&Value::Null, &db).unwrap();
+        assert_eq!(global.as_array().unwrap().len(), 1);
+        assert_eq!(global[0]["outcome"], "deny");
+        // Scoped to this approval.
+        let scoped = decisions(&json!({"id": id.as_uuid().to_string()}), &db).unwrap();
+        assert_eq!(scoped.as_array().unwrap().len(), 1);
+        assert_eq!(scoped[0]["approval_id"], id.as_uuid().to_string());
     }
 
     #[test]

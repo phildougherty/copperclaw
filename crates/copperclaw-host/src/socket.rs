@@ -307,6 +307,8 @@ pub fn build_dispatch_table() -> DispatchTable {
     );
     ins!("approvals.approve", handlers::approvals::approve, true);
     ins!("approvals.deny", handlers::approvals::deny, true);
+    ins!("approvals.revoke", handlers::approvals::revoke, true);
+    ins!("approvals.decisions", handlers::approvals::decisions, false);
     ins!("audit.list", handlers::audit::list, false);
     ins!("budgets.list", handlers::budgets::list, false);
     ins!("budgets.set", handlers::budgets::set, true);
