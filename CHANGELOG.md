@@ -6,6 +6,45 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security (M16 hardening wave 1 — make the advertised controls real — 2026-06-02)
+
+First wave of the M16 security-hardening roadmap (see `PLAN.md`). Closes the
+inert/open-fail controls found in tree; all five landed gate-clean (6,078
+workspace tests pass).
+
+- **SSRF guard on `web_fetch` / `web_search`.** New
+  `crates/copperclaw-mcp/src/tools/net_guard.rs` resolves a target host and
+  rejects loopback, link-local (incl. the `169.254.169.254` metadata
+  endpoint), RFC1918, IPv6 ULA (`fc00::/7`), CGNAT (`100.64/10`), and
+  unspecified addresses, and installs a `reqwest::redirect::Policy` that
+  re-classifies **every** redirect hop (the default blindly followed up to
+  10). Non-HTTP(S) schemes are rejected. Previously both tools issued
+  `client.get(url)` with no checks, reachable to internal addresses.
+  Documented residual: DNS-rebinding TOCTOU (guard resolves, reqwest
+  re-resolves at connect) — closed later by pinning the validated IP.
+- **Permission gate fails closed.** `crates/copperclaw-modules/src/permissions.rs`
+  now returns `Deny` (with an audit line naming the op) instead of `Defer`
+  for an op that fails `PermissionOp::parse()`, and host gate resolution
+  treats a missing decision as deny for privileged ops — previously an
+  unknown op open-failed even with the permissions module installed.
+- **Secret redaction in logs + tighter perms.** New redaction helpers
+  (`copperclaw-host/src/log_redact.rs`, `copperclaw-runner/src/redact.rs`)
+  scrub `sk-…` / `sk-or-v1-…` / `Bearer` token shapes from host and runner
+  log output; the per-session `runner.json` is written `0600`.
+- **Repeated-tool-call circuit breakers.** `copperclaw-runner`'s turn loop
+  now detects N identical consecutive tool calls and ping-pong A/B/A/B
+  alternation, ends the loop with a surfaced message, and emits a
+  `copperclaw-metrics` event — complementing (not replacing) the existing
+  tool-turn depth cap and token budget.
+- **Approval lifecycle: TTL, revocation, decision audit.** Migration
+  `017_approval_decisions.sql` adds an append-only `approval_decisions`
+  receipt table (`ON DELETE CASCADE` so `sessions::delete` still works) and
+  expiry/revocation state on `pending_approvals`; approvals default to a ~1h
+  TTL, can be revoked, and every approve/deny/expire/revoke is recorded.
+  `sweep_expired` runs in a single `IMMEDIATE` transaction and only logs an
+  expire decision when it actually flips a row (no duplicate receipts under
+  concurrent sweeps). New `cclaw` revoke + decision-audit commands.
+
 ### Fixed (`create_agent` children inherit the parent's model — 2026-06-02)
 
 A child spawned via `create_agent` was created with an `agent_groups` row and
