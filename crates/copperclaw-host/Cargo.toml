@@ -70,6 +70,10 @@ thiserror              = { workspace = true }
 uuid                   = { workspace = true }
 rusqlite               = { workspace = true }
 sha2                   = { workspace = true }
+hex                    = { workspace = true }
+rand                   = { workspace = true }
+reqwest                = { workspace = true }
+axum                   = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -81,6 +85,7 @@ copperclaw-mcp = { workspace = true }
 tokio = { workspace = true }
 wiremock = "=0.6.2"
 regex = "1"
+tower = { version = "0.5", features = ["util"] }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 
