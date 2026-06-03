@@ -216,6 +216,12 @@ fn runner_emit_set_matches_source() {
             &[
                 "fn apply_",
                 "fn emit_usage_report",
+                // The `usage_report` payload literal moved out of
+                // `emit_usage_report` into this shared builder (so the live
+                // emit path and the host's emit->record->fold integration test
+                // construct it identically). Scan its body for the same
+                // `json!({ "usage_report": ... })` first-key pattern.
+                "fn build_usage_report_payload",
                 // Trailing `(` pins this to the function definition,
                 // not the unit-test names like
                 // `fn emit_breadcrumb_finish_writes_update_system_row`

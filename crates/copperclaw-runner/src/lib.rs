@@ -38,6 +38,13 @@ pub use run::{
     MIN_TOOL_DEADLINE_SECS, POLL_INTERVAL_MS, PROVIDER_DEADLINE_ENV, RunnerDeps, TOOL_DEADLINE_ENV,
     resolve_max_tool_turns, resolve_provider_deadline, resolve_tool_deadline_secs, run_loop,
 };
+// Provider resilience (M16 Phase 4): the runner builds the per-turn
+// `usage_report` payload (carrying the failure reason that drives the host's
+// degrade/restore fold) via `build_usage_report_payload`. `TurnOutcome` is
+// the input enum. Both are public so the host's emit→record→fold integration
+// test exercises the same payload-construction code the live path runs.
+pub use run::drive_turn::TurnOutcome;
+pub use run::{UsageReportInputs, build_usage_report_payload};
 // Production wiring for the typing-indicator-keepalive path: the
 // runner binary constructs a HeartbeatPinger so each LLM stream
 // refreshes the heartbeat file (and thus the host's typing-ticker

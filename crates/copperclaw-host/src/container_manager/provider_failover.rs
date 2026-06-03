@@ -201,6 +201,35 @@ impl ContainerManager {
         Some(sel)
     }
 
+    /// Resolve only the `api_key_env` the chain selection would write into
+    /// `runner.json` for this session, WITHOUT any side effects (no fold, no
+    /// audit, no health upsert). `build_spec` uses it to inject the selected
+    /// non-default key's *value* into the container env — `runner.json` names
+    /// the env var (e.g. `KEY_B`) but the runner can only read it if the host
+    /// actually puts `KEY_B=<secret>` in the container env.
+    ///
+    /// Read-only on purpose: the mutating fold + degrade audit already ran in
+    /// [`Self::resolve_provider_selection`] when `runner_config_for` assembled
+    /// the config earlier in the same spawn. Re-running them here would
+    /// double-audit. We re-select against the same persisted chain + health,
+    /// which is deterministic, so the env name matches what `runner.json` got.
+    ///
+    /// Returns `None` for a group with no chain, or when the selected key is
+    /// the ambient credential / declares no `api_key_env` (the default
+    /// `ANTHROPIC_API_KEY` path that `build_spec` already injects).
+    pub(crate) fn selected_api_key_env(
+        &self,
+        session: &Session,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<String> {
+        let id = session.agent_group_id;
+        let chain = load_chain(&self.central, id)?;
+        let health = hydrate_health(&self.central, id);
+        let channel = self.triggering_channel(session);
+        let sel = chain.select(channel.as_deref(), &health, now)?;
+        sel.api_key_env
+    }
+
     /// Audit a degrade: the spawn selected a non-primary chain entry because
     /// the primary is unhealthy. Best-effort (audit failures only log).
     fn audit_provider_degrade(&self, session: &Session, sel: &Selection) {
@@ -275,16 +304,20 @@ impl ContainerManager {
         let mut health = hydrate_health(&self.central, id);
         // Oldest-first so successive failures/recoveries apply in order.
         for turn in turns.into_iter().rev() {
-            // Find the chain entry this turn ran on (by provider + model). A
-            // turn for a provider/model not in the chain (e.g. an old config)
-            // is ignored.
-            let Some(entry) = chain
-                .entries
-                .iter()
-                .find(|e| e.provider == turn.provider && e.model == turn.model)
-            else {
+            // Resolve the chain entry this turn ran on. Direct `(provider,
+            // model)` match for an unpinned turn; for a per-channel-pinned turn
+            // the recorded model is the PINNED model (not any entry's default),
+            // so we attribute it back to the originating entry by provider +
+            // pin membership. A turn for a provider/model that matches neither
+            // (e.g. an old config) is ignored.
+            let Some(entry) = Self::fold_entry_for_turn(chain, &turn.provider, &turn.model) else {
                 continue;
             };
+            // Health is keyed by the ENTRY's default model, never the pinned
+            // model: `FallbackChain::select` looks up eligibility by the entry's
+            // own (provider, model), so degrading a pinned model id would write
+            // a health row the selector never reads. Fold against `entry.model`.
+            let model = entry.model.as_str();
             let is_error = turn.status == "error";
             if is_error {
                 let Some(reason) = turn
@@ -299,12 +332,12 @@ impl ContainerManager {
                 // this entry. Falls back to the entry's first key id.
                 let key_id = chain
                     .select(None, &health, turn.ended_at)
-                    .filter(|s| s.provider == turn.provider && s.model == turn.model)
+                    .filter(|s| s.provider == turn.provider && s.model == model)
                     .map_or_else(
                         || entry.key_ids().into_iter().next().unwrap_or_default(),
                         |s| s.key_id,
                     );
-                let hk = HealthKey::new(&turn.provider, &turn.model, &key_id);
+                let hk = HealthKey::new(&turn.provider, model, &key_id);
                 let last_failure = health.get(&hk).and_then(|h| h.last_failure_at);
                 // Only degrade on a turn newer than the last recorded failure
                 // (idempotent: re-reading the same turn is a no-op).
@@ -314,21 +347,13 @@ impl ContainerManager {
                 chain.record_failure(
                     &mut health,
                     &turn.provider,
-                    &turn.model,
+                    model,
                     &key_id,
                     reason,
                     turn.ended_at,
                 );
                 if let Some(h) = health.get(&hk) {
-                    persist_health(
-                        &self.central,
-                        id,
-                        &turn.provider,
-                        &turn.model,
-                        &key_id,
-                        h,
-                        now,
-                    );
+                    persist_health(&self.central, id, &turn.provider, model, &key_id, h, now);
                 }
             } else {
                 // A successful turn restores every key of this entry that is
@@ -336,7 +361,7 @@ impl ContainerManager {
                 // the re-probe-and-restore half. (A success carries no key id,
                 // so it heals whichever of the entry's keys had degraded.)
                 for key_id in entry.key_ids() {
-                    let hk = HealthKey::new(&turn.provider, &turn.model, &key_id);
+                    let hk = HealthKey::new(&turn.provider, model, &key_id);
                     let recovered = health
                         .get(&hk)
                         .and_then(|h| h.last_failure_at)
@@ -344,21 +369,49 @@ impl ContainerManager {
                     if !recovered {
                         continue;
                     }
-                    chain.record_success(&mut health, &turn.provider, &turn.model, &key_id);
+                    chain.record_success(&mut health, &turn.provider, model, &key_id);
                     if let Some(h) = health.get(&hk) {
-                        persist_health(
-                            &self.central,
-                            id,
-                            &turn.provider,
-                            &turn.model,
-                            &key_id,
-                            h,
-                            now,
-                        );
+                        persist_health(&self.central, id, &turn.provider, model, &key_id, h, now);
                     }
                 }
             }
         }
+    }
+
+    /// Resolve which chain entry a recorded `agent_turns` row should fold
+    /// into. Returns `None` when the turn matches neither a chain entry's
+    /// `(provider, model)` directly nor a per-channel pin.
+    ///
+    /// Two cases:
+    /// 1. Unpinned turn: the recorded model IS an entry's default model — a
+    ///    direct `(provider, model)` match.
+    /// 2. Pinned turn: the recorded model is a per-channel PIN (a value in
+    ///    `model_by_channel`), not any entry's default. The pin overrode only
+    ///    the model; the provider is still the originating entry's. We
+    ///    attribute it to the chain entry with the matching provider —
+    ///    preferring the *primary* (lowest-index) such entry, which is the one
+    ///    the selector would have chosen to produce the pin. Without this a
+    ///    pinned-channel failure (e.g. a telegram-pinned model that 429s)
+    ///    matches no entry and never degrades the chain.
+    fn fold_entry_for_turn<'a>(
+        chain: &'a FallbackChain,
+        provider: &str,
+        model: &str,
+    ) -> Option<&'a ChainEntry> {
+        if let Some(direct) = chain
+            .entries
+            .iter()
+            .find(|e| e.provider == provider && e.model == model)
+        {
+            return Some(direct);
+        }
+        // Pinned turn: the model is a configured pin value, and the provider
+        // matches an entry whose model the pin overrode.
+        let is_pinned_model = chain.model_by_channel.values().any(|m| m == model);
+        if is_pinned_model {
+            return chain.entries.iter().find(|e| e.provider == provider);
+        }
+        None
     }
 }
 
@@ -781,5 +834,224 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(h.failure_count, 1, "same turn folded once, not thrice");
+    }
+
+    /// Record an `agent_turns` row through the REAL emit -> record pipeline,
+    /// NOT the test-only `agent_turns::insert`. This is what proves the live
+    /// path actually persists the failure reason:
+    ///   1. `copperclaw_runner::build_usage_report_payload` builds the exact
+    ///      `usage_report` payload the runner emits at the end of a turn
+    ///      (carrying the failure reason — the field the pre-fix code dropped);
+    ///   2. `parse_system_content` parses the system-row envelope the way the
+    ///      delivery service does on the live path;
+    ///   3. `copperclaw_host_delivery::service::record_usage_report` persists
+    ///      it into `agent_turns` (reading the `error` field).
+    ///
+    /// `outcome` is the runner's real `TurnOutcome`.
+    fn record_turn_via_real_pipeline(
+        m: &ContainerManager,
+        s: &Session,
+        provider: &str,
+        model: &str,
+        outcome: &copperclaw_runner::TurnOutcome,
+        seq: i64,
+        ended_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        // (1) Runner builds the payload — the genuine code under test.
+        let envelope =
+            copperclaw_runner::build_usage_report_payload(&copperclaw_runner::UsageReportInputs {
+                session_id: s.id,
+                agent_group_id: s.agent_group_id,
+                seq,
+                model,
+                provider,
+                input_tokens: 1,
+                output_tokens: 1,
+                started_at: ended_at,
+                ended_at,
+                outcome,
+            });
+        // (2) Delivery service parses the system row's `{"usage_report": {...}}`
+        //     envelope into the inner action payload.
+        let action = copperclaw_host_delivery::parse_system_content(&envelope)
+            .unwrap()
+            .expect("usage_report is an actionable system row");
+        assert_eq!(action.name, "usage_report");
+        // (3) Delivery service persists it into agent_turns (reads `error`).
+        let row = copperclaw_types::MessageOutRow {
+            id: copperclaw_types::MessageId::new(),
+            seq,
+            in_reply_to: None,
+            timestamp: ended_at,
+            deliver_after: None,
+            recurrence: None,
+            kind: copperclaw_types::MessageKind::System,
+            platform_id: None,
+            channel_type: None,
+            thread_id: None,
+            content: envelope.clone(),
+        };
+        copperclaw_host_delivery::service::record_usage_report(&m.central, &row, &action.payload);
+    }
+
+    /// THE point of the fix: a GENUINE provider failure reported by the runner
+    /// (a wrapped reason string, not the bare `ProviderError` Display) must
+    /// flow emit -> record -> fold and degrade the chain, and a later success
+    /// must restore it. Exercises the real payload builder + real recorder +
+    /// real fold — none of the test-only helpers.
+    #[test]
+    fn real_emit_record_fold_degrades_on_failure_and_restores_on_recovery() {
+        use copperclaw_runner::TurnOutcome;
+        let m = mgr();
+        let g = group(&m);
+        let s = session(&m, g);
+        set_chain(
+            &m,
+            g,
+            &json!([
+                {"provider": "anthropic", "model": "claude-sonnet-4-6",
+                 "keys": [{"id": "k1", "api_key_env": "ANTHROPIC_API_KEY"}]},
+                {"provider": "ollama", "model": "qwen3.6:27b"}
+            ]),
+            &json!({}),
+        );
+
+        let t0 = chrono::Utc::now() - chrono::Duration::seconds(30);
+        // The runner reports a terminal query-time failure. This is the EXACT
+        // wrapped reason `provider_call::format_provider_failure_reason`
+        // produces for a 429 — the shape the old prefix-only classifier could
+        // never match, leaving the chain stuck on the primary.
+        let failure = TurnOutcome::Failed(
+            "provider rejected the query before streaming started \
+             (api error 429: rate limit exceeded)"
+                .to_string(),
+        );
+        record_turn_via_real_pipeline(&m, &s, "anthropic", "claude-sonnet-4-6", &failure, 0, t0);
+
+        // Sanity: the recorder actually persisted the reason into the column
+        // the fold reads — the precise NULL-`error` bug the reviewer flagged.
+        let persisted = copperclaw_db::tables::agent_turns::recent_for_group(
+            &m.central,
+            &g.as_uuid().to_string(),
+            t0 - chrono::Duration::minutes(1),
+            10,
+        )
+        .unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].status, "error");
+        assert!(
+            persisted[0]
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("api error 429")),
+            "failure reason must reach agent_turns.error, got {:?}",
+            persisted[0].error
+        );
+
+        // Fold the real outcome: degrades off the (now rate-limited) primary
+        // onto the ollama fallback.
+        let sel = m
+            .resolve_provider_selection(&s, t0 + chrono::Duration::seconds(1))
+            .unwrap();
+        assert_eq!(sel.provider, "ollama", "real 429 degraded to fallback");
+        assert!(sel.degraded);
+
+        // The runner later reports a successful turn on the primary (the host's
+        // re-probe). Through the same real pipeline it restores the primary.
+        record_turn_via_real_pipeline(
+            &m,
+            &s,
+            "anthropic",
+            "claude-sonnet-4-6",
+            &TurnOutcome::Done,
+            1,
+            t0 + chrono::Duration::seconds(10),
+        );
+        let sel = m
+            .resolve_provider_selection(&s, t0 + chrono::Duration::seconds(11))
+            .unwrap();
+        assert_eq!(sel.provider, "anthropic", "success restored the primary");
+        assert!(!sel.degraded);
+    }
+
+    /// MEDIUM 4 regression: a failure on a per-channel-PINNED turn must still
+    /// degrade the chain. The runner records the PINNED model on the turn (not
+    /// the chain entry's default model), so the fold has to attribute it back
+    /// to the originating entry — otherwise a pinned channel never degrades.
+    #[test]
+    fn pinned_channel_failure_degrades_via_real_pipeline() {
+        use copperclaw_db::session::{SessionPaths, open_inbound};
+        use copperclaw_runner::TurnOutcome;
+        let tmp = tempfile::tempdir().unwrap();
+        let central = CentralDb::open_in_memory().unwrap();
+        let m = ContainerManager::new(
+            central,
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let g = group(&m);
+        let s = session(&m, g);
+        // Primary anthropic entry (default model claude-sonnet-4-6) with a
+        // telegram pin to claude-opus-4-1, plus an ollama fallback.
+        set_chain(
+            &m,
+            g,
+            &json!([
+                {"provider": "anthropic", "model": "claude-sonnet-4-6",
+                 "keys": [{"id": "k1", "api_key_env": "ANTHROPIC_API_KEY"}]},
+                {"provider": "ollama", "model": "qwen3.6:27b"}
+            ]),
+            &json!({"telegram": "claude-opus-4-1"}),
+        );
+        // Seed a telegram pending inbound so the spawn-time pin resolves.
+        let paths = SessionPaths::new(tmp.path(), s.agent_group_id, s.id);
+        let conn = open_inbound(&paths).unwrap();
+        copperclaw_db::tables::messages_in::insert(
+            &conn,
+            &copperclaw_db::tables::messages_in::WriteInbound {
+                id: copperclaw_types::MessageId::new(),
+                kind: copperclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: json!({"text": "hi"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("tg-1".into()),
+                channel_type: Some(copperclaw_types::ChannelType::new("telegram")),
+                thread_id: None,
+                source_session_id: None,
+                reply_to: None,
+                is_group: None,
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        let t0 = chrono::Utc::now() - chrono::Duration::seconds(30);
+        // The pinned turn ran on the PINNED model (claude-opus-4-1) and 5xx'd.
+        record_turn_via_real_pipeline(
+            &m,
+            &s,
+            "anthropic",
+            "claude-opus-4-1",
+            &TurnOutcome::Failed(
+                "provider stream ended with an error event (503 Service Unavailable)".to_string(),
+            ),
+            0,
+            t0,
+        );
+
+        // Despite the turn carrying the pinned model, the fold attributes it to
+        // the originating anthropic entry and degrades to the ollama fallback.
+        let sel = m
+            .resolve_provider_selection(&s, t0 + chrono::Duration::seconds(1))
+            .unwrap();
+        assert_eq!(
+            sel.provider, "ollama",
+            "pinned-channel failure degraded the chain"
+        );
+        assert!(sel.degraded);
     }
 }

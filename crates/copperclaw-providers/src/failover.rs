@@ -142,6 +142,29 @@ impl HealthStatus {
     }
 }
 
+/// True when `haystack` contains the decimal `status` as a standalone token
+/// (digit run not adjacent to other digits) — so `429` matches in
+/// "http 429" but neither `4290` nor `81429` does. Used by
+/// [`DegradeReason::from_error_text`] to spot a bare HTTP status in a
+/// provider's free-form SSE error body without false-matching a longer
+/// number that happens to embed the code.
+fn contains_status(haystack: &str, status: u16) -> bool {
+    let needle = status.to_string();
+    let bytes = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(&needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let left_ok = start == 0 || !bytes[start - 1].is_ascii_digit();
+        let right_ok = end >= bytes.len() || !bytes[end].is_ascii_digit();
+        if left_ok && right_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
 /// Why a chain entry/key was last degraded. Short, stable reason strings for
 /// audit + inspect.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -181,38 +204,81 @@ impl DegradeReason {
     }
 
     /// Classify a recorded error *string* (as the runner persists it on an
-    /// `agent_turns` row: the `Display` of a [`crate::ProviderError`]) into a
-    /// degrade reason, or `None` when the text is not resilience-relevant.
+    /// `agent_turns` row) into a degrade reason, or `None` when the text is
+    /// not resilience-relevant.
     ///
     /// The host reads turn outcomes from the central DB (not live
     /// `ProviderError` values — those live inside the container), so it
-    /// classifies by the stable error-message shape:
-    /// * `"overloaded"` -> [`Self::Overloaded`]
-    /// * `"transport error: ..."` -> [`Self::Transport`]
-    /// * `"api error 429: ..."` -> [`Self::RateLimit`]
-    /// * `"api error 5xx: ..."` -> [`Self::ServerError`]
-    /// * anything else (bad request, decode, cancelled, session invalid,
-    ///   deadline) -> `None`.
+    /// classifies by the stable error-message shape. Crucially the live
+    /// reason is NOT a bare `ProviderError` Display: the runner wraps it
+    /// (`provider_call::format_provider_failure_reason` emits "provider
+    /// rejected the query before streaming started (<err>)" and the stream
+    /// path emits "provider stream ended with an error event (<body>)"), so
+    /// matching the bare Display by *prefix* misses every real failure. We
+    /// therefore match by SUBSTRING and prefer the structured `ProviderError`
+    /// markers, falling back to the common provider phrasing on the
+    /// stream-body path:
+    /// * embedded `"api error <status>: ..."` -> 429 ⇒ rate-limit,
+    ///   5xx ⇒ server-error, other (4xx) ⇒ `None`;
+    /// * `"transport error"` / connection-reset / timeout phrasing ⇒ transport;
+    /// * `"overloaded"` / `529` ⇒ overloaded;
+    /// * bare `429` / "rate limit" phrasing ⇒ rate-limit;
+    /// * "service unavailable" / "bad gateway" / "internal server error" /
+    ///   `500`..`599` phrasing ⇒ server-error.
+    ///
+    /// Non-resilience shapes (bad request / 4xx, decode, cancelled, session
+    /// invalid, deadline) classify to `None` so they never degrade the chain.
     #[must_use]
     pub fn from_error_text(text: &str) -> Option<Self> {
         let t = text.trim().to_ascii_lowercase();
-        if t.starts_with("overloaded") {
-            return Some(DegradeReason::Overloaded);
+        if t.is_empty() {
+            return None;
         }
-        if t.starts_with("transport error") {
-            return Some(DegradeReason::Transport);
-        }
-        // Shape: "api error <status>: <message>".
-        if let Some(rest) = t.strip_prefix("api error ") {
+        // 1. Authoritative: the structured `api error <status>: ...` shape the
+        //    `ProviderError::Api` Display produces, found ANYWHERE in the
+        //    string (the runner wraps it in a parenthesised prefix). A 4xx
+        //    other than 429 is NOT a resilience failure, so return early on
+        //    any `api error` marker rather than falling through to the looser
+        //    substring heuristics below (which must not reclassify a 400/404).
+        if let Some(idx) = t.find("api error ") {
+            let rest = &t[idx + "api error ".len()..];
             let status: Option<u16> = rest
                 .split(|c: char| !c.is_ascii_digit())
                 .find(|s| !s.is_empty())
                 .and_then(|s| s.parse().ok());
             return match status {
                 Some(429) => Some(DegradeReason::RateLimit),
-                Some(s) if s >= 500 => Some(DegradeReason::ServerError),
+                Some(s) if (500..600).contains(&s) => Some(DegradeReason::ServerError),
                 _ => None,
             };
+        }
+        // 2. Transport: our own `transport error: ...` marker plus the
+        //    connection-level phrasing a provider SSE body may carry.
+        if t.contains("transport error")
+            || t.contains("connection reset")
+            || t.contains("connection refused")
+            || t.contains("timed out")
+            || t.contains("timeout")
+        {
+            return Some(DegradeReason::Transport);
+        }
+        // 3. Overload: our `overloaded` marker, the explicit Anthropic
+        //    `overloaded_error`, or a bare 529.
+        if t.contains("overload") || contains_status(&t, 529) {
+            return Some(DegradeReason::Overloaded);
+        }
+        // 4. Rate-limit: provider phrasing or a bare 429.
+        if t.contains("rate limit") || t.contains("rate-limit") || contains_status(&t, 429) {
+            return Some(DegradeReason::RateLimit);
+        }
+        // 5. Server error: common 5xx phrasing or a bare 5xx status.
+        if t.contains("service unavailable")
+            || t.contains("bad gateway")
+            || t.contains("internal server error")
+            || t.contains("gateway timeout")
+            || (500..600).any(|s| contains_status(&t, s))
+        {
+            return Some(DegradeReason::ServerError);
         }
         None
     }
@@ -723,7 +789,7 @@ mod tests {
 
     #[test]
     fn degrade_reason_classifies_error_text() {
-        // Round-trips the ProviderError Display shapes the runner persists.
+        // Round-trips the bare ProviderError Display shapes.
         assert_eq!(
             DegradeReason::from_error_text(&ProviderError::Overloaded.to_string()),
             Some(DegradeReason::Overloaded)
@@ -769,6 +835,85 @@ mod tests {
         );
         assert_eq!(DegradeReason::from_error_text(""), None);
         assert_eq!(DegradeReason::from_error_text("weird garbage"), None);
+    }
+
+    #[test]
+    fn degrade_reason_classifies_real_wrapped_reason_strings() {
+        // These are the EXACT shapes the live runner persists into
+        // `agent_turns.error` (see `provider_call::format_provider_failure_reason`
+        // and the stream-error path). The old prefix-matching classifier
+        // missed every one of them, so the live failover never fired.
+
+        // Query-time wrapper around `ProviderError::Api { 429 }`.
+        let q429 =
+            "provider rejected the query before streaming started (api error 429: rate limited)";
+        assert_eq!(
+            DegradeReason::from_error_text(q429),
+            Some(DegradeReason::RateLimit)
+        );
+        // Query-time wrapper around a 5xx.
+        let q503 = "provider rejected the query before streaming started \
+                    (api error 503: upstream connect error)";
+        assert_eq!(
+            DegradeReason::from_error_text(q503),
+            Some(DegradeReason::ServerError)
+        );
+        // Query-time wrapper around overloaded.
+        let qover = "provider rejected the query before streaming started (overloaded)";
+        assert_eq!(
+            DegradeReason::from_error_text(qover),
+            Some(DegradeReason::Overloaded)
+        );
+        // Query-time wrapper around a transport error.
+        let qtrans = "provider rejected the query before streaming started \
+                      (transport error: connection reset by peer)";
+        assert_eq!(
+            DegradeReason::from_error_text(qtrans),
+            Some(DegradeReason::Transport)
+        );
+        // Query-time wrapper around a 4xx -> NOT a resilience failure.
+        let q400 =
+            "provider rejected the query before streaming started (api error 400: prompt too long)";
+        assert_eq!(DegradeReason::from_error_text(q400), None);
+
+        // Stream-time path: bare sentinel with no embedded marker stays inert
+        // (we can't tell what failed, so we don't degrade on it alone).
+        let bare = "provider stream ended with an error event";
+        assert_eq!(DegradeReason::from_error_text(bare), None);
+        // Stream-time path carrying the provider's own body: classify by the
+        // common phrasing providers actually emit.
+        let s_over = "provider stream ended with an error event (overloaded_error: \
+                      Anthropic is temporarily overloaded)";
+        assert_eq!(
+            DegradeReason::from_error_text(s_over),
+            Some(DegradeReason::Overloaded)
+        );
+        let s_rl = "provider stream ended with an error event (HTTP 429 Too Many Requests)";
+        assert_eq!(
+            DegradeReason::from_error_text(s_rl),
+            Some(DegradeReason::RateLimit)
+        );
+        let s_5xx = "provider stream ended with an error event (503 Service Unavailable)";
+        assert_eq!(
+            DegradeReason::from_error_text(s_5xx),
+            Some(DegradeReason::ServerError)
+        );
+        let s_timeout = "provider stream ended with an error event (upstream request timed out)";
+        assert_eq!(
+            DegradeReason::from_error_text(s_timeout),
+            Some(DegradeReason::Transport)
+        );
+    }
+
+    #[test]
+    fn contains_status_matches_only_standalone_tokens() {
+        assert!(contains_status("http 429 too many", 429));
+        assert!(contains_status("(429)", 429));
+        assert!(contains_status("429", 429));
+        // Embedded in a longer number must NOT match.
+        assert!(!contains_status("error 14290 occurred", 429));
+        assert!(!contains_status("4295", 429));
+        assert!(!contains_status("x4290", 429));
     }
 
     #[test]

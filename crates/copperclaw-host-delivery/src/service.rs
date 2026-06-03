@@ -2513,7 +2513,17 @@ fn build_combined(root: Option<TodoList>, children: &[(String, TodoList)]) -> To
 ///   }
 /// }
 /// ```
-fn record_usage_report(
+/// Persist a runner-emitted `usage_report` payload into `agent_turns`. The
+/// `payload` is the inner object of the system row's `{"usage_report": {...}}`
+/// envelope (i.e. `ParsedAction::payload` from
+/// [`crate::system_actions::parse_system_content`]).
+///
+/// `pub` so the host crate's provider-resilience integration test can drive
+/// the REAL record step of the emit→record→fold path, rather than re-creating
+/// the row through the test-only `agent_turns::insert` helper. The crucial
+/// field is `error`: without it persisted, the host's health fold can never
+/// classify a failure and an automatic failover never fires.
+pub fn record_usage_report(
     central: &copperclaw_db::central::CentralDb,
     _row: &MessageOutRow,
     payload: &serde_json::Value,

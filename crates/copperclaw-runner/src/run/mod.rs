@@ -665,6 +665,71 @@ fn build_inbound_context_block(
     self::prompt::render_conversation_context(rows, depth)
 }
 
+/// Inputs for one end-of-turn `usage_report` system row.
+///
+/// A struct (rather than a long arg list) so [`build_usage_report_payload`]
+/// stays under clippy's argument cap and so the host's cross-crate
+/// emit→record→fold integration test constructs the same inputs the live
+/// runner does.
+#[derive(Debug, Clone)]
+pub struct UsageReportInputs<'a> {
+    pub session_id: copperclaw_types::SessionId,
+    pub agent_group_id: copperclaw_types::AgentGroupId,
+    pub seq: i64,
+    pub model: &'a str,
+    pub provider: &'a str,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub ended_at: chrono::DateTime<chrono::Utc>,
+    pub outcome: &'a TurnOutcome,
+}
+
+/// Build the `usage_report` system-row payload the runner appends to
+/// `outbound.db` at the end of every LLM turn. The host's delivery service
+/// (`record_usage_report`) reads this object's fields straight into an
+/// `agent_turns` row.
+///
+/// Extracted as a free function so the live emit path and the cross-crate
+/// emit→record→fold integration test (`copperclaw-host`) build the payload
+/// with identical logic — in particular the `error` field, which is
+/// load-bearing for provider resilience: the host's health fold
+/// (`fold_recent_turns`) classifies that string with
+/// `DegradeReason::from_error_text` to decide whether to degrade the chain.
+/// Omitting it (the pre-fix bug) left `agent_turns.error` NULL, so an
+/// automatic failover never fired. `Done` carries no error, so the column
+/// stays NULL on a successful turn.
+#[must_use]
+pub fn build_usage_report_payload(inputs: &UsageReportInputs<'_>) -> serde_json::Value {
+    let (status, error) = match inputs.outcome {
+        TurnOutcome::Done => ("ok", None),
+        TurnOutcome::Failed(reason) => ("error", Some(reason.as_str())),
+    };
+    serde_json::json!({
+        "usage_report": {
+            // Bare UUIDs (no `ag_`/`sess_` Display prefix): the host stores
+            // these verbatim into `agent_turns.{session_id,agent_group_id}`,
+            // and EVERY consumer query — the resilience fold
+            // (`recent_for_group`), budget tracking (`tokens_since`), and the
+            // usage rollup's join against `agent_groups.id` — keys by the bare
+            // uuid (`id.as_uuid().to_string()`). Emitting the prefixed Display
+            // form here (the prior bug) wrote rows no query could ever match,
+            // so the fold never degraded and usage/budget never attributed.
+            "session_id": inputs.session_id.as_uuid().to_string(),
+            "agent_group_id": inputs.agent_group_id.as_uuid().to_string(),
+            "seq": inputs.seq,
+            "model": inputs.model,
+            "provider": inputs.provider,
+            "input_tokens": inputs.input_tokens,
+            "output_tokens": inputs.output_tokens,
+            "started_at": inputs.started_at.to_rfc3339(),
+            "ended_at": inputs.ended_at.to_rfc3339(),
+            "status": status,
+            "error": error,
+        }
+    })
+}
+
 /// Append a `usage_report` system row to `outbound.db`. The host's
 /// delivery service intercepts this kind of system action (instead of
 /// dispatching it to a channel adapter) and writes the corresponding
@@ -677,22 +742,17 @@ pub(in crate::run) async fn emit_usage_report(
     outcome: &TurnOutcome,
 ) {
     use copperclaw_db::tables::messages_out::{WriteOutbound, insert as insert_out};
-    let payload = serde_json::json!({
-        "usage_report": {
-            "session_id": deps.session_id.to_string(),
-            "agent_group_id": deps.agent_group_id.to_string(),
-            "seq": deps.turn_seq.load(std::sync::atomic::Ordering::Relaxed),
-            "model": deps.model,
-            "provider": deps.provider.name(),
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "started_at": started_at.to_rfc3339(),
-            "ended_at": chrono::Utc::now().to_rfc3339(),
-            "status": match outcome {
-                TurnOutcome::Done => "ok",
-                TurnOutcome::Failed(_) => "error",
-            },
-        }
+    let payload = build_usage_report_payload(&UsageReportInputs {
+        session_id: deps.session_id,
+        agent_group_id: deps.agent_group_id,
+        seq: deps.turn_seq.load(std::sync::atomic::Ordering::Relaxed),
+        model: &deps.model,
+        provider: deps.provider.name(),
+        input_tokens,
+        output_tokens,
+        started_at,
+        ended_at: chrono::Utc::now(),
+        outcome,
     });
     let row = WriteOutbound {
         id: copperclaw_types::MessageId::new(),
