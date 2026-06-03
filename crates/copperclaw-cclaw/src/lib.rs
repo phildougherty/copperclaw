@@ -18,6 +18,7 @@ pub mod client;
 pub mod commands;
 pub mod output;
 pub mod protocol;
+pub mod security;
 
 pub use client::{CclawClient, ClientError, DEFAULT_TIMEOUT};
 pub use commands::{ALL_COMMANDS, Cli, ParsedCall, TopCommand, default_user_socket};
@@ -242,6 +243,7 @@ where
         "status" => run_status(transport, caller, as_json).await,
         "health" => run_health(transport, caller, as_json).await,
         "doctor" => run_doctor(args, transport, caller, as_json).await,
+        "security-audit" => security::run_security_audit(args, transport, caller, as_json).await,
         "completions" => run_completions(args),
         "chat" => run_chat(args).await,
         "dashboard" => run_dashboard(transport, caller, as_json).await,
@@ -3195,5 +3197,244 @@ mod tests {
         assert!(host_unreachable(&io));
         let to = ClientError::Timeout;
         assert!(!host_unreachable(&to));
+    }
+
+    // -- cclaw security audit (end-to-end via run_cli) --
+    //
+    // A command-keyed transport: maps a command name to a canned response
+    // and records the full (command, args) call sequence so a test can
+    // assert that `--fix` issued the right *audited* host mutations. Unlike
+    // `SequencedTransport` this is order-independent, which matters because
+    // the audit fans out a variable number of `groups.config.get` calls.
+    struct KeyedTransport {
+        responses: Mutex<std::collections::HashMap<String, serde_json::Value>>,
+        calls: Mutex<Vec<(String, serde_json::Value)>>,
+    }
+
+    impl KeyedTransport {
+        fn new(pairs: Vec<(&str, serde_json::Value)>) -> Self {
+            Self {
+                responses: Mutex::new(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+        fn calls_to(&self, command: &str) -> Vec<serde_json::Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(c, _)| c == command)
+                .map(|(_, a)| a.clone())
+                .collect()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CallTransport for KeyedTransport {
+        async fn call(
+            &self,
+            command: &str,
+            args: serde_json::Value,
+            _caller: Caller,
+        ) -> Result<serde_json::Value, ClientError> {
+            self.calls.lock().unwrap().push((command.to_string(), args));
+            self.responses
+                .lock()
+                .unwrap()
+                .get(command)
+                .cloned()
+                .ok_or(ClientError::Timeout)
+        }
+    }
+
+    /// Posture with a planted open `unknown_sender_policy=open` and an
+    /// allow-all egress mode. Loose files come from a throwaway temp dir.
+    fn planted_open_responses() -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            (
+                "egress.status",
+                json!({
+                    "mode": "allow-all",
+                    "groups": [{"agent_group_id": "ag-1", "configured_allow": []}],
+                }),
+            ),
+            ("groups.list", json!([{"id": "ag-1", "name": "demo"}])),
+            (
+                "groups.config.get",
+                json!({"agent_group_id": "ag-1", "tool_profile": "messaging"}),
+            ),
+            (
+                "messaging-groups.list",
+                json!([{
+                    "id": "mg-1",
+                    "name": "lobby",
+                    "channel_type": "telegram",
+                    "unknown_sender_policy": "open",
+                }]),
+            ),
+            ("messaging-groups.update", json!({"id": "mg-1"})),
+            (
+                "groups.config.set-egress-allow",
+                json!({"egress_allow": []}),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn security_audit_detects_planted_open_policy() {
+        let t = KeyedTransport::new(planted_open_responses());
+        let tmp = tempfile::tempdir().unwrap();
+        let out = run_cli(
+            [
+                "cclaw",
+                "security",
+                "audit",
+                "--data-dir",
+                tmp.path().to_str().unwrap(),
+            ],
+            &t,
+        )
+        .await;
+        let combined = format!("{}{}", out.stdout, out.stderr);
+        assert!(
+            combined.contains("approvals-open"),
+            "missing finding: {combined}"
+        );
+        assert!(combined.contains("HIGH"));
+        assert!(combined.contains("egress-mode"));
+        // No --fix -> open policy remains -> failure exit (stderr non-empty).
+        assert!(
+            !out.stderr.is_empty(),
+            "open policy must be a non-zero exit"
+        );
+        // And it did NOT mutate anything without --fix.
+        assert!(t.calls_to("messaging-groups.update").is_empty());
+        assert!(t.calls_to("groups.config.set-egress-allow").is_empty());
+    }
+
+    #[tokio::test]
+    async fn security_audit_fix_remediates_and_audits_open_policy() {
+        let t = KeyedTransport::new(planted_open_responses());
+        let tmp = tempfile::tempdir().unwrap();
+        let out = run_cli(
+            [
+                "cclaw",
+                "security",
+                "audit",
+                "--fix",
+                "--data-dir",
+                tmp.path().to_str().unwrap(),
+            ],
+            &t,
+        )
+        .await;
+        let combined = format!("{}{}", out.stdout, out.stderr);
+        // --fix issued the tightening mutation (audited by the host's
+        // socket dispatch layer — every HOST_ONLY_COMMANDS call is logged).
+        let appr_calls = t.calls_to("messaging-groups.update");
+        assert_eq!(
+            appr_calls.len(),
+            1,
+            "exactly one approval tighten: {combined}"
+        );
+        assert_eq!(appr_calls[0]["id"], "mg-1");
+        assert_eq!(
+            appr_calls[0]["unknown_sender_policy"], "request_approval",
+            "must tighten, never loosen",
+        );
+        // And it scaffolded the empty allow-list for ag-1.
+        let egress_calls = t.calls_to("groups.config.set-egress-allow");
+        assert_eq!(egress_calls.len(), 1);
+        assert_eq!(egress_calls[0]["id"], "ag-1");
+        assert_eq!(egress_calls[0]["allow"][0], security::EGRESS_SCAFFOLD_ENTRY);
+        assert!(combined.contains("applied fixes"));
+        assert!(
+            out.stderr.is_empty(),
+            "fix run should succeed: {:?}",
+            out.stderr
+        );
+    }
+
+    #[tokio::test]
+    async fn security_audit_never_loosens_a_tight_policy() {
+        let t = KeyedTransport::new(vec![
+            (
+                "egress.status",
+                json!({
+                    "mode": "deny-default",
+                    "groups": [{"agent_group_id": "ag-1", "configured_allow": ["api:443"]}],
+                }),
+            ),
+            ("groups.list", json!([{"id": "ag-1", "name": "demo"}])),
+            (
+                "groups.config.get",
+                json!({"agent_group_id": "ag-1", "tool_profile": "messaging"}),
+            ),
+            (
+                "messaging-groups.list",
+                json!([{
+                    "id": "mg-1",
+                    "name": "lobby",
+                    "channel_type": "telegram",
+                    "unknown_sender_policy": "request_approval",
+                }]),
+            ),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let out = run_cli(
+            [
+                "cclaw",
+                "security",
+                "audit",
+                "--fix",
+                "--data-dir",
+                tmp.path().to_str().unwrap(),
+            ],
+            &t,
+        )
+        .await;
+        // Even with --fix, a tight posture must trigger ZERO mutations.
+        assert!(t.calls_to("messaging-groups.update").is_empty());
+        assert!(t.calls_to("groups.config.set-egress-allow").is_empty());
+        assert!(
+            out.stdout.contains("no open policies"),
+            "stdout={:?}",
+            out.stdout
+        );
+    }
+
+    #[tokio::test]
+    async fn security_audit_fix_chmods_loose_session_file_to_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let sess_dir = tmp.path().join("sessions").join("ag").join("sess");
+        std::fs::create_dir_all(&sess_dir).unwrap();
+        let db = sess_dir.join("inbound.db");
+        std::fs::write(&db, b"x").unwrap();
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let t = KeyedTransport::new(vec![
+            (
+                "egress.status",
+                json!({"mode": "deny-default", "groups": []}),
+            ),
+            ("groups.list", json!([])),
+            ("messaging-groups.list", json!([])),
+        ]);
+        let out = run_cli(
+            [
+                "cclaw",
+                "security",
+                "audit",
+                "--fix",
+                "--data-dir",
+                tmp.path().to_str().unwrap(),
+            ],
+            &t,
+        )
+        .await;
+        let mode = std::fs::metadata(&db).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "file should be tightened to 0600");
+        assert!(out.stdout.contains("applied fixes"));
     }
 }
