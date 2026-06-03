@@ -1698,3 +1698,136 @@ Items deliberately deferred from 0.1.0; tracked here so they don't get rediscove
 Updates to the plan happen in-tree from this point on. Whenever a step
 in **Progress** is completed, tick the box and reference the artifact
 that landed it.
+
+---
+
+## M16 — OpenClaw parity + security-hardening roadmap (2026-06-02)
+
+Derived from a multi-agent gap analysis of OpenClaw (formerly ClawdBot /
+Moltbot) against the Copperclaw tree. The defining bet: Copperclaw covers
+~70% of OpenClaw's capability with a deliberately smaller surface. We close
+the gap by *first* making the controls we already advertise actually run,
+*then* adding capability in an order where each new attack surface lands on
+controls that bound its blast radius. We do **not** claim "strictly safer at
+every step" — that is false once a browser and vector memory ship. Every
+phase is tagged **[REDUCES surface]** or **[EXPANDS surface]**.
+
+### Inert controls found in tree (fix before any new capability)
+
+Three advertised controls do not actually run today (verified file:line):
+
+- **Egress allow-list is a no-op.** `container-rt/src/spec.rs:179` claims
+  iptables enforcement; `docker.rs` wires only `extra_hosts` — no
+  `NetworkMode`/netns/nftables, no DNS handling. Containers get the default
+  bridge = unrestricted outbound.
+- **Provider key is leaked.** `host/src/container_manager/spawn.rs:481`
+  forwards `ANTHROPIC_API_KEY` as a plain container env var; one injected
+  `printenv` exfiltrates the master key.
+- **Per-skill `allowed-tools` is parsed, never enforced.** Read only in
+  tests; the sole live gate is the static 9-entry `disallowed.rs` list.
+- Plus: `web_fetch`/`web_search` (`mcp/src/tools/computer_use.rs`,
+  `web_search.rs`) have no SSRF guard and no redirect policy (loopback /
+  `169.254.169.254` / RFC1918 reachable); `modules/src/permissions.rs:194`
+  returns `Defer` (open-fail) on an unknown op even with the module
+  installed; `drive_turn.rs:108` caps consecutive tool turns but has no
+  identical/ping-pong loop detection; `mount_security.rs` symlink check is
+  TOCTOU.
+
+### Phases
+
+- **Phase 0a — Egress + DNS default-deny + SSRF [REDUCES]** (M-L, 3-4wk).
+  Internal no-default-route network; only model endpoint + allow-list +
+  filtering resolver reachable; pin `resolv.conf` to a filtering resolver;
+  shared SSRF guard for `web_fetch`/`web_search`/browser with per-hop
+  redirect re-check. Auto-inject the model endpoint into every group's
+  implicit allow-list (migration is a 100%-outage risk); ship opt-in in N,
+  flip default in N+1, gate with `cclaw groups egress migrate`. Files:
+  `container-rt/src/{docker.rs,spec.rs}`, new `egress.rs`, `spawn.rs`, new
+  `mcp/src/tools/net_guard.rs`. v1 allow-lists the direct model endpoint
+  (not the not-yet-built broker) so it ships before 0b.
+- **Phase 0b — Credential broker [REDUCES]** (M-L, 3-4wk, single-owner).
+  Stop forwarding the key (`spawn.rs:481`); host-side loopback model proxy;
+  per-session, group-scoped, TTL-bounded, revocable token; per-group budget
+  at the broker. Honest caveat: brokering stops key *theft*, not *misuse* —
+  the token is still a live in-box credential and exfil survives inside
+  model prompts. We narrow exfil to model-proxy + approved recipients; we
+  never say "severs."
+- **Phase 0c — Default-deny fallbacks + log redaction [REDUCES]** (S-M).
+  `permissions.rs:195` unparseable op -> Deny + audit; host default-deny
+  when no permissions module installed; secret redaction in runner/host
+  logs; `0600` on session dirs/.env. **Phase 0 gate is mechanical**: doctor
+  FAILs / `rebuild.sh` refuses to bake an image if any Phase-3+ capability
+  is on while egress is allow-all or the broker is down.
+- **Phase 1 — Layered tool authorization + loop breakers [REDUCES]** (M).
+  Make `allowed_tools` real: dispatch-time positive allow-list vs (group,
+  sender role, active skill); profiles minimal/messaging/coding/full;
+  repeated-call circuit breakers. Un-gated; run parallel with Phase 0.
+  Files: `runner/src/disallowed.rs`->`policy.rs`, `skills/src/registry.rs`,
+  `modules/src/permissions.rs`, `run/drive_turn.rs`.
+- **Phase 2 — Approval lifecycle + DM pairing + mention gating [REDUCES]**
+  (M, parallel w/ 1). Approval TTL + revocation + decision-audit; 8-char
+  1hr rate-limited pairing codes; per-group `requireMention` + regex +
+  implicit-mention-on-quote. Files: `modules/src/approvals.rs`, new
+  migration, `host/src/handlers/approvals.rs`, channel adapters, `cclaw`.
+- **Phase 3 — Searchable memory + provenance [EXPANDS]** (L+M, gated by
+  0,1,2). Per-group `sqlite-vec`+FTS5 store; embeddings via broker.
+  Provenance is necessarily coarse (taint does not propagate through an
+  LLM): any turn containing untrusted-provenance content requires fresh
+  approval for credentialed external actions; autonomous/heartbeat turns
+  may search but not act (read-then-propose).
+- **Phase 4 — Provider fallback chains + multi-key [neutral]** (M). Home =
+  `copperclaw-providers` directly (not gated on broker). New migration for
+  per-group provider profiles + health state; per-channel pinning.
+- **Phase 5 — Browser tool [EXPANDS — max trifecta risk]**. 5a (committed,
+  gated by 0+1): headless render + screenshot + read-only DOM in a
+  dedicated child container under gVisor/microVM, off the broker trust
+  domain, reusing the 0a SSRF guard. 5b (stretch, gated by 0+1+3):
+  interactive click/type + browser-writes-memory; demand-pull only.
+- **Phase 6 — Operability + MCP + supply-chain integrity [REDUCES]** (S-M).
+  `cclaw security audit [--fix]`; per-server MCP tool filtering + host-side
+  oauth store; constrain `install_packages` subprocesses (deny broker
+  token); TOCTOU symlink fix (`mount_security.rs`); signed/attested image +
+  runner binary; heartbeat condition-check-in only.
+- **Phase 7 — More channels [neutral]** — demand-pull only. Ranked SMS,
+  IRC, Twitch, Feishu, then the long tail. Keep WhatsApp on the official
+  Cloud API; never Baileys QR.
+
+### How we stay MORE secure than OpenClaw (with honest residuals)
+
+- **Containers for all** (vs OpenClaw `sandbox.mode=off`) — residual: shared
+  kernel; a runtime escape defeats it (hence microVM for the browser).
+- **Default-deny egress + DNS** — residual: exfil survives through *allowed*
+  channels (model prompts, approved recipients). "Narrows," not "severs."
+- **Credential brokering** — residual: token is a live in-box credential;
+  stops theft, not misuse.
+- **No in-process plugins** — residual: moves third-party code from host to
+  container trust (install_packages / MCP), does not eliminate it.
+- **Injection defenses** — residual: no control makes an LLM injection-proof;
+  the trifecta is bounded, never eliminated.
+
+### Won't chase (deliberate non-goals)
+
+Runtime plugin/ClawHub registry (imports the supply-chain breach class we
+avoid by construction); Baileys QR WhatsApp; telephony + device-node
+companion apps; voice wake / always-listening; Canvas/A2UI; any
+`sandbox.mode=off`; full interactive browser (5b is demand-pull).
+
+### Sequencing
+
+| Phase | Surface delta | Effort | Gated by |
+|---|---|---|---|
+| 0a egress+DNS+SSRF | REDUCES | M-L | — |
+| 0b credential broker | REDUCES | M-L | 0a |
+| 0c default-deny + redaction | REDUCES | S-M | — |
+| 1 tool auth + loop breakers | REDUCES | M | — (parallel w/ 0) |
+| 2 approvals + pairing + mentions | REDUCES | M | — (parallel w/ 1) |
+| 3 searchable memory + provenance | EXPANDS | L+M | 0,1,2 |
+| 4 provider fallback/multi-key | neutral | M | — |
+| 5a browser read-only | EXPANDS | committed | 0,1 |
+| 5b browser interactive | EXPANDS | stretch | 0,1,3 |
+| 6 security-audit/MCP/attestation | REDUCES | S-M | — |
+| 7 more channels | neutral | demand-pull | — |
+
+Note: OpenClaw threat-intel figures (CVE dates, "~341 malicious skills",
+"~7.1% leak secrets") came from the research dossier and are **unverified**;
+do not cite externally without confirmation.
