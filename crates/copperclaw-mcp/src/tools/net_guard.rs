@@ -349,6 +349,18 @@ pub fn redirect_policy() -> reqwest::redirect::Policy {
     })
 }
 
+/// Synchronously classify a redirect-hop URL given as a string, parsing it
+/// first. This is the same check [`redirect_policy`] applies to every
+/// `reqwest` redirect hop, exposed for callers that follow redirects through a
+/// different mechanism than `reqwest` (the headless-browser tool re-guards each
+/// hop the page navigates). Rejects non-HTTP schemes and any host that
+/// resolves to a blocked (loopback / link-local / RFC1918 / unique-local /
+/// unspecified) address.
+pub fn guard_redirect_url(url: &str) -> Result<(), SsrfError> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| SsrfError::InvalidUrl(url.to_string()))?;
+    classify_redirect(&parsed)
+}
+
 /// Run the SSRF classification for a single redirect-hop URL. Pulled
 /// out of the closure in [`redirect_policy`] so all borrows of the
 /// `Attempt`'s URL are resolved into an owned `Result` before the
@@ -619,6 +631,49 @@ mod tests {
         guard_url("http://8.8.8.8/")
             .await
             .expect("public must pass");
+    }
+
+    // ── guard_redirect_url (string entry, used by the browser tool) ──────
+
+    #[test]
+    fn guard_redirect_url_blocks_metadata() {
+        let err = guard_redirect_url("http://169.254.169.254/latest/meta-data/").unwrap_err();
+        assert!(matches!(
+            err,
+            SsrfError::BlockedAddress {
+                category: "link-local",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn guard_redirect_url_blocks_rfc1918_literal() {
+        let err = guard_redirect_url("http://10.1.2.3/").unwrap_err();
+        assert!(matches!(
+            err,
+            SsrfError::BlockedAddress {
+                category: "private",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn guard_redirect_url_rejects_non_http_scheme() {
+        let err = guard_redirect_url("file:///etc/passwd").unwrap_err();
+        assert!(matches!(err, SsrfError::InvalidUrl(_)));
+    }
+
+    #[test]
+    fn guard_redirect_url_rejects_garbage() {
+        let err = guard_redirect_url("not a url").unwrap_err();
+        assert!(matches!(err, SsrfError::InvalidUrl(_)));
+    }
+
+    #[test]
+    fn guard_redirect_url_allows_public_literal() {
+        guard_redirect_url("https://8.8.8.8/").expect("public redirect hop must pass");
     }
 
     #[test]

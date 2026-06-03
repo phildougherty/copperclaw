@@ -21,6 +21,7 @@ use crate::error::ToolError;
 pub mod agents;
 pub mod apply_patch;
 pub mod artifact_path;
+pub mod browser_render;
 pub mod clear_history;
 pub mod compact_now;
 pub mod computer_use;
@@ -97,6 +98,7 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         computer_use::read_file::entry(),
         computer_use::write_file::entry(),
         computer_use::web_fetch::entry(),
+        browser_render::entry(),
         view_image::entry(),
         // Git inspection tools — read-only structured access to a
         // libgit2-backed repository view. Registered alphabetically.
@@ -207,6 +209,7 @@ mod tests {
             "read_file",
             "write_file",
             "web_fetch",
+            "browser_render",
             "view_image",
             "git_blame",
             "git_diff",

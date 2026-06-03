@@ -31,7 +31,10 @@ pub use crate::build::{ExtraFile, ImageBuildSpec};
 pub use crate::dns::{FilterResolverConfig, dnsmasq_conf, resolv_conf_contents};
 pub use crate::docker::DockerRuntime;
 pub use crate::nftables::{NftApplyPlan, NftPlan, build_ruleset};
-pub use crate::spec::{ContainerHandle, ContainerSpec, EgressMode, Mount, ResourceLimits};
+pub use crate::spec::{
+    ContainerHandle, ContainerSpec, EgressMode, Mount, ResourceLimits, SandboxProfile,
+    SandboxRuntime, select_sandbox_runtime,
+};
 
 /// Every fallible container-runtime call returns this.
 #[derive(Debug, Error)]

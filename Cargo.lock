@@ -426,6 +426,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "copperclaw-browser"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "copperclaw-container-rt",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "copperclaw-cclaw"
 version = "0.1.0"
 dependencies = [
@@ -1132,7 +1146,9 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "copperclaw-browser",
  "copperclaw-channels-core",
+ "copperclaw-container-rt",
  "copperclaw-db",
  "copperclaw-types",
  "git2",
