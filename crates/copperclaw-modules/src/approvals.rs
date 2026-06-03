@@ -34,6 +34,12 @@ use copperclaw_types::{
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
+/// Default time-to-live applied to a pending approval that doesn't carry an
+/// explicit `expires_at`: ~1 hour. An unanswered approval lapses rather than
+/// lingering as a live grant. Mirrors `copperclaw_db`'s `DEFAULT_APPROVAL_TTL`
+/// (kept local so the modules crate doesn't depend on the DB crate).
+pub const DEFAULT_APPROVAL_TTL: chrono::Duration = chrono::Duration::hours(1);
+
 /// One row of [`ApprovalsModule::pending_approvals_summary`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalSummary {
@@ -43,12 +49,50 @@ pub struct ApprovalSummary {
     pub agent_group_id: Option<AgentGroupId>,
     pub requester: Option<UserId>,
     pub created_at: DateTime<Utc>,
+    /// Deadline after which the approval is no longer actionable. When
+    /// `None` the entry never lapses (used for entries seeded without a
+    /// TTL); [`ApprovalsModule::record_pending`] fills a ~1h default.
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
     pub description: String,
+}
+
+impl ApprovalSummary {
+    /// True when the entry's deadline is at or before `now`.
+    #[must_use]
+    pub fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at.is_some_and(|exp| exp <= now)
+    }
+}
+
+/// How a pending approval left the queue. Recorded on the in-memory
+/// decision log so callers can audit who/what/when/outcome without the
+/// modules crate depending on the DB.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DecisionOutcome {
+    Approve,
+    Deny,
+    Expire,
+    Revoke,
+}
+
+/// One append-only decision receipt held in memory by the module.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionRecord {
+    pub id: ApprovalId,
+    pub outcome: DecisionOutcome,
+    pub decided_by: String,
+    pub reason: Option<String>,
+    pub decided_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Default)]
 struct PendingStore {
     pending: Vec<ApprovalSummary>,
+    /// Append-only log of every terminal decision (approve / deny /
+    /// expire / revoke) taken against an entry.
+    decisions: Vec<DecisionRecord>,
 }
 
 /// Persistent-store lookup the gate consults when its in-memory
@@ -81,6 +125,18 @@ pub struct NewPendingCtx {
 /// dispatched asynchronously via the [`DeliveryDispatcher`].
 pub type NewPendingNotifier = Arc<dyn Fn(NewPendingCtx, Arc<dyn DeliveryDispatcher>) + Send + Sync>;
 
+/// Callback invoked by the approvals gate when an unknown sender lands in
+/// pending, so the host can mint a DM pairing code and deliver it *back to
+/// that sender* through the ordinary outbound path. Distinct from
+/// [`NewPendingNotifier`], which notifies the *operator* on the agent
+/// group's primary channel. Both fire on the same gate event; either may be
+/// wired independently.
+///
+/// Called synchronously on the router's hot path (same constraints as
+/// [`NewPendingNotifier`]): mint + dispatch must be cheap, and the dispatch
+/// itself fans the adapter work out to a background task.
+pub type PairingNotifier = Arc<dyn Fn(NewPendingCtx, Arc<dyn DeliveryDispatcher>) + Send + Sync>;
+
 /// Approvals module.
 pub struct ApprovalsModule {
     /// In-memory pending list, fed by the host via `record_pending` calls.
@@ -93,6 +149,10 @@ pub struct ApprovalsModule {
     /// Optional callback fired the first time a new sender hits pending.
     /// Wired by the host at boot to post an in-channel "approve?" prompt.
     new_pending_notifier: Option<NewPendingNotifier>,
+    /// Optional callback fired when an unknown sender hits pending. Wired by
+    /// the host at boot to mint a DM pairing code and deliver it back to the
+    /// sender. Independent of `new_pending_notifier`.
+    pairing_notifier: Option<PairingNotifier>,
     /// Dispatcher captured via `on_delivery_adapter_ready`; used by the
     /// gate closure to post notifications without blocking the router.
     dispatcher: Arc<Mutex<Option<Arc<dyn DeliveryDispatcher>>>>,
@@ -111,6 +171,7 @@ impl ApprovalsModule {
             known_senders: Arc::new(Mutex::new(Vec::new())),
             persistent_lookup: None,
             new_pending_notifier: None,
+            pairing_notifier: None,
             dispatcher: Arc::new(Mutex::new(None)),
         }
     }
@@ -127,6 +188,7 @@ impl ApprovalsModule {
             known_senders: Arc::new(Mutex::new(senders)),
             persistent_lookup: None,
             new_pending_notifier: None,
+            pairing_notifier: None,
             dispatcher: Arc::new(Mutex::new(None)),
         }
     }
@@ -150,6 +212,15 @@ impl ApprovalsModule {
         self
     }
 
+    /// Builder: attach a pairing notifier that fires when an unknown sender
+    /// is placed in pending. The host wires this to mint a DM pairing code
+    /// and deliver it back to the sender via the [`DeliveryDispatcher`].
+    #[must_use]
+    pub fn with_pairing_notifier(mut self, notifier: PairingNotifier) -> Self {
+        self.pairing_notifier = Some(notifier);
+        self
+    }
+
     /// Mark a sender as approved so the gate stops returning `Pending` for
     /// them.
     pub fn approve_sender(&self, identity: SenderIdentity) {
@@ -166,25 +237,136 @@ impl ApprovalsModule {
     }
 
     /// Push a new pending approval into the in-memory store. The host calls
-    /// this when its sender-scope gate produces `Pending`.
-    pub fn record_pending(&self, summary: ApprovalSummary) {
+    /// this when its sender-scope gate produces `Pending`. If the summary
+    /// carries no `expires_at`, a ~1h default TTL is stamped so the entry
+    /// lapses instead of lingering forever.
+    pub fn record_pending(&self, mut summary: ApprovalSummary) {
+        if summary.expires_at.is_none() {
+            summary.expires_at = Some(Utc::now() + DEFAULT_APPROVAL_TTL);
+        }
         self.store.lock().unwrap().pending.push(summary);
     }
 
-    /// Remove a pending approval by id (called once an admin approves/rejects).
-    pub fn resolve(&self, id: ApprovalId) {
-        self.store.lock().unwrap().pending.retain(|p| p.id != id);
+    /// Build + record a pending approval for a **credentialed external
+    /// action** blocked by the runner's coarse provenance gate (M16 Phase 3).
+    ///
+    /// This is the reuse seam for the gate: when the runner refuses a
+    /// credentialed external action on a tainted turn, the host surfaces the
+    /// request through *this* module — the same Wave-2 approvals mechanism
+    /// (`record_pending` → operator `resolve` / `resolve_with`) that gates
+    /// unknown senders, channels, and self-mod installs. No parallel approval
+    /// path is introduced. Returns the assigned [`ApprovalId`] so the caller
+    /// can correlate the eventual decision.
+    ///
+    /// `tool` is the blocked tool name, `taint_source` a short label for the
+    /// untrusted content that tainted the turn (e.g. the fetched URL). Both are
+    /// folded into the human-readable `description` the approver sees.
+    pub fn record_credentialed_external_action(
+        &self,
+        agent_group_id: AgentGroupId,
+        messaging_group_id: Option<MessagingGroupId>,
+        requester: Option<UserId>,
+        tool: &str,
+        taint_source: &str,
+    ) -> ApprovalId {
+        let id = ApprovalId::new();
+        let summary = ApprovalSummary {
+            id,
+            kind: ApprovalKind::CredentialedExternalAction,
+            messaging_group_id,
+            agent_group_id: Some(agent_group_id),
+            requester,
+            created_at: Utc::now(),
+            expires_at: None,
+            description: format!(
+                "Agent requested credentialed external action `{tool}` on a turn whose context was tainted by untrusted-provenance content ({taint_source}). Approve to clear the taint for this action."
+            ),
+        };
+        self.record_pending(summary);
+        id
     }
 
-    /// Build the summary list, optionally filtered by kind.
+    /// Remove a pending approval by id, recording an `approve` decision.
+    /// Called once an admin approves the entry.
+    pub fn resolve(&self, id: ApprovalId) {
+        self.resolve_with(id, DecisionOutcome::Approve, "host", None);
+    }
+
+    /// Remove a pending approval by id, recording the given outcome on the
+    /// append-only decision log. The `decided_by` actor label and optional
+    /// `reason` are captured for the audit trail.
+    pub fn resolve_with(
+        &self,
+        id: ApprovalId,
+        outcome: DecisionOutcome,
+        decided_by: &str,
+        reason: Option<&str>,
+    ) {
+        let mut store = self.store.lock().unwrap();
+        let existed = store.pending.iter().any(|p| p.id == id);
+        store.pending.retain(|p| p.id != id);
+        if existed {
+            store.decisions.push(DecisionRecord {
+                id,
+                outcome,
+                decided_by: decided_by.to_owned(),
+                reason: reason.map(str::to_owned),
+                decided_at: Utc::now(),
+            });
+        }
+    }
+
+    /// Revoke a previously recorded pending approval, dropping it from the
+    /// queue and logging a `revoke` decision. Distinct from [`Self::resolve`]
+    /// (an approval) and a deny: revocation withdraws a request that was
+    /// neither approved nor denied.
+    pub fn revoke(&self, id: ApprovalId, decided_by: &str, reason: Option<&str>) {
+        self.resolve_with(id, DecisionOutcome::Revoke, decided_by, reason);
+    }
+
+    /// Sweep entries whose `expires_at` is at or before `now`, dropping each
+    /// from the queue and logging an `expire` decision. Returns the ids that
+    /// lapsed. Idempotent — a second sweep over the same window is a no-op.
+    pub fn sweep_expired(&self, now: DateTime<Utc>) -> Vec<ApprovalId> {
+        let mut store = self.store.lock().unwrap();
+        let expired: Vec<ApprovalId> = store
+            .pending
+            .iter()
+            .filter(|p| p.is_expired_at(now))
+            .map(|p| p.id)
+            .collect();
+        store.pending.retain(|p| !p.is_expired_at(now));
+        for id in &expired {
+            store.decisions.push(DecisionRecord {
+                id: *id,
+                outcome: DecisionOutcome::Expire,
+                decided_by: "system:expiry".to_owned(),
+                reason: None,
+                decided_at: now,
+            });
+        }
+        expired
+    }
+
+    /// Build the summary list, optionally filtered by kind. Entries whose
+    /// TTL has already lapsed (relative to `now`) are excluded — an expired
+    /// pending approval is not actionable and must not be surfaced as live.
     pub fn pending_approvals_summary(&self, kind: Option<ApprovalKind>) -> Vec<ApprovalSummary> {
+        let now = Utc::now();
         let store = self.store.lock().unwrap();
         store
             .pending
             .iter()
+            .filter(|p| !p.is_expired_at(now))
             .filter(|p| kind.is_none_or(|k| k == p.kind))
             .cloned()
             .collect()
+    }
+
+    /// Snapshot of the append-only decision log (newest last). Exposed for
+    /// diagnostics and tests.
+    pub fn decisions(&self) -> Vec<DecisionRecord> {
+        self.store.lock().unwrap().decisions.clone()
     }
 }
 
@@ -251,6 +433,7 @@ impl Module for ApprovalsModule {
         let known = Arc::clone(&self.known_senders);
         let persistent = self.persistent_lookup.clone();
         let notifier = self.new_pending_notifier.clone();
+        let pairing = self.pairing_notifier.clone();
         let dispatcher_slot = Arc::clone(&self.dispatcher);
 
         ctx.set_sender_scope_gate(Arc::new(move |s: SenderScopeCtx| {
@@ -276,11 +459,12 @@ impl Module for ApprovalsModule {
                     return SenderScopeDecision::Defer;
                 }
             }
-            // Sender is unknown. Fire the new-pending notifier if one is
-            // registered and a dispatcher is available. The notifier is
-            // responsible for de-duplicating via the DB upsert's
-            // `newly_inserted` flag so this hot path stays cheap.
-            if let Some(ref notify) = notifier {
+            // Sender is unknown. Fire the new-pending notifier and the
+            // pairing notifier if registered and a dispatcher is available.
+            // Both are responsible for their own de-duplication / rate
+            // limiting so this hot path stays cheap. The dispatcher lock is
+            // taken once and the same handle handed to both callbacks.
+            if notifier.is_some() || pairing.is_some() {
                 if let Some(ref dispatcher) = *dispatcher_slot.lock().unwrap() {
                     let ctx_info = NewPendingCtx {
                         sender: sender.clone(),
@@ -288,7 +472,12 @@ impl Module for ApprovalsModule {
                         messaging_group_id: s.messaging_group_id,
                         first_seen: Utc::now(),
                     };
-                    notify(ctx_info, Arc::clone(dispatcher));
+                    if let Some(ref notify) = notifier {
+                        notify(ctx_info.clone(), Arc::clone(dispatcher));
+                    }
+                    if let Some(ref pair) = pairing {
+                        pair(ctx_info, Arc::clone(dispatcher));
+                    }
                 }
             }
             SenderScopeDecision::Pending(format!(
@@ -323,6 +512,7 @@ mod tests {
             agent_group_id: None,
             requester: None,
             created_at: Utc::now(),
+            expires_at: None,
             description: "test".into(),
         }
     }
@@ -336,6 +526,122 @@ mod tests {
         assert_eq!(m.pending_approvals_summary(None).len(), 1);
         m.resolve(id);
         assert!(m.pending_approvals_summary(None).is_empty());
+        // resolve() logs an `approve` decision for the audit trail.
+        let decisions = m.decisions();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].outcome, DecisionOutcome::Approve);
+        assert_eq!(decisions[0].id, id);
+    }
+
+    #[test]
+    fn credentialed_external_action_reuses_approvals_module() {
+        // The Phase-3 coarse gate reuses the Wave-2 approvals mechanism: the
+        // blocked credentialed external action is surfaced as a pending
+        // approval of the new kind, then cleared by the same resolve() path.
+        let m = ApprovalsModule::new();
+        let group = AgentGroupId::new();
+        let id = m.record_credentialed_external_action(
+            group,
+            None,
+            None,
+            "web_fetch",
+            "web_fetch:https://evil.example",
+        );
+        // It lands in the queue, filterable by the dedicated kind.
+        let by_kind = m.pending_approvals_summary(Some(ApprovalKind::CredentialedExternalAction));
+        assert_eq!(by_kind.len(), 1);
+        assert_eq!(by_kind[0].id, id);
+        assert_eq!(by_kind[0].agent_group_id, Some(group));
+        assert!(by_kind[0].description.contains("web_fetch"));
+        assert!(by_kind[0].description.contains("untrusted-provenance"));
+        // A default TTL is stamped (it lapses rather than lingering).
+        assert!(by_kind[0].expires_at.is_some());
+        // It does NOT show up under a different kind's filter.
+        assert!(
+            m.pending_approvals_summary(Some(ApprovalKind::Sender))
+                .is_empty()
+        );
+        // Operator approves it via the same resolve() path; an approve
+        // decision is logged.
+        m.resolve(id);
+        assert!(
+            m.pending_approvals_summary(Some(ApprovalKind::CredentialedExternalAction))
+                .is_empty()
+        );
+        assert_eq!(
+            m.decisions().last().unwrap().outcome,
+            DecisionOutcome::Approve
+        );
+    }
+
+    #[test]
+    fn record_pending_stamps_default_ttl() {
+        let m = ApprovalsModule::new();
+        let before = Utc::now();
+        let mut s = summary(ApprovalKind::Sender);
+        s.expires_at = None;
+        m.record_pending(s);
+        let listed = m.pending_approvals_summary(None);
+        let exp = listed[0].expires_at.expect("default TTL stamped");
+        assert!(exp > before + chrono::Duration::minutes(59));
+        assert!(exp < before + chrono::Duration::minutes(61));
+    }
+
+    #[test]
+    fn expired_pending_is_not_actionable() {
+        let m = ApprovalsModule::new();
+        let mut s = summary(ApprovalKind::Sender);
+        s.expires_at = Some(Utc::now() - chrono::Duration::minutes(1));
+        m.record_pending(s);
+        // Already lapsed: never surfaced as live.
+        assert!(m.pending_approvals_summary(None).is_empty());
+    }
+
+    #[test]
+    fn sweep_expired_drops_and_logs_expire() {
+        let m = ApprovalsModule::new();
+        let mut stale = summary(ApprovalKind::Sender);
+        stale.expires_at = Some(Utc::now() - chrono::Duration::minutes(1));
+        let stale_id = stale.id;
+        m.record_pending(stale);
+        let mut fresh = summary(ApprovalKind::Sender);
+        fresh.expires_at = Some(Utc::now() + chrono::Duration::hours(1));
+        m.record_pending(fresh);
+        let now = Utc::now();
+        let swept = m.sweep_expired(now);
+        assert_eq!(swept, vec![stale_id]);
+        let decisions = m.decisions();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].outcome, DecisionOutcome::Expire);
+        assert_eq!(decisions[0].decided_by, "system:expiry");
+        // Second sweep is a no-op.
+        assert!(m.sweep_expired(Utc::now()).is_empty());
+        assert_eq!(m.decisions().len(), 1);
+    }
+
+    #[test]
+    fn revoke_drops_and_logs_revoke() {
+        let m = ApprovalsModule::new();
+        let mut s = summary(ApprovalKind::Sender);
+        s.expires_at = Some(Utc::now() + chrono::Duration::hours(1));
+        let id = s.id;
+        m.record_pending(s);
+        m.revoke(id, "host", Some("operator withdrew the request"));
+        assert!(m.pending_approvals_summary(None).is_empty());
+        let decisions = m.decisions();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].outcome, DecisionOutcome::Revoke);
+        assert_eq!(
+            decisions[0].reason.as_deref(),
+            Some("operator withdrew the request")
+        );
+    }
+
+    #[test]
+    fn revoke_unknown_id_logs_nothing() {
+        let m = ApprovalsModule::new();
+        m.revoke(ApprovalId::new(), "host", None);
+        assert!(m.decisions().is_empty());
     }
 
     #[test]
@@ -693,6 +999,81 @@ mod tests {
         assert_eq!(c.agent_group_id, ag_id);
         assert_eq!(c.messaging_group_id, Some(mg_id));
         assert_eq!(c.sender.identity, "T-7");
+    }
+
+    #[tokio::test]
+    async fn pairing_notifier_fires_for_unknown_sender() {
+        use crate::context::MockDispatcher;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pair_calls = Arc::new(AtomicUsize::new(0));
+        let pair_calls2 = Arc::clone(&pair_calls);
+        let pairing: PairingNotifier = Arc::new(move |ctx, dispatcher| {
+            pair_calls2.fetch_add(1, Ordering::SeqCst);
+            // Deliver the (synthetic) code back to the sender's own channel.
+            let target = DispatchTarget::channel(
+                ctx.sender.channel_type.clone(),
+                ctx.sender.identity.clone(),
+                None,
+            );
+            let msg = OutboundMessage {
+                kind: MessageKind::Chat,
+                content: serde_json::json!({"text": "your pairing code is ABCDEFGH"}),
+                files: vec![],
+            };
+            dispatcher.dispatch(&target, &msg);
+        });
+
+        let m = ApprovalsModule::new().with_pairing_notifier(pairing);
+        let ctx = MockModuleContext::new();
+        m.install(ctx.clone()).await.unwrap();
+        let mock_dispatcher = MockDispatcher::new();
+        let d: Arc<dyn DeliveryDispatcher> = mock_dispatcher.clone();
+        ctx.fire_delivery_ready(&d);
+
+        let gate = ctx.sender_scope_gates.lock().unwrap()[0].clone();
+        let decision = (gate)(SenderScopeCtx {
+            event_sender: Some(unknown_sender("telegram", "u-pair")),
+            messaging_group_id: None,
+            agent_group_id: AgentGroupId::new(),
+            resolved_user: None,
+        });
+        assert!(decision.is_pending());
+        assert_eq!(pair_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(mock_dispatcher.dispatched_count(), 1);
+        // The code was delivered to the sender's own channel.
+        let dispatched = mock_dispatcher.dispatched.lock().unwrap();
+        let (target, _msg) = &dispatched[0];
+        assert_eq!(target.platform_id.as_deref(), Some("u-pair"));
+    }
+
+    #[tokio::test]
+    async fn pairing_notifier_does_not_fire_for_known_sender() {
+        use crate::context::MockDispatcher;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pair_calls = Arc::new(AtomicUsize::new(0));
+        let pair_calls2 = Arc::clone(&pair_calls);
+        let pairing: PairingNotifier = Arc::new(move |_ctx, _d| {
+            pair_calls2.fetch_add(1, Ordering::SeqCst);
+        });
+        let sender = unknown_sender("slack", "U-known");
+        let m = ApprovalsModule::new().with_pairing_notifier(pairing);
+        m.approve_sender(sender.clone());
+        let ctx = MockModuleContext::new();
+        m.install(ctx.clone()).await.unwrap();
+        let d: Arc<dyn DeliveryDispatcher> = MockDispatcher::new();
+        ctx.fire_delivery_ready(&d);
+
+        let gate = ctx.sender_scope_gates.lock().unwrap()[0].clone();
+        let decision = (gate)(SenderScopeCtx {
+            event_sender: Some(sender),
+            messaging_group_id: None,
+            agent_group_id: AgentGroupId::new(),
+            resolved_user: None,
+        });
+        assert!(decision.is_defer());
+        assert_eq!(pair_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -149,6 +149,54 @@ pub fn tokens_since(
     Ok(n)
 }
 
+/// Fetch the most recent turns for a group whose `ended_at` is at or after
+/// `since`, newest first, capped at `limit`. Drives the provider-resilience
+/// health fold (M16 Phase 4): the host reads the runner's reported turn
+/// outcomes (`provider`, `model`, `status`, `error`) and degrades / restores
+/// the matching chain entry. Cheap — bounded by `limit`.
+pub fn recent_for_group(
+    db: &CentralDb,
+    agent_group_id: &str,
+    since: DateTime<Utc>,
+    limit: i64,
+) -> Result<Vec<AgentTurn>, DbError> {
+    let conn = db.conn()?;
+    let mut stmt = conn.prepare(
+        "SELECT id, session_id, agent_group_id, seq, model, provider,
+                input_tokens, output_tokens, started_at, ended_at, status, error
+         FROM agent_turns
+         WHERE agent_group_id = ?1 AND ended_at >= ?2
+         ORDER BY ended_at DESC, id DESC
+         LIMIT ?3",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![agent_group_id, since.to_rfc3339(), limit],
+            row_to_turn,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn row_to_turn(row: &Row<'_>) -> rusqlite::Result<AgentTurn> {
+    let started_str: String = row.get("started_at")?;
+    let ended_str: String = row.get("ended_at")?;
+    Ok(AgentTurn {
+        id: row.get("id")?,
+        session_id: row.get("session_id")?,
+        agent_group_id: row.get("agent_group_id")?,
+        seq: row.get("seq")?,
+        model: row.get("model")?,
+        provider: row.get("provider")?,
+        input_tokens: row.get("input_tokens")?,
+        output_tokens: row.get("output_tokens")?,
+        started_at: parse_ts(&started_str)?,
+        ended_at: parse_ts(&ended_str)?,
+        status: row.get("status")?,
+        error: row.get("error")?,
+    })
+}
+
 /// Count rows in the table. Cheap diagnostic.
 pub fn count(db: &CentralDb) -> Result<i64, DbError> {
     let conn = db.conn()?;

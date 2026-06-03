@@ -17,6 +17,10 @@ pub mod task_store;
 mod test_support;
 
 pub use checks::apology::{APOLOGY_TRIES_MARKER, ApologyEmit, ApologyReason};
+pub use checks::condition_checkin::{
+    CHECKIN_AUDIT_COMMAND, Condition, ConditionContext, ConditionKind, ConditionStore,
+    ContextSampler,
+};
 pub use clock::{Clock, SystemClock};
 pub use error::SweepError;
 pub use service::{

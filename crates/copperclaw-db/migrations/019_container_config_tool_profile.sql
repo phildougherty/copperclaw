@@ -1,0 +1,27 @@
+-- Per-group tool-authorization profile.
+--
+-- Security-hardening (M16 Phase 1.1) shipped a layered ToolPolicy in the
+-- container runner (`copperclaw-runner::policy`) that scopes every tool
+-- dispatch to a group profile: `minimal` (conversation + housekeeping
+-- only), `messaging` (+ read-only / informational tools), `coding` (+
+-- filesystem mutation, shell, agent-spawning), or `full` (+
+-- self-modification). The engine was dormant — nothing fed it a profile,
+-- so every group ran at the permissive `full` default.
+--
+-- This column is the FUEL: the host reads it in the runner-config
+-- assembler and writes the resolved profile into `runner.json`, which the
+-- runner parses into its dispatch policy. A `messaging`-profile group now
+-- has shell blocked at the runner, beneath the host-owned DISALLOWED_TOOLS
+-- floor.
+--
+-- NULL (the default) means "no explicit profile"; the runner falls back to
+-- `full`, preserving the historical full tool surface for every existing
+-- group. Operators opt a group down via
+-- `cclaw groups config update --field 'tool_profile="messaging"' <id>`
+-- (or `cclaw groups config edit <id>`).
+--
+-- Runner-config-only (like `surface_thinking`): it changes `runner.json`,
+-- not the container image, so it is intentionally OUTSIDE
+-- `compute_fingerprint` — switching a profile takes effect on the next
+-- spawn without forcing an image rebuild.
+ALTER TABLE container_configs ADD COLUMN tool_profile TEXT;

@@ -628,6 +628,9 @@ impl CreateAgentHandler {
             resource_limits: cfg.resource_limits,
             coding_enabled: cfg.coding_enabled,
             surface_thinking: cfg.surface_thinking,
+            // Inherit the parent's tool-profile so a child agent stays
+            // within the same tool-authorization scope as its parent.
+            tool_profile: cfg.tool_profile,
         };
         if let Err(err) = container_configs::upsert(central, req) {
             warn!(
@@ -920,6 +923,7 @@ mod tests {
                 resource_limits: serde_json::json!({}),
                 coding_enabled: true,
                 surface_thinking: false,
+                tool_profile: None,
             },
         )
         .unwrap();

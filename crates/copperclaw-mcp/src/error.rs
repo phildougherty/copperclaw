@@ -61,6 +61,17 @@ pub enum McpError {
     /// The remote did not respond within the allowed window.
     #[error("timeout")]
     Timeout,
+    /// The call was refused by the per-server tool include/exclude filter
+    /// before it ever reached the remote — a denied (or not-allowed) tool.
+    /// Carrying this as a distinct variant lets the runner surface a precise
+    /// "blocked by policy" message instead of a generic protocol error.
+    #[error("tool `{tool}` blocked by server filter: {reason}")]
+    ToolFiltered {
+        /// The tool name that was refused.
+        tool: String,
+        /// Stable reason token (`"denied"` / `"not-allowed"`).
+        reason: &'static str,
+    },
 }
 
 impl McpError {
@@ -71,6 +82,7 @@ impl McpError {
             Self::Protocol(_) => "protocol",
             Self::RemoteError { .. } => "remote",
             Self::Timeout => "timeout",
+            Self::ToolFiltered { .. } => "filtered",
         }
     }
 }

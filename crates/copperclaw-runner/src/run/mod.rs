@@ -417,6 +417,14 @@ pub struct RunnerDeps {
     /// is plumbed in from `container_configs.surface_thinking` by the
     /// host's container manager into the runner's JSON config file.
     pub surface_thinking: bool,
+    /// Layered tool-authorization policy evaluated at every dispatch
+    /// (see [`crate::policy`]). Combines the group's tool-profile, the
+    /// sender role, and the active skill's `allowed-tools` over the
+    /// host-owned [`crate::policy::DISALLOWED_TOOLS`] floor. Default
+    /// ([`crate::policy::ToolPolicy::default`]) is the permissive `Full`
+    /// profile with no role/skill scope, so groups that don't set a
+    /// profile keep their historical full tool surface.
+    pub policy: crate::policy::ToolPolicy,
 }
 
 /// Default per-tool-call deadline. Comfortably above an `npm install`
@@ -483,6 +491,10 @@ impl RunnerDeps {
             // floor unless the operator explicitly opts the group in
             // via `container_configs.surface_thinking`.
             surface_thinking: false,
+            // Permissive default: `Full` profile, no role/skill scope.
+            // The host overrides this from the group config + sender
+            // role; tests opt into a tighter policy explicitly.
+            policy: crate::policy::ToolPolicy::default(),
         }
     }
 }
@@ -616,6 +628,20 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
         } else {
             deps.tool_ctx.set_originating(None, None, None, None);
         }
+
+        // PROVENANCE / autonomy gate (Phase 3): classify this turn as
+        // autonomous when nothing in the batch is a human channel message
+        // (Chat) — i.e. it was driven by a scheduled `Task` fire or a wake.
+        // Autonomous turns may search memory and propose but may NOT take a
+        // credentialed external action (read-then-propose). `approved` is
+        // wired `false` here: the live fresh-approval grant is a host
+        // follow-up (see the policy / memory module docs) — until then a
+        // tainted turn stays blocked, which is the safe default.
+        let autonomous = !formatted
+            .rows
+            .iter()
+            .any(|r| r.kind == copperclaw_types::MessageKind::Chat);
+        deps.tool_ctx.set_turn_provenance(autonomous, false);
 
         // Surface child-agent failure notices to the user channel
         // BEFORE the parent's LLM picks them up. Without this the
@@ -759,6 +785,71 @@ fn build_inbound_context_block(
     self::prompt::render_conversation_context(rows, depth)
 }
 
+/// Inputs for one end-of-turn `usage_report` system row.
+///
+/// A struct (rather than a long arg list) so [`build_usage_report_payload`]
+/// stays under clippy's argument cap and so the host's cross-crate
+/// emit→record→fold integration test constructs the same inputs the live
+/// runner does.
+#[derive(Debug, Clone)]
+pub struct UsageReportInputs<'a> {
+    pub session_id: copperclaw_types::SessionId,
+    pub agent_group_id: copperclaw_types::AgentGroupId,
+    pub seq: i64,
+    pub model: &'a str,
+    pub provider: &'a str,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub ended_at: chrono::DateTime<chrono::Utc>,
+    pub outcome: &'a TurnOutcome,
+}
+
+/// Build the `usage_report` system-row payload the runner appends to
+/// `outbound.db` at the end of every LLM turn. The host's delivery service
+/// (`record_usage_report`) reads this object's fields straight into an
+/// `agent_turns` row.
+///
+/// Extracted as a free function so the live emit path and the cross-crate
+/// emit→record→fold integration test (`copperclaw-host`) build the payload
+/// with identical logic — in particular the `error` field, which is
+/// load-bearing for provider resilience: the host's health fold
+/// (`fold_recent_turns`) classifies that string with
+/// `DegradeReason::from_error_text` to decide whether to degrade the chain.
+/// Omitting it (the pre-fix bug) left `agent_turns.error` NULL, so an
+/// automatic failover never fired. `Done` carries no error, so the column
+/// stays NULL on a successful turn.
+#[must_use]
+pub fn build_usage_report_payload(inputs: &UsageReportInputs<'_>) -> serde_json::Value {
+    let (status, error) = match inputs.outcome {
+        TurnOutcome::Done => ("ok", None),
+        TurnOutcome::Failed(reason) => ("error", Some(reason.as_str())),
+    };
+    serde_json::json!({
+        "usage_report": {
+            // Bare UUIDs (no `ag_`/`sess_` Display prefix): the host stores
+            // these verbatim into `agent_turns.{session_id,agent_group_id}`,
+            // and EVERY consumer query — the resilience fold
+            // (`recent_for_group`), budget tracking (`tokens_since`), and the
+            // usage rollup's join against `agent_groups.id` — keys by the bare
+            // uuid (`id.as_uuid().to_string()`). Emitting the prefixed Display
+            // form here (the prior bug) wrote rows no query could ever match,
+            // so the fold never degraded and usage/budget never attributed.
+            "session_id": inputs.session_id.as_uuid().to_string(),
+            "agent_group_id": inputs.agent_group_id.as_uuid().to_string(),
+            "seq": inputs.seq,
+            "model": inputs.model,
+            "provider": inputs.provider,
+            "input_tokens": inputs.input_tokens,
+            "output_tokens": inputs.output_tokens,
+            "started_at": inputs.started_at.to_rfc3339(),
+            "ended_at": inputs.ended_at.to_rfc3339(),
+            "status": status,
+            "error": error,
+        }
+    })
+}
+
 /// Append a `usage_report` system row to `outbound.db`. The host's
 /// delivery service intercepts this kind of system action (instead of
 /// dispatching it to a channel adapter) and writes the corresponding
@@ -771,22 +862,17 @@ pub(in crate::run) async fn emit_usage_report(
     outcome: &TurnOutcome,
 ) {
     use copperclaw_db::tables::messages_out::{WriteOutbound, insert as insert_out};
-    let payload = serde_json::json!({
-        "usage_report": {
-            "session_id": deps.session_id.to_string(),
-            "agent_group_id": deps.agent_group_id.to_string(),
-            "seq": deps.turn_seq.load(std::sync::atomic::Ordering::Relaxed),
-            "model": deps.model,
-            "provider": deps.provider.name(),
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "started_at": started_at.to_rfc3339(),
-            "ended_at": chrono::Utc::now().to_rfc3339(),
-            "status": match outcome {
-                TurnOutcome::Done => "ok",
-                TurnOutcome::Failed(_) => "error",
-            },
-        }
+    let payload = build_usage_report_payload(&UsageReportInputs {
+        session_id: deps.session_id,
+        agent_group_id: deps.agent_group_id,
+        seq: deps.turn_seq.load(std::sync::atomic::Ordering::Relaxed),
+        model: &deps.model,
+        provider: deps.provider.name(),
+        input_tokens,
+        output_tokens,
+        started_at,
+        ended_at: chrono::Utc::now(),
+        outcome,
     });
     let row = WriteOutbound {
         id: copperclaw_types::MessageId::new(),
@@ -1863,6 +1949,75 @@ mod tests {
         assert_eq!(
             parse_error_results, 3,
             "expected 3 synthetic parse-error tool_results in history, got {parse_error_results}"
+        );
+    }
+
+    /// Content-loop breaker: the model emits the SAME `(tool, args)`
+    /// call on every turn. After `TOOL_LOOP_BREAKER_THRESHOLD` identical
+    /// calls the runner trips the circuit breaker, terminates the
+    /// inbound as `failed`, and surfaces a loop-specific apology — well
+    /// before the `max_tool_turns` depth cap (still 150 here) would
+    /// fire. Pins the depth-cap-vs-content-cap distinction.
+    #[tokio::test]
+    async fn identical_tool_call_loop_trips_breaker() {
+        // Script many more identical turns than the breaker threshold so
+        // we prove the breaker — not the turn count — is what stops it.
+        let identical = || {
+            vec![ProviderEvent::ToolCall {
+                id: "tu_loop".into(),
+                name: "read_file".into(),
+                input: serde_json::json!({"path": "/data/stuck"}),
+            }]
+        };
+        let scripts: Vec<Vec<ProviderEvent>> = (0..20).map(|_| identical()).collect();
+        let mut setup = build_setup(scripts);
+        let id = {
+            let g = setup.deps.inbound.lock().await;
+            insert_pending(&g, "do the thing")
+        };
+        // Leave max_tool_turns at the default (150) so the ONLY thing
+        // that can stop this loop is the content breaker.
+        setup.deps.max_turns = Some(1);
+        run_loop(setup.deps).await.unwrap();
+
+        let inbound = open_inbound(&setup.paths).unwrap();
+        let status: String = inbound
+            .query_row(
+                "SELECT status FROM messages_in WHERE id = ?1",
+                rusqlite::params![id.as_uuid().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "failed",
+            "an identical-call loop must terminally fail the inbound"
+        );
+
+        // The apology should name the loop, not the depth cap.
+        let outbound = open_outbound(&setup.paths).unwrap();
+        let rows = messages_out::list_due(&outbound).unwrap();
+        let error_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == copperclaw_types::MessageKind::Error)
+            .collect();
+        assert_eq!(
+            error_rows.len(),
+            1,
+            "expected exactly one Error apology row, got: {error_rows:?}"
+        );
+
+        // Crucially, the breaker must fire well before 150 turns: the
+        // history should hold ~threshold tool_use cycles, not 150.
+        let st = load_state(&outbound).unwrap();
+        let read_file_calls = st
+            .history
+            .iter()
+            .filter(|m| matches!(m, HistoryMessage::ToolUse { name, .. } if name == "read_file"))
+            .count();
+        assert!(
+            read_file_calls <= 6,
+            "breaker should trip near the threshold, not run to the depth cap; \
+             saw {read_file_calls} read_file calls"
         );
     }
 

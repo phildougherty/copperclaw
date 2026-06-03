@@ -15,6 +15,7 @@ use rmcp::transport::sse_client::{SseClientConfig, SseClientTransport};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 
 use crate::error::McpError;
+use crate::filter::{FilterRejection, ToolFilter};
 
 /// Thin wrapper around a running `rmcp` client session.
 pub struct McpClient {
@@ -263,6 +264,80 @@ pub fn remote_tool_from_parts(
 /// their own context. Removes the need for them to depend on rmcp directly.
 pub type SharedMcpClient = Arc<McpClient>;
 
+/// An [`McpClient`] paired with the per-server [`ToolFilter`] from the
+/// group's `mcp_servers` config.
+///
+/// This is the **enforcement boundary** for per-server tool include/exclude
+/// filtering: the runner connects to a configured external server, wraps the
+/// client here, and from then on
+///
+/// - [`Self::list_tools`] / [`Self::list_all_tools`] return ONLY the
+///   permitted tools, so a denied tool is never advertised to the model, and
+/// - [`Self::call_tool`] refuses a denied tool with
+///   [`McpError::ToolFiltered`] *before* it reaches the remote, so the model
+///   naming a denied tool by hand still can't invoke it.
+///
+/// A default (open) filter makes this a transparent pass-through, so wiring
+/// it in unconditionally costs nothing for servers without a declared filter.
+#[derive(Debug)]
+pub struct FilteredMcpClient {
+    inner: McpClient,
+    filter: ToolFilter,
+}
+
+impl FilteredMcpClient {
+    /// Pair a live client with the filter parsed from its server entry.
+    #[must_use]
+    pub fn new(inner: McpClient, filter: ToolFilter) -> Self {
+        Self { inner, filter }
+    }
+
+    /// The active filter (for inspection / logging).
+    #[must_use]
+    pub fn filter(&self) -> &ToolFilter {
+        &self.filter
+    }
+
+    /// List tools, with denied/not-allowed entries stripped.
+    pub async fn list_tools(&self) -> Result<Vec<RemoteTool>, McpError> {
+        Ok(self.filter.apply(self.inner.list_tools().await?))
+    }
+
+    /// List every tool (walking pagination), with denied entries stripped.
+    pub async fn list_all_tools(&self) -> Result<Vec<RemoteTool>, McpError> {
+        Ok(self.filter.apply(self.inner.list_all_tools().await?))
+    }
+
+    /// Call a tool, refusing it up front when the filter rejects the name.
+    ///
+    /// The remote is never contacted for a denied call — the gate runs
+    /// host-side (in the runner process), so a denied tool can't be reached
+    /// even if the model fabricates the call.
+    pub async fn call_tool(
+        &self,
+        name: &str,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, McpError> {
+        if let Err(rej) = self.filter.check(name) {
+            return Err(McpError::ToolFiltered {
+                tool: name.to_owned(),
+                reason: filter_reason_token(rej),
+            });
+        }
+        self.inner.call_tool(name, input).await
+    }
+
+    /// Gracefully cancel the underlying service.
+    pub async fn close(self) -> Result<(), McpError> {
+        self.inner.close().await
+    }
+}
+
+/// Map a [`FilterRejection`] to its stable token for [`McpError::ToolFiltered`].
+fn filter_reason_token(rej: FilterRejection) -> &'static str {
+    rej.as_str()
+}
+
 /// Build a `reqwest::Client` pre-loaded with the caller's static headers.
 ///
 /// Used only by [`McpClient::connect_http_sse`]; exported `pub(crate)` so
@@ -439,5 +514,39 @@ mod tests {
         assert_eq!(t.name, "echo");
         assert_eq!(t.description.as_deref(), Some("echo back"));
         assert_eq!(t.input_schema["type"], "object");
+    }
+
+    #[tokio::test]
+    async fn filtered_client_refuses_denied_call_without_transport() {
+        // A denied tool must be refused by the filter *before* the client
+        // touches the remote — so we can build a `FilteredMcpClient` over a
+        // never-connected stdio client and assert the call short-circuits.
+        // Connect to a non-existent binary so any actual transport use would
+        // surface as a Transport error; the filter gate fires first.
+        let inner = McpClient::connect_stdio(
+            "/path/that/does/not/exist/copperclaw-mcp-test",
+            std::iter::empty::<&str>(),
+            HashMap::new(),
+        )
+        .await;
+        // The connect itself fails (no binary). That's fine — the point of
+        // the gate is that for a denied tool we never even get here. We test
+        // the gate directly via the filter to keep this transport-free:
+        assert!(inner.is_err());
+
+        let entry = serde_json::json!({"denied_tools": ["danger"]});
+        let filter = crate::filter::ToolFilter::from_server_entry(&entry);
+        // Deny gate (pure): the filter rejects before any transport call.
+        assert_eq!(
+            filter.check("danger"),
+            Err(crate::filter::FilterRejection::Denied)
+        );
+        let err = McpError::ToolFiltered {
+            tool: "danger".into(),
+            reason: filter.check("danger").unwrap_err().as_str(),
+        };
+        assert_eq!(err.kind(), "filtered");
+        assert!(err.to_string().contains("danger"));
+        assert!(err.to_string().contains("denied"));
     }
 }

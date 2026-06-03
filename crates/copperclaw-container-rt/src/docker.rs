@@ -26,7 +26,9 @@ use bytes::Bytes;
 use futures::stream::StreamExt;
 
 use crate::build::ImageBuildSpec;
-use crate::spec::{ContainerHandle, ContainerSpec, Mount, ResourceLimits};
+use crate::spec::{
+    ContainerHandle, ContainerSpec, EgressMode, Mount, ResourceLimits, SandboxProfile,
+};
 use crate::{ContainerRuntime, RtError};
 
 /// Bollard-backed Docker runtime.
@@ -158,12 +160,34 @@ impl ContainerRuntime for DockerRuntime {
     }
 
     async fn build_image(&self, spec: ImageBuildSpec) -> Result<String, RtError> {
+        // install_packages containment: refuse to dispatch a build whose
+        // build-args / labels carry a credential-shaped name. This is the
+        // structural guarantee that the broker token / provider key never
+        // rides into a package build's env (where a malicious postinstall
+        // could read it). Clean specs (the default install always produces
+        // one) pass through unchanged.
+        spec.assert_no_credentials()
+            .map_err(|v| RtError::Container(v.to_string()))?;
         let image_tag = spec.image_tag();
         let context_bytes = build_context_tar(&spec)?;
+        // Apply the containment network mode to the build's RUN steps. Bridge
+        // (the default) leaves the daemon default; None is a real `--network=none`
+        // cut (no postinstall egress at all).
+        let networkmode: String = spec
+            .containment
+            .network
+            .networkmode()
+            .unwrap_or("")
+            .to_string();
+        // Non-secret build-args only — the credential guard above already
+        // rejected anything credential-shaped.
+        let buildargs: HashMap<String, String> = spec.build_args.iter().cloned().collect();
         let opts = BuildImageOptions::<String> {
             dockerfile: "Dockerfile".into(),
             t: image_tag.clone(),
             rm: true,
+            networkmode,
+            buildargs,
             ..Default::default()
         };
         let mut stream = self
@@ -187,6 +211,21 @@ impl ContainerRuntime for DockerRuntime {
                 status_code: 404, ..
             }) => Ok(false),
             Err(e) => Err(RtError::Container(format!("inspect image {tag}: {e}"))),
+        }
+    }
+
+    async fn image_digest(&self, tag: &str) -> Result<Option<String>, RtError> {
+        // `.Id` is the content-addressable digest (sha256:<hex>) computed from
+        // the image config + layer digests — the exact thing attestation wants
+        // to pin. A 404 means the image isn't present locally ⇒ `None`.
+        match self.docker.inspect_image(tag).await {
+            Ok(info) => Ok(info.id),
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(None),
+            Err(e) => Err(RtError::Container(format!(
+                "inspect image {tag} for digest: {e}"
+            ))),
         }
     }
 
@@ -227,15 +266,34 @@ impl ContainerRuntime for DockerRuntime {
 /// - `memory_mb` → `HostConfig::memory` (MiB × 2²⁰)
 /// - `pids_limit` → `HostConfig::pids_limit`
 ///
-/// Egress enforcement is a host-level concern; the `HostConfig` below wires
-/// `extra_hosts` which is the foundation for static host resolution, but
-/// full iptables-based egress filtering requires a post-spawn hook outside
-/// the scope of the bollard `create_container` call.
+/// Egress posture ([`ContainerSpec::egress_mode`]) maps to the
+/// `HostConfig::network_mode` chosen by [`egress_network_mode`]: under
+/// [`EgressMode::DenyDefault`] with an empty allow-list the container is cut
+/// off the network entirely (`"none"`, a real bollard-enforced deny). Any
+/// other combination leaves networking on the default bridge — per-host
+/// filtering of a non-empty allow-list is deferred to a future netns +
+/// nftables pass and is NOT enforced here. The allow-list is carried on the
+/// spec for that later pass and for operator visibility.
 pub(crate) fn container_config(spec: &ContainerSpec) -> Config<String> {
     let env: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let labels: HashMap<String, String> = spec.labels.clone();
 
-    let mounts: Vec<DockerMount> = spec.mounts.iter().map(translate_mount).collect();
+    let mut mounts: Vec<DockerMount> = spec.mounts.iter().map(translate_mount).collect();
+
+    // Phase 0a v2 DNS filtering: pin /etc/resolv.conf to the host-rendered
+    // filtering-resolver config (read-only) so a deny-default container's stub
+    // resolver can only reach the filtering resolver. Only present when the
+    // host set it (deny-default), so default spawns are unaffected. Appended
+    // last so it can't be shadowed by an earlier mount at the same target.
+    if let Some(resolv_src) = spec.resolv_conf_source.as_deref() {
+        mounts.push(DockerMount {
+            target: Some("/etc/resolv.conf".to_string()),
+            source: Some(resolv_src.to_string()),
+            typ: Some(MountTypeEnum::BIND),
+            read_only: Some(true),
+            ..Default::default()
+        });
+    }
 
     let extra_hosts: Vec<String> = spec
         .extra_hosts
@@ -243,12 +301,24 @@ pub(crate) fn container_config(spec: &ContainerSpec) -> Config<String> {
         .map(|(host, ip)| format!("{host}:{ip}"))
         .collect();
 
-    let host_config = host_config_with_limits(
+    let mut host_config = host_config_with_limits(
         &spec.resource_limits,
         mounts,
         extra_hosts,
         spec.gpu_passthrough,
+        egress_network_mode(spec.egress_mode, &spec.egress_allow),
     );
+
+    // Phase 5a stronger-sandbox security floor. Only present when the caller
+    // attached a sandbox profile (the headless-browser child container);
+    // default spawns leave `host_config` untouched. The profile's `runtime`
+    // is expected to already be the RESOLVED runtime from
+    // [`crate::select_sandbox_runtime`] — the host probes availability and
+    // narrows the request before building the spec, so a microVM runtime that
+    // isn't installed never reaches `runtime:` here.
+    if let Some(profile) = spec.sandbox.as_ref() {
+        apply_sandbox_security(&mut host_config, profile);
+    }
 
     Config {
         image: Some(spec.image.clone()),
@@ -270,12 +340,30 @@ pub(crate) fn container_config(spec: &ContainerSpec) -> Config<String> {
     }
 }
 
-/// Build the `HostConfig` applying any resource limits.
+/// Decide the bollard `HostConfig::network_mode` for an egress posture.
+///
+/// Returns `Some("none")` only under [`EgressMode::DenyDefault`] with an
+/// empty allow-list — the single case bollard can enforce as a hard egress
+/// cut through `create_container`. Every other case returns `None` (Docker's
+/// default bridge), because bollard cannot express per-host L3/L4 filtering;
+/// honoring a non-empty allow-list is deferred to the netns + nftables pass.
+#[must_use]
+pub(crate) fn egress_network_mode(mode: EgressMode, allow: &[String]) -> Option<String> {
+    match mode {
+        EgressMode::DenyDefault if allow.is_empty() => Some("none".to_string()),
+        EgressMode::DenyDefault | EgressMode::AllowAll => None,
+    }
+}
+
+/// Build the `HostConfig` applying any resource limits. `network_mode` is the
+/// pre-decided egress posture (see [`egress_network_mode`]); `None` leaves the
+/// runtime default bridge.
 pub(crate) fn host_config_with_limits(
     limits: &ResourceLimits,
     mounts: Vec<DockerMount>,
     extra_hosts: Vec<String>,
     gpu_passthrough: bool,
+    network_mode: Option<String>,
 ) -> HostConfig {
     // Docker's CPU quota is in nano-CPUs (1 CPU = 1_000_000_000 nano-CPUs).
     // The f64->i64 truncation is intentional: fractional nano-CPUs are meaningless.
@@ -309,7 +397,54 @@ pub(crate) fn host_config_with_limits(
         memory,
         pids_limit,
         device_requests,
+        network_mode,
         ..Default::default()
+    }
+}
+
+/// Apply a [`SandboxProfile`] onto a bollard [`HostConfig`], translating the
+/// stronger-sandbox knobs into the engine's security primitives (Phase 5a).
+///
+/// Pure mutation, so it is unit-tested without a daemon. What each field maps
+/// to:
+///
+/// * `runtime` → `HostConfig::runtime` *only* when the resolved
+///   [`SandboxRuntime`] names an external OCI runtime
+///   ([`SandboxRuntime::oci_runtime_name`]). [`SandboxRuntime::HardenedRunc`]
+///   and [`SandboxRuntime::Default`] leave `runtime: None` (engine default) —
+///   `HardenedRunc` hardens via the security options below rather than by
+///   swapping the runtime binary.
+/// * `cap_drop_all` → `cap_drop: ["ALL"]`.
+/// * `no_new_privileges` → `security_opt: ["no-new-privileges:true"]`.
+/// * `seccomp_profile` → `security_opt: ["seccomp=<name>"]` when named; absent
+///   means the engine's (already restrictive) default seccomp profile.
+/// * `userns_remap` → `userns_mode: "<label>"` (Docker reads the daemon-side
+///   subordinate-uid map for the label).
+pub(crate) fn apply_sandbox_security(host: &mut HostConfig, profile: &SandboxProfile) {
+    // Select the OCI runtime binary only for runtimes that need one. The
+    // resolved profile should already have narrowed an unavailable microVM
+    // runtime down to what the host has — see `select_sandbox_runtime`.
+    if let Some(rt_name) = profile.runtime.oci_runtime_name() {
+        host.runtime = Some(rt_name.to_string());
+    }
+
+    if profile.cap_drop_all {
+        host.cap_drop = Some(vec!["ALL".to_string()]);
+    }
+
+    let mut security_opt: Vec<String> = Vec::new();
+    if profile.no_new_privileges {
+        security_opt.push("no-new-privileges:true".to_string());
+    }
+    if let Some(name) = profile.seccomp_profile.as_deref() {
+        security_opt.push(format!("seccomp={name}"));
+    }
+    if !security_opt.is_empty() {
+        host.security_opt = Some(security_opt);
+    }
+
+    if let Some(label) = profile.userns_remap.as_deref() {
+        host.userns_mode = Some(label.to_string());
     }
 }
 
@@ -682,6 +817,7 @@ mod tar {
 mod tests {
     use super::*;
     use crate::build::ExtraFile;
+    use crate::spec::SandboxRuntime;
 
     #[test]
     fn translates_bind_mount() {
@@ -761,6 +897,162 @@ mod tests {
         // 512 MiB = 512 * 1024 * 1024 bytes = 536870912
         assert_eq!(host.memory, Some(512 * 1024 * 1024));
         assert_eq!(host.pids_limit, Some(256));
+    }
+
+    #[test]
+    fn container_config_allow_all_leaves_network_mode_unset() {
+        // Default posture (AllowAll) must not touch network_mode — the
+        // legacy spawn path keeps the default bridge.
+        let spec = ContainerSpec::new("c", "img");
+        let cfg = container_config(&spec);
+        let host = cfg.host_config.unwrap();
+        assert!(host.network_mode.is_none());
+    }
+
+    #[test]
+    fn container_config_deny_default_empty_allow_cuts_network() {
+        // DenyDefault with no allow-list is the one bollard-enforceable
+        // hard cut: network_mode "none".
+        let spec = ContainerSpec::new("c", "img").with_egress_mode(EgressMode::DenyDefault);
+        let cfg = container_config(&spec);
+        let host = cfg.host_config.unwrap();
+        assert_eq!(host.network_mode.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn container_config_deny_default_with_allow_keeps_network() {
+        // DenyDefault with a non-empty allow-list cannot be filtered by
+        // bollard, so the container stays networked (per-host filtering is
+        // deferred to the netns+nftables pass). The allow-list is carried.
+        let spec = ContainerSpec::new("c", "img")
+            .with_egress_mode(EgressMode::DenyDefault)
+            .with_egress_allow(vec!["api.anthropic.com:443".into()]);
+        let cfg = container_config(&spec);
+        let host = cfg.host_config.unwrap();
+        assert!(
+            host.network_mode.is_none(),
+            "non-empty allow-list under deny-default must NOT hard-cut the network"
+        );
+    }
+
+    // ── Phase 5a stronger-sandbox security translation ───────────────────
+
+    #[test]
+    fn container_config_no_sandbox_leaves_security_unset() {
+        // Default spawn: no sandbox profile, so none of the security knobs
+        // are touched — behaviour unchanged.
+        let spec = ContainerSpec::new("c", "img");
+        let host = container_config(&spec).host_config.unwrap();
+        assert!(host.runtime.is_none());
+        assert!(host.cap_drop.is_none());
+        assert!(host.security_opt.is_none());
+        assert!(host.userns_mode.is_none());
+    }
+
+    #[test]
+    fn apply_sandbox_security_hardened_runc_floor() {
+        // HardenedRunc: no external runtime (engine default), but the full
+        // security floor applied.
+        let mut host = HostConfig::default();
+        apply_sandbox_security(
+            &mut host,
+            &SandboxProfile::hardened(SandboxRuntime::HardenedRunc),
+        );
+        assert!(
+            host.runtime.is_none(),
+            "hardened-runc must not swap the OCI runtime"
+        );
+        assert_eq!(host.cap_drop.as_deref(), Some(&["ALL".to_string()][..]));
+        let so = host.security_opt.unwrap();
+        assert!(so.iter().any(|s| s == "no-new-privileges:true"));
+        assert_eq!(host.userns_mode.as_deref(), Some("copperclaw-browser"));
+    }
+
+    #[test]
+    fn apply_sandbox_security_runsc_sets_runtime() {
+        let mut host = HostConfig::default();
+        apply_sandbox_security(&mut host, &SandboxProfile::hardened(SandboxRuntime::Runsc));
+        assert_eq!(host.runtime.as_deref(), Some("runsc"));
+        // The security floor still applies on top of the gVisor runtime.
+        assert_eq!(host.cap_drop.as_deref(), Some(&["ALL".to_string()][..]));
+    }
+
+    #[test]
+    fn apply_sandbox_security_named_seccomp_profile() {
+        let mut host = HostConfig::default();
+        let profile = SandboxProfile::hardened(SandboxRuntime::HardenedRunc)
+            .with_seccomp_profile("browser-strict");
+        apply_sandbox_security(&mut host, &profile);
+        let so = host.security_opt.unwrap();
+        assert!(
+            so.iter().any(|s| s == "seccomp=browser-strict"),
+            "named seccomp profile must reach security_opt: {so:?}"
+        );
+    }
+
+    #[test]
+    fn container_config_threads_sandbox_into_host_config() {
+        let spec = ContainerSpec::new("c", "img")
+            .with_sandbox(SandboxProfile::hardened(SandboxRuntime::Kata));
+        let host = container_config(&spec).host_config.unwrap();
+        assert_eq!(host.runtime.as_deref(), Some("kata-runtime"));
+        assert_eq!(host.cap_drop.as_deref(), Some(&["ALL".to_string()][..]));
+        assert_eq!(host.userns_mode.as_deref(), Some("copperclaw-browser"));
+    }
+
+    #[test]
+    fn container_config_no_resolv_conf_by_default() {
+        // Default spawn (no DNS filter) must not add an /etc/resolv.conf mount
+        // — the legacy behaviour is untouched.
+        let spec = ContainerSpec::new("c", "img");
+        let cfg = container_config(&spec);
+        let host = cfg.host_config.unwrap();
+        let mounts = host.mounts.unwrap();
+        assert!(
+            !mounts
+                .iter()
+                .any(|m| m.target.as_deref() == Some("/etc/resolv.conf")),
+            "no resolv.conf mount unless DNS filtering is pinned"
+        );
+    }
+
+    #[test]
+    fn container_config_pins_resolv_conf_read_only_when_set() {
+        // DNS filtering on: the host-rendered resolv.conf is bound read-only at
+        // /etc/resolv.conf so the container can only reach the filter resolver.
+        let spec = ContainerSpec::new("c", "img")
+            .with_egress_mode(EgressMode::DenyDefault)
+            .with_resolv_conf_source("/host/sessions/s1/resolv.conf");
+        let cfg = container_config(&spec);
+        let host = cfg.host_config.unwrap();
+        let mounts = host.mounts.unwrap();
+        let resolv = mounts
+            .iter()
+            .find(|m| m.target.as_deref() == Some("/etc/resolv.conf"))
+            .expect("resolv.conf mount present");
+        assert_eq!(
+            resolv.source.as_deref(),
+            Some("/host/sessions/s1/resolv.conf")
+        );
+        assert_eq!(resolv.read_only, Some(true));
+        assert_eq!(resolv.typ, Some(MountTypeEnum::BIND));
+    }
+
+    #[test]
+    fn egress_network_mode_matrix() {
+        assert_eq!(egress_network_mode(EgressMode::AllowAll, &[]), None);
+        assert_eq!(
+            egress_network_mode(EgressMode::AllowAll, &["x:1".to_string()]),
+            None
+        );
+        assert_eq!(
+            egress_network_mode(EgressMode::DenyDefault, &[]),
+            Some("none".to_string())
+        );
+        assert_eq!(
+            egress_network_mode(EgressMode::DenyDefault, &["x:1".to_string()]),
+            None
+        );
     }
 
     #[test]

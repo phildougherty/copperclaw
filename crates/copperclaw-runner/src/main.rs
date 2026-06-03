@@ -139,7 +139,13 @@ async fn main() -> Result<()> {
     };
     let mut tool_ctx_inner = RunnerToolCtx::new(outbound.clone(), paths.outbox.clone())
         .with_subagent(subagent_deps)
-        .with_breadcrumbs_from_env();
+        .with_breadcrumbs_from_env()
+        // Per-group searchable memory store: the host bind-mounts the group's
+        // `memory/` dir at `/data/memory`, so the store lives at
+        // `<session_dir>/memory/memory.db`. `MemoryStore::open` creates +
+        // migrates it lazily on first `memory_search` / `memory_get`. A child
+        // (subagent) session shares the same group store.
+        .with_memory_db(paths.root.join("memory").join("memory.db"));
     if let Some(parent) = cfg.source_session_id {
         tool_ctx_inner = tool_ctx_inner.with_source_session_id(parent);
     }
@@ -183,6 +189,11 @@ async fn main() -> Result<()> {
         // per-group `surface_thinking` flag on. Default-off keeps the
         // historical "drop on the floor" behaviour for existing groups.
         surface_thinking: cfg.surface_thinking,
+        // Tool authorization: scope every dispatch to the group's
+        // tool-profile and the triggering sender's resolved RBAC role,
+        // over the host-owned DISALLOWED_TOOLS floor. The active-skill
+        // layer is applied per-call at dispatch from the ToolContext.
+        policy: copperclaw_runner::ToolPolicy::new(cfg.tool_profile, cfg.sender_role),
     };
 
     tracing::info!(
@@ -302,6 +313,8 @@ mod build_provider_tests {
             codex_args: None,
             source_session_id: None,
             surface_thinking: false,
+            tool_profile: copperclaw_runner::ToolProfile::Full,
+            sender_role: None,
         }
     }
 

@@ -58,6 +58,24 @@ pub struct Skill {
     pub source: SkillSource,
 }
 
+impl Skill {
+    /// The skill's `allowed-tools` frontmatter normalized into the
+    /// copperclaw MCP tool names the runner dispatches against (see
+    /// [`crate::tool_names::normalize`]).
+    ///
+    /// Returns `None` when the skill declared no `allowed-tools` (i.e.
+    /// the skill imposes no tool scope — the group profile alone bounds
+    /// it). Returns `Some(names)` otherwise; the runner feeds this into
+    /// its per-turn tool policy so a skill declaring
+    /// `allowed-tools: [Read]` blocks `Bash`/`shell` at dispatch.
+    #[must_use]
+    pub fn allowed_tool_names(&self) -> Option<Vec<String>> {
+        self.allowed_tools
+            .as_ref()
+            .map(|raw| crate::tool_names::normalize(raw))
+    }
+}
+
 /// Selector for which skills should be exposed to an agent group.
 ///
 /// Mirrors `copperclaw_db::tables::container_configs::SkillsSelector`:
@@ -416,6 +434,36 @@ mod tests {
         let s = load_skill(&td.path().join("tools-skill"), SkillSource::Global).unwrap();
         assert_eq!(s.allowed_tools, Some(vec!["Read".into(), "Bash".into()]));
         assert_eq!(s.id.as_str(), "tools-skill");
+    }
+
+    #[test]
+    fn allowed_tool_names_normalizes_to_mcp_names() {
+        let td = TempDir::new().unwrap();
+        write_skill_with_tools(td.path(), "rw-skill", &["Read", "Bash"]);
+        let s = load_skill(&td.path().join("rw-skill"), SkillSource::Global).unwrap();
+        let names = s.allowed_tool_names().unwrap();
+        assert!(names.contains(&"read_file".to_string()));
+        assert!(names.contains(&"shell".to_string()));
+    }
+
+    #[test]
+    fn allowed_tool_names_read_only_blocks_shell() {
+        // Headline Phase 1.1 case: `allowed-tools: [Read]` must not
+        // include `shell`, so the runner's policy blocks Bash.
+        let td = TempDir::new().unwrap();
+        write_skill_with_tools(td.path(), "ro-skill", &["Read"]);
+        let s = load_skill(&td.path().join("ro-skill"), SkillSource::Global).unwrap();
+        let names = s.allowed_tool_names().unwrap();
+        assert_eq!(names, vec!["read_file".to_string()]);
+        assert!(!names.contains(&"shell".to_string()));
+    }
+
+    #[test]
+    fn allowed_tool_names_none_when_unset() {
+        let td = TempDir::new().unwrap();
+        write_skill(td.path(), "no-tools", "no-tools", "d");
+        let s = load_skill(&td.path().join("no-tools"), SkillSource::Global).unwrap();
+        assert!(s.allowed_tool_names().is_none());
     }
 
     #[test]

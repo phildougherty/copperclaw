@@ -196,6 +196,41 @@ pub struct RunnerToolCtx {
     /// the aggregate chip's expandable region, plus whether the chip has
     /// been emitted yet this turn). Reset by [`Self::begin_activity`].
     activity: Arc<std::sync::Mutex<ActivityState>>,
+    /// Active skill's `allowed-tools` (set by the `load_skill` tool when
+    /// the loaded skill declared an `allowed-tools` frontmatter list).
+    /// `None` means no tool-scoping skill is active. The runner's
+    /// dispatch gate reads this each call and feeds it into
+    /// [`crate::policy::ToolPolicy::with_active_skill`] so a read-only
+    /// skill narrows the live policy. `Arc<Mutex<...>>` so it survives
+    /// `Arc<dyn ToolContext>` erasure and is mutable from the shared ref.
+    active_skill_allowed: Arc<std::sync::Mutex<Option<Vec<String>>>>,
+    /// Path to this group's searchable memory store (`memory.db`), bind-mounted
+    /// into the container under `/data/memory/`. `None` disables the
+    /// `memory_search` / `memory_get` tools (they surface a Context error) —
+    /// e.g. subagent contexts and tests that don't wire a store. Set by the
+    /// runner binary from `<session_dir>/memory/memory.db`.
+    memory_db_path: Option<PathBuf>,
+    /// Per-turn coarse-provenance taint flag (M16 Phase 3). Flipped `true` by
+    /// [`copperclaw_mcp::ToolContext::mark_untrusted_context`] (a `web_fetch`
+    /// body) and by the `memory_search` / `memory_get` impls when they return
+    /// an untrusted hit. The runner's dispatch gate reads it via
+    /// [`Self::is_context_tainted`] and feeds it into
+    /// [`crate::policy::TurnTrust`]; `run_loop` resets it at the top of each
+    /// turn via [`copperclaw_mcp::ToolContext::begin_activity`].
+    /// `Arc<AtomicBool>` so it survives `Arc<dyn ToolContext>` erasure and is
+    /// mutable from a shared ref.
+    context_tainted: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the current turn is autonomous (heartbeat / scheduled wake, no
+    /// triggering human message). Set per-turn by `run_loop` via
+    /// [`Self::set_turn_provenance`]; read by the dispatch gate. Autonomous
+    /// turns may search memory and propose but may NOT take a credentialed
+    /// external action (read-then-propose).
+    autonomous_turn: Arc<std::sync::atomic::AtomicBool>,
+    /// Whether a fresh operator approval has cleared the provenance taint for
+    /// credentialed external actions on this turn. Set per-turn by `run_loop`
+    /// via [`Self::set_turn_provenance`] (today always `false` — the live
+    /// approval wiring is a host follow-up; see the module / policy docs).
+    external_approved: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// How tool-progress breadcrumbs are presented in chat.
@@ -244,6 +279,11 @@ impl RunnerToolCtx {
             parent_reply_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             breadcrumb_style: BreadcrumbStyle::default(),
             activity: Arc::new(std::sync::Mutex::new(ActivityState::default())),
+            active_skill_allowed: Arc::new(std::sync::Mutex::new(None)),
+            memory_db_path: None,
+            context_tainted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            autonomous_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            external_approved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -775,6 +815,95 @@ impl RunnerToolCtx {
     pub fn outbox_root(&self) -> &Path {
         &self.outbox_root
     }
+
+    /// Wire the per-group searchable memory store path so the
+    /// `memory_search` / `memory_get` tools resolve against it. Without
+    /// this the tools surface a "memory store not configured" Context
+    /// error. The runner binary passes `<session_dir>/memory/memory.db`
+    /// (the bind-mounted per-group store).
+    #[must_use]
+    pub fn with_memory_db(mut self, path: impl Into<PathBuf>) -> Self {
+        self.memory_db_path = Some(path.into());
+        self
+    }
+
+    /// True when this turn's context has been tainted by
+    /// untrusted-provenance content (a `web_fetch` body or an untrusted
+    /// memory hit). Read by the runner's dispatch gate to build the
+    /// per-call [`crate::policy::TurnTrust`].
+    #[must_use]
+    pub fn is_context_tainted(&self) -> bool {
+        self.context_tainted
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Reset the per-turn taint flag. Called by `run_loop` at the top of
+    /// each turn (via the [`copperclaw_mcp::ToolContext::begin_activity`]
+    /// hook) so taint from a prior turn's fetch doesn't bleed forward.
+    pub fn reset_taint(&self) {
+        self.context_tainted
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Set the per-turn provenance signals the dispatch gate reads:
+    /// `autonomous` (heartbeat / scheduled wake, no human message) and
+    /// `approved` (a fresh operator grant clearing the taint block). Called by
+    /// `run_loop` before driving each turn. The taint flag itself is NOT set
+    /// here — it accrues during the turn from `mark_untrusted_context`.
+    pub fn set_turn_provenance(&self, autonomous: bool, approved: bool) {
+        self.autonomous_turn
+            .store(autonomous, std::sync::atomic::Ordering::Release);
+        self.external_approved
+            .store(approved, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether the current turn is autonomous (read by the dispatch gate).
+    #[must_use]
+    pub fn is_autonomous_turn(&self) -> bool {
+        self.autonomous_turn
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Whether a fresh approval has cleared the taint block this turn.
+    #[must_use]
+    pub fn external_action_approved(&self) -> bool {
+        self.external_approved
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The wired memory-store path, for tests that want to seed the store.
+    #[cfg(test)]
+    #[must_use]
+    pub fn memory_db_path_for_test(&self) -> Option<&Path> {
+        self.memory_db_path.as_deref()
+    }
+
+    /// Open the per-group memory store, or `None` when no path is wired.
+    /// Opened per-call: the `SQLite` handle isn't `Send` across awaits and a
+    /// fresh open is cheap (the file is bind-mounted and already migrated).
+    fn open_memory(&self) -> Result<Option<copperclaw_db::memory::MemoryStore>, ToolError> {
+        let Some(path) = self.memory_db_path.as_ref() else {
+            return Ok(None);
+        };
+        copperclaw_db::memory::MemoryStore::open(path)
+            .map(Some)
+            .map_err(|e| ToolError::Internal(format!("open memory store: {e}")))
+    }
+}
+
+/// Map a `copperclaw_db::memory::MemoryEntry` into the MCP wire view.
+fn entry_to_view(
+    entry: copperclaw_db::memory::MemoryEntry,
+    score: Option<f64>,
+) -> copperclaw_mcp::MemoryHitView {
+    copperclaw_mcp::MemoryHitView {
+        key: entry.key,
+        body: entry.body,
+        provenance: entry.provenance.as_str().to_string(),
+        source: entry.source,
+        score,
+        updated_at: entry.updated_at,
+    }
 }
 
 #[async_trait]
@@ -860,6 +989,102 @@ impl ToolContext for RunnerToolCtx {
         Self::clear_originating(self);
     }
 
+    fn set_active_skill_allowed_tools(&self, allowed: Option<Vec<String>>) {
+        if let Ok(mut guard) = self.active_skill_allowed.lock() {
+            *guard = allowed;
+        }
+    }
+
+    fn active_skill_allowed_tools(&self) -> Option<Vec<String>> {
+        self.active_skill_allowed
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    async fn memory_search(
+        &self,
+        spec: copperclaw_mcp::MemorySearchSpec,
+    ) -> Result<Vec<copperclaw_mcp::MemoryHitView>, ToolError> {
+        let Some(store) = self.open_memory()? else {
+            return Err(ToolError::Context(
+                "memory store not configured in this context".into(),
+            ));
+        };
+        // Vector half deferred: embedding generation must route through the
+        // host credential broker (no embeddings endpoint there yet), so we
+        // run the FTS5 half today. The store's cosine pass is real and fires
+        // automatically the moment a query embedding is supplied — see the
+        // module header in `copperclaw_db::memory`.
+        let hits = store
+            .search(&copperclaw_db::memory::MemoryQuery {
+                text: &spec.query,
+                embedding: &[],
+                limit: spec.limit.unwrap_or(5),
+            })
+            .map_err(|e| ToolError::Internal(format!("memory search: {e}")))?;
+        // PROVENANCE: if any returned hit is untrusted, taint the turn so the
+        // coarse gate blocks credentialed external actions until fresh
+        // approval. Done here (not in the pure tool handler) because the taint
+        // side-effect belongs to the side-effecting context.
+        if hits.iter().any(|h| h.entry.provenance.is_untrusted()) {
+            self.mark_untrusted_context("memory_search:untrusted_hit");
+        }
+        Ok(hits
+            .into_iter()
+            .map(|h| entry_to_view(h.entry, Some(h.score)))
+            .collect())
+    }
+
+    async fn memory_get(
+        &self,
+        key: &str,
+    ) -> Result<Option<copperclaw_mcp::MemoryHitView>, ToolError> {
+        let Some(store) = self.open_memory()? else {
+            return Err(ToolError::Context(
+                "memory store not configured in this context".into(),
+            ));
+        };
+        let entry = store
+            .get(key)
+            .map_err(|e| ToolError::Internal(format!("memory get: {e}")))?;
+        Ok(match entry {
+            Some(e) => {
+                if e.provenance.is_untrusted() {
+                    self.mark_untrusted_context("memory_get:untrusted_hit");
+                }
+                Some(entry_to_view(e, None))
+            }
+            None => None,
+        })
+    }
+
+    fn mark_untrusted_context(&self, source: &str) {
+        tracing::info!(
+            target: "copperclaw_runner::provenance",
+            %source,
+            "turn context tainted by untrusted-provenance content; credentialed external actions now require fresh approval"
+        );
+        self.context_tainted
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn is_context_tainted(&self) -> bool {
+        Self::is_context_tainted(self)
+    }
+
+    fn is_autonomous_turn(&self) -> bool {
+        Self::is_autonomous_turn(self)
+    }
+
+    fn external_action_approved(&self) -> bool {
+        Self::external_action_approved(self)
+    }
+
+    fn set_turn_provenance(&self, autonomous: bool, approved: bool) {
+        Self::set_turn_provenance(self, autonomous, approved);
+    }
+
     fn parent_reply_sent(&self) -> bool {
         Self::parent_reply_sent(self)
     }
@@ -870,6 +1095,11 @@ impl ToolContext for RunnerToolCtx {
 
     fn begin_activity(&self) {
         self.reset_activity();
+        // Reset the coarse-provenance taint at the top of every turn: a
+        // web_fetch / untrusted memory hit taints only the turn it happened
+        // in. The next turn starts clean (subject to a fresh approval / a
+        // fresh untrusted fetch). See [`crate::policy::TurnTrust`].
+        self.reset_taint();
     }
 
     async fn emit_breadcrumb_finish(

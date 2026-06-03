@@ -9,10 +9,12 @@
 //! - [`session`] — per-session `inbound.db` / `outbound.db` openers and
 //!   filesystem helpers.
 //! - [`attachments`] — safety-checked attachment extraction.
+//! - [`memory`] — per-agent-group searchable memory store (FTS5 + cosine).
 //! - [`tables`] — per-resource CRUD modules.
 
 pub mod attachments;
 pub mod central;
+pub mod memory;
 pub mod migrate;
 pub mod session;
 pub mod tables;

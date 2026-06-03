@@ -21,18 +21,21 @@
 pub mod client;
 pub mod context;
 pub mod error;
+pub mod filter;
 pub mod server;
 pub mod tools;
 
-pub use client::{McpClient, RemoteTool, SharedMcpClient};
+pub use client::{FilteredMcpClient, McpClient, RemoteTool, SharedMcpClient};
 pub use context::{
     AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec, EditMessageSpec,
-    EmitTodoListSpec, InstallSpec, MockToolContext, OutboundToolEffect, Recipient,
-    SUBAGENT_MAX_TOKENS_LIMIT, SUBAGENT_MAX_TURNS_LIMIT, SUBAGENT_WALL_CLOCK_SECS, ScheduleSpec,
-    SendCardSpec, SendFileSpec, SendMessageSpec, SubagentRequest, SubagentResult, SubagentToolCall,
-    TaskSummary, ToolContext, ToolEffectAck, UpdateTaskSpec,
+    EmitTodoListSpec, InstallSpec, MemoryHitView, MemorySearchSpec, MockToolContext,
+    OutboundToolEffect, Recipient, SUBAGENT_MAX_TOKENS_LIMIT, SUBAGENT_MAX_TURNS_LIMIT,
+    SUBAGENT_WALL_CLOCK_SECS, ScheduleSpec, SendCardSpec, SendFileSpec, SendMessageSpec,
+    SubagentRequest, SubagentResult, SubagentToolCall, TaskSummary, ToolContext, ToolEffectAck,
+    UpdateTaskSpec,
 };
 pub use error::{McpError, ToolError};
+pub use filter::{ALLOWED_TOOLS_KEY, DENIED_TOOLS_KEY, FilterRejection, ToolFilter};
 
 pub use server::{CopperclawServer, build_server};
 /// Sentinel file the `clear_history` tool drops to ask the runner to

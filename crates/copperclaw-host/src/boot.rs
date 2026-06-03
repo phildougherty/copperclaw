@@ -21,8 +21,9 @@ use copperclaw_host_router::Router;
 use copperclaw_host_sweep::{SqliteTaskStore, SweepService};
 use copperclaw_modules::{
     AgentDispatchModule, AgentToAgentModule, ApprovalsModule, CreateAgentModule, InteractiveModule,
-    Module, MountSecurityModule, NewPendingCtx, NewPendingNotifier, PermissionsModule,
-    SchedulingModule, SelfModModule, TypingConfig, TypingModule, create_agent_users_table_check,
+    Module, MountHostContext, MountSecurityModule, NewPendingCtx, NewPendingNotifier,
+    PermissionsModule, SchedulingModule, SelfModModule, TypingConfig, TypingModule,
+    create_agent_users_table_check,
 };
 use dashmap::DashMap;
 use std::path::PathBuf;
@@ -150,6 +151,110 @@ fn build_pending_notifier(central: copperclaw_db::central::CentralDb) -> NewPend
             notify_channel = mg.channel_type.as_str(),
             notify_platform_id = mg.platform_id.as_str(),
             "approvals: posted pending-sender notification to primary messaging group"
+        );
+    })
+}
+
+/// Notice text prefixed to a freshly minted DM pairing code. Plain ASCII
+/// (project "no emojis" rule). Delivered back to the *sender* through the
+/// same outbound delivery path adapters render for ordinary chat messages —
+/// not a card variant.
+const PAIRING_NOTICE: &str = concat!(
+    "You are not yet approved to talk to this assistant.\n",
+    "Share this one-time pairing code with the operator to be approved:",
+);
+
+/// Build the closure wired to [`ApprovalsModule::with_pairing_notifier`].
+///
+/// Fires synchronously inside the router's sender-scope gate the moment an
+/// unknown sender is seen. It:
+///
+/// 1. De-dupes against `unregistered_senders` (same as the operator notifier)
+///    so a sender that keeps messaging doesn't mint a fresh code on every
+///    inbound — only the first contact mints.
+/// 2. Mints an 8-char, 1h, rate-limited (3/channel) code via
+///    [`copperclaw_db::tables::dm_pairing_codes::mint`]. A rate-limit hit is
+///    logged and the inbound still lands in pending (the operator can still
+///    approve out-of-band via `cclaw approvals approve`).
+/// 3. Delivers the code text **back to the sender's own DM channel** with a
+///    plain `MessageKind::Chat` `{"text": ...}` payload — the exact shape
+///    every adapter renders today — via the [`DeliveryDispatcher`].
+fn build_pairing_notifier(
+    central: copperclaw_db::central::CentralDb,
+) -> copperclaw_modules::PairingNotifier {
+    Arc::new(move |ctx: NewPendingCtx, dispatcher| {
+        // De-dupe on first contact only. The `unregistered_senders` row is
+        // written by the router AFTER the gate returns, so absence means this
+        // is the sender's first ever contact and the only time we mint.
+        let already_seen = copperclaw_db::tables::unregistered_senders::get(
+            &central,
+            &ctx.sender.channel_type,
+            &ctx.sender.identity,
+        )
+        .ok()
+        .flatten()
+        .is_some();
+        if already_seen {
+            return;
+        }
+
+        let minted = copperclaw_db::tables::dm_pairing_codes::mint(
+            &central,
+            copperclaw_db::tables::dm_pairing_codes::MintPairingCode {
+                channel_type: ctx.sender.channel_type.clone(),
+                identity: ctx.sender.identity.clone(),
+                display_name: ctx.sender.display_name.clone(),
+                agent_group_id: Some(ctx.agent_group_id),
+                messaging_group_id: ctx.messaging_group_id,
+            },
+            chrono::Utc::now(),
+        );
+        let code = match minted {
+            Ok(c) => c,
+            Err(copperclaw_db::tables::dm_pairing_codes::MintError::RateLimited {
+                channel_type,
+                active,
+            }) => {
+                tracing::warn!(
+                    channel_type = channel_type.as_str(),
+                    active,
+                    identity = ctx.sender.identity.as_str(),
+                    "pairing: rate limit hit; not minting a new code for this sender"
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    identity = ctx.sender.identity.as_str(),
+                    "pairing: failed to mint pairing code; skipping"
+                );
+                return;
+            }
+        };
+
+        // Deliver the code back to the sender's own DM channel. The sender's
+        // `identity` IS the platform id of their DM with the bot.
+        let text = format!(
+            "{notice}\n\n{code}\n\nThis code expires in 1 hour.",
+            notice = PAIRING_NOTICE,
+            code = code.code,
+        );
+        let target = copperclaw_modules::DispatchTarget::channel(
+            ctx.sender.channel_type.clone(),
+            ctx.sender.identity.clone(),
+            None,
+        );
+        let message = copperclaw_types::OutboundMessage {
+            kind: copperclaw_types::MessageKind::Chat,
+            content: serde_json::json!({"text": text}),
+            files: vec![],
+        };
+        dispatcher.dispatch(&target, &message);
+        tracing::info!(
+            channel_type = ctx.sender.channel_type.as_str(),
+            identity = ctx.sender.identity.as_str(),
+            "pairing: minted and delivered DM pairing code to sender"
         );
     })
 }
@@ -349,7 +454,18 @@ pub fn assemble(
 
     let router_root: Arc<dyn copperclaw_host_router::SessionRoot + Send + Sync> =
         Arc::new(FsSessionRoot::new(cfg.sessions_root()));
-    let router = Arc::new(Router::new(central.clone(), router_root));
+    // Mention gating policy is construction-time config on the Router (fixed
+    // before it's shared behind an `Arc`, never mutated through it). The
+    // secure default — require a mention in group chats, never in DMs — can
+    // be overridden host-wide via env; per-group overrides come off each
+    // wiring's `engage_mode` (Pattern engages on a regex match instead of a
+    // mention; Mention / MentionSticky require one).
+    let mention_gate = copperclaw_host_router::MentionGate {
+        require_in_groups: parse_truthy_env_default("COPPERCLAW_REQUIRE_MENTION_GROUPS", true),
+        require_in_dms: parse_truthy_env_default("COPPERCLAW_REQUIRE_MENTION_DMS", false),
+    };
+    let router =
+        Arc::new(Router::new(central.clone(), router_root).with_mention_gate(mention_gate));
 
     let delivery_root: Arc<dyn copperclaw_host_delivery::SessionRoot> =
         Arc::new(FsSessionRoot::new(cfg.sessions_root()));
@@ -385,7 +501,17 @@ pub fn assemble(
 pub async fn install_modules(host_ctx: Arc<HostContext>, data_root: PathBuf) {
     let modules: Vec<Box<dyn Module>> = vec![
         Box::new(TypingModule::new(TypingConfig::default())),
-        Box::new(MountSecurityModule::new()),
+        // Register with a LIVE host root (the sessions dir all per-session
+        // bind sources live under) so the module's `validate` enforces
+        // against the real on-disk tree instead of the `host: None`
+        // placeholder it shipped with — which made `validate` a no-op that
+        // always returned `MountError::Empty`. The container manager's spawn
+        // path holds its own equivalently-rooted validator; this registration
+        // is what surfaces the module in `cclaw modules list` with a real
+        // root and keeps the two in sync.
+        Box::new(MountSecurityModule::with_host(MountHostContext {
+            session_root: data_root.join("sessions"),
+        })),
         Box::new(PermissionsModule::deny_all()),
         // Pre-approve the cli channel's deterministic `local` sender.
         // The cli channel reads the host's own stdin — the only
@@ -415,7 +541,8 @@ pub async fn install_modules(host_ctx: Arc<HostContext>, data_root: PathBuf) {
                         .is_some()
                 })
             })
-            .with_new_pending_notifier(build_pending_notifier(host_ctx.central().clone())),
+            .with_new_pending_notifier(build_pending_notifier(host_ctx.central().clone()))
+            .with_pairing_notifier(build_pairing_notifier(host_ctx.central().clone())),
         ),
         Box::new(InteractiveModule::default()),
         Box::new(SchedulingModule::with_store(Arc::new(
@@ -613,12 +740,29 @@ pub async fn run_host(
     ));
     let todo_task = tokio::spawn(Arc::clone(&todo_watcher).run_loop(shutdown.clone()));
 
+    // 13b. Credential broker (Phase 0b). Opt-in via
+    // `COPPERCLAW_CREDENTIAL_BROKER`. When enabled, this binds a loopback
+    // model proxy holding the real key, and the container manager stops
+    // forwarding the master key into containers (it mints per-session tokens
+    // instead). Default-off, so the legacy spawn path is unchanged.
+    let broker_default_provider = cfg
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "anthropic".into());
+    let broker = maybe_start_broker(
+        state.central.clone(),
+        &broker_default_provider,
+        shutdown.clone(),
+    )
+    .await;
+
     let spawned = spawn_container_manager(
         &cfg,
         state.central.clone(),
         Arc::clone(&runtime),
         shutdown.clone(),
         Arc::clone(state.sweep.spawn_tracker()),
+        broker,
     );
     let (manager_task, manager_handle): (
         Option<tokio::task::JoinHandle<()>>,
@@ -797,6 +941,7 @@ fn spawn_container_manager(
     runtime: Arc<dyn ContainerRuntime>,
     shutdown: CancellationToken,
     spawn_tracker: Arc<copperclaw_host_sweep::SpawnAttemptTracker>,
+    broker: Option<(Arc<crate::container_manager::broker::BrokerState>, String)>,
 ) -> Option<SpawnedManager> {
     let Some(image_tag) = cfg.default_image_tag.clone() else {
         warn!(
@@ -833,6 +978,14 @@ fn spawn_container_manager(
         skills_mode: cfg.skills_mode,
         gpu_passthrough: parse_truthy_env("COPPERCLAW_CONTAINER_GPU"),
         forward_env: collect_forward_env(),
+        // Phase 0a v1 egress posture (Top 10 #6). Opt-in: default allow-all
+        // keeps the spawn path unchanged; an operator sets
+        // `COPPERCLAW_EGRESS_MODE=deny-default` to enable. The model endpoint
+        // is always auto-injected into the resolved allow-list at spawn so
+        // deny-default can never blackhole model traffic.
+        egress_mode: crate::container_manager::parse_egress_mode(
+            std::env::var("COPPERCLAW_EGRESS_MODE").ok().as_deref(),
+        ),
     };
 
     // Startup safety check: the host's heartbeat-staleness threshold
@@ -863,10 +1016,13 @@ fn spawn_container_manager(
             );
         }
     }
-    let manager = Arc::new(
+    let mut manager =
         crate::container_manager::ContainerManager::new(central, runtime, manager_cfg)
-            .with_spawn_tracker(spawn_tracker),
-    );
+            .with_spawn_tracker(spawn_tracker);
+    if let Some((broker_state, broker_base_url)) = broker {
+        manager = manager.with_broker(broker_state, broker_base_url);
+    }
+    let manager = Arc::new(manager);
     let task = tokio::spawn(Arc::clone(&manager).run_loop(shutdown));
     Some((task, manager))
 }
@@ -897,6 +1053,16 @@ async fn run_boot_image_health_check(
     match crate::image_health::check_image_health(&probe, image_tag, host_fp.as_deref()).await {
         Ok(()) => {
             info!(image_tag = %image_tag, "boot image health check passed");
+            // Phase 6 supply-chain: boot-time attestation digest check. Opt-in
+            // via COPPERCLAW_EXPECTED_IMAGE_DIGEST — when an operator pins the
+            // expected image content digest, compare the live digest against it
+            // (a real comparison, not a stub). Default install pins nothing, so
+            // this reports `no-baseline` and changes nothing. The result is
+            // logged inside the helper; a mismatch is loud but does NOT degrade
+            // boot (the image health check above already gates spawnability).
+            let expected = std::env::var(crate::image_health::EXPECTED_IMAGE_DIGEST_ENV).ok();
+            crate::image_health::check_boot_image_digest(&probe, image_tag, expected.as_deref())
+                .await;
             None
         }
         Err(reason) => {
@@ -941,6 +1107,20 @@ fn parse_truthy_env(name: &str) -> bool {
                 | "ALL"
         )
     )
+}
+
+/// Like [`parse_truthy_env`] but with an explicit default when the variable
+/// is unset/empty, and recognising falsey spellings so an operator can turn a
+/// default-on knob OFF. Unrecognised non-empty values keep `default`.
+fn parse_truthy_env_default(name: &str, default: bool) -> bool {
+    match std::env::var(name).ok().as_deref() {
+        Some("1" | "true" | "True" | "TRUE" | "yes" | "Yes" | "YES" | "on" | "On" | "ON") => true,
+        Some("0" | "false" | "False" | "FALSE" | "no" | "No" | "NO" | "off" | "Off" | "OFF") => {
+            false
+        }
+        // Unset, empty, or an unrecognised value keeps the default.
+        None | Some(_) => default,
+    }
 }
 
 /// Parse `COPPERCLAW_DEFAULT_EFFORT` env var into an `Effort` tier.
@@ -1010,6 +1190,79 @@ fn collect_forward_env() -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Resolve the credential broker (Phase 0b) from the process env and, when
+/// enabled, bind the loopback listener and start its server task.
+///
+/// Returns `Some((state, base_url))` only when `COPPERCLAW_CREDENTIAL_BROKER`
+/// is truthy AND a real `ANTHROPIC_API_KEY` is present (without a key there is
+/// nothing to broker). The returned pair is handed to the container manager
+/// via [`crate::container_manager::ContainerManager::with_broker`]; the spawn
+/// path then stops forwarding the master key and mints per-session tokens
+/// instead. Returns `None` (default, behaviour unchanged) otherwise.
+///
+/// Binds on loopback only. The bound port is dynamic (`:0`) so multiple hosts
+/// on one box don't collide. A bind failure logs a warning and disables the
+/// broker rather than killing boot — the host falls back to the default path.
+async fn maybe_start_broker(
+    central: copperclaw_db::central::CentralDb,
+    default_provider: &str,
+    shutdown: CancellationToken,
+) -> Option<(Arc<crate::container_manager::broker::BrokerState>, String)> {
+    use crate::container_manager::broker::{BrokerConfig, BrokerState};
+
+    let enabled = BrokerConfig::parse_enabled(
+        std::env::var("COPPERCLAW_CREDENTIAL_BROKER")
+            .ok()
+            .as_deref(),
+    );
+    let upstream_key = std::env::var("ANTHROPIC_API_KEY").ok();
+    let upstream_base = std::env::var("ANTHROPIC_BASE_URL").ok();
+    let ttl_override = std::env::var("COPPERCLAW_BROKER_TOKEN_TTL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok());
+
+    let config = BrokerConfig::resolve(
+        enabled,
+        upstream_key.as_deref(),
+        upstream_base.as_deref(),
+        ttl_override,
+    )?;
+    if enabled && upstream_key.as_deref().filter(|k| !k.is_empty()).is_none() {
+        warn!(
+            "COPPERCLAW_CREDENTIAL_BROKER is set but ANTHROPIC_API_KEY is empty; \
+             broker disabled, falling back to default behaviour"
+        );
+        return None;
+    }
+
+    let broker = Arc::new(BrokerState::new(config));
+    let server_state = crate::container_manager::broker_server::production_state(
+        Arc::clone(&broker),
+        Some(default_provider),
+        central,
+    );
+
+    // Bind loopback with a dynamic port so collisions never block boot.
+    let bind_addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("loopback addr is valid");
+    match crate::container_manager::broker_server::serve(bind_addr, server_state, shutdown).await {
+        Ok(local) => {
+            let base_url = format!("http://{local}");
+            info!(
+                addr = %local,
+                "credential broker enabled; the master provider key will NOT be forwarded into containers"
+            );
+            Some((broker, base_url))
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "credential broker failed to bind loopback listener; falling back to default key forwarding"
+            );
+            None
+        }
+    }
 }
 
 /// Print a one-screen summary of the running host so an operator can see
@@ -1742,5 +1995,165 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // build_pairing_notifier tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pairing_notifier_mints_and_delivers_code_to_sender() {
+        use copperclaw_db::tables::dm_pairing_codes;
+        use copperclaw_modules::DeliveryDispatcher;
+        use copperclaw_modules::context::MockDispatcher;
+        use copperclaw_types::{ChannelType, SenderIdentity};
+
+        let db = copperclaw_db::central::CentralDb::open_in_memory().unwrap();
+        let notifier = build_pairing_notifier(db.clone());
+
+        let mock = MockDispatcher::new();
+        let dispatcher: Arc<dyn DeliveryDispatcher> = mock.clone();
+        let ctx = NewPendingCtx {
+            sender: SenderIdentity {
+                channel_type: ChannelType::new("telegram"),
+                identity: "u-pair".into(),
+                display_name: Some("Alice".into()),
+            },
+            agent_group_id: copperclaw_types::AgentGroupId::new(),
+            messaging_group_id: None,
+            first_seen: chrono::Utc::now(),
+        };
+        notifier(ctx, dispatcher);
+
+        // A real row was persisted.
+        let codes = dm_pairing_codes::list(&db, None).unwrap();
+        assert_eq!(codes.len(), 1, "exactly one code minted");
+        let minted = &codes[0];
+        assert_eq!(minted.code.len(), 8, "code is 8 chars");
+        assert_eq!(minted.identity, "u-pair");
+
+        // The code was delivered back to the SENDER's own DM channel as a
+        // plain Chat {"text": ...} message — the shape adapters render.
+        assert_eq!(mock.dispatched_count(), 1);
+        let sent = mock.dispatched.lock().unwrap();
+        let (target, msg) = &sent[0];
+        assert_eq!(
+            target.channel_type.as_ref().map(ChannelType::as_str),
+            Some("telegram")
+        );
+        assert_eq!(target.platform_id.as_deref(), Some("u-pair"));
+        assert_eq!(msg.kind, copperclaw_types::MessageKind::Chat);
+        let text = msg.content.get("text").unwrap().as_str().unwrap();
+        assert!(
+            text.contains(&minted.code),
+            "delivered text carries the code"
+        );
+        assert!(text.is_ascii(), "no emojis: {text}");
+    }
+
+    #[test]
+    fn pairing_notifier_skips_repeat_sender() {
+        use copperclaw_db::tables::dm_pairing_codes;
+        use copperclaw_db::tables::unregistered_senders::{
+            UpsertUnregisteredSender, upsert as upsert_unreg,
+        };
+        use copperclaw_modules::DeliveryDispatcher;
+        use copperclaw_modules::context::MockDispatcher;
+        use copperclaw_types::{ChannelType, SenderIdentity};
+
+        let db = copperclaw_db::central::CentralDb::open_in_memory().unwrap();
+        let ct = ChannelType::new("slack");
+        // Mark the sender as already seen so the notifier de-dupes.
+        upsert_unreg(
+            &db,
+            UpsertUnregisteredSender {
+                channel_type: ct.clone(),
+                platform_id: "U-repeat".into(),
+                user_id: None,
+                sender_name: None,
+                reason: "scope_pending".into(),
+                messaging_group_id: None,
+                agent_group_id: None,
+            },
+        )
+        .unwrap();
+
+        let notifier = build_pairing_notifier(db.clone());
+        let mock = MockDispatcher::new();
+        let dispatcher: Arc<dyn DeliveryDispatcher> = mock.clone();
+        notifier(
+            NewPendingCtx {
+                sender: SenderIdentity {
+                    channel_type: ct,
+                    identity: "U-repeat".into(),
+                    display_name: None,
+                },
+                agent_group_id: copperclaw_types::AgentGroupId::new(),
+                messaging_group_id: None,
+                first_seen: chrono::Utc::now(),
+            },
+            dispatcher,
+        );
+        assert_eq!(mock.dispatched_count(), 0, "repeat sender: no delivery");
+        assert!(
+            dm_pairing_codes::list(&db, None).unwrap().is_empty(),
+            "repeat sender: no code minted"
+        );
+    }
+
+    #[test]
+    fn pairing_notifier_honours_rate_limit_per_channel() {
+        use copperclaw_db::tables::dm_pairing_codes::{self, MAX_ACTIVE_CODES_PER_CHANNEL};
+        use copperclaw_modules::DeliveryDispatcher;
+        use copperclaw_modules::context::MockDispatcher;
+        use copperclaw_types::{ChannelType, SenderIdentity};
+
+        let db = copperclaw_db::central::CentralDb::open_in_memory().unwrap();
+        let notifier = build_pairing_notifier(db.clone());
+        let mock = MockDispatcher::new();
+
+        // Fill the telegram channel to its cap via the notifier itself
+        // (distinct first-contact senders each mint one code).
+        for i in 0..MAX_ACTIVE_CODES_PER_CHANNEL {
+            let dispatcher: Arc<dyn DeliveryDispatcher> = mock.clone();
+            notifier(
+                NewPendingCtx {
+                    sender: SenderIdentity {
+                        channel_type: ChannelType::new("telegram"),
+                        identity: format!("u-{i}"),
+                        display_name: None,
+                    },
+                    agent_group_id: copperclaw_types::AgentGroupId::new(),
+                    messaging_group_id: None,
+                    first_seen: chrono::Utc::now(),
+                },
+                dispatcher,
+            );
+        }
+        assert_eq!(mock.dispatched_count(), MAX_ACTIVE_CODES_PER_CHANNEL);
+
+        // One more telegram sender: rate-limited, so no mint and no delivery.
+        let dispatcher: Arc<dyn DeliveryDispatcher> = mock.clone();
+        notifier(
+            NewPendingCtx {
+                sender: SenderIdentity {
+                    channel_type: ChannelType::new("telegram"),
+                    identity: "u-overflow".into(),
+                    display_name: None,
+                },
+                agent_group_id: copperclaw_types::AgentGroupId::new(),
+                messaging_group_id: None,
+                first_seen: chrono::Utc::now(),
+            },
+            dispatcher,
+        );
+        assert_eq!(
+            mock.dispatched_count(),
+            MAX_ACTIVE_CODES_PER_CHANNEL,
+            "rate-limited sender must not deliver a new code"
+        );
+        let active =
+            dm_pairing_codes::list(&db, Some(dm_pairing_codes::PairingStatus::Active)).unwrap();
+        assert_eq!(active.len(), MAX_ACTIVE_CODES_PER_CHANNEL);
     }
 }

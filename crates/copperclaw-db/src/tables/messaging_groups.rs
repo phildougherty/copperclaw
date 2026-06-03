@@ -6,6 +6,19 @@ use chrono::{DateTime, Utc};
 use copperclaw_types::{ChannelType, MessagingGroupId};
 use rusqlite::{OptionalExtension, Row, params};
 
+/// Default `unknown_sender_policy` for a newly-created DM (1:1) messaging
+/// group. `"request_approval"` means an unknown sender's first inbound is
+/// gated: the host mints a DM pairing code and holds the message in pending
+/// until an operator approves. This is the secure default — a stranger who
+/// DMs the bot does not reach the agent until a human (or a relayed pairing
+/// code) approves them.
+///
+/// Defined here so the value is canonical: the `messaging-groups.create`
+/// handler and any DM auto-creation path reference this constant instead of
+/// hard-coding a string, so the default can never silently drift between
+/// call sites.
+pub const DEFAULT_UNKNOWN_SENDER_POLICY: &str = "request_approval";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessagingGroup {
     pub id: MessagingGroupId,

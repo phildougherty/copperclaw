@@ -21,6 +21,7 @@ use crate::error::ToolError;
 pub mod agents;
 pub mod apply_patch;
 pub mod artifact_path;
+pub mod browser_render;
 pub mod clear_history;
 pub mod compact_now;
 pub mod computer_use;
@@ -38,7 +39,9 @@ pub mod glob;
 pub mod grep;
 pub mod interactive;
 pub mod load_skill;
+pub mod memory;
 pub mod multi_edit;
+pub mod net_guard;
 pub mod scheduling;
 pub mod self_mod;
 pub mod sentinel;
@@ -95,6 +98,7 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         computer_use::read_file::entry(),
         computer_use::write_file::entry(),
         computer_use::web_fetch::entry(),
+        browser_render::entry(),
         view_image::entry(),
         // Git inspection tools — read-only structured access to a
         // libgit2-backed repository view. Registered alphabetically.
@@ -107,6 +111,8 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         web_search::entry(),
         explore::entry(),
         load_skill::entry(),
+        memory::memory_search::entry(),
+        memory::memory_get::entry(),
         todo::add::entry(),
         todo::list::entry(),
         todo::update::entry(),
@@ -203,6 +209,7 @@ mod tests {
             "read_file",
             "write_file",
             "web_fetch",
+            "browser_render",
             "view_image",
             "git_blame",
             "git_diff",
@@ -213,6 +220,8 @@ mod tests {
             "web_search",
             "explore",
             "load_skill",
+            "memory_search",
+            "memory_get",
             "todo_add",
             "todo_list",
             "todo_update",

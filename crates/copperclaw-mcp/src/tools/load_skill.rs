@@ -113,7 +113,7 @@ pub fn schema() -> Tool {
 
 pub async fn handle(
     arguments: Option<JsonObject>,
-    _ctx: &dyn ToolContext,
+    ctx: &dyn ToolContext,
 ) -> Result<CallToolResult, ToolError> {
     let input: Input = parse_args(arguments)?;
     let name = input.name.trim();
@@ -174,6 +174,24 @@ pub async fn handle(
         .get("body")
         .and_then(Value::as_str)
         .ok_or_else(|| ToolError::Internal(format!("catalogue entry for `{name}` has no body")))?;
+
+    // Wire the loaded skill's `allowed-tools` into the live tool policy:
+    // a skill declaring `allowed-tools: [Read]` narrows the runner's
+    // per-turn dispatch gate so `shell` is blocked until the scope is
+    // cleared. The catalogue carries names already normalized to
+    // copperclaw MCP tool names (see the host's catalogue writer). A skill
+    // with no declared `allowed-tools` (field absent or not an array)
+    // clears any prior scope — loading an unscoped skill doesn't keep an
+    // earlier skill's narrowing in force.
+    let allowed_tools: Option<Vec<String>> = entry
+        .get("allowed_tools")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        });
+    ctx.set_active_skill_allowed_tools(allowed_tools);
 
     let rendered = format!(
         "<skill name=\"{}\" description=\"{}\">\n{}\n</skill>",
@@ -392,5 +410,38 @@ mod tests {
     fn entry_returns_tool_with_correct_name() {
         let e = entry();
         assert_eq!(e.tool.name.as_ref(), "load_skill");
+    }
+
+    #[tokio::test]
+    async fn sets_active_skill_allowed_tools_from_catalogue() {
+        // Loading a skill whose catalogue entry carries `allowed_tools`
+        // must push that list into the tool-policy hook so the runner can
+        // narrow dispatch (the FUEL for the active-skill policy layer).
+        let _g = CatalogueGuard::new(
+            r#"[{"name": "reader", "description": "read-only", "body": "b", "allowed_tools": ["read_file"]}]"#,
+        );
+        let ctx = MockToolContext::new();
+        handle(arg("reader"), &ctx).await.unwrap();
+        assert_eq!(
+            ctx.active_skill_allowed_recorded(),
+            Some(Some(vec!["read_file".to_string()])),
+            "load_skill must record the catalogue's normalized allowed_tools"
+        );
+    }
+
+    #[tokio::test]
+    async fn clears_active_skill_scope_when_no_allowed_tools() {
+        // A skill with no `allowed_tools` field clears any prior scope —
+        // loading an unscoped skill must not leave an earlier skill's
+        // narrowing in force.
+        let _g =
+            CatalogueGuard::new(r#"[{"name": "open", "description": "no scope", "body": "b"}]"#);
+        let ctx = MockToolContext::new();
+        handle(arg("open"), &ctx).await.unwrap();
+        assert_eq!(
+            ctx.active_skill_allowed_recorded(),
+            Some(None),
+            "loading an unscoped skill must clear the active-skill scope"
+        );
     }
 }
