@@ -543,6 +543,7 @@ impl ReplayHarness {
 
         let deps = RunnerDeps {
             provider,
+            policy: copperclaw_runner::ToolPolicy::default(),
             tool_ctx,
             inbound,
             outbound,
