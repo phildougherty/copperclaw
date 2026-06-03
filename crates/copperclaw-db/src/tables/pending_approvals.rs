@@ -6,12 +6,18 @@ use chrono::{DateTime, Utc};
 use copperclaw_types::{AgentGroupId, ApprovalId, ChannelType, SessionId};
 use rusqlite::{OptionalExtension, Row, params};
 
+/// Default time-to-live for a freshly recorded pending approval: ~1 hour.
+/// Callers that don't supply an explicit `expires_at` get this window so an
+/// unanswered approval lapses instead of lingering as a live grant forever.
+pub const DEFAULT_APPROVAL_TTL: chrono::Duration = chrono::Duration::hours(1);
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ApprovalStatus {
     Pending,
     Approved,
     Denied,
     Expired,
+    Revoked,
 }
 
 impl ApprovalStatus {
@@ -21,6 +27,7 @@ impl ApprovalStatus {
             ApprovalStatus::Approved => "approved",
             ApprovalStatus::Denied => "denied",
             ApprovalStatus::Expired => "expired",
+            ApprovalStatus::Revoked => "revoked",
         }
     }
 
@@ -30,7 +37,35 @@ impl ApprovalStatus {
             "approved" => Some(ApprovalStatus::Approved),
             "denied" => Some(ApprovalStatus::Denied),
             "expired" => Some(ApprovalStatus::Expired),
+            "revoked" => Some(ApprovalStatus::Revoked),
             _ => None,
+        }
+    }
+
+    /// True when this is a settled (non-actionable) state. Terminal rows
+    /// cannot be approved, denied, or revoked again.
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, ApprovalStatus::Pending)
+    }
+}
+
+/// One outcome recorded against a pending approval. Mirrors the
+/// `approval_decisions` table (migration `017_approval_decisions`).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum DecisionOutcome {
+    Approve,
+    Deny,
+    Expire,
+    Revoke,
+}
+
+impl DecisionOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DecisionOutcome::Approve => "approve",
+            DecisionOutcome::Deny => "deny",
+            DecisionOutcome::Expire => "expire",
+            DecisionOutcome::Revoke => "revoke",
         }
     }
 }
@@ -51,6 +86,36 @@ pub struct PendingApproval {
     pub status: ApprovalStatus,
     pub title: String,
     pub options: Vec<String>,
+}
+
+impl PendingApproval {
+    /// True when the row carries an `expires_at` that is at or before `now`.
+    /// Independent of `status` — a row that has already been resolved can
+    /// still report "its window has passed" without that being meaningful.
+    #[must_use]
+    pub fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at.is_some_and(|exp| exp <= now)
+    }
+
+    /// True when the row can still be acted upon: it is `Pending` and has not
+    /// passed its expiry window. An expired-but-still-`pending` row (the
+    /// expiry sweep hasn't run yet) is NOT actionable.
+    #[must_use]
+    pub fn is_actionable_at(&self, now: DateTime<Utc>) -> bool {
+        self.status == ApprovalStatus::Pending && !self.is_expired_at(now)
+    }
+}
+
+/// One row of the append-only `approval_decisions` log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalDecision {
+    pub id: i64,
+    pub approval_id: ApprovalId,
+    pub action: String,
+    pub outcome: DecisionOutcome,
+    pub decided_by: String,
+    pub reason: Option<String>,
+    pub decided_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -231,6 +296,10 @@ pub fn upsert(db: &CentralDb, req: UpsertPendingApproval) -> Result<PendingAppro
     let options_json = serde_json::to_string(&options)?;
     let id = ApprovalId::new();
     let now = Utc::now();
+    // A pending approval that is never answered should lapse rather than
+    // linger as a live grant forever. When the caller doesn't pin an
+    // explicit deadline, default to ~1h from now.
+    let expires_at = expires_at.or_else(|| Some(now + DEFAULT_APPROVAL_TTL));
 
     conn.execute(
         "INSERT INTO pending_approvals
@@ -310,6 +379,147 @@ pub fn delete(db: &CentralDb, id: ApprovalId) -> Result<(), DbError> {
         return Err(DbError::NotFound);
     }
     Ok(())
+}
+
+/// Append one decision receipt to the append-only `approval_decisions`
+/// log. Never updates or deletes — every approve / deny / expire / revoke
+/// lands a fresh row. `action` is copied from the pending row for
+/// query convenience; `decided_by` is a free-text actor label.
+pub fn record_decision(
+    db: &CentralDb,
+    approval_id: ApprovalId,
+    action: &str,
+    outcome: DecisionOutcome,
+    decided_by: &str,
+    reason: Option<&str>,
+) -> Result<(), DbError> {
+    let conn = db.conn()?;
+    conn.execute(
+        "INSERT INTO approval_decisions
+           (approval_id, action, outcome, decided_by, reason, decided_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            approval_id.as_uuid().to_string(),
+            action,
+            outcome.as_str(),
+            decided_by,
+            reason,
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn row_to_decision(row: &Row<'_>) -> rusqlite::Result<ApprovalDecision> {
+    let approval_id_str: String = row.get("approval_id")?;
+    let approval_id = uuid::Uuid::parse_str(&approval_id_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let outcome_str: String = row.get("outcome")?;
+    let outcome = match outcome_str.as_str() {
+        "approve" => DecisionOutcome::Approve,
+        "deny" => DecisionOutcome::Deny,
+        "expire" => DecisionOutcome::Expire,
+        "revoke" => DecisionOutcome::Revoke,
+        other => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("unknown decision outcome {other}").into(),
+            ));
+        }
+    };
+    let decided_at_str: String = row.get("decided_at")?;
+    let decided_at = DateTime::parse_from_rfc3339(&decided_at_str)
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })?
+        .with_timezone(&Utc);
+    Ok(ApprovalDecision {
+        id: row.get("id")?,
+        approval_id: ApprovalId(approval_id),
+        action: row.get("action")?,
+        outcome,
+        decided_by: row.get("decided_by")?,
+        reason: row.get("reason")?,
+        decided_at,
+    })
+}
+
+/// List decision receipts newest-first. `approval_id = Some(..)` scopes to
+/// one approval's history; `None` returns the global log capped at `limit`.
+pub fn list_decisions(
+    db: &CentralDb,
+    approval_id: Option<ApprovalId>,
+    limit: i64,
+) -> Result<Vec<ApprovalDecision>, DbError> {
+    let conn = db.conn()?;
+    if let Some(id) = approval_id {
+        let mut stmt = conn.prepare(
+            "SELECT id, approval_id, action, outcome, decided_by, reason, decided_at
+             FROM approval_decisions
+             WHERE approval_id = ?1
+             ORDER BY decided_at DESC, id DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![id.as_uuid().to_string(), limit], row_to_decision)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    } else {
+        let mut stmt = conn.prepare(
+            "SELECT id, approval_id, action, outcome, decided_by, reason, decided_at
+             FROM approval_decisions
+             ORDER BY decided_at DESC, id DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit], row_to_decision)?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+}
+
+/// Sweep pending rows whose `expires_at` is at or before `now`, flipping
+/// them to `expired` and appending an `expire` decision (`decided_by =
+/// "system:expiry"`) for each. Returns the ids that were swept.
+///
+/// Idempotent: only rows still `status = 'pending'` are touched, so a
+/// second sweep over the same window is a no-op.
+pub fn sweep_expired(db: &CentralDb, now: DateTime<Utc>) -> Result<Vec<ApprovalId>, DbError> {
+    let conn = db.conn()?;
+    let now_str = now.to_rfc3339();
+    let mut swept = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT approval_id, action FROM pending_approvals
+             WHERE status = 'pending' AND expires_at IS NOT NULL AND expires_at <= ?1",
+        )?;
+        let rows = stmt.query_map(params![now_str], |r| {
+            let id: String = r.get(0)?;
+            let action: String = r.get(1)?;
+            Ok((id, action))
+        })?;
+        for row in rows {
+            let (id_str, action) = row?;
+            let parsed = uuid::Uuid::parse_str(&id_str).map_err(|e| {
+                DbError::Invariant(format!(
+                    "invalid uuid in pending_approvals.approval_id: {e}"
+                ))
+            })?;
+            swept.push((ApprovalId(parsed), action));
+        }
+    }
+    for (id, action) in &swept {
+        conn.execute(
+            "UPDATE pending_approvals SET status = 'expired'
+             WHERE approval_id = ?1 AND status = 'pending'",
+            params![id.as_uuid().to_string()],
+        )?;
+        conn.execute(
+            "INSERT INTO approval_decisions
+               (approval_id, action, outcome, decided_by, reason, decided_at)
+             VALUES (?1, ?2, 'expire', 'system:expiry', NULL, ?3)",
+            params![id.as_uuid().to_string(), action, now_str],
+        )?;
+    }
+    Ok(swept.into_iter().map(|(id, _)| id).collect())
 }
 
 #[cfg(test)]
@@ -492,6 +702,145 @@ mod tests {
         assert_eq!(denied.len(), 1, "old denied row stays in place");
         let pending = list(&db, None, Some(ApprovalStatus::Pending)).unwrap();
         assert_eq!(pending.len(), 1, "exactly one pending row exists");
+    }
+
+    #[test]
+    fn upsert_defaults_expiry_to_one_hour() {
+        let db = db();
+        let before = Utc::now();
+        let a = upsert(&db, sample("r-ttl")).unwrap();
+        let exp = a
+            .expires_at
+            .expect("default TTL should populate expires_at");
+        let lo = before + chrono::Duration::minutes(59);
+        let hi = before + chrono::Duration::minutes(61);
+        assert!(exp > lo && exp < hi, "expiry should be ~1h out, got {exp}");
+    }
+
+    #[test]
+    fn upsert_respects_explicit_expiry() {
+        let db = db();
+        let pinned = Utc::now() + chrono::Duration::minutes(5);
+        let mut req = sample("r-pin");
+        req.expires_at = Some(pinned);
+        let a = upsert(&db, req).unwrap();
+        assert_eq!(a.expires_at, Some(pinned));
+    }
+
+    #[test]
+    fn is_actionable_reflects_status_and_expiry() {
+        let db = db();
+        let mut req = sample("r-act");
+        let now = Utc::now();
+        req.expires_at = Some(now + chrono::Duration::hours(1));
+        let a = upsert(&db, req).unwrap();
+        assert!(a.is_actionable_at(now));
+        // Past its expiry but still flagged pending: NOT actionable.
+        assert!(!a.is_actionable_at(now + chrono::Duration::hours(2)));
+        assert!(a.is_expired_at(now + chrono::Duration::hours(2)));
+    }
+
+    #[test]
+    fn sweep_expired_flips_pending_and_logs_decision() {
+        let db = db();
+        let mut req = sample("r-sweep");
+        req.expires_at = Some(Utc::now() - chrono::Duration::minutes(1));
+        let a = upsert(&db, req).unwrap();
+        let swept = sweep_expired(&db, Utc::now()).unwrap();
+        assert_eq!(swept, vec![a.approval_id]);
+        let after = get(&db, a.approval_id).unwrap();
+        assert_eq!(after.status, ApprovalStatus::Expired);
+        let decisions = list_decisions(&db, Some(a.approval_id), 10).unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].outcome, DecisionOutcome::Expire);
+        assert_eq!(decisions[0].decided_by, "system:expiry");
+    }
+
+    #[test]
+    fn sweep_expired_ignores_future_and_terminal_rows() {
+        let db = db();
+        // Future expiry — untouched.
+        let mut future = sample("r-future");
+        future.expires_at = Some(Utc::now() + chrono::Duration::hours(1));
+        let f = upsert(&db, future).unwrap();
+        // Already approved — untouched even if past expiry.
+        let mut done = sample("r-done");
+        done.action = "other".into();
+        done.expires_at = Some(Utc::now() - chrono::Duration::minutes(1));
+        let d = upsert(&db, done).unwrap();
+        update_status(&db, d.approval_id, ApprovalStatus::Approved).unwrap();
+        let swept = sweep_expired(&db, Utc::now()).unwrap();
+        assert!(swept.is_empty());
+        assert_eq!(
+            get(&db, f.approval_id).unwrap().status,
+            ApprovalStatus::Pending
+        );
+        assert_eq!(
+            get(&db, d.approval_id).unwrap().status,
+            ApprovalStatus::Approved
+        );
+    }
+
+    #[test]
+    fn sweep_expired_is_idempotent() {
+        let db = db();
+        let mut req = sample("r-idem-sweep");
+        req.expires_at = Some(Utc::now() - chrono::Duration::minutes(1));
+        upsert(&db, req).unwrap();
+        let first = sweep_expired(&db, Utc::now()).unwrap();
+        assert_eq!(first.len(), 1);
+        let second = sweep_expired(&db, Utc::now()).unwrap();
+        assert!(second.is_empty(), "second sweep must be a no-op");
+        // Exactly one expire decision was logged.
+        let decisions = list_decisions(&db, None, 100).unwrap();
+        assert_eq!(decisions.len(), 1);
+    }
+
+    #[test]
+    fn record_and_list_decisions_newest_first() {
+        let db = db();
+        let a = upsert(&db, sample("r-dec")).unwrap();
+        record_decision(
+            &db,
+            a.approval_id,
+            "send_message",
+            DecisionOutcome::Revoke,
+            "host",
+            Some("operator changed their mind"),
+        )
+        .unwrap();
+        record_decision(
+            &db,
+            a.approval_id,
+            "send_message",
+            DecisionOutcome::Approve,
+            "host",
+            None,
+        )
+        .unwrap();
+        let scoped = list_decisions(&db, Some(a.approval_id), 10).unwrap();
+        assert_eq!(scoped.len(), 2);
+        // Newest first (the approve was inserted second).
+        assert_eq!(scoped[0].outcome, DecisionOutcome::Approve);
+        assert_eq!(scoped[1].outcome, DecisionOutcome::Revoke);
+        assert_eq!(
+            scoped[1].reason.as_deref(),
+            Some("operator changed their mind")
+        );
+        // Global log returns the same rows.
+        let global = list_decisions(&db, None, 10).unwrap();
+        assert_eq!(global.len(), 2);
+    }
+
+    #[test]
+    fn status_revoked_round_trips() {
+        assert_eq!(
+            ApprovalStatus::parse("revoked"),
+            Some(ApprovalStatus::Revoked)
+        );
+        assert_eq!(ApprovalStatus::Revoked.as_str(), "revoked");
+        assert!(ApprovalStatus::Revoked.is_terminal());
+        assert!(!ApprovalStatus::Pending.is_terminal());
     }
 
     /// Race regression: 16 concurrent upserts against the same

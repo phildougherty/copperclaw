@@ -887,6 +887,29 @@ pub enum ApprovalsCmd {
         /// Pending-approval row id (UUID).
         id: String,
     },
+    /// Revoke a pending row by id: withdraw the request without approving
+    /// or denying it. Marks the row `status = 'revoked'`, applies no side
+    /// effects, and lands a `revoke` entry in the decision audit log.
+    /// Idempotent; conflicts with already-settled (approved / denied /
+    /// expired) rows.
+    Revoke {
+        /// Pending-approval row id (UUID).
+        id: String,
+        /// Optional rationale recorded on the decision log.
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Show the append-only approval-decision audit log (who / what / when /
+    /// outcome). With `--id`, scopes to one approval's history; otherwise
+    /// returns the global log newest-first.
+    Decisions {
+        /// Optional approval id (UUID) to scope the history to.
+        #[arg(long)]
+        id: Option<String>,
+        /// Max rows returned. Default 50.
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
+    },
     /// Approve a sender by `(channel_type, identity)`. Persists a
     /// `users` row keyed on that pair; the host's sender-scope
     /// gate consults `users` on every inbound, so the approval
@@ -1486,6 +1509,18 @@ impl ApprovalsCmd {
             Self::Get { id } => ParsedCall::new("approvals.get", json!({"id": id})),
             Self::ApproveById { id } => ParsedCall::new("approvals.approve", json!({"id": id})),
             Self::Deny { id } => ParsedCall::new("approvals.deny", json!({"id": id})),
+            Self::Revoke { id, reason } => {
+                let mut o = Map::new();
+                o.insert("id".into(), id.clone().into());
+                insert_opt(&mut o, "reason", reason.clone());
+                ParsedCall::new("approvals.revoke", Value::Object(o))
+            }
+            Self::Decisions { id, limit } => {
+                let mut o = Map::new();
+                insert_opt(&mut o, "id", id.clone());
+                o.insert("limit".into(), (*limit).into());
+                ParsedCall::new("approvals.decisions", Value::Object(o))
+            }
             Self::Approve {
                 channel,
                 identity,
@@ -1599,6 +1634,8 @@ pub const ALL_COMMANDS: &[&str] = &[
     "approvals.approve_sender",
     "approvals.approve",
     "approvals.deny",
+    "approvals.revoke",
+    "approvals.decisions",
     "audit.list",
     "budgets.list",
     "budgets.set",
@@ -2383,6 +2420,41 @@ mod tests {
         assert_eq!(p.args, json!({"id": "appr_3"}));
     }
 
+    #[test]
+    fn approvals_revoke_emits_revoke_with_id_and_reason() {
+        let p = parse(&["cclaw", "approvals", "revoke", "appr_4"]);
+        assert_eq!(p.command, "approvals.revoke");
+        assert_eq!(p.args, json!({"id": "appr_4"}));
+        let p = parse(&[
+            "cclaw",
+            "approvals",
+            "revoke",
+            "appr_5",
+            "--reason",
+            "withdrew",
+        ]);
+        assert_eq!(p.command, "approvals.revoke");
+        assert_eq!(p.args, json!({"id": "appr_5", "reason": "withdrew"}));
+    }
+
+    #[test]
+    fn approvals_decisions_emits_decisions_view() {
+        let p = parse(&["cclaw", "approvals", "decisions"]);
+        assert_eq!(p.command, "approvals.decisions");
+        assert_eq!(p.args, json!({"limit": 50}));
+        let p = parse(&[
+            "cclaw",
+            "approvals",
+            "decisions",
+            "--id",
+            "appr_6",
+            "--limit",
+            "10",
+        ]);
+        assert_eq!(p.command, "approvals.decisions");
+        assert_eq!(p.args, json!({"id": "appr_6", "limit": 10}));
+    }
+
     // --- meta --------------------------------------------------------------
 
     #[test]
@@ -2527,6 +2599,8 @@ mod tests {
             ],
             &["cclaw", "approvals", "approve-id", "appr-1"],
             &["cclaw", "approvals", "deny", "appr-1"],
+            &["cclaw", "approvals", "revoke", "appr-1"],
+            &["cclaw", "approvals", "decisions"],
             &["cclaw", "audit", "list"],
             &["cclaw", "budgets", "list"],
             &[

@@ -34,6 +34,12 @@ use copperclaw_types::{
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 
+/// Default time-to-live applied to a pending approval that doesn't carry an
+/// explicit `expires_at`: ~1 hour. An unanswered approval lapses rather than
+/// lingering as a live grant. Mirrors `copperclaw_db`'s `DEFAULT_APPROVAL_TTL`
+/// (kept local so the modules crate doesn't depend on the DB crate).
+pub const DEFAULT_APPROVAL_TTL: chrono::Duration = chrono::Duration::hours(1);
+
 /// One row of [`ApprovalsModule::pending_approvals_summary`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApprovalSummary {
@@ -43,12 +49,50 @@ pub struct ApprovalSummary {
     pub agent_group_id: Option<AgentGroupId>,
     pub requester: Option<UserId>,
     pub created_at: DateTime<Utc>,
+    /// Deadline after which the approval is no longer actionable. When
+    /// `None` the entry never lapses (used for entries seeded without a
+    /// TTL); [`ApprovalsModule::record_pending`] fills a ~1h default.
+    #[serde(default)]
+    pub expires_at: Option<DateTime<Utc>>,
     pub description: String,
+}
+
+impl ApprovalSummary {
+    /// True when the entry's deadline is at or before `now`.
+    #[must_use]
+    pub fn is_expired_at(&self, now: DateTime<Utc>) -> bool {
+        self.expires_at.is_some_and(|exp| exp <= now)
+    }
+}
+
+/// How a pending approval left the queue. Recorded on the in-memory
+/// decision log so callers can audit who/what/when/outcome without the
+/// modules crate depending on the DB.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DecisionOutcome {
+    Approve,
+    Deny,
+    Expire,
+    Revoke,
+}
+
+/// One append-only decision receipt held in memory by the module.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionRecord {
+    pub id: ApprovalId,
+    pub outcome: DecisionOutcome,
+    pub decided_by: String,
+    pub reason: Option<String>,
+    pub decided_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Default)]
 struct PendingStore {
     pending: Vec<ApprovalSummary>,
+    /// Append-only log of every terminal decision (approve / deny /
+    /// expire / revoke) taken against an entry.
+    decisions: Vec<DecisionRecord>,
 }
 
 /// Persistent-store lookup the gate consults when its in-memory
@@ -166,25 +210,97 @@ impl ApprovalsModule {
     }
 
     /// Push a new pending approval into the in-memory store. The host calls
-    /// this when its sender-scope gate produces `Pending`.
-    pub fn record_pending(&self, summary: ApprovalSummary) {
+    /// this when its sender-scope gate produces `Pending`. If the summary
+    /// carries no `expires_at`, a ~1h default TTL is stamped so the entry
+    /// lapses instead of lingering forever.
+    pub fn record_pending(&self, mut summary: ApprovalSummary) {
+        if summary.expires_at.is_none() {
+            summary.expires_at = Some(Utc::now() + DEFAULT_APPROVAL_TTL);
+        }
         self.store.lock().unwrap().pending.push(summary);
     }
 
-    /// Remove a pending approval by id (called once an admin approves/rejects).
+    /// Remove a pending approval by id, recording an `approve` decision.
+    /// Called once an admin approves the entry.
     pub fn resolve(&self, id: ApprovalId) {
-        self.store.lock().unwrap().pending.retain(|p| p.id != id);
+        self.resolve_with(id, DecisionOutcome::Approve, "host", None);
     }
 
-    /// Build the summary list, optionally filtered by kind.
+    /// Remove a pending approval by id, recording the given outcome on the
+    /// append-only decision log. The `decided_by` actor label and optional
+    /// `reason` are captured for the audit trail.
+    pub fn resolve_with(
+        &self,
+        id: ApprovalId,
+        outcome: DecisionOutcome,
+        decided_by: &str,
+        reason: Option<&str>,
+    ) {
+        let mut store = self.store.lock().unwrap();
+        let existed = store.pending.iter().any(|p| p.id == id);
+        store.pending.retain(|p| p.id != id);
+        if existed {
+            store.decisions.push(DecisionRecord {
+                id,
+                outcome,
+                decided_by: decided_by.to_owned(),
+                reason: reason.map(str::to_owned),
+                decided_at: Utc::now(),
+            });
+        }
+    }
+
+    /// Revoke a previously recorded pending approval, dropping it from the
+    /// queue and logging a `revoke` decision. Distinct from [`Self::resolve`]
+    /// (an approval) and a deny: revocation withdraws a request that was
+    /// neither approved nor denied.
+    pub fn revoke(&self, id: ApprovalId, decided_by: &str, reason: Option<&str>) {
+        self.resolve_with(id, DecisionOutcome::Revoke, decided_by, reason);
+    }
+
+    /// Sweep entries whose `expires_at` is at or before `now`, dropping each
+    /// from the queue and logging an `expire` decision. Returns the ids that
+    /// lapsed. Idempotent — a second sweep over the same window is a no-op.
+    pub fn sweep_expired(&self, now: DateTime<Utc>) -> Vec<ApprovalId> {
+        let mut store = self.store.lock().unwrap();
+        let expired: Vec<ApprovalId> = store
+            .pending
+            .iter()
+            .filter(|p| p.is_expired_at(now))
+            .map(|p| p.id)
+            .collect();
+        store.pending.retain(|p| !p.is_expired_at(now));
+        for id in &expired {
+            store.decisions.push(DecisionRecord {
+                id: *id,
+                outcome: DecisionOutcome::Expire,
+                decided_by: "system:expiry".to_owned(),
+                reason: None,
+                decided_at: now,
+            });
+        }
+        expired
+    }
+
+    /// Build the summary list, optionally filtered by kind. Entries whose
+    /// TTL has already lapsed (relative to `now`) are excluded — an expired
+    /// pending approval is not actionable and must not be surfaced as live.
     pub fn pending_approvals_summary(&self, kind: Option<ApprovalKind>) -> Vec<ApprovalSummary> {
+        let now = Utc::now();
         let store = self.store.lock().unwrap();
         store
             .pending
             .iter()
+            .filter(|p| !p.is_expired_at(now))
             .filter(|p| kind.is_none_or(|k| k == p.kind))
             .cloned()
             .collect()
+    }
+
+    /// Snapshot of the append-only decision log (newest last). Exposed for
+    /// diagnostics and tests.
+    pub fn decisions(&self) -> Vec<DecisionRecord> {
+        self.store.lock().unwrap().decisions.clone()
     }
 }
 
@@ -323,6 +439,7 @@ mod tests {
             agent_group_id: None,
             requester: None,
             created_at: Utc::now(),
+            expires_at: None,
             description: "test".into(),
         }
     }
@@ -336,6 +453,81 @@ mod tests {
         assert_eq!(m.pending_approvals_summary(None).len(), 1);
         m.resolve(id);
         assert!(m.pending_approvals_summary(None).is_empty());
+        // resolve() logs an `approve` decision for the audit trail.
+        let decisions = m.decisions();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].outcome, DecisionOutcome::Approve);
+        assert_eq!(decisions[0].id, id);
+    }
+
+    #[test]
+    fn record_pending_stamps_default_ttl() {
+        let m = ApprovalsModule::new();
+        let before = Utc::now();
+        let mut s = summary(ApprovalKind::Sender);
+        s.expires_at = None;
+        m.record_pending(s);
+        let listed = m.pending_approvals_summary(None);
+        let exp = listed[0].expires_at.expect("default TTL stamped");
+        assert!(exp > before + chrono::Duration::minutes(59));
+        assert!(exp < before + chrono::Duration::minutes(61));
+    }
+
+    #[test]
+    fn expired_pending_is_not_actionable() {
+        let m = ApprovalsModule::new();
+        let mut s = summary(ApprovalKind::Sender);
+        s.expires_at = Some(Utc::now() - chrono::Duration::minutes(1));
+        m.record_pending(s);
+        // Already lapsed: never surfaced as live.
+        assert!(m.pending_approvals_summary(None).is_empty());
+    }
+
+    #[test]
+    fn sweep_expired_drops_and_logs_expire() {
+        let m = ApprovalsModule::new();
+        let mut stale = summary(ApprovalKind::Sender);
+        stale.expires_at = Some(Utc::now() - chrono::Duration::minutes(1));
+        let stale_id = stale.id;
+        m.record_pending(stale);
+        let mut fresh = summary(ApprovalKind::Sender);
+        fresh.expires_at = Some(Utc::now() + chrono::Duration::hours(1));
+        m.record_pending(fresh);
+        let now = Utc::now();
+        let swept = m.sweep_expired(now);
+        assert_eq!(swept, vec![stale_id]);
+        let decisions = m.decisions();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].outcome, DecisionOutcome::Expire);
+        assert_eq!(decisions[0].decided_by, "system:expiry");
+        // Second sweep is a no-op.
+        assert!(m.sweep_expired(Utc::now()).is_empty());
+        assert_eq!(m.decisions().len(), 1);
+    }
+
+    #[test]
+    fn revoke_drops_and_logs_revoke() {
+        let m = ApprovalsModule::new();
+        let mut s = summary(ApprovalKind::Sender);
+        s.expires_at = Some(Utc::now() + chrono::Duration::hours(1));
+        let id = s.id;
+        m.record_pending(s);
+        m.revoke(id, "host", Some("operator withdrew the request"));
+        assert!(m.pending_approvals_summary(None).is_empty());
+        let decisions = m.decisions();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].outcome, DecisionOutcome::Revoke);
+        assert_eq!(
+            decisions[0].reason.as_deref(),
+            Some("operator withdrew the request")
+        );
+    }
+
+    #[test]
+    fn revoke_unknown_id_logs_nothing() {
+        let m = ApprovalsModule::new();
+        m.revoke(ApprovalId::new(), "host", None);
+        assert!(m.decisions().is_empty());
     }
 
     #[test]
