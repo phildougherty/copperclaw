@@ -33,6 +33,22 @@ pub const DEFAULT_SAFETY_MARGIN: usize = 16_000;
 /// reject the request for `input + max_tokens > window`. Matches the
 /// runner's default `max_tokens` so the two move together.
 pub const DEFAULT_OUTPUT_RESERVE: usize = 4_096;
+/// Default *soft* compaction target in tokens.
+///
+/// The hard ceiling (`model_input_window − safety_margin − output_reserve`,
+/// ~180K on a 200K window) only ever fires to avoid a 400 from the
+/// provider. The dominant cost on a long session isn't that one rejection
+/// — it's replaying a steady ~30–60K transcript verbatim on *every* turn,
+/// turn after turn. This much-lower target summarises the oldest half long
+/// before the ceiling, capping the per-turn replay at roughly this size.
+///
+/// 40K is a deliberate middle ground: high enough that a normal multi-turn
+/// task isn't summarised mid-thought, low enough that a runaway session
+/// can't sit at 120K for a hundred turns. The hard ceiling stays in place
+/// as the safety net (whichever threshold is lower triggers first). Set
+/// `soft_target_tokens` to `0` to disable the soft trigger entirely and
+/// recover the historical hard-window-only behaviour.
+pub const DEFAULT_SOFT_TARGET: usize = 40_000;
 /// System prompt the runner sends to the provider when asking for a summary.
 pub const SUMMARY_SYSTEM_PROMPT: &str = "Summarize the following conversation succinctly. Preserve any decisions, \
 open questions, identifiers, and unresolved tool requests. Be terse.";
@@ -50,6 +66,12 @@ pub struct CompactionCfg {
     /// never violates `input + max_tokens > window` — the failure mode
     /// that surfaced as a hard 400 on Haiku 4.5 with a long transcript.
     pub output_reserve_tokens: usize,
+    /// Soft compaction target in tokens. When non-zero, compaction fires
+    /// once the estimate exceeds this value — well below the hard
+    /// ceiling — so a long session doesn't replay a large transcript
+    /// every turn. `0` disables the soft trigger and falls back to the
+    /// hard-window-only rule. See [`DEFAULT_SOFT_TARGET`].
+    pub soft_target_tokens: usize,
     /// Provider model name to use for the summarisation turn.
     pub summary_model: String,
     /// Effort hint for the summarisation turn.
@@ -62,19 +84,41 @@ pub struct CompactionCfg {
 }
 
 impl CompactionCfg {
-    /// True iff `estimated_tokens` has crossed the threshold. The
-    /// threshold subtracts both `safety_margin_tokens` (to cover the
-    /// static request overhead the estimator doesn't count — system
-    /// prompt, tool schemas, formatting) and `output_reserve_tokens`
-    /// (the per-turn output budget the provider enforces as part of
-    /// the total window).
+    /// The hard ceiling, in tokens: `model_input_window` less the
+    /// `safety_margin_tokens` (static request overhead the estimator
+    /// doesn't count — system prompt, tool schemas, formatting) and the
+    /// `output_reserve_tokens` (the per-turn output budget the provider
+    /// enforces as part of the total window). Crossing this risks a hard
+    /// 400 from the provider, so it is the non-negotiable safety net.
+    #[must_use]
+    pub fn hard_threshold(&self) -> usize {
+        self.model_input_window
+            .saturating_sub(self.safety_margin_tokens)
+            .saturating_sub(self.output_reserve_tokens)
+    }
+
+    /// The effective threshold compaction triggers at: the lower of the
+    /// soft target and the hard ceiling. A non-zero `soft_target_tokens`
+    /// pulls the trigger far below the window so a long session stops
+    /// replaying a large transcript every turn; `0` disables the soft
+    /// trigger and leaves only the hard ceiling. The hard ceiling always
+    /// caps the result, so a misconfigured soft target larger than the
+    /// window can never push the trigger past the safety net.
+    #[must_use]
+    pub fn effective_threshold(&self) -> usize {
+        let hard = self.hard_threshold();
+        if self.soft_target_tokens == 0 {
+            hard
+        } else {
+            self.soft_target_tokens.min(hard)
+        }
+    }
+
+    /// True iff `estimated_tokens` has crossed the effective threshold
+    /// (the lower of the soft target and the hard ceiling).
     #[must_use]
     pub fn should_compact(&self, estimated_tokens: usize) -> bool {
-        let threshold = self
-            .model_input_window
-            .saturating_sub(self.safety_margin_tokens)
-            .saturating_sub(self.output_reserve_tokens);
-        estimated_tokens > threshold
+        estimated_tokens > self.effective_threshold()
     }
 }
 
@@ -183,6 +227,7 @@ async fn summarise(
 ) -> Result<String> {
     let input = QueryInput {
         system: SUMMARY_SYSTEM_PROMPT.into(),
+        system_context: None,
         model: cfg.summary_model.clone(),
         effort: cfg.summary_effort,
         previous_continuation: None,
@@ -281,6 +326,10 @@ mod tests {
             model_input_window: 200_000,
             safety_margin_tokens: 16_000,
             output_reserve_tokens: 4_096,
+            // 0 = soft trigger disabled, so the existing hard-ceiling
+            // assertions below are unaffected. The soft-trigger tests
+            // set this explicitly.
+            soft_target_tokens: 0,
             summary_model: "claude-sonnet-4-6".into(),
             summary_effort: Effort::Low,
             summary_max_tokens: 1024,
@@ -391,6 +440,75 @@ mod tests {
         // old rule: 190K < 192K → no compact → 194K total → fail.
         // New rule: 190K > 187_904 → compact → safe.
         assert!(cfg.should_compact(190_000));
+    }
+
+    #[test]
+    fn soft_target_fires_far_below_hard_ceiling() {
+        // The whole point: on a 200K window with a 40K soft target, a
+        // 50K transcript compacts immediately instead of riding to ~180K.
+        let cfg = CompactionCfg {
+            soft_target_tokens: 40_000,
+            ..cfg_with_dir(PathBuf::from("/tmp"))
+        };
+        assert_eq!(cfg.effective_threshold(), 40_000);
+        assert!(!cfg.should_compact(40_000));
+        assert!(cfg.should_compact(40_001));
+        assert!(cfg.should_compact(50_000));
+        // ...and well below the hard ceiling (179_904).
+        assert!(cfg.should_compact(100_000));
+    }
+
+    #[test]
+    fn soft_target_zero_falls_back_to_hard_ceiling() {
+        // 0 disables the soft trigger: behaviour is identical to the
+        // historical hard-window-only rule (179_904 on this config).
+        let cfg = cfg_with_dir(PathBuf::from("/tmp")); // soft_target_tokens = 0
+        assert_eq!(cfg.effective_threshold(), 179_904);
+        assert!(!cfg.should_compact(50_000));
+        assert!(!cfg.should_compact(179_904));
+        assert!(cfg.should_compact(179_905));
+    }
+
+    #[test]
+    fn hard_ceiling_caps_an_oversized_soft_target() {
+        // A misconfigured soft target larger than the window must never
+        // push the trigger past the safety net — the hard ceiling wins.
+        let cfg = CompactionCfg {
+            soft_target_tokens: 10_000_000,
+            ..cfg_with_dir(PathBuf::from("/tmp"))
+        };
+        assert_eq!(cfg.effective_threshold(), cfg.hard_threshold());
+        assert_eq!(cfg.effective_threshold(), 179_904);
+    }
+
+    #[test]
+    fn default_soft_target_is_well_below_default_window() {
+        const _: () = assert!(DEFAULT_SOFT_TARGET < DEFAULT_INPUT_WINDOW);
+        // A long synthetic transcript estimated near a typical steady
+        // context (~50K tokens) must trip the default soft target.
+        let cfg = CompactionCfg {
+            soft_target_tokens: DEFAULT_SOFT_TARGET,
+            ..cfg_with_dir(PathBuf::from("/tmp"))
+        };
+        // ~50K tokens ≈ 200K chars across many user turns.
+        let history: Vec<HistoryMessage> = (0..1_000)
+            .map(|i| HistoryMessage::User {
+                content: format!("turn {i}: ").repeat(20),
+            })
+            .collect();
+        let est = estimate_tokens(&history);
+        assert!(
+            est > DEFAULT_SOFT_TARGET,
+            "synthetic transcript ({est} tok) should exceed the soft target"
+        );
+        assert!(cfg.should_compact(est));
+        // The same transcript would NOT have triggered the hard-ceiling
+        // rule, proving the soft target is what saves the per-turn replay.
+        let hard_only = CompactionCfg {
+            soft_target_tokens: 0,
+            ..cfg
+        };
+        assert!(!hard_only.should_compact(est));
     }
 
     #[test]

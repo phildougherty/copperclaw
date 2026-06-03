@@ -87,6 +87,16 @@ pub(super) struct LlmTurnOutput {
     /// failure-site identification from the empty-string sentinel
     /// the old code used (#12 in code-review notes).
     pub(super) failure_reason: String,
+    /// Input tokens billed for THIS LLM round-trip, as reported by the
+    /// provider's `Usage` event (0 when the provider didn't surface a
+    /// count or the turn failed before streaming). Surfaced up to
+    /// `drive_turn` so the tool loop can accumulate per-task cost and
+    /// enforce the per-task token ceiling (`COPPERCLAW_MAX_TASK_TOKENS`).
+    /// Independent of the Prometheus histogram observe in `run_llm_turn`
+    /// — that records every call; this drives the abort decision.
+    pub(super) input_tokens: u32,
+    /// Output tokens billed for THIS LLM round-trip. See `input_tokens`.
+    pub(super) output_tokens: u32,
 }
 
 /// Persist `history` + `continuation` to `outbound` mid-message so a
@@ -299,6 +309,15 @@ pub(super) async fn drive_turn(
     let mut last_status_emit_at = drive_turn_started_at;
     let mut cumulative_tool_runs: usize = 0;
     let mut last_tool_name: Option<String> = None;
+    // Cumulative input+output tokens spent across THIS inbound's tool
+    // loop. Drives the per-task cost ceiling (`deps.max_task_tokens`),
+    // which hard-aborts a runaway mid-loop independently of
+    // `max_tool_turns` and the per-day group cap. A token-heavy task
+    // that re-reads a large context on each of many tool calls can blow
+    // millions of tokens without exceeding the turn cap; this bounds the
+    // worst-case spend to the configured ceiling. u64 because a single
+    // big-context task can sum past u32::MAX (~4.3B) over a long loop.
+    let mut task_tokens_spent: u64 = 0;
     // Content-loop circuit breaker (complements the depth cap below and
     // the token budget). Tracks the trailing window of model-requested
     // `(tool, args)` fingerprints and trips on N-identical or A,B,A,B
@@ -308,6 +327,13 @@ pub(super) async fn drive_turn(
     for tool_turn in 0..deps.max_tool_turns.max(1) {
         let output = run_llm_turn(deps, history, continuation.as_deref(), context_block).await?;
         continuation = output.continuation.or(continuation);
+        // Accumulate this round-trip's billed tokens before any
+        // early-return below so the per-task total reflects every call
+        // the provider charged for (including the turn that trips the
+        // ceiling). `failed` turns report 0 tokens, so this is a no-op
+        // on the error path.
+        task_tokens_spent = task_tokens_spent
+            .saturating_add(u64::from(output.input_tokens) + u64::from(output.output_tokens));
 
         if output.failed {
             // Preserve the site-specific reason from provider_call if
@@ -529,6 +555,35 @@ pub(super) async fn drive_turn(
                 continuation,
                 outcome: TurnOutcome::Failed(format!(
                     "model produced malformed tool-call JSON {consecutive_parse_error_turns} turns in a row"
+                )),
+            });
+        }
+
+        // Per-task cost ceiling. We only reach here when the turn
+        // produced tool calls and is about to loop again, so the check
+        // sits on the runaway path: a token-heavy loop that re-reads a
+        // big context burns the budget here even when it would never hit
+        // `max_tool_turns`. `0` disables the ceiling. Fires a metrics
+        // trip + ERROR log (the audit narrative) and falls through to
+        // the existing terminal-failure path so `finalize_messages`
+        // marks the inbound failed and the user sees the surfaced
+        // "task budget reached" reason on the apology row. Independent
+        // of the per-day group cap (spawn-time gate) and the parse-error
+        // / max-turns breakers above.
+        if deps.max_task_tokens > 0 && task_tokens_spent >= deps.max_task_tokens {
+            tracing::error!(
+                agent_group_id = %deps.agent_group_id,
+                session_id = %deps.session_id,
+                tokens_spent = task_tokens_spent,
+                ceiling = deps.max_task_tokens,
+                tool_turn,
+                "per-task token budget reached; aborting tool loop"
+            );
+            copperclaw_metrics::inc_task_budget_exhausted(&deps.agent_group_id.to_string());
+            return Ok(TurnResult {
+                continuation,
+                outcome: TurnOutcome::Failed(format!(
+                    "task budget reached: {task_tokens_spent} tokens; stopping"
                 )),
             });
         }

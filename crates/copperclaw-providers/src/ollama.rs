@@ -253,8 +253,13 @@ pub(crate) fn tools_to_openai_form(tools: &[ToolDef]) -> Vec<Value> {
 /// and tools work with both).
 pub(crate) fn history_to_messages(input: &QueryInput) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
-    if !input.system.is_empty() {
-        out.push(json!({ "role": "system", "content": input.system }));
+    // Flatten the static system + volatile conversation-context back
+    // into one string. Ollama does no prompt caching, so the split the
+    // Anthropic provider relies on is irrelevant here — `combined_system`
+    // reproduces the exact bytes this path emitted before the split.
+    let system = input.combined_system();
+    if !system.is_empty() {
+        out.push(json!({ "role": "system", "content": system }));
     }
     for m in &input.history {
         match m {
@@ -600,6 +605,9 @@ async fn emit_terminal(
             .send(ProviderEvent::Usage {
                 input_tokens: p,
                 output_tokens: e,
+                // Ollama is a local backend with no prompt cache.
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
             })
             .await;
     }

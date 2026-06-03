@@ -6,6 +6,32 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Performance (LLM token-cost reduction — 2026-06-03)
+
+The agent loop was paying full input price to re-send a near-identical,
+growing transcript on every tool-call turn (a 123-turn run billed ~6.3M
+input vs 38K output — 164:1). Three changes cut that:
+
+- **Anthropic prompt caching.** `copperclaw-providers` now stamps
+  `cache_control` breakpoints on a **byte-stable** prefix — the static
+  system block, the tools tail, and the transcript tail — while the
+  volatile per-inbound context is emitted *after* the breakpoint (and
+  non-caching providers flatten it back, so their request bytes are
+  unchanged). Gated to Anthropic-family models so a non-Anthropic gateway
+  can't reject an unknown field. Cached prefix reads bill at ~10% of input,
+  for **~60-78% input-cost reduction on long multi-turn runs**. Cache
+  read/creation token counts now surface on `ProviderEvent::Usage`.
+- **Aggressive compaction + stale tool-result elision** (`copperclaw-runner`).
+  Compaction now fires at a much lower configurable soft target (not just
+  near the 200K window), and old, already-acted-on tool outputs (file reads,
+  command stdout, diffs) are elided to short stubs in the *replayed* view
+  (the persisted history is untouched, tool_use/tool_result pairing
+  preserved). ~70K tokens/turn saved on a long run. NOTE: the default
+  compaction target is now more aggressive than before.
+- **Per-task token budget** (`copperclaw-runner`). A configurable per-task
+  ceiling (default 2M input+output tokens) hard-aborts a runaway mid-loop
+  with a surfaced message + metric/audit — distinct from the per-day group
+  cap; bounds worst-case single-task cost.
 ### Security (M16 wave 5 — browser 5a, MCP supply-chain, security-audit; provider failover live — 2026-06-03)
 
 Final hardening wave + the provider-failover rework. All opt-in / default-

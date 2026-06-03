@@ -15,7 +15,8 @@ use copperclaw_db::session::{SessionPaths, open_inbound_rw_no_mmap, open_outboun
 use copperclaw_providers::{AnthropicProvider, CodexProvider, OllamaProvider};
 use copperclaw_runner::{
     RunnerConfig, RunnerDeps, RunnerToolCtx, SubagentRunnerDeps, compaction::CompactionCfg,
-    resolve_max_tool_turns, resolve_provider_deadline, resolve_tool_deadline_secs, run_loop,
+    resolve_max_task_tokens, resolve_max_tool_turns, resolve_provider_deadline,
+    resolve_tool_deadline_secs, run_loop,
 };
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
@@ -80,10 +81,22 @@ async fn main() -> Result<()> {
         // provider (the exact failure mode that crashed Haiku-4.5 with
         // a long transcript).
         output_reserve_tokens: cfg.max_tokens as usize,
+        // Soft target pulls compaction far below the hard window so a
+        // long session stops replaying a large transcript every turn.
+        // `0` (operator opt-out) falls back to hard-window-only.
+        soft_target_tokens: cfg.soft_compaction_target_tokens,
         summary_model: cfg.model.clone(),
         summary_effort: copperclaw_types::Effort::Low,
         summary_max_tokens: 1024,
         archive_dir: paths.outbox.join("_compactions"),
+    };
+    // Per-turn transcript shrinker: stub stale, oversized tool-result
+    // bodies so old file reads / command stdout / diffs aren't re-sent
+    // verbatim every turn. Recent results (current turn included) stay
+    // full. Sourced from the same config knobs.
+    let elision = copperclaw_runner::ElisionCfg {
+        recent_results_kept: cfg.recent_tool_results_kept,
+        max_result_bytes: cfg.tool_result_elide_bytes,
     };
 
     // Build the in-process MCP tool inventory once and reuse it on
@@ -151,6 +164,7 @@ async fn main() -> Result<()> {
         temperature: cfg.temperature,
         assistant_name: cfg.assistant_name.clone(),
         compaction,
+        elision,
         max_turns: None,
         idle_sleep: std::time::Duration::from_millis(copperclaw_runner::POLL_INTERVAL_MS),
         heartbeat_path: Some(paths.heartbeat.clone()),
@@ -159,6 +173,7 @@ async fn main() -> Result<()> {
         turn_seq: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         tool_map,
         max_tool_turns: resolve_max_tool_turns(&env),
+        max_task_tokens: resolve_max_task_tokens(&env),
         provider_deadline,
         tool_deadline_secs: resolve_tool_deadline_secs(&env),
         // Keep the typing indicator alive across long LLM streams by
@@ -288,6 +303,9 @@ mod build_provider_tests {
             api_base_url: None,
             model_input_window: 200_000,
             safety_margin_tokens: 8_000,
+            soft_compaction_target_tokens: copperclaw_runner::compaction::DEFAULT_SOFT_TARGET,
+            recent_tool_results_kept: copperclaw_runner::formatter::DEFAULT_RECENT_TOOL_RESULTS,
+            tool_result_elide_bytes: copperclaw_runner::formatter::DEFAULT_TOOL_RESULT_ELIDE_BYTES,
             max_tokens: 4096,
             assistant_name: None,
             temperature: None,

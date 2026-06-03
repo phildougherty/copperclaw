@@ -60,9 +60,30 @@ pub enum ProviderEvent {
     /// surfaces it (Anthropic's `message_delta.usage` field). The
     /// runner accumulates these into the `agent_turns` table for
     /// observability and per-group budgeting.
+    ///
+    /// `cache_read_tokens` / `cache_creation_tokens` mirror Anthropic's
+    /// prompt-caching usage fields (`cache_read_input_tokens` /
+    /// `cache_creation_input_tokens`). They are `0` for providers that
+    /// don't report caching (the `#[serde(default)]` keeps older event
+    /// payloads decodable). A non-zero `cache_read_tokens` is the signal
+    /// that a cache breakpoint *hit* this turn — that's what makes the
+    /// cost win observable. Anthropic bills cached reads at ~10% of the
+    /// base input rate and cache writes at ~125%, so the two are tracked
+    /// separately. Note: on the Anthropic wire `input_tokens` already
+    /// EXCLUDES the cached prefix, so total prompt size is
+    /// `input_tokens + cache_read_tokens + cache_creation_tokens`.
     Usage {
         input_tokens: u32,
         output_tokens: u32,
+        /// Input tokens served from the prompt cache (a cache hit). `0`
+        /// when caching is off or the prefix missed.
+        #[serde(default)]
+        cache_read_tokens: u32,
+        /// Input tokens written into the prompt cache this turn (a cache
+        /// write — billed at a premium, amortized over later hits). `0`
+        /// when caching is off.
+        #[serde(default)]
+        cache_creation_tokens: u32,
     },
     /// The provider finished reassembling a `tool_use` block but the
     /// concatenated `input_json_delta` chunks did not parse as JSON.

@@ -37,6 +37,11 @@ rusqlite = { workspace = true }
 [dev-dependencies]
 copperclaw-channels-core = { workspace = true }
 tempfile = "3"
+# Test-only: lets the per-task-budget tests install an isolated
+# Prometheus recorder and assert that crossing the ceiling actually
+# trips `copperclaw_task_budget_exhausted_total`, not just the abort.
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 
 [lints]
 workspace = true

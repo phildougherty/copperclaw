@@ -302,7 +302,10 @@ fn build_query_line(input: &QueryInput) -> Value {
     let tools: Vec<Value> = input.tools.iter().map(tool_to_json).collect();
     let mut obj = json!({
         "type": "query",
-        "system": input.system,
+        // Subprocess bridges (codex / opencode shims) consume a single
+        // flat system string and do not cache, so collapse the static +
+        // volatile parts. Byte-identical to the pre-split shape.
+        "system": input.combined_system(),
         "history": history,
         "tools": tools,
         "model": input.model,

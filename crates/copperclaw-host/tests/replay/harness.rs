@@ -558,10 +558,15 @@ impl ReplayHarness {
                 model_input_window: 200_000,
                 safety_margin_tokens: 8_000,
                 output_reserve_tokens: 4_096,
+                soft_target_tokens: 0,
                 summary_model: "claude-sonnet-4-6".into(),
                 summary_effort: Effort::Low,
                 summary_max_tokens: 1024,
                 archive_dir: paths.outbox.join("_compactions"),
+            },
+            elision: copperclaw_runner::ElisionCfg {
+                recent_results_kept: 0,
+                max_result_bytes: usize::MAX,
             },
             max_turns: Some(1),
             idle_sleep: Duration::from_millis(10),
@@ -571,6 +576,10 @@ impl ReplayHarness {
             turn_seq: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             tool_map,
             max_tool_turns: 5,
+            // Replay fixtures bound the run via the tool-turn cap; the
+            // per-task token ceiling is disabled (0) so deterministic
+            // replays never trip the cost backstop.
+            max_task_tokens: 0,
             // Short replay-side deadline so the `provider-timeout`
             // fixture (which sets a deliberately long wiremock delay)
             // trips quickly and the retry budget runs to completion

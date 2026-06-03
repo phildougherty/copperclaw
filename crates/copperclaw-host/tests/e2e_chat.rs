@@ -329,10 +329,15 @@ async fn run_one_turn(
             model_input_window: 200_000,
             safety_margin_tokens: 8_000,
             output_reserve_tokens: 4_096,
+            soft_target_tokens: 0,
             summary_model: "claude-sonnet-4-6".into(),
             summary_effort: Effort::Low,
             summary_max_tokens: 1024,
             archive_dir: paths.outbox.join("_compactions"),
+        },
+        elision: copperclaw_runner::ElisionCfg {
+            recent_results_kept: 0,
+            max_result_bytes: usize::MAX,
         },
         max_turns: Some(1),
         idle_sleep: Duration::from_millis(10),
@@ -342,6 +347,9 @@ async fn run_one_turn(
         turn_seq: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         tool_map,
         max_tool_turns: 5,
+        // No per-task token ceiling in this e2e — the tool-turn cap and
+        // wiremock scripts bound the run; 0 disables the cost backstop.
+        max_task_tokens: 0,
         // Tests run against wiremock; keep the deadline tight so
         // accidental hangs surface as a test timeout instead of a
         // 60-second stall.
