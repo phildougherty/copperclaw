@@ -26,7 +26,9 @@ use bytes::Bytes;
 use futures::stream::StreamExt;
 
 use crate::build::ImageBuildSpec;
-use crate::spec::{ContainerHandle, ContainerSpec, EgressMode, Mount, ResourceLimits};
+use crate::spec::{
+    ContainerHandle, ContainerSpec, EgressMode, Mount, ResourceLimits, SandboxProfile,
+};
 use crate::{ContainerRuntime, RtError};
 
 /// Bollard-backed Docker runtime.
@@ -262,13 +264,24 @@ pub(crate) fn container_config(spec: &ContainerSpec) -> Config<String> {
         .map(|(host, ip)| format!("{host}:{ip}"))
         .collect();
 
-    let host_config = host_config_with_limits(
+    let mut host_config = host_config_with_limits(
         &spec.resource_limits,
         mounts,
         extra_hosts,
         spec.gpu_passthrough,
         egress_network_mode(spec.egress_mode, &spec.egress_allow),
     );
+
+    // Phase 5a stronger-sandbox security floor. Only present when the caller
+    // attached a sandbox profile (the headless-browser child container);
+    // default spawns leave `host_config` untouched. The profile's `runtime`
+    // is expected to already be the RESOLVED runtime from
+    // [`crate::select_sandbox_runtime`] — the host probes availability and
+    // narrows the request before building the spec, so a microVM runtime that
+    // isn't installed never reaches `runtime:` here.
+    if let Some(profile) = spec.sandbox.as_ref() {
+        apply_sandbox_security(&mut host_config, profile);
+    }
 
     Config {
         image: Some(spec.image.clone()),
@@ -349,6 +362,52 @@ pub(crate) fn host_config_with_limits(
         device_requests,
         network_mode,
         ..Default::default()
+    }
+}
+
+/// Apply a [`SandboxProfile`] onto a bollard [`HostConfig`], translating the
+/// stronger-sandbox knobs into the engine's security primitives (Phase 5a).
+///
+/// Pure mutation, so it is unit-tested without a daemon. What each field maps
+/// to:
+///
+/// * `runtime` → `HostConfig::runtime` *only* when the resolved
+///   [`SandboxRuntime`] names an external OCI runtime
+///   ([`SandboxRuntime::oci_runtime_name`]). [`SandboxRuntime::HardenedRunc`]
+///   and [`SandboxRuntime::Default`] leave `runtime: None` (engine default) —
+///   `HardenedRunc` hardens via the security options below rather than by
+///   swapping the runtime binary.
+/// * `cap_drop_all` → `cap_drop: ["ALL"]`.
+/// * `no_new_privileges` → `security_opt: ["no-new-privileges:true"]`.
+/// * `seccomp_profile` → `security_opt: ["seccomp=<name>"]` when named; absent
+///   means the engine's (already restrictive) default seccomp profile.
+/// * `userns_remap` → `userns_mode: "<label>"` (Docker reads the daemon-side
+///   subordinate-uid map for the label).
+pub(crate) fn apply_sandbox_security(host: &mut HostConfig, profile: &SandboxProfile) {
+    // Select the OCI runtime binary only for runtimes that need one. The
+    // resolved profile should already have narrowed an unavailable microVM
+    // runtime down to what the host has — see `select_sandbox_runtime`.
+    if let Some(rt_name) = profile.runtime.oci_runtime_name() {
+        host.runtime = Some(rt_name.to_string());
+    }
+
+    if profile.cap_drop_all {
+        host.cap_drop = Some(vec!["ALL".to_string()]);
+    }
+
+    let mut security_opt: Vec<String> = Vec::new();
+    if profile.no_new_privileges {
+        security_opt.push("no-new-privileges:true".to_string());
+    }
+    if let Some(name) = profile.seccomp_profile.as_deref() {
+        security_opt.push(format!("seccomp={name}"));
+    }
+    if !security_opt.is_empty() {
+        host.security_opt = Some(security_opt);
+    }
+
+    if let Some(label) = profile.userns_remap.as_deref() {
+        host.userns_mode = Some(label.to_string());
     }
 }
 
@@ -721,6 +780,7 @@ mod tar {
 mod tests {
     use super::*;
     use crate::build::ExtraFile;
+    use crate::spec::SandboxRuntime;
 
     #[test]
     fn translates_bind_mount() {
@@ -836,6 +896,71 @@ mod tests {
             host.network_mode.is_none(),
             "non-empty allow-list under deny-default must NOT hard-cut the network"
         );
+    }
+
+    // ── Phase 5a stronger-sandbox security translation ───────────────────
+
+    #[test]
+    fn container_config_no_sandbox_leaves_security_unset() {
+        // Default spawn: no sandbox profile, so none of the security knobs
+        // are touched — behaviour unchanged.
+        let spec = ContainerSpec::new("c", "img");
+        let host = container_config(&spec).host_config.unwrap();
+        assert!(host.runtime.is_none());
+        assert!(host.cap_drop.is_none());
+        assert!(host.security_opt.is_none());
+        assert!(host.userns_mode.is_none());
+    }
+
+    #[test]
+    fn apply_sandbox_security_hardened_runc_floor() {
+        // HardenedRunc: no external runtime (engine default), but the full
+        // security floor applied.
+        let mut host = HostConfig::default();
+        apply_sandbox_security(
+            &mut host,
+            &SandboxProfile::hardened(SandboxRuntime::HardenedRunc),
+        );
+        assert!(
+            host.runtime.is_none(),
+            "hardened-runc must not swap the OCI runtime"
+        );
+        assert_eq!(host.cap_drop.as_deref(), Some(&["ALL".to_string()][..]));
+        let so = host.security_opt.unwrap();
+        assert!(so.iter().any(|s| s == "no-new-privileges:true"));
+        assert_eq!(host.userns_mode.as_deref(), Some("copperclaw-browser"));
+    }
+
+    #[test]
+    fn apply_sandbox_security_runsc_sets_runtime() {
+        let mut host = HostConfig::default();
+        apply_sandbox_security(&mut host, &SandboxProfile::hardened(SandboxRuntime::Runsc));
+        assert_eq!(host.runtime.as_deref(), Some("runsc"));
+        // The security floor still applies on top of the gVisor runtime.
+        assert_eq!(host.cap_drop.as_deref(), Some(&["ALL".to_string()][..]));
+    }
+
+    #[test]
+    fn apply_sandbox_security_named_seccomp_profile() {
+        let mut host = HostConfig::default();
+        let profile = SandboxProfile::hardened(SandboxRuntime::HardenedRunc)
+            .with_seccomp_profile("browser-strict");
+        apply_sandbox_security(&mut host, &profile);
+        let so = host.security_opt.unwrap();
+        assert!(
+            so.iter().any(|s| s == "seccomp=browser-strict"),
+            "named seccomp profile must reach security_opt: {so:?}"
+        );
+    }
+
+    #[test]
+    fn container_config_threads_sandbox_into_host_config() {
+        let spec = ContainerSpec::new("c", "img")
+            .with_sandbox(SandboxProfile::hardened(SandboxRuntime::Kata));
+        let host = container_config(&spec).host_config.unwrap();
+        assert_eq!(host.runtime.as_deref(), Some("kata-runtime"));
+        assert_eq!(host.cap_drop.as_deref(), Some(&["ALL".to_string()][..]));
+        assert_eq!(host.userns_mode.as_deref(), Some("copperclaw-browser"));
     }
 
     #[test]
