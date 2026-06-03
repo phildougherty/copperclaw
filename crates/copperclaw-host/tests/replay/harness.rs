@@ -491,6 +491,7 @@ impl ReplayHarness {
             skills_mode: copperclaw_host::SkillsMode::default(),
             gpu_passthrough: false,
             forward_env: Vec::new(),
+            egress_mode: copperclaw_container_rt::EgressMode::AllowAll,
         };
         let runtime: Arc<dyn ContainerRuntime> = Arc::new(HarnessRuntime::default());
         let mgr = Arc::new(ContainerManager::new(self.central.clone(), runtime, cfg));

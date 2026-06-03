@@ -26,7 +26,7 @@ use bytes::Bytes;
 use futures::stream::StreamExt;
 
 use crate::build::ImageBuildSpec;
-use crate::spec::{ContainerHandle, ContainerSpec, Mount, ResourceLimits};
+use crate::spec::{ContainerHandle, ContainerSpec, EgressMode, Mount, ResourceLimits};
 use crate::{ContainerRuntime, RtError};
 
 /// Bollard-backed Docker runtime.
@@ -227,10 +227,14 @@ impl ContainerRuntime for DockerRuntime {
 /// - `memory_mb` → `HostConfig::memory` (MiB × 2²⁰)
 /// - `pids_limit` → `HostConfig::pids_limit`
 ///
-/// Egress enforcement is a host-level concern; the `HostConfig` below wires
-/// `extra_hosts` which is the foundation for static host resolution, but
-/// full iptables-based egress filtering requires a post-spawn hook outside
-/// the scope of the bollard `create_container` call.
+/// Egress posture ([`ContainerSpec::egress_mode`]) maps to the
+/// `HostConfig::network_mode` chosen by [`egress_network_mode`]: under
+/// [`EgressMode::DenyDefault`] with an empty allow-list the container is cut
+/// off the network entirely (`"none"`, a real bollard-enforced deny). Any
+/// other combination leaves networking on the default bridge — per-host
+/// filtering of a non-empty allow-list is deferred to a future netns +
+/// nftables pass and is NOT enforced here. The allow-list is carried on the
+/// spec for that later pass and for operator visibility.
 pub(crate) fn container_config(spec: &ContainerSpec) -> Config<String> {
     let env: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let labels: HashMap<String, String> = spec.labels.clone();
@@ -248,6 +252,7 @@ pub(crate) fn container_config(spec: &ContainerSpec) -> Config<String> {
         mounts,
         extra_hosts,
         spec.gpu_passthrough,
+        egress_network_mode(spec.egress_mode, &spec.egress_allow),
     );
 
     Config {
@@ -270,12 +275,30 @@ pub(crate) fn container_config(spec: &ContainerSpec) -> Config<String> {
     }
 }
 
-/// Build the `HostConfig` applying any resource limits.
+/// Decide the bollard `HostConfig::network_mode` for an egress posture.
+///
+/// Returns `Some("none")` only under [`EgressMode::DenyDefault`] with an
+/// empty allow-list — the single case bollard can enforce as a hard egress
+/// cut through `create_container`. Every other case returns `None` (Docker's
+/// default bridge), because bollard cannot express per-host L3/L4 filtering;
+/// honoring a non-empty allow-list is deferred to the netns + nftables pass.
+#[must_use]
+pub(crate) fn egress_network_mode(mode: EgressMode, allow: &[String]) -> Option<String> {
+    match mode {
+        EgressMode::DenyDefault if allow.is_empty() => Some("none".to_string()),
+        EgressMode::DenyDefault | EgressMode::AllowAll => None,
+    }
+}
+
+/// Build the `HostConfig` applying any resource limits. `network_mode` is the
+/// pre-decided egress posture (see [`egress_network_mode`]); `None` leaves the
+/// runtime default bridge.
 pub(crate) fn host_config_with_limits(
     limits: &ResourceLimits,
     mounts: Vec<DockerMount>,
     extra_hosts: Vec<String>,
     gpu_passthrough: bool,
+    network_mode: Option<String>,
 ) -> HostConfig {
     // Docker's CPU quota is in nano-CPUs (1 CPU = 1_000_000_000 nano-CPUs).
     // The f64->i64 truncation is intentional: fractional nano-CPUs are meaningless.
@@ -309,6 +332,7 @@ pub(crate) fn host_config_with_limits(
         memory,
         pids_limit,
         device_requests,
+        network_mode,
         ..Default::default()
     }
 }
@@ -761,6 +785,59 @@ mod tests {
         // 512 MiB = 512 * 1024 * 1024 bytes = 536870912
         assert_eq!(host.memory, Some(512 * 1024 * 1024));
         assert_eq!(host.pids_limit, Some(256));
+    }
+
+    #[test]
+    fn container_config_allow_all_leaves_network_mode_unset() {
+        // Default posture (AllowAll) must not touch network_mode — the
+        // legacy spawn path keeps the default bridge.
+        let spec = ContainerSpec::new("c", "img");
+        let cfg = container_config(&spec);
+        let host = cfg.host_config.unwrap();
+        assert!(host.network_mode.is_none());
+    }
+
+    #[test]
+    fn container_config_deny_default_empty_allow_cuts_network() {
+        // DenyDefault with no allow-list is the one bollard-enforceable
+        // hard cut: network_mode "none".
+        let spec = ContainerSpec::new("c", "img").with_egress_mode(EgressMode::DenyDefault);
+        let cfg = container_config(&spec);
+        let host = cfg.host_config.unwrap();
+        assert_eq!(host.network_mode.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn container_config_deny_default_with_allow_keeps_network() {
+        // DenyDefault with a non-empty allow-list cannot be filtered by
+        // bollard, so the container stays networked (per-host filtering is
+        // deferred to the netns+nftables pass). The allow-list is carried.
+        let spec = ContainerSpec::new("c", "img")
+            .with_egress_mode(EgressMode::DenyDefault)
+            .with_egress_allow(vec!["api.anthropic.com:443".into()]);
+        let cfg = container_config(&spec);
+        let host = cfg.host_config.unwrap();
+        assert!(
+            host.network_mode.is_none(),
+            "non-empty allow-list under deny-default must NOT hard-cut the network"
+        );
+    }
+
+    #[test]
+    fn egress_network_mode_matrix() {
+        assert_eq!(egress_network_mode(EgressMode::AllowAll, &[]), None);
+        assert_eq!(
+            egress_network_mode(EgressMode::AllowAll, &["x:1".to_string()]),
+            None
+        );
+        assert_eq!(
+            egress_network_mode(EgressMode::DenyDefault, &[]),
+            Some("none".to_string())
+        );
+        assert_eq!(
+            egress_network_mode(EgressMode::DenyDefault, &["x:1".to_string()]),
+            None
+        );
     }
 
     #[test]

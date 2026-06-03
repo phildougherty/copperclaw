@@ -537,6 +537,7 @@ mod tests {
             skills_mode: SkillsMode::Inline,
             gpu_passthrough: false,
             forward_env: Vec::new(),
+            egress_mode: copperclaw_container_rt::EgressMode::AllowAll,
         }
     }
 

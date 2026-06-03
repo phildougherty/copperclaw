@@ -76,6 +76,54 @@ impl Mount {
     }
 }
 
+/// Egress posture for a spawned container.
+///
+/// `AllowAll` (the default) preserves the legacy behaviour: the container
+/// joins Docker's default bridge with full outbound NAT and the
+/// [`ContainerSpec::egress_allow`] list is purely advisory.
+///
+/// `DenyDefault` is the opt-in first cut of a default-deny network posture.
+/// What the Docker runtime **genuinely enforces** for `DenyDefault` today:
+///
+/// * When the resolved allow-list is **empty**, the container is spawned
+///   with `network_mode: "none"` — a real, bollard-enforced full network
+///   cut (no interfaces beyond loopback). This is the only posture in which
+///   bollard alone can guarantee egress is blocked.
+/// * When the allow-list is **non-empty** (the normal production case, since
+///   the host auto-injects the model endpoint so the agent can always reach
+///   its provider), bollard cannot express per-host L3/L4 filtering through
+///   `create_container`. The container therefore keeps its default-bridge
+///   networking, and the allow-list is recorded on the spec + surfaced to
+///   the operator (`cclaw doctor`, host log) so the gap is visible.
+///
+/// What is **explicitly deferred** to a later netns + nftables pass: turning
+/// the recorded allow-list into actual packet filtering (allowing only the
+/// listed `host:port` pairs and dropping everything else). Until that lands,
+/// `DenyDefault` with a non-empty allow-list does NOT restrict which hosts a
+/// container can reach — it only carries the policy. Callers must not treat
+/// a non-empty-allow-list `DenyDefault` spawn as a hard egress boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EgressMode {
+    /// Full outbound networking on the default bridge. The allow-list is
+    /// advisory only.
+    #[default]
+    AllowAll,
+    /// Opt-in default-deny posture. See the type-level docs for exactly
+    /// what bollard enforces vs. what is deferred.
+    DenyDefault,
+}
+
+impl EgressMode {
+    /// Stable lower-case token for logs / JSON surfaces.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EgressMode::AllowAll => "allow-all",
+            EgressMode::DenyDefault => "deny-default",
+        }
+    }
+}
+
 /// Per-group resource caps forwarded to the container runtime at spawn.
 ///
 /// All fields are optional. The Docker runtime translates present fields
@@ -175,11 +223,18 @@ pub struct ContainerSpec {
     /// device-request against a host without the toolkit fails the
     /// spawn outright.
     pub gpu_passthrough: bool,
-    /// Egress allow-list.  Empty means allow-all.  Non-empty restricts
-    /// outbound traffic to the listed `"host:port"` pairs.  Docker:
-    /// enforced via iptables inside the container network namespace.
-    /// Apple: returns `RtError::Unsupported`.
+    /// Resolved egress allow-list as `"host:port"` pairs.
+    ///
+    /// This is the *policy*, not a guarantee of enforcement — see
+    /// [`EgressMode`] for exactly what the Docker runtime enforces today
+    /// (a `network_mode: "none"` cut only when this list is empty under
+    /// [`EgressMode::DenyDefault`]) and what is deferred to a future
+    /// netns + nftables pass (per-host filtering of a non-empty list).
+    /// Under [`EgressMode::AllowAll`] this list is advisory only.
     pub egress_allow: Vec<String>,
+    /// Egress posture. See [`EgressMode`]. Defaults to
+    /// [`EgressMode::AllowAll`] so the legacy spawn path is unchanged.
+    pub egress_mode: EgressMode,
 }
 
 impl ContainerSpec {
@@ -256,10 +311,19 @@ impl ContainerSpec {
         self
     }
 
-    /// Set the egress allow-list.  An empty slice means allow-all.
+    /// Set the egress allow-list (the resolved `host:port` policy). Under
+    /// [`EgressMode::AllowAll`] this is advisory; under
+    /// [`EgressMode::DenyDefault`] see [`EgressMode`] for enforcement.
     #[must_use]
     pub fn with_egress_allow(mut self, allow: Vec<String>) -> Self {
         self.egress_allow = allow;
+        self
+    }
+
+    /// Set the egress posture. See [`EgressMode`].
+    #[must_use]
+    pub fn with_egress_mode(mut self, mode: EgressMode) -> Self {
+        self.egress_mode = mode;
         self
     }
 }
@@ -365,6 +429,7 @@ mod tests {
         assert!(spec.extra_hosts.is_empty());
         assert!(spec.resource_limits.is_empty());
         assert!(spec.egress_allow.is_empty());
+        assert_eq!(spec.egress_mode, EgressMode::AllowAll);
     }
 
     #[test]
@@ -386,6 +451,24 @@ mod tests {
         let spec =
             ContainerSpec::new("c", "img").with_egress_allow(vec!["api.example.com:443".into()]);
         assert_eq!(spec.egress_allow, vec!["api.example.com:443".to_string()]);
+    }
+
+    #[test]
+    fn spec_egress_mode_defaults_to_allow_all() {
+        let spec = ContainerSpec::new("c", "img");
+        assert_eq!(spec.egress_mode, EgressMode::AllowAll);
+    }
+
+    #[test]
+    fn spec_with_egress_mode() {
+        let spec = ContainerSpec::new("c", "img").with_egress_mode(EgressMode::DenyDefault);
+        assert_eq!(spec.egress_mode, EgressMode::DenyDefault);
+    }
+
+    #[test]
+    fn egress_mode_as_str_is_stable() {
+        assert_eq!(EgressMode::AllowAll.as_str(), "allow-all");
+        assert_eq!(EgressMode::DenyDefault.as_str(), "deny-default");
     }
 
     #[test]

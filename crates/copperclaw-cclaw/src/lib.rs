@@ -910,6 +910,55 @@ where
         ));
     }
 
+    // 9. Egress posture (Phase 0a v1 / Top 10 #6). Surface the host egress
+    //    mode and each group's effective allow-list so the operator can see,
+    //    in one place, that deny-default (when enabled) carries the
+    //    auto-injected model endpoint and won't blackhole model traffic.
+    if let Ok(egress) = transport
+        .call("egress.status", serde_json::json!({}), caller.clone())
+        .await
+    {
+        let mode = egress
+            .get("mode")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("allow-all");
+        let model = egress
+            .get("model_endpoint")
+            .and_then(serde_json::Value::as_str);
+        let group_n = egress.get("groups").map_or(0, array_len);
+        let model_note = model.map_or_else(
+            || {
+                " (no model endpoint auto-injected — ANTHROPIC_BASE_URL unset on the host)"
+                    .to_string()
+            },
+            |m| format!(" (model endpoint auto-injected: {m})"),
+        );
+        if mode == "allow-all" {
+            checks.push(Check::ok(
+                "egress",
+                format!(
+                    "egress mode: allow-all (default; per-group allow-lists advisory only){model_note}; {group_n} group(s)"
+                ),
+            ));
+        } else {
+            // deny-default is enforced as a network cut only for groups whose
+            // effective allow-list is empty; per-host filtering of non-empty
+            // lists is deferred to the netns+nftables pass. Warn (not fail):
+            // it's an intentional opt-in posture, but the operator should know
+            // the filtering caveat.
+            checks.push(Check::warn(
+                "egress",
+                format!(
+                    "egress mode: deny-default (opt-in){model_note}; {group_n} group(s). \
+                     bollard enforces a hard network cut only when a group's effective \
+                     allow-list is empty — per-host filtering of non-empty lists is deferred \
+                     to the netns+nftables pass and is NOT yet enforced"
+                ),
+                Some("`cclaw egress` shows each group's effective allow-list; set per-group entries with `cclaw groups config set-egress-allow`"),
+            ));
+        }
+    }
+
     finalise_doctor(&checks, as_json)
 }
 
@@ -2441,6 +2490,52 @@ mod tests {
             "unexpected trailer: {:?}",
             out.stdout,
         );
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_egress_allow_all_as_ok() {
+        // 6th seeded response is the egress.status call. allow-all → OK row.
+        let t = SequencedTransport::new(vec![
+            Ok(json!([{"id": "ag-1"}])),
+            Ok(json!([{"id": "w-1"}])),
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!({
+                "mode": "allow-all",
+                "model_endpoint": "api.anthropic.com:443",
+                "groups": [{"agent_group_id": "ag-1", "effective_allow": ["api.anthropic.com:443"]}],
+            })),
+        ]);
+        let out = run_cli(["cclaw", "doctor"], &t).await;
+        let combined = format!("{}{}", out.stdout, out.stderr);
+        assert!(combined.contains("egress"));
+        assert!(combined.contains("allow-all"));
+        assert!(combined.contains("api.anthropic.com:443"));
+        assert!(!out.stdout.contains("FAIL"));
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_egress_deny_default_as_warn() {
+        let t = SequencedTransport::new(vec![
+            Ok(json!([{"id": "ag-1"}])),
+            Ok(json!([{"id": "w-1"}])),
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!({
+                "mode": "deny-default",
+                "model_endpoint": "api.anthropic.com:443",
+                "groups": [{"agent_group_id": "ag-1", "effective_allow": ["api.anthropic.com:443"]}],
+            })),
+        ]);
+        let out = run_cli(["cclaw", "doctor"], &t).await;
+        let combined = format!("{}{}", out.stdout, out.stderr);
+        assert!(combined.contains("WARN"));
+        assert!(combined.contains("egress"));
+        assert!(combined.contains("deny-default"));
+        // The filtering-deferral caveat must be surfaced, not hidden.
+        assert!(combined.contains("deferred"));
     }
 
     #[tokio::test]

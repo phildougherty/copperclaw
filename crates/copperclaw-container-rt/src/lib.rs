@@ -27,7 +27,7 @@ pub mod spec;
 pub use crate::apple::AppleContainerRuntime;
 pub use crate::build::{ExtraFile, ImageBuildSpec};
 pub use crate::docker::DockerRuntime;
-pub use crate::spec::{ContainerHandle, ContainerSpec, Mount, ResourceLimits};
+pub use crate::spec::{ContainerHandle, ContainerSpec, EgressMode, Mount, ResourceLimits};
 
 /// Every fallible container-runtime call returns this.
 #[derive(Debug, Error)]

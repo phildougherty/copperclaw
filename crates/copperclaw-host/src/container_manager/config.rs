@@ -138,6 +138,13 @@ pub struct ManagerConfig {
     /// values are skipped so an unset operator env doesn't write
     /// `FOO=` lines into the container env.
     pub forward_env: Vec<(String, String)>,
+    /// Host-wide egress posture (Phase 0a v1 / Top 10 #6). Default
+    /// [`EgressMode::AllowAll`] keeps the legacy spawn path; an operator
+    /// opts in to default-deny via `COPPERCLAW_EGRESS_MODE=deny-default`.
+    /// The model endpoint is always auto-injected into the resolved
+    /// allow-list at spawn so deny-default can never blackhole model
+    /// traffic. See [`super::egress`].
+    pub egress_mode: copperclaw_container_rt::EgressMode,
 }
 
 /// How skill bodies reach the agent. The default mirrors today's

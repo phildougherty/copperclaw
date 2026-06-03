@@ -131,6 +131,13 @@ impl ContainerRuntime for AppleContainerRuntime {
                     .into(),
             ));
         }
+        if spec.egress_mode != crate::spec::EgressMode::AllowAll {
+            return Err(RtError::Unsupported(
+                "egress deny-default mode is not supported by the Apple Container \
+                 runtime; use Docker or set egress mode back to allow-all"
+                    .into(),
+            ));
+        }
         let args = run_args(&spec)?;
         let out = Command::new(&self.binary)
             .args(&args)
@@ -770,6 +777,18 @@ mod tests {
         let rt = AppleContainerRuntime::with_binary("/no/such/binary-9b3f");
         let spec =
             ContainerSpec::new("c", "img").with_egress_allow(vec!["api.example.com:443".into()]);
+        let err = rt.spawn(spec).await.unwrap_err();
+        assert!(
+            matches!(err, RtError::Unsupported(_)),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_egress_deny_default_mode() {
+        let rt = AppleContainerRuntime::with_binary("/no/such/binary-9b3f");
+        let spec =
+            ContainerSpec::new("c", "img").with_egress_mode(crate::spec::EgressMode::DenyDefault);
         let err = rt.spawn(spec).await.unwrap_err();
         assert!(
             matches!(err, RtError::Unsupported(_)),
