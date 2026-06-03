@@ -46,7 +46,10 @@ pub use context::{
 pub use error::ModuleError;
 pub use interactive::{InteractiveModule, PendingQuestion, QuestionId};
 pub use mount_security::{MountError, MountSecurityModule, validate_mount_target};
-pub use permissions::{PermissionOp, PermissionsModule, Role, check as permissions_check};
+pub use permissions::{
+    PermissionOp, PermissionsModule, Role, ToolProfile, check as permissions_check,
+    default_profile_for_role,
+};
 pub use scheduling::{
     CreateTaskSpec, InMemoryTaskStore, ScheduleError, ScheduleHandler, SchedulingModule,
     TaskRecord, TaskStatus as ScheduledTaskStatus, TaskStore, UpdateTaskFields, When,

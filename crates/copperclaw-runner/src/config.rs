@@ -99,6 +99,14 @@ pub struct RunnerConfigFile {
     /// chain-of-thought has privacy implications.
     #[serde(default)]
     pub surface_thinking: Option<bool>,
+    /// Per-group tool authorization profile: the positive allow-list the
+    /// agent is scoped to (`"minimal"` / `"messaging"` / `"coding"` /
+    /// `"full"`). Plumbed in from the group's container config by the
+    /// host. Unset / unknown values resolve to
+    /// [`crate::policy::ToolProfile::Full`] (a WARN is logged for an
+    /// unknown value) so existing groups keep their full tool surface.
+    #[serde(default)]
+    pub tool_profile: Option<String>,
 }
 
 /// Fully-resolved runner config.
@@ -154,6 +162,11 @@ pub struct RunnerConfig {
     /// privacy-default tenet. Plumbed in from
     /// `container_configs.surface_thinking`.
     pub surface_thinking: bool,
+    /// Resolved per-group tool authorization profile. Defaults to
+    /// [`crate::policy::ToolProfile::Full`] when the JSON file omits
+    /// `tool_profile` (or carries an unknown value) so existing groups
+    /// keep their historical full tool surface.
+    pub tool_profile: crate::policy::ToolProfile,
 }
 
 impl RunnerConfig {
@@ -198,6 +211,16 @@ impl RunnerConfig {
             .as_deref()
             .map(|s| parse_uuid::<SessionId>(Some(s), "source_session_id"))
             .transpose()?;
+        let tool_profile = match file.tool_profile.as_deref() {
+            None | Some("") => crate::policy::ToolProfile::default(),
+            Some(s) => crate::policy::ToolProfile::parse(s).unwrap_or_else(|| {
+                tracing::warn!(
+                    tool_profile = s,
+                    "unknown tool_profile in runner config; falling back to `full`"
+                );
+                crate::policy::ToolProfile::Full
+            }),
+        };
         Ok(Self {
             session_id,
             agent_group_id,
@@ -221,6 +244,7 @@ impl RunnerConfig {
             codex_args: file.codex_args,
             source_session_id,
             surface_thinking: file.surface_thinking.unwrap_or(false),
+            tool_profile,
         })
     }
 
@@ -313,6 +337,7 @@ mod tests {
             codex_args: None,
             source_session_id: None,
             surface_thinking: None,
+            tool_profile: None,
         }
     }
 
@@ -326,6 +351,31 @@ mod tests {
         assert_eq!(cfg.system, "you are an agent");
         assert_eq!(cfg.assistant_name.as_deref(), Some("Claude"));
         assert!((cfg.temperature.unwrap() - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tool_profile_defaults_to_full_when_unset() {
+        let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "k")]);
+        let cfg = RunnerConfig::from_file_struct(good_file(), &env).unwrap();
+        assert_eq!(cfg.tool_profile, crate::policy::ToolProfile::Full);
+    }
+
+    #[test]
+    fn tool_profile_parsed_from_file() {
+        let mut file = good_file();
+        file.tool_profile = Some("coding".into());
+        let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "k")]);
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert_eq!(cfg.tool_profile, crate::policy::ToolProfile::Coding);
+    }
+
+    #[test]
+    fn tool_profile_unknown_falls_back_to_full() {
+        let mut file = good_file();
+        file.tool_profile = Some("bogus".into());
+        let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "k")]);
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert_eq!(cfg.tool_profile, crate::policy::ToolProfile::Full);
     }
 
     #[test]

@@ -322,6 +322,14 @@ pub struct RunnerDeps {
     /// is plumbed in from `container_configs.surface_thinking` by the
     /// host's container manager into the runner's JSON config file.
     pub surface_thinking: bool,
+    /// Layered tool-authorization policy evaluated at every dispatch
+    /// (see [`crate::policy`]). Combines the group's tool-profile, the
+    /// sender role, and the active skill's `allowed-tools` over the
+    /// host-owned [`crate::policy::DISALLOWED_TOOLS`] floor. Default
+    /// ([`crate::policy::ToolPolicy::default`]) is the permissive `Full`
+    /// profile with no role/skill scope, so groups that don't set a
+    /// profile keep their historical full tool surface.
+    pub policy: crate::policy::ToolPolicy,
 }
 
 /// Default per-tool-call deadline. Comfortably above an `npm install`
@@ -377,6 +385,10 @@ impl RunnerDeps {
             // floor unless the operator explicitly opts the group in
             // via `container_configs.surface_thinking`.
             surface_thinking: false,
+            // Permissive default: `Full` profile, no role/skill scope.
+            // The host overrides this from the group config + sender
+            // role; tests opt into a tighter policy explicitly.
+            policy: crate::policy::ToolPolicy::default(),
         }
     }
 }

@@ -168,6 +168,11 @@ async fn main() -> Result<()> {
         // per-group `surface_thinking` flag on. Default-off keeps the
         // historical "drop on the floor" behaviour for existing groups.
         surface_thinking: cfg.surface_thinking,
+        // Tool authorization: scope every dispatch to the group's
+        // tool-profile (over the host-owned DISALLOWED_TOOLS floor).
+        // Sender role is not yet plumbed per-session, so the role floor
+        // is left unset here; the profile + floor are enforced today.
+        policy: copperclaw_runner::ToolPolicy::new(cfg.tool_profile, None),
     };
 
     tracing::info!(
@@ -284,6 +289,7 @@ mod build_provider_tests {
             codex_args: None,
             source_session_id: None,
             surface_thinking: false,
+            tool_profile: copperclaw_runner::ToolProfile::Full,
         }
     }
 

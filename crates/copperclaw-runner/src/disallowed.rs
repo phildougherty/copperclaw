@@ -1,34 +1,17 @@
-//! Disallowed built-in tool list (PLAN.md § 6 T5).
+//! Host-owned disallowed tool list (PLAN.md § 6 T5).
 //!
-//! These tools are owned by the host orchestrator and the runner must
-//! refuse them with a synthetic error result. The list is enforced at the
-//! runner's tool-dispatch layer (not by hiding the names from the model).
+//! This module is the historical home of the floor list. It is now a thin
+//! compatibility re-export: the canonical definitions live in
+//! [`crate::policy`], where they form layer 1 (the host-owned floor) of
+//! the layered [`crate::policy::ToolPolicy`] gate. Existing callers that
+//! import [`DISALLOWED_TOOLS`] / [`is_disallowed`] from here keep working.
 //!
 //! Note: `ask_user_question` is an MCP tool we own and is *allowed*. The
 //! disallow list targets the historical built-in tool name
 //! `AskUserQuestion` (pascal-case) — matching is case-sensitive on purpose
 //! so that the lower-case MCP variant remains usable.
 
-/// Built-in tool names the runner must refuse.
-pub const DISALLOWED_TOOLS: &[&str] = &[
-    "CronCreate",
-    "CronDelete",
-    "CronList",
-    "ScheduleWakeup",
-    "AskUserQuestion",
-    "EnterPlanMode",
-    "ExitPlanMode",
-    "EnterWorktree",
-    "ExitWorktree",
-];
-
-/// Returns `true` if `name` exactly matches a disallowed tool. Matching is
-/// case-sensitive: lower-case variants (e.g. our MCP `ask_user_question`)
-/// are *not* on the list.
-#[must_use]
-pub fn is_disallowed(name: &str) -> bool {
-    DISALLOWED_TOOLS.iter().any(|t| *t == name)
-}
+pub use crate::policy::{DISALLOWED_TOOLS, is_disallowed};
 
 #[cfg(test)]
 mod tests {
