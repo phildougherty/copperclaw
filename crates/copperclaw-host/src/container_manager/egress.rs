@@ -36,13 +36,38 @@
 //!
 //! ## What is enforced
 //!
-//! Enforcement lives in `copperclaw-container-rt` (see
-//! [`copperclaw_container_rt::EgressMode`]): under deny-default with an empty
-//! resolved allow-list bollard cuts the network entirely; with a non-empty
-//! list per-host filtering is deferred to a future netns + nftables pass.
-//! This module is purely the *policy resolution* half.
+//! Policy resolution is the *resolution* half (the [`resolve_allow_list`]
+//! family). Phase 0a v2 adds two enforcement layers on top, both built from
+//! the resolved allow-list and both gated on deny-default:
+//!
+//!   - **DNS filtering** ([`build_dns_filter_plan`]): the container's
+//!     `/etc/resolv.conf` is pinned to a filtering resolver that answers ONLY
+//!     the effective allow-listed names and NXDOMAINs everything else — so a
+//!     deny-default session can't exfiltrate via DNS labels to an arbitrary
+//!     resolver. Active whenever deny-default is on (the resolv.conf pin is a
+//!     read-only bind mount the runtime always applies).
+//!   - **nftables** (rules built by [`build_dns_filter_plan`] →
+//!     [`copperclaw_container_rt::NftPlan`]): a per-session drop-all-except-
+//!     allow-list ruleset. The construction is pure + tested; the privileged
+//!     `nft -f` apply against the session netns needs `CAP_NET_ADMIN` and the
+//!     container PID and is the deferred runtime path
+//!     (`spawn::apply_session_nftables`).
+//!
+//! The legacy bollard layer still applies: under deny-default with an *empty*
+//! resolved allow-list bollard cuts the network entirely (`network_mode:
+//! none`). See [`copperclaw_container_rt::EgressMode`].
 
 use copperclaw_container_rt::EgressMode;
+use copperclaw_container_rt::dns::{FilterResolverConfig, dnsmasq_conf, resolv_conf_contents};
+use copperclaw_container_rt::nftables::{NftApplyPlan, NftPlan};
+
+/// Filename of the per-session pinned `/etc/resolv.conf`, written into the
+/// session dir and bound read-only into the container under deny-default.
+pub const RESOLV_CONF_FILENAME: &str = "resolv.conf";
+
+/// Filename of the per-session DNS-filter resolver config (dnsmasq-style),
+/// written next to the resolv.conf for the filter sidecar to load.
+pub const DNSMASQ_CONF_FILENAME: &str = "dnsmasq.conf";
 
 /// Parse the operator-facing `COPPERCLAW_EGRESS_MODE` value into an
 /// [`EgressMode`]. Accepts `deny-default` / `deny` / `1` / `true` / `on`
@@ -235,6 +260,129 @@ pub fn resolve_allow_list(group_allow: &[String], base_url: Option<&str>) -> Vec
         }
     }
     out
+}
+
+/// Parse upstream nameservers out of a host `/etc/resolv.conf` document.
+///
+/// The DNS filter forwards *allowed* names to these upstreams (so the filter
+/// itself doesn't need to recurse). Returns the `nameserver` IPs in file
+/// order. A line is only treated as an upstream when its IP parses (so a
+/// pinned filter loopback line, or a malformed entry, doesn't poison the
+/// forward set). Pure — the caller reads the file.
+#[must_use]
+pub fn parse_resolv_conf_upstreams(content: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix("nameserver") else {
+            continue;
+        };
+        let ip = rest.trim();
+        // Only accept real IP literals as upstreams.
+        if ip.parse::<std::net::IpAddr>().is_ok() {
+            out.push(ip.to_string());
+        }
+    }
+    out
+}
+
+/// Choose the upstreams the DNS filter forwards allowed names to.
+///
+/// Reads the host's `/etc/resolv.conf` for `nameserver` lines, dropping any
+/// loopback entry (a loopback upstream would point the filter back at itself —
+/// a forwarding loop). When the host file yields no usable upstream, returns an
+/// empty list, which the filter config treats as "use the sidecar's system
+/// default". Pure: `resolv_conf_content` is the already-read host file (or
+/// `None` to skip reading it).
+#[must_use]
+pub fn filter_upstreams(resolv_conf_content: Option<&str>) -> Vec<String> {
+    let Some(content) = resolv_conf_content else {
+        return Vec::new();
+    };
+    parse_resolv_conf_upstreams(content)
+        .into_iter()
+        .filter(|ip| {
+            ip.parse::<std::net::IpAddr>()
+                .map(|a| !a.is_loopback())
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+/// The bytes a deny-default spawn writes to the session dir to enforce DNS
+/// filtering, plus the nftables apply plan for the session netns.
+///
+/// All three artifacts are derived purely from the resolved allow-list +
+/// upstreams via [`build_dns_filter_plan`]; writing them to disk + applying
+/// the nftables ruleset is the runtime path ([`crate::container_manager::ContainerManager`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DnsFilterPlan {
+    /// The pinned `/etc/resolv.conf` content (single filter nameserver, no
+    /// search domains).
+    pub resolv_conf: String,
+    /// The dnsmasq-style filter config (allow-list names → upstream, catch-all
+    /// → NXDOMAIN).
+    pub dnsmasq_conf: String,
+    /// The resolver config (allow names + listen address + upstreams).
+    pub resolver: FilterResolverConfig,
+    /// The per-session nftables apply plan (ruleset + argv). The privileged
+    /// apply is the deferred runtime path.
+    pub nft: NftApplyPlan,
+}
+
+/// Build the full deny-default DNS-filter + nftables plan from a spawn's
+/// resolved `host:port` allow-list.
+///
+/// `table` is the per-session nftables table name. `upstreams` are the
+/// resolvers the filter forwards allowed names to (see [`filter_upstreams`]).
+/// Pure — the caller persists the files + applies the ruleset. The resolver
+/// listens on its default loopback:53, which is what the resolv.conf is pinned
+/// to and what the nftables DNS carve-out allows.
+#[must_use]
+pub fn build_dns_filter_plan(
+    table: impl Into<String>,
+    allow: &[String],
+    upstreams: &[String],
+) -> DnsFilterPlan {
+    let resolver = FilterResolverConfig::from_allow_list(allow, upstreams);
+    let resolv_conf = resolv_conf_contents(&resolver.listen_ip, resolver.listen_port);
+    let dnsmasq = dnsmasq_conf(&resolver);
+    let nft_plan = NftPlan::from_allow_list(
+        table,
+        allow,
+        Some(&resolver.listen_ip),
+        resolver.listen_port,
+    );
+    DnsFilterPlan {
+        resolv_conf,
+        dnsmasq_conf: dnsmasq,
+        resolver,
+        nft: NftApplyPlan::new(&nft_plan),
+    }
+}
+
+/// Stable per-session nftables table name derived from the container name.
+///
+/// nftables identifiers can't contain `-`/`.`, so the container name
+/// (`copperclaw-<uuid>`) is sanitised to `[A-Za-z0-9_]`. Truncated to a safe
+/// length; the session UUID keeps it unique. Pure.
+#[must_use]
+pub fn nft_table_name(container_name: &str) -> String {
+    let sanitised: String = container_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    // nftables table names cap at 256 chars; ours are well under, but truncate
+    // defensively in case a future container name grows.
+    let truncated = if sanitised.len() > 200 {
+        sanitised[..200].to_string()
+    } else {
+        sanitised
+    };
+    format!("cc_eg_{truncated}")
 }
 
 #[cfg(test)]
@@ -554,5 +702,136 @@ mod tests {
             Some("http://localhost:11434"),
         );
         assert_eq!(resolved, group);
+    }
+
+    // --- Phase 0a v2: DNS filtering + nftables wiring ----------------------
+
+    #[test]
+    fn parse_resolv_conf_upstreams_extracts_nameservers_in_order() {
+        let content = "# comment\nnameserver 1.1.1.1\nsearch lan\nnameserver 8.8.8.8\n";
+        assert_eq!(
+            parse_resolv_conf_upstreams(content),
+            vec!["1.1.1.1".to_string(), "8.8.8.8".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_resolv_conf_upstreams_rejects_non_ip_and_comments() {
+        let content =
+            "; semicolon comment\nnameserver not-an-ip\noptions edns0\nnameserver 9.9.9.9\n";
+        assert_eq!(
+            parse_resolv_conf_upstreams(content),
+            vec!["9.9.9.9".to_string()]
+        );
+    }
+
+    #[test]
+    fn filter_upstreams_drops_loopback_to_avoid_forward_loop() {
+        // A loopback upstream would point the filter back at itself.
+        let content = "nameserver 127.0.0.1\nnameserver 1.1.1.1\nnameserver ::1\n";
+        assert_eq!(filter_upstreams(Some(content)), vec!["1.1.1.1".to_string()]);
+    }
+
+    #[test]
+    fn filter_upstreams_none_yields_empty() {
+        assert!(filter_upstreams(None).is_empty());
+        // All-loopback host file → empty (use sidecar default).
+        assert!(filter_upstreams(Some("nameserver 127.0.0.53\n")).is_empty());
+    }
+
+    #[test]
+    fn nft_table_name_sanitises_container_name() {
+        let t = nft_table_name("copperclaw-00000000-0000-0000-0000-000000000000");
+        // No dashes/dots; nftables-safe identifier with a stable prefix.
+        assert!(t.starts_with("cc_eg_"));
+        assert!(
+            t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "table name must be nftables-safe: {t}"
+        );
+        assert!(t.contains("copperclaw_00000000"));
+    }
+
+    #[test]
+    fn build_dns_filter_plan_pins_resolver_and_allows_only_listed_names() {
+        let allow = vec![
+            "api.anthropic.com:443".to_string(),
+            "db.local:5432".to_string(),
+            // IP literal: enforced by nftables daddr, NOT a DNS name.
+            "10.0.0.5:6000".to_string(),
+        ];
+        let plan = build_dns_filter_plan("cc_eg_s1", &allow, &["1.1.1.1".to_string()]);
+
+        // resolv.conf pins the single loopback filter nameserver, no search.
+        assert!(plan.resolv_conf.contains("nameserver 127.0.0.1\n"));
+        assert!(!plan.resolv_conf.contains("search "));
+
+        // dnsmasq answers ONLY the names, NXDOMAINs the rest, drops the IP.
+        assert!(
+            plan.dnsmasq_conf
+                .contains("server=/api.anthropic.com/1.1.1.1\n")
+        );
+        assert!(plan.dnsmasq_conf.contains("server=/db.local/1.1.1.1\n"));
+        assert!(
+            !plan.dnsmasq_conf.contains("server=/10.0.0.5/"),
+            "IP-literal allow entry must not become a DNS name"
+        );
+        assert!(plan.dnsmasq_conf.contains("address=/#/\n"));
+
+        // resolver config reflects the names only.
+        assert_eq!(
+            plan.resolver.allow_names,
+            vec!["api.anthropic.com".to_string(), "db.local".to_string()]
+        );
+
+        // nftables: default-deny + the DNS carve-out + the IP literal daddr +
+        // the name port-rules; teardown deletes the named table.
+        assert!(plan.nft.ruleset.contains("policy drop;"));
+        assert!(
+            plan.nft
+                .ruleset
+                .contains("ip daddr 127.0.0.1 udp dport 53 accept")
+        );
+        assert!(
+            plan.nft
+                .ruleset
+                .contains("ip daddr 10.0.0.5 tcp dport 6000 accept")
+        );
+        assert!(
+            plan.nft.ruleset.contains(
+                "tcp dport 443 accept comment \"allow api.anthropic.com (dns-filtered)\""
+            )
+        );
+        assert_eq!(plan.nft.apply_argv, vec!["nft", "-f", "-"]);
+        assert_eq!(
+            plan.nft.teardown_argv,
+            vec!["nft", "delete", "table", "inet", "cc_eg_s1"]
+        );
+    }
+
+    #[test]
+    fn build_dns_filter_plan_empty_allow_is_fully_closed() {
+        // Empty allow-list: the DNS filter answers nothing (closed), the
+        // nftables ruleset allows only DNS + loopback + established. This is
+        // the deny-default corner where even the model endpoint isn't injected.
+        let plan = build_dns_filter_plan("cc_eg_s2", &[], &[]);
+        assert!(plan.resolver.is_closed());
+        assert!(!plan.dnsmasq_conf.contains("server=/"));
+        // Only the DNS resolver tcp/53 accept (no destination allows).
+        assert_eq!(plan.nft.ruleset.matches("tcp dport").count(), 1);
+    }
+
+    #[test]
+    fn build_dns_filter_plan_is_deterministic() {
+        let a = build_dns_filter_plan(
+            "t",
+            &["b.com:443".to_string(), "a.com:443".to_string()],
+            &["1.1.1.1".to_string()],
+        );
+        let b = build_dns_filter_plan(
+            "t",
+            &["a.com:443".to_string(), "b.com:443".to_string()],
+            &["1.1.1.1".to_string()],
+        );
+        assert_eq!(a, b);
     }
 }

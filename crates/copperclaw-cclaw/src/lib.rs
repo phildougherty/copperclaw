@@ -926,6 +926,14 @@ where
             .get("model_endpoint")
             .and_then(serde_json::Value::as_str);
         let group_n = egress.get("groups").map_or(0, array_len);
+        let dns_filter = egress
+            .get("dns_filter")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let nft_status = egress
+            .get("nft_status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unsupported");
         let model_note = model.map_or_else(
             || {
                 " (no model endpoint auto-injected — ANTHROPIC_BASE_URL unset on the host)"
@@ -941,20 +949,35 @@ where
                 ),
             ));
         } else {
-            // deny-default is enforced as a network cut only for groups whose
-            // effective allow-list is empty; per-host filtering of non-empty
-            // lists is deferred to the netns+nftables pass. Warn (not fail):
-            // it's an intentional opt-in posture, but the operator should know
-            // the filtering caveat.
+            // deny-default (v2): DNS filtering is enforced (resolv.conf pinned
+            // to a resolver answering only the effective allow-list); the
+            // empty-allow `network_mode: none` cut is enforced; the per-session
+            // nftables L3/L4 ruleset is constructed and its privileged netns
+            // apply is gated on `nft_status`. Warn (not fail): it's an
+            // intentional opt-in posture, but the operator should know which
+            // layers are live vs. deferred.
+            let dns_note = if dns_filter {
+                "DNS filtering ON (resolv.conf pinned read-only to the filter resolver; the resolver answers only the allow-list and NXDOMAINs the rest — the filter-resolver sidecar is the runtime piece)"
+            } else {
+                "DNS filtering OFF"
+            };
+            let nft_note = match nft_status {
+                "available" => {
+                    "nftables ruleset constructed; netns apply deferred (needs container PID + CAP_NET_ADMIN)"
+                }
+                "tool-missing" => {
+                    "nftables NOT applied (`nft` not on host PATH); ruleset constructed"
+                }
+                _ => "nftables NOT applied (unsupported platform); ruleset constructed",
+            };
             checks.push(Check::warn(
                 "egress",
                 format!(
                     "egress mode: deny-default (opt-in){model_note}; {group_n} group(s). \
-                     bollard enforces a hard network cut only when a group's effective \
-                     allow-list is empty — per-host filtering of non-empty lists is deferred \
-                     to the netns+nftables pass and is NOT yet enforced"
+                     {dns_note}. {nft_note}. bollard hard-cuts the network when a group's \
+                     effective allow-list is empty"
                 ),
-                Some("`cclaw egress` shows each group's effective allow-list; set per-group entries with `cclaw groups config set-egress-allow`"),
+                Some("`cclaw egress` shows each group's effective allow-list; set per-group entries with `cclaw groups config set-egress-allow`. Install `nftables` + run the host with CAP_NET_ADMIN to enable L3/L4 filtering"),
             ));
         }
     }
@@ -2527,6 +2550,8 @@ mod tests {
             Ok(json!({
                 "mode": "deny-default",
                 "model_endpoint": "api.anthropic.com:443",
+                "dns_filter": true,
+                "nft_status": "available",
                 "groups": [{"agent_group_id": "ag-1", "effective_allow": ["api.anthropic.com:443"]}],
             })),
         ]);
@@ -2535,8 +2560,40 @@ mod tests {
         assert!(combined.contains("WARN"));
         assert!(combined.contains("egress"));
         assert!(combined.contains("deny-default"));
-        // The filtering-deferral caveat must be surfaced, not hidden.
+        // Phase 0a v2: the DNS-filter layer (enforced) must be surfaced.
+        assert!(
+            combined.contains("DNS filtering ON"),
+            "doctor must report DNS filtering status: {combined}"
+        );
+        // The nftables netns-apply deferral caveat must be surfaced, not hidden.
         assert!(combined.contains("deferred"));
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_egress_deny_default_nft_tool_missing() {
+        // When `nft` isn't on the host PATH, doctor must say the L3/L4 ruleset
+        // was constructed but NOT applied — never claim enforcement we lack.
+        let t = SequencedTransport::new(vec![
+            Ok(json!([{"id": "ag-1"}])),
+            Ok(json!([{"id": "w-1"}])),
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!({
+                "mode": "deny-default",
+                "model_endpoint": "api.anthropic.com:443",
+                "dns_filter": true,
+                "nft_status": "tool-missing",
+                "groups": [{"agent_group_id": "ag-1", "effective_allow": ["api.anthropic.com:443"]}],
+            })),
+        ]);
+        let out = run_cli(["cclaw", "doctor"], &t).await;
+        let combined = format!("{}{}", out.stdout, out.stderr);
+        assert!(combined.contains("DNS filtering ON"));
+        assert!(
+            combined.contains("nftables NOT applied"),
+            "doctor must NOT claim nftables enforcement when `nft` is missing: {combined}"
+        );
     }
 
     #[tokio::test]

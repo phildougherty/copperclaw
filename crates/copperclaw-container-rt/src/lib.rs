@@ -21,12 +21,16 @@ use thiserror::Error;
 
 pub mod apple;
 pub mod build;
+pub mod dns;
 pub mod docker;
+pub mod nftables;
 pub mod spec;
 
 pub use crate::apple::AppleContainerRuntime;
 pub use crate::build::{ExtraFile, ImageBuildSpec};
+pub use crate::dns::{FilterResolverConfig, dnsmasq_conf, resolv_conf_contents};
 pub use crate::docker::DockerRuntime;
+pub use crate::nftables::{NftApplyPlan, NftPlan, build_ruleset};
 pub use crate::spec::{ContainerHandle, ContainerSpec, EgressMode, Mount, ResourceLimits};
 
 /// Every fallible container-runtime call returns this.
