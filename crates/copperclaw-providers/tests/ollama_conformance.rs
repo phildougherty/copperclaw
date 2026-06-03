@@ -94,7 +94,8 @@ async fn ollama_simple_text_reply() {
             e,
             ProviderEvent::Usage {
                 input_tokens: 12,
-                output_tokens: 3
+                output_tokens: 3,
+                ..
             }
         )
     });
@@ -344,6 +345,7 @@ async fn ollama_usage_includes_token_counts() {
         ProviderEvent::Usage {
             input_tokens,
             output_tokens,
+            ..
         } => Some((*input_tokens, *output_tokens)),
         _ => None,
     });

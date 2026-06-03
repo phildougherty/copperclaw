@@ -14,7 +14,6 @@ use tokio::time::{sleep, timeout};
 use crate::disallowed::is_disallowed;
 
 use super::drive_turn::{LlmTurnOutput, PendingToolCall, TurnOutcome};
-use super::prompt::system_with_context;
 use super::{RunnerDeps, clear_current_tool, emit_usage_report, set_current_tool};
 
 /// Maximum number of `provider.query()` attempts (including the first)
@@ -70,15 +69,24 @@ pub(super) async fn run_llm_turn(
     previous_continuation: Option<&str>,
     context_block: Option<&str>,
 ) -> Result<LlmTurnOutput> {
-    let system = system_with_context(&deps.system, context_block);
     // Shrink the replayed transcript: stub stale, oversized tool-result
     // bodies (old file reads, command stdout, diffs) so they aren't
     // re-sent verbatim every turn. Recent results — including this turn's
     // — stay full, and the tool_use/tool_result pairing is preserved. The
     // persisted `state.history` is untouched (this is a send-time view).
     let history = crate::formatter::elide_stale_tool_results(history.to_vec(), &deps.elision);
+    // Hand the static system prompt and the volatile per-inbound context to
+    // the provider AS SEPARATE PARTS. The Anthropic provider places a cache
+    // breakpoint after the stable `system` and emits the volatile
+    // `system_context` only AFTER the transcript-tail breakpoint, so the
+    // cached prefix stays byte-stable across inbounds (a caching HIT instead
+    // of a per-turn MISS/rewrite). Non-caching providers flatten the two
+    // back via `QueryInput::combined_system`, so their request bytes are
+    // unchanged (same `\n\n` join the runner used to do inline here).
+    let system_context = context_block.filter(|b| !b.is_empty()).map(str::to_string);
     let input = QueryInput {
-        system,
+        system: deps.system.clone(),
+        system_context,
         model: deps.model.clone(),
         effort: deps.effort,
         previous_continuation: previous_continuation.map(str::to_string),
@@ -239,12 +247,28 @@ pub(super) async fn pump_events(
             ProviderEvent::Usage {
                 input_tokens: it,
                 output_tokens: ot,
+                cache_read_tokens: cr,
+                cache_creation_tokens: cc,
             } => {
                 if it > 0 {
                     input_tokens = it;
                 }
                 if ot > 0 {
                     output_tokens = ot;
+                }
+                // Surface cache hits/writes for cost observability. A
+                // non-zero `cr` means the prompt-caching prefix HIT this
+                // turn (cached input billed at ~10% of the base rate);
+                // `cc` is the premium-billed write that primes later hits.
+                // Logged at debug so a single `RUST_LOG=…=debug` run can
+                // confirm the breakpoints are landing without a schema
+                // change.
+                if cr > 0 || cc > 0 {
+                    tracing::debug!(
+                        cache_read_tokens = cr,
+                        cache_creation_tokens = cc,
+                        "prompt cache usage"
+                    );
                 }
             }
             ProviderEvent::Result { text } => {
@@ -919,6 +943,8 @@ mod tests {
             ProviderEvent::Usage {
                 input_tokens: 5,
                 output_tokens: 0,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
             },
             ProviderEvent::Result {
                 text: Some("hello".into()),

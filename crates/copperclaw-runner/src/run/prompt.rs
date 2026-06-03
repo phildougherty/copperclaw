@@ -130,28 +130,6 @@ pub(super) fn render_conversation_context(
     Some(block)
 }
 
-/// Append a rendered conversation-context block to the static system
-/// prompt. Returns the combined string the provider call should use.
-/// When `block` is `None` or empty, returns `system` clone-equivalent
-/// so the caller never has to special-case the empty path.
-#[must_use]
-pub(super) fn system_with_context(system: &str, block: Option<&str>) -> String {
-    match block {
-        Some(b) if !b.is_empty() => {
-            if system.is_empty() {
-                b.to_string()
-            } else {
-                // Two newlines so the block reads as its own paragraph
-                // regardless of whether the base system prompt ends in
-                // one trailing newline already.
-                let trimmed = system.trim_end_matches('\n');
-                format!("{trimmed}\n\n{b}")
-            }
-        }
-        _ => system.to_string(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,26 +259,6 @@ mod tests {
     }
 
     #[test]
-    fn system_with_context_appends_when_block_present() {
-        let combined = system_with_context(
-            "you are helpful",
-            Some("Conversation context: this turn is in a direct conversation on cli."),
-        );
-        assert!(combined.starts_with("you are helpful"));
-        assert!(combined.contains("Conversation context:"));
-        // Paragraph break between persona and context.
-        assert!(combined.contains("\n\n"));
-    }
-
-    #[test]
-    fn system_with_context_empty_block_returns_original() {
-        let combined = system_with_context("you are helpful", None);
-        assert_eq!(combined, "you are helpful");
-        let combined = system_with_context("you are helpful", Some(""));
-        assert_eq!(combined, "you are helpful");
-    }
-
-    #[test]
     fn dm_with_reply_to_surfaces_both_signals() {
         // Channel populated `is_group=Some(false)` (a DM) and
         // `reply_to=Some(...)` (the user replied to an earlier message).
@@ -400,9 +358,185 @@ mod tests {
         );
     }
 
+    /// End-to-end guard for the prompt-caching fix: drive TWO successive
+    /// inbounds through the REAL `render_conversation_context` and the REAL
+    /// Anthropic request-build path, then assert the cached prefix the
+    /// provider emits (static system block + tools + the prior-transcript
+    /// blocks up to the transcript-tail breakpoint) is BYTE-IDENTICAL
+    /// across the two turns — even though the volatile conversation-context
+    /// paragraph differs between them (turn 2 has a deeper history, so
+    /// `render_conversation_context` produces a different "N prior entries"
+    /// clause).
+    ///
+    /// This replaces the earlier provider-only stability test that fed a
+    /// static system string straight in: that gave FALSE confidence because
+    /// the volatile per-turn context never flowed through the path under
+    /// test. Here the context is produced by the genuine renderer and placed
+    /// into `QueryInput::system_context` exactly as `run::run_llm_turn` does,
+    /// so a regression that folds it back into the cached system block (the
+    /// original v1 bug) would flip this test red.
     #[test]
-    fn system_with_context_empty_system_returns_just_block() {
-        let combined = system_with_context("", Some("Conversation context: x."));
-        assert_eq!(combined, "Conversation context: x.");
+    fn cached_prefix_stable_across_two_real_inbounds_despite_changing_context() {
+        use copperclaw_providers::anthropic::build_request_body_for_model;
+        use copperclaw_providers::{HistoryMessage, QueryInput, ToolDef};
+
+        // The static system prompt + tool catalogue the runner holds across
+        // the whole session (RunnerDeps::system / ::tools).
+        const STATIC_SYSTEM: &str = "you are a large stable persona + skills preamble";
+        let tools = vec![
+            ToolDef {
+                name: "read_file".into(),
+                description: "read a file".into(),
+                input_schema: serde_json::json!({ "type": "object" }),
+            },
+            ToolDef {
+                name: "shell".into(),
+                description: "run a shell command".into(),
+                input_schema: serde_json::json!({ "type": "object" }),
+            },
+        ];
+
+        // Build one QueryInput the way `run::run_llm_turn` does: static
+        // system in `system`, the rendered volatile block in
+        // `system_context`, on a Claude model so the caching gate fires.
+        let make_input = |history: Vec<HistoryMessage>, context: Option<String>| QueryInput {
+            system: STATIC_SYSTEM.to_string(),
+            system_context: context.filter(|c| !c.is_empty()),
+            model: "claude-sonnet-4-6".into(),
+            history,
+            tools: tools.clone(),
+            ..QueryInput::default()
+        };
+
+        // Turn 1: one inbound, two prior history entries.
+        let rows1 = vec![row(MessageKind::Chat, Some("cli"), Some("p1"), None)];
+        let history1 = vec![
+            HistoryMessage::User {
+                content: "first question".into(),
+            },
+            HistoryMessage::Assistant {
+                content: "first answer".into(),
+            },
+            HistoryMessage::User {
+                content: "second question".into(),
+            },
+        ];
+        let ctx1 = render_conversation_context(&rows1, history1.len());
+        let body1 = build_request_body_for_model(&make_input(history1.clone(), ctx1.clone()));
+
+        // Turn 2: the same transcript grown by one exchange, so the rendered
+        // context reports a DIFFERENT history depth — the realistic live
+        // case where the per-turn context paragraph changes every inbound.
+        let mut history2 = history1.clone();
+        history2.push(HistoryMessage::Assistant {
+            content: "second answer".into(),
+        });
+        history2.push(HistoryMessage::User {
+            content: "third question".into(),
+        });
+        let rows2 = vec![row(MessageKind::Chat, Some("cli"), Some("p1"), None)];
+        let ctx2 = render_conversation_context(&rows2, history2.len());
+        let body2 = build_request_body_for_model(&make_input(history2, ctx2.clone()));
+
+        // The renderer really did produce different volatile context across
+        // the two turns (different "N prior entries" clause).
+        assert_ne!(
+            ctx1, ctx2,
+            "the rendered conversation-context must differ between the two turns"
+        );
+
+        // System block + tools are byte-identical across turns.
+        assert_eq!(
+            serde_json::to_vec(&body1["system"]).unwrap(),
+            serde_json::to_vec(&body2["system"]).unwrap(),
+            "static system block (incl. its cache breakpoint) must be byte-stable"
+        );
+        assert_eq!(
+            serde_json::to_vec(&body1["tools"]).unwrap(),
+            serde_json::to_vec(&body2["tools"]).unwrap(),
+            "tools array (incl. its tail breakpoint) must be byte-stable"
+        );
+        // The volatile context must NOT have leaked into the cached system
+        // block (the v1 bug). The system is a single static text block.
+        let sys1 = body1["system"].as_array().expect("system is a block array");
+        assert_eq!(sys1.len(), 1);
+        assert!(
+            !sys1[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Conversation context"),
+            "volatile context must stay OUT of the cached system block"
+        );
+
+        // Turn 1's cached message prefix (everything up to and including its
+        // transcript-tail breakpoint, with the volatile context block that
+        // follows the breakpoint dropped) must be a byte-stable PREFIX of
+        // turn 2's flattened messages — that is exactly the condition under
+        // which Anthropic's longest-prefix cache match HITS on turn 2.
+        let cached1 = cached_message_prefix(&body1);
+        let turn2_blocks = flatten_message_blocks(&body2);
+        assert!(!cached1.is_empty(), "the cached prefix must span something");
+        assert!(
+            turn2_blocks.starts_with(&cached1),
+            "turn 1's cached message prefix must be a byte-stable prefix of \
+             turn 2's messages (cache HIT); cached1.len()={}, turn2.len()={}",
+            cached1.len(),
+            turn2_blocks.len(),
+        );
+
+        // And the volatile context block sits AFTER the breakpoint (outside
+        // the cached span) and differs across the two turns.
+        let last1 = body1["messages"].as_array().unwrap().last().unwrap();
+        let vol1 = last1["content"].as_array().unwrap().last().unwrap();
+        assert!(
+            vol1.get("cache_control").is_none(),
+            "the volatile context block must not carry a breakpoint"
+        );
+        assert_eq!(vol1["text"], ctx1.unwrap());
+        let last2 = body2["messages"].as_array().unwrap().last().unwrap();
+        let vol2 = last2["content"].as_array().unwrap().last().unwrap();
+        assert_eq!(vol2["text"], ctx2.unwrap());
+        assert_ne!(vol1["text"], vol2["text"]);
+    }
+
+    /// Flatten a body's `messages` into the `[role, block]` sequence
+    /// Anthropic concatenates for cache-prefix matching, with every
+    /// `cache_control` marker stripped so two turns compare on stable bytes.
+    fn flatten_message_blocks(body: &serde_json::Value) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        for msg in body["messages"].as_array().unwrap() {
+            let role = msg["role"].clone();
+            for block in msg["content"].as_array().unwrap() {
+                let mut b = block.clone();
+                if let Some(o) = b.as_object_mut() {
+                    o.remove("cache_control");
+                }
+                out.push(json!([role.clone(), b]));
+            }
+        }
+        out
+    }
+
+    /// Turn-1 cached message prefix: the flattened `[role, block]` sequence
+    /// up to AND INCLUDING the block carrying the transcript-tail
+    /// `cache_control`. Everything after it (the volatile context block) is
+    /// dropped — it is outside the cached span.
+    fn cached_message_prefix(body: &serde_json::Value) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        'outer: for msg in body["messages"].as_array().unwrap() {
+            let role = msg["role"].clone();
+            for block in msg["content"].as_array().unwrap() {
+                let has_bp = block.get("cache_control").is_some();
+                let mut b = block.clone();
+                if let Some(o) = b.as_object_mut() {
+                    o.remove("cache_control");
+                }
+                out.push(json!([role.clone(), b]));
+                if has_bp {
+                    break 'outer;
+                }
+            }
+        }
+        out
     }
 }
