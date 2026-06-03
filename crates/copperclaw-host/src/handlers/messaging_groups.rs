@@ -26,8 +26,11 @@ pub fn create(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> 
         .get("is_group")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let unknown_sender_policy =
-        opt_str(args, "unknown_sender_policy").unwrap_or_else(|| "strict".to_owned());
+    // Secure-by-default for DMs: an unknown sender's first message is gated
+    // (a pairing code is minted; the message is held pending) until an
+    // operator approves. The caller may override with an explicit policy.
+    let unknown_sender_policy = opt_str(args, "unknown_sender_policy")
+        .unwrap_or_else(|| messaging_groups::DEFAULT_UNKNOWN_SENDER_POLICY.to_owned());
     let row = messaging_groups::upsert(
         central,
         messaging_groups::UpsertMessagingGroup {
@@ -165,11 +168,29 @@ mod tests {
             &json!({
                 "channel_type": "telegram",
                 "platform_id": "p3",
-                "unknown_sender_policy": "request_approval",
+                "unknown_sender_policy": "open",
             }),
             &db,
         )
         .unwrap();
+        assert_eq!(v["unknown_sender_policy"], "open");
+    }
+
+    #[test]
+    fn create_defaults_to_approval_required() {
+        // Secure-by-default: a messaging group created without an explicit
+        // policy must require approval for unknown senders, not silently
+        // allow them. Pins the wired `DEFAULT_UNKNOWN_SENDER_POLICY`.
+        let db = db();
+        let v = create(
+            &json!({"channel_type": "telegram", "platform_id": "dm-1"}),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(
+            v["unknown_sender_policy"],
+            messaging_groups::DEFAULT_UNKNOWN_SENDER_POLICY
+        );
         assert_eq!(v["unknown_sender_policy"], "request_approval");
     }
 }

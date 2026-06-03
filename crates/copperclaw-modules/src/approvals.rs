@@ -125,6 +125,18 @@ pub struct NewPendingCtx {
 /// dispatched asynchronously via the [`DeliveryDispatcher`].
 pub type NewPendingNotifier = Arc<dyn Fn(NewPendingCtx, Arc<dyn DeliveryDispatcher>) + Send + Sync>;
 
+/// Callback invoked by the approvals gate when an unknown sender lands in
+/// pending, so the host can mint a DM pairing code and deliver it *back to
+/// that sender* through the ordinary outbound path. Distinct from
+/// [`NewPendingNotifier`], which notifies the *operator* on the agent
+/// group's primary channel. Both fire on the same gate event; either may be
+/// wired independently.
+///
+/// Called synchronously on the router's hot path (same constraints as
+/// [`NewPendingNotifier`]): mint + dispatch must be cheap, and the dispatch
+/// itself fans the adapter work out to a background task.
+pub type PairingNotifier = Arc<dyn Fn(NewPendingCtx, Arc<dyn DeliveryDispatcher>) + Send + Sync>;
+
 /// Approvals module.
 pub struct ApprovalsModule {
     /// In-memory pending list, fed by the host via `record_pending` calls.
@@ -137,6 +149,10 @@ pub struct ApprovalsModule {
     /// Optional callback fired the first time a new sender hits pending.
     /// Wired by the host at boot to post an in-channel "approve?" prompt.
     new_pending_notifier: Option<NewPendingNotifier>,
+    /// Optional callback fired when an unknown sender hits pending. Wired by
+    /// the host at boot to mint a DM pairing code and deliver it back to the
+    /// sender. Independent of `new_pending_notifier`.
+    pairing_notifier: Option<PairingNotifier>,
     /// Dispatcher captured via `on_delivery_adapter_ready`; used by the
     /// gate closure to post notifications without blocking the router.
     dispatcher: Arc<Mutex<Option<Arc<dyn DeliveryDispatcher>>>>,
@@ -155,6 +171,7 @@ impl ApprovalsModule {
             known_senders: Arc::new(Mutex::new(Vec::new())),
             persistent_lookup: None,
             new_pending_notifier: None,
+            pairing_notifier: None,
             dispatcher: Arc::new(Mutex::new(None)),
         }
     }
@@ -171,6 +188,7 @@ impl ApprovalsModule {
             known_senders: Arc::new(Mutex::new(senders)),
             persistent_lookup: None,
             new_pending_notifier: None,
+            pairing_notifier: None,
             dispatcher: Arc::new(Mutex::new(None)),
         }
     }
@@ -191,6 +209,15 @@ impl ApprovalsModule {
     #[must_use]
     pub fn with_new_pending_notifier(mut self, notifier: NewPendingNotifier) -> Self {
         self.new_pending_notifier = Some(notifier);
+        self
+    }
+
+    /// Builder: attach a pairing notifier that fires when an unknown sender
+    /// is placed in pending. The host wires this to mint a DM pairing code
+    /// and deliver it back to the sender via the [`DeliveryDispatcher`].
+    #[must_use]
+    pub fn with_pairing_notifier(mut self, notifier: PairingNotifier) -> Self {
+        self.pairing_notifier = Some(notifier);
         self
     }
 
@@ -367,6 +394,7 @@ impl Module for ApprovalsModule {
         let known = Arc::clone(&self.known_senders);
         let persistent = self.persistent_lookup.clone();
         let notifier = self.new_pending_notifier.clone();
+        let pairing = self.pairing_notifier.clone();
         let dispatcher_slot = Arc::clone(&self.dispatcher);
 
         ctx.set_sender_scope_gate(Arc::new(move |s: SenderScopeCtx| {
@@ -392,11 +420,12 @@ impl Module for ApprovalsModule {
                     return SenderScopeDecision::Defer;
                 }
             }
-            // Sender is unknown. Fire the new-pending notifier if one is
-            // registered and a dispatcher is available. The notifier is
-            // responsible for de-duplicating via the DB upsert's
-            // `newly_inserted` flag so this hot path stays cheap.
-            if let Some(ref notify) = notifier {
+            // Sender is unknown. Fire the new-pending notifier and the
+            // pairing notifier if registered and a dispatcher is available.
+            // Both are responsible for their own de-duplication / rate
+            // limiting so this hot path stays cheap. The dispatcher lock is
+            // taken once and the same handle handed to both callbacks.
+            if notifier.is_some() || pairing.is_some() {
                 if let Some(ref dispatcher) = *dispatcher_slot.lock().unwrap() {
                     let ctx_info = NewPendingCtx {
                         sender: sender.clone(),
@@ -404,7 +433,12 @@ impl Module for ApprovalsModule {
                         messaging_group_id: s.messaging_group_id,
                         first_seen: Utc::now(),
                     };
-                    notify(ctx_info, Arc::clone(dispatcher));
+                    if let Some(ref notify) = notifier {
+                        notify(ctx_info.clone(), Arc::clone(dispatcher));
+                    }
+                    if let Some(ref pair) = pairing {
+                        pair(ctx_info, Arc::clone(dispatcher));
+                    }
                 }
             }
             SenderScopeDecision::Pending(format!(
@@ -885,6 +919,81 @@ mod tests {
         assert_eq!(c.agent_group_id, ag_id);
         assert_eq!(c.messaging_group_id, Some(mg_id));
         assert_eq!(c.sender.identity, "T-7");
+    }
+
+    #[tokio::test]
+    async fn pairing_notifier_fires_for_unknown_sender() {
+        use crate::context::MockDispatcher;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pair_calls = Arc::new(AtomicUsize::new(0));
+        let pair_calls2 = Arc::clone(&pair_calls);
+        let pairing: PairingNotifier = Arc::new(move |ctx, dispatcher| {
+            pair_calls2.fetch_add(1, Ordering::SeqCst);
+            // Deliver the (synthetic) code back to the sender's own channel.
+            let target = DispatchTarget::channel(
+                ctx.sender.channel_type.clone(),
+                ctx.sender.identity.clone(),
+                None,
+            );
+            let msg = OutboundMessage {
+                kind: MessageKind::Chat,
+                content: serde_json::json!({"text": "your pairing code is ABCDEFGH"}),
+                files: vec![],
+            };
+            dispatcher.dispatch(&target, &msg);
+        });
+
+        let m = ApprovalsModule::new().with_pairing_notifier(pairing);
+        let ctx = MockModuleContext::new();
+        m.install(ctx.clone()).await.unwrap();
+        let mock_dispatcher = MockDispatcher::new();
+        let d: Arc<dyn DeliveryDispatcher> = mock_dispatcher.clone();
+        ctx.fire_delivery_ready(&d);
+
+        let gate = ctx.sender_scope_gates.lock().unwrap()[0].clone();
+        let decision = (gate)(SenderScopeCtx {
+            event_sender: Some(unknown_sender("telegram", "u-pair")),
+            messaging_group_id: None,
+            agent_group_id: AgentGroupId::new(),
+            resolved_user: None,
+        });
+        assert!(decision.is_pending());
+        assert_eq!(pair_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(mock_dispatcher.dispatched_count(), 1);
+        // The code was delivered to the sender's own channel.
+        let dispatched = mock_dispatcher.dispatched.lock().unwrap();
+        let (target, _msg) = &dispatched[0];
+        assert_eq!(target.platform_id.as_deref(), Some("u-pair"));
+    }
+
+    #[tokio::test]
+    async fn pairing_notifier_does_not_fire_for_known_sender() {
+        use crate::context::MockDispatcher;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pair_calls = Arc::new(AtomicUsize::new(0));
+        let pair_calls2 = Arc::clone(&pair_calls);
+        let pairing: PairingNotifier = Arc::new(move |_ctx, _d| {
+            pair_calls2.fetch_add(1, Ordering::SeqCst);
+        });
+        let sender = unknown_sender("slack", "U-known");
+        let m = ApprovalsModule::new().with_pairing_notifier(pairing);
+        m.approve_sender(sender.clone());
+        let ctx = MockModuleContext::new();
+        m.install(ctx.clone()).await.unwrap();
+        let d: Arc<dyn DeliveryDispatcher> = MockDispatcher::new();
+        ctx.fire_delivery_ready(&d);
+
+        let gate = ctx.sender_scope_gates.lock().unwrap()[0].clone();
+        let decision = (gate)(SenderScopeCtx {
+            event_sender: Some(sender),
+            messaging_group_id: None,
+            agent_group_id: AgentGroupId::new(),
+            resolved_user: None,
+        });
+        assert!(decision.is_defer());
+        assert_eq!(pair_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

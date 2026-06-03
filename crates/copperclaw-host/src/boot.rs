@@ -155,6 +155,110 @@ fn build_pending_notifier(central: copperclaw_db::central::CentralDb) -> NewPend
     })
 }
 
+/// Notice text prefixed to a freshly minted DM pairing code. Plain ASCII
+/// (project "no emojis" rule). Delivered back to the *sender* through the
+/// same outbound delivery path adapters render for ordinary chat messages —
+/// not a card variant.
+const PAIRING_NOTICE: &str = concat!(
+    "You are not yet approved to talk to this assistant.\n",
+    "Share this one-time pairing code with the operator to be approved:",
+);
+
+/// Build the closure wired to [`ApprovalsModule::with_pairing_notifier`].
+///
+/// Fires synchronously inside the router's sender-scope gate the moment an
+/// unknown sender is seen. It:
+///
+/// 1. De-dupes against `unregistered_senders` (same as the operator notifier)
+///    so a sender that keeps messaging doesn't mint a fresh code on every
+///    inbound — only the first contact mints.
+/// 2. Mints an 8-char, 1h, rate-limited (3/channel) code via
+///    [`copperclaw_db::tables::dm_pairing_codes::mint`]. A rate-limit hit is
+///    logged and the inbound still lands in pending (the operator can still
+///    approve out-of-band via `cclaw approvals approve`).
+/// 3. Delivers the code text **back to the sender's own DM channel** with a
+///    plain `MessageKind::Chat` `{"text": ...}` payload — the exact shape
+///    every adapter renders today — via the [`DeliveryDispatcher`].
+fn build_pairing_notifier(
+    central: copperclaw_db::central::CentralDb,
+) -> copperclaw_modules::PairingNotifier {
+    Arc::new(move |ctx: NewPendingCtx, dispatcher| {
+        // De-dupe on first contact only. The `unregistered_senders` row is
+        // written by the router AFTER the gate returns, so absence means this
+        // is the sender's first ever contact and the only time we mint.
+        let already_seen = copperclaw_db::tables::unregistered_senders::get(
+            &central,
+            &ctx.sender.channel_type,
+            &ctx.sender.identity,
+        )
+        .ok()
+        .flatten()
+        .is_some();
+        if already_seen {
+            return;
+        }
+
+        let minted = copperclaw_db::tables::dm_pairing_codes::mint(
+            &central,
+            copperclaw_db::tables::dm_pairing_codes::MintPairingCode {
+                channel_type: ctx.sender.channel_type.clone(),
+                identity: ctx.sender.identity.clone(),
+                display_name: ctx.sender.display_name.clone(),
+                agent_group_id: Some(ctx.agent_group_id),
+                messaging_group_id: ctx.messaging_group_id,
+            },
+            chrono::Utc::now(),
+        );
+        let code = match minted {
+            Ok(c) => c,
+            Err(copperclaw_db::tables::dm_pairing_codes::MintError::RateLimited {
+                channel_type,
+                active,
+            }) => {
+                tracing::warn!(
+                    channel_type = channel_type.as_str(),
+                    active,
+                    identity = ctx.sender.identity.as_str(),
+                    "pairing: rate limit hit; not minting a new code for this sender"
+                );
+                return;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    identity = ctx.sender.identity.as_str(),
+                    "pairing: failed to mint pairing code; skipping"
+                );
+                return;
+            }
+        };
+
+        // Deliver the code back to the sender's own DM channel. The sender's
+        // `identity` IS the platform id of their DM with the bot.
+        let text = format!(
+            "{notice}\n\n{code}\n\nThis code expires in 1 hour.",
+            notice = PAIRING_NOTICE,
+            code = code.code,
+        );
+        let target = copperclaw_modules::DispatchTarget::channel(
+            ctx.sender.channel_type.clone(),
+            ctx.sender.identity.clone(),
+            None,
+        );
+        let message = copperclaw_types::OutboundMessage {
+            kind: copperclaw_types::MessageKind::Chat,
+            content: serde_json::json!({"text": text}),
+            files: vec![],
+        };
+        dispatcher.dispatch(&target, &message);
+        tracing::info!(
+            channel_type = ctx.sender.channel_type.as_str(),
+            identity = ctx.sender.identity.as_str(),
+            "pairing: minted and delivered DM pairing code to sender"
+        );
+    })
+}
+
 /// Boot-time errors that abort startup.
 ///
 /// Maps onto the exit codes documented in the brief:
@@ -437,7 +541,8 @@ pub async fn install_modules(host_ctx: Arc<HostContext>, data_root: PathBuf) {
                         .is_some()
                 })
             })
-            .with_new_pending_notifier(build_pending_notifier(host_ctx.central().clone())),
+            .with_new_pending_notifier(build_pending_notifier(host_ctx.central().clone()))
+            .with_pairing_notifier(build_pairing_notifier(host_ctx.central().clone())),
         ),
         Box::new(InteractiveModule::default()),
         Box::new(SchedulingModule::with_store(Arc::new(
@@ -1786,5 +1891,165 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // build_pairing_notifier tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pairing_notifier_mints_and_delivers_code_to_sender() {
+        use copperclaw_db::tables::dm_pairing_codes;
+        use copperclaw_modules::DeliveryDispatcher;
+        use copperclaw_modules::context::MockDispatcher;
+        use copperclaw_types::{ChannelType, SenderIdentity};
+
+        let db = copperclaw_db::central::CentralDb::open_in_memory().unwrap();
+        let notifier = build_pairing_notifier(db.clone());
+
+        let mock = MockDispatcher::new();
+        let dispatcher: Arc<dyn DeliveryDispatcher> = mock.clone();
+        let ctx = NewPendingCtx {
+            sender: SenderIdentity {
+                channel_type: ChannelType::new("telegram"),
+                identity: "u-pair".into(),
+                display_name: Some("Alice".into()),
+            },
+            agent_group_id: copperclaw_types::AgentGroupId::new(),
+            messaging_group_id: None,
+            first_seen: chrono::Utc::now(),
+        };
+        notifier(ctx, dispatcher);
+
+        // A real row was persisted.
+        let codes = dm_pairing_codes::list(&db, None).unwrap();
+        assert_eq!(codes.len(), 1, "exactly one code minted");
+        let minted = &codes[0];
+        assert_eq!(minted.code.len(), 8, "code is 8 chars");
+        assert_eq!(minted.identity, "u-pair");
+
+        // The code was delivered back to the SENDER's own DM channel as a
+        // plain Chat {"text": ...} message — the shape adapters render.
+        assert_eq!(mock.dispatched_count(), 1);
+        let sent = mock.dispatched.lock().unwrap();
+        let (target, msg) = &sent[0];
+        assert_eq!(
+            target.channel_type.as_ref().map(ChannelType::as_str),
+            Some("telegram")
+        );
+        assert_eq!(target.platform_id.as_deref(), Some("u-pair"));
+        assert_eq!(msg.kind, copperclaw_types::MessageKind::Chat);
+        let text = msg.content.get("text").unwrap().as_str().unwrap();
+        assert!(
+            text.contains(&minted.code),
+            "delivered text carries the code"
+        );
+        assert!(text.is_ascii(), "no emojis: {text}");
+    }
+
+    #[test]
+    fn pairing_notifier_skips_repeat_sender() {
+        use copperclaw_db::tables::dm_pairing_codes;
+        use copperclaw_db::tables::unregistered_senders::{
+            UpsertUnregisteredSender, upsert as upsert_unreg,
+        };
+        use copperclaw_modules::DeliveryDispatcher;
+        use copperclaw_modules::context::MockDispatcher;
+        use copperclaw_types::{ChannelType, SenderIdentity};
+
+        let db = copperclaw_db::central::CentralDb::open_in_memory().unwrap();
+        let ct = ChannelType::new("slack");
+        // Mark the sender as already seen so the notifier de-dupes.
+        upsert_unreg(
+            &db,
+            UpsertUnregisteredSender {
+                channel_type: ct.clone(),
+                platform_id: "U-repeat".into(),
+                user_id: None,
+                sender_name: None,
+                reason: "scope_pending".into(),
+                messaging_group_id: None,
+                agent_group_id: None,
+            },
+        )
+        .unwrap();
+
+        let notifier = build_pairing_notifier(db.clone());
+        let mock = MockDispatcher::new();
+        let dispatcher: Arc<dyn DeliveryDispatcher> = mock.clone();
+        notifier(
+            NewPendingCtx {
+                sender: SenderIdentity {
+                    channel_type: ct,
+                    identity: "U-repeat".into(),
+                    display_name: None,
+                },
+                agent_group_id: copperclaw_types::AgentGroupId::new(),
+                messaging_group_id: None,
+                first_seen: chrono::Utc::now(),
+            },
+            dispatcher,
+        );
+        assert_eq!(mock.dispatched_count(), 0, "repeat sender: no delivery");
+        assert!(
+            dm_pairing_codes::list(&db, None).unwrap().is_empty(),
+            "repeat sender: no code minted"
+        );
+    }
+
+    #[test]
+    fn pairing_notifier_honours_rate_limit_per_channel() {
+        use copperclaw_db::tables::dm_pairing_codes::{self, MAX_ACTIVE_CODES_PER_CHANNEL};
+        use copperclaw_modules::DeliveryDispatcher;
+        use copperclaw_modules::context::MockDispatcher;
+        use copperclaw_types::{ChannelType, SenderIdentity};
+
+        let db = copperclaw_db::central::CentralDb::open_in_memory().unwrap();
+        let notifier = build_pairing_notifier(db.clone());
+        let mock = MockDispatcher::new();
+
+        // Fill the telegram channel to its cap via the notifier itself
+        // (distinct first-contact senders each mint one code).
+        for i in 0..MAX_ACTIVE_CODES_PER_CHANNEL {
+            let dispatcher: Arc<dyn DeliveryDispatcher> = mock.clone();
+            notifier(
+                NewPendingCtx {
+                    sender: SenderIdentity {
+                        channel_type: ChannelType::new("telegram"),
+                        identity: format!("u-{i}"),
+                        display_name: None,
+                    },
+                    agent_group_id: copperclaw_types::AgentGroupId::new(),
+                    messaging_group_id: None,
+                    first_seen: chrono::Utc::now(),
+                },
+                dispatcher,
+            );
+        }
+        assert_eq!(mock.dispatched_count(), MAX_ACTIVE_CODES_PER_CHANNEL);
+
+        // One more telegram sender: rate-limited, so no mint and no delivery.
+        let dispatcher: Arc<dyn DeliveryDispatcher> = mock.clone();
+        notifier(
+            NewPendingCtx {
+                sender: SenderIdentity {
+                    channel_type: ChannelType::new("telegram"),
+                    identity: "u-overflow".into(),
+                    display_name: None,
+                },
+                agent_group_id: copperclaw_types::AgentGroupId::new(),
+                messaging_group_id: None,
+                first_seen: chrono::Utc::now(),
+            },
+            dispatcher,
+        );
+        assert_eq!(
+            mock.dispatched_count(),
+            MAX_ACTIVE_CODES_PER_CHANNEL,
+            "rate-limited sender must not deliver a new code"
+        );
+        let active =
+            dm_pairing_codes::list(&db, Some(dm_pairing_codes::PairingStatus::Active)).unwrap();
+        assert_eq!(active.len(), MAX_ACTIVE_CODES_PER_CHANNEL);
     }
 }
