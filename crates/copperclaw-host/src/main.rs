@@ -33,6 +33,7 @@
 #![forbid(unsafe_code)]
 
 use clap::{Parser, Subcommand};
+use copperclaw_host::log_redact::RedactingMakeWriter;
 use copperclaw_host::{HostConfig, boot, config, daemon, run_host};
 use std::process::ExitCode;
 use tokio_util::sync::CancellationToken;
@@ -124,13 +125,15 @@ async fn main() -> ExitCode {
             let file_appender = tracing_appender::rolling::daily(dir, "host.log");
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
-            // Fan-out: stderr + rolling file.
+            // Fan-out: stderr + rolling file. Both writers are wrapped in a
+            // secret-redacting `MakeWriter` so provider keys / bearer tokens
+            // never reach `copperclaw.log` or an interactive stderr capture.
             let stderr_layer = tracing_subscriber::fmt::layer()
                 .with_ansi(use_ansi)
-                .with_writer(std::io::stderr);
+                .with_writer(RedactingMakeWriter::new(std::io::stderr));
             let file_layer = tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_writer(non_blocking);
+                .with_writer(RedactingMakeWriter::new(non_blocking));
 
             tracing_subscriber::registry()
                 .with(tracing_subscriber::EnvFilter::new(&cfg.log_filter))
@@ -176,9 +179,11 @@ async fn main() -> ExitCode {
 /// Install the stderr-only tracing subscriber (the default path when
 /// `COPPERCLAW_LOG_DIR` is not set).
 fn setup_stderr_only(cfg: &HostConfig, use_ansi: bool) {
+    // Wrap stderr so secrets are scrubbed before any log line is written —
+    // the same redaction the file/stderr fan-out path applies.
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(&cfg.log_filter))
-        .with_writer(std::io::stderr)
+        .with_writer(RedactingMakeWriter::new(std::io::stderr))
         .with_ansi(use_ansi)
         .init();
 }

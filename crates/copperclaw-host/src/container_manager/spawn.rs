@@ -121,6 +121,43 @@ pub fn check_heartbeat_deadline_alignment(
     ))
 }
 
+/// Tighten a session directory to owner-only (`0700`). Best-effort and a
+/// no-op on non-unix targets; a failure is logged at `warn!` rather than
+/// aborting the spawn, because a slightly-too-loose dir is preferable to a
+/// group going dark over a chmod hiccup (e.g. the host doesn't own the path).
+/// Set explicitly on every spawn so the permission is enforced regardless of
+/// the host's umask.
+fn harden_dir_0700(path: &std::path::Path) {
+    set_mode(path, 0o700, "session directory");
+}
+
+/// Tighten a secret-bearing session file to owner read/write (`0600`).
+/// Same best-effort, umask-independent contract as [`harden_dir_0700`].
+fn harden_file_0600(path: &std::path::Path) {
+    set_mode(path, 0o600, "session config file");
+}
+
+/// Shared chmod helper for the session-dir hardening. `#[cfg(unix)]`-gated;
+/// on non-unix it consumes the args and returns so callers stay portable.
+fn set_mode(path: &std::path::Path, mode: u32, what: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(err) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+            warn!(
+                ?err,
+                path = %path.display(),
+                mode = format!("{mode:o}"),
+                "could not tighten {what} permissions"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode, what);
+    }
+}
+
 impl ContainerManager {
     /// Try to spawn a container for `session`. Returns `Ok(true)` when
     /// a container was actually spawned (i.e. pending work was found
@@ -139,6 +176,12 @@ impl ContainerManager {
         }
         let paths = SessionPaths::new(&self.cfg.data_dir, session.agent_group_id, session.id);
         paths.ensure_dirs().map_err(ManagerError::Io)?;
+        // Harden the session dir to owner-only (`0700`) explicitly rather
+        // than relying on the host's umask — the dir holds the session DBs,
+        // attachments, and `runner.json` (provider + model config). Set it on
+        // every spawn so a dir created under a permissive umask by an older
+        // host (or restored from a backup) gets tightened on the next tick.
+        harden_dir_0700(&paths.root);
 
         if !Self::has_pending_inbound(&paths)? {
             return Ok(false);
@@ -199,8 +242,12 @@ impl ContainerManager {
         let runner_cfg =
             self.runner_config_for(session, cfg_row.as_ref(), Some(paths.root.as_path()));
         let runner_json = serde_json::to_vec_pretty(&runner_cfg).map_err(ManagerError::Json)?;
-        std::fs::write(paths.root.join(RUNNER_CONFIG_FILENAME), runner_json)
-            .map_err(ManagerError::Io)?;
+        let runner_cfg_path = paths.root.join(RUNNER_CONFIG_FILENAME);
+        std::fs::write(&runner_cfg_path, runner_json).map_err(ManagerError::Io)?;
+        // `runner.json` carries the provider/model config the runner reads on
+        // boot. Lock it to owner read/write (`0600`) explicitly, not via
+        // umask, so a permissive default can't leave it group/world-readable.
+        harden_file_0600(&runner_cfg_path);
 
         // Image rebuild gate (Top 10 #1 / M13).  Compute the fingerprint of
         // the rebuild-relevant config fields.  If the stored fingerprint
@@ -931,6 +978,44 @@ mod tests {
     use copperclaw_db::tables::sessions::{CreateSession, create as create_session};
     use copperclaw_types::{ContainerStatus, SessionId};
     use std::path::PathBuf;
+
+    /// `harden_dir_0700` sets a session directory to owner-only `0700`
+    /// regardless of the mode it was created with — proving the perms are
+    /// enforced explicitly, not left to the host umask.
+    #[cfg(unix)]
+    #[test]
+    fn harden_dir_sets_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("sess");
+        std::fs::create_dir(&dir).unwrap();
+        // Start deliberately loose.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        harden_dir_0700(&dir);
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o700,
+            "session dir must be tightened to 0700, got {mode:o}"
+        );
+    }
+
+    /// `harden_file_0600` locks a secret-bearing session file to owner
+    /// read/write `0600`, again independent of the creating umask.
+    #[cfg(unix)]
+    #[test]
+    fn harden_file_sets_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("runner.json");
+        std::fs::write(&path, b"{}").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        harden_file_0600(&path);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "session config file must be tightened to 0600, got {mode:o}"
+        );
+    }
 
     /// Backoff is empty on construction: every group is allowed to
     /// rebuild immediately.
