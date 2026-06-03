@@ -16,12 +16,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bollard::Docker;
+use bollard::container::InspectContainerOptions;
 use bollard::container::{
     Config, CreateContainerOptions, ListContainersOptions, LogsOptions, RemoveContainerOptions,
     StopContainerOptions,
 };
 use bollard::image::BuildImageOptions;
-use bollard::models::{DeviceRequest, HostConfig, Mount as DockerMount, MountTypeEnum};
+use bollard::models::{
+    ContainerInspectResponse, DeviceRequest, HostConfig, Mount as DockerMount, MountTypeEnum,
+};
 use bytes::Bytes;
 use futures::stream::StreamExt;
 
@@ -122,7 +125,24 @@ impl ContainerRuntime for DockerRuntime {
             .await
             .map_err(|e| RtError::Container(format!("start container {name}: {e}")))?;
 
-        Ok(ContainerHandle::new(create.id, name))
+        // Surface the host-visible PID of the container's main process so the
+        // deny-default egress apply has a netns target (`nsenter -t <pid> -n
+        // nft -f -`). Best-effort: a failed/empty inspect degrades to a handle
+        // with `host_pid: None` rather than failing the spawn — the host then
+        // reports the egress apply as deferred (no target) instead of guessing
+        // a PID. We inspect by name (just started, so it resolves) and read
+        // `State.Pid`; `pid_from_inspect` normalises Docker's not-running PID 0
+        // (and any non-positive value) to `None`.
+        let host_pid = match self
+            .docker
+            .inspect_container(&name, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(info) => pid_from_inspect(&info),
+            Err(_) => None,
+        };
+
+        Ok(ContainerHandle::new(create.id, name).with_host_pid(host_pid))
     }
 
     async fn stop(&self, name: &str, grace: Duration) -> Result<(), RtError> {
@@ -255,9 +275,49 @@ impl ContainerRuntime for DockerRuntime {
         }
         Ok(buf)
     }
+
+    async fn container_pid(&self, name: &str) -> Result<Option<i32>, RtError> {
+        match self
+            .docker
+            .inspect_container(name, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(info) => Ok(pid_from_inspect(&info)),
+            // A 404 = the container is gone; report "no PID" rather than
+            // erroring so a caller probing a since-removed session degrades
+            // cleanly.
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(None),
+            Err(e) => Err(RtError::Container(format!(
+                "inspect container {name} pid: {e}"
+            ))),
+        }
+    }
 }
 
 // ---- pure translation helpers ------------------------------------------
+
+/// Extract the host-visible main-process PID from a Docker
+/// [`ContainerInspectResponse`] (`State.Pid`).
+///
+/// Returns `None` when the response has no `State`, no `Pid`, or a
+/// non-positive `Pid`. Docker reports `Pid: 0` for a created-but-not-running
+/// container, which is never a valid `nsenter --target` — folding it to `None`
+/// keeps the privileged egress apply honest (no target ⇒ deferred, not a wild
+/// `nsenter -t 0`). The `i64`→`i32` narrowing is safe: Linux PIDs are bounded
+/// by `/proc/sys/kernel/pid_max` (≤ 2^22 by default, ≤ 2^31 absolute max), so a
+/// real PID always fits; an out-of-range value (corrupt response) folds to
+/// `None` rather than wrapping to a bogus target. Pure, so it is unit-tested
+/// against a constructed inspect response without a daemon.
+#[must_use]
+pub(crate) fn pid_from_inspect(info: &ContainerInspectResponse) -> Option<i32> {
+    let pid = info.state.as_ref()?.pid?;
+    if pid <= 0 {
+        return None;
+    }
+    i32::try_from(pid).ok()
+}
 
 /// Translate a [`ContainerSpec`] into a bollard [`Config`].
 ///
@@ -1142,6 +1202,67 @@ mod tests {
             RtError::Container(msg) => assert!(msg.contains("USTAR path"), "{msg}"),
             other => panic!("expected Container, got {other:?}"),
         }
+    }
+
+    // ---- host-PID surfacing (deny-default egress netns target) ----------
+
+    #[test]
+    fn pid_from_inspect_reads_state_pid() {
+        // A running container's inspect carries State.Pid — the host-visible
+        // PID the deny-default egress apply targets via `nsenter -t <pid>`.
+        let info = ContainerInspectResponse {
+            state: Some(bollard::models::ContainerState {
+                pid: Some(4242),
+                running: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(pid_from_inspect(&info), Some(4242));
+    }
+
+    #[test]
+    fn pid_from_inspect_zero_pid_is_none() {
+        // Docker reports Pid 0 for a created-but-not-running container — never
+        // a valid netns target, so it must surface as None (deferred apply),
+        // never a wild `nsenter -t 0`.
+        let info = ContainerInspectResponse {
+            state: Some(bollard::models::ContainerState {
+                pid: Some(0),
+                running: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(pid_from_inspect(&info), None);
+    }
+
+    #[test]
+    fn pid_from_inspect_missing_state_or_pid_is_none() {
+        // No State at all.
+        assert_eq!(pid_from_inspect(&ContainerInspectResponse::default()), None);
+        // State present but no Pid field.
+        let info = ContainerInspectResponse {
+            state: Some(bollard::models::ContainerState {
+                pid: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(pid_from_inspect(&info), None);
+    }
+
+    #[test]
+    fn pid_from_inspect_deserialised_from_docker_json() {
+        // The exact wire shape `docker inspect` returns (`{"State":{"Pid":...}}`)
+        // must deserialise into the response and yield the PID — this is the
+        // mocked-inspect-response path the task calls out.
+        let json = serde_json::json!({
+            "Id": "deadbeef",
+            "State": { "Status": "running", "Running": true, "Pid": 31337 }
+        });
+        let info: ContainerInspectResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(pid_from_inspect(&info), Some(31337));
     }
 
     #[test]
