@@ -40,6 +40,7 @@ pub mod budgets;
 pub mod classify;
 pub mod config;
 pub mod egress;
+pub mod mcp_tools;
 pub mod mount_guard;
 pub mod prompt;
 pub mod provider_failover;

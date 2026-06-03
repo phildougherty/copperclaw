@@ -25,7 +25,7 @@ pub mod filter;
 pub mod server;
 pub mod tools;
 
-pub use client::{FilteredMcpClient, McpClient, RemoteTool, SharedMcpClient};
+pub use client::{FilteredMcpClient, McpClient, McpToolTransport, RemoteTool, SharedMcpClient};
 pub use context::{
     AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec, EditMessageSpec,
     EmitTodoListSpec, InstallSpec, MemoryHitView, MemorySearchSpec, MockToolContext,
