@@ -183,6 +183,7 @@ async fn summarise(
 ) -> Result<String> {
     let input = QueryInput {
         system: SUMMARY_SYSTEM_PROMPT.into(),
+        system_context: None,
         model: cfg.summary_model.clone(),
         effort: cfg.summary_effort,
         previous_continuation: None,

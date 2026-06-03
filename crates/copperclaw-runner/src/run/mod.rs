@@ -2357,6 +2357,7 @@ mod tests {
     fn dummy_input() -> QueryInput {
         QueryInput {
             system: "sys".into(),
+            system_context: None,
             model: "m".into(),
             effort: Effort::Medium,
             previous_continuation: None,

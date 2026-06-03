@@ -178,6 +178,9 @@ pub async fn run_inner_loop(
         // workload the subagent does.
         let input = QueryInput {
             system: system.clone(),
+            // Subagents prepend their full prompt into `system`; there is
+            // no per-inbound conversation-context paragraph here.
+            system_context: None,
             model: deps.model.to_string(),
             effort: deps.effort,
             previous_continuation: None,

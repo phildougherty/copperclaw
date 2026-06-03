@@ -252,6 +252,17 @@ fn mark_messages_tail(messages: &mut [Value]) {
     }
 }
 
+/// Build the exact request-body JSON [`AnthropicProvider::query`] would
+/// POST for `input`, with the prompt-caching gate derived from the model
+/// the same way `query` derives it ([`is_anthropic_family_model`]). Public
+/// so callers (and cross-crate tests) can inspect the wire shape — in
+/// particular to verify the cached prefix is byte-stable across turns —
+/// without standing up an HTTP mock. Does NOT send anything.
+#[must_use]
+pub fn build_request_body_for_model(input: &QueryInput) -> Value {
+    build_request_body(input, is_anthropic_family_model(&input.model))
+}
+
 /// Build the request body. `caching` is the gate computed by the caller
 /// from [`is_anthropic_family_model`]: when `false` the body is byte-for-byte
 /// the pre-caching shape (no `cache_control` anywhere, system stays a plain
@@ -262,8 +273,19 @@ fn build_request_body(input: &QueryInput, caching: bool) -> Value {
     // block of the last message so the entire growing prefix caches across
     // turns. The new content each turn lands AFTER this breakpoint, keeping
     // the cached span byte-stable turn over turn.
+    //
+    // ORDER MATTERS: stamp the breakpoint on the STABLE transcript tail
+    // FIRST, then append the volatile conversation-context AFTER it. The
+    // context block thus lands one position past the breakpoint and never
+    // enters any cached prefix — that is the whole point of holding it out
+    // of the system block. (Non-caching path: the context is folded into
+    // the plain-string `system` by `build_system`/`combined_system`, so we
+    // skip the message-append entirely to keep those bytes unchanged.)
     if caching {
         mark_messages_tail(&mut messages);
+        if let Some(ctx) = input.system_context.as_deref().filter(|c| !c.is_empty()) {
+            append_context_to_last_user_message(&mut messages, ctx);
+        }
     }
     let mut body = json!({
         "model": input.model,
@@ -272,23 +294,8 @@ fn build_request_body(input: &QueryInput, caching: bool) -> Value {
         "messages": messages,
     });
     let obj = body.as_object_mut().expect("json object");
-    if !input.system.is_empty() {
-        // Breakpoint 2 (when caching): the system prompt. It is large and
-        // stable, so it caches as a structured single-block array with a
-        // trailing breakpoint. Without caching we keep the plain-string
-        // form for an identical pre-caching request shape.
-        if caching {
-            obj.insert(
-                "system".into(),
-                json!([{
-                    "type": "text",
-                    "text": input.system,
-                    "cache_control": ephemeral_cache_control(),
-                }]),
-            );
-        } else {
-            obj.insert("system".into(), Value::String(input.system.clone()));
-        }
+    if let Some(system) = build_system(input, caching) {
+        obj.insert("system".into(), system);
     }
     if let Some(temp) = input.temperature {
         obj.insert("temperature".into(), json!(temp));
@@ -319,6 +326,82 @@ fn build_request_body(input: &QueryInput, caching: bool) -> Value {
         copperclaw_types::Effort::Medium => {}
     }
     body
+}
+
+/// Build the `system` field of the request body, returning `None` when
+/// there is nothing to send.
+///
+/// Non-caching path: emit a single plain string — the static system and
+/// the volatile conversation-context flattened by
+/// [`QueryInput::combined_system`]. This is byte-identical to the
+/// pre-split shape (the runner used to hand us the already-concatenated
+/// string), so non-Anthropic gateways see exactly the same bytes.
+///
+/// Caching path: emit Anthropic's system-ARRAY form carrying ONLY the
+/// STATIC system prompt as a single block with a trailing
+/// `cache_control` breakpoint. The volatile conversation-context does
+/// NOT go here — it is appended to the last user message AFTER the
+/// transcript-tail breakpoint (see [`build_request_body`]). Keeping the
+/// system block byte-stable is what makes BOTH the system breakpoint AND
+/// the transcript-tail breakpoint (whose cached prefix spans
+/// `tools + system + prior messages`) actually hit across turns: if any
+/// volatile text lived in `system`, the messages-prefix that the
+/// transcript breakpoint caches would shift every inbound and miss.
+fn build_system(input: &QueryInput, caching: bool) -> Option<Value> {
+    if !caching {
+        let combined = input.combined_system();
+        if combined.is_empty() {
+            return None;
+        }
+        return Some(Value::String(combined));
+    }
+
+    if input.system.is_empty() {
+        return None;
+    }
+    Some(json!([{
+        "type": "text",
+        "text": input.system,
+        "cache_control": ephemeral_cache_control(),
+    }]))
+}
+
+/// Append the volatile conversation-context as a trailing `text` block on
+/// the LAST user message, placed strictly AFTER the transcript-tail
+/// `cache_control` breakpoint so it never perturbs the cached prefix.
+///
+/// Ordering contract (caching path): [`build_request_body`] calls this
+/// only AFTER [`mark_messages_tail`] has stamped the breakpoint on the
+/// last block of the last message — so the freshly-pushed context block
+/// becomes the new final block, sitting one position past the breakpoint.
+/// The cached span (`tools + system + every block up to and including the
+/// breakpoint`) is therefore byte-stable turn-over-turn even though this
+/// context paragraph changes on (almost) every inbound.
+///
+/// When the transcript ends on an assistant turn, or on a user message
+/// that already holds `tool_result` blocks (mixing text with those would
+/// trip the same strict-gateway rule `push_block` guards against), the
+/// context goes into a FRESH trailing user message instead — still after
+/// the breakpoint, still outside the cached span.
+fn append_context_to_last_user_message(messages: &mut Vec<Value>, context: &str) {
+    let block = json!({ "type": "text", "text": context });
+    if let Some(last) = messages.last_mut() {
+        if last.get("role").and_then(Value::as_str) == Some("user") {
+            if let Some(arr) = last.get_mut("content").and_then(Value::as_array_mut) {
+                // Don't mix a text block into a tool_result-bearing user
+                // message — keep them in separate user messages exactly as
+                // `push_block` does for the transcript proper.
+                if !would_mix_tool_result_and_text(arr, &block) {
+                    arr.push(block);
+                    return;
+                }
+            }
+        }
+    }
+    // The transcript ends on an assistant turn (or a tool_result user
+    // message): append a fresh user message carrying just the context so
+    // it still lands after the breakpoint and outside the cached prefix.
+    messages.push(json!({ "role": "user", "content": [block] }));
 }
 
 fn tools_to_json(tools: &[ToolDef], caching: bool) -> Vec<Value> {
@@ -918,9 +1001,16 @@ mod tests {
     // ----- prompt caching -------------------------------------------------
 
     /// Build a representative multi-turn input: system + tools + a couple
-    /// of transcript turns. `model` selects the caching gate.
+    /// of transcript turns. `model` selects the caching gate. Carries a
+    /// volatile `system_context` so the tests exercise the static/volatile
+    /// split that keeps the cached prefix stable.
     fn caching_fixture(model: &str) -> QueryInput {
         let mut q = QueryInput::new("you are a large stable system prompt", model);
+        q.system_context = Some(
+            "Conversation context: this turn is in a direct conversation on cli; \
+                  3 prior entries in session history."
+                .into(),
+        );
         q.tools.push(ToolDef {
             name: "read_file".into(),
             description: "read a file".into(),
@@ -995,13 +1085,23 @@ mod tests {
         let q = caching_fixture("claude-sonnet-4-6");
         let body = build_request_body(&q, true);
 
-        // System prompt becomes a single-block array with a trailing
-        // breakpoint (was a plain string in the non-caching shape).
+        // System prompt becomes a single STATIC block with a trailing
+        // breakpoint. The volatile conversation-context is NOT here — it
+        // moves into the last user message after the transcript breakpoint
+        // (asserted below) so it can never perturb the cached prefix.
         let system = body["system"].as_array().expect("system is a block array");
-        assert_eq!(system.len(), 1);
+        assert_eq!(system.len(), 1, "only the static system block lives here");
         assert_eq!(system[0]["type"], "text");
         assert_eq!(system[0]["text"], "you are a large stable system prompt");
         assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+        // The volatile context must not have leaked into the system block.
+        assert!(
+            !system[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Conversation context"),
+            "volatile context must not be in the cached system block"
+        );
 
         // Tools: only the LAST tool carries the breakpoint.
         let tools = body["tools"].as_array().unwrap();
@@ -1009,11 +1109,27 @@ mod tests {
         assert!(tools[0].get("cache_control").is_none());
         assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
 
-        // Transcript: only the last block of the last message is marked.
+        // Transcript tail: the original last user message ("second
+        // question") carries the breakpoint, and the volatile context was
+        // appended as a SUBSEQUENT block on the same user message WITHOUT a
+        // breakpoint — so the breakpoint marks the stable block and the
+        // volatile text lands strictly after it.
         let messages = body["messages"].as_array().unwrap();
         let last = messages.last().unwrap();
+        assert_eq!(last["role"], "user");
         let blocks = last["content"].as_array().unwrap();
-        assert_eq!(blocks.last().unwrap()["cache_control"]["type"], "ephemeral");
+        assert_eq!(
+            blocks.len(),
+            2,
+            "stable question block + volatile context block"
+        );
+        assert_eq!(blocks[0]["text"], "second question");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(blocks[1]["text"], q.system_context.as_deref().unwrap());
+        assert!(
+            blocks[1].get("cache_control").is_none(),
+            "volatile context block must NOT carry a breakpoint"
+        );
         // An earlier message must NOT carry a breakpoint.
         let first = &messages[0];
         let first_blocks = first["content"].as_array().unwrap();
@@ -1030,29 +1146,50 @@ mod tests {
         let q = caching_fixture("deepseek/deepseek-r1");
         let body = build_request_body(&q, false);
 
-        // System stays a plain string (pre-caching shape, no unknown field).
+        // System stays a plain string (pre-caching shape, no unknown field):
+        // the static system and the volatile context flattened back into one
+        // string exactly as the pre-split runner produced it.
         assert!(body["system"].is_string());
-        assert_eq!(body["system"], "you are a large stable system prompt");
+        assert_eq!(body["system"], q.combined_system());
+        assert_eq!(
+            body["system"],
+            "you are a large stable system prompt\n\n\
+             Conversation context: this turn is in a direct conversation on cli; \
+             3 prior entries in session history."
+        );
         // No cache_control anywhere — a strict gateway would reject it.
         assert_eq!(count_cache_control(&body), 0);
+        // The volatile context is NOT appended as a separate message block on
+        // the non-caching path (it lives in the flat system string instead),
+        // so the last user message still has exactly its original one block.
+        let messages = body["messages"].as_array().unwrap();
+        let last = messages.last().unwrap();
+        assert_eq!(last["content"].as_array().unwrap().len(), 1);
+        assert_eq!(last["content"][0]["text"], "second question");
         // Tools are present but unmarked.
         let tools = body["tools"].as_array().unwrap();
         assert!(tools.iter().all(|t| t.get("cache_control").is_none()));
     }
 
     #[test]
-    fn cached_prefix_bytes_are_stable_across_turns() {
-        // Two successive turns that share the same prior history (turn 2
-        // appends a new user message AFTER the prior transcript). The cached
-        // prefix — the system block, the tools array, and every transcript
-        // message up to the turn-1 tail — must be byte-identical so the
-        // cache actually hits. We assert it by serializing the stable
-        // portions of each body and comparing the raw bytes.
+    fn cached_prefix_bytes_are_stable_across_turns_even_when_context_differs() {
+        // Two successive turns. Turn 2 grows the transcript AND carries a
+        // DIFFERENT volatile conversation-context (its history depth and
+        // batch shape changed — the realistic live case). The cached prefix
+        // — the static system block, the tools array, and every transcript
+        // block up to and including turn-1's tail breakpoint — must be
+        // byte-identical so the cache HITS, despite the context differing.
         let turn1 = caching_fixture("claude-sonnet-4-6");
         let body1 = build_request_body(&turn1, true);
 
-        // Turn 2: identical history plus one appended user message.
+        // Turn 2: the prior transcript plus one appended exchange, AND a
+        // changed volatile context (different history-depth phrasing).
         let mut turn2 = turn1.clone();
+        turn2.system_context = Some(
+            "Conversation context: this turn is in a direct conversation on cli; \
+             5 prior entries in session history."
+                .into(),
+        );
         turn2.history.push(HistoryMessage::Assistant {
             content: "second answer".into(),
         });
@@ -1061,11 +1198,15 @@ mod tests {
         });
         let body2 = build_request_body(&turn2, true);
 
-        // System + tools are stable verbatim across turns.
+        // Sanity: the volatile context really did differ between the turns.
+        assert_ne!(turn1.system_context, turn2.system_context);
+
+        // System + tools are stable verbatim across turns (the volatile
+        // context lives in the messages, never the system block).
         assert_eq!(
             serde_json::to_vec(&body1["system"]).unwrap(),
             serde_json::to_vec(&body2["system"]).unwrap(),
-            "system block (incl. its breakpoint) must be byte-stable"
+            "static system block (incl. its breakpoint) must be byte-stable"
         );
         assert_eq!(
             serde_json::to_vec(&body1["tools"]).unwrap(),
@@ -1073,22 +1214,82 @@ mod tests {
             "tools array (incl. its tail breakpoint) must be byte-stable"
         );
 
-        // The transcript PREFIX is everything turn 1 sent EXCEPT its tail
-        // breakpoint. In turn 2 those same messages appear with no
-        // breakpoint (the breakpoint has moved to turn 2's new tail). Strip
-        // the turn-1 tail breakpoint and compare the prefix messages.
-        let msgs1 = body1["messages"].as_array().unwrap();
-        let msgs2 = body2["messages"].as_array().unwrap();
-        assert!(msgs2.len() > msgs1.len());
-        let mut prefix1: Vec<Value> = msgs1.clone();
-        strip_all_cache_control(&mut prefix1);
-        let mut prefix2: Vec<Value> = msgs2[..msgs1.len()].to_vec();
-        strip_all_cache_control(&mut prefix2);
-        assert_eq!(
-            serde_json::to_vec(&prefix1).unwrap(),
-            serde_json::to_vec(&prefix2).unwrap(),
-            "the shared transcript prefix must be byte-stable across turns"
+        // Turn 1 WROTE a cache spanning everything up to and including its
+        // tail breakpoint (the "second question" block) — excluding the
+        // volatile context block, which lands AFTER the breakpoint and so
+        // is outside the cached span. For the cache to HIT on turn 2, that
+        // exact byte sequence must be a PREFIX of turn 2's serialized
+        // message blocks. Anthropic matches the longest common prefix, so
+        // "prefix of turn 2" is the precise correctness condition.
+        let cached1 = cached_message_prefix(&body1);
+        let turn2_blocks = flatten_message_blocks(&body2);
+        assert!(
+            turn2_blocks.starts_with(&cached1),
+            "turn 1's cached message prefix must be a byte-stable prefix of \
+             turn 2's messages so the cache hits; cached1.len()={}, \
+             turn2.len()={}",
+            cached1.len(),
+            turn2_blocks.len(),
         );
+        assert!(
+            !cached1.is_empty(),
+            "the cached prefix must be non-empty (the cache must actually span something)"
+        );
+
+        // And the volatile context block itself DID change between turns —
+        // proving the variation is real and that it lives strictly past the
+        // breakpoint (i.e. it never entered the cached prefix asserted above).
+        let ctx1 = volatile_context_block(&body1);
+        let ctx2 = volatile_context_block(&body2);
+        assert_ne!(
+            ctx1, ctx2,
+            "the volatile context block must differ across the two turns"
+        );
+    }
+
+    /// Flatten a body's `messages` into the sequence of (role, block) pairs
+    /// the way Anthropic concatenates them for cache-prefix matching, with
+    /// every `cache_control` marker stripped so two turns can be compared on
+    /// their stable content alone. Each element is `[role, block]`.
+    fn flatten_message_blocks(body: &Value) -> Vec<Value> {
+        let mut out: Vec<Value> = Vec::new();
+        for msg in body["messages"].as_array().unwrap() {
+            let role = msg["role"].clone();
+            for block in msg["content"].as_array().unwrap() {
+                let mut b = block.clone();
+                strip_all_cache_control(std::slice::from_mut(&mut b));
+                out.push(json!([role.clone(), b]));
+            }
+        }
+        out
+    }
+
+    /// Turn 1's cached message prefix: the flattened (role, block) sequence
+    /// up to AND INCLUDING the block carrying the transcript-tail
+    /// `cache_control`. Everything after it (the volatile context block) is
+    /// dropped — it is outside the cached span.
+    fn cached_message_prefix(body: &Value) -> Vec<Value> {
+        let mut out: Vec<Value> = Vec::new();
+        'outer: for msg in body["messages"].as_array().unwrap() {
+            let role = msg["role"].clone();
+            for block in msg["content"].as_array().unwrap() {
+                let has_bp = block.get("cache_control").is_some();
+                let mut b = block.clone();
+                strip_all_cache_control(std::slice::from_mut(&mut b));
+                out.push(json!([role.clone(), b]));
+                if has_bp {
+                    break 'outer; // nothing past the breakpoint is cached
+                }
+            }
+        }
+        out
+    }
+
+    /// The volatile conversation-context block: the trailing text block on
+    /// the last user message that carries no `cache_control`.
+    fn volatile_context_block(body: &Value) -> Value {
+        let last = body["messages"].as_array().unwrap().last().unwrap();
+        last["content"].as_array().unwrap().last().unwrap().clone()
     }
 
     /// Recursively drop every `cache_control` key so two bodies can be

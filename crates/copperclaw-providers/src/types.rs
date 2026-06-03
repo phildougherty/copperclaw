@@ -72,8 +72,23 @@ pub enum HistoryMessage {
 /// + field assignment or via [`QueryInput::new`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryInput {
-    /// System prompt prepended to every turn.
+    /// Static system prompt prepended to every turn. This is the
+    /// persona / skills / safety preamble assembled once at runner
+    /// startup — it does NOT vary turn-to-turn, which is what makes it
+    /// the stable prefix the Anthropic provider can cache (see
+    /// [`Self::system_context`] for the volatile counterpart).
     pub system: String,
+    /// Optional volatile system addendum — the per-inbound
+    /// "Conversation context" paragraph (venue shape, batch size,
+    /// history depth, …) that changes on (almost) every turn. Held
+    /// separate from [`Self::system`] so a caching provider can place a
+    /// cache breakpoint AFTER the stable system prompt but BEFORE this
+    /// volatile text, keeping the cached prefix byte-stable across
+    /// inbounds. Providers that don't cache flatten the two back into
+    /// one system string via [`Self::combined_system`], so the request
+    /// they emit is byte-identical to the pre-split shape.
+    #[serde(default)]
+    pub system_context: Option<String>,
     /// Provider-native model identifier (e.g. `claude-sonnet-4-6`).
     pub model: String,
     /// Tier-of-effort hint.
@@ -99,6 +114,7 @@ impl Default for QueryInput {
     fn default() -> Self {
         Self {
             system: String::new(),
+            system_context: None,
             model: String::new(),
             effort: Effort::Medium,
             previous_continuation: None,
@@ -122,6 +138,31 @@ impl QueryInput {
             ..Self::default()
         }
     }
+
+    /// Flatten [`Self::system`] (stable) and [`Self::system_context`]
+    /// (volatile) back into the single system string that every
+    /// non-caching provider sends on the wire. The concatenation is
+    /// byte-identical to the pre-split runner join the runner used to
+    /// perform inline before handing us one combined `system` string:
+    /// a `\n\n` paragraph break between persona and context, the static
+    /// system's trailing newlines trimmed first so the gap is always
+    /// exactly one blank line. When the context is absent/empty this
+    /// returns the static system verbatim; when the static system is
+    /// empty it returns just the context.
+    #[must_use]
+    pub fn combined_system(&self) -> String {
+        match self.system_context.as_deref() {
+            Some(ctx) if !ctx.is_empty() => {
+                if self.system.is_empty() {
+                    ctx.to_string()
+                } else {
+                    let trimmed = self.system.trim_end_matches('\n');
+                    format!("{trimmed}\n\n{ctx}")
+                }
+            }
+            _ => self.system.clone(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -132,6 +173,7 @@ mod tests {
     fn default_query_input() {
         let q = QueryInput::default();
         assert_eq!(q.system, "");
+        assert!(q.system_context.is_none());
         assert_eq!(q.model, "");
         assert_eq!(q.effort, Effort::Medium);
         assert!(q.previous_continuation.is_none());
@@ -214,6 +256,7 @@ mod tests {
     fn query_input_full_serde() {
         let q = QueryInput {
             system: "S".into(),
+            system_context: Some("CTX".into()),
             model: "M".into(),
             effort: Effort::High,
             previous_continuation: Some("c1".into()),
@@ -233,6 +276,7 @@ mod tests {
         let s = serde_json::to_string(&q).unwrap();
         let back: QueryInput = serde_json::from_str(&s).unwrap();
         assert_eq!(back.system, "S");
+        assert_eq!(back.system_context.as_deref(), Some("CTX"));
         assert_eq!(back.model, "M");
         assert_eq!(back.effort, Effort::High);
         assert_eq!(back.previous_continuation.as_deref(), Some("c1"));
@@ -242,5 +286,44 @@ mod tests {
         assert!((back.temperature.unwrap() - 0.7).abs() < 1e-6);
         assert_eq!(back.assistant_name.as_deref(), Some("Claude"));
         assert_eq!(back.display_name.as_deref(), Some("Bot"));
+    }
+
+    #[test]
+    fn combined_system_joins_static_and_context_with_blank_line() {
+        let mut q = QueryInput::new("you are helpful", "m");
+        q.system_context = Some("Conversation context: x.".into());
+        assert_eq!(
+            q.combined_system(),
+            "you are helpful\n\nConversation context: x."
+        );
+    }
+
+    #[test]
+    fn combined_system_trims_trailing_newlines_on_static_before_joining() {
+        // The static prompt may already end in a newline; the join must
+        // still produce exactly one blank line, never two.
+        let mut q = QueryInput::new("you are helpful\n", "m");
+        q.system_context = Some("ctx".into());
+        assert_eq!(q.combined_system(), "you are helpful\n\nctx");
+    }
+
+    #[test]
+    fn combined_system_without_context_returns_static_verbatim() {
+        let q = QueryInput::new("you are helpful", "m");
+        assert_eq!(q.combined_system(), "you are helpful");
+    }
+
+    #[test]
+    fn combined_system_empty_context_returns_static_verbatim() {
+        let mut q = QueryInput::new("you are helpful", "m");
+        q.system_context = Some(String::new());
+        assert_eq!(q.combined_system(), "you are helpful");
+    }
+
+    #[test]
+    fn combined_system_empty_static_returns_just_context() {
+        let mut q = QueryInput::new("", "m");
+        q.system_context = Some("Conversation context: x.".into());
+        assert_eq!(q.combined_system(), "Conversation context: x.");
     }
 }

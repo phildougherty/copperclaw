@@ -14,7 +14,6 @@ use tokio::time::{sleep, timeout};
 use crate::disallowed::is_disallowed;
 
 use super::drive_turn::{LlmTurnOutput, PendingToolCall, TurnOutcome};
-use super::prompt::system_with_context;
 use super::{RunnerDeps, clear_current_tool, emit_usage_report, set_current_tool};
 
 /// Maximum number of `provider.query()` attempts (including the first)
@@ -70,9 +69,20 @@ pub(super) async fn run_llm_turn(
     previous_continuation: Option<&str>,
     context_block: Option<&str>,
 ) -> Result<LlmTurnOutput> {
-    let system = system_with_context(&deps.system, context_block);
+    // Hand the static system prompt and the volatile per-inbound context
+    // to the provider AS SEPARATE PARTS. The Anthropic provider places a
+    // cache breakpoint after the stable `system` and emits the volatile
+    // `system_context` only AFTER the transcript-tail breakpoint, so the
+    // cached prefix stays byte-stable across inbounds (a caching HIT
+    // instead of a per-turn cache MISS/rewrite). Non-caching providers
+    // flatten the two back into one string via `QueryInput::combined_system`,
+    // so their request bytes are unchanged. That flatten reproduces the
+    // exact `\n\n` join the runner used to perform inline here before the
+    // split — see `QueryInput::combined_system`'s doc comment.
+    let system_context = context_block.filter(|b| !b.is_empty()).map(str::to_string);
     let input = QueryInput {
-        system,
+        system: deps.system.clone(),
+        system_context,
         model: deps.model.clone(),
         effort: deps.effort,
         previous_continuation: previous_continuation.map(str::to_string),
