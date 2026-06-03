@@ -239,7 +239,22 @@ pub(crate) fn container_config(spec: &ContainerSpec) -> Config<String> {
     let env: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
     let labels: HashMap<String, String> = spec.labels.clone();
 
-    let mounts: Vec<DockerMount> = spec.mounts.iter().map(translate_mount).collect();
+    let mut mounts: Vec<DockerMount> = spec.mounts.iter().map(translate_mount).collect();
+
+    // Phase 0a v2 DNS filtering: pin /etc/resolv.conf to the host-rendered
+    // filtering-resolver config (read-only) so a deny-default container's stub
+    // resolver can only reach the filtering resolver. Only present when the
+    // host set it (deny-default), so default spawns are unaffected. Appended
+    // last so it can't be shadowed by an earlier mount at the same target.
+    if let Some(resolv_src) = spec.resolv_conf_source.as_deref() {
+        mounts.push(DockerMount {
+            target: Some("/etc/resolv.conf".to_string()),
+            source: Some(resolv_src.to_string()),
+            typ: Some(MountTypeEnum::BIND),
+            read_only: Some(true),
+            ..Default::default()
+        });
+    }
 
     let extra_hosts: Vec<String> = spec
         .extra_hosts
@@ -821,6 +836,44 @@ mod tests {
             host.network_mode.is_none(),
             "non-empty allow-list under deny-default must NOT hard-cut the network"
         );
+    }
+
+    #[test]
+    fn container_config_no_resolv_conf_by_default() {
+        // Default spawn (no DNS filter) must not add an /etc/resolv.conf mount
+        // — the legacy behaviour is untouched.
+        let spec = ContainerSpec::new("c", "img");
+        let cfg = container_config(&spec);
+        let host = cfg.host_config.unwrap();
+        let mounts = host.mounts.unwrap();
+        assert!(
+            !mounts
+                .iter()
+                .any(|m| m.target.as_deref() == Some("/etc/resolv.conf")),
+            "no resolv.conf mount unless DNS filtering is pinned"
+        );
+    }
+
+    #[test]
+    fn container_config_pins_resolv_conf_read_only_when_set() {
+        // DNS filtering on: the host-rendered resolv.conf is bound read-only at
+        // /etc/resolv.conf so the container can only reach the filter resolver.
+        let spec = ContainerSpec::new("c", "img")
+            .with_egress_mode(EgressMode::DenyDefault)
+            .with_resolv_conf_source("/host/sessions/s1/resolv.conf");
+        let cfg = container_config(&spec);
+        let host = cfg.host_config.unwrap();
+        let mounts = host.mounts.unwrap();
+        let resolv = mounts
+            .iter()
+            .find(|m| m.target.as_deref() == Some("/etc/resolv.conf"))
+            .expect("resolv.conf mount present");
+        assert_eq!(
+            resolv.source.as_deref(),
+            Some("/host/sessions/s1/resolv.conf")
+        );
+        assert_eq!(resolv.read_only, Some(true));
+        assert_eq!(resolv.typ, Some(MountTypeEnum::BIND));
     }
 
     #[test]

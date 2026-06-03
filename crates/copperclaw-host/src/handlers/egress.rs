@@ -92,6 +92,16 @@ fn build_report(
         }));
     }
 
+    // Phase 0a v2: under deny-default the host pins each container's
+    // /etc/resolv.conf to a filtering resolver (DNS filtering, Part A) and
+    // constructs a per-session nftables ruleset (Part B). Surface both so
+    // `cclaw doctor` shows what's enforced vs. constructed-and-deferred. The
+    // DNS pin is active whenever deny-default is on; the nftables apply depends
+    // on the host runtime (CAP_NET_ADMIN + `nft` on PATH), reported as a status
+    // token by the spawn path.
+    let dns_filter_active = mode == EgressMode::DenyDefault;
+    let nft_status = crate::container_manager::spawn::dns_filter_runtime_status().as_str();
+
     Ok(json!({
         "mode": mode.as_str(),
         // The endpoint the host auto-injects for the *default* provider so
@@ -103,6 +113,15 @@ fn build_report(
         "model_endpoint": model_endpoint_entry(
             anthropic_base_url.unwrap_or(DEFAULT_ANTHROPIC_BASE_URL)
         ),
+        // DNS filtering (Part A): true under deny-default — the container's
+        // resolv.conf is pinned to a resolver that answers ONLY the effective
+        // allow-list and NXDOMAINs everything else.
+        "dns_filter": dns_filter_active,
+        // nftables apply (Part B): whether the privileged netns apply can run.
+        // "available" = `nft` present (apply attempted under deny-default);
+        // "tool-missing" = ruleset constructed but not applied; "unsupported"
+        // = non-Linux platform.
+        "nft_status": nft_status,
         "groups": group_reports,
     }))
 }

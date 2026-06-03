@@ -46,7 +46,9 @@ pub mod tasks_snapshot;
 
 pub use config::{ManagerConfig, ROTATABLE_ENV_KEYS, RotatableConfig, SkillsMode};
 pub use egress::{
-    model_base_url_for_provider, model_endpoint_entry, parse_egress_mode, resolve_allow_list,
+    DNSMASQ_CONF_FILENAME, DnsFilterPlan, RESOLV_CONF_FILENAME, build_dns_filter_plan,
+    filter_upstreams, model_base_url_for_provider, model_endpoint_entry, nft_table_name,
+    parse_egress_mode, parse_resolv_conf_upstreams, resolve_allow_list,
     resolve_allow_list_for_provider,
 };
 pub use prompt::{

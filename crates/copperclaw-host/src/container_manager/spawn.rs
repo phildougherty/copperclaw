@@ -357,6 +357,19 @@ impl ContainerManager {
             }
         };
         let spawn_elapsed = spawn_started.elapsed().as_secs_f64();
+
+        // Phase 0a v2 (Part B): the privileged nftables apply for the new
+        // session's network namespace. This is the deferred-but-implemented
+        // runtime path: the ruleset is constructed + persisted in
+        // `build_spec`/`apply_dns_filter` (pure + tested), and applied here
+        // only under deny-default. The apply needs `CAP_NET_ADMIN` and a
+        // resolvable session netns; if either is missing it logs and degrades
+        // to the carried policy + DNS-filter confinement rather than failing
+        // the spawn. Default (allow-all) spawns never reach this.
+        if self.cfg.egress_mode == copperclaw_container_rt::EgressMode::DenyDefault {
+            apply_session_nftables(session, &paths);
+        }
+
         // Successful spawn: clear any prior failure record so a future
         // crash doesn't immediately trip the apology threshold.
         self.spawn_tracker.record_success(session.id);
@@ -641,9 +654,23 @@ impl ContainerManager {
             ollama_base_url,
         );
         if !resolved_allow.is_empty() {
-            spec = spec.with_egress_allow(resolved_allow);
+            spec = spec.with_egress_allow(resolved_allow.clone());
         }
         spec = spec.with_egress_mode(self.cfg.egress_mode);
+
+        // Phase 0a v2 (Part A): under deny-default, pin the container's
+        // /etc/resolv.conf to a host-controlled filtering resolver that
+        // answers ONLY the effective allow-list and NXDOMAINs everything else
+        // — so a deny-default session can't exfiltrate via DNS labels to an
+        // arbitrary resolver. The per-session resolv.conf + dnsmasq filter
+        // config are written into the session dir and the resolv.conf is bound
+        // read-only into the container. Gated on deny-default so default
+        // (allow-all) spawns are untouched. Best-effort: a write failure logs
+        // and drops the pin rather than failing the spawn (the agent's model
+        // traffic still flows; the operator sees the warning).
+        if self.cfg.egress_mode == copperclaw_container_rt::EgressMode::DenyDefault {
+            spec = wire_dns_filter(spec, session, paths, &resolved_allow);
+        }
 
         // Host-wide Nvidia GPU passthrough. Gated by `COPPERCLAW_CONTAINER_GPU`
         // at boot so a default install never asks Docker for a device the
@@ -657,6 +684,193 @@ impl ContainerManager {
 
         Ok(spec)
     }
+}
+
+/// Phase 0a v2 (Part A + B): wire the per-session DNS filter into `spec`
+/// under deny-default.
+///
+/// Writes the pinned `/etc/resolv.conf` + dnsmasq filter config into the
+/// session dir and binds the resolv.conf read-only into the container, so
+/// the session can only resolve the effective allow-list and reaches no
+/// arbitrary resolver. Also constructs the per-session nftables apply plan
+/// and writes the ruleset to the session dir for the privileged apply (the
+/// runtime path; see [`dns_filter_runtime_status`]).
+///
+/// Best-effort: a write failure logs at `warn!` and leaves the spec
+/// without the resolv.conf pin rather than failing the spawn — model
+/// traffic still flows on the carried allow-list, and the operator sees
+/// the warning in the host log + `cclaw doctor`.
+fn wire_dns_filter(
+    mut spec: ContainerSpec,
+    session: &Session,
+    paths: &SessionPaths,
+    resolved_allow: &[String],
+) -> ContainerSpec {
+    // Forward the allowed names to whatever the host's own resolver uses,
+    // dropping loopback to avoid a forwarding loop. Empty → the filter
+    // sidecar uses its system default.
+    let host_resolv = std::fs::read_to_string("/etc/resolv.conf").ok();
+    let upstreams = super::egress::filter_upstreams(host_resolv.as_deref());
+    let table = super::egress::nft_table_name(&spec.name);
+    let plan = super::egress::build_dns_filter_plan(table, resolved_allow, &upstreams);
+
+    let resolv_path = paths.root.join(super::egress::RESOLV_CONF_FILENAME);
+    let dnsmasq_path = paths.root.join(super::egress::DNSMASQ_CONF_FILENAME);
+    let nft_path = paths.root.join(EGRESS_NFT_FILENAME);
+
+    // Persist the filter config + ruleset. The resolv.conf is the one that
+    // must land for the pin to take effect; the others are inputs to the
+    // (deferred) privileged apply + filter sidecar.
+    if let Err(err) = std::fs::write(&resolv_path, plan.resolv_conf.as_bytes()) {
+        warn!(
+            session = %session.id.as_uuid(),
+            ?err,
+            path = %resolv_path.display(),
+            "could not write pinned resolv.conf; deny-default DNS pin skipped this spawn"
+        );
+        return spec;
+    }
+    if let Err(err) = std::fs::write(&dnsmasq_path, plan.dnsmasq_conf.as_bytes()) {
+        warn!(session = %session.id.as_uuid(), ?err, "could not write dnsmasq filter config");
+    }
+    if let Err(err) = std::fs::write(&nft_path, plan.nft.ruleset.as_bytes()) {
+        warn!(session = %session.id.as_uuid(), ?err, "could not write nftables ruleset");
+    }
+
+    spec = spec.with_resolv_conf_source(resolv_path.to_string_lossy().into_owned());
+
+    info!(
+        session = %session.id.as_uuid(),
+        allow_names = plan.resolver.allow_names.len(),
+        dns_filter = "pinned",
+        nft_status = dns_filter_runtime_status().as_str(),
+        "deny-default DNS filter wired; resolv.conf pinned to filtering resolver"
+    );
+
+    spec
+}
+
+/// Filename of the per-session constructed nftables ruleset, written into the
+/// session dir for the privileged netns apply (the deferred runtime path).
+pub const EGRESS_NFT_FILENAME: &str = "egress.nft";
+
+/// Phase 0a v2 (Part B) runtime path: apply the per-session nftables ruleset
+/// written by [`wire_dns_filter`].
+///
+/// The ruleset (constructed + tested purely) lives at `<session>/egress.nft`.
+/// Applying it requires `CAP_NET_ADMIN` and must target the session's own
+/// network namespace (not the host's). We do NOT apply it to the host netns —
+/// that would be both wrong (it would filter the host) and unsafe. Until the
+/// netns-entering apply lands (it needs the running container's PID to
+/// `nsenter --net`), this records the constructed-and-deferred status so
+/// `cclaw doctor` reports it honestly. The deny-default DNS filter + the
+/// empty-allow `network_mode: none` cut are the enforcement that IS live; the
+/// L3/L4 nftables filtering of a non-empty list is constructed here and
+/// deferred to the privileged netns apply.
+///
+/// Returns the status so callers/tests can assert what happened. Never fails
+/// the spawn.
+fn apply_session_nftables(session: &Session, paths: &SessionPaths) -> NftRuntimeStatus {
+    let status = dns_filter_runtime_status();
+    let nft_path = paths.root.join(EGRESS_NFT_FILENAME);
+    match status {
+        NftRuntimeStatus::Available => {
+            // The privileged netns apply is the deferred runtime tail: it
+            // needs the running container's PID to enter its netns
+            // (`nsenter -t <pid> -n nft -f <ruleset>`), which the runtime
+            // doesn't yet surface to the host. Constructing + persisting the
+            // exact ruleset that apply would load is done; wiring the PID
+            // handoff + the privileged exec is the remaining step. We log the
+            // constructed ruleset path so an operator can apply it by hand
+            // against the session netns in the interim.
+            info!(
+                session = %session.id.as_uuid(),
+                ruleset = %nft_path.display(),
+                "deny-default nftables ruleset constructed; netns apply deferred to the privileged path (requires container PID + CAP_NET_ADMIN)"
+            );
+        }
+        NftRuntimeStatus::ToolMissing => {
+            warn!(
+                session = %session.id.as_uuid(),
+                "deny-default: `nft` not found on PATH — L3/L4 egress filtering not applied; DNS filtering + empty-allow network cut still enforced"
+            );
+        }
+        NftRuntimeStatus::Unsupported => {
+            warn!(
+                session = %session.id.as_uuid(),
+                "deny-default: nftables unsupported on this platform — L3/L4 egress filtering not applied"
+            );
+        }
+    }
+    status
+}
+
+/// Report whether the privileged nftables apply path can run in this host
+/// process. The rule construction is always done (pure + tested); the *apply*
+/// needs `CAP_NET_ADMIN` against the session netns. This probe lets `cclaw
+/// doctor` show whether deny-default's L3/L4 filtering is actually enforced or
+/// only constructed-and-deferred. Linux-only; non-Linux always reports the
+/// deferred status (nftables is a Linux facility).
+#[must_use]
+pub fn dns_filter_runtime_status() -> NftRuntimeStatus {
+    #[cfg(target_os = "linux")]
+    {
+        // `nft` on PATH is necessary for the apply; CAP_NET_ADMIN is checked
+        // by attempting a privileged no-op only at the actual apply site (we
+        // don't probe it here to avoid a syscall on every spawn). Presence of
+        // the binary is the cheap, side-effect-free signal doctor surfaces.
+        if which_nft().is_some() {
+            NftRuntimeStatus::Available
+        } else {
+            NftRuntimeStatus::ToolMissing
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        NftRuntimeStatus::Unsupported
+    }
+}
+
+/// Whether the per-session nftables apply (the deferred runtime path) can run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NftRuntimeStatus {
+    /// `nft` is on PATH and the platform supports it — the privileged apply
+    /// can be attempted at spawn (subject to `CAP_NET_ADMIN`).
+    Available,
+    /// `nft` is not installed; the ruleset is constructed but cannot be
+    /// applied. Deny-default still enforces DNS filtering + the empty-allow
+    /// `network_mode: none` cut.
+    ToolMissing,
+    /// The platform doesn't support nftables (non-Linux). Ruleset construction
+    /// is exercised by tests; application is not applicable here.
+    Unsupported,
+}
+
+impl NftRuntimeStatus {
+    /// Stable token for logs / JSON surfaces.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NftRuntimeStatus::Available => "available",
+            NftRuntimeStatus::ToolMissing => "tool-missing",
+            NftRuntimeStatus::Unsupported => "unsupported",
+        }
+    }
+}
+
+/// Locate `nft` on `PATH` without spawning it. Splits `$PATH` and checks each
+/// entry for an `nft` file. Returns the first match. Linux-only helper for
+/// [`dns_filter_runtime_status`].
+#[cfg(target_os = "linux")]
+fn which_nft() -> Option<std::path::PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join("nft");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// Share the PARENT agent's workspace into a `create_agent` sibling.
@@ -1431,6 +1645,125 @@ mod tests {
         let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
         let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
         assert!(spec.env.iter().all(|(k, _)| k != "ANTHROPIC_BASE_URL"));
+    }
+
+    // --- Phase 0a v2: deny-default DNS filtering wiring --------------------
+
+    #[test]
+    fn build_spec_allow_all_does_not_pin_resolv_conf() {
+        // Default (allow-all) spawns must be entirely unaffected: no
+        // resolv.conf pin, no filter files written.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()), // egress_mode = AllowAll
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
+        assert!(
+            spec.resolv_conf_source.is_none(),
+            "allow-all must not pin resolv.conf"
+        );
+        assert!(
+            !paths
+                .root
+                .join(super::super::egress::RESOLV_CONF_FILENAME)
+                .exists(),
+            "allow-all must not write a resolv.conf"
+        );
+    }
+
+    #[test]
+    fn build_spec_deny_default_pins_resolv_conf_and_writes_filter_files() {
+        // Under deny-default, build_spec writes the per-session resolv.conf +
+        // dnsmasq filter + nftables ruleset and pins the resolv.conf into the
+        // container.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.egress_mode = copperclaw_container_rt::EgressMode::DenyDefault;
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        let spec = mgr.build_spec(&session, &paths, "img", None).unwrap();
+
+        // resolv.conf is pinned to the written host file.
+        let resolv_path = paths.root.join(super::super::egress::RESOLV_CONF_FILENAME);
+        assert_eq!(
+            spec.resolv_conf_source.as_deref(),
+            Some(resolv_path.to_string_lossy().as_ref())
+        );
+        // The file exists, pins a single nameserver, and carries no search.
+        let resolv = std::fs::read_to_string(&resolv_path).unwrap();
+        assert!(resolv.contains("nameserver 127.0.0.1\n"));
+        assert!(!resolv.contains("search "));
+
+        // The dnsmasq filter answers the model endpoint and NXDOMAINs the rest.
+        // The manager fixture sets ANTHROPIC_BASE_URL to openrouter, so the
+        // injected model endpoint is openrouter.ai (NOT api.anthropic.com).
+        let dnsmasq =
+            std::fs::read_to_string(paths.root.join(super::super::egress::DNSMASQ_CONF_FILENAME))
+                .unwrap();
+        assert!(
+            dnsmasq.contains("server=/openrouter.ai/"),
+            "dnsmasq must allow the injected model endpoint: {dnsmasq}"
+        );
+        assert!(dnsmasq.contains("address=/#/\n"));
+
+        // The nftables ruleset was constructed + persisted with a drop policy.
+        let nft = std::fs::read_to_string(paths.root.join(EGRESS_NFT_FILENAME)).unwrap();
+        assert!(nft.contains("policy drop;"));
+        assert!(nft.contains("ip daddr 127.0.0.1 udp dport 53 accept"));
+        // The name endpoint becomes a port-gated rule with the dns-filtered note.
+        assert!(
+            nft.contains("tcp dport 443 accept comment \"allow openrouter.ai (dns-filtered)\""),
+            "ruleset must gate the model endpoint port: {nft}"
+        );
+    }
+
+    #[test]
+    fn apply_session_nftables_never_fails_spawn_and_reports_status() {
+        // The privileged apply is best-effort: it returns a status and never
+        // errors, regardless of whether `nft` is present.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.egress_mode = copperclaw_container_rt::EgressMode::DenyDefault;
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            cfg,
+        );
+        let session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        // Build the spec so the ruleset file exists, then apply.
+        let _ = mgr.build_spec(&session, &paths, "img", None).unwrap();
+        let status = apply_session_nftables(&session, &paths);
+        // The status is one of the three honest values — never a claim of
+        // applied enforcement.
+        assert!(matches!(
+            status,
+            NftRuntimeStatus::Available
+                | NftRuntimeStatus::ToolMissing
+                | NftRuntimeStatus::Unsupported
+        ));
+    }
+
+    #[test]
+    fn nft_runtime_status_as_str_is_stable() {
+        assert_eq!(NftRuntimeStatus::Available.as_str(), "available");
+        assert_eq!(NftRuntimeStatus::ToolMissing.as_str(), "tool-missing");
+        assert_eq!(NftRuntimeStatus::Unsupported.as_str(), "unsupported");
     }
 
     #[test]

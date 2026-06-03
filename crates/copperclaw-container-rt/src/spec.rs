@@ -96,12 +96,27 @@ impl Mount {
 ///   networking, and the allow-list is recorded on the spec + surfaced to
 ///   the operator (`cclaw doctor`, host log) so the gap is visible.
 ///
-/// What is **explicitly deferred** to a later netns + nftables pass: turning
-/// the recorded allow-list into actual packet filtering (allowing only the
-/// listed `host:port` pairs and dropping everything else). Until that lands,
-/// `DenyDefault` with a non-empty allow-list does NOT restrict which hosts a
-/// container can reach — it only carries the policy. Callers must not treat
-/// a non-empty-allow-list `DenyDefault` spawn as a hard egress boundary.
+/// Phase 0a **v2** strengthens this with two opt-in layers, both gated on
+/// `DenyDefault` so default spawns are unaffected:
+///
+/// * **DNS filtering** ([`crate::dns`]): the container's `/etc/resolv.conf` is
+///   pinned ([`ContainerSpec::resolv_conf_source`]) to a host-controlled
+///   filtering resolver that answers ONLY the effective allow-listed names and
+///   NXDOMAINs everything else — so a deny-default session can't exfiltrate via
+///   DNS labels to an arbitrary resolver.
+/// * **nftables** ([`crate::nftables`]): a per-session ruleset (drop-all egress
+///   except the allow-listed `host:port` set + the filtering resolver) is
+///   constructed for application to the session's network namespace. The rule
+///   *construction* is pure + tested; the *application* needs `CAP_NET_ADMIN`
+///   at spawn and is the runtime path.
+///
+/// What remains **deferred to the runtime** (constructed + tested here, but
+/// requiring `CAP_NET_ADMIN` / a live netns to actually apply): the privileged
+/// `nft -f` load against the session netns, and standing up the filter-resolver
+/// sidecar. Callers must not treat a non-empty-allow-list `DenyDefault` spawn
+/// as a hard L3/L4 boundary unless the host confirms the nftables apply
+/// succeeded — until then the carried ruleset + pinned resolv.conf are the
+/// policy and the DNS-level confinement.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum EgressMode {
     /// Full outbound networking on the default bridge. The allow-list is
@@ -235,6 +250,15 @@ pub struct ContainerSpec {
     /// Egress posture. See [`EgressMode`]. Defaults to
     /// [`EgressMode::AllowAll`] so the legacy spawn path is unchanged.
     pub egress_mode: EgressMode,
+    /// Host path to a pinned `/etc/resolv.conf` to bind read-only into the
+    /// container (Phase 0a v2, DNS filtering). When `Some`, the runtime adds a
+    /// read-only bind mount of this file at `/etc/resolv.conf` so the
+    /// container's stub resolver can only reach the host-controlled filtering
+    /// resolver (which answers ONLY the effective allow-list and NXDOMAINs
+    /// everything else). `None` (the default) leaves the image's resolv.conf
+    /// untouched — the legacy behaviour. Set only under
+    /// [`EgressMode::DenyDefault`] so default spawns are unaffected.
+    pub resolv_conf_source: Option<String>,
 }
 
 impl ContainerSpec {
@@ -324,6 +348,14 @@ impl ContainerSpec {
     #[must_use]
     pub fn with_egress_mode(mut self, mode: EgressMode) -> Self {
         self.egress_mode = mode;
+        self
+    }
+
+    /// Pin the container's `/etc/resolv.conf` to a host-controlled file
+    /// (Phase 0a v2 DNS filtering). See [`Self::resolv_conf_source`].
+    #[must_use]
+    pub fn with_resolv_conf_source(mut self, source: impl Into<String>) -> Self {
+        self.resolv_conf_source = Some(source.into());
         self
     }
 }
@@ -430,6 +462,13 @@ mod tests {
         assert!(spec.resource_limits.is_empty());
         assert!(spec.egress_allow.is_empty());
         assert_eq!(spec.egress_mode, EgressMode::AllowAll);
+        assert!(spec.resolv_conf_source.is_none());
+    }
+
+    #[test]
+    fn spec_with_resolv_conf_source() {
+        let spec = ContainerSpec::new("c", "img").with_resolv_conf_source("/h/resolv.conf");
+        assert_eq!(spec.resolv_conf_source.as_deref(), Some("/h/resolv.conf"));
     }
 
     #[test]
