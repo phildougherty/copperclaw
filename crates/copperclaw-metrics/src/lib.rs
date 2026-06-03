@@ -40,6 +40,7 @@
 //! | Counter   | `copperclaw_budget_exhausted_total`  | `agent_group_id`, `gate` |
 //! | Counter   | `copperclaw_budget_exhausted_replies_total` | `agent_group_id` |
 //! | Counter   | `copperclaw_budget_exhausted_suppressed_total` | `agent_group_id` |
+//! | Counter   | `copperclaw_task_budget_exhausted_total` | `agent_group_id` |
 //! | Histogram | `copperclaw_llm_call_seconds`        | —              |
 //! | Histogram | `copperclaw_llm_tokens_input`        | —              |
 //! | Histogram | `copperclaw_llm_tokens_output`       | —              |
@@ -74,6 +75,7 @@ pub const SELF_MOD_SUCCEEDED_TOTAL: &str = "copperclaw_self_mod_succeeded_total"
 pub const BUDGET_EXHAUSTED_TOTAL: &str = "copperclaw_budget_exhausted_total";
 pub const BUDGET_EXHAUSTED_REPLIES_TOTAL: &str = "copperclaw_budget_exhausted_replies_total";
 pub const BUDGET_EXHAUSTED_SUPPRESSED_TOTAL: &str = "copperclaw_budget_exhausted_suppressed_total";
+pub const TASK_BUDGET_EXHAUSTED_TOTAL: &str = "copperclaw_task_budget_exhausted_total";
 pub const LLM_CALL_SECONDS: &str = "copperclaw_llm_call_seconds";
 pub const LLM_TOKENS_INPUT: &str = "copperclaw_llm_tokens_input";
 pub const LLM_TOKENS_OUTPUT: &str = "copperclaw_llm_tokens_output";
@@ -243,6 +245,24 @@ pub fn inc_budget_exhausted_reply(agent_group_id: &str) {
 pub fn inc_budget_exhausted_suppressed(agent_group_id: &str) {
     counter!(
         BUDGET_EXHAUSTED_SUPPRESSED_TOTAL,
+        "agent_group_id" => agent_group_id.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Increment `copperclaw_task_budget_exhausted_total{agent_group_id}`. Fired by
+/// the runner's tool loop ([`drive_turn`]) when the cumulative input+output
+/// tokens spent on a SINGLE inbound's tool-loop crosses the configured
+/// per-task ceiling (`COPPERCLAW_MAX_TASK_TOKENS`). This is distinct from the
+/// per-DAY group cap surfaced via [`inc_budget_exhausted`] with
+/// [`BUDGET_GATE_DAILY_TOKENS`]: the daily gate refuses to *spawn*, this one
+/// hard-aborts a runaway *mid-loop* so a single confused task cannot blow the
+/// token bill even when it stays inside `COPPERCLAW_MAX_TOOL_TURNS`.
+///
+/// [`drive_turn`]: https://docs.rs/copperclaw-runner
+pub fn inc_task_budget_exhausted(agent_group_id: &str) {
+    counter!(
+        TASK_BUDGET_EXHAUSTED_TOTAL,
         "agent_group_id" => agent_group_id.to_owned(),
     )
     .increment(1);
@@ -615,6 +635,7 @@ mod tests {
         inc_budget_exhausted("ag-test", BUDGET_GATE_TURNS_PER_HOUR);
         inc_budget_exhausted_reply("ag-test");
         inc_budget_exhausted_suppressed("ag-test");
+        inc_task_budget_exhausted("ag-test");
         inc_stuck_inbound_apology("ag-test", STUCK_REASON_PENDING_TOO_LONG);
         inc_stuck_inbound_apology("ag-test", STUCK_REASON_CONTAINER_SPAWN_FAILED);
     }
@@ -683,6 +704,25 @@ mod tests {
     }
 
     #[test]
+    fn task_budget_exhausted_counter_renders_with_labels() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            inc_task_budget_exhausted("ag-runaway-7");
+            inc_task_budget_exhausted("ag-runaway-7");
+        });
+        let body = handle.render();
+        assert!(
+            body.contains(TASK_BUDGET_EXHAUSTED_TOTAL),
+            "missing task-budget counter:\n{body}"
+        );
+        assert!(
+            body.contains("agent_group_id=\"ag-runaway-7\""),
+            "missing agent_group_id label:\n{body}"
+        );
+    }
+
+    #[test]
     fn histogram_helpers_compile() {
         observe_llm_call_seconds(1.23);
         observe_llm_tokens_input(512);
@@ -708,6 +748,7 @@ mod tests {
             BUDGET_EXHAUSTED_TOTAL,
             BUDGET_EXHAUSTED_REPLIES_TOTAL,
             BUDGET_EXHAUSTED_SUPPRESSED_TOTAL,
+            TASK_BUDGET_EXHAUSTED_TOTAL,
             LLM_CALL_SECONDS,
             LLM_TOKENS_INPUT,
             LLM_TOKENS_OUTPUT,
@@ -745,6 +786,7 @@ mod tests {
             BUDGET_EXHAUSTED_TOTAL,
             BUDGET_EXHAUSTED_REPLIES_TOTAL,
             BUDGET_EXHAUSTED_SUPPRESSED_TOTAL,
+            TASK_BUDGET_EXHAUSTED_TOTAL,
             STUCK_INBOUND_APOLOGY_TOTAL,
         ];
         for name in counters {

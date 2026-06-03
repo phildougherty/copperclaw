@@ -341,6 +341,9 @@ async fn run_one_turn(
         turn_seq: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         tool_map,
         max_tool_turns: 5,
+        // No per-task token ceiling in this e2e — the tool-turn cap and
+        // wiremock scripts bound the run; 0 disables the cost backstop.
+        max_task_tokens: 0,
         // Tests run against wiremock; keep the deadline tight so
         // accidental hangs surface as a test timeout instead of a
         // 60-second stall.

@@ -197,6 +197,79 @@ pub fn resolve_max_tool_turns(env: &dyn crate::config::EnvLookup) -> usize {
     parsed
 }
 
+/// Env var operators use to override the per-TASK token ceiling — the
+/// total input+output tokens a single inbound's tool-loop may spend
+/// before the runner hard-aborts. Distinct from the per-DAY group cap
+/// (`budgets`/`BUDGET_GATE_DAILY_TOKENS`), which gates at *spawn* time:
+/// this bounds the cost of a single runaway task mid-loop. A confused
+/// agent that re-reads a large context on every one of 119 tool calls
+/// can blow millions of tokens without exceeding
+/// [`MAX_TOOL_TURNS_ENV`]; this ceiling is the cost backstop for that
+/// shape. Set to `0` to disable (no per-task ceiling).
+pub const MAX_TASK_TOKENS_ENV: &str = "COPPERCLAW_MAX_TASK_TOKENS";
+
+/// Default per-task token ceiling. Sized so a normal build/research task
+/// never trips it (those land in the tens-to-low-hundreds of thousands of
+/// tokens across their tool loop), while a genuine runaway is caught well
+/// before it becomes expensive. Calibrated against a live ~6M-token
+/// single-task runaway: at 2M the abort fires around a third of the way
+/// in, bounding the worst-case spend to roughly a third of what that run
+/// actually cost. Operators tune via [`MAX_TASK_TOKENS_ENV`] (clamped to
+/// [`MIN_MAX_TASK_TOKENS`, `MAX_MAX_TASK_TOKENS`], or `0` to disable).
+pub const DEFAULT_MAX_TASK_TOKENS: u64 = 2_000_000;
+
+/// Floor for a *non-zero* per-task ceiling. Below this even a single
+/// large-context turn (a 200k-window model echoing its whole history)
+/// could trip the abort on turn one, defeating the purpose. `0` is a
+/// distinct sentinel meaning "disabled" and is allowed past this floor.
+pub const MIN_MAX_TASK_TOKENS: u64 = 100_000;
+
+/// Ceiling for the per-task token budget. Beyond this the "budget" stops
+/// being a cost backstop — a single task spending 50M+ tokens is a
+/// runaway by any measure, so we refuse to honour a configured value
+/// that high and fall back to the default with a WARN.
+pub const MAX_MAX_TASK_TOKENS: u64 = 50_000_000;
+
+/// Resolve the per-task token ceiling from the env. Same fallback shape
+/// as [`resolve_max_tool_turns`]: unparseable / out-of-range values fall
+/// back to [`DEFAULT_MAX_TASK_TOKENS`] with a one-shot WARN. The literal
+/// `0` is honoured as "disabled" (returns `0`); any other value below
+/// [`MIN_MAX_TASK_TOKENS`] or above [`MAX_MAX_TASK_TOKENS`] is rejected.
+#[must_use]
+pub fn resolve_max_task_tokens(env: &dyn crate::config::EnvLookup) -> u64 {
+    static MISCONFIG_WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    let warn_once = |line: &str, raw: &str| {
+        MISCONFIG_WARNED.get_or_init(|| {
+            tracing::warn!(
+                env = MAX_TASK_TOKENS_ENV,
+                value = %raw,
+                "{line} (using default {DEFAULT_MAX_TASK_TOKENS}; suppressing further warnings this process)",
+            );
+        });
+    };
+    let Some(raw) = env.get(MAX_TASK_TOKENS_ENV) else {
+        return DEFAULT_MAX_TASK_TOKENS;
+    };
+    let Ok(parsed) = raw.parse::<u64>() else {
+        warn_once("max task tokens is not a valid integer", &raw);
+        return DEFAULT_MAX_TASK_TOKENS;
+    };
+    // 0 is the explicit "disable the per-task ceiling" sentinel.
+    if parsed == 0 {
+        return 0;
+    }
+    if !(MIN_MAX_TASK_TOKENS..=MAX_MAX_TASK_TOKENS).contains(&parsed) {
+        warn_once(
+            &format!(
+                "max task tokens out of range [{MIN_MAX_TASK_TOKENS}, {MAX_MAX_TASK_TOKENS}] (0 to disable)"
+            ),
+            &raw,
+        );
+        return DEFAULT_MAX_TASK_TOKENS;
+    }
+    parsed
+}
+
 /// Resolve the per-tool deadline from the env. Same shape as
 /// [`resolve_provider_deadline`]: out-of-range / unparseable values
 /// fall back to [`DEFAULT_TOOL_DEADLINE_SECS`] with a WARN.
@@ -279,6 +352,20 @@ pub struct RunnerDeps {
     /// Hard cap on consecutive tool-use turns per inbound. Stops a
     /// confused model from looping forever. Default 20.
     pub max_tool_turns: usize,
+    /// Per-TASK token ceiling: the cumulative input+output tokens a
+    /// single inbound's tool-loop may spend before [`drive_turn`]
+    /// hard-aborts with a surfaced "task budget reached" message and a
+    /// [`copperclaw_metrics::inc_task_budget_exhausted`] trip. `0`
+    /// disables the ceiling (no per-task abort). Complements — does not
+    /// replace — [`max_tool_turns`] and the per-DAY group cap: it bounds
+    /// COST specifically, catching a token-heavy runaway that re-reads a
+    /// big context without burning many *turns*. The runner binary
+    /// resolves it from [`MAX_TASK_TOKENS_ENV`] via
+    /// [`resolve_max_task_tokens`]; the default in [`RunnerDeps::minimal`]
+    /// is [`DEFAULT_MAX_TASK_TOKENS`].
+    ///
+    /// [`drive_turn`]: crate::run::drive_turn
+    pub max_task_tokens: u64,
     /// Per-LLM-call deadline. Wraps each `provider.query()` attempt in
     /// `tokio::time::timeout`. On expiry the attempt is treated as a
     /// retryable failure and reissued (with backoff) up to
@@ -358,6 +445,7 @@ impl RunnerDeps {
             turn_seq: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             tool_map: Arc::new(HashMap::new()),
             max_tool_turns: DEFAULT_MAX_TOOL_TURNS,
+            max_task_tokens: DEFAULT_MAX_TASK_TOKENS,
             compaction: CompactionCfg {
                 model_input_window: 200_000,
                 safety_margin_tokens: 8_000,
@@ -2998,5 +3086,226 @@ mod tests {
             st.history,
         );
         let _ = id;
+    }
+
+    // ── Per-task token budget (COPPERCLAW_MAX_TASK_TOKENS) ──────────────
+    //
+    // These exercise `drive_turn` directly so the assertions are about
+    // the tool-loop's per-task cost accumulator, not the whole run_loop
+    // pipeline. A "looping turn" emits one tool_call (an unknown tool,
+    // which `invoke_tool` turns into an is_error tool_result) plus a
+    // `Usage` event carrying the per-call token counts — the same shape
+    // a real runaway has: many tool turns, each billing tokens, never
+    // producing a no-tool final answer until the loop is stopped.
+
+    /// One scripted turn that keeps the tool loop going and bills
+    /// `in_tok` input + `out_tok` output tokens. The `noop_loop` tool is
+    /// not in the (empty) `tool_map`, so `invoke_tool` returns an
+    /// `is_error` `tool_result` and the loop runs another turn.
+    fn looping_turn_with_usage(in_tok: u32, out_tok: u32) -> Vec<ProviderEvent> {
+        vec![
+            ProviderEvent::ToolCall {
+                id: format!("tu_{in_tok}_{out_tok}"),
+                name: "noop_loop".into(),
+                input: serde_json::json!({}),
+            },
+            ProviderEvent::Usage {
+                input_tokens: in_tok,
+                output_tokens: out_tok,
+            },
+        ]
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn task_budget_aborts_runaway_and_trips_metric() {
+        // Ceiling 1,000,000. Each turn bills 300k in + 100k out = 400k.
+        // Turn 1 → 400k (under), turn 2 → 800k (under), turn 3 → 1.2M
+        // (>= ceiling) → abort after pushing the third turn's tool
+        // results. Plenty of scripted turns left over to prove we stop
+        // on budget, not on running out of script or hitting
+        // max_tool_turns.
+        let scripts: Vec<Vec<ProviderEvent>> = (0..10)
+            .map(|_| looping_turn_with_usage(300_000, 100_000))
+            .collect();
+        let mut setup = build_setup(scripts);
+        setup.deps.max_task_tokens = 1_000_000;
+        // Keep the turn cap well above the expected trip point so the
+        // per-task BUDGET is unambiguously what stopped the loop.
+        setup.deps.max_tool_turns = 50;
+
+        // Install an isolated Prometheus recorder for THIS thread for the
+        // duration of the (current-thread) drive_turn future, so we can
+        // assert the budget trip incremented the counter without racing
+        // the process-global recorder. The guard must outlive the await.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let mut history = Vec::new();
+        let outcome = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let turn = drive_turn(&setup.deps, &mut history, None, None)
+                .await
+                .unwrap();
+            turn.outcome
+        };
+
+        match outcome {
+            TurnOutcome::Failed(reason) => {
+                assert!(
+                    reason.contains("task budget reached") && reason.contains("tokens"),
+                    "expected per-task budget abort reason, got: {reason:?}"
+                );
+                // 3 turns × 400k = 1.2M accumulated when the abort fires.
+                assert!(
+                    reason.contains("1200000"),
+                    "reason should surface the accumulated token count: {reason:?}"
+                );
+            }
+            TurnOutcome::Done => panic!("runaway should have aborted on the per-task budget"),
+        }
+
+        let body = handle.render();
+        assert!(
+            body.contains(copperclaw_metrics::TASK_BUDGET_EXHAUSTED_TOTAL),
+            "budget trip must increment the metric:\n{body}"
+        );
+        assert!(
+            body.contains(&format!("agent_group_id=\"{}\"", setup.deps.agent_group_id)),
+            "metric must carry the agent_group_id label:\n{body}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn task_budget_under_ceiling_runs_to_completion() {
+        // Two cheap looping turns (50k each → 100k total, well under the
+        // 1M ceiling) then a clean no-tool final answer. The loop must
+        // finish normally — the budget check must NOT fire.
+        let scripts: Vec<Vec<ProviderEvent>> = vec![
+            looping_turn_with_usage(30_000, 20_000),
+            looping_turn_with_usage(30_000, 20_000),
+            vec![ProviderEvent::Result {
+                text: Some("all done".into()),
+            }],
+        ];
+        let mut setup = build_setup(scripts);
+        setup.deps.max_task_tokens = 1_000_000;
+        setup.deps.max_tool_turns = 50;
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let mut history = Vec::new();
+        let outcome = {
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let turn = drive_turn(&setup.deps, &mut history, None, None)
+                .await
+                .unwrap();
+            turn.outcome
+        };
+
+        assert!(
+            matches!(outcome, TurnOutcome::Done),
+            "under the ceiling the task must complete normally, got: {outcome:?}"
+        );
+        let body = handle.render();
+        assert!(
+            !body.contains(copperclaw_metrics::TASK_BUDGET_EXHAUSTED_TOTAL),
+            "budget metric must NOT trip under the ceiling:\n{body}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn task_budget_disabled_when_zero() {
+        // max_task_tokens == 0 disables the per-task ceiling: even a
+        // turn billing more than any sane ceiling must not abort on
+        // budget. It runs until the (small) turn cap instead, proving
+        // the two breakers are independent.
+        let scripts: Vec<Vec<ProviderEvent>> = (0..10)
+            .map(|_| looping_turn_with_usage(5_000_000, 5_000_000))
+            .collect();
+        let mut setup = build_setup(scripts);
+        setup.deps.max_task_tokens = 0; // disabled
+        setup.deps.max_tool_turns = 4;
+
+        let mut history = Vec::new();
+        let turn = drive_turn(&setup.deps, &mut history, None, None)
+            .await
+            .unwrap();
+        match turn.outcome {
+            TurnOutcome::Failed(reason) => {
+                assert!(
+                    reason.contains("ran out of turns"),
+                    "with the budget disabled the turn cap must be what stops it: {reason:?}"
+                );
+                assert!(
+                    !reason.contains("task budget"),
+                    "budget abort must not fire when disabled: {reason:?}"
+                );
+            }
+            TurnOutcome::Done => panic!("expected the turn-cap breaker to stop the loop"),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn task_budget_independent_of_max_turns_breaker() {
+        // Per-task budget set high enough that it never trips; the loop
+        // must still bail on `max_tool_turns` exactly as before. Proves
+        // adding the budget check didn't disturb the existing breaker.
+        let scripts: Vec<Vec<ProviderEvent>> = (0..10)
+            .map(|_| looping_turn_with_usage(1_000, 1_000))
+            .collect();
+        let mut setup = build_setup(scripts);
+        setup.deps.max_task_tokens = 10_000_000; // never reached (2k/turn)
+        setup.deps.max_tool_turns = 3;
+
+        let mut history = Vec::new();
+        let turn = drive_turn(&setup.deps, &mut history, None, None)
+            .await
+            .unwrap();
+        match turn.outcome {
+            TurnOutcome::Failed(reason) => assert!(
+                reason.contains("ran out of turns after 3"),
+                "max-turns breaker must still fire independently: {reason:?}"
+            ),
+            TurnOutcome::Done => panic!("expected the max-turns breaker to stop the loop"),
+        }
+    }
+
+    // ── resolve_max_task_tokens ────────────────────────────────────────
+
+    #[test]
+    fn resolve_max_task_tokens_uses_env_when_in_range() {
+        let env = crate::config::MapEnv::from_pairs([(MAX_TASK_TOKENS_ENV, "3000000")]);
+        assert_eq!(resolve_max_task_tokens(&env), 3_000_000);
+    }
+
+    #[test]
+    fn resolve_max_task_tokens_falls_back_when_unset() {
+        let env = crate::config::MapEnv::default();
+        assert_eq!(resolve_max_task_tokens(&env), DEFAULT_MAX_TASK_TOKENS);
+    }
+
+    #[test]
+    fn resolve_max_task_tokens_zero_disables() {
+        let env = crate::config::MapEnv::from_pairs([(MAX_TASK_TOKENS_ENV, "0")]);
+        assert_eq!(resolve_max_task_tokens(&env), 0);
+    }
+
+    #[test]
+    fn resolve_max_task_tokens_rejects_below_floor() {
+        // Below MIN (but non-zero) → fall back to default, not the tiny
+        // value (which would trip on the first big-context turn).
+        let env = crate::config::MapEnv::from_pairs([(MAX_TASK_TOKENS_ENV, "5000")]);
+        assert_eq!(resolve_max_task_tokens(&env), DEFAULT_MAX_TASK_TOKENS);
+    }
+
+    #[test]
+    fn resolve_max_task_tokens_rejects_above_ceiling() {
+        let env = crate::config::MapEnv::from_pairs([(MAX_TASK_TOKENS_ENV, "999999999")]);
+        assert_eq!(resolve_max_task_tokens(&env), DEFAULT_MAX_TASK_TOKENS);
+    }
+
+    #[test]
+    fn resolve_max_task_tokens_rejects_garbage() {
+        let env = crate::config::MapEnv::from_pairs([(MAX_TASK_TOKENS_ENV, "lots")]);
+        assert_eq!(resolve_max_task_tokens(&env), DEFAULT_MAX_TASK_TOKENS);
     }
 }

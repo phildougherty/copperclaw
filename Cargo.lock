@@ -1228,6 +1228,8 @@ dependencies = [
  "copperclaw-metrics",
  "copperclaw-providers",
  "copperclaw-types",
+ "metrics",
+ "metrics-exporter-prometheus",
  "rmcp",
  "rusqlite",
  "serde",
