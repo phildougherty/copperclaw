@@ -177,6 +177,19 @@ pub enum TopCommand {
     /// Returns a non-zero exit when any check is in FAIL state so CI
     /// and pre-flight scripts can branch on it.
     Doctor,
+    /// Security-posture audit. Flags open policies (egress allow-all,
+    /// default-allow approvals, missing tool profiles, world-readable
+    /// session files, broker disabled while sensitive) and, with `--fix`,
+    /// remediates the safe ones (scaffolds an allow-list, tightens an open
+    /// approval policy, chmods loose session files to 0600/0700). Every
+    /// host-side fix is audited; the audit never auto-loosens anything.
+    ///
+    /// Returns a non-zero exit when an open policy remains so CI /
+    /// pre-flight scripts can gate on it.
+    Security {
+        #[command(subcommand)]
+        action: SecurityCmd,
+    },
     /// Report the host egress posture: the global mode (allow-all vs.
     /// opt-in deny-default) and, per agent group, the effective outbound
     /// allow-list (operator-configured entries plus the auto-injected
@@ -253,6 +266,51 @@ pub enum TopCommand {
     ///   `"future"` when applied > expected (downgrade detected).
     #[command(name = "schema-version")]
     SchemaVersion,
+}
+
+// --- security --------------------------------------------------------------
+
+/// `cclaw security ...` — security-posture audit and safe remediation.
+#[derive(Debug, Subcommand)]
+pub enum SecurityCmd {
+    /// One-shot posture report. Reads the host's egress mode, per-group
+    /// allow-lists + tool profiles, messaging-group approval policies, the
+    /// credential-broker toggle, and local session-file permissions, then
+    /// flags every open policy. With `--fix`, applies the safe, tightening
+    /// remediations and re-reports.
+    Audit {
+        /// Remediate the safe findings: scaffold an allow-list for groups
+        /// that have none, tighten an `open` approval policy to
+        /// `request_approval`, and chmod loose session files to 0600/0700.
+        /// Each host-side fix is audited. Never loosens anything.
+        #[arg(long)]
+        fix: bool,
+        /// Override the data dir whose `sessions/` tree is scanned for
+        /// loose file permissions. Defaults to the resolved install data
+        /// dir. Mainly for tests / non-default installs.
+        #[arg(long)]
+        data_dir: Option<std::path::PathBuf>,
+    },
+}
+
+impl SecurityCmd {
+    /// Build the marker `ParsedCall` for the security composite. Like the
+    /// other composites this never reaches the transport directly —
+    /// `run_cli` recognises the `composite.security-audit` prefix.
+    pub fn to_call(&self) -> ParsedCall {
+        match self {
+            Self::Audit { fix, data_dir } => {
+                let mut o = Map::new();
+                if *fix {
+                    o.insert("fix".into(), Value::Bool(true));
+                }
+                if let Some(p) = data_dir {
+                    o.insert("data_dir".into(), p.to_string_lossy().into_owned().into());
+                }
+                ParsedCall::new("composite.security-audit", Value::Object(o))
+            }
+        }
+    }
 }
 
 // --- db --------------------------------------------------------------------
@@ -1110,6 +1168,7 @@ impl TopCommand {
             Self::Status => ParsedCall::new("composite.status", json!({})),
             Self::Health => ParsedCall::new("composite.health", json!({})),
             Self::Doctor => ParsedCall::new("composite.doctor", json!({})),
+            Self::Security { action } => action.to_call(),
             Self::Egress => ParsedCall::new("egress.status", json!({})),
             Self::Usage { since } => ParsedCall::new("usage.rollup", json!({"since": since})),
             Self::Chat {
