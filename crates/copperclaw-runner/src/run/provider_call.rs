@@ -41,7 +41,12 @@ const FAILURE_REASON_CAP: usize = 200;
 /// tells the user what went wrong instead of a bare "rejected the
 /// query".
 fn format_provider_failure_reason(err: &ProviderError) -> String {
-    let raw = format!("provider rejected the query before streaming started ({err})");
+    // Scrub key/token shapes out of the provider error body before it
+    // reaches the usage_report (audit log) and the user-visible apology —
+    // some gateways echo the offending `Authorization` value in a 401 body.
+    let raw = crate::redact::redact_secrets(&format!(
+        "provider rejected the query before streaming started ({err})"
+    ));
     // Trim at a char boundary, append `…` if we truncated. Cheaper
     // than pulling unicode-segmentation; correct because `chars()`
     // returns codepoints.
@@ -117,8 +122,10 @@ pub(super) async fn run_llm_turn(
                 // Mark this turn as a terminal failure so the caller flips
                 // the inbound to `failed` and emits a usage_report with
                 // status=error. Do NOT bubble — the runner must stay up.
+                // Redact the error body — a 401/403 from some gateways
+                // echoes the offending key/`Authorization` header.
                 tracing::error!(
-                    error = %err,
+                    error = %crate::redact::redact_secrets(&err.to_string()),
                     provider = deps.provider.name(),
                     "provider query failed terminally; marking turn as failed"
                 );
@@ -241,6 +248,11 @@ pub(super) async fn pump_events(
                 break;
             }
             ProviderEvent::Error { message, retryable } => {
+                // Scrub key/token shapes out of the streamed error body
+                // before it reaches stdout / the transcript / the apology —
+                // the `message` is whatever the provider streamed back and
+                // can carry an echoed `Authorization` value on some gateways.
+                let message = crate::redact::redact_secrets(&message);
                 tracing::warn!(
                     error = %message,
                     retryable,
@@ -486,13 +498,17 @@ pub(super) async fn query_with_retry(
             }
         };
 
-        // We have a ProviderError. Decide whether to retry.
+        // We have a ProviderError. Decide whether to retry. Redact the
+        // error body once up-front — some gateways echo the offending
+        // key/`Authorization` value in a 4xx body, and `err` is logged at
+        // every branch below.
+        let redacted_err = crate::redact::redact_secrets(&err.to_string());
         if err.is_retryable() && attempt < MAX_PROVIDER_ATTEMPTS {
             tracing::warn!(
                 attempt,
                 max = MAX_PROVIDER_ATTEMPTS,
                 provider = deps.provider.name(),
-                error = %err,
+                error = %redacted_err,
                 "provider query failed; retrying after backoff"
             );
             copperclaw_metrics::inc_provider_retry(deps.provider.name());
@@ -506,14 +522,14 @@ pub(super) async fn query_with_retry(
                 attempt,
                 max = MAX_PROVIDER_ATTEMPTS,
                 provider = deps.provider.name(),
-                error = %err,
+                error = %redacted_err,
                 "provider query failed; retry budget exhausted"
             );
         } else {
             tracing::error!(
                 attempt,
                 provider = deps.provider.name(),
-                error = %err,
+                error = %redacted_err,
                 "provider query failed with non-retryable error"
             );
         }
