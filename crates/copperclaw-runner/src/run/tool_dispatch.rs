@@ -49,6 +49,16 @@ pub(super) async fn invoke_tool(
         tracing::info!(tool = %call.name, %reason, "tool call denied by policy");
         return (reason, Vec::new(), true);
     }
+    // External MCP tool? Route to the host-proxied request/response path
+    // instead of the in-container tool_map. The policy gate above already ran
+    // (an `mcp__`-prefixed name is credentialed-external, so it inherits the
+    // provenance / autonomy block). Keep the heartbeat fresh across the
+    // round-trip exactly like a local tool dispatch.
+    if let Some(route) = deps.external_tools.get(&call.name) {
+        let _hb = HeartbeatTicker::start(deps.heartbeat_path.clone());
+        return super::external_mcp::dispatch_external(deps, route, &call.name, call.input.clone())
+            .await;
+    }
     let Some(entry) = deps.tool_map.get(&call.name) else {
         return (
             format!("Unknown tool `{}` — no handler registered.", call.name),
@@ -568,5 +578,119 @@ mod tests {
             input,
             parse_error: None,
         }
+    }
+
+    // ── external MCP tools: host-proxied dispatch through invoke_tool ─────────
+
+    use crate::run::external_mcp::ExternalToolRoute;
+    use copperclaw_db::tables::mcp_calls::{self, McpCallResponse};
+
+    #[tokio::test]
+    async fn external_mcp_call_round_trips_through_invoke_tool_and_taints() {
+        // Headline external-MCP case end-to-end through the dispatch gate: the
+        // model calls a namespaced external tool, invoke_tool routes it to the
+        // host-proxied path (request → host responds → result), and the result
+        // taints the turn (external MCP output is attacker-influenceable).
+        let (_tmp, mut deps, ctx) = deps_with_runner_ctx();
+        let mut routes = HashMap::new();
+        routes.insert(
+            "mcp__weather__forecast".to_string(),
+            ExternalToolRoute {
+                server: "weather".into(),
+                tool: "forecast".into(),
+            },
+        );
+        deps.external_tools = Arc::new(routes);
+
+        // A fake host: watch outbound for the request the runner writes, then
+        // answer it on inbound (exactly what the delivery executor does).
+        let outbound = deps.outbound.clone();
+        let inbound = deps.inbound.clone();
+        let host = tokio::spawn(async move {
+            loop {
+                let pending = {
+                    let conn = outbound.lock().await;
+                    mcp_calls::list_requests(&conn).unwrap()
+                };
+                if let Some(req) = pending.into_iter().next() {
+                    assert_eq!(req.server, "weather");
+                    assert_eq!(req.tool, "forecast");
+                    assert_eq!(req.input["city"], "NYC");
+                    let conn = inbound.lock().await;
+                    mcp_calls::insert_response(
+                        &conn,
+                        &McpCallResponse {
+                            request_id: req.request_id,
+                            is_error: false,
+                            result: "sunny, 72F".into(),
+                        },
+                    )
+                    .unwrap();
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+
+        assert!(!ctx.is_context_tainted(), "fresh turn starts untainted");
+        let (content, imgs, is_error) = invoke_tool(
+            &deps,
+            &call_with("mcp__weather__forecast", serde_json::json!({"city": "NYC"})),
+        )
+        .await;
+        host.await.unwrap();
+
+        assert!(!is_error, "successful external call must not be an error");
+        assert!(content.contains("sunny"), "got: {content}");
+        assert!(imgs.is_empty());
+        assert!(
+            ctx.is_context_tainted(),
+            "an external MCP result must taint the turn (untrusted-provenance)"
+        );
+
+        // …and the request row was GC'd by the runner after consuming it.
+        let leftover = {
+            let conn = deps.outbound.lock().await;
+            mcp_calls::list_requests(&conn).unwrap()
+        };
+        assert!(
+            leftover.is_empty(),
+            "runner must delete its consumed request"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_mcp_call_blocked_on_tainted_turn_before_dispatch() {
+        // Defense-in-depth: an external MCP call is a credentialed external
+        // action, so a turn already tainted by untrusted-provenance content
+        // blocks it at the policy gate — it never reaches the host-proxy path.
+        let (_tmp, mut deps, ctx) = deps_with_runner_ctx();
+        let mut routes = HashMap::new();
+        routes.insert(
+            "mcp__weather__forecast".to_string(),
+            ExternalToolRoute {
+                server: "weather".into(),
+                tool: "forecast".into(),
+            },
+        );
+        deps.external_tools = Arc::new(routes);
+
+        ctx.mark_untrusted_context("web_fetch:https://evil.example");
+        let (blocked, _imgs, is_error) = invoke_tool(
+            &deps,
+            &call_with("mcp__weather__forecast", serde_json::json!({"city": "NYC"})),
+        )
+        .await;
+        assert!(is_error);
+        assert!(
+            blocked.contains("untrusted-provenance"),
+            "tainted turn must block the external MCP call at the gate; got: {blocked}"
+        );
+        // Nothing was queued — the gate fired before the host-proxy path.
+        let queued = {
+            let conn = deps.outbound.lock().await;
+            mcp_calls::list_requests(&conn).unwrap()
+        };
+        assert!(queued.is_empty(), "blocked call must not queue a request");
     }
 }

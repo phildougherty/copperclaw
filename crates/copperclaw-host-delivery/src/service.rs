@@ -13,7 +13,8 @@ use copperclaw_channels_core::{
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
 use copperclaw_db::tables::{
-    agent_groups, delivered, messages_in, messages_out, session_routing, sessions,
+    agent_groups, container_configs, delivered, mcp_calls, messages_in, messages_out,
+    session_routing, sessions,
 };
 use copperclaw_modules::{
     DeliveryActionHandler, DeliveryActionInput, DeliveryDispatcher, DispatchTarget,
@@ -38,6 +39,11 @@ pub const SWEEP_POLL_MS: u64 = 60_000;
 pub const ABSOLUTE_CEILING_MS: u64 = 1_800_000;
 /// How many times we retry an adapter-level failure before giving up.
 pub const MAX_DELIVERY_ATTEMPTS: u32 = 3;
+/// Host-side ceiling on a single external MCP tool call. Bounds a hung server
+/// so the detached drain task (and its per-session guard) can't live forever.
+/// Kept below the runner's `EXTERNAL_MCP_DEADLINE_SECS` (120s) so the runner
+/// still receives the host's error response before its own poll gives up.
+pub const HOST_MCP_CALL_DEADLINE_SECS: u64 = 90;
 /// Base value for exponential backoff between retries.
 pub const BACKOFF_BASE_MS: u64 = 5_000;
 
@@ -225,6 +231,57 @@ fn backoff_delay_ms(tries: u32) -> u64 {
     scaled.min(ABSOLUTE_CEILING_MS)
 }
 
+/// Flatten the `content` array from an [`copperclaw_mcp::call_external_tool`]
+/// result (the serialized rmcp `CallToolResult` content blocks) into plain
+/// model-facing text. Text blocks are joined with blank lines; non-text blocks
+/// (images / resources) are rendered as a short type tag so the model at least
+/// sees they happened. Rendering host-side keeps the runner free of any rmcp
+/// content-shape knowledge — it just stores and replays this string.
+fn render_mcp_content(content: Option<&serde_json::Value>) -> String {
+    let Some(serde_json::Value::Array(blocks)) = content else {
+        return "(external MCP tool produced no output)".to_string();
+    };
+    let mut out = String::new();
+    for block in blocks {
+        let piece = match block.get("type").and_then(serde_json::Value::as_str) {
+            // A text block (or an untyped block carrying a `text` field) renders
+            // as its text; any other typed block renders as a short type tag.
+            Some("text") | None => block
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            Some(other) => format!("<{other}>"),
+        };
+        if piece.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&piece);
+    }
+    if out.is_empty() {
+        "(external MCP tool produced no output)".to_string()
+    } else {
+        out
+    }
+}
+
+/// RAII guard for the per-session external-MCP drain in-flight set. Removing
+/// the session's entry on drop (including a panic-unwind in the detached drain
+/// task) guarantees a future tick can always re-spawn a drain for the session.
+struct McpDrainGuard {
+    map: Arc<DashMap<SessionId, Instant>>,
+    session_id: SessionId,
+}
+
+impl Drop for McpDrainGuard {
+    fn drop(&mut self) {
+        self.map.remove(&self.session_id);
+    }
+}
+
 /// The delivery service — public entry point for the host.
 pub struct DeliveryService {
     central: CentralDb,
@@ -256,6 +313,13 @@ pub struct DeliveryService {
     /// (e.g. after a host restart); cleared when the plan fully completes
     /// so a later fresh plan re-pins.
     todo_anchors: DashMap<SessionId, String>,
+    /// Per-session in-flight guard for host-proxied external MCP tool calls.
+    /// A session present here has a drain task running; the active loop skips
+    /// re-spawning one so a slow external call is never executed twice. `Arc`
+    /// so the detached drain task can clear its own entry on completion. Keyed
+    /// by session id (the runner has at most one external call outstanding per
+    /// session — it blocks on each `tool_result` before the model can call again).
+    mcp_drain_inflight: Arc<DashMap<SessionId, Instant>>,
 }
 
 impl DeliveryService {
@@ -290,6 +354,7 @@ impl DeliveryService {
             selfmod_hard_fail: AtomicBool::new(selfmod_hard_fail_from_env()),
             todo_locks: DashMap::new(),
             todo_anchors: DashMap::new(),
+            mcp_drain_inflight: Arc::new(DashMap::new()),
         })
     }
 
@@ -330,6 +395,7 @@ impl DeliveryService {
             selfmod_hard_fail: AtomicBool::new(selfmod_hard_fail_from_env()),
             todo_locks: DashMap::new(),
             todo_anchors: DashMap::new(),
+            mcp_drain_inflight: Arc::new(DashMap::new()),
         })
     }
 
@@ -532,7 +598,174 @@ impl DeliveryService {
             }
         }
 
+        // Host-proxied external MCP tool calls: drain any requests the runner
+        // wrote to outbound.db, execute them against the configured external
+        // server (through the per-server filter), and write the result back to
+        // inbound.db for the runner's blocking poll. Best-effort — an external
+        // MCP hiccup must never poison the message-delivery pass.
+        if let Err(err) = self.drain_mcp_calls(sess, &outbound_pool, &inbound_pool) {
+            warn!(
+                ?err,
+                session = %sess.id.as_uuid(),
+                "external MCP call drain failed"
+            );
+        }
+
         Ok(report)
+    }
+
+    /// Execute the external MCP tool-call requests the runner left in
+    /// `outbound.db::mcp_call_requests` and write each result back to
+    /// `inbound.db::mcp_call_responses`, then GC responses the runner has
+    /// already consumed. Returns the number of calls executed this pass.
+    ///
+    /// The fast, synchronous part runs on the delivery tick: snapshot the
+    /// pending requests and GC consumed responses. The external calls
+    /// themselves run in a **detached task** off the delivery critical path —
+    /// the active loop processes sessions sequentially, so awaiting a slow or
+    /// hung external server here would head-of-line block message delivery for
+    /// every other session. A per-session in-flight guard
+    /// ([`Self::mcp_drain_inflight`]) keeps a slow call from being executed
+    /// twice across ticks; the runner only ever has one external call
+    /// outstanding per session, so session granularity is sufficient.
+    fn drain_mcp_calls(
+        &self,
+        sess: &Session,
+        outbound_pool: &SessionPool,
+        inbound_pool: &SessionPool,
+    ) -> Result<(), DeliveryError> {
+        // Snapshot outstanding requests + GC consumed responses — both fast,
+        // local DB ops; release the connections immediately.
+        let (requests, live_ids) = {
+            let out = outbound_pool.connect()?;
+            (
+                mcp_calls::list_requests(&out)?,
+                mcp_calls::request_ids(&out)?,
+            )
+        };
+        {
+            let inb = inbound_pool.connect()?;
+            mcp_calls::gc_orphan_responses(&inb, &live_ids)?;
+        }
+        if requests.is_empty() {
+            return Ok(());
+        }
+
+        // One drain task per session at a time. A slow call already in flight
+        // owns the guard; skip until it finishes (and writes its response).
+        if self.mcp_drain_inflight.contains_key(&sess.id) {
+            return Ok(());
+        }
+
+        let answered = {
+            let inb = inbound_pool.connect()?;
+            mcp_calls::response_ids(&inb)?
+        };
+        let todo: Vec<mcp_calls::McpCallRequest> = requests
+            .into_iter()
+            .filter(|r| !answered.contains(&r.request_id))
+            .collect();
+        if todo.is_empty() {
+            return Ok(());
+        }
+
+        // The group's external-server config, read once for the whole batch.
+        let servers = container_configs::get_mcp_servers(&self.central, sess.agent_group_id)
+            .unwrap_or(serde_json::Value::Null);
+
+        // Claim the guard and hand everything to a detached task. The guard is
+        // cleared on drop (including panic), so a wedged task can't permanently
+        // block the session's future drains.
+        self.mcp_drain_inflight.insert(sess.id, Instant::now());
+        let guard = McpDrainGuard {
+            map: Arc::clone(&self.mcp_drain_inflight),
+            session_id: sess.id,
+        };
+        let inbound_pool = inbound_pool.clone();
+        tokio::spawn(async move {
+            let _guard = guard; // cleared on drop
+            for req in todo {
+                let resp = Self::execute_mcp_call_bounded(&servers, &req).await;
+                match inbound_pool.connect() {
+                    Ok(inb) => {
+                        if let Err(err) = mcp_calls::insert_response(&inb, &resp) {
+                            warn!(?err, request_id = %req.request_id, "could not write external MCP response");
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            ?err,
+                            "could not open inbound.db to write external MCP response"
+                        );
+                    }
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// [`Self::execute_mcp_call`] wrapped in a host-side deadline so a hung
+    /// external server can't keep the drain task (and its session guard) alive
+    /// indefinitely. The deadline is shorter than the runner's own poll
+    /// deadline so the runner still receives the error response in time.
+    async fn execute_mcp_call_bounded(
+        servers: &serde_json::Value,
+        req: &mcp_calls::McpCallRequest,
+    ) -> mcp_calls::McpCallResponse {
+        let fut = Self::execute_mcp_call(servers, req);
+        match tokio::time::timeout(Duration::from_secs(HOST_MCP_CALL_DEADLINE_SECS), fut).await {
+            Ok(resp) => resp,
+            Err(_) => mcp_calls::McpCallResponse {
+                request_id: req.request_id.clone(),
+                is_error: true,
+                result: format!(
+                    "External MCP tool `{}` (server `{}`) did not respond within {HOST_MCP_CALL_DEADLINE_SECS}s.",
+                    req.tool, req.server
+                ),
+            },
+        }
+    }
+
+    /// Execute one external MCP tool-call request against the configured
+    /// server, through its per-server filter, and render the result into the
+    /// host-written response row. Every failure mode (missing server, connect
+    /// failure, filter-denied, remote error) becomes an `is_error` response —
+    /// the runner's blocking poll is never left unanswered.
+    async fn execute_mcp_call(
+        servers: &serde_json::Value,
+        req: &mcp_calls::McpCallRequest,
+    ) -> mcp_calls::McpCallResponse {
+        let Some(entry) = servers.get(&req.server) else {
+            return mcp_calls::McpCallResponse {
+                request_id: req.request_id.clone(),
+                is_error: true,
+                result: format!(
+                    "External MCP server `{}` is not configured for this group.",
+                    req.server
+                ),
+            };
+        };
+        match copperclaw_mcp::call_external_tool(entry, &req.tool, req.input.clone()).await {
+            Ok(value) => {
+                let is_error = value
+                    .get("is_error")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                mcp_calls::McpCallResponse {
+                    request_id: req.request_id.clone(),
+                    is_error,
+                    result: render_mcp_content(value.get("content")),
+                }
+            }
+            Err(err) => mcp_calls::McpCallResponse {
+                request_id: req.request_id.clone(),
+                is_error: true,
+                result: format!(
+                    "External MCP tool `{}` (server `{}`) failed: {err}",
+                    req.tool, req.server
+                ),
+            },
+        }
     }
 
     /// Pluck a system action handler invocation off the parsed row, if any.
@@ -1405,6 +1638,29 @@ impl DeliveryService {
                 )
                 .await?
             }
+            // Stale anchor: the chip this edit targeted is gone. Re-post a
+            // fresh chip instead of failing — same recovery as the todo card
+            // (see `dispatch_todo_list` / `is_stale_edit_target`). Breadcrumbs
+            // resolve their anchor from `delivered` each emit, so the fresh
+            // row's record becomes the next lookup target; no cache to clear.
+            Err(AdapterError::BadRequest(msg))
+                if existing_message_id.is_some() && is_stale_edit_target(&msg) =>
+            {
+                warn!(
+                    channel = adapter.channel_type().as_str(),
+                    stale_anchor = existing_message_id.unwrap_or(""),
+                    "breadcrumb edit target is gone; re-posting a fresh chip"
+                );
+                adapter
+                    .deliver_breadcrumb(
+                        &platform_id,
+                        target.thread_id.as_deref(),
+                        &breadcrumb,
+                        None,
+                    )
+                    .await
+                    .map_err(DeliveryError::Adapter)?
+            }
             Err(other) => return Err(DeliveryError::Adapter(other)),
         };
         let in_conn = inbound_pool.connect()?;
@@ -1563,6 +1819,32 @@ impl DeliveryService {
                     &outbound,
                 )
                 .await?
+            }
+            // Stale anchor: the card this edit targeted is gone (deleted, too
+            // old to edit, or pinned before a host restart / long idle gap).
+            // Don't fail the row forever — drop the dead anchor and re-post a
+            // FRESH card (pin it) so the plan keeps updating. Without this, the
+            // stale `todo_anchors` / `delivered` anchor is re-resolved on every
+            // subsequent emit and every todo update fails indefinitely.
+            Err(AdapterError::BadRequest(msg))
+                if prior_external_id.is_some() && is_stale_edit_target(&msg) =>
+            {
+                warn!(
+                    channel = adapter.channel_type().as_str(),
+                    stale_anchor = prior_external_id.as_deref().unwrap_or(""),
+                    "todo card edit target is gone; re-posting a fresh card"
+                );
+                self.todo_anchors.remove(&root.id);
+                adapter
+                    .deliver_todo_list(
+                        &platform_id,
+                        target.thread_id.as_deref(),
+                        &combined,
+                        None, // fresh post, no edit target
+                        true, // pin the new card
+                    )
+                    .await
+                    .map_err(DeliveryError::Adapter)?
             }
             Err(other) => return Err(DeliveryError::Adapter(other)),
         };
@@ -2271,6 +2553,31 @@ pub(crate) fn is_formatting_bad_request(msg: &str) -> bool {
         || m.contains("embeds")
         || m.contains("format")
         || m.contains("formatting")
+}
+
+/// Return `true` when a `BadRequest` indicates the message an edit targeted is
+/// **gone** — deleted, too old for the platform to edit, or never existed
+/// against this chat. This is distinct from a formatting rejection
+/// ([`is_formatting_bad_request`]): the request shape was fine, the *anchor*
+/// is stale. The delivery loop uses this to recover an in-place card update
+/// (a pinned todo/plan card whose anchor outlived a host restart or a long
+/// idle gap) by re-posting a FRESH card instead of failing the row forever.
+///
+/// Patterns covered (case-insensitive), across the channels that support
+/// in-place edits:
+/// - Telegram: `message to edit not found`, `message can't be edited`,
+///   `message_id_invalid`.
+/// - Slack: `message_not_found`, `cant_update_message`.
+/// - Discord: `unknown message`.
+pub(crate) fn is_stale_edit_target(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("message to edit not found")
+        || m.contains("message can't be edited")
+        || m.contains("message cant be edited")
+        || m.contains("message_id_invalid")
+        || m.contains("message_not_found")
+        || m.contains("cant_update_message")
+        || m.contains("unknown message")
 }
 
 /// Helper used by tests / the sweep loop to filter on container status.
@@ -4953,6 +5260,59 @@ mod tests {
         );
     }
 
+    /// A breadcrumb in-place edit whose anchor chip is gone must re-post a
+    /// fresh chip rather than fail the row — the same stale-anchor recovery as
+    /// the todo card.
+    #[tokio::test]
+    async fn update_breadcrumb_recovers_from_stale_edit_anchor() {
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        // Step 1: a Running chip, recorded in `delivered` with a platform id
+        // (this becomes the edit anchor the update resolves to).
+        let running =
+            copperclaw_channels_core::Breadcrumb::running("shell").with_detail("cargo check");
+        write_row(
+            &out_pool,
+            &make_row(
+                MessageKind::Breadcrumb,
+                json!({ "breadcrumb": serde_json::to_value(&running).unwrap() }),
+            ),
+        );
+        let _ = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(mock.deliveries().len(), 1);
+
+        // Step 2: the in-place edit fails as the platform does for a gone
+        // message; the loop must re-post a fresh chip instead of failing.
+        mock.fail_next_deliver(AdapterError::BadRequest(
+            "Bad Request: message to edit not found".into(),
+        ));
+        let done = running.clone().finished(true, Some("passed".into()));
+        write_row(
+            &out_pool,
+            &make_row(
+                MessageKind::System,
+                json!({
+                    "update_breadcrumb": {
+                        "tool_name": "shell",
+                        "breadcrumb": serde_json::to_value(&done).unwrap(),
+                    }
+                }),
+            ),
+        );
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(
+            rpt.failed, 0,
+            "a stale breadcrumb anchor must not fail the row"
+        );
+        assert_eq!(rpt.delivered, 1);
+        // Fresh chip re-posted: a second delivery landed (the failed edit is
+        // not recorded by the mock).
+        assert_eq!(mock.deliveries().len(), 2);
+    }
+
     /// A Diff-kind row pulls `content.diff` out, hands the canonical
     /// `DiffCard` to the adapter's `deliver_diff` hook, and the
     /// trait-level default text-fallback rendering reaches `deliver`.
@@ -5090,6 +5450,72 @@ mod tests {
         assert_eq!(rpt.failed, 1);
         assert_eq!(rpt.delivered, 0);
         assert!(mock.deliveries().is_empty());
+    }
+
+    #[test]
+    fn stale_edit_target_matches_platform_phrasings() {
+        for s in [
+            "Bad Request: message to edit not found",
+            "Bad Request: message can't be edited",
+            "message_not_found",
+            "cant_update_message",
+            "Unknown Message",
+            "MESSAGE_ID_INVALID",
+        ] {
+            assert!(
+                is_stale_edit_target(s),
+                "should match stale-edit-target: {s}"
+            );
+        }
+        for s in [
+            "Bad Request: can't parse entities",
+            "chat_id is empty",
+            "rate limited",
+            "",
+        ] {
+            assert!(!is_stale_edit_target(s), "should NOT match: {s}");
+        }
+    }
+
+    /// Headline resilience case: a todo/plan card whose pinned anchor is gone
+    /// (deleted, too old, or survived a host restart) must NOT fail the row
+    /// forever. The delivery loop drops the dead anchor and re-posts a fresh
+    /// card, so the plan keeps updating.
+    #[tokio::test]
+    async fn todo_list_stale_edit_anchor_reposts_fresh_card() {
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        // A stale anchor: the previously-pinned card no longer exists.
+        service
+            .todo_anchors
+            .insert(sess.id, "stale-old-card".to_string());
+        // The first (edit) deliver fails exactly as Telegram does for a gone
+        // message; the fresh re-post that follows succeeds (queue is empty).
+        mock.fail_next_deliver(AdapterError::BadRequest(
+            "Bad Request: message to edit not found".into(),
+        ));
+        let list = build_dispatch_todo_list();
+        let content = json!({ "todo_list": serde_json::to_value(&list).unwrap() });
+        write_row(&out_pool, &make_row(MessageKind::TodoList, content));
+
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        // Recovered — the row delivered via a fresh card, not marked failed.
+        assert_eq!(rpt.failed, 0, "a stale anchor must not fail the row");
+        assert_eq!(rpt.delivered, 1);
+        // Exactly one delivery landed: the failed edit isn't recorded, the
+        // fresh re-post is.
+        assert_eq!(mock.deliveries().len(), 1);
+        // The dead anchor was dropped and replaced with the fresh card's id.
+        let anchor = service.todo_anchors.get(&sess.id).map(|r| r.clone());
+        assert!(anchor.is_some(), "a fresh anchor must be recorded");
+        assert_ne!(
+            anchor.as_deref(),
+            Some("stale-old-card"),
+            "the stale anchor must be replaced"
+        );
     }
 
     #[test]
@@ -5637,5 +6063,121 @@ mod tests {
             Some("mock-1"),
             "platform_message_id must remain the first chunk's id across retries"
         );
+    }
+
+    // ── external MCP host-proxy: rendering + missing-server path ──────────────
+
+    #[test]
+    fn render_mcp_content_flattens_text_blocks() {
+        let content = serde_json::json!([
+            {"type": "text", "text": "line one"},
+            {"type": "text", "text": "line two"}
+        ]);
+        assert_eq!(render_mcp_content(Some(&content)), "line one\n\nline two");
+    }
+
+    #[test]
+    fn render_mcp_content_tags_non_text_blocks() {
+        let content = serde_json::json!([
+            {"type": "text", "text": "see attached"},
+            {"type": "image", "data": "..."}
+        ]);
+        assert_eq!(
+            render_mcp_content(Some(&content)),
+            "see attached\n\n<image>"
+        );
+    }
+
+    #[test]
+    fn render_mcp_content_handles_empty_and_missing() {
+        assert_eq!(
+            render_mcp_content(None),
+            "(external MCP tool produced no output)"
+        );
+        assert_eq!(
+            render_mcp_content(Some(&serde_json::json!([]))),
+            "(external MCP tool produced no output)"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_mcp_call_errors_when_server_is_not_configured() {
+        // The runner named a server the group's config doesn't have — every
+        // failure mode lands as an is_error response so the runner's poll is
+        // never left unanswered.
+        let servers = serde_json::json!({"weather": {"command": "x"}});
+        let req = mcp_calls::McpCallRequest {
+            request_id: "r1".into(),
+            server: "ghost".into(),
+            tool: "forecast".into(),
+            input: serde_json::json!({}),
+        };
+        let resp = DeliveryService::execute_mcp_call(&servers, &req).await;
+        assert!(resp.is_error);
+        assert!(resp.result.contains("ghost"), "got: {}", resp.result);
+        assert_eq!(resp.request_id, "r1");
+    }
+
+    #[tokio::test]
+    async fn execute_mcp_call_errors_when_connect_fails() {
+        // A configured-but-unreachable stdio server surfaces a connect failure
+        // as an is_error response naming the tool + server.
+        let servers = serde_json::json!({
+            "weather": {"command": "/no/such/binary-xyz-copperclaw-test"}
+        });
+        let req = mcp_calls::McpCallRequest {
+            request_id: "r2".into(),
+            server: "weather".into(),
+            tool: "forecast".into(),
+            input: serde_json::json!({}),
+        };
+        let resp = DeliveryService::execute_mcp_call(&servers, &req).await;
+        assert!(resp.is_error);
+        assert!(resp.result.contains("forecast"), "got: {}", resp.result);
+    }
+
+    #[tokio::test]
+    async fn drain_mcp_calls_spawns_and_writes_a_response() {
+        // End-to-end host side: a request in outbound.db is drained off the
+        // critical path (detached task) and an is_error response appears in
+        // inbound.db — here the named server isn't configured for the group.
+        let (service, _root, sess, _mock) = make_service().await;
+        let out_pool = service
+            .session_paths()
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let in_pool = service
+            .session_paths()
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        {
+            let out = out_pool.connect().unwrap();
+            mcp_calls::insert_request(
+                &out,
+                &mcp_calls::McpCallRequest {
+                    request_id: "rq".into(),
+                    server: "ghost".into(),
+                    tool: "t".into(),
+                    input: serde_json::json!({}),
+                },
+            )
+            .unwrap();
+        }
+
+        service.drain_mcp_calls(&sess, &out_pool, &in_pool).unwrap();
+
+        // The call runs detached; poll inbound.db for the response row.
+        let mut resp = None;
+        for _ in 0..200 {
+            let inb = in_pool.connect().unwrap();
+            if let Some(r) = mcp_calls::get_response(&inb, "rq").unwrap() {
+                resp = Some(r);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let resp = resp.expect("host drain must write a response");
+        assert!(resp.is_error);
+        assert!(resp.result.contains("ghost"), "got: {}", resp.result);
     }
 }

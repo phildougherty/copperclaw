@@ -21,11 +21,12 @@
 pub mod client;
 pub mod context;
 pub mod error;
+pub mod external;
 pub mod filter;
 pub mod server;
 pub mod tools;
 
-pub use client::{FilteredMcpClient, McpClient, RemoteTool, SharedMcpClient};
+pub use client::{FilteredMcpClient, McpClient, McpToolTransport, RemoteTool, SharedMcpClient};
 pub use context::{
     AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec, EditMessageSpec,
     EmitTodoListSpec, InstallSpec, MemoryHitView, MemorySearchSpec, MockToolContext,
@@ -35,6 +36,7 @@ pub use context::{
     UpdateTaskSpec,
 };
 pub use error::{McpError, ToolError};
+pub use external::{call_external_tool, connect_filtered};
 pub use filter::{ALLOWED_TOOLS_KEY, DENIED_TOOLS_KEY, FilterRejection, ToolFilter};
 
 pub use server::{CopperclawServer, build_server};

@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
     // dispatch the calls back to their handlers against the same
     // `ToolContext` the model sees.
     let tool_set = copperclaw_mcp::build_tool_set();
-    let tool_defs: Vec<copperclaw_providers::ToolDef> = tool_set
+    let mut tool_defs: Vec<copperclaw_providers::ToolDef> = tool_set
         .iter()
         .map(|e| copperclaw_providers::ToolDef {
             name: e.tool.name.to_string(),
@@ -121,6 +121,28 @@ async fn main() -> Result<()> {
             .map(|e| (e.tool.name.to_string(), std::sync::Arc::new(e)))
             .collect(),
     );
+
+    // External MCP tools: the host wrote the filter-stripped, per-server tool
+    // set to `<session_dir>/mcp_tools.json` at spawn. Advertise each to the
+    // provider under a namespaced `mcp__<server>__<tool>` name; a call to one
+    // routes through the host-proxied request/response path (the host holds the
+    // connection + credentials + filter and executes it host-side). A missing
+    // manifest just yields no external tools.
+    let (external_defs, external_routes) =
+        copperclaw_runner::run::external_mcp::load_external_tools(&cfg.session_dir);
+    if !external_defs.is_empty() {
+        tracing::info!(
+            count = external_defs.len(),
+            servers = external_routes
+                .values()
+                .map(|r| r.server.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            "advertising external MCP tools from host manifest"
+        );
+    }
+    tool_defs.extend(external_defs);
+    let external_tools = std::sync::Arc::new(external_routes);
 
     // Wire the subagent deps onto the ctx so the `explore` tool can
     // open a fresh bounded LLM loop with the same provider, model,
@@ -172,6 +194,7 @@ async fn main() -> Result<()> {
         agent_group_id: cfg.agent_group_id,
         turn_seq: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0)),
         tool_map,
+        external_tools,
         max_tool_turns: resolve_max_tool_turns(&env),
         max_task_tokens: resolve_max_task_tokens(&env),
         provider_deadline,
