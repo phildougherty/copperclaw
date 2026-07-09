@@ -8,6 +8,7 @@ version.workspace = true
 [dependencies]
 copperclaw-types         = { workspace = true }
 copperclaw-db            = { workspace = true }
+copperclaw-mcp           = { workspace = true }
 copperclaw-channels-core = { workspace = true }
 copperclaw-modules       = { workspace = true }
 copperclaw-metrics       = { workspace = true }

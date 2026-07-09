@@ -450,7 +450,7 @@ impl ContainerManager {
     async fn write_mcp_tools_manifest(&self, session: &Session, paths: &SessionPaths) {
         let assembled =
             super::mcp_tools::assemble_mcp_tools(&self.central, session.agent_group_id).await;
-        let advertised = assembled.advertised_tools();
+        let advertised = assembled.advertised_with_server();
         if assembled.server_count() > 0 {
             info!(
                 session = %session.id.as_uuid(),
@@ -460,10 +460,14 @@ impl ContainerManager {
                 "assembled external MCP tools through per-server filter"
             );
         }
+        // Each manifest entry carries its owning `server` so the runner can
+        // namespace the tool (`mcp__<server>__<tool>`) and the host's
+        // call-proxy can route a dispatched call back to the right server.
         let manifest: Vec<serde_json::Value> = advertised
             .iter()
-            .map(|t| {
+            .map(|(server, t)| {
                 serde_json::json!({
+                    "server": server,
                     "name": t.name,
                     "description": t.description,
                     "input_schema": t.input_schema,

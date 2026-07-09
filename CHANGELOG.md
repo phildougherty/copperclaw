@@ -6,10 +6,69 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (runner external-MCP consumer — host-proxied — 2026-06-03)
+
+The in-container runner can now consume **external** MCP servers configured on a
+group (`container_configs.mcp_servers`), surfacing their tools to the model in
+the *current* session — and this lands the previously-deferred per-server tool
+filter as live enforcement (it was held because nothing model-facing consumed
+external MCP tools yet). External tool calls execute **host-side** so the
+container stays sandboxed under deny-default egress.
+
+- **Advertise.** The host already writes the filter-stripped tool set to
+  `<session_dir>/mcp_tools.json` at spawn; each entry now carries its owning
+  `server` (`copperclaw-host/src/container_manager/spawn.rs` +
+  `mcp_tools.rs::advertised_with_server`). The runner reads it at startup
+  (`copperclaw-runner/src/run/external_mcp.rs`) and advertises each tool under a
+  namespaced `mcp__<server>__<tool>` name so external tools never collide with
+  the first-party set.
+- **Host-proxied execution (no new socket).** When the model calls an external
+  tool, the runner writes a request row to `outbound.db::mcp_call_requests` and
+  blocks-polls `inbound.db::mcp_call_responses` for the host's reply; the host's
+  delivery loop (`copperclaw-host-delivery::process_session_once`) drains the
+  requests, connects the one named server through its per-server filter
+  (`copperclaw_mcp::call_external_tool`), and writes the rendered result back.
+  Request-in-outbound / response-in-inbound preserves the
+  single-writer-per-bind-mounted-DB invariant (new migrations 023/024 + table
+  helper `copperclaw-db/src/tables/mcp_calls.rs`).
+- **Filter enforced on both ends.** Denied tools are stripped from the advertised
+  manifest *and* refused at the host executor (`FilteredMcpClient`), so a stale
+  manifest can't smuggle a denied call. The shared single-server connect/call
+  primitive now lives in `copperclaw-mcp` (`external.rs`) so the manifest seam
+  and the call executor can never drift.
+- **Provenance.** An external MCP result taints the turn
+  (`mark_untrusted_context`) exactly like a `web_fetch` body, and `mcp__`-prefixed
+  names are treated as credentialed-external in the dispatch policy — blocked
+  outright on an autonomous turn and on a tainted turn until fresh approval.
+- **Scope/limits.** Stateless lazy-connect per call (no host connection
+  registry); stdio + HTTP-SSE transports; host active-loop latency adds ~1-2s per
+  call; image-bearing remote results render as `<image>` (text-only this version).
+
+### Fixed (in-place cards recover from a stale edit anchor — 2026-06-03)
+
+- **A pinned todo/plan card whose anchor is gone no longer fails forever.**
+  `DeliveryService::dispatch_todo_list` edits a single pinned card in place,
+  resolving the anchor from the in-memory `todo_anchors` cache or (after a host
+  restart) the root session's persisted `delivered` records. When that anchor
+  points at a message the platform won't edit — deleted, too old, or pinned
+  before a long downtime — the edit returned `BadRequest("message to edit not
+  found")`, which was non-retryable, so the row was marked failed *and the stale
+  anchor was never cleared* — every subsequent todo update then re-hit the dead
+  card and failed indefinitely (observed live after a ~18h gap + restart: 8
+  consecutive `todo_list` delivery failures). The loop now detects a stale edit
+  target (new `is_stale_edit_target` predicate, covering Telegram / Slack /
+  Discord phrasings), drops the dead anchor, and re-posts a fresh pinned card so
+  the plan keeps updating. The same recovery is applied to **breadcrumb chips**
+  (`dispatch_breadcrumb`), so an in-place chip edit against a gone message
+  re-posts a fresh chip instead of failing the row.
+  `crates/copperclaw-host-delivery/src/service.rs`.
+
 ### Security (M16 close-the-gaps — web_search provenance + egress PID handoff — 2026-06-03)
 
 Two of the previously-deferred runtime gaps closed (full workspace gate clean,
-6,661 tests). The third (per-server MCP tool filter) stays deferred — see note.
+6,661 tests). The third (per-server MCP tool filter) was deferred here and has
+since been resolved — see "Added (runner external-MCP consumer)" above, which
+builds the consumer that made the filter live code.
 
 - **`web_search` results tagged untrusted-provenance.** `web_search`'s handler
   now calls the `ToolContext` untrusted-marking path (mirroring `web_fetch` /
@@ -24,12 +83,11 @@ Two of the previously-deferred runtime gaps closed (full workspace gate clean,
   `DenyDefault`. The privileged apply itself is still gated behind the opt-in
   flag and remains CAP_NET_ADMIN-dependent at runtime (honestly reported, not
   faked when unavailable).
-- **Still deferred — per-server MCP tool filter.** Held: the runner does not
-  consume external MCP tools yet (it loads only the first-party tool set), so
-  there is no model-facing path for the filter to enforce on. Closing this
-  needs the runner-side external-MCP consumer built first — a feature, not a
-  gap-patch — so the filter logic is left unmerged rather than shipped as dead
-  code.
+- **Per-server MCP tool filter — now live (was deferred here).** Originally held
+  because the runner consumed no external MCP tools, so the filter had nothing
+  model-facing to enforce on. The runner external-MCP consumer (see the "Added"
+  entry above) supplies that path: the filter now strips denied tools from the
+  advertised manifest and refuses denied calls at the host executor.
 
 ### Performance (LLM token-cost reduction — 2026-06-03)
 

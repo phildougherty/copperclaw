@@ -346,6 +346,7 @@ async fn run_one_turn(
         agent_group_id: ag,
         turn_seq: Arc::new(std::sync::atomic::AtomicI64::new(0)),
         tool_map,
+        external_tools: Arc::new(std::collections::HashMap::new()),
         max_tool_turns: 5,
         // No per-task token ceiling in this e2e — the tool-turn cap and
         // wiremock scripts bound the run; 0 disables the cost backstop.

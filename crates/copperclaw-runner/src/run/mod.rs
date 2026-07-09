@@ -10,6 +10,7 @@
 //! the inbound/outbound connections.
 
 pub(super) mod drive_turn;
+pub mod external_mcp;
 pub(super) mod formatting;
 pub(super) mod prompt;
 pub(super) mod provider_call;
@@ -357,6 +358,13 @@ pub struct RunnerDeps {
     /// validate the input and invoke the handler against the
     /// runner's `ToolContext`.
     pub tool_map: Arc<HashMap<String, Arc<ToolEntry>>>,
+    /// Routes for **external** MCP tools advertised from the host's
+    /// `mcp_tools.json` manifest. Keyed by the advertised, namespaced name
+    /// (`mcp__<server>__<tool>`); a hit routes the call through the
+    /// host-proxied request/response path
+    /// ([`external_mcp::dispatch_external`]) instead of the in-container
+    /// `tool_map`. Empty when the group configures no external MCP servers.
+    pub external_tools: Arc<HashMap<String, external_mcp::ExternalToolRoute>>,
     /// Hard cap on consecutive tool-use turns per inbound. Stops a
     /// confused model from looping forever. Default 20.
     pub max_tool_turns: usize,
@@ -460,6 +468,9 @@ impl RunnerDeps {
             agent_group_id: copperclaw_types::AgentGroupId(uuid::Uuid::nil()),
             turn_seq: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             tool_map: Arc::new(HashMap::new()),
+            // No external MCP servers by default; production wires this from
+            // the host's `mcp_tools.json` manifest, tests opt in explicitly.
+            external_tools: Arc::new(HashMap::new()),
             max_tool_turns: DEFAULT_MAX_TOOL_TURNS,
             max_task_tokens: DEFAULT_MAX_TASK_TOKENS,
             compaction: CompactionCfg {

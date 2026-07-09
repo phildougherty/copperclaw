@@ -1083,6 +1083,7 @@ dependencies = [
  "chrono",
  "copperclaw-channels-core",
  "copperclaw-db",
+ "copperclaw-mcp",
  "copperclaw-metrics",
  "copperclaw-modules",
  "copperclaw-types",

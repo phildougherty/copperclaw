@@ -108,12 +108,24 @@ const SESSION_INBOUND: &[Migration] = &[
         name: "015_messages_in_reply_to_is_group",
         sql: include_str!("../migrations/015_messages_in_reply_to_is_group.sql"),
     },
+    // Host-written responses for host-proxied external MCP tool calls.
+    Migration {
+        name: "024_session_mcp_call_responses",
+        sql: include_str!("../migrations/024_session_mcp_call_responses.sql"),
+    },
 ];
 
-const SESSION_OUTBOUND: &[Migration] = &[Migration {
-    name: "003_session_outbound",
-    sql: include_str!("../migrations/003_session_outbound.sql"),
-}];
+const SESSION_OUTBOUND: &[Migration] = &[
+    Migration {
+        name: "003_session_outbound",
+        sql: include_str!("../migrations/003_session_outbound.sql"),
+    },
+    // Runner-written requests for host-proxied external MCP tool calls.
+    Migration {
+        name: "023_session_mcp_call_requests",
+        sql: include_str!("../migrations/023_session_mcp_call_requests.sql"),
+    },
+];
 
 const MEMORY: &[Migration] = &[Migration {
     name: "021_memory_store",

@@ -18,6 +18,7 @@ pub mod destinations;
 pub mod dm_pairing_codes;
 pub mod dropped_messages;
 pub mod group_budgets;
+pub mod mcp_calls;
 pub mod mcp_oauth_tokens;
 pub mod messages_in;
 pub mod messages_out;

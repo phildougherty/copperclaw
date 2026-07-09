@@ -156,11 +156,25 @@ const CREDENTIALED_EXTERNAL_TOOLS: &[&str] = &[
     "add_mcp_server",
 ];
 
+/// Namespace prefix the runner gives every **external** MCP tool it advertises
+/// (`mcp__<server>__<tool>`). Mirrors the `mcp__server__tool` convention used
+/// elsewhere and keeps external tools from colliding with first-party names.
+pub const EXTERNAL_MCP_PREFIX: &str = "mcp__";
+
 /// True when `tool` takes a credentialed external action (see
 /// [`CREDENTIALED_EXTERNAL_TOOLS`]).
+///
+/// External MCP tools (the `mcp__`-prefixed names the runner advertises from a
+/// group's configured external servers) are treated as credentialed external
+/// actions too: the host executes them over the network on the broker's dime,
+/// so they must obey the same provenance / autonomy gate as `web_fetch` —
+/// blocked outright on an autonomous turn, and blocked on a tainted turn until
+/// a fresh approval clears it. This closes the confused-deputy hole where a
+/// prompt-injected turn could route the agent at an attacker-chosen external
+/// MCP tool to exfiltrate.
 #[must_use]
 pub fn is_credentialed_external(tool: &str) -> bool {
-    CREDENTIALED_EXTERNAL_TOOLS.contains(&tool)
+    CREDENTIALED_EXTERNAL_TOOLS.contains(&tool) || tool.starts_with(EXTERNAL_MCP_PREFIX)
 }
 
 /// A group's tool profile: the positive allow-list the agent is scoped
@@ -828,6 +842,63 @@ mod tests {
         assert!(clean.evaluate("web_fetch").is_allow());
         assert!(clean.evaluate("web_search").is_allow());
         assert!(clean.evaluate("add_mcp_server").is_allow());
+    }
+
+    #[test]
+    fn external_mcp_tools_are_credentialed_external() {
+        // The `mcp__<server>__<tool>` namespace marks a host-proxied external
+        // MCP call, which egresses on the broker's dime — gated like web_fetch.
+        assert!(is_credentialed_external("mcp__weather__forecast"));
+        assert!(is_credentialed_external("mcp__gh__create_issue"));
+        // First-party / local tools are NOT external.
+        assert!(!is_credentialed_external("read_file"));
+        assert!(!is_credentialed_external("send_message"));
+        // A name that merely contains "mcp" but lacks the `mcp__` prefix is not
+        // treated as an external MCP call (only the namespaced form is).
+        assert!(!is_credentialed_external("inspect_mcp_filter"));
+    }
+
+    #[test]
+    fn external_mcp_call_blocked_on_autonomous_turn() {
+        // An autonomous turn may not take a credentialed external action — and
+        // an external MCP tool is one. Under Full it would otherwise pass.
+        let auto = ToolPolicy::new(ToolProfile::Full, None).with_trust(TurnTrust {
+            tainted: false,
+            approved: false,
+            autonomous: true,
+        });
+        let d = auto.evaluate("mcp__weather__forecast");
+        assert!(!d.is_allow());
+        assert!(d.deny_reason().unwrap().contains("autonomous"));
+    }
+
+    #[test]
+    fn external_mcp_call_blocked_on_tainted_turn_until_approved() {
+        let tainted = ToolPolicy::new(ToolProfile::Full, None).with_trust(TurnTrust {
+            tainted: true,
+            approved: false,
+            autonomous: false,
+        });
+        assert!(
+            tainted
+                .evaluate("mcp__weather__forecast")
+                .deny_reason()
+                .unwrap()
+                .contains("untrusted-provenance")
+        );
+        // Fresh approval clears it.
+        let approved = ToolPolicy::new(ToolProfile::Full, None).with_trust(TurnTrust {
+            tainted: true,
+            approved: true,
+            autonomous: false,
+        });
+        assert!(approved.evaluate("mcp__weather__forecast").is_allow());
+    }
+
+    #[test]
+    fn external_mcp_call_passes_on_clean_full_turn() {
+        let clean = ToolPolicy::new(ToolProfile::Full, None);
+        assert!(clean.evaluate("mcp__weather__forecast").is_allow());
     }
 
     #[test]

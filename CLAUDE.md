@@ -4,11 +4,42 @@ Project-specific instructions for Claude (and you, if you're reading this fresh)
 
 ## What this project is
 
-Copperclaw — a self-hosted Rust runtime for Claude-style AI agents. One host
-binary (`copperclaw`), one admin client (`cclaw`), one setup wizard
-(`copperclaw-setup`). Per-session Linux containers brokered by 21 channel
-adapters. See `README.md` for the user-facing intro, `PLAN.md` for the
-design + milestone history.
+Copperclaw — a self-hosted Rust runtime for Claude-style AI agents. Four
+binaries: the host (`copperclaw`), the admin client (`cclaw`), the setup
+wizard (`copperclaw-setup`), and the in-container agent (`copperclaw-runner`).
+Per-session Linux containers brokered by 21 channel adapters. See `README.md`
+for the user-facing intro, `PLAN.md` for the design + milestone history.
+
+## Crate map (where each subsystem lives)
+
+18 workspace crates under `crates/`. The split mirrors the runtime's process
+boundaries — host, in-container runner, and the channel adapters are
+deliberately separate processes (see "Diagnosing" below for why that matters).
+
+  - `copperclaw-host` — the `copperclaw` binary: lifecycle, supervision, wiring.
+  - `copperclaw-host-router` — inbound router: resolves messaging groups, fans
+    out to agents, writes `messages_in`.
+  - `copperclaw-host-delivery` — outbound delivery loops (active 1s + sweep 60s):
+    polls `messages_out`, hands replies to channel adapters.
+  - `copperclaw-host-sweep` — 60s maintenance loop: stuck detection, recurrence
+    fanout, GC.
+  - `copperclaw-runner` — the `copperclaw-runner` binary: the in-container agent
+    loop (provider calls, tool dispatch, compaction, per-task budget).
+  - `copperclaw-providers` — agent provider trait + impls; prompt caching and
+    provider failover live here.
+  - `copperclaw-mcp` — the in-container first-party tool surface + a thin client.
+  - `copperclaw-channels` — 21 channel adapters (+ a `core` of shared infra),
+    each implementing `ChannelAdapter`.
+  - `copperclaw-container-rt` / `copperclaw-modules` — container runtime
+    abstraction (Docker) + pluggable host-side modules (egress, approvals).
+  - `copperclaw-browser` — headless-browser render core (read-only).
+  - `copperclaw-skills` — skill discovery, validation, container materialization.
+  - `copperclaw-db` — central + per-session SQLite; migrations live here.
+  - `copperclaw-metrics` — Prometheus metrics (a hotspot — many crates touch it).
+  - `copperclaw-onecli` — Agent Vault HTTP client (credential injection).
+  - `copperclaw-cclaw` — the `cclaw` admin binary.
+  - `copperclaw-setup` — the `copperclaw-setup` wizard; steps in `src/steps/`.
+  - `copperclaw-types` — shared workspace types.
 
 ## Local development loop
 
@@ -58,7 +89,8 @@ cargo test --workspace --no-fail-fast
 ```
 
 The workspace forbids `unsafe_code` and treats clippy warnings as errors.
-Current baseline: ~5,980 passing tests. Don't break that.
+Pinned toolchain: Rust 1.85, edition 2024 (`rust-toolchain.toml`). Current
+baseline: ~6,660 passing tests. Don't break that.
 
 ### Formatting (rustfmt is the authority)
 
@@ -208,8 +240,10 @@ operators and future-you.
 
 ## Parallel-agent work
 
-This codebase is designed for parallel-agent contribution. Recent batches:
-batches M-P added replay-fixture coverage; batches Q-S closed the gaps the
-fixtures surfaced. When spawning subagents, give each one a disjoint file
-scope to avoid merge conflicts (channels are independent; the runner +
-provider are not; metrics is a hotspot).
+This codebase is designed for parallel-agent contribution — the crate map
+above is also the conflict-avoidance map. When spawning subagents, give each
+one a disjoint file scope: channel adapters are independent of each other; the
+runner + providers are tightly coupled (treat as one scope); `copperclaw-metrics`
+is a hotspot many crates touch (serialize edits to it). Recent milestone: the
+M16 security-hardening program (waves 1-5) plus the LLM-cost work landed via
+parallel branches merged through PRs #6-#8.

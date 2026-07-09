@@ -575,6 +575,7 @@ impl ReplayHarness {
             agent_group_id: ag,
             turn_seq: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             tool_map,
+            external_tools: Arc::new(std::collections::HashMap::new()),
             max_tool_turns: 5,
             // Replay fixtures bound the run via the tool-turn cap; the
             // per-task token ceiling is disabled (0) so deterministic

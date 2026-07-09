@@ -32,7 +32,7 @@ use std::collections::HashMap;
 
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::container_configs;
-use copperclaw_mcp::{FilteredMcpClient, McpClient, McpError, RemoteTool, ToolFilter};
+use copperclaw_mcp::{FilteredMcpClient, McpError, RemoteTool};
 use copperclaw_types::AgentGroupId;
 use serde_json::Value;
 use tracing::warn;
@@ -67,6 +67,17 @@ impl AssembledMcpTools {
     #[must_use]
     pub fn advertised_tools(&self) -> Vec<RemoteTool> {
         self.advertised.iter().map(|(_, t)| t.clone()).collect()
+    }
+
+    /// The advertised tools tagged with their owning server name. The runner
+    /// uses the server name to namespace the tool (`mcp__<server>__<tool>`) and
+    /// to route a call back to the right server when the host proxies it.
+    #[must_use]
+    pub fn advertised_with_server(&self) -> Vec<(String, RemoteTool)> {
+        self.advertised
+            .iter()
+            .map(|(idx, t)| (self.servers[*idx].name.clone(), t.clone()))
+            .collect()
     }
 
     /// True when `name` is advertised (i.e. permitted by its server's filter).
@@ -173,62 +184,23 @@ async fn add_server(assembled: &mut AssembledMcpTools, handle: McpServerHandle) 
 
 /// Connect one configured server and wrap it in its per-server filter.
 ///
-/// This is the production construction site of [`FilteredMcpClient`]: the
-/// filter is parsed from the same `mcp_servers` entry the operator configured,
-/// so the host-side `mcp.inspect-filter` view and the live enforcement agree.
+/// Delegates the transport selection + filter wrap to
+/// [`copperclaw_mcp::connect_filtered`], the single shared connect site that
+/// the host-proxied call executor (`copperclaw-host-delivery`) also uses, so
+/// the advertised manifest and the live call path can never disagree about how
+/// a server is reached or filtered.
 async fn connect_one(name: &str, entry: &Value) -> Result<McpServerHandle, McpError> {
-    let filter = ToolFilter::from_server_entry(entry);
-    let client = connect_transport(entry).await?;
     Ok(McpServerHandle {
         name: name.to_owned(),
-        client: FilteredMcpClient::new(client, filter),
+        client: copperclaw_mcp::connect_filtered(entry).await?,
     })
-}
-
-/// Build a live [`McpClient`] from a server entry. Supports the two transports
-/// `McpClient` implements: stdio (`command` + `args` + `env`) and HTTP SSE
-/// (`url` + `headers`). The preset registry writes the stdio shape.
-async fn connect_transport(entry: &Value) -> Result<McpClient, McpError> {
-    if let Some(url) = entry.get("url").and_then(Value::as_str) {
-        let headers = string_map(entry.get("headers"));
-        return McpClient::connect_http_sse(url, headers).await;
-    }
-    if let Some(command) = entry.get("command").and_then(Value::as_str) {
-        let args: Vec<String> = entry
-            .get("args")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let env = string_map(entry.get("env"));
-        return McpClient::connect_stdio(command, args, env).await;
-    }
-    Err(McpError::Protocol(
-        "mcp_servers entry has neither a `command` (stdio) nor a `url` (http-sse) transport".into(),
-    ))
-}
-
-/// Parse a JSON object of string→string (env / headers). Non-string values are
-/// skipped; a non-object is treated as empty.
-fn string_map(value: Option<&Value>) -> HashMap<String, String> {
-    value
-        .and_then(Value::as_object)
-        .map(|m| {
-            m.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use copperclaw_mcp::McpToolTransport;
+    use copperclaw_mcp::{McpToolTransport, ToolFilter};
 
     /// In-process fake server that advertises a fixed tool list and echoes the
     /// call name, so the filter's strip/refuse behaviour can be proven without
@@ -402,21 +374,19 @@ mod tests {
         assert!(matches!(err, McpError::Protocol(_)), "got {err:?}");
     }
 
-    #[test]
-    fn connect_transport_requires_a_transport() {
-        // Pure (no await): an entry with neither command nor url is rejected.
-        let entry = serde_json::json!({"denied_tools": ["x"]});
-        assert!(entry.get("command").is_none() && entry.get("url").is_none());
-    }
-
-    #[test]
-    fn string_map_skips_non_strings_and_non_objects() {
-        let v = serde_json::json!({"A": "1", "B": 2, "C": "3"});
-        let m = string_map(Some(&v));
-        assert_eq!(m.get("A").map(String::as_str), Some("1"));
-        assert_eq!(m.get("C").map(String::as_str), Some("3"));
-        assert!(!m.contains_key("B"));
-        assert!(string_map(None).is_empty());
-        assert!(string_map(Some(&serde_json::json!("not an object"))).is_empty());
+    #[tokio::test]
+    async fn advertised_with_server_tags_each_tool_with_its_origin() {
+        // The manifest needs the owning server name per tool so the runner can
+        // namespace + route it. A two-tool server tags both with its name.
+        let filter = ToolFilter::from_server_entry(&serde_json::json!({}));
+        let (assembled, _) = assemble_fake("weather", &["forecast", "alerts"], filter).await;
+        let tagged = assembled.advertised_with_server();
+        assert_eq!(tagged.len(), 2);
+        for (server, _tool) in &tagged {
+            assert_eq!(server, "weather");
+        }
+        let mut tools: Vec<String> = tagged.into_iter().map(|(_, t)| t.name).collect();
+        tools.sort();
+        assert_eq!(tools, vec!["alerts".to_string(), "forecast".to_string()]);
     }
 }
