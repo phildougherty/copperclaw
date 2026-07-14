@@ -17,8 +17,9 @@ async fn ncl_client_groups_list_round_trip() {
     let server_path = socket_path.clone();
     let server_cancel = shutdown.clone();
     let server_central = central.clone();
+    let server_data_dir = tmp.path().to_path_buf();
     let server_task = tokio::spawn(async move {
-        run_server(server_path, server_central, server_cancel)
+        run_server(server_path, server_central, server_data_dir, server_cancel)
             .await
             .unwrap();
     });
@@ -70,8 +71,9 @@ async fn ncl_client_agent_caller_blocked_on_mutation() {
     let server_path = socket_path.clone();
     let server_cancel = shutdown.clone();
     let server_central = central.clone();
+    let server_data_dir = tmp.path().to_path_buf();
     let server_task = tokio::spawn(async move {
-        run_server(server_path, server_central, server_cancel)
+        run_server(server_path, server_central, server_data_dir, server_cancel)
             .await
             .unwrap();
     });
@@ -101,6 +103,90 @@ async fn ncl_client_agent_caller_blocked_on_mutation() {
         }
         other => panic!("expected permission_denied, got {other:?}"),
     }
+
+    shutdown.cancel();
+    server_task.await.unwrap();
+}
+
+/// Regression: `sessions.delete` must remove the on-disk session
+/// directory through the REAL socket server wiring. The server used to
+/// build its `HandlerCtx` with the default relative `"data"` path, so
+/// dir removal resolved against the daemon's CWD and silently returned
+/// `directory_removed: false` in production (the handler-level unit
+/// test passed because it injected an absolute path directly). The
+/// server here gets a tempdir as its data dir — which is never the
+/// test process CWD — so this fails if the wiring regresses.
+#[tokio::test]
+async fn ncl_sessions_delete_removes_dir_via_socket_server() {
+    use copperclaw_db::session::SessionPaths;
+    use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+    use copperclaw_db::tables::sessions::{CreateSession, create as create_session};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let socket_path = tmp.path().join("cclaw.sock");
+    let data_dir = tmp.path().join("data");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let central = CentralDb::open_in_memory().unwrap();
+
+    // Seed one agent group + session and materialise its on-disk tree
+    // under the server's data dir.
+    let g = create_ag(
+        &central,
+        CreateAgentGroup {
+            name: "g".into(),
+            folder: "g".into(),
+            agent_provider: None,
+        },
+    )
+    .unwrap();
+    let s = create_session(
+        &central,
+        CreateSession {
+            agent_group_id: g.id,
+            messaging_group_id: None,
+            thread_id: None,
+            agent_provider: None,
+            source_session_id: None,
+        },
+    )
+    .unwrap();
+    let paths = SessionPaths::new(&data_dir, g.id, s.id);
+    paths.ensure_dirs().unwrap();
+    assert!(paths.root.exists());
+
+    let shutdown = CancellationToken::new();
+    let server_path = socket_path.clone();
+    let server_cancel = shutdown.clone();
+    let server_central = central.clone();
+    let server_data_dir = data_dir.clone();
+    let server_task = tokio::spawn(async move {
+        run_server(server_path, server_central, server_data_dir, server_cancel)
+            .await
+            .unwrap();
+    });
+
+    for _ in 0..80 {
+        if socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(socket_path.exists(), "socket should be up");
+
+    let client = CclawClient::connect(socket_path.clone());
+    let v = client
+        .call(
+            "sessions.delete",
+            json!({"id": s.id.as_uuid().to_string()}),
+            Caller::Host,
+        )
+        .await
+        .unwrap();
+    assert_eq!(v["directory_removed"], true, "response: {v}");
+    assert!(
+        !paths.root.exists(),
+        "session dir must be removed by the socket-served handler"
+    );
 
     shutdown.cancel();
     server_task.await.unwrap();

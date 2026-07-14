@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (admin-socket data dir — 2026-07-14)
+
+- The cclaw socket server built its `HandlerCtx` with the default relative `"data"` path instead of the install's absolute data dir, so `sessions.delete` never removed the on-disk session directory when the host ran daemonized (it reported `directory_removed: false` with no warning) and dead-letter `dropped-messages replay` resolved per-session DBs against the daemon's CWD. `serve_listener`/`run_server` now take the data dir explicitly and boot passes `cfg.data_dir` (`crates/copperclaw-host/src/{socket.rs,boot.rs}`); regression e2e drives `sessions.delete` through the real socket server with a non-CWD data dir.
+
 ### Added (runner external-MCP consumer — host-proxied — 2026-06-03)
 
 The in-container runner can now consume **external** MCP servers configured on a

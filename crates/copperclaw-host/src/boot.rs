@@ -794,10 +794,22 @@ pub async fn run_host(
     // accept loop then runs on the spawned task as before.
     let socket_path = cfg.ncl_socket_path.clone();
     let socket_central = state.central.clone();
+    // Absolute data dir for handlers that touch per-session files
+    // (`sessions.delete` dir removal, dead-letter replay). The daemon's
+    // CWD is not the install root, so the HandlerCtx default relative
+    // path must never be used here.
+    let socket_data_dir = cfg.data_dir.clone();
     let socket_cancel = shutdown.clone();
     let listener = bind_listener(&socket_path).map_err(BootError::Socket)?;
     let socket_task = tokio::spawn(async move {
-        serve_listener(listener, socket_path, socket_central, socket_cancel).await
+        serve_listener(
+            listener,
+            socket_path,
+            socket_central,
+            socket_data_dir,
+            socket_cancel,
+        )
+        .await
     });
 
     print_ready_banner(&cfg, &initialized);
