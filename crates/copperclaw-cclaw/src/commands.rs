@@ -30,6 +30,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Disable ANSI color in human-readable output. Color is also
+    /// suppressed automatically when stdout is not a terminal or when the
+    /// `NO_COLOR` environment variable is set.
+    #[arg(long, global = true)]
+    pub no_color: bool,
+
     /// Top-level subcommand. When omitted, `cclaw` emits a one-shot
     /// operator dashboard via the `composite.dashboard` marker. The
     /// dashboard contract is in `crate::run_dashboard`.
