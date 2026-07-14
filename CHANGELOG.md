@@ -10,6 +10,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 - `cclaw` human-readable output is colorized when stdout is a real terminal: doctor OK/WARN/FAIL levels (green/yellow/red), `fix:` hint lines (cyan), table and dashboard section headers (bold), and `remote error:` lines (red). Gated on `std::io::IsTerminal`, the `NO_COLOR` convention, and a new global `--no-color` flag (`crates/copperclaw-cclaw/src/style.rs`); `--json` output is never styled and piped output stays byte-identical.
 
+### Fixed (M17 D2 — honest `sessions get`, new `sessions tail` — 2026-07-14)
+
+- `cclaw sessions get` now delivers what its help text always claimed: the session row plus the last 10 `messages_in` / `messages_out` rows (kind, status, timestamp, ~120-char secret-redacted content preview), read read-only from the per-session DBs host-side (`crates/copperclaw-host/src/handlers/sessions.rs`); and a new `cclaw sessions tail <id> [--follow]` prints the merged time-ordered rows with direction markers (`<-` inbound, `->` outbound, `--` breadcrumb/status kinds), polling 1s under `--follow` — safe against a running session (WAL concurrent reader), and message previews are withheld from agent callers asking about foreign sessions.
+
 ### Added (runner external-MCP consumer — host-proxied — 2026-06-03)
 
 The in-container runner can now consume **external** MCP servers configured on a
