@@ -2,14 +2,15 @@
 //! `run_llm_turn` until the model produces a no-tool turn or we hit the
 //! per-inbound cap.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use copperclaw_providers::HistoryMessage;
 
 use super::RunnerDeps;
-use super::provider_call::run_llm_turn;
-use super::tool_dispatch::invoke_tool;
+use super::provider_call::{HeartbeatTicker, run_llm_turn};
+use super::tool_dispatch::{ToolImage, invoke_tool};
 use crate::state::save_state;
 
 /// Wall-clock budget the runner gives itself between user-facing emits
@@ -435,33 +436,35 @@ pub(super) async fn drive_turn(
             n = output.tool_calls.len(),
             "executing tool calls"
         );
-        // Set when the content-loop breaker trips while executing this
-        // turn's calls. We finish executing + persisting the current
-        // batch (so the audit history is complete) before bailing.
+        // Content-loop guard runs against the whole batch BEFORE spawning
+        // — it is a purely sequential, ordering-sensitive check on the
+        // model-requested `(name, args)` fingerprints and must not race
+        // with tool execution. Preserve the original semantics exactly:
+        // observe each non-parse-error call in original order and keep the
+        // FIRST pattern that trips; stop observing once tripped so the
+        // trailing window isn't polluted by calls past the trip point.
+        // Parse-error synthetic calls (input is Null) are skipped here and
+        // bounded instead by the parse-error cap below.
+        //
+        // Set when the content-loop breaker trips: we still execute +
+        // persist the current batch (so the audit history is complete)
+        // before bailing.
         let mut tripped_loop: Option<LoopPattern> = None;
         for call in &output.tool_calls {
-            // Feed the model-requested call into the content-loop guard.
-            // Skip parse-error synthetic calls: their `input` is Null and
-            // they're already bounded by the parse-error cap below.
             if call.parse_error.is_none() && tripped_loop.is_none() {
                 tripped_loop = loop_guard.observe(&call.name, &call.input);
             }
-            let (content, images, is_error) = if let Some(parse_err) = call.parse_error.as_deref() {
-                // Synthetic call from `ProviderEvent::ToolInputParseError`:
-                // we never actually invoke the tool — instead we hand the
-                // model a tool_result describing what went wrong so it
-                // can re-emit the call with valid JSON next turn.
-                (
-                    format!(
-                        "Your tool_use input JSON could not be parsed: {parse_err}. Please re-issue this exact tool call with valid JSON.",
-                    ),
-                    Vec::new(),
-                    true,
-                )
-            } else {
-                invoke_tool(deps, call).await
-            };
-            finish_tool_breadcrumb(deps, call, &content, is_error).await;
+        }
+
+        // Execute the batch concurrently, then append results to history
+        // in the ORIGINAL call order. Independent calls (e.g. N read_file)
+        // finish in ~max(latency) instead of ~sum. Ordering-preserving
+        // append keeps transcripts deterministic and tool_use/tool_result
+        // pairing intact regardless of completion order. `shell` calls and
+        // same-path edit-family calls are serialised inside the batch (see
+        // `execute_tool_batch`) because they mutate shared state.
+        let batch = execute_tool_batch(deps, &output.tool_calls).await;
+        for (call, (content, images, is_error)) in output.tool_calls.iter().zip(batch) {
             cumulative_tool_runs += 1;
             last_tool_name = Some(call.name.clone());
             history.push(HistoryMessage::Tool {
@@ -600,6 +603,131 @@ pub(super) async fn drive_turn(
             "the agent ran out of turns after {cap} tool calls without finishing the task"
         )),
     })
+}
+
+/// One executed tool call's rendering: `(content, images, is_error)` —
+/// the text for the `HistoryMessage::Tool` row, any image blocks, and
+/// whether the call errored. Mirrors `invoke_tool`'s return shape.
+type ToolCallOutput = (String, Vec<ToolImage>, bool);
+
+/// Edit-family tools that mutate a file identified by a `path` input.
+/// Two calls in one batch that target the same file both read-modify-
+/// write it, so [`execute_tool_batch`] groups them into one serial chain
+/// keyed by path. Names mirror the tool-map registrations.
+const EDIT_FAMILY_TOOLS: [&str; 4] = ["edit_file", "multi_edit", "apply_patch", "write_file"];
+
+/// Serialisation key for an edit-family call: the target file `path`, so
+/// two edits to the *same* file run in order while edits to *different*
+/// files stay concurrent. Non-edit tools return `None` (fully
+/// concurrent). An edit-family call whose `path` can't be resolved from
+/// its input collapses to one shared sentinel key so unknown-target edits
+/// never race — conservative, and vanishingly rare in practice.
+fn edit_family_path(name: &str, input: &serde_json::Value) -> Option<String> {
+    if !EDIT_FAMILY_TOOLS.contains(&name) {
+        return None;
+    }
+    match input.get("path").and_then(serde_json::Value::as_str) {
+        Some(path) => Some(path.to_string()),
+        None => Some("\u{0}edit-family-unresolved-path\u{0}".to_string()),
+    }
+}
+
+/// Execute one batch of model-requested tool calls concurrently and
+/// return their `(content, images, is_error)` results in the SAME order
+/// as `calls`. Independent calls run in parallel (so N slow `read_file`s
+/// finish in ~max latency, not ~sum); two classes are serialised because
+/// they mutate shared state that would corrupt under interleaving:
+///
+/// - **`shell`**: persists cwd/env to `/data/.shell_state`, so every
+///   `shell` call in the batch runs in its original relative order
+///   (still concurrent with the non-shell calls).
+/// - **edit family targeting the same path** (`edit_file` / `multi_edit`
+///   / `apply_patch` / `write_file`): grouped by `path` and serialised
+///   within a group so two writes to one file don't race; different paths
+///   stay concurrent.
+///
+/// A batch-scoped [`HeartbeatTicker`] is held across the whole join so the
+/// heartbeat stays fresh even in the micro-gap between two calls in a
+/// serial chain (each `invoke_tool` also starts its own per-call ticker).
+async fn execute_tool_batch(deps: &RunnerDeps, calls: &[PendingToolCall]) -> Vec<ToolCallOutput> {
+    let _batch_hb = HeartbeatTicker::start(deps.heartbeat_path.clone());
+
+    // Assign each call to a serialisation chain. Distinct chains run
+    // concurrently; calls within a chain run sequentially in call order.
+    let mut chain_of: Vec<usize> = Vec::with_capacity(calls.len());
+    let mut next_chain = 0usize;
+    let mut shell_chain: Option<usize> = None;
+    let mut edit_chains: HashMap<String, usize> = HashMap::new();
+    for call in calls {
+        let chain = if call.name == "shell" {
+            *shell_chain.get_or_insert_with(|| {
+                let c = next_chain;
+                next_chain += 1;
+                c
+            })
+        } else if let Some(path) = edit_family_path(&call.name, &call.input) {
+            *edit_chains.entry(path).or_insert_with(|| {
+                let c = next_chain;
+                next_chain += 1;
+                c
+            })
+        } else {
+            let c = next_chain;
+            next_chain += 1;
+            c
+        };
+        chain_of.push(chain);
+    }
+
+    // Bucket the original call indices into their chains (call order
+    // preserved within each bucket).
+    let mut chains: Vec<Vec<usize>> = vec![Vec::new(); next_chain];
+    for (idx, &chain) in chain_of.iter().enumerate() {
+        chains[chain].push(idx);
+    }
+
+    // One future per chain: awaits its calls in order. Chains are polled
+    // concurrently by `join_all`, so cross-chain calls overlap.
+    let chain_futures = chains.into_iter().map(|indices| async move {
+        let mut out: Vec<(usize, ToolCallOutput)> = Vec::with_capacity(indices.len());
+        for idx in indices {
+            let result = run_one_call(deps, &calls[idx]).await;
+            out.push((idx, result));
+        }
+        out
+    });
+
+    // Flatten and restore original call order for a deterministic
+    // transcript (tool_use/tool_result pairing must not depend on which
+    // call finished first).
+    let mut flat: Vec<(usize, ToolCallOutput)> = futures::future::join_all(chain_futures)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+    flat.sort_by_key(|(idx, _)| *idx);
+    flat.into_iter().map(|(_, result)| result).collect()
+}
+
+/// Run one model-requested tool call to a `(content, images, is_error)`
+/// result and flip its breadcrumb chip. Parse-error synthetic calls
+/// (input is Null) never dispatch — they hand the model a `tool_result`
+/// describing the JSON parse failure so it can re-emit valid input next
+/// turn (bounded by the parse-error cap in `drive_turn`).
+async fn run_one_call(deps: &RunnerDeps, call: &PendingToolCall) -> ToolCallOutput {
+    let (content, images, is_error) = if let Some(parse_err) = call.parse_error.as_deref() {
+        (
+            format!(
+                "Your tool_use input JSON could not be parsed: {parse_err}. Please re-issue this exact tool call with valid JSON.",
+            ),
+            Vec::new(),
+            true,
+        )
+    } else {
+        invoke_tool(deps, call).await
+    };
+    finish_tool_breadcrumb(deps, call, &content, is_error).await;
+    (content, images, is_error)
 }
 
 /// Flip the in-place breadcrumb chip from "Running" to "Done"/"Failed"
@@ -755,6 +883,598 @@ mod first_line_truncated_tests {
         // breadcrumb chip should fall back to status-only.
         assert_eq!(first_line_truncated("{}", 200), None);
         assert_eq!(first_line_truncated("{\n}", 200), None);
+    }
+}
+
+#[cfg(test)]
+mod execute_tool_batch_tests {
+    use std::borrow::Cow;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    use async_trait::async_trait;
+    use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
+    use copperclaw_mcp::{ToolContext, ToolEntry, ToolError, ToolHandler};
+    use copperclaw_providers::{
+        AgentProvider, AgentQuery, HistoryMessage, ProviderError, QueryInput,
+    };
+    use copperclaw_types::{AgentGroupId, ProviderEvent, SessionId};
+    use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
+    use tokio::sync::Mutex;
+
+    use super::{PendingToolCall, TurnOutcome, drive_turn, execute_tool_batch};
+    use crate::run::RunnerDeps;
+    use crate::tools::RunnerToolCtx;
+
+    /// Shared high-water mark of concurrently-executing mock tool bodies.
+    /// `peak() >= 2` proves two calls genuinely overlapped; `peak() == 1`
+    /// proves strict serialisation.
+    #[derive(Default)]
+    struct ConcurrencyTracker {
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+    }
+
+    impl ConcurrencyTracker {
+        fn enter(&self) {
+            let now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(now, Ordering::SeqCst);
+        }
+        fn exit(&self) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
+        fn peak(&self) -> usize {
+            self.max_active.load(Ordering::SeqCst)
+        }
+    }
+
+    fn arg_str(arguments: Option<&JsonObject>, key: &str) -> String {
+        arguments
+            .and_then(|a| a.get(key))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?")
+            .to_string()
+    }
+
+    fn arg_u64(arguments: Option<&JsonObject>, key: &str) -> u64 {
+        arguments
+            .and_then(|a| a.get(key))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    }
+
+    /// Mock tool: sleeps `delay_ms` (from args), then echoes its `id`
+    /// argument as `done:<id>`. Records start/end events + concurrency.
+    struct SlowEcho {
+        tracker: Arc<ConcurrencyTracker>,
+        log: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl ToolHandler for SlowEcho {
+        async fn call(
+            &self,
+            arguments: Option<JsonObject>,
+            _ctx: &dyn ToolContext,
+        ) -> Result<CallToolResult, ToolError> {
+            let id = arg_str(arguments.as_ref(), "id");
+            let delay_ms = arg_u64(arguments.as_ref(), "delay_ms");
+            self.log.lock().unwrap().push(format!("start:{id}"));
+            self.tracker.enter();
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            self.tracker.exit();
+            self.log.lock().unwrap().push(format!("end:{id}"));
+            Ok(CallToolResult::success(vec![Content::text(format!(
+                "done:{id}"
+            ))]))
+        }
+    }
+
+    /// Mock `shell`: emulates the real tool's persisted-cwd semantics
+    /// (`/data/.shell_state`). `cmd: "cd <path>"` sleeps 100ms and THEN
+    /// records the new cwd — so a concurrently-running `pwd` would read
+    /// the stale value; a serialised one observes the change.
+    struct MockShell {
+        cwd: Arc<StdMutex<String>>,
+        tracker: Arc<ConcurrencyTracker>,
+    }
+
+    #[async_trait]
+    impl ToolHandler for MockShell {
+        async fn call(
+            &self,
+            arguments: Option<JsonObject>,
+            _ctx: &dyn ToolContext,
+        ) -> Result<CallToolResult, ToolError> {
+            let cmd = arg_str(arguments.as_ref(), "cmd");
+            self.tracker.enter();
+            let out = if let Some(path) = cmd.strip_prefix("cd ") {
+                // Sleep BEFORE mutating so an interleaved reader sees
+                // the old cwd — this is what makes lost-ordering visible.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                *self.cwd.lock().unwrap() = path.to_string();
+                String::new()
+            } else {
+                // pwd
+                self.cwd.lock().unwrap().clone()
+            };
+            self.tracker.exit();
+            Ok(CallToolResult::success(vec![Content::text(out)]))
+        }
+    }
+
+    /// Mock `write_file`: read-modify-write against a shared per-path
+    /// map with a sleep in the middle, so two concurrent appends to the
+    /// same path lose an update while serialised appends compose.
+    struct MockWriteFile {
+        files: Arc<StdMutex<HashMap<String, String>>>,
+        tracker: Arc<ConcurrencyTracker>,
+    }
+
+    #[async_trait]
+    impl ToolHandler for MockWriteFile {
+        async fn call(
+            &self,
+            arguments: Option<JsonObject>,
+            _ctx: &dyn ToolContext,
+        ) -> Result<CallToolResult, ToolError> {
+            let path = arg_str(arguments.as_ref(), "path");
+            let append = arg_str(arguments.as_ref(), "append");
+            self.tracker.enter();
+            let current = self
+                .files
+                .lock()
+                .unwrap()
+                .get(&path)
+                .cloned()
+                .unwrap_or_default();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let merged = format!("{current}{append}");
+            self.files.lock().unwrap().insert(path, merged.clone());
+            self.tracker.exit();
+            Ok(CallToolResult::success(vec![Content::text(merged)]))
+        }
+    }
+
+    /// Provider stub for the batch-execution tests (never queried) and
+    /// scripted variant for the `drive_turn` loop-guard test.
+    struct ScriptedProvider {
+        scripts: StdMutex<Vec<Vec<ProviderEvent>>>,
+    }
+
+    #[async_trait]
+    impl AgentProvider for ScriptedProvider {
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+        async fn query(&self, _input: QueryInput) -> Result<Box<dyn AgentQuery>, ProviderError> {
+            let mut g = self.scripts.lock().unwrap();
+            let events = if g.is_empty() {
+                vec![ProviderEvent::Result { text: None }]
+            } else {
+                g.remove(0)
+            };
+            Ok(Box::new(ScriptedQuery {
+                events: StdMutex::new(events),
+            }))
+        }
+        fn is_session_invalid(&self, _err: &ProviderError) -> bool {
+            false
+        }
+    }
+
+    struct ScriptedQuery {
+        events: StdMutex<Vec<ProviderEvent>>,
+    }
+
+    #[async_trait]
+    impl AgentQuery for ScriptedQuery {
+        async fn push(&mut self, _: String) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<ProviderEvent> {
+            let mut g = self.events.lock().unwrap();
+            if g.is_empty() {
+                None
+            } else {
+                Some(g.remove(0))
+            }
+        }
+        async fn abort(&mut self) {}
+    }
+
+    /// Build `RunnerDeps` whose `tool_map` holds exactly the supplied mock
+    /// handlers (keyed by tool name) and whose provider replays `scripts`.
+    fn deps_with_mocks(
+        mocks: Vec<(&'static str, Box<dyn ToolHandler>)>,
+        scripts: Vec<Vec<ProviderEvent>>,
+    ) -> (tempfile::TempDir, RunnerDeps) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let inbound = Arc::new(Mutex::new(open_inbound(&paths).unwrap()));
+        let outbound = Arc::new(Mutex::new(open_outbound(&paths).unwrap()));
+        let tool_ctx: Arc<dyn ToolContext> =
+            Arc::new(RunnerToolCtx::new(outbound.clone(), paths.outbox.clone()));
+        let provider: Arc<dyn AgentProvider> = Arc::new(ScriptedProvider {
+            scripts: StdMutex::new(scripts),
+        });
+        let archive_dir = paths.outbox.join("_compactions");
+        let mut deps = RunnerDeps::minimal(provider, tool_ctx, inbound, outbound, archive_dir);
+        let mut map: HashMap<String, Arc<ToolEntry>> = HashMap::new();
+        for (name, handler) in mocks {
+            map.insert(
+                name.to_string(),
+                Arc::new(ToolEntry {
+                    tool: Tool {
+                        name: Cow::Borrowed(name),
+                        description: None,
+                        input_schema: Arc::new(JsonObject::new()),
+                        annotations: None,
+                    },
+                    handler,
+                }),
+            );
+        }
+        deps.tool_map = Arc::new(map);
+        (tmp, deps)
+    }
+
+    fn call(name: &str, id: &str, input: serde_json::Value) -> PendingToolCall {
+        PendingToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            input,
+            parse_error: None,
+        }
+    }
+
+    /// N independent slow calls complete in ~max latency, not ~sum. The
+    /// concurrency high-water mark is the primary (deterministic)
+    /// assertion; the wall-clock bound is a generous secondary check
+    /// (sum would be 4 x 100ms = 400ms).
+    #[tokio::test]
+    async fn independent_calls_run_concurrently() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let (_tmp, deps) = deps_with_mocks(
+            vec![(
+                "mock_read",
+                Box::new(SlowEcho {
+                    tracker: tracker.clone(),
+                    log,
+                }),
+            )],
+            vec![],
+        );
+        let calls: Vec<PendingToolCall> = (0..4)
+            .map(|i| {
+                call(
+                    "mock_read",
+                    &format!("tu_{i}"),
+                    serde_json::json!({"id": format!("c{i}"), "delay_ms": 100}),
+                )
+            })
+            .collect();
+        let started = Instant::now();
+        let results = execute_tool_batch(&deps, &calls).await;
+        let elapsed = started.elapsed();
+        assert_eq!(results.len(), 4);
+        assert_eq!(
+            tracker.peak(),
+            4,
+            "all four independent calls must be in flight at once"
+        );
+        assert!(
+            elapsed < Duration::from_millis(300),
+            "4 x 100ms independent calls must finish in ~max, not ~sum; took {elapsed:?}"
+        );
+    }
+
+    /// Results come back in the ORIGINAL call order even when the first
+    /// call is the slowest (completion order is reversed).
+    #[tokio::test]
+    async fn results_keep_original_call_order() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let (_tmp, deps) = deps_with_mocks(
+            vec![(
+                "mock_read",
+                Box::new(SlowEcho {
+                    tracker,
+                    log: log.clone(),
+                }),
+            )],
+            vec![],
+        );
+        let calls = vec![
+            call(
+                "mock_read",
+                "tu_a",
+                serde_json::json!({"id": "a", "delay_ms": 150}),
+            ),
+            call(
+                "mock_read",
+                "tu_b",
+                serde_json::json!({"id": "b", "delay_ms": 50}),
+            ),
+            call(
+                "mock_read",
+                "tu_c",
+                serde_json::json!({"id": "c", "delay_ms": 0}),
+            ),
+        ];
+        let results = execute_tool_batch(&deps, &calls).await;
+        let contents: Vec<&str> = results.iter().map(|(c, _, _)| c.as_str()).collect();
+        assert_eq!(
+            contents,
+            vec!["done:a", "done:b", "done:c"],
+            "results must be ordered by call position, not completion time"
+        );
+        // Sanity: completion order genuinely differed from call order.
+        let events = log.lock().unwrap().clone();
+        let end_c = events.iter().position(|e| e == "end:c").unwrap();
+        let end_a = events.iter().position(|e| e == "end:a").unwrap();
+        assert!(
+            end_c < end_a,
+            "the fast call must have finished first: {events:?}"
+        );
+    }
+
+    /// Two `shell` calls in one batch run in order relative to each
+    /// other — the second observes the first's cwd change — while a
+    /// non-shell call still overlaps them.
+    #[tokio::test]
+    async fn shell_calls_serialize_and_observe_cwd_in_order() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let cwd = Arc::new(StdMutex::new("/".to_string()));
+        let (_tmp, deps) = deps_with_mocks(
+            vec![
+                (
+                    "shell",
+                    Box::new(MockShell {
+                        cwd,
+                        tracker: tracker.clone(),
+                    }),
+                ),
+                (
+                    "mock_read",
+                    Box::new(SlowEcho {
+                        tracker: tracker.clone(),
+                        log,
+                    }),
+                ),
+            ],
+            vec![],
+        );
+        let calls = vec![
+            call("shell", "tu_1", serde_json::json!({"cmd": "cd /work"})),
+            call("shell", "tu_2", serde_json::json!({"cmd": "pwd"})),
+            call(
+                "mock_read",
+                "tu_3",
+                serde_json::json!({"id": "r", "delay_ms": 100}),
+            ),
+        ];
+        let results = execute_tool_batch(&deps, &calls).await;
+        // The second shell call must see the first one's cwd change: had
+        // they run concurrently, `pwd` (no sleep) would have returned "/".
+        assert_eq!(
+            results[1].0, "/work",
+            "second shell call must observe the first's cwd change"
+        );
+        // The non-shell call still overlapped the shell chain.
+        assert!(
+            tracker.peak() >= 2,
+            "non-shell call must run concurrently with the shell chain; peak={}",
+            tracker.peak()
+        );
+    }
+
+    /// Edit-family calls targeting the SAME path serialize (no lost
+    /// update); a call to a DIFFERENT path overlaps them.
+    #[tokio::test]
+    async fn edit_family_same_path_serializes_different_paths_overlap() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let files = Arc::new(StdMutex::new(HashMap::new()));
+        let (_tmp, deps) = deps_with_mocks(
+            vec![(
+                "write_file",
+                Box::new(MockWriteFile {
+                    files: files.clone(),
+                    tracker: tracker.clone(),
+                }),
+            )],
+            vec![],
+        );
+        let calls = vec![
+            call(
+                "write_file",
+                "tu_1",
+                serde_json::json!({"path": "/data/f", "append": "a"}),
+            ),
+            call(
+                "write_file",
+                "tu_2",
+                serde_json::json!({"path": "/data/f", "append": "b"}),
+            ),
+            call(
+                "write_file",
+                "tu_3",
+                serde_json::json!({"path": "/data/g", "append": "x"}),
+            ),
+        ];
+        let results = execute_tool_batch(&deps, &calls).await;
+        // Serialised same-path appends compose; a concurrent interleave
+        // would lose the first append ("b" instead of "ab").
+        assert_eq!(
+            results[1].0, "ab",
+            "second same-path edit must observe the first's write"
+        );
+        assert_eq!(
+            files.lock().unwrap().get("/data/f").map(String::as_str),
+            Some("ab")
+        );
+        // The different-path edit overlapped the same-path chain.
+        assert!(
+            tracker.peak() >= 2,
+            "different-path edit must run concurrently; peak={}",
+            tracker.peak()
+        );
+    }
+
+    /// A single batch whose calls are duplicate-heavy (four identical
+    /// `(tool, args)` pairs) trips the content-loop breaker: the batch
+    /// still executes fully (audit history complete) but the turn ends
+    /// `Failed` with the loop-specific reason.
+    #[tokio::test]
+    async fn loop_guard_trips_on_duplicate_heavy_batch() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let identical = || ProviderEvent::ToolCall {
+            id: "tu_dup".into(),
+            name: "mock_read".into(),
+            input: serde_json::json!({"id": "same", "delay_ms": 0}),
+        };
+        let (_tmp, deps) = deps_with_mocks(
+            vec![(
+                "mock_read",
+                Box::new(SlowEcho {
+                    tracker,
+                    log: log.clone(),
+                }),
+            )],
+            // One scripted turn: a duplicate-heavy batch. A second turn
+            // must never be consumed — the breaker ends the inbound.
+            vec![
+                vec![identical(), identical(), identical(), identical()],
+                vec![ProviderEvent::Result {
+                    text: Some("must never be reached".into()),
+                }],
+            ],
+        );
+        let mut history: Vec<HistoryMessage> = Vec::new();
+        let result = drive_turn(&deps, &mut history, None, None).await.unwrap();
+        let TurnOutcome::Failed(reason) = result.outcome else {
+            panic!("duplicate-heavy batch must fail the turn: {result:?}");
+        };
+        assert!(
+            reason.contains("repeating the same"),
+            "reason must name the loop, got: {reason}"
+        );
+        // The whole batch still executed and landed in history (audit
+        // trail stays complete even when the breaker trips).
+        let tool_results = history
+            .iter()
+            .filter(|m| matches!(m, HistoryMessage::Tool { .. }))
+            .count();
+        assert_eq!(tool_results, 4, "all four batch calls must be in history");
+        assert_eq!(log.lock().unwrap().len(), 8, "4 starts + 4 ends");
+    }
+
+    /// A single-tool batch behaves exactly like the old sequential path:
+    /// one result, correct pairing, no reordering.
+    #[tokio::test]
+    async fn single_call_batch_is_equivalent_to_sequential() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let (_tmp, deps) = deps_with_mocks(
+            vec![("mock_read", Box::new(SlowEcho { tracker, log }))],
+            vec![],
+        );
+        let calls = vec![call(
+            "mock_read",
+            "tu_only",
+            serde_json::json!({"id": "solo", "delay_ms": 0}),
+        )];
+        let results = execute_tool_batch(&deps, &calls).await;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, "done:solo");
+        assert!(!results[0].2, "successful call must not be an error");
+    }
+
+    /// Parse-error synthetic calls never dispatch — they produce the
+    /// canned feedback result even inside a concurrent batch, and real
+    /// calls around them still run.
+    #[tokio::test]
+    async fn parse_error_calls_synthesize_feedback_in_batch() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let (_tmp, deps) = deps_with_mocks(
+            vec![(
+                "mock_read",
+                Box::new(SlowEcho {
+                    tracker,
+                    log: log.clone(),
+                }),
+            )],
+            vec![],
+        );
+        let calls = vec![
+            PendingToolCall {
+                id: "tu_bad".into(),
+                name: "mock_read".into(),
+                input: serde_json::Value::Null,
+                parse_error: Some("EOF while parsing".into()),
+            },
+            call(
+                "mock_read",
+                "tu_ok",
+                serde_json::json!({"id": "ok", "delay_ms": 0}),
+            ),
+        ];
+        let results = execute_tool_batch(&deps, &calls).await;
+        assert!(results[0].2, "parse-error call must be an error result");
+        assert!(
+            results[0].0.contains("could not be parsed"),
+            "got: {}",
+            results[0].0
+        );
+        assert_eq!(results[1].0, "done:ok");
+        // Only the real call dispatched.
+        assert_eq!(log.lock().unwrap().len(), 2, "1 start + 1 end");
+    }
+}
+
+#[cfg(test)]
+mod edit_family_path_tests {
+    use super::edit_family_path;
+    use serde_json::json;
+
+    #[test]
+    fn edit_family_tools_key_on_path() {
+        for name in ["edit_file", "multi_edit", "apply_patch", "write_file"] {
+            assert_eq!(
+                edit_family_path(name, &json!({"path": "/data/x"})),
+                Some("/data/x".to_string()),
+                "{name} must serialize by path"
+            );
+        }
+    }
+
+    #[test]
+    fn non_edit_tools_are_unkeyed() {
+        assert_eq!(
+            edit_family_path("read_file", &json!({"path": "/data/x"})),
+            None
+        );
+        assert_eq!(edit_family_path("shell", &json!({"cmd": "ls"})), None);
+        assert_eq!(edit_family_path("grep", &json!({"pattern": "x"})), None);
+    }
+
+    #[test]
+    fn missing_path_collapses_to_shared_sentinel() {
+        // Unresolvable targets all share one chain so they never race.
+        let a = edit_family_path("write_file", &json!({}));
+        let b = edit_family_path("edit_file", &serde_json::Value::Null);
+        assert!(a.is_some());
+        assert_eq!(a, b, "unresolved edit targets must share one chain");
     }
 }
 
