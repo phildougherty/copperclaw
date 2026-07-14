@@ -32,6 +32,7 @@ use dashmap::DashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Instant;
+use tokio::sync::Notify;
 
 /// Outcome of routing an inbound event. The caller (a channel adapter or
 /// test harness) gets one of these per call and uses it for logging and to
@@ -102,6 +103,15 @@ pub struct Router {
     inflight: InflightSet,
     fanout_seq: AtomicI64,
     mention_gate: MentionGate,
+    /// Signalled after every successful `messages_in` insert. The host's
+    /// container manager awaits this handle (via [`Self::inbound_wake`]) so a
+    /// message to an idle/stopped session triggers an immediate reconcile
+    /// tick instead of waiting out the poll interval. `Notify` semantics
+    /// coalesce bursts into a single stored permit — N inserts while the
+    /// manager is mid-tick wake it exactly once more. Purely an accelerator:
+    /// nobody is required to listen, and the manager's polling loop remains
+    /// the crash-safe fallback.
+    inbound_wake: Arc<Notify>,
 }
 
 impl Router {
@@ -123,6 +133,7 @@ impl Router {
             inflight: InflightSet::new(),
             fanout_seq: AtomicI64::new(0),
             mention_gate: MentionGate::default(),
+            inbound_wake: Arc::new(Notify::new()),
         }
     }
 
@@ -171,6 +182,17 @@ impl Router {
     /// Borrow the underlying in-flight set.
     pub fn inflight(&self) -> &Arc<DashMap<InflightKey, ()>> {
         self.inflight.inner()
+    }
+
+    /// Clone the inbound-wake handle. The router calls
+    /// `notify_one` on it after every successful `messages_in` insert; the
+    /// host hands the clone to the container manager so its reconcile loop
+    /// can `notified().await` alongside its poll timer and react to new
+    /// inbound immediately. See the field docs on `inbound_wake` for the
+    /// coalescing / fallback contract.
+    #[must_use]
+    pub fn inbound_wake(&self) -> Arc<Notify> {
+        Arc::clone(&self.inbound_wake)
     }
 
     /// Snapshot of the per-fanout counter — primarily for diagnostics in the
@@ -434,6 +456,12 @@ impl Router {
         let seq = pool.with_conn(|c| insert_in(c, &write))?;
 
         copperclaw_metrics::inc_messages_inbound(event.channel_type.as_str());
+
+        // Wake the container manager's reconcile loop so an idle/stopped
+        // session spawns within ~one tick instead of waiting out the poll
+        // interval. Best-effort accelerator: if nobody is awaiting the
+        // handle, the permit is stored (and coalesced) by `Notify`.
+        self.inbound_wake.notify_one();
 
         Ok(FanoutOutcome::Delivered(DeliveredTo {
             agent_group_id: session.agent_group_id,
@@ -1470,5 +1498,61 @@ mod tests {
         let fx = fixture(SessionMode::Shared);
         let s = format!("{:?}", fx.router);
         assert!(s.contains("Router"));
+    }
+
+    #[tokio::test]
+    async fn delivered_route_signals_inbound_wake() {
+        let fx = fixture(SessionMode::Shared);
+        let wake = fx.router.inbound_wake();
+        let out = fx.router.route(event(None, "w1")).await.unwrap();
+        assert!(matches!(out, RouteOutcome::Delivered { .. }));
+        // The insert stored a permit; a waiter completes immediately.
+        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+            .await
+            .expect("wake permit must be stored after a delivered route");
+    }
+
+    #[tokio::test]
+    async fn dropped_route_does_not_signal_inbound_wake() {
+        // A mention-gated drop writes no messages_in row, so it must not
+        // wake the container manager (no spawn storms from ambient chatter).
+        let fx = group_fixture(EngageMode::Mention, None, None);
+        let wake = fx.router.inbound_wake();
+        let out = fx.router.route(group_event("w2")).await.unwrap();
+        assert!(matches!(
+            out,
+            RouteOutcome::Dropped {
+                reason: DropReason::MentionGated
+            }
+        ));
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(50), wake.notified()).await;
+        assert!(waited.is_err(), "dropped route must not store a permit");
+    }
+
+    #[tokio::test]
+    async fn inbound_wake_coalesces_burst_of_inserts() {
+        // N delivered routes while nobody is listening store exactly ONE
+        // permit (Notify semantics): the first waiter completes, the second
+        // blocks. This is the no-spawn-storm guarantee at the router end.
+        let fx = fixture(SessionMode::Shared);
+        let wake = fx.router.inbound_wake();
+        for i in 0..10 {
+            let out = fx
+                .router
+                .route(event(None, &format!("b{i}")))
+                .await
+                .unwrap();
+            assert!(matches!(out, RouteOutcome::Delivered { .. }));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+            .await
+            .expect("first waiter consumes the coalesced permit");
+        let second =
+            tokio::time::timeout(std::time::Duration::from_millis(50), wake.notified()).await;
+        assert!(
+            second.is_err(),
+            "burst of inserts must coalesce into a single permit"
+        );
     }
 }
