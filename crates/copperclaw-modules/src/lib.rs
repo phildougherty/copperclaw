@@ -27,6 +27,7 @@ pub mod error;
 pub mod interactive;
 pub mod mount_security;
 pub mod permissions;
+pub mod preview;
 pub mod scheduling;
 pub mod self_mod;
 pub mod typing;
@@ -54,6 +55,7 @@ pub use permissions::{
     PermissionOp, PermissionsModule, Role, ToolProfile, check as permissions_check,
     default_profile_for_role,
 };
+pub use preview::{PreviewBroker, PreviewError, PreviewExposed, SessionInfoLite};
 pub use scheduling::{
     CreateTaskSpec, InMemoryTaskStore, ScheduleError, ScheduleHandler, SchedulingModule,
     TaskRecord, TaskStatus as ScheduledTaskStatus, TaskStore, UpdateTaskFields, When,

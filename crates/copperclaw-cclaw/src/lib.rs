@@ -19,14 +19,16 @@ pub mod commands;
 pub mod output;
 pub mod protocol;
 pub mod security;
+pub mod style;
 
 pub use client::{CclawClient, ClientError, DEFAULT_TIMEOUT};
 pub use commands::{ALL_COMMANDS, Cli, ParsedCall, TopCommand, default_user_socket};
-pub use output::{render, render_json_pretty};
+pub use output::{render, render_json_pretty, render_with};
 pub use protocol::{
     Caller, ErrorPayload, ProtoError, Request, Response, read_frame, read_request, read_response,
     write_frame, write_request, write_response,
 };
+pub use style::{Palette, color_enabled, should_colorize};
 
 use std::process::ExitCode;
 
@@ -199,18 +201,27 @@ where
         Err(e) => return RunOutput::failure(format!("{e}\n")),
     };
 
+    // One styling decision for the whole invocation: never style JSON
+    // (byte-identical for scripts), otherwise color only on a real
+    // terminal with neither `--no-color` nor `NO_COLOR` set.
+    let palette = if cli.json {
+        Palette::plain()
+    } else {
+        Palette::new(color_enabled(cli.no_color))
+    };
+
     let call = cli.to_call();
     // Composite client-side ops produce a `composite.*` marker command
     // that we recognise here before reaching the transport.
     if let Some(suffix) = call.command.strip_prefix("composite.") {
-        return run_composite(suffix, &call.args, transport, caller, cli.json).await;
+        return run_composite(suffix, &call.args, transport, caller, cli.json, palette).await;
     }
     match transport.call(&call.command, call.args, caller).await {
         Ok(data) => {
             let text = if cli.json {
                 render_json_pretty(&data)
             } else {
-                render(&data)
+                render_with(&data, palette)
             };
             let mut out = text;
             if !out.ends_with('\n') {
@@ -218,9 +229,10 @@ where
             }
             RunOutput::success(out)
         }
-        Err(ClientError::Remote(e)) => {
-            RunOutput::failure(format!("remote error: {} ({})\n", e.message, e.code))
-        }
+        Err(ClientError::Remote(e)) => RunOutput::failure(format!(
+            "{}\n",
+            palette.error(&format!("remote error: {} ({})", e.message, e.code))
+        )),
         Err(other) => RunOutput::failure(format!("{other}\n")),
     }
 }
@@ -234,21 +246,235 @@ async fn run_composite<T>(
     transport: &T,
     caller: Caller,
     as_json: bool,
+    palette: Palette,
 ) -> RunOutput
 where
     T: CallTransport + ?Sized,
 {
     match op {
         "quickstart-cli" => run_quickstart_cli(args, transport, caller, as_json).await,
-        "status" => run_status(transport, caller, as_json).await,
-        "health" => run_health(transport, caller, as_json).await,
-        "doctor" => run_doctor(args, transport, caller, as_json).await,
+        "status" => run_status(transport, caller, as_json, palette).await,
+        "health" => run_health(transport, caller, as_json, palette).await,
+        "doctor" => run_doctor(args, transport, caller, as_json, palette).await,
         "security-audit" => security::run_security_audit(args, transport, caller, as_json).await,
         "completions" => run_completions(args),
         "chat" => run_chat(args).await,
-        "dashboard" => run_dashboard(transport, caller, as_json).await,
+        "dashboard" => run_dashboard(transport, caller, as_json, palette).await,
         "groups.config-edit" => run_groups_config_edit(args, transport, caller).await,
+        "sessions-get" => run_sessions_get(args, transport, caller, as_json, palette).await,
+        "sessions-tail" => run_sessions_tail(args, transport, caller, as_json, palette).await,
         other => RunOutput::failure(format!("unknown composite op: {other}\n")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `cclaw sessions get` / `cclaw sessions tail` — per-session message rows.
+// ---------------------------------------------------------------------------
+
+/// `cclaw sessions get <id>` — one wire call (`sessions.get`), rendered
+/// client-side as the session key/value table followed by the recent
+/// inbound / outbound message-row tables the host attaches.
+async fn run_sessions_get<T>(
+    args: &serde_json::Value,
+    transport: &T,
+    caller: Caller,
+    as_json: bool,
+    palette: Palette,
+) -> RunOutput
+where
+    T: CallTransport + ?Sized,
+{
+    let Some(id) = args.get("id").and_then(serde_json::Value::as_str) else {
+        return RunOutput::failure("sessions get: missing id\n".to_string());
+    };
+    let data = match transport
+        .call("sessions.get", serde_json::json!({"id": id}), caller)
+        .await
+    {
+        Ok(v) => v,
+        Err(ClientError::Remote(e)) => {
+            return RunOutput::failure(format!(
+                "{}\n",
+                palette.error(&format!("remote error: {} ({})", e.message, e.code))
+            ));
+        }
+        Err(other) => return RunOutput::failure(format!("{other}\n")),
+    };
+    if as_json {
+        let mut out = render_json_pretty(&data);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        return RunOutput::success(out);
+    }
+    // Pull the message-row arrays out so the session row renders as a
+    // clean KV table and each direction gets its own table below it.
+    let mut session = data.clone();
+    let (inbound, outbound) = match session.as_object_mut() {
+        Some(o) => (o.remove("recent_inbound"), o.remove("recent_outbound")),
+        None => (None, None),
+    };
+    let mut out = render_with(&session, palette);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    for (label, rows) in [("recent inbound", inbound), ("recent outbound", outbound)] {
+        let Some(rows) = rows else { continue };
+        let n = rows.as_array().map_or(0, Vec::len);
+        out.push('\n');
+        out.push_str(&palette.header(&format!("{label} (last {n})")));
+        out.push('\n');
+        if n == 0 {
+            out.push_str("  (none)\n");
+        } else {
+            out.push_str(&render_with(&rows, palette));
+        }
+    }
+    RunOutput::success(out)
+}
+
+/// Direction marker for one tail row: `<-` inbound, `->` outbound, `--`
+/// for progress/status kinds (breadcrumbs, todo lists, diff cards) in
+/// either direction.
+fn tail_marker(direction: &str, kind: &str) -> &'static str {
+    match kind {
+        "breadcrumb" | "todo_list" | "diff" => "--",
+        _ if direction == "in" => "<-",
+        _ => "->",
+    }
+}
+
+/// Render one `sessions.tail` row as a single output line.
+fn format_tail_row(row: &serde_json::Value) -> String {
+    let get = |k: &str| row.get(k).and_then(serde_json::Value::as_str).unwrap_or("");
+    let (direction, kind, status) = (get("direction"), get("kind"), get("status"));
+    format!(
+        "{}  {} {:<10} {:<9} {}",
+        get("ts"),
+        tail_marker(direction, kind),
+        kind,
+        status,
+        get("preview"),
+    )
+}
+
+/// `cclaw sessions tail <id> [--follow]`.
+///
+/// One-shot: a single `sessions.tail` call, rows printed merged and
+/// time-ordered. `--follow`: prints the initial snapshot immediately to
+/// stdout, then polls every second with the `since_*_seq` cursors the
+/// host returns, printing only new rows — Ctrl-C to exit. Follow mode
+/// streams (bypasses the buffered [`RunOutput`]) like `cclaw chat` does.
+async fn run_sessions_tail<T>(
+    args: &serde_json::Value,
+    transport: &T,
+    caller: Caller,
+    as_json: bool,
+    palette: Palette,
+) -> RunOutput
+where
+    T: CallTransport + ?Sized,
+{
+    use std::io::Write as _;
+    let Some(id) = args.get("id").and_then(serde_json::Value::as_str) else {
+        return RunOutput::failure("sessions tail: missing id\n".to_string());
+    };
+    let follow = args
+        .get("follow")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if follow && as_json {
+        return RunOutput::failure(
+            "sessions tail: --follow streams lines and cannot honor --json\n".to_string(),
+        );
+    }
+    let first = match transport
+        .call(
+            "sessions.tail",
+            serde_json::json!({"id": id}),
+            caller.clone(),
+        )
+        .await
+    {
+        Ok(v) => v,
+        Err(ClientError::Remote(e)) => {
+            return RunOutput::failure(format!(
+                "{}\n",
+                palette.error(&format!("remote error: {} ({})", e.message, e.code))
+            ));
+        }
+        Err(other) => return RunOutput::failure(format!("{other}\n")),
+    };
+    if as_json {
+        let mut out = render_json_pretty(&first);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        return RunOutput::success(out);
+    }
+    let mut out = String::new();
+    let rows = first.get("rows").and_then(serde_json::Value::as_array);
+    match rows {
+        Some(rows) if !rows.is_empty() => {
+            for row in rows {
+                out.push_str(&format_tail_row(row));
+                out.push('\n');
+            }
+        }
+        _ => out.push_str("(no message rows yet)\n"),
+    }
+    if !follow {
+        return RunOutput::success(out);
+    }
+
+    // Follow mode: emit the snapshot now, then poll with the seq
+    // cursors, printing only new rows. Runs until Ctrl-C / transport
+    // failure.
+    print!("{out}");
+    let _ = std::io::stdout().flush();
+    let mut since_in = first.get("last_in_seq").and_then(serde_json::Value::as_i64);
+    let mut since_out = first
+        .get("last_out_seq")
+        .and_then(serde_json::Value::as_i64);
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let update = match transport
+            .call(
+                "sessions.tail",
+                serde_json::json!({
+                    "id": id,
+                    "since_in_seq": since_in,
+                    "since_out_seq": since_out,
+                }),
+                caller.clone(),
+            )
+            .await
+        {
+            Ok(v) => v,
+            Err(ClientError::Remote(e)) => {
+                return RunOutput::failure(format!(
+                    "{}\n",
+                    palette.error(&format!("remote error: {} ({})", e.message, e.code))
+                ));
+            }
+            Err(other) => return RunOutput::failure(format!("{other}\n")),
+        };
+        if let Some(rows) = update.get("rows").and_then(serde_json::Value::as_array) {
+            for row in rows {
+                println!("{}", format_tail_row(row));
+            }
+            if !rows.is_empty() {
+                let _ = std::io::stdout().flush();
+            }
+        }
+        since_in = update
+            .get("last_in_seq")
+            .and_then(serde_json::Value::as_i64)
+            .or(since_in);
+        since_out = update
+            .get("last_out_seq")
+            .and_then(serde_json::Value::as_i64)
+            .or(since_out);
     }
 }
 
@@ -496,7 +722,7 @@ fn resolve_install_root() -> Option<std::path::PathBuf> {
 /// and whether anything has recently mutated state. Designed to be
 /// cheap and side-effect-free; a real `/healthz` HTTP endpoint can
 /// reuse the same data.
-async fn run_health<T>(transport: &T, caller: Caller, as_json: bool) -> RunOutput
+async fn run_health<T>(transport: &T, caller: Caller, as_json: bool, palette: Palette) -> RunOutput
 where
     T: CallTransport + ?Sized,
 {
@@ -588,7 +814,7 @@ where
     out.push('\n');
     if array_len(&audit) > 0 {
         out.push_str("recent mutations (24h, up to 5)\n");
-        out.push_str(&render(&audit));
+        out.push_str(&render_with(&audit, palette));
         out.push('\n');
     } else {
         out.push_str("recent mutations (24h): none\n");
@@ -700,6 +926,7 @@ async fn run_doctor<T>(
     transport: &T,
     caller: Caller,
     as_json: bool,
+    palette: Palette,
 ) -> RunOutput
 where
     T: CallTransport + ?Sized,
@@ -725,7 +952,7 @@ where
                 format!("could not reach the host socket: {e}"),
                 Some("start the host: `copperclaw run` (or `systemctl start copperclaw` if installed as a service)"),
             ));
-            return finalise_doctor(&checks, as_json);
+            return finalise_doctor(&checks, as_json, palette);
         }
     };
 
@@ -984,11 +1211,175 @@ where
         }
     }
 
-    finalise_doctor(&checks, as_json)
+    // 10. Free disk on the filesystem holding the install's data dir.
+    //     Local check (no transport). The host degrades *silently* when
+    //     the root fs fills — `tasks_snapshot` write failures, container
+    //     spawns and test suites failing on ENOSPC — and before this row
+    //     `cclaw doctor` reported all-OK straight through a real 100%-full
+    //     incident. This closes that gap.
+    checks.push(disk_space_check());
+
+    finalise_doctor(&checks, as_json, palette)
+}
+
+/// Byte thresholds for the `disk-space` doctor check, kept next to the
+/// pure classifier they parameterise. WARN below 10% free *or* below
+/// 20 GiB free (whichever trips first); FAIL below 3% free *or* below
+/// 5 GiB free.
+const GIB: u64 = 1024 * 1024 * 1024;
+const DISK_WARN_BYTES: u64 = 20 * GIB;
+const DISK_FAIL_BYTES: u64 = 5 * GIB;
+
+/// Remediation hint shared by the WARN/FAIL disk rows.
+const DISK_FIX: &str = "reclaim space: rotate/delete old host logs under \
+    <data>/logs, `docker system prune -af --volumes`, and clear stale \
+    Rust `target/` dirs (`cargo clean` in dev checkouts)";
+
+/// Classify free disk into a [`CheckLevel`]. Pure so the boundaries are
+/// unit-testable without touching a real filesystem. Percent is compared
+/// with integer (u128) math to stay clippy-clean (no float casts) and
+/// overflow-free: `free/total < n%`  ⇔  `free*100 < total*n`.
+fn disk_level(free_bytes: u64, total_bytes: u64) -> CheckLevel {
+    let free = u128::from(free_bytes);
+    let total = u128::from(total_bytes);
+    let below_pct = |n: u128| total != 0 && free * 100 < total * n;
+    if below_pct(3) || free_bytes < DISK_FAIL_BYTES {
+        CheckLevel::Fail
+    } else if below_pct(10) || free_bytes < DISK_WARN_BYTES {
+        CheckLevel::Warn
+    } else {
+        CheckLevel::Ok
+    }
+}
+
+/// Human-readable byte size (binary units) for disk-check detail lines.
+/// Integer-only (no float casts) to stay clippy-pedantic-clean; one
+/// decimal place via scaled u128 arithmetic with round-to-nearest.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut unit = 0;
+    let mut scale: u64 = 1;
+    while unit < UNITS.len() - 1 && n / scale >= 1024 {
+        scale *= 1024;
+        unit += 1;
+    }
+    if unit == 0 {
+        return format!("{n} B");
+    }
+    let scale = u128::from(scale);
+    let tenths = (u128::from(n) * 10 + scale / 2) / scale;
+    format!("{}.{} {}", tenths / 10, tenths % 10, UNITS[unit])
+}
+
+/// Integer free-space percentage (rounded down) for detail lines. Result
+/// is 0..=100, so the `try_from` fallback is unreachable in practice; it
+/// exists to dodge a lossy-cast clippy lint without an `as` cast.
+fn free_pct(free_bytes: u64, total_bytes: u64) -> u64 {
+    if total_bytes == 0 {
+        return 0;
+    }
+    let pct = (u128::from(free_bytes) * 100) / u128::from(total_bytes);
+    u64::try_from(pct).unwrap_or(100)
+}
+
+// Test seam: when set on the current thread, `disk_space_check` skips the
+// real `statvfs` and reports these synthetic `(free, total)` bytes. Keeps
+// the transport-seeded doctor tests deterministic (independent of the test
+// host's actual free space) and lets tests drive the WARN/FAIL rendering
+// through the full doctor flow. Thread-local, so parallel tests don't race;
+// only ever compiled in test builds.
+#[cfg(test)]
+thread_local! {
+    static DISK_OVERRIDE: std::cell::Cell<Option<(u64, u64)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_disk_override(free_bytes: u64, total_bytes: u64) {
+    DISK_OVERRIDE.with(|c| c.set(Some((free_bytes, total_bytes))));
+}
+
+/// Build the `disk-space` doctor row. Resolves the install's data dir
+/// client-side (cclaw runs on the same box as the host), stats the
+/// filesystem holding it, and classifies free space. Degrades to a WARN
+/// row — never a panic, never a block — when the path can't be resolved
+/// or `statvfs` fails, so a stat error can't take down the rest of doctor.
+fn disk_space_check() -> Check {
+    // In test builds, default to a healthy synthetic filesystem so the
+    // transport-focused doctor tests don't hinge on the host's real disk;
+    // individual tests override via `set_disk_override`.
+    #[cfg(test)]
+    {
+        let (free, total) = DISK_OVERRIDE
+            .with(std::cell::Cell::get)
+            .unwrap_or((500 * GIB, 1024 * GIB));
+        disk_check_bytes(free, total, std::path::Path::new("<test>"))
+    }
+    #[cfg(not(test))]
+    {
+        let Some(root) = resolve_install_root() else {
+            return Check::warn(
+                "disk-space",
+                "could not resolve the install root to stat free disk space",
+                Some("set $HOME (or XDG_DATA_HOME on Linux) so cclaw can locate the install"),
+            );
+        };
+        // Prefer the data dir; on a fresh box it may not exist yet, so fall
+        // back to the nearest existing ancestor (the mount is the same).
+        let data_dir = root.join("data");
+        let mut stat_path = data_dir.clone();
+        while !stat_path.exists() {
+            match stat_path.parent() {
+                Some(parent) => stat_path = parent.to_path_buf(),
+                None => break,
+            }
+        }
+        disk_check_at(&stat_path, &data_dir)
+    }
+}
+
+/// Format a classified `(free, total)` pair into a `disk-space` [`Check`].
+/// The pure rendering half — no I/O — shared by the real `statvfs` path
+/// and the test seam.
+fn disk_check_bytes(free: u64, total: u64, label_path: &std::path::Path) -> Check {
+    let detail = format!(
+        "{} free of {} ({}% free) on the filesystem holding {}",
+        human_bytes(free),
+        human_bytes(total),
+        free_pct(free, total),
+        label_path.display(),
+    );
+    match disk_level(free, total) {
+        CheckLevel::Ok => Check::ok("disk-space", detail),
+        CheckLevel::Warn => Check::warn("disk-space", detail, Some(DISK_FIX)),
+        CheckLevel::Fail => Check::fail("disk-space", detail, Some(DISK_FIX)),
+    }
+}
+
+/// The stat + classify half of [`disk_space_check`], split out so the
+/// path resolution above stays readable. `label_path` is what the detail
+/// line names (the data dir), `stat_path` is what we actually statvfs.
+fn disk_check_at(stat_path: &std::path::Path, label_path: &std::path::Path) -> Check {
+    match rustix::fs::statvfs(stat_path) {
+        Ok(vfs) => {
+            // Bytes = block count * fragment size. `f_bavail` is the space
+            // available to unprivileged writers (excludes root-reserved
+            // blocks) — the number that actually predicts write failures.
+            let frag = vfs.f_frsize;
+            let total = vfs.f_blocks.saturating_mul(frag);
+            let free = vfs.f_bavail.saturating_mul(frag);
+            disk_check_bytes(free, total, label_path)
+        }
+        Err(e) => Check::warn(
+            "disk-space",
+            format!("could not stat {}: {e}", stat_path.display()),
+            Some("free space is unknown — check the path exists and is readable"),
+        ),
+    }
 }
 
 /// Render the collected `doctor` checks and pick the exit code.
-fn finalise_doctor(checks: &[Check], as_json: bool) -> RunOutput {
+fn finalise_doctor(checks: &[Check], as_json: bool, palette: Palette) -> RunOutput {
     let any_fail = checks.iter().any(|c| c.level == CheckLevel::Fail);
     if as_json {
         let payload = serde_json::json!({
@@ -1007,15 +1398,17 @@ fn finalise_doctor(checks: &[Check], as_json: bool) -> RunOutput {
     }
     let mut out = String::new();
     for c in checks {
-        out.push_str(&format!(
-            "[{}] {:<18} {}\n",
-            c.level.tag(),
-            c.name,
-            c.detail
-        ));
+        // Style only the level tag: the padded plain tag keeps column
+        // alignment independent of the ANSI escape bytes.
+        let tag = match c.level {
+            CheckLevel::Ok => palette.ok(c.level.tag()),
+            CheckLevel::Warn => palette.warn(c.level.tag()),
+            CheckLevel::Fail => palette.fail(c.level.tag()),
+        };
+        out.push_str(&format!("[{tag}] {:<18} {}\n", c.name, c.detail));
         if c.level != CheckLevel::Ok {
             if let Some(fix) = &c.fix {
-                out.push_str(&format!("       fix: {fix}\n"));
+                out.push_str(&format!("       {}\n", palette.fix(&format!("fix: {fix}"))));
             }
         }
     }
@@ -1054,7 +1447,7 @@ fn run_completions(args: &serde_json::Value) -> RunOutput {
 /// transport doesn't support batching). Renders a digest of counts
 /// plus a small table per resource so the user can immediately see
 /// what's wired up.
-async fn run_status<T>(transport: &T, caller: Caller, as_json: bool) -> RunOutput
+async fn run_status<T>(transport: &T, caller: Caller, as_json: bool, palette: Palette) -> RunOutput
 where
     T: CallTransport + ?Sized,
 {
@@ -1117,22 +1510,22 @@ where
     out.push('\n');
     if array_len(&groups) > 0 {
         out.push_str("agent groups\n");
-        out.push_str(&render(&groups));
+        out.push_str(&render_with(&groups, palette));
         out.push_str("\n\n");
     }
     if array_len(&mgs) > 0 {
         out.push_str("messaging groups\n");
-        out.push_str(&render(&mgs));
+        out.push_str(&render_with(&mgs, palette));
         out.push_str("\n\n");
     }
     if array_len(&wirings) > 0 {
         out.push_str("wirings\n");
-        out.push_str(&render(&wirings));
+        out.push_str(&render_with(&wirings, palette));
         out.push_str("\n\n");
     }
     if array_len(&sessions) > 0 {
         out.push_str("active sessions\n");
-        out.push_str(&render(&sessions));
+        out.push_str(&render_with(&sessions, palette));
         out.push_str("\n\n");
     }
     if !out.ends_with('\n') {
@@ -1295,7 +1688,12 @@ fn host_unreachable(e: &ClientError) -> bool {
 /// [`tokio::join`] so the wall time is bounded by the slowest call,
 /// not the sum. The composite is pure client-side; no new socket
 /// commands are introduced.
-async fn run_dashboard<T>(transport: &T, caller: Caller, as_json: bool) -> RunOutput
+async fn run_dashboard<T>(
+    transport: &T,
+    caller: Caller,
+    as_json: bool,
+    palette: Palette,
+) -> RunOutput
 where
     T: CallTransport + ?Sized,
 {
@@ -1382,6 +1780,7 @@ where
         &dropped,
         &usage,
         &suggestions,
+        palette,
     );
     RunOutput::success(text)
 }
@@ -1424,6 +1823,7 @@ fn dashboard_suggestions(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // One line per dashboard section; splitting hurts readability.
 fn render_dashboard_text(
     install_root: &str,
     groups: &serde_json::Value,
@@ -1433,11 +1833,18 @@ fn render_dashboard_text(
     dropped: &serde_json::Value,
     usage: &serde_json::Value,
     suggestions: &[String],
+    palette: Palette,
 ) -> String {
     let mut out = String::new();
-    out.push_str(&format!("copperclaw at {install_root}\n\n"));
+    out.push_str(&format!(
+        "{}\n\n",
+        palette.header(&format!("copperclaw at {install_root}"))
+    ));
 
-    out.push_str(&format!("agent groups ({})\n", array_len(groups)));
+    out.push_str(&format!(
+        "{}\n",
+        palette.header(&format!("agent groups ({})", array_len(groups)))
+    ));
     if let Some(items) = groups.as_array() {
         if items.is_empty() {
             out.push_str("  (none)\n");
@@ -1453,7 +1860,10 @@ fn render_dashboard_text(
     }
     out.push('\n');
 
-    out.push_str(&format!("wirings ({})\n", array_len(wirings)));
+    out.push_str(&format!(
+        "{}\n",
+        palette.header(&format!("wirings ({})", array_len(wirings)))
+    ));
     if let Some(items) = wirings.as_array() {
         if items.is_empty() {
             out.push_str("  (none)\n");
@@ -1469,7 +1879,10 @@ fn render_dashboard_text(
     }
     out.push('\n');
 
-    out.push_str(&format!("active sessions ({})\n", array_len(sessions)));
+    out.push_str(&format!(
+        "{}\n",
+        palette.header(&format!("active sessions ({})", array_len(sessions)))
+    ));
     if array_len(sessions) == 0 {
         out.push_str("  (none)\n");
     } else if let Some(items) = sessions.as_array() {
@@ -1488,7 +1901,10 @@ fn render_dashboard_text(
             .count()
     });
     let outbound_drops = array_len(dropped);
-    out.push_str("recent activity (last 1h)\n");
+    out.push_str(&format!(
+        "{}\n",
+        palette.header("recent activity (last 1h)")
+    ));
     out.push_str(&format!(
         "  audit:    {mutations} mutations, {errors} errors\n",
     ));
@@ -1509,7 +1925,7 @@ fn render_dashboard_text(
     }
     out.push('\n');
 
-    out.push_str("suggested next:\n");
+    out.push_str(&format!("{}\n", palette.header("suggested next:")));
     for s in suggestions {
         out.push_str(&format!("  {s}\n"));
     }
@@ -1537,6 +1953,10 @@ const EDITABLE_SCALAR_FIELDS: &[&str] = &[
     "assistant_name",
     "max_messages_per_prompt",
     "tool_profile",
+    // M17 session-preview proxy: master switch + bind interface. The host
+    // validates both (`preview_enabled` bool; `preview_bind` IP-or-null).
+    "preview_enabled",
+    "preview_bind",
 ];
 
 /// Fields the host returns but does not accept on update. They are
@@ -2436,6 +2856,175 @@ mod tests {
     }
 
     // ── cclaw doctor ───────────────────────────────────────────────
+
+    #[test]
+    fn disk_level_ok_when_plenty_free() {
+        // 500 GiB free of 1 TiB: well above every threshold.
+        let level = disk_level(500 * GIB, 1024 * GIB);
+        assert_eq!(level, CheckLevel::Ok);
+    }
+
+    #[test]
+    fn disk_level_warn_on_low_percent() {
+        // 8% free of a large disk (>20 GiB free, so only the percent
+        // rule can trip): 80 GiB free of 1 TiB → WARN, not FAIL.
+        let level = disk_level(80 * GIB, 1000 * GIB);
+        assert_eq!(level, CheckLevel::Warn);
+    }
+
+    #[test]
+    fn disk_level_warn_on_low_absolute_even_when_percent_is_fine() {
+        // 15 GiB free of a tiny 30 GiB disk: 50% free (percent rule OK)
+        // but under the 20 GiB absolute WARN floor → WARN.
+        let level = disk_level(15 * GIB, 30 * GIB);
+        assert_eq!(level, CheckLevel::Warn);
+    }
+
+    #[test]
+    fn disk_level_fail_on_critical_percent() {
+        // 2% free of a large disk: 20 GiB free of 1000 GiB. Under 3%
+        // (FAIL) even though 20 GiB is at the WARN absolute floor.
+        let level = disk_level(20 * GIB, 1000 * GIB);
+        assert_eq!(level, CheckLevel::Fail);
+    }
+
+    #[test]
+    fn disk_level_fail_on_critical_absolute() {
+        // 4 GiB free of a 100 GiB disk: 4% (above 3%) but under the
+        // 5 GiB absolute FAIL floor → FAIL.
+        let level = disk_level(4 * GIB, 100 * GIB);
+        assert_eq!(level, CheckLevel::Fail);
+    }
+
+    #[test]
+    fn disk_level_boundaries_are_inclusive_of_ok_at_the_edge() {
+        // Exactly 10% free, well above the 20 GiB floor → not *below* the
+        // threshold → OK. 200 GiB of 2000 GiB is exactly 10%.
+        assert_eq!(disk_level(200 * GIB, 2000 * GIB), CheckLevel::Ok);
+        // A hair under 10% → WARN.
+        assert_eq!(disk_level(199 * GIB, 2000 * GIB), CheckLevel::Warn);
+        // Exactly at the 20 GiB WARN floor with healthy pct → OK.
+        assert_eq!(disk_level(20 * GIB, 40 * GIB), CheckLevel::Ok);
+        // Just under 20 GiB free (healthy pct) → WARN via the absolute floor.
+        assert_eq!(disk_level(19 * GIB, 40 * GIB), CheckLevel::Warn);
+        // Exactly 3% free (not *below* 3%) but under the 5 GiB FAIL floor:
+        // 3 GiB of 100 GiB → FAIL via the absolute floor.
+        assert_eq!(disk_level(3 * GIB, 100 * GIB), CheckLevel::Fail);
+    }
+
+    #[test]
+    fn disk_level_handles_zero_total_without_panicking() {
+        // Degenerate stat (total 0): percent rule short-circuits to
+        // false, free 0 < 5 GiB → FAIL. Must not divide-by-zero.
+        assert_eq!(disk_level(0, 0), CheckLevel::Fail);
+    }
+
+    #[test]
+    fn disk_check_degrades_to_warn_on_stat_failure() {
+        // A path that cannot be statvfs'd must yield a WARN row (never a
+        // panic), so a stat error can't take down the rest of doctor.
+        let missing = std::path::Path::new("/copperclaw/definitely/not/here");
+        let check = disk_check_at(missing, missing);
+        assert_eq!(check.level, CheckLevel::Warn);
+        assert!(check.detail.contains("could not stat"));
+        assert!(check.fix.is_some());
+    }
+
+    #[test]
+    fn human_bytes_renders_binary_units() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(20 * GIB), "20.0 GiB");
+        assert_eq!(human_bytes(1536 * 1024 * 1024), "1.5 GiB");
+    }
+
+    #[test]
+    fn free_pct_is_floored_and_zero_safe() {
+        assert_eq!(free_pct(50 * GIB, 100 * GIB), 50);
+        assert_eq!(free_pct(1, 3), 33); // 33.3% floored
+        assert_eq!(free_pct(0, 0), 0); // zero-total is safe, not a panic
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_disk_space_row_with_healthy_default() {
+        // No override → healthy synthetic disk → OK row present, no FAIL.
+        let t = SequencedTransport::new(vec![
+            Ok(json!([{"id": "ag-1"}])),
+            Ok(json!([{"id": "w-1"}])),
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!([])),
+        ]);
+        let out = run_cli(["cclaw", "doctor"], &t).await;
+        assert!(out.stdout.contains("disk-space"));
+        assert!(!out.stdout.contains("[FAIL"));
+    }
+
+    #[tokio::test]
+    async fn doctor_disk_space_fail_surfaces_fix_line() {
+        // Critically low disk → FAIL row + `fix:` hint; whole report moves
+        // to stderr (finalise_doctor uses failure() when any row FAILs).
+        set_disk_override(GIB, 100 * GIB);
+        let t = SequencedTransport::new(vec![
+            Ok(json!([{"id": "ag-1"}])),
+            Ok(json!([{"id": "w-1"}])),
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!([])),
+        ]);
+        let out = run_cli(["cclaw", "doctor"], &t).await;
+        assert!(out.stderr.contains("FAIL"));
+        assert!(out.stderr.contains("disk-space"));
+        assert!(out.stderr.contains("fix:"));
+        assert!(out.stderr.contains("reclaim space"));
+    }
+
+    #[tokio::test]
+    async fn doctor_disk_space_warn_stays_on_stdout() {
+        // Low-but-not-critical disk → WARN row (success exit, stdout).
+        set_disk_override(60 * GIB, 1000 * GIB); // 6% free, >5 GiB
+        let t = SequencedTransport::new(vec![
+            Ok(json!([{"id": "ag-1"}])),
+            Ok(json!([{"id": "w-1"}])),
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!([])),
+        ]);
+        let out = run_cli(["cclaw", "doctor"], &t).await;
+        assert!(
+            out.stderr.is_empty(),
+            "WARN must not fail: {:?}",
+            out.stderr
+        );
+        assert!(out.stdout.contains("WARN"));
+        assert!(out.stdout.contains("disk-space"));
+    }
+
+    #[tokio::test]
+    async fn doctor_json_carries_disk_space_row() {
+        // --json output must include the disk-space check consistently
+        // with other rows (name/level/detail/fix keys).
+        set_disk_override(GIB, 100 * GIB);
+        let t = SequencedTransport::new(vec![
+            Ok(json!([{"id": "ag-1"}])),
+            Ok(json!([{"id": "w-1"}])),
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!([])),
+        ]);
+        let out = run_cli(["cclaw", "--json", "doctor"], &t).await;
+        let combined = format!("{}{}", out.stdout, out.stderr);
+        let v: serde_json::Value = serde_json::from_str(&combined).expect("valid json");
+        assert_eq!(v["status"], "fail");
+        let disk = v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "disk-space")
+            .expect("disk-space row present in json");
+        assert_eq!(disk["level"], "fail");
+        assert!(disk["detail"].is_string());
+        assert!(disk["fix"].is_string());
+    }
 
     #[tokio::test]
     async fn doctor_socket_unreachable_fails_with_fix() {
@@ -3436,5 +4025,244 @@ mod tests {
         let mode = std::fs::metadata(&db).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "file should be tightened to 0600");
         assert!(out.stdout.contains("applied fixes"));
+    }
+
+    // ---- D1: color + TTY awareness ---------------------------------------
+
+    #[test]
+    fn finalise_doctor_plain_palette_has_no_ansi() {
+        let checks = vec![
+            Check::ok("a", "fine"),
+            Check::warn("b", "meh", Some("do the thing")),
+            Check::fail("c", "bad", Some("fix the thing")),
+        ];
+        let out = finalise_doctor(&checks, false, Palette::plain());
+        let combined = format!("{}{}", out.stdout, out.stderr);
+        assert!(!combined.contains('\u{1b}'));
+        assert!(combined.contains("fix: do the thing"));
+    }
+
+    #[test]
+    fn finalise_doctor_colored_palette_styles_levels_and_fix_hints() {
+        let checks = vec![
+            Check::ok("a", "fine"),
+            Check::warn("b", "meh", Some("do the thing")),
+            Check::fail("c", "bad", Some("fix the thing")),
+        ];
+        let out = finalise_doctor(&checks, false, Palette::new(true));
+        let combined = format!("{}{}", out.stdout, out.stderr);
+        // Green OK, yellow WARN, red FAIL, cyan fix hints.
+        assert!(combined.contains("\u{1b}[32mOK"));
+        assert!(combined.contains("\u{1b}[33mWARN"));
+        assert!(combined.contains("\u{1b}[31mFAIL"));
+        assert!(combined.contains("\u{1b}[36mfix:"));
+        // The plain text is still present once escapes are ignored.
+        assert!(combined.contains("fix the thing"));
+    }
+
+    #[test]
+    fn finalise_doctor_json_is_never_styled_even_with_colored_palette() {
+        let checks = vec![Check::fail("c", "bad", Some("fix it"))];
+        let colored = finalise_doctor(&checks, true, Palette::new(true));
+        let plain = finalise_doctor(&checks, true, Palette::plain());
+        assert_eq!(colored.stderr, plain.stderr);
+        assert_eq!(colored.stdout, plain.stdout);
+        assert!(!format!("{}{}", colored.stdout, colored.stderr).contains('\u{1b}'));
+    }
+
+    #[test]
+    fn dashboard_text_colored_headers_strip_to_plain() {
+        let groups = json!([{"id": "ag-1", "name": "g", "agent_provider": "anthropic"}]);
+        let empty = json!([]);
+        let suggestions = vec!["do a thing".to_string()];
+        let plain = render_dashboard_text(
+            "/root",
+            &groups,
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+            &suggestions,
+            Palette::plain(),
+        );
+        let colored = render_dashboard_text(
+            "/root",
+            &groups,
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+            &empty,
+            &suggestions,
+            Palette::new(true),
+        );
+        assert!(!plain.contains('\u{1b}'));
+        assert!(colored.contains('\u{1b}'));
+        let stripped = colored.replace("\u{1b}[1m", "").replace("\u{1b}[0m", "");
+        assert_eq!(stripped, plain);
+    }
+
+    #[tokio::test]
+    async fn run_cli_unit_tests_are_colorless_by_construction() {
+        // `color_enabled` forces the terminal probe to false under
+        // cfg(test), so every in-process run_cli invocation stays plain.
+        let t = SequencedTransport::new(vec![Ok(json!([{"id": "ag-1", "name": "x"}]))]);
+        let out = run_cli(["cclaw", "groups", "list"], &t).await;
+        assert!(!out.stdout.contains('\u{1b}'));
+        assert!(out.stdout.contains("ID"));
+    }
+
+    #[tokio::test]
+    async fn remote_error_line_shape_is_unchanged_when_plain() {
+        let t = SequencedTransport::new(vec![Err(ClientError::Remote(ErrorPayload::new(
+            "boom", "it broke",
+        )))]);
+        let out = run_cli(["cclaw", "groups", "list"], &t).await;
+        assert_eq!(out.stderr, "remote error: it broke (boom)\n");
+    }
+
+    // ---- D2: sessions get / sessions tail --------------------------------
+
+    fn sessions_get_payload() -> serde_json::Value {
+        json!({
+            "id": "0198c0de-0000-7000-8000-000000000001",
+            "status": "active",
+            "container_status": "running",
+            "recent_inbound": [
+                {"direction": "in", "seq": 2, "kind": "chat", "status": "completed",
+                 "ts": "2026-07-14T10:00:00+00:00", "preview": "hello agent"},
+            ],
+            "recent_outbound": [
+                {"direction": "out", "seq": 3, "kind": "chat", "status": "delivered",
+                 "ts": "2026-07-14T10:00:05+00:00", "preview": "hi human"},
+            ],
+        })
+    }
+
+    #[tokio::test]
+    async fn sessions_get_renders_session_row_and_message_tables() {
+        let t = SequencedTransport::new(vec![Ok(sessions_get_payload())]);
+        let out = run_cli(["cclaw", "sessions", "get", "s1"], &t).await;
+        // One wire call to sessions.get with the id.
+        let calls = t.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "sessions.get");
+        assert_eq!(calls[0].1, json!({"id": "s1"}));
+        drop(calls);
+        // Session KV table plus both message sections.
+        assert!(out.stdout.contains("container_status"));
+        assert!(out.stdout.contains("recent inbound (last 1)"));
+        assert!(out.stdout.contains("recent outbound (last 1)"));
+        assert!(out.stdout.contains("hello agent"));
+        assert!(out.stdout.contains("hi human"));
+        // The arrays are not dumped into the KV table as raw JSON.
+        assert!(!out.stdout.contains("recent_inbound"));
+    }
+
+    #[tokio::test]
+    async fn sessions_get_json_returns_raw_payload() {
+        let payload = sessions_get_payload();
+        let t = SequencedTransport::new(vec![Ok(payload.clone())]);
+        let out = run_cli(["cclaw", "--json", "sessions", "get", "s1"], &t).await;
+        let parsed: serde_json::Value = serde_json::from_str(out.stdout.trim()).unwrap();
+        assert_eq!(parsed, payload, "--json must be the untouched wire payload");
+    }
+
+    #[tokio::test]
+    async fn sessions_get_without_recents_renders_row_only() {
+        // A host that predates D2 (or a foreign-session agent caller)
+        // returns just the session row; rendering degrades gracefully.
+        let t = SequencedTransport::new(vec![Ok(json!({"id": "x", "status": "active"}))]);
+        let out = run_cli(["cclaw", "sessions", "get", "x"], &t).await;
+        assert!(out.stdout.contains("active"));
+        assert!(!out.stdout.contains("recent inbound"));
+    }
+
+    fn tail_payload() -> serde_json::Value {
+        json!({
+            "session_id": "s1",
+            "rows": [
+                {"direction": "in", "seq": 2, "kind": "chat", "status": "completed",
+                 "ts": "2026-07-14T10:00:00+00:00", "preview": "hello agent"},
+                {"direction": "out", "seq": 1, "kind": "breadcrumb", "status": "pending",
+                 "ts": "2026-07-14T10:00:02+00:00", "preview": "[shell] cargo check"},
+                {"direction": "out", "seq": 3, "kind": "chat", "status": "delivered",
+                 "ts": "2026-07-14T10:00:05+00:00", "preview": "hi human"},
+            ],
+            "last_in_seq": 2,
+            "last_out_seq": 3,
+        })
+    }
+
+    #[tokio::test]
+    async fn sessions_tail_one_shot_prints_ordered_rows_with_markers() {
+        let t = SequencedTransport::new(vec![Ok(tail_payload())]);
+        let out = run_cli(["cclaw", "sessions", "tail", "s1"], &t).await;
+        let lines: Vec<&str> = out.stdout.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("<- "));
+        assert!(lines[0].contains("hello agent"));
+        assert!(lines[1].contains("-- "));
+        assert!(lines[1].contains("[shell] cargo check"));
+        assert!(lines[2].contains("-> "));
+        assert!(lines[2].contains("hi human"));
+        // Time order is preserved as delivered by the host.
+        assert!(lines[0].starts_with("2026-07-14T10:00:00"));
+        assert!(lines[2].starts_with("2026-07-14T10:00:05"));
+    }
+
+    #[tokio::test]
+    async fn sessions_tail_empty_says_so() {
+        let t = SequencedTransport::new(vec![Ok(
+            json!({"session_id": "s1", "rows": [], "last_in_seq": 0, "last_out_seq": 0}),
+        )]);
+        let out = run_cli(["cclaw", "sessions", "tail", "s1"], &t).await;
+        assert_eq!(out.stdout, "(no message rows yet)\n");
+    }
+
+    #[tokio::test]
+    async fn sessions_tail_follow_rejects_json() {
+        let t = SequencedTransport::new(vec![]);
+        let out = run_cli(
+            ["cclaw", "--json", "sessions", "tail", "s1", "--follow"],
+            &t,
+        )
+        .await;
+        assert!(out.stderr.contains("--follow"));
+        assert!(t.calls.lock().unwrap().is_empty(), "no wire call issued");
+    }
+
+    #[tokio::test]
+    async fn sessions_tail_remote_error_is_surfaced() {
+        let t = SequencedTransport::new(vec![Err(ClientError::Remote(ErrorPayload::new(
+            "not_found",
+            "no such session",
+        )))]);
+        let out = run_cli(["cclaw", "sessions", "tail", "s1"], &t).await;
+        assert!(
+            out.stderr
+                .contains("remote error: no such session (not_found)")
+        );
+    }
+
+    #[test]
+    fn tail_marker_covers_directions_and_status_kinds() {
+        assert_eq!(tail_marker("in", "chat"), "<-");
+        assert_eq!(tail_marker("out", "chat"), "->");
+        assert_eq!(tail_marker("out", "breadcrumb"), "--");
+        assert_eq!(tail_marker("in", "todo_list"), "--");
+        assert_eq!(tail_marker("out", "diff"), "--");
+        assert_eq!(tail_marker("out", "card"), "->");
+    }
+
+    #[test]
+    fn format_tail_row_is_single_line() {
+        let row = json!({"direction": "in", "seq": 2, "kind": "chat", "status": "pending",
+                         "ts": "t", "preview": "p"});
+        let line = format_tail_row(&row);
+        assert!(!line.contains('\n'));
+        assert!(line.contains("<- "));
+        assert!(line.ends_with('p'));
     }
 }

@@ -20,6 +20,47 @@ adheres to [Semantic Versioning](https://semver.org/).
   `debug`, not `warn`. `crates/copperclaw-host/src/typing_ticker.rs`,
   `crates/copperclaw-host-delivery/src/dispatch.rs`,
   `crates/copperclaw-modules/src/context.rs`.
+### Added
+
+- `cclaw doctor` now runs a `disk-space` check on the filesystem holding the install's data dir (`resolve_install_root()/data`): WARN below 10% free or 20 GiB free, FAIL below 3% or 5 GiB, each with a `fix:` reclaim-space hint; a `statvfs` failure or unresolvable path degrades the row to WARN instead of panicking. Closes the gap that left doctor all-OK through a live root-fs-full incident that silently degraded the host. Thresholds live in the pure, unit-tested `disk_level()`; free space is read via `rustix::fs::statvfs` (safe, no `unsafe` — new `rustix` workspace dep with the `fs` feature) (`crates/copperclaw-cclaw/src/lib.rs`).
+
+### Fixed (delivery loop no longer poisoned by a duplicate `delivered` record — 2026-07-15)
+
+- Made `delivered::insert` (`copperclaw-db/src/tables/delivered.rs`) idempotent
+  (`ON CONFLICT(message_out_id) DO NOTHING`, returns whether a row was newly
+  inserted) and made the delivery pass's in-flight claim atomic via the DashMap
+  `entry` API (`copperclaw-host-delivery/src/service.rs::process_session_once`).
+  Root cause: the 1s active loop and the 60s sweep loop share one
+  `DeliveryService` and each pass reads the already-delivered id set once at its
+  start; a concurrent pass could re-send and re-record a row whose snapshot went
+  stale, and the old plain `INSERT` raised `UNIQUE constraint failed:
+  delivered.message_out_id` — which then made the error arm try to record the
+  row a third time as `failed`, hitting the same constraint and erroring the
+  whole pass on every subsequent tick until the session was deleted.
+### Added (session preview proxy — 2026-07-14)
+
+- **Session preview proxy (M17):** an in-container agent can expose an HTTP app it built to the operator's machine / LAN for hands-on testing via two new first-party tools, `expose_preview {port, name?}` and `close_preview {port}`. The tools ride the existing external-MCP host-broker relay under the reserved server name `__preview` (`crates/copperclaw-runner/src/run/preview.rs`, dispatch hook in `run/tool_dispatch.rs`); the delivery loop routes `__preview` requests to a host-side broker (`crates/copperclaw-host-delivery/src/service.rs::execute_preview_call`, trait in `crates/copperclaw-modules/src/preview.rs`). The broker (`crates/copperclaw-host/src/preview.rs`) resolves the container's bridge IP (new `ContainerRuntime::container_ip`, Docker impl via inspect in `crates/copperclaw-container-rt`), allocates a host port from 8100-8199 (caps: 4/session, 16/host), and serves a token-gated axum reverse proxy: `GET /__preview/<token>` sets an HttpOnly cookie + redirects to `/`; requests without the matching cookie get 403; WebSocket upgrades are refused (501, v1). Secure-by-default: **off per group** until the operator runs `cclaw groups config update --field preview_enabled=true <group>`; the proxy binds loopback unless `preview_bind` is set (e.g. `"0.0.0.0"` for LAN, validated as an IP) — migration `025_container_config_preview.sql` adds both columns, editable via `cclaw groups config get/update/edit`. Runner policy treats both tools as coding-profile AND credentialed-external (guest-denied, blocked on tainted turns without fresh approval, blocked on autonomous turns). Previews expire after 30 min idle (reaper), and are torn down on `close_preview`, container idle-stop/crash (container-manager hook), and host shutdown — every expose/teardown writes an `audit_log` row. `__preview` is rejected as an external MCP server name in the add-server handlers. New `skills/preview/SKILL.md` teaches the flow (serve on 0.0.0.0, relay the URL verbatim, relay the enable command on the off-state error).
+
+### Fixed (dynamic model identity — 2026-07-14)
+
+- The agent's system prompt `# Environment` block now carries a `Model:` line with the session's actual resolved model (post-failover, same value as `runner.json`), and `skills/identity/SKILL.md` was rewritten model-agnostic: it instructs the agent to answer "what model are you?" from that line and never hardcodes a model name. Previously the skill's examples said "Powered by Claude Sonnet 4.6 under the hood", which non-Claude models parroted verbatim (`crates/copperclaw-host/src/container_manager/prompt.rs`, `skills/identity/SKILL.md`).
+
+### Fixed (admin-socket data dir — 2026-07-14)
+
+- The cclaw socket server built its `HandlerCtx` with the default relative `"data"` path instead of the install's absolute data dir, so `sessions.delete` never removed the on-disk session directory when the host ran daemonized (it reported `directory_removed: false` with no warning) and dead-letter `dropped-messages replay` resolved per-session DBs against the daemon's CWD. `serve_listener`/`run_server` now take the data dir explicitly and boot passes `cfg.data_dir` (`crates/copperclaw-host/src/{socket.rs,boot.rs}`); regression e2e drives `sessions.delete` through the real socket server with a non-CWD data dir.
+### Added (M17 D1 — cclaw color + TTY awareness — 2026-07-14)
+
+- `cclaw` human-readable output is colorized when stdout is a real terminal: doctor OK/WARN/FAIL levels (green/yellow/red), `fix:` hint lines (cyan), table and dashboard section headers (bold), and `remote error:` lines (red). Gated on `std::io::IsTerminal`, the `NO_COLOR` convention, and a new global `--no-color` flag (`crates/copperclaw-cclaw/src/style.rs`); `--json` output is never styled and piped output stays byte-identical.
+
+### Fixed (M17 D2 — honest `sessions get`, new `sessions tail` — 2026-07-14)
+
+- `cclaw sessions get` now delivers what its help text always claimed: the session row plus the last 10 `messages_in` / `messages_out` rows (kind, status, timestamp, ~120-char secret-redacted content preview), read read-only from the per-session DBs host-side (`crates/copperclaw-host/src/handlers/sessions.rs`); and a new `cclaw sessions tail <id> [--follow]` prints the merged time-ordered rows with direction markers (`<-` inbound, `->` outbound, `--` breadcrumb/status kinds), polling 1s under `--follow` — safe against a running session (WAL concurrent reader), and message previews are withheld from agent callers asking about foreign sessions.
+### Changed (event-driven wake for idle sessions — M17 C3 — 2026-07-14)
+
+- A message to a stopped/idle session now spawns its container within ~one reconcile tick instead of waiting out the container manager's poll cadence: the router signals a `tokio::sync::Notify` after every `messages_in` insert (`copperclaw-host-router/src/route.rs`, `Router::inbound_wake`) and the container manager's `run_loop` ticks immediately on it (`copperclaw-host/src/container_manager/mod.rs`, `with_wake_notify`; idle→stopped self-chains the spawn tick in `classify.rs`). Notify coalescing plus `classify()` as the single decision point prevent spawn storms; the 1s poll loop remains the crash-safe fallback.
+### Changed (M17 A1 — parallel tool execution — 2026-07-14)
+
+- The runner executes each turn's tool-call batch concurrently instead of sequentially (`crates/copperclaw-runner/src/run/drive_turn.rs::execute_tool_batch`): independent calls overlap (N reads finish in ~max latency, not ~sum) while results still append to history in the original call order; `shell` calls keep their relative order (persisted cwd/env) and edit-family calls (`edit_file`/`multi_edit`/`apply_patch`/`write_file`) serialize per target path.
 
 ### Added (runner external-MCP consumer — host-proxied — 2026-06-03)
 
@@ -59,7 +100,22 @@ container stays sandboxed under deny-default egress.
   registry); stdio + HTTP-SSE transports; host active-loop latency adds ~1-2s per
   call; image-bearing remote results render as `<image>` (text-only this version).
 
-### Fixed (in-place cards recover from a stale edit anchor — 2026-06-03)
+### Fixed (host log-noise: quiet crash-log capture on a gone container + dedupe stale-image warn — 2026-07-15)
+
+- **Crash-restart log capture no longer WARNs when the container is already
+  gone.** `copperclaw-host/src/container_manager/classify.rs::capture_crash_log`
+  downgrades an already-removed container (operator `docker rm -f`, or the daemon
+  reaped it) from WARN to debug — a missing container is an expected outcome for
+  this best-effort probe, not a failure. The runtime layer now carries the
+  structure to tell them apart: new `copperclaw_container_rt::RtError::NotFound`
+  variant (`is_not_found()` helper), produced by `docker.rs::logs` on a Docker
+  404 instead of the generic `Container` string. Other capture failures (daemon
+  errors) still WARN.
+- **The boot-time "image runner may be stale" fingerprint mismatch warns once
+  per host process, not on every check.** `copperclaw-host/src/image_health.rs`
+  gains an in-memory dedupe set keyed on `(tag, expected, actual)`; a standing
+  mismatch logs at debug after the first WARN, and a *changed* triple warns
+  again because it's new information.
 
 - **A pinned todo/plan card whose anchor is gone no longer fails forever.**
   `DeliveryService::dispatch_todo_list` edits a single pinned card in place,

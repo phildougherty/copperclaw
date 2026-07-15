@@ -30,6 +30,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Disable ANSI color in human-readable output. Color is also
+    /// suppressed automatically when stdout is not a terminal or when the
+    /// `NO_COLOR` environment variable is set.
+    #[arg(long, global = true)]
+    pub no_color: bool,
+
     /// Top-level subcommand. When omitted, `cclaw` emits a one-shot
     /// operator dashboard via the `composite.dashboard` marker. The
     /// dashboard contract is in `crate::run_dashboard`.
@@ -932,11 +938,25 @@ pub enum SessionsCmd {
         #[arg(long)]
         status: Option<String>,
     },
-    /// Show one session by id (state, last-active, container status,
-    /// last few inbound / outbound rows).
+    /// Show one session by id: state, last-active, container status,
+    /// plus the last 10 inbound and outbound message rows (kind, status,
+    /// timestamp, redacted content preview) read from the per-session
+    /// DBs.
     Get {
         /// Session id (UUID).
         id: String,
+    },
+    /// Print recent inbound / outbound message rows merged in time
+    /// order, with direction markers: `<-` inbound, `->` outbound,
+    /// `--` breadcrumb / status kinds. One-shot by default; with
+    /// `--follow`, polls every second and prints new rows as they land
+    /// (Ctrl-C to exit). Read-only — safe against a running session.
+    Tail {
+        /// Session id (UUID).
+        id: String,
+        /// Keep polling for new rows every second.
+        #[arg(long)]
+        follow: bool,
     },
     /// Delete a session: remove its central-DB row plus every per-session
     /// row that references it (`agent_turns`, `tasks`, `pending_questions`,
@@ -1712,7 +1732,15 @@ impl SessionsCmd {
                 insert_opt(&mut o, "status", status.clone());
                 ParsedCall::new("sessions.list", Value::Object(o))
             }
-            Self::Get { id } => ParsedCall::new("sessions.get", json!({"id": id})),
+            // `sessions get` / `sessions tail` render client-side (session
+            // KV table + message-row tables / merged tail lines), so they
+            // route through composite markers; the underlying wire calls
+            // are `sessions.get` / `sessions.tail`.
+            Self::Get { id } => ParsedCall::new("composite.sessions-get", json!({"id": id})),
+            Self::Tail { id, follow } => ParsedCall::new(
+                "composite.sessions-tail",
+                json!({"id": id, "follow": *follow}),
+            ),
             Self::Delete { id, force } => {
                 ParsedCall::new("sessions.delete", json!({"id": id, "force": *force}))
             }
@@ -1890,6 +1918,7 @@ pub const ALL_COMMANDS: &[&str] = &[
     "destinations.remove",
     "sessions.list",
     "sessions.get",
+    "sessions.tail",
     "sessions.delete",
     "user-dms.list",
     "dropped-messages.list",
@@ -2708,7 +2737,17 @@ mod tests {
         ]);
         assert_eq!(p.args, json!({"agent_group_id":"ag1","status":"running"}));
         let p = parse(&["cclaw", "sessions", "get", "s1"]);
-        assert_eq!(p.command, "sessions.get");
+        assert_eq!(p.command, "composite.sessions-get");
+        assert_eq!(p.args, json!({"id": "s1"}));
+    }
+
+    #[test]
+    fn sessions_tail_emits_composite() {
+        let p = parse(&["cclaw", "sessions", "tail", "s1"]);
+        assert_eq!(p.command, "composite.sessions-tail");
+        assert_eq!(p.args, json!({"id": "s1", "follow": false}));
+        let p = parse(&["cclaw", "sessions", "tail", "s1", "--follow"]);
+        assert_eq!(p.args, json!({"id": "s1", "follow": true}));
     }
 
     #[test]
@@ -2949,7 +2988,11 @@ mod tests {
             ],
             &["cclaw", "destinations", "remove", "ag", "--name", "n"],
             &["cclaw", "sessions", "list"],
-            &["cclaw", "sessions", "get", "x"],
+            // Note: `sessions get` / `sessions tail` emit composite
+            // markers (client-side rendering) whose underlying wire
+            // calls `sessions.get` / `sessions.tail` stay in
+            // ALL_COMMANDS — they're exempted from the reverse check
+            // below.
             &["cclaw", "sessions", "delete", "x"],
             &["cclaw", "user-dms", "list"],
             &["cclaw", "dropped-messages", "list"],
@@ -3027,10 +3070,16 @@ mod tests {
             );
         }
         // And the reverse: every entry in ALL_COMMANDS should have been
-        // emitted at least once above.
+        // emitted at least once above. Wire commands reached only via a
+        // composite (never emitted by `to_call` directly) are exempt —
+        // the composite calls them through the transport.
+        let composite_called: &[&str] = &["sessions.get", "sessions.tail"];
         let emitted: std::collections::HashSet<String> =
             invocations.iter().map(|args| parse(args).command).collect();
         for c in ALL_COMMANDS {
+            if composite_called.contains(c) {
+                continue;
+            }
             assert!(
                 emitted.contains(*c),
                 "ALL_COMMANDS lists {c:?} but no invocation here produces it",

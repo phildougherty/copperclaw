@@ -631,6 +631,8 @@ impl CreateAgentHandler {
             // Inherit the parent's tool-profile so a child agent stays
             // within the same tool-authorization scope as its parent.
             tool_profile: cfg.tool_profile,
+            preview_enabled: cfg.preview_enabled,
+            preview_bind: cfg.preview_bind,
         };
         if let Err(err) = container_configs::upsert(central, req) {
             warn!(
@@ -924,6 +926,8 @@ mod tests {
                 coding_enabled: true,
                 surface_thinking: false,
                 tool_profile: None,
+                preview_enabled: false,
+                preview_bind: None,
             },
         )
         .unwrap();

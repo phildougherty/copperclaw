@@ -266,6 +266,7 @@ impl ContainerManager {
             session.id,
             now,
             assistant_name.as_deref(),
+            &model,
             effective_mode,
             catalogue_for_prompt.as_deref(),
             exclude_names,
@@ -669,6 +670,8 @@ mod tests {
             coding_enabled: false,
             surface_thinking: false,
             tool_profile: None,
+            preview_enabled: false,
+            preview_bind: None,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -725,6 +728,8 @@ mod tests {
             coding_enabled: false,
             surface_thinking: false,
             tool_profile: None,
+            preview_enabled: false,
+            preview_bind: None,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -774,6 +779,8 @@ mod tests {
             coding_enabled: false,
             surface_thinking: false,
             tool_profile: None,
+            preview_enabled: false,
+            preview_bind: None,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -816,6 +823,8 @@ mod tests {
             coding_enabled: false,
             surface_thinking: false,
             tool_profile: None,
+            preview_enabled: false,
+            preview_bind: None,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -944,6 +953,8 @@ mod tests {
             coding_enabled: false,
             surface_thinking: false,
             tool_profile: None,
+            preview_enabled: false,
+            preview_bind: None,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -980,6 +991,8 @@ mod tests {
             coding_enabled,
             surface_thinking: false,
             tool_profile: None,
+            preview_enabled: false,
+            preview_bind: None,
             updated_at: chrono::Utc::now(),
         }
     }
@@ -1104,6 +1117,14 @@ mod tests {
         // a couple of cheap structural sanity checks here.
         assert!(rc.system.contains("You are a Copperclaw agent"));
         assert!(rc.system.contains("# Environment"));
+        // The environment block must name the model actually backing the
+        // session (same value runner.json's `model` field carries) so the
+        // agent can answer "what model are you?" without guessing.
+        assert!(
+            rc.system.contains(&format!("Model: {}", rc.model)),
+            "system prompt must carry the resolved model; got: {}",
+            rc.model
+        );
     }
 
     #[test]
@@ -1364,6 +1385,8 @@ mod tests {
             coding_enabled: false,
             surface_thinking: false,
             tool_profile: tool_profile.map(str::to_string),
+            preview_enabled: false,
+            preview_bind: None,
             updated_at: chrono::Utc::now(),
         }
     }
