@@ -33,8 +33,15 @@
 //! (`files.getUploadURLExternal` → PUT to `upload_url` →
 //! `files.completeUploadExternal`).
 //!
-//! `set_typing` calls `assistant.threads.setStatus` — this only does
-//! anything in an Assistants context but is harmless otherwise.
+//! `set_typing` calls `assistant.threads.setStatus`, but only when the
+//! target is an assistant-thread surface (a thread inside the bot's own
+//! `D…`-prefixed DM) — the one place Slack renders the status. On any
+//! other target (channel/group threads, thread-less DMs) the call would
+//! be a silent no-op on Slack's side, so the adapter skips the API
+//! round-trip and instead reports the gap through the
+//! `ChannelAdapter::typing_indicator_visible` capability flag, which
+//! the host's progress UX (M18 Task HUD, card H1) reads to provide its
+//! own liveness signal on those surfaces.
 //!
 //! # Errors
 //!

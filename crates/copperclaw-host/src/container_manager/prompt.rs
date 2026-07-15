@@ -2,6 +2,7 @@
 
 use super::config::SkillsMode;
 use copperclaw_db::tables::container_configs;
+use copperclaw_modules::permissions::ToolProfile;
 use copperclaw_types::AgentGroupId;
 use std::path::Path;
 use tracing::warn;
@@ -151,6 +152,56 @@ end. One or two sentences is usually enough; add a code block, \
 command, or link when it helps and skip the prose around it. Never use \
 emojis unless the user explicitly asks.
 ";
+
+/// Condensed coding-discipline block appended to [`BASE_PREAMBLE`] when
+/// the group's tool profile can write code (`Coding` or `Full` — and an
+/// unset profile, which the runner treats as `full`). The rules that
+/// decide whether a build succeeds — git init first, commit per
+/// increment, verify before claiming done, deliver the artifact — used
+/// to live only in the `coding-task` skill body, reachable only if the
+/// model remembered `load_skill("coding-task")`: a repeatedly-observed
+/// failure mode, worst on small local models. This block is the floor;
+/// the long-form skill stays the depth reference and the block points
+/// at it.
+///
+/// Static per spawn — the content never varies per turn, so it joins
+/// `BASE_PREAMBLE` inside the provider's cached prompt prefix. Written
+/// for small local models: short imperative lines, no prose paragraphs.
+/// `Messaging` / `Minimal` profiles never receive it (their prompts gain
+/// zero bytes — pinned by test).
+pub const CODING_PREAMBLE: &str = "
+# Coding work — the floor
+
+These rules always apply when you write code. For the full discipline, \
+`load_skill(\"coding-task\")` before starting real coding work.
+
+- Every project is a git repo, and `git init` comes FIRST: \
+`mkdir -p /data/<project> && cd /data/<project> && git init`.
+- One repo per project dir under `/data`; never pile projects into one.
+- Commit after EACH working increment — not one commit at the end.
+- Verify before you claim done. Run the code (`python3 x.py`, \
+`node x.js`, curl the running server), and run the project's own check \
+command (its tests / build / lint) before marking a code todo \
+`completed`. \"It compiles\" is not the bar.
+- Use the project's canonical whole-project build (`cargo build`, \
+`go build ./...`, `npm run build`) — never an ad-hoc per-file check.
+- Could not run it? Say so plainly. \"Done\" without evidence is \
+fabrication.
+- End EVERY build with an artifact-delivery step. Files under `/data` \
+are invisible to the operator until you `send_file` (small files), \
+`artifact_path` (whole projects — paste the returned host path in your \
+reply), or `expose_preview` (HTTP apps). No delivery step means you \
+built nothing the operator can use.
+";
+
+/// Whether `profile` gets the inline [`CODING_PREAMBLE`]. `Coding` and
+/// `Full` can write code, so they get the floor rules. `Messaging` and
+/// `Minimal` cannot, and their prompts must not grow by a single byte —
+/// that keeps non-coding groups' cached prompt prefixes bit-identical to
+/// the pre-block prompts.
+pub(crate) fn profile_includes_coding(profile: ToolProfile) -> bool {
+    matches!(profile, ToolProfile::Coding | ToolProfile::Full)
+}
 
 /// Filename of the per-session marker dropped when the per-group memory
 /// mount could not be configured. The agent reads
@@ -320,6 +371,7 @@ pub(crate) fn assemble_system_prompt(
     assistant_name: Option<&str>,
     model: &str,
     skills_mode: SkillsMode,
+    tool_profile: ToolProfile,
 ) -> String {
     assemble_system_prompt_with_catalogue(
         skills_dir,
@@ -332,6 +384,7 @@ pub(crate) fn assemble_system_prompt(
         assistant_name,
         model,
         skills_mode,
+        tool_profile,
         None,
         &[],
     )
@@ -346,6 +399,12 @@ pub(crate) fn assemble_system_prompt(
 /// Inline-mode fallback (no prebuilt catalogue) honours the same filter
 /// as the Callable path. When a prebuilt catalogue is supplied the
 /// caller is expected to have already applied any filtering.
+///
+/// `tool_profile` selects whether the [`CODING_PREAMBLE`] block joins the
+/// preamble: `Coding` / `Full` get it, `Messaging` / `Minimal` get a
+/// prompt byte-identical to the profile-less historical shape. The
+/// profile is fixed per spawn, so the added block never varies per turn
+/// and prompt-cache prefix stability is preserved.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble_system_prompt_with_catalogue(
     skills_dir: Option<&Path>,
@@ -358,11 +417,15 @@ pub(crate) fn assemble_system_prompt_with_catalogue(
     assistant_name: Option<&str>,
     model: &str,
     skills_mode: SkillsMode,
+    tool_profile: ToolProfile,
     prebuilt_catalogue: Option<&[SkillCatalogueEntry]>,
     exclude_names: &[&str],
 ) -> String {
     let mut out = String::with_capacity(16 * 1024);
     out.push_str(BASE_PREAMBLE);
+    if profile_includes_coding(tool_profile) {
+        out.push_str(CODING_PREAMBLE);
+    }
     out.push_str(&environment_block(
         session_id,
         agent_group_id,
@@ -991,6 +1054,7 @@ mod tests {
             None,
             "test-model-1.0",
             SkillsMode::Inline,
+            ToolProfile::Full,
         );
         // Preamble is mode-agnostic — these phrases anchor it.
         assert!(prompt.contains("You are a Copperclaw agent"));
@@ -1018,6 +1082,7 @@ mod tests {
             None,
             "test-model-1.0",
             SkillsMode::Inline,
+            ToolProfile::Full,
         );
         assert!(prompt.contains(&session.as_uuid().to_string()));
         assert!(prompt.contains(&ag.as_uuid().to_string()));
@@ -1036,6 +1101,7 @@ mod tests {
             Some("Atlas"),
             "test-model-1.0",
             SkillsMode::Inline,
+            ToolProfile::Full,
         );
         assert!(with_name.contains("Assistant name: Atlas"));
         let without_name = assemble_system_prompt(
@@ -1049,6 +1115,7 @@ mod tests {
             None,
             "test-model-1.0",
             SkillsMode::Inline,
+            ToolProfile::Full,
         );
         assert!(!without_name.contains("Assistant name:"));
     }
@@ -1067,6 +1134,7 @@ mod tests {
             None,
             "test-model-1.0",
             SkillsMode::Inline,
+            ToolProfile::Full,
         );
         assert!(!prompt.contains("# Project briefing"));
         assert!(!prompt.contains("<briefing"));
@@ -1091,6 +1159,7 @@ mod tests {
             None,
             "test-model-1.0",
             SkillsMode::Inline,
+            ToolProfile::Full,
         );
         assert!(prompt.contains("# Project briefing"));
         assert!(prompt.contains("<briefing source=\"session:"));
@@ -1119,6 +1188,7 @@ mod tests {
             None,
             "test-model-1.0",
             SkillsMode::Inline,
+            ToolProfile::Full,
         );
         assert!(prompt.contains("<briefing source=\"group:"));
         assert!(prompt.contains("This deployment runs the support workload."));
@@ -1149,6 +1219,7 @@ mod tests {
             None,
             "test-model-1.0",
             SkillsMode::Inline,
+            ToolProfile::Full,
         );
         let g_pos = prompt.find("GROUP-LEVEL").expect("group briefing present");
         let s_pos = prompt
@@ -1175,6 +1246,7 @@ mod tests {
             None,
             "test-model-1.0",
             SkillsMode::Inline,
+            ToolProfile::Full,
         );
         assert!(!prompt.contains("# Project briefing"));
     }
@@ -1197,6 +1269,7 @@ mod tests {
             None,
             "test-model-1.0",
             SkillsMode::Inline,
+            ToolProfile::Full,
         );
         let brief_pos = prompt.find("BRIEF").expect("brief present");
         let skill_pos = prompt.find("<skill name=\"alpha\"").expect("skill present");
@@ -1218,6 +1291,7 @@ mod tests {
             None,
             "test-model-1.0",
             SkillsMode::Inline,
+            ToolProfile::Full,
         );
         assert!(prompt.contains("You are a Copperclaw agent"));
         assert!(!prompt.contains("<skill name="));
@@ -1313,6 +1387,7 @@ mod tests {
             None,
             "test-model-1.0",
             SkillsMode::Inline,
+            ToolProfile::Full,
         );
         assert!(
             prompt.contains("Briefing diagnostics"),
@@ -1394,6 +1469,136 @@ mod tests {
         assert!(
             inline_chunk.contains("name=\"weird&amp;&quot;name\""),
             "inline mode must escape `&` and `\"` in skill name"
+        );
+    }
+
+    /// Assemble a prompt for `profile` with everything else held fixed,
+    /// so per-profile outputs are byte-comparable.
+    fn assemble_for_profile(
+        profile: ToolProfile,
+        session: copperclaw_types::SessionId,
+        ag: AgentGroupId,
+    ) -> String {
+        assemble_system_prompt(
+            None,
+            None,
+            ag,
+            &copperclaw_skills::SkillsSelector::All,
+            None,
+            session,
+            fixed_now(),
+            None,
+            "test-model-1.0",
+            SkillsMode::Inline,
+            profile,
+        )
+    }
+
+    #[test]
+    fn profile_includes_coding_matches_write_capable_profiles() {
+        assert!(profile_includes_coding(ToolProfile::Coding));
+        assert!(profile_includes_coding(ToolProfile::Full));
+        assert!(!profile_includes_coding(ToolProfile::Messaging));
+        assert!(!profile_includes_coding(ToolProfile::Minimal));
+        // The unset-profile fallback is `Full` (matches the runner's
+        // dispatch-time default), so unconfigured groups keep coding.
+        assert!(profile_includes_coding(ToolProfile::default()));
+    }
+
+    #[test]
+    fn coding_and_full_profiles_inline_the_coding_block() {
+        // Per-profile snapshot: the condensed coding-discipline block sits
+        // between the base preamble and the environment block, and points
+        // at the long-form skill for depth.
+        let session = copperclaw_types::SessionId::new();
+        let ag = AgentGroupId::new();
+        for profile in [ToolProfile::Coding, ToolProfile::Full] {
+            let prompt = assemble_for_profile(profile, session, ag);
+            let expected_prefix = format!("{BASE_PREAMBLE}{CODING_PREAMBLE}\n# Environment");
+            assert!(
+                prompt.starts_with(&expected_prefix),
+                "profile {profile:?}: coding block must follow the base preamble \
+                 and precede the environment block"
+            );
+            assert!(prompt.contains("# Coding work — the floor"));
+            assert!(prompt.contains("load_skill(\"coding-task\")"));
+            assert!(prompt.contains("git init"));
+            // The verification line must reference the project's own check
+            // command (not a copperclaw-invented mechanism) so it stays
+            // true when a project-level verify convention lands.
+            assert!(prompt.contains("project's own check"));
+            // Artifact delivery: all three delivery routes are named.
+            assert!(prompt.contains("`send_file`"));
+            assert!(prompt.contains("`artifact_path`"));
+            assert!(prompt.contains("`expose_preview`"));
+        }
+    }
+
+    #[test]
+    fn messaging_and_minimal_profiles_gain_zero_new_bytes() {
+        // Hard acceptance: a non-coding profile's prompt is BYTE-IDENTICAL
+        // to the coding prompt minus the coding block — i.e. the block is
+        // the only difference and Messaging/Minimal gained nothing.
+        let session = copperclaw_types::SessionId::new();
+        let ag = AgentGroupId::new();
+        let coding = assemble_for_profile(ToolProfile::Coding, session, ag);
+        let full = assemble_for_profile(ToolProfile::Full, session, ag);
+        let messaging = assemble_for_profile(ToolProfile::Messaging, session, ag);
+        let minimal = assemble_for_profile(ToolProfile::Minimal, session, ag);
+
+        assert_eq!(coding, full, "coding and full share one prompt shape");
+        assert_eq!(
+            messaging, minimal,
+            "messaging and minimal share one prompt shape"
+        );
+        assert_eq!(
+            coding.replacen(CODING_PREAMBLE, "", 1),
+            messaging,
+            "removing the coding block from the coding prompt must yield \
+             the messaging prompt byte-for-byte"
+        );
+        assert_eq!(
+            messaging.len() + CODING_PREAMBLE.len(),
+            coding.len(),
+            "the coding block is the only added bytes"
+        );
+        let expected_prefix = format!("{BASE_PREAMBLE}\n# Environment");
+        assert!(
+            messaging.starts_with(&expected_prefix),
+            "non-coding prompt must keep the historical preamble -> \
+             environment layout with nothing in between"
+        );
+        assert!(!messaging.contains("# Coding work"));
+        assert!(!messaging.contains("load_skill(\"coding-task\")"));
+    }
+
+    #[test]
+    fn coding_block_is_static_per_spawn_for_cache_stability() {
+        // Prompt-cache guard (host-side analogue of the runner's
+        // cached-prefix stability test): the coding block is a const with
+        // no per-turn or per-spawn interpolation, so (a) two assemblies
+        // with identical inputs are byte-identical, and (b) everything
+        // before the environment block — the region shared across spawns
+        // — does not vary with session identity.
+        let session = copperclaw_types::SessionId::new();
+        let ag = AgentGroupId::new();
+        let a = assemble_for_profile(ToolProfile::Coding, session, ag);
+        let b = assemble_for_profile(ToolProfile::Coding, session, ag);
+        assert_eq!(a, b, "same inputs must assemble byte-identically");
+
+        let other = assemble_for_profile(
+            ToolProfile::Coding,
+            copperclaw_types::SessionId::new(),
+            AgentGroupId::new(),
+        );
+        let prefix = |s: &str| {
+            let end = s.find("\n# Environment").expect("environment block");
+            s[..end].to_string()
+        };
+        assert_eq!(
+            prefix(&a),
+            prefix(&other),
+            "the preamble + coding block must not vary with session identity"
         );
     }
 }

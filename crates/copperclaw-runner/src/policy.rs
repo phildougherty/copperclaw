@@ -1,60 +1,51 @@
 //! Tool authorization policy (PLAN.md § 6 T5, security-hardening Phase 1.1).
 //!
-//! Generalizes the old static [`DISALLOWED_TOOLS`] floor into a layered
-//! gate evaluated at every tool dispatch (see
+//! A layered gate evaluated at every tool dispatch (see
 //! [`crate::run::tool_dispatch::invoke_tool`]). A tool call is permitted
 //! only when it survives, in order:
 //!
-//! 1. **Host-owned floor.** [`DISALLOWED_TOOLS`] names are *never*
-//!    reachable from inside the container, regardless of profile, role,
-//!    or skill. This is the same case-sensitive list the runner has
-//!    always enforced — it sits *beneath* the positive allow-list so no
-//!    looser layer can re-grant a host-owned tool.
-//! 2. **Sender role.** A [`SenderRole::Guest`] sender is held to a
+//! 1. **Sender role.** A [`SenderRole::Guest`] sender is held to a
 //!    read-only floor: shell / file-mutation / self-modification tools
 //!    are denied even if the active profile would otherwise allow them.
-//! 3. **Active skill `allowed-tools`.** When the turn is running under a
+//! 2. **Active skill `allowed-tools`.** When the turn is running under a
 //!    skill that declared an `allowed-tools` frontmatter list, only the
 //!    named tools (plus the always-available housekeeping set) pass —
 //!    so a skill declaring `allowed-tools: [Read]` blocks `shell`.
-//! 4. **Group tool-profile.** The positive allow-list for the group:
+//! 3. **Group tool-profile.** The positive allow-list for the group:
 //!    [`ToolProfile::Minimal`] / [`Messaging`] / [`Coding`] / [`Full`].
+//! 4. **Coarse provenance / autonomy gate.** Credentialed external
+//!    actions (see [`is_credentialed_external`]) are blocked on a
+//!    tainted turn until a fresh approval, and blocked outright on an
+//!    autonomous turn (see [`TurnTrust`]).
 //!
-//! Layers 2-4 are a positive allow-list (default-deny intersection);
-//! layer 1 is a hard floor (default-allow with a deny-set carve-out).
+//! Layers 1-3 are a positive allow-list (default-deny intersection);
+//! layer 4 is a conditional gate over a small set of external actions.
+//!
+//! ## Where the `DISALLOWED_TOOLS` floor went (M18 R0)
+//!
+//! Until M18 this module also carried a "host-owned floor": a hard
+//! deny-list of nine historical pascal-case built-in tool names
+//! (`CronCreate`, `AskUserQuestion`, `EnterPlanMode`, ... — PLAN.md § 6
+//! T5) inherited from the upstream design, evaluated before every other
+//! layer. Those names never matched the runner's actual `snake_case` tool
+//! inventory ([`copperclaw_mcp::build_tool_set`]), so the floor never
+//! denied a real call — every effective deny came from the role / skill
+//! / profile / provenance layers above. The list was deleted rather than
+//! repopulated: every first-party tool is intentionally reachable under
+//! the `Full` profile, so there is no in-tree name an unconditional
+//! deny-list should pin. **The profiles are the enforcement mechanism.**
+//! A name that matches no registered tool still fails at dispatch with
+//! an "Unknown tool" error (`crate::run::tool_dispatch`). To keep the
+//! profile lists from rotting the same way the floor did, the
+//! `tool_name_drift` integration test pins every name referenced by
+//! [`PROFILE_TOOL_LISTS`] to the real inventory.
 //!
 //! [`Messaging`]: ToolProfile::Messaging
 //! [`Coding`]: ToolProfile::Coding
 //! [`Full`]: ToolProfile::Full
+//! [`copperclaw_mcp::build_tool_set`]: copperclaw_mcp::build_tool_set
 
 use serde::{Deserialize, Serialize};
-
-/// Built-in tool names the runner must always refuse, regardless of the
-/// active profile, sender role, or skill. These are owned by the host
-/// orchestrator (it implements them out-of-band) and must never be
-/// reachable from inside the container.
-///
-/// Matching is case-sensitive on purpose: lower-case MCP variants (e.g.
-/// our `ask_user_question`, owned by `copperclaw-mcp`) are *allowed* and
-/// must not collide with the historical pascal-case built-in names here.
-pub const DISALLOWED_TOOLS: &[&str] = &[
-    "CronCreate",
-    "CronDelete",
-    "CronList",
-    "ScheduleWakeup",
-    "AskUserQuestion",
-    "EnterPlanMode",
-    "ExitPlanMode",
-    "EnterWorktree",
-    "ExitWorktree",
-];
-
-/// Returns `true` if `name` exactly matches a host-owned disallowed tool.
-/// Matching is case-sensitive (see [`DISALLOWED_TOOLS`]).
-#[must_use]
-pub fn is_disallowed(name: &str) -> bool {
-    DISALLOWED_TOOLS.iter().any(|t| *t == name)
-}
 
 /// Tools that are available under *every* profile and to *every* role:
 /// the conversation + session-housekeeping primitives. Blocking these
@@ -171,6 +162,27 @@ const CREDENTIALED_EXTERNAL_TOOLS: &[&str] = &[
     "close_preview",
 ];
 
+/// Every tool-name list this policy references, labelled for diagnostics.
+///
+/// This is the drift-guard surface: the `tool_name_drift` integration test
+/// asserts every name here exists in the real in-container inventory
+/// ([`copperclaw_mcp::build_tool_set`]) or is one of the host-brokered
+/// preview tools relayed via the `__preview` server
+/// (`crate::run::preview`). The old `DISALLOWED_TOOLS` floor rotted
+/// precisely because nothing pinned its names to the inventory (see the
+/// module docs); this export exists so the same drift in the profile
+/// lists fails CI instead.
+///
+/// [`copperclaw_mcp::build_tool_set`]: copperclaw_mcp::build_tool_set
+pub const PROFILE_TOOL_LISTS: &[(&str, &[&str])] = &[
+    ("ALWAYS_TOOLS", ALWAYS_TOOLS),
+    ("READONLY_TOOLS", READONLY_TOOLS),
+    ("SCHEDULING_MUTATION_TOOLS", SCHEDULING_MUTATION_TOOLS),
+    ("CODING_TOOLS", CODING_TOOLS),
+    ("SELF_MOD_TOOLS", SELF_MOD_TOOLS),
+    ("CREDENTIALED_EXTERNAL_TOOLS", CREDENTIALED_EXTERNAL_TOOLS),
+];
+
 /// Namespace prefix the runner gives every **external** MCP tool it advertises
 /// (`mcp__<server>__<tool>`). Mirrors the `mcp__server__tool` convention used
 /// elsewhere and keeps external tools from colliding with first-party names.
@@ -242,8 +254,8 @@ impl ToolProfile {
     }
 
     /// Whether this profile's positive allow-list admits `tool`. `Full`
-    /// admits every tool (subject to the floor and the other layers);
-    /// the lower tiers admit their cumulative tool sets.
+    /// admits every tool (subject to the other policy layers); the lower
+    /// tiers admit their cumulative tool sets.
     #[must_use]
     pub fn allows(self, tool: &str) -> bool {
         if ALWAYS_TOOLS.contains(&tool) {
@@ -259,9 +271,10 @@ impl ToolProfile {
                     || SCHEDULING_MUTATION_TOOLS.contains(&tool)
                     || CODING_TOOLS.contains(&tool)
             }
-            // `Full` is an open allow-list: anything that isn't on the
-            // host-owned floor is permitted (new MCP tools are usable
-            // without touching the profile table).
+            // `Full` is an open allow-list: everything is permitted at
+            // the profile layer (new MCP tools are usable without
+            // touching the profile table); a name that matches no
+            // registered tool still fails at dispatch as unknown.
             Self::Full => true,
         }
     }
@@ -446,17 +459,10 @@ impl ToolPolicy {
 
     /// Evaluate `tool` against every layer. See the module docs for the
     /// ordering. Returns [`PolicyDecision::Allow`] only when the tool
-    /// survives the floor *and* every positive layer.
+    /// survives every layer.
     #[must_use]
     pub fn evaluate(&self, tool: &str) -> PolicyDecision {
-        // Layer 1: host-owned floor. Always wins.
-        if is_disallowed(tool) {
-            return PolicyDecision::Deny(format!(
-                "Tool `{tool}` is disallowed inside the copperclaw container (host-owned)."
-            ));
-        }
-
-        // Layer 2: sender-role floor. A guest cannot invoke mutating
+        // Layer 1: sender-role floor. A guest cannot invoke mutating
         // tools, period — even under a permissive profile.
         if let Some(role) = self.sender_role {
             if role.denies_mutating() && is_mutating(tool) {
@@ -467,7 +473,7 @@ impl ToolPolicy {
             }
         }
 
-        // Layer 3: active-skill `allowed-tools`. When a skill scoped the
+        // Layer 2: active-skill `allowed-tools`. When a skill scoped the
         // turn, only its declared tools (plus the always-available
         // housekeeping set) pass.
         if let Some(allowed) = &self.skill_allowed {
@@ -478,7 +484,7 @@ impl ToolPolicy {
             }
         }
 
-        // Layer 4: group profile ceiling.
+        // Layer 3: group profile ceiling.
         if !self.profile.allows(tool) {
             return PolicyDecision::Deny(format!(
                 "Tool `{tool}` is not permitted by the `{}` tool profile.",
@@ -486,7 +492,7 @@ impl ToolPolicy {
             ));
         }
 
-        // Layer 5: coarse provenance / autonomy gate (Phase 3). Only
+        // Layer 4: coarse provenance / autonomy gate (Phase 3). Only
         // credentialed external actions are gated here — memory search,
         // messaging, and local tools always pass so an autonomous turn can
         // still read-then-propose.
@@ -524,31 +530,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn floor_has_nine_entries() {
-        // PLAN.md § 6 names exactly nine host-owned tools.
-        assert_eq!(DISALLOWED_TOOLS.len(), 9);
-    }
-
-    #[test]
-    fn every_floor_name_is_disallowed() {
-        for name in DISALLOWED_TOOLS {
-            assert!(is_disallowed(name), "expected disallowed: {name}");
+    fn profile_tool_lists_cover_every_policy_list() {
+        // The drift-guard export must carry all six lists (the
+        // `tool_name_drift` integration test iterates it; a list missing
+        // here escapes the guard).
+        let labels: Vec<&str> = PROFILE_TOOL_LISTS.iter().map(|(l, _)| *l).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "ALWAYS_TOOLS",
+                "READONLY_TOOLS",
+                "SCHEDULING_MUTATION_TOOLS",
+                "CODING_TOOLS",
+                "SELF_MOD_TOOLS",
+                "CREDENTIALED_EXTERNAL_TOOLS",
+            ]
+        );
+        for (label, names) in PROFILE_TOOL_LISTS {
+            assert!(!names.is_empty(), "{label} is empty");
         }
     }
 
     #[test]
-    fn floor_is_case_sensitive() {
-        assert!(is_disallowed("CronCreate"));
-        assert!(!is_disallowed("croncreate"));
-        assert!(!is_disallowed("CRONCREATE"));
-        // Our MCP lower-case variants stay usable.
-        for name in [
-            "ask_user_question",
-            "enter_plan_mode",
-            "cron_create",
-            "schedule_wakeup",
-        ] {
-            assert!(!is_disallowed(name), "unexpectedly disallowed: {name}");
+    fn profile_tool_names_are_snake_case() {
+        // The old DISALLOWED_TOOLS floor rotted because it carried
+        // pascal-case names that never matched the snake_case inventory.
+        // Keep pascal-case (or any other casing) from creeping into the
+        // live lists.
+        for (label, names) in PROFILE_TOOL_LISTS {
+            for name in *names {
+                assert!(
+                    name.chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                    "{label} entry `{name}` is not snake_case"
+                );
+            }
         }
     }
 
@@ -614,13 +630,14 @@ mod tests {
     }
 
     #[test]
-    fn full_profile_allows_everything_not_on_floor() {
+    fn full_profile_allows_everything() {
         let p = ToolProfile::Full;
         assert!(p.allows("shell"));
         assert!(p.allows("install_packages"));
         assert!(p.allows("add_mcp_server"));
         // Even a tool we've never heard of passes the profile layer
-        // under Full (the floor still catches host-owned names).
+        // under Full — an unregistered name fails at dispatch as
+        // "Unknown tool" instead (there is no deny-list floor).
         assert!(p.allows("some_future_tool"));
     }
 
@@ -642,12 +659,15 @@ mod tests {
     }
 
     #[test]
-    fn floor_denied_under_every_profile_and_role() {
+    fn unknown_tool_denied_under_every_non_full_profile() {
+        // With the decorative DISALLOWED_TOOLS floor gone, the profile
+        // allow-lists are the mechanism: a name outside the lists is
+        // denied by every profile except the open `Full` allow-list
+        // (where an unregistered name fails at dispatch as unknown).
         for profile in [
             ToolProfile::Minimal,
             ToolProfile::Messaging,
             ToolProfile::Coding,
-            ToolProfile::Full,
         ] {
             for role in [
                 None,
@@ -656,12 +676,12 @@ mod tests {
                 Some(SenderRole::Guest),
             ] {
                 let p = ToolPolicy::new(profile, role);
-                let d = p.evaluate("CronCreate");
+                let d = p.evaluate("some_unknown_tool");
                 assert!(
                     !d.is_allow(),
-                    "floor should deny CronCreate ({profile:?}/{role:?})"
+                    "{profile:?}/{role:?} should deny an unknown tool"
                 );
-                assert!(d.deny_reason().unwrap().contains("host-owned"));
+                assert!(d.deny_reason().unwrap().contains(profile.as_str()));
             }
         }
     }
