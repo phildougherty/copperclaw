@@ -9,6 +9,9 @@ adheres to [Semantic Versioning](https://semver.org/).
 ### Changed (event-driven wake for idle sessions — M17 C3 — 2026-07-14)
 
 - A message to a stopped/idle session now spawns its container within ~one reconcile tick instead of waiting out the container manager's poll cadence: the router signals a `tokio::sync::Notify` after every `messages_in` insert (`copperclaw-host-router/src/route.rs`, `Router::inbound_wake`) and the container manager's `run_loop` ticks immediately on it (`copperclaw-host/src/container_manager/mod.rs`, `with_wake_notify`; idle→stopped self-chains the spawn tick in `classify.rs`). Notify coalescing plus `classify()` as the single decision point prevent spawn storms; the 1s poll loop remains the crash-safe fallback.
+### Changed (M17 A1 — parallel tool execution — 2026-07-14)
+
+- The runner executes each turn's tool-call batch concurrently instead of sequentially (`crates/copperclaw-runner/src/run/drive_turn.rs::execute_tool_batch`): independent calls overlap (N reads finish in ~max latency, not ~sum) while results still append to history in the original call order; `shell` calls keep their relative order (persisted cwd/env) and edit-family calls (`edit_file`/`multi_edit`/`apply_patch`/`write_file`) serialize per target path.
 
 ### Added (runner external-MCP consumer — host-proxied — 2026-06-03)
 
