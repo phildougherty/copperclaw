@@ -35,6 +35,7 @@
 
 pub mod dispatch;
 pub mod error;
+mod fence;
 pub mod loops;
 pub mod service;
 pub mod system_actions;

@@ -15,7 +15,6 @@
 pub mod compaction;
 pub mod config;
 pub mod destinations;
-pub mod disallowed;
 pub mod formatter;
 pub mod policy;
 pub mod redact;
@@ -27,7 +26,6 @@ pub mod tools;
 pub use compaction::{CompactionCfg, compact, estimate_tokens};
 pub use config::{RunnerConfig, RunnerConfigFile};
 pub use destinations::{ResolvedRoute, resolve_recipient};
-pub use disallowed::{DISALLOWED_TOOLS, is_disallowed};
 pub use formatter::{ElisionCfg, FormattedTurn, elide_stale_tool_results, format_messages};
 pub use policy::{
     PolicyDecision, SenderRole, ToolPolicy, ToolProfile, TurnTrust, is_credentialed_external,

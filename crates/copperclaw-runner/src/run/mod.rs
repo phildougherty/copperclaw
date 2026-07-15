@@ -428,8 +428,7 @@ pub struct RunnerDeps {
     pub surface_thinking: bool,
     /// Layered tool-authorization policy evaluated at every dispatch
     /// (see [`crate::policy`]). Combines the group's tool-profile, the
-    /// sender role, and the active skill's `allowed-tools` over the
-    /// host-owned [`crate::policy::DISALLOWED_TOOLS`] floor. Default
+    /// sender role, and the active skill's `allowed-tools`. Default
     /// ([`crate::policy::ToolPolicy::default`]) is the permissive `Full`
     /// profile with no role/skill scope, so groups that don't set a
     /// profile keep their historical full tool surface.
@@ -2225,23 +2224,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disallowed_tool_produces_refusal_in_history() {
-        // First turn: model emits a ToolCall to a disallowed tool;
-        // the runner pushes a `Tool { is_error: true }` refusal,
-        // then runs a second turn where the model concedes.
+    async fn policy_denied_tool_produces_refusal_in_history() {
+        // First turn: model emits a ToolCall the group's tool-profile
+        // denies (`shell` under `messaging`); the runner pushes a
+        // `Tool { is_error: true }` refusal, then runs a second turn
+        // where the model concedes.
         let mut setup = build_setup(vec![
             vec![ProviderEvent::ToolCall {
                 id: "tu_1".into(),
-                name: "CronCreate".into(),
-                input: serde_json::json!({}),
+                name: "shell".into(),
+                input: serde_json::json!({"command": "ls"}),
             }],
             vec![ProviderEvent::Result {
                 text: Some("ok".into()),
             }],
         ]);
+        setup.deps.policy =
+            crate::policy::ToolPolicy::new(crate::policy::ToolProfile::Messaging, None);
         {
             let g = setup.deps.inbound.lock().await;
-            insert_pending(&g, "please cron");
+            insert_pending(&g, "please run ls");
         }
         setup.deps.max_turns = Some(1);
         run_loop(setup.deps).await.unwrap();
@@ -2252,9 +2254,9 @@ mod tests {
             st.history.iter().any(|m| matches!(
                 m,
                 HistoryMessage::Tool { content, is_error: true, .. }
-                    if content.contains("disallowed")
+                    if content.contains("not permitted by the `messaging` tool profile")
             )),
-            "expected a disallowed-tool refusal in history, got: {:?}",
+            "expected a policy-denied refusal in history, got: {:?}",
             st.history
         );
     }
