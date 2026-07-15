@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
+use copperclaw_db::tables::messages_in;
 use copperclaw_providers::HistoryMessage;
 
 use super::RunnerDeps;
@@ -329,6 +330,19 @@ async fn drive_turn_inner(
     // `(tool, args)` fingerprints and trips on N-identical or A,B,A,B
     // patterns — see `ToolLoopGuard`.
     let mut loop_guard = ToolLoopGuard::default();
+    // M18 R2: mid-turn interruption + steering. Snapshot the highest
+    // `messages_in.seq` that already exists when this drive starts — the
+    // row(s) that triggered this inbound are already in the table at
+    // this point (the host router wrote them; `run_loop` hasn't marked
+    // them completed yet), so this ceiling is exactly "known when the
+    // turn began". Any row peeked between tool batches with `seq` above
+    // it arrived strictly after — a `/stop` control row or a human
+    // steering message. On a query failure, default to "nothing is new"
+    // (i64::MAX) rather than risk treating the whole inbox as fresh.
+    let known_seq_ceiling: i64 = {
+        let g = deps.inbound.lock().await;
+        messages_in::max_seq(&g).unwrap_or(i64::MAX)
+    };
 
     for tool_turn in 0..deps.max_tool_turns.max(1) {
         let output = run_llm_turn(deps, history, continuation.as_deref(), context_block).await?;
@@ -511,6 +525,26 @@ async fn drive_turn_inner(
         )
         .await;
 
+        // M18 R2: mid-turn interruption + steering. This is the natural
+        // cooperative point between tool batches — checked before the
+        // loop-breaker / parse-error / budget bails below so an explicit
+        // user `/stop` always wins even if the model also happened to
+        // spin in the same batch. A `/stop` control row ends the turn
+        // right here; a new human Chat row is folded into the transcript
+        // as an interjection and the loop continues. Anything else
+        // peeked (a scheduled Task fire, another agent's dispatch) is
+        // left untouched — it stays `pending` and the next `run_loop`
+        // poll picks it up normally once this inbound resolves.
+        if let Some(stopped) =
+            check_mid_turn_steering(deps, history, known_seq_ceiling, cumulative_tool_runs, hud)
+                .await?
+        {
+            return Ok(TurnResult {
+                continuation,
+                outcome: stopped,
+            });
+        }
+
         // Content-loop circuit breaker. After persisting this turn's
         // tool_results (so the audit history shows the full degenerate
         // run), bail if the model has spun on the same call or
@@ -603,6 +637,107 @@ async fn drive_turn_inner(
             "the agent ran out of turns after {cap} tool calls without finishing the task"
         )),
     })
+}
+
+/// M18 R2: peek `inbound.db` for rows that arrived strictly after
+/// `known_seq_ceiling` and act on the two shapes M17-A2 defines:
+///
+/// - A `/stop` control row (see `copperclaw_host_router::commands`'s
+///   contract — `content.control.op == "stop"`) ends the turn cleanly:
+///   the row is marked completed, a short "stopped" reply goes out on
+///   the originating channel, and `Some(TurnOutcome::Done)` tells the
+///   caller to return immediately. A `/stop` wins over any interjection
+///   peeked in the same batch — the turn is ending, so there is nothing
+///   left to steer.
+/// - Any new human `Chat` row (with no `/stop` present) is folded into
+///   `history` as one interjection message, marked completed, and the
+///   HUD gets a one-shot "steering noted" note. Returns `None` so the
+///   caller keeps looping — the model sees the interjection on its next
+///   turn.
+///
+/// Anything else peeked (a scheduled Task fire, another session's
+/// dispatch) is left `pending` untouched: it isn't part of either
+/// contract, so the next `run_loop` poll picks it up normally once this
+/// inbound resolves — never double-processed because we only mark rows
+/// completed here when we actually act on them.
+async fn check_mid_turn_steering(
+    deps: &RunnerDeps,
+    history: &mut Vec<HistoryMessage>,
+    known_seq_ceiling: i64,
+    cumulative_tool_runs: usize,
+    hud: &TaskHud,
+) -> Result<Option<TurnOutcome>> {
+    let peeked = {
+        let g = deps.inbound.lock().await;
+        messages_in::get_new_since(&g, known_seq_ceiling).unwrap_or_default()
+    };
+    if peeked.is_empty() {
+        return Ok(None);
+    }
+
+    if let Some(stop_row) = peeked.iter().find(|r| is_stop_control_row(r)) {
+        mark_mid_turn_row_completed(deps, stop_row.id).await;
+        let plural = if cumulative_tool_runs == 1 { "" } else { "s" };
+        let stopped_text = format!(
+            "Stopped — here's where things stand. I'd completed {cumulative_tool_runs} \
+             tool call{plural} on this task before stopping. Send a new message to \
+             continue or redirect me."
+        );
+        let spec = copperclaw_mcp::SendMessageSpec {
+            to: None,
+            text: stopped_text,
+        };
+        let _ = deps
+            .tool_ctx
+            .emit_outbound(copperclaw_mcp::OutboundToolEffect::SendMessage(spec))
+            .await;
+        return Ok(Some(TurnOutcome::Done));
+    }
+
+    let interjections: Vec<_> = peeked
+        .into_iter()
+        .filter(|r| r.kind == copperclaw_types::MessageKind::Chat)
+        .collect();
+    if !interjections.is_empty() {
+        let formatted = crate::formatter::format_messages(interjections.clone());
+        history.push(HistoryMessage::User {
+            content: format!(
+                "[user interjection — sent while a tool turn was already in progress]\n{}",
+                formatted.prompt
+            ),
+        });
+        for row in &interjections {
+            mark_mid_turn_row_completed(deps, row.id).await;
+        }
+        hud.add_note("steering noted");
+    }
+    Ok(None)
+}
+
+/// `content.control.op == "stop"` per
+/// `copperclaw_host_router::commands`'s control-row contract.
+fn is_stop_control_row(row: &copperclaw_types::MessageInRow) -> bool {
+    row.content
+        .get("control")
+        .and_then(|c| c.get("op"))
+        .and_then(serde_json::Value::as_str)
+        == Some("stop")
+}
+
+/// Best-effort `mark_completed` for a row consumed mid-turn. Errors are
+/// logged and swallowed — the row stays `pending` and gets picked up
+/// (and acted on again) on the runner's next mid-turn peek or the
+/// following `run_loop` poll, so a transient `SQLite` hiccup here can't
+/// silently drop the steering signal.
+async fn mark_mid_turn_row_completed(deps: &RunnerDeps, id: copperclaw_types::MessageId) {
+    let g = deps.inbound.lock().await;
+    if let Err(err) = messages_in::mark_completed(&g, id) {
+        tracing::warn!(
+            ?err,
+            row_id = %id.as_uuid(),
+            "M18 R2: mid-turn mark_completed failed; continuing"
+        );
+    }
 }
 
 /// One executed tool call's rendering: `(content, images, is_error)` —
@@ -739,12 +874,16 @@ mod execute_tool_batch_tests {
 
     use async_trait::async_trait;
     use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
+    use copperclaw_db::tables::messages_in::{self, WriteInbound};
     use copperclaw_mcp::{ToolContext, ToolEntry, ToolError, ToolHandler};
     use copperclaw_providers::{
         AgentProvider, AgentQuery, HistoryMessage, ProviderError, QueryInput,
     };
-    use copperclaw_types::{AgentGroupId, ProviderEvent, SessionId};
+    use copperclaw_types::{
+        AgentGroupId, ChannelType, MessageId, MessageKind, ProviderEvent, SessionId,
+    };
     use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
+    use rusqlite::Connection;
     use tokio::sync::Mutex;
 
     use super::{PendingToolCall, TurnOutcome, drive_turn, execute_tool_batch};
@@ -1525,6 +1664,245 @@ mod execute_tool_batch_tests {
             .as_str()
             .unwrap();
         assert!(summary.starts_with("stopped after "), "got: {summary}");
+    }
+
+    // ----- M18 R2 mid-turn interruption + steering acceptance ------------
+
+    fn stop_control_row() -> WriteInbound {
+        WriteInbound {
+            id: MessageId::new(),
+            kind: MessageKind::System,
+            timestamp: chrono::Utc::now(),
+            // Mirrors `copperclaw_host_router::commands::control_content`'s
+            // pinned shape exactly (kind=system, trigger=false, the
+            // `content.control.op` marker).
+            content: serde_json::json!({
+                "control": {"op": "stop"},
+                "command": "stop",
+                "text": "/stop",
+            }),
+            trigger: false,
+            on_wake: false,
+            process_after: None,
+            recurrence: None,
+            series_id: None,
+            platform_id: Some("chat-1".into()),
+            channel_type: Some(ChannelType::new("cli")),
+            thread_id: None,
+            source_session_id: None,
+            reply_to: None,
+            is_group: None,
+        }
+    }
+
+    fn chat_row(text: &str) -> WriteInbound {
+        WriteInbound {
+            id: MessageId::new(),
+            kind: MessageKind::Chat,
+            timestamp: chrono::Utc::now(),
+            content: serde_json::json!({"text": text}),
+            trigger: true,
+            on_wake: false,
+            process_after: None,
+            recurrence: None,
+            series_id: None,
+            platform_id: Some("chat-1".into()),
+            channel_type: Some(ChannelType::new("cli")),
+            thread_id: None,
+            source_session_id: None,
+            reply_to: None,
+            is_group: None,
+        }
+    }
+
+    /// A mock tool whose execution simulates a row landing in
+    /// `inbound.db` WHILE the current tool batch is in flight — exactly
+    /// the race R2 exists to handle. Inserts once, on its first call.
+    struct InjectInboundRow {
+        inbound: Arc<Mutex<Connection>>,
+        row: StdMutex<Option<WriteInbound>>,
+    }
+
+    #[async_trait]
+    impl ToolHandler for InjectInboundRow {
+        async fn call(
+            &self,
+            _arguments: Option<JsonObject>,
+            _ctx: &dyn ToolContext,
+        ) -> Result<CallToolResult, ToolError> {
+            let row = self.row.lock().unwrap().take();
+            if let Some(row) = row {
+                let conn = self.inbound.lock().await;
+                messages_in::insert(&conn, &row).unwrap();
+            }
+            Ok(CallToolResult::success(vec![Content::text("ok")]))
+        }
+    }
+
+    fn tool_entry(name: &'static str, handler: Box<dyn ToolHandler>) -> Arc<ToolEntry> {
+        Arc::new(ToolEntry {
+            tool: Tool {
+                name: Cow::Borrowed(name),
+                description: None,
+                input_schema: Arc::new(JsonObject::new()),
+                annotations: None,
+            },
+            handler,
+        })
+    }
+
+    /// Acceptance (M17-A2 / M18 R2): a `/stop` control row that lands
+    /// mid-turn ends the turn cleanly — `Done`, not `Failed` — with a
+    /// "stopped" reply, and the control row is consumed (never
+    /// double-processed). The second scripted turn's text must never be
+    /// reached: the turn ends right after the batch that raced the stop.
+    #[tokio::test]
+    async fn mid_turn_stop_control_row_ends_turn_cleanly() {
+        let (_tmp, mut deps) = deps_with_mocks(
+            vec![],
+            vec![
+                vec![ProviderEvent::ToolCall {
+                    id: "tu_0".into(),
+                    name: "inject".into(),
+                    input: serde_json::json!({}),
+                }],
+                vec![ProviderEvent::Result {
+                    text: Some("must never be reached".into()),
+                }],
+            ],
+        );
+        let mut map: HashMap<String, Arc<ToolEntry>> = HashMap::new();
+        map.insert(
+            "inject".to_string(),
+            tool_entry(
+                "inject",
+                Box::new(InjectInboundRow {
+                    inbound: deps.inbound.clone(),
+                    row: StdMutex::new(Some(stop_control_row())),
+                }),
+            ),
+        );
+        deps.tool_map = Arc::new(map);
+        deps.tool_ctx
+            .set_originating(Some("cli"), Some("chat-1"), None, None);
+
+        let mut history: Vec<HistoryMessage> = Vec::new();
+        let result = drive_turn(&deps, &mut history, None, None).await.unwrap();
+        assert!(
+            matches!(result.outcome, TurnOutcome::Done),
+            "a /stop must end the turn cleanly, not fail it: {result:?}",
+        );
+
+        // Exactly one chat reply went out, and it's the stop
+        // confirmation — the second script's text was never consumed.
+        let rows = outbound_rows(&deps).await;
+        let chat_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == copperclaw_types::MessageKind::Chat)
+            .collect();
+        assert_eq!(chat_rows.len(), 1, "only the stop reply: {chat_rows:?}");
+        let text = chat_rows[0].content["text"].as_str().unwrap_or_default();
+        assert!(
+            text.to_lowercase().contains("stopped"),
+            "reply must acknowledge the stop; got: {text}"
+        );
+
+        // The control row is consumed — `get_new_since` must not
+        // re-surface it (proves no double-processing on the next poll).
+        let inbound = deps.inbound.lock().await;
+        let ceiling = messages_in::max_seq(&inbound).unwrap() - 1;
+        assert!(
+            messages_in::get_new_since(&inbound, ceiling)
+                .unwrap()
+                .is_empty(),
+            "the stop row must be marked completed, not left pending"
+        );
+    }
+
+    /// Acceptance (M17-A2 / M18 R2): a new human `Chat` row that lands
+    /// mid-turn is folded into the transcript as an interjection — the
+    /// turn keeps going (unlike `/stop`), the row is consumed, and the
+    /// HUD picks up the "steering noted" note on its next frame.
+    #[tokio::test]
+    async fn mid_turn_chat_interjection_folds_in_and_continues() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let (_tmp, mut deps) = deps_with_mocks(
+            vec![],
+            vec![
+                vec![ProviderEvent::ToolCall {
+                    id: "tu_0".into(),
+                    name: "inject".into(),
+                    input: serde_json::json!({}),
+                }],
+                vec![ProviderEvent::ToolCall {
+                    id: "tu_1".into(),
+                    name: "mock_read".into(),
+                    input: serde_json::json!({"id": "x", "delay_ms": 0}),
+                }],
+                vec![ProviderEvent::Result {
+                    text: Some("wrapped up".into()),
+                }],
+            ],
+        );
+        let mut map: HashMap<String, Arc<ToolEntry>> = HashMap::new();
+        map.insert(
+            "inject".to_string(),
+            tool_entry(
+                "inject",
+                Box::new(InjectInboundRow {
+                    inbound: deps.inbound.clone(),
+                    row: StdMutex::new(Some(chat_row("actually use SQLite"))),
+                }),
+            ),
+        );
+        map.insert(
+            "mock_read".to_string(),
+            tool_entry("mock_read", Box::new(SlowEcho { tracker, log })),
+        );
+        deps.tool_map = Arc::new(map);
+        // Telegram: live HUD, so the "steering noted" note has somewhere
+        // to render.
+        deps.tool_ctx
+            .set_originating(Some("telegram"), Some("chat-1"), None, None);
+
+        let mut history: Vec<HistoryMessage> = Vec::new();
+        let result = drive_turn(&deps, &mut history, None, None).await.unwrap();
+        assert!(matches!(result.outcome, TurnOutcome::Done), "{result:?}");
+
+        // The interjection landed in the transcript as a User entry,
+        // and the turn reached the second batch + final text (proving
+        // it did NOT stop, unlike the /stop case above).
+        let interjection = history.iter().find_map(|m| match m {
+            HistoryMessage::User { content } if content.contains("user interjection") => {
+                Some(content.clone())
+            }
+            _ => None,
+        });
+        let interjection = interjection.expect("interjection must land in history");
+        assert!(
+            interjection.contains("actually use SQLite"),
+            "interjection text must carry the user's steering message; got: {interjection}"
+        );
+
+        // The interjection row is consumed (not left for a future poll
+        // to double-process).
+        let inbound = deps.inbound.lock().await;
+        assert_eq!(messages_in::get_new_since(&inbound, 0).unwrap().len(), 0);
+        drop(inbound);
+
+        // HUD picks up the one-shot "steering noted" note on the next
+        // frame after the interjection (the second batch's start-edit).
+        let rows = outbound_rows(&deps).await;
+        let edits = hud_edits(&rows);
+        assert!(
+            edits.iter().any(|r| {
+                r.content["update_breadcrumb"]["breadcrumb"]["summary"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("steering noted"))
+            }),
+            "HUD must surface 'steering noted' on the frame after the interjection"
+        );
     }
 }
 
