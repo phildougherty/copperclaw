@@ -69,7 +69,22 @@ container stays sandboxed under deny-default egress.
   registry); stdio + HTTP-SSE transports; host active-loop latency adds ~1-2s per
   call; image-bearing remote results render as `<image>` (text-only this version).
 
-### Fixed (in-place cards recover from a stale edit anchor — 2026-06-03)
+### Fixed (host log-noise: quiet crash-log capture on a gone container + dedupe stale-image warn — 2026-07-15)
+
+- **Crash-restart log capture no longer WARNs when the container is already
+  gone.** `copperclaw-host/src/container_manager/classify.rs::capture_crash_log`
+  downgrades an already-removed container (operator `docker rm -f`, or the daemon
+  reaped it) from WARN to debug — a missing container is an expected outcome for
+  this best-effort probe, not a failure. The runtime layer now carries the
+  structure to tell them apart: new `copperclaw_container_rt::RtError::NotFound`
+  variant (`is_not_found()` helper), produced by `docker.rs::logs` on a Docker
+  404 instead of the generic `Container` string. Other capture failures (daemon
+  errors) still WARN.
+- **The boot-time "image runner may be stale" fingerprint mismatch warns once
+  per host process, not on every check.** `copperclaw-host/src/image_health.rs`
+  gains an in-memory dedupe set keyed on `(tag, expected, actual)`; a standing
+  mismatch logs at debug after the first WARN, and a *changed* triple warns
+  again because it's new information.
 
 - **A pinned todo/plan card whose anchor is gone no longer fails forever.**
   `DeliveryService::dispatch_todo_list` edits a single pinned card in place,

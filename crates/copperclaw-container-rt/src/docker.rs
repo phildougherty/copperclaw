@@ -269,6 +269,20 @@ impl ContainerRuntime for DockerRuntime {
                     buf.push_str(&String::from_utf8_lossy(chunk.as_ref()));
                 }
                 Err(e) => {
+                    // A 404 = the container is already gone (an operator
+                    // `docker rm -f`'d it, or the daemon reaped it before
+                    // we could capture logs). Report it as NotFound so the
+                    // host's crash-restart log capture can treat it as an
+                    // expected, quiet outcome rather than a warn.
+                    if matches!(
+                        e,
+                        bollard::errors::Error::DockerResponseServerError {
+                            status_code: 404,
+                            ..
+                        }
+                    ) {
+                        return Err(RtError::NotFound(format!("fetch logs {name}: {e}")));
+                    }
                     return Err(RtError::Container(format!("fetch logs {name}: {e}")));
                 }
             }
