@@ -159,6 +159,37 @@ impl CommandHandler for CtxFnHandler {
     }
 }
 
+/// Handler variant that additionally receives the [`Caller`] — for
+/// commands whose response shape depends on caller scope (e.g.
+/// `sessions.get` attaches message previews for the host and for an
+/// agent asking about its own session, but not for a foreign one).
+type CallerHandlerFn =
+    dyn Fn(&Value, &Caller, &HandlerCtx) -> Result<Value, ErrorPayload> + Send + Sync;
+
+pub struct CallerFnHandler {
+    f: Box<CallerHandlerFn>,
+}
+
+impl CallerFnHandler {
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(&Value, &Caller, &HandlerCtx) -> Result<Value, ErrorPayload> + Send + Sync + 'static,
+    {
+        Self { f: Box::new(f) }
+    }
+}
+
+impl CommandHandler for CallerFnHandler {
+    fn handle(
+        &self,
+        args: &Value,
+        caller: &Caller,
+        ctx: &HandlerCtx,
+    ) -> Result<Value, ErrorPayload> {
+        (self.f)(args, caller, ctx)
+    }
+}
+
 /// In-memory mapping of dotted command names to their handler.
 pub type DispatchTable = HashMap<&'static str, Arc<dyn CommandHandler>>;
 
@@ -303,7 +334,17 @@ pub fn build_dispatch_table() -> DispatchTable {
     ins!("destinations.remove", handlers::destinations::remove, true);
 
     ins!("sessions.list", handlers::sessions::list, false);
-    ins!("sessions.get", handlers::sessions::get, false);
+    // Caller-aware: attaches per-session message previews for the host
+    // (and for an agent asking about its own session). Scope is enforced
+    // inside the handler, not via `requires_host`.
+    t.insert(
+        "sessions.get",
+        Arc::new(CallerFnHandler::new(handlers::sessions::get)) as Arc<dyn CommandHandler>,
+    );
+    t.insert(
+        "sessions.tail",
+        Arc::new(CallerFnHandler::new(handlers::sessions::tail)) as Arc<dyn CommandHandler>,
+    );
     ins_ctx!("sessions.delete", handlers::sessions::delete, true);
 
     ins!("user-dms.list", handlers::user_dms::list, false);

@@ -128,6 +128,15 @@ impl ContainerManager {
                 sessions::mark_container_stopped(&self.central, session.id)
                     .map_err(ManagerError::Db)?;
                 info!(session = %session.id.as_uuid(), "idle → stopped (pending inbound)");
+                // Idle → Stopped is deliberately a two-tick transition
+                // (the spawn wants the freshest session row). When the
+                // event-driven wake is wired, chain straight into the next
+                // tick so the spawn doesn't wait out another poll interval;
+                // without it, the poll cadence picks the session up as
+                // before.
+                if let Some(wake) = &self.wake {
+                    wake.notify_one();
+                }
                 Ok(())
             }
             ReconcileAction::IdleStop => {

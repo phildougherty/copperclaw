@@ -17,6 +17,19 @@ adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed (admin-socket data dir — 2026-07-14)
 
 - The cclaw socket server built its `HandlerCtx` with the default relative `"data"` path instead of the install's absolute data dir, so `sessions.delete` never removed the on-disk session directory when the host ran daemonized (it reported `directory_removed: false` with no warning) and dead-letter `dropped-messages replay` resolved per-session DBs against the daemon's CWD. `serve_listener`/`run_server` now take the data dir explicitly and boot passes `cfg.data_dir` (`crates/copperclaw-host/src/{socket.rs,boot.rs}`); regression e2e drives `sessions.delete` through the real socket server with a non-CWD data dir.
+### Added (M17 D1 — cclaw color + TTY awareness — 2026-07-14)
+
+- `cclaw` human-readable output is colorized when stdout is a real terminal: doctor OK/WARN/FAIL levels (green/yellow/red), `fix:` hint lines (cyan), table and dashboard section headers (bold), and `remote error:` lines (red). Gated on `std::io::IsTerminal`, the `NO_COLOR` convention, and a new global `--no-color` flag (`crates/copperclaw-cclaw/src/style.rs`); `--json` output is never styled and piped output stays byte-identical.
+
+### Fixed (M17 D2 — honest `sessions get`, new `sessions tail` — 2026-07-14)
+
+- `cclaw sessions get` now delivers what its help text always claimed: the session row plus the last 10 `messages_in` / `messages_out` rows (kind, status, timestamp, ~120-char secret-redacted content preview), read read-only from the per-session DBs host-side (`crates/copperclaw-host/src/handlers/sessions.rs`); and a new `cclaw sessions tail <id> [--follow]` prints the merged time-ordered rows with direction markers (`<-` inbound, `->` outbound, `--` breadcrumb/status kinds), polling 1s under `--follow` — safe against a running session (WAL concurrent reader), and message previews are withheld from agent callers asking about foreign sessions.
+### Changed (event-driven wake for idle sessions — M17 C3 — 2026-07-14)
+
+- A message to a stopped/idle session now spawns its container within ~one reconcile tick instead of waiting out the container manager's poll cadence: the router signals a `tokio::sync::Notify` after every `messages_in` insert (`copperclaw-host-router/src/route.rs`, `Router::inbound_wake`) and the container manager's `run_loop` ticks immediately on it (`copperclaw-host/src/container_manager/mod.rs`, `with_wake_notify`; idle→stopped self-chains the spawn tick in `classify.rs`). Notify coalescing plus `classify()` as the single decision point prevent spawn storms; the 1s poll loop remains the crash-safe fallback.
+### Changed (M17 A1 — parallel tool execution — 2026-07-14)
+
+- The runner executes each turn's tool-call batch concurrently instead of sequentially (`crates/copperclaw-runner/src/run/drive_turn.rs::execute_tool_batch`): independent calls overlap (N reads finish in ~max latency, not ~sum) while results still append to history in the original call order; `shell` calls keep their relative order (persisted cwd/env) and edit-family calls (`edit_file`/`multi_edit`/`apply_patch`/`write_file`) serialize per target path.
 
 ### Added (runner external-MCP consumer — host-proxied — 2026-06-03)
 
