@@ -1211,7 +1211,171 @@ where
         }
     }
 
+    // 10. Free disk on the filesystem holding the install's data dir.
+    //     Local check (no transport). The host degrades *silently* when
+    //     the root fs fills — `tasks_snapshot` write failures, container
+    //     spawns and test suites failing on ENOSPC — and before this row
+    //     `cclaw doctor` reported all-OK straight through a real 100%-full
+    //     incident. This closes that gap.
+    checks.push(disk_space_check());
+
     finalise_doctor(&checks, as_json, palette)
+}
+
+/// Byte thresholds for the `disk-space` doctor check, kept next to the
+/// pure classifier they parameterise. WARN below 10% free *or* below
+/// 20 GiB free (whichever trips first); FAIL below 3% free *or* below
+/// 5 GiB free.
+const GIB: u64 = 1024 * 1024 * 1024;
+const DISK_WARN_BYTES: u64 = 20 * GIB;
+const DISK_FAIL_BYTES: u64 = 5 * GIB;
+
+/// Remediation hint shared by the WARN/FAIL disk rows.
+const DISK_FIX: &str = "reclaim space: rotate/delete old host logs under \
+    <data>/logs, `docker system prune -af --volumes`, and clear stale \
+    Rust `target/` dirs (`cargo clean` in dev checkouts)";
+
+/// Classify free disk into a [`CheckLevel`]. Pure so the boundaries are
+/// unit-testable without touching a real filesystem. Percent is compared
+/// with integer (u128) math to stay clippy-clean (no float casts) and
+/// overflow-free: `free/total < n%`  ⇔  `free*100 < total*n`.
+fn disk_level(free_bytes: u64, total_bytes: u64) -> CheckLevel {
+    let free = u128::from(free_bytes);
+    let total = u128::from(total_bytes);
+    let below_pct = |n: u128| total != 0 && free * 100 < total * n;
+    if below_pct(3) || free_bytes < DISK_FAIL_BYTES {
+        CheckLevel::Fail
+    } else if below_pct(10) || free_bytes < DISK_WARN_BYTES {
+        CheckLevel::Warn
+    } else {
+        CheckLevel::Ok
+    }
+}
+
+/// Human-readable byte size (binary units) for disk-check detail lines.
+/// Integer-only (no float casts) to stay clippy-pedantic-clean; one
+/// decimal place via scaled u128 arithmetic with round-to-nearest.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut unit = 0;
+    let mut scale: u64 = 1;
+    while unit < UNITS.len() - 1 && n / scale >= 1024 {
+        scale *= 1024;
+        unit += 1;
+    }
+    if unit == 0 {
+        return format!("{n} B");
+    }
+    let scale = u128::from(scale);
+    let tenths = (u128::from(n) * 10 + scale / 2) / scale;
+    format!("{}.{} {}", tenths / 10, tenths % 10, UNITS[unit])
+}
+
+/// Integer free-space percentage (rounded down) for detail lines. Result
+/// is 0..=100, so the `try_from` fallback is unreachable in practice; it
+/// exists to dodge a lossy-cast clippy lint without an `as` cast.
+fn free_pct(free_bytes: u64, total_bytes: u64) -> u64 {
+    if total_bytes == 0 {
+        return 0;
+    }
+    let pct = (u128::from(free_bytes) * 100) / u128::from(total_bytes);
+    u64::try_from(pct).unwrap_or(100)
+}
+
+// Test seam: when set on the current thread, `disk_space_check` skips the
+// real `statvfs` and reports these synthetic `(free, total)` bytes. Keeps
+// the transport-seeded doctor tests deterministic (independent of the test
+// host's actual free space) and lets tests drive the WARN/FAIL rendering
+// through the full doctor flow. Thread-local, so parallel tests don't race;
+// only ever compiled in test builds.
+#[cfg(test)]
+thread_local! {
+    static DISK_OVERRIDE: std::cell::Cell<Option<(u64, u64)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_disk_override(free_bytes: u64, total_bytes: u64) {
+    DISK_OVERRIDE.with(|c| c.set(Some((free_bytes, total_bytes))));
+}
+
+/// Build the `disk-space` doctor row. Resolves the install's data dir
+/// client-side (cclaw runs on the same box as the host), stats the
+/// filesystem holding it, and classifies free space. Degrades to a WARN
+/// row — never a panic, never a block — when the path can't be resolved
+/// or `statvfs` fails, so a stat error can't take down the rest of doctor.
+fn disk_space_check() -> Check {
+    // In test builds, default to a healthy synthetic filesystem so the
+    // transport-focused doctor tests don't hinge on the host's real disk;
+    // individual tests override via `set_disk_override`.
+    #[cfg(test)]
+    {
+        let (free, total) = DISK_OVERRIDE
+            .with(std::cell::Cell::get)
+            .unwrap_or((500 * GIB, 1024 * GIB));
+        disk_check_bytes(free, total, std::path::Path::new("<test>"))
+    }
+    #[cfg(not(test))]
+    {
+        let Some(root) = resolve_install_root() else {
+            return Check::warn(
+                "disk-space",
+                "could not resolve the install root to stat free disk space",
+                Some("set $HOME (or XDG_DATA_HOME on Linux) so cclaw can locate the install"),
+            );
+        };
+        // Prefer the data dir; on a fresh box it may not exist yet, so fall
+        // back to the nearest existing ancestor (the mount is the same).
+        let data_dir = root.join("data");
+        let mut stat_path = data_dir.clone();
+        while !stat_path.exists() {
+            match stat_path.parent() {
+                Some(parent) => stat_path = parent.to_path_buf(),
+                None => break,
+            }
+        }
+        disk_check_at(&stat_path, &data_dir)
+    }
+}
+
+/// Format a classified `(free, total)` pair into a `disk-space` [`Check`].
+/// The pure rendering half — no I/O — shared by the real `statvfs` path
+/// and the test seam.
+fn disk_check_bytes(free: u64, total: u64, label_path: &std::path::Path) -> Check {
+    let detail = format!(
+        "{} free of {} ({}% free) on the filesystem holding {}",
+        human_bytes(free),
+        human_bytes(total),
+        free_pct(free, total),
+        label_path.display(),
+    );
+    match disk_level(free, total) {
+        CheckLevel::Ok => Check::ok("disk-space", detail),
+        CheckLevel::Warn => Check::warn("disk-space", detail, Some(DISK_FIX)),
+        CheckLevel::Fail => Check::fail("disk-space", detail, Some(DISK_FIX)),
+    }
+}
+
+/// The stat + classify half of [`disk_space_check`], split out so the
+/// path resolution above stays readable. `label_path` is what the detail
+/// line names (the data dir), `stat_path` is what we actually statvfs.
+fn disk_check_at(stat_path: &std::path::Path, label_path: &std::path::Path) -> Check {
+    match rustix::fs::statvfs(stat_path) {
+        Ok(vfs) => {
+            // Bytes = block count * fragment size. `f_bavail` is the space
+            // available to unprivileged writers (excludes root-reserved
+            // blocks) — the number that actually predicts write failures.
+            let frag = vfs.f_frsize;
+            let total = vfs.f_blocks.saturating_mul(frag);
+            let free = vfs.f_bavail.saturating_mul(frag);
+            disk_check_bytes(free, total, label_path)
+        }
+        Err(e) => Check::warn(
+            "disk-space",
+            format!("could not stat {}: {e}", stat_path.display()),
+            Some("free space is unknown — check the path exists and is readable"),
+        ),
+    }
 }
 
 /// Render the collected `doctor` checks and pick the exit code.
@@ -2688,6 +2852,175 @@ mod tests {
     }
 
     // ── cclaw doctor ───────────────────────────────────────────────
+
+    #[test]
+    fn disk_level_ok_when_plenty_free() {
+        // 500 GiB free of 1 TiB: well above every threshold.
+        let level = disk_level(500 * GIB, 1024 * GIB);
+        assert_eq!(level, CheckLevel::Ok);
+    }
+
+    #[test]
+    fn disk_level_warn_on_low_percent() {
+        // 8% free of a large disk (>20 GiB free, so only the percent
+        // rule can trip): 80 GiB free of 1 TiB → WARN, not FAIL.
+        let level = disk_level(80 * GIB, 1000 * GIB);
+        assert_eq!(level, CheckLevel::Warn);
+    }
+
+    #[test]
+    fn disk_level_warn_on_low_absolute_even_when_percent_is_fine() {
+        // 15 GiB free of a tiny 30 GiB disk: 50% free (percent rule OK)
+        // but under the 20 GiB absolute WARN floor → WARN.
+        let level = disk_level(15 * GIB, 30 * GIB);
+        assert_eq!(level, CheckLevel::Warn);
+    }
+
+    #[test]
+    fn disk_level_fail_on_critical_percent() {
+        // 2% free of a large disk: 20 GiB free of 1000 GiB. Under 3%
+        // (FAIL) even though 20 GiB is at the WARN absolute floor.
+        let level = disk_level(20 * GIB, 1000 * GIB);
+        assert_eq!(level, CheckLevel::Fail);
+    }
+
+    #[test]
+    fn disk_level_fail_on_critical_absolute() {
+        // 4 GiB free of a 100 GiB disk: 4% (above 3%) but under the
+        // 5 GiB absolute FAIL floor → FAIL.
+        let level = disk_level(4 * GIB, 100 * GIB);
+        assert_eq!(level, CheckLevel::Fail);
+    }
+
+    #[test]
+    fn disk_level_boundaries_are_inclusive_of_ok_at_the_edge() {
+        // Exactly 10% free, well above the 20 GiB floor → not *below* the
+        // threshold → OK. 200 GiB of 2000 GiB is exactly 10%.
+        assert_eq!(disk_level(200 * GIB, 2000 * GIB), CheckLevel::Ok);
+        // A hair under 10% → WARN.
+        assert_eq!(disk_level(199 * GIB, 2000 * GIB), CheckLevel::Warn);
+        // Exactly at the 20 GiB WARN floor with healthy pct → OK.
+        assert_eq!(disk_level(20 * GIB, 40 * GIB), CheckLevel::Ok);
+        // Just under 20 GiB free (healthy pct) → WARN via the absolute floor.
+        assert_eq!(disk_level(19 * GIB, 40 * GIB), CheckLevel::Warn);
+        // Exactly 3% free (not *below* 3%) but under the 5 GiB FAIL floor:
+        // 3 GiB of 100 GiB → FAIL via the absolute floor.
+        assert_eq!(disk_level(3 * GIB, 100 * GIB), CheckLevel::Fail);
+    }
+
+    #[test]
+    fn disk_level_handles_zero_total_without_panicking() {
+        // Degenerate stat (total 0): percent rule short-circuits to
+        // false, free 0 < 5 GiB → FAIL. Must not divide-by-zero.
+        assert_eq!(disk_level(0, 0), CheckLevel::Fail);
+    }
+
+    #[test]
+    fn disk_check_degrades_to_warn_on_stat_failure() {
+        // A path that cannot be statvfs'd must yield a WARN row (never a
+        // panic), so a stat error can't take down the rest of doctor.
+        let missing = std::path::Path::new("/copperclaw/definitely/not/here");
+        let check = disk_check_at(missing, missing);
+        assert_eq!(check.level, CheckLevel::Warn);
+        assert!(check.detail.contains("could not stat"));
+        assert!(check.fix.is_some());
+    }
+
+    #[test]
+    fn human_bytes_renders_binary_units() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(20 * GIB), "20.0 GiB");
+        assert_eq!(human_bytes(1536 * 1024 * 1024), "1.5 GiB");
+    }
+
+    #[test]
+    fn free_pct_is_floored_and_zero_safe() {
+        assert_eq!(free_pct(50 * GIB, 100 * GIB), 50);
+        assert_eq!(free_pct(1, 3), 33); // 33.3% floored
+        assert_eq!(free_pct(0, 0), 0); // zero-total is safe, not a panic
+    }
+
+    #[tokio::test]
+    async fn doctor_reports_disk_space_row_with_healthy_default() {
+        // No override → healthy synthetic disk → OK row present, no FAIL.
+        let t = SequencedTransport::new(vec![
+            Ok(json!([{"id": "ag-1"}])),
+            Ok(json!([{"id": "w-1"}])),
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!([])),
+        ]);
+        let out = run_cli(["cclaw", "doctor"], &t).await;
+        assert!(out.stdout.contains("disk-space"));
+        assert!(!out.stdout.contains("[FAIL"));
+    }
+
+    #[tokio::test]
+    async fn doctor_disk_space_fail_surfaces_fix_line() {
+        // Critically low disk → FAIL row + `fix:` hint; whole report moves
+        // to stderr (finalise_doctor uses failure() when any row FAILs).
+        set_disk_override(GIB, 100 * GIB);
+        let t = SequencedTransport::new(vec![
+            Ok(json!([{"id": "ag-1"}])),
+            Ok(json!([{"id": "w-1"}])),
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!([])),
+        ]);
+        let out = run_cli(["cclaw", "doctor"], &t).await;
+        assert!(out.stderr.contains("FAIL"));
+        assert!(out.stderr.contains("disk-space"));
+        assert!(out.stderr.contains("fix:"));
+        assert!(out.stderr.contains("reclaim space"));
+    }
+
+    #[tokio::test]
+    async fn doctor_disk_space_warn_stays_on_stdout() {
+        // Low-but-not-critical disk → WARN row (success exit, stdout).
+        set_disk_override(60 * GIB, 1000 * GIB); // 6% free, >5 GiB
+        let t = SequencedTransport::new(vec![
+            Ok(json!([{"id": "ag-1"}])),
+            Ok(json!([{"id": "w-1"}])),
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!([])),
+        ]);
+        let out = run_cli(["cclaw", "doctor"], &t).await;
+        assert!(
+            out.stderr.is_empty(),
+            "WARN must not fail: {:?}",
+            out.stderr
+        );
+        assert!(out.stdout.contains("WARN"));
+        assert!(out.stdout.contains("disk-space"));
+    }
+
+    #[tokio::test]
+    async fn doctor_json_carries_disk_space_row() {
+        // --json output must include the disk-space check consistently
+        // with other rows (name/level/detail/fix keys).
+        set_disk_override(GIB, 100 * GIB);
+        let t = SequencedTransport::new(vec![
+            Ok(json!([{"id": "ag-1"}])),
+            Ok(json!([{"id": "w-1"}])),
+            Ok(json!([])),
+            Ok(json!([])),
+            Ok(json!([])),
+        ]);
+        let out = run_cli(["cclaw", "--json", "doctor"], &t).await;
+        let combined = format!("{}{}", out.stdout, out.stderr);
+        let v: serde_json::Value = serde_json::from_str(&combined).expect("valid json");
+        assert_eq!(v["status"], "fail");
+        let disk = v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "disk-space")
+            .expect("disk-space row present in json");
+        assert_eq!(disk["level"], "fail");
+        assert!(disk["detail"].is_string());
+        assert!(disk["fix"].is_string());
+    }
 
     #[tokio::test]
     async fn doctor_socket_unreachable_fails_with_fix() {
