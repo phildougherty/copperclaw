@@ -966,6 +966,10 @@ type SpawnedManager = (
 /// returns `None` so the host still boots (sessions just won't get
 /// a runner). The returned `manager` is what the SIGHUP handler holds
 /// to apply secret rotation.
+// Boot wiring: one parameter per optional subsystem the manager attaches
+// (spawn tracker, broker, preview, wake). Splitting the fn or bundling the
+// args into a struct would only move the wiring noise around.
+#[allow(clippy::too_many_arguments)]
 fn spawn_container_manager(
     cfg: &HostConfig,
     central: copperclaw_db::central::CentralDb,
