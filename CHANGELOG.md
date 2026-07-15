@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (M17 A1 — parallel tool execution — 2026-07-14)
+
+- The runner executes each turn's tool-call batch concurrently instead of sequentially (`crates/copperclaw-runner/src/run/drive_turn.rs::execute_tool_batch`): independent calls overlap (N reads finish in ~max latency, not ~sum) while results still append to history in the original call order; `shell` calls keep their relative order (persisted cwd/env) and edit-family calls (`edit_file`/`multi_edit`/`apply_patch`/`write_file`) serialize per target path.
+
 ### Added (runner external-MCP consumer — host-proxied — 2026-06-03)
 
 The in-container runner can now consume **external** MCP servers configured on a
