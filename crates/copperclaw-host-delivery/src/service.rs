@@ -526,15 +526,8 @@ impl DeliveryService {
             }
             let key = DeliveryKey::new(sess.id, row.id);
 
-            // Re-entry guard.
-            if let Some(started) = self.inflight.get(&key).map(|r| *r) {
-                if now.duration_since(started) < Duration::from_millis(ABSOLUTE_CEILING_MS) {
-                    continue;
-                }
-                // Otherwise treat as a stale entry and continue.
-            }
-
-            // Backoff guard.
+            // Backoff guard. Checked before we claim the in-flight slot so a
+            // row still inside its retry window doesn't leave a stale claim.
             if let Some(not_before) = self.retries.get(&key).map(|r| r.not_before) {
                 if now < not_before {
                     report.deferred += 1;
@@ -542,7 +535,49 @@ impl DeliveryService {
                 }
             }
 
-            self.inflight.insert(key, now);
+            // Re-entry guard — claim this (session, row) for the current pass.
+            //
+            // ROOT CAUSE of the `delivered.message_out_id` UNIQUE violations:
+            // the active loop (1s) and the sweep loop (60s) share ONE
+            // `DeliveryService`, so both run passes over the same running
+            // session and can process the same row concurrently. The old guard
+            // was a non-atomic get-then-insert: two passes on separate runtime
+            // worker threads could both observe an empty slot and both send +
+            // record the row, and the second `delivered::insert` blew up the
+            // UNIQUE constraint (which then poisoned the whole pass). Claiming
+            // the slot through the `entry` API holds the shard lock across the
+            // read-and-insert, so at most one pass sends the row at a time.
+            //
+            // A stale claim (older than the ceiling — e.g. a prior pass that
+            // panicked before clearing it) is reclaimed rather than blocking
+            // the row forever. This closes the *concurrent* window; the
+            // *sequential-stale* window (pass A finishes and clears the slot
+            // before pass B, working from a snapshot taken before A recorded,
+            // reaches the row) is covered by `delivered::insert` being
+            // idempotent — a duplicate record is a no-op, never a poison.
+            {
+                use dashmap::mapref::entry::Entry;
+                let claimed = match self.inflight.entry(key) {
+                    Entry::Occupied(mut occ) => {
+                        if now.duration_since(*occ.get())
+                            < Duration::from_millis(ABSOLUTE_CEILING_MS)
+                        {
+                            false
+                        } else {
+                            occ.insert(now);
+                            true
+                        }
+                    }
+                    Entry::Vacant(vac) => {
+                        vac.insert(now);
+                        true
+                    }
+                };
+                if !claimed {
+                    continue;
+                }
+            }
+
             let result = self
                 .process_row(sess, &row, routing.as_ref(), &inbound_pool)
                 .await;
@@ -3266,6 +3301,97 @@ mod tests {
             deferred: 2,
         };
         assert_eq!(r.total(), 6);
+    }
+
+    /// Regression for the `delivered.message_out_id` UNIQUE poison. A pass that
+    /// re-processes a row already recorded as `delivered=ok` (because its
+    /// delivered snapshot went stale relative to a racing pass) must complete
+    /// green — NOT raise a Db error that then poisons every subsequent pass.
+    #[tokio::test]
+    async fn re_delivering_already_recorded_row_is_ok_not_poison() {
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+
+        let chat = make_row(MessageKind::Chat, json!({"text": "hi"}));
+        write_row(&out_pool, &chat);
+        let row = {
+            let c = out_pool.connect().unwrap();
+            messages_out::get(&c, chat.id).unwrap()
+        };
+
+        // Mimic the pass that won the race: the row is already recorded ok.
+        {
+            let c = in_pool.connect().unwrap();
+            assert!(delivered::insert(&c, chat.id, Some("p-1"), "ok").unwrap());
+        }
+
+        // The losing pass re-runs `process_row` for the same row off a stale
+        // snapshot. Under the old plain INSERT this returned Err(Db(UNIQUE));
+        // now the record is an idempotent no-op and the row delivers cleanly.
+        service
+            .process_row(&sess, &row, None, &in_pool)
+            .await
+            .expect("re-delivering an already-recorded row must not error");
+
+        // Exactly one delivered row survives — the duplicate record was dropped.
+        let rows = {
+            let c = in_pool.connect().unwrap();
+            delivered::list(&c).unwrap()
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].status, "ok");
+        assert_eq!(rows[0].platform_message_id.as_deref(), Some("p-1"));
+        // The re-send did reach the adapter (the accepted rare-duplicate-send
+        // tradeoff); what matters is the pass stayed green.
+        assert_eq!(mock.deliveries().len(), 1);
+    }
+
+    /// Root-cause sequence: the active loop and the sweep loop share one
+    /// `DeliveryService` and can run passes over the same running session
+    /// concurrently. The atomic in-flight claim must let at most one pass send
+    /// the row, leaving a single delivered record and no error from either
+    /// pass. (Before the fix, both passes could send + record and the second
+    /// insert blew up the UNIQUE constraint.)
+    #[tokio::test]
+    async fn concurrent_passes_deliver_row_once() {
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        write_row(
+            &out_pool,
+            &make_row(MessageKind::Chat, json!({"text": "hi"})),
+        );
+
+        // Two overlapping passes over the same session, as the active + sweep
+        // loops would produce for a running session.
+        let a = service.process_session_once(&sess);
+        let b = service.process_session_once(&sess);
+        let (ra, rb) = tokio::join!(a, b);
+        let ra = ra.expect("pass A must not error");
+        let rb = rb.expect("pass B must not error");
+
+        // Exactly one pass delivered the row; the other found it claimed /
+        // already recorded and skipped it. Never two DB records, never a poison.
+        assert_eq!(ra.delivered + rb.delivered, 1);
+        assert_eq!(mock.deliveries().len(), 1);
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let rows = {
+            let c = in_pool.connect().unwrap();
+            delivered::list(&c).unwrap()
+        };
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]
