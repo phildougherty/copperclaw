@@ -176,6 +176,8 @@ mod tests {
                 coding_enabled: false,
                 surface_thinking: false,
                 tool_profile: None,
+                preview_enabled: false,
+                preview_bind: None,
             },
         )
         .unwrap();
@@ -274,6 +276,8 @@ mod tests {
                 coding_enabled: false,
                 surface_thinking: false,
                 tool_profile: None,
+                preview_enabled: false,
+                preview_bind: None,
             },
         )
         .unwrap();

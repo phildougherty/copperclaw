@@ -132,6 +132,17 @@ impl ContainerManager {
             }
             ReconcileAction::IdleStop => {
                 let name = container_name(session.agent_group_id, session.id);
+                // Previews first: the container's bridge IP dies with the
+                // container (and may be reassigned), so its proxies must not
+                // outlive it.
+                if let Some(preview) = &self.preview {
+                    preview
+                        .close_all_for_session(
+                            session.id,
+                            crate::preview::TeardownReason::SessionStop,
+                        )
+                        .await;
+                }
                 let _ = self
                     .runtime
                     .stop(&name, Duration::from_secs(self.cfg.stop_grace_secs))
@@ -170,6 +181,15 @@ impl ContainerManager {
         //    non-fatal — operators still have host logs + the apology
         //    row even if we can't archive the runner's last words.
         capture_crash_log(&*self.runtime, &name, &paths).await;
+
+        // 1b. Tear down the session's previews before the container is
+        //     removed — the crashed container's bridge IP is dead and may be
+        //     reassigned to an unrelated container on respawn.
+        if let Some(preview) = &self.preview {
+            preview
+                .close_all_for_session(session.id, crate::preview::TeardownReason::SessionStop)
+                .await;
+        }
 
         // 2. Remove (not just stop) so the next spawn doesn't collide
         //    on the container name. `remove` is a stop+rm that treats

@@ -154,6 +154,26 @@ pub trait ContainerRuntime: Send + Sync {
         let _ = name;
         Ok(None)
     }
+
+    /// Resolve the container's **bridge IP address** (Docker's
+    /// `NetworkSettings.Networks.<net>.IPAddress`, or the legacy top-level
+    /// `NetworkSettings.IPAddress`), or `Ok(None)` when the backend can't
+    /// report one or the container isn't attached to a bridge network.
+    ///
+    /// This is the target the host's session-preview reverse proxy dials: a
+    /// session container runs on the Docker bridge with no published ports, so
+    /// the host reaches the app it built at `http://<container_ip>:<port>`
+    /// directly (the container never has to expose a host port).
+    ///
+    /// Default impl returns `Ok(None)` — backends that can't inspect a bridge
+    /// IP (`AppleContainerRuntime` today, in-process test stubs) report "no IP"
+    /// rather than failing; the preview manager treats a missing IP as
+    /// "preview not available for this session" and answers with an is_error.
+    /// Concrete runtimes (Docker) override.
+    async fn container_ip(&self, name: &str) -> Result<Option<String>, RtError> {
+        let _ = name;
+        Ok(None)
+    }
 }
 
 /// Picker for [`detect`] / explicit selection.
