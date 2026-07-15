@@ -307,11 +307,32 @@ pub trait DeliveryActionHandler: Send + Sync {
     fn handle(&self, input: DeliveryActionInput) -> Result<DeliveryActionOutput, ModuleError>;
 }
 
+/// Outcome of a best-effort [`DeliveryDispatcher::set_typing`] call, reported
+/// back asynchronously so callers that re-fire on a cadence (the host's
+/// `TypingTicker`) can back off when the channel rate-limits us instead of
+/// hammering the adapter every tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypingOutcome {
+    /// The adapter accepted the typing action (or it was a no-op).
+    Ok,
+    /// The channel rate-limited the typing action. Callers should skip this
+    /// target for `retry_after` seconds (or a sane default when `None`).
+    RateLimited { retry_after: Option<u64> },
+}
+
 /// Implemented by the host's delivery loop. Modules use it to push messages
 /// of their own initiative (typing indicators, refreshed approval cards).
 pub trait DeliveryDispatcher: Send + Sync {
     /// Best-effort: ask the channel adapter to emit a typing indicator.
-    fn set_typing(&self, target: &DispatchTarget);
+    ///
+    /// Returns a receiver that resolves to the dispatch [`TypingOutcome`] once
+    /// the (spawned, async) adapter call completes, or `None` when nothing was
+    /// dispatched (no adapter / missing target fields). Callers that don't care
+    /// about rate-limit feedback may simply drop it.
+    fn set_typing(
+        &self,
+        target: &DispatchTarget,
+    ) -> Option<tokio::sync::oneshot::Receiver<TypingOutcome>>;
 
     /// Push a synthetic outbound message through the normal delivery path.
     fn dispatch(&self, target: &DispatchTarget, message: &OutboundMessage);
@@ -425,8 +446,12 @@ mod mock {
     }
 
     impl DeliveryDispatcher for MockDispatcher {
-        fn set_typing(&self, target: &DispatchTarget) {
+        fn set_typing(
+            &self,
+            target: &DispatchTarget,
+        ) -> Option<tokio::sync::oneshot::Receiver<super::TypingOutcome>> {
             self.typing_calls.lock().unwrap().push(target.clone());
+            None
         }
         fn dispatch(&self, target: &DispatchTarget, message: &OutboundMessage) {
             self.dispatched

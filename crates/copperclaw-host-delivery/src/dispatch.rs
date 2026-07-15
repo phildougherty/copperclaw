@@ -6,12 +6,13 @@
 //! emit typing indicators (best-effort) or dispatch fully-formed messages
 //! without going through the `messages_out` table.
 
-use copperclaw_channels_core::ChannelAdapter;
-use copperclaw_modules::{DeliveryDispatcher, DispatchTarget};
+use copperclaw_channels_core::{AdapterError, ChannelAdapter};
+use copperclaw_modules::{DeliveryDispatcher, DispatchTarget, TypingOutcome};
 use copperclaw_types::{ChannelType, OutboundMessage};
 use std::sync::Arc;
 use tokio::runtime::Handle;
-use tracing::warn;
+use tokio::sync::oneshot;
+use tracing::{debug, warn};
 
 /// Looks up an adapter for a given channel type.
 ///
@@ -56,19 +57,31 @@ impl HostDispatcher {
 }
 
 impl DeliveryDispatcher for HostDispatcher {
-    fn set_typing(&self, target: &DispatchTarget) {
-        let Some(adapter) = self.resolve(target) else {
-            return;
-        };
-        let Some(platform_id) = target.platform_id.clone() else {
-            return;
-        };
+    fn set_typing(&self, target: &DispatchTarget) -> Option<oneshot::Receiver<TypingOutcome>> {
+        let adapter = self.resolve(target)?;
+        let platform_id = target.platform_id.clone()?;
         let thread_id = target.thread_id.clone();
+        let (tx, rx) = oneshot::channel();
         self.runtime.spawn(async move {
-            if let Err(err) = adapter.set_typing(&platform_id, thread_id.as_deref()).await {
-                warn!(?err, "dispatcher: set_typing failed");
-            }
+            let outcome = match adapter.set_typing(&platform_id, thread_id.as_deref()).await {
+                Ok(()) => TypingOutcome::Ok,
+                Err(err) => {
+                    // Typing is documented best-effort; a rate-limit or transient
+                    // adapter error must never be WARN-level noise. The ticker
+                    // (which holds the returned receiver) backs off on Rate.
+                    debug!(?err, "dispatcher: set_typing failed (best-effort)");
+                    match err {
+                        AdapterError::Rate { retry_after } => {
+                            TypingOutcome::RateLimited { retry_after }
+                        }
+                        _ => TypingOutcome::Ok,
+                    }
+                }
+            };
+            // Receiver may be gone (caller dropped it) — that's fine.
+            let _ = tx.send(outcome);
         });
+        Some(rx)
     }
 
     fn dispatch(&self, target: &DispatchTarget, message: &OutboundMessage) {

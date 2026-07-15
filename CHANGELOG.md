@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (typing-indicator ticker backs off on channel rate limits — 2026-07-15)
+
+- **The host's `TypingTicker` no longer hammers a rate-limited channel every
+  4s.** Telegram (and other adapters) answer `set_typing` with
+  `Rate { retry_after }`; the ticker ignored it and re-fired on the next tick,
+  producing warn spam (68 `dispatcher: set_typing failed err=Rate` lines in one
+  day) and wasted API calls. `DeliveryDispatcher::set_typing` now returns the
+  dispatch outcome (`TypingOutcome::Ok` / `RateLimited`) via a receiver; the
+  ticker installs a per-session cooldown (`retry_after` seconds, or a 10s
+  fallback) and skips that session until it lapses, evicting the cooldown with
+  the existing idle eviction. Best-effort typing failures are now logged at
+  `debug`, not `warn`. `crates/copperclaw-host/src/typing_ticker.rs`,
+  `crates/copperclaw-host-delivery/src/dispatch.rs`,
+  `crates/copperclaw-modules/src/context.rs`.
+
 ### Added (runner external-MCP consumer — host-proxied — 2026-06-03)
 
 The in-container runner can now consume **external** MCP servers configured on a
