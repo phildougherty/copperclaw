@@ -133,8 +133,8 @@ pub struct RunnerConfigFile {
     /// permissions resolution. Applies the sender-role floor in the
     /// runner's [`crate::policy::ToolPolicy`]: a `"guest"` sender is held
     /// to a read-only floor regardless of the group profile. Absent /
-    /// unknown means "no role floor" — the profile + host-owned floor
-    /// still apply.
+    /// unknown means "no role floor" — the profile ceiling still
+    /// applies.
     #[serde(default)]
     pub sender_role: Option<String>,
 }
@@ -210,8 +210,8 @@ pub struct RunnerConfig {
     pub tool_profile: crate::policy::ToolProfile,
     /// Resolved sender role for the triggering sender, if the host
     /// supplied one. `None` means "do not apply the role floor" (the
-    /// group profile + host-owned floor still apply). An unknown role
-    /// string also resolves to `None` (a WARN is logged).
+    /// group profile ceiling still applies). An unknown role string
+    /// also resolves to `None` (a WARN is logged).
     pub sender_role: Option<crate::policy::SenderRole>,
 }
 

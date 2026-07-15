@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Removed (dead tool-policy floor — M18 R0, 2026-07-15)
+
+- Deleted the runner's decorative `DISALLOWED_TOOLS` floor (and its `disallowed` compat module): its nine pascal-case Claude-Code built-in names (`CronCreate`, `EnterPlanMode`, ...) never matched the runner's snake_case tool inventory, so the floor denied nothing — the `ToolProfile` allow-lists (plus sender-role, active-skill, and provenance layers) are and remain the real gate. A new `tool_name_drift` integration test (`crates/copperclaw-runner/tests/tool_name_drift.rs`) now pins every name in the policy lists (exported as `policy::PROFILE_TOOL_LISTS`) to `copperclaw_mcp::build_tool_set()` so a renamed or removed tool fails CI instead of leaving a decorative allow-list (`crates/copperclaw-runner/src/policy.rs`).
+
 ### Changed (Slack typing degrades gracefully off assistant threads — 2026-07-15)
 
 - Slack `set_typing` now only calls `assistant.threads.setStatus` on assistant-thread surfaces (a thread inside the bot's `D…`-prefixed DM — the one place Slack renders the status) and skips the silent-no-op API round-trip on channel/group threads and thread-less DMs; the gap is reported through a new additive `ChannelAdapter::typing_indicator_visible(platform_id, thread_id)` capability flag (default `true`; Slack overrides it) that the M18 Task HUD (card H1) will read to force `hud_mode=full` + a tighter edit cadence where the platform shows no typing signal (`crates/copperclaw-channels/slack/src/adapter.rs`, `crates/copperclaw-channels/core/src/adapter.rs`).
