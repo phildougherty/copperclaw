@@ -1,0 +1,16 @@
+{
+  "name": "telegram-slash-status",
+  "channel": "telegram",
+  "description": "Unmentioned /status in a mention-gated telegram group: bypasses the gate and is answered by the host from central-DB state; no messages_in row, no runner turn.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "last active: [0-9T:.+-]+": "last active: <TS>",
+    "created: [0-9T:.+-]+": "created: <TS>"
+  }
+}

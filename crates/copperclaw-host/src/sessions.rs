@@ -64,6 +64,21 @@ impl router::SessionRoot for FsSessionRoot {
         router::SessionPool::open(&paths)
     }
 
+    // The router writes to `messages_out` only for host-answered slash
+    // commands (`/status`), where the reply is synthesized from central-DB
+    // state and must reach the delivery loop without waking the runner.
+    fn outbound_pool(
+        &self,
+        agent_group_id: &AgentGroupId,
+        session_id: &SessionId,
+    ) -> Result<router::SessionPool, router::RouterError> {
+        let paths = self.paths(*agent_group_id, *session_id);
+        paths
+            .ensure_dirs()
+            .map_err(|e| router::RouterError::session_create(format!("ensure_dirs: {e}")))?;
+        router::SessionPool::open_outbound(&paths)
+    }
+
     fn ensure_session_dir(
         &self,
         agent_group_id: &AgentGroupId,
@@ -164,6 +179,20 @@ mod tests {
         let pool = router::SessionRoot::inbound_pool(&root, &ag, &sess).unwrap();
         let count: i64 = pool.with_conn(|c| {
             c.query_row("SELECT COUNT(*) FROM messages_in", [], |r| r.get(0))
+                .unwrap()
+        });
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn router_outbound_pool_reaches_messages_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = FsSessionRoot::new(tmp.path());
+        let ag = AgentGroupId::new();
+        let sess = SessionId::new();
+        let pool = router::SessionRoot::outbound_pool(&root, &ag, &sess).unwrap();
+        let count: i64 = pool.with_conn(|c| {
+            c.query_row("SELECT COUNT(*) FROM messages_out", [], |r| r.get(0))
                 .unwrap()
         });
         assert_eq!(count, 0);

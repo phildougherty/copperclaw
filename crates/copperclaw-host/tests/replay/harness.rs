@@ -274,6 +274,24 @@ impl ReplayHarness {
                         }
                     }
                 }
+                RouteOutcome::Answered { sessions } => {
+                    // Host-answered slash command (`/status`): the router
+                    // already wrote the synthesized reply to the session's
+                    // `messages_out` and no inbound row exists, so there is
+                    // nothing for a runner to do — mirror production by
+                    // skipping the runner entirely and draining delivery.
+                    for d in sessions {
+                        if !self
+                            .touched_sessions
+                            .iter()
+                            .any(|(_, s)| *s == d.session_id)
+                        {
+                            self.touched_sessions.push((d.agent_group_id, d.session_id));
+                        }
+                        self.deliver_session(d.agent_group_id, d.session_id).await?;
+                    }
+                    continue;
+                }
                 RouteOutcome::Dropped { reason } => {
                     anyhow::bail!("router dropped event: {reason:?}");
                 }
@@ -306,16 +324,24 @@ impl ReplayHarness {
                 self.run_budget_gate(ag).await?;
                 self.deliver_session(ag, sess).await?;
             } else {
-                // One turn per inbound step. The runner exits when
-                // `max_turns` is reached. Failure-mode fixtures may
-                // make the runner return Err (e.g. `provider.query()`
-                // bailing on a 503 before the in-stream Error path
-                // can run). Capture that as state so the diff layer
-                // can compare against the fixture's expected post-
-                // state instead of panicking.
-                if let Err(err) = self.run_one_turn(ag, sess).await {
-                    self.runner_errors.push(err.to_string());
-                    tracing::warn!(error = %err, "runner errored on turn (captured)");
+                // Mirror the container manager's spawn classifier: only
+                // run a turn when the session has DUE TRIGGER work
+                // (`messages_in::count_due`, which filters `trigger = 1`).
+                // A `/stop` control row is written with `trigger = false`
+                // precisely so it does NOT spawn a container — the
+                // harness must not fake-spawn one either.
+                if self.session_has_due_inbound(ag, sess)? {
+                    // One turn per inbound step. The runner exits when
+                    // `max_turns` is reached. Failure-mode fixtures may
+                    // make the runner return Err (e.g. `provider.query()`
+                    // bailing on a 503 before the in-stream Error path
+                    // can run). Capture that as state so the diff layer
+                    // can compare against the fixture's expected post-
+                    // state instead of panicking.
+                    if let Err(err) = self.run_one_turn(ag, sess).await {
+                        self.runner_errors.push(err.to_string());
+                        tracing::warn!(error = %err, "runner errored on turn (captured)");
+                    }
                 }
                 // Drain outbound for this session through the mock adapter.
                 self.deliver_session(ag, sess).await?;
@@ -499,6 +525,18 @@ impl ReplayHarness {
         mgr
     }
 
+    /// Whether the session has due, `trigger = 1` inbound work — the
+    /// same `messages_in::count_due` gate the container manager's spawn
+    /// classifier applies. Control rows (`/stop`, `trigger = 0`) don't
+    /// count, so a control-only step runs no turn.
+    fn session_has_due_inbound(&self, ag: AgentGroupId, sess: SessionId) -> Result<bool> {
+        let paths = SessionPaths::new(self.tempdir.path(), ag, sess);
+        let conn = open_inbound_rw_no_mmap(&paths).context("open inbound for due check")?;
+        let due = copperclaw_db::tables::messages_in::count_due(&conn)
+            .context("count_due for spawn-mirror gate")?;
+        Ok(due > 0)
+    }
+
     async fn run_one_turn(&self, ag: AgentGroupId, sess: SessionId) -> Result<()> {
         let paths = SessionPaths::new(self.tempdir.path(), ag, sess);
         paths.ensure_dirs().context("ensure session dirs")?;
@@ -568,7 +606,14 @@ impl ReplayHarness {
                 recent_results_kept: 0,
                 max_result_bytes: usize::MAX,
             },
-            max_turns: Some(1),
+            // Drain-mode fixtures (slash-command handling) never count a
+            // turn, so the loop must be unbounded and cancelled by the
+            // drain watcher below instead.
+            max_turns: if self.fixture.manifest.runner_drain {
+                None
+            } else {
+                Some(1)
+            },
             idle_sleep: Duration::from_millis(10),
             heartbeat_path: Some(paths.heartbeat.clone()),
             session_id: sess,
@@ -602,7 +647,27 @@ impl ReplayHarness {
             hud_mode: copperclaw_runner::config::HudMode::default(),
             todo_path: paths.root.join("agent_todos.json"),
         };
-        run_loop(deps).await.context("runner one-turn")?;
+        if self.fixture.manifest.runner_drain {
+            // The runner handles a pure slash-command batch synchronously
+            // and `continue`s WITHOUT counting a turn, so `max_turns`
+            // can never bound the loop. Instead, race the (unbounded)
+            // loop against a watcher that waits for every pending
+            // `messages_in` row to be finalized; the confirmation
+            // outbound is written BEFORE the rows are marked completed
+            // (`handle_slash_command`: save_state -> emit -> finalize),
+            // so cancelling at drain time never races the reply write.
+            let watch_paths = SessionPaths::new(self.tempdir.path(), ag, sess);
+            tokio::select! {
+                r = run_loop(deps) => {
+                    r.context("runner drain-mode")?;
+                }
+                r = wait_for_inbound_drain(watch_paths) => {
+                    r?;
+                }
+            }
+        } else {
+            run_loop(deps).await.context("runner one-turn")?;
+        }
         Ok(())
     }
 
@@ -909,6 +974,32 @@ async fn mount_claude_turns(server: &MockServer, turns: &[ClaudeTurn]) {
             .with_priority(pri)
             .mount(server)
             .await;
+    }
+}
+
+/// Drain watcher for `runner_drain` fixtures: resolves once the
+/// session's `messages_in` has no `pending` rows left (the runner's
+/// slash-command handler finalizes the batch as its last step), or
+/// errors after a 10 s safety deadline. Polls a dedicated read
+/// connection so it never touches the runner's own handle.
+async fn wait_for_inbound_drain(paths: SessionPaths) -> Result<()> {
+    let conn = open_inbound_rw_no_mmap(&paths).context("open inbound for drain watch")?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages_in WHERE status = 'pending'",
+                [],
+                |r| r.get(0),
+            )
+            .context("count pending for drain watch")?;
+        if pending == 0 {
+            return Ok(());
+        }
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("inbound did not drain within 10s (pending = {pending})");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 

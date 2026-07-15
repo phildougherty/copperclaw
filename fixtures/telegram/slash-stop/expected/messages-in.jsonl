@@ -1,0 +1,1 @@
+{"id":"<UUID>","seq":2,"kind":"system","timestamp":"<TS>","status":"pending","process_after":null,"recurrence":null,"series_id":null,"tries":0,"trigger":false,"platform_id":"100","channel_type":"telegram","thread_id":null,"content":{"control":{"op":"stop"},"command":"stop","text":"/stop"},"source_session_id":null,"on_wake":false}

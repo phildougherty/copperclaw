@@ -175,6 +175,62 @@ async fn cli_scheduled_wake() {
     run_fixture("cli", "scheduled-wake").await;
 }
 
+// ---- M18 R1: end-user slash commands (fixture per command, cli + telegram) ----
+
+/// `/stop` persists a control{op:stop} row (kind=system, trigger=0,
+/// status pending for R2); no runner turn, no outbound, no delivery.
+#[tokio::test]
+async fn cli_slash_stop_control_row() {
+    run_fixture("cli", "slash-stop").await;
+}
+
+/// `/status` is answered by the host from central-DB state: no
+/// messages_in row, no runner turn, one synthesized outbound + delivery.
+#[tokio::test]
+async fn cli_slash_status_host_answer() {
+    run_fixture("cli", "slash-status").await;
+}
+
+/// `/clear` wires through to the runner's clear-history sentinel: no
+/// LLM turn, one confirmation outbound, inbound marked completed.
+#[tokio::test]
+async fn cli_slash_clear_runner_sentinel() {
+    run_fixture("cli", "slash-clear").await;
+}
+
+/// `/compact` wires through to the runner's compaction sentinel: short
+/// history is a no-op, no LLM turn, one confirmation outbound.
+#[tokio::test]
+async fn cli_slash_compact_runner_sentinel() {
+    run_fixture("cli", "slash-compact").await;
+}
+
+/// Telegram twin of `cli_slash_stop_control_row`, in a mention-gated
+/// group with no mention — routes only via the command bypass.
+#[tokio::test]
+async fn telegram_slash_stop_control_row_bypasses_mention_gate() {
+    run_fixture("telegram", "slash-stop").await;
+}
+
+/// Telegram twin of `cli_slash_status_host_answer` (gated group).
+#[tokio::test]
+async fn telegram_slash_status_host_answer_bypasses_mention_gate() {
+    run_fixture("telegram", "slash-status").await;
+}
+
+/// Telegram twin of `cli_slash_clear_runner_sentinel`; also pins the
+/// `@BotName` suffix + case normalisation (`/CLEAR@ReplayBot`).
+#[tokio::test]
+async fn telegram_slash_clear_normalises_bot_suffix() {
+    run_fixture("telegram", "slash-clear").await;
+}
+
+/// Telegram twin of `cli_slash_compact_runner_sentinel` (gated group).
+#[tokio::test]
+async fn telegram_slash_compact_runner_sentinel() {
+    run_fixture("telegram", "slash-compact").await;
+}
+
 /// D2 e2e: after a real replayed turn (per-session DBs on disk, WAL
 /// outbound), `sessions.get` attaches the recent message rows its help
 /// text promises and `sessions.tail` returns the merged, time-ordered
@@ -330,6 +386,56 @@ async fn discord_long_message_split_paragraph_boundary() {
             "discord chunk {i} exceeds cap"
         );
     }
+}
+
+/// Telegram outbound whose text is an intro line plus a fenced python
+/// code block, the fence alone exceeding the 4096-char cap. Pins the
+/// fence-aware splitter (M18/C2): the intro is cut off before the
+/// fence, the fence is closed at the mid-block cut and reopened with
+/// the same info string on the next chunk. Beyond the JSONL diff this
+/// asserts the exact chunk count, the per-chunk cap, and — the point
+/// of the card — that every delivered chunk parses with balanced
+/// fences (an even number of fence-marker lines, so no chunk leaves a
+/// code block dangling open in the Telegram rendering).
+#[tokio::test]
+async fn telegram_long_code_reply_fence_balanced() {
+    let harness = run_fixture_into_harness("telegram", "long-code-reply").await;
+    let mock = mock_for(&harness, "telegram");
+    let deliveries = mock.deliveries();
+    assert_eq!(
+        deliveries.len(),
+        3,
+        "expected intro + close/reopen fence chunks (3 deliveries), got {}",
+        deliveries.len()
+    );
+    for (i, d) in deliveries.iter().enumerate() {
+        let text = d
+            .message
+            .content
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("chunk {i} missing text"));
+        assert!(
+            text.chars().count() <= 4096,
+            "telegram chunk {i} exceeds the 4096-char cap"
+        );
+        let fence_lines = text
+            .lines()
+            .filter(|l| l.trim_start().starts_with("```"))
+            .count();
+        assert_eq!(
+            fence_lines % 2,
+            0,
+            "chunk {i} has unbalanced code fences ({fence_lines} fence lines):\n{text}"
+        );
+    }
+    // The reopened chunk must carry the original info string.
+    let last = deliveries[2].message.content["text"].as_str().unwrap();
+    assert!(
+        last.starts_with("```python\n"),
+        "reopened chunk must restore the ```python info string: {last}"
+    );
+    assert!(last.ends_with("```"), "final chunk must close the fence");
 }
 
 /// Telegram adapter's first `deliver` returns `Rate { retry_after: 1 }`.
