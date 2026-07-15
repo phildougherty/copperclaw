@@ -202,6 +202,35 @@ pub fn config_update(args: &Value, central: &CentralDb) -> Result<Value, ErrorPa
                 }
             };
         }
+        // M18 R3 completion-gate verify-command override. `null` clears
+        // it (→ "use whatever the agent discovered and wrote to
+        // `.copperclaw/verify`").
+        "check_command" => {
+            existing.check_command = match &value {
+                Value::Null => None,
+                Value::String(s) => Some(s.clone()),
+                _ => {
+                    return Err(ErrorPayload::new(
+                        "bad_request",
+                        "`check_command` must be a shell command string or null",
+                    ));
+                }
+            };
+        }
+        // M18 R3 completion-gate master switch. Boolean only — the
+        // copy-pasteable operator command is
+        // `cclaw groups config update --field verify_gate=false <group>`.
+        "verify_gate" => {
+            existing.verify_gate = match value {
+                Value::Bool(b) => b,
+                _ => {
+                    return Err(ErrorPayload::new(
+                        "bad_request",
+                        "`verify_gate` must be true or false",
+                    ));
+                }
+            };
+        }
         other => {
             return Err(ErrorPayload::new(
                 "bad_request",
@@ -233,6 +262,8 @@ pub fn config_update(args: &Value, central: &CentralDb) -> Result<Value, ErrorPa
             tool_profile: existing.tool_profile,
             preview_enabled: existing.preview_enabled,
             preview_bind: existing.preview_bind,
+            check_command: existing.check_command,
+            verify_gate: existing.verify_gate,
         },
     )
     .map_err(db_err)?;
@@ -441,6 +472,8 @@ fn default_config(id: AgentGroupId) -> container_configs::ContainerConfig {
         tool_profile: None,
         preview_enabled: false,
         preview_bind: None,
+        check_command: None,
+        verify_gate: true,
         updated_at: chrono::Utc::now(),
     }
 }
@@ -475,6 +508,8 @@ fn ensure_config_row(central: &CentralDb, id: AgentGroupId) -> Result<(), ErrorP
                 tool_profile: row.tool_profile,
                 preview_enabled: row.preview_enabled,
                 preview_bind: row.preview_bind,
+                check_command: row.check_command,
+                verify_gate: row.verify_gate,
             },
         )
         .map_err(db_err)?;

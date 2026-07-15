@@ -91,6 +91,10 @@ impl SkillsSelector {
     }
 }
 
+// Mirrors `container_configs`' columns 1:1 — a flag-bag by nature, not a
+// state machine candidate. `coding_enabled` / `surface_thinking` /
+// `preview_enabled` / `verify_gate` are independent per-group switches.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContainerConfig {
     pub agent_group_id: AgentGroupId,
@@ -173,9 +177,28 @@ pub struct ContainerConfig {
     /// An operator who wants LAN reachability sets `"0.0.0.0"` (or a
     /// specific interface IP). Only consulted when `preview_enabled`.
     pub preview_bind: Option<String>,
+    /// Per-group override for the M18 R3 completion-gate's verify command.
+    /// Wins over whatever the agent discovered and wrote to
+    /// `/data/<project>/.copperclaw/verify`. `None` means "no override —
+    /// use the agent-discovered command".
+    ///
+    /// Runner-config-only (mirrors `tool_profile`): changes `runner.json`,
+    /// not the image, so it stays OUTSIDE `compute_fingerprint`.
+    pub check_command: Option<String>,
+    /// Master switch for the M18 R3 completion gate. `true` (the default —
+    /// resolved from a `NULL` column) means the gate is ON: a
+    /// `todo_update(status=completed)` on a todo whose project directory is
+    /// dirty since the last passing verify run is refused. `false` restores
+    /// pre-R3 behaviour (evidence-only completion) for pure-chat / non-
+    /// coding groups that have nothing meaningful to verify.
+    ///
+    /// Runner-config-only (mirrors `tool_profile`): stays OUTSIDE
+    /// `compute_fingerprint`.
+    pub verify_gate: bool,
     pub updated_at: DateTime<Utc>,
 }
 
+#[allow(clippy::struct_excessive_bools)] // mirrors `ContainerConfig` — see its comment
 #[derive(Debug, Clone)]
 pub struct UpsertContainerConfig {
     pub agent_group_id: AgentGroupId,
@@ -199,6 +222,8 @@ pub struct UpsertContainerConfig {
     pub tool_profile: Option<String>,
     pub preview_enabled: bool,
     pub preview_bind: Option<String>,
+    pub check_command: Option<String>,
+    pub verify_gate: bool,
 }
 
 fn effort_as_str(e: Effort) -> &'static str {
@@ -288,6 +313,9 @@ fn row_to_container_config(row: &Row<'_>) -> rusqlite::Result<ContainerConfig> {
     let preview_enabled_int: i64 = row.get("preview_enabled")?;
     let preview_enabled = preview_enabled_int != 0;
     let preview_bind: Option<String> = row.get("preview_bind")?;
+    let check_command: Option<String> = row.get("check_command")?;
+    let verify_gate_int: Option<i64> = row.get("verify_gate")?;
+    let verify_gate = verify_gate_int != Some(0);
     let updated_at_str: String = row.get("updated_at")?;
     let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
         .map_err(|e| {
@@ -316,6 +344,8 @@ fn row_to_container_config(row: &Row<'_>) -> rusqlite::Result<ContainerConfig> {
         tool_profile,
         preview_enabled,
         preview_bind,
+        check_command,
+        verify_gate,
         updated_at,
     })
 }
@@ -332,7 +362,7 @@ pub fn get(
                     packages_npm, additional_mounts, cli_scope,
                     config_fingerprint, egress_allow, resource_limits,
                     coding_enabled, surface_thinking, tool_profile,
-                    preview_enabled, preview_bind, updated_at
+                    preview_enabled, preview_bind, check_command, verify_gate, updated_at
              FROM container_configs
              WHERE agent_group_id = ?1",
             params![agent_group_id.as_uuid().to_string()],
@@ -358,8 +388,8 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
             packages_npm, additional_mounts, cli_scope,
             config_fingerprint, egress_allow, resource_limits,
             coding_enabled, surface_thinking, tool_profile,
-            preview_enabled, preview_bind, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+            preview_enabled, preview_bind, check_command, verify_gate, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
          ON CONFLICT(agent_group_id) DO UPDATE SET
              provider = excluded.provider,
              model = excluded.model,
@@ -381,6 +411,8 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
              tool_profile = excluded.tool_profile,
              preview_enabled = excluded.preview_enabled,
              preview_bind = excluded.preview_bind,
+             check_command = excluded.check_command,
+             verify_gate = excluded.verify_gate,
              updated_at = excluded.updated_at",
         params![
             req.agent_group_id.as_uuid().to_string(),
@@ -404,6 +436,10 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
             req.tool_profile.clone(),
             i64::from(req.preview_enabled),
             req.preview_bind.clone(),
+            req.check_command.clone(),
+            // NULL (the default, "on") vs 0 ("off") — see the migration's
+            // doc comment for why there is no explicit "1" state.
+            if req.verify_gate { None } else { Some(0i64) },
             now.to_rfc3339(),
         ],
     )?;
@@ -429,6 +465,8 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
         tool_profile: req.tool_profile,
         preview_enabled: req.preview_enabled,
         preview_bind: req.preview_bind,
+        check_command: req.check_command,
+        verify_gate: req.verify_gate,
         updated_at: now,
     })
 }
@@ -890,6 +928,56 @@ pub fn set_preview_bind(
     Ok(())
 }
 
+/// Narrow setter for the per-group `check_command` override (M18 R3
+/// completion gate). `None` clears the override, restoring "use whatever
+/// the agent discovered and wrote to `.copperclaw/verify`".
+pub fn set_check_command(
+    db: &CentralDb,
+    agent_group_id: AgentGroupId,
+    command: Option<&str>,
+) -> Result<(), DbError> {
+    let conn = db.conn()?;
+    let n = conn.execute(
+        "UPDATE container_configs
+         SET check_command = ?1, updated_at = ?2
+         WHERE agent_group_id = ?3",
+        params![
+            command,
+            Utc::now().to_rfc3339(),
+            agent_group_id.as_uuid().to_string()
+        ],
+    )?;
+    if n == 0 {
+        return Err(DbError::NotFound);
+    }
+    Ok(())
+}
+
+/// Narrow setter for the per-group `verify_gate` master switch (M18 R3).
+/// `true` writes `NULL` (the default, gate ON); `false` writes `0` (gate
+/// OFF, pre-R3 evidence-only completion).
+pub fn set_verify_gate(
+    db: &CentralDb,
+    agent_group_id: AgentGroupId,
+    enabled: bool,
+) -> Result<(), DbError> {
+    let conn = db.conn()?;
+    let n = conn.execute(
+        "UPDATE container_configs
+         SET verify_gate = ?1, updated_at = ?2
+         WHERE agent_group_id = ?3",
+        params![
+            if enabled { None } else { Some(0i64) },
+            Utc::now().to_rfc3339(),
+            agent_group_id.as_uuid().to_string()
+        ],
+    )?;
+    if n == 0 {
+        return Err(DbError::NotFound);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -936,6 +1024,8 @@ mod tests {
             tool_profile: None,
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
         }
     }
 
@@ -974,6 +1064,48 @@ mod tests {
             cleared.preview_enabled,
             "clearing bind must not touch enabled"
         );
+    }
+
+    #[test]
+    fn verify_gate_fields_default_on_and_round_trip() {
+        let db = db();
+        let ag = make_agent_group(&db, "verify");
+        // Defaults: gate on (NULL column), no check_command override.
+        let cfg = upsert(&db, minimal_req(ag)).unwrap();
+        assert!(cfg.verify_gate);
+        assert_eq!(cfg.check_command, None);
+        let fetched = get(&db, ag).unwrap().unwrap();
+        assert!(fetched.verify_gate);
+        assert_eq!(fetched.check_command, None);
+
+        // Narrow setters flip both, and a re-read reflects them.
+        set_verify_gate(&db, ag, false).unwrap();
+        set_check_command(&db, ag, Some("make check")).unwrap();
+        let after = get(&db, ag).unwrap().unwrap();
+        assert!(!after.verify_gate);
+        assert_eq!(after.check_command.as_deref(), Some("make check"));
+
+        // Turning the gate back on and clearing the override round-trip
+        // independently.
+        set_verify_gate(&db, ag, true).unwrap();
+        set_check_command(&db, ag, None).unwrap();
+        let cleared = get(&db, ag).unwrap().unwrap();
+        assert!(cleared.verify_gate);
+        assert_eq!(cleared.check_command, None);
+    }
+
+    #[test]
+    fn verify_gate_setters_error_when_group_missing() {
+        let db = db();
+        let ghost = AgentGroupId::new();
+        assert!(matches!(
+            set_verify_gate(&db, ghost, false),
+            Err(DbError::NotFound)
+        ));
+        assert!(matches!(
+            set_check_command(&db, ghost, Some("cargo check")),
+            Err(DbError::NotFound)
+        ));
     }
 
     #[test]
@@ -1070,6 +1202,8 @@ mod tests {
             tool_profile: Some("messaging".into()),
             preview_enabled: true,
             preview_bind: Some("0.0.0.0".into()),
+            check_command: Some("cargo check".into()),
+            verify_gate: false,
         };
         let saved = upsert(&db, req.clone()).unwrap();
         let fetched = get(&db, ag).unwrap().unwrap();
@@ -1098,6 +1232,8 @@ mod tests {
         assert_eq!(fetched.tool_profile.as_deref(), Some("messaging"));
         assert!(fetched.preview_enabled);
         assert_eq!(fetched.preview_bind.as_deref(), Some("0.0.0.0"));
+        assert_eq!(fetched.check_command.as_deref(), Some("cargo check"));
+        assert!(!fetched.verify_gate);
     }
 
     #[test]

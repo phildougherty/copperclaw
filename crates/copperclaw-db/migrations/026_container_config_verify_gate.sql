@@ -1,0 +1,26 @@
+-- Per-group verification-gate override + check command (M18 R3).
+--
+-- The runner's completion gate refuses `todo_update(status=completed)` on
+-- a todo whose project directory is "dirty" (edited since the last passing
+-- verify run) until a recorded verify command has been re-run clean. The
+-- command itself is normally agent-discovered and written to
+-- `/data/<project>/.copperclaw/verify` on first edit (prompt guidance in
+-- M18 P1); `check_command` here is a per-group OVERRIDE that wins over
+-- whatever the agent wrote, for operators who want to pin the check for
+-- every project a group builds (e.g. always `make check`).
+--
+-- `verify_gate` is the per-group escape hatch for pure-chat / non-coding
+-- groups where the gate has nothing meaningful to check: NULL (default)
+-- means "gate ON" (the runner's own default); `0` turns it off, restoring
+-- pre-R3 behaviour (evidence-only completion, byte-stable for existing
+-- fixtures). There is no explicit "1" state to set — NULL already means on;
+-- the column only needs to represent the off case.
+--
+-- Runner-config-only (like `tool_profile` / `surface_thinking`): both
+-- columns change `runner.json`, not the container image, so they stay
+-- OUTSIDE `compute_fingerprint` — flipping either takes effect on the next
+-- spawn without an image rebuild. Operators set them via
+-- `cclaw groups config update --field 'check_command="npm test"'` /
+-- `--field verify_gate=false`.
+ALTER TABLE container_configs ADD COLUMN check_command TEXT;
+ALTER TABLE container_configs ADD COLUMN verify_gate INTEGER;

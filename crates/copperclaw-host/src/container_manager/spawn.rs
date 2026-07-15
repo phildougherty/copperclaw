@@ -2837,6 +2837,8 @@ mod tests {
             tool_profile: None,
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
             updated_at: chrono::Utc::now(),
         };
         let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg)).unwrap();
@@ -2878,6 +2880,8 @@ mod tests {
             tool_profile: None,
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
             updated_at: chrono::Utc::now(),
         };
         let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg)).unwrap();
@@ -2927,6 +2931,8 @@ mod tests {
             tool_profile: None,
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
             updated_at: chrono::Utc::now(),
         };
         let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg)).unwrap();
@@ -3009,6 +3015,8 @@ mod tests {
             tool_profile: None,
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
             updated_at: chrono::Utc::now(),
         };
         let spec = mgr
@@ -3529,6 +3537,8 @@ mod tests {
             tool_profile: None,
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
             updated_at: chrono::Utc::now(),
         };
         // rebuild_image writes the new tag back to container_configs, so the
@@ -3557,6 +3567,8 @@ mod tests {
                 tool_profile: None,
                 preview_enabled: false,
                 preview_bind: None,
+                check_command: None,
+                verify_gate: true,
             },
         )
         .unwrap();
