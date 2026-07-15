@@ -20,12 +20,13 @@
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::session::{SessionPaths, open_inbound_ro_no_mmap};
 use copperclaw_db::tables::{messages_in, messaging_groups, sessions};
-use copperclaw_modules::{DeliveryDispatcher, DispatchTarget};
+use copperclaw_modules::{DeliveryDispatcher, DispatchTarget, TypingOutcome};
 use copperclaw_types::SessionId;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -33,6 +34,11 @@ use tracing::{debug, warn};
 /// `TypingModule::DEFAULT_INTERVAL_MS` and is below Telegram's ~5s
 /// indicator-fade-out so the bubble stays solid.
 pub const TICK_INTERVAL: Duration = Duration::from_secs(4);
+
+/// Fallback cooldown applied when a channel rate-limits `set_typing` but
+/// gives no `retry_after`. Ten seconds is comfortably past Telegram's
+/// chat-action window without stalling the indicator for a whole turn.
+const RATE_LIMIT_FALLBACK: Duration = Duration::from_secs(10);
 
 /// Service that keeps the typing indicator alive during long agent
 /// turns. Spawn one per host via [`run_loop`].
@@ -51,6 +57,20 @@ pub struct TypingTicker {
     /// cache. Steady-state sqlite churn drops from O(running sessions
     /// per tick) to O(idle transitions per tick).
     last_seen_pending: RwLock<HashMap<SessionId, Instant>>,
+    /// Per-session rate-limit cooldown: the `Instant` until which we must
+    /// NOT re-fire `set_typing` for this session. Populated when a prior
+    /// dispatch reports [`TypingOutcome::RateLimited`] (Telegram et al.
+    /// answer `set_typing` with `Rate { retry_after }` and hammering the
+    /// next tick just earns more 429s + warn spam). Evicted alongside
+    /// `last_seen_pending` when the session goes idle.
+    cooldowns: RwLock<HashMap<SessionId, Instant>>,
+    /// In-flight typing-dispatch outcome receivers, keyed by session. The
+    /// dispatcher runs the adapter call on a spawned task, so the outcome
+    /// (ok / rate-limited) arrives asynchronously; we stash the receiver
+    /// here and drain it (non-blocking) at the head of the next tick to
+    /// apply any cooldown. One in-flight receipt per session is enough —
+    /// a newer dispatch supersedes the last.
+    pending_receipts: Mutex<HashMap<SessionId, oneshot::Receiver<TypingOutcome>>>,
 }
 
 impl TypingTicker {
@@ -65,6 +85,8 @@ impl TypingTicker {
             data_root: data_root.into(),
             interval: TICK_INTERVAL,
             last_seen_pending: RwLock::new(HashMap::new()),
+            cooldowns: RwLock::new(HashMap::new()),
+            pending_receipts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -90,6 +112,9 @@ impl TypingTicker {
     /// dispatcher. Exposed `pub(crate)` so the loop and tests can call
     /// it directly; the public surface is [`run_loop`].
     pub(crate) fn tick(&self) -> usize {
+        // Apply any rate-limit feedback from the previous pass's dispatches
+        // before deciding who to ping this time.
+        self.drain_typing_feedback();
         let running = match sessions::list_running(&self.central) {
             Ok(s) => s,
             Err(err) => {
@@ -97,6 +122,7 @@ impl TypingTicker {
                 return 0;
             }
         };
+        let now = Instant::now();
         let mut fired = 0usize;
         for s in running {
             let Some(mg_id) = s.messaging_group_id else {
@@ -114,6 +140,12 @@ impl TypingTicker {
             if !self.has_pending_inbound(s.agent_group_id, s.id) {
                 continue;
             }
+            // Respect a live rate-limit cooldown: a prior tick's dispatch
+            // came back `RateLimited`, so stay quiet for this target until
+            // the backoff elapses instead of hammering the adapter again.
+            if self.in_cooldown(s.id, now) {
+                continue;
+            }
             let mg = match messaging_groups::get(&self.central, mg_id) {
                 Ok(m) => m,
                 Err(err) => {
@@ -126,10 +158,51 @@ impl TypingTicker {
                 }
             };
             let target = DispatchTarget::channel(mg.channel_type, mg.platform_id, s.thread_id);
-            self.dispatcher.set_typing(&target);
+            if let Some(rx) = self.dispatcher.set_typing(&target) {
+                // Stash the outcome receiver so the next tick can apply any
+                // cooldown; a fresh dispatch supersedes an earlier pending one.
+                if let Ok(mut guard) = self.pending_receipts.lock() {
+                    guard.insert(s.id, rx);
+                }
+            }
             fired += 1;
         }
         fired
+    }
+
+    /// Drain the outcome receivers stashed by the previous tick's
+    /// dispatches, applying a per-session cooldown for any that came back
+    /// [`TypingOutcome::RateLimited`]. Non-blocking: receivers still in
+    /// flight (adapter call not yet resolved) are kept for a later drain;
+    /// resolved / closed ones are removed.
+    fn drain_typing_feedback(&self) {
+        let Ok(mut receipts) = self.pending_receipts.lock() else {
+            return;
+        };
+        let now = Instant::now();
+        receipts.retain(|session_id, rx| match rx.try_recv() {
+            Ok(TypingOutcome::RateLimited { retry_after }) => {
+                let backoff = retry_after.map_or(RATE_LIMIT_FALLBACK, Duration::from_secs);
+                if let Ok(mut cooldowns) = self.cooldowns.write() {
+                    cooldowns.insert(*session_id, now + backoff);
+                }
+                false
+            }
+            // Success or a dropped sender (nothing dispatched): no cooldown,
+            // drop the receipt.
+            Ok(TypingOutcome::Ok) | Err(oneshot::error::TryRecvError::Closed) => false,
+            // Adapter call hasn't resolved yet — keep waiting.
+            Err(oneshot::error::TryRecvError::Empty) => true,
+        });
+    }
+
+    /// Whether `session_id` is inside a live rate-limit cooldown as of `now`.
+    fn in_cooldown(&self, session_id: SessionId, now: Instant) -> bool {
+        self.cooldowns
+            .read()
+            .ok()
+            .and_then(|g| g.get(&session_id).copied())
+            .is_some_and(|until| now < until)
     }
 
     /// Cheaply check whether a session has unprocessed inbound rows.
@@ -188,8 +261,16 @@ impl TypingTicker {
             }
             Ok(_) => {
                 // Idle: drop any stale cache entry so the next
-                // pending-work transition reopens sqlite cleanly.
+                // pending-work transition reopens sqlite cleanly. Evict the
+                // rate-limit cooldown + any pending typing receipt in the
+                // same breath — an idle session carries no live typing state.
                 if let Ok(mut guard) = self.last_seen_pending.write() {
+                    guard.remove(&session_id);
+                }
+                if let Ok(mut guard) = self.cooldowns.write() {
+                    guard.remove(&session_id);
+                }
+                if let Ok(mut guard) = self.pending_receipts.lock() {
                     guard.remove(&session_id);
                 }
                 false
@@ -236,15 +317,33 @@ mod tests {
     use std::sync::{Arc as StdArc, Mutex};
 
     /// Captures every dispatcher call so tests can assert on the
-    /// `set_typing` invocation count + targets.
+    /// `set_typing` invocation count + targets. When `next_outcome` is set,
+    /// every `set_typing` reports that outcome back through the returned
+    /// receiver so cooldown behaviour can be driven.
     #[derive(Default)]
     struct MockDispatcher {
         typing_calls: Mutex<Vec<DispatchTarget>>,
+        next_outcome: Mutex<Option<TypingOutcome>>,
+    }
+
+    impl MockDispatcher {
+        /// Make every subsequent `set_typing` come back rate-limited with
+        /// the given `retry_after` (seconds).
+        fn rate_limit(&self, retry_after: Option<u64>) {
+            *self.next_outcome.lock().unwrap() = Some(TypingOutcome::RateLimited { retry_after });
+        }
     }
 
     impl DeliveryDispatcher for MockDispatcher {
-        fn set_typing(&self, target: &DispatchTarget) {
+        fn set_typing(&self, target: &DispatchTarget) -> Option<oneshot::Receiver<TypingOutcome>> {
             self.typing_calls.lock().unwrap().push(target.clone());
+            let outcome = self.next_outcome.lock().unwrap().clone();
+            outcome.map(|o| {
+                let (tx, rx) = oneshot::channel();
+                // Resolve immediately so the next tick's drain sees it.
+                let _ = tx.send(o);
+                rx
+            })
         }
         fn dispatch(&self, _target: &DispatchTarget, _message: &copperclaw_types::OutboundMessage) {
             // Not used by the ticker; assert at test sites if they
@@ -665,5 +764,76 @@ mod tests {
             !ticker.last_seen_pending.read().unwrap().contains_key(&s.id),
             "idle session must not be cached",
         );
+    }
+
+    #[test]
+    fn rate_limited_dispatch_backs_off_then_resumes() {
+        // The fix: when a set_typing dispatch comes back RateLimited, the
+        // ticker must skip that session until the retry_after cooldown
+        // elapses (instead of hammering the adapter every tick and
+        // generating the observed warn spam), then resume.
+        let (tmp, central) = fresh_central();
+        let _s = make_running_session_with_pending(&central, tmp.path(), "telegram");
+        let mock = StdArc::new(MockDispatcher::default());
+        // 1s retry_after keeps the sleep short while still exercising the
+        // whole-seconds cooldown path.
+        mock.rate_limit(Some(1));
+        let ticker = TypingTicker::new(
+            central,
+            StdArc::clone(&mock) as Arc<dyn DeliveryDispatcher>,
+            tmp.path(),
+        );
+
+        // Tick 1: fires (no cooldown yet); the mock hands back a
+        // RateLimited receipt that resolves immediately.
+        assert_eq!(ticker.tick(), 1, "first tick must fire");
+        // Tick 2: drains the receipt, sets the cooldown, then skips.
+        assert_eq!(ticker.tick(), 0, "tick within cooldown must NOT dispatch");
+        // Tick 3 (still inside the 1s window): still skipped.
+        assert_eq!(
+            ticker.tick(),
+            0,
+            "second tick within cooldown must NOT dispatch"
+        );
+        assert_eq!(
+            mock.typing_calls.lock().unwrap().len(),
+            1,
+            "no extra adapter calls while rate-limited",
+        );
+
+        // Let the cooldown lapse; the next tick must resume.
+        std::thread::sleep(Duration::from_millis(1100));
+        assert_eq!(
+            ticker.tick(),
+            1,
+            "tick after the cooldown must dispatch again"
+        );
+        assert_eq!(
+            mock.typing_calls.lock().unwrap().len(),
+            2,
+            "exactly one more adapter call after the cooldown lapsed",
+        );
+    }
+
+    #[test]
+    fn successful_dispatch_keeps_normal_cadence() {
+        // Successful pings (no rate-limit feedback) must never install a
+        // cooldown — every tick keeps firing at the usual cadence.
+        let (tmp, central) = fresh_central();
+        let _s = make_running_session_with_pending(&central, tmp.path(), "telegram");
+        let mock = StdArc::new(MockDispatcher::default());
+        let ticker = TypingTicker::new(
+            central,
+            StdArc::clone(&mock) as Arc<dyn DeliveryDispatcher>,
+            tmp.path(),
+        );
+        for _ in 0..4 {
+            assert_eq!(ticker.tick(), 1, "successful dispatch must fire every tick");
+        }
+        assert!(
+            ticker.cooldowns.read().unwrap().is_empty(),
+            "success must not install any cooldown",
+        );
+        assert_eq!(mock.typing_calls.lock().unwrap().len(), 4);
     }
 }

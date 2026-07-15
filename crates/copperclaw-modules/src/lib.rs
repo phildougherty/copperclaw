@@ -46,6 +46,7 @@ pub use context::{
     ChannelRequestCtx, DeliveryActionHandler, DeliveryActionInput, DeliveryActionOutput,
     DeliveryDispatcher, DispatchTarget, GateCtx, GateDecision, InterceptorCtx, InterceptorDecision,
     Module, ModuleContext, MountHostContext, SenderResolver, SenderScopeCtx, SenderScopeDecision,
+    TypingOutcome,
 };
 pub use error::ModuleError;
 pub use interactive::{InteractiveModule, PendingQuestion, QuestionId};
