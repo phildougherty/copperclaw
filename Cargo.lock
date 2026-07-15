@@ -450,6 +450,7 @@ dependencies = [
  "clap_complete",
  "copperclaw-db",
  "copperclaw-types",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

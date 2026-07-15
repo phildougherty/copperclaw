@@ -135,6 +135,7 @@ ignore             = "0.4"
 globset            = "0.4"
 regex              = "1"
 similar            = "2"
+rustix             = { version = "1", features = ["fs"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
