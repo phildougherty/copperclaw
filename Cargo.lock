@@ -1253,6 +1253,7 @@ dependencies = [
  "copperclaw-metrics",
  "copperclaw-providers",
  "copperclaw-types",
+ "futures",
  "metrics",
  "metrics-exporter-prometheus",
  "rmcp",

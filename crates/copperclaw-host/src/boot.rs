@@ -763,6 +763,12 @@ pub async fn run_host(
         shutdown.clone(),
         Arc::clone(state.sweep.spawn_tracker()),
         broker,
+        // Event-driven wake: the router signals this handle after every
+        // messages_in insert; the manager's reconcile loop ticks on it
+        // immediately instead of waiting out the poll interval. Router and
+        // manager live in the same host process, so this is a plain
+        // in-process Notify — polling stays as the crash-safe fallback.
+        state.router.inbound_wake(),
     );
     let (manager_task, manager_handle): (
         Option<tokio::task::JoinHandle<()>>,
@@ -942,6 +948,7 @@ fn spawn_container_manager(
     shutdown: CancellationToken,
     spawn_tracker: Arc<copperclaw_host_sweep::SpawnAttemptTracker>,
     broker: Option<(Arc<crate::container_manager::broker::BrokerState>, String)>,
+    inbound_wake: Arc<tokio::sync::Notify>,
 ) -> Option<SpawnedManager> {
     let Some(image_tag) = cfg.default_image_tag.clone() else {
         warn!(
@@ -1018,7 +1025,8 @@ fn spawn_container_manager(
     }
     let mut manager =
         crate::container_manager::ContainerManager::new(central, runtime, manager_cfg)
-            .with_spawn_tracker(spawn_tracker);
+            .with_spawn_tracker(spawn_tracker)
+            .with_wake_notify(inbound_wake);
     if let Some((broker_state, broker_base_url)) = broker {
         manager = manager.with_broker(broker_state, broker_base_url);
     }
