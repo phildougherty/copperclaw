@@ -10,7 +10,7 @@ use copperclaw_host_sweep::APOLOGY_TRIES_MARKER;
 use copperclaw_types::{ChannelType, ContainerStatus, MessageId, MessageKind, Session};
 use rusqlite::{OptionalExtension, params};
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// User-facing apology emitted by the crash-restart path when one or
 /// more inbound messages were in-flight on the dying container. Kept
@@ -303,6 +303,18 @@ async fn capture_crash_log(
 
     let body = match runtime.logs(container_name, CRASH_LOG_TAIL_LINES).await {
         Ok(body) => body,
+        Err(err) if err.is_not_found() => {
+            // The container is already gone (an operator ran `docker rm
+            // -f`, or the daemon reaped it before we got here). There's
+            // nothing to archive — an expected, uninteresting outcome,
+            // so log at debug instead of spamming a warn every time.
+            debug!(
+                container = container_name,
+                ?err,
+                "container already gone; skipping crash-log capture"
+            );
+            return;
+        }
         Err(err) => {
             warn!(
                 container = container_name,
