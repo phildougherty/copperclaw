@@ -82,7 +82,7 @@ pub mod shell {
     use super::{
         CallToolResult, Deserialize, Duration, JsonObject, SHELL_DEFAULT_TIMEOUT_SECS,
         SHELL_MAX_TIMEOUT_SECS, SHELL_OUTPUT_CAP, Tool, ToolEntry, ToolError, ToolHandler,
-        cap_output, json, parse_args, shell_state_path, success_json,
+        cap_output, cap_shell_stream, json, parse_args, shell_state_path, success_json,
     };
 
     #[derive(Debug, Deserialize)]
@@ -92,6 +92,12 @@ pub mod shell {
         cwd: Option<String>,
         #[serde(default)]
         timeout_secs: Option<u64>,
+        /// When set, keep the LAST N bytes of each stream instead of
+        /// the first `SHELL_OUTPUT_CAP`. Clamped to the cap. The
+        /// default (unset) stays head-truncate so existing callers see
+        /// byte-identical output.
+        #[serde(default)]
+        tail_bytes: Option<u64>,
         /// When true, wipe the persistent shell-state file before
         /// running. `cd`/exports from earlier calls are discarded.
         #[serde(default)]
@@ -108,7 +114,7 @@ pub mod shell {
     pub fn schema() -> Tool {
         super::make_tool(
             "shell",
-            "Run a bash command inside the container. Returns stdout, stderr, and exit code. Output is capped at 32 KiB per stream — if you expect more, narrow it first with `tail -n 200`, `head -n 200`, or `grep`. Working directory and exported environment variables persist across calls within a session; pass `reset: true` to wipe that state.\n\nFor a long-running command (a dev server, a slow build/test, anything you want to keep running while you do other work), pass `background: true`: the call returns immediately with a `pid` and a `log_path`. Poll progress with `read_file` on the log_path (or `tail -n 50 <log_path>`), check it's alive with `kill -0 <pid>`, and stop it with `kill <pid>`. The container persists, so the job keeps running across later tool calls. Foreground `shell` is capped at 600s — use `background: true` for anything longer.\n\nDO NOT use `shell` to create or edit files. Use the dedicated tools instead: `write_file` for new files, `edit_file` / `multi_edit` / `apply_patch` for changes, `copy_file` to duplicate. Heredoc patterns like `cat > foo << 'EOF' ... EOF` and `echo \"content\" > foo` waste tokens twice: the file body travels through history as the shell `command` string, AND the tool result. The dedicated tools take the body as a clean `content` field and don't echo it back. Heredoc-style file writes are REJECTED here with a redirect message.",
+            "Run a bash command inside the container. Returns stdout, stderr, and exit code. Output is capped at 32 KiB per stream, keeping the FIRST 32 KiB by default — if you expect more, narrow it first with `tail -n 200`, `head -n 200`, or `grep`. Pass `tail_bytes: N` to keep the LAST N bytes of each stream instead — the recovery move when a command's output was truncated right where the interesting part is (e.g. a failing build or test run whose error is at the end of the log: re-run it with `tail_bytes: 16384`). Working directory and exported environment variables persist across calls within a session; pass `reset: true` to wipe that state.\n\nFor a long-running command (a dev server, a slow build/test, anything you want to keep running while you do other work), pass `background: true`: the call returns immediately with a `pid` and a `log_path`. Poll progress with `read_file` on the log_path (or `tail -n 50 <log_path>`), check it's alive with `kill -0 <pid>`, and stop it with `kill <pid>`. The container persists, so the job keeps running across later tool calls. Foreground `shell` is capped at 600s — use `background: true` for anything longer.\n\nDO NOT use `shell` to create or edit files. Use the dedicated tools instead: `write_file` for new files, `edit_file` / `multi_edit` / `apply_patch` for changes, `copy_file` to duplicate. Heredoc patterns like `cat > foo << 'EOF' ... EOF` and `echo \"content\" > foo` waste tokens twice: the file body travels through history as the shell `command` string, AND the tool result. The dedicated tools take the body as a clean `content` field and don't echo it back. Heredoc-style file writes are REJECTED here with a redirect message.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -117,6 +123,7 @@ pub mod shell {
                     "command":      { "type": "string", "minLength": 1 },
                     "cwd":          { "type": ["string", "null"] },
                     "timeout_secs": { "type": ["integer", "null"], "minimum": 1, "maximum": 600 },
+                    "tail_bytes":   { "type": ["integer", "null"], "minimum": 1, "maximum": 32768 },
                     "reset":        { "type": "boolean" },
                     "background":   { "type": "boolean" }
                 }
@@ -171,6 +178,20 @@ pub mod shell {
         let input: Input = parse_args(arguments)?;
         if input.command.trim().is_empty() {
             return Err(ToolError::Validation("`command` must be non-empty".into()));
+        }
+        if input.tail_bytes == Some(0) {
+            return Err(ToolError::Validation("`tail_bytes` must be >= 1".into()));
+        }
+        if input.tail_bytes.is_some() && input.background {
+            // Background jobs stream to a log file, not the tool result —
+            // there is nothing to tail here. Reject so the model learns
+            // the actual recovery path instead of silently ignoring it.
+            return Err(ToolError::Validation(
+                "`tail_bytes` has no effect with `background: true` — the job's output goes to \
+                 `log_path` under /data/.jobs/; read its end with `shell tail -n 50 <log_path>` \
+                 or page it with `read_file`"
+                    .into(),
+            ));
         }
         if let Some(pattern) = detect_file_write_anti_pattern(&input.command) {
             // Reject the heredoc-file-write pattern with a precise redirect
@@ -261,12 +282,21 @@ pub mod shell {
             }
         };
 
+        // `tail_bytes` flips per-stream capping from "keep the first
+        // SHELL_OUTPUT_CAP bytes" to "keep the last N". The cap still
+        // bounds N — context-window protection is non-negotiable.
+        let tail = input.tail_bytes.is_some();
+        let cap = input.tail_bytes.map_or(SHELL_OUTPUT_CAP, |n| {
+            usize::try_from(n)
+                .unwrap_or(usize::MAX)
+                .min(SHELL_OUTPUT_CAP)
+        });
         let (stdout, stdout_truncated) =
-            cap_output(&String::from_utf8_lossy(&output.stdout), SHELL_OUTPUT_CAP);
+            cap_shell_stream(&String::from_utf8_lossy(&output.stdout), cap, tail);
         let (stderr, stderr_truncated) =
-            cap_output(&String::from_utf8_lossy(&output.stderr), SHELL_OUTPUT_CAP);
+            cap_shell_stream(&String::from_utf8_lossy(&output.stderr), cap, tail);
 
-        Ok(success_json(&json!({
+        let mut out = json!({
             "command": input.command,
             "exit_code": output.status.code(),
             "stdout": stdout,
@@ -274,7 +304,19 @@ pub mod shell {
             "stdout_truncated": stdout_truncated,
             "stderr_truncated": stderr_truncated,
             "elapsed_ms": started.elapsed().as_millis(),
-        })))
+        });
+        // Echo the *applied* tail window (post-clamp) only when the
+        // caller asked for one — the default result shape must stay
+        // byte-identical for existing callers and replay fixtures.
+        if tail {
+            if let Some(map) = out.as_object_mut() {
+                map.insert(
+                    "tail_bytes".into(),
+                    serde_json::Value::Number((cap as u64).into()),
+                );
+            }
+        }
+        Ok(success_json(&out))
     }
 
     /// Compose the bash one-liner that sources the prior state, runs
@@ -472,7 +514,9 @@ pub mod read_file {
     //!     reads the first 50 lines; `offset = 200, limit = 100` reads
     //!     lines 200–299. The line-count cap still applies via
     //!     `READ_FILE_CAP` — bytes accumulated past the cap stop the
-    //!     read and flip `truncated`.
+    //!     read and flip `truncated`. Lines mode also reports
+    //!     `total_lines` (the whole file's line count) so the model
+    //!     can page deterministically instead of probing for EOF.
     //!
     //! Out-of-range offsets return an empty body with `truncated: false`,
     //! not an error — the agent gets a clean signal that it walked off
@@ -533,7 +577,7 @@ pub mod read_file {
     pub fn schema() -> Tool {
         super::make_tool(
             "read_file",
-            "Read a UTF-8 file. Default reads from the start, capped at 128 KiB. For larger files or precise regions, use `offset` + `limit` + `mode: 'bytes' | 'lines'`. Examples: `{path:'x.log', mode:'lines', offset:200, limit:100}` reads lines 200-299; `{path:'x.log', mode:'bytes', offset:1000000, limit:8000}` reads 8 KB starting at byte 1 MB. Tail-reads aren't supported — use `shell tail -n N` for those.",
+            "Read a UTF-8 file. Default reads from the start, capped at 128 KiB. For larger files or precise regions, use `offset` + `limit` + `mode: 'bytes' | 'lines'`. Paging idiom for a big file (build log, dataset): start with `{path:'x.log', mode:'lines', offset:1, limit:200}` — the result includes `total_lines` for the whole file — then advance `offset` (201, 401, ...) window by window until you've covered `total_lines`; `truncated: true` means there was more file past the returned window. Byte windows work too: `{path:'x.log', mode:'bytes', offset:1000000, limit:8000}` reads 8 KB starting at byte 1 MB. Tail-reads aren't supported — use `shell tail -n N` for those.",
             json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -648,11 +692,16 @@ pub mod read_file {
     /// `READ_FILE_CAP` with `truncated: true`. `offset = 0` is
     /// treated as `1` for ergonomics (1-indexed but agents will mix
     /// it up).
+    ///
+    /// The final tuple element is the file's TOTAL line count — free
+    /// to compute here since lines mode reads the whole file anyway,
+    /// and it's what makes the paging idiom deterministic (the model
+    /// knows exactly how many windows remain).
     async fn read_lines_range(
         path: &std::path::Path,
         offset: u64,
         limit: u64,
-    ) -> Result<(String, bool, u64), ToolError> {
+    ) -> Result<(String, bool, u64, u64), ToolError> {
         // Read the whole file up to the cap+1 so we can detect overflow.
         // For very large files this is the same memory pressure as the
         // existing implementation — we don't make it worse.
@@ -660,6 +709,7 @@ pub mod read_file {
             .await
             .map_err(|e| ToolError::Internal(format!("read_file({}): {e}", path.display())))?;
         let text = String::from_utf8_lossy(&bytes);
+        let total_lines = text.split_inclusive('\n').count() as u64;
         // Normalise offset: 1-indexed, but accept 0 as "from the start".
         let start_line = offset.max(1);
         let mut out = String::new();
@@ -693,7 +743,7 @@ pub mod read_file {
         }
         // If the loop exhausted the file without filling `limit`, the
         // body is exactly what the caller asked for — not truncated.
-        Ok((out, truncated, count))
+        Ok((out, truncated, count, total_lines))
     }
 
     pub async fn handle(
@@ -706,9 +756,22 @@ pub mod read_file {
         // For `bytes` mode + default path (offset=0, no caller-supplied
         // limit beyond the cap) we preserve the pre-existing read-the-
         // whole-file-and-truncate-the-head shape. Tests pin this.
-        let (body, truncated, bytes_read) = match plan.mode {
-            Mode::Bytes => read_bytes_range(&plan.path, plan.offset, plan.limit).await?,
-            Mode::Lines => read_lines_range(&plan.path, plan.offset, plan.limit).await?,
+        //
+        // `total_lines` is only known in lines mode (which reads the
+        // whole file anyway). Bytes mode — including the default no-args
+        // read — must stay byte-identical for existing callers, so it
+        // never grows the field.
+        let (body, truncated, bytes_read, total_lines) = match plan.mode {
+            Mode::Bytes => {
+                let (body, truncated, bytes_read) =
+                    read_bytes_range(&plan.path, plan.offset, plan.limit).await?;
+                (body, truncated, bytes_read, None)
+            }
+            Mode::Lines => {
+                let (body, truncated, bytes_read, total) =
+                    read_lines_range(&plan.path, plan.offset, plan.limit).await?;
+                (body, truncated, bytes_read, Some(total))
+            }
         };
 
         // `limit_applied` is the cap actually enforced for this call.
@@ -725,7 +788,7 @@ pub mod read_file {
             }
         };
 
-        Ok(success_json(&json!({
+        let mut out = json!({
             "path": plan.path.display().to_string(),
             "body": body,
             "truncated": truncated,
@@ -733,7 +796,16 @@ pub mod read_file {
             "offset": plan.offset,
             "limit_applied": limit_applied,
             "mode": plan.mode.as_str(),
-        })))
+        });
+        if let Some(total) = total_lines {
+            if let Some(map) = out.as_object_mut() {
+                map.insert(
+                    "total_lines".into(),
+                    serde_json::Value::Number(total.into()),
+                );
+            }
+        }
+        Ok(success_json(&out))
     }
 
     struct Handler;
@@ -1178,6 +1250,55 @@ fn shell_state_path() -> PathBuf {
         .map_or_else(|| PathBuf::from(SHELL_STATE_DEFAULT_PATH), PathBuf::from)
 }
 
+/// Cap a `shell` stream to `max` bytes on a char boundary. Returns
+/// `(capped_string, truncated_flag)`.
+///
+/// `tail = false` (the default) keeps the head of the stream and
+/// appends a one-line recovery hint: re-run with `tail_bytes` to see
+/// the end, or use `background: true` and page the full log under
+/// `/data/.jobs/` — the truncated result itself names the path so the
+/// model doesn't have to remember where background logs live.
+///
+/// `tail = true` keeps the LAST `max` bytes and prepends a marker so
+/// the model knows how much it's looking at and that the head was
+/// dropped.
+fn cap_shell_stream(s: &str, max: usize, tail: bool) -> (String, bool) {
+    if s.len() <= max {
+        return (s.to_string(), false);
+    }
+    if tail {
+        let mut start = s.len() - max;
+        while !s.is_char_boundary(start) {
+            start += 1;
+        }
+        (
+            format!(
+                "[truncated; showing the last {} of {} bytes]…{}",
+                s.len() - start,
+                s.len(),
+                &s[start..]
+            ),
+            true,
+        )
+    } else {
+        let mut cap = max;
+        while !s.is_char_boundary(cap) {
+            cap -= 1;
+        }
+        (
+            format!(
+                "{}…[truncated at {} of {} bytes; re-run with `tail_bytes` to see the end, \
+                 narrow with grep, or use `background: true` and page the full log at \
+                 /data/.jobs/<job>.log with `read_file`]",
+                &s[..cap],
+                cap,
+                s.len()
+            ),
+            true,
+        )
+    }
+}
+
 /// Cap a string to `max` bytes on a char boundary. Returns
 /// `(capped_string, truncated_flag)`. The trailing hint nudges the
 /// model toward narrowing the source (`tail -n 200`, `head -n 200`,
@@ -1308,6 +1429,135 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, ToolError::Validation(_)));
+    }
+
+    /// `tail_bytes` keeps the END of a large stream — the failing-build
+    /// recovery path: the error is at the tail, so the tail must
+    /// survive capping. ~205 KB of numbered lines; only the last 2000
+    /// bytes may come back.
+    #[tokio::test]
+    async fn shell_tail_bytes_returns_end_of_large_stream() {
+        let _g = ShellTestGuard::new();
+        let res = shell::handle(
+            Some(
+                json!({
+                    "command": "seq -f 'line-%.0f' 1 20000",
+                    "tail_bytes": 2000,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            ctx().as_ref(),
+        )
+        .await
+        .unwrap();
+        let body = result_text(&res);
+        // The very last line must be present...
+        assert!(body.contains("line-20000"), "missing tail: {body}");
+        assert!(body.contains("line-19999\\n"), "missing tail: {body}");
+        // ...and the head/middle must be gone.
+        assert!(body.contains("showing the last"), "missing marker: {body}");
+        assert!(!body.contains("line-10000\\n"), "head leaked: {body}");
+        assert!(body.contains("\"stdout_truncated\": true"), "got: {body}");
+        // Honest metadata: the applied window is echoed back.
+        assert!(body.contains("\"tail_bytes\": 2000"), "got: {body}");
+    }
+
+    /// `tail_bytes` above the 32 KiB stream cap is clamped — the cap
+    /// protects the context window regardless of what the caller asks.
+    #[tokio::test]
+    async fn shell_tail_bytes_clamped_to_stream_cap() {
+        let _g = ShellTestGuard::new();
+        let res = shell::handle(
+            Some(
+                json!({
+                    "command": "seq -f 'line-%.0f' 1 20000",
+                    "tail_bytes": 1_000_000,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            ctx().as_ref(),
+        )
+        .await
+        .unwrap();
+        let body = result_text(&res);
+        assert!(body.contains("\"tail_bytes\": 32768"), "got: {body}");
+        assert!(body.contains("line-20000"), "missing tail: {body}");
+    }
+
+    /// Default (no `tail_bytes`) stays head-truncate for compatibility,
+    /// and the truncation hint names the recovery paths: `tail_bytes`
+    /// and the background-job log dir `/data/.jobs/`. The `tail_bytes`
+    /// result FIELD must stay absent so default output is byte-stable.
+    #[tokio::test]
+    async fn shell_default_truncation_keeps_head_and_hints_recovery() {
+        let _g = ShellTestGuard::new();
+        let res = shell::handle(
+            Some(
+                json!({"command": "seq -f 'line-%.0f' 1 20000"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            ctx().as_ref(),
+        )
+        .await
+        .unwrap();
+        let body = result_text(&res);
+        // Head survives; tail is cut.
+        assert!(body.contains("line-1\\n"), "missing head: {body}");
+        assert!(!body.contains("line-20000"), "tail leaked: {body}");
+        assert!(body.contains("\"stdout_truncated\": true"), "got: {body}");
+        // The hint names both recovery paths.
+        assert!(body.contains("tail_bytes"), "missing hint: {body}");
+        assert!(
+            body.contains("/data/.jobs"),
+            "missing log-path hint: {body}"
+        );
+        // No `tail_bytes` FIELD in the default result shape.
+        assert!(!body.contains("\"tail_bytes\":"), "field leaked: {body}");
+    }
+
+    #[tokio::test]
+    async fn shell_rejects_tail_bytes_zero() {
+        let _g = ShellTestGuard::new();
+        let err = shell::handle(
+            Some(
+                json!({"command": "echo hi", "tail_bytes": 0})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            ctx().as_ref(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ToolError::Validation(_)));
+    }
+
+    /// Background jobs stream to a log file, so `tail_bytes` can't
+    /// apply — reject the combination with a pointer at the real
+    /// recovery path instead of silently ignoring the parameter.
+    #[tokio::test]
+    async fn shell_rejects_tail_bytes_with_background() {
+        let _g = ShellTestGuard::new();
+        let err = shell::handle(
+            Some(
+                json!({"command": "echo hi", "tail_bytes": 100, "background": true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            ctx().as_ref(),
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(matches!(err, ToolError::Validation(_)));
+        assert!(msg.contains("log_path"), "must name the recovery: {msg}");
     }
 
     #[tokio::test]
@@ -2310,6 +2560,99 @@ mod tests {
         );
     }
 
+    /// Lines mode reports the whole file's `total_lines` — the anchor
+    /// for the paging idiom (the model reads it once, then knows
+    /// exactly how many windows remain).
+    #[tokio::test]
+    async fn read_file_lines_mode_reports_total_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lines.txt");
+        tokio::fs::write(&path, b"a\nb\nc\n").await.unwrap();
+        let res = read_file::handle(
+            Some(
+                json!({
+                    "path": path.to_string_lossy(),
+                    "mode": "lines",
+                    "offset": 1,
+                    "limit": 2,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            ctx().as_ref(),
+        )
+        .await
+        .unwrap();
+        let body = result_text(&res);
+        assert!(body.contains("\"total_lines\": 3"), "got: {body}");
+    }
+
+    /// The default (bytes-mode) result shape must NOT grow a
+    /// `total_lines` field — a golden fixture depends on byte-stable
+    /// default output.
+    #[tokio::test]
+    async fn read_file_default_omits_total_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hello.txt");
+        tokio::fs::write(&path, b"abc\ndef\n").await.unwrap();
+        let res = read_file::handle(
+            Some(
+                json!({"path": path.to_string_lossy()})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            ctx().as_ref(),
+        )
+        .await
+        .unwrap();
+        let body = result_text(&res);
+        assert!(!body.contains("total_lines"), "field leaked: {body}");
+    }
+
+    /// Acceptance for paged reads: a 1M-line file returns exactly the
+    /// requested window plus honest metadata (`total_lines`,
+    /// `truncated`).
+    #[tokio::test]
+    async fn read_file_paged_window_of_million_line_file() {
+        use std::fmt::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.log");
+        let mut content = String::with_capacity(13 * 1_000_000);
+        for i in 1..=1_000_000_u32 {
+            let _ = writeln!(content, "line-{i:07}");
+        }
+        tokio::fs::write(&path, &content).await.unwrap();
+        let res = read_file::handle(
+            Some(
+                json!({
+                    "path": path.to_string_lossy(),
+                    "mode": "lines",
+                    "offset": 999_901,
+                    "limit": 50,
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+            ),
+            ctx().as_ref(),
+        )
+        .await
+        .unwrap();
+        let body = result_text(&res);
+        // Exactly the requested window: lines 999901-999950.
+        assert!(body.contains("line-0999901"), "got: {body}");
+        assert!(body.contains("line-0999950"), "got: {body}");
+        assert!(!body.contains("line-0999900"), "window start off: {body}");
+        assert!(!body.contains("line-0999951"), "window end off: {body}");
+        // Honest metadata: the whole file's line count, and truncated
+        // flips on because there were lines past the window.
+        assert!(body.contains("\"total_lines\": 1000000"), "got: {body}");
+        assert!(body.contains("\"truncated\": true"), "got: {body}");
+        assert!(body.contains("\"mode\": \"lines\""), "got: {body}");
+    }
+
     #[tokio::test]
     async fn write_file_no_create_parents_errors() {
         let dir = tempfile::tempdir().unwrap();
@@ -2354,6 +2697,41 @@ mod tests {
         let (got, truncated) = cap_output("hello", 100);
         assert_eq!(got, "hello");
         assert!(!truncated);
+    }
+
+    #[test]
+    fn cap_shell_stream_head_hint_names_recovery_paths() {
+        let s = "x".repeat(100);
+        let (got, truncated) = cap_shell_stream(&s, 10, false);
+        assert!(truncated);
+        assert!(got.starts_with("xxxxxxxxxx"), "got: {got}");
+        // The hint must name both recovery paths: tail_bytes and the
+        // background-job log dir.
+        assert!(got.contains("tail_bytes"), "got: {got}");
+        assert!(got.contains("/data/.jobs"), "got: {got}");
+    }
+
+    #[test]
+    fn cap_shell_stream_tail_keeps_end_on_char_boundary() {
+        // "héllo" is 6 bytes; 600 bytes total. Keeping the last 10
+        // bytes lands mid-'é', so the boundary walk trims to 9.
+        let s = "héllo".repeat(100);
+        let (got, truncated) = cap_shell_stream(&s, 10, true);
+        assert!(truncated);
+        assert!(got.ends_with("héllo"), "got: {got}");
+        assert!(
+            got.contains("showing the last 9 of 600 bytes"),
+            "got: {got}"
+        );
+    }
+
+    #[test]
+    fn cap_shell_stream_passes_through_short_strings_both_modes() {
+        for tail in [false, true] {
+            let (got, truncated) = cap_shell_stream("hello", 100, tail);
+            assert_eq!(got, "hello");
+            assert!(!truncated);
+        }
     }
 
     /// Pull the first text block out of a `CallToolResult`. Helpers
