@@ -163,6 +163,45 @@ pub fn config_update(args: &Value, central: &CentralDb) -> Result<Value, ErrorPa
                 }
             };
         }
+        // M17 session-preview proxy master switch. Boolean only — the
+        // copy-pasteable operator command is
+        // `cclaw groups config update --field preview_enabled=true <group>`.
+        "preview_enabled" => {
+            existing.preview_enabled = match value {
+                Value::Bool(b) => b,
+                _ => {
+                    return Err(ErrorPayload::new(
+                        "bad_request",
+                        "`preview_enabled` must be true or false",
+                    ));
+                }
+            };
+        }
+        // Preview proxy bind interface. `null` clears it (→ loopback-only
+        // default); a string must parse as an IP address so a malformed bind
+        // can't reach the preview manager (which would silently fall back).
+        "preview_bind" => {
+            existing.preview_bind = match &value {
+                Value::Null => None,
+                Value::String(s) => {
+                    if s.parse::<std::net::IpAddr>().is_err() {
+                        return Err(ErrorPayload::new(
+                            "bad_request",
+                            format!(
+                                "`preview_bind` must be an IP address (e.g. \"127.0.0.1\" or \"0.0.0.0\") or null to clear; got `{s}`"
+                            ),
+                        ));
+                    }
+                    Some(s.clone())
+                }
+                _ => {
+                    return Err(ErrorPayload::new(
+                        "bad_request",
+                        "`preview_bind` must be an IP address string or null",
+                    ));
+                }
+            };
+        }
         other => {
             return Err(ErrorPayload::new(
                 "bad_request",
@@ -192,6 +231,8 @@ pub fn config_update(args: &Value, central: &CentralDb) -> Result<Value, ErrorPa
             coding_enabled: existing.coding_enabled,
             surface_thinking: existing.surface_thinking,
             tool_profile: existing.tool_profile,
+            preview_enabled: existing.preview_enabled,
+            preview_bind: existing.preview_bind,
         },
     )
     .map_err(db_err)?;
@@ -211,6 +252,18 @@ pub fn config_add_mcp_server(args: &Value, central: &CentralDb) -> Result<Value,
             "`server.name` is required and must be a string",
         )
     })?;
+    // `__preview` is the reserved relay name the M17 session-preview tools
+    // ride through `mcp_call_requests`; an external server registered under
+    // it would be shadowed by (and could impersonate) the preview broker.
+    if name == copperclaw_host_delivery::PREVIEW_SERVER {
+        return Err(ErrorPayload::new(
+            "bad_request",
+            format!(
+                "`{}` is a reserved server name (session-preview relay) and cannot be used for an external MCP server",
+                copperclaw_host_delivery::PREVIEW_SERVER
+            ),
+        ));
+    }
     ensure_config_row(central, id)?;
     let mut current = container_configs::get_mcp_servers(central, id)
         .map_err(db_err)
@@ -386,6 +439,8 @@ fn default_config(id: AgentGroupId) -> container_configs::ContainerConfig {
         coding_enabled: false,
         surface_thinking: false,
         tool_profile: None,
+        preview_enabled: false,
+        preview_bind: None,
         updated_at: chrono::Utc::now(),
     }
 }
@@ -418,6 +473,8 @@ fn ensure_config_row(central: &CentralDb, id: AgentGroupId) -> Result<(), ErrorP
                 coding_enabled: row.coding_enabled,
                 surface_thinking: row.surface_thinking,
                 tool_profile: row.tool_profile,
+                preview_enabled: row.preview_enabled,
+                preview_bind: row.preview_bind,
             },
         )
         .map_err(db_err)?;
@@ -454,6 +511,8 @@ fn container_config_to_json(c: &container_configs::ContainerConfig) -> Value {
         "resource_limits": c.resource_limits,
         "coding_enabled": c.coding_enabled,
         "tool_profile": c.tool_profile,
+        "preview_enabled": c.preview_enabled,
+        "preview_bind": c.preview_bind,
         "updated_at": c.updated_at.to_rfc3339(),
     })
 }
@@ -715,6 +774,79 @@ mod tests {
         )
         .unwrap();
         assert!(v["tool_profile"].is_null());
+    }
+
+    #[test]
+    fn config_update_sets_preview_enabled_and_bind() {
+        // The operator's opt-in path: `cclaw groups config update --field
+        // preview_enabled=true <group>` (+ optional preview_bind).
+        let db = db();
+        let g = make_group(&db, "g");
+        let v = config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "preview_enabled", "value": true}),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["preview_enabled"], true);
+        let v = config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "preview_bind", "value": "0.0.0.0"}),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["preview_bind"], "0.0.0.0");
+        let stored = container_configs::get(&db, g.id).unwrap().unwrap();
+        assert!(stored.preview_enabled);
+        assert_eq!(stored.preview_bind.as_deref(), Some("0.0.0.0"));
+        // Null clears the bind (→ loopback default).
+        let v = config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "preview_bind", "value": null}),
+            &db,
+        )
+        .unwrap();
+        assert!(v["preview_bind"].is_null());
+    }
+
+    #[test]
+    fn config_update_preview_enabled_rejects_non_bool() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let err = config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "preview_enabled", "value": "yes"}),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+    }
+
+    #[test]
+    fn config_update_preview_bind_rejects_non_ip() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let err = config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "preview_bind", "value": "not-an-ip"}),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("IP address"));
+    }
+
+    #[test]
+    fn config_add_mcp_server_rejects_reserved_preview_name() {
+        // `__preview` is the session-preview relay's reserved server name; an
+        // external server registered under it could impersonate the broker.
+        let db = db();
+        let g = make_group(&db, "g");
+        let err = config_add_mcp_server(
+            &json!({
+                "id": g.id.as_uuid().to_string(),
+                "server": {"name": "__preview", "command": "evil"}
+            }),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("reserved"));
     }
 
     #[test]

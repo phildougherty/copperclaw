@@ -17,7 +17,8 @@ use copperclaw_db::tables::{
     session_routing, sessions,
 };
 use copperclaw_modules::{
-    DeliveryActionHandler, DeliveryActionInput, DeliveryDispatcher, DispatchTarget,
+    DeliveryActionHandler, DeliveryActionInput, DeliveryDispatcher, DispatchTarget, PreviewBroker,
+    SessionInfoLite,
 };
 use copperclaw_types::{
     AgentGroupId, ChannelType, ContainerStatus, MessageId, MessageKind, MessageOutRow,
@@ -44,6 +45,11 @@ pub const MAX_DELIVERY_ATTEMPTS: u32 = 3;
 /// Kept below the runner's `EXTERNAL_MCP_DEADLINE_SECS` (120s) so the runner
 /// still receives the host's error response before its own poll gives up.
 pub const HOST_MCP_CALL_DEADLINE_SECS: u64 = 90;
+/// Reserved MCP "server" name (M17) the runner uses to route `expose_preview`
+/// / `close_preview` tool calls through the external-MCP relay to the host-side
+/// preview broker. Must never collide with a real external server name — the
+/// `groups.config.add-mcp-server` handler rejects it.
+pub const PREVIEW_SERVER: &str = "__preview";
 /// Base value for exponential backoff between retries.
 pub const BACKOFF_BASE_MS: u64 = 5_000;
 
@@ -225,6 +231,17 @@ enum DeferOutcome {
 /// Compute the next delay (milliseconds) for the given `tries` value.
 ///
 /// `BACKOFF_BASE_MS * 2.pow(tries - 1)`, capped at `ABSOLUTE_CEILING_MS`.
+/// Parse the `port` field of a `__preview` tool input into a valid TCP port
+/// (1..=65535). Returns `None` for a missing / non-integer / out-of-range
+/// value so the caller can render a clear `is_error` to the model.
+fn parse_preview_port(input: &serde_json::Value) -> Option<u16> {
+    let n = input.get("port")?.as_u64()?;
+    if n == 0 || n > u64::from(u16::MAX) {
+        return None;
+    }
+    u16::try_from(n).ok()
+}
+
 fn backoff_delay_ms(tries: u32) -> u64 {
     let exp = tries.saturating_sub(1).min(31);
     let scaled = BACKOFF_BASE_MS.saturating_mul(1u64 << exp);
@@ -320,6 +337,13 @@ pub struct DeliveryService {
     /// by session id (the runner has at most one external call outstanding per
     /// session — it blocks on each `tool_result` before the model can call again).
     mcp_drain_inflight: Arc<DashMap<SessionId, Instant>>,
+    /// Host-side broker for the reserved `__preview` MCP server (M17 session
+    /// preview proxy). Set once at boot via [`DeliveryService::set_preview_broker`]
+    /// after the service is wrapped in an `Arc` (the preview manager needs the
+    /// container runtime, which is resolved later in boot). `None` (unset) means
+    /// this host has no preview support — a `__preview` request is answered with
+    /// a clear `is_error` rather than being left to hang the runner's poll.
+    preview_broker: std::sync::OnceLock<Arc<dyn PreviewBroker>>,
 }
 
 impl DeliveryService {
@@ -355,6 +379,7 @@ impl DeliveryService {
             todo_locks: DashMap::new(),
             todo_anchors: DashMap::new(),
             mcp_drain_inflight: Arc::new(DashMap::new()),
+            preview_broker: std::sync::OnceLock::new(),
         })
     }
 
@@ -396,12 +421,21 @@ impl DeliveryService {
             todo_locks: DashMap::new(),
             todo_anchors: DashMap::new(),
             mcp_drain_inflight: Arc::new(DashMap::new()),
+            preview_broker: std::sync::OnceLock::new(),
         })
     }
 
     /// Reusable dispatcher handle suitable to hand to modules.
     pub fn dispatcher(&self) -> Arc<dyn DeliveryDispatcher> {
         Arc::clone(&self.dispatcher)
+    }
+
+    /// Wire the host-side preview broker (M17). Called once at boot after the
+    /// service is wrapped in an `Arc` (the preview manager depends on the
+    /// container runtime, resolved later in boot). Returns whether the broker
+    /// was set (a second call is a no-op — the `OnceLock` keeps the first).
+    pub fn set_preview_broker(&self, broker: Arc<dyn PreviewBroker>) -> bool {
+        self.preview_broker.set(broker).is_ok()
     }
 
     /// Register or replace a delivery action handler.
@@ -708,6 +742,12 @@ impl DeliveryService {
         let servers = container_configs::get_mcp_servers(&self.central, sess.agent_group_id)
             .unwrap_or(serde_json::Value::Null);
 
+        // The reserved `__preview` server (M17) routes to the host-side preview
+        // broker instead of an external MCP server. Capture a clone for the
+        // detached task (None => this host has no preview support).
+        let preview_broker = self.preview_broker.get().map(Arc::clone);
+        let preview_session = SessionInfoLite::new(sess.id, sess.agent_group_id);
+
         // Claim the guard and hand everything to a detached task. The guard is
         // cleared on drop (including panic), so a wedged task can't permanently
         // block the session's future drains.
@@ -720,7 +760,11 @@ impl DeliveryService {
         tokio::spawn(async move {
             let _guard = guard; // cleared on drop
             for req in todo {
-                let resp = Self::execute_mcp_call_bounded(&servers, &req).await;
+                let resp = if req.server == PREVIEW_SERVER {
+                    Self::execute_preview_call(preview_broker.as_ref(), preview_session, &req).await
+                } else {
+                    Self::execute_mcp_call_bounded(&servers, &req).await
+                };
                 match inbound_pool.connect() {
                     Ok(inb) => {
                         if let Err(err) = mcp_calls::insert_response(&inb, &resp) {
@@ -737,6 +781,75 @@ impl DeliveryService {
             }
         });
         Ok(())
+    }
+
+    /// Service a `__preview` relay request against the host-side preview broker
+    /// (M17). Every failure mode becomes an `is_error` response — the runner's
+    /// blocking poll is never left unanswered.
+    ///
+    /// A `None` broker (this host has no preview support — no container runtime,
+    /// or the feature not wired) answers with a clear `is_error` rather than
+    /// hanging. An unknown reserved tool name is likewise an `is_error`.
+    async fn execute_preview_call(
+        broker: Option<&Arc<dyn PreviewBroker>>,
+        session: SessionInfoLite,
+        req: &mcp_calls::McpCallRequest,
+    ) -> mcp_calls::McpCallResponse {
+        let err = |msg: String| mcp_calls::McpCallResponse {
+            request_id: req.request_id.clone(),
+            is_error: true,
+            result: msg,
+        };
+        let Some(broker) = broker else {
+            return err(
+                "Preview is not available on this host (no container runtime / preview support). \
+                 The operator must run copperclaw on a Docker host to use `expose_preview`."
+                    .to_string(),
+            );
+        };
+        match req.tool.as_str() {
+            "expose_preview" => {
+                let Some(port) = parse_preview_port(&req.input) else {
+                    return err(
+                        "`expose_preview` requires an integer `port` between 1 and 65535 (the \
+                         port your server listens on INSIDE the container)."
+                            .to_string(),
+                    );
+                };
+                let name = req
+                    .input
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                match broker.expose(&session, port, name).await {
+                    Ok(exposed) => mcp_calls::McpCallResponse {
+                        request_id: req.request_id.clone(),
+                        is_error: false,
+                        result: format!("{}\n{}", exposed.url, exposed.note),
+                    },
+                    Err(e) => err(e.to_string()),
+                }
+            }
+            "close_preview" => {
+                let Some(port) = parse_preview_port(&req.input) else {
+                    return err(
+                        "`close_preview` requires an integer `port` between 1 and 65535."
+                            .to_string(),
+                    );
+                };
+                match broker.close(session.session_id, port).await {
+                    Ok(()) => mcp_calls::McpCallResponse {
+                        request_id: req.request_id.clone(),
+                        is_error: false,
+                        result: format!("Preview on port {port} closed."),
+                    },
+                    Err(e) => err(e.to_string()),
+                }
+            }
+            other => err(format!(
+                "Unknown preview action `{other}` (expected `expose_preview` or `close_preview`)."
+            )),
+        }
     }
 
     /// [`Self::execute_mcp_call`] wrapped in a host-side deadline so a hung
@@ -3043,6 +3156,8 @@ fn ensure_config_row(
             coding_enabled: false,
             surface_thinking: false,
             tool_profile: None,
+            preview_enabled: false,
+            preview_bind: None,
         },
     )?;
     Ok(())
@@ -4351,6 +4466,8 @@ mod tests {
                 coding_enabled: false,
                 surface_thinking: false,
                 tool_profile: None,
+                preview_enabled: false,
+                preview_bind: None,
             },
         )
         .unwrap();
@@ -4389,6 +4506,8 @@ mod tests {
                 coding_enabled: false,
                 surface_thinking: false,
                 tool_profile: None,
+                preview_enabled: false,
+                preview_bind: None,
             },
         )
         .unwrap();
@@ -6305,5 +6424,201 @@ mod tests {
         let resp = resp.expect("host drain must write a response");
         assert!(resp.is_error);
         assert!(resp.result.contains("ghost"), "got: {}", resp.result);
+    }
+
+    // ── M17 preview relay: `__preview` reserved server routing ───────────────
+
+    use copperclaw_modules::{PreviewError, PreviewExposed};
+
+    /// A mock preview broker recording its calls and returning a canned result.
+    struct MockPreviewBroker {
+        expose_result: Result<PreviewExposed, PreviewError>,
+        calls: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PreviewBroker for MockPreviewBroker {
+        async fn expose(
+            &self,
+            _session: &SessionInfoLite,
+            port: u16,
+            name: Option<String>,
+        ) -> Result<PreviewExposed, PreviewError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("expose:{port}:{}", name.unwrap_or_default()));
+            self.expose_result.clone()
+        }
+        async fn close(&self, _session_id: SessionId, port: u16) -> Result<(), PreviewError> {
+            self.calls.lock().unwrap().push(format!("close:{port}"));
+            Ok(())
+        }
+    }
+
+    fn preview_req(tool: &str, input: serde_json::Value) -> mcp_calls::McpCallRequest {
+        mcp_calls::McpCallRequest {
+            request_id: "pv".into(),
+            server: PREVIEW_SERVER.into(),
+            tool: tool.into(),
+            input,
+        }
+    }
+
+    #[tokio::test]
+    async fn preview_call_without_broker_is_error() {
+        let req = preview_req("expose_preview", json!({ "port": 3000 }));
+        let resp = DeliveryService::execute_preview_call(
+            None,
+            SessionInfoLite::new(SessionId::new(), AgentGroupId::new()),
+            &req,
+        )
+        .await;
+        assert!(resp.is_error);
+        assert!(resp.result.contains("not available on this host"));
+    }
+
+    #[tokio::test]
+    async fn preview_expose_routes_to_broker_and_renders_url() {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let broker: Arc<dyn PreviewBroker> = Arc::new(MockPreviewBroker {
+            expose_result: Ok(PreviewExposed {
+                url: "http://192.168.1.9:8100/__preview/tok".into(),
+                note: "Valid until idle for 30 minutes.".into(),
+            }),
+            calls: Arc::clone(&calls),
+        });
+        let req = preview_req("expose_preview", json!({ "port": 3000, "name": "demo" }));
+        let resp = DeliveryService::execute_preview_call(
+            Some(&broker),
+            SessionInfoLite::new(SessionId::new(), AgentGroupId::new()),
+            &req,
+        )
+        .await;
+        assert!(!resp.is_error);
+        assert!(
+            resp.result
+                .contains("http://192.168.1.9:8100/__preview/tok")
+        );
+        assert!(resp.result.contains("30 minutes"));
+        assert_eq!(calls.lock().unwrap().as_slice(), ["expose:3000:demo"]);
+    }
+
+    #[tokio::test]
+    async fn preview_expose_broker_error_is_surfaced() {
+        let broker: Arc<dyn PreviewBroker> = Arc::new(MockPreviewBroker {
+            expose_result: Err(PreviewError::Disabled {
+                group: "ag-1".into(),
+            }),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let req = preview_req("expose_preview", json!({ "port": 3000 }));
+        let resp = DeliveryService::execute_preview_call(
+            Some(&broker),
+            SessionInfoLite::new(SessionId::new(), AgentGroupId::new()),
+            &req,
+        )
+        .await;
+        assert!(resp.is_error);
+        assert!(resp.result.contains("preview_enabled=true ag-1"));
+    }
+
+    #[tokio::test]
+    async fn preview_missing_port_is_error() {
+        let broker: Arc<dyn PreviewBroker> = Arc::new(MockPreviewBroker {
+            expose_result: Ok(PreviewExposed {
+                url: "x".into(),
+                note: "y".into(),
+            }),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let req = preview_req("expose_preview", json!({}));
+        let resp = DeliveryService::execute_preview_call(
+            Some(&broker),
+            SessionInfoLite::new(SessionId::new(), AgentGroupId::new()),
+            &req,
+        )
+        .await;
+        assert!(resp.is_error);
+        assert!(resp.result.contains("integer `port`"));
+    }
+
+    #[tokio::test]
+    async fn preview_unknown_tool_is_error() {
+        let broker: Arc<dyn PreviewBroker> = Arc::new(MockPreviewBroker {
+            expose_result: Ok(PreviewExposed {
+                url: "x".into(),
+                note: "y".into(),
+            }),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let req = preview_req("frobnicate", json!({ "port": 1 }));
+        let resp = DeliveryService::execute_preview_call(
+            Some(&broker),
+            SessionInfoLite::new(SessionId::new(), AgentGroupId::new()),
+            &req,
+        )
+        .await;
+        assert!(resp.is_error);
+        assert!(resp.result.contains("Unknown preview action"));
+    }
+
+    #[test]
+    fn parse_preview_port_bounds() {
+        assert_eq!(parse_preview_port(&json!({ "port": 8080 })), Some(8080));
+        assert_eq!(parse_preview_port(&json!({ "port": 1 })), Some(1));
+        assert_eq!(parse_preview_port(&json!({ "port": 65535 })), Some(65535));
+        assert_eq!(parse_preview_port(&json!({ "port": 0 })), None);
+        assert_eq!(parse_preview_port(&json!({ "port": 65536 })), None);
+        assert_eq!(parse_preview_port(&json!({ "port": "80" })), None);
+        assert_eq!(parse_preview_port(&json!({})), None);
+    }
+
+    #[tokio::test]
+    async fn drain_routes_preview_request_to_wired_broker() {
+        // End-to-end through drain_mcp_calls: a `__preview` request row is
+        // serviced by the wired broker, and the response lands in inbound.db.
+        let (service, _root, sess, _mock) = make_service().await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        service.set_preview_broker(Arc::new(MockPreviewBroker {
+            expose_result: Ok(PreviewExposed {
+                url: "http://127.0.0.1:8100/__preview/abc".into(),
+                note: "note".into(),
+            }),
+            calls: Arc::clone(&calls),
+        }));
+
+        let out_pool = service
+            .session_paths()
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let in_pool = service
+            .session_paths()
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        {
+            let out = out_pool.connect().unwrap();
+            mcp_calls::insert_request(
+                &out,
+                &preview_req("expose_preview", json!({ "port": 5000 })),
+            )
+            .unwrap();
+        }
+
+        service.drain_mcp_calls(&sess, &out_pool, &in_pool).unwrap();
+
+        let mut resp = None;
+        for _ in 0..200 {
+            let inb = in_pool.connect().unwrap();
+            if let Some(r) = mcp_calls::get_response(&inb, "pv").unwrap() {
+                resp = Some(r);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let resp = resp.expect("host drain must answer the preview request");
+        assert!(!resp.is_error, "got: {}", resp.result);
+        assert!(resp.result.contains("http://127.0.0.1:8100/__preview/abc"));
+        assert_eq!(calls.lock().unwrap().as_slice(), ["expose:5000:"]);
     }
 }

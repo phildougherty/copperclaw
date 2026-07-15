@@ -30,8 +30,10 @@
 //! chat inbound gets a one-time apology row routed back to the
 //! originating channel.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -42,7 +44,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::process::Command;
 use tokio::time::timeout;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// The label name an `copperclaw-setup`-built image carries with the
 /// runner fingerprint. Must match the `LABEL` written by
@@ -392,6 +394,38 @@ pub fn default_host_runner_path() -> Option<PathBuf> {
     None
 }
 
+/// De-duplicates the "image runner may be stale" fingerprint warning.
+/// The boot-time image health check runs on every host start, and a
+/// standing fingerprint mismatch (e.g. an operator who refreshed the
+/// host binaries but not the session image) would otherwise emit an
+/// identical WARN on every check. This tracks the `(tag, expected,
+/// actual)` triples already warned about so the same mismatch warns
+/// once per host process and logs at debug thereafter. A *changed*
+/// triple is new information and warns again.
+#[derive(Debug, Default)]
+struct FingerprintWarnDedup {
+    seen: Mutex<HashSet<(String, String, String)>>,
+}
+
+impl FingerprintWarnDedup {
+    /// Returns `true` the first time this exact `(tag, expected, actual)`
+    /// triple is observed (caller should WARN), and `false` on every
+    /// later identical observation (caller should log at debug). Pure
+    /// aside from its own set — it does no logging itself, so it can be
+    /// unit-tested directly. Backed by `HashSet::insert`, which returns
+    /// `true` only when the key was newly inserted.
+    fn should_warn(&self, tag: &str, expected: &str, actual: &str) -> bool {
+        let key = (tag.to_string(), expected.to_string(), actual.to_string());
+        self.seen.lock().unwrap().insert(key)
+    }
+}
+
+/// Process-global stale-fingerprint warn deduper. "Once per host boot"
+/// == once per process lifetime, so a single global instance is the
+/// right scope.
+static FINGERPRINT_WARN_DEDUP: LazyLock<FingerprintWarnDedup> =
+    LazyLock::new(FingerprintWarnDedup::default);
+
 /// Run the health-check pipeline against `image_tag`. Returns Ok on
 /// success (image is healthy enough to run); returns Err with the
 /// [`HealthDegradedReason`] that caused the failure.
@@ -460,12 +494,25 @@ pub async fn check_image_health(
             match probe.image_label(&tag, FINGERPRINT_LABEL).await {
                 Ok(Some(image_fp)) => {
                     if image_fp != host_fp {
-                        warn!(
-                            tag = %tag,
-                            expected = %host_fp,
-                            image_has = %image_fp,
-                            "image runner may be stale; expected fingerprint {host_fp}, image has {image_fp}",
-                        );
+                        // A standing mismatch would warn on every boot
+                        // check; dedupe so it's loud once per host
+                        // process and quiet (debug) thereafter. A
+                        // changed triple warns again — it's new info.
+                        if FINGERPRINT_WARN_DEDUP.should_warn(&tag, host_fp, &image_fp) {
+                            warn!(
+                                tag = %tag,
+                                expected = %host_fp,
+                                image_has = %image_fp,
+                                "image runner may be stale; expected fingerprint {host_fp}, image has {image_fp}",
+                            );
+                        } else {
+                            debug!(
+                                tag = %tag,
+                                expected = %host_fp,
+                                image_has = %image_fp,
+                                "image runner may be stale (already warned this boot); expected fingerprint {host_fp}, image has {image_fp}",
+                            );
+                        }
                     }
                 }
                 Ok(None) => {
@@ -921,6 +968,24 @@ pub(crate) mod tests {
                 "label {lbl:?} must be snake_case ASCII"
             );
         }
+    }
+
+    #[test]
+    fn fingerprint_warn_dedup_warns_once_per_triple() {
+        let dedup = FingerprintWarnDedup::default();
+        // First observation of a triple → warn.
+        assert!(dedup.should_warn("tag", "exp", "act"));
+        // Repeats of the same triple → debug (no second warn).
+        assert!(!dedup.should_warn("tag", "exp", "act"));
+        assert!(!dedup.should_warn("tag", "exp", "act"));
+        // A CHANGED triple is new information → warns again. Vary each
+        // field independently.
+        assert!(dedup.should_warn("tag", "exp", "act2"));
+        assert!(dedup.should_warn("tag", "exp2", "act"));
+        assert!(dedup.should_warn("tag2", "exp", "act"));
+        // …and those new triples then dedupe on their own repeats.
+        assert!(!dedup.should_warn("tag", "exp", "act2"));
+        assert!(!dedup.should_warn("tag2", "exp", "act"));
     }
 
     #[test]

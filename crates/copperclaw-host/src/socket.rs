@@ -46,6 +46,13 @@ pub struct HandlerCtx {
 }
 
 impl HandlerCtx {
+    /// Test-only convenience: defaults `data_dir` to the RELATIVE path
+    /// `"data"`, which resolves against the process CWD. Production code
+    /// must use [`Self::with_data_dir`] with the install's absolute data
+    /// dir — a daemonized host's CWD is not the install root, so the
+    /// relative default silently breaks every handler that touches
+    /// per-session files (`sessions.delete` dir removal, dead-letter
+    /// replay).
     pub fn new(central: CentralDb) -> Self {
         Self {
             central,
@@ -149,6 +156,37 @@ impl CommandHandler for CtxFnHandler {
             ));
         }
         (self.f)(args, ctx)
+    }
+}
+
+/// Handler variant that additionally receives the [`Caller`] — for
+/// commands whose response shape depends on caller scope (e.g.
+/// `sessions.get` attaches message previews for the host and for an
+/// agent asking about its own session, but not for a foreign one).
+type CallerHandlerFn =
+    dyn Fn(&Value, &Caller, &HandlerCtx) -> Result<Value, ErrorPayload> + Send + Sync;
+
+pub struct CallerFnHandler {
+    f: Box<CallerHandlerFn>,
+}
+
+impl CallerFnHandler {
+    pub fn new<F>(f: F) -> Self
+    where
+        F: Fn(&Value, &Caller, &HandlerCtx) -> Result<Value, ErrorPayload> + Send + Sync + 'static,
+    {
+        Self { f: Box::new(f) }
+    }
+}
+
+impl CommandHandler for CallerFnHandler {
+    fn handle(
+        &self,
+        args: &Value,
+        caller: &Caller,
+        ctx: &HandlerCtx,
+    ) -> Result<Value, ErrorPayload> {
+        (self.f)(args, caller, ctx)
     }
 }
 
@@ -296,7 +334,17 @@ pub fn build_dispatch_table() -> DispatchTable {
     ins!("destinations.remove", handlers::destinations::remove, true);
 
     ins!("sessions.list", handlers::sessions::list, false);
-    ins!("sessions.get", handlers::sessions::get, false);
+    // Caller-aware: attaches per-session message previews for the host
+    // (and for an agent asking about its own session). Scope is enforced
+    // inside the handler, not via `requires_host`.
+    t.insert(
+        "sessions.get",
+        Arc::new(CallerFnHandler::new(handlers::sessions::get)) as Arc<dyn CommandHandler>,
+    );
+    t.insert(
+        "sessions.tail",
+        Arc::new(CallerFnHandler::new(handlers::sessions::tail)) as Arc<dyn CommandHandler>,
+    );
     ins_ctx!("sessions.delete", handlers::sessions::delete, true);
 
     ins!("user-dms.list", handlers::user_dms::list, false);
@@ -751,10 +799,11 @@ pub async fn serve_listener(
     listener: tokio::net::UnixListener,
     path: PathBuf,
     central: CentralDb,
+    data_dir: PathBuf,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
     let table = Arc::new(build_dispatch_table());
-    let ctx = Arc::new(HandlerCtx::new(central));
+    let ctx = Arc::new(HandlerCtx::with_data_dir(central, data_dir));
     let limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     let host_uid = host_effective_uid();
 
@@ -818,10 +867,11 @@ pub async fn serve_listener(
 pub async fn run_server(
     path: PathBuf,
     central: CentralDb,
+    data_dir: PathBuf,
     shutdown: CancellationToken,
 ) -> Result<(), std::io::Error> {
     let listener = bind_listener(&path)?;
-    serve_listener(listener, path, central, shutdown).await
+    serve_listener(listener, path, central, data_dir, shutdown).await
 }
 
 /// Build a dispatch table populated with only the handlers in `commands`
@@ -1294,8 +1344,11 @@ mod tests {
         let shutdown = CancellationToken::new();
         let server_path = socket_path.clone();
         let cancel = shutdown.clone();
+        let data_dir = tmp.path().to_path_buf();
         let task = tokio::spawn(async move {
-            run_server(server_path, central, cancel).await.unwrap();
+            run_server(server_path, central, data_dir, cancel)
+                .await
+                .unwrap();
         });
 
         // Wait for the socket file to exist.
@@ -1328,7 +1381,9 @@ mod tests {
         let path = tmp.path().join("notasocket");
         std::fs::write(&path, b"hi").unwrap();
         let shutdown = CancellationToken::new();
-        let err = run_server(path, central(), shutdown).await.unwrap_err();
+        let err = run_server(path, central(), tmp.path().to_path_buf(), shutdown)
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     }
 
@@ -1346,8 +1401,11 @@ mod tests {
         let shutdown = CancellationToken::new();
         let path_clone = path.clone();
         let cancel = shutdown.clone();
+        let data_dir = tmp.path().to_path_buf();
         let task = tokio::spawn(async move {
-            run_server(path_clone, central(), cancel).await.unwrap();
+            run_server(path_clone, central(), data_dir, cancel)
+                .await
+                .unwrap();
         });
         for _ in 0..40 {
             if path.exists() {
@@ -1636,8 +1694,11 @@ mod tests {
         let shutdown = CancellationToken::new();
         let server_path = path.clone();
         let cancel = shutdown.clone();
+        let data_dir = tmp.path().to_path_buf();
         let task = tokio::spawn(async move {
-            run_server(server_path, central, cancel).await.unwrap();
+            run_server(server_path, central, data_dir, cancel)
+                .await
+                .unwrap();
         });
         // Wait for the socket file.
         for _ in 0..80 {

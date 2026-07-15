@@ -159,6 +159,20 @@ pub struct ContainerConfig {
     /// rewrites `runner.json` but not the image, so it stays OUTSIDE
     /// `compute_fingerprint`.
     pub tool_profile: Option<String>,
+    /// Master switch for the session-preview proxy (M17). When `false`
+    /// (the default), an `expose_preview` tool call is refused host-side
+    /// with an `is_error` naming the operator command that enables it — no
+    /// listener is ever opened for a group that has not opted in.
+    ///
+    /// Host-side-only: consumed by the preview manager, never written into
+    /// `runner.json` and irrelevant to the image, so it stays OUTSIDE
+    /// `compute_fingerprint` (mirrors `surface_thinking` / `tool_profile`).
+    pub preview_enabled: bool,
+    /// Host interface the preview proxy binds. `None`/absent means bind
+    /// loopback only (`127.0.0.1`) — reachable from the host, not the LAN.
+    /// An operator who wants LAN reachability sets `"0.0.0.0"` (or a
+    /// specific interface IP). Only consulted when `preview_enabled`.
+    pub preview_bind: Option<String>,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -183,6 +197,8 @@ pub struct UpsertContainerConfig {
     pub coding_enabled: bool,
     pub surface_thinking: bool,
     pub tool_profile: Option<String>,
+    pub preview_enabled: bool,
+    pub preview_bind: Option<String>,
 }
 
 fn effort_as_str(e: Effort) -> &'static str {
@@ -269,6 +285,9 @@ fn row_to_container_config(row: &Row<'_>) -> rusqlite::Result<ContainerConfig> {
     let surface_thinking_int: i64 = row.get("surface_thinking")?;
     let surface_thinking = surface_thinking_int != 0;
     let tool_profile: Option<String> = row.get("tool_profile")?;
+    let preview_enabled_int: i64 = row.get("preview_enabled")?;
+    let preview_enabled = preview_enabled_int != 0;
+    let preview_bind: Option<String> = row.get("preview_bind")?;
     let updated_at_str: String = row.get("updated_at")?;
     let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
         .map_err(|e| {
@@ -295,6 +314,8 @@ fn row_to_container_config(row: &Row<'_>) -> rusqlite::Result<ContainerConfig> {
         coding_enabled,
         surface_thinking,
         tool_profile,
+        preview_enabled,
+        preview_bind,
         updated_at,
     })
 }
@@ -310,7 +331,8 @@ pub fn get(
                     max_messages_per_prompt, skills, mcp_servers, packages_apt,
                     packages_npm, additional_mounts, cli_scope,
                     config_fingerprint, egress_allow, resource_limits,
-                    coding_enabled, surface_thinking, tool_profile, updated_at
+                    coding_enabled, surface_thinking, tool_profile,
+                    preview_enabled, preview_bind, updated_at
              FROM container_configs
              WHERE agent_group_id = ?1",
             params![agent_group_id.as_uuid().to_string()],
@@ -335,8 +357,9 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
             max_messages_per_prompt, skills, mcp_servers, packages_apt,
             packages_npm, additional_mounts, cli_scope,
             config_fingerprint, egress_allow, resource_limits,
-            coding_enabled, surface_thinking, tool_profile, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+            coding_enabled, surface_thinking, tool_profile,
+            preview_enabled, preview_bind, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
          ON CONFLICT(agent_group_id) DO UPDATE SET
              provider = excluded.provider,
              model = excluded.model,
@@ -356,6 +379,8 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
              coding_enabled = excluded.coding_enabled,
              surface_thinking = excluded.surface_thinking,
              tool_profile = excluded.tool_profile,
+             preview_enabled = excluded.preview_enabled,
+             preview_bind = excluded.preview_bind,
              updated_at = excluded.updated_at",
         params![
             req.agent_group_id.as_uuid().to_string(),
@@ -377,6 +402,8 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
             i64::from(req.coding_enabled),
             i64::from(req.surface_thinking),
             req.tool_profile.clone(),
+            i64::from(req.preview_enabled),
+            req.preview_bind.clone(),
             now.to_rfc3339(),
         ],
     )?;
@@ -400,6 +427,8 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
         coding_enabled: req.coding_enabled,
         surface_thinking: req.surface_thinking,
         tool_profile: req.tool_profile,
+        preview_enabled: req.preview_enabled,
+        preview_bind: req.preview_bind,
         updated_at: now,
     })
 }
@@ -805,6 +834,62 @@ pub fn set_resource_limits(
     Ok(())
 }
 
+/// Narrow setter for the per-group `preview_enabled` master switch (M17
+/// session-preview proxy). When `false` (the default), an `expose_preview`
+/// tool call is refused host-side — no listener is opened for a group that
+/// has not opted in. Runner-config-independent; consumed only by the host's
+/// preview manager, so it does not force an image rebuild.
+pub fn set_preview_enabled(
+    db: &CentralDb,
+    agent_group_id: AgentGroupId,
+    enabled: bool,
+) -> Result<(), DbError> {
+    let conn = db.conn()?;
+    let n = conn.execute(
+        "UPDATE container_configs
+         SET preview_enabled = ?1, updated_at = ?2
+         WHERE agent_group_id = ?3",
+        params![
+            i64::from(enabled),
+            Utc::now().to_rfc3339(),
+            agent_group_id.as_uuid().to_string()
+        ],
+    )?;
+    if n == 0 {
+        return Err(DbError::NotFound);
+    }
+    Ok(())
+}
+
+/// Narrow setter for the per-group `preview_bind` interface (M17).
+///
+/// `None` clears the override so the preview proxy binds loopback only
+/// (`127.0.0.1`); `Some("0.0.0.0")` (or a specific interface IP) widens it
+/// to the LAN. The value is stored verbatim — validation (rejecting a bind
+/// that does not parse as an IP address) lives in the `cclaw groups config`
+/// handler so a malformed value can't reach the preview manager.
+pub fn set_preview_bind(
+    db: &CentralDb,
+    agent_group_id: AgentGroupId,
+    bind: Option<&str>,
+) -> Result<(), DbError> {
+    let conn = db.conn()?;
+    let n = conn.execute(
+        "UPDATE container_configs
+         SET preview_bind = ?1, updated_at = ?2
+         WHERE agent_group_id = ?3",
+        params![
+            bind,
+            Utc::now().to_rfc3339(),
+            agent_group_id.as_uuid().to_string()
+        ],
+    )?;
+    if n == 0 {
+        return Err(DbError::NotFound);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -849,6 +934,8 @@ mod tests {
             coding_enabled: false,
             surface_thinking: false,
             tool_profile: None,
+            preview_enabled: false,
+            preview_bind: None,
         }
     }
 
@@ -858,6 +945,49 @@ mod tests {
             assert_eq!(CliScope::parse(s.as_str()), Some(s));
         }
         assert_eq!(CliScope::parse("nope"), None);
+    }
+
+    #[test]
+    fn preview_fields_default_off_and_round_trip() {
+        let db = db();
+        let ag = make_agent_group(&db, "prev");
+        // Defaults: disabled, no bind override.
+        let cfg = upsert(&db, minimal_req(ag)).unwrap();
+        assert!(!cfg.preview_enabled);
+        assert_eq!(cfg.preview_bind, None);
+        let fetched = get(&db, ag).unwrap().unwrap();
+        assert!(!fetched.preview_enabled);
+        assert_eq!(fetched.preview_bind, None);
+
+        // Narrow setters flip both, and a re-read reflects them.
+        set_preview_enabled(&db, ag, true).unwrap();
+        set_preview_bind(&db, ag, Some("0.0.0.0")).unwrap();
+        let after = get(&db, ag).unwrap().unwrap();
+        assert!(after.preview_enabled);
+        assert_eq!(after.preview_bind.as_deref(), Some("0.0.0.0"));
+
+        // Clearing the bind restores loopback-default semantics (NULL).
+        set_preview_bind(&db, ag, None).unwrap();
+        let cleared = get(&db, ag).unwrap().unwrap();
+        assert_eq!(cleared.preview_bind, None);
+        assert!(
+            cleared.preview_enabled,
+            "clearing bind must not touch enabled"
+        );
+    }
+
+    #[test]
+    fn preview_setters_error_when_group_missing() {
+        let db = db();
+        let ghost = AgentGroupId::new();
+        assert!(matches!(
+            set_preview_enabled(&db, ghost, true),
+            Err(DbError::NotFound)
+        ));
+        assert!(matches!(
+            set_preview_bind(&db, ghost, Some("127.0.0.1")),
+            Err(DbError::NotFound)
+        ));
     }
 
     #[test]
@@ -938,6 +1068,8 @@ mod tests {
             coding_enabled: true,
             surface_thinking: true,
             tool_profile: Some("messaging".into()),
+            preview_enabled: true,
+            preview_bind: Some("0.0.0.0".into()),
         };
         let saved = upsert(&db, req.clone()).unwrap();
         let fetched = get(&db, ag).unwrap().unwrap();
@@ -964,6 +1096,8 @@ mod tests {
         assert!(fetched.coding_enabled);
         assert!(fetched.surface_thinking);
         assert_eq!(fetched.tool_profile.as_deref(), Some("messaging"));
+        assert!(fetched.preview_enabled);
+        assert_eq!(fetched.preview_bind.as_deref(), Some("0.0.0.0"));
     }
 
     #[test]

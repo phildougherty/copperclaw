@@ -51,6 +51,15 @@ pub enum RtError {
     /// found, container already exists, build error, etc.).
     #[error("container error: {0}")]
     Container(String),
+    /// The target container or image does not exist — the backend
+    /// reported a 404 / "no such container". Split out from the generic
+    /// [`RtError::Container`] so callers can treat an already-gone
+    /// target as an expected, quiet outcome (e.g. the crash-restart log
+    /// capture skips a container an operator already `docker rm -f`'d)
+    /// rather than a warn-worthy failure. Detect it with
+    /// [`RtError::is_not_found`].
+    #[error("not found: {0}")]
+    NotFound(String),
     /// Underlying I/O error (tempfile create, socket open, etc.).
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -60,6 +69,19 @@ pub enum RtError {
     /// requested capability.
     #[error("unsupported: {0}")]
     Unsupported(String),
+}
+
+impl RtError {
+    /// Whether this error is the backend's "target does not exist"
+    /// signal — a 404 / "no such container". Lets host-side callers
+    /// downgrade an already-gone container from a warn to a debug: a
+    /// missing container is an expected, uninteresting outcome for
+    /// best-effort probes like the crash-restart log capture (the
+    /// operator ran `docker rm -f`, or the daemon reaped it).
+    #[must_use]
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, RtError::NotFound(_))
+    }
 }
 
 /// Container-runtime trait. Both backends implement this; see crate
@@ -151,6 +173,26 @@ pub trait ContainerRuntime: Send + Sync {
     /// (`AppleContainerRuntime` today, in-process test stubs) report "no PID"
     /// rather than failing. Concrete runtimes (Docker) override.
     async fn container_pid(&self, name: &str) -> Result<Option<i32>, RtError> {
+        let _ = name;
+        Ok(None)
+    }
+
+    /// Resolve the container's **bridge IP address** (Docker's
+    /// `NetworkSettings.Networks.<net>.IPAddress`, or the legacy top-level
+    /// `NetworkSettings.IPAddress`), or `Ok(None)` when the backend can't
+    /// report one or the container isn't attached to a bridge network.
+    ///
+    /// This is the target the host's session-preview reverse proxy dials: a
+    /// session container runs on the Docker bridge with no published ports, so
+    /// the host reaches the app it built at `http://<container_ip>:<port>`
+    /// directly (the container never has to expose a host port).
+    ///
+    /// Default impl returns `Ok(None)` — backends that can't inspect a bridge
+    /// IP (`AppleContainerRuntime` today, in-process test stubs) report "no IP"
+    /// rather than failing; the preview manager treats a missing IP as
+    /// "preview not available for this session" and answers with an is_error.
+    /// Concrete runtimes (Docker) override.
+    async fn container_ip(&self, name: &str) -> Result<Option<String>, RtError> {
         let _ = name;
         Ok(None)
     }
@@ -318,6 +360,23 @@ mod tests {
     fn rt_error_display_unsupported() {
         let e = RtError::Unsupported("egress_allow".into());
         assert_eq!(e.to_string(), "unsupported: egress_allow");
+    }
+
+    #[test]
+    fn rt_error_display_not_found() {
+        let e = RtError::NotFound("fetch logs copperclaw-abc: 404".into());
+        assert_eq!(e.to_string(), "not found: fetch logs copperclaw-abc: 404");
+    }
+
+    #[test]
+    fn rt_error_is_not_found_classification() {
+        // Only NotFound reports as not-found; every other variant (a
+        // generic Container error, an unavailable daemon, etc.) is a
+        // real failure the caller must not silence.
+        assert!(RtError::NotFound("gone".into()).is_not_found());
+        assert!(!RtError::Container("boom".into()).is_not_found());
+        assert!(!RtError::Unavailable("daemon down".into()).is_not_found());
+        assert!(!RtError::Unsupported("egress".into()).is_not_found());
     }
 
     #[test]

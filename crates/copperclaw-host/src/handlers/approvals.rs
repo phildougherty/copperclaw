@@ -461,6 +461,18 @@ fn apply_add_mcp_server(
             "add_mcp_server payload `name` must be non-empty",
         ));
     }
+    // `__preview` is the reserved session-preview relay name — an external
+    // server registered under it could impersonate the preview broker. Refuse
+    // even through the approval path (the request name is agent-supplied).
+    if name == copperclaw_host_delivery::PREVIEW_SERVER {
+        return Err(ErrorPayload::new(
+            "bad_request",
+            format!(
+                "`{}` is a reserved server name (session-preview relay) and cannot be used for an external MCP server",
+                copperclaw_host_delivery::PREVIEW_SERVER
+            ),
+        ));
+    }
     let transport = row.payload.get("transport").cloned().unwrap_or(Value::Null);
     ensure_config_row(central, ag_id)?;
     let mut current = container_configs::get_mcp_servers(central, ag_id)
@@ -535,6 +547,8 @@ fn ensure_config_row(central: &CentralDb, ag_id: AgentGroupId) -> Result<(), Err
             coding_enabled: false,
             surface_thinking: false,
             tool_profile: None,
+            preview_enabled: false,
+            preview_bind: None,
         },
     )
     .map_err(db_err)?;
