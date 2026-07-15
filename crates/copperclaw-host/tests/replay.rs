@@ -332,6 +332,56 @@ async fn discord_long_message_split_paragraph_boundary() {
     }
 }
 
+/// Telegram outbound whose text is an intro line plus a fenced python
+/// code block, the fence alone exceeding the 4096-char cap. Pins the
+/// fence-aware splitter (M18/C2): the intro is cut off before the
+/// fence, the fence is closed at the mid-block cut and reopened with
+/// the same info string on the next chunk. Beyond the JSONL diff this
+/// asserts the exact chunk count, the per-chunk cap, and — the point
+/// of the card — that every delivered chunk parses with balanced
+/// fences (an even number of fence-marker lines, so no chunk leaves a
+/// code block dangling open in the Telegram rendering).
+#[tokio::test]
+async fn telegram_long_code_reply_fence_balanced() {
+    let harness = run_fixture_into_harness("telegram", "long-code-reply").await;
+    let mock = mock_for(&harness, "telegram");
+    let deliveries = mock.deliveries();
+    assert_eq!(
+        deliveries.len(),
+        3,
+        "expected intro + close/reopen fence chunks (3 deliveries), got {}",
+        deliveries.len()
+    );
+    for (i, d) in deliveries.iter().enumerate() {
+        let text = d
+            .message
+            .content
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("chunk {i} missing text"));
+        assert!(
+            text.chars().count() <= 4096,
+            "telegram chunk {i} exceeds the 4096-char cap"
+        );
+        let fence_lines = text
+            .lines()
+            .filter(|l| l.trim_start().starts_with("```"))
+            .count();
+        assert_eq!(
+            fence_lines % 2,
+            0,
+            "chunk {i} has unbalanced code fences ({fence_lines} fence lines):\n{text}"
+        );
+    }
+    // The reopened chunk must carry the original info string.
+    let last = deliveries[2].message.content["text"].as_str().unwrap();
+    assert!(
+        last.starts_with("```python\n"),
+        "reopened chunk must restore the ```python info string: {last}"
+    );
+    assert!(last.ends_with("```"), "final chunk must close the fence");
+}
+
 /// Telegram adapter's first `deliver` returns `Rate { retry_after: 1 }`.
 /// The delivery loop defers the row, the harness sleeps 1200 ms (past
 /// the 1 s retry_after window), and the second `process_session_once`

@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (fence-aware message splitter — 2026-07-15)
+
+- The delivery loop's chat-text splitter no longer cuts a chunk in the middle of a code fence — a split fence rendered as garbage on Telegram/Discord (the most visible "janky" signal for a coding agent). `split_text_into_chunks` (`crates/copperclaw-host-delivery/src/service.rs`) now consults a self-contained fence scanner (`crates/copperclaw-host-delivery/src/fence.rs`, markdown ``` fences and Telegram HTML `<pre>` blocks): when the natural cut lands inside a fence it cuts after the fence if the whole fence fits the window, before the fence when pre-fence content exists, and otherwise closes the fence at the cut and reopens it with the same info string / tag on the next chunk — so every emitted chunk parses with balanced fences. Pinned end-to-end by the new `fixtures/telegram/long-code-reply` replay fixture.
+
 ### Removed (dead tool-policy floor — M18 R0, 2026-07-15)
 
 - Deleted the runner's decorative `DISALLOWED_TOOLS` floor (and its `disallowed` compat module): its nine pascal-case Claude-Code built-in names (`CronCreate`, `EnterPlanMode`, ...) never matched the runner's snake_case tool inventory, so the floor denied nothing — the `ToolProfile` allow-lists (plus sender-role, active-skill, and provenance layers) are and remain the real gate. A new `tool_name_drift` integration test (`crates/copperclaw-runner/tests/tool_name_drift.rs`) now pins every name in the policy lists (exported as `policy::PROFILE_TOOL_LISTS`) to `copperclaw_mcp::build_tool_set()` so a renamed or removed tool fails CI instead of leaving a decorative allow-list (`crates/copperclaw-runner/src/policy.rs`).
