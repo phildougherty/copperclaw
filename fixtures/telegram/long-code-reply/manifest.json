@@ -1,0 +1,16 @@
+{
+  "name": "telegram-long-code-reply",
+  "channel": "telegram",
+  "description": "Agent emits a single chat outbound whose text is an intro line plus a fenced python code block; the fence alone exceeds the telegram 4096-char cap. Expected: the fence-aware splitter cuts before the fence, then closes the fence at the mid-block cut (```) and reopens it with the same info string on the next chunk, producing 3 adapter deliveries that each parse with balanced fences while keeping one messages_out row.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (fence-aware message splitter — 2026-07-15)
+
+- The delivery loop's chat-text splitter no longer cuts a chunk in the middle of a code fence — a split fence rendered as garbage on Telegram/Discord (the most visible "janky" signal for a coding agent). `split_text_into_chunks` (`crates/copperclaw-host-delivery/src/service.rs`) now consults a self-contained fence scanner (`crates/copperclaw-host-delivery/src/fence.rs`, markdown ``` fences and Telegram HTML `<pre>` blocks): when the natural cut lands inside a fence it cuts after the fence if the whole fence fits the window, before the fence when pre-fence content exists, and otherwise closes the fence at the cut and reopens it with the same info string / tag on the next chunk — so every emitted chunk parses with balanced fences. Pinned end-to-end by the new `fixtures/telegram/long-code-reply` replay fixture.
+
 ### Fixed (typing-indicator ticker backs off on channel rate limits — 2026-07-15)
 
 - **The host's `TypingTicker` no longer hammers a rate-limited channel every
