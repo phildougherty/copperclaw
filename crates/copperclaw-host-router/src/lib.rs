@@ -9,6 +9,7 @@
 
 #![doc(html_root_url = "https://docs.rs/copperclaw-host-router/0.1.0")]
 
+pub mod commands;
 pub mod debounce;
 pub mod error;
 pub mod hooks;
@@ -16,6 +17,7 @@ pub mod mention;
 pub mod route;
 pub mod session;
 
+pub use commands::SlashCommand;
 pub use debounce::{DEBOUNCE_WINDOW, DebounceKey, Debouncer, InflightKey, InflightSet};
 pub use error::RouterError;
 pub use hooks::HookChain;

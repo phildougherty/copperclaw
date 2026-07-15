@@ -175,6 +175,62 @@ async fn cli_scheduled_wake() {
     run_fixture("cli", "scheduled-wake").await;
 }
 
+// ---- M18 R1: end-user slash commands (fixture per command, cli + telegram) ----
+
+/// `/stop` persists a control{op:stop} row (kind=system, trigger=0,
+/// status pending for R2); no runner turn, no outbound, no delivery.
+#[tokio::test]
+async fn cli_slash_stop_control_row() {
+    run_fixture("cli", "slash-stop").await;
+}
+
+/// `/status` is answered by the host from central-DB state: no
+/// messages_in row, no runner turn, one synthesized outbound + delivery.
+#[tokio::test]
+async fn cli_slash_status_host_answer() {
+    run_fixture("cli", "slash-status").await;
+}
+
+/// `/clear` wires through to the runner's clear-history sentinel: no
+/// LLM turn, one confirmation outbound, inbound marked completed.
+#[tokio::test]
+async fn cli_slash_clear_runner_sentinel() {
+    run_fixture("cli", "slash-clear").await;
+}
+
+/// `/compact` wires through to the runner's compaction sentinel: short
+/// history is a no-op, no LLM turn, one confirmation outbound.
+#[tokio::test]
+async fn cli_slash_compact_runner_sentinel() {
+    run_fixture("cli", "slash-compact").await;
+}
+
+/// Telegram twin of `cli_slash_stop_control_row`, in a mention-gated
+/// group with no mention — routes only via the command bypass.
+#[tokio::test]
+async fn telegram_slash_stop_control_row_bypasses_mention_gate() {
+    run_fixture("telegram", "slash-stop").await;
+}
+
+/// Telegram twin of `cli_slash_status_host_answer` (gated group).
+#[tokio::test]
+async fn telegram_slash_status_host_answer_bypasses_mention_gate() {
+    run_fixture("telegram", "slash-status").await;
+}
+
+/// Telegram twin of `cli_slash_clear_runner_sentinel`; also pins the
+/// `@BotName` suffix + case normalisation (`/CLEAR@ReplayBot`).
+#[tokio::test]
+async fn telegram_slash_clear_normalises_bot_suffix() {
+    run_fixture("telegram", "slash-clear").await;
+}
+
+/// Telegram twin of `cli_slash_compact_runner_sentinel` (gated group).
+#[tokio::test]
+async fn telegram_slash_compact_runner_sentinel() {
+    run_fixture("telegram", "slash-compact").await;
+}
+
 /// D2 e2e: after a real replayed turn (per-session DBs on disk, WAL
 /// outbound), `sessions.get` attaches the recent message rows its help
 /// text promises and `sessions.tail` returns the merged, time-ordered

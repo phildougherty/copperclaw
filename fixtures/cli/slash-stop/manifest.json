@@ -1,0 +1,14 @@
+{
+  "name": "cli-slash-stop",
+  "channel": "cli",
+  "description": "User types /stop: router persists a control{op:stop} row (kind=system, trigger=0, status stays pending for R2); no runner turn, no outbound, no delivery.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\""
+  }
+}

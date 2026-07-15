@@ -6,7 +6,7 @@
 //! rooted at any directory.
 
 use crate::error::RouterError;
-use copperclaw_db::session::{SessionPaths, open_inbound};
+use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
 use copperclaw_types::{AgentGroupId, SessionId};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
@@ -36,6 +36,15 @@ impl SessionPool {
         Ok(Self::from_connection(conn))
     }
 
+    /// Open the outbound.db at `paths` and wrap the resulting connection.
+    /// Used by the router's host-side `/status` reply path, which writes a
+    /// synthesized `messages_out` row without involving the runner.
+    pub fn open_outbound(paths: &SessionPaths) -> Result<Self, RouterError> {
+        let conn = open_outbound(paths)
+            .map_err(|e| RouterError::session_create(format!("open outbound: {e}")))?;
+        Ok(Self::from_connection(conn))
+    }
+
     /// Run `f` against the underlying connection. Panics if the inner
     /// mutex is poisoned — a poisoned writer connection means the host has
     /// already lost the integrity guarantee, so failing fast is correct.
@@ -59,6 +68,16 @@ pub trait SessionRoot: Send + Sync {
     /// are responsible for any caching they want; the router calls this once
     /// per fan-out target.
     fn inbound_pool(
+        &self,
+        agent_group_id: &AgentGroupId,
+        session_id: &SessionId,
+    ) -> Result<SessionPool, RouterError>;
+
+    /// Open the outbound pool for `(agent_group_id, session_id)`. The router
+    /// writes to `messages_out` only for host-answered slash commands
+    /// (`/status`), where the reply is synthesized from host state and must
+    /// reach the delivery loop without waking the runner.
+    fn outbound_pool(
         &self,
         agent_group_id: &AgentGroupId,
         session_id: &SessionId,
@@ -108,6 +127,15 @@ impl SessionRoot for FsSessionRoot {
     ) -> Result<SessionPool, RouterError> {
         let paths = self.paths(agent_group_id, session_id);
         SessionPool::open(&paths)
+    }
+
+    fn outbound_pool(
+        &self,
+        agent_group_id: &AgentGroupId,
+        session_id: &SessionId,
+    ) -> Result<SessionPool, RouterError> {
+        let paths = self.paths(agent_group_id, session_id);
+        SessionPool::open_outbound(&paths)
     }
 
     fn ensure_session_dir(
@@ -181,6 +209,21 @@ mod tests {
             .unwrap()
         });
         assert_eq!(seq % 2, 0);
+    }
+
+    #[test]
+    fn fs_session_root_open_outbound_pool_reaches_messages_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = FsSessionRoot::new(tmp.path());
+        let ag = AgentGroupId::new();
+        let sess = SessionId::new();
+        root.ensure_session_dir(&ag, &sess).unwrap();
+        let pool = root.outbound_pool(&ag, &sess).unwrap();
+        let count: i64 = pool.with_conn(|c| {
+            c.query_row("SELECT COUNT(*) FROM messages_out", [], |r| r.get(0))
+                .unwrap()
+        });
+        assert_eq!(count, 0);
     }
 
     #[test]

@@ -1,0 +1,1 @@
+{"channel_type":"telegram","platform_id":"100","thread_id":null,"kind":"chat","content":{"text":"Agent status\n- agent group: Replay\n- session: <UUID>\n- session state: active (container stopped)\n- queued messages: 0\n- last active: <TS>\n- created: <TS>"},"files":0}

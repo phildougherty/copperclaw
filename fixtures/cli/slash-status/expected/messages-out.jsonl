@@ -1,0 +1,1 @@
+{"id":"<UUID>","seq":1,"in_reply_to":null,"timestamp":"<TS>","deliver_after":null,"recurrence":null,"kind":"chat","platform_id":"stdin","channel_type":"cli","thread_id":null,"content":{"text":"Agent status\n- agent group: Replay\n- session: <UUID>\n- session state: active (container stopped)\n- queued messages: 0\n- last active: <TS>\n- created: <TS>"}}

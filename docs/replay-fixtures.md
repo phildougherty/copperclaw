@@ -80,6 +80,24 @@ Optional fields used by failure-mode fixtures:
   a second time. Lets a fixture pin "row deferred on first tick,
   delivered on the second tick after the retry window elapses" without
   poking at `DeliveryService`'s private retry-state map.
+- `runner_drain`: `true` — run the per-step runner in DRAIN mode
+  instead of the default `max_turns = 1` mode: `run_loop` is raced
+  against a watcher that resolves once the session's `messages_in` has
+  no `pending` rows left, then the loop is cancelled. Needed by the
+  `slash-clear` / `slash-compact` fixtures because the runner's
+  slash-command sentinel handles a pure command batch synchronously
+  and `continue`s WITHOUT counting a turn, so a `max_turns`-bounded
+  loop would never return.
+
+Two harness behaviours the slash-command fixtures rely on (M18 R1):
+
+- Per inbound step, the runner only runs when the session has due
+  `trigger = 1` work (`messages_in::count_due` — the same gate the
+  container manager's spawn classifier applies). A `/stop` control row
+  is written with `trigger = 0`, so a control-only step runs no turn.
+- A `RouteOutcome::Answered` route (host-answered `/status`) skips the
+  runner entirely and goes straight to the delivery pass — the router
+  already wrote the synthesized reply to `messages_out`.
 
 `replay.mode` is `direct` for the current harness — inbound payloads
 are handed to the adapter's `MockAdapter::inject` rather than through

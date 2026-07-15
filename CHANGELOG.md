@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (end-user slash commands, M18 R1 — 2026-07-15)
+
+- End-user slash commands parsed router-side (`crates/copperclaw-host-router/src/commands.rs`): `/stop` (alias `/cancel`) persists a documented `control{op:stop}` row into `messages_in` (`kind=system`, `trigger=0`, pending for M18 R2's mid-turn consumer) even while a turn is in flight; `/status` is answered by the host from central-DB state straight into `messages_out` (new `RouteOutcome::Answered`, new `SessionRoot::outbound_pool`) without waking the runner; `/compact` and `/clear` (aliases `/reset`, `/new`, telegram `@BotName` suffix and case normalised) bypass the group-chat mention gate and wire through to the runner's existing sentinels; unknown `/x` falls through to the agent unchanged. Replay fixtures per command on cli + telegram under `fixtures/{cli,telegram}/slash-*` (harness: `count_due` spawn-mirror gate + `runner_drain` manifest flag, `docs/replay-fixtures.md`).
+
 ### Fixed (fence-aware message splitter — 2026-07-15)
 
 - The delivery loop's chat-text splitter no longer cuts a chunk in the middle of a code fence — a split fence rendered as garbage on Telegram/Discord (the most visible "janky" signal for a coding agent). `split_text_into_chunks` (`crates/copperclaw-host-delivery/src/service.rs`) now consults a self-contained fence scanner (`crates/copperclaw-host-delivery/src/fence.rs`, markdown ``` fences and Telegram HTML `<pre>` blocks): when the natural cut lands inside a fence it cuts after the fence if the whole fence fits the window, before the fence when pre-fence content exists, and otherwise closes the fence at the cut and reopens it with the same info string / tag on the next chunk — so every emitted chunk parses with balanced fences. Pinned end-to-end by the new `fixtures/telegram/long-code-reply` replay fixture.
