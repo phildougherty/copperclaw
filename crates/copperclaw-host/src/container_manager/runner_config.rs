@@ -257,6 +257,24 @@ impl ContainerManager {
             }
         }
 
+        // Parse the per-group tool-profile before prompt assembly: the
+        // assembler inlines the condensed coding-discipline block only for
+        // profiles that can write code. An unset / unrecognised profile is
+        // treated as `Full` here — exactly the fallback the runner applies
+        // at dispatch time — so the prompt and the enforced tool surface
+        // can never disagree about whether the agent codes.
+        let parsed_tool_profile = cc.and_then(|c| c.tool_profile.as_deref()).and_then(|p| {
+            let parsed = copperclaw_modules::permissions::ToolProfile::parse(p);
+            if parsed.is_none() {
+                warn!(
+                    agent_group = %session.agent_group_id.as_uuid(),
+                    tool_profile = p,
+                    "unknown tool_profile in container config; runner will fall back to `full`"
+                );
+            }
+            parsed
+        });
+
         let system = assemble_system_prompt_with_catalogue(
             self.cfg.skills_dir.as_deref(),
             self.cfg.groups_dir.as_deref(),
@@ -268,6 +286,7 @@ impl ContainerManager {
             assistant_name.as_deref(),
             &model,
             effective_mode,
+            parsed_tool_profile.unwrap_or_default(),
             catalogue_for_prompt.as_deref(),
             exclude_names,
         );
@@ -380,22 +399,12 @@ impl ContainerManager {
 
         // Plumb the per-group tool-profile (the FUEL for the runner's
         // layered ToolPolicy) into `runner.json`. Only emit a recognised
-        // profile name; an unknown / malformed value is dropped so the
-        // runner falls back to its permissive `full` default rather than
-        // mis-parsing. Skip emitting when unset for the same reason
-        // `surface_thinking` is skipped: keep the unconfigured-group
-        // `runner.json` shape stable.
-        let tool_profile = cc.and_then(|c| c.tool_profile.as_deref()).and_then(|p| {
-            let parsed = copperclaw_modules::permissions::ToolProfile::parse(p);
-            if parsed.is_none() {
-                warn!(
-                    agent_group = %session.agent_group_id.as_uuid(),
-                    tool_profile = p,
-                    "unknown tool_profile in container config; runner will fall back to `full`"
-                );
-            }
-            parsed.map(|profile| profile.as_str().to_string())
-        });
+        // profile name; an unknown / malformed value was dropped at parse
+        // time above (with a WARN) so the runner falls back to its
+        // permissive `full` default rather than mis-parsing. Skip emitting
+        // when unset for the same reason `surface_thinking` is skipped:
+        // keep the unconfigured-group `runner.json` shape stable.
+        let tool_profile = parsed_tool_profile.map(|profile| profile.as_str().to_string());
 
         // Resolve the triggering sender's RBAC role and plumb it into
         // `runner.json` so the runner applies the per-role floor (a guest
@@ -1446,6 +1455,39 @@ mod tests {
         let cc = cc_with_tool_profile(session.agent_group_id, Some("bogus"));
         let rc = mgr.runner_config_for(&session, Some(&cc), None);
         assert!(rc.tool_profile.is_none());
+    }
+
+    #[test]
+    fn runner_config_system_prompt_gates_coding_block_on_tool_profile() {
+        // The parsed profile must actually reach the prompt assembler:
+        // coding/full (and the unset fallback, which the runner treats as
+        // `full`) get the inline coding-discipline block; messaging /
+        // minimal get zero new bytes. The byte-level guarantee is pinned
+        // in `prompt::tests`; this test pins the end-to-end plumbing.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        for profile in [Some("coding"), Some("full"), None, Some("bogus")] {
+            let cc = cc_with_tool_profile(session.agent_group_id, profile);
+            let rc = mgr.runner_config_for(&session, Some(&cc), None);
+            assert!(
+                rc.system.contains("# Coding work — the floor"),
+                "profile {profile:?} must carry the coding block"
+            );
+        }
+        for profile in ["messaging", "minimal"] {
+            let cc = cc_with_tool_profile(session.agent_group_id, Some(profile));
+            let rc = mgr.runner_config_for(&session, Some(&cc), None);
+            assert!(
+                !rc.system.contains("# Coding work"),
+                "profile {profile:?} must not carry the coding block"
+            );
+        }
     }
 
     // ----- Input 2: resolved sender-role FUEL -------------------------------
