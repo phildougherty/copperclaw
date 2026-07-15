@@ -166,6 +166,40 @@ pub fn mark_failed(conn: &Connection, id: MessageId) -> Result<(), DbError> {
     Ok(())
 }
 
+/// Highest `seq` currently in the table, or `0` if empty. Used by the
+/// M18 R2 mid-turn steering check: the runner snapshots this once at
+/// `drive_turn` entry as the "known at turn start" ceiling, then any row
+/// peeked with `seq` above it arrived strictly after the turn began.
+pub fn max_seq(conn: &Connection) -> Result<i64, DbError> {
+    let max: i64 = conn.query_row("SELECT COALESCE(MAX(seq), 0) FROM messages_in", [], |r| {
+        r.get(0)
+    })?;
+    Ok(max)
+}
+
+/// Pending rows inserted strictly after `min_seq`, oldest first. The M18
+/// R2 mid-turn steering check calls this between tool batches to detect a
+/// `/stop` control row or a human interjection that arrived while the
+/// turn was already running — same due-now / non-wake filter as
+/// [`get_pending`], but scoped by sequence instead of a row limit so the
+/// caller sees every new arrival, not just the newest N.
+pub fn get_new_since(conn: &Connection, min_seq: i64) -> Result<Vec<MessageInRow>, DbError> {
+    let now = Utc::now().to_rfc3339();
+    let mut stmt = conn.prepare(
+        "SELECT id, seq, kind, timestamp, status, process_after, recurrence,
+                series_id, tries, trigger, platform_id, channel_type, thread_id,
+                content, source_session_id, on_wake, reply_to, is_group
+         FROM messages_in
+         WHERE status = 'pending'
+           AND seq > ?1
+           AND on_wake = 0
+           AND (process_after IS NULL OR process_after <= ?2)
+         ORDER BY seq ASC",
+    )?;
+    let rows = stmt.query_map(params![min_seq, now], row_to_message_in)?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 pub fn get_pending(
     conn: &Connection,
     first_poll: bool,
@@ -486,6 +520,67 @@ mod tests {
         let rows = get_pending(&conn, true, 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].reply_to, None);
+    }
+
+    #[test]
+    fn max_seq_is_zero_when_empty_and_tracks_the_high_water_mark() {
+        let (_tmp, conn) = fresh_inbound();
+        assert_eq!(max_seq(&conn).unwrap(), 0);
+        let seq1 = insert(&conn, &make_msg()).unwrap();
+        assert_eq!(max_seq(&conn).unwrap(), seq1);
+        let second = make_msg();
+        let second_id = second.id;
+        let seq2 = insert(&conn, &second).unwrap();
+        assert_eq!(max_seq(&conn).unwrap(), seq2);
+        // Completing a row doesn't move the high-water mark backward.
+        mark_completed(&conn, second_id).unwrap();
+        assert_eq!(max_seq(&conn).unwrap(), seq2);
+    }
+
+    #[test]
+    fn get_new_since_returns_only_rows_past_the_ceiling() {
+        let (_tmp, conn) = fresh_inbound();
+        let before = insert(&conn, &make_msg()).unwrap();
+        let ceiling = max_seq(&conn).unwrap();
+        assert_eq!(ceiling, before);
+        assert!(get_new_since(&conn, ceiling).unwrap().is_empty());
+
+        let mut after_msg = make_msg();
+        after_msg.content = json!({"text": "arrived after"});
+        let after_id = after_msg.id;
+        insert(&conn, &after_msg).unwrap();
+
+        let new_rows = get_new_since(&conn, ceiling).unwrap();
+        assert_eq!(new_rows.len(), 1);
+        assert_eq!(new_rows[0].id, after_id);
+    }
+
+    #[test]
+    fn get_new_since_excludes_completed_and_on_wake_and_future_rows() {
+        let (_tmp, conn) = fresh_inbound();
+        let ceiling = max_seq(&conn).unwrap();
+
+        let completed = make_msg();
+        let completed_id = completed.id;
+        insert(&conn, &completed).unwrap();
+        mark_completed(&conn, completed_id).unwrap();
+
+        let mut wake_only = make_msg();
+        wake_only.on_wake = true;
+        insert(&conn, &wake_only).unwrap();
+
+        let mut future = make_msg();
+        future.process_after = Some(Utc::now() + chrono::Duration::seconds(60));
+        insert(&conn, &future).unwrap();
+
+        let mut due = make_msg();
+        due.content = json!({"text": "this one counts"});
+        let due_id = due.id;
+        insert(&conn, &due).unwrap();
+
+        let new_rows = get_new_since(&conn, ceiling).unwrap();
+        assert_eq!(new_rows.len(), 1, "only the due, non-wake, pending row");
+        assert_eq!(new_rows[0].id, due_id);
     }
 
     #[test]
