@@ -1,14 +1,27 @@
 //! Handlers for `sessions.*` commands.
 
 use super::{db_err, opt_str, parse_uuid, req_str};
-use copperclaw_cclaw::ErrorPayload;
+use copperclaw_cclaw::{Caller, ErrorPayload};
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::session::SessionPaths;
 use copperclaw_db::tables::sessions;
 use copperclaw_types::{AgentGroupId, ContainerStatus, Session, SessionId};
+use rusqlite::{Connection, OpenFlags};
 use serde_json::{Value, json};
 use std::path::Path;
 use tracing::warn;
+
+/// Number of recent rows per direction attached to `sessions.get`.
+const RECENT_ROWS: i64 = 10;
+
+/// Default per-direction row cap for `sessions.tail` when the caller
+/// doesn't pass `limit`. Clamped to [`TAIL_LIMIT_MAX`].
+const TAIL_LIMIT_DEFAULT: i64 = 50;
+const TAIL_LIMIT_MAX: i64 = 500;
+
+/// Content previews are truncated to roughly this many characters
+/// (after secret redaction, on a char boundary).
+const PREVIEW_CHARS: usize = 120;
 
 pub fn list(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     let status = opt_str(args, "status");
@@ -24,10 +37,253 @@ pub fn list(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     Ok(json!(rows.iter().map(session_to_json).collect::<Vec<_>>()))
 }
 
-pub fn get(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
+/// `sessions.get` — the session row plus, when the caller is allowed to
+/// read message content, the last [`RECENT_ROWS`] `messages_in` /
+/// `messages_out` rows (kind, status, ts, redacted content preview) read
+/// **read-only** from the per-session DBs.
+///
+/// Message previews are attached for [`Caller::Host`] always, and for a
+/// [`Caller::Agent`] only when it asks about its *own* session — an agent
+/// must not read another session's traffic. Foreign-session agent calls
+/// degrade to today's row-only response rather than erroring, so existing
+/// container-side introspection keeps working.
+pub fn get(
+    args: &Value,
+    caller: &Caller,
+    ctx: &crate::socket::HandlerCtx,
+) -> Result<Value, ErrorPayload> {
     let id = SessionId(parse_uuid(&req_str(args, "id")?)?);
-    let row = sessions::get(central, id).map_err(db_err)?;
-    Ok(session_to_json(&row))
+    let row = sessions::get(&ctx.central, id).map_err(db_err)?;
+    let mut obj = session_to_json(&row);
+    if caller_may_read_messages(caller, id) {
+        let paths = SessionPaths::new(&ctx.data_dir, row.agent_group_id, id);
+        let inbound = read_message_rows(&paths.inbound_db, Direction::In, None, RECENT_ROWS);
+        let outbound = read_message_rows(&paths.outbound_db, Direction::Out, None, RECENT_ROWS);
+        if let Some(o) = obj.as_object_mut() {
+            o.insert("recent_inbound".into(), json!(inbound));
+            o.insert("recent_outbound".into(), json!(outbound));
+        }
+    }
+    Ok(obj)
+}
+
+/// `sessions.tail` — merged, time-ordered recent rows from both
+/// per-session DBs, read-only, callable while the session is running
+/// (`inbound.db` is `journal_mode=DELETE`; `outbound.db` is WAL — both
+/// tolerate a concurrent reader).
+///
+/// Args: `id` (required), `since_in_seq` / `since_out_seq` (optional —
+/// return only rows with a strictly greater `seq`; the `--follow` poll
+/// loop uses these), `limit` (optional per-direction cap).
+///
+/// Unlike `sessions.get`, the whole point of this command is message
+/// content, so a foreign-session agent caller is refused outright.
+pub fn tail(
+    args: &Value,
+    caller: &Caller,
+    ctx: &crate::socket::HandlerCtx,
+) -> Result<Value, ErrorPayload> {
+    let id = SessionId(parse_uuid(&req_str(args, "id")?)?);
+    if !caller_may_read_messages(caller, id) {
+        return Err(ErrorPayload::new(
+            "permission_denied",
+            "sessions.tail on another session is host-only",
+        ));
+    }
+    let row = sessions::get(&ctx.central, id).map_err(db_err)?;
+    let since_in = args.get("since_in_seq").and_then(Value::as_i64);
+    let since_out = args.get("since_out_seq").and_then(Value::as_i64);
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_i64)
+        .unwrap_or(TAIL_LIMIT_DEFAULT)
+        .clamp(1, TAIL_LIMIT_MAX);
+
+    let paths = SessionPaths::new(&ctx.data_dir, row.agent_group_id, id);
+    let inbound = read_message_rows(&paths.inbound_db, Direction::In, since_in, limit);
+    let outbound = read_message_rows(&paths.outbound_db, Direction::Out, since_out, limit);
+
+    let last_in_seq = max_seq(&inbound).or(since_in).unwrap_or(0);
+    let last_out_seq = max_seq(&outbound).or(since_out).unwrap_or(0);
+
+    let mut rows: Vec<MessageRow> = inbound;
+    rows.extend(outbound);
+    // RFC3339 UTC timestamps sort lexicographically; fall back to seq so
+    // same-instant rows keep a stable order.
+    rows.sort_by(|a, b| a.ts.cmp(&b.ts).then(a.seq.cmp(&b.seq)));
+
+    Ok(json!({
+        "session_id": id.as_uuid().to_string(),
+        "rows": rows,
+        "last_in_seq": last_in_seq,
+        "last_out_seq": last_out_seq,
+    }))
+}
+
+/// Whether `caller` may read message content for `session`: the host
+/// always, an agent only for its own session.
+fn caller_may_read_messages(caller: &Caller, session: SessionId) -> bool {
+    match caller {
+        Caller::Host => true,
+        Caller::Agent { session_id, .. } => *session_id == session,
+    }
+}
+
+/// Direction tag on a tail row: which per-session DB it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    In,
+    Out,
+}
+
+impl Direction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::In => "in",
+            Self::Out => "out",
+        }
+    }
+}
+
+/// One message row as surfaced by `sessions.get` / `sessions.tail`.
+#[derive(Debug, serde::Serialize)]
+struct MessageRow {
+    direction: &'static str,
+    seq: i64,
+    kind: String,
+    status: String,
+    ts: String,
+    preview: String,
+}
+
+fn max_seq(rows: &[MessageRow]) -> Option<i64> {
+    rows.iter().map(|r| r.seq).max()
+}
+
+/// Read up to `limit` rows from one per-session DB, oldest-first.
+///
+/// `since_seq: Some(n)` returns rows with `seq > n` (ascending);
+/// `None` returns the *last* `limit` rows. A missing or unreadable DB
+/// yields an empty list (the session may simply never have spawned) —
+/// never an error, because message rows are supplemental to the session
+/// row itself.
+fn read_message_rows(
+    db_path: &Path,
+    direction: Direction,
+    since_seq: Option<i64>,
+    limit: i64,
+) -> Vec<MessageRow> {
+    let Some(conn) = open_session_db_readonly(db_path) else {
+        return Vec::new();
+    };
+    match query_message_rows(&conn, direction, since_seq, limit) {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!(
+                error = %e,
+                path = %db_path.display(),
+                "sessions handler: per-session DB query failed; returning no rows",
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// Open a per-session DB strictly for reading. Prefers a read-only
+/// handle; falls back to read-write-no-create because a WAL database
+/// whose `-shm` file is absent can refuse pure read-only openers
+/// (`SQLITE_READONLY_CANTINIT`). No writes are ever issued either way.
+fn open_session_db_readonly(path: &Path) -> Option<Connection> {
+    if !path.exists() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .or_else(|_| Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE))
+        .ok()?;
+    conn.execute_batch("PRAGMA busy_timeout=5000;").ok()?;
+    Some(conn)
+}
+
+fn query_message_rows(
+    conn: &Connection,
+    direction: Direction,
+    since_seq: Option<i64>,
+    limit: i64,
+) -> rusqlite::Result<Vec<MessageRow>> {
+    // `messages_in` carries its own status column; outbound delivery
+    // status lives in `processing_ack` keyed by message id.
+    let sql = match (direction, since_seq.is_some()) {
+        (Direction::In, true) => {
+            "SELECT seq, kind, status, timestamp, content FROM messages_in
+             WHERE seq > ?1 ORDER BY seq ASC LIMIT ?2"
+        }
+        (Direction::In, false) => {
+            "SELECT seq, kind, status, timestamp, content FROM
+               (SELECT seq, kind, status, timestamp, content FROM messages_in
+                ORDER BY seq DESC LIMIT ?1)
+             ORDER BY seq ASC"
+        }
+        (Direction::Out, true) => {
+            "SELECT m.seq, m.kind, COALESCE(p.status, 'pending') AS status,
+                    m.timestamp, m.content
+             FROM messages_out m
+             LEFT JOIN processing_ack p ON p.message_id = m.id
+             WHERE m.seq > ?1 ORDER BY m.seq ASC LIMIT ?2"
+        }
+        (Direction::Out, false) => {
+            "SELECT seq, kind, status, timestamp, content FROM
+               (SELECT m.seq AS seq, m.kind AS kind,
+                       COALESCE(p.status, 'pending') AS status,
+                       m.timestamp AS timestamp, m.content AS content
+                FROM messages_out m
+                LEFT JOIN processing_ack p ON p.message_id = m.id
+                ORDER BY m.seq DESC LIMIT ?1)
+             ORDER BY seq ASC"
+        }
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let map_row = |row: &rusqlite::Row<'_>| {
+        let content: String = row.get("content")?;
+        Ok(MessageRow {
+            direction: direction.as_str(),
+            seq: row.get("seq")?,
+            kind: row.get("kind")?,
+            status: row.get("status")?,
+            ts: row.get("timestamp")?,
+            preview: content_preview(&content),
+        })
+    };
+    let rows = if let Some(since) = since_seq {
+        stmt.query_map(rusqlite::params![since, limit], map_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    } else {
+        stmt.query_map(rusqlite::params![limit], map_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    Ok(rows)
+}
+
+/// Render a short, redacted, single-line preview of a message `content`
+/// column. Chat-shaped payloads (`{"text": ...}`) surface the text;
+/// anything else surfaces its compact JSON. Secrets are redacted through
+/// the same pass the log pipeline uses (`copperclaw_runner::redact_secrets`)
+/// *before* truncation so a cut can never expose a partial secret.
+fn content_preview(raw: &str) -> String {
+    let text = match serde_json::from_str::<Value>(raw) {
+        Ok(Value::Object(map)) => map
+            .get("text")
+            .and_then(Value::as_str)
+            .map_or_else(|| Value::Object(map.clone()).to_string(), str::to_owned),
+        Ok(other) => other.to_string(),
+        Err(_) => raw.to_string(),
+    };
+    let redacted = copperclaw_runner::redact_secrets(&text);
+    let flat = redacted.replace(['\n', '\r'], " ");
+    let mut out: String = flat.chars().take(PREVIEW_CHARS).collect();
+    if flat.chars().count() > PREVIEW_CHARS {
+        out.push_str("...");
+    }
+    out
 }
 
 /// `sessions.delete` — drop the central DB row, cascade per-session
@@ -180,14 +436,26 @@ mod tests {
     #[test]
     fn get_by_id() {
         let (db, s, _g) = db_with_session();
-        let v = get(&json!({"id": s.as_uuid().to_string()}), &db).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx_with(db, tmp.path().to_path_buf());
+        let v = get(&json!({"id": s.as_uuid().to_string()}), &Caller::Host, &ctx).unwrap();
         assert_eq!(v["id"].as_str().unwrap(), s.as_uuid().to_string());
+        // No per-session DBs on disk → empty recents, never an error.
+        assert_eq!(v["recent_inbound"], json!([]));
+        assert_eq!(v["recent_outbound"], json!([]));
     }
 
     #[test]
     fn get_missing_is_not_found() {
         let db = CentralDb::open_in_memory().unwrap();
-        let err = get(&json!({"id": uuid::Uuid::now_v7().to_string()}), &db).unwrap_err();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx_with(db, tmp.path().to_path_buf());
+        let err = get(
+            &json!({"id": uuid::Uuid::now_v7().to_string()}),
+            &Caller::Host,
+            &ctx,
+        )
+        .unwrap_err();
         assert_eq!(err.code, "not_found");
     }
 
@@ -216,7 +484,7 @@ mod tests {
         assert_eq!(v["deleted"], s.as_uuid().to_string());
         assert_eq!(v["agent_group_id"], ag.as_uuid().to_string());
         // Session is gone from the central DB.
-        let err = get(&json!({"id": s.as_uuid().to_string()}), &ctx.central).unwrap_err();
+        let err = get(&json!({"id": s.as_uuid().to_string()}), &Caller::Host, &ctx).unwrap_err();
         assert_eq!(err.code, "not_found");
     }
 
@@ -229,7 +497,7 @@ mod tests {
         let err = delete(&json!({"id": s.as_uuid().to_string()}), &ctx).unwrap_err();
         assert_eq!(err.code, "container_not_stopped");
         // Session still present.
-        assert!(get(&json!({"id": s.as_uuid().to_string()}), &ctx.central).is_ok());
+        assert!(get(&json!({"id": s.as_uuid().to_string()}), &Caller::Host, &ctx).is_ok());
     }
 
     #[test]
@@ -239,7 +507,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ctx = ctx_with(db, tmp.path().to_path_buf());
         delete(&json!({"id": s.as_uuid().to_string(), "force": true}), &ctx).unwrap();
-        let err = get(&json!({"id": s.as_uuid().to_string()}), &ctx.central).unwrap_err();
+        let err = get(&json!({"id": s.as_uuid().to_string()}), &Caller::Host, &ctx).unwrap_err();
         assert_eq!(err.code, "not_found");
     }
 
@@ -274,5 +542,260 @@ mod tests {
         let v = delete(&json!({"id": s.as_uuid().to_string()}), &ctx).unwrap();
         // No directory pre-existed.
         assert_eq!(v["directory_removed"], false);
+    }
+
+    // ---- D2: sessions.get message previews + sessions.tail ---------------
+
+    use chrono::{Duration, Utc};
+    use copperclaw_db::session::{open_inbound, open_outbound};
+    use copperclaw_db::tables::{messages_in, messages_out};
+    use copperclaw_types::{MessageId, MessageKind};
+
+    fn inbound_write(text: &str, at_offset_secs: i64) -> messages_in::WriteInbound {
+        messages_in::WriteInbound {
+            id: MessageId::new(),
+            kind: MessageKind::Chat,
+            timestamp: Utc::now() + Duration::seconds(at_offset_secs),
+            content: json!({"text": text}),
+            trigger: true,
+            on_wake: false,
+            process_after: None,
+            recurrence: None,
+            series_id: None,
+            platform_id: None,
+            channel_type: None,
+            thread_id: None,
+            source_session_id: None,
+            reply_to: None,
+            is_group: None,
+        }
+    }
+
+    fn outbound_write(
+        kind: MessageKind,
+        text: &str,
+        at_offset_secs: i64,
+    ) -> messages_out::WriteOutbound {
+        messages_out::WriteOutbound {
+            id: MessageId::new(),
+            in_reply_to: None,
+            timestamp: Utc::now() + Duration::seconds(at_offset_secs),
+            deliver_after: None,
+            recurrence: None,
+            kind,
+            platform_id: None,
+            channel_type: None,
+            thread_id: None,
+            content: json!({"text": text}),
+        }
+    }
+
+    /// Seed the per-session DBs under `data_dir` for `(ag, s)` with
+    /// `n_in` inbound chats and `n_out` outbound chats at increasing
+    /// timestamps (inbound at even offsets, outbound at odd, so the
+    /// merged order strictly interleaves in→out→in→out…).
+    fn seed_session_dbs(
+        data_dir: &Path,
+        ag: AgentGroupId,
+        s: SessionId,
+        n_in: usize,
+        n_out: usize,
+    ) {
+        let paths = SessionPaths::new(data_dir, ag, s);
+        let in_conn = open_inbound(&paths).unwrap();
+        for i in 0..n_in {
+            let off = i64::try_from(i).unwrap() * 2;
+            messages_in::insert(&in_conn, &inbound_write(&format!("inbound {i}"), off)).unwrap();
+        }
+        let out_conn = open_outbound(&paths).unwrap();
+        for i in 0..n_out {
+            let off = i64::try_from(i).unwrap() * 2 + 1;
+            messages_out::insert(
+                &out_conn,
+                &outbound_write(MessageKind::Chat, &format!("outbound {i}"), off),
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn get_attaches_last_ten_rows_per_direction() {
+        let (db, s, ag) = db_with_session();
+        let tmp = tempfile::tempdir().unwrap();
+        seed_session_dbs(tmp.path(), ag, s, 12, 12);
+        let ctx = ctx_with(db, tmp.path().to_path_buf());
+        let v = get(&json!({"id": s.as_uuid().to_string()}), &Caller::Host, &ctx).unwrap();
+        let inbound = v["recent_inbound"].as_array().unwrap();
+        let outbound = v["recent_outbound"].as_array().unwrap();
+        assert_eq!(inbound.len(), 10, "capped at the last 10 inbound rows");
+        assert_eq!(outbound.len(), 10, "capped at the last 10 outbound rows");
+        // Oldest rows (0, 1) fell off; newest are present, oldest-first.
+        assert_eq!(inbound[0]["preview"], "inbound 2");
+        assert_eq!(inbound[9]["preview"], "inbound 11");
+        // Row shape: kind, status, ts, preview.
+        for row in inbound.iter().chain(outbound.iter()) {
+            assert!(row["kind"].is_string());
+            assert!(row["status"].is_string());
+            assert!(row["ts"].is_string());
+            assert!(row["preview"].is_string());
+        }
+        assert_eq!(inbound[0]["kind"], "chat");
+        assert_eq!(inbound[0]["status"], "pending");
+        // Outbound status comes from processing_ack (absent → pending).
+        assert_eq!(outbound[0]["status"], "pending");
+    }
+
+    #[test]
+    fn get_agent_caller_sees_own_messages_but_not_foreign() {
+        let (db, s, ag) = db_with_session();
+        let tmp = tempfile::tempdir().unwrap();
+        seed_session_dbs(tmp.path(), ag, s, 1, 0);
+        let ctx = ctx_with(db, tmp.path().to_path_buf());
+        let own = Caller::Agent {
+            session_id: s,
+            agent_group_id: ag,
+            messaging_group_id: None,
+        };
+        let v = get(&json!({"id": s.as_uuid().to_string()}), &own, &ctx).unwrap();
+        assert_eq!(v["recent_inbound"].as_array().unwrap().len(), 1);
+
+        let foreign = Caller::Agent {
+            session_id: SessionId::new(),
+            agent_group_id: ag,
+            messaging_group_id: None,
+        };
+        let v = get(&json!({"id": s.as_uuid().to_string()}), &foreign, &ctx).unwrap();
+        // Row-only response: previews are withheld entirely.
+        assert!(v.get("recent_inbound").is_none());
+        assert!(v.get("recent_outbound").is_none());
+        // But the session row itself still comes back (back-compat).
+        assert_eq!(v["id"].as_str().unwrap(), s.as_uuid().to_string());
+    }
+
+    #[test]
+    fn tail_merges_rows_in_time_order_with_directions() {
+        let (db, s, ag) = db_with_session();
+        let tmp = tempfile::tempdir().unwrap();
+        seed_session_dbs(tmp.path(), ag, s, 2, 2);
+        let ctx = ctx_with(db, tmp.path().to_path_buf());
+        let v = tail(&json!({"id": s.as_uuid().to_string()}), &Caller::Host, &ctx).unwrap();
+        let rows = v["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 4);
+        // Interleaved by timestamp: in, out, in, out.
+        let dirs: Vec<&str> = rows
+            .iter()
+            .map(|r| r["direction"].as_str().unwrap())
+            .collect();
+        assert_eq!(dirs, vec!["in", "out", "in", "out"]);
+        let previews: Vec<&str> = rows
+            .iter()
+            .map(|r| r["preview"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            previews,
+            vec!["inbound 0", "outbound 0", "inbound 1", "outbound 1"]
+        );
+        // Cursors reflect the max seq seen per direction.
+        assert!(v["last_in_seq"].as_i64().unwrap() > 0);
+        assert!(v["last_out_seq"].as_i64().unwrap() > 0);
+    }
+
+    #[test]
+    fn tail_since_seq_returns_only_newer_rows() {
+        let (db, s, ag) = db_with_session();
+        let tmp = tempfile::tempdir().unwrap();
+        seed_session_dbs(tmp.path(), ag, s, 2, 2);
+        let ctx = ctx_with(db, tmp.path().to_path_buf());
+        let first = tail(&json!({"id": s.as_uuid().to_string()}), &Caller::Host, &ctx).unwrap();
+        let (in_seq, out_seq) = (first["last_in_seq"].clone(), first["last_out_seq"].clone());
+
+        // Nothing new yet.
+        let again = tail(
+            &json!({
+                "id": s.as_uuid().to_string(),
+                "since_in_seq": in_seq,
+                "since_out_seq": out_seq,
+            }),
+            &Caller::Host,
+            &ctx,
+        )
+        .unwrap();
+        assert!(again["rows"].as_array().unwrap().is_empty());
+        // Cursors are carried forward even when no rows arrive.
+        assert_eq!(again["last_in_seq"], first["last_in_seq"]);
+        assert_eq!(again["last_out_seq"], first["last_out_seq"]);
+
+        // A new outbound row lands (concurrent-writer shape: WAL reader).
+        let paths = SessionPaths::new(tmp.path(), ag, s);
+        let out_conn = open_outbound(&paths).unwrap();
+        messages_out::insert(&out_conn, &outbound_write(MessageKind::Chat, "fresh", 99)).unwrap();
+
+        let update = tail(
+            &json!({
+                "id": s.as_uuid().to_string(),
+                "since_in_seq": first["last_in_seq"],
+                "since_out_seq": first["last_out_seq"],
+            }),
+            &Caller::Host,
+            &ctx,
+        )
+        .unwrap();
+        let rows = update["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["preview"], "fresh");
+        assert_eq!(rows[0]["direction"], "out");
+    }
+
+    #[test]
+    fn tail_foreign_agent_caller_is_denied() {
+        let (db, s, ag) = db_with_session();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx_with(db, tmp.path().to_path_buf());
+        let foreign = Caller::Agent {
+            session_id: SessionId::new(),
+            agent_group_id: ag,
+            messaging_group_id: None,
+        };
+        let err = tail(&json!({"id": s.as_uuid().to_string()}), &foreign, &ctx).unwrap_err();
+        assert_eq!(err.code, "permission_denied");
+    }
+
+    #[test]
+    fn tail_missing_session_is_not_found() {
+        let db = CentralDb::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = ctx_with(db, tmp.path().to_path_buf());
+        let err = tail(
+            &json!({"id": SessionId::new().as_uuid().to_string()}),
+            &Caller::Host,
+            &ctx,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "not_found");
+    }
+
+    #[test]
+    fn preview_extracts_chat_text_and_truncates() {
+        let long = "x".repeat(300);
+        let p = content_preview(&json!({"text": long}).to_string());
+        assert_eq!(p.chars().count(), PREVIEW_CHARS + 3);
+        assert!(p.ends_with("..."));
+        // Non-chat shapes surface compact JSON.
+        let p = content_preview(&json!({"breadcrumb": {"tool": "shell"}}).to_string());
+        assert!(p.contains("breadcrumb"));
+        // Non-JSON content passes through raw.
+        assert_eq!(content_preview("plain"), "plain");
+    }
+
+    #[test]
+    fn preview_redacts_secrets_before_truncation() {
+        let secret = format!("sk-ant-{}", "a1B2".repeat(20));
+        let text = format!("here is a key {secret} in a message");
+        let p = content_preview(&json!({"text": text}).to_string());
+        assert!(!p.contains(&secret), "raw secret must not survive: {p}");
+        assert!(p.contains("[REDACTED]"));
+        // Newlines are flattened so a preview is always one line.
+        let p = content_preview(&json!({"text": "a\nb\r\nc"}).to_string());
+        assert!(!p.contains('\n'));
     }
 }
