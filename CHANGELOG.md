@@ -26,6 +26,8 @@ adheres to [Semantic Versioning](https://semver.org/).
   `crates/copperclaw-modules/src/context.rs`.
 ### Added
 
+- The core coding disciplines (git repo per project with `git init` first, commit per working increment, run the project's own check command before marking a code todo `completed`, always end with an artifact-delivery step via `send_file` / `artifact_path` / `expose_preview`) are now inlined into the base system prompt as a static `CODING_PREAMBLE` block whenever the group's tool profile can write code (`coding` / `full`, including the unset default) — previously these rules lived only in the `coding-task` skill body and were lost whenever a model (worst on small local ones) forgot `load_skill("coding-task")`; the block points at that skill for depth, is fixed per spawn so the prompt-cache prefix stays stable, and `messaging` / `minimal` profiles gain zero new prompt bytes (pinned by test) (`crates/copperclaw-host/src/container_manager/prompt.rs`, `runner_config.rs`).
+
 - `cclaw doctor` now runs a `disk-space` check on the filesystem holding the install's data dir (`resolve_install_root()/data`): WARN below 10% free or 20 GiB free, FAIL below 3% or 5 GiB, each with a `fix:` reclaim-space hint; a `statvfs` failure or unresolvable path degrades the row to WARN instead of panicking. Closes the gap that left doctor all-OK through a live root-fs-full incident that silently degraded the host. Thresholds live in the pure, unit-tested `disk_level()`; free space is read via `rustix::fs::statvfs` (safe, no `unsafe` — new `rustix` workspace dep with the `fs` feature) (`crates/copperclaw-cclaw/src/lib.rs`).
 
 ### Fixed (delivery loop no longer poisoned by a duplicate `delivered` record — 2026-07-15)
