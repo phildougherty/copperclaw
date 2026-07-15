@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (Slack typing degrades gracefully off assistant threads — 2026-07-15)
+
+- Slack `set_typing` now only calls `assistant.threads.setStatus` on assistant-thread surfaces (a thread inside the bot's `D…`-prefixed DM — the one place Slack renders the status) and skips the silent-no-op API round-trip on channel/group threads and thread-less DMs; the gap is reported through a new additive `ChannelAdapter::typing_indicator_visible(platform_id, thread_id)` capability flag (default `true`; Slack overrides it) that the M18 Task HUD (card H1) will read to force `hud_mode=full` + a tighter edit cadence where the platform shows no typing signal (`crates/copperclaw-channels/slack/src/adapter.rs`, `crates/copperclaw-channels/core/src/adapter.rs`).
+
 ### Fixed (typing-indicator ticker backs off on channel rate limits — 2026-07-15)
 
 - **The host's `TypingTicker` no longer hammers a rate-limited channel every
@@ -23,6 +27,8 @@ adheres to [Semantic Versioning](https://semver.org/).
 ### Added
 
 - `read_file` lines-mode results now report `total_lines` (whole-file line count, free since lines mode already reads the file) and `shell` accepts `tail_bytes: N` to keep the LAST N bytes of each stream instead of the first 32 KiB — the recovery path for a failing build whose error sits at the end of the log; on default head-truncation the appended hint now names `tail_bytes` and the `/data/.jobs/` background-log path, both tool descriptions document the paging/tail idioms, and defaults stay byte-identical (no new fields unless the new parameters are used) (`crates/copperclaw-mcp/src/tools/computer_use.rs`).
+- The core coding disciplines (git repo per project with `git init` first, commit per working increment, run the project's own check command before marking a code todo `completed`, always end with an artifact-delivery step via `send_file` / `artifact_path` / `expose_preview`) are now inlined into the base system prompt as a static `CODING_PREAMBLE` block whenever the group's tool profile can write code (`coding` / `full`, including the unset default) — previously these rules lived only in the `coding-task` skill body and were lost whenever a model (worst on small local ones) forgot `load_skill("coding-task")`; the block points at that skill for depth, is fixed per spawn so the prompt-cache prefix stays stable, and `messaging` / `minimal` profiles gain zero new prompt bytes (pinned by test) (`crates/copperclaw-host/src/container_manager/prompt.rs`, `runner_config.rs`).
+
 - `cclaw doctor` now runs a `disk-space` check on the filesystem holding the install's data dir (`resolve_install_root()/data`): WARN below 10% free or 20 GiB free, FAIL below 3% or 5 GiB, each with a `fix:` reclaim-space hint; a `statvfs` failure or unresolvable path degrades the row to WARN instead of panicking. Closes the gap that left doctor all-OK through a live root-fs-full incident that silently degraded the host. Thresholds live in the pure, unit-tested `disk_level()`; free space is read via `rustix::fs::statvfs` (safe, no `unsafe` — new `rustix` workspace dep with the `fs` feature) (`crates/copperclaw-cclaw/src/lib.rs`).
 
 ### Fixed (delivery loop no longer poisoned by a duplicate `delivered` record — 2026-07-15)
