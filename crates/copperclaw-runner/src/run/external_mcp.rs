@@ -186,8 +186,16 @@ pub(super) async fn dispatch_external(
     //    later credentialed external action must trip the provenance gate
     //    (same treatment as a web_fetch body). Conservative: taint on any
     //    received response — over-restriction here only fails safe.
-    deps.tool_ctx
-        .mark_untrusted_context(&format!("mcp:{}:{}", route.server, route.tool));
+    //
+    //    Exception: the reserved `__preview` relay (M17 session-preview tools)
+    //    is answered by the HOST's preview broker, not a remote server — the
+    //    response (URL + fixed note, or a host-composed error) carries no
+    //    attacker-influenceable content, and tainting it would block the
+    //    paired same-turn `close_preview` (itself credentialed-external).
+    if route.server != crate::run::preview::PREVIEW_SERVER {
+        deps.tool_ctx
+            .mark_untrusted_context(&format!("mcp:{}:{}", route.server, route.tool));
+    }
 
     (resp.result, Vec::new(), resp.is_error)
 }

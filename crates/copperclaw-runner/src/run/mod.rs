@@ -12,6 +12,7 @@
 pub(super) mod drive_turn;
 pub mod external_mcp;
 pub(super) mod formatting;
+pub mod preview;
 pub(super) mod prompt;
 pub(super) mod provider_call;
 pub(super) mod tool_dispatch;

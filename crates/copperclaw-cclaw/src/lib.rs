@@ -1789,6 +1789,10 @@ const EDITABLE_SCALAR_FIELDS: &[&str] = &[
     "assistant_name",
     "max_messages_per_prompt",
     "tool_profile",
+    // M17 session-preview proxy: master switch + bind interface. The host
+    // validates both (`preview_enabled` bool; `preview_bind` IP-or-null).
+    "preview_enabled",
+    "preview_bind",
 ];
 
 /// Fields the host returns but does not accept on update. They are

@@ -20,6 +20,7 @@ pub mod handlers;
 pub mod image_health;
 pub mod log_redact;
 pub mod orphans;
+pub mod preview;
 pub mod sessions;
 pub mod socket;
 pub mod todo_watcher;

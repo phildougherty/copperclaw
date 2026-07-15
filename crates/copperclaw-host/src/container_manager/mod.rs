@@ -198,6 +198,12 @@ pub struct ContainerManager {
     /// deployment's responsibility (host networking / docker bridge); see the
     /// module docs.
     pub(crate) broker_base_url: Option<String>,
+    /// M17 session-preview manager. When wired (via [`Self::with_preview`]),
+    /// the idle-stop and crash-restart paths tear down every preview the
+    /// session had open — a stopped/removed container's bridge IP is dead (or
+    /// worse, may be reassigned), so its proxies must not outlive it. `None`
+    /// (the default, and every test constructor) is a no-op.
+    pub(crate) preview: Option<Arc<crate::preview::PreviewManager>>,
     /// Event-driven wake accelerator. When wired (via
     /// [`Self::with_wake_notify`], from the router's
     /// `inbound_wake` handle), [`Self::run_loop`] awaits it alongside the
@@ -235,9 +241,19 @@ impl ContainerManager {
             }),
             broker: None,
             broker_base_url: None,
+            preview: None,
             wake: None,
             cfg,
         }
+    }
+
+    /// Wire the M17 session-preview manager so container stop / removal tears
+    /// down the session's previews. Mutates `self` so the boot sequence can
+    /// attach it after building the manager.
+    #[must_use]
+    pub fn with_preview(mut self, preview: Arc<crate::preview::PreviewManager>) -> Self {
+        self.preview = Some(preview);
+        self
     }
 
     /// Wire an event-driven wake signal into the manager. The host passes

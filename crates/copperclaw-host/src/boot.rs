@@ -756,6 +756,18 @@ pub async fn run_host(
     )
     .await;
 
+    // 13b-pre. M17 session-preview manager: the broker behind the agent's
+    // `expose_preview` / `close_preview` tools. Wired into the delivery
+    // service (which routes the reserved `__preview` relay requests to it)
+    // and into the container manager (which tears a session's previews down
+    // when its container stops). Its idle reaper runs under the same
+    // shutdown token as every other loop.
+    let preview = crate::preview::PreviewManager::new(state.central.clone(), Arc::clone(&runtime));
+    preview.spawn_reaper(shutdown.clone());
+    state
+        .delivery
+        .set_preview_broker(Arc::clone(&preview) as Arc<dyn copperclaw_modules::PreviewBroker>);
+
     let spawned = spawn_container_manager(
         &cfg,
         state.central.clone(),
@@ -763,6 +775,7 @@ pub async fn run_host(
         shutdown.clone(),
         Arc::clone(state.sweep.spawn_tracker()),
         broker,
+        Arc::clone(&preview),
         // Event-driven wake: the router signals this handle after every
         // messages_in insert; the manager's reconcile loop ticks on it
         // immediately instead of waiting out the poll interval. Router and
@@ -960,6 +973,7 @@ fn spawn_container_manager(
     shutdown: CancellationToken,
     spawn_tracker: Arc<copperclaw_host_sweep::SpawnAttemptTracker>,
     broker: Option<(Arc<crate::container_manager::broker::BrokerState>, String)>,
+    preview: Arc<crate::preview::PreviewManager>,
     inbound_wake: Arc<tokio::sync::Notify>,
 ) -> Option<SpawnedManager> {
     let Some(image_tag) = cfg.default_image_tag.clone() else {
@@ -1038,6 +1052,7 @@ fn spawn_container_manager(
     let mut manager =
         crate::container_manager::ContainerManager::new(central, runtime, manager_cfg)
             .with_spawn_tracker(spawn_tracker)
+            .with_preview(preview)
             .with_wake_notify(inbound_wake);
     if let Some((broker_state, broker_base_url)) = broker {
         manager = manager.with_broker(broker_state, broker_base_url);
