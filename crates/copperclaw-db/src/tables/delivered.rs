@@ -20,16 +20,38 @@ pub struct Delivered {
 
 /// Record a delivery outcome for an outbound message. `delivered_at` is set
 /// to `Utc::now()` at the moment of insertion.
+///
+/// Idempotent: `message_out_id` is the primary key, and a second record
+/// attempt for a row that is already recorded is a no-op (`ON CONFLICT DO
+/// NOTHING`) rather than a `UNIQUE` constraint failure. This is deliberate
+/// defence-in-depth against a poisoned delivery loop. The host runs two
+/// delivery passes concurrently — the 1s active loop and the 60s sweep loop
+/// share one `DeliveryService` — and each pass reads the set of
+/// already-delivered ids ONCE at its start. That snapshot goes stale: if
+/// pass A delivers and records a row after pass B took its snapshot but
+/// before pass B reaches that same row, pass B re-sends and then tries to
+/// record the same `message_out_id` again. Under the old plain `INSERT` this
+/// raised `UNIQUE constraint failed: delivered.message_out_id`, which
+/// propagated out of the delivery pass — and because the error arm then tried
+/// to record the row a THIRD time as `failed`, hitting the same constraint,
+/// the whole pass returned `Err`, so the session's delivery loop logged the
+/// same failure on every subsequent pass. A rare duplicate send is strictly
+/// better than a permanently wedged loop, so a duplicate record is treated as
+/// success here.
+///
+/// Returns `true` when a new row was inserted, `false` when the row was
+/// already recorded (the conflict was ignored).
 pub fn insert(
     conn: &Connection,
     message_out_id: MessageId,
     platform_message_id: Option<&str>,
     status: &str,
-) -> Result<(), DbError> {
+) -> Result<bool, DbError> {
     let now = Utc::now().to_rfc3339();
-    conn.execute(
+    let affected = conn.execute(
         "INSERT INTO delivered (message_out_id, platform_message_id, status, delivered_at)
-         VALUES (?1, ?2, ?3, ?4)",
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(message_out_id) DO NOTHING",
         params![
             message_out_id.as_uuid().to_string(),
             platform_message_id,
@@ -37,7 +59,7 @@ pub fn insert(
             now,
         ],
     )?;
-    Ok(())
+    Ok(affected > 0)
 }
 
 /// Return just the ids of delivered messages. Hot path on every container
@@ -124,12 +146,25 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_message_out_id_is_error() {
+    fn duplicate_message_out_id_is_idempotent_no_op() {
+        // A second record attempt for the same message_out_id must NOT raise a
+        // UNIQUE constraint failure (which used to poison the delivery loop —
+        // see the `insert` docs). It is a silent no-op that keeps the first row.
         let (_tmp, conn) = fresh_inbound();
         let id = MessageId::new();
-        insert(&conn, id, None, "ok").unwrap();
-        let err = insert(&conn, id, None, "ok").unwrap_err();
-        assert!(matches!(err, DbError::Sqlite(_)));
+        assert!(
+            insert(&conn, id, Some("p-1"), "ok").unwrap(),
+            "first insert reports newly inserted"
+        );
+        assert!(
+            !insert(&conn, id, Some("p-2"), "failed").unwrap(),
+            "duplicate insert reports already-recorded"
+        );
+        // The original row survives unchanged; the duplicate is dropped.
+        let rows = list(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].platform_message_id.as_deref(), Some("p-1"));
+        assert_eq!(rows[0].status, "ok");
     }
 
     #[test]

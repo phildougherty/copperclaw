@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (delivery loop no longer poisoned by a duplicate `delivered` record — 2026-07-15)
+
+- Made `delivered::insert` (`copperclaw-db/src/tables/delivered.rs`) idempotent
+  (`ON CONFLICT(message_out_id) DO NOTHING`, returns whether a row was newly
+  inserted) and made the delivery pass's in-flight claim atomic via the DashMap
+  `entry` API (`copperclaw-host-delivery/src/service.rs::process_session_once`).
+  Root cause: the 1s active loop and the 60s sweep loop share one
+  `DeliveryService` and each pass reads the already-delivered id set once at its
+  start; a concurrent pass could re-send and re-record a row whose snapshot went
+  stale, and the old plain `INSERT` raised `UNIQUE constraint failed:
+  delivered.message_out_id` — which then made the error arm try to record the
+  row a third time as `failed`, hitting the same constraint and erroring the
+  whole pass on every subsequent tick until the session was deleted.
+
 ### Added (runner external-MCP consumer — host-proxied — 2026-06-03)
 
 The in-container runner can now consume **external** MCP servers configured on a
