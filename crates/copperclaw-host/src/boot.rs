@@ -1205,16 +1205,12 @@ fn collect_forward_env() -> Vec<(String, String)> {
         // set `OLLAMA_BASE_URL=http://172.17.0.1:11434` (or
         // `host.docker.internal`) in the install's .env.
         "OLLAMA_BASE_URL",
-        // UX visibility flags read by the runner inside the container.
-        // The runner's `RunnerToolCtx::with_breadcrumbs_from_env()`
-        // checks `COPPERCLAW_TOOL_BREADCRUMBS`; without forwarding the
-        // operator's `.env` value never reaches the container and the
-        // flag silently no-ops.
-        "COPPERCLAW_TOOL_BREADCRUMBS",
-        // Breadcrumb presentation style read by the runner: `rolling`
-        // collapses a turn's tools into one expandable activity chip
-        // (else legacy per-tool chips). Same forward-or-no-op caveat.
-        "COPPERCLAW_BREADCRUMB_STYLE",
+        // NOTE: the old `COPPERCLAW_TOOL_BREADCRUMBS` /
+        // `COPPERCLAW_BREADCRUMB_STYLE` forwards were removed with the
+        // M18 Task HUD (card H1): per-tool breadcrumb chips no longer
+        // exist, and the HUD's `COPPERCLAW_HUD_MODE` knob reaches the
+        // runner through `runner.json`'s `hud_mode` field instead of
+        // container env forwarding.
         // Per-session turn cap override. The runner main reads this
         // to size `max_tool_turns` (default 60); operators bump it for
         // long build/research sessions that would otherwise bail mid-flight.

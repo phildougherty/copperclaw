@@ -137,6 +137,47 @@ pub struct RunnerConfigFile {
     /// applies.
     #[serde(default)]
     pub sender_role: Option<String>,
+    /// M18 Task HUD mode: `"full"` (live self-editing HUD, default) /
+    /// `"final"` (only the end-of-task summary line) / `"off"` (no HUD;
+    /// bare-channel periodic status rows only). Plumbed in from the
+    /// host's `COPPERCLAW_HUD_MODE` env var by the container manager.
+    /// Unset / unknown values resolve to [`HudMode::Full`] (a WARN is
+    /// logged for an unknown value).
+    #[serde(default)]
+    pub hud_mode: Option<String>,
+}
+
+/// How the per-inbound Task HUD behaves. See
+/// [`RunnerConfigFile::hud_mode`] for the wire values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HudMode {
+    /// Live self-editing HUD: posted at the first tool call, edited in
+    /// place after every tool batch (and on a wall-clock cadence), then
+    /// collapsed to a one-line "done in M:SS, N tool calls" summary.
+    #[default]
+    Full,
+    /// Only the end-of-task one-line summary — no live churn during the
+    /// run. Forced back to [`Self::Full`] on surfaces where the platform
+    /// shows no typing indicator (the user would otherwise see nothing
+    /// at all for the whole run).
+    Final,
+    /// No HUD. Bare-channel behaviour (periodic status rows after long
+    /// silent stretches) still applies everywhere.
+    Off,
+}
+
+impl HudMode {
+    /// Parse the wire value. `None` for unknown strings (caller warns
+    /// and falls back to the default).
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "full" => Some(Self::Full),
+            "final" => Some(Self::Final),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
 }
 
 /// Fully-resolved runner config.
@@ -213,6 +254,9 @@ pub struct RunnerConfig {
     /// group profile ceiling still applies). An unknown role string
     /// also resolves to `None` (a WARN is logged).
     pub sender_role: Option<crate::policy::SenderRole>,
+    /// Resolved Task HUD mode. Defaults to [`HudMode::Full`] when the
+    /// JSON file omits `hud_mode` (or carries an unknown value).
+    pub hud_mode: HudMode,
 }
 
 impl RunnerConfig {
@@ -280,6 +324,16 @@ impl RunnerConfig {
                 role
             }
         };
+        let hud_mode = match file.hud_mode.as_deref() {
+            None | Some("") => HudMode::default(),
+            Some(s) => HudMode::parse(s).unwrap_or_else(|| {
+                tracing::warn!(
+                    hud_mode = s,
+                    "unknown hud_mode in runner config; falling back to `full`"
+                );
+                HudMode::Full
+            }),
+        };
         Ok(Self {
             session_id,
             agent_group_id,
@@ -324,6 +378,7 @@ impl RunnerConfig {
             surface_thinking: file.surface_thinking.unwrap_or(false),
             tool_profile,
             sender_role,
+            hud_mode,
         })
     }
 
@@ -429,6 +484,7 @@ mod tests {
             surface_thinking: None,
             tool_profile: None,
             sender_role: None,
+            hud_mode: None,
         }
     }
 
@@ -449,6 +505,37 @@ mod tests {
         let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "k")]);
         let cfg = RunnerConfig::from_file_struct(good_file(), &env).unwrap();
         assert_eq!(cfg.tool_profile, crate::policy::ToolProfile::Full);
+    }
+
+    #[test]
+    fn hud_mode_defaults_to_full_when_unset() {
+        let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "k")]);
+        let cfg = RunnerConfig::from_file_struct(good_file(), &env).unwrap();
+        assert_eq!(cfg.hud_mode, HudMode::Full);
+    }
+
+    #[test]
+    fn hud_mode_parsed_from_file() {
+        let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "k")]);
+        for (wire, want) in [
+            ("full", HudMode::Full),
+            ("final", HudMode::Final),
+            ("off", HudMode::Off),
+        ] {
+            let mut file = good_file();
+            file.hud_mode = Some(wire.into());
+            let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+            assert_eq!(cfg.hud_mode, want, "wire value {wire}");
+        }
+    }
+
+    #[test]
+    fn hud_mode_unknown_falls_back_to_full() {
+        let mut file = good_file();
+        file.hud_mode = Some("bogus".into());
+        let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "k")]);
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert_eq!(cfg.hud_mode, HudMode::Full);
     }
 
     #[test]

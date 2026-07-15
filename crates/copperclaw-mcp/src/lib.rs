@@ -30,10 +30,10 @@ pub use client::{FilteredMcpClient, McpClient, McpToolTransport, RemoteTool, Sha
 pub use context::{
     AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec, EditMessageSpec,
     EmitTodoListSpec, InstallSpec, MemoryHitView, MemorySearchSpec, MockToolContext,
-    OutboundToolEffect, Recipient, SUBAGENT_MAX_TOKENS_LIMIT, SUBAGENT_MAX_TURNS_LIMIT,
-    SUBAGENT_WALL_CLOCK_SECS, ScheduleSpec, SendCardSpec, SendFileSpec, SendMessageSpec,
-    SubagentRequest, SubagentResult, SubagentToolCall, TaskSummary, ToolContext, ToolEffectAck,
-    UpdateTaskSpec,
+    OriginatingChannel, OutboundToolEffect, Recipient, SUBAGENT_MAX_TOKENS_LIMIT,
+    SUBAGENT_MAX_TURNS_LIMIT, SUBAGENT_WALL_CLOCK_SECS, ScheduleSpec, SendCardSpec, SendFileSpec,
+    SendMessageSpec, SubagentRequest, SubagentResult, SubagentToolCall, TaskSummary, ToolContext,
+    ToolEffectAck, UpdateTaskSpec,
 };
 pub use error::{McpError, ToolError};
 pub use external::{call_external_tool, connect_filtered};
