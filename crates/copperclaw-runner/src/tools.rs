@@ -166,12 +166,6 @@ pub struct RunnerToolCtx {
     /// routes `to: None` outbound rows up to the parent's inbound
     /// instead of dumping into the inherited messaging-group channel.
     source_session_id: Option<copperclaw_types::SessionId>,
-    /// When true, the runner emits a brief `[tool] tool_name` chat
-    /// message to the originating channel at the start of every
-    /// "visible" tool call (`shell` / `web_search` / `write_file` /
-    /// `explore` / etc.). Off by default; enabled via the
-    /// `COPPERCLAW_TOOL_BREADCRUMBS` env var.
-    breadcrumbs_enabled: bool,
     /// One-shot gate for child agents (sessions with
     /// [`source_session_id`] set). Flipped to `true` the first time the
     /// child emits a `send_message` effect. The runner's main loop
@@ -187,15 +181,6 @@ pub struct RunnerToolCtx {
     /// Stays `false` forever for root sessions (no `source_session_id`),
     /// so the gate is a no-op for the top-level conversation.
     parent_reply_sent: Arc<std::sync::atomic::AtomicBool>,
-    /// Chip presentation: `Chips` (one chip message per tool, legacy
-    /// default) or `Rolling` (one aggregate "activity" chip per turn that
-    /// accumulates every tool step into an expandable region). Set via
-    /// `COPPERCLAW_BREADCRUMB_STYLE`.
-    breadcrumb_style: BreadcrumbStyle,
-    /// Rolling-mode accumulator for the current turn (the steps shown in
-    /// the aggregate chip's expandable region, plus whether the chip has
-    /// been emitted yet this turn). Reset by [`Self::begin_activity`].
-    activity: Arc<std::sync::Mutex<ActivityState>>,
     /// Active skill's `allowed-tools` (set by the `load_skill` tool when
     /// the loaded skill declared an `allowed-tools` frontmatter list).
     /// `None` means no tool-scoping skill is active. The runner's
@@ -233,35 +218,12 @@ pub struct RunnerToolCtx {
     external_approved: Arc<std::sync::atomic::AtomicBool>,
 }
 
-/// How tool-progress breadcrumbs are presented in chat.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum BreadcrumbStyle {
-    /// One chip message per tool call, edited Running → Done in place.
-    #[default]
-    Chips,
-    /// One aggregate "activity" chip per turn: a collapsed summary line
-    /// plus an expandable, per-step-styled list of every tool the turn
-    /// ran. Far less chat churn for long, tool-heavy turns.
-    Rolling,
-}
-
-/// Per-turn accumulator backing [`BreadcrumbStyle::Rolling`].
-#[derive(Debug, Default)]
-struct ActivityState {
-    /// Tool steps for the current turn, in start order. Each is a
-    /// `Breadcrumb` (tool/detail/status/summary) the renderer styles
-    /// individually inside the expandable region.
-    steps: Vec<copperclaw_channels_core::Breadcrumb>,
-    /// True once the aggregate chip has been emitted this turn, so later
-    /// events edit it (via `update_breadcrumb`) instead of opening a new
-    /// chip. Reset to `false` at the start of each turn.
-    chip_open: bool,
-}
-
-/// Stable pseudo tool-name the aggregate chip rides under so the host's
-/// "most recent Breadcrumb row for this tool/origin" correlation edits
-/// the same chip across a turn's tool events.
-const ACTIVITY_CHIP_TOOL: &str = "activity";
+/// Stable pseudo tool-name the per-inbound Task HUD message rides
+/// under. The host's delivery loop correlates `update_breadcrumb`
+/// System rows to "the most recent Breadcrumb-kind row for this
+/// tool/origin", so a fixed name means every HUD update edits the same
+/// platform message in place (on adapters with an edit API).
+pub const TASK_HUD_TOOL: &str = "task";
 
 impl RunnerToolCtx {
     /// Build a fresh context around the given outbound DB handle and outbox
@@ -275,10 +237,7 @@ impl RunnerToolCtx {
             in_subagent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             originating: Arc::new(std::sync::Mutex::new(OriginatingRouting::default())),
             source_session_id: None,
-            breadcrumbs_enabled: false,
             parent_reply_sent: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            breadcrumb_style: BreadcrumbStyle::default(),
-            activity: Arc::new(std::sync::Mutex::new(ActivityState::default())),
             active_skill_allowed: Arc::new(std::sync::Mutex::new(None)),
             memory_db_path: None,
             context_tainted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -298,148 +257,42 @@ impl RunnerToolCtx {
                 .load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// Enable native tool-progress breadcrumb chips for visible tools.
-    /// **Default: ON.** Reads the `COPPERCLAW_TOOL_BREADCRUMBS` env var
-    /// to allow an operator to OPT OUT (`0`/`false`/`no`/`off`); any
-    /// other value (including unset) leaves the default on. Called at
-    /// runner startup from `main.rs`.
+    /// M18 Task HUD emit path: one self-editing status message per
+    /// inbound task, riding the breadcrumb rails.
     ///
-    /// The default flip (off → on) shipped alongside the slice-2
-    /// `deliver_breadcrumb` native renderers — there's no UX payoff if
-    /// the surface is gated behind an env var nobody knows to set.
-    /// The opt-out exists for noisy / low-bandwidth deployments where
-    /// the operator doesn't want chip churn in chat.
-    #[must_use]
-    pub fn with_breadcrumbs_from_env(mut self) -> Self {
-        self.breadcrumbs_enabled = !matches!(
-            std::env::var("COPPERCLAW_TOOL_BREADCRUMBS").ok().as_deref(),
-            Some("0" | "false" | "no" | "off")
-        );
-        // `rolling` collapses a turn's tools into one expandable activity
-        // chip; anything else (incl. unset) keeps the legacy per-tool chips.
-        self.breadcrumb_style = match std::env::var("COPPERCLAW_BREADCRUMB_STYLE").ok().as_deref() {
-            Some("rolling") => BreadcrumbStyle::Rolling,
-            _ => BreadcrumbStyle::Chips,
-        };
-        self
-    }
-
-    /// Force-enable breadcrumbs. Used by tests so we don't depend on
-    /// process-level env vars in concurrent test runs.
-    #[must_use]
-    pub fn with_breadcrumbs_enabled(mut self, enabled: bool) -> Self {
-        self.breadcrumbs_enabled = enabled;
-        self
-    }
-
-    /// Force the breadcrumb presentation style. Used by tests.
-    #[must_use]
-    pub fn with_breadcrumb_style(mut self, style: BreadcrumbStyle) -> Self {
-        self.breadcrumb_style = style;
-        self
-    }
-
-    /// Start a fresh rolling-activity turn: clear the accumulated steps so
-    /// the next tool opens a new aggregate chip. Called via the
-    /// [`copperclaw_mcp::ToolContext::begin_activity`] trait hook at the
-    /// top of each `drive_turn`. No-op in `Chips` mode.
-    fn reset_activity(&self) {
-        if self.breadcrumb_style != BreadcrumbStyle::Rolling {
-            return;
-        }
-        if let Ok(mut act) = self.activity.lock() {
-            act.steps.clear();
-            act.chip_open = false;
-        }
-    }
-
-    /// Emit a [`MessageKind::Breadcrumb`] outbound row capturing the
-    /// agent's tool invocation as a `Running` chip on the originating
-    /// channel. The host's delivery loop hands the row to the
-    /// adapter's `deliver_breadcrumb` hook, which renders a compact
-    /// native chip (Telegram HTML `<code>`, Slack Block Kit `context`,
-    /// Discord embed footer, Google Chat cards v2, Matrix `m.notice`
-    /// with `<code>`) — or falls back to the legacy `[tool] detail`
-    /// text line on adapters without a native renderer.
+    /// `first: true` posts the HUD as a fresh
+    /// [`MessageKind::Breadcrumb`] row (the delivery loop renders it as
+    /// a native chip — Telegram HTML `<code>`, Slack Block Kit
+    /// `context`, Discord embed footer — or a plain text line on
+    /// adapters without a native renderer). `first: false` writes a
+    /// `MessageKind::System` `update_breadcrumb` row; the delivery loop
+    /// resolves the prior HUD row's platform message id and edits it in
+    /// place via the adapter's `edit_message`-backed
+    /// `deliver_breadcrumb(existing_message_id)` path.
     ///
-    /// No-op when breadcrumbs are disabled, the tool isn't on the
-    /// "visible" allowlist, or there's no channel routing to send to
-    /// (e.g. agent-to-agent rows where the destination is the parent).
+    /// The caller (the runner's [`crate::run`] Task HUD) only invokes
+    /// this on channels whose adapter supports in-place edits
+    /// (`copperclaw_channels_core::capabilities::supports_message_edit`)
+    /// — bare channels get the periodic-status-row fallback instead, so
+    /// HUD updates never degrade into fresh-message spam.
     ///
-    /// We also stash a row-id → seq mapping (via the
-    /// `_breadcrumb_seq` field on the row body) so a subsequent
-    /// [`Self::emit_breadcrumb_finish`] can reference the original
-    /// chip when emitting the update — adapters with an in-place edit
-    /// API use this to replace the chip's contents rather than emit a
-    /// fresh row.
-    ///
-    /// Errors are swallowed: breadcrumbs are best-effort UX
-    /// observability, NOT load-bearing — a failed write shouldn't
-    /// abort the turn or surface to the user.
-    pub async fn emit_breadcrumb(&self, tool_name: &str, input: Option<&serde_json::Value>) {
-        if !self.breadcrumbs_enabled {
-            return;
-        }
-        if !is_visible_breadcrumb_tool(tool_name) {
-            return;
-        }
-        // Skip for child sessions only (their recipient is another
-        // LLM, not a user). Origin's channel routing may be None —
-        // delivery's session_routing wiring fallback resolves it.
-        // See [`should_skip_user_facing_emit`] for the 2026-05-24
-        // incident that motivated this relaxation.
+    /// Skipped for child sessions (their recipient is another LLM, not
+    /// a user). Errors are swallowed: the HUD is best-effort UX
+    /// observability, NOT load-bearing — a failed write must not abort
+    /// the turn.
+    pub async fn emit_task_hud(
+        &self,
+        breadcrumb: &copperclaw_channels_core::Breadcrumb,
+        first: bool,
+    ) {
         if self.should_skip_user_facing_emit() {
             return;
         }
         let origin = self.current_originating();
-        // Per-tool detail: shell command, search query, file path…
-        // Falls back to None when extraction fails so the renderer
-        // shows just `[tool_name]`.
-        let detail = input.and_then(|v| breadcrumb_detail(tool_name, v));
-        if self.breadcrumb_style == BreadcrumbStyle::Rolling {
-            self.emit_rolling_start(tool_name, detail, &origin).await;
-            return;
-        }
-        let breadcrumb = copperclaw_channels_core::Breadcrumb {
-            tool_name: tool_name.to_owned(),
-            detail,
-            status: copperclaw_channels_core::BreadcrumbStatus::Running,
-            summary: None,
-            steps: Vec::new(),
-        };
-        // `breadcrumb.validate()` is best-effort: a too-long detail
-        // would just cap the renderer's display. Skip validation here
-        // (the runner already truncates detail strings to 80 chars).
-        self.insert_breadcrumb_row(&breadcrumb, &origin).await;
-    }
-
-    /// Rolling-mode tool start: append a `Running` step and emit (first
-    /// tool of the turn) or edit (subsequent) the single aggregate chip.
-    async fn emit_rolling_start(
-        &self,
-        tool_name: &str,
-        detail: Option<String>,
-        origin: &OriginatingRouting,
-    ) {
-        let (aggregate, first) = {
-            let Ok(mut act) = self.activity.lock() else {
-                return;
-            };
-            act.steps.push(copperclaw_channels_core::Breadcrumb {
-                tool_name: tool_name.to_owned(),
-                detail,
-                status: copperclaw_channels_core::BreadcrumbStatus::Running,
-                summary: None,
-                steps: Vec::new(),
-            });
-            let first = !act.chip_open;
-            act.chip_open = true;
-            (activity_aggregate(&act.steps), first)
-        };
         if first {
-            self.insert_breadcrumb_row(&aggregate, origin).await;
+            self.insert_breadcrumb_row(breadcrumb, &origin).await;
         } else {
-            self.insert_update_breadcrumb_row(ACTIVITY_CHIP_TOOL, &aggregate, origin)
+            self.insert_update_breadcrumb_row(TASK_HUD_TOOL, breadcrumb, &origin)
                 .await;
         }
     }
@@ -489,111 +342,6 @@ impl RunnerToolCtx {
         let mut guard = self.outbound.lock().await;
         let conn: &mut Connection = &mut guard;
         let _ = insert_outbound_row(conn, MessageId::new(), payload, &routed);
-    }
-
-    /// Finalisation half of [`Self::emit_breadcrumb`]. Writes a
-    /// `MessageKind::System` row carrying an `update_breadcrumb`
-    /// action; the host's delivery loop looks up the most recent
-    /// Breadcrumb-kind row for this tool/origin and, on adapters with
-    /// an edit API, edits the original chip in place. Adapters
-    /// without an edit API surface a fresh chip with the completion
-    /// blurb (visible but harmless).
-    ///
-    /// Best-effort: swallows errors and is a no-op when breadcrumbs
-    /// are disabled, the tool isn't on the visible allowlist, or the
-    /// originating routing was cleared.
-    pub async fn emit_breadcrumb_finish(
-        &self,
-        tool_name: &str,
-        input: Option<&serde_json::Value>,
-        ok: bool,
-        summary: Option<&str>,
-    ) {
-        if !self.breadcrumbs_enabled {
-            return;
-        }
-        if !is_visible_breadcrumb_tool(tool_name) {
-            return;
-        }
-        // Mirror `emit_breadcrumb`'s relaxation — skip only for child
-        // sessions, not when origin lacks channel routing.
-        if self.should_skip_user_facing_emit() {
-            return;
-        }
-        let origin = self.current_originating();
-        let detail = input.and_then(|v| breadcrumb_detail(tool_name, v));
-        if self.breadcrumb_style == BreadcrumbStyle::Rolling {
-            self.emit_rolling_finish(tool_name, detail, ok, summary, &origin)
-                .await;
-            return;
-        }
-        let status = if ok {
-            copperclaw_channels_core::BreadcrumbStatus::Done
-        } else {
-            copperclaw_channels_core::BreadcrumbStatus::Failed
-        };
-        let breadcrumb = copperclaw_channels_core::Breadcrumb {
-            tool_name: tool_name.to_owned(),
-            detail,
-            status,
-            summary: summary.map(str::to_owned),
-            steps: Vec::new(),
-        };
-        // Update rows ride the System path so the delivery loop's
-        // existing system-action dispatch handles them. The row inherits
-        // the originating inbound's channel routing so the adapter can
-        // look up the prior chip's platform message id.
-        self.insert_update_breadcrumb_row(tool_name, &breadcrumb, &origin)
-            .await;
-    }
-
-    /// Rolling-mode tool finish: flip the matching `Running` step to
-    /// `Done`/`Failed` and edit the aggregate chip in place.
-    async fn emit_rolling_finish(
-        &self,
-        tool_name: &str,
-        detail: Option<String>,
-        ok: bool,
-        summary: Option<&str>,
-        origin: &OriginatingRouting,
-    ) {
-        let status = if ok {
-            copperclaw_channels_core::BreadcrumbStatus::Done
-        } else {
-            copperclaw_channels_core::BreadcrumbStatus::Failed
-        };
-        let aggregate = {
-            let Ok(mut act) = self.activity.lock() else {
-                return;
-            };
-            // Flip the earliest still-running step for this tool. Parallel
-            // calls to the same tool finish in execution order, so the
-            // earliest Running one is the right match.
-            if let Some(step) = act.steps.iter_mut().find(|s| {
-                s.tool_name == tool_name
-                    && s.status == copperclaw_channels_core::BreadcrumbStatus::Running
-            }) {
-                step.status = status;
-                step.summary = summary.map(str::to_owned);
-                if step.detail.is_none() {
-                    step.detail = detail;
-                }
-            } else {
-                // A finish with no matching start (shouldn't happen, but be
-                // safe): append it so the step is still surfaced.
-                act.steps.push(copperclaw_channels_core::Breadcrumb {
-                    tool_name: tool_name.to_owned(),
-                    detail,
-                    status,
-                    summary: summary.map(str::to_owned),
-                    steps: Vec::new(),
-                });
-                act.chip_open = true;
-            }
-            activity_aggregate(&act.steps)
-        };
-        self.insert_update_breadcrumb_row(ACTIVITY_CHIP_TOOL, &aggregate, origin)
-            .await;
     }
 
     /// Slice-3.5 opt-in emit path. Persists a structured
@@ -672,7 +420,7 @@ impl RunnerToolCtx {
     ///
     /// Errors are swallowed: diff cards are best-effort UX, NOT
     /// load-bearing — a failed write must not abort the file edit.
-    /// Same no-route guard as `emit_breadcrumb`: skip when there's no
+    /// Same no-route guard as `emit_task_hud`: skip when there's no
     /// human channel on the receiving end (agent-to-agent rows).
     pub async fn emit_diff(&self, diff: copperclaw_channels_core::DiffCard) {
         // Mirror `emit_status`'s relaxation — see
@@ -1089,12 +837,7 @@ impl ToolContext for RunnerToolCtx {
         Self::parent_reply_sent(self)
     }
 
-    async fn emit_breadcrumb(&self, tool_name: &str, input: Option<&serde_json::Value>) {
-        Self::emit_breadcrumb(self, tool_name, input).await;
-    }
-
     fn begin_activity(&self) {
-        self.reset_activity();
         // Reset the coarse-provenance taint at the top of every turn: a
         // web_fetch / untrusted memory hit taints only the turn it happened
         // in. The next turn starts clean (subject to a fresh approval / a
@@ -1102,14 +845,25 @@ impl ToolContext for RunnerToolCtx {
         self.reset_taint();
     }
 
-    async fn emit_breadcrumb_finish(
-        &self,
-        tool_name: &str,
-        input: Option<&serde_json::Value>,
-        ok: bool,
-        summary: Option<&str>,
-    ) {
-        Self::emit_breadcrumb_finish(self, tool_name, input, ok, summary).await;
+    fn originating_channel(&self) -> Option<copperclaw_mcp::OriginatingChannel> {
+        // Child sessions report to another LLM, not a user channel —
+        // expose no channel so the Task HUD stays inactive for them
+        // (mirrors `should_skip_user_facing_emit`).
+        if self.should_skip_user_facing_emit() {
+            return None;
+        }
+        let origin = self.current_originating();
+        origin
+            .channel_type
+            .map(|channel_type| copperclaw_mcp::OriginatingChannel {
+                channel_type,
+                platform_id: origin.platform_id,
+                thread_id: origin.thread_id,
+            })
+    }
+
+    async fn emit_task_hud(&self, breadcrumb: &copperclaw_channels_core::Breadcrumb, first: bool) {
+        Self::emit_task_hud(self, breadcrumb, first).await;
     }
 
     async fn emit_thinking(&self, text: &str, redacted: bool, model: Option<&str>) {
@@ -1288,95 +1042,6 @@ fn apply_effect(
     }
 }
 
-/// Strip model-emitted reasoning blocks from outbound chat text.
-///
-/// Some models (notably Haiku 4.5 in our live testing) ignore the
-/// "private reasoning" convention of the Anthropic API's
-/// `thinking` content blocks and instead emit literal
-/// `<thinking>...</thinking>` markup as part of regular text output.
-/// That markup leaks to end users — they see the model "talking to
-/// itself" in the chat. Strip it here, before the row hits
-/// `messages_out`, so no future-channel-adapter has to worry about
-/// the same payload.
-///
-/// Conservative: only strip closed `<thinking>...</thinking>` pairs.
-/// An unterminated `<thinking>` without a closing tag is preserved
-/// verbatim so we never accidentally swallow large chunks of
-/// legitimate prose. Case-insensitive open/close tags, multi-line
-/// content, leaves the surrounding text intact.
-/// Build the collapsed aggregate chip from the current rolling steps.
-/// The top-level fields are the one-line summary (current activity +
-/// completed/total count) shown collapsed; `steps` carries the full
-/// per-step list the renderer styles individually in the expandable
-/// region. The aggregate's `tool_name` is the stable [`ACTIVITY_CHIP_TOOL`]
-/// so the host correlation edits one chip across the turn.
-fn activity_aggregate(
-    steps: &[copperclaw_channels_core::Breadcrumb],
-) -> copperclaw_channels_core::Breadcrumb {
-    use copperclaw_channels_core::BreadcrumbStatus;
-    let total = steps.len();
-    let done = steps
-        .iter()
-        .filter(|s| s.status != BreadcrumbStatus::Running)
-        .count();
-    let any_running = steps.iter().any(|s| s.status == BreadcrumbStatus::Running);
-    let any_failed = steps.iter().any(|s| s.status == BreadcrumbStatus::Failed);
-    // Current activity = the latest still-running step, else the last step.
-    let current = steps
-        .iter()
-        .rev()
-        .find(|s| s.status == BreadcrumbStatus::Running)
-        .or_else(|| steps.last());
-    let detail = current.map(|s| match &s.detail {
-        Some(d) if !d.is_empty() => format!("{} {}", s.tool_name, d),
-        _ => s.tool_name.clone(),
-    });
-    let status = if any_running {
-        BreadcrumbStatus::Running
-    } else if any_failed {
-        BreadcrumbStatus::Failed
-    } else {
-        BreadcrumbStatus::Done
-    };
-    let summary = Some(if total == 1 {
-        "1 step".to_owned()
-    } else {
-        format!("{done}/{total} steps")
-    });
-    copperclaw_channels_core::Breadcrumb {
-        tool_name: ACTIVITY_CHIP_TOOL.to_owned(),
-        detail,
-        status,
-        summary,
-        steps: steps.to_vec(),
-    }
-}
-
-/// Allow-list of tool names that get a chat breadcrumb when
-/// `COPPERCLAW_TOOL_BREADCRUMBS=1`. Limited to tools that (a) take
-/// long enough that the user wants to know about them and (b)
-/// aren't already user-visible via their own outbound emission.
-fn is_visible_breadcrumb_tool(name: &str) -> bool {
-    matches!(
-        name,
-        "shell"
-            | "web_search"
-            | "web_fetch"
-            | "explore"
-            | "read_file"
-            | "write_file"
-            | "edit_file"
-            | "multi_edit"
-            | "apply_patch"
-            | "copy_file"
-            | "grep"
-            | "glob"
-            | "create_agent"
-            | "install_packages"
-            | "add_mcp_server"
-    )
-}
-
 /// Per-tool detail extractor: given a tool name and the model's input
 /// JSON, return a short string (≤80 chars) for the user-visible
 /// breadcrumb. Returns `None` when the tool has no useful arg to
@@ -1386,7 +1051,7 @@ fn is_visible_breadcrumb_tool(name: &str) -> bool {
 /// Caps are deliberately tight: the breadcrumb is a UX cue, not the
 /// full request. Long commands / paths / queries get truncated with
 /// an ellipsis so the chat line stays readable on mobile.
-fn breadcrumb_detail(name: &str, input: &serde_json::Value) -> Option<String> {
+pub(crate) fn breadcrumb_detail(name: &str, input: &serde_json::Value) -> Option<String> {
     const MAX_LEN: usize = 80;
     let field = |key: &str| -> Option<String> {
         input.get(key).and_then(|v| v.as_str()).map(str::to_owned)
@@ -1443,6 +1108,22 @@ fn breadcrumb_detail(name: &str, input: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Strip model-emitted reasoning blocks from outbound chat text.
+///
+/// Some models (notably Haiku 4.5 in our live testing) ignore the
+/// "private reasoning" convention of the Anthropic API's
+/// `thinking` content blocks and instead emit literal
+/// `<thinking>...</thinking>` markup as part of regular text output.
+/// That markup leaks to end users — they see the model "talking to
+/// itself" in the chat. Strip it here, before the row hits
+/// `messages_out`, so no future-channel-adapter has to worry about
+/// the same payload.
+///
+/// Conservative: only strip closed `<thinking>...</thinking>` pairs.
+/// An unterminated `<thinking>` without a closing tag is preserved
+/// verbatim so we never accidentally swallow large chunks of
+/// legitimate prose. Case-insensitive open/close tags, multi-line
+/// content, leaves the surrounding text intact.
 fn strip_reasoning_blocks(text: &str) -> String {
     // Hand-rolled scan instead of pulling in `regex` just for this.
     // Looking for `<thinking>` followed by anything up to `</thinking>`,
@@ -2128,43 +1809,6 @@ mod tests {
     }
 
     #[test]
-    fn activity_aggregate_summarises_steps_and_current() {
-        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
-        let steps = vec![
-            Breadcrumb::running("read_file")
-                .with_detail("a.rs")
-                .finished(true, Some("10 lines".into())),
-            Breadcrumb::running("shell").with_detail("cargo build"),
-        ];
-        let agg = activity_aggregate(&steps);
-        assert_eq!(agg.tool_name, ACTIVITY_CHIP_TOOL);
-        // A still-running step → overall Running.
-        assert_eq!(agg.status, BreadcrumbStatus::Running);
-        assert_eq!(agg.summary.as_deref(), Some("1/2 steps"));
-        // Current activity = the latest running step.
-        assert_eq!(agg.detail.as_deref(), Some("shell cargo build"));
-        assert_eq!(agg.steps.len(), 2);
-    }
-
-    #[test]
-    fn activity_aggregate_status_rolls_up_done_and_failed() {
-        use copperclaw_channels_core::{Breadcrumb, BreadcrumbStatus};
-        let all_ok = vec![
-            Breadcrumb::running("a").finished(true, None),
-            Breadcrumb::running("b").finished(true, None),
-        ];
-        assert_eq!(activity_aggregate(&all_ok).status, BreadcrumbStatus::Done);
-        let with_fail = vec![
-            Breadcrumb::running("a").finished(true, None),
-            Breadcrumb::running("b").finished(false, Some("boom".into())),
-        ];
-        assert_eq!(
-            activity_aggregate(&with_fail).status,
-            BreadcrumbStatus::Failed
-        );
-    }
-
-    #[test]
     fn breadcrumb_detail_web_search_includes_query() {
         let input = serde_json::json!({"query": "rust async runtime comparison"});
         assert_eq!(
@@ -2223,18 +1867,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn emit_breadcrumb_writes_breadcrumb_kind_row() {
-        // The runner used to write a Chat-kind row; this verifies the
-        // switch to MessageKind::Breadcrumb with the canonical
-        // `Breadcrumb` payload under `content.breadcrumb`. The
-        // host's delivery loop dispatches on the kind so it can call
-        // the adapter's `deliver_breadcrumb` hook (native chip
-        // rendering) instead of plain `deliver`.
+    async fn emit_task_hud_first_writes_breadcrumb_kind_row() {
+        // The HUD's first emit is a fresh MessageKind::Breadcrumb row
+        // carrying the canonical `Breadcrumb` payload under
+        // `content.breadcrumb`. The host's delivery loop dispatches on
+        // the kind so it can call the adapter's `deliver_breadcrumb`
+        // hook (native chip rendering) instead of plain `deliver`.
         let tmp = tempfile::tempdir().unwrap();
         let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
         let conn = open_outbound(&paths).unwrap();
-        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
-            .with_breadcrumbs_enabled(true);
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone());
         ctx.set_originating(OriginatingRouting {
             channel_type: Some("telegram".into()),
             platform_id: Some("chat-1".into()),
@@ -2242,72 +1884,80 @@ mod tests {
             in_reply_to: None,
             source_session_id: None,
         });
-        ctx.emit_breadcrumb(
-            "shell",
-            Some(&serde_json::json!({"command": "cargo check"})),
-        )
-        .await;
+        let hud = copperclaw_channels_core::Breadcrumb {
+            tool_name: TASK_HUD_TOOL.to_owned(),
+            detail: Some("running: shell".into()),
+            status: copperclaw_channels_core::BreadcrumbStatus::Running,
+            summary: Some("1 tool call | 0:03".into()),
+            steps: Vec::new(),
+        };
+        ctx.emit_task_hud(&hud, true).await;
         let row = last_row(&ctx).await;
         assert_eq!(row.kind, MessageKind::Breadcrumb);
         let bc: copperclaw_channels_core::Breadcrumb =
             serde_json::from_value(row.content["breadcrumb"].clone()).unwrap();
-        assert_eq!(bc.tool_name, "shell");
-        assert_eq!(bc.detail.as_deref(), Some("cargo check"));
+        assert_eq!(bc.tool_name, TASK_HUD_TOOL);
+        assert_eq!(bc.detail.as_deref(), Some("running: shell"));
         assert_eq!(
             bc.status,
             copperclaw_channels_core::BreadcrumbStatus::Running
         );
-        assert!(bc.summary.is_none());
         // Channel routing is inherited from the originating inbound so
         // the delivery loop has a target to dispatch to.
         assert_eq!(row.platform_id.as_deref(), Some("chat-1"));
     }
 
     #[tokio::test]
-    async fn emit_breadcrumb_writes_even_without_channel_routing_for_root_session() {
-        // 2026-05-24 fix: the gate used to skip when origin had NULL
-        // channel routing. Lived through with a parent runner processing
-        // an agent-dispatched inbound (child report up to parent): the
-        // inbound row carries NULL channel_type/platform_id but
-        // delivery's session_routing wiring fallback fills in the user
-        // channel before dispatch. The old gate over-skipped, so the
-        // user saw no breadcrumb chips during multi-minute synthesis.
-        // The new gate skips ONLY for child sessions (source_session_id
-        // set on the runner ctx); root sessions emit regardless.
+    async fn emit_task_hud_update_writes_update_system_row() {
+        // Subsequent HUD emits are MessageKind::System rows carrying an
+        // `update_breadcrumb` action anchored to the stable
+        // TASK_HUD_TOOL name. The host-delivery service's system-action
+        // dispatcher resolves the prior HUD row's platform message id
+        // and edits the same message in place on adapters with an edit
+        // API.
         let tmp = tempfile::tempdir().unwrap();
         let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
         let conn = open_outbound(&paths).unwrap();
-        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
-            .with_breadcrumbs_enabled(true);
-        // No originating set → no channel info, but THIS IS A ROOT
-        // session (no source_session_id) so the emit must fire.
-        ctx.emit_breadcrumb("shell", Some(&serde_json::json!({"command": "ls"})))
-            .await;
-        let guard = ctx.outbound.lock().await;
-        let rows = copperclaw_db::tables::messages_out::list_due(&guard).unwrap();
+        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone());
+        ctx.set_originating(OriginatingRouting {
+            channel_type: Some("slack".into()),
+            platform_id: Some("C123".into()),
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: None,
+        });
+        let hud = copperclaw_channels_core::Breadcrumb {
+            tool_name: TASK_HUD_TOOL.to_owned(),
+            detail: None,
+            status: copperclaw_channels_core::BreadcrumbStatus::Done,
+            summary: Some("done in 1:23, 12 tool calls".into()),
+            steps: Vec::new(),
+        };
+        ctx.emit_task_hud(&hud, false).await;
+        let row = last_row(&ctx).await;
+        assert_eq!(row.kind, MessageKind::System);
+        let bc: copperclaw_channels_core::Breadcrumb =
+            serde_json::from_value(row.content["update_breadcrumb"]["breadcrumb"].clone()).unwrap();
+        assert_eq!(bc.status, copperclaw_channels_core::BreadcrumbStatus::Done);
+        assert_eq!(bc.summary.as_deref(), Some("done in 1:23, 12 tool calls"));
         assert_eq!(
-            rows.len(),
-            1,
-            "root-session breadcrumb must land even with NULL routing"
+            row.content["update_breadcrumb"]["tool_name"], TASK_HUD_TOOL,
+            "tool_name is duplicated at the action level so the host's \
+             dispatcher can look up the prior HUD row without \
+             deserialising the full Breadcrumb",
         );
-        assert_eq!(rows[0].kind, MessageKind::Breadcrumb);
-        // Routing fields on the row stay NULL; delivery's
-        // session_routing fallback resolves them at dispatch time.
-        assert!(rows[0].channel_type.is_none());
-        assert!(rows[0].platform_id.is_none());
     }
 
     #[tokio::test]
-    async fn emit_breadcrumb_skips_for_child_session() {
+    async fn emit_task_hud_skips_for_child_session() {
         // Child sessions (source_session_id set on the runner) report
-        // up to a parent LLM, not a user — breadcrumb chatter would
-        // just bloat the parent's history.
+        // up to a parent LLM, not a user — HUD chatter would just
+        // bloat the parent's history.
         let tmp = tempfile::tempdir().unwrap();
         let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
         let conn = open_outbound(&paths).unwrap();
         let parent_session = SessionId::new();
         let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
-            .with_breadcrumbs_enabled(true)
             .with_source_session_id(parent_session);
         ctx.set_originating(OriginatingRouting {
             channel_type: Some("telegram".into()),
@@ -2316,98 +1966,52 @@ mod tests {
             in_reply_to: None,
             source_session_id: Some(parent_session),
         });
-        ctx.emit_breadcrumb("shell", Some(&serde_json::json!({"command": "ls"})))
-            .await;
+        let hud = copperclaw_channels_core::Breadcrumb {
+            tool_name: TASK_HUD_TOOL.to_owned(),
+            detail: None,
+            status: copperclaw_channels_core::BreadcrumbStatus::Running,
+            summary: None,
+            steps: Vec::new(),
+        };
+        ctx.emit_task_hud(&hud, true).await;
         let guard = ctx.outbound.lock().await;
         let rows = copperclaw_db::tables::messages_out::list_due(&guard).unwrap();
-        assert!(rows.is_empty(), "child-session breadcrumb must skip");
+        assert!(rows.is_empty(), "child-session HUD emit must skip");
     }
 
     #[tokio::test]
-    async fn emit_breadcrumb_skips_when_disabled() {
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
-        let conn = open_outbound(&paths).unwrap();
-        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone());
-        // breadcrumbs_enabled defaults to false.
-        ctx.set_originating(OriginatingRouting {
-            channel_type: Some("telegram".into()),
-            platform_id: Some("chat-1".into()),
-            thread_id: None,
-            in_reply_to: None,
-            source_session_id: None,
-        });
-        ctx.emit_breadcrumb("shell", Some(&serde_json::json!({"command": "ls"})))
-            .await;
-        let guard = ctx.outbound.lock().await;
-        let rows = copperclaw_db::tables::messages_out::list_due(&guard).unwrap();
-        assert!(rows.is_empty());
-    }
-
-    #[tokio::test]
-    async fn emit_breadcrumb_finish_writes_update_system_row() {
-        // The finish hook writes a MessageKind::System row carrying
-        // an `update_breadcrumb` action. The host-delivery service's
-        // system-action dispatcher (see `update_breadcrumb`
-        // registration in copperclaw-host-delivery) translates this
-        // into an in-place edit of the original chip.
-        let tmp = tempfile::tempdir().unwrap();
-        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
-        let conn = open_outbound(&paths).unwrap();
-        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
-            .with_breadcrumbs_enabled(true);
+    async fn originating_channel_exposes_routing_for_root_session_only() {
+        use copperclaw_mcp::ToolContext as _;
+        let (_tmp, ctx) = fresh_ctx();
+        // No originating set: no channel to expose.
+        assert!(ctx.originating_channel().is_none());
         ctx.set_originating(OriginatingRouting {
             channel_type: Some("slack".into()),
-            platform_id: Some("C123".into()),
-            thread_id: None,
+            platform_id: Some("D042".into()),
+            thread_id: Some("99.0".into()),
             in_reply_to: None,
             source_session_id: None,
         });
-        ctx.emit_breadcrumb_finish(
-            "shell",
-            Some(&serde_json::json!({"command": "cargo check"})),
-            true,
-            Some("passed (0.4s)"),
-        )
-        .await;
-        let row = last_row(&ctx).await;
-        assert_eq!(row.kind, MessageKind::System);
-        let bc: copperclaw_channels_core::Breadcrumb =
-            serde_json::from_value(row.content["update_breadcrumb"]["breadcrumb"].clone()).unwrap();
-        assert_eq!(bc.status, copperclaw_channels_core::BreadcrumbStatus::Done);
-        assert_eq!(bc.summary.as_deref(), Some("passed (0.4s)"));
-        assert_eq!(
-            row.content["update_breadcrumb"]["tool_name"], "shell",
-            "tool_name is duplicated at the action level so the host's \
-             dispatcher can look up the prior chip without deserialising \
-             the full Breadcrumb",
-        );
-    }
+        let oc = ctx.originating_channel().expect("root session exposes it");
+        assert_eq!(oc.channel_type, "slack");
+        assert_eq!(oc.platform_id.as_deref(), Some("D042"));
+        assert_eq!(oc.thread_id.as_deref(), Some("99.0"));
 
-    #[tokio::test]
-    async fn emit_breadcrumb_finish_marks_failed_when_not_ok() {
+        // Child sessions expose nothing (the HUD must stay inactive —
+        // their recipient is another LLM, not a user).
         let tmp = tempfile::tempdir().unwrap();
         let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
         let conn = open_outbound(&paths).unwrap();
-        let ctx = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
-            .with_breadcrumbs_enabled(true);
-        ctx.set_originating(OriginatingRouting {
+        let child = RunnerToolCtx::new(Arc::new(Mutex::new(conn)), paths.outbox.clone())
+            .with_source_session_id(SessionId::new());
+        child.set_originating(OriginatingRouting {
             channel_type: Some("slack".into()),
-            platform_id: Some("C123".into()),
+            platform_id: Some("D042".into()),
             thread_id: None,
             in_reply_to: None,
             source_session_id: None,
         });
-        ctx.emit_breadcrumb_finish("shell", None, false, Some("ENOENT"))
-            .await;
-        let row = last_row(&ctx).await;
-        let bc: copperclaw_channels_core::Breadcrumb =
-            serde_json::from_value(row.content["update_breadcrumb"]["breadcrumb"].clone()).unwrap();
-        assert_eq!(
-            bc.status,
-            copperclaw_channels_core::BreadcrumbStatus::Failed
-        );
-        assert_eq!(bc.summary.as_deref(), Some("ENOENT"));
+        assert!(child.originating_channel().is_none());
     }
 
     fn fresh_ctx() -> (tempfile::TempDir, RunnerToolCtx) {
@@ -2578,7 +2182,7 @@ mod tests {
 
     #[tokio::test]
     async fn emit_diff_writes_even_without_channel_routing_for_root_session() {
-        // Mirror of emit_breadcrumb's same-gate test — 2026-05-24 fix.
+        // Same-gate test for the user-facing-emit guard — 2026-05-24 fix.
         // Root sessions emit even when origin lacks channel routing;
         // delivery's session_routing wiring fallback fills in the user
         // channel at dispatch time.

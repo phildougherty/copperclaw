@@ -362,6 +362,11 @@ async fn run_one_turn(
         activity_pinger: Arc::new(copperclaw_runner::NoopPinger),
         // Slice-3.5 surface defaults to off — tests don't rely on it.
         surface_thinking: false,
+        // Task HUD default; the cli channel has no edit-capable
+        // adapter, so the HUD degrades to the legacy status-row path
+        // (silent within this test's runtime).
+        hud_mode: copperclaw_runner::config::HudMode::default(),
+        todo_path: paths.root.join("agent_todos.json"),
     };
     run_loop(deps).await.context("runner one-turn")?;
     Ok(())

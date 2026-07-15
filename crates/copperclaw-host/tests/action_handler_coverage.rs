@@ -58,11 +58,12 @@ fn runner_emit_set() -> HashSet<&'static str> {
         // Scheduling — every op (create / list / cancel / pause / resume /
         // update) emits the same top-level "schedule" key with an inner `op`.
         "schedule",
-        // Tool-progress chip finalisation. `emit_breadcrumb_finish` in
-        // tools.rs writes a System row carrying this action; the host's
-        // delivery service intercepts it inline (see
-        // `inline_handler_set`) and drives an in-place edit of the
-        // prior chip via `deliver_breadcrumb(..., existing_message_id)`.
+        // M18 Task HUD in-place edits. `RunnerToolCtx::emit_task_hud`
+        // (via `insert_update_breadcrumb_row` in tools.rs) writes a
+        // System row carrying this action; the host's delivery service
+        // intercepts it inline (see `inline_handler_set`) and drives an
+        // in-place edit of the prior HUD message via
+        // `deliver_breadcrumb(..., existing_message_id)`.
         "update_breadcrumb",
     ]
     .into_iter()
@@ -222,14 +223,9 @@ fn runner_emit_set_matches_source() {
                 // construct it identically). Scan its body for the same
                 // `json!({ "usage_report": ... })` first-key pattern.
                 "fn build_usage_report_payload",
-                // Trailing `(` pins this to the function definition,
-                // not the unit-test names like
-                // `fn emit_breadcrumb_finish_writes_update_system_row`
-                // that would otherwise share the prefix.
-                "fn emit_breadcrumb_finish(",
                 // The `update_breadcrumb` System action is constructed in
-                // this shared helper (used by both the legacy finish path
-                // and the rolling-activity start/finish emits).
+                // this shared helper (used by the M18 Task HUD's
+                // in-place edit emits, `RunnerToolCtx::emit_task_hud`).
                 "fn insert_update_breadcrumb_row(",
             ],
         ) {

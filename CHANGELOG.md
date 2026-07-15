@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (Task HUD: one self-editing status message per task — M18 H1, 2026-07-15)
+
+- A multi-minute agent run now surfaces ONE self-editing Task HUD message per inbound task instead of the old trio of overlapping progress mechanisms (env-gated per-tool breadcrumb chips, the 60s "still working" status row, the typing bubble alone): the HUD posts at the first tool call and is edited in place after every tool batch (plus a 30s wall-clock ticker), showing the current `agent_todos.json` step, the last tool + running/done, the cumulative tool count, and elapsed time; the final edit collapses it to a one-line "done in M:SS, N tool calls". It rides the existing breadcrumb/`update_breadcrumb` delivery rails, so it only runs on channels whose adapter supports in-place edits (static table in the new `copperclaw_channels_core::capabilities` module: telegram/slack/discord/matrix/webex); bare channels (cli, webhooks, ...) keep the old periodic status rows, and surfaces with no visible typing indicator (Slack off assistant threads, per PR #24's flag) force full HUD behaviour at a tighter 10s cadence. Config: `hud_mode = full|final|off` (default `full`), host-wide via `COPPERCLAW_HUD_MODE` in `.env` -> `runner.json` (a per-group column is deferred; migration 026 is reserved). The per-tool breadcrumb chips (`COPPERCLAW_TOOL_BREADCRUMBS` / `COPPERCLAW_BREADCRUMB_STYLE`) and the in-loop 60s status emit were removed, not left as a fourth mechanism (`crates/copperclaw-runner/src/run/hud.rs`, `run/drive_turn.rs`, `tools.rs`, `crates/copperclaw-channels/core/src/capabilities.rs`, `crates/copperclaw-host/src/container_manager/runner_config.rs`).
+
 ### Added (end-user slash commands, M18 R1 — 2026-07-15)
 
 - End-user slash commands parsed router-side (`crates/copperclaw-host-router/src/commands.rs`): `/stop` (alias `/cancel`) persists a documented `control{op:stop}` row into `messages_in` (`kind=system`, `trigger=0`, pending for M18 R2's mid-turn consumer) even while a turn is in flight; `/status` is answered by the host from central-DB state straight into `messages_out` (new `RouteOutcome::Answered`, new `SessionRoot::outbound_pool`) without waking the runner; `/compact` and `/clear` (aliases `/reset`, `/new`, telegram `@BotName` suffix and case normalised) bypass the group-chat mention gate and wire through to the runner's existing sentinels; unknown `/x` falls through to the agent unchanged. Replay fixtures per command on cli + telegram under `fixtures/{cli,telegram}/slash-*` (harness: `count_due` spawn-mirror gate + `runner_drain` manifest flag, `docs/replay-fixtures.md`).
@@ -17,6 +21,7 @@ adheres to [Semantic Versioning](https://semver.org/).
 ### Removed (dead tool-policy floor — M18 R0, 2026-07-15)
 
 - Deleted the runner's decorative `DISALLOWED_TOOLS` floor (and its `disallowed` compat module): its nine pascal-case Claude-Code built-in names (`CronCreate`, `EnterPlanMode`, ...) never matched the runner's snake_case tool inventory, so the floor denied nothing — the `ToolProfile` allow-lists (plus sender-role, active-skill, and provenance layers) are and remain the real gate. A new `tool_name_drift` integration test (`crates/copperclaw-runner/tests/tool_name_drift.rs`) now pins every name in the policy lists (exported as `policy::PROFILE_TOOL_LISTS`) to `copperclaw_mcp::build_tool_set()` so a renamed or removed tool fails CI instead of leaving a decorative allow-list (`crates/copperclaw-runner/src/policy.rs`).
+
 
 ### Changed (Slack typing degrades gracefully off assistant threads — 2026-07-15)
 

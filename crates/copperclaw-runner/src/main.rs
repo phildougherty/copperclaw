@@ -166,7 +166,6 @@ async fn main() -> Result<()> {
     };
     let mut tool_ctx_inner = RunnerToolCtx::new(outbound.clone(), paths.outbox.clone())
         .with_subagent(subagent_deps)
-        .with_breadcrumbs_from_env()
         // Per-group searchable memory store: the host bind-mounts the group's
         // `memory/` dir at `/data/memory`, so the store lives at
         // `<session_dir>/memory/memory.db`. `MemoryStore::open` creates +
@@ -222,6 +221,11 @@ async fn main() -> Result<()> {
         // The active-skill layer is applied per-call at dispatch from
         // the ToolContext.
         policy: copperclaw_runner::ToolPolicy::new(cfg.tool_profile, cfg.sender_role),
+        // M18 Task HUD: one self-editing status message per inbound
+        // task (`full` by default; host-wide override via
+        // COPPERCLAW_HUD_MODE -> runner.json's `hud_mode`).
+        hud_mode: cfg.hud_mode,
+        todo_path: std::path::PathBuf::from(copperclaw_runner::run::hud::TODO_STORE_DEFAULT_PATH),
     };
 
     tracing::info!(
@@ -343,6 +347,7 @@ mod build_provider_tests {
             surface_thinking: false,
             tool_profile: copperclaw_runner::ToolProfile::Full,
             sender_role: None,
+            hud_mode: copperclaw_runner::config::HudMode::Full,
         }
     }
 

@@ -640,6 +640,12 @@ impl ReplayHarness {
             // Replay fixtures don't exercise the slice-3.5 thinking
             // surface — default off.
             surface_thinking: false,
+            // Task HUD default (`full`). Fixture channels either lack
+            // an edit-capable adapter (cli -> legacy status rows, none
+            // within a fast replay's 60s budget) or run no tool turns,
+            // so expected outputs are unchanged.
+            hud_mode: copperclaw_runner::config::HudMode::default(),
+            todo_path: paths.root.join("agent_todos.json"),
         };
         if self.fixture.manifest.runner_drain {
             // The runner handles a pure slash-command batch synchronously

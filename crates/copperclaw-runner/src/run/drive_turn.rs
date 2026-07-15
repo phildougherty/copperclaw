@@ -3,25 +3,15 @@
 //! per-inbound cap.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use copperclaw_providers::HistoryMessage;
 
 use super::RunnerDeps;
+use super::hud::TaskHud;
 use super::provider_call::{HeartbeatTicker, run_llm_turn};
 use super::tool_dispatch::{ToolImage, invoke_tool};
 use crate::state::save_state;
-
-/// Wall-clock budget the runner gives itself between user-facing emits
-/// before it surfaces a "still working" status row. Sized to cover one
-/// or two long tool calls (npm install, large grep, file build) without
-/// chattering, while still putting a heartbeat in chat before the user
-/// concludes the agent has hung. The user-reported live failure on
-/// 2026-05-24 saw a 5+ minute silent stretch after a child sub-task
-/// failed and the parent went off building a prototype — at 60s
-/// cadence that stretch would have produced ~5 status rows.
-const STATUS_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub(super) struct TurnResult {
@@ -278,21 +268,44 @@ impl ToolLoopGuard {
 /// keeps the historical behaviour where the model sees only the
 /// pre-baked system prompt — tests that don't care about channel
 /// shape can leave it unset.
-// `drive_turn` is the central tool-loop orchestrator; its length is
-// intrinsic to the state machine (one branch per `TurnOutcome` shape
-// times the parse-error vs invoke-tool fork). Splitting further would
-// just push the locals into a struct with no readability win.
-#[allow(clippy::too_many_lines)]
 pub(super) async fn drive_turn(
     deps: &RunnerDeps,
     history: &mut Vec<HistoryMessage>,
     previous_continuation: Option<&str>,
     context_block: Option<&str>,
 ) -> Result<TurnResult> {
+    // One Task HUD per inbound: posted at the first tool call, edited
+    // in place around every tool batch (plus a wall-clock ticker), then
+    // collapsed to a one-line summary here — on the failure paths too,
+    // so a budget/loop/parse abort never strands a "Running" HUD.
+    let hud = TaskHud::new(deps);
+    let result = drive_turn_inner(deps, history, previous_continuation, context_block, &hud).await;
+    let ok = matches!(
+        &result,
+        Ok(TurnResult {
+            outcome: TurnOutcome::Done,
+            ..
+        })
+    );
+    hud.finalize(ok).await;
+    result
+}
+
+// `drive_turn_inner` is the central tool-loop orchestrator; its length
+// is intrinsic to the state machine (one branch per `TurnOutcome` shape
+// times the parse-error vs invoke-tool fork). Splitting further would
+// just push the locals into a struct with no readability win.
+#[allow(clippy::too_many_lines)]
+async fn drive_turn_inner(
+    deps: &RunnerDeps,
+    history: &mut Vec<HistoryMessage>,
+    previous_continuation: Option<&str>,
+    context_block: Option<&str>,
+    hud: &TaskHud,
+) -> Result<TurnResult> {
     let mut continuation: Option<String> = previous_continuation.map(str::to_string);
-    // Start a fresh rolling-activity chip for this turn (no-op unless
-    // COPPERCLAW_BREADCRUMB_STYLE=rolling). Subsequent tool starts/finishes
-    // accumulate into the one aggregate chip until the next drive_turn.
+    // Reset per-turn context state (the coarse-provenance taint flag)
+    // at the top of each inbound's drive.
     deps.tool_ctx.begin_activity();
     // Counts consecutive turns whose output included any
     // parse-error-tagged tool call. Reset when a turn produces a
@@ -300,14 +313,6 @@ pub(super) async fn drive_turn(
     // `MAX_TOOL_PARSE_ERROR_ATTEMPTS` so a stuck model can't loop us
     // forever.
     let mut consecutive_parse_error_turns: u32 = 0;
-    // Wall-clock anchor for the "still working" status heartbeat.
-    // Started at drive_turn entry (effectively when the runner picked
-    // up the inbound); bumped after each emit so cadence stays at
-    // `STATUS_INTERVAL` regardless of how long individual tool calls
-    // take. Cumulative `tool_runs` is reported in the status text so
-    // the user can see real progress, not just a clock tick.
-    let drive_turn_started_at = Instant::now();
-    let mut last_status_emit_at = drive_turn_started_at;
     let mut cumulative_tool_runs: usize = 0;
     let mut last_tool_name: Option<String> = None;
     // Cumulative input+output tokens spent across THIS inbound's tool
@@ -456,6 +461,10 @@ pub(super) async fn drive_turn(
             }
         }
 
+        // Task HUD: show the batch as Running before it executes (this
+        // posts the HUD on the first tool call of the inbound).
+        hud.on_batch_start(&output.tool_calls).await;
+
         // Execute the batch concurrently, then append results to history
         // in the ORIGINAL call order. Independent calls (e.g. N read_file)
         // finish in ~max(latency) instead of ~sum. Ordering-preserving
@@ -464,9 +473,11 @@ pub(super) async fn drive_turn(
         // same-path edit-family calls are serialised inside the batch (see
         // `execute_tool_batch`) because they mutate shared state.
         let batch = execute_tool_batch(deps, &output.tool_calls).await;
+        let mut batch_all_ok = true;
         for (call, (content, images, is_error)) in output.tool_calls.iter().zip(batch) {
             cumulative_tool_runs += 1;
             last_tool_name = Some(call.name.clone());
+            batch_all_ok &= !is_error;
             history.push(HistoryMessage::Tool {
                 tool_use_id: call.id.clone(),
                 content,
@@ -488,6 +499,17 @@ pub(super) async fn drive_turn(
         // Failure to save is warn-and-continue — the next iteration or
         // the end-of-message save_state in run_loop will retry.
         persist_mid_message(deps, history, continuation.as_deref(), tool_turn).await;
+
+        // Task HUD: fold the finished batch into the one self-editing
+        // status message (edit-capable channels), or surface the legacy
+        // periodic "still working" status row when the silent stretch
+        // exceeds its 60s budget (bare channels / hud_mode=off).
+        hud.on_batch_end(
+            cumulative_tool_runs,
+            last_tool_name.as_deref(),
+            batch_all_ok,
+        )
+        .await;
 
         // Content-loop circuit breaker. After persisting this turn's
         // tool_results (so the audit history shows the full degenerate
@@ -521,28 +543,6 @@ pub(super) async fn drive_turn(
                 continuation,
                 outcome: TurnOutcome::Failed(reason),
             });
-        }
-
-        // "Still working" heartbeat. Emitted only when the runner is
-        // about to loop again (we have tool calls + we're past the
-        // parse-error cap check below) AND the user-facing channel has
-        // been silent for `STATUS_INTERVAL`. The status emit goes
-        // direct to outbound as a Chat row via `emit_status` — it
-        // does NOT push into `state.history`, so the model's view of
-        // its own turn isn't contaminated by runner-generated chatter.
-        // Child-agent sessions (no channel routing) skip inside
-        // `RunnerToolCtx::emit_status`, so this is a no-op for them.
-        if last_status_emit_at.elapsed() >= STATUS_INTERVAL {
-            let elapsed_secs = drive_turn_started_at.elapsed().as_secs();
-            let last = last_tool_name.as_deref().unwrap_or("thinking");
-            let plural = if cumulative_tool_runs == 1 { "" } else { "s" };
-            let status = format!(
-                "Still working on this — {elapsed_secs}s in, \
-                 {cumulative_tool_runs} tool call{plural} so far (latest: {last}). \
-                 I'll keep going."
-            );
-            deps.tool_ctx.emit_status(&status).await;
-            last_status_emit_at = Instant::now();
         }
 
         // After pushing the tool_results, enforce the parse-error cap.
@@ -710,12 +710,12 @@ async fn execute_tool_batch(deps: &RunnerDeps, calls: &[PendingToolCall]) -> Vec
 }
 
 /// Run one model-requested tool call to a `(content, images, is_error)`
-/// result and flip its breadcrumb chip. Parse-error synthetic calls
-/// (input is Null) never dispatch — they hand the model a `tool_result`
-/// describing the JSON parse failure so it can re-emit valid input next
-/// turn (bounded by the parse-error cap in `drive_turn`).
+/// result. Parse-error synthetic calls (input is Null) never dispatch —
+/// they hand the model a `tool_result` describing the JSON parse
+/// failure so it can re-emit valid input next turn (bounded by the
+/// parse-error cap in `drive_turn`).
 async fn run_one_call(deps: &RunnerDeps, call: &PendingToolCall) -> ToolCallOutput {
-    let (content, images, is_error) = if let Some(parse_err) = call.parse_error.as_deref() {
+    if let Some(parse_err) = call.parse_error.as_deref() {
         (
             format!(
                 "Your tool_use input JSON could not be parsed: {parse_err}. Please re-issue this exact tool call with valid JSON.",
@@ -725,164 +725,6 @@ async fn run_one_call(deps: &RunnerDeps, call: &PendingToolCall) -> ToolCallOutp
         )
     } else {
         invoke_tool(deps, call).await
-    };
-    finish_tool_breadcrumb(deps, call, &content, is_error).await;
-    (content, images, is_error)
-}
-
-/// Flip the in-place breadcrumb chip from "Running" to "Done"/"Failed"
-/// once a tool call returns. Summary is the first non-empty line of the
-/// tool result, char-truncated to 200 to fit the breadcrumb schema's
-/// `MAX_SUMMARY_CHARS`.
-async fn finish_tool_breadcrumb(
-    deps: &RunnerDeps,
-    call: &PendingToolCall,
-    content: &str,
-    is_error: bool,
-) {
-    let summary = first_line_truncated(content, 200);
-    deps.tool_ctx
-        .emit_breadcrumb_finish(&call.name, Some(&call.input), !is_error, summary.as_deref())
-        .await;
-}
-
-/// First useful line of `s`, char-truncated to `max_chars` with an
-/// ellipsis when truncated. Returns `None` when `s` has no non-whitespace
-/// content (so the breadcrumb chip shows status-only instead of an empty
-/// summary).
-///
-/// "Useful" excludes pretty-printed-JSON / array open-brackets (`{` or
-/// `[` alone on the first line) — without this filter, a tool that
-/// returns `{\n  "wrote_bytes": 1234\n}` would render a breadcrumb chip
-/// ending in `— {` instead of `— wrote_bytes: 1234`. The chip is meant
-/// to be a quick "what did this produce?" signal; an opening brace
-/// signals nothing.
-///
-/// When the first non-empty line is a bare structural opener, the
-/// helper scans forward and concatenates subsequent meaningful lines
-/// (trimmed, joined by " · ") until the char budget is consumed — so
-/// `{\n  "wrote_bytes": 1234,\n  "path": "/data/x.py"\n}` becomes
-/// `"wrote_bytes": 1234, · "path": "/data/x.py" ·` (truncated). The
-/// trailing closing brace `}` / `]` is dropped for the same reason.
-fn first_line_truncated(s: &str, max_chars: usize) -> Option<String> {
-    // First pass: find the first non-empty line.
-    let mut lines = s.lines();
-    let first_raw = lines.find_map(|l| {
-        let t = l.trim();
-        if t.is_empty() { None } else { Some(t) }
-    })?;
-
-    // If it's a meaningful line (not a bare structural opener), use it
-    // as-is. Multi-line tool output like `cargo test` stdout reads
-    // best as just the first real line — no join.
-    let is_bare_opener = matches!(first_raw, "{" | "}" | "[" | "]" | "{}" | "[]");
-    if !is_bare_opener {
-        return Some(truncate_with_ellipsis(first_raw, max_chars));
-    }
-
-    // Bare-opener case (pretty-printed JSON `{`, `[`): scan forward
-    // and join meaningful subsequent lines with " · " so the chip
-    // shows the actual fields instead of the useless brace. Caught
-    // live on 2026-05-24 when `write_file` returned `{\n  "wrote_bytes":
-    // 1234\n}` and the chip rendered `— {`.
-    let mut out = String::new();
-    for line in lines {
-        let t = line.trim();
-        if t.is_empty() || matches!(t, "{" | "}" | "[" | "]") {
-            continue;
-        }
-        // Strip a trailing comma — JSON field lines like
-        // `"wrote_bytes": 1234,` read cleaner without the comma.
-        let t = t.trim_end_matches(',');
-        if out.is_empty() {
-            out.push_str(t);
-        } else {
-            if out.chars().count() + 3 + t.chars().count() > max_chars {
-                break;
-            }
-            out.push_str(" · ");
-            out.push_str(t);
-        }
-        if out.chars().count() >= max_chars {
-            break;
-        }
-    }
-    if out.is_empty() {
-        return None;
-    }
-    Some(truncate_with_ellipsis(&out, max_chars))
-}
-
-/// Char-truncate `s` to `max_chars`, appending `…` when truncated.
-fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
-    let count = s.chars().count();
-    if count <= max_chars {
-        return s.to_string();
-    }
-    let truncated: String = s.chars().take(max_chars.saturating_sub(1)).collect();
-    format!("{truncated}…")
-}
-
-#[cfg(test)]
-mod first_line_truncated_tests {
-    use super::first_line_truncated;
-
-    #[test]
-    fn empty_input_returns_none() {
-        assert_eq!(first_line_truncated("", 200), None);
-        assert_eq!(first_line_truncated("   \n\t\n", 200), None);
-    }
-
-    #[test]
-    fn returns_first_non_empty_line() {
-        assert_eq!(
-            first_line_truncated("first\nsecond", 200),
-            Some("first".into())
-        );
-        assert_eq!(
-            first_line_truncated("\n\n  hello \n", 200),
-            Some("hello".into())
-        );
-    }
-
-    #[test]
-    fn truncates_with_ellipsis_when_too_long() {
-        let s = "a".repeat(250);
-        let out = first_line_truncated(&s, 200).unwrap();
-        assert_eq!(out.chars().count(), 200);
-        assert!(out.ends_with('…'));
-    }
-
-    #[test]
-    fn skips_bare_open_brace_in_pretty_printed_json() {
-        // Regression for the 2026-05-24 live test: write_file tool
-        // returned pretty-printed JSON `{\n  "wrote_bytes": 1234\n}`
-        // and the breadcrumb chip rendered `— {` (useless). The helper
-        // should skip the bare opener and report the next meaningful
-        // line.
-        let s = "{\n  \"wrote_bytes\": 1234\n}";
-        let out = first_line_truncated(s, 200).unwrap();
-        assert!(out.contains("wrote_bytes"), "got: {out}");
-        assert!(!out.starts_with('{'), "should not start with `{{`: {out}");
-    }
-
-    #[test]
-    fn joins_multiple_meaningful_lines_with_separator() {
-        let s = "{\n  \"a\": 1,\n  \"b\": 2,\n  \"c\": 3\n}";
-        let out = first_line_truncated(s, 200).unwrap();
-        // All three field lines should appear, joined by " · ".
-        assert!(out.contains("\"a\": 1"), "got: {out}");
-        assert!(out.contains("\"b\": 2"), "got: {out}");
-        assert!(out.contains("\"c\": 3"), "got: {out}");
-        assert!(out.contains(" · "), "uses ` · ` joiner: {out}");
-    }
-
-    #[test]
-    fn bare_braces_only_returns_none() {
-        // A tool result that is JUST `{}` carries no information; the
-        // breadcrumb chip should fall back to status-only.
-        assert_eq!(first_line_truncated("{}", 200), None);
-        assert_eq!(first_line_truncated("{\n}", 200), None);
     }
 }
 
@@ -1439,6 +1281,250 @@ mod execute_tool_batch_tests {
         assert_eq!(results[1].0, "done:ok");
         // Only the real call dispatched.
         assert_eq!(log.lock().unwrap().len(), 2, "1 start + 1 end");
+    }
+
+    // ----- M18 Task HUD acceptance (card H1) -------------------------------
+
+    /// Scripted N-tool run: each turn requests one `mock_read` with
+    /// distinct args (so the content-loop breaker stays quiet), then a
+    /// final text turn.
+    fn hud_scripts(n_tools: usize, final_text: &str) -> Vec<Vec<ProviderEvent>> {
+        let mut scripts: Vec<Vec<ProviderEvent>> = (0..n_tools)
+            .map(|i| {
+                vec![ProviderEvent::ToolCall {
+                    id: format!("tu_{i}"),
+                    name: "mock_read".into(),
+                    input: serde_json::json!({"id": format!("c{i}"), "delay_ms": 0}),
+                }]
+            })
+            .collect();
+        scripts.push(vec![ProviderEvent::Result {
+            text: Some(final_text.into()),
+        }]);
+        scripts
+    }
+
+    /// All outbound rows, snapshotted after the drive.
+    async fn outbound_rows(deps: &RunnerDeps) -> Vec<copperclaw_types::MessageOutRow> {
+        let guard = deps.outbound.lock().await;
+        copperclaw_db::tables::messages_out::list_due(&guard).unwrap()
+    }
+
+    /// Rows that ARE the HUD message (`MessageKind::Breadcrumb` with the
+    /// stable `task` anchor).
+    fn hud_posts(
+        rows: &[copperclaw_types::MessageOutRow],
+    ) -> Vec<&copperclaw_types::MessageOutRow> {
+        rows.iter()
+            .filter(|r| {
+                r.kind == copperclaw_types::MessageKind::Breadcrumb
+                    && r.content["breadcrumb"]["tool_name"] == "task"
+            })
+            .collect()
+    }
+
+    /// Rows that EDIT the HUD message in place (`update_breadcrumb`
+    /// System rows anchored to `task`).
+    fn hud_edits(
+        rows: &[copperclaw_types::MessageOutRow],
+    ) -> Vec<&copperclaw_types::MessageOutRow> {
+        rows.iter()
+            .filter(|r| {
+                r.kind == copperclaw_types::MessageKind::System
+                    && r.content["update_breadcrumb"]["tool_name"] == "task"
+            })
+            .collect()
+    }
+
+    /// Acceptance: on a rich adapter (edit-capable channel) a 10-tool
+    /// scripted turn produces exactly ONE HUD message, edited in place
+    /// at least 10 times, then finalized to the one-line collapse.
+    /// Posting periodic NEW messages is the failure mode this pins
+    /// against — everything after the first post must be an edit.
+    #[tokio::test]
+    async fn hud_ten_tool_turn_posts_once_and_edits_in_place() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let (tmp, mut deps) = deps_with_mocks(
+            vec![("mock_read", Box::new(SlowEcho { tracker, log }))],
+            hud_scripts(10, "all done"),
+        );
+        // Current todo step feeds the HUD's detail line.
+        let todo_path = tmp.path().join("agent_todos.json");
+        std::fs::write(
+            &todo_path,
+            r#"[{"id":1,"text":"read the files","status":"in_progress","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},
+                {"id":2,"text":"reply","status":"pending","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}]"#,
+        )
+        .unwrap();
+        deps.todo_path = todo_path;
+        // Telegram implements `edit_message` -> live HUD.
+        deps.tool_ctx
+            .set_originating(Some("telegram"), Some("chat-1"), None, None);
+
+        let mut history: Vec<HistoryMessage> = Vec::new();
+        let result = drive_turn(&deps, &mut history, None, None).await.unwrap();
+        assert!(matches!(result.outcome, TurnOutcome::Done), "{result:?}");
+
+        let rows = outbound_rows(&deps).await;
+        let posts = hud_posts(&rows);
+        let edits = hud_edits(&rows);
+        assert_eq!(
+            posts.len(),
+            1,
+            "exactly one HUD message per inbound task; got {}",
+            posts.len()
+        );
+        assert!(
+            edits.len() >= 10,
+            "a 10-tool turn must edit the HUD at least 10 times; got {}",
+            edits.len()
+        );
+        // The HUD post is Running-state and carries the todo step.
+        assert_eq!(posts[0].content["breadcrumb"]["status"], "running");
+        let post_detail = posts[0].content["breadcrumb"]["detail"].as_str().unwrap();
+        assert!(
+            post_detail.contains("step 1/2: read the files"),
+            "HUD detail must carry the current todo step; got: {post_detail}"
+        );
+        // The LAST edit is the finalization collapse: Done + the
+        // one-line "done in M:SS, N tool calls" summary.
+        let last = edits.last().unwrap();
+        assert_eq!(
+            last.content["update_breadcrumb"]["breadcrumb"]["status"],
+            "done"
+        );
+        let summary = last.content["update_breadcrumb"]["breadcrumb"]["summary"]
+            .as_str()
+            .unwrap();
+        assert!(
+            summary.starts_with("done in ") && summary.ends_with("10 tool calls"),
+            "final collapse must be the one-liner; got: {summary}"
+        );
+        // Every non-final edit stays Running and reports progress.
+        let mid = &edits[edits.len() / 2];
+        assert_eq!(
+            mid.content["update_breadcrumb"]["breadcrumb"]["status"],
+            "running"
+        );
+    }
+
+    /// A bare adapter (cli: no `edit_message`) must get the old
+    /// behaviour — no HUD rows at all in a fast run (the periodic
+    /// status row only fires after a 60s silent stretch).
+    #[tokio::test]
+    async fn hud_bare_adapter_emits_no_hud_rows() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let (_tmp, deps) = deps_with_mocks(
+            vec![("mock_read", Box::new(SlowEcho { tracker, log }))],
+            hud_scripts(3, "done"),
+        );
+        deps.tool_ctx
+            .set_originating(Some("cli"), Some("stdin"), None, None);
+
+        let mut history: Vec<HistoryMessage> = Vec::new();
+        let result = drive_turn(&deps, &mut history, None, None).await.unwrap();
+        assert!(matches!(result.outcome, TurnOutcome::Done), "{result:?}");
+
+        let rows = outbound_rows(&deps).await;
+        assert!(hud_posts(&rows).is_empty(), "no HUD post on bare adapters");
+        assert!(hud_edits(&rows).is_empty(), "no HUD edits on bare adapters");
+        // No "still working" status row either — the run is far inside
+        // the 60s budget, so the outbound trace matches the pre-HUD
+        // behaviour byte-for-byte (the only chat row is the reply).
+        let chat_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == copperclaw_types::MessageKind::Chat)
+            .collect();
+        assert_eq!(chat_rows.len(), 1, "only the final reply: {chat_rows:?}");
+    }
+
+    /// `hud_mode = off` restores the pre-HUD outbound shape even on an
+    /// edit-capable channel.
+    #[tokio::test]
+    async fn hud_mode_off_emits_no_hud_rows() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let (_tmp, mut deps) = deps_with_mocks(
+            vec![("mock_read", Box::new(SlowEcho { tracker, log }))],
+            hud_scripts(3, "done"),
+        );
+        deps.hud_mode = crate::config::HudMode::Off;
+        deps.tool_ctx
+            .set_originating(Some("telegram"), Some("chat-1"), None, None);
+
+        let mut history: Vec<HistoryMessage> = Vec::new();
+        drive_turn(&deps, &mut history, None, None).await.unwrap();
+
+        let rows = outbound_rows(&deps).await;
+        assert!(hud_posts(&rows).is_empty(), "hud_mode=off: no HUD post");
+        assert!(hud_edits(&rows).is_empty(), "hud_mode=off: no HUD edits");
+    }
+
+    /// `hud_mode = final` posts only the end-of-task one-liner: no live
+    /// churn during the run, one Breadcrumb row at completion.
+    #[tokio::test]
+    async fn hud_mode_final_posts_only_the_summary_line() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let (_tmp, mut deps) = deps_with_mocks(
+            vec![("mock_read", Box::new(SlowEcho { tracker, log }))],
+            hud_scripts(3, "done"),
+        );
+        deps.hud_mode = crate::config::HudMode::Final;
+        // Telegram's typing indicator is visible, so `final` sticks
+        // (on a typing-less surface it would be forced back to full).
+        deps.tool_ctx
+            .set_originating(Some("telegram"), Some("chat-1"), None, None);
+
+        let mut history: Vec<HistoryMessage> = Vec::new();
+        drive_turn(&deps, &mut history, None, None).await.unwrap();
+
+        let rows = outbound_rows(&deps).await;
+        let posts = hud_posts(&rows);
+        assert_eq!(posts.len(), 1, "final mode posts exactly one row");
+        assert!(hud_edits(&rows).is_empty(), "final mode never edits");
+        assert_eq!(posts[0].content["breadcrumb"]["status"], "done");
+        let summary = posts[0].content["breadcrumb"]["summary"].as_str().unwrap();
+        assert!(summary.starts_with("done in "), "got: {summary}");
+    }
+
+    /// A failed turn (content-loop breaker) still finalizes the HUD —
+    /// the collapse reads "stopped after ..." with Failed status, so no
+    /// stale "Running" HUD is stranded in chat.
+    #[tokio::test]
+    async fn hud_failure_collapses_with_stopped_summary() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let identical = || ProviderEvent::ToolCall {
+            id: "tu_dup".into(),
+            name: "mock_read".into(),
+            input: serde_json::json!({"id": "same", "delay_ms": 0}),
+        };
+        let (_tmp, deps) = deps_with_mocks(
+            vec![("mock_read", Box::new(SlowEcho { tracker, log }))],
+            vec![vec![identical(), identical(), identical(), identical()]],
+        );
+        deps.tool_ctx
+            .set_originating(Some("telegram"), Some("chat-1"), None, None);
+
+        let mut history: Vec<HistoryMessage> = Vec::new();
+        let result = drive_turn(&deps, &mut history, None, None).await.unwrap();
+        assert!(matches!(result.outcome, TurnOutcome::Failed(_)));
+
+        let rows = outbound_rows(&deps).await;
+        assert_eq!(hud_posts(&rows).len(), 1);
+        let edits = hud_edits(&rows);
+        let last = edits.last().expect("failure must still finalize");
+        assert_eq!(
+            last.content["update_breadcrumb"]["breadcrumb"]["status"],
+            "failed"
+        );
+        let summary = last.content["update_breadcrumb"]["breadcrumb"]["summary"]
+            .as_str()
+            .unwrap();
+        assert!(summary.starts_with("stopped after "), "got: {summary}");
     }
 }
 

@@ -117,6 +117,33 @@ pub(crate) struct RunnerConfigForFile {
     /// when None, leaving the runner's built-in default (4096).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_tokens: Option<u32>,
+    /// M18 Task HUD mode (`"full"` / `"final"` / `"off"`). Sourced from
+    /// `COPPERCLAW_HUD_MODE` in `.env` (host-wide; a per-group column is
+    /// deliberately deferred — migration 026 is reserved by a later
+    /// card). Skipped when unset so existing `runner.json` shapes stay
+    /// bit-identical and the runner applies its `full` default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) hud_mode: Option<String>,
+}
+
+/// Validate a raw `COPPERCLAW_HUD_MODE` value down to the three modes the
+/// runner understands. Unknown values WARN and resolve to `None` (the
+/// runner's `full` default) rather than shipping a typo into every
+/// session's `runner.json`.
+fn validate_hud_mode(raw: Option<String>) -> Option<String> {
+    let raw = raw?;
+    let trimmed = raw.trim();
+    match trimmed {
+        "" => None,
+        "full" | "final" | "off" => Some(trimmed.to_string()),
+        other => {
+            warn!(
+                hud_mode = other,
+                "unknown COPPERCLAW_HUD_MODE; ignoring (runner defaults to `full`)"
+            );
+            None
+        }
+    }
 }
 
 impl ContainerManager {
@@ -445,6 +472,13 @@ impl ContainerManager {
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok());
 
+        // Host-wide Task HUD mode from `COPPERCLAW_HUD_MODE` (`.env`).
+        // Unset → the runner's `full` default (HUD on). Follows the same
+        // env-var pattern as temperature / max_tokens above; a per-group
+        // container-config column is deferred (migration 026 is reserved
+        // by a later M18 card).
+        let hud_mode = validate_hud_mode(std::env::var("COPPERCLAW_HUD_MODE").ok());
+
         RunnerConfigForFile {
             session_id: session.id.as_uuid().to_string(),
             agent_group_id: session.agent_group_id.as_uuid().to_string(),
@@ -468,6 +502,7 @@ impl ContainerManager {
             effort,
             temperature,
             max_tokens,
+            hud_mode,
         }
     }
 
@@ -622,6 +657,27 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let content = format!("---\nname: {name}\ndescription: desc-of-{name}\n---\n\n{body}");
         std::fs::write(dir.join("SKILL.md"), content).unwrap();
+    }
+
+    #[test]
+    fn validate_hud_mode_accepts_known_modes_and_drops_garbage() {
+        assert_eq!(super::validate_hud_mode(None), None);
+        assert_eq!(super::validate_hud_mode(Some(String::new())), None);
+        assert_eq!(super::validate_hud_mode(Some("  ".into())), None);
+        assert_eq!(
+            super::validate_hud_mode(Some("full".into())).as_deref(),
+            Some("full")
+        );
+        assert_eq!(
+            super::validate_hud_mode(Some(" final ".into())).as_deref(),
+            Some("final")
+        );
+        assert_eq!(
+            super::validate_hud_mode(Some("off".into())).as_deref(),
+            Some("off")
+        );
+        // Typos must not ship into every session's runner.json.
+        assert_eq!(super::validate_hud_mode(Some("fulll".into())), None);
     }
 
     #[test]
