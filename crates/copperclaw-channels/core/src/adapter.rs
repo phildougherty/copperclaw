@@ -68,6 +68,32 @@ pub trait ChannelAdapter: Send + Sync {
         Ok(())
     }
 
+    /// Capability flag: does a [`Self::set_typing`] call against this
+    /// conversation target produce a signal the user can actually see?
+    ///
+    /// This is per-target, not per-adapter — some platforms render a
+    /// typing indicator only on specific surfaces. Slack is the
+    /// motivating case: `assistant.threads.setStatus` renders inside
+    /// assistant threads only, so in a regular channel or DM the
+    /// keepalive is a silent no-op and the user gets no "agent is
+    /// working" signal during long runs.
+    ///
+    /// Consumers: the host's progress UX (the M18 Task HUD, card H1)
+    /// reads this flag when choosing how much visible feedback it must
+    /// provide itself — when the flag is `false` the HUD should force
+    /// `hud_mode=full` and a tighter edit cadence, because the platform
+    /// contributes no liveness signal of its own on that surface.
+    ///
+    /// Defaults to `true`: the host has historically assumed typing
+    /// works everywhere, and `true` preserves that behaviour for
+    /// adapters that have not audited their typing surface yet.
+    /// Adapters whose typing indicator is a no-op for some (or all)
+    /// targets should override this and return `false` for those
+    /// targets, mirroring the short-circuit in their `set_typing`.
+    fn typing_indicator_visible(&self, _platform_id: &str, _thread_id: Option<&str>) -> bool {
+        true
+    }
+
     /// Deliver an outbound message. Returns the platform-side message id
     /// when known (`None` if the platform doesn't expose one).
     async fn deliver(
@@ -554,6 +580,16 @@ mod tests {
     async fn default_set_typing_returns_ok() {
         let a = MockAdapter::new("x");
         a.set_typing("p", None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_typing_indicator_visible_is_true() {
+        // The trait-level default preserves the historical assumption
+        // that typing renders everywhere; adapters with surface-limited
+        // typing (Slack assistant threads) override per target.
+        let a = MockAdapter::new("x");
+        assert!(a.typing_indicator_visible("p", None));
+        assert!(a.typing_indicator_visible("p", Some("t")));
     }
 
     #[tokio::test]
