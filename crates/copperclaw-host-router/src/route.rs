@@ -5,6 +5,7 @@
 //! lives in [`Router::route`]; the supporting types in this module describe
 //! the outcome the caller (typically a channel adapter) sees.
 
+use crate::commands::{self, SlashCommand};
 use crate::debounce::{DebounceKey, Debouncer, InflightKey, InflightSet};
 use crate::error::RouterError;
 use crate::hooks::HookChain;
@@ -13,7 +14,8 @@ use crate::session::SessionRoot;
 
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::dropped_messages::{InsertDroppedMessage, insert as insert_dropped};
-use copperclaw_db::tables::messages_in::{WriteInbound, insert as insert_in};
+use copperclaw_db::tables::messages_in::{WriteInbound, count_due, insert as insert_in};
+use copperclaw_db::tables::messages_out::{WriteOutbound, insert as insert_out};
 use copperclaw_db::tables::messaging_group_agents::{
     MessagingGroupAgent, list_for_mg as list_wirings,
 };
@@ -42,6 +44,13 @@ pub enum RouteOutcome {
     /// Inbound event was routed to one or more sessions. `sessions` holds the
     /// per-target write result.
     Delivered { sessions: Vec<DeliveredTo> },
+    /// Event was a host-answered slash command (`/status`): no
+    /// `messages_in` row was written and the runner was never woken —
+    /// the router synthesized a reply from host state and wrote it
+    /// straight into the session's `messages_out` for the delivery
+    /// loop. `message_id` / `seq` on each [`DeliveredTo`] refer to that
+    /// OUTBOUND row (odd container-parity seq), not an inbound row.
+    Answered { sessions: Vec<DeliveredTo> },
     /// Event was rejected before any write happened.
     Dropped { reason: DropReason },
     /// Event is awaiting an out-of-band approval; no inbound row was written
@@ -268,13 +277,20 @@ impl Router {
             });
         }
 
-        // 6. Fanout to each wiring.
+        // 6. End-user slash-command detection (M18 R1). Detected once per
+        //    event; every wiring below takes the same command path. See
+        //    [`crate::commands`] for the per-command routing contract.
+        let command = SlashCommand::detect(&event);
+
+        // 7. Fanout to each wiring.
         let mut sessions = Vec::with_capacity(wirings.len());
+        let mut answered: Vec<DeliveredTo> = Vec::new();
         let mut last_pending: Option<PendingReason> = None;
         for wiring in wirings {
             self.fanout_seq.fetch_add(1, Ordering::Relaxed);
-            match self.route_one(&event, &mg.id, mg.is_group, &wiring, user_id)? {
+            match self.route_one(&event, &mg.id, mg.is_group, &wiring, user_id, command)? {
                 FanoutOutcome::Delivered(d) => sessions.push(d),
+                FanoutOutcome::Answered(d) => answered.push(d),
                 FanoutOutcome::Dropped(reason) => {
                     self.record_drop(
                         &event,
@@ -282,7 +298,7 @@ impl Router {
                         Some(wiring.agent_group_id),
                         &drop_reason_label(&reason),
                     )?;
-                    if sessions.is_empty() {
+                    if sessions.is_empty() && answered.is_empty() {
                         // First-and-only wiring dropped; propagate the drop.
                         return Ok(RouteOutcome::Dropped { reason });
                     }
@@ -295,17 +311,20 @@ impl Router {
             }
         }
 
-        if sessions.is_empty() {
-            if let Some(reason) = last_pending {
-                return Ok(RouteOutcome::Pending { reason });
-            }
-            // Defensive: should not happen — at least one fanout result
-            // must classify the event.
-            return Ok(RouteOutcome::Dropped {
-                reason: DropReason::NoAgents,
-            });
+        if !sessions.is_empty() {
+            return Ok(RouteOutcome::Delivered { sessions });
         }
-        Ok(RouteOutcome::Delivered { sessions })
+        if !answered.is_empty() {
+            return Ok(RouteOutcome::Answered { sessions: answered });
+        }
+        if let Some(reason) = last_pending {
+            return Ok(RouteOutcome::Pending { reason });
+        }
+        // Defensive: should not happen — at least one fanout result
+        // must classify the event.
+        Ok(RouteOutcome::Dropped {
+            reason: DropReason::NoAgents,
+        })
     }
 
     /// Per-wiring delivery.
@@ -316,6 +335,7 @@ impl Router {
         mg_is_group: bool,
         wiring: &MessagingGroupAgent,
         user_id: Option<copperclaw_types::UserId>,
+        command: Option<SlashCommand>,
     ) -> Result<FanoutOutcome, RouterError> {
         // Access gate per agent group. `resolve_access_gate` applies the
         // host default policy: privileged ops close-fail (a missing or
@@ -388,16 +408,24 @@ impl Router {
         // the inbound event itself reports `is_group == Some(true)`; the OR
         // keeps a stale `messaging_groups.is_group` from silently un-gating a
         // real group chat.
+        // Recognised slash commands bypass the gate entirely: issuing a
+        // command IS a direct address, exactly like the adapter-stamped
+        // `content.command` payloads `MentionGate::decide` already
+        // whitelists. Raw-text commands (`/stop` typed into a gated
+        // group) have no such stamp on the wire, so the router's own
+        // detection stands in for it here.
         let is_group = mg_is_group || event.message.is_group == Some(true);
-        if let MentionDecision::Drop(_label) = self.mention_gate.decide(
-            event,
-            is_group,
-            wiring.engage_mode,
-            wiring.engage_pattern.as_deref(),
-        ) {
-            // The caller records a `dropped_messages` row from the returned
-            // `FanoutOutcome::Dropped` via `drop_reason_label` ("mention_gated").
-            return Ok(FanoutOutcome::Dropped(DropReason::MentionGated));
+        if command.is_none() {
+            if let MentionDecision::Drop(_label) = self.mention_gate.decide(
+                event,
+                is_group,
+                wiring.engage_mode,
+                wiring.engage_pattern.as_deref(),
+            ) {
+                // The caller records a `dropped_messages` row from the returned
+                // `FanoutOutcome::Dropped` via `drop_reason_label` ("mention_gated").
+                return Ok(FanoutOutcome::Dropped(DropReason::MentionGated));
+            }
         }
 
         // Resolve the target session for this wiring.
@@ -421,6 +449,13 @@ impl Router {
             .enter(inflight_key)
             .ok_or_else(|| RouterError::invalid_wiring("re-entered in-flight session"))?;
 
+        // `/status` is answered by the host: synthesize the reply from
+        // central-DB state and write it straight to `messages_out`. No
+        // inbound row is written and the runner is never woken.
+        if command == Some(SlashCommand::Status) {
+            return self.answer_status(event, &session);
+        }
+
         // Open inbound.db and write the row.
         let pool = self
             .session_paths
@@ -436,12 +471,47 @@ impl Router {
         // say "in reply to the user's earlier message" without lugging
         // the redundant chat handle into per-session storage.
         let reply_to_id = event.reply_to.as_ref().and_then(|r| r.thread_id.clone());
+        // Per-command row shaping (see `crate::commands` for the contracts):
+        //
+        // - `/stop` persists a CONTROL row: `kind = system`, `trigger =
+        //   false` (must not spawn a container — `count_due` filters on
+        //   trigger, so the container manager's classifier ignores it),
+        //   `content.control.op = "stop"`. The M18 R2 card consumes it
+        //   mid-turn; the row lands even while a runner turn is in
+        //   flight because the write path here never depends on runner
+        //   state.
+        // - `/compact` / `/clear` pass through as normal trigger rows
+        //   with the text normalised to the canonical command so the
+        //   runner's existing slash-command sentinel fires.
+        // - Unrecognised text (including unknown `/x`) routes unchanged.
+        let original_text = event
+            .message
+            .content
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let (kind, content, trigger) = match command {
+            Some(cmd @ SlashCommand::Stop) => (
+                MessageKind::System,
+                commands::control_content(cmd, original_text),
+                false,
+            ),
+            Some(cmd @ (SlashCommand::Compact | SlashCommand::Clear)) => (
+                event.message.kind,
+                commands::passthrough_content(cmd, &event.message.content, original_text),
+                true,
+            ),
+            // `/status` returned above; everything else routes unchanged.
+            Some(SlashCommand::Status) | None => {
+                (event.message.kind, event.message.content.clone(), true)
+            }
+        };
         let write = WriteInbound {
             id: message_id,
-            kind: event.message.kind,
+            kind,
             timestamp: event.message.timestamp,
-            content: event.message.content.clone(),
-            trigger: true,
+            content,
+            trigger,
             on_wake: false,
             process_after: None,
             recurrence: None,
@@ -461,9 +531,62 @@ impl Router {
         // session spawns within ~one tick instead of waiting out the poll
         // interval. Best-effort accelerator: if nobody is awaiting the
         // handle, the permit is stored (and coalesced) by `Notify`.
-        self.inbound_wake.notify_one();
+        //
+        // Control rows (`trigger = false`) skip the wake on purpose: the
+        // manager's spawn classifier counts only trigger rows, so waking
+        // it for a `/stop` against an idle session would be a guaranteed
+        // no-op tick.
+        if trigger {
+            self.inbound_wake.notify_one();
+        }
 
         Ok(FanoutOutcome::Delivered(DeliveredTo {
+            agent_group_id: session.agent_group_id,
+            session_id: session.id,
+            message_id,
+            seq,
+        }))
+    }
+
+    /// Answer `/status` from host state: load the session + agent-group
+    /// rows from the central DB, count the session's due inbound work,
+    /// and write a synthesized chat reply straight into the session's
+    /// `messages_out`. The delivery loop picks it up like any
+    /// runner-emitted row; the runner itself is never involved. The
+    /// reply carries the originating event's channel routing explicitly
+    /// so delivery does not depend on `session_routing`.
+    fn answer_status(
+        &self,
+        event: &InboundEvent,
+        session: &TargetSession,
+    ) -> Result<FanoutOutcome, RouterError> {
+        let full = copperclaw_db::tables::sessions::get(&self.central, session.id)?;
+        let group =
+            copperclaw_db::tables::agent_groups::get(&self.central, session.agent_group_id)?;
+        let inbound = self
+            .session_paths
+            .inbound_pool(&session.agent_group_id, &session.id)?;
+        let queued = inbound.with_conn(count_due)?;
+        let text = commands::render_status(&group.name, &full, queued);
+
+        let outbound = self
+            .session_paths
+            .outbound_pool(&session.agent_group_id, &session.id)?;
+        let message_id = MessageId::new();
+        let write = WriteOutbound {
+            id: message_id,
+            in_reply_to: None,
+            timestamp: chrono::Utc::now(),
+            deliver_after: None,
+            recurrence: None,
+            kind: MessageKind::Chat,
+            platform_id: Some(event.platform_id.clone()),
+            channel_type: Some(event.channel_type.clone()),
+            thread_id: event.thread_id.clone(),
+            content: serde_json::json!({ "text": text }),
+        };
+        let seq = outbound.with_conn(|c| insert_out(c, &write))?;
+        Ok(FanoutOutcome::Answered(DeliveredTo {
             agent_group_id: session.agent_group_id,
             session_id: session.id,
             message_id,
@@ -590,6 +713,9 @@ impl std::fmt::Debug for Router {
 #[derive(Debug)]
 enum FanoutOutcome {
     Delivered(DeliveredTo),
+    /// Host-answered slash command (`/status`): the `DeliveredTo` points
+    /// at the synthesized `messages_out` row, not an inbound row.
+    Answered(DeliveredTo),
     Dropped(DropReason),
     Pending(PendingReason),
 }
@@ -936,11 +1062,15 @@ mod tests {
 
     #[tokio::test]
     async fn mention_gate_processes_command_in_group() {
+        // An adapter-stamped `content.command` payload bypasses the gate
+        // even when the command itself isn't one the router recognises
+        // (recognised ones take their own path — see the slash-command
+        // tests below; `/status` in particular is host-Answered).
         let fx = group_fixture(EngageMode::Mention, None, None);
         let mut ev = group_event("g5b");
         ev.message.content = serde_json::json!({
-            "text": "/status",
-            "command": "status",
+            "text": "/frobnicate",
+            "command": "frobnicate",
         });
         let out = fx.router.route(ev).await.unwrap();
         assert!(
@@ -1468,6 +1598,13 @@ mod tests {
             seq: 2,
         });
         assert!(format!("{f:?}").contains("Delivered"));
+        let f = FanoutOutcome::Answered(DeliveredTo {
+            agent_group_id: AgentGroupId::new(),
+            session_id: SessionId::new(),
+            message_id: MessageId::new(),
+            seq: 1,
+        });
+        assert!(format!("{f:?}").contains("Answered"));
         let f = FanoutOutcome::Dropped(DropReason::Debounced);
         assert!(format!("{f:?}").contains("Dropped"));
         let f = FanoutOutcome::Pending(PendingReason::SenderUnregistered);
@@ -1554,5 +1691,289 @@ mod tests {
             second.is_err(),
             "burst of inserts must coalesce into a single permit"
         );
+    }
+
+    // ---- end-user slash commands (M18 R1) ----
+
+    /// Read every `messages_in` row for the routed session.
+    fn inbound_rows(fx: &Fixture, target: &DeliveredTo) -> Vec<copperclaw_types::MessageInRow> {
+        let pool = fx
+            .router
+            .session_paths()
+            .inbound_pool(&target.agent_group_id, &target.session_id)
+            .unwrap();
+        pool.with_conn(|c| copperclaw_db::tables::messages_in::get_pending(c, true, 50))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn slash_stop_writes_control_row() {
+        let fx = fixture(SessionMode::Shared);
+        let mut ev = event(None, "cmd-stop-1");
+        ev.message.content = serde_json::json!({"text": "/stop"});
+        let out = fx.router.route(ev).await.unwrap();
+        let RouteOutcome::Delivered { sessions } = out else {
+            panic!("expected delivered, got {out:?}");
+        };
+        let rows = inbound_rows(&fx, &sessions[0]);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(
+            row.kind,
+            MessageKind::System,
+            "control rows are system-kind"
+        );
+        assert!(!row.trigger, "control rows must not spawn a container");
+        assert!(!row.on_wake);
+        assert_eq!(row.status, "pending", "control rows stay pending for R2");
+        assert_eq!(row.content["control"]["op"], "stop");
+        assert_eq!(row.content["command"], "stop");
+        assert_eq!(row.content["text"], "/stop");
+    }
+
+    #[tokio::test]
+    async fn slash_stop_lands_even_while_turn_in_flight() {
+        // Simulate a turn in flight: a prior chat row is pending
+        // (picked up but unfinished — runner state never blocks the
+        // router's write path). The /stop control row must still land,
+        // marked control, alongside it.
+        let fx = fixture(SessionMode::Shared);
+        let first = fx.router.route(event(None, "busy-1")).await.unwrap();
+        let RouteOutcome::Delivered { sessions: s1 } = first else {
+            panic!("expected delivered");
+        };
+        let mut stop = event(None, "cmd-stop-2");
+        stop.message.content = serde_json::json!({"text": "/stop"});
+        let out = fx.router.route(stop).await.unwrap();
+        let RouteOutcome::Delivered { sessions: s2 } = out else {
+            panic!("expected delivered, got {out:?}");
+        };
+        assert_eq!(s1[0].session_id, s2[0].session_id, "same session");
+        let rows = inbound_rows(&fx, &s2[0]);
+        assert_eq!(rows.len(), 2, "chat row + control row coexist");
+        let control = rows
+            .iter()
+            .find(|r| r.content.get("control").is_some())
+            .expect("control row present");
+        assert_eq!(control.kind, MessageKind::System);
+        assert!(!control.trigger);
+        assert_eq!(control.status, "pending");
+        assert!(
+            control.seq > s1[0].seq,
+            "control row sequenced after the in-flight chat row"
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_stop_bypasses_mention_gate_in_group() {
+        let fx = group_fixture(EngageMode::Mention, None, None);
+        let mut ev = group_event("cmd-stop-3");
+        ev.message.content = serde_json::json!({"text": "/stop"});
+        ev.message.is_mention = None;
+        let out = fx.router.route(ev).await.unwrap();
+        assert!(
+            matches!(out, RouteOutcome::Delivered { .. }),
+            "unmentioned /stop in a gated group must route: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_stop_does_not_signal_inbound_wake() {
+        // trigger = false rows are invisible to the spawn classifier,
+        // so waking the manager for them would be a guaranteed no-op.
+        let fx = fixture(SessionMode::Shared);
+        let wake = fx.router.inbound_wake();
+        let mut ev = event(None, "cmd-stop-4");
+        ev.message.content = serde_json::json!({"text": "/cancel"});
+        let out = fx.router.route(ev).await.unwrap();
+        assert!(matches!(out, RouteOutcome::Delivered { .. }));
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(50), wake.notified()).await;
+        assert!(waited.is_err(), "control row must not store a wake permit");
+    }
+
+    #[tokio::test]
+    async fn slash_clear_normalises_text_and_stamps_command() {
+        let fx = fixture(SessionMode::Shared);
+        let mut ev = event(None, "cmd-clear-1");
+        ev.message.content = serde_json::json!({"text": "/CLEAR@ReplayBot"});
+        let out = fx.router.route(ev).await.unwrap();
+        let RouteOutcome::Delivered { sessions } = out else {
+            panic!("expected delivered, got {out:?}");
+        };
+        let rows = inbound_rows(&fx, &sessions[0]);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.kind, MessageKind::Chat, "passthrough keeps chat kind");
+        assert!(row.trigger, "passthrough rows wake the runner normally");
+        assert_eq!(
+            row.content["text"], "/clear",
+            "text normalised to what the runner sentinel matches"
+        );
+        assert_eq!(row.content["command"], "clear");
+        assert_eq!(row.content["original_text"], "/CLEAR@ReplayBot");
+    }
+
+    #[tokio::test]
+    async fn slash_compact_bypasses_mention_gate_and_wakes() {
+        let fx = group_fixture(EngageMode::Mention, None, None);
+        let wake = fx.router.inbound_wake();
+        let mut ev = group_event("cmd-compact-1");
+        ev.message.content = serde_json::json!({"text": "/compact"});
+        let out = fx.router.route(ev).await.unwrap();
+        let RouteOutcome::Delivered { sessions } = out else {
+            panic!("unmentioned /compact in a gated group must route: {out:?}");
+        };
+        let rows = inbound_rows(&fx, &sessions[0]);
+        assert_eq!(rows[0].content["text"], "/compact");
+        assert_eq!(rows[0].content["command"], "compact");
+        assert!(rows[0].content.get("original_text").is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+            .await
+            .expect("/compact is a trigger row and must wake the manager");
+    }
+
+    #[tokio::test]
+    async fn slash_status_answers_from_host_without_inbound_row() {
+        let fx = fixture(SessionMode::Shared);
+        let wake = fx.router.inbound_wake();
+        let mut ev = event(Some("t-7"), "cmd-status-1");
+        ev.message.content = serde_json::json!({"text": "/status"});
+        let out = fx.router.route(ev).await.unwrap();
+        let RouteOutcome::Answered { sessions } = out else {
+            panic!("expected answered, got {out:?}");
+        };
+        assert_eq!(sessions.len(), 1);
+        let target = &sessions[0];
+        assert_eq!(
+            target.seq % 2,
+            1,
+            "outbound rows use odd (container) parity"
+        );
+
+        // No inbound row was written and the manager was not woken.
+        let rows = inbound_rows(&fx, target);
+        assert!(
+            rows.is_empty(),
+            "/status must not write messages_in: {rows:?}"
+        );
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(50), wake.notified()).await;
+        assert!(waited.is_err(), "/status must not store a wake permit");
+
+        // The synthesized reply landed in messages_out with explicit
+        // routing back to the originating channel.
+        let outbound = fx
+            .router
+            .session_paths()
+            .outbound_pool(&target.agent_group_id, &target.session_id)
+            .unwrap();
+        let out_rows = outbound
+            .with_conn(copperclaw_db::tables::messages_out::list_due)
+            .unwrap();
+        assert_eq!(out_rows.len(), 1);
+        let reply = &out_rows[0];
+        assert_eq!(reply.kind, MessageKind::Chat);
+        assert_eq!(reply.platform_id.as_deref(), Some("chat-1"));
+        assert_eq!(
+            reply.channel_type.as_ref().map(ChannelType::as_str),
+            Some("cli")
+        );
+        assert_eq!(reply.thread_id.as_deref(), Some("t-7"));
+        let text = reply.content["text"].as_str().unwrap();
+        assert!(text.contains("Agent status"), "{text}");
+        assert!(text.contains("queued messages: 0"), "{text}");
+        assert!(text.contains("session state: active"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn slash_status_bypasses_mention_gate_in_group() {
+        let fx = group_fixture(EngageMode::Mention, None, None);
+        let mut ev = group_event("cmd-status-2");
+        ev.message.content = serde_json::json!({"text": "/status"});
+        let out = fx.router.route(ev).await.unwrap();
+        assert!(
+            matches!(out, RouteOutcome::Answered { .. }),
+            "unmentioned /status in a gated group must be answered: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_status_counts_queued_trigger_rows() {
+        let fx = fixture(SessionMode::Shared);
+        // Queue one normal message first, then ask for status.
+        let first = fx.router.route(event(None, "queued-1")).await.unwrap();
+        assert!(matches!(first, RouteOutcome::Delivered { .. }));
+        let mut ev = event(None, "cmd-status-3");
+        ev.message.content = serde_json::json!({"text": "/status"});
+        let out = fx.router.route(ev).await.unwrap();
+        let RouteOutcome::Answered { sessions } = out else {
+            panic!("expected answered, got {out:?}");
+        };
+        let outbound = fx
+            .router
+            .session_paths()
+            .outbound_pool(&sessions[0].agent_group_id, &sessions[0].session_id)
+            .unwrap();
+        let out_rows = outbound
+            .with_conn(copperclaw_db::tables::messages_out::list_due)
+            .unwrap();
+        let text = out_rows[0].content["text"].as_str().unwrap();
+        assert!(text.contains("queued messages: 1"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn unknown_slash_command_falls_through_unchanged() {
+        let fx = fixture(SessionMode::Shared);
+        let mut ev = event(None, "cmd-unknown-1");
+        ev.message.content = serde_json::json!({"text": "/frobnicate now"});
+        let out = fx.router.route(ev).await.unwrap();
+        let RouteOutcome::Delivered { sessions } = out else {
+            panic!("expected delivered, got {out:?}");
+        };
+        let rows = inbound_rows(&fx, &sessions[0]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, MessageKind::Chat);
+        assert!(rows[0].trigger);
+        assert_eq!(
+            rows[0].content,
+            serde_json::json!({"text": "/frobnicate now"}),
+            "unknown commands must be byte-identical passthrough"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_slash_command_still_subject_to_mention_gate() {
+        // Unknown /x is plain text: in a gated group without a mention
+        // it drops like any other ambient chatter.
+        let fx = group_fixture(EngageMode::Mention, None, None);
+        let mut ev = group_event("cmd-unknown-2");
+        ev.message.content = serde_json::json!({"text": "/frobnicate"});
+        let out = fx.router.route(ev).await.unwrap();
+        assert!(
+            matches!(
+                out,
+                RouteOutcome::Dropped {
+                    reason: DropReason::MentionGated
+                }
+            ),
+            "unknown command is not a mention-gate bypass: {out:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn known_command_with_args_falls_through_as_text() {
+        // "/stop the build" is prose for the model, not a command.
+        let fx = fixture(SessionMode::Shared);
+        let mut ev = event(None, "cmd-args-1");
+        ev.message.content = serde_json::json!({"text": "/stop the build"});
+        let out = fx.router.route(ev).await.unwrap();
+        let RouteOutcome::Delivered { sessions } = out else {
+            panic!("expected delivered, got {out:?}");
+        };
+        let rows = inbound_rows(&fx, &sessions[0]);
+        assert_eq!(rows[0].kind, MessageKind::Chat);
+        assert!(rows[0].content.get("control").is_none());
+        assert_eq!(rows[0].content["text"], "/stop the build");
     }
 }

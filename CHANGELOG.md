@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (end-user slash commands, M18 R1 — 2026-07-15)
+
+- End-user slash commands parsed router-side (`crates/copperclaw-host-router/src/commands.rs`): `/stop` (alias `/cancel`) persists a documented `control{op:stop}` row into `messages_in` (`kind=system`, `trigger=0`, pending for M18 R2's mid-turn consumer) even while a turn is in flight; `/status` is answered by the host from central-DB state straight into `messages_out` (new `RouteOutcome::Answered`, new `SessionRoot::outbound_pool`) without waking the runner; `/compact` and `/clear` (aliases `/reset`, `/new`, telegram `@BotName` suffix and case normalised) bypass the group-chat mention gate and wire through to the runner's existing sentinels; unknown `/x` falls through to the agent unchanged. Replay fixtures per command on cli + telegram under `fixtures/{cli,telegram}/slash-*` (harness: `count_due` spawn-mirror gate + `runner_drain` manifest flag, `docs/replay-fixtures.md`).
+
 ### Fixed (typing-indicator ticker backs off on channel rate limits — 2026-07-15)
 
 - **The host's `TypingTicker` no longer hammers a rate-limited channel every

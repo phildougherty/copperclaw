@@ -98,6 +98,16 @@ pub struct Manifest {
     /// (one delivery pass per inbound, the legacy behaviour).
     #[serde(default)]
     pub redrive_after_ms: Option<u64>,
+    /// When true, the per-step runner runs in DRAIN mode instead of the
+    /// default `max_turns = Some(1)` mode: `run_loop` is raced against a
+    /// watcher that polls the session's `messages_in` until no `pending`
+    /// rows remain, then cancels the loop. Needed by the slash-command
+    /// fixtures (`/clear`, `/compact`): the runner handles a pure
+    /// slash-command batch synchronously and `continue`s WITHOUT
+    /// counting a turn, so a `max_turns`-bounded loop would never
+    /// return. Default false (the legacy one-turn behaviour).
+    #[serde(default)]
+    pub runner_drain: bool,
 }
 
 /// Script one `MockAdapter::fail_next_deliver` call. `kind` decides the
