@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Removed (dead tool-policy floor — M18 R0, 2026-07-15)
+
+- Deleted the runner's decorative `DISALLOWED_TOOLS` floor (and its `disallowed` compat module): its nine pascal-case Claude-Code built-in names (`CronCreate`, `EnterPlanMode`, ...) never matched the runner's snake_case tool inventory, so the floor denied nothing — the `ToolProfile` allow-lists (plus sender-role, active-skill, and provenance layers) are and remain the real gate. A new `tool_name_drift` integration test (`crates/copperclaw-runner/tests/tool_name_drift.rs`) now pins every name in the policy lists (exported as `policy::PROFILE_TOOL_LISTS`) to `copperclaw_mcp::build_tool_set()` so a renamed or removed tool fails CI instead of leaving a decorative allow-list (`crates/copperclaw-runner/src/policy.rs`).
+
 ### Fixed (typing-indicator ticker backs off on channel rate limits — 2026-07-15)
 
 - **The host's `TypingTicker` no longer hammers a rate-limited channel every

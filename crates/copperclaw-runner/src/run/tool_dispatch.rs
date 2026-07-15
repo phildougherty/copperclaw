@@ -17,11 +17,10 @@ pub(super) async fn invoke_tool(
     deps: &RunnerDeps,
     call: &PendingToolCall,
 ) -> (String, Vec<ToolImage>, bool) {
-    // Layered authorization: host-owned floor + sender role + active
-    // skill `allowed-tools` + group tool-profile. The floor (the old
-    // `DISALLOWED_TOOLS`) is the innermost layer and can never be
-    // re-granted by a looser profile. A deny synthesises a model-facing
-    // `tool_result { is_error: true }` so the model can self-correct.
+    // Layered authorization: sender role + active skill `allowed-tools`
+    // + group tool-profile + the coarse provenance/autonomy gate. A deny
+    // synthesises a model-facing `tool_result { is_error: true }` so the
+    // model can self-correct.
     //
     // The active-skill layer is dynamic: a `load_skill` call earlier in
     // the conversation may have narrowed the scope to the loaded skill's
@@ -287,11 +286,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn floor_tool_is_denied_before_dispatch() {
+    async fn profile_denied_tool_is_refused_before_dispatch() {
+        // `shell` IS registered in the tool map (see deps_with_policy),
+        // so an allow would dispatch it — the deny proves the policy
+        // gate fires before the handler is reached.
+        let policy = ToolPolicy::new(ToolProfile::Messaging, None);
+        let (_tmp, deps) = deps_with_policy(policy);
+        let (content, _imgs, is_error) = invoke_tool(&deps, &call("shell")).await;
+        assert!(is_error);
+        assert!(content.contains("messaging"), "got: {content}");
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_errors_at_dispatch_under_full() {
+        // With the decorative DISALLOWED_TOOLS floor deleted (M18 R0),
+        // a name outside the inventory passes the open Full profile and
+        // fails at the tool-map lookup instead.
         let (_tmp, deps) = deps_with_policy(ToolPolicy::default());
         let (content, _imgs, is_error) = invoke_tool(&deps, &call("CronCreate")).await;
         assert!(is_error);
-        assert!(content.contains("host-owned"), "got: {content}");
+        assert!(content.contains("Unknown tool"), "got: {content}");
     }
 
     #[tokio::test]
