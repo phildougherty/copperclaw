@@ -120,10 +120,21 @@ impl ChannelAdapter for SlackAdapter {
         platform_id: &str,
         thread_id: Option<&str>,
     ) -> Result<(), AdapterError> {
+        // Slack only renders a typing status on assistant-thread
+        // surfaces (a thread inside the bot's own DM). Everywhere else
+        // — channel/group threads, thread-less DMs — the
+        // `assistant.threads.setStatus` call is a silent no-op on
+        // Slack's side, so skip the pointless API round-trip entirely.
+        // The host can read `typing_indicator_visible` for the same
+        // target to learn that typing produced no visible signal here
+        // (the M18 Task HUD, card H1, uses that to force
+        // `hud_mode=full` + a tighter edit cadence on these surfaces).
         let Some(thread) = thread_id else {
-            // Slack only exposes a typing status for assistants threads.
             return Ok(());
         };
+        if !is_assistant_thread_surface(platform_id, Some(thread)) {
+            return Ok(());
+        }
         // Best effort — `assistant.threads.setStatus` returns an error
         // outside an Assistants context. Swallow `not_in_channel`-style
         // bad-request responses so typing remains a soft no-op.
@@ -135,6 +146,18 @@ impl ChannelAdapter for SlackAdapter {
             Ok(()) | Err(AdapterError::BadRequest(_)) => Ok(()),
             Err(other) => Err(other),
         }
+    }
+
+    /// Slack's typing indicator (`assistant.threads.setStatus`) only
+    /// renders on assistant-thread surfaces — see
+    /// [`is_assistant_thread_surface`]. On every other target
+    /// (channel/group threads, thread-less DMs) `set_typing` is a
+    /// deliberate no-op, so report `false` there: the Task HUD (M18
+    /// card H1) reads this flag to force `hud_mode=full` and a tighter
+    /// edit cadence on surfaces where Slack contributes no liveness
+    /// signal of its own.
+    fn typing_indicator_visible(&self, platform_id: &str, thread_id: Option<&str>) -> bool {
+        is_assistant_thread_surface(platform_id, thread_id)
     }
 
     async fn deliver(
@@ -982,6 +1005,29 @@ pub(crate) fn build_todo_list_blocks(list: &TodoList) -> Value {
     Value::Array(blocks)
 }
 
+/// Whether `(platform_id, thread_id)` addresses a Slack
+/// assistant-thread surface — the only place
+/// `assistant.threads.setStatus` (the typing indicator) actually
+/// renders.
+///
+/// Slack's Agents & Assistants surface lives inside the bot's own DM
+/// as a thread, and direct-message conversation ids are `D`-prefixed.
+/// A thread in a regular channel (`C…`) or group / mpim (`G…`) is NOT
+/// an assistant thread, and a DM without a thread has no assistant
+/// context either — `setStatus` against both is a silent no-op on
+/// Slack's side. Detection is by conversation-id prefix plus thread
+/// presence, mirroring the `C` / `G` prefix classification
+/// `events::types::MessageEvent::is_group_channel` uses on the
+/// inbound path.
+///
+/// This predicate backs both `set_typing` (skip the pointless API
+/// call off-surface) and the adapter's `typing_indicator_visible`
+/// capability flag (which the M18 Task HUD, card H1, reads to force
+/// `hud_mode=full` + a tighter edit cadence where typing is invisible).
+pub(crate) fn is_assistant_thread_surface(platform_id: &str, thread_id: Option<&str>) -> bool {
+    thread_id.is_some() && platform_id.starts_with('D')
+}
+
 /// Slack mrkdwn only treats `&`, `<`, `>` as control characters; the
 /// usual markdown punctuation is rendered literally. We escape just
 /// those three so user-supplied paths / URLs / queries don't trip the
@@ -1199,9 +1245,89 @@ mod tests {
 
     #[tokio::test]
     async fn set_typing_no_thread_is_noop_ok() {
+        // No thread means no assistant context anywhere — even in the
+        // bot's own DM. No API call must go out.
         let server = MockServer::start().await;
         let adapter = adapter_for(&server);
         adapter.set_typing("C1", None).await.unwrap();
+        adapter.set_typing("D1", None).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.is_empty(),
+            "expected no API calls, got {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_typing_assistant_thread_calls_set_status() {
+        // A thread in the bot's DM (D-prefixed conversation id) is the
+        // assistant-thread surface — the one place setStatus renders,
+        // so the API call must go out exactly once.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/assistant.threads.setStatus"))
+            .and(header("authorization", "Bearer xoxb-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let adapter = adapter_for(&server);
+        adapter.set_typing("D1", Some("99.0")).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: Value = requests[0].body_json().unwrap();
+        assert_eq!(body["channel_id"], "D1");
+        assert_eq!(body["thread_ts"], "99.0");
+    }
+
+    #[tokio::test]
+    async fn set_typing_channel_thread_skips_api_call() {
+        // A thread in a regular channel (C…) or group / mpim (G…) is
+        // NOT an assistant thread; setStatus would be a silent no-op on
+        // Slack's side, so the adapter must not spend the API call.
+        // No mocks mounted: an outbound request would 404 and fail loud.
+        let server = MockServer::start().await;
+        let adapter = adapter_for(&server);
+        adapter.set_typing("C1", Some("99.0")).await.unwrap();
+        adapter.set_typing("G1", Some("99.0")).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests.is_empty(),
+            "expected no API calls, got {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn typing_indicator_visible_only_on_assistant_thread_surface() {
+        // The capability flag mirrors the set_typing short-circuit:
+        // true exactly where setStatus renders (thread in the bot DM),
+        // false everywhere Slack draws nothing. The M18 Task HUD (card
+        // H1) reads this to force hud_mode=full + tighter cadence.
+        let server = MockServer::start().await;
+        let adapter = adapter_for(&server);
+        assert!(adapter.typing_indicator_visible("D1", Some("99.0")));
+        assert!(!adapter.typing_indicator_visible("D1", None));
+        assert!(!adapter.typing_indicator_visible("C1", Some("99.0")));
+        assert!(!adapter.typing_indicator_visible("C1", None));
+        assert!(!adapter.typing_indicator_visible("G1", Some("99.0")));
+    }
+
+    #[test]
+    fn assistant_thread_surface_detection() {
+        assert!(is_assistant_thread_surface(
+            "D042ABCDEF",
+            Some("1720000000.000100")
+        ));
+        assert!(!is_assistant_thread_surface("D042ABCDEF", None));
+        assert!(!is_assistant_thread_surface(
+            "C042ABCDEF",
+            Some("1720000000.000100")
+        ));
+        assert!(!is_assistant_thread_surface(
+            "G042ABCDEF",
+            Some("1720000000.000100")
+        ));
+        assert!(!is_assistant_thread_surface("", Some("1720000000.000100")));
     }
 
     #[tokio::test]
@@ -1216,7 +1342,7 @@ mod tests {
             .mount(&server)
             .await;
         let adapter = adapter_for(&server);
-        adapter.set_typing("C1", Some("99.0")).await.unwrap();
+        adapter.set_typing("D1", Some("99.0")).await.unwrap();
     }
 
     #[tokio::test]
@@ -1231,7 +1357,7 @@ mod tests {
             .mount(&server)
             .await;
         let adapter = adapter_for(&server);
-        match adapter.set_typing("C1", Some("99.0")).await {
+        match adapter.set_typing("D1", Some("99.0")).await {
             Err(AdapterError::Auth(_)) => {}
             other => panic!("expected Auth, got {other:?}"),
         }
@@ -1246,7 +1372,7 @@ mod tests {
             .mount(&server)
             .await;
         let adapter = adapter_for(&server);
-        match adapter.set_typing("C1", Some("99.0")).await {
+        match adapter.set_typing("D1", Some("99.0")).await {
             Err(AdapterError::Rate { retry_after }) => assert_eq!(retry_after, Some(1)),
             other => panic!("expected Rate, got {other:?}"),
         }
