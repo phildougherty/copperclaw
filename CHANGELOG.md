@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (Slack typing degrades gracefully off assistant threads — 2026-07-15)
+
+- Slack `set_typing` now only calls `assistant.threads.setStatus` on assistant-thread surfaces (a thread inside the bot's `D…`-prefixed DM — the one place Slack renders the status) and skips the silent-no-op API round-trip on channel/group threads and thread-less DMs; the gap is reported through a new additive `ChannelAdapter::typing_indicator_visible(platform_id, thread_id)` capability flag (default `true`; Slack overrides it) that the M18 Task HUD (card H1) will read to force `hud_mode=full` + a tighter edit cadence where the platform shows no typing signal (`crates/copperclaw-channels/slack/src/adapter.rs`, `crates/copperclaw-channels/core/src/adapter.rs`).
+
 ### Fixed (typing-indicator ticker backs off on channel rate limits — 2026-07-15)
 
 - **The host's `TypingTicker` no longer hammers a rate-limited channel every
