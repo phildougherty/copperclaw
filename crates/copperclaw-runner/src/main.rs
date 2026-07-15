@@ -142,6 +142,11 @@ async fn main() -> Result<()> {
         );
     }
     tool_defs.extend(external_defs);
+    // M17 session-preview tools: advertised first-party but serviced host-side
+    // through the reserved `__preview` broker relay (see `run::preview`). Always
+    // advertised — the runner policy gate + the host's per-group enable flag
+    // decide whether a call is honoured.
+    tool_defs.extend(copperclaw_runner::run::preview::preview_tool_defs());
     let external_tools = std::sync::Arc::new(external_routes);
 
     // Wire the subagent deps onto the ctx so the `explore` tool can

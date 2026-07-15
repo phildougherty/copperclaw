@@ -169,10 +169,22 @@ pub(crate) fn environment_block(
     agent_group_id: AgentGroupId,
     now: chrono::DateTime<chrono::Utc>,
     assistant_name: Option<&str>,
+    model: &str,
 ) -> String {
     let mut out = String::with_capacity(512);
     out.push_str("\n# Environment\n\n");
     out.push_str(&format!("Today is {}.\n", now.format("%Y-%m-%d")));
+    // The model actually backing this session (post-failover selection,
+    // exactly what runner.json carries). This line is the single source
+    // of truth for "what model am I?" — the identity skill points here,
+    // so the agent never has to guess or parrot a hardcoded name.
+    let trimmed_model = model.trim();
+    if !trimmed_model.is_empty() {
+        out.push_str(&format!(
+            "Model: {trimmed_model} (the AI model powering you in this \
+             session; state this honestly if asked what model you are)\n",
+        ));
+    }
     out.push_str(&format!("Session id: {}\n", session_id.as_uuid()));
     out.push_str(&format!("Agent group id: {}\n", agent_group_id.as_uuid()));
     out.push_str(&format!(
@@ -306,6 +318,7 @@ pub(crate) fn assemble_system_prompt(
     session_id: copperclaw_types::SessionId,
     now: chrono::DateTime<chrono::Utc>,
     assistant_name: Option<&str>,
+    model: &str,
     skills_mode: SkillsMode,
 ) -> String {
     assemble_system_prompt_with_catalogue(
@@ -317,6 +330,7 @@ pub(crate) fn assemble_system_prompt(
         session_id,
         now,
         assistant_name,
+        model,
         skills_mode,
         None,
         &[],
@@ -342,6 +356,7 @@ pub(crate) fn assemble_system_prompt_with_catalogue(
     session_id: copperclaw_types::SessionId,
     now: chrono::DateTime<chrono::Utc>,
     assistant_name: Option<&str>,
+    model: &str,
     skills_mode: SkillsMode,
     prebuilt_catalogue: Option<&[SkillCatalogueEntry]>,
     exclude_names: &[&str],
@@ -353,6 +368,7 @@ pub(crate) fn assemble_system_prompt_with_catalogue(
         agent_group_id,
         now,
         assistant_name,
+        model,
     ));
     if let Some(brief) = read_project_briefing(session_root, groups_dir, agent_group_id) {
         out.push_str(&brief);
@@ -973,6 +989,7 @@ mod tests {
             copperclaw_types::SessionId::new(),
             fixed_now(),
             None,
+            "test-model-1.0",
             SkillsMode::Inline,
         );
         // Preamble is mode-agnostic — these phrases anchor it.
@@ -999,6 +1016,7 @@ mod tests {
             session,
             fixed_now(),
             None,
+            "test-model-1.0",
             SkillsMode::Inline,
         );
         assert!(prompt.contains(&session.as_uuid().to_string()));
@@ -1016,6 +1034,7 @@ mod tests {
             copperclaw_types::SessionId::new(),
             fixed_now(),
             Some("Atlas"),
+            "test-model-1.0",
             SkillsMode::Inline,
         );
         assert!(with_name.contains("Assistant name: Atlas"));
@@ -1028,6 +1047,7 @@ mod tests {
             copperclaw_types::SessionId::new(),
             fixed_now(),
             None,
+            "test-model-1.0",
             SkillsMode::Inline,
         );
         assert!(!without_name.contains("Assistant name:"));
@@ -1045,6 +1065,7 @@ mod tests {
             copperclaw_types::SessionId::new(),
             fixed_now(),
             None,
+            "test-model-1.0",
             SkillsMode::Inline,
         );
         assert!(!prompt.contains("# Project briefing"));
@@ -1068,6 +1089,7 @@ mod tests {
             copperclaw_types::SessionId::new(),
             fixed_now(),
             None,
+            "test-model-1.0",
             SkillsMode::Inline,
         );
         assert!(prompt.contains("# Project briefing"));
@@ -1095,6 +1117,7 @@ mod tests {
             copperclaw_types::SessionId::new(),
             fixed_now(),
             None,
+            "test-model-1.0",
             SkillsMode::Inline,
         );
         assert!(prompt.contains("<briefing source=\"group:"));
@@ -1124,6 +1147,7 @@ mod tests {
             copperclaw_types::SessionId::new(),
             fixed_now(),
             None,
+            "test-model-1.0",
             SkillsMode::Inline,
         );
         let g_pos = prompt.find("GROUP-LEVEL").expect("group briefing present");
@@ -1149,6 +1173,7 @@ mod tests {
             copperclaw_types::SessionId::new(),
             fixed_now(),
             None,
+            "test-model-1.0",
             SkillsMode::Inline,
         );
         assert!(!prompt.contains("# Project briefing"));
@@ -1170,6 +1195,7 @@ mod tests {
             copperclaw_types::SessionId::new(),
             fixed_now(),
             None,
+            "test-model-1.0",
             SkillsMode::Inline,
         );
         let brief_pos = prompt.find("BRIEF").expect("brief present");
@@ -1190,6 +1216,7 @@ mod tests {
             copperclaw_types::SessionId::new(),
             fixed_now(),
             None,
+            "test-model-1.0",
             SkillsMode::Inline,
         );
         assert!(prompt.contains("You are a Copperclaw agent"));
@@ -1207,9 +1234,10 @@ mod tests {
     fn environment_block_includes_all_required_fields() {
         let session = copperclaw_types::SessionId::new();
         let ag = AgentGroupId::new();
-        let block = environment_block(session, ag, fixed_now(), Some("Atlas"));
+        let block = environment_block(session, ag, fixed_now(), Some("Atlas"), "z-ai/glm-5.2");
         assert!(block.starts_with("\n# Environment\n"));
         assert!(block.contains("Today is 2026-05-22"));
+        assert!(block.contains("Model: z-ai/glm-5.2"));
         assert!(block.contains(&format!("Session id: {}", session.as_uuid())));
         assert!(block.contains(&format!("Agent group id: {}", ag.as_uuid())));
         assert!(block.contains("Working directory: /data"));
@@ -1223,8 +1251,21 @@ mod tests {
             AgentGroupId::new(),
             fixed_now(),
             Some("   "),
+            "test-model-1.0",
         );
         assert!(!block.contains("Assistant name:"));
+    }
+
+    #[test]
+    fn environment_block_omits_model_line_when_model_blank() {
+        let block = environment_block(
+            copperclaw_types::SessionId::new(),
+            AgentGroupId::new(),
+            fixed_now(),
+            None,
+            "  ",
+        );
+        assert!(!block.contains("Model:"));
     }
 
     #[test]
@@ -1270,6 +1311,7 @@ mod tests {
             copperclaw_types::SessionId::new(),
             fixed_now(),
             None,
+            "test-model-1.0",
             SkillsMode::Inline,
         );
         assert!(

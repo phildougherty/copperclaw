@@ -10,7 +10,7 @@ use copperclaw_host_sweep::APOLOGY_TRIES_MARKER;
 use copperclaw_types::{ChannelType, ContainerStatus, MessageId, MessageKind, Session};
 use rusqlite::{OptionalExtension, params};
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// User-facing apology emitted by the crash-restart path when one or
 /// more inbound messages were in-flight on the dying container. Kept
@@ -128,10 +128,30 @@ impl ContainerManager {
                 sessions::mark_container_stopped(&self.central, session.id)
                     .map_err(ManagerError::Db)?;
                 info!(session = %session.id.as_uuid(), "idle → stopped (pending inbound)");
+                // Idle → Stopped is deliberately a two-tick transition
+                // (the spawn wants the freshest session row). When the
+                // event-driven wake is wired, chain straight into the next
+                // tick so the spawn doesn't wait out another poll interval;
+                // without it, the poll cadence picks the session up as
+                // before.
+                if let Some(wake) = &self.wake {
+                    wake.notify_one();
+                }
                 Ok(())
             }
             ReconcileAction::IdleStop => {
                 let name = container_name(session.agent_group_id, session.id);
+                // Previews first: the container's bridge IP dies with the
+                // container (and may be reassigned), so its proxies must not
+                // outlive it.
+                if let Some(preview) = &self.preview {
+                    preview
+                        .close_all_for_session(
+                            session.id,
+                            crate::preview::TeardownReason::SessionStop,
+                        )
+                        .await;
+                }
                 let _ = self
                     .runtime
                     .stop(&name, Duration::from_secs(self.cfg.stop_grace_secs))
@@ -170,6 +190,15 @@ impl ContainerManager {
         //    non-fatal — operators still have host logs + the apology
         //    row even if we can't archive the runner's last words.
         capture_crash_log(&*self.runtime, &name, &paths).await;
+
+        // 1b. Tear down the session's previews before the container is
+        //     removed — the crashed container's bridge IP is dead and may be
+        //     reassigned to an unrelated container on respawn.
+        if let Some(preview) = &self.preview {
+            preview
+                .close_all_for_session(session.id, crate::preview::TeardownReason::SessionStop)
+                .await;
+        }
 
         // 2. Remove (not just stop) so the next spawn doesn't collide
         //    on the container name. `remove` is a stop+rm that treats
@@ -303,6 +332,18 @@ async fn capture_crash_log(
 
     let body = match runtime.logs(container_name, CRASH_LOG_TAIL_LINES).await {
         Ok(body) => body,
+        Err(err) if err.is_not_found() => {
+            // The container is already gone (an operator ran `docker rm
+            // -f`, or the daemon reaped it before we got here). There's
+            // nothing to archive — an expected, uninteresting outcome,
+            // so log at debug instead of spamming a warn every time.
+            debug!(
+                container = container_name,
+                ?err,
+                "container already gone; skipping crash-log capture"
+            );
+            return;
+        }
         Err(err) => {
             warn!(
                 container = container_name,

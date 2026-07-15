@@ -49,6 +49,23 @@ pub(super) async fn invoke_tool(
         tracing::info!(tool = %call.name, %reason, "tool call denied by policy");
         return (reason, Vec::new(), true);
     }
+    // M17 session-preview tools (`expose_preview` / `close_preview`) are
+    // host-owned but ride the SAME host-broker relay as external MCP: the
+    // runner writes a request row under the reserved `__preview` server name and
+    // block-polls for the host's response. The policy gate above already ran
+    // (both are coding-profile + credentialed-external). Reuse
+    // `dispatch_external` with a synthetic route so there's one wait loop.
+    if super::preview::is_preview_tool(&call.name) {
+        let _hb = HeartbeatTicker::start(deps.heartbeat_path.clone());
+        let route = super::preview::preview_route(&call.name);
+        return super::external_mcp::dispatch_external(
+            deps,
+            &route,
+            &call.name,
+            call.input.clone(),
+        )
+        .await;
+    }
     // External MCP tool? Route to the host-proxied request/response path
     // instead of the in-container tool_map. The policy gate above already ran
     // (an `mcp__`-prefixed name is credentialed-external, so it inherits the
@@ -657,6 +674,67 @@ mod tests {
             leftover.is_empty(),
             "runner must delete its consumed request"
         );
+    }
+
+    #[tokio::test]
+    async fn expose_preview_writes_a_reserved_preview_request_row() {
+        // M17: `expose_preview` is a first-party tool routed through the SAME
+        // host-broker relay as external MCP, under the reserved `__preview`
+        // server. invoke_tool must write a request row with server=`__preview`,
+        // tool=`expose_preview`, carrying the port — then consume the host's
+        // response.
+        let (_tmp, deps, ctx) = deps_with_runner_ctx();
+        let outbound = deps.outbound.clone();
+        let inbound = deps.inbound.clone();
+        let host = tokio::spawn(async move {
+            loop {
+                let pending = {
+                    let conn = outbound.lock().await;
+                    mcp_calls::list_requests(&conn).unwrap()
+                };
+                if let Some(req) = pending.into_iter().next() {
+                    assert_eq!(req.server, "__preview");
+                    assert_eq!(req.tool, "expose_preview");
+                    assert_eq!(req.input["port"], 3000);
+                    let conn = inbound.lock().await;
+                    mcp_calls::insert_response(
+                        &conn,
+                        &McpCallResponse {
+                            request_id: req.request_id,
+                            is_error: false,
+                            result: "http://127.0.0.1:8100/__preview/tok\nnote".into(),
+                        },
+                    )
+                    .unwrap();
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+
+        let (content, imgs, is_error) = invoke_tool(
+            &deps,
+            &call_with("expose_preview", serde_json::json!({ "port": 3000 })),
+        )
+        .await;
+        host.await.unwrap();
+
+        assert!(!is_error, "got: {content}");
+        assert!(content.contains("/__preview/tok"), "got: {content}");
+        assert!(imgs.is_empty());
+        // The preview response is host-composed (URL + note) — unlike a real
+        // external MCP result it must NOT taint the turn, or the paired
+        // same-turn `close_preview` (credentialed-external) would be blocked.
+        assert!(
+            !ctx.is_context_tainted(),
+            "a __preview relay response must not taint the turn"
+        );
+        // The consumed request row was GC'd by the runner.
+        let leftover = {
+            let conn = deps.outbound.lock().await;
+            mcp_calls::list_requests(&conn).unwrap()
+        };
+        assert!(leftover.is_empty());
     }
 
     #[tokio::test]
