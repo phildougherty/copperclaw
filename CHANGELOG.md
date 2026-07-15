@@ -22,6 +22,7 @@ adheres to [Semantic Versioning](https://semver.org/).
   `crates/copperclaw-modules/src/context.rs`.
 ### Added
 
+- `read_file` lines-mode results now report `total_lines` (whole-file line count, free since lines mode already reads the file) and `shell` accepts `tail_bytes: N` to keep the LAST N bytes of each stream instead of the first 32 KiB — the recovery path for a failing build whose error sits at the end of the log; on default head-truncation the appended hint now names `tail_bytes` and the `/data/.jobs/` background-log path, both tool descriptions document the paging/tail idioms, and defaults stay byte-identical (no new fields unless the new parameters are used) (`crates/copperclaw-mcp/src/tools/computer_use.rs`).
 - `cclaw doctor` now runs a `disk-space` check on the filesystem holding the install's data dir (`resolve_install_root()/data`): WARN below 10% free or 20 GiB free, FAIL below 3% or 5 GiB, each with a `fix:` reclaim-space hint; a `statvfs` failure or unresolvable path degrades the row to WARN instead of panicking. Closes the gap that left doctor all-OK through a live root-fs-full incident that silently degraded the host. Thresholds live in the pure, unit-tested `disk_level()`; free space is read via `rustix::fs::statvfs` (safe, no `unsafe` — new `rustix` workspace dep with the `fs` feature) (`crates/copperclaw-cclaw/src/lib.rs`).
 
 ### Fixed (delivery loop no longer poisoned by a duplicate `delivered` record — 2026-07-15)
