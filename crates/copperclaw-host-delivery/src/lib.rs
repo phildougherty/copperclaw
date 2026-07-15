@@ -46,6 +46,7 @@ pub use dispatch::{AdapterResolver, HostDispatcher};
 pub use error::DeliveryError;
 pub use service::{
     ABSOLUTE_CEILING_MS, ACTIVE_POLL_MS, BACKOFF_BASE_MS, DeliveryKey, DeliveryReport,
-    DeliveryService, FsSessionRoot, MAX_DELIVERY_ATTEMPTS, SWEEP_POLL_MS, SessionPool, SessionRoot,
+    DeliveryService, FsSessionRoot, MAX_DELIVERY_ATTEMPTS, PREVIEW_SERVER, SWEEP_POLL_MS,
+    SessionPool, SessionRoot,
 };
 pub use system_actions::{ParsedAction, parse_system_content};

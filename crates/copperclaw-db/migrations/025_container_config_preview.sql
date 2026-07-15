@@ -1,0 +1,32 @@
+-- Per-group session-preview proxy gate.
+--
+-- The M17 preview-proxy feature lets an in-container agent expose an HTTP app
+-- it built (listening on `0.0.0.0:<port>` INSIDE the container) to the
+-- operator's machine / LAN for hands-on testing. The host runs a token-gated
+-- reverse proxy from a host port to the container's bridge IP; the agent
+-- drives it with the first-party `expose_preview` / `close_preview` tools.
+--
+-- Exposing a LAN listener is a privileged, opt-in capability, so it is gated
+-- per-group and OFF by default. `preview_enabled` is the master switch;
+-- `preview_bind` selects the host interface the proxy binds:
+--
+--   * `preview_enabled = 0` (default) — the tool answers with an is_error that
+--     tells the agent which operator command turns it on. No listener is ever
+--     opened for a group that has not opted in.
+--   * `preview_bind` — NULL/absent means bind loopback only ("127.0.0.1"), the
+--     safe default (reachable from the host, not the LAN). An operator who
+--     wants LAN reachability sets it to "0.0.0.0" (or a specific interface IP).
+--
+-- Runner-config-independent: these columns are consumed host-side by the
+-- preview manager, not written into `runner.json`, and they do NOT affect the
+-- container image — so they stay OUTSIDE `compute_fingerprint` (like
+-- `surface_thinking` / `tool_profile`); toggling them takes effect on the next
+-- `expose_preview` call without any rebuild.
+--
+-- Operators opt a group in via
+--   cclaw groups config update --field preview_enabled=true <group>
+-- and (optionally) widen the bind with
+--   cclaw groups config update --field 'preview_bind="0.0.0.0"' <group>
+-- then restart the group so the change is picked up.
+ALTER TABLE container_configs ADD COLUMN preview_enabled INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE container_configs ADD COLUMN preview_bind TEXT;

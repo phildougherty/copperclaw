@@ -124,6 +124,11 @@ const CODING_TOOLS: &[&str] = &[
     "copy_file",
     "explore",
     "create_agent",
+    // M17 session-preview proxy: exposing / closing an HTTP app the agent
+    // built is part of the build-test loop, so it rides the coding profile
+    // (and is denied to a guest via the mutating floor — see `is_mutating`).
+    "expose_preview",
+    "close_preview",
 ];
 
 /// Self-modification tools, layered on only by the `full` profile. These
@@ -154,6 +159,16 @@ const CREDENTIALED_EXTERNAL_TOOLS: &[&str] = &[
     "web_search",
     "install_packages",
     "add_mcp_server",
+    // M17 session-preview proxy: `expose_preview` stands up a LAN-reachable
+    // listener on the operator's network — an external action. It obeys the
+    // same provenance / autonomy gate as `web_fetch`: blocked outright on an
+    // autonomous turn, and blocked on a tainted turn until a fresh approval
+    // clears it, so a prompt-injected turn can't publish an attacker-chosen
+    // app to the LAN. `close_preview` is the paired teardown; gating it too
+    // keeps the pair symmetric and harmless (tearing down is safe, but the
+    // block only bites on already-tainted/autonomous turns).
+    "expose_preview",
+    "close_preview",
 ];
 
 /// Namespace prefix the runner gives every **external** MCP tool it advertises
@@ -944,6 +959,76 @@ mod tests {
         assert_eq!(ToolPolicy::default().trust(), TurnTrust::default());
         assert!(!TurnTrust::default().tainted);
         assert!(!TurnTrust::default().autonomous);
+    }
+
+    // ── M17 preview tools policy ─────────────────────────────────────────
+
+    #[test]
+    fn preview_tools_are_coding_profile_and_credentialed_external() {
+        for t in ["expose_preview", "close_preview"] {
+            // Coding + full profiles admit them; minimal/messaging do not.
+            assert!(ToolProfile::Coding.allows(t), "coding should allow {t}");
+            assert!(ToolProfile::Full.allows(t), "full should allow {t}");
+            assert!(!ToolProfile::Minimal.allows(t), "minimal must deny {t}");
+            assert!(!ToolProfile::Messaging.allows(t), "messaging must deny {t}");
+            // They take a credentialed external action (LAN listener).
+            assert!(
+                is_credentialed_external(t),
+                "{t} must be credentialed-external"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_tools_denied_to_guest() {
+        // A guest under an otherwise-permissive Full profile is barred (they're
+        // mutating tools via CODING_TOOLS).
+        let p = ToolPolicy::new(ToolProfile::Full, Some(SenderRole::Guest));
+        for t in ["expose_preview", "close_preview"] {
+            let d = p.evaluate(t);
+            assert!(!d.is_allow(), "guest should be denied {t}");
+            assert!(d.deny_reason().unwrap().contains("guest"), "{t}");
+        }
+    }
+
+    #[test]
+    fn preview_expose_denied_on_tainted_turn_without_approval() {
+        let tainted =
+            ToolPolicy::new(ToolProfile::Coding, Some(SenderRole::Admin)).with_trust(TurnTrust {
+                tainted: true,
+                approved: false,
+                autonomous: false,
+            });
+        let d = tainted.evaluate("expose_preview");
+        assert!(!d.is_allow());
+        assert!(d.deny_reason().unwrap().contains("untrusted-provenance"));
+        // A fresh approval clears it.
+        let approved =
+            ToolPolicy::new(ToolProfile::Coding, Some(SenderRole::Admin)).with_trust(TurnTrust {
+                tainted: true,
+                approved: true,
+                autonomous: false,
+            });
+        assert!(approved.evaluate("expose_preview").is_allow());
+    }
+
+    #[test]
+    fn preview_expose_blocked_on_autonomous_turn() {
+        let auto = ToolPolicy::new(ToolProfile::Coding, None).with_trust(TurnTrust {
+            tainted: false,
+            approved: false,
+            autonomous: true,
+        });
+        let d = auto.evaluate("expose_preview");
+        assert!(!d.is_allow());
+        assert!(d.deny_reason().unwrap().contains("autonomous"));
+    }
+
+    #[test]
+    fn preview_expose_allowed_on_clean_coding_turn() {
+        let clean = ToolPolicy::new(ToolProfile::Coding, Some(SenderRole::Member));
+        assert!(clean.evaluate("expose_preview").is_allow());
+        assert!(clean.evaluate("close_preview").is_allow());
     }
 
     #[test]

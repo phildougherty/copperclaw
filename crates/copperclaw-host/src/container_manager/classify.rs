@@ -128,10 +128,30 @@ impl ContainerManager {
                 sessions::mark_container_stopped(&self.central, session.id)
                     .map_err(ManagerError::Db)?;
                 info!(session = %session.id.as_uuid(), "idle → stopped (pending inbound)");
+                // Idle → Stopped is deliberately a two-tick transition
+                // (the spawn wants the freshest session row). When the
+                // event-driven wake is wired, chain straight into the next
+                // tick so the spawn doesn't wait out another poll interval;
+                // without it, the poll cadence picks the session up as
+                // before.
+                if let Some(wake) = &self.wake {
+                    wake.notify_one();
+                }
                 Ok(())
             }
             ReconcileAction::IdleStop => {
                 let name = container_name(session.agent_group_id, session.id);
+                // Previews first: the container's bridge IP dies with the
+                // container (and may be reassigned), so its proxies must not
+                // outlive it.
+                if let Some(preview) = &self.preview {
+                    preview
+                        .close_all_for_session(
+                            session.id,
+                            crate::preview::TeardownReason::SessionStop,
+                        )
+                        .await;
+                }
                 let _ = self
                     .runtime
                     .stop(&name, Duration::from_secs(self.cfg.stop_grace_secs))
@@ -170,6 +190,15 @@ impl ContainerManager {
         //    non-fatal — operators still have host logs + the apology
         //    row even if we can't archive the runner's last words.
         capture_crash_log(&*self.runtime, &name, &paths).await;
+
+        // 1b. Tear down the session's previews before the container is
+        //     removed — the crashed container's bridge IP is dead and may be
+        //     reassigned to an unrelated container on respawn.
+        if let Some(preview) = &self.preview {
+            preview
+                .close_all_for_session(session.id, crate::preview::TeardownReason::SessionStop)
+                .await;
+        }
 
         // 2. Remove (not just stop) so the next spawn doesn't collide
         //    on the container name. `remove` is a stop+rm that treats

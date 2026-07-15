@@ -97,6 +97,10 @@ const CENTRAL: &[Migration] = &[
         name: "022_mcp_oauth_tokens",
         sql: include_str!("../migrations/022_mcp_oauth_tokens.sql"),
     },
+    Migration {
+        name: "025_container_config_preview",
+        sql: include_str!("../migrations/025_container_config_preview.sql"),
+    },
 ];
 
 const SESSION_INBOUND: &[Migration] = &[

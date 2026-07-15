@@ -198,6 +198,23 @@ pub struct ContainerManager {
     /// deployment's responsibility (host networking / docker bridge); see the
     /// module docs.
     pub(crate) broker_base_url: Option<String>,
+    /// M17 session-preview manager. When wired (via [`Self::with_preview`]),
+    /// the idle-stop and crash-restart paths tear down every preview the
+    /// session had open — a stopped/removed container's bridge IP is dead (or
+    /// worse, may be reassigned), so its proxies must not outlive it. `None`
+    /// (the default, and every test constructor) is a no-op.
+    pub(crate) preview: Option<Arc<crate::preview::PreviewManager>>,
+    /// Event-driven wake accelerator. When wired (via
+    /// [`Self::with_wake_notify`], from the router's
+    /// `inbound_wake` handle), [`Self::run_loop`] awaits it alongside the
+    /// poll timer and runs an immediate [`Self::tick`] on signal — so a
+    /// message to an idle/stopped session spawns a container within ~one
+    /// tick instead of waiting out the poll interval. `Notify` coalesces
+    /// bursts into a single stored permit, and `classify()` stays the single
+    /// decision point, so there are no spawn storms. `None` (the default)
+    /// keeps the pure polling loop — the poll cadence remains the crash-safe
+    /// fallback either way.
+    pub(crate) wake: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl ContainerManager {
@@ -224,8 +241,30 @@ impl ContainerManager {
             }),
             broker: None,
             broker_base_url: None,
+            preview: None,
+            wake: None,
             cfg,
         }
+    }
+
+    /// Wire the M17 session-preview manager so container stop / removal tears
+    /// down the session's previews. Mutates `self` so the boot sequence can
+    /// attach it after building the manager.
+    #[must_use]
+    pub fn with_preview(mut self, preview: Arc<crate::preview::PreviewManager>) -> Self {
+        self.preview = Some(preview);
+        self
+    }
+
+    /// Wire an event-driven wake signal into the manager. The host passes
+    /// the router's `inbound_wake` handle so a `messages_in` insert wakes
+    /// the reconcile loop immediately (see the field docs on [`Self::wake`]
+    /// for the coalescing / fallback contract). Mutates `self` so the boot
+    /// sequence can attach it after building the manager.
+    #[must_use]
+    pub fn with_wake_notify(mut self, wake: Arc<tokio::sync::Notify>) -> Self {
+        self.wake = Some(wake);
+        self
     }
 
     /// Wire an enabled credential broker into the manager. Stores the broker
@@ -345,14 +384,35 @@ impl ContainerManager {
     }
 
     /// Poll loop. Returns when `shutdown` is cancelled.
+    ///
+    /// When a wake signal is wired ([`Self::with_wake_notify`]), the loop
+    /// also runs an immediate global [`Self::tick`] whenever the router
+    /// signals a fresh `messages_in` insert. The timer arm keeps firing
+    /// regardless — polling is the crash-safe fallback, the notify is only
+    /// an accelerator. `Notify` stores at most one permit, so a burst of
+    /// inserts arriving while a tick is in flight coalesces into exactly one
+    /// follow-up tick; `classify()` remains the single decision point, so an
+    /// extra tick against an already-reconciled session is a no-op.
     pub async fn run_loop(self: Arc<Self>, shutdown: CancellationToken) {
         let interval = Duration::from_millis(POLL_INTERVAL_MS);
+        // When no wake signal is wired, park the wake arm on a private
+        // Notify nobody ever signals — the select then degenerates to the
+        // original timer-only loop.
+        let wake = self
+            .wake
+            .clone()
+            .unwrap_or_else(|| Arc::new(tokio::sync::Notify::new()));
         loop {
             tokio::select! {
                 () = shutdown.cancelled() => return,
                 () = tokio::time::sleep(interval) => {
                     if let Err(err) = self.tick().await {
                         warn!(?err, "container_manager tick failed");
+                    }
+                }
+                () = wake.notified() => {
+                    if let Err(err) = self.tick().await {
+                        warn!(?err, "container_manager wake tick failed");
                     }
                 }
             }
@@ -404,5 +464,195 @@ impl ContainerManager {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    //! Event-driven wake (M17 C3): the run loop's `Notify` arm and its
+    //! coalescing behaviour. Spawn-path details are covered in
+    //! `spawn.rs` / `classify.rs`; here we only assert the wiring between
+    //! the wake handle and `tick()`.
+
+    use super::config::{ManagerConfig, SkillsMode};
+    use super::spawn::{
+        DEFAULT_HEARTBEAT_STALE_SECS, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_STOP_GRACE_SECS,
+    };
+    use super::*;
+    use copperclaw_db::session::{SessionPaths, open_inbound};
+    use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+    use copperclaw_db::tables::messages_in;
+    use copperclaw_db::tables::sessions::{CreateSession, create as create_session};
+    use copperclaw_types::{ContainerStatus, Session};
+    use std::path::PathBuf;
+    use tokio::sync::Notify;
+
+    fn manager_cfg(data_dir: PathBuf) -> ManagerConfig {
+        ManagerConfig {
+            install_slug: "test".into(),
+            data_dir,
+            default_image_tag: "copperclaw/session:test".into(),
+            default_provider: "anthropic".into(),
+            default_model: "claude-sonnet-4-6".into(),
+            default_effort: None,
+            anthropic_api_key: Some("sk-test".into()),
+            anthropic_base_url: None,
+            idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+            heartbeat_stale_secs: DEFAULT_HEARTBEAT_STALE_SECS,
+            stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
+            skills_dir: None,
+            groups_dir: None,
+            skills_mode: SkillsMode::Inline,
+            gpu_passthrough: false,
+            forward_env: Vec::new(),
+            egress_mode: copperclaw_container_rt::EgressMode::AllowAll,
+        }
+    }
+
+    fn fixture_session(db: &CentralDb) -> Session {
+        let ag = create_ag(
+            db,
+            CreateAgentGroup {
+                name: "demo".into(),
+                folder: "demo".into(),
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        create_session(
+            db,
+            CreateSession {
+                agent_group_id: ag.id,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap()
+    }
+
+    fn seed_pending_inbound(data_dir: &Path, session: &Session) {
+        let paths = SessionPaths::new(data_dir, session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        let conn = open_inbound(&paths).unwrap();
+        messages_in::insert(
+            &conn,
+            &messages_in::WriteInbound {
+                id: copperclaw_types::MessageId::new(),
+                kind: copperclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "hi"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("stdin".into()),
+                channel_type: Some(copperclaw_types::ChannelType::new("cli")),
+                thread_id: None,
+                source_session_id: None,
+                reply_to: None,
+                is_group: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// A burst of wake signals against a stopped session with pending
+    /// inbound produces exactly ONE spawn, and it lands well before the
+    /// poll timer would have fired — the wake is an accelerator, the
+    /// coalescing is the no-spawn-storm guarantee.
+    #[tokio::test]
+    async fn wake_burst_spawns_once_before_poll_interval() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let runtime = Arc::new(crate::tests::NoopRuntime::default());
+        let wake = Arc::new(Notify::new());
+        let mgr = Arc::new(
+            ContainerManager::new(db.clone(), runtime.clone(), manager_cfg(tmp.path().into()))
+                .with_wake_notify(Arc::clone(&wake)),
+        );
+        let session = fixture_session(&db);
+        seed_pending_inbound(tmp.path(), &session);
+
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(Arc::clone(&mgr).run_loop(shutdown.clone()));
+        // Let the loop park on its select before signalling.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let start = std::time::Instant::now();
+        for _ in 0..25 {
+            wake.notify_one();
+        }
+
+        // Poll for the spawn; the timer arm can't have fired before
+        // POLL_INTERVAL_MS (1000ms), so a spawn observed inside this
+        // 800ms budget was wake-driven.
+        let budget = Duration::from_millis(800);
+        loop {
+            if !runtime.spawn_calls().is_empty() {
+                break;
+            }
+            assert!(
+                start.elapsed() < budget,
+                "wake did not trigger a spawn within {budget:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Give any (incorrectly) queued extra wake ticks a chance to run,
+        // then assert the burst coalesced into a single spawn.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            runtime.spawn_calls().len(),
+            1,
+            "burst of 25 wake signals must coalesce into one spawn"
+        );
+
+        shutdown.cancel();
+        let _ = task.await;
+    }
+
+    /// `WakeFromIdle` is a two-tick transition (idle → stopped, then
+    /// spawn). With the wake wired, the first tick chains the second by
+    /// self-signalling instead of waiting out another poll interval.
+    #[tokio::test]
+    async fn wake_from_idle_tick_self_signals_for_the_spawn_tick() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let runtime = Arc::new(crate::tests::NoopRuntime::default());
+        let wake = Arc::new(Notify::new());
+        let mgr = ContainerManager::new(db.clone(), runtime, manager_cfg(tmp.path().into()))
+            .with_wake_notify(Arc::clone(&wake));
+        let session = fixture_session(&db);
+        sessions::mark_container_idle(&db, session.id).unwrap();
+        seed_pending_inbound(tmp.path(), &session);
+
+        mgr.tick().await.unwrap();
+
+        let updated = sessions::get(&db, session.id).unwrap();
+        assert!(matches!(updated.container_status, ContainerStatus::Stopped));
+        // The idle → stopped transition stored a permit so the next loop
+        // iteration spawns immediately.
+        tokio::time::timeout(Duration::from_secs(1), wake.notified())
+            .await
+            .expect("WakeFromIdle must self-signal the follow-up tick");
+    }
+
+    /// Without a wired wake handle the manager behaves exactly as before:
+    /// no permit is stored anywhere and `tick()` still reconciles.
+    #[tokio::test]
+    async fn tick_without_wake_handle_is_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let runtime = Arc::new(crate::tests::NoopRuntime::default());
+        let mgr = ContainerManager::new(db.clone(), runtime, manager_cfg(tmp.path().into()));
+        assert!(mgr.wake.is_none(), "wake defaults to None");
+        let session = fixture_session(&db);
+        sessions::mark_container_idle(&db, session.id).unwrap();
+        seed_pending_inbound(tmp.path(), &session);
+        mgr.tick().await.unwrap();
+        let updated = sessions::get(&db, session.id).unwrap();
+        assert!(matches!(updated.container_status, ContainerStatus::Stopped));
     }
 }

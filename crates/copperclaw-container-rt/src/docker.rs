@@ -308,6 +308,24 @@ impl ContainerRuntime for DockerRuntime {
             ))),
         }
     }
+
+    async fn container_ip(&self, name: &str) -> Result<Option<String>, RtError> {
+        match self
+            .docker
+            .inspect_container(name, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(info) => Ok(ip_from_inspect(&info)),
+            // 404 = the container is gone; report "no IP" rather than erroring
+            // so a caller probing a since-removed session degrades cleanly.
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(None),
+            Err(e) => Err(RtError::Container(format!(
+                "inspect container {name} ip: {e}"
+            ))),
+        }
+    }
 }
 
 // ---- pure translation helpers ------------------------------------------
@@ -331,6 +349,51 @@ pub(crate) fn pid_from_inspect(info: &ContainerInspectResponse) -> Option<i32> {
         return None;
     }
     i32::try_from(pid).ok()
+}
+
+/// Extract the container's bridge IP from a Docker
+/// [`ContainerInspectResponse`].
+///
+/// Prefers the per-network `NetworkSettings.Networks.<net>.IPAddress` (the
+/// modern shape — a container may be attached to several networks; we take the
+/// first non-empty address, preferring the default `bridge` network when
+/// present) and falls back to the legacy top-level `NetworkSettings.IPAddress`.
+/// Returns `None` when neither is populated (container stopped, or on a
+/// `network_mode = "none"` sandbox with no bridge attachment — an egress-denied
+/// session, which correctly has no reachable preview IP). Pure, so it is
+/// unit-tested against a constructed inspect response without a daemon.
+#[must_use]
+pub(crate) fn ip_from_inspect(info: &ContainerInspectResponse) -> Option<String> {
+    let settings = info.network_settings.as_ref()?;
+    if let Some(networks) = settings.networks.as_ref() {
+        // Prefer the default bridge network if the container is on it, else
+        // take the first network with a non-empty IPAddress. Deterministic:
+        // `bridge` is checked first, then a sorted scan of the rest.
+        if let Some(ip) = networks
+            .get("bridge")
+            .and_then(|ep| ep.ip_address.as_ref())
+            .filter(|ip| !ip.is_empty())
+        {
+            return Some(ip.clone());
+        }
+        let mut names: Vec<&String> = networks.keys().collect();
+        names.sort();
+        for net in names {
+            if let Some(ip) = networks
+                .get(net)
+                .and_then(|ep| ep.ip_address.as_ref())
+                .filter(|ip| !ip.is_empty())
+            {
+                return Some(ip.clone());
+            }
+        }
+    }
+    // Legacy top-level field (older daemons / single-network shape).
+    settings
+        .ip_address
+        .as_ref()
+        .filter(|ip| !ip.is_empty())
+        .cloned()
 }
 
 /// Translate a [`ContainerSpec`] into a bollard [`Config`].
@@ -1277,6 +1340,64 @@ mod tests {
         });
         let info: ContainerInspectResponse = serde_json::from_value(json).unwrap();
         assert_eq!(pid_from_inspect(&info), Some(31337));
+    }
+
+    #[test]
+    fn ip_from_inspect_prefers_bridge_network() {
+        // The modern per-network shape: prefer the default `bridge` network's
+        // IPAddress even when another network is listed first alphabetically.
+        let json = serde_json::json!({
+            "Id": "deadbeef",
+            "NetworkSettings": {
+                "Networks": {
+                    "aardvark-net": { "IPAddress": "10.9.9.9" },
+                    "bridge": { "IPAddress": "172.17.0.4" }
+                }
+            }
+        });
+        let info: ContainerInspectResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(ip_from_inspect(&info), Some("172.17.0.4".to_string()));
+    }
+
+    #[test]
+    fn ip_from_inspect_first_named_network_when_no_bridge() {
+        // No `bridge` key: take the first (sorted) network with a non-empty IP.
+        let json = serde_json::json!({
+            "NetworkSettings": {
+                "Networks": {
+                    "zeta": { "IPAddress": "10.0.0.2" },
+                    "alpha": { "IPAddress": "" }
+                }
+            }
+        });
+        let info: ContainerInspectResponse = serde_json::from_value(json).unwrap();
+        // `alpha` sorts first but has an empty IP, so `zeta` wins.
+        assert_eq!(ip_from_inspect(&info), Some("10.0.0.2".to_string()));
+    }
+
+    #[test]
+    fn ip_from_inspect_falls_back_to_legacy_top_level() {
+        let json = serde_json::json!({
+            "NetworkSettings": { "IPAddress": "172.17.0.9" }
+        });
+        let info: ContainerInspectResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(ip_from_inspect(&info), Some("172.17.0.9".to_string()));
+    }
+
+    #[test]
+    fn ip_from_inspect_none_when_unattached() {
+        // No NetworkSettings at all (e.g. a `network_mode = "none"` sandbox
+        // container, which correctly has no reachable preview IP).
+        assert_eq!(ip_from_inspect(&ContainerInspectResponse::default()), None);
+        // NetworkSettings present but every address empty.
+        let json = serde_json::json!({
+            "NetworkSettings": {
+                "IPAddress": "",
+                "Networks": { "none": { "IPAddress": "" } }
+            }
+        });
+        let info: ContainerInspectResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(ip_from_inspect(&info), None);
     }
 
     #[test]

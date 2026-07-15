@@ -382,6 +382,8 @@ fn ensure_config_row(central: &CentralDb, id: AgentGroupId) -> Result<(), ErrorP
                 coding_enabled: false,
                 surface_thinking: false,
                 tool_profile: None,
+                preview_enabled: false,
+                preview_bind: None,
             },
         )
         .map_err(db_err)?;

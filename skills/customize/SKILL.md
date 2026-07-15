@@ -91,7 +91,7 @@ Or `copperclaw stop && copperclaw start` for a full host bounce.
 ## Triggers
 
 - "customize yourself"
-- "use a different model" / "switch to opus" / "lower effort"
+- "use a different model" / "switch to <some model name>" / "lower effort"
 - "add the github MCP server" / "install ripgrep"
 - "tweak your behavior" / "be more concise"
 - "raise/lower my budget" / "how much can you spend"

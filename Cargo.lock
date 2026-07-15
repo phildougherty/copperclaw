@@ -443,6 +443,7 @@ dependencies = [
 name = "copperclaw-cclaw"
 version = "0.1.0"
 dependencies = [
+ "anstyle",
  "anyhow",
  "async-trait",
  "clap",
@@ -1252,6 +1253,7 @@ dependencies = [
  "copperclaw-metrics",
  "copperclaw-providers",
  "copperclaw-types",
+ "futures",
  "metrics",
  "metrics-exporter-prometheus",
  "rmcp",

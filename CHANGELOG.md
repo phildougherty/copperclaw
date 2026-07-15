@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (session preview proxy — 2026-07-14)
+
+- **Session preview proxy (M17):** an in-container agent can expose an HTTP app it built to the operator's machine / LAN for hands-on testing via two new first-party tools, `expose_preview {port, name?}` and `close_preview {port}`. The tools ride the existing external-MCP host-broker relay under the reserved server name `__preview` (`crates/copperclaw-runner/src/run/preview.rs`, dispatch hook in `run/tool_dispatch.rs`); the delivery loop routes `__preview` requests to a host-side broker (`crates/copperclaw-host-delivery/src/service.rs::execute_preview_call`, trait in `crates/copperclaw-modules/src/preview.rs`). The broker (`crates/copperclaw-host/src/preview.rs`) resolves the container's bridge IP (new `ContainerRuntime::container_ip`, Docker impl via inspect in `crates/copperclaw-container-rt`), allocates a host port from 8100-8199 (caps: 4/session, 16/host), and serves a token-gated axum reverse proxy: `GET /__preview/<token>` sets an HttpOnly cookie + redirects to `/`; requests without the matching cookie get 403; WebSocket upgrades are refused (501, v1). Secure-by-default: **off per group** until the operator runs `cclaw groups config update --field preview_enabled=true <group>`; the proxy binds loopback unless `preview_bind` is set (e.g. `"0.0.0.0"` for LAN, validated as an IP) — migration `025_container_config_preview.sql` adds both columns, editable via `cclaw groups config get/update/edit`. Runner policy treats both tools as coding-profile AND credentialed-external (guest-denied, blocked on tainted turns without fresh approval, blocked on autonomous turns). Previews expire after 30 min idle (reaper), and are torn down on `close_preview`, container idle-stop/crash (container-manager hook), and host shutdown — every expose/teardown writes an `audit_log` row. `__preview` is rejected as an external MCP server name in the add-server handlers. New `skills/preview/SKILL.md` teaches the flow (serve on 0.0.0.0, relay the URL verbatim, relay the enable command on the off-state error).
+
+### Fixed (dynamic model identity — 2026-07-14)
+
+- The agent's system prompt `# Environment` block now carries a `Model:` line with the session's actual resolved model (post-failover, same value as `runner.json`), and `skills/identity/SKILL.md` was rewritten model-agnostic: it instructs the agent to answer "what model are you?" from that line and never hardcodes a model name. Previously the skill's examples said "Powered by Claude Sonnet 4.6 under the hood", which non-Claude models parroted verbatim (`crates/copperclaw-host/src/container_manager/prompt.rs`, `skills/identity/SKILL.md`).
+
+### Fixed (admin-socket data dir — 2026-07-14)
+
+- The cclaw socket server built its `HandlerCtx` with the default relative `"data"` path instead of the install's absolute data dir, so `sessions.delete` never removed the on-disk session directory when the host ran daemonized (it reported `directory_removed: false` with no warning) and dead-letter `dropped-messages replay` resolved per-session DBs against the daemon's CWD. `serve_listener`/`run_server` now take the data dir explicitly and boot passes `cfg.data_dir` (`crates/copperclaw-host/src/{socket.rs,boot.rs}`); regression e2e drives `sessions.delete` through the real socket server with a non-CWD data dir.
+### Added (M17 D1 — cclaw color + TTY awareness — 2026-07-14)
+
+- `cclaw` human-readable output is colorized when stdout is a real terminal: doctor OK/WARN/FAIL levels (green/yellow/red), `fix:` hint lines (cyan), table and dashboard section headers (bold), and `remote error:` lines (red). Gated on `std::io::IsTerminal`, the `NO_COLOR` convention, and a new global `--no-color` flag (`crates/copperclaw-cclaw/src/style.rs`); `--json` output is never styled and piped output stays byte-identical.
+
+### Fixed (M17 D2 — honest `sessions get`, new `sessions tail` — 2026-07-14)
+
+- `cclaw sessions get` now delivers what its help text always claimed: the session row plus the last 10 `messages_in` / `messages_out` rows (kind, status, timestamp, ~120-char secret-redacted content preview), read read-only from the per-session DBs host-side (`crates/copperclaw-host/src/handlers/sessions.rs`); and a new `cclaw sessions tail <id> [--follow]` prints the merged time-ordered rows with direction markers (`<-` inbound, `->` outbound, `--` breadcrumb/status kinds), polling 1s under `--follow` — safe against a running session (WAL concurrent reader), and message previews are withheld from agent callers asking about foreign sessions.
+### Changed (event-driven wake for idle sessions — M17 C3 — 2026-07-14)
+
+- A message to a stopped/idle session now spawns its container within ~one reconcile tick instead of waiting out the container manager's poll cadence: the router signals a `tokio::sync::Notify` after every `messages_in` insert (`copperclaw-host-router/src/route.rs`, `Router::inbound_wake`) and the container manager's `run_loop` ticks immediately on it (`copperclaw-host/src/container_manager/mod.rs`, `with_wake_notify`; idle→stopped self-chains the spawn tick in `classify.rs`). Notify coalescing plus `classify()` as the single decision point prevent spawn storms; the 1s poll loop remains the crash-safe fallback.
+### Changed (M17 A1 — parallel tool execution — 2026-07-14)
+
+- The runner executes each turn's tool-call batch concurrently instead of sequentially (`crates/copperclaw-runner/src/run/drive_turn.rs::execute_tool_batch`): independent calls overlap (N reads finish in ~max latency, not ~sum) while results still append to history in the original call order; `shell` calls keep their relative order (persisted cwd/env) and edit-family calls (`edit_file`/`multi_edit`/`apply_patch`/`write_file`) serialize per target path.
+
 ### Added (runner external-MCP consumer — host-proxied — 2026-06-03)
 
 The in-container runner can now consume **external** MCP servers configured on a
