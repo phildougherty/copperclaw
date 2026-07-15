@@ -175,6 +175,69 @@ async fn cli_scheduled_wake() {
     run_fixture("cli", "scheduled-wake").await;
 }
 
+/// D2 e2e: after a real replayed turn (per-session DBs on disk, WAL
+/// outbound), `sessions.get` attaches the recent message rows its help
+/// text promises and `sessions.tail` returns the merged, time-ordered
+/// rows plus seq cursors that make `--follow` incremental.
+#[tokio::test]
+async fn cli_text_reply_sessions_get_and_tail() {
+    use copperclaw_cclaw::Caller;
+    use copperclaw_host::handlers::sessions as sessions_handlers;
+    use copperclaw_host::socket::HandlerCtx;
+
+    let harness = run_fixture_into_harness("cli", "text-reply").await;
+    let (_ag, sess) = harness.touched_sessions[0];
+    let ctx = HandlerCtx::with_data_dir(harness.central.clone(), harness.tempdir.path());
+    let args = serde_json::json!({"id": sess.as_uuid().to_string()});
+
+    // sessions.get: session row + last inbound/outbound rows.
+    let v = sessions_handlers::get(&args, &Caller::Host, &ctx).unwrap();
+    assert_eq!(v["id"].as_str().unwrap(), sess.as_uuid().to_string());
+    let inbound = v["recent_inbound"].as_array().unwrap();
+    assert_eq!(inbound.len(), 1, "one inbound chat row: {inbound:?}");
+    assert_eq!(inbound[0]["preview"], "hello");
+    assert_eq!(inbound[0]["kind"], "chat");
+    assert_eq!(inbound[0]["status"], "completed");
+    let outbound = v["recent_outbound"].as_array().unwrap();
+    assert!(
+        outbound.iter().any(|r| r["preview"] == "Hello back!"),
+        "outbound rows must include the chat reply: {outbound:?}"
+    );
+
+    // sessions.tail: merged, time-ordered, inbound first.
+    let t = sessions_handlers::tail(&args, &Caller::Host, &ctx).unwrap();
+    let rows = t["rows"].as_array().unwrap();
+    assert!(
+        rows.len() >= 2,
+        "expected inbound + outbound rows: {rows:?}"
+    );
+    assert_eq!(rows[0]["direction"], "in");
+    assert_eq!(rows[0]["preview"], "hello");
+    let reply = rows
+        .iter()
+        .find(|r| r["preview"] == "Hello back!")
+        .expect("tail must show the outbound reply");
+    assert_eq!(reply["direction"], "out");
+    // Timestamps are non-decreasing (merged order).
+    let ts: Vec<&str> = rows.iter().map(|r| r["ts"].as_str().unwrap()).collect();
+    let mut sorted = ts.clone();
+    sorted.sort_unstable();
+    assert_eq!(ts, sorted, "tail rows must be time-ordered");
+
+    // Cursoring: replaying with the returned seqs yields nothing new.
+    let again = sessions_handlers::tail(
+        &serde_json::json!({
+            "id": sess.as_uuid().to_string(),
+            "since_in_seq": t["last_in_seq"],
+            "since_out_seq": t["last_out_seq"],
+        }),
+        &Caller::Host,
+        &ctx,
+    )
+    .unwrap();
+    assert!(again["rows"].as_array().unwrap().is_empty());
+}
+
 /// Telegram outbound text exceeding the adapter's 4096-char cap is
 /// split by the delivery loop into two paragraph-bounded chunks before
 /// reaching the adapter (slice-1 chat-text splitter). Beyond the JSONL

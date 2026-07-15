@@ -5,8 +5,15 @@
 //! table. Anything more complex (or anything the caller wants raw) goes
 //! through [`render_json_pretty`], which is what `--json` triggers.
 
+use crate::style::Palette;
 use serde_json::Value;
 use std::fmt::Write as _;
+
+/// Render `value` to a human-friendly string with no styling. Equivalent
+/// to [`render_with`] under [`Palette::plain`].
+pub fn render(value: &Value) -> String {
+    render_with(value, Palette::plain())
+}
 
 /// Render `value` to a human-friendly string.
 ///
@@ -16,10 +23,13 @@ use std::fmt::Write as _;
 ///    order.
 /// 2. If `value` is a single object, render a two-column key/value table.
 /// 3. Otherwise, fall back to pretty JSON.
-pub fn render(value: &Value) -> String {
+///
+/// Table headers are emphasised via `palette` (bold when color is on;
+/// verbatim otherwise). JSON fallback is never styled.
+pub fn render_with(value: &Value, palette: Palette) -> String {
     match value {
-        Value::Array(items) if items.iter().all(Value::is_object) => render_table(items),
-        Value::Object(map) => render_kv(map),
+        Value::Array(items) if items.iter().all(Value::is_object) => render_table(items, palette),
+        Value::Object(map) => render_kv(map, palette),
         _ => render_json_pretty(value),
     }
 }
@@ -29,7 +39,7 @@ pub fn render_json_pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
-fn render_table(items: &[Value]) -> String {
+fn render_table(items: &[Value], palette: Palette) -> String {
     if items.is_empty() {
         return "(empty)".to_string();
     }
@@ -55,10 +65,10 @@ fn render_table(items: &[Value]) -> String {
         rows.push(row);
     }
     let headers: Vec<String> = columns.iter().map(|c| c.to_uppercase()).collect();
-    format_table(&headers, &rows)
+    format_table(&headers, &rows, palette)
 }
 
-fn render_kv(map: &serde_json::Map<String, Value>) -> String {
+fn render_kv(map: &serde_json::Map<String, Value>, palette: Palette) -> String {
     if map.is_empty() {
         return "(empty)".to_string();
     }
@@ -66,7 +76,7 @@ fn render_kv(map: &serde_json::Map<String, Value>) -> String {
     for (k, v) in map {
         rows.push(vec![k.clone(), stringify(v)]);
     }
-    format_table(&["KEY".to_string(), "VALUE".to_string()], &rows)
+    format_table(&["KEY".to_string(), "VALUE".to_string()], &rows, palette)
 }
 
 fn stringify(v: &Value) -> String {
@@ -79,7 +89,7 @@ fn stringify(v: &Value) -> String {
     }
 }
 
-fn format_table(headers: &[String], rows: &[Vec<String>]) -> String {
+fn format_table(headers: &[String], rows: &[Vec<String>], palette: Palette) -> String {
     let cols = headers.len();
     if cols == 0 {
         return String::new();
@@ -93,7 +103,13 @@ fn format_table(headers: &[String], rows: &[Vec<String>]) -> String {
         }
     }
     let mut out = String::new();
-    write_row(&mut out, headers, &widths);
+    // Style the header line as a whole *after* padding so ANSI escape
+    // bytes never participate in the column-width math.
+    let mut header_line = String::new();
+    write_row(&mut header_line, headers, &widths);
+    let trimmed = header_line.trim_end_matches('\n');
+    out.push_str(&palette.header(trimmed));
+    out.push('\n');
     writeln_separator(&mut out, &widths);
     for row in rows {
         write_row(&mut out, row, &widths);
@@ -248,6 +264,42 @@ mod tests {
 
     #[test]
     fn format_table_with_no_columns_is_empty() {
-        assert_eq!(format_table(&[], &[]), "");
+        assert_eq!(format_table(&[], &[], Palette::plain()), "");
+    }
+
+    #[test]
+    fn plain_palette_output_has_no_ansi() {
+        let v = json!([{"id":"ag_1","name":"Greeter"}]);
+        let out = render_with(&v, Palette::plain());
+        assert!(!out.contains('\u{1b}'));
+        assert_eq!(out, render(&v));
+    }
+
+    #[test]
+    fn colored_palette_bolds_headers_only() {
+        let v = json!([{"id":"ag_1","name":"Greeter"}]);
+        let out = render_with(&v, Palette::new(true));
+        let lines: Vec<&str> = out.lines().collect();
+        // Header line carries ANSI, data rows do not.
+        assert!(lines[0].contains('\u{1b}'));
+        assert!(!lines[2].contains('\u{1b}'));
+        // Stripping the escapes yields the plain rendering.
+        let stripped = out.replace("\u{1b}[1m", "").replace("\u{1b}[0m", "");
+        assert_eq!(stripped, render(&v));
+    }
+
+    #[test]
+    fn colored_kv_headers_do_not_break_alignment() {
+        let v = json!({"id":"ag_1","name":"Greeter"});
+        let plain = render_with(&v, Palette::plain());
+        let colored = render_with(&v, Palette::new(true));
+        let stripped = colored.replace("\u{1b}[1m", "").replace("\u{1b}[0m", "");
+        assert_eq!(stripped, plain);
+    }
+
+    #[test]
+    fn json_fallback_is_never_styled() {
+        let out = render_with(&json!([1, 2, 3]), Palette::new(true));
+        assert!(!out.contains('\u{1b}'));
     }
 }

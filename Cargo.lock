@@ -443,6 +443,7 @@ dependencies = [
 name = "copperclaw-cclaw"
 version = "0.1.0"
 dependencies = [
+ "anstyle",
  "anyhow",
  "async-trait",
  "clap",
