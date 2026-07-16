@@ -139,7 +139,11 @@ async fn render_after_spawn(
     let transport = connector.connect(&http_base).await.inspect_err(|_e| {
         copperclaw_metrics::inc_browser_cdp_connect_failure();
     })?;
-    let driver = CdpBrowserDriver::new(transport, opts.screenshot_dir.clone(), opts.nav_timeout);
+    // M20 D2: `req.capture` defaults to `CaptureOptions::legacy_full_page()`
+    // (an omitted wire field), so this stays byte-identical to the pre-D2
+    // driver for every existing `browser_render` caller.
+    let driver = CdpBrowserDriver::new(transport, opts.screenshot_dir.clone(), opts.nav_timeout)
+        .with_capture(req.capture.clone());
 
     // Reuse the exact SSRF orchestration: target pre-flight + per-redirect
     // re-guard + untrusted provenance tagging.
@@ -412,6 +416,7 @@ mod tests {
             url: "https://example.com".into(),
             mode: RenderMode::DomText,
             timeout_secs: None,
+            capture: crate::capture::CaptureOptions::default(),
         }
     }
 
@@ -597,6 +602,7 @@ AAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
             url: "http://172.17.0.9:5173/".into(),
             mode: RenderMode::Screenshot,
             timeout_secs: None,
+            capture: crate::capture::CaptureOptions::default(),
         };
         let opts = LiveRenderOptions {
             screenshot_dir: out_dir.clone(),
@@ -742,6 +748,7 @@ AAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
             url: "http://169.254.169.254/latest/meta-data/".into(),
             mode: RenderMode::DomText,
             timeout_secs: None,
+            capture: crate::capture::CaptureOptions::default(),
         };
         let err = render_live(&bad, enabled_spec(), &guard, &runtime, &connector, &opts())
             .await

@@ -235,6 +235,61 @@ adheres to [Semantic Versioning](https://semver.org/).
   (`ui_screenshot_docker_end_to_end` in `ui_screenshot.rs`) is `#[ignore]`d
   per the `session_install_docker_end_to_end` precedent (`self_mod.rs`).
 
+### Added (M20 D2 — Screenshot fidelity: viewport control, format/quality, size safety)
+
+- New shared `crates/copperclaw-browser/src/capture.rs` module: `ViewportPreset`
+  (`Desktop` 1280x800, `Mobile` 390x844 + touch emulation + a mobile UA
+  override — ONE mobile preset, not a device matrix), `ImageFormat`
+  (`Png`/`Jpeg` with an optional quality), and `CaptureOptions` (viewport /
+  `full_page` / format / quality), plus `apply_viewport` — the single place
+  that knows the `Emulation.setDeviceMetricsOverride` /
+  `Emulation.setTouchEmulationEnabled` / `Network.setUserAgentOverride` wire
+  shape, shared by BOTH the host-side CDP driver (`cdp.rs`) and the
+  in-container driver (`incontainer.rs`) so a preset serializes identically
+  for both call sites.
+- `CdpBrowserDriver` (`cdp.rs`) gains `capture_opts` (defaulting, via `::new`,
+  to `CaptureOptions::legacy_full_page()` — the exact pre-D2 hard-coded
+  `{"format":"png","captureBeyondViewport":true}`, no `Emulation.*` call at
+  all) and an opt-in `.with_capture(opts)` builder. `browser_render`'s live
+  path (`copperclaw-browser/src/live.rs::render_after_spawn`) now threads its
+  `RenderRequest.capture` field through `.with_capture(...)`; `browser_interact`
+  (via `interact_after_spawn`) is untouched and keeps the byte-identical
+  legacy default.
+- `browser_render` (`crates/copperclaw-mcp/src/tools/browser_render.rs`) gains
+  optional `viewport` (`desktop`|`mobile`), `full_page` (default `true` —
+  unchanged from today), `format` (`png`|`jpeg`), and `quality` args. With
+  NONE of them passed, `resolve_capture_options` returns
+  `CaptureOptions::legacy_full_page()` byte-for-byte — the critical back-compat
+  guarantee this card requires; every pre-existing `browser_render`/
+  `browser_interact` unit test passes unmodified.
+- `ui_screenshot` (`crates/copperclaw-mcp/src/tools/ui_screenshot.rs`) gains
+  the same `viewport` (default `desktop`, byte-identical to D1's fixed
+  1280x800 windowed PNG), `full_page` (default `false`), `format`
+  (default `png`), and `quality` args, resolved the same way — no args
+  reproduces `CaptureOptions::ui_screenshot_default()` exactly.
+- Size safety: `incontainer::capture_with_size_safety` captures per the
+  request and, if the result exceeds the 5 MB image-attachment cap and isn't
+  already jpeg, automatically retries ONCE as jpeg at quality 70
+  (`DOWNGRADE_JPEG_QUALITY`) rather than erroring; `ui_screenshot`'s response
+  text notes the downgrade (`"auto-downgraded to jpeg q=70 because..."`)
+  instead of refusing the call outright. Still refuses (clean error) if the
+  jpeg retry is also over cap.
+- `ScreenshotRequest` (`incontainer.rs`) replaces its ad hoc `width`/`height`
+  fields with a `capture: CaptureOptions`; `RenderRequest`
+  (`copperclaw-browser/src/render.rs`) gains a `#[serde(default)] capture:
+  CaptureOptions` field (defaulting to `legacy_full_page()`).
+- Unit tests (mock `CdpTransport`, reusing D1's mock seam): device-metrics +
+  capture params serialize correctly per preset (`capture.rs`); the desktop
+  preset issues only the `Emulation.setDeviceMetricsOverride` call (no
+  touch/UA calls) while mobile issues all three; an oversize PNG capture
+  auto-downgrades to jpeg with the note flag set
+  (`incontainer::capture_with_size_safety` tests); `browser_render`'s
+  existing test suite plus new `resolve_capture_options`/`prepare` tests are
+  all green. Live smoke (`#[ignore]`d, per the D1 precedent):
+  `ui_screenshot_mobile_preset_differs_in_dimensions_from_desktop` proves a
+  `viewport: "mobile"` capture reports different dimensions (390x844) than
+  the `desktop` default (1280x800) against the same vite page.
+
 ### Added (M20 Q8 — Compaction preserves build knowledge)
 
 - The pinned project-facts header compaction re-generates on every round

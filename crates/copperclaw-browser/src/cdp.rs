@@ -34,6 +34,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use serde_json::{Value, json};
 
+use crate::capture::{self, CaptureOptions};
 use crate::driver::{BrowserDriver, DriverRender, Navigation, RenderedArtifact};
 use crate::error::BrowserError;
 use crate::interactive::InteractiveDriver;
@@ -77,6 +78,11 @@ pub struct CdpBrowserDriver {
     screenshot_dir: PathBuf,
     /// Navigation timeout handed to [`CdpTransport::wait_for_load`].
     nav_timeout: Duration,
+    /// Capture fidelity (M20 D2): viewport preset, full-page vs. windowed,
+    /// format/quality. Defaults to [`CaptureOptions::legacy_full_page`] — the
+    /// pre-D2 hard-coded behavior — so [`Self::new`] stays byte-compatible
+    /// with every caller that doesn't opt into [`Self::with_capture`].
+    capture_opts: CaptureOptions,
 }
 
 /// Monotonic counter so concurrent screenshots never collide on a filename.
@@ -95,7 +101,17 @@ impl CdpBrowserDriver {
             transport,
             screenshot_dir: screenshot_dir.into(),
             nav_timeout,
+            capture_opts: CaptureOptions::legacy_full_page(),
         }
+    }
+
+    /// Opt into non-default capture fidelity (M20 D2): a viewport preset,
+    /// full-page vs. windowed, and/or image format/quality. Every caller that
+    /// doesn't call this keeps [`Self::new`]'s byte-identical pre-D2 default.
+    #[must_use]
+    pub fn with_capture(mut self, opts: CaptureOptions) -> Self {
+        self.capture_opts = opts;
+        self
     }
 
     /// Evaluate a JS expression and return its value coerced to a string
@@ -128,15 +144,17 @@ impl CdpBrowserDriver {
             .map(str::to_string))
     }
 
-    /// Capture a PNG screenshot, write it under `screenshot_dir`, return the
-    /// host-side path.
+    /// Capture a screenshot per `self.capture_opts`, write it under
+    /// `screenshot_dir`, return the host-side path. `self.capture_opts`
+    /// defaults to [`CaptureOptions::legacy_full_page`] (set by [`Self::new`]),
+    /// which reproduces this method's pre-D2 hard-coded params byte-for-byte
+    /// and skips the viewport override entirely (see
+    /// [`capture::apply_viewport`]).
     async fn capture_screenshot(&self) -> Result<String, BrowserError> {
+        capture::apply_viewport(self.transport.as_ref(), self.capture_opts.viewport).await?;
         let out = self
             .transport
-            .send(
-                "Page.captureScreenshot",
-                json!({ "format": "png", "captureBeyondViewport": true }),
-            )
+            .send("Page.captureScreenshot", self.capture_opts.capture_params())
             .await?;
         let b64 = out.get("data").and_then(Value::as_str).ok_or_else(|| {
             BrowserError::Driver("Page.captureScreenshot returned no data".into())
@@ -149,9 +167,10 @@ impl CdpBrowserDriver {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
+        let ext = self.capture_opts.format.file_extension();
         let path = self
             .screenshot_dir
-            .join(format!("render-{nanos}-{seq}.png"));
+            .join(format!("render-{nanos}-{seq}.{ext}"));
         tokio::fs::create_dir_all(&self.screenshot_dir)
             .await
             .map_err(|e| BrowserError::Driver(format!("screenshot dir create: {e}")))?;
@@ -837,6 +856,7 @@ mod tests {
                 url: "https://public.example/redir".into(),
                 mode: RenderMode::DomText,
                 timeout_secs: None,
+                capture: CaptureOptions::default(),
             },
             &guard,
             &driver,
@@ -863,6 +883,7 @@ mod tests {
                 url: "https://example.com".into(),
                 mode: RenderMode::DomText,
                 timeout_secs: None,
+                capture: CaptureOptions::default(),
             },
             &guard,
             &driver,
@@ -1253,5 +1274,136 @@ mod tests {
             BrowserError::Driver(m) => assert!(m.contains("no element"), "{m}"),
             other => panic!("expected driver error, got {other:?}"),
         }
+    }
+
+    // ── M20 D2: capture fidelity (viewport / format / full-page) ─────────
+
+    /// A transport recording every call (method + params) it received,
+    /// through a `Mutex` shared via `Arc` so a test can keep reading it after
+    /// the transport itself is boxed and moved into the driver. Replies to
+    /// `Page.captureScreenshot` and `Runtime.evaluate` with plausible values
+    /// so the render orchestration completes.
+    struct CaptureRecordingTransport {
+        calls: std::sync::Arc<Mutex<Vec<(String, Value)>>>,
+    }
+
+    #[async_trait]
+    impl CdpTransport for CaptureRecordingTransport {
+        async fn send(&self, method: &str, params: Value) -> Result<Value, BrowserError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((method.to_string(), params));
+            match method {
+                "Page.captureScreenshot" => Ok(json!({
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                })),
+                "Runtime.evaluate" => Ok(json!({ "result": { "value": "https://example.com/" } })),
+                _ => Ok(json!({})),
+            }
+        }
+        async fn wait_for_load(&self, _timeout: Duration) -> Result<(), BrowserError> {
+            Ok(())
+        }
+        fn redirect_hops(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn main_status(&self) -> Option<u16> {
+            Some(200)
+        }
+    }
+
+    #[tokio::test]
+    async fn default_driver_sends_byte_identical_legacy_capture_params() {
+        // `CdpBrowserDriver::new` alone (no `.with_capture`) must reproduce
+        // the EXACT pre-D2 hard-coded params: no Emulation.* call at all,
+        // full-page PNG.
+        let calls = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let transport = CaptureRecordingTransport {
+            calls: std::sync::Arc::clone(&calls),
+        };
+        let driver = CdpBrowserDriver::new(Box::new(transport), tmp_dir(), DEFAULT_NAV_TIMEOUT);
+        driver
+            .render("https://example.com", RenderMode::Screenshot)
+            .await
+            .unwrap();
+        let recorded = calls.lock().unwrap();
+        assert!(
+            recorded
+                .iter()
+                .all(|(m, _)| m != "Emulation.setDeviceMetricsOverride"),
+            "legacy default must skip Emulation.* entirely: {recorded:?}"
+        );
+        let shot = recorded
+            .iter()
+            .find(|(m, _)| m == "Page.captureScreenshot")
+            .expect("a capture call happened");
+        assert_eq!(
+            shot.1,
+            json!({ "format": "png", "captureBeyondViewport": true })
+        );
+    }
+
+    #[tokio::test]
+    async fn with_capture_mobile_jpeg_wires_metrics_and_format_through() {
+        let calls = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let transport = CaptureRecordingTransport {
+            calls: std::sync::Arc::clone(&calls),
+        };
+        let opts = CaptureOptions {
+            viewport: Some(crate::capture::ViewportPreset::Mobile),
+            full_page: true,
+            format: crate::capture::ImageFormat::Jpeg,
+            quality: Some(80),
+        };
+        let driver = CdpBrowserDriver::new(Box::new(transport), tmp_dir(), DEFAULT_NAV_TIMEOUT)
+            .with_capture(opts);
+        driver
+            .render("https://example.com", RenderMode::Screenshot)
+            .await
+            .unwrap();
+        let recorded = calls.lock().unwrap();
+        let metrics = recorded
+            .iter()
+            .find(|(m, _)| m == "Emulation.setDeviceMetricsOverride")
+            .expect("mobile preset must set device metrics");
+        assert_eq!(metrics.1["mobile"], json!(true));
+        assert_eq!(metrics.1["width"], json!(390));
+        let shot = recorded
+            .iter()
+            .find(|(m, _)| m == "Page.captureScreenshot")
+            .expect("a capture call happened");
+        assert_eq!(
+            shot.1,
+            json!({ "format": "jpeg", "captureBeyondViewport": true, "quality": 80 })
+        );
+    }
+
+    #[tokio::test]
+    async fn with_capture_jpeg_writes_jpg_extension() {
+        let dir = tmp_dir();
+        let calls = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let transport = CaptureRecordingTransport { calls };
+        let opts = CaptureOptions {
+            viewport: None,
+            full_page: true,
+            format: crate::capture::ImageFormat::Jpeg,
+            quality: Some(70),
+        };
+        let driver = CdpBrowserDriver::new(Box::new(transport), &dir, DEFAULT_NAV_TIMEOUT)
+            .with_capture(opts);
+        let out = driver
+            .render("https://example.com", RenderMode::Screenshot)
+            .await
+            .unwrap();
+        let path = match out.artifact {
+            RenderedArtifact::ScreenshotPath(p) => p,
+            RenderedArtifact::Text(t) => panic!("expected screenshot path, got text {t:?}"),
+        };
+        let ext = std::path::Path::new(&path)
+            .extension()
+            .and_then(|e| e.to_str());
+        assert_eq!(ext, Some("jpg"), "path was {path}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

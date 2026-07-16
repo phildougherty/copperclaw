@@ -61,6 +61,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod capture;
 pub mod cdp;
 pub mod container;
 pub mod driver;
@@ -71,6 +72,7 @@ pub mod interactive;
 pub mod live;
 pub mod render;
 
+pub use crate::capture::{CaptureOptions, DOWNGRADE_JPEG_QUALITY, ImageFormat, ViewportPreset};
 pub use crate::cdp::{
     CdpBrowserDriver, CdpTransport, DEFAULT_NAV_TIMEOUT, WsCdpTransport, serialize_ax_tree,
 };
@@ -82,8 +84,9 @@ pub use crate::driver::{BrowserDriver, DriverRender, Navigation, RenderedArtifac
 pub use crate::error::BrowserError;
 pub use crate::guard::{GuardResult, NavigationGuard};
 pub use crate::incontainer::{
-    CHROMIUM_BINARY_CANDIDATES, ChromiumSingleton, DEFAULT_CDP_PORT, DEFAULT_HEIGHT, DEFAULT_WIDTH,
-    MAX_WAIT_MS as UI_SCREENSHOT_MAX_WAIT_MS, ScreenshotRequest, capture, find_chromium_binary,
+    CHROMIUM_BINARY_CANDIDATES, ChromiumSingleton, DEFAULT_CDP_PORT,
+    MAX_WAIT_MS as UI_SCREENSHOT_MAX_WAIT_MS, SIZE_SAFETY_CAP_BYTES, ScreenshotRequest,
+    SizeSafeCapture, capture, capture_with_size_safety, find_chromium_binary,
     find_chromium_binary_in, global as chromium_singleton,
 };
 pub use crate::interactive::{

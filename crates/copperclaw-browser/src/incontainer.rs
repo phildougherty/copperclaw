@@ -41,17 +41,23 @@
 //!     back to back), and a background reaper kills it after
 //!     [`IDLE_TIMEOUT`] with no calls so a session that finished building
 //!     doesn't hold a browser process open forever.
-//!   * [`capture`] — the pure CDP command orchestration for one windowed
-//!     screenshot (viewport size → navigate → optional wait → capture),
-//!     driven purely against the [`CdpTransport`] seam so it is fully
-//!     unit-tested with a mock transport, exactly like [`crate::cdp`]'s own
-//!     tests. Deliberately **windowed**, not `captureBeyondViewport`: a
-//!     full-page capture of a long page blows the 5 MB `view_image`-class
-//!     cap the resulting image block is held to (see
-//!     `copperclaw-mcp/src/tools/view_image.rs`). D2 (a later M20 card)
-//!     generalises viewport presets / formats / full-page capture across
-//!     this AND the host-side render path; this module only needs the one
-//!     fixed default D1 requires.
+//!   * [`capture`] — the pure CDP command orchestration for one screenshot
+//!     (viewport size → navigate → optional wait → capture), driven purely
+//!     against the [`CdpTransport`] seam so it is fully unit-tested with a
+//!     mock transport, exactly like [`crate::cdp`]'s own tests. The capture
+//!     fidelity ([`crate::capture::CaptureOptions`] — viewport preset,
+//!     full-page vs. windowed, format/quality) is a request field (M20 D2);
+//!     D1's fixed windowed 1280x800 PNG lives on as
+//!     [`crate::capture::CaptureOptions::ui_screenshot_default`], the
+//!     `ui_screenshot` tool's own default, chosen because a full-page capture
+//!     of a long page blows the 5 MB `view_image`-class cap the resulting
+//!     image block is held to (see `copperclaw-mcp/src/tools/view_image.rs`).
+//!   * [`capture_with_size_safety`] — M20 D2's size-safety net: capture per
+//!     the request, and if the result exceeds a byte cap (and isn't already
+//!     the lowest-fidelity jpeg), automatically retry ONCE as jpeg at
+//!     [`crate::capture::DOWNGRADE_JPEG_QUALITY`] rather than erroring. The
+//!     caller (`ui_screenshot`) surfaces the downgrade as a text note instead
+//!     of a refusal.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -63,6 +69,7 @@ use serde_json::{Value, json};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 
+use crate::capture::{self, CaptureOptions, ImageFormat};
 use crate::cdp::CdpTransport;
 use crate::error::BrowserError;
 use crate::live::{CdpConnector, WsCdpConnector};
@@ -80,14 +87,15 @@ pub const CHROMIUM_BINARY_CANDIDATES: &[&str] =
 /// spawned child container).
 pub const DEFAULT_CDP_PORT: u16 = 9223;
 
-/// Default (and D1's only) capture viewport: a typical laptop browser
-/// window. Windowed, not full-page — see the module docs.
-pub const DEFAULT_WIDTH: u32 = 1280;
-pub const DEFAULT_HEIGHT: u32 = 800;
-
 /// Hard cap on an explicit `wait_ms` sleep, so one screenshot call can't
 /// turn into an unbounded stall.
 pub const MAX_WAIT_MS: u64 = 10_000;
+
+/// Cap on an inline capture beyond which [`capture_with_size_safety`]
+/// auto-retries as a lower-fidelity jpeg rather than handing the caller an
+/// oversize blob. Mirrors `ui_screenshot`'s `view_image`-class 5 MB
+/// image-attachment cap (M20 D2).
+pub const SIZE_SAFETY_CAP_BYTES: u64 = 5 * 1024 * 1024;
 
 /// Default `wait_for_selector` poll budget when the caller doesn't specify
 /// one via `nav_timeout`-adjacent knobs.
@@ -134,10 +142,11 @@ pub fn find_chromium_binary() -> Option<PathBuf> {
 pub struct ScreenshotRequest {
     /// The (already loopback-validated, by the caller) navigation target.
     pub url: String,
-    /// Viewport width in CSS pixels.
-    pub width: u32,
-    /// Viewport height in CSS pixels.
-    pub height: u32,
+    /// Capture fidelity: viewport preset, full-page vs. windowed, and
+    /// format/quality (M20 D2). `ui_screenshot` always sets `viewport`
+    /// (defaulting to [`CaptureOptions::ui_screenshot_default`] — D1's fixed
+    /// windowed 1280x800 PNG).
+    pub capture: CaptureOptions,
     /// Extra fixed delay after load before capturing, in milliseconds
     /// (clamped to [`MAX_WAIT_MS`]).
     pub wait_ms: Option<u64>,
@@ -147,10 +156,11 @@ pub struct ScreenshotRequest {
     pub nav_timeout: Duration,
 }
 
-/// Drive one windowed screenshot over `transport`: enable the domains the
-/// wait needs, size the viewport, navigate, optionally wait, then capture a
-/// PNG clipped to EXACTLY the viewport (never `captureBeyondViewport`).
-/// Returns the raw (not base64) PNG bytes.
+/// Drive one screenshot over `transport`: enable the domains the wait needs,
+/// apply the requested viewport (or none, for the legacy path — see
+/// [`capture::apply_viewport`]), navigate, optionally wait, then capture per
+/// `req.capture`'s format/full-page params. Returns the raw (not base64)
+/// image bytes.
 ///
 /// Pure CDP-command orchestration against the [`CdpTransport`] seam — no
 /// process management here (see [`ChromiumSingleton`] for that), so this is
@@ -161,17 +171,7 @@ pub async fn capture(
 ) -> Result<Vec<u8>, BrowserError> {
     transport.send("Page.enable", json!({})).await?;
     transport.send("Network.enable", json!({})).await?;
-    transport
-        .send(
-            "Emulation.setDeviceMetricsOverride",
-            json!({
-                "width": req.width,
-                "height": req.height,
-                "deviceScaleFactor": 1,
-                "mobile": false,
-            }),
-        )
-        .await?;
+    capture::apply_viewport(transport, req.capture.viewport).await?;
 
     let nav = transport
         .send("Page.navigate", json!({ "url": req.url }))
@@ -194,10 +194,7 @@ pub async fn capture(
     }
 
     let out = transport
-        .send(
-            "Page.captureScreenshot",
-            json!({ "format": "png", "captureBeyondViewport": false }),
-        )
+        .send("Page.captureScreenshot", req.capture.capture_params())
         .await?;
     let b64 = out
         .get("data")
@@ -206,6 +203,48 @@ pub async fn capture(
     base64::engine::general_purpose::STANDARD
         .decode(b64)
         .map_err(|e| BrowserError::Driver(format!("screenshot base64 decode: {e}")))
+}
+
+/// Result of [`capture_with_size_safety`]: the bytes actually captured, the
+/// [`CaptureOptions`] that produced them (differs from the request's when an
+/// auto-downgrade fired), and whether a downgrade fired.
+#[derive(Debug, Clone)]
+pub struct SizeSafeCapture {
+    pub bytes: Vec<u8>,
+    pub capture: CaptureOptions,
+    pub downgraded: bool,
+}
+
+/// Capture per `req`; if the result exceeds `cap_bytes` — and the request
+/// wasn't already the lowest-fidelity jpeg — retry ONCE as jpeg at
+/// [`capture::DOWNGRADE_JPEG_QUALITY`] rather than erroring (M20 D2's size
+/// safety net). The caller decides what to do if the capture is STILL
+/// oversize after the retry: [`copperclaw_mcp`]'s `ui_screenshot` refuses at
+/// that point with an actionable hint rather than silently truncating.
+pub async fn capture_with_size_safety(
+    transport: &dyn CdpTransport,
+    req: &ScreenshotRequest,
+    cap_bytes: u64,
+) -> Result<SizeSafeCapture, BrowserError> {
+    let bytes = capture(transport, req).await?;
+    if (bytes.len() as u64) <= cap_bytes || req.capture.format == ImageFormat::Jpeg {
+        return Ok(SizeSafeCapture {
+            bytes,
+            capture: req.capture.clone(),
+            downgraded: false,
+        });
+    }
+    let downgraded_opts = req.capture.downgraded_to_jpeg();
+    let retry_req = ScreenshotRequest {
+        capture: downgraded_opts.clone(),
+        ..req.clone()
+    };
+    let retry_bytes = capture(transport, &retry_req).await?;
+    Ok(SizeSafeCapture {
+        bytes: retry_bytes,
+        capture: downgraded_opts,
+        downgraded: true,
+    })
 }
 
 /// Poll until an element matching `selector` exists in the page, or
@@ -531,8 +570,7 @@ AAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
     fn req(url: &str) -> ScreenshotRequest {
         ScreenshotRequest {
             url: url.to_string(),
-            width: DEFAULT_WIDTH,
-            height: DEFAULT_HEIGHT,
+            capture: CaptureOptions::ui_screenshot_default(),
             wait_ms: None,
             wait_for_selector: None,
             nav_timeout: Duration::from_secs(5),
@@ -555,15 +593,23 @@ AAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
         let metrics = transport.metrics_calls.lock().unwrap().clone();
         assert_eq!(metrics.len(), 1);
-        assert_eq!(metrics[0]["width"], json!(DEFAULT_WIDTH));
-        assert_eq!(metrics[0]["height"], json!(DEFAULT_HEIGHT));
+        assert_eq!(
+            metrics[0]["width"],
+            json!(crate::capture::ViewportPreset::DESKTOP_WIDTH)
+        );
+        assert_eq!(
+            metrics[0]["height"],
+            json!(crate::capture::ViewportPreset::DESKTOP_HEIGHT)
+        );
         assert_eq!(metrics[0]["mobile"], json!(false));
     }
 
     #[tokio::test]
-    async fn capture_never_requests_beyond_viewport() {
-        // The one D1 acceptance property: never full-page (blows the 5 MB
-        // cap). D2 will make this configurable; D1's default must be false.
+    async fn capture_never_requests_beyond_viewport_by_default() {
+        // D1's acceptance property, preserved by D2's default: the
+        // `ui_screenshot_default()` capture options never go full-page (that
+        // would blow the 5 MB cap). D2 makes this configurable via
+        // `full_page`; this test pins the DEFAULT only.
         struct RecordingParams(StdMutex<Option<Value>>);
         #[async_trait]
         impl CdpTransport for RecordingParams {
@@ -671,5 +717,113 @@ AAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
             .await
             .unwrap_err();
         assert!(matches!(err, BrowserError::Driver(_)));
+    }
+
+    // ── capture_with_size_safety: auto jpeg-downgrade on oversize (M20 D2) ──
+
+    /// A transport that answers successive `Page.captureScreenshot` calls
+    /// with DIFFERENT payloads (first oversize, then undersize) so the
+    /// size-safety retry path is exercised end-to-end. Records the params of
+    /// every capture call, in order.
+    struct SizeSafetyTransport {
+        capture_calls: StdMutex<Vec<Value>>,
+        payloads: Vec<String>,
+    }
+
+    #[async_trait]
+    impl CdpTransport for SizeSafetyTransport {
+        async fn send(&self, method: &str, params: Value) -> Result<Value, BrowserError> {
+            if method == "Page.captureScreenshot" {
+                let mut calls = self.capture_calls.lock().unwrap();
+                let idx = calls.len();
+                calls.push(params);
+                let data = self
+                    .payloads
+                    .get(idx)
+                    .cloned()
+                    .unwrap_or_else(|| self.payloads.last().cloned().unwrap_or_default());
+                return Ok(json!({ "data": data }));
+            }
+            Ok(json!({}))
+        }
+        async fn wait_for_load(&self, _timeout: Duration) -> Result<(), BrowserError> {
+            Ok(())
+        }
+        fn redirect_hops(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn main_status(&self) -> Option<u16> {
+            Some(200)
+        }
+    }
+
+    fn b64_of_len(len: u64) -> String {
+        let len = usize::try_from(len).expect("test payload length fits in usize");
+        base64::engine::general_purpose::STANDARD.encode(vec![0u8; len])
+    }
+
+    #[tokio::test]
+    async fn size_safety_downgrades_oversize_png_to_jpeg_with_note_flag() {
+        const CAP: u64 = 5 * 1024 * 1024;
+        let transport = SizeSafetyTransport {
+            capture_calls: StdMutex::new(Vec::new()),
+            payloads: vec![
+                b64_of_len(CAP + 1024), // 1st capture: over the cap
+                b64_of_len(1024),       // 2nd (jpeg retry): under the cap
+            ],
+        };
+        let result = capture_with_size_safety(&transport, &req("http://127.0.0.1:5173"), CAP)
+            .await
+            .unwrap();
+        assert!(result.downgraded, "must flag the auto-downgrade");
+        assert_eq!(result.bytes.len(), 1024);
+        assert_eq!(result.capture.format, ImageFormat::Jpeg);
+        assert_eq!(
+            result.capture.quality,
+            Some(crate::capture::DOWNGRADE_JPEG_QUALITY)
+        );
+
+        let calls = transport.capture_calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "exactly one retry, not an unbounded loop");
+        assert_eq!(calls[0]["format"], json!("png"));
+        assert_eq!(calls[1]["format"], json!("jpeg"));
+        assert_eq!(
+            calls[1]["quality"],
+            json!(crate::capture::DOWNGRADE_JPEG_QUALITY)
+        );
+    }
+
+    #[tokio::test]
+    async fn size_safety_does_not_retry_when_under_cap() {
+        const CAP: u64 = 5 * 1024 * 1024;
+        let transport = SizeSafetyTransport {
+            capture_calls: StdMutex::new(Vec::new()),
+            payloads: vec![b64_of_len(1024)],
+        };
+        let result = capture_with_size_safety(&transport, &req("http://127.0.0.1:5173"), CAP)
+            .await
+            .unwrap();
+        assert!(!result.downgraded);
+        assert_eq!(result.capture.format, ImageFormat::Png);
+        assert_eq!(transport.capture_calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn size_safety_does_not_retry_when_already_jpeg() {
+        // Already the lowest-fidelity format this tool speaks — a second
+        // retry would not help, so `capture_with_size_safety` must not loop.
+        const CAP: u64 = 1024; // deliberately tiny so ANY payload is "oversize"
+        let mut jpeg_req = req("http://127.0.0.1:5173");
+        jpeg_req.capture.format = ImageFormat::Jpeg;
+        let transport = SizeSafetyTransport {
+            capture_calls: StdMutex::new(Vec::new()),
+            payloads: vec![b64_of_len(4096)],
+        };
+        let result = capture_with_size_safety(&transport, &jpeg_req, CAP)
+            .await
+            .unwrap();
+        assert!(!result.downgraded);
+        assert_eq!(result.bytes.len(), 4096, "still returns the oversize bytes");
+        assert_eq!(transport.capture_calls.lock().unwrap().len(), 1);
     }
 }

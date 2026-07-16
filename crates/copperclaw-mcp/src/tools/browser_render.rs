@@ -45,8 +45,8 @@ use crate::context::ToolContext;
 use crate::error::ToolError;
 use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args, success_json};
 use copperclaw_browser::{
-    BrowserContainerParams, BrowserError, BrowserToolConfig, LiveRenderOptions, NavigationGuard,
-    RenderMode, RenderRequest, WsCdpConnector,
+    BrowserContainerParams, BrowserError, BrowserToolConfig, CaptureOptions, ImageFormat,
+    LiveRenderOptions, NavigationGuard, RenderMode, RenderRequest, ViewportPreset, WsCdpConnector,
 };
 use copperclaw_container_rt::SandboxRuntime;
 use rmcp::model::{CallToolResult, JsonObject, Tool};
@@ -174,6 +174,52 @@ pub struct Input {
     pub mode: Option<String>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// M20 D2: screenshot-mode capture fidelity. `desktop` | `mobile`.
+    /// Omitted → no viewport override at all (the pre-D2 behavior: whatever
+    /// window size the child container's chromium was launched with).
+    #[serde(default)]
+    pub viewport: Option<String>,
+    /// M20 D2: `Page.captureScreenshot`'s `captureBeyondViewport`. Omitted →
+    /// `true` (the pre-D2 hard-coded full-page default) — UNCHANGED from
+    /// today so existing callers stay byte-compatible.
+    #[serde(default)]
+    pub full_page: Option<bool>,
+    /// M20 D2: `png` | `jpeg`. Omitted → `png` (unchanged from today).
+    #[serde(default)]
+    pub format: Option<String>,
+    /// M20 D2: jpeg quality (1-100). Ignored for png.
+    #[serde(default)]
+    pub quality: Option<u8>,
+}
+
+/// Resolve the screenshot-mode [`CaptureOptions`] from `input`. With NONE of
+/// `viewport`/`full_page`/`format`/`quality` set, this is byte-identical to
+/// [`CaptureOptions::legacy_full_page`] — the CRITICAL back-compat property
+/// this card requires: an existing `browser_render` caller that passes no
+/// capture args gets the EXACT pre-D2 CDP command sequence.
+fn resolve_capture_options(input: &Input) -> Result<CaptureOptions, ToolError> {
+    let viewport = input
+        .viewport
+        .as_deref()
+        .map(|s| {
+            ViewportPreset::parse(s)
+                .map_err(|e| ToolError::Validation(format!("browser_render: {e}")))
+        })
+        .transpose()?;
+    let format = match input.format.as_deref() {
+        Some(s) => ImageFormat::parse(s)
+            .map_err(|e| ToolError::Validation(format!("browser_render: {e}")))?,
+        None => ImageFormat::Png,
+    };
+    Ok(CaptureOptions {
+        viewport,
+        // Pre-D2 default was unconditionally full-page — preserved here
+        // regardless of whether OTHER capture args were set, so e.g. passing
+        // only `format: "jpeg"` still captures the whole page, just as jpeg.
+        full_page: input.full_page.unwrap_or(true),
+        format,
+        quality: input.quality,
+    })
 }
 
 fn parse_mode(raw: Option<&str>) -> Result<RenderMode, ToolError> {
@@ -252,10 +298,12 @@ pub async fn prepare(
 
     // 3. Validate shape.
     let mode = parse_mode(input.mode.as_deref())?;
+    let capture = resolve_capture_options(&input)?;
     let req = RenderRequest {
         url: input.url.clone(),
         mode,
         timeout_secs: input.timeout_secs,
+        capture,
     };
     req.validate()
         .map_err(|e| ToolError::Validation(e.to_string()))?;
@@ -322,7 +370,12 @@ pub fn schema() -> Tool {
          Returns a screenshot path, the page DOM text, or a read-only ARIA snapshot. \
          Opt-in and OFF by default; the operator must enable it. Output is treated as \
          UNTRUSTED external content. The navigation target and every redirect are \
-         SSRF-guarded (internal/metadata addresses are refused).",
+         SSRF-guarded (internal/metadata addresses are refused). For `mode: \"screenshot\"`: \
+         `viewport` (`desktop` | `mobile`) applies a device-metrics override, `full_page` \
+         controls `captureBeyondViewport` (default true, matching prior behavior), and \
+         `format` (`png` | `jpeg`, with optional `quality`) selects the encoding. All four \
+         are optional; omitting them all reproduces the exact pre-existing full-page PNG \
+         capture.",
         json!({
             "type": "object",
             "additionalProperties": false,
@@ -330,7 +383,11 @@ pub fn schema() -> Tool {
             "properties": {
                 "url":          { "type": "string", "minLength": 1 },
                 "mode":         { "type": ["string", "null"], "enum": ["screenshot", "dom_text", "aria_snapshot", null] },
-                "timeout_secs": { "type": ["integer", "null"], "minimum": 1, "maximum": 120 }
+                "timeout_secs": { "type": ["integer", "null"], "minimum": 1, "maximum": 120 },
+                "viewport":     { "type": ["string", "null"], "enum": ["desktop", "mobile", null] },
+                "full_page":    { "type": ["boolean", "null"] },
+                "format":       { "type": ["string", "null"], "enum": ["png", "jpeg", null] },
+                "quality":      { "type": ["integer", "null"], "minimum": 1, "maximum": 100 }
             }
         }),
     )
@@ -511,6 +568,10 @@ mod tests {
             url: url.into(),
             mode: mode.map(str::to_string),
             timeout_secs: None,
+            viewport: None,
+            full_page: None,
+            format: None,
+            quality: None,
         }
     }
 
@@ -858,5 +919,110 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ToolError::Validation(_)));
+    }
+
+    // ── M20 D2: capture fidelity (viewport / format / full-page) ─────────
+
+    #[test]
+    fn schema_advertises_capture_fidelity_args() {
+        let tool = schema();
+        let v: serde_json::Value = serde_json::to_value(&*tool.input_schema).unwrap();
+        let props = v.get("properties").unwrap();
+        for key in ["viewport", "full_page", "format", "quality"] {
+            assert!(props.get(key).is_some(), "schema missing `{key}`");
+        }
+    }
+
+    #[test]
+    fn resolve_capture_options_with_no_args_is_byte_identical_to_legacy_default() {
+        // THE critical back-compat property this card requires: an existing
+        // `browser_render` caller passing none of viewport/full_page/format/
+        // quality gets the EXACT pre-D2 capture options.
+        let opts = resolve_capture_options(&input("https://example.com/", None)).unwrap();
+        assert_eq!(opts, CaptureOptions::legacy_full_page());
+    }
+
+    #[test]
+    fn resolve_capture_options_viewport_preset_parsed() {
+        let mut i = input("https://example.com/", Some("screenshot"));
+        i.viewport = Some("mobile".to_string());
+        let opts = resolve_capture_options(&i).unwrap();
+        assert_eq!(opts.viewport, Some(ViewportPreset::Mobile));
+        // full_page stays the legacy default (true) when not explicitly set.
+        assert!(opts.full_page);
+    }
+
+    #[test]
+    fn resolve_capture_options_explicit_full_page_false_is_honored() {
+        let mut i = input("https://example.com/", Some("screenshot"));
+        i.full_page = Some(false);
+        let opts = resolve_capture_options(&i).unwrap();
+        assert!(!opts.full_page);
+    }
+
+    #[test]
+    fn resolve_capture_options_format_and_quality_pass_through() {
+        let mut i = input("https://example.com/", Some("screenshot"));
+        i.format = Some("jpeg".to_string());
+        i.quality = Some(55);
+        let opts = resolve_capture_options(&i).unwrap();
+        assert_eq!(opts.format, ImageFormat::Jpeg);
+        assert_eq!(opts.quality, Some(55));
+        // Setting ONLY format must not disturb the legacy full-page default.
+        assert!(opts.full_page);
+    }
+
+    #[test]
+    fn resolve_capture_options_rejects_unknown_viewport() {
+        let mut i = input("https://example.com/", Some("screenshot"));
+        i.viewport = Some("tablet".to_string());
+        assert!(matches!(
+            resolve_capture_options(&i),
+            Err(ToolError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_capture_options_rejects_unknown_format() {
+        let mut i = input("https://example.com/", Some("screenshot"));
+        i.format = Some("bmp".to_string());
+        assert!(matches!(
+            resolve_capture_options(&i),
+            Err(ToolError::Validation(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn prepare_with_no_capture_args_yields_legacy_request_capture() {
+        let ctx = TaintRecordingCtx::default();
+        let prepared = prepare(
+            input("https://8.8.8.8/", Some("screenshot")),
+            &env(&[("COPPERCLAW_BROWSER_ENABLED", "1")]),
+            &NavGuard,
+            &ctx,
+        )
+        .await
+        .expect("public literal passes");
+        assert_eq!(prepared.req.capture, CaptureOptions::legacy_full_page());
+    }
+
+    #[tokio::test]
+    async fn prepare_with_mobile_viewport_and_jpeg_wires_capture_through() {
+        let ctx = TaintRecordingCtx::default();
+        let mut i = input("https://8.8.8.8/", Some("screenshot"));
+        i.viewport = Some("mobile".to_string());
+        i.format = Some("jpeg".to_string());
+        i.quality = Some(60);
+        let prepared = prepare(
+            i,
+            &env(&[("COPPERCLAW_BROWSER_ENABLED", "1")]),
+            &NavGuard,
+            &ctx,
+        )
+        .await
+        .expect("public literal passes");
+        assert_eq!(prepared.req.capture.viewport, Some(ViewportPreset::Mobile));
+        assert_eq!(prepared.req.capture.format, ImageFormat::Jpeg);
+        assert_eq!(prepared.req.capture.quality, Some(60));
     }
 }
