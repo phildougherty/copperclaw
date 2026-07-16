@@ -175,6 +175,7 @@ pub fn build_approval_interceptor(
 
         // Authorisation: only Owner/Admin (global or group-scoped) may resolve.
         let Some((_uid, approver)) = resolve_approver(&central, agent_group_id, &ctx) else {
+            copperclaw_metrics::inc_approval_tap("unauthorized");
             audit(
                 &central,
                 agent_group_id,
@@ -211,6 +212,10 @@ pub fn build_approval_interceptor(
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false);
                 if applied {
+                    copperclaw_metrics::inc_approval_tap(match verb {
+                        Verb::Approve => "approved",
+                        Verb::Deny => "denied",
+                    });
                     audit(
                         &central,
                         agent_group_id,
@@ -225,6 +230,7 @@ pub fn build_approval_interceptor(
                     // Already resolved before this tap landed (CLI/in-chat
                     // race, or a double-tap). First resolution won; this is a
                     // deliberate no-op — no second edit, no error surfaced.
+                    copperclaw_metrics::inc_approval_tap("race_noop");
                     tracing::info!(
                         approval_id = %approval_id.as_uuid(),
                         "approvals: in-chat tap on an already-resolved approval; no-op"
@@ -233,6 +239,7 @@ pub fn build_approval_interceptor(
                 ApprovalInterceptDecision::Handled
             }
             Err(err) => {
+                copperclaw_metrics::inc_approval_tap("race_noop");
                 // `conflict` (row already denied/approved/expired) or
                 // `not_found` (swept). Either way the request is settled: the
                 // race loser must not crash and must not double-resolve.

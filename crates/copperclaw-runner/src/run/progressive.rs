@@ -89,6 +89,28 @@ pub(super) fn should_grow(edit_capable: bool, elapsed: Duration, answer: &str) -
     edit_capable && elapsed >= MIN_ELAPSED && worth_growing(answer)
 }
 
+/// R6 metric helper: the first gate arm that declined growth, or `None` when
+/// [`should_grow`] would return `true`. Mirrors `should_grow`'s ordering so the
+/// `copperclaw_progressive_final_skipped_total{reason}` label names the exact
+/// arm that fired.
+pub(super) fn grow_skip_reason(
+    edit_capable: bool,
+    elapsed: Duration,
+    answer: &str,
+) -> Option<&'static str> {
+    if !edit_capable {
+        Some("bare_adapter")
+    } else if elapsed < MIN_ELAPSED {
+        Some("short_turn")
+    } else if answer.chars().count() < MIN_GROW_CHARS {
+        Some("short_answer")
+    } else if crate::tools::build_expander_decorator(answer).is_some() {
+        Some("expander_scale")
+    } else {
+        None
+    }
+}
+
 /// Split `answer` into the ascending sequence of growing prefixes to
 /// reveal. The first element is the initial post; each subsequent one is
 /// a strictly-longer prefix; the last is always the complete `answer`.
@@ -132,7 +154,9 @@ pub(super) async fn grow_final_answer(
     answer: String,
     step_interval: Duration,
 ) -> anyhow::Result<()> {
-    let mut steps = reveal_steps(&answer).into_iter();
+    let all_steps = reveal_steps(&answer);
+    copperclaw_metrics::observe_progressive_final_steps(all_steps.len() as u64);
+    let mut steps = all_steps.into_iter();
     // `reveal_steps` always yields >= 1 element for a non-empty answer.
     let Some(first) = steps.next() else {
         return Ok(());

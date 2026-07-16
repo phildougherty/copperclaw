@@ -765,10 +765,12 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
             tracing::info!("history compacted (sentinel consumed)");
         }
 
-        if deps
-            .compaction
-            .should_compact(estimate_tokens(&state.history))
-        {
+        let est_tokens = estimate_tokens(&state.history);
+        if deps.compaction.should_compact(est_tokens) {
+            // R4: count auto-triggered compactions by profile + the estimated
+            // token count at the trigger point.
+            copperclaw_metrics::inc_compaction_triggered(deps.policy.profile().as_str());
+            copperclaw_metrics::observe_compaction_estimated_tokens(est_tokens as u64);
             state.history = compact(state.history, deps.provider.as_ref(), &deps.compaction)
                 .await
                 .context("compaction failed")?;

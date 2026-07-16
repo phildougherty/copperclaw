@@ -212,6 +212,26 @@ pub mod install_packages {
         },
     }
 
+    impl SessionInstallError {
+        /// The failing ecosystem (`pip` / `npm`) for the E1 metrics.
+        pub(crate) fn ecosystem(&self) -> &'static str {
+            match self {
+                SessionInstallError::Egress { ecosystem, .. }
+                | SessionInstallError::ToolchainMissing { ecosystem, .. }
+                | SessionInstallError::Other { ecosystem, .. } => ecosystem,
+            }
+        }
+
+        /// The `outcome` label for `copperclaw_session_install_total`.
+        pub(crate) fn outcome_label(&self) -> &'static str {
+            match self {
+                SessionInstallError::Egress { .. } => "egress_blocked",
+                SessionInstallError::ToolchainMissing { .. } => "toolchain_missing",
+                SessionInstallError::Other { .. } => "other",
+            }
+        }
+    }
+
     /// Registries a given ecosystem reaches, as `host:port` for the egress
     /// allow-list.
     pub(crate) fn registry_hosts(ecosystem: &str) -> &'static [&'static str] {
@@ -447,6 +467,7 @@ pub mod install_packages {
             }
         }
         if input.scope == InstallScope::Image && !input.pip.is_empty() {
+            copperclaw_metrics::inc_session_install_image_scope_rejected();
             return Err(ToolError::Validation(
                 "pip packages require scope:\"session\" — there is no image-level pip \
                  bake. Resubmit with scope:\"session\", or move them to apt/npm."
@@ -498,10 +519,27 @@ pub mod install_packages {
             InstallScope::Session => {
                 // Works NOW: run the local install in-container. On egress
                 // denial this returns the allow-list hint (correction 2).
-                installer
-                    .install(&input.pip, &input.npm)
-                    .await
-                    .map_err(|e| session_error_to_tool_error(&e))?;
+                let started = std::time::Instant::now();
+                let install_result = installer.install(&input.pip, &input.npm).await;
+                copperclaw_metrics::observe_session_install_seconds(
+                    started.elapsed().as_secs_f64(),
+                );
+                if let Err(e) = &install_result {
+                    // E1: attribute the failure by ecosystem + outcome, and
+                    // count the deny-default egress hint when it fires.
+                    copperclaw_metrics::inc_session_install(e.ecosystem(), e.outcome_label());
+                    if matches!(e, SessionInstallError::Egress { .. }) {
+                        copperclaw_metrics::inc_session_install_egress_hint(e.ecosystem());
+                    }
+                } else {
+                    if !input.pip.is_empty() {
+                        copperclaw_metrics::inc_session_install("pip", "ok");
+                    }
+                    if !input.npm.is_empty() {
+                        copperclaw_metrics::inc_session_install("npm", "ok");
+                    }
+                }
+                install_result.map_err(|e| session_error_to_tool_error(&e))?;
 
                 // Works LATER: record the bakeable ecosystems (apt/npm) so the
                 // next image carries them. pip has no image dimension and lives

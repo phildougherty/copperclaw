@@ -24,6 +24,7 @@ bytes = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 futures = { workspace = true }
+copperclaw-metrics.workspace = true
 
 [dev-dependencies]
 wiremock = "=0.6.2"

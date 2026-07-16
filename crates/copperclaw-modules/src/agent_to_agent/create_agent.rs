@@ -418,6 +418,7 @@ impl DeliveryActionHandler for CreateAgentHandler {
                 name = %payload.name,
                 "create_agent rejected: would exceed subagent depth cap",
             );
+            copperclaw_metrics::inc_delegate_depth_rejection(self.deps.profile.action_name());
             self.write_parent_result(
                 parent_session.as_ref(),
                 ResultStatus::Rejected,
@@ -471,6 +472,7 @@ impl DeliveryActionHandler for CreateAgentHandler {
                 max_depth = self.deps.max_depth,
                 "create_agent rejected on lock re-check: concurrent spawn won",
             );
+            copperclaw_metrics::inc_delegate_depth_rejection(self.deps.profile.action_name());
             self.write_parent_result(
                 parent_session.as_ref(),
                 ResultStatus::Rejected,

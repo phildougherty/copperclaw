@@ -21,6 +21,7 @@ uuid = { workspace = true }
 futures = { workspace = true }
 bytes = { workspace = true }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+copperclaw-metrics.workspace = true
 
 [dev-dependencies]
 wiremock = "=0.6.2"

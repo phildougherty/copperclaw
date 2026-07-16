@@ -198,7 +198,19 @@ impl ChannelAdapter for MattermostAdapter {
         external_id: &str,
         new_text: &str,
     ) -> Result<(), AdapterError> {
-        self.api.update_post(external_id, new_text).await
+        let ct = self.channel_type().as_str();
+        match self.api.update_post(external_id, new_text).await {
+            Ok(()) => {
+                copperclaw_metrics::inc_hud_edit(ct, "ok");
+                copperclaw_metrics::inc_adapter_edit_message(ct, "ok");
+                Ok(())
+            }
+            Err(e) => {
+                copperclaw_metrics::inc_hud_edit(ct, "error");
+                copperclaw_metrics::inc_adapter_edit_message(ct, "error");
+                Err(e)
+            }
+        }
     }
 
     /// Native card — a Mattermost Markdown post (heading + body + field
@@ -210,6 +222,7 @@ impl ChannelAdapter for MattermostAdapter {
         card: &Card,
         _to: Option<&str>,
     ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type().as_str(), "card");
         let text = render::render_card(card);
         let id = self.api.create_post(platform_id, &text, thread_id).await?;
         Ok(Some(id))
@@ -222,6 +235,7 @@ impl ChannelAdapter for MattermostAdapter {
         thread_id: Option<&str>,
         diff: &DiffCard,
     ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type().as_str(), "diff");
         let text = render::render_diff(diff);
         let id = self.api.create_post(platform_id, &text, thread_id).await?;
         Ok(Some(id))
@@ -236,6 +250,7 @@ impl ChannelAdapter for MattermostAdapter {
         summary: &str,
         preview_lines: &[String],
     ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type().as_str(), "collapsible");
         let body = render::render_collapsible(text, summary, preview_lines);
         let id = self.api.create_post(platform_id, &body, thread_id).await?;
         Ok(Some(id))
@@ -252,6 +267,7 @@ impl ChannelAdapter for MattermostAdapter {
         existing_message_id: Option<&str>,
         _pin_hint: bool,
     ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type().as_str(), "todo");
         let text = render::render_todo_list(list);
         if let Some(existing) = existing_message_id {
             self.api.update_post(existing, &text).await?;
@@ -269,6 +285,7 @@ impl ChannelAdapter for MattermostAdapter {
         thread_id: Option<&str>,
         thinking: &ThinkingBlock,
     ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type().as_str(), "thinking");
         let text = render::render_thinking(thinking);
         let id = self.api.create_post(platform_id, &text, thread_id).await?;
         Ok(Some(id))
@@ -281,6 +298,7 @@ impl ChannelAdapter for MattermostAdapter {
         thread_id: Option<&str>,
         err: &ErrorCard,
     ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type().as_str(), "error");
         let text = render::render_error(err);
         let id = self.api.create_post(platform_id, &text, thread_id).await?;
         Ok(Some(id))

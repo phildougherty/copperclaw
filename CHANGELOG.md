@@ -6,6 +6,50 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M18 M1 — metrics rider: sweep of merged-PR metric wishes, 2026-07-16)
+
+- Swept the "Metrics wishes" recorded across merged M18 PRs #24-#54 into real
+  Prometheus metrics: ~55 new `copperclaw_*` counters / histograms / gauges
+  defined in `crates/copperclaw-metrics/src/lib.rs`, each emitted at a real
+  call site in the crate its wish named. One PR, single owner of the metrics
+  hotspot. Highlights by lane:
+  - **Channels:** slack typing skip / set-status / HUD-decision (C1);
+    per-channel inbound-file materialize + byte histogram across slack /
+    discord / telegram / deltachat (C3/C4); native rich-render + HUD self-edit
+    counters for signal / whatsapp-cloud / mattermost (C5); shared markdown
+    `render`/unbalanced-marker + the relocated fence-split / unbalanced-input
+    counters emitted from `markdown::split_into_chunks` (C2/C5b — the splitter
+    gained a `channel_type` label param, threaded from host-delivery).
+  - **Runner / providers:** mid-turn stop vs interjection (R2); verify-gate
+    completion + verify-run + fix-cycles histogram (R3/X2); compaction
+    triggered / estimated-tokens / facts-header-bytes (R4); provider failover
+    from→to + chain-exhausted, plus the `pump_events` retry-label accuracy fix
+    (R5); progressive-final grown/single-emit/skip-reason/steps/chars (R6);
+    Task-HUD posts / edits / degraded / finalize (H1); preview-expose
+    served/timeout (X1); policy denials by layer+tool (R0).
+  - **mcp:** shell truncation by mode + pre-cap bytes, read_file lines-mode +
+    pages (T1); unknown-tool + filter-deny layer (R0); load_skill inline vs
+    callable (P1); session-install by ecosystem/outcome + wall-clock +
+    image-scope rejection + egress-hint (E1); browser render by mode/outcome,
+    screenshot result + latency, preview-allow injection, SSRF blocks, CDP
+    connect failures, child spawn/teardown (V3/V4).
+  - **host / modules:** preview WS upgrades / active gauge / frames / bytes /
+    session-seconds (V1); enable-preview card outcomes + tombstone recovery +
+    tombstoned gauge (V2); in-chat approval taps (G1); image rebuild by profile
+    + per-group image-profile gauge (E2); sessions-spawned-per-profile +
+    system-prompt bytes (P1); delegate spawn-gate outcomes + depth rejections +
+    worktree-provision latency (R7); slash-commands + control-rows +
+    status-answer timing (R1, in `copperclaw-host-router`).
+  - **Adapted / dropped (documented, no dead metrics):** the wished
+    `control_rows_pending` gauge landed as a `..._written_total` counter (its
+    consumer is a separate process, so no in-registry decrement); P3's
+    "prototype ready" ritual metrics and X2's `ritual_card_sent_total` were
+    dropped — the ritual is model-driven with no distinct code path to key on;
+    V2's tombstone-duration histogram and R7's concurrent-delegates histogram
+    were deferred to an M1b follow-up (both need new runtime state to emit).
+  - **Deferred:** V5 (#55, tunnel exposures) is held for security sign-off and
+    is NOT on `main`; its metrics are an M1-followup once V5 merges.
+
 ### Added (M18 R7 — `delegate`: write-capable middle-tier build worker, 2026-07-16)
 
 - New **`delegate`** tool + delivery-action: the middle tier between the read-only

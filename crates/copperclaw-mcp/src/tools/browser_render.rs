@@ -259,10 +259,10 @@ pub async fn prepare(
         .map_err(|e| ToolError::Validation(e.to_string()))?;
 
     // 4. SSRF pre-flight on the navigation target (reuses net_guard).
-    guard
-        .guard_target(&req.url)
-        .await
-        .map_err(ToolError::Validation)?;
+    guard.guard_target(&req.url).await.map_err(|e| {
+        copperclaw_metrics::inc_browser_ssrf_block("target_preflight");
+        ToolError::Validation(e)
+    })?;
 
     // 5. Build the locked-down child-container spec (no broker token, egress
     //    restricted to the target, stronger sandbox requested). The host
@@ -283,7 +283,13 @@ pub async fn prepare(
     //    via `PREVIEW_ALLOW_ENV`; we inject it into the deny-default allow-list
     //    here so the child can reach it. Unset → target-only (pre-V4).
     let mut egress_allow = egress_allow_for(&req.url)?;
-    for extra in preview_egress_allow(env) {
+    let preview_extras = preview_egress_allow(env);
+    if !preview_extras.is_empty() {
+        // V4: the host injected the preview host:port into the allow-list (vs a
+        // target-only render).
+        copperclaw_metrics::inc_browser_render_preview_allow_injected();
+    }
+    for extra in preview_extras {
         if !egress_allow.contains(&extra) {
             egress_allow.push(extra);
         }
@@ -374,9 +380,15 @@ async fn render_prepared_live(
     guard: &dyn NavigationGuard,
     env: &dyn EnvLookup,
 ) -> Result<CallToolResult, ToolError> {
+    // V3/V4 metric labels — captured before `prepared` is partially moved into
+    // the render call below.
+    let mode_label = prepared.req.mode.as_str().to_owned();
+    let is_screenshot = prepared.req.mode.as_str() == "screenshot";
+
     let runtime = match copperclaw_container_rt::detect().await {
         Ok(rt) => rt,
         Err(e) => {
+            copperclaw_metrics::inc_browser_render(&mode_label, "unavailable");
             return Err(ToolError::Internal(format!(
                 "browser_render: navigation target `{}` passed the SSRF + opt-in checks and a \
                  locked-down child-container spec was constructed (egress={:?}), but no container \
@@ -396,7 +408,8 @@ async fn render_prepared_live(
     };
     let connector = WsCdpConnector::new(nav_timeout);
 
-    match copperclaw_browser::render_live(
+    let started = std::time::Instant::now();
+    let result = copperclaw_browser::render_live(
         &prepared.req,
         prepared.spec,
         guard,
@@ -404,8 +417,25 @@ async fn render_prepared_live(
         &connector,
         &opts,
     )
-    .await
-    {
+    .await;
+
+    // V3: render outcome by mode; V4: screenshot-specific outcome + latency.
+    let outcome = match &result {
+        Ok(_) => "ok",
+        Err(BrowserError::Blocked(_)) => "blocked",
+        Err(_) => "driver_error",
+    };
+    copperclaw_metrics::inc_browser_render(&mode_label, outcome);
+    if is_screenshot {
+        copperclaw_metrics::inc_browser_render_screenshot(outcome);
+        if result.is_ok() {
+            copperclaw_metrics::observe_browser_screenshot_duration_seconds(
+                started.elapsed().as_secs_f64(),
+            );
+        }
+    }
+
+    match result {
         Ok(out) => Ok(success_json(&out)),
         // A redirect that lands in a blocked (internal) range is a user-visible
         // refusal, not an internal fault.
