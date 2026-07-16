@@ -228,6 +228,31 @@ impl MatrixApi {
         self.send_room_event(room_id, "m.room.message", body).await
     }
 
+    /// As [`send_threaded`](Self::send_threaded) but also carries
+    /// `format` / `formatted_body` so a threaded reply renders its
+    /// HTML on capable clients. Used by the U6 plain-text path so a
+    /// threaded agent message gets the same shared-renderer HTML as a
+    /// top-level one.
+    pub async fn send_threaded_html(
+        &self,
+        room_id: &str,
+        thread_event_id: &str,
+        plain: &str,
+        html: &str,
+    ) -> Result<SendResponse, AdapterError> {
+        let body = json!({
+            "msgtype": "m.text",
+            "body": plain,
+            "format": "org.matrix.custom.html",
+            "formatted_body": html,
+            "m.relates_to": {
+                "rel_type": "m.thread",
+                "event_id": thread_event_id,
+            }
+        });
+        self.send_room_event(room_id, "m.room.message", body).await
+    }
+
     /// Edit a previously-sent message by sending an `m.replace` event.
     pub async fn edit_message(
         &self,

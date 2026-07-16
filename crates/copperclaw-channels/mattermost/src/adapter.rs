@@ -29,6 +29,7 @@
 use crate::api::MattermostApi;
 use crate::render;
 use async_trait::async_trait;
+use copperclaw_channels_core::markdown::{Flavor, render as render_markdown};
 use copperclaw_channels_core::{
     AdapterError, Breadcrumb, Card, ChannelAdapter, DiffCard, ErrorCard, ThinkingBlock, TodoList,
 };
@@ -144,12 +145,17 @@ impl ChannelAdapter for MattermostAdapter {
         }
         match action {
             "post" => {
-                let text = content
+                let raw_text = content
                     .get("text")
                     .and_then(serde_json::Value::as_str)
                     .ok_or_else(|| {
                         AdapterError::BadRequest("missing `text` in outbound content".into())
                     })?;
+                // U6: route the agent's canonical Markdown through the shared
+                // renderer ([`Flavor::Mattermost`] — full CommonMark) so
+                // bullets normalise and the plain-text path shares one
+                // formatter with every other channel.
+                let text = render_markdown(raw_text, Flavor::Mattermost);
                 // Two-step upload: upload each file to /api/v4/files
                 // against the destination channel, collect ids, then
                 // POST the message with `file_ids` attached. Each
@@ -164,7 +170,7 @@ impl ChannelAdapter for MattermostAdapter {
                 }
                 let id = self
                     .api
-                    .create_post_with_files(platform_id, text, thread_id, &file_ids)
+                    .create_post_with_files(platform_id, &text, thread_id, &file_ids)
                     .await?;
                 Ok(Some(id))
             }

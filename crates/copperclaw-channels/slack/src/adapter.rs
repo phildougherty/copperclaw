@@ -2,6 +2,7 @@
 
 use crate::api::{CompleteUploadEntry, SlackApi, build_card_blocks};
 use async_trait::async_trait;
+use copperclaw_channels_core::markdown::{Flavor, render as render_markdown};
 use copperclaw_channels_core::{
     AdapterError, Breadcrumb, BreadcrumbStatus, Card, ChannelAdapter, DiffCard, DmHandle,
     ErrorCard, ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList,
@@ -180,13 +181,22 @@ impl ChannelAdapter for SlackAdapter {
         thread_id: Option<&str>,
         message: &OutboundMessage,
     ) -> Result<Option<String>, AdapterError> {
-        let text = message
+        let raw_text = message
             .content
             .get("text")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
+            .unwrap_or("");
         let blocks = message.content.get("blocks").cloned();
+        // Plain-text path only: when the agent supplied explicit Block Kit
+        // `blocks` (a U1–U5 rich surface) the `text` is a notification
+        // fallback and is left verbatim. Otherwise route the canonical
+        // Markdown through the shared renderer (U6) so `**bold**` → `*bold*`,
+        // headings degrade to bold, links become `<url|text>`, etc.
+        let text = if blocks.is_some() {
+            raw_text.to_owned()
+        } else {
+            render_markdown(raw_text, Flavor::Slack)
+        };
         let ephemeral_to = message.content.get("ephemeral_to").and_then(Value::as_str);
 
         let ts = if let Some(user) = ephemeral_to {

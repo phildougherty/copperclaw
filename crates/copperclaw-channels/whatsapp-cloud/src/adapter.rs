@@ -8,6 +8,7 @@
 use crate::api::WhatsappCloudApi;
 use crate::render;
 use async_trait::async_trait;
+use copperclaw_channels_core::markdown::{Flavor, render as render_markdown};
 use copperclaw_channels_core::{
     AdapterError, Card, ChannelAdapter, DiffCard, DmHandle, ErrorCard, ThinkingBlock, TodoList,
 };
@@ -198,11 +199,15 @@ impl ChannelAdapter for WhatsappCloudAdapter {
                 .await;
         }
 
-        let text = message
+        let raw_text = message
             .content
             .get("text")
             .and_then(Value::as_str)
             .unwrap_or("");
+        // U6: render the agent's canonical Markdown into WhatsApp's inline
+        // vocabulary (`*bold*`, `_italic_`, `~strike~`, monospace fences)
+        // via the shared renderer, replacing the previous raw passthrough.
+        let text = render_markdown(raw_text, Flavor::WhatsApp);
 
         // Files-first: upload + send by media id, threading via `in_reply_to`.
         if !message.files.is_empty() {
@@ -212,10 +217,10 @@ impl ChannelAdapter for WhatsappCloudAdapter {
             if !text.is_empty() {
                 let id = if let Some(reply) = thread_id {
                     self.api
-                        .send_text_reply(&pnid, recipient, text, reply)
+                        .send_text_reply(&pnid, recipient, &text, reply)
                         .await?
                 } else {
-                    self.api.send_text(&pnid, recipient, text).await?
+                    self.api.send_text(&pnid, recipient, &text).await?
                 };
                 first_id = Some(id);
             }
@@ -228,10 +233,10 @@ impl ChannelAdapter for WhatsappCloudAdapter {
         // Pure text.
         let id = if let Some(reply) = thread_id {
             self.api
-                .send_text_reply(&pnid, recipient, text, reply)
+                .send_text_reply(&pnid, recipient, &text, reply)
                 .await?
         } else {
-            self.api.send_text(&pnid, recipient, text).await?
+            self.api.send_text(&pnid, recipient, &text).await?
         };
         Ok(Some(id))
     }
