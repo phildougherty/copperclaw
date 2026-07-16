@@ -1,9 +1,16 @@
-//! `copperclaw-browser` — headless-browser render core (Phase 5a, read-only).
+//! `copperclaw-browser` — headless-browser core (Phase 5a render + Phase 5b
+//! interactive).
 //!
-//! This crate carries the pure, host-side logic for the read-only headless
-//! browser tool: render a page and return a screenshot path, the DOM text, or
-//! a read-only ARIA snapshot. It is deliberately **read-only** — no
-//! interactive click / type / scroll (that is Phase 5b, out of scope).
+//! This crate carries the pure, host-side logic for the headless browser tool.
+//! Phase 5a (read-only): render a page and return a screenshot path, the DOM
+//! text, or a read-only ARIA snapshot. Phase 5b ([`interactive`], demand-pull,
+//! behind a *stricter separate* opt-in flag): a bounded, caller-scripted
+//! click / type / scroll / wait-for-selector sequence that returns the
+//! post-interaction DOM — an incremental extension of the same live path, NOT
+//! an autonomous browsing loop and NOT a memory-writing capability. Both phases
+//! tag output [`Provenance::Untrusted`] and re-run the SSRF
+//! [`NavigationGuard`] on every navigation (Phase 5b re-guards after every
+//! action; see [`interactive::interact`]).
 //!
 //! ## What lives here (pure + tested) vs. the runtime path
 //!
@@ -50,6 +57,7 @@ pub mod container;
 pub mod driver;
 pub mod error;
 pub mod guard;
+pub mod interactive;
 pub mod live;
 pub mod render;
 
@@ -63,5 +71,10 @@ pub use crate::container::{
 pub use crate::driver::{BrowserDriver, DriverRender, Navigation, RenderedArtifact, render};
 pub use crate::error::BrowserError;
 pub use crate::guard::{GuardResult, NavigationGuard};
-pub use crate::live::{CdpConnector, LiveRenderOptions, WsCdpConnector, render_live};
+pub use crate::interactive::{
+    InteractRequest, InteractiveAction, InteractiveDriver, MAX_ACTIONS, MAX_TYPE_LEN, interact,
+};
+pub use crate::live::{
+    CdpConnector, LiveRenderOptions, WsCdpConnector, interact_live, render_live,
+};
 pub use crate::render::{Provenance, RenderMode, RenderOutput, RenderRequest};

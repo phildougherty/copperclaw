@@ -21,6 +21,7 @@ use crate::error::ToolError;
 pub mod agents;
 pub mod apply_patch;
 pub mod artifact_path;
+pub mod browser_interact;
 pub mod browser_render;
 pub mod clear_history;
 pub mod compact_now;
@@ -76,7 +77,7 @@ pub trait ToolHandler: Send + Sync {
 /// Adding a tool here exposes it to the model on the *next* container
 /// spawn — no schema migration, no other wiring.
 pub fn build_tool_set() -> Vec<ToolEntry> {
-    vec![
+    let mut set = vec![
         core::send_message::entry(),
         core::send_file::entry(),
         core::edit_message::entry(),
@@ -126,7 +127,18 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         compact_now::entry(),
         clear_history::entry(),
         artifact_path::entry(),
-    ]
+    ];
+
+    // A2 (Phase 5b): the interactive browser is registered ONLY when its
+    // stricter, SEPARATE opt-in is set (both COPPERCLAW_BROWSER_ENABLED and
+    // COPPERCLAW_BROWSER_INTERACTIVE truthy). With the flag off the tool is
+    // entirely absent — the tool set, schemas, and behaviour are byte-identical
+    // to the read-only baseline, so the model never sees the interactive verb.
+    if browser_interact::interactive_opt_in(&browser_render::SystemEnv) {
+        set.push(browser_interact::entry());
+    }
+
+    set
 }
 
 /// Lookup table form of [`build_tool_set`] for the server router.
