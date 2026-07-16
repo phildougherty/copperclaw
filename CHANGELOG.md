@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (M19 A7 — Preview-exposure provenance refinement)
+
+- Exposing a **LAN-only** session preview (`expose_preview` / `close_preview`)
+  is no longer blocked by the M16 coarse **taint** gate. M18's live post-mortem
+  found that a "research … then build" request web-tainted the turn, so the
+  provenance gate denied `expose_preview` as a credentialed external action —
+  the operator's preview didn't appear until a fresh untainted turn, a felt UX
+  papercut. A LAN preview stands up a listener reachable only on the operator's
+  own machine / LAN: a *local surface*, not the same risk class as
+  `web_search` / `web_fetch` / a public tunnel routing the agent's credentials
+  at an attacker-chosen target. New `LAN_PREVIEW_TOOLS` const + `is_lan_preview`
+  helper in `crates/copperclaw-runner/src/policy.rs` carve the two LAN verbs out
+  of the taint half of the provenance/autonomy gate; a web-tainted turn can now
+  `expose_preview` without a fresh approval. The verbs stay gated by every other
+  layer — the guest role floor (they are mutating), the coding/full profile
+  ceiling, the per-group preview opt-in (host-side), and the **autonomy** gate
+  (an autonomous/heartbeat turn still may not stand up a listener with no human
+  present). The durable boundary is documented in code: **LAN preview = local
+  surface** (taint-exempt); **public tunnel = external** (NOT exempt). An
+  outward-facing public/tunnel verb such as `make_preview_public` (M19 A3) is
+  deliberately absent from the carve-out and stays fully taint-gated even though
+  it rides the same preview subsystem — a robustness test asserts the public
+  verb is never taint-exempt so A3's verb inherits full gating the moment it
+  lands. Audit rows and approval flows are unchanged.
+
 ### Added (M19 A6 — Durable scheduled-task fire lifecycle, migration 028)
 
 - Scheduled tasks now carry a durable, queryable record of their firing
