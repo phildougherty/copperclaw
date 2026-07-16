@@ -136,6 +136,29 @@ pub(crate) struct RunnerConfigForFile {
     /// `runner.json` shape stays bit-identical to the pre-R3 shape.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) verify_gate: Option<bool>,
+    /// M18 R5 hot in-session provider failover: the ORDERED list of
+    /// currently-healthy fallback providers the runner may switch to
+    /// mid-turn (resolved from the group's `FallbackChain` + live health,
+    /// security-bounded to entries the container can already reach). Skipped
+    /// when empty / unconfigured so the `runner.json` shape stays
+    /// bit-identical for groups with no chain. See
+    /// [`ContainerManager::resolve_failover_chain_for_file`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) failover_chain: Option<Vec<FailoverEntryForFile>>,
+}
+
+/// One alternate provider in [`RunnerConfigForFile::failover_chain`].
+/// Mirrors the runner's `FailoverEntryFile`. Only ever names a credential
+/// slot (`api_key_env`) the container already holds — the host never
+/// broadens the in-container secret set for failover.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct FailoverEntryForFile {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) api_key_env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) api_base_url: Option<String>,
 }
 
 /// Validate a raw `COPPERCLAW_HUD_MODE` value down to the three modes the
@@ -381,17 +404,7 @@ impl ContainerManager {
             // wired in (they are set together by `with_broker`). Gating on both
             // means this path and the env-var path in `build_spec` can never
             // disagree about which endpoint the runner hits.
-            _ => self
-                .broker
-                .as_ref()
-                .and(self.broker_base_url.clone())
-                .or_else(|| {
-                    self.rotatable
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .anthropic_base_url
-                        .clone()
-                }),
+            _ => self.anthropic_envelope_base_url(),
         };
 
         // Codex binary + args. Sourced from the rotatable forward_env
@@ -501,6 +514,18 @@ impl ContainerManager {
         let check_command = cc.and_then(|c| c.check_command.clone());
         let verify_gate = cc.map(|c| c.verify_gate).filter(|on| !on).map(|_| false);
 
+        // M18 R5 hot in-session provider failover: resolve the ordered,
+        // security-bounded healthy fallback chain the runner walks when the
+        // primary exhausts its retries. `None` (and unconfigured groups)
+        // leaves the field off — `runner.json` shape stays bit-identical.
+        // Reuses the primary's already-injected credential slot + endpoint;
+        // never ships a new secret (see the method's security note).
+        let failover_chain = self.resolve_failover_chain_for_file(
+            session,
+            failover.as_ref(),
+            api_key_env.as_deref(),
+        );
+
         RunnerConfigForFile {
             session_id: session.id.as_uuid().to_string(),
             agent_group_id: session.agent_group_id.as_uuid().to_string(),
@@ -527,7 +552,121 @@ impl ContainerManager {
             hud_mode,
             check_command,
             verify_gate,
+            failover_chain,
         }
+    }
+
+    /// The Anthropic-envelope base URL the runner should hit: the broker
+    /// loopback when the credential broker is enabled (both the broker
+    /// state and its loopback URL are wired together by `with_broker`),
+    /// else the operator's rotatable real base URL. Shared by the primary
+    /// provider resolution and the R5 failover chain so the two can never
+    /// disagree about the endpoint — and so a broker-enabled deployment
+    /// never leaks the real endpoint to a failover entry.
+    fn anthropic_envelope_base_url(&self) -> Option<String> {
+        self.broker
+            .as_ref()
+            .and(self.broker_base_url.clone())
+            .or_else(|| {
+                self.rotatable
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .anthropic_base_url
+                    .clone()
+            })
+    }
+
+    /// Resolve the R5 in-container failover chain written into `runner.json`:
+    /// the ordered, currently-healthy fallback entries the runner may switch
+    /// to mid-turn, filtered to those the container can ALREADY reach.
+    ///
+    /// **Security boundary (M18 R5).** Shipping several providers' keys into
+    /// the container would enlarge its secret surface. We refuse to broaden
+    /// it: an entry is included only when serving it needs NO credential the
+    /// container doesn't already hold:
+    ///
+    /// - no-auth local providers (`ollama` / `ollama-shim` / `codex`) — no
+    ///   secret at all (ollama reads the already-forwarded `OLLAMA_BASE_URL`);
+    /// - Anthropic-envelope entries when the credential broker is enabled —
+    ///   brokered by the capability token already in the `ANTHROPIC_API_KEY`
+    ///   slot (the real key never enters the container), pointed at the same
+    ///   broker loopback as the primary;
+    /// - Anthropic-envelope entries when the broker is disabled ONLY when the
+    ///   entry's selected key is the default `ANTHROPIC_API_KEY` or the exact
+    ///   same `api_key_env` the primary already injected — the SAME credential.
+    ///
+    /// An Anthropic entry that would require injecting a DIFFERENT real key
+    /// (a second account) is excluded and logged. Every included Anthropic
+    /// entry reuses the primary's already-injected credential slot + endpoint
+    /// and varies only the model (and possibly the provider kind, to a local
+    /// model). `None` when no chain is configured / no eligible in-boundary
+    /// alternate exists.
+    fn resolve_failover_chain_for_file(
+        &self,
+        session: &Session,
+        primary: Option<&copperclaw_providers::failover::Selection>,
+        primary_key_env: Option<&str>,
+    ) -> Option<Vec<FailoverEntryForFile>> {
+        let primary = primary?;
+        let alternates = self.failover_alternates(session, primary, chrono::Utc::now());
+        if alternates.is_empty() {
+            return None;
+        }
+        let broker_enabled = self.broker.is_some() && self.broker_base_url.is_some();
+        let anthropic_base = self.anthropic_envelope_base_url();
+        let mut out: Vec<FailoverEntryForFile> = Vec::new();
+        for alt in alternates {
+            // Normalise the provider kind the same way the primary path does.
+            let provider = match alt.provider.as_str() {
+                "" => continue,
+                "claude" => "anthropic".to_string(),
+                other => other.to_string(),
+            };
+            match provider.as_str() {
+                // No-auth / local providers: no secret shipped. Endpoint /
+                // binary comes from the container env (OLLAMA_BASE_URL, codex).
+                "ollama" | "ollama-shim" | "codex" => out.push(FailoverEntryForFile {
+                    provider,
+                    model: alt.model,
+                    api_key_env: None,
+                    api_base_url: None,
+                }),
+                // Anthropic-envelope: apply the credential boundary.
+                _ => {
+                    let entry_key_env = alt.key_env.as_deref();
+                    let compatible = broker_enabled
+                        || entry_key_env.is_none()
+                        || entry_key_env == Some("ANTHROPIC_API_KEY")
+                        || entry_key_env == primary_key_env;
+                    if !compatible {
+                        warn!(
+                            agent_group = %session.agent_group_id.as_uuid(),
+                            provider = %provider,
+                            model = %alt.model,
+                            "R5 failover: excluding entry that would require a NEW in-container \
+                             credential (different api_key_env than the primary, no broker) — \
+                             not broadening the container secret surface"
+                        );
+                        continue;
+                    }
+                    // Reuse the primary's already-injected credential slot: the
+                    // broker token slot when brokered, else the primary's own
+                    // injected var (defaulting to ANTHROPIC_API_KEY).
+                    let api_key_env = if broker_enabled {
+                        Some("ANTHROPIC_API_KEY".to_string())
+                    } else {
+                        Some(primary_key_env.unwrap_or("ANTHROPIC_API_KEY").to_string())
+                    };
+                    out.push(FailoverEntryForFile {
+                        provider,
+                        model: alt.model,
+                        api_key_env,
+                        api_base_url: anthropic_base.clone(),
+                    });
+                }
+            }
+        }
+        (!out.is_empty()).then_some(out)
     }
 
     /// Resolve the RBAC role of the sender that triggered this session,
@@ -1830,6 +1969,145 @@ mod tests {
         assert!(
             open.get("allowed_tools").is_none(),
             "a skill with no allowed-tools must omit the field (skip_serializing_if)"
+        );
+    }
+
+    // ----- M18 R5: hot in-session provider failover chain in runner.json -----
+
+    use copperclaw_db::tables::provider_profiles;
+    use serde_json::json;
+
+    fn set_chain(mgr: &ContainerManager, id: AgentGroupId, chain: &serde_json::Value) {
+        provider_profiles::set_chain(
+            &mgr.central,
+            id,
+            chain,
+            &json!({}),
+            None,
+            chrono::Utc::now(),
+        )
+        .unwrap();
+    }
+
+    /// No fallback chain configured → the `runner.json` shape is unchanged:
+    /// the `failover_chain` field is skipped entirely.
+    #[test]
+    fn runner_config_omits_failover_chain_when_no_chain_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        let cfg = mgr.runner_config_for(&session, None, None);
+        assert!(cfg.failover_chain.is_none());
+        // And the serialized shape omits the key.
+        let v = serde_json::to_value(&cfg).unwrap();
+        assert!(v.get("failover_chain").is_none());
+    }
+
+    /// A healthy ollama fallback below the anthropic primary is emitted as a
+    /// no-auth failover entry (no key, no endpoint — the container reads
+    /// `OLLAMA_BASE_URL` itself). This is the flagship "anthropic hiccups →
+    /// keep building on the local model" case.
+    #[test]
+    fn runner_config_emits_ollama_fallback_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        set_chain(
+            &mgr,
+            session.agent_group_id,
+            &json!([
+                {"provider": "anthropic", "model": "claude-sonnet-4-6",
+                 "keys": [{"id": "k1", "api_key_env": "ANTHROPIC_API_KEY"}]},
+                {"provider": "ollama", "model": "qwen3.6:27b"}
+            ]),
+        );
+        let cfg = mgr.runner_config_for(&session, None, None);
+        let chain = cfg.failover_chain.expect("failover chain emitted");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].provider, "ollama");
+        assert_eq!(chain[0].model, "qwen3.6:27b");
+        assert!(
+            chain[0].api_key_env.is_none(),
+            "no-auth: no key slot shipped"
+        );
+        assert!(chain[0].api_base_url.is_none());
+    }
+
+    /// SECURITY BOUNDARY: an anthropic fallback that would require a
+    /// DIFFERENT real key than the primary (a second account, broker
+    /// disabled) is EXCLUDED — we never broaden the in-container secret set.
+    #[test]
+    fn runner_config_excludes_second_anthropic_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        set_chain(
+            &mgr,
+            session.agent_group_id,
+            &json!([
+                {"provider": "anthropic", "model": "m1",
+                 "keys": [{"id": "k1", "api_key_env": "ANTHROPIC_API_KEY_A"}]},
+                {"provider": "anthropic", "model": "m2",
+                 "keys": [{"id": "k2", "api_key_env": "ANTHROPIC_API_KEY_B"}]}
+            ]),
+        );
+        let cfg = mgr.runner_config_for(&session, None, None);
+        assert!(
+            cfg.failover_chain.is_none(),
+            "a second-account anthropic entry must not reach the container"
+        );
+    }
+
+    /// An anthropic fallback that reuses the SAME key as the primary is
+    /// within the boundary: it's emitted, reusing the already-injected
+    /// credential slot + the shared Anthropic endpoint (only the model
+    /// differs).
+    #[test]
+    fn runner_config_includes_same_key_anthropic_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let mgr = ContainerManager::new(
+            db.clone(),
+            std::sync::Arc::new(crate::tests::NoopRuntime::default()),
+            manager_cfg(tmp.path().to_path_buf()),
+        );
+        let session = fixture_session(&db);
+        set_chain(
+            &mgr,
+            session.agent_group_id,
+            &json!([
+                {"provider": "anthropic", "model": "m1",
+                 "keys": [{"id": "k1", "api_key_env": "ANTHROPIC_API_KEY_A"}]},
+                {"provider": "anthropic", "model": "m2",
+                 "keys": [{"id": "k2", "api_key_env": "ANTHROPIC_API_KEY_A"}]}
+            ]),
+        );
+        let cfg = mgr.runner_config_for(&session, None, None);
+        let chain = cfg.failover_chain.expect("same-key fallback emitted");
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].provider, "anthropic");
+        assert_eq!(chain[0].model, "m2");
+        // Reuses the primary's already-injected key slot (not a new secret).
+        assert_eq!(chain[0].api_key_env.as_deref(), Some("ANTHROPIC_API_KEY_A"));
+        // Shares the primary's Anthropic endpoint (manager_cfg = openrouter).
+        assert_eq!(
+            chain[0].api_base_url.as_deref(),
+            Some("https://openrouter.ai/api/v1")
         );
     }
 }

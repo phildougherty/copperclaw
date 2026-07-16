@@ -372,6 +372,8 @@ async fn run_one_turn(
         // exercises it.
         verify_gate: true,
         check_command_override: None,
+        // Single-provider e2e — no R5 failover chain.
+        failover_chain: Vec::new(),
     };
     run_loop(deps).await.context("runner one-turn")?;
     Ok(())

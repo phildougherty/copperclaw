@@ -181,14 +181,21 @@ impl TaskHud {
 
     /// One-shot annotation for the next HUD edit. Cleared after it has
     /// been rendered once; only live HUD frames render it. This is the
-    /// M18 R2/R5 hook ("steering noted", "switched provider") — those
-    /// cards only need to call this, so it ships (tested) ahead of its
-    /// first production caller.
-    #[allow(dead_code)]
+    /// M18 R2 "steering noted" / R5 "switched to <provider>" hook —
+    /// `run_llm_turn` calls it on a mid-turn provider failover.
     pub(super) fn add_note(&self, text: &str) {
         if let Ok(mut s) = self.shared.lock() {
             s.note = Some(text.to_owned());
         }
+    }
+
+    /// Test-only: peek the pending one-shot note without consuming it.
+    /// Lets the R5 failover tests assert `add_note` fired on a mid-turn
+    /// provider switch even under the `StatusRows` behaviour (where the
+    /// note is never rendered/taken).
+    #[cfg(test)]
+    pub(super) fn note_for_test(&self) -> Option<String> {
+        self.shared.lock().ok().and_then(|s| s.note.clone())
     }
 
     /// A tool batch is about to execute. Live HUD: post (first batch) or
