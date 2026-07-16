@@ -10,6 +10,7 @@ copperclaw-types   = { workspace = true }
 copperclaw-db      = { workspace = true }
 copperclaw-modules = { workspace = true }
 copperclaw-metrics = { workspace = true }
+copperclaw-channels-core = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }

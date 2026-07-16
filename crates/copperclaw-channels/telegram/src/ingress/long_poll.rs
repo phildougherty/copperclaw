@@ -403,8 +403,11 @@ mod tests {
         assert_eq!(evt.message.kind, copperclaw_types::MessageKind::Chat);
         let att = &evt.message.content["attachment"];
         assert_eq!(att["kind"], "telegram.document");
-        let on_disk = att["path"].as_str().unwrap();
-        assert_eq!(std::fs::read(on_disk).unwrap(), b"hello");
+        // Inbound-file contract: the adapter stages the bytes; the
+        // router owns the final session-inbox placement and `path`.
+        assert!(att.get("path").is_none());
+        let staged = att["staged_path"].as_str().unwrap();
+        assert_eq!(std::fs::read(staged).unwrap(), b"hello");
 
         cancel.cancel();
         handle.await.unwrap();

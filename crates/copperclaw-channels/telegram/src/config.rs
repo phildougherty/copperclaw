@@ -129,8 +129,9 @@ pub struct TelegramConfig {
     /// When `true` (the default), inbound `document` / `photo` / `audio` /
     /// `video` / `voice` / `video_note` / `sticker` attachments are
     /// downloaded via `getFile` and surfaced as
-    /// [`copperclaw_types::MessageKind::Chat`] events with the file written
-    /// under `data_dir/inbox/<msg_id>/<filename>` and metadata embedded in
+    /// [`copperclaw_types::MessageKind::Chat`] events with the file staged
+    /// under `data_dir/staging/<unique>/<filename>` (see the channels-core
+    /// inbound-file contract) and metadata embedded in
     /// `content["attachment"]`.
     ///
     /// When `false`, the adapter falls back to the legacy behaviour: an

@@ -52,8 +52,9 @@ pub struct TelegramAdapter {
     bot_username: Option<String>,
     /// Stored config (kept for `Debug` and potential introspection).
     config: TelegramConfig,
-    /// Per-channel data directory. Inbound attachments are written under
-    /// `<data_dir>/inbox/<msg_id>/<filename>`.
+    /// Per-channel data directory. Inbound attachments are staged under
+    /// `<data_dir>/staging/<unique>/<filename>` for the router to
+    /// materialize into the resolved session's inbox at route time.
     data_dir: PathBuf,
     /// Background task handle (long-poll or webhook driver).
     ingress_handle: Mutex<Option<JoinHandle<()>>>,

@@ -9,13 +9,14 @@ use crate::types::{
 };
 use chrono::{DateTime, TimeZone, Utc};
 use copperclaw_channels_core::AdapterError;
+use copperclaw_channels_core::inbound_file::{
+    STAGED_PATH_KEY, STAGING_SUBDIR, sanitize_filename, stage_inbound_file,
+};
 use copperclaw_types::{
     ChannelType, InboundEvent, InboundMessage, MessageKind, ReplyTo, SenderIdentity,
 };
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-
-const MAX_INBOUND_FILENAME_LEN: usize = 255;
 
 /// Settings the ingress layer needs to materialise an [`InboundEvent`].
 #[derive(Debug, Clone)]
@@ -30,8 +31,13 @@ pub struct IngressSettings {
     pub max_attachment_bytes: u64,
     /// Resolved bot username (from `getMe`) used for mention detection.
     pub bot_username: Option<String>,
-    /// Per-channel data directory; downloaded files land under
-    /// `data_dir/inbox/<msg_id>/<filename>`.
+    /// Per-channel data directory; downloaded files are STAGED under
+    /// `data_dir/staging/<unique>/<filename>` and surfaced on the
+    /// attachment as `staged_path`, per the channels-core inbound-file
+    /// contract ([`copperclaw_channels_core::inbound_file`]). The router
+    /// moves the bytes into the resolved session's
+    /// `inbox/<msg_id>/<filename>` at route time and rewrites the
+    /// attachment `path` to the container-visible `/data/inbox/...`.
     pub data_dir: PathBuf,
 }
 
@@ -194,7 +200,7 @@ async fn message_to_event(
         (MessageKind::System, legacy_metadata_value(&att))
     } else {
         let descriptor = attachment.expect("just checked");
-        match download_one(api, settings, msg.message_id, &descriptor).await {
+        match download_one(api, settings, &descriptor).await {
             DownloadOutcome::Ok { path, size } => {
                 let mut content_obj = serde_json::Map::new();
                 content_obj.insert("text".to_owned(), Value::String(caption_or_text.clone()));
@@ -441,10 +447,14 @@ fn legacy_metadata_value(att: &AttachmentDescriptor) -> Value {
     Value::Object(obj)
 }
 
-/// Build the `content["attachment"]` object describing a downloaded file.
+/// Build the `content["attachment"]` object describing a downloaded
+/// (staged) file. Per the inbound-file contract the object carries
+/// `staged_path` (the host-side staging location) and NO `path` key —
+/// the router sets `path` to the container-visible `/data/inbox/...`
+/// location when it materializes the file into the resolved session.
 fn attachment_json(
     att: &AttachmentDescriptor,
-    path: &Path,
+    staged_path: &Path,
     actual_size: u64,
 ) -> serde_json::Map<String, Value> {
     let mut obj = serde_json::Map::new();
@@ -455,8 +465,8 @@ fn attachment_json(
     obj.insert("file_id".to_owned(), Value::String(att.file_id.clone()));
     obj.insert("filename".to_owned(), Value::String(att.filename.clone()));
     obj.insert(
-        "path".to_owned(),
-        Value::String(path.to_string_lossy().into_owned()),
+        STAGED_PATH_KEY.to_owned(),
+        Value::String(staged_path.to_string_lossy().into_owned()),
     );
     obj.insert(
         "mime_type".to_owned(),
@@ -504,7 +514,8 @@ async fn inline_image_base64(
 
 /// Outcome of a single attachment fetch.
 enum DownloadOutcome {
-    /// File written under `data_dir/inbox/<msg_id>/<filename>`.
+    /// File staged under `data_dir/staging/<unique>/<filename>` for the
+    /// router to materialize into the resolved session's inbox.
     Ok { path: PathBuf, size: u64 },
     /// Telegram-reported size exceeded the configured cap; we never invoked
     /// `getFile`. `reported` is the size Telegram included with the update,
@@ -519,7 +530,6 @@ enum DownloadOutcome {
 async fn download_one(
     api: &TelegramApi,
     settings: &IngressSettings,
-    message_id: i64,
     descriptor: &AttachmentDescriptor,
 ) -> DownloadOutcome {
     if let Some(size) = descriptor.file_size {
@@ -554,69 +564,23 @@ async fn download_one(
             reported: Some(bytes.len() as u64),
         };
     }
-    match write_attachment(&settings.data_dir, message_id, &descriptor.filename, &bytes).await {
+    // Stage per the channels-core inbound-file contract: the router owns
+    // the final `<session>/inbox/<msg_id>/<filename>` placement (and the
+    // cleanup of the staged copy) because only the router knows the
+    // resolved session at route time.
+    match stage_inbound_file(
+        &settings.data_dir.join(STAGING_SUBDIR),
+        &descriptor.filename,
+        &bytes,
+    )
+    .await
+    {
         Ok(path) => DownloadOutcome::Ok {
             path,
             size: bytes.len() as u64,
         },
         Err(error) => DownloadOutcome::Failed { error },
     }
-}
-
-/// Write `bytes` into `<data_dir>/inbox/<msg_id>/<filename>`, creating the
-/// parent directories as needed. Returns the on-disk path.
-async fn write_attachment(
-    data_dir: &Path,
-    message_id: i64,
-    filename: &str,
-    bytes: &[u8],
-) -> Result<PathBuf, AdapterError> {
-    let inbox = data_dir.join("inbox").join(message_id.to_string());
-    tokio::fs::create_dir_all(&inbox).await.map_err(|e| {
-        AdapterError::Transport(format!(
-            "telegram inbox create {} failed: {e}",
-            inbox.display()
-        ))
-    })?;
-    let path = inbox.join(filename);
-    tokio::fs::write(&path, bytes).await.map_err(|e| {
-        AdapterError::Transport(format!(
-            "telegram inbox write {} failed: {e}",
-            path.display()
-        ))
-    })?;
-    Ok(path)
-}
-
-/// Sanitise a Telegram-supplied filename into something safe to use as a
-/// single path component. Falls back to `fallback` when the supplied name
-/// is empty or unusable.
-fn sanitize_filename(name: Option<&str>, fallback: &str) -> String {
-    let raw = name.unwrap_or("").trim();
-    if raw.is_empty() {
-        return fallback.to_owned();
-    }
-    let cleaned: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    // Trim leading dots / underscores to avoid hidden-file names and to drop
-    // path-traversal residue (e.g. `..` becomes `__` then `""`). Trailing
-    // characters are preserved so callers can see how the original differed.
-    let trimmed = cleaned.trim_start_matches(['.', '_']);
-    if trimmed.is_empty() {
-        return fallback.to_owned();
-    }
-    if trimmed.len() > MAX_INBOUND_FILENAME_LEN {
-        return trimmed[..MAX_INBOUND_FILENAME_LEN].to_owned();
-    }
-    trimmed.to_owned()
 }
 
 fn message_mentions(msg: &Message, bot_username: &str) -> bool {
@@ -1276,7 +1240,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn document_download_succeeds_and_writes_to_inbox() {
+    async fn document_download_succeeds_and_stages_file() {
         let server = MockServer::start().await;
         mount_get_file(&server, "F", "documents/file_1.txt", 5).await;
         mount_file_download(&server, "documents/file_1.txt", b"hello".to_vec()).await;
@@ -1299,8 +1263,19 @@ mod tests {
         assert_eq!(att["kind"], "telegram.document");
         assert_eq!(att["filename"], "a.txt");
         assert_eq!(att["size"], 5);
-        let on_disk = att["path"].as_str().unwrap();
-        let bytes = std::fs::read(on_disk).unwrap();
+        // Contract: the adapter STAGES the download and never sets `path`
+        // (the router owns that key at materialization time).
+        assert!(
+            att.get("path").is_none(),
+            "adapters must not set attachment.path: {att}"
+        );
+        let staged = att[STAGED_PATH_KEY].as_str().unwrap();
+        let staged_path = Path::new(staged);
+        assert!(
+            staged_path.starts_with(dir.path().join(STAGING_SUBDIR)),
+            "staged under <data_dir>/staging: {staged}"
+        );
+        let bytes = std::fs::read(staged_path).unwrap();
         assert_eq!(bytes, b"hello");
     }
 
@@ -1816,25 +1791,10 @@ mod tests {
         assert_eq!(att["filename"], "document.bin");
     }
 
-    #[test]
-    fn sanitize_filename_falls_back_when_input_is_only_dots() {
-        assert_eq!(sanitize_filename(Some("...."), "x"), "x");
-        assert_eq!(sanitize_filename(None, "x"), "x");
-        assert_eq!(sanitize_filename(Some(""), "x"), "x");
-    }
-
-    #[test]
-    fn sanitize_filename_truncates_long_input() {
-        let long = "a".repeat(1024);
-        let safe = sanitize_filename(Some(&long), "x");
-        assert!(safe.len() <= MAX_INBOUND_FILENAME_LEN);
-    }
-
-    #[test]
-    fn sanitize_filename_replaces_unsafe_characters() {
-        assert_eq!(sanitize_filename(Some("a b.c"), "x"), "a_b.c");
-        assert_eq!(sanitize_filename(Some("weird?name!"), "x"), "weird_name_");
-    }
+    // sanitize_filename unit tests live in
+    // `copperclaw_channels_core::inbound_file` alongside the shared
+    // implementation; the adapter-level tests above/below cover the
+    // telegram-specific fallback names and traversal handling.
 
     #[test]
     fn legacy_metadata_carries_known_fields() {
