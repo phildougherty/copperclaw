@@ -28,22 +28,25 @@
 //!     the navigation target, and a stronger-sandbox runtime requested
 //!     ([`copperclaw_browser::build_browser_container_spec`]).
 //!
-//! ## Enforced here vs. deferred runtime path
+//! ## Enforced here vs. the live runtime path
 //!
 //! Enforced + tested at this layer: opt-in gating, the SSRF pre-flight + the
 //! per-redirect [`NavGuard`], the untrusted tagging, and construction of the
-//! locked-down child-container spec. **Deferred runtime path**: the live
-//! Chromium / CDP session and the privileged spawn of the child container (a
-//! real headless browser + container runtime is environment-dependent and not
-//! available at unit-test time). Until a driver is wired by the host, the tool
-//! performs every safety step and then reports that the live renderer is not
-//! provisioned — it never returns fabricated page content.
+//! locked-down child-container spec. **Live runtime path** (behind the opt-in
+//! gate): [`handle`] detects a container runtime and drives
+//! [`copperclaw_browser::render_live`], which spawns the locked-down child,
+//! connects a CDP session to the Chromium inside it, and renders read-only. A
+//! real headless browser + Docker daemon is environment-dependent; where none
+//! is reachable (e.g. the in-container runner, which has no Docker socket by
+//! design), the tool reports unavailable cleanly after running every safety
+//! step — it never fabricates page content and never panics.
 
 use crate::context::ToolContext;
 use crate::error::ToolError;
-use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args};
+use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args, success_json};
 use copperclaw_browser::{
-    BrowserContainerParams, BrowserToolConfig, NavigationGuard, RenderMode, RenderRequest,
+    BrowserContainerParams, BrowserError, BrowserToolConfig, LiveRenderOptions, NavigationGuard,
+    RenderMode, RenderRequest, WsCdpConnector,
 };
 use copperclaw_container_rt::SandboxRuntime;
 use rmcp::model::{CallToolResult, JsonObject, Tool};
@@ -269,6 +272,10 @@ pub fn schema() -> Tool {
     )
 }
 
+/// Optional override for where rendered screenshots are written host-side.
+/// Defaults to a temp subdir; V4 refines this to the session `/data` dir.
+const OUTPUT_DIR_ENV: &str = "COPPERCLAW_BROWSER_OUTPUT_DIR";
+
 pub async fn handle(
     arguments: Option<JsonObject>,
     ctx: &dyn ToolContext,
@@ -276,23 +283,66 @@ pub async fn handle(
     let input: Input = parse_args(arguments)?;
     let env = SystemEnv;
     let guard = NavGuard;
+    // `prepare` runs every safety step (opt-in gate, untrusted tagging, SSRF
+    // target pre-flight, locked-down child spec). With the tool disabled it
+    // returns the byte-identical "disabled" validation error before any of the
+    // live path below is reached.
     let prepared = prepare(input, &env, &guard, ctx).await?;
-    // The live headless-browser render is the deferred runtime path: a real
-    // CDP session + container spawn is environment-dependent and not wired in
-    // this build. We have already done every safety step (opt-in, untrusted
-    // tagging, SSRF pre-flight, locked-down child spec). Report honestly
-    // rather than fabricate page content.
-    let sandbox = prepared
-        .spec
-        .sandbox
-        .as_ref()
-        .map_or("none", |s| s.runtime.as_str());
-    Err(ToolError::Internal(format!(
-        "browser_render: navigation target `{}` passed the SSRF + opt-in checks and a \
-         locked-down child-container spec was constructed (egress={:?}, sandbox={}), but the \
-         live headless-browser driver is not provisioned in this build (deferred runtime path).",
-        prepared.req.url, prepared.spec.egress_allow, sandbox,
-    )))
+    render_prepared_live(prepared, &guard, &env).await
+}
+
+/// Drive the live render for a fully-prepared request: detect a container
+/// runtime, spawn the locked-down browser child, and render through the SSRF
+/// orchestration. When no container runtime is reachable (e.g. the in-container
+/// runner, which has no Docker socket by design), report unavailable cleanly —
+/// never a panic, and every safety step already ran in [`prepare`].
+async fn render_prepared_live(
+    prepared: Prepared,
+    guard: &dyn NavigationGuard,
+    env: &dyn EnvLookup,
+) -> Result<CallToolResult, ToolError> {
+    let runtime = match copperclaw_container_rt::detect().await {
+        Ok(rt) => rt,
+        Err(e) => {
+            return Err(ToolError::Internal(format!(
+                "browser_render: navigation target `{}` passed the SSRF + opt-in checks and a \
+                 locked-down child-container spec was constructed (egress={:?}), but no container \
+                 runtime is reachable here to spawn the headless-browser child ({e}). The browser \
+                 render runs where a Docker daemon is available.",
+                prepared.req.url, prepared.spec.egress_allow,
+            )));
+        }
+    };
+
+    let screenshot_dir = env.get(OUTPUT_DIR_ENV).map_or_else(
+        || std::env::temp_dir().join("copperclaw-browser"),
+        std::path::PathBuf::from,
+    );
+    let nav_timeout =
+        std::time::Duration::from_secs(prepared.req.timeout_secs.unwrap_or(30).clamp(1, 120));
+    let opts = LiveRenderOptions {
+        screenshot_dir,
+        cdp_port: 9222,
+        nav_timeout,
+    };
+    let connector = WsCdpConnector::new(nav_timeout);
+
+    match copperclaw_browser::render_live(
+        &prepared.req,
+        prepared.spec,
+        guard,
+        runtime.as_ref(),
+        &connector,
+        &opts,
+    )
+    .await
+    {
+        Ok(out) => Ok(success_json(&out)),
+        // A redirect that lands in a blocked (internal) range is a user-visible
+        // refusal, not an internal fault.
+        Err(BrowserError::Blocked(m)) => Err(ToolError::Validation(m)),
+        Err(e) => Err(ToolError::Internal(format!("browser_render: {e}"))),
+    }
 }
 
 struct Handler;

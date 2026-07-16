@@ -18,12 +18,19 @@
 //!     Firecracker, falling back to hardened `runc`).
 //!   * [`BrowserToolConfig`] opt-in gating — **OFF by default**.
 //!
-//! The **runtime path** (deferred, environment-dependent):
-//!   * the real Chromium / CDP [`BrowserDriver`] implementation (needs a live
-//!     child container + Chromium binary);
-//!   * the privileged spawn of the child container with the requested microVM
-//!     / gVisor runtime (availability is environment-dependent — see
-//!     [`copperclaw_container_rt::select_sandbox_runtime`]).
+//! The **live runtime path** (implemented; environment-dependent, opt-in):
+//!   * [`CdpBrowserDriver`] — the concrete Chromium / CDP [`BrowserDriver`],
+//!     speaking CDP over a WebSocket ([`WsCdpTransport`]) to the child
+//!     container's Chromium. The command sequence is unit-tested against a mock
+//!     transport; the live WebSocket needs a real Chromium.
+//!   * [`render_live`] — the privileged spawn path: it `spawn`s the child
+//!     container spec, resolves its bridge IP, connects a CDP session, drives
+//!     the read-only render through the same SSRF [`render`] orchestration, and
+//!     tears the container down unconditionally. The spawn/CDP-connect need a
+//!     live Docker daemon + Chromium image, so the live path runs only behind
+//!     the `COPPERCLAW_BROWSER_ENABLED` opt-in; the spawn→resolve→connect→
+//!     render→teardown orchestration is unit-tested against a mock runtime +
+//!     mock connector.
 //!
 //! Default deployments are unaffected: with the tool disabled, nothing here
 //! spawns a container or opens a browser.
@@ -38,12 +45,17 @@
 
 #![forbid(unsafe_code)]
 
+pub mod cdp;
 pub mod container;
 pub mod driver;
 pub mod error;
 pub mod guard;
+pub mod live;
 pub mod render;
 
+pub use crate::cdp::{
+    CdpBrowserDriver, CdpTransport, DEFAULT_NAV_TIMEOUT, WsCdpTransport, serialize_ax_tree,
+};
 pub use crate::container::{
     BrowserContainerParams, BrowserToolConfig, FORBIDDEN_ENV_KEYS, browser_env,
     build_browser_container_spec,
@@ -51,4 +63,5 @@ pub use crate::container::{
 pub use crate::driver::{BrowserDriver, DriverRender, Navigation, RenderedArtifact, render};
 pub use crate::error::BrowserError;
 pub use crate::guard::{GuardResult, NavigationGuard};
+pub use crate::live::{CdpConnector, LiveRenderOptions, WsCdpConnector, render_live};
 pub use crate::render::{Provenance, RenderMode, RenderOutput, RenderRequest};

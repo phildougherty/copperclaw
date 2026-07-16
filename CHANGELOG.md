@@ -6,6 +6,48 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M18 V3 — live headless-browser driver, 2026-07-16)
+
+- `crates/copperclaw-browser/src/cdp.rs` (new): the concrete Chromium/CDP
+  `BrowserDriver` behind the existing trait. `CdpBrowserDriver` speaks the
+  Chrome DevTools Protocol over a WebSocket to the Chromium in the locked-down
+  child container and produces the requested read-only artifact
+  (`Page.captureScreenshot` PNG, `Runtime.evaluate` DOM text, or
+  `Accessibility.getFullAXTree` flattened to text). The command sequence sits
+  behind a small `CdpTransport` seam and is fully unit-tested with a mock
+  transport; the live `WsCdpTransport` (over `tokio-tungstenite`, already in
+  the workspace lock via the discord adapter) carries the real session and is
+  exercised only behind the opt-in gate. Redirect hops + main-document status
+  are observed from `Network.*` events (pure parsers `redirect_hops_from_events`
+  / `main_status_from_events`) so the SSRF per-redirect re-guard still fires
+  against a live chain. We hand-rolled the minimal CDP client rather than
+  pull `chromiumoxide`/`headless_chrome` because those spawn a *local*
+  Chromium process, whereas ours runs in a dedicated child *container* the
+  driver must *connect* to — and the seam keeps the crate `unsafe`-free,
+  clippy-clean, and unit-testable without a live browser.
+- `crates/copperclaw-browser/src/live.rs` (new): `render_live` — the
+  previously-deferred privileged spawn path (`container.rs:23-25`). It runs
+  the SSRF target pre-flight, `spawn`s the locked-down child spec via the
+  `ContainerRuntime` seam (the `runtime.spawn` call that did not exist
+  before), resolves the child's bridge IP, connects a CDP session
+  (`CdpConnector` / `WsCdpConnector` via the browser's `/json/new` endpoint),
+  renders through the same `driver::render` orchestration, and tears the
+  container down unconditionally. Unit-tested against a mock runtime + mock
+  connector (happy path, teardown-on-connect-failure, no-bridge-IP,
+  spawn-failure, and SSRF-target-blocked-before-spawn).
+- `crates/copperclaw-mcp/src/tools/browser_render.rs`: `handle()` no longer
+  returns the terminal "driver not provisioned" error. It now runs every
+  safety step (`prepare`), detects a container runtime, and drives
+  `copperclaw_browser::render_live` to return the real PNG path / DOM text /
+  ARIA snapshot. Still gated behind `COPPERCLAW_BROWSER_ENABLED`: unset →
+  byte-identical "disabled" validation error before any live path; enabled but
+  no container runtime reachable (e.g. the in-container runner, which has no
+  Docker socket by design) → a clean "renderer unavailable here" report, never
+  a panic. New optional `COPPERCLAW_BROWSER_OUTPUT_DIR` selects where
+  screenshots land (V4 refines this to the session `/data` dir). All SSRF /
+  deny-default-egress / forbidden-env / unprivileged-user / hardened-sandbox
+  properties are preserved unchanged.
+
 ### Changed (M18 R4 — compaction that survives long builds, 2026-07-16)
 
 - `crates/copperclaw-runner/src/compaction.rs`: (a) the token estimator
