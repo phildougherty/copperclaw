@@ -9,6 +9,7 @@ use crate::config::MatrixConfig;
 use crate::factory::CHANNEL_TYPE_STR;
 use crate::sync::{NEXT_BATCH_FILENAME, run_sync_loop};
 use async_trait::async_trait;
+use copperclaw_channels_core::markdown::{Flavor, render as render_markdown};
 use copperclaw_channels_core::{
     AdapterError, Breadcrumb, BreadcrumbStatus, Card, ChannelAdapter, DiffCard, DmHandle,
     ErrorCard, ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList,
@@ -241,10 +242,19 @@ impl ChannelAdapter for MatrixAdapter {
                 text.as_str()
             };
             self.api.send_html(&room_id, plain, &html).await?
-        } else if let Some(thread) = thread_id {
-            self.api.send_threaded(&room_id, thread, &text).await?
         } else {
-            self.api.send_text(&room_id, &text).await?
+            // U6: no agent-supplied HTML — render the canonical Markdown
+            // into Matrix's `org.matrix.custom.html` via the shared
+            // renderer ([`Flavor::Html`]) and carry it as `formatted_body`
+            // (with the raw text as the plaintext fallback `body`).
+            let rendered = render_markdown(&text, Flavor::Html);
+            if let Some(thread) = thread_id {
+                self.api
+                    .send_threaded_html(&room_id, thread, &text, &rendered)
+                    .await?
+            } else {
+                self.api.send_html(&room_id, &text, &rendered).await?
+            }
         };
         Ok(Some(sent.event_id))
     }
@@ -1143,13 +1153,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_text_routes_to_send_text() {
+    async fn deliver_text_renders_markdown_to_formatted_html() {
+        // U6: the plain-text path now routes the agent's canonical
+        // Markdown through the shared renderer and carries the result as
+        // `formatted_body` (raw text remains the fallback `body`).
         let s = MockServer::start().await;
         mount_empty_sync(&s).await;
         Mock::given(method("PUT"))
             .and(path_regex(
                 r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
             ))
+            .and(wiremock::matchers::body_string_contains(
+                "\"formatted_body\"",
+            ))
+            .and(wiremock::matchers::body_string_contains("<b>bold</b>"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$x:m.org"
             })))
@@ -1162,7 +1179,7 @@ mod tests {
                 None,
                 &OutboundMessage {
                     kind: MessageKind::Chat,
-                    content: json!({ "text": "hi" }),
+                    content: json!({ "text": "say **bold**" }),
                     files: vec![],
                 },
             )
@@ -1173,7 +1190,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_with_thread_id_routes_to_send_threaded() {
+    async fn deliver_with_thread_id_routes_to_threaded_html() {
+        // U6: threaded plain text also renders via the shared renderer,
+        // carrying both the `m.thread` relation and `formatted_body`.
         let s = MockServer::start().await;
         mount_empty_sync(&s).await;
         Mock::given(method("PUT"))
@@ -1181,6 +1200,9 @@ mod tests {
                 r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
             ))
             .and(wiremock::matchers::body_string_contains("\"m.thread\""))
+            .and(wiremock::matchers::body_string_contains(
+                "\"formatted_body\"",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$t:m.org"
             })))

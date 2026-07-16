@@ -22,6 +22,7 @@ use crate::gateway::lifecycle::{NextAction, SessionState, decide_resume_or_ident
 use crate::gateway::{self, Frame, codec};
 use crate::rest::DiscordRest;
 use async_trait::async_trait;
+use copperclaw_channels_core::markdown::{Flavor, render as render_markdown};
 use copperclaw_channels_core::{
     AdapterError, Breadcrumb, BreadcrumbStatus, Card, CardButton, ChannelAdapter,
     ContainerContribution, DiffCard, DmHandle as CoreDmHandle, ErrorCard, ErrorCardKind,
@@ -1038,10 +1039,14 @@ fn render_step_line_content(s: &Breadcrumb) -> String {
 }
 
 /// Render an `OutboundMessage` to a plain string suitable for Discord's
-/// `content` field. Pull `content.text` when present; otherwise compact JSON.
+/// `content` field. Pull `content.text` when present and run it through the
+/// shared [`copperclaw_channels_core::markdown::render`] renderer with
+/// [`Flavor::Discord`] (U6) so the agent's canonical Markdown lands as
+/// Discord `CommonMark` (bullets normalised to `-`, headings/bold/fences
+/// preserved); otherwise fall back to compact JSON.
 pub fn render_outbound_text(message: &OutboundMessage) -> String {
     if let Some(t) = message.content.get("text").and_then(|v| v.as_str()) {
-        t.to_owned()
+        render_markdown(t, Flavor::Discord)
     } else {
         message.content.to_string()
     }

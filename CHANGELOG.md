@@ -74,6 +74,49 @@ adheres to [Semantic Versioning](https://semver.org/).
     reference context; runner tests cover the real store round-trip + downgrade
     (`run/tool_dispatch.rs`) and the guest mutating floor (`policy.rs`).
 
+### Changed (M19 U6 — Adopt the shared `core/markdown` renderer in adapters, 2026-07-16)
+
+- `copperclaw_channels_core::markdown::render(md, Flavor)` existed and was
+  tested but **no adapter consumed it** — every adapter either hand-rolled its
+  own markdown→flavor formatter or passed the agent's canonical Markdown to the
+  wire raw, leaving `Flavor::{Discord,Slack,Mattermost,WhatsApp}` as dead
+  capability and a standing drift risk. U6 routes each adapter's plain-text
+  outbound path through the shared renderer (the U1–U5 rich-surface renderers /
+  field escapers are unchanged):
+  - **telegram** (`crates/copperclaw-channels/telegram/src/adapter.rs`): the
+    bespoke `markdown_to_html` renderer (plus its `find_fence_close`,
+    `replace_paired`, `replace_italic_paired`, `replace_inline_links` helpers)
+    is deleted; the HTML send path now calls `render(_, Flavor::Html)`. Behaviour
+    is byte-identical for bold/italic/strike/code/links/fences; the shared
+    renderer additionally formats headings (`# x` → `<b>x</b>`), blockquotes, and
+    normalises `-`/`*`/`+` bullets to the `•` glyph (previously left literal) —
+    the affected unit test was updated to pin the new bullet output.
+    `escape_markdown_v2` (`api.rs`) is kept: it escapes the MarkdownV2 photo
+    caption, a dialect the renderer has no `Flavor` for.
+  - **discord** (`adapter.rs` `render_outbound_text`): now
+    `render(_, Flavor::Discord)` — CommonMark passes through with `*`/`+` bullets
+    normalised to `-`. `escape_discord_markdown` (rich tool-summary escaper) kept.
+  - **slack** (`adapter.rs` `deliver`): the plain-text send now calls
+    `render(_, Flavor::Slack)` (`**bold**` → `*bold*`, headings degrade to bold,
+    links → `<url|text>`); skipped when the agent supplied explicit Block Kit
+    `blocks` (a rich surface). `escape_mrkdwn` (rich field escaper) kept.
+  - **mattermost** (`adapter.rs` `deliver` "post" action):
+    `render(_, Flavor::Mattermost)`. The `render.rs` rich-card renderers unchanged.
+  - **whatsapp-cloud** (`adapter.rs` `deliver`): `render(_, Flavor::WhatsApp)`
+    (`*bold*`/`_italic_`/`~strike~`/monospace), replacing the raw passthrough.
+    The `render.rs` rich-card renderers unchanged.
+  - **matrix** (`adapter.rs` `deliver` + new `api.rs` `send_threaded_html`): the
+    plain-text path with no agent-supplied HTML now renders
+    `render(_, Flavor::Html)` and carries it as `formatted_body` (raw text as the
+    fallback `body`), for both top-level and threaded sends. The rich-surface
+    `escape_html_matrix` helpers are unchanged.
+- **gchat** is intentionally left on raw passthrough: Google Chat text formatting
+  (`*bold*`/`_italic_`/`~strike~`, no headings, no `[text](url)` links) matches no
+  existing `Flavor` exactly, and adding a `Gchat` flavor is out of U6 scope (the
+  card is "consume the renderer, don't rewrite it"). Its `escape_html_gchat`
+  helper is rich-surface (Cards v2 HTML) and unaffected. Follow-up: add a `Gchat`
+  flavor to `core/markdown` so it can adopt the shared path too.
+
 ### Added (M19 U4 — Native cards on gchat + matrix, 2026-07-16)
 
 - Neither `gchat` nor `matrix` overrode the trait
