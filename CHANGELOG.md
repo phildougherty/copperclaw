@@ -48,6 +48,35 @@ adheres to [Semantic Versioning](https://semver.org/).
   deny-default-egress / forbidden-env / unprivileged-user / hardened-sandbox
   properties are preserved unchanged.
 
+### Added (M18 T2 — unconditional data-root env override, 2026-07-16)
+
+- `COPPERCLAW_DATA_ROOT` env var, consulted by
+  `copperclaw-mcp`'s `verify_gate::data_root()` (and, through it,
+  `todo.rs`'s todo-store path). When set on the runner process's
+  environment it replaces `/data` as the root the R3 verify gate and the
+  per-session todo store resolve against; when unset, production behavior
+  is byte-identical to the compiled-in `/data` default. Mirrors the shell
+  tool's `COPPERCLAW_SHELL_STATE_FILE` precedent. This un-gates the R3
+  verify mechanic for host-side integration tests / fixtures, which run
+  outside a container where `/data` is an unwritable root-owned path
+  (the gap X1 flagged). Security: the runner process env is
+  host-controlled at spawn; an in-container agent's `shell` calls execute
+  inside the container, not the runner process, so they cannot mutate this
+  var and cannot use it to escape the gate. The pre-existing
+  `#[cfg(test)]` in-process override still wins over the env var, so the
+  gate's own test battery is unaffected.
+
+### Fixed (M18 T2 — artifact_path test race, 2026-07-16)
+
+- `copperclaw-mcp`'s `artifact_path.rs` unit tests
+  (`returns_host_path_from_discovery_file`,
+  `error_when_discovery_file_missing`) now serialize on a shared `Mutex`
+  guard (an RAII `HostPathGuard`, same shape as `todo.rs`'s `TodoGuard`).
+  They share the global `HOST_PATH_FILE_TEST_OVERRIDE` static; without
+  serialization a parallel `cargo test` run could leak one test's
+  override into the other's assertions — a confirmed latent race, more
+  likely to surface under full-workspace load.
+
 ### Changed (M18 R4 — compaction that survives long builds, 2026-07-16)
 
 - `crates/copperclaw-runner/src/compaction.rs`: (a) the token estimator
