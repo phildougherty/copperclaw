@@ -1,0 +1,15 @@
+{
+  "name": "slack-approval-conflict",
+  "channel": "slack",
+  "description": "M19 F3b. Approval e1 was already resolved (approved by host). Owner taps Approve on the still-visible card (Slack block_action, callback under content.callback.value). The losing tap is not silent: the interceptor replies 'This request was already resolved by host.' and does not re-resolve. No inbound row is written.",
+  "schema": 1,
+  "gates": ["approvals"],
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\""
+  }
+}

@@ -113,6 +113,44 @@ adheres to [Semantic Versioning](https://semver.org/).
   failure are all unchanged (the generic apology still fires off the
   blocker categories).
 
+### Fixed (M19 F3 — approval-card correctness + blocked-on-approval legibility, 2026-07-16)
+
+- **Approval card no longer stuck live after resolution (fallback-id path).**
+  `crates/copperclaw-host/src/approval_intercept.rs`: an approval card is
+  stamped "Approved/Denied by <name>" in place using the `platform_message_id`
+  persisted at delivery. Root cause of the stuck-card bug: that id is only
+  persisted when the delivering adapter reports one (`host-delivery`
+  `set_platform_message_id`); adapters that return no id (or where the card
+  degraded to a text fallback) left the row's `platform_message_id` NULL, and
+  `edit_card` then *silently skipped* — leaving live Approve/Deny buttons on an
+  already-decided request. `edit_card` now posts the resolution as a short
+  follow-up reply on the tapping surface when there is no editable anchor, so
+  the outcome is always visible.
+- **Losing tapper in a resolution race is no longer silent.**
+  `approval_intercept.rs`: a second (losing) tap on an already-resolved approval
+  — same verb (`applied = false`) or opposite verb (`conflict`) — now gets a
+  short "This request was already resolved by <name>." reply (or an
+  "expired … ask the agent to try again" line when it lapsed), read from the
+  decision log, instead of the old no-reply no-op that looked broken.
+- **Silent approval expiry now stamps the card terminal.**
+  `crates/copperclaw-host/src/handlers/approvals.rs` adds
+  `expire_and_edit_cards`, which sweeps overdue pending approvals to `expired`
+  and edits each lapsed card to a terminal "expired — ask the agent to try
+  again" state (idempotent; only rows the sweep actually flips are stamped). It
+  is run opportunistically at the top of the in-chat approval interceptor (the
+  one host surface that both fires on approval activity and holds the delivery
+  dispatcher) and is `pub` so a periodic host sweep can call it later.
+- **Blocked-on-approval legibility.** `crates/copperclaw-modules/src/approvals.rs`
+  `ApprovalCardHandler` now appends a "The agent is paused, waiting for your
+  approval." line to the card body so an approval-gated agent is legible rather
+  than looking hung. (The in-HUD `TaskHud::add_note` seam lives in the *runner*,
+  a separate process — `hud.rs`, `pub(super)` — so lane G surfaces the waiting
+  state on the operator-facing card it owns.)
+- Replay fixtures: `fixtures/telegram/approval-resolution` (fallback-id reply +
+  expiry stamp) and `fixtures/slack/approval-conflict` (already-resolved loser
+  reply, `block_actions` shape), registered in
+  `crates/copperclaw-host/tests/replay.rs`.
+
 ### Fixed (M18 — Task HUD no-op edit / Telegram "message is not modified", 2026-07-16)
 
 - The H1 Task HUD and R6 progressive-final-answer edit a pinned status

@@ -233,6 +233,90 @@ async fn slack_approval_block_action_round_trip() {
     assert_eq!(edits[0].new_text, "Approved by Owner Olivia");
 }
 
+/// M19 F3 acceptance (a + c). Owner taps Approve on a card that recorded no
+/// `platform_message_id` (fallback-id path): the interceptor resolves it and
+/// posts the outcome as a follow-up reply (asserted via the fixture's
+/// `delivered` stream) rather than leaving live buttons. The same tap's
+/// opportunistic expiry sweep stamps a separately-lapsed card terminal.
+#[tokio::test]
+async fn telegram_approval_resolution_fallback_and_expiry() {
+    use copperclaw_db::tables::pending_approvals::{self, ApprovalStatus};
+    use copperclaw_types::ApprovalId;
+
+    let harness = run_fixture_into_harness("telegram", "approval-resolution").await;
+
+    let fallback =
+        ApprovalId(uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000d1").unwrap());
+    let expired =
+        ApprovalId(uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000d3").unwrap());
+
+    // (a) The fallback-id approval resolved via the shared DB path even though
+    // its card had no editable anchor (the follow-up reply is checked by the
+    // fixture's `delivered` diff).
+    assert_eq!(
+        pending_approvals::get(&harness.central, fallback)
+            .unwrap()
+            .status,
+        ApprovalStatus::Approved
+    );
+
+    // (c) The lapsed approval was swept to `expired` and its card stamped
+    // terminal by the opportunistic sweep the tap triggered.
+    assert_eq!(
+        pending_approvals::get(&harness.central, expired)
+            .unwrap()
+            .status,
+        ApprovalStatus::Expired
+    );
+    let tg = mock_for(&harness, "telegram");
+    let edits = tg.edits();
+    let stamped = edits
+        .iter()
+        .find(|e| e.external_id == "tg-exp-card")
+        .expect("expired card was stamped terminal");
+    assert!(
+        stamped.new_text.contains("expired"),
+        "expired card must carry a terminal 'expired' note; got: {}",
+        stamped.new_text
+    );
+    // The fallback-id approval had no card, so it is NOT edited — only the
+    // lapsed card is.
+    assert_eq!(edits.len(), 1, "exactly the one expired-card stamp");
+}
+
+/// M19 F3 acceptance (b). A tap on an already-resolved approval is not silent:
+/// the loser is told who resolved it. Asserted via the fixture's `delivered`
+/// stream ("This request was already resolved by host.").
+#[tokio::test]
+async fn slack_approval_conflict_already_resolved() {
+    use copperclaw_db::tables::pending_approvals::{self, ApprovalStatus};
+    use copperclaw_types::ApprovalId;
+
+    let harness = run_fixture_into_harness("slack", "approval-conflict").await;
+
+    let already =
+        ApprovalId(uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000e1").unwrap());
+    // Still exactly one decision (the original winner's); the loser tap did not
+    // re-resolve or re-edit.
+    assert_eq!(
+        pending_approvals::get(&harness.central, already)
+            .unwrap()
+            .status,
+        ApprovalStatus::Approved
+    );
+    assert_eq!(
+        pending_approvals::list_decisions(&harness.central, Some(already), 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    let slack = mock_for(&harness, "slack");
+    assert!(
+        slack.edits().is_empty(),
+        "loser tap must not re-edit the card"
+    );
+}
+
 #[tokio::test]
 async fn slack_event_message_round_trip() {
     run_fixture("slack", "event-message").await;

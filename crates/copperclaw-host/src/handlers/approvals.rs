@@ -44,8 +44,88 @@ use copperclaw_cclaw::ErrorPayload;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::pending_approvals::{ApprovalStatus, DecisionOutcome};
 use copperclaw_db::tables::{container_configs, messaging_groups, pending_approvals, users};
+use copperclaw_modules::{DeliveryDispatcher, DispatchTarget};
 use copperclaw_types::{AgentGroupId, ApprovalId};
 use serde_json::{Value, json};
+use std::sync::Arc;
+
+/// Terminal text stamped onto an approval card whose TTL lapsed before anyone
+/// resolved it (F3c). Kept short and actionable — the request is dead, so the
+/// only useful next step is to re-ask the agent.
+pub const EXPIRED_CARD_TEXT: &str =
+    "This approval request expired before anyone responded. Ask the agent to try again.";
+
+/// Sweep overdue pending approvals to `expired` AND stamp each lapsed card with
+/// a terminal "expired" edit, so a silently-lapsed approval never lingers in
+/// chat with live Approve/Deny buttons (F3c — "silent expiry").
+///
+/// Best-effort and idempotent: a card is edited exactly once (only for the rows
+/// this call actually flips from `pending` to `expired`), and a row without a
+/// recorded `platform_message_id` + channel coordinates is swept but not edited
+/// (there is no delivered card to stamp). Returns the number of cards edited.
+///
+/// Wired onto the in-chat approval interceptor (`approval_intercept.rs`) so any
+/// approval tap opportunistically clears stale cards on the surface that
+/// already holds the dispatcher; it is equally safe to call from a periodic
+/// host sweep (a lane-H follow-up) since the DB sweep is race-safe.
+#[must_use]
+pub fn expire_and_edit_cards(
+    central: &CentralDb,
+    dispatcher: &Arc<dyn DeliveryDispatcher>,
+) -> usize {
+    let now = chrono::Utc::now();
+    // Snapshot the cards about to lapse BEFORE the sweep flips them — after the
+    // flip we would have lost nothing (the row keeps its columns) but the
+    // snapshot also lets us skip the sweep entirely in the common no-op case.
+    let doomed: Vec<pending_approvals::PendingApproval> =
+        match pending_approvals::list(central, None, Some(ApprovalStatus::Pending)) {
+            Ok(rows) => rows.into_iter().filter(|r| r.is_expired_at(now)).collect(),
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "approvals: could not list pending rows for expiry sweep"
+                );
+                return 0;
+            }
+        };
+    if doomed.is_empty() {
+        return 0;
+    }
+    let swept = match pending_approvals::sweep_expired(central, now) {
+        Ok(ids) => ids,
+        Err(err) => {
+            tracing::warn!(?err, "approvals: expiry sweep failed");
+            return 0;
+        }
+    };
+    let mut edited = 0;
+    for row in doomed {
+        // Only stamp rows this sweep actually flipped (guards against a
+        // concurrent resolve landing between the snapshot and the sweep).
+        if !swept.contains(&row.approval_id) {
+            continue;
+        }
+        let (Some(channel), Some(platform), Some(message_id)) = (
+            row.channel_type.clone(),
+            row.platform_id.clone(),
+            row.platform_message_id.clone(),
+        ) else {
+            continue; // no delivered card to stamp terminal
+        };
+        // The card's originating thread is not persisted on the row; edits key
+        // off (channel, platform_id, message_id), which is sufficient on every
+        // edit-capable adapter.
+        let target = DispatchTarget::channel(channel, platform, None);
+        dispatcher.edit_message(&target, &message_id, EXPIRED_CARD_TEXT);
+        copperclaw_metrics::inc_approval_tap("expired_card");
+        tracing::info!(
+            approval_id = %row.approval_id.as_uuid(),
+            "approvals: stamped expired approval card terminal"
+        );
+        edited += 1;
+    }
+    edited
+}
 
 pub fn list(_args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     // Lapse any overdue pending rows first so the live list never includes
@@ -1609,6 +1689,124 @@ mod tests {
         let scoped = decisions(&json!({"id": id.as_uuid().to_string()}), &db).unwrap();
         assert_eq!(scoped.as_array().unwrap().len(), 1);
         assert_eq!(scoped[0]["approval_id"], id.as_uuid().to_string());
+    }
+
+    // -----------------------------------------------------------------------
+    // F3c: expiry stamps the card terminal
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn expire_and_edit_cards_stamps_only_lapsed_cards() {
+        use copperclaw_modules::context::MockDispatcher;
+        let db = db();
+        // Overdue, has a delivered card → swept AND stamped.
+        let with_card = upsert(
+            &db,
+            UpsertPendingApproval {
+                request_id: "exp-card".into(),
+                action: "sender".into(),
+                payload: json!({}),
+                channel_type: Some(ChannelType::new("telegram")),
+                platform_id: Some("100".into()),
+                platform_message_id: Some("card-1".into()),
+                expires_at: Some(chrono::Utc::now() - chrono::Duration::minutes(5)),
+                title: "x".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .approval_id;
+        // Overdue, but NO delivered card → swept, not stamped (nothing to edit).
+        let no_card = upsert(
+            &db,
+            UpsertPendingApproval {
+                request_id: "exp-nocard".into(),
+                action: "sender".into(),
+                payload: json!({}),
+                channel_type: Some(ChannelType::new("telegram")),
+                platform_id: Some("100".into()),
+                platform_message_id: None,
+                expires_at: Some(chrono::Utc::now() - chrono::Duration::minutes(5)),
+                title: "x".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .approval_id;
+        // Live (not overdue) → untouched.
+        let live = upsert(
+            &db,
+            UpsertPendingApproval {
+                request_id: "exp-live".into(),
+                action: "sender".into(),
+                payload: json!({}),
+                channel_type: Some(ChannelType::new("telegram")),
+                platform_id: Some("100".into()),
+                platform_message_id: Some("card-live".into()),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                title: "x".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .approval_id;
+
+        let mock = MockDispatcher::new();
+        let dispatcher: std::sync::Arc<dyn DeliveryDispatcher> = mock.clone();
+        let edited = expire_and_edit_cards(&db, &dispatcher);
+        assert_eq!(
+            edited, 1,
+            "only the lapsed card with a message id is stamped"
+        );
+
+        // Both overdue rows are now expired; the live one stays pending.
+        assert_eq!(
+            get_row(&db, with_card).unwrap().status,
+            ApprovalStatus::Expired
+        );
+        assert_eq!(
+            get_row(&db, no_card).unwrap().status,
+            ApprovalStatus::Expired
+        );
+        assert_eq!(get_row(&db, live).unwrap().status, ApprovalStatus::Pending);
+
+        // Exactly one terminal edit, addressed by the recorded message id.
+        let edits = mock.edits.lock().unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].1, "card-1");
+        assert_eq!(edits[0].2, EXPIRED_CARD_TEXT);
+
+        // Idempotent: a second sweep finds nothing pending-overdue.
+        assert_eq!(expire_and_edit_cards(&db, &dispatcher), 0);
+    }
+
+    #[test]
+    fn expire_and_edit_cards_noop_when_nothing_overdue() {
+        use copperclaw_modules::context::MockDispatcher;
+        let db = db();
+        upsert(
+            &db,
+            UpsertPendingApproval {
+                request_id: "fresh".into(),
+                action: "sender".into(),
+                payload: json!({}),
+                channel_type: Some(ChannelType::new("telegram")),
+                platform_id: Some("100".into()),
+                platform_message_id: Some("card-f".into()),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                title: "x".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mock = MockDispatcher::new();
+        let dispatcher: std::sync::Arc<dyn DeliveryDispatcher> = mock.clone();
+        assert_eq!(expire_and_edit_cards(&db, &dispatcher), 0);
+        assert_eq!(mock.edit_count(), 0);
     }
 
     #[test]
