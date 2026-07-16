@@ -6,6 +6,27 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M18 C4b — discord inbound files, 2026-07-15)
+
+- Discord now downloads inbound message attachments from the CDN and stages
+  them per the C3 inbound-file contract, so "here's the file, build around
+  it" actually reaches the agent's `/data/inbox/...`. The Discord adapter
+  (`crates/copperclaw-channels/discord/src/{events,rest,config,adapter,factory}.rs`)
+  gains `DiscordRest::download_cdn_file` (a public, auth-header-free GET —
+  Discord CDN URLs are pre-signed, unlike Slack's `url_private`) and
+  `events::message_create_to_inbound_downloaded`, which fetches the first
+  attachment, enforces the new `max_attachment_bytes` config (default
+  25 MiB, Discord's non-Nitro cap), stages via
+  `copperclaw_channels_core::inbound_file::stage_inbound_file` (setting
+  `staged_path`, never `path`), and inlines small images as `data_base64`
+  for vision parity with Telegram. Oversized files yield a `too_large`
+  system row and download errors a `download_failed` row — never a silent
+  drop. Opt-out via `attachment_download: false`. New replay fixture
+  `fixtures/discord/inbound-file-attachment/` (registered as
+  `discord_inbound_file_attachment_round_trip` +
+  `..._file_readable_from_session_dir` in
+  `crates/copperclaw-host/tests/replay.rs`) mirrors the C3 telegram fixture.
+
 ### Added (M18 X1 — golden-path program fixture, 2026-07-15)
 
 - New replay fixture `fixtures/cli/prototype-golden/` (registered as

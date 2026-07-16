@@ -29,6 +29,7 @@ use copperclaw_channels_core::{
 };
 use copperclaw_types::{ChannelType, InboundEvent, OutboundMessage};
 use serde_json::{Value, json};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
@@ -45,6 +46,10 @@ pub struct DiscordAdapter {
     config: DiscordConfig,
     /// Inbound sender. Held so [`spawn_gateway`] can push events.
     inbound_tx: mpsc::Sender<InboundEvent>,
+    /// Per-channel data directory. Inbound attachment downloads are staged
+    /// under `data_dir/staging/<unique>/<filename>` for the router to
+    /// materialize (see [`crate::events::AttachmentSettings`]).
+    data_dir: PathBuf,
     /// Handle to the gateway task; aborted on drop via [`shutdown`].
     gateway_task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -66,6 +71,7 @@ impl DiscordAdapter {
         rest: DiscordRest,
         config: DiscordConfig,
         inbound_tx: mpsc::Sender<InboundEvent>,
+        data_dir: impl Into<PathBuf>,
     ) -> Self {
         Self {
             channel_type: ChannelType::new(CHANNEL_TYPE_STR),
@@ -74,6 +80,7 @@ impl DiscordAdapter {
             bot_user_id: Arc::new(Mutex::new(None)),
             config,
             inbound_tx,
+            data_dir: data_dir.into(),
             gateway_task: Mutex::new(None),
         }
     }
@@ -82,6 +89,16 @@ impl DiscordAdapter {
     /// use this to verify mention detection without running a live socket.
     pub async fn set_bot_user_id(&self, id: impl Into<String>) {
         *self.bot_user_id.lock().await = Some(id.into());
+    }
+
+    /// Snapshot the inbound-attachment download settings from config + the
+    /// adapter's data dir. Cheap; built per `MESSAGE_CREATE`.
+    fn attachment_settings(&self) -> events::AttachmentSettings {
+        events::AttachmentSettings {
+            attachment_download: self.config.attachment_download,
+            max_attachment_bytes: self.config.max_attachment_bytes,
+            data_dir: self.data_dir.clone(),
+        }
     }
 
     /// Get the current session snapshot. Useful for tests and metrics.
@@ -282,7 +299,15 @@ impl DiscordAdapter {
             }
             "MESSAGE_CREATE" => {
                 let bot_id = self.bot_user_id.lock().await.clone();
-                match events::message_create_to_inbound(data, bot_id.as_deref()) {
+                let settings = self.attachment_settings();
+                match events::message_create_to_inbound_downloaded(
+                    data,
+                    bot_id.as_deref(),
+                    &self.rest,
+                    &settings,
+                )
+                .await
+                {
                     Ok(evt) => {
                         if self.inbound_tx.send(evt).await.is_err() {
                             tracing::warn!("inbound channel closed; dropping event");
@@ -1464,10 +1489,13 @@ mod tests {
             intents: 33_281,
             api_base: server.uri(),
             gateway_url: "ws://127.0.0.1:1".into(),
+            attachment_download: true,
+            max_attachment_bytes: crate::config::DEFAULT_MAX_ATTACHMENT_BYTES,
         };
         let rest = DiscordRest::new(Client::new(), &cfg.bot_token, &cfg.api_base);
         let (tx, rx) = mpsc::channel(8);
-        (Arc::new(DiscordAdapter::new(rest, cfg, tx)), rx)
+        let dir = std::env::temp_dir().join(format!("cclaw-discord-test-{}", uuid::Uuid::new_v4()));
+        (Arc::new(DiscordAdapter::new(rest, cfg, tx, dir)), rx)
     }
 
     fn outbound_text(t: &str) -> OutboundMessage {

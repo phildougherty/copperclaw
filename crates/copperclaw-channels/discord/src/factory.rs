@@ -41,7 +41,12 @@ impl ChannelFactory for DiscordFactory {
             .build()
             .map_err(|e| AdapterError::Transport(format!("reqwest build: {e}")))?;
         let rest = DiscordRest::new(client, &cfg.bot_token, &cfg.api_base);
-        let adapter = Arc::new(DiscordAdapter::new(rest, cfg, setup.inbound_tx));
+        let adapter = Arc::new(DiscordAdapter::new(
+            rest,
+            cfg,
+            setup.inbound_tx,
+            setup.data_dir,
+        ));
         adapter.spawn_gateway().await;
         Ok(adapter as Arc<dyn ChannelAdapter>)
     }

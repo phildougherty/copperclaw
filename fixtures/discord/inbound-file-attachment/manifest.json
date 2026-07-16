@@ -1,0 +1,17 @@
+{
+  "name": "discord-inbound-file-attachment",
+  "channel": "discord",
+  "description": "M18 C4b acceptance: a discord CDN attachment is staged by the adapter, materialized by the router into the resolved session's inbox with a container-visible /data/inbox path, then a second oversized attachment still yields the too_large system fallback (no staging, no materialization).",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\"",
+    "\"staged_path\":\"[^\"]*\"": "\"staged_path\":\"<STAGED>\""
+  }
+}

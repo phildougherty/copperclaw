@@ -29,6 +29,14 @@ pub const DEFAULT_GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=j
 /// `38_401`. We use the literal bit-OR so the constant stays correct.)
 pub const DEFAULT_INTENTS: u64 = (1 << 0) | (1 << 9) | (1 << 10) | (1 << 12) | (1 << 15);
 
+/// Default cap on the size of an inbound attachment we download from the
+/// Discord CDN and stage for the router. Discord's default (non-Nitro)
+/// per-file upload limit is 25 MiB, so a file the platform accepted from the
+/// user is one we're willing to fetch. Files larger than this yield a
+/// `too_large` system row instead of a download (mirrors Telegram's
+/// `max_attachment_bytes`).
+pub const DEFAULT_MAX_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
+
 /// Parsed Discord channel configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscordConfig {
@@ -36,6 +44,16 @@ pub struct DiscordConfig {
     pub intents: u64,
     pub api_base: String,
     pub gateway_url: String,
+    /// When true (the default), inbound message attachments are downloaded
+    /// from the Discord CDN and staged for the router per the channels-core
+    /// inbound-file contract ([`copperclaw_channels_core::inbound_file`]).
+    /// When false, attachments are forwarded as URL metadata only (the
+    /// pre-C4b behaviour).
+    pub attachment_download: bool,
+    /// Refuse to download an attachment larger than this many bytes; oversized
+    /// attachments fall back to a `MessageKind::System` `too_large` row.
+    /// Defaults to [`DEFAULT_MAX_ATTACHMENT_BYTES`].
+    pub max_attachment_bytes: u64,
 }
 
 impl DiscordConfig {
@@ -96,11 +114,38 @@ impl DiscordConfig {
             }
         };
 
+        let attachment_download = match obj.get("attachment_download") {
+            None | Some(Value::Null) => true,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => {
+                return Err(AdapterError::BadRequest(
+                    "discord config field `attachment_download` must be a boolean".into(),
+                ));
+            }
+        };
+
+        let max_attachment_bytes = match obj.get("max_attachment_bytes") {
+            None | Some(Value::Null) => DEFAULT_MAX_ATTACHMENT_BYTES,
+            Some(Value::Number(n)) => n.as_u64().ok_or_else(|| {
+                AdapterError::BadRequest(
+                    "discord config field `max_attachment_bytes` must be a non-negative integer"
+                        .into(),
+                )
+            })?,
+            Some(_) => {
+                return Err(AdapterError::BadRequest(
+                    "discord config field `max_attachment_bytes` must be a number".into(),
+                ));
+            }
+        };
+
         Ok(Self {
             bot_token,
             intents,
             api_base,
             gateway_url,
+            attachment_download,
+            max_attachment_bytes,
         })
     }
 }
@@ -240,5 +285,62 @@ mod tests {
         let b = a.clone();
         assert_eq!(a, b);
         let _ = format!("{a:?}");
+    }
+
+    #[test]
+    fn attachment_download_defaults_to_true_and_can_be_overridden() {
+        let cfg = DiscordConfig::from_value(&json!({ "bot_token": "t" })).unwrap();
+        assert!(cfg.attachment_download);
+        let off =
+            DiscordConfig::from_value(&json!({ "bot_token": "t", "attachment_download": false }))
+                .unwrap();
+        assert!(!off.attachment_download);
+    }
+
+    #[test]
+    fn attachment_download_null_uses_default() {
+        let cfg =
+            DiscordConfig::from_value(&json!({ "bot_token": "t", "attachment_download": null }))
+                .unwrap();
+        assert!(cfg.attachment_download);
+    }
+
+    #[test]
+    fn attachment_download_non_bool_errors() {
+        let err =
+            DiscordConfig::from_value(&json!({ "bot_token": "t", "attachment_download": "yes" }))
+                .unwrap_err();
+        assert!(matches!(err, AdapterError::BadRequest(m) if m.contains("attachment_download")));
+    }
+
+    #[test]
+    fn max_attachment_bytes_defaults_to_25mb() {
+        let cfg = DiscordConfig::from_value(&json!({ "bot_token": "t" })).unwrap();
+        assert_eq!(cfg.max_attachment_bytes, DEFAULT_MAX_ATTACHMENT_BYTES);
+        assert_eq!(DEFAULT_MAX_ATTACHMENT_BYTES, 25 * 1024 * 1024);
+    }
+
+    #[test]
+    fn max_attachment_bytes_can_be_overridden() {
+        let cfg =
+            DiscordConfig::from_value(&json!({ "bot_token": "t", "max_attachment_bytes": 1024 }))
+                .unwrap();
+        assert_eq!(cfg.max_attachment_bytes, 1024);
+    }
+
+    #[test]
+    fn max_attachment_bytes_negative_errors() {
+        let err =
+            DiscordConfig::from_value(&json!({ "bot_token": "t", "max_attachment_bytes": -1 }))
+                .unwrap_err();
+        assert!(matches!(err, AdapterError::BadRequest(m) if m.contains("max_attachment_bytes")));
+    }
+
+    #[test]
+    fn max_attachment_bytes_wrong_type_errors() {
+        let err =
+            DiscordConfig::from_value(&json!({ "bot_token": "t", "max_attachment_bytes": "lots" }))
+                .unwrap_err();
+        assert!(matches!(err, AdapterError::BadRequest(m) if m.contains("max_attachment_bytes")));
     }
 }
