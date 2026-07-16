@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M20 X-rider Wave 3 — vision-loop fixtures, testing)
+
+- Assessed all three Wave-3 X-rider fixture wishes (see→fix transcript
+  shape / D4, viewport-preset screenshot metadata / D2, console-error
+  surfacing / D5) against the CLI replay harness. **No new fixture added** —
+  all three route through `ui_screenshot`/`ui_inspect`, which the Wave-1
+  X-rider already established are not replay-expressible: the harness
+  (`crates/copperclaw-host/tests/replay/harness.rs`) dispatches real
+  production tools with no injection point for a mock `CdpTransport`, so an
+  `ui_screenshot`/`ui_inspect` call in a fixture would spawn real chromium
+  rather than replay a canned capture. All three are unit-covered in their
+  own cards instead: the see→fix floor wiring by the `prompt.rs` snapshot +
+  byte-stability tests and `skills/frontend-design` validation (D4/D3); the
+  viewport/format arg surface + oversize→jpeg auto-downgrade by the mocked
+  `CdpTransport` unit tests in `copperclaw-browser` (D2); the curated
+  computed-style whitelist, console buffer cap, and untrusted-marking path
+  by the `ui_inspect` unit tests + `ui_screenshot` console fold-in tests
+  (D5). The generic image→provider-block read path is pinned by
+  `ui_screenshot_tool_result_image_converts_to_provider_image_block`
+  (`copperclaw-providers/src/anthropic.rs`, from D1). Closing this gap for
+  real would require a `ToolContext`-level `CdpTransport` seam in the
+  harness (a product change) — recorded as a follow-up, deliberately not
+  forced here per the X-rider honesty rule.
+
 ### Added (M20 D3 — `frontend-design` skill)
 
 - New `skills/frontend-design/SKILL.md` (6,659-byte body, well under the
