@@ -64,6 +64,6 @@ lands, the link plus the file is the hand-off.)
 - The preview expires after 30 minutes idle; re-expose if it lapsed.
 - Anyone on the operator's network who has the link can open it, so
   do not put secrets in the app you expose.
-- WebSockets are not proxied in this version — plain HTTP requests
-  and streamed responses only. Prefer polling over sockets in demo
-  apps you build for preview.
+- WebSockets are proxied: Vite dev servers, live reload, and realtime
+  apps work through the preview link the same as plain HTTP. Build with
+  sockets when they fit the app — no need to fall back to polling.
