@@ -77,6 +77,53 @@ pub struct MessageEvent {
     /// Block kit payload. Captured verbatim and forwarded in `content`.
     #[serde(default)]
     pub blocks: Option<Value>,
+    /// Files shared with the message. Slack attaches uploads here; each
+    /// entry carries a `url_private` the bot downloads with its token
+    /// (see the ingress inbound-file handling in `events::router`).
+    #[serde(default)]
+    pub files: Option<Vec<SlackFile>>,
+}
+
+/// One file shared with a Slack message.
+///
+/// Slack's file object is large; we deserialize only the fields the
+/// inbound-file download path needs. `url_private` is the
+/// token-authenticated download URL (Slack requires `Authorization:
+/// Bearer <bot-token>` on it); `url_private_download` is the same bytes
+/// with a forced `Content-Disposition: attachment` and serves as a
+/// fallback when `url_private` is absent.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SlackFile {
+    /// Slack file id (`F...`).
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Sender-supplied filename.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// MIME type Slack reports for the upload.
+    #[serde(default)]
+    pub mimetype: Option<String>,
+    /// Token-authenticated download URL.
+    #[serde(default)]
+    pub url_private: Option<String>,
+    /// Fallback download URL (forced attachment disposition).
+    #[serde(default)]
+    pub url_private_download: Option<String>,
+    /// Slack-reported byte size (informational; the downloaded byte
+    /// count is authoritative for the size cap).
+    #[serde(default)]
+    pub size: Option<u64>,
+}
+
+impl SlackFile {
+    /// Preferred download URL: `url_private`, falling back to
+    /// `url_private_download`. `None` when Slack sent neither.
+    #[must_use]
+    pub fn download_url(&self) -> Option<&str> {
+        self.url_private
+            .as_deref()
+            .or(self.url_private_download.as_deref())
+    }
 }
 
 impl MessageEvent {
@@ -216,6 +263,7 @@ mod tests {
             channel_type: None,
             subtype: None,
             blocks: None,
+            files: None,
         };
         assert!(m.is_group_channel());
         m.channel = "G123".into();
@@ -235,6 +283,7 @@ mod tests {
             channel_type: None,
             subtype: None,
             blocks: None,
+            files: None,
         };
         assert!(m.mentions_user("UBOT"));
         assert!(!m.mentions_user("UOTHER"));
@@ -251,6 +300,7 @@ mod tests {
             channel_type: None,
             subtype: None,
             blocks: None,
+            files: None,
         };
         assert!(!m.mentions_user("UBOT"));
     }

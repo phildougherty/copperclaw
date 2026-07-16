@@ -23,6 +23,11 @@ pub const DEFAULT_PORT: u16 = 8082;
 pub const DEFAULT_PATH: &str = "/slack/events";
 /// Default Slack Web API base URL.
 pub const DEFAULT_API_BASE: &str = "https://slack.com/api";
+/// Default cap on inbound attachment size (20 MB), matching the Telegram
+/// adapter's default so an operator sees the same ceiling across channels.
+/// Files larger than this are surfaced as a `too_large` system row instead
+/// of being downloaded.
+pub const DEFAULT_MAX_ATTACHMENT_BYTES: u64 = 20 * 1024 * 1024;
 
 /// Parsed Slack channel configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +40,10 @@ pub struct SlackConfig {
     pub webhook: WebhookConfig,
     /// Slack Web API base URL. Overridable for tests.
     pub api_base: String,
+    /// Refuse to download an inbound file larger than this many bytes;
+    /// oversized files fall back to a `too_large` system row. Defaults to
+    /// [`DEFAULT_MAX_ATTACHMENT_BYTES`].
+    pub max_attachment_bytes: u64,
 }
 
 /// Bind settings for the Events API HTTP server.
@@ -81,11 +90,27 @@ impl SlackConfig {
             }
         };
 
+        let max_attachment_bytes = match obj.get("max_attachment_bytes") {
+            None | Some(Value::Null) => DEFAULT_MAX_ATTACHMENT_BYTES,
+            Some(Value::Number(n)) => n.as_u64().ok_or_else(|| {
+                AdapterError::BadRequest(
+                    "slack config field `max_attachment_bytes` must be a non-negative integer"
+                        .into(),
+                )
+            })?,
+            Some(_) => {
+                return Err(AdapterError::BadRequest(
+                    "slack config field `max_attachment_bytes` must be a number".into(),
+                ));
+            }
+        };
+
         Ok(Self {
             bot_token,
             signing_secret,
             webhook,
             api_base,
+            max_attachment_bytes,
         })
     }
 }
@@ -346,6 +371,43 @@ mod tests {
         assert_eq!(d.host, DEFAULT_HOST);
         assert_eq!(d.port, DEFAULT_PORT);
         assert_eq!(d.path, DEFAULT_PATH);
+    }
+
+    #[test]
+    fn max_attachment_bytes_defaults_to_20mb() {
+        let c = SlackConfig::from_value(&json!({
+            "bot_token":"x","signing_secret":"s"
+        }))
+        .unwrap();
+        assert_eq!(c.max_attachment_bytes, DEFAULT_MAX_ATTACHMENT_BYTES);
+        assert_eq!(DEFAULT_MAX_ATTACHMENT_BYTES, 20 * 1024 * 1024);
+    }
+
+    #[test]
+    fn max_attachment_bytes_can_be_overridden() {
+        let c = SlackConfig::from_value(&json!({
+            "bot_token":"x","signing_secret":"s","max_attachment_bytes": 4096
+        }))
+        .unwrap();
+        assert_eq!(c.max_attachment_bytes, 4096);
+    }
+
+    #[test]
+    fn max_attachment_bytes_negative_errors() {
+        let err = SlackConfig::from_value(&json!({
+            "bot_token":"x","signing_secret":"s","max_attachment_bytes": -1
+        }))
+        .unwrap_err();
+        assert!(matches!(err, AdapterError::BadRequest(m) if m.contains("max_attachment_bytes")));
+    }
+
+    #[test]
+    fn max_attachment_bytes_wrong_type_errors() {
+        let err = SlackConfig::from_value(&json!({
+            "bot_token":"x","signing_secret":"s","max_attachment_bytes": "lots"
+        }))
+        .unwrap_err();
+        assert!(matches!(err, AdapterError::BadRequest(m) if m.contains("max_attachment_bytes")));
     }
 
     #[test]
