@@ -138,6 +138,30 @@ adheres to [Semantic Versioning](https://semver.org/).
   delivered structurally rather than degraded host-side. Per-adapter *wire*
   rendering stays the adapters' own unit-test concern.
 
+### Added (M19 X-rider Wave 3 — capability fixtures)
+
+- Test-only. Fixtures/tests locking the Wave-3 capability cards (A1/A3/A7).
+  **A3** (public-verb ritual card): a new replay fixture
+  `fixtures/cli/prototype-public-share` (registered in
+  `crates/copperclaw-host/tests/replay.rs` as
+  `cli_prototype_public_share_ritual_card_has_public_button`) drives
+  `expose_preview` → `make_preview_public` → `send_card` end-to-end and pins the
+  prototype-ready ritual card gaining an "Open the public link" button pointing
+  at the public tunnel URL. Adds a `"tunnel"` harness gate + `FixtureTunnelBroker`
+  (mirroring the `"preview"` gate + `FixturePreviewBroker`) so `make_preview_public`
+  routes to a canned post-approval public-URL reply. **A1** (fan-out aggregate):
+  `delegate_batch_partial_worker_failure_surfaces_in_aggregate` in
+  `crates/copperclaw-runner/src/run/tool_dispatch.rs` drives a mixed batch (2
+  workers report, 1 fails to spawn) through the real `invoke_tool` dispatch and
+  asserts ONE aggregate carrying both reports + the failed worker's per-worker
+  error, not a lost turn or total refusal. **A7** (preview-taint reclassification):
+  `tainted_turn_exposes_lan_preview_but_is_blocked_from_public` drives a
+  web-tainted turn through dispatch, proving `expose_preview` (LAN) succeeds
+  without a fresh approval while `make_preview_public` stays taint-gated and never
+  queues a relay row. A1/A3/A7 approval + tunnel-broker internals remain covered
+  by their own host-handler / policy unit tests; these are the pipeline-level
+  and dispatch-level X-rider complements.
+
 ### Added (M19 A6 — Durable scheduled-task fire lifecycle, migration 028)
 
 - Scheduled tasks now carry a durable, queryable record of their firing
