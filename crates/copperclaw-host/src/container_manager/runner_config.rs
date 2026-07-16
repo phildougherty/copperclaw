@@ -118,12 +118,24 @@ pub(crate) struct RunnerConfigForFile {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_tokens: Option<u32>,
     /// M18 Task HUD mode (`"full"` / `"final"` / `"off"`). Sourced from
-    /// `COPPERCLAW_HUD_MODE` in `.env` (host-wide; a per-group column is
-    /// deliberately deferred — migration 026 is reserved by a later
-    /// card). Skipped when unset so existing `runner.json` shapes stay
-    /// bit-identical and the runner applies its `full` default.
+    /// `COPPERCLAW_HUD_MODE` in `.env` (host-wide). Skipped when unset so
+    /// existing `runner.json` shapes stay bit-identical and the runner
+    /// applies its `full` default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) hud_mode: Option<String>,
+    /// M18 R3 completion-gate verify-command override. Plumbed in from
+    /// `container_configs.check_command`; wins over whatever the agent
+    /// discovered and wrote to `.copperclaw/verify`. Skipped when unset
+    /// (no override — the agent-discovered command applies).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) check_command: Option<String>,
+    /// M18 R3 completion-gate master switch. Only emitted as `Some(false)`
+    /// when the group has explicitly turned it off
+    /// (`container_configs.verify_gate = 0`); skipped otherwise so the
+    /// runner applies its own default (gate ON) and unconfigured groups'
+    /// `runner.json` shape stays bit-identical to the pre-R3 shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) verify_gate: Option<bool>,
 }
 
 /// Validate a raw `COPPERCLAW_HUD_MODE` value down to the three modes the
@@ -479,6 +491,16 @@ impl ContainerManager {
         // by a later M18 card).
         let hud_mode = validate_hud_mode(std::env::var("COPPERCLAW_HUD_MODE").ok());
 
+        // M18 R3: per-group verify-command override + gate switch. Both
+        // are plain `container_configs` columns (no env fallback, unlike
+        // the host-wide knobs above) — an operator overrides per group
+        // via `cclaw groups config edit`. `verify_gate` only emits when
+        // explicitly off; `true` (the default) is left unset so the
+        // runner's own default applies and unconfigured groups keep a
+        // stable `runner.json` shape.
+        let check_command = cc.and_then(|c| c.check_command.clone());
+        let verify_gate = cc.map(|c| c.verify_gate).filter(|on| !on).map(|_| false);
+
         RunnerConfigForFile {
             session_id: session.id.as_uuid().to_string(),
             agent_group_id: session.agent_group_id.as_uuid().to_string(),
@@ -503,6 +525,8 @@ impl ContainerManager {
             temperature,
             max_tokens,
             hud_mode,
+            check_command,
+            verify_gate,
         }
     }
 
@@ -737,6 +761,8 @@ mod tests {
             tool_profile: None,
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -795,6 +821,8 @@ mod tests {
             tool_profile: None,
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -846,6 +874,8 @@ mod tests {
             tool_profile: None,
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -890,6 +920,8 @@ mod tests {
             tool_profile: None,
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -1020,6 +1052,8 @@ mod tests {
             tool_profile: None,
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -1058,6 +1092,8 @@ mod tests {
             tool_profile: None,
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
             updated_at: chrono::Utc::now(),
         }
     }
@@ -1452,6 +1488,8 @@ mod tests {
             tool_profile: tool_profile.map(str::to_string),
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
             updated_at: chrono::Utc::now(),
         }
     }

@@ -173,7 +173,7 @@ pub mod shell {
 
     pub async fn handle(
         arguments: Option<JsonObject>,
-        _ctx: &dyn crate::context::ToolContext,
+        ctx: &dyn crate::context::ToolContext,
     ) -> Result<CallToolResult, ToolError> {
         let input: Input = parse_args(arguments)?;
         if input.command.trim().is_empty() {
@@ -239,7 +239,7 @@ pub mod shell {
         // because the container persists; the model polls the log with
         // `read_file` and stops the job with `kill`.
         if input.background {
-            return run_background(&input.command, input.cwd.as_deref(), &state_path).await;
+            return run_background(ctx, &input.command, input.cwd.as_deref(), &state_path).await;
         }
 
         // Build the wrapped command. The leading `source` is guarded by
@@ -273,6 +273,11 @@ pub mod shell {
                 return Err(ToolError::Internal(format!("shell wait failed: {e}")));
             }
             Err(_) => {
+                // Conservative: a timed-out command may have written
+                // files before it was cut off; we don't know its exit
+                // status, so this can never be treated as a verify
+                // run — only mark_dirty, never clear/record_failure.
+                mark_dirty_for_shell_cwd(ctx, input.cwd.as_deref()).await;
                 return Ok(success_json(&json!({
                     "command": input.command,
                     "timed_out": true,
@@ -295,6 +300,16 @@ pub mod shell {
             cap_shell_stream(&String::from_utf8_lossy(&output.stdout), cap, tail);
         let (stderr, stderr_truncated) =
             cap_shell_stream(&String::from_utf8_lossy(&output.stderr), cap, tail);
+
+        apply_verify_gate(
+            ctx,
+            input.cwd.as_deref(),
+            &input.command,
+            output.status.success(),
+            &stdout,
+            &stderr,
+        )
+        .await;
 
         let mut out = json!({
             "command": input.command,
@@ -347,10 +362,70 @@ pub mod shell {
         )
     }
 
+    /// M18 R3 verification gate. Runs after a foreground command
+    /// completes (never on timeout/background — those paths use
+    /// [`mark_dirty_for_shell_cwd`] instead since we don't have a
+    /// trustworthy exit status). No-op when the gate is off, `cwd`
+    /// wasn't passed, or `cwd` doesn't resolve to a project.
+    ///
+    /// When `command` matches the project's recorded verify command
+    /// (trimmed, exact match), this *is* the verify run: success
+    /// clears dirty, failure records a fix cycle with the tail output
+    /// attached. Any other command conservatively marks the project
+    /// dirty — it could have written files (`npm install` touching
+    /// `package-lock.json`, etc).
+    async fn apply_verify_gate(
+        ctx: &dyn crate::context::ToolContext,
+        cwd: Option<&str>,
+        command: &str,
+        success: bool,
+        stdout: &str,
+        stderr: &str,
+    ) {
+        if !ctx.verify_gate_enabled() {
+            return;
+        }
+        let Some(cwd) = cwd else { return };
+        let Some(project_root) = crate::tools::verify_gate::project_root_of(cwd) else {
+            return;
+        };
+        let recorded = crate::tools::verify_gate::recorded_verify_command(
+            &project_root,
+            ctx.check_command_override().as_deref(),
+        )
+        .await;
+        if recorded.as_deref() == Some(command.trim()) {
+            if success {
+                crate::tools::verify_gate::clear_dirty(&project_root).await;
+            } else {
+                let tail = format!("stdout:\n{stdout}\n\nstderr:\n{stderr}");
+                crate::tools::verify_gate::record_verify_failure(&project_root, &tail).await;
+            }
+        } else {
+            crate::tools::verify_gate::mark_dirty(&project_root).await;
+        }
+    }
+
+    /// Conservative dirty-mark for shell paths where we can't
+    /// establish a trustworthy verify-run match (timed-out or
+    /// backgrounded commands): the command may have written files
+    /// before we lost track of it, so mark dirty unconditionally
+    /// rather than risk silently missing an edit.
+    async fn mark_dirty_for_shell_cwd(ctx: &dyn crate::context::ToolContext, cwd: Option<&str>) {
+        if !ctx.verify_gate_enabled() {
+            return;
+        }
+        let Some(cwd) = cwd else { return };
+        if let Some(project_root) = crate::tools::verify_gate::project_root_of(cwd) {
+            crate::tools::verify_gate::mark_dirty(&project_root).await;
+        }
+    }
+
     /// Launch `command` detached in its own session and return its PID +
     /// log path immediately. Split out of [`handle`] so that function
     /// stays within the line budget. See [`build_background_command`].
     async fn run_background(
+        ctx: &dyn crate::context::ToolContext,
         command: &str,
         working_dir: Option<&str>,
         state_path: &std::path::Path,
@@ -378,6 +453,10 @@ pub mod shell {
         let child = cmd
             .spawn()
             .map_err(|e| ToolError::Internal(format!("shell spawn failed: {e}")))?;
+        // Conservative: the job is now running detached and may write
+        // files at any point from here on, regardless of whether the
+        // launcher itself reports back in time below.
+        mark_dirty_for_shell_cwd(ctx, working_dir).await;
         // The launcher returns as soon as it backgrounds the job; a short
         // timeout guards against a command that fails to detach (e.g. one
         // that blocks reading stdin despite the redirect).
@@ -950,6 +1029,7 @@ pub mod write_file {
                 ctx.emit_diff(card).await;
             }
         }
+        crate::tools::verify_gate::mark_dirty_for_write(ctx, &path.display().to_string()).await;
         Ok(success_json(&json!({
             "path": path.display().to_string(),
             "bytes_written": bytes.len(),
@@ -2743,5 +2823,197 @@ mod tests {
             }
         }
         String::new()
+    }
+
+    // ── M18 R3 verification gate ─────────────────────────────────
+
+    /// RAII guard that points `verify_gate`'s data root at a fresh
+    /// tempdir. Shares `verify_gate`'s own test lock so this file's
+    /// gate tests never race `todo.rs`'s or `verify_gate.rs`'s.
+    struct DataRootGuard {
+        dir: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl DataRootGuard {
+        fn new() -> Self {
+            let lock = crate::tools::verify_gate::data_root_test_lock()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let dir = tempfile::tempdir().expect("tempdir");
+            crate::tools::verify_gate::data_root_test_override_set(dir.path().to_path_buf());
+            Self { dir, _lock: lock }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            self.dir.path()
+        }
+    }
+
+    impl Drop for DataRootGuard {
+        fn drop(&mut self) {
+            crate::tools::verify_gate::data_root_test_override_clear();
+        }
+    }
+
+    fn obj(value: &serde_json::Value) -> JsonObject {
+        value.as_object().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn write_file_marks_project_dirty() {
+        let g = DataRootGuard::new();
+        let path = g.path().join("proj").join("main.rs");
+        let mock = crate::context::MockToolContext::new();
+        let args = obj(&json!({"path": path.to_string_lossy(), "content": "fn main() {}"}));
+        write_file::handle(Some(args), &mock).await.unwrap();
+        assert!(crate::tools::verify_gate::is_dirty(&g.path().join("proj")).await);
+    }
+
+    #[tokio::test]
+    async fn write_file_respects_verify_gate_disabled() {
+        let g = DataRootGuard::new();
+        let path = g.path().join("proj").join("main.rs");
+        let mock = crate::context::MockToolContext::new();
+        mock.set_verify_gate_enabled(false);
+        let args = obj(&json!({"path": path.to_string_lossy(), "content": "fn main() {}"}));
+        write_file::handle(Some(args), &mock).await.unwrap();
+        assert!(!crate::tools::verify_gate::is_dirty(&g.path().join("proj")).await);
+    }
+
+    #[tokio::test]
+    async fn write_file_outside_data_root_does_not_mark_anything() {
+        let _g = DataRootGuard::new();
+        let outside = tempfile::tempdir().unwrap();
+        let path = outside.path().join("scratch.txt");
+        let mock = crate::context::MockToolContext::new();
+        let args = obj(&json!({"path": path.to_string_lossy(), "content": "x"}));
+        // Just must not panic / error — there's no project to mark.
+        write_file::handle(Some(args), &mock).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn concurrent_writes_to_different_projects_mark_independently() {
+        let g = DataRootGuard::new();
+        let path_a = g.path().join("proj-a").join("a.rs");
+        let path_b = g.path().join("proj-b").join("b.rs");
+        let mock = crate::context::MockToolContext::new();
+        let args_a = obj(&json!({"path": path_a.to_string_lossy(), "content": "a"}));
+        let args_b = obj(&json!({"path": path_b.to_string_lossy(), "content": "b"}));
+        let (r1, r2) = tokio::join!(
+            write_file::handle(Some(args_a), &mock),
+            write_file::handle(Some(args_b), &mock),
+        );
+        r1.unwrap();
+        r2.unwrap();
+        assert!(crate::tools::verify_gate::is_dirty(&g.path().join("proj-a")).await);
+        assert!(crate::tools::verify_gate::is_dirty(&g.path().join("proj-b")).await);
+    }
+
+    #[tokio::test]
+    async fn shell_verify_run_success_clears_dirty() {
+        let _shell_g = ShellTestGuard::new();
+        let g = DataRootGuard::new();
+        let proj = g.path().join("proj");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(proj.join(".copperclaw").join("verify"), "true").unwrap();
+        crate::tools::verify_gate::mark_dirty(&proj).await;
+
+        let mock = crate::context::MockToolContext::new();
+        let args = obj(&json!({"command": "true", "cwd": proj.to_string_lossy()}));
+        shell::handle(Some(args), &mock).await.unwrap();
+        assert!(!crate::tools::verify_gate::is_dirty(&proj).await);
+    }
+
+    #[tokio::test]
+    async fn shell_verify_run_failure_records_and_keeps_dirty() {
+        let _shell_g = ShellTestGuard::new();
+        let g = DataRootGuard::new();
+        let proj = g.path().join("proj");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(proj.join(".copperclaw").join("verify"), "false").unwrap();
+        crate::tools::verify_gate::mark_dirty(&proj).await;
+
+        let mock = crate::context::MockToolContext::new();
+        let args = obj(&json!({"command": "false", "cwd": proj.to_string_lossy()}));
+        shell::handle(Some(args), &mock).await.unwrap();
+        assert!(crate::tools::verify_gate::is_dirty(&proj).await);
+        assert_eq!(crate::tools::verify_gate::fix_cycles(&proj).await, 1);
+        assert!(
+            crate::tools::verify_gate::last_failure(&proj)
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_non_verify_command_marks_dirty_conservatively() {
+        let _shell_g = ShellTestGuard::new();
+        let g = DataRootGuard::new();
+        let proj = g.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let mock = crate::context::MockToolContext::new();
+        let args = obj(&json!({"command": "echo hi", "cwd": proj.to_string_lossy()}));
+        shell::handle(Some(args), &mock).await.unwrap();
+        assert!(crate::tools::verify_gate::is_dirty(&proj).await);
+    }
+
+    #[tokio::test]
+    async fn shell_without_cwd_does_not_mark_any_project_dirty() {
+        let _shell_g = ShellTestGuard::new();
+        let g = DataRootGuard::new();
+        let proj = g.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let mock = crate::context::MockToolContext::new();
+        let args = obj(&json!({"command": "echo hi"}));
+        shell::handle(Some(args), &mock).await.unwrap();
+        assert!(!crate::tools::verify_gate::is_dirty(&proj).await);
+    }
+
+    #[tokio::test]
+    async fn shell_respects_verify_gate_disabled() {
+        let _shell_g = ShellTestGuard::new();
+        let g = DataRootGuard::new();
+        let proj = g.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let mock = crate::context::MockToolContext::new();
+        mock.set_verify_gate_enabled(false);
+        let args = obj(&json!({"command": "echo hi", "cwd": proj.to_string_lossy()}));
+        shell::handle(Some(args), &mock).await.unwrap();
+        assert!(!crate::tools::verify_gate::is_dirty(&proj).await);
+    }
+
+    #[tokio::test]
+    async fn shell_check_command_override_used_for_verify_match() {
+        let _shell_g = ShellTestGuard::new();
+        let g = DataRootGuard::new();
+        let proj = g.path().join("proj");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(proj.join(".copperclaw").join("verify"), "npm test").unwrap();
+        crate::tools::verify_gate::mark_dirty(&proj).await;
+
+        let mock = crate::context::MockToolContext::new();
+        mock.set_check_command_override(Some("true".into()));
+        let args = obj(&json!({"command": "true", "cwd": proj.to_string_lossy()}));
+        shell::handle(Some(args), &mock).await.unwrap();
+        // "true" matches the override, not the recorded "npm test" —
+        // it's treated as the verify run and clears dirty.
+        assert!(!crate::tools::verify_gate::is_dirty(&proj).await);
+    }
+
+    #[tokio::test]
+    async fn shell_background_conservatively_marks_dirty() {
+        let _shell_g = ShellTestGuard::new();
+        let g = DataRootGuard::new();
+        let proj = g.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let mock = crate::context::MockToolContext::new();
+        let args = obj(&json!({
+            "command": "true",
+            "cwd": proj.to_string_lossy(),
+            "background": true,
+        }));
+        shell::handle(Some(args), &mock).await.unwrap();
+        assert!(crate::tools::verify_gate::is_dirty(&proj).await);
     }
 }

@@ -171,7 +171,10 @@ async fn main() -> Result<()> {
         // `<session_dir>/memory/memory.db`. `MemoryStore::open` creates +
         // migrates it lazily on first `memory_search` / `memory_get`. A child
         // (subagent) session shares the same group store.
-        .with_memory_db(paths.root.join("memory").join("memory.db"));
+        .with_memory_db(paths.root.join("memory").join("memory.db"))
+        // M18 R3 verification gate: the live enforcement path (the
+        // `copperclaw-mcp` tool handlers only see `&dyn ToolContext`).
+        .with_verify_gate(cfg.verify_gate, cfg.check_command_override.clone());
     if let Some(parent) = cfg.source_session_id {
         tool_ctx_inner = tool_ctx_inner.with_source_session_id(parent);
     }
@@ -226,6 +229,8 @@ async fn main() -> Result<()> {
         // COPPERCLAW_HUD_MODE -> runner.json's `hud_mode`).
         hud_mode: cfg.hud_mode,
         todo_path: std::path::PathBuf::from(copperclaw_runner::run::hud::TODO_STORE_DEFAULT_PATH),
+        verify_gate: cfg.verify_gate,
+        check_command_override: cfg.check_command_override.clone(),
     };
 
     tracing::info!(
@@ -348,6 +353,8 @@ mod build_provider_tests {
             tool_profile: copperclaw_runner::ToolProfile::Full,
             sender_role: None,
             hud_mode: copperclaw_runner::config::HudMode::Full,
+            check_command_override: None,
+            verify_gate: true,
         }
     }
 

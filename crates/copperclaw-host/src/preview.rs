@@ -911,6 +911,8 @@ mod manager_tests {
                 tool_profile: None,
                 preview_enabled,
                 preview_bind: bind.map(str::to_string),
+                check_command: None,
+                verify_gate: true,
             },
         )
         .unwrap();

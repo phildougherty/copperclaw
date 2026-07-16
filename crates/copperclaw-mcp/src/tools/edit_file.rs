@@ -109,6 +109,7 @@ pub async fn handle(
     // first — a 4 MB file overwrite shouldn't try to compute a real
     // diff. See `slice-3-native-ui.md` § Surface 1 for the rationale.
     emit_diff_card(ctx, &result).await;
+    crate::tools::verify_gate::mark_dirty_for_write(ctx, &result.path).await;
 
     Ok(success_json(&json!({
         "path": result.path,
@@ -636,6 +637,72 @@ mod tests {
         assert_eq!(card.added, 1);
         assert_eq!(card.removed, 1);
         assert_eq!(card.language.as_deref(), Some("rust"));
+    }
+
+    /// M18 R3 verification gate: RAII guard pointing `verify_gate`'s
+    /// data root at a fresh tempdir, sharing its cross-file test lock.
+    struct DataRootGuard {
+        dir: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl DataRootGuard {
+        fn new() -> Self {
+            let lock = crate::tools::verify_gate::data_root_test_lock()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let dir = tempfile::tempdir().expect("tempdir");
+            crate::tools::verify_gate::data_root_test_override_set(dir.path().to_path_buf());
+            Self { dir, _lock: lock }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            self.dir.path()
+        }
+    }
+
+    impl Drop for DataRootGuard {
+        fn drop(&mut self) {
+            crate::tools::verify_gate::data_root_test_override_clear();
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_edit_marks_project_dirty() {
+        let g = DataRootGuard::new();
+        let proj = g.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let path = proj.join("a.rs");
+        std::fs::write(&path, "let x = 1;\n").unwrap();
+
+        let mock = Arc::new(crate::context::MockToolContext::new());
+        let args = json!({
+            "path": path.to_string_lossy(),
+            "old_string": "let x = 1;",
+            "new_string": "let x = 2;",
+        });
+        let map = args.as_object().unwrap().clone();
+        handle(Some(map), mock.as_ref()).await.unwrap();
+        assert!(crate::tools::verify_gate::is_dirty(&proj).await);
+    }
+
+    #[tokio::test]
+    async fn failed_edit_does_not_mark_project_dirty() {
+        let g = DataRootGuard::new();
+        let proj = g.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let path = proj.join("a.rs");
+        std::fs::write(&path, "hello world\n").unwrap();
+
+        let mock = Arc::new(crate::context::MockToolContext::new());
+        let args = json!({
+            "path": path.to_string_lossy(),
+            "old_string": "nope",
+            "new_string": "x",
+        });
+        let map = args.as_object().unwrap().clone();
+        assert!(handle(Some(map), mock.as_ref()).await.is_err());
+        assert!(!crate::tools::verify_gate::is_dirty(&proj).await);
     }
 
     /// Failed edits (no match, ambiguous match) must NOT emit a diff
