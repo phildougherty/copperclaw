@@ -115,6 +115,40 @@ adheres to [Semantic Versioning](https://semver.org/).
   The rewrite stays under the 8 KiB per-skill body cap enforced by
   `crates/copperclaw-skills/tests/coverage.rs` (8,013 bytes), verified via
   the full skill coverage suite (name/registry/size/marker checks all pass).
+
+### Added (M20 D4 — Wire the see→fix loop + the ritual screenshot)
+
+- `CODING_PREAMBLE` (`crates/copperclaw-host/src/container_manager/prompt.rs`)
+  gained a fifth static bullet, sequenced right after Q4's multi-stage-verify
+  bullet (architecture decision (e)): for any app with a UI, after the first
+  visual milestone run `ui_screenshot`, LOOK at the image, run the
+  `frontend-design` skill's `## Critique checklist`
+  (`load_skill("frontend-design")`), fix the worst two things, and
+  `ui_screenshot` again — one full cycle minimum before the delivery todo.
+  Still a static const (rule 8): no per-turn content, `Messaging`/`Minimal`
+  gain zero bytes, and `coding_preamble_appears_exactly_once_in_coding_profile_prompt`
+  / `messaging_and_minimal_profiles_gain_zero_new_bytes` pass unmodified
+  against the new block.
+- Rewrote the "prototype ready" delivery ritual's screenshot line: the
+  delivery screenshot is no longer an assumed artifact from elsewhere — the
+  agent takes it itself (`ui_screenshot` the final state, then `send_file`
+  it alongside the ready-card). The old "when one exists" hedge is now "omit
+  only when there is genuinely no UI", matching D1's default-on
+  `ui_screenshot` registration in Coding/Full profiles.
+- `skills/coding-task/SKILL.md` gained a new "See it, then fix it — before
+  the delivery todo" section: a 5-step numbered loop (screenshot, look,
+  critique via `frontend-design`, fix the worst two, screenshot again)
+  cross-referenced from `web-app-scaffold`. To make room under the 8 KiB
+  body cap, trimmed redundant prose across several sections (git-repo setup,
+  dependency choice, robustness scope, verify-gate mechanics, the delivery
+  ritual, and the fabrication rules) without dropping any rule; final body
+  is 8,141 bytes (down from 8,077 pre-trim + the new section), verified by
+  `crates/copperclaw-skills/tests/coverage.rs`'s `skill_bodies_under_size_cap`.
+- Metrics wishes for M1: see→fix cycles per build (screenshot → critique →
+  fix → re-screenshot count) and ritual screenshots delivered (count of
+  ready-card turns whose `send_card` was accompanied by a `send_file` of an
+  agent-taken screenshot vs. omitted for no-UI builds).
+
 ### Changed (M20 Q2 — Multi-stage verify: named stages, per-stage state, stage-attributed failures)
 
 - `.copperclaw/verify` may now contain MULTIPLE lines, each an independent
