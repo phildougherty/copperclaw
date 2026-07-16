@@ -1303,11 +1303,13 @@ mod tests {
                     id: 1,
                     text: "Scaffold".into(),
                     status: TodoItemStatus::Completed,
+                    blocked_reason: None,
                 },
                 TodoListItem {
                     id: 2,
                     text: "Wire routes".into(),
                     status: TodoItemStatus::InProgress,
+                    blocked_reason: None,
                 },
             ],
             title: Some("Build".into()),
