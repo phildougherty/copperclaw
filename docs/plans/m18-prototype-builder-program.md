@@ -1402,8 +1402,11 @@ called for. Screenshots archived in the eighth-session chat.
    (`trailing characters at line 10`), then the read path can't quarantine a
    file a racing writer already renamed (`No such file or directory`). Store
    self-heals ("starting fresh") but todo state was repeatedly reset mid-build.
-   **Fix (a post-M18 hardening card, lane T): serialize the todo
-   read-modify-write (async Mutex) and/or use a unique per-write tempfile name.**
+   **FIXED — PR #57 (`hardening/todo-store-write-race`, merged):** process-wide
+   `tokio::sync::Mutex` across the todo read-modify-write in `add`/`update`/
+   `delete` (fixes corruption AND lost updates) + unique `<store>.tmp.<pid>.<seq>`
+   tempfile. New test fails pre-fix (`left: 1, right: 8`), passes post-fix; gate
+   7207/0. Needs a `./rebuild.sh` to reach running agents (in-container surface).
 2. **WORKING AS DESIGNED — provenance/taint denials (4).** The "research …
    then build" request web-tainted the turn, so the M16 gate denied
    `expose_preview` ×2, `web_search`, `web_fetch` (credentialed external
