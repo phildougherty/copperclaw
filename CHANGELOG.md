@@ -6,6 +6,35 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M18 C5b — shared markdown → per-platform renderer, 2026-07-16)
+
+- New `crates/copperclaw-channels/core/src/markdown/` module — the single
+  place canonical agent Markdown turns into each chat platform's flavor,
+  replacing the per-adapter duplication (telegram `markdown_to_html`, slack
+  `mrkdwn`, discord escaping) over time.
+  - `markdown::render(md, Flavor)` renders ATX headings, fenced + inline code,
+    bold/italic/strikethrough, links, unordered/ordered lists, and blockquotes
+    into `Flavor::{Html, Discord, Slack, Mattermost, WhatsApp, Plain}`. Forgiving
+    on unbalanced markers (emits the literal char, matching the adapters' current
+    behaviour on natural-language prose). Unit table proves per-platform output
+    for headings/bold/code/lists (+ links, quotes, HTML escaping, robustness).
+  - `markdown::split_into_chunks` / `markdown::is_balanced` — fence-aware
+    chunking of a long reply into cap-sized pieces that each parse with
+    balanced code fences.
+
+### Changed (M18 C5b — fence logic migrated out of host-delivery)
+
+- Migrated C2's fence scanner + splitter from `copperclaw-host-delivery` into
+  the shared renderer, per the explicit migration note C2 left at
+  `host-delivery/src/fence.rs:22-24`. `scan_fence_spans`, the
+  `FenceKind`/`FenceSpan` model, `is_balanced`, and the fence-aware
+  `split_into_chunks` now live in `copperclaw-channels-core::markdown`
+  (`fence.rs` + `split.rs`, moved verbatim). `copperclaw-host-delivery` now
+  **consumes** the renderer: `service::split_text_into_chunks` is a thin
+  delegate to `markdown::split_into_chunks`, and `host-delivery/src/fence.rs`
+  is a documented shim re-exporting `is_balanced` for its C2 splitter tests —
+  which still pass, now routed through the migrated logic.
+
 ### Added (M18 C5 — adapter rich-surface floor: signal / whatsapp-cloud / mattermost, 2026-07-16)
 
 - Raised **signal**, **whatsapp-cloud**, and **mattermost** off the trait-default
