@@ -514,6 +514,10 @@ impl RunnerDeps {
                 summary_effort: Effort::Low,
                 summary_max_tokens: 1024,
                 archive_dir,
+                // Matches production (`/data`); scanned read-only for the
+                // pinned project-facts header. Absent in the test env, so
+                // fixtures get no header and stay byte-stable.
+                data_root: PathBuf::from("/data"),
             },
             // Test default: elision effectively off (no result body can
             // exceed `usize::MAX`), so transcript/replay fixtures see the

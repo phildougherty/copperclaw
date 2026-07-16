@@ -6,6 +6,34 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (M18 R4 — compaction that survives long builds, 2026-07-16)
+
+- `crates/copperclaw-runner/src/compaction.rs`: (a) the token estimator
+  (`estimate_tokens`) replaces the flat 4-chars/token heuristic with a
+  calibrated ~3.5-chars/token approximation (applied as the exact rational
+  2/7 in integer math) over a *whitespace-collapsed* character count, so
+  indentation- and JSON-heavy build transcripts no longer over-count and
+  trip compaction early. Chosen over `tiktoken-rs` deliberately: `cl100k_base`
+  is GPT's tokenizer (itself only an approximation of Claude's token count)
+  and would add ~1.5 MB of BPE vocab + a `fancy-regex` dep to every
+  in-container runner binary, for precision the safety margins already
+  absorb — error bounds documented at the `estimate_tokens` docstring. (b)
+  the soft compaction target default is now profile-conditional
+  (`default_soft_target_for_profile`, wired through
+  `crates/copperclaw-runner/src/config.rs`): code-oriented profiles
+  (`Coding`/`Full`) get 80K on a 200K window so a 90-minute build keeps its
+  mid-task detail; `Messaging`/`Minimal` keep the original 40K. Still
+  config-clamped — an explicit `soft_compaction_target_tokens` / env var
+  overrides, and the hard ceiling always clamps via `effective_threshold`.
+  (c) a structured **project-facts header** (project path, git branch,
+  recorded verify command, and the todo-list plan) is now sourced fresh from
+  on-disk R3 verify-gate state + the todo store on every compaction and
+  pinned **verbatim** at the front of the compacted transcript — never handed
+  to the summarizer — so a long build never loses those facts to
+  summarization. Exactly one, always-current header is carried forward; a
+  pure-chat session with no project/todo state gets no header (byte-identical
+  to pre-R4). `CompactionCfg` gains a `data_root` field (the `/data` mount)
+  as the header's source root.
 ### Added (M18 C4b — discord inbound files, 2026-07-15)
 
 - Discord now downloads inbound message attachments from the CDN and stages

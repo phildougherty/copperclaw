@@ -89,6 +89,10 @@ async fn main() -> Result<()> {
         summary_effort: copperclaw_types::Effort::Low,
         summary_max_tokens: 1024,
         archive_dir: paths.outbox.join("_compactions"),
+        // The container binds the session dir at `/data`; projects and the
+        // todo store live there, the same root `todo.rs` / `verify_gate.rs`
+        // hardcode. Source for the pinned project-facts header.
+        data_root: std::path::PathBuf::from("/data"),
     };
     // Per-turn transcript shrinker: stub stale, oversized tool-result
     // bodies so old file reads / command stdout / diffs aren't re-sent
