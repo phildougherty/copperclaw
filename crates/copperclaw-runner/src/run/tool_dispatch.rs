@@ -795,8 +795,10 @@ mod tests {
         assert!(content.contains("/__preview/tok"), "got: {content}");
         assert!(imgs.is_empty());
         // The preview response is host-composed (URL + note) — unlike a real
-        // external MCP result it must NOT taint the turn, or the paired
-        // same-turn `close_preview` (credentialed-external) would be blocked.
+        // external MCP result it must NOT taint the turn. (The LAN preview verbs
+        // are themselves exempt from the taint gate as of M19 A7, but keeping
+        // the relay response clean still matters: it must not taint OTHER
+        // credentialed external actions the same turn goes on to take.)
         assert!(
             !ctx.is_context_tainted(),
             "a __preview relay response must not taint the turn"
