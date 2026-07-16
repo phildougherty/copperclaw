@@ -757,6 +757,60 @@ pub mod update {
                     copperclaw_metrics::inc_verify_gate_completion("passed");
                 }
             }
+            // M20 Q6: enforced self-review gate before final delivery (see
+            // `crate::tools::self_review`'s module docs for the design).
+            // Runs only when the verify gate above didn't already divert
+            // this todo to `blocked` (no point review-gating a todo that's
+            // ending up blocked anyway), and only for the FINAL remaining
+            // todo — completing this one must leave no other item still
+            // `pending`/`in_progress`. Non-final todos are never gated.
+            // Shares the verify gate's `verify_gate_enabled()` escape
+            // hatch: one off-switch, not two, per decision (d).
+            if ctx.verify_gate_enabled() && matches!(effective_status, Some(TodoStatus::Completed))
+            {
+                let is_final = items.iter().all(|it| {
+                    it.id == input.id
+                        || !matches!(it.status, TodoStatus::Pending | TodoStatus::InProgress)
+                });
+                if is_final {
+                    let needing_review =
+                        crate::tools::self_review::scan_projects_needing_review().await;
+                    if let Some(project_root) = needing_review.first() {
+                        let cycles = crate::tools::self_review::review_cycles(project_root).await;
+                        if cycles < crate::tools::self_review::REVIEW_CYCLE_CAP {
+                            let new_cycles =
+                                crate::tools::self_review::record_review_refusal(project_root)
+                                    .await;
+                            let remaining = crate::tools::self_review::REVIEW_CYCLE_CAP
+                                .saturating_sub(new_cycles);
+                            let display = project_root.display();
+                            return Err(ToolError::Validation(format!(
+                                "cannot mark todo {} completed: it is the final/delivery todo, \
+                                 and `{display}` has not been self-reviewed since its last \
+                                 change. Call `self_review` with `project: \"{display}\"` to \
+                                 read the diff since your last review (or since the project's \
+                                 first commit), then submit `findings` (a non-empty array) or \
+                                 `no_findings: true` to record the review — for anything \
+                                 non-trivial, run `load_skill(\"code-review\")` first for the \
+                                 depth checklist. ({remaining} review cycle(s) remaining before \
+                                 this todo auto-blocks instead).",
+                                input.id,
+                            )));
+                        }
+                        // Review-cycle cap already burned and still dirty-
+                        // since-review: auto-transition to `blocked`,
+                        // mirroring the verify gate's own cap-exhaustion
+                        // behaviour above — never silently completed, but
+                        // never permanently stuck refusing forever either.
+                        effective_status = Some(TodoStatus::Blocked);
+                        blocked_reason = Some(format!(
+                            "self-review was never completed for `{}` after {} cycle(s)",
+                            project_root.display(),
+                            crate::tools::self_review::REVIEW_CYCLE_CAP
+                        ));
+                    }
+                }
+            }
         }
         if let Some(text) = input.text {
             let trimmed = text.trim();
@@ -1879,5 +1933,289 @@ mod tests {
             ToolError::Validation(msg) => assert!(msg.contains("npm test"), "got: {msg}"),
             other => panic!("expected Validation, got {other:?}"),
         }
+    }
+
+    // ── M20 Q6: enforced self-review gate before final delivery ──────────
+
+    /// `git init && commit` a project dir under the gate's data root, the
+    /// same one-liner `skills/coding-task/SKILL.md` teaches. Review-gating
+    /// only ever engages for a project that is its own git repo.
+    fn init_review_project(proj: &std::path::Path) {
+        std::fs::create_dir_all(proj).unwrap();
+        crate::tools::git_common::tests::init_with_commit(proj, "app.py", "print('hi')\n");
+    }
+
+    #[tokio::test]
+    async fn final_todo_on_never_reviewed_git_project_refuses_with_teaching_hint() {
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        init_review_project(&proj);
+
+        let ctx = MockToolContext::new();
+        let added = body_json(
+            &add::handle(obj(json!({"text": "ship the app"})), &ctx)
+                .await
+                .unwrap(),
+        );
+        let id = added["id"].as_u64().unwrap();
+        let err = update::handle(
+            obj(json!({
+                "id": id,
+                "status": "completed",
+                "evidence": substantive_evidence(),
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        match err {
+            ToolError::Validation(msg) => {
+                assert!(msg.contains("self_review"), "got: {msg}");
+                assert!(msg.contains("final/delivery todo"), "got: {msg}");
+                assert!(msg.contains("load_skill(\"code-review\")"), "got: {msg}");
+                // First refusal increments the cycle count to 1 (out of a
+                // cap of 2), so 1 remains before this todo auto-blocks.
+                assert!(msg.contains("1 review cycle"), "got: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        // The todo itself must NOT have been mutated to completed.
+        let listed = body_json(&list::handle(obj(json!({})), &ctx).await.unwrap());
+        assert_eq!(listed[0]["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn completion_succeeds_after_self_review_submission() {
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        init_review_project(&proj);
+
+        let ctx = MockToolContext::new();
+        let added = body_json(
+            &add::handle(obj(json!({"text": "ship"})), &ctx)
+                .await
+                .unwrap(),
+        );
+        let id = added["id"].as_u64().unwrap();
+
+        crate::tools::self_review::handle(
+            obj(json!({
+                "project": proj.to_string_lossy(),
+                "no_findings": true,
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        let updated = body_json(
+            &update::handle(
+                obj(json!({
+                    "id": id,
+                    "status": "completed",
+                    "evidence": substantive_evidence(),
+                })),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(updated["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn post_review_edit_redirties_and_rerefuses() {
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        init_review_project(&proj);
+
+        let ctx = MockToolContext::new();
+        let added = body_json(
+            &add::handle(obj(json!({"text": "ship"})), &ctx)
+                .await
+                .unwrap(),
+        );
+        let id = added["id"].as_u64().unwrap();
+
+        crate::tools::self_review::handle(
+            obj(json!({
+                "project": proj.to_string_lossy(),
+                "no_findings": true,
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        // An edit after the review re-dirties the project (the recomputed
+        // diff-hash no longer matches the marker) without any new marker
+        // plumbing — it falls out of the content-hash design.
+        std::fs::write(proj.join("app.py"), "print('hi')\nprint('bye')\n").unwrap();
+
+        let err = update::handle(
+            obj(json!({
+                "id": id,
+                "status": "completed",
+                "evidence": substantive_evidence(),
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        match err {
+            ToolError::Validation(msg) => assert!(msg.contains("self_review"), "got: {msg}"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn review_cap_stops_the_third_cycle_with_blocked() {
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        init_review_project(&proj);
+
+        let ctx = MockToolContext::new();
+        let added = body_json(
+            &add::handle(obj(json!({"text": "ship"})), &ctx)
+                .await
+                .unwrap(),
+        );
+        let id = added["id"].as_u64().unwrap();
+
+        // Never call self_review at all: two refusals burn the review-
+        // cycle budget (0 -> 1 -> 2); the third attempt auto-blocks
+        // instead of refusing forever.
+        for _ in 0..crate::tools::self_review::REVIEW_CYCLE_CAP {
+            let err = update::handle(
+                obj(json!({
+                    "id": id,
+                    "status": "completed",
+                    "evidence": substantive_evidence(),
+                })),
+                &ctx,
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, ToolError::Validation(_)));
+        }
+        let updated = body_json(
+            &update::handle(
+                obj(json!({
+                    "id": id,
+                    "status": "completed",
+                    "evidence": substantive_evidence(),
+                })),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(updated["status"], "blocked");
+        assert!(
+            updated["blocked_reason"]
+                .as_str()
+                .unwrap()
+                .contains("self-review"),
+            "got: {updated}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_final_todo_completion_is_never_review_gated() {
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        init_review_project(&proj);
+
+        let ctx = MockToolContext::new();
+        let first = body_json(
+            &add::handle(obj(json!({"text": "step one"})), &ctx)
+                .await
+                .unwrap(),
+        );
+        let _second = body_json(
+            &add::handle(obj(json!({"text": "step two"})), &ctx)
+                .await
+                .unwrap(),
+        );
+        let first_id = first["id"].as_u64().unwrap();
+
+        // Completing the first of TWO pending items is not final — must
+        // succeed even though the project has never been reviewed.
+        let updated = body_json(
+            &update::handle(
+                obj(json!({
+                    "id": first_id,
+                    "status": "completed",
+                    "evidence": substantive_evidence(),
+                })),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(updated["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn review_gate_off_when_verify_gate_disabled() {
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        init_review_project(&proj);
+
+        let ctx = MockToolContext::new();
+        ctx.set_verify_gate_enabled(false);
+        let added = body_json(
+            &add::handle(obj(json!({"text": "ship"})), &ctx)
+                .await
+                .unwrap(),
+        );
+        let id = added["id"].as_u64().unwrap();
+        // Never reviewed, project is a git repo — would normally refuse;
+        // `verify_gate=off` skips the review gate too (one off-switch,
+        // not two, per decision (d)).
+        let updated = body_json(
+            &update::handle(
+                obj(json!({
+                    "id": id,
+                    "status": "completed",
+                    "evidence": substantive_evidence(),
+                })),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(updated["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn non_git_project_is_never_review_gated() {
+        // Regression guard: a project directory that never ran `git init`
+        // must complete exactly as it did before this card — the review
+        // gate fails open (`ReviewState::NotApplicable`) for it.
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let ctx = MockToolContext::new();
+        let added = body_json(
+            &add::handle(obj(json!({"text": "ship"})), &ctx)
+                .await
+                .unwrap(),
+        );
+        let id = added["id"].as_u64().unwrap();
+        let updated = body_json(
+            &update::handle(
+                obj(json!({
+                    "id": id,
+                    "status": "completed",
+                    "evidence": substantive_evidence(),
+                })),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(updated["status"], "completed");
     }
 }

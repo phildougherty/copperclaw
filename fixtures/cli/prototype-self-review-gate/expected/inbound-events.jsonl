@@ -1,0 +1,1 @@
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"message":{"id":"fixture-prototype-self-review-gate-001","kind":"chat","content":{"text":"build a tiny greeting script, review your own diff before calling it done, then mark the task done"},"timestamp":"<TS>","is_mention":null,"is_group":null},"reply_to":null,"sender":null}

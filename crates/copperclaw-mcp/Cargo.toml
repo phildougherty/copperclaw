@@ -33,6 +33,10 @@ similar = { workspace = true }
 # build time only; the resulting binary statically links libgit2.
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
 copperclaw-metrics.workspace = true
+# M20 Q6: content-hash the project diff at review-submission time so a later
+# `todo_update(completed)` can tell "nothing changed since review" from "it
+# did" without a git ref (uncommitted work has no ref to pin to).
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
