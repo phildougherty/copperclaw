@@ -120,32 +120,30 @@ not host-side, because `ContainerRuntime` exposes no host→container exec
 primitive — a documented correction to the card's framing. Local `main` =
 `origin/main` at `599a05e`.
 
-**Wave B — READY TO FIRE (Wave A is merged).** All on disjoint lanes, launch in
-parallel:
-- **V2** (lane V) — one-tap preview enablement + expired-link tombstone
-  re-expose. Held out of Wave A ONLY because it writes `preview.rs`, which V4
-  reads — so it MUST land after V4 merges (else preview.rs conflict). Its part
-  2 was AMENDED (see the V2 "Verified state" block — the 30-min figure is the
-  idle reaper, not a token TTL; the amended tombstone-listener design is
-  authoritative). Depends on G1 (merged) for the approval-card enablement path.
-- **C5** (lane C) — adapter floor (signal/whatsapp/mattermost, three disjoint
-  sub-cards) + shared markdown renderer in `channels/core`, absorbing C2's
-  `fence.rs`. P2, large; deliver a smaller whole thing if needed (e.g. the
-  three floors first, renderer second). Ready now (C4a/C4b merged) but held for
-  batch size. Also owes the two stale-doc-comment fixes flagged in PR #30
-  (`host-delivery/src/service.rs:1707`, `:2378`). Keep `EDIT_CAPABLE_CHANNELS`
-  (`capabilities.rs`) in sync in the SAME PR when an adapter gains
-  `edit_message`.
-- **R6** (lane R) — progressive final answers (edit-based growth of long final
-  text on >30s turns, rich adapters, default ON). Ready now (R5 merged, H1
-  machinery shipped); held only to keep lane R serialized behind the R5 merge.
-  Reuse H1's `emit_task_hud` anchor per the R6 "Verified state" block.
+**Wave B — MERGED (eighth session):** **R6** (#50), **V2** (#51), **C5** (#52) —
+three parallel agents on disjoint lanes (R/V/C), all merged. Integrated gate on
+`main` after merge: **fmt / check / clippy -D warnings clean, 7166 passed / 0
+failed**. Only CHANGELOG conflicted (the three cards touch disjoint code).
+**C5 was split:** part 1 (the three adapter rich-surface floors +
+`EDIT_CAPABLE_CHANNELS` sync + the two PR-#30 doc-comment fixes) landed in #52;
+the shared markdown renderer + `fence.rs` migration were deferred as **C5b**
+(now a Wave C card, in flight). Notable: V4's host-side-container-direct render
+meant V2 had no `preview.rs` conflict after all. Local `main` = `origin/main`
+at `10e473b`.
 
-**Wave C — the tail, after Wave B:** **R7** (lane R, after R6 — subagent
-fan-out middle tier), **V5** (lane V, after V2 — public tunnel module, security
-review required before merge), then **M1** (lane M, ABSOLUTE LAST — sweep every
-merged PR's "Metrics wishes" incl. #40-#45 and all Wave A/B/C PRs). After Wave
-C, the only program-acceptance item left is the live telegram smoke test.
+**Wave C — IN FLIGHT (eighth session), three parallel agents:** **R7** (lane R,
+`m18/r7-subagent-fanout` — write-capable parallel-delegation middle tier reusing
+the worktree mechanics), **C5b** (lane C, `m18/c5b-shared-renderer` — the
+deferred shared markdown renderer + `fence.rs` migration from C2), **V5** (lane
+V, `m18/v5-public-tunnel` — public tunnel module). **V5 is HELD for explicit
+human security sign-off** — it touches the outward-facing surface, the plan
+mandates a security review before merge, and the launching session will NOT
+auto-merge it; the V5 agent runs `/security-review` and writes the threat model
+into its PR body for the human to sign off. After Wave C merges (V5 pending
+sign-off), **M1** (lane M, ABSOLUTE LAST) sweeps every merged PR's "Metrics
+wishes" (incl. #40-#52 and all Wave C PRs). Then the only program-acceptance
+item left is the live telegram smoke test (needs a message from the operator's
+phone; the automatable cli-channel proxy can be run in the meantime).
 
 Two housekeeping traps that bit this session, worth checking early in any
 fresh session: (1) local `main` can silently drift behind `origin/main` by
@@ -186,7 +184,13 @@ main..<branch> --oneline` yourself first.
 | V4 | **Merged.** Screenshot-the-preview: renders **host-side container-direct** (`http://<container_ip>:<port>`, NOT the cookie-gated proxy URL — a cookieless render would 403), leaving `preview.rs` untouched (reads `PreviewEntry.container_ip/port`). PNG lands under `<data_root>/screenshots` (`COPPERCLAW_DATA_ROOT`-aware) for in-container `send_file`; new `COPPERCLAW_BROWSER_PREVIEW_ALLOW` injects the bridge IP:port into the child's deny-default egress allow-list; unset `COPPERCLAW_BROWSER_ENABLED` → ritual omits screenshot, never errors. No replay fixture (live path needs Docker/Chromium, same as V3). Gate 7105/0, fmt clean. | #47 |
 | P3 | **Merged.** The "prototype ready" ritual: one closing bullet in the static `CODING_PREAMBLE` (Coding/Full only, cache-prefix unchanged, Messaging/Minimal +0 bytes) mandating one `send_card` (title + one-liner + "What to try" + Open-preview URL button + Download `value` button answered next turn with a `git archive` zip via `send_file` + `artifact_path` footer + screenshot alongside via `send_file`). `skills/coding-task` hedge dropped; `skills/send-card` ritual example added. Copy + skills + one prompt line, no new tools. Skills lint 86/0 isolated; gate 7096/0, fmt clean. | #46 |
 | E1 | **Merged.** `install_packages` gains `scope: session` (default `image`): runs the ecosystem-local install now (`pip` into `/data/.venv`, `npm --prefix /data/.npm-global -g`) AND records the package into pending image config to bake next spawn; ack text states pending-approval vs done; NEW deny-default-egress-failure detection appends the `cclaw set-egress-allow` hint. Design correction: the "works now" install runs **in-container** (the tool surface's process), not host-side — `ContainerRuntime` has no host→container exec primitive. Real pip/npm e2e is an `#[ignore]`d Docker test; skill teaching deferred (lane P owned skills this wave). Gate 7110/0, fmt clean. | #49 |
-| All others (R6-R7, V2, V5, C5, M1) | Not started | — |
+| R6 | **Merged.** Progressive final answers: edit-based paced reveal of the FINAL answer only, gated on rich adapter AND elapsed ≥30s AND answer in `280..expander-scale` chars (excludes >30-line/>64KB answers so it never overlaps the long-output collapsible chip). First chunk is a `send_message` anchor, later chunks `edit_message` on that seq — exactly one Chat row, no double-post, reuses H1's `emit_task_hud` pattern. Byte-stable fallback for <30s/bare-adapter. No token streaming (rejected). Gate 7130/0, fmt clean. | #50 |
+| V2 | **Merged.** One-tap preview enablement: `PreviewError::Disabled` raises a G1 in-chat "Enable previews" approval card (new `ApprovalKind::EnablePreview` + `apply_enable_preview`, routed through G1's interceptor + shared DB path; flips `preview_enabled`, secure-by-default preserved, idempotent). Amended part 2: idle-reap keeps the listener as a `Live`/`Tombstone` phase machine serving an expired page + a one-shot per-token re-expose while the container is up (the original "re-mint expired token" was impossible — reaping cancels the listener). Gate 7130/0, fmt clean. | #51 |
+| C5 | **Merged (part 1; renderer split to C5b).** Adapter rich-surface floors for signal / whatsapp-cloud / mattermost (each a new `render.rs`): mattermost + signal gained `edit_message` → added to `EDIT_CAPABLE_CHANNELS`; whatsapp-cloud correctly stays non-edit-capable (Cloud API can't edit sent messages). Plus the two PR-#30 stale-doc-comment fixes (`emit_breadcrumb`→`emit_task_hud`). Shared markdown renderer + `fence.rs` migration deferred to **C5b** (Wave C). Gate 7148/0, fmt clean. | #52 |
+| C5b | In flight (Wave C) — shared markdown renderer in `channels/core` + `fence.rs` migration from C2 (`m18/c5b-shared-renderer`). | — |
+| R7 | In flight (Wave C) — write-capable parallel-delegation middle tier (`m18/r7-subagent-fanout`). | — |
+| V5 | In flight (Wave C), **HELD for human security sign-off** — public tunnel module, `/security-review` + threat model in PR body (`m18/v5-public-tunnel`). | — |
+| M1 | Not started — ABSOLUTE LAST; metrics sweep of all merged PRs (#24-#52 + Wave C). | — |
 
 ### R3 history (merged as #32 — skip unless you're touching the gate)
 
