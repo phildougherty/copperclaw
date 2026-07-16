@@ -7,6 +7,7 @@
 pub mod approval;
 pub mod channel;
 pub mod id;
+pub mod image;
 pub mod message;
 pub mod provider;
 pub mod routing;
@@ -16,6 +17,7 @@ pub mod session;
 pub use approval::*;
 pub use channel::*;
 pub use id::*;
+pub use image::*;
 pub use message::*;
 pub use provider::*;
 pub use routing::*;

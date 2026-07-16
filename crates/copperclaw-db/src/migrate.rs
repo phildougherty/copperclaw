@@ -105,6 +105,10 @@ const CENTRAL: &[Migration] = &[
         name: "026_container_config_verify_gate",
         sql: include_str!("../migrations/026_container_config_verify_gate.sql"),
     },
+    Migration {
+        name: "027_container_config_image_profile",
+        sql: include_str!("../migrations/027_container_config_image_profile.sql"),
+    },
 ];
 
 const SESSION_INBOUND: &[Migration] = &[

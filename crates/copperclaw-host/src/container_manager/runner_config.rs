@@ -763,6 +763,7 @@ mod tests {
             preview_bind: None,
             check_command: None,
             verify_gate: true,
+            image_profile: copperclaw_types::ImageProfile::Minimal,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -823,6 +824,7 @@ mod tests {
             preview_bind: None,
             check_command: None,
             verify_gate: true,
+            image_profile: copperclaw_types::ImageProfile::Minimal,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -876,6 +878,7 @@ mod tests {
             preview_bind: None,
             check_command: None,
             verify_gate: true,
+            image_profile: copperclaw_types::ImageProfile::Minimal,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -922,6 +925,7 @@ mod tests {
             preview_bind: None,
             check_command: None,
             verify_gate: true,
+            image_profile: copperclaw_types::ImageProfile::Minimal,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -1054,6 +1058,7 @@ mod tests {
             preview_bind: None,
             check_command: None,
             verify_gate: true,
+            image_profile: copperclaw_types::ImageProfile::Minimal,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -1094,6 +1099,7 @@ mod tests {
             preview_bind: None,
             check_command: None,
             verify_gate: true,
+            image_profile: copperclaw_types::ImageProfile::Minimal,
             updated_at: chrono::Utc::now(),
         }
     }
@@ -1490,6 +1496,7 @@ mod tests {
             preview_bind: None,
             check_command: None,
             verify_gate: true,
+            image_profile: copperclaw_types::ImageProfile::Minimal,
             updated_at: chrono::Utc::now(),
         }
     }

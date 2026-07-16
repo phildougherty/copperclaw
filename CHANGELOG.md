@@ -6,6 +6,46 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M18 E2 — warm "prototyping" image variant, 2026-07-16)
+
+- A second, per-group container image profile, `image_profile = minimal |
+  prototyping` (default `minimal`, secure-by-default). `prototyping` bakes a
+  warm web-prototyping toolchain into the session image so the first "build me
+  a web app" doesn't burn its opening minutes bootstrapping (and, since
+  containers have no apt egress at runtime, so the tools are present rather
+  than un-installable): `sqlite3`, headless `chromium` (doubles as a
+  browser-render fallback), and `zip` via apt, plus global `vite` /
+  `create-vite` pre-seeded through the existing `npm install -g` mechanism.
+- `crates/copperclaw-types/src/image.rs` (new): the shared `ImageProfile`
+  enum + the `PROTOTYPING_APT_PACKAGES` / `PROTOTYPING_NPM_PACKAGES` bundles
+  (single source of truth; both `copperclaw-db` and `copperclaw-container-rt`
+  consume it without depending on each other).
+- Migration `027_container_config_image_profile.sql`: `container_configs`
+  gains a nullable `image_profile TEXT` column (NULL reads back as `minimal`,
+  so existing groups are untouched on upgrade). Registered in
+  `crates/copperclaw-db/src/migrate.rs`'s CENTRAL list.
+- `crates/copperclaw-db/src/tables/container_configs.rs`: `ContainerConfig` /
+  `UpsertContainerConfig` carry `image_profile: ImageProfile`; narrow setter
+  `set_image_profile`. UNLIKE `tool_profile` / `verify_gate` /
+  `surface_thinking`, `image_profile` IS folded into `compute_fingerprint`
+  (it changes baked packages, so it must trigger a rebuild) — folded
+  CONDITIONALLY so a `minimal` config hashes byte-identically to a pre-E2 one
+  (no mass rebuild on upgrade), while a profile change flips the fingerprint.
+- `crates/copperclaw-container-rt/src/build.rs`: `ImageBuildSpec` carries the
+  profile; `effective_apt_packages` / `effective_npm_packages` append the
+  profile's extras, and both `dockerfile()` and `fingerprint()` render/hash
+  through them. `crates/copperclaw-host/src/container_manager/spawn.rs`'s
+  `rebuild_image` threads `cfg.image_profile` into the build spec.
+- `crates/copperclaw-setup/src/steps/image.rs`: the image step asks once for
+  the base image's profile (`COPPERCLAW_SETUP_IMAGE_PROFILE`, default
+  `minimal`) and bakes it via `default_spec(profile)`; the choice is recorded
+  on `SetupConfig.image_profile`. Idempotent — the same answer maps to the
+  same fingerprint/tag.
+- Operators set it per group via
+  `cclaw groups config update --field 'image_profile="prototyping"' <id>`
+  (`crates/copperclaw-host/src/handlers/groups.rs`, validated against the
+  known profile names); a spawned child agent inherits its parent's profile.
+
 ### Changed (M18 R4 — compaction that survives long builds, 2026-07-16)
 
 - `crates/copperclaw-runner/src/compaction.rs`: (a) the token estimator
