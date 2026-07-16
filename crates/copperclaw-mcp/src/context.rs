@@ -69,9 +69,41 @@ pub enum Recipient {
     },
 }
 
+/// Where an `install_packages` request applies.
+///
+/// `Image` (the historical default) records the packages into the group's
+/// pending `container_configs` so the *next* container spawn bakes them into
+/// the image. `Session` additionally runs an ecosystem-appropriate LOCAL
+/// install into the session's persistent `/data` **now** (a venv for pip, a
+/// prefixed global for npm) so the package is usable in the *current* session
+/// without waiting for a rebuild — the "works now, permanent later" default
+/// the agent actually wants. Bakeable ecosystems (apt/npm) are still recorded
+/// for the next image even under `Session`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum InstallScope {
+    /// Record into the pending image config; applies at the next spawn.
+    #[default]
+    Image,
+    /// Install into the session's `/data` now AND record bakeables for the
+    /// next image.
+    Session,
+}
+
+impl InstallScope {
+    /// Stable token for the wire payload / logging.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Image => "image",
+            Self::Session => "session",
+        }
+    }
+}
+
 /// A single self-mod install request. The runner translates this into an
 /// approval request and ultimately a privileged action.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct InstallSpec {
     /// `apt` package names.
     pub apt: Vec<String>,
@@ -79,6 +111,10 @@ pub struct InstallSpec {
     pub npm: Vec<String>,
     /// Human-readable reason for the install (required, audited).
     pub reason: String,
+    /// Where the request applies (see [`InstallScope`]). Defaults to
+    /// [`InstallScope::Image`] for backward compatibility.
+    #[serde(default)]
+    pub scope: InstallScope,
 }
 
 /// A request to register a new MCP server with the host for this agent.
@@ -1138,6 +1174,7 @@ mod tests {
                     apt: vec![],
                     npm: vec![],
                     reason: "r".into(),
+                    scope: InstallScope::Image,
                 }),
                 "install_packages",
             ),

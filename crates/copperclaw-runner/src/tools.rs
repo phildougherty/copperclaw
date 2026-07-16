@@ -1577,6 +1577,10 @@ fn apply_install_packages(
             "apt": spec.apt,
             "npm": spec.npm,
             "reason": spec.reason,
+            // M18 E1: carry the scope through so the host apply path can note
+            // whether a session-local install already ran (the apt/npm merge
+            // itself is scope-independent — it always feeds the next image).
+            "scope": spec.scope.as_str(),
         }
     });
     insert_row(conn, MessageKind::System, payload)?;
@@ -2974,6 +2978,7 @@ mod tests {
                 apt: vec!["jq".into()],
                 npm: vec!["zod".into()],
                 reason: "needed for x".into(),
+                scope: copperclaw_mcp::context::InstallScope::Image,
             }))
             .await
             .unwrap();

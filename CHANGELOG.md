@@ -6,6 +6,45 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M18 E1 — session-local installs that work *this* turn, 2026-07-16)
+
+- `install_packages` gains a `scope` field (`"image"` default — unchanged — or
+  `"session"`) plus a `pip` array, so an agent mid-build can get a package
+  usable **now** instead of only after the next image rebuild.
+  - `crates/copperclaw-mcp/src/context.rs`: new `InstallScope` enum
+    (`Image` | `Session`, default `Image`) and a `scope` field on `InstallSpec`
+    (`#[serde(default)]`, so old payloads deserialize unchanged); re-exported
+    from the crate root.
+  - `crates/copperclaw-mcp/src/tools/self_mod.rs`: `scope: "session"` runs the
+    ecosystem-appropriate LOCAL install into the session's persistent `/data`
+    **in-container, now** — `python3 -m venv /data/.venv` + `pip install` for
+    `pip`, `npm install -g --prefix /data/.npm-global` for `npm` — and reports
+    the activation line (`source /data/.venv/bin/activate` /
+    `export PATH=/data/.npm-global/bin:$PATH`). Bakeable ecosystems (apt/npm)
+    are ALSO recorded for the next image via the existing approval/config-merge
+    path ("works now, permanent later"); pip lives durably in `/data` (which
+    survives respawns for the session) and has no image bake dimension, so it is
+    session-only and is rejected under `scope: "image"`. The ack text is a
+    two-state machine — *pending image build* (image scope) vs *installed now*
+    (session scope, with the activation line).
+  - **New deny-default egress hint:** when a session install can't reach its
+    registry (DNS/nftables denial — previously a raw, unactionable network
+    error), the tool error now carries the exact remediation, e.g.
+    `cclaw groups config set-egress-allow <agent-group-id> --allow pypi.org:443
+    --allow files.pythonhosted.org:443`.
+  - `crates/copperclaw-runner/src/tools.rs`: the outbound `install_packages`
+    row carries `scope` so the host apply path can flavour its response.
+  - `crates/copperclaw-host/src/handlers/approvals.rs`: `apply_install_packages`
+    reads `scope`, still merges the bakeable apt/npm into `container_configs`
+    regardless of scope, and echoes a session-flavoured rebuild note (the
+    session copy is already live under `/data`).
+  - The `scope: "session"` local install runs in-container because the
+    `ContainerRuntime` trait exposes no host→container exec primitive; the
+    execution is split behind a `SessionInstaller` trait so the schema-parse,
+    ack-text state machine, egress-hint construction, and config-merge paths are
+    covered by ordinary unit tests, with the real pip/npm run gated behind an
+    `#[ignore]`d Docker-integration test (opt in with `--ignored`).
+
 ### Added (M18 X2 — close the golden-fixture gaps, 2026-07-16)
 
 - The M18 program-acceptance golden fixture now covers the two legs X1

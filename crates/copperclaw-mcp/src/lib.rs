@@ -29,7 +29,7 @@ pub mod tools;
 pub use client::{FilteredMcpClient, McpClient, McpToolTransport, RemoteTool, SharedMcpClient};
 pub use context::{
     AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec, EditMessageSpec,
-    EmitTodoListSpec, InstallSpec, MemoryHitView, MemorySearchSpec, MockToolContext,
+    EmitTodoListSpec, InstallScope, InstallSpec, MemoryHitView, MemorySearchSpec, MockToolContext,
     OriginatingChannel, OutboundToolEffect, Recipient, SUBAGENT_MAX_TOKENS_LIMIT,
     SUBAGENT_MAX_TURNS_LIMIT, SUBAGENT_WALL_CLOCK_SECS, ScheduleSpec, SendCardSpec, SendFileSpec,
     SendMessageSpec, SubagentRequest, SubagentResult, SubagentToolCall, TaskSummary, ToolContext,
