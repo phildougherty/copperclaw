@@ -4,8 +4,8 @@ use crate::api::GchatApi;
 use crate::emoji::emoji_codepoint;
 use async_trait::async_trait;
 use copperclaw_channels_core::{
-    AdapterError, Breadcrumb, BreadcrumbStatus, ChannelAdapter, DiffCard, DmHandle, ErrorCard,
-    ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList,
+    AdapterError, Breadcrumb, BreadcrumbStatus, Card, CardButton, ChannelAdapter, DiffCard,
+    DmHandle, ErrorCard, ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList,
 };
 use copperclaw_types::{ChannelType, OutboundMessage};
 use serde_json::{Value, json};
@@ -177,6 +177,31 @@ impl ChannelAdapter for GchatAdapter {
         } else {
             self.api.send_text(space, &text).await?
         };
+        Ok(Some(resp.name))
+    }
+
+    /// Native portable-card renderer — builds a Google Chat Cards v2
+    /// card from the canonical [`Card`] and POSTs it via
+    /// `spaces.messages.create`. Before this override the M18 approval /
+    /// ritual cards fell through to [`Card::to_text_fallback`] and
+    /// rendered as plain prose; now they render structurally: `title` as
+    /// the card header, `body` / `fields` as widgets, and `buttons` as a
+    /// native `buttonList` (URL buttons open the link; callback buttons
+    /// fire a `CARD_CLICKED` the events router surfaces inbound). See
+    /// [`build_portable_card`] for the full mapping.
+    ///
+    /// `to` is a DM-open hint we don't model here — Google Chat DM
+    /// spaces are addressed directly via `platform_id`.
+    async fn deliver_card(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        card: &Card,
+        _to: Option<&str>,
+    ) -> Result<Option<String>, AdapterError> {
+        let built = build_portable_card(card);
+        let space = Self::space_segment(platform_id)?;
+        let resp = self.api.send_card(space, "card", &built).await?;
         Ok(Some(resp.name))
     }
 
@@ -848,6 +873,109 @@ pub(crate) fn build_todo_list_card(list: &TodoList) -> Value {
     })
 }
 
+/// Build a Google Chat Cards v2 card from the canonical portable
+/// [`Card`]. Mapping:
+///
+/// - `title` → card `header.title` (rendered as the card headline).
+/// - `body` → a `textParagraph` widget (HTML-escaped, `\n` → `<br>`).
+/// - `fields` → one `decoratedText` widget each (`topLabel` = label,
+///   `text` = value). The `inline` hint has no Cards-v2 side-by-side
+///   analog, so fields always render full-width — that single hint
+///   degrades to the text-fallback shape while everything else is native.
+/// - `image_url` → an `image` widget.
+/// - `buttons` → a native `buttonList` widget (see [`button_to_gchat`]):
+///   `url` buttons open the link, `value` buttons fire a `CARD_CLICKED`
+///   whose action carries the callback value.
+///
+/// A card with only a title yields a header and no `sections`, which is
+/// a valid Cards v2 card; the [`Card`] validator guarantees at least one
+/// of title / body / fields / image so the result is never empty.
+pub(crate) fn build_portable_card(card: &Card) -> Value {
+    let mut widgets: Vec<Value> = Vec::new();
+    if let Some(body) = card
+        .body
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+    {
+        let html = escape_html_gchat(body).replace('\n', "<br>");
+        widgets.push(json!({ "textParagraph": { "text": html } }));
+    }
+    for f in &card.fields {
+        widgets.push(json!({
+            "decoratedText": {
+                "topLabel": escape_html_gchat(f.label.trim()),
+                "text": escape_html_gchat(&f.value),
+            }
+        }));
+    }
+    if let Some(img) = card
+        .image_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    {
+        widgets.push(json!({ "image": { "imageUrl": img } }));
+    }
+    if !card.buttons.is_empty() {
+        let buttons: Vec<Value> = card.buttons.iter().filter_map(button_to_gchat).collect();
+        if !buttons.is_empty() {
+            widgets.push(json!({ "buttonList": { "buttons": buttons } }));
+        }
+    }
+
+    let mut out = serde_json::Map::new();
+    if let Some(title) = card
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        out.insert("header".to_owned(), json!({ "title": title }));
+    }
+    if !widgets.is_empty() {
+        out.insert("sections".to_owned(), json!([{ "widgets": widgets }]));
+    }
+    Value::Object(out)
+}
+
+/// Map one canonical [`CardButton`] to a Google Chat Cards v2 button.
+/// `url` buttons open the link (`onClick.openLink`); `value` buttons
+/// post a `CARD_CLICKED` back to the bot (`onClick.action.function`
+/// carrying the callback value, which the events router surfaces as an
+/// inbound `action`). Returns `None` for the malformed "both / neither"
+/// shapes the [`Card`] validator already rejects upstream — defensive
+/// only.
+fn button_to_gchat(btn: &CardButton) -> Option<Value> {
+    let mut elem = serde_json::Map::new();
+    elem.insert("text".to_owned(), Value::String(btn.label.clone()));
+    match (btn.value.as_deref(), btn.url.as_deref()) {
+        (Some(v), None) => {
+            elem.insert("onClick".to_owned(), json!({ "action": { "function": v } }));
+            if let Some(color) = button_color_gchat(btn.style.as_deref()) {
+                elem.insert("color".to_owned(), color);
+            }
+        }
+        (None, Some(u)) => {
+            elem.insert("onClick".to_owned(), json!({ "openLink": { "url": u } }));
+        }
+        (Some(_), Some(_)) | (None, None) => return None,
+    }
+    Some(Value::Object(elem))
+}
+
+/// Map a canonical button style to a Cards v2 button `color` (float
+/// RGBA). Only `primary` / `danger` carry a colour; every other (or
+/// absent) style renders the platform default. URL buttons ignore style
+/// entirely — they use Google Chat's default link affordance.
+fn button_color_gchat(style: Option<&str>) -> Option<Value> {
+    match style {
+        Some("primary") => Some(json!({ "red": 0.26, "green": 0.52, "blue": 0.96, "alpha": 1.0 })),
+        Some("danger") => Some(json!({ "red": 0.85, "green": 0.19, "blue": 0.15, "alpha": 1.0 })),
+        _ => None,
+    }
+}
+
 /// Google Chat's text-paragraph HTML subset uses the same five XML
 /// escapes as Telegram; mirrors that pattern so user-supplied stderr /
 /// tracebacks can't break the parser.
@@ -1040,6 +1168,141 @@ mod tests {
         };
         let id = adapter.deliver("spaces/AAA", None, &msg).await.unwrap();
         assert_eq!(id.as_deref(), Some("spaces/AAA/messages/CARD2"));
+    }
+
+    // ── Native portable card (U4) rendering ───────────────────────
+
+    fn approval_card() -> Card {
+        Card {
+            title: Some("Approve deploy?".into()),
+            body: Some("Runner wants to push to prod.".into()),
+            fields: vec![copperclaw_channels_core::CardField {
+                label: "Service".into(),
+                value: "api".into(),
+                inline: false,
+            }],
+            buttons: vec![
+                CardButton {
+                    label: "Approve".into(),
+                    value: Some("approve:1".into()),
+                    url: None,
+                    style: Some("primary".into()),
+                },
+                CardButton {
+                    label: "Deny".into(),
+                    value: Some("deny:1".into()),
+                    url: None,
+                    style: Some("danger".into()),
+                },
+                CardButton {
+                    label: "Diff".into(),
+                    value: None,
+                    url: Some("https://example.com/diff".into()),
+                    style: None,
+                },
+            ],
+            image_url: None,
+        }
+    }
+
+    #[test]
+    fn build_portable_card_maps_all_sections() {
+        let built = super::build_portable_card(&approval_card());
+        // Title becomes the card header.
+        assert_eq!(built["header"]["title"], "Approve deploy?");
+        let widgets = built["sections"][0]["widgets"].as_array().unwrap();
+        // body paragraph, one field, one buttonList.
+        assert_eq!(widgets.len(), 3);
+        assert_eq!(
+            widgets[0]["textParagraph"]["text"],
+            "Runner wants to push to prod."
+        );
+        assert_eq!(widgets[1]["decoratedText"]["topLabel"], "Service");
+        assert_eq!(widgets[1]["decoratedText"]["text"], "api");
+        let buttons = widgets[2]["buttonList"]["buttons"].as_array().unwrap();
+        assert_eq!(buttons.len(), 3);
+        // Callback button → onClick.action.function carries the value.
+        assert_eq!(buttons[0]["text"], "Approve");
+        assert_eq!(buttons[0]["onClick"]["action"]["function"], "approve:1");
+        // primary style → blue-ish colour present.
+        assert!(buttons[0].get("color").is_some());
+        // danger style also coloured.
+        assert!(buttons[1].get("color").is_some());
+        // URL button → onClick.openLink, and no style colour.
+        assert_eq!(
+            buttons[2]["onClick"]["openLink"]["url"],
+            "https://example.com/diff"
+        );
+        assert!(buttons[2].get("color").is_none());
+    }
+
+    #[test]
+    fn build_portable_card_escapes_body_and_fields() {
+        let card = Card {
+            title: Some("t".into()),
+            body: Some("line1\n<b>x</b>".into()),
+            fields: vec![copperclaw_channels_core::CardField {
+                label: "<k>".into(),
+                value: "<v>".into(),
+                inline: false,
+            }],
+            ..Card::default()
+        };
+        let built = super::build_portable_card(&card);
+        let widgets = built["sections"][0]["widgets"].as_array().unwrap();
+        // `\n` → `<br>`, angle brackets escaped.
+        assert_eq!(
+            widgets[0]["textParagraph"]["text"],
+            "line1<br>&lt;b&gt;x&lt;/b&gt;"
+        );
+        assert_eq!(widgets[1]["decoratedText"]["topLabel"], "&lt;k&gt;");
+        assert_eq!(widgets[1]["decoratedText"]["text"], "&lt;v&gt;");
+    }
+
+    #[test]
+    fn build_portable_card_title_only_has_no_sections() {
+        let card = Card {
+            title: Some("just a title".into()),
+            ..Card::default()
+        };
+        let built = super::build_portable_card(&card);
+        assert_eq!(built["header"]["title"], "just a title");
+        assert!(built.get("sections").is_none());
+    }
+
+    #[tokio::test]
+    async fn deliver_card_posts_native_cards_v2() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/spaces/AAA/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "spaces/AAA/messages/PC"
+            })))
+            .mount(&server)
+            .await;
+        let adapter = adapter_for(&server);
+        let id = adapter
+            .deliver_card("spaces/AAA", None, &approval_card(), None)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("spaces/AAA/messages/PC"));
+        let req_body: serde_json::Value = serde_json::from_slice(
+            &server
+                .received_requests()
+                .await
+                .unwrap()
+                .last()
+                .unwrap()
+                .body,
+        )
+        .unwrap();
+        let card_v2 = &req_body["cardsV2"][0];
+        assert_eq!(card_v2["cardId"], "card");
+        assert_eq!(card_v2["card"]["header"]["title"], "Approve deploy?");
+        let buttons = card_v2["card"]["sections"][0]["widgets"][2]["buttonList"]["buttons"]
+            .as_array()
+            .unwrap();
+        assert_eq!(buttons.len(), 3);
     }
 
     #[tokio::test]

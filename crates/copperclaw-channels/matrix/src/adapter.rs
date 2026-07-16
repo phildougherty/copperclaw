@@ -10,8 +10,8 @@ use crate::factory::CHANNEL_TYPE_STR;
 use crate::sync::{NEXT_BATCH_FILENAME, run_sync_loop};
 use async_trait::async_trait;
 use copperclaw_channels_core::{
-    AdapterError, Breadcrumb, BreadcrumbStatus, ChannelAdapter, DiffCard, DmHandle, ErrorCard,
-    ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList,
+    AdapterError, Breadcrumb, BreadcrumbStatus, Card, ChannelAdapter, DiffCard, DmHandle,
+    ErrorCard, ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList,
 };
 use copperclaw_types::{ChannelType, InboundEvent, OutboundMessage};
 use serde_json::Value;
@@ -247,6 +247,32 @@ impl ChannelAdapter for MatrixAdapter {
             self.api.send_text(&room_id, &text).await?
         };
         Ok(Some(sent.event_id))
+    }
+
+    /// Native portable-card renderer — Matrix has no interactive-button
+    /// primitive, so the card degrades to an `m.text` HTML event whose
+    /// `formatted_body` carries the title / body / fields, with buttons
+    /// rendered as labelled links (the "buttons-as-links fallback"):
+    /// `url` buttons become real `<a href>` anchors, `value` (callback)
+    /// buttons degrade to a labelled `callback:<value>` line — the same
+    /// shape as [`Card::to_text_fallback`] but HTML. Before this override
+    /// the M18 approval / ritual cards fell through to the trait-level
+    /// text fallback and rendered as flat prose. The plain-text `body`
+    /// field carries the canonical text fallback so non-HTML clients
+    /// still render sensibly. `m.text` (not `m.notice`) so approval cards
+    /// raise a notification — same reasoning as the error-card renderer.
+    async fn deliver_card(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        card: &Card,
+        _to: Option<&str>,
+    ) -> Result<Option<String>, AdapterError> {
+        let room_id = self.resolve_room(platform_id).await?;
+        let html = render_card_html_matrix(card);
+        let plain = card.to_text_fallback();
+        let resp = self.api.send_html(&room_id, &plain, &html).await?;
+        Ok(Some(resp.event_id))
     }
 
     /// Native breadcrumb chip — rendered as an `m.notice` HTML event
@@ -858,6 +884,108 @@ pub(crate) fn render_todo_list_html_matrix(list: &TodoList) -> String {
     out
 }
 
+/// Render the canonical portable [`Card`] as Matrix HTML
+/// `formatted_body`. Matrix has no native button widget, so the layout
+/// mirrors [`Card::to_text_fallback`]'s section ordering (title, body,
+/// fields, buttons, image) but in HTML:
+///
+/// - `title` → `<b>…</b>`.
+/// - `body` → escaped text, `\n` → `<br>`.
+/// - `fields` → a `<ul>` of `<li><b>label</b>: value</li>`.
+/// - `buttons` → a `<b>Buttons:</b>` list; `url` buttons become real
+///   `<a href>` anchors (the "buttons-as-links" degrade), `value`
+///   (callback) buttons render `label — <code>callback:value</code>`
+///   since Matrix can't wire a tap back.
+/// - `image_url` → a labelled `[image]` link.
+///
+/// Every dynamic field is HTML-escaped individually; the quote-escaping
+/// in [`escape_html_matrix`] also prevents a button `url` from breaking
+/// out of the `href` attribute (the [`Card`] validator already restricts
+/// URLs to http/https upstream).
+pub(crate) fn render_card_html_matrix(card: &Card) -> String {
+    let mut out = String::with_capacity(160);
+    if let Some(t) = card
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        out.push_str("<b>");
+        out.push_str(&escape_html_matrix(t));
+        out.push_str("</b>");
+    }
+    if let Some(b) = card
+        .body
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+    {
+        if !out.is_empty() {
+            out.push_str("<br>");
+        }
+        out.push_str(&escape_html_matrix(b).replace('\n', "<br>"));
+    }
+    if !card.fields.is_empty() {
+        if !out.is_empty() {
+            out.push_str("<br>");
+        }
+        out.push_str("<ul>");
+        for f in &card.fields {
+            out.push_str("<li><b>");
+            out.push_str(&escape_html_matrix(f.label.trim()));
+            out.push_str("</b>: ");
+            out.push_str(&escape_html_matrix(&f.value));
+            out.push_str("</li>");
+        }
+        out.push_str("</ul>");
+    }
+    if !card.buttons.is_empty() {
+        if !out.is_empty() {
+            out.push_str("<br>");
+        }
+        out.push_str("<b>Buttons:</b><ul>");
+        for b in &card.buttons {
+            out.push_str("<li>");
+            match (b.value.as_deref(), b.url.as_deref()) {
+                (None, Some(u)) => {
+                    out.push_str("<a href=\"");
+                    out.push_str(&escape_html_matrix(u));
+                    out.push_str("\">");
+                    out.push_str(&escape_html_matrix(b.label.trim()));
+                    out.push_str("</a>");
+                }
+                (Some(v), None) => {
+                    out.push_str(&escape_html_matrix(b.label.trim()));
+                    out.push_str(" — <code>callback:");
+                    out.push_str(&escape_html_matrix(v));
+                    out.push_str("</code>");
+                }
+                // Malformed shapes the validator rejects upstream — render
+                // just the label rather than panic.
+                (Some(_), Some(_)) | (None, None) => {
+                    out.push_str(&escape_html_matrix(b.label.trim()));
+                }
+            }
+            out.push_str("</li>");
+        }
+        out.push_str("</ul>");
+    }
+    if let Some(img) = card
+        .image_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    {
+        if !out.is_empty() {
+            out.push_str("<br>");
+        }
+        out.push_str("<a href=\"");
+        out.push_str(&escape_html_matrix(img));
+        out.push_str("\">[image]</a>");
+    }
+    out
+}
+
 fn escape_html_matrix(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -1138,6 +1266,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(id.as_deref(), Some("$h2:m.org"));
+        adapter.shutdown().await;
+    }
+
+    // ── Native portable card (U4) rendering ───────────────────────
+
+    fn approval_card() -> Card {
+        Card {
+            title: Some("Approve deploy?".into()),
+            body: Some("Runner wants to push to prod.".into()),
+            fields: vec![copperclaw_channels_core::CardField {
+                label: "Service".into(),
+                value: "api".into(),
+                inline: false,
+            }],
+            buttons: vec![
+                copperclaw_channels_core::CardButton {
+                    label: "Approve".into(),
+                    value: Some("approve:1".into()),
+                    url: None,
+                    style: Some("primary".into()),
+                },
+                copperclaw_channels_core::CardButton {
+                    label: "Diff".into(),
+                    value: None,
+                    url: Some("https://example.com/diff".into()),
+                    style: None,
+                },
+            ],
+            image_url: None,
+        }
+    }
+
+    #[test]
+    fn render_card_html_matrix_maps_all_sections() {
+        let html = super::render_card_html_matrix(&approval_card());
+        assert!(html.contains("<b>Approve deploy?</b>"));
+        assert!(html.contains("Runner wants to push to prod."));
+        // Field row.
+        assert!(html.contains("<li><b>Service</b>: api</li>"));
+        // URL button → real anchor.
+        assert!(html.contains("<a href=\"https://example.com/diff\">Diff</a>"));
+        // Callback button → labelled callback code, no anchor.
+        assert!(html.contains("Approve — <code>callback:approve:1</code>"));
+    }
+
+    #[test]
+    fn render_card_html_matrix_escapes_and_breaks() {
+        let card = Card {
+            title: Some("<t>".into()),
+            body: Some("l1\n<b>x</b>".into()),
+            image_url: Some("https://ex.com/i.png".into()),
+            ..Card::default()
+        };
+        let html = super::render_card_html_matrix(&card);
+        assert!(html.contains("<b>&lt;t&gt;</b>"));
+        // `\n` → `<br>`, inner markup escaped.
+        assert!(html.contains("l1<br>&lt;b&gt;x&lt;/b&gt;"));
+        // Image degrades to a labelled link.
+        assert!(html.contains("<a href=\"https://ex.com/i.png\">[image]</a>"));
+    }
+
+    #[tokio::test]
+    async fn deliver_card_sends_html_and_text_fallback() {
+        let s = MockServer::start().await;
+        mount_empty_sync(&s).await;
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
+            .and(wiremock::matchers::body_string_contains("\"m.text\""))
+            .and(wiremock::matchers::body_string_contains(
+                "\"formatted_body\"",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "event_id": "$card:m.org"
+            })))
+            .mount(&s)
+            .await;
+        let (adapter, _dir, _rx) = build_adapter(&s.uri());
+        let id = adapter
+            .deliver_card("!a:m.org", None, &approval_card(), None)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("$card:m.org"));
+        // Plain-text `body` carries the canonical text fallback. Select
+        // the message-send PUT specifically — the mock also fields
+        // background `/sync` GETs, so `.last()` can race onto a sync poll.
+        let req = s.received_requests().await.unwrap();
+        let sent = req
+            .iter()
+            .rfind(|r| r.method == wiremock::http::Method::PUT)
+            .expect("a message-send PUT was recorded");
+        let body: serde_json::Value = serde_json::from_slice(&sent.body).unwrap();
+        let plain = body["body"].as_str().unwrap();
+        assert!(plain.contains("**Approve deploy?**"));
+        assert!(plain.contains("[Approve] -> callback:approve:1"));
         adapter.shutdown().await;
     }
 

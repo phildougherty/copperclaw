@@ -6,6 +6,38 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M19 U4 — Native cards on gchat + matrix, 2026-07-16)
+
+- Neither `gchat` nor `matrix` overrode the trait
+  `ChannelAdapter::deliver_card`, so the M18 approval / ritual cards fell through
+  to the trait-level `Card::to_text_fallback` and rendered as flat prose on both.
+  Both now render the canonical [`Card`] natively:
+  - `GchatAdapter` overrides trait `deliver_card`
+    (`crates/copperclaw-channels/gchat/src/adapter.rs`), building a Google Chat
+    Cards v2 card via the new `build_portable_card` helper and POSTing it through
+    the existing `send_card` path (`cardId = "card"`). `title` → card
+    `header.title`; `body` → a `textParagraph` widget (HTML-escaped, `\n` →
+    `<br>`); `fields` → one `decoratedText` widget each; `image_url` → an `image`
+    widget; `buttons` → a native `buttonList` — URL buttons open the link
+    (`onClick.openLink`), callback buttons fire a `CARD_CLICKED` whose
+    `onClick.action.function` carries the value (surfaced inbound by the events
+    router), with `primary` / `danger` styles mapped to a button `color`. The
+    `CardField.inline` hint has no Cards-v2 analog, so fields stay full-width —
+    the one field that degrades to its text-fallback shape.
+  - `MatrixAdapter` overrides trait `deliver_card`
+    (`crates/copperclaw-channels/matrix/src/adapter.rs`), rendering the card as an
+    `m.text` HTML event whose `formatted_body` is built by the new
+    `render_card_html_matrix` helper. Matrix has no native button primitive, so
+    buttons degrade to labelled links (the buttons-as-links fallback): `url`
+    buttons become real `<a href>` anchors, `value` buttons render
+    `label — <code>callback:value</code>` — the same shape as
+    `Card::to_text_fallback` but HTML. `m.text` (not `m.notice`) so approval
+    cards raise a notification, matching the error-card renderer; the plain-text
+    `body` field carries the canonical text fallback for non-HTML clients. Builds
+    on the F1 `edit_message` override already present on matrix (unchanged).
+  - Unit + mock-server tests on both adapters cover the field/button mapping,
+    HTML escaping, URL-vs-callback button rendering, and the text fallback.
+
 ### Added (M19 U2 — Teams in-place edit + reactions, 2026-07-16)
 
 - The `teams` adapter rendered every rich surface (cards / diffs / collapsible /
