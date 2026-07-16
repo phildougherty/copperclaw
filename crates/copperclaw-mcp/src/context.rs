@@ -139,6 +139,23 @@ pub struct CreateAgentSpec {
     pub channel: Option<String>,
 }
 
+/// Spec for `delegate` — the middle-tier write-capable build worker.
+///
+/// A `delegate` is lighter and more contained than a `create_agent`
+/// sibling: it is NOT wired into any channel and it reports ONLY back to
+/// the spawning parent (never into the user's chat), but — unlike the
+/// read-only `explore` subagent — it gets a WRITABLE git worktree of the
+/// parent's repo (same mechanics as `create_agent`) so it can build and
+/// commit in isolation. It carries no `channel` field precisely because
+/// it is never user-facing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateSpec {
+    /// Display name for the worker (also the folder slug seed).
+    pub name: String,
+    /// Build instructions / task for the worker.
+    pub instructions: String,
+}
+
 /// Spec for `schedule_task`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScheduleSpec {
@@ -313,6 +330,8 @@ pub enum OutboundToolEffect {
     EmitTodoList(EmitTodoListSpec),
     /// `create_agent`.
     CreateAgent(CreateAgentSpec),
+    /// `delegate` — spawn a write-capable, parent-only build worker.
+    Delegate(DelegateSpec),
     /// `install_packages`.
     InstallPackages(InstallSpec),
     /// `add_mcp_server`.
@@ -352,6 +371,7 @@ impl OutboundToolEffect {
             Self::SendCard(_) => "send_card",
             Self::EmitTodoList(_) => "emit_todo_list",
             Self::CreateAgent(_) => "create_agent",
+            Self::Delegate(_) => "delegate",
             Self::InstallPackages(_) => "install_packages",
             Self::AddMcpServer(_) => "add_mcp_server",
             Self::ScheduleTask(_) => "schedule_task",

@@ -60,10 +60,10 @@ use copperclaw_db::DbError;
 use copperclaw_db::attachments::safe_attachment_name;
 use copperclaw_db::tables::messages_out::{self, WriteOutbound};
 use copperclaw_mcp::{
-    AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec, EditMessageSpec,
-    EmitTodoListSpec, InstallSpec, OutboundToolEffect, Recipient, ScheduleSpec, SendCardSpec,
-    SendFileSpec, SendMessageSpec, SubagentRequest, SubagentResult, TaskSummary, ToolContext,
-    ToolEffectAck, ToolEntry, ToolError, UpdateTaskSpec,
+    AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec, DelegateSpec,
+    EditMessageSpec, EmitTodoListSpec, InstallSpec, OutboundToolEffect, Recipient, ScheduleSpec,
+    SendCardSpec, SendFileSpec, SendMessageSpec, SubagentRequest, SubagentResult, TaskSummary,
+    ToolContext, ToolEffectAck, ToolEntry, ToolError, UpdateTaskSpec,
 };
 use copperclaw_providers::AgentProvider;
 use copperclaw_types::{Effort, MessageId, MessageKind};
@@ -1066,6 +1066,7 @@ fn apply_effect(
         OutboundToolEffect::SendCard(spec) => apply_send_card(conn, spec, origin),
         OutboundToolEffect::EmitTodoList(spec) => apply_emit_todo_list(conn, spec, origin),
         OutboundToolEffect::CreateAgent(spec) => apply_create_agent(conn, spec),
+        OutboundToolEffect::Delegate(spec) => apply_delegate(conn, spec),
         OutboundToolEffect::InstallPackages(spec) => apply_install_packages(conn, spec),
         OutboundToolEffect::AddMcpServer(spec) => apply_add_mcp_server(conn, spec),
         OutboundToolEffect::ScheduleTask(spec) => apply_schedule_create(conn, spec),
@@ -1108,7 +1109,7 @@ pub(crate) fn breadcrumb_detail(name: &str, input: &serde_json::Value) -> Option
             }
         }
         "grep" | "glob" => field("pattern"),
-        "create_agent" => field("name").or_else(|| field("prompt")),
+        "create_agent" | "delegate" => field("name").or_else(|| field("prompt")),
         "add_mcp_server" => field("name"),
         "install_packages" => {
             // Two parallel arrays in this tool's input. Show the names
@@ -1564,6 +1565,24 @@ fn apply_create_agent(
     insert_row(conn, MessageKind::System, payload)?;
     // The host assigns the session id; we surface a synthetic placeholder so
     // the calling agent knows the request was queued.
+    Ok(ToolEffectAck::Accepted)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn apply_delegate(
+    conn: &mut Connection,
+    spec: DelegateSpec,
+) -> Result<ToolEffectAck, ToolApplyError> {
+    // The host's `delegate` delivery-action handler parses this row. It
+    // reuses the `create_agent` spawn + worktree mechanics but keeps the
+    // worker contained (no channel wiring, reports only to the parent).
+    let payload = serde_json::json!({
+        "delegate": {
+            "name": spec.name,
+            "instructions": spec.instructions,
+        }
+    });
+    insert_row(conn, MessageKind::System, payload)?;
     Ok(ToolEffectAck::Accepted)
 }
 
@@ -2968,6 +2987,27 @@ mod tests {
         let row = last_row(&ctx).await;
         assert_eq!(row.content["create_agent"]["name"], "n");
         assert_eq!(row.content["create_agent"]["channel"], "cli");
+    }
+
+    #[tokio::test]
+    async fn delegate_writes_system_row_and_accepts() {
+        let (_tmp, ctx) = fresh_ctx();
+        let ack = ctx
+            .emit_outbound(OutboundToolEffect::Delegate(DelegateSpec {
+                name: "builder".into(),
+                instructions: "build under /workspace".into(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(ack, ToolEffectAck::Accepted);
+        let row = last_row(&ctx).await;
+        assert_eq!(row.content["delegate"]["name"], "builder");
+        assert_eq!(
+            row.content["delegate"]["instructions"],
+            "build under /workspace"
+        );
+        // A delegate carries no channel binding — it is never user-facing.
+        assert!(row.content["delegate"].get("channel").is_none());
     }
 
     #[tokio::test]
