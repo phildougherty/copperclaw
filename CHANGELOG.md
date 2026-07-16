@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M20 D3 — `frontend-design` skill)
+
+- New `skills/frontend-design/SKILL.md` (6,659-byte body, well under the
+  8 KiB cap): a genuinely opinionated visual-design skill teaching typography
+  (one Inter/JetBrains-Mono pairing, a 4-5 stop 1.25-ratio type scale,
+  line-height/measure rules), spacing (one 4px/8px unit, whitespace as a
+  hierarchy signal, group-by-proximity), color (one saturated accent + a
+  neutral ramp, states derived from the accent, a WCAG-AA contrast floor,
+  dark-background desaturation), and layout (hierarchy-first, grid alignment,
+  max content widths, designed empty/loading/error states). Includes explicit
+  anti-generic rules (no default-blue gradient hero, no lorem ipsum, no
+  reflexive three-equal-cards row, one border-radius/shadow reused
+  everywhere, a constrained Tailwind palette) and an 8-question
+  **`## Critique checklist`** — the stable, grep-able heading the D4 see→fix
+  loop names when it points the agent at this skill after `ui_screenshot`.
+  Cross-referenced from `skills/web-app-scaffold/SKILL.md` (which already
+  forward-referenced this skill by name) and `skills/coding-task/SKILL.md`;
+  this card makes the target real. No Rust files touched; validates against
+  all 9 `crates/copperclaw-skills/tests/coverage.rs` checks (directory/name
+  match, description length, tool-reference resolution, alphabetical load
+  order, body-size cap, no unresolved template markers).
+
 ### Added (M20 Q1 — Bake the coding toolchain + design assets into the prototyping image)
 
 - The `Prototyping` image profile bundle (`crates/copperclaw-types/src/image.rs`)
