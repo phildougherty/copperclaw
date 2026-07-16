@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (M18 — todo store parallel-batch write race, 2026-07-16)
+
+- `crates/copperclaw-mcp/src/tools/todo.rs`: the `todo_*` store's
+  read-modify-write cycle was not concurrency-safe. R2's parallel tool-batch
+  execution can fire two `todo_add` / `todo_update` mutators from one batch
+  concurrently; both read the same pre-image (one mutation silently clobbered
+  the other — a lost update) and both wrote `write_all`'s single fixed sibling
+  tempfile `agent_todos.json.tmp` then renamed it into place (bytes interleaved
+  → corrupt JSON). Seen live as ~12 `todo store was unparseable … trailing
+  characters` + `could not quarantine corrupt todo store … No such file or
+  directory` warnings inside one long build, resetting todo state mid-run.
+  Two-part fix: (1) a process-wide `todo_write_lock` (`tokio::sync::Mutex`,
+  held across the whole read+mutate+write in every mutator — `add`, `update`,
+  `delete`) serializes mutators, fixing both the corruption and the lost
+  updates; (2) `write_all` now names its tempfile `<store>.tmp.<pid>.<seq>`
+  (pid + monotonic `AtomicU64`) so even an unlocked writer can't collide, as
+  defence in depth. On-disk format, quarantine-on-corrupt-read behaviour,
+  atomic-rename crash-safety, and the public tool API are unchanged. New
+  `concurrent_adds_never_corrupt_or_lose_updates` test fires eight concurrent
+  adds and asserts the store stays parseable with all eight items — it fails
+  against the pre-fix code (only one item survives) and passes with the lock.
+
 ### Added (M18 M1 — metrics rider: sweep of merged-PR metric wishes, 2026-07-16)
 
 - Swept the "Metrics wishes" recorded across merged M18 PRs #24-#54 into real
