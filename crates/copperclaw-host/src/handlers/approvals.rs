@@ -445,6 +445,14 @@ fn apply_channel(
 /// the affected group's `container_configs.packages_apt`/`packages_npm`.
 /// Returns a `rebuild_hint` in the side-effect payload — does NOT queue
 /// a rebuild itself.
+///
+/// M18 E1: the payload may carry a `scope` (`"image"` | `"session"`). The
+/// apt/npm merge is scope-independent — it always feeds the NEXT image build
+/// ("works later"). Under `"session"` the agent's `install_packages` tool has
+/// ALREADY run the local pip/npm install into the session's `/data` in-container
+/// ("works now"), so the side-effect payload records the scope and reflects
+/// that the session copy is already live (nothing here can re-run an
+/// in-container install — the runtime exposes no host→container exec).
 fn apply_install_packages(
     central: &CentralDb,
     row: &pending_approvals::PendingApproval,
@@ -455,6 +463,13 @@ fn apply_install_packages(
             "install_packages approval row is missing `agent_group_id`",
         )
     })?;
+    let scope = row
+        .payload
+        .get("scope")
+        .and_then(Value::as_str)
+        .unwrap_or("image")
+        .to_owned();
+    let session_scope = scope == "session";
     let apt_new = json_str_array(&row.payload, "apt");
     let npm_new = json_str_array(&row.payload, "npm");
     if apt_new.is_empty() && npm_new.is_empty() {
@@ -474,16 +489,29 @@ fn apply_install_packages(
         container_configs::add_package_npm(central, ag_id, p.clone()).map_err(db_err)?;
         added_npm.push(p);
     }
-    Ok(json!({
-        "kind": "install_packages",
-        "agent_group_id": ag_id.as_uuid().to_string(),
-        "added_apt": added_apt,
-        "added_npm": added_npm,
-        "rebuild_hint": format!(
+    let session_note = if session_scope {
+        // npm is baked here; the session copy under /data is already live from
+        // the tool's in-container install, so a rebuild is optional (not urgent).
+        format!(
+            "session-scope: npm already installed live under /data for the current \
+             session; merged into container_configs so a fresh session/group inherits \
+             it. Rebuild when convenient: `cclaw groups restart {}`",
+            ag_id.as_uuid()
+        )
+    } else {
+        format!(
             "packages merged into container_configs but NOT rebuilt; \
              run `cclaw groups restart {}` when convenient",
             ag_id.as_uuid()
-        ),
+        )
+    };
+    Ok(json!({
+        "kind": "install_packages",
+        "agent_group_id": ag_id.as_uuid().to_string(),
+        "scope": scope,
+        "added_apt": added_apt,
+        "added_npm": added_npm,
+        "rebuild_hint": session_note,
     }))
 }
 
@@ -884,6 +912,37 @@ mod tests {
         let cfg = container_configs::get(&db, ag).unwrap().unwrap();
         assert!(cfg.packages_apt.contains(&"jq".to_string()));
         assert!(cfg.packages_apt.contains(&"ripgrep".to_string()));
+        assert!(cfg.packages_npm.contains(&"typescript".to_string()));
+    }
+
+    #[test]
+    fn approve_install_packages_session_scope_still_merges_bakeables() {
+        // M18 E1: a session-scope request (npm already installed live
+        // in-container) must STILL merge the bakeable npm into the config so a
+        // fresh session/group inherits it. The side-effect echoes the scope
+        // and a session-flavoured rebuild note.
+        use copperclaw_db::tables::container_configs;
+        let db = db();
+        let ag = seed_ag(&db);
+        let id = insert_pending(
+            &db,
+            "install_packages",
+            UpsertPendingApproval {
+                request_id: "r-ip-session".into(),
+                payload: json!({"apt": [], "npm": ["typescript"], "scope": "session"}),
+                agent_group_id: Some(ag),
+                title: "install?".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        let v = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap();
+        assert_eq!(v["applied"], true);
+        assert_eq!(v["side_effect"]["kind"], "install_packages");
+        assert_eq!(v["side_effect"]["scope"], "session");
+        let hint = v["side_effect"]["rebuild_hint"].as_str().unwrap();
+        assert!(hint.contains("session-scope"));
+        let cfg = container_configs::get(&db, ag).unwrap().unwrap();
         assert!(cfg.packages_npm.contains(&"typescript".to_string()));
     }
 
