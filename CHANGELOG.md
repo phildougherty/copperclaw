@@ -6,6 +6,44 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M18 R5 — hot in-session provider failover, 2026-07-16)
+
+- The in-container runner now fails over between providers **mid-turn**
+  instead of dying with an apology when a gateway hiccups: a 20-minute build
+  no longer dies at minute 18 because one provider rate-limited. When the
+  primary provider exhausts its two in-provider retry layers,
+  `crates/copperclaw-runner/src/run/provider_call.rs`'s `run_llm_turn` now
+  walks a host-resolved ordered chain of healthy fallbacks
+  (`RunnerDeps::failover_chain`), retries the SAME LLM call against the next
+  entry, and only surfaces the terminal apology once the WHOLE chain is
+  exhausted. Each attempt reports its OWN `usage_report`
+  (`emit_usage_report` now takes the serving provider/model), so the host's
+  degrade/restore health fold stays authoritative — the failed primary is
+  degraded and the fallback that served stays healthy. An empty chain (the
+  default, and every unconfigured group) is byte-identical to the pre-R5
+  single-provider path. The switch is surfaced on the H1 Task HUD via
+  `TaskHud::add_note("switched to <provider>")` so a mid-run style change
+  isn't mistaken for confusion.
+- Host: `crates/copperclaw-host/src/container_manager/runner_config.rs`'s
+  `runner_config_for` resolves the ordered healthy chain at spawn
+  (`resolve_failover_chain_for_file`, backed by
+  `container_manager/provider_failover.rs::failover_alternates`) and writes
+  it into `runner.json`'s new `failover_chain` field (skipped when
+  empty/unconfigured — bit-identical shape otherwise). The runner parses it
+  (`crates/copperclaw-runner/src/config.rs`: `failover_chain` /
+  `FailoverEntryFile` / `FailoverProviderConfig`) and pre-builds the
+  alternate providers at startup (`main.rs::build_failover_chain`).
+- **Security boundary (in the PR):** the in-container failover chain is
+  limited to entries the container can ALREADY reach WITHOUT shipping a new
+  credential — no-auth local providers (ollama/codex), Anthropic-envelope
+  entries brokered by the existing capability token when the credential
+  broker is on, or Anthropic entries reusing the SAME `api_key_env` the
+  primary already injected. An Anthropic entry that would require a DIFFERENT
+  real key (a second account, broker off) is excluded and logged. The
+  container secret surface is never broadened for failover; alternates reuse
+  the primary's already-injected credential slot + endpoint and vary only
+  the model (and possibly the provider kind, to a local model).
+
 ### Added (M18 V1 — WebSocket pass-through in the preview proxy, 2026-07-16)
 
 - `crates/copperclaw-host/src/preview.rs`: the session-preview reverse proxy

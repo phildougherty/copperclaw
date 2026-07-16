@@ -463,6 +463,16 @@ pub struct RunnerDeps {
     /// [`Self::verify_gate`] for why this is also surfaced here rather
     /// than solely on the `ToolContext`.
     pub check_command_override: Option<String>,
+    /// M18 R5 hot in-session provider failover: pre-built alternate
+    /// providers, in priority order, the runner switches to mid-turn when
+    /// the primary ([`Self::provider`] / [`Self::model`]) exhausts its
+    /// in-provider retries. Built once at startup from
+    /// `runner.json`'s host-resolved `failover_chain` (see
+    /// [`crate::config::RunnerConfig::failover_chain`]). Empty (the
+    /// default, and for tests) keeps the historical single-provider
+    /// behaviour byte-identical. See
+    /// [`provider_call::run_llm_turn`] for the walk.
+    pub failover_chain: Vec<provider_call::FailoverProvider>,
 }
 
 /// Default per-tool-call deadline. Comfortably above an `npm install`
@@ -550,6 +560,9 @@ impl RunnerDeps {
             // hud_mode/policy above; tests opt out explicitly.
             verify_gate: true,
             check_command_override: None,
+            // No in-turn failover by default: tests that exercise the R5
+            // walk populate this explicitly.
+            failover_chain: Vec::new(),
         }
     }
 }
@@ -909,8 +922,16 @@ pub fn build_usage_report_payload(inputs: &UsageReportInputs<'_>) -> serde_json:
 /// delivery service intercepts this kind of system action (instead of
 /// dispatching it to a channel adapter) and writes the corresponding
 /// `agent_turns` row.
+///
+/// `provider_name` / `model` name the provider/model that ACTUALLY served
+/// this turn — which for an R5 hot-failover switch is a fallback entry,
+/// not `deps.provider`/`deps.model`. Reporting the serving entry keeps the
+/// host's health fold authoritative: the failed primary is degraded and
+/// the fallback that succeeded stays healthy.
 pub(in crate::run) async fn emit_usage_report(
     deps: &RunnerDeps,
+    provider_name: &str,
+    model: &str,
     input_tokens: u32,
     output_tokens: u32,
     started_at: chrono::DateTime<chrono::Utc>,
@@ -921,8 +942,8 @@ pub(in crate::run) async fn emit_usage_report(
         session_id: deps.session_id,
         agent_group_id: deps.agent_group_id,
         seq: deps.turn_seq.load(std::sync::atomic::Ordering::Relaxed),
-        model: &deps.model,
-        provider: deps.provider.name(),
+        model,
+        provider: provider_name,
         input_tokens,
         output_tokens,
         started_at,
@@ -2728,7 +2749,7 @@ mod tests {
         let deps = deps_with_provider(provider.clone(), Duration::from_secs(5));
 
         let started = std::time::Instant::now();
-        let result = query_with_retry(&deps, dummy_input()).await;
+        let result = query_with_retry(&deps, deps.provider.as_ref(), dummy_input()).await;
         let elapsed = started.elapsed();
         assert!(result.is_ok(), "expected Ok, got {:?}", result.map(|_| ()));
         assert_eq!(provider.attempts(), 2);
@@ -2748,7 +2769,7 @@ mod tests {
         ]);
         let deps = deps_with_provider(provider.clone(), Duration::from_secs(5));
 
-        let err = match query_with_retry(&deps, dummy_input()).await {
+        let err = match query_with_retry(&deps, deps.provider.as_ref(), dummy_input()).await {
             Ok(_) => panic!("expected terminal failure"),
             Err(e) => e,
         };
@@ -2761,7 +2782,7 @@ mod tests {
         let provider = PlanProvider::new(vec![PlanStep::Err(ProviderErrorKind::BadRequest)]);
         let deps = deps_with_provider(provider.clone(), Duration::from_secs(5));
 
-        let err = match query_with_retry(&deps, dummy_input()).await {
+        let err = match query_with_retry(&deps, deps.provider.as_ref(), dummy_input()).await {
             Ok(_) => panic!("expected terminal failure"),
             Err(e) => e,
         };
@@ -2789,7 +2810,7 @@ mod tests {
             }
         }
         let deps = deps_with_provider(Arc::new(Always), Duration::from_secs(5));
-        let err = match query_with_retry(&deps, dummy_input()).await {
+        let err = match query_with_retry(&deps, deps.provider.as_ref(), dummy_input()).await {
             Ok(_) => panic!("expected terminal failure"),
             Err(e) => e,
         };
@@ -2808,7 +2829,7 @@ mod tests {
             },
         ]);
         let deps = deps_with_provider(provider.clone(), Duration::from_secs(5));
-        let result = query_with_retry(&deps, dummy_input()).await;
+        let result = query_with_retry(&deps, deps.provider.as_ref(), dummy_input()).await;
         assert!(result.is_ok());
         assert_eq!(provider.attempts(), 2);
     }
@@ -2832,7 +2853,7 @@ mod tests {
             },
         ]);
         let deps = deps_with_provider(provider.clone(), Duration::from_millis(50));
-        let result = query_with_retry(&deps, dummy_input()).await;
+        let result = query_with_retry(&deps, deps.provider.as_ref(), dummy_input()).await;
         assert!(result.is_ok(), "expected eventual success");
         assert_eq!(provider.attempts(), 2);
     }
@@ -2856,7 +2877,7 @@ mod tests {
             },
         ]);
         let deps = deps_with_provider(provider.clone(), Duration::from_millis(30));
-        let err = match query_with_retry(&deps, dummy_input()).await {
+        let err = match query_with_retry(&deps, deps.provider.as_ref(), dummy_input()).await {
             Ok(_) => panic!("expected DeadlineExceeded"),
             Err(e) => e,
         };

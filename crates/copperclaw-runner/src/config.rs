@@ -161,6 +161,61 @@ pub struct RunnerConfigFile {
     /// `NULL` = gate on); only an explicit `false` turns it off.
     #[serde(default)]
     pub verify_gate: Option<bool>,
+    /// M18 R5 hot in-session provider failover: the ORDERED list of
+    /// healthy fallback providers the runner may switch to mid-turn when
+    /// the primary (the top-level `provider`/`model`) exhausts its
+    /// in-provider retries. Resolved host-side at spawn from the group's
+    /// `FallbackChain` + live health and filtered to entries the
+    /// container can ALREADY reach without shipping a new credential
+    /// (same key / gateway-brokered / no-auth local model) — see the
+    /// host's `resolve_failover_chain`. Absent / empty means "no in-turn
+    /// failover": the runner keeps its historical single-provider
+    /// behaviour (byte-identical `runner.json` shape for unconfigured
+    /// groups).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failover_chain: Option<Vec<FailoverEntryFile>>,
+}
+
+/// On-disk shape of one alternate provider in
+/// [`RunnerConfigFile::failover_chain`]. Mirrors the host's
+/// `FailoverEntryForFile`. `api_key_env` / `api_base_url` follow the same
+/// semantics as the top-level primary fields — the runner reads the named
+/// env var for the key and prefers this base URL over `ANTHROPIC_BASE_URL`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct FailoverEntryFile {
+    /// Provider kind, e.g. `"anthropic"`, `"ollama"`, `"ollama-shim"`,
+    /// `"codex"`.
+    pub provider: String,
+    /// Provider-native model id for this alternate.
+    pub model: String,
+    /// Name of the env var to read this entry's API key from. `None` for
+    /// no-auth providers (ollama / codex). Never a NEW secret var: the
+    /// host only ever emits a slot the container already holds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    /// Endpoint override for the Anthropic-envelope providers (the broker
+    /// loopback when the credential broker is enabled, else the operator's
+    /// real base URL). `None` for ollama / codex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_base_url: Option<String>,
+}
+
+/// Fully-resolved alternate provider for hot in-session failover. Mirrors
+/// the primary's resolved `provider` / `model` / `api_key` / `api_base_url`
+/// fields; the API key is read from `api_key_env` at config-resolution time
+/// exactly like the primary.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FailoverProviderConfig {
+    /// Resolved (normalised) provider kind.
+    pub provider: String,
+    /// Provider-native model id.
+    pub model: String,
+    /// API key value, resolved from the entry's `api_key_env`. `None` for
+    /// no-auth providers or when the named var is unset.
+    pub api_key: Option<String>,
+    /// Endpoint override passed to the provider builder (Anthropic-envelope
+    /// only). `None` for ollama / codex.
+    pub api_base_url: Option<String>,
 }
 
 /// How the per-inbound Task HUD behaves. See
@@ -280,6 +335,33 @@ pub struct RunnerConfig {
     /// gate is enforced. Defaults to `true` when the JSON file omits
     /// `verify_gate`. See [`RunnerConfigFile::verify_gate`].
     pub verify_gate: bool,
+    /// M18 R5 hot in-session provider failover: the ordered alternate
+    /// providers the runner switches to mid-turn when the primary
+    /// exhausts its in-provider retries. Empty (the default) preserves
+    /// the historical single-provider behaviour. See
+    /// [`RunnerConfigFile::failover_chain`].
+    pub failover_chain: Vec<FailoverProviderConfig>,
+}
+
+/// Normalise a raw provider kind string to one of the four the runner
+/// understands, mapping the `claude` alias and unknown / empty values to
+/// `anthropic` (unknown logs a WARN). Shared by the primary provider
+/// resolution and the R5 failover-chain resolution so the two can never
+/// disagree about a provider name.
+fn normalize_provider(raw: Option<&str>) -> String {
+    match raw {
+        None | Some("" | "anthropic" | "claude") => "anthropic".to_string(),
+        Some("ollama") => "ollama".to_string(),
+        Some("ollama-shim") => "ollama-shim".to_string(),
+        Some("codex") => "codex".to_string(),
+        Some(other) => {
+            tracing::warn!(
+                provider = other,
+                "unknown provider kind in runner config; falling back to anthropic"
+            );
+            "anthropic".to_string()
+        }
+    }
 }
 
 impl RunnerConfig {
@@ -306,19 +388,22 @@ impl RunnerConfig {
         // `ANTHROPIC_BASE_URL` from the environment so a single env var
         // configures every session (matches how api_key is sourced).
         let api_base_url = file.api_base_url.or_else(|| env.get("ANTHROPIC_BASE_URL"));
-        let provider = match file.provider.as_deref() {
-            None | Some("" | "anthropic" | "claude") => "anthropic".to_string(),
-            Some("ollama") => "ollama".to_string(),
-            Some("ollama-shim") => "ollama-shim".to_string(),
-            Some("codex") => "codex".to_string(),
-            Some(other) => {
-                tracing::warn!(
-                    provider = other,
-                    "unknown provider kind in runner config; falling back to anthropic"
-                );
-                "anthropic".to_string()
-            }
-        };
+        let provider = normalize_provider(file.provider.as_deref());
+        // R5 failover chain: resolve each alternate's provider kind + key
+        // (from its named env var, exactly like the primary above) at
+        // config time so the runner can build the provider without any
+        // further env lookups mid-turn.
+        let failover_chain: Vec<FailoverProviderConfig> = file
+            .failover_chain
+            .unwrap_or_default()
+            .into_iter()
+            .map(|e| FailoverProviderConfig {
+                provider: normalize_provider(Some(e.provider.as_str())),
+                model: e.model,
+                api_key: e.api_key_env.as_deref().and_then(|name| env.get(name)),
+                api_base_url: e.api_base_url,
+            })
+            .collect();
         let source_session_id = file
             .source_session_id
             .as_deref()
@@ -409,6 +494,7 @@ impl RunnerConfig {
             hud_mode,
             check_command_override: file.check_command,
             verify_gate: file.verify_gate.unwrap_or(true),
+            failover_chain,
         })
     }
 
@@ -517,7 +603,49 @@ mod tests {
             hud_mode: None,
             check_command: None,
             verify_gate: None,
+            failover_chain: None,
         }
+    }
+
+    #[test]
+    fn failover_chain_defaults_to_empty_when_unset() {
+        let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "k")]);
+        let cfg = RunnerConfig::from_file_struct(good_file(), &env).unwrap();
+        assert!(cfg.failover_chain.is_empty());
+    }
+
+    #[test]
+    fn failover_chain_resolves_provider_and_key_per_entry() {
+        let mut file = good_file();
+        file.failover_chain = Some(vec![
+            FailoverEntryFile {
+                provider: "claude".into(), // alias -> anthropic
+                model: "claude-haiku-4-6".into(),
+                api_key_env: Some("ANTHROPIC_API_KEY".into()),
+                api_base_url: Some("https://broker.local".into()),
+            },
+            FailoverEntryFile {
+                provider: "ollama".into(),
+                model: "qwen3.6:27b".into(),
+                api_key_env: None,
+                api_base_url: None,
+            },
+        ]);
+        let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "key-xyz")]);
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert_eq!(cfg.failover_chain.len(), 2);
+        // Alias normalised; key resolved from the named env var.
+        assert_eq!(cfg.failover_chain[0].provider, "anthropic");
+        assert_eq!(cfg.failover_chain[0].model, "claude-haiku-4-6");
+        assert_eq!(cfg.failover_chain[0].api_key.as_deref(), Some("key-xyz"));
+        assert_eq!(
+            cfg.failover_chain[0].api_base_url.as_deref(),
+            Some("https://broker.local")
+        );
+        // No-auth provider: no key resolved, no endpoint.
+        assert_eq!(cfg.failover_chain[1].provider, "ollama");
+        assert!(cfg.failover_chain[1].api_key.is_none());
+        assert!(cfg.failover_chain[1].api_base_url.is_none());
     }
 
     #[test]
