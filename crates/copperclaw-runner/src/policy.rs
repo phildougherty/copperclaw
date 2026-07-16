@@ -115,6 +115,7 @@ const CODING_TOOLS: &[&str] = &[
     "copy_file",
     "explore",
     "create_agent",
+    "delegate",
     // M17 session-preview proxy: exposing / closing an HTTP app the agent
     // built is part of the build-test loop, so it rides the coding profile
     // (and is denied to a guest via the mutating floor — see `is_mutating`).

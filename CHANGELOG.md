@@ -6,6 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M18 R7 — `delegate`: write-capable middle-tier build worker, 2026-07-16)
+
+- New **`delegate`** tool + delivery-action: the middle tier between the read-only
+  in-process `explore` subagent and a full persistent `create_agent` sibling. A
+  delegate spawns a **write-capable** build worker in its own container that — when
+  the parent's current project is a git repo — gets a **writable git worktree** of
+  that repo at `/workspace` on its own `sib/<id>` branch (the exact
+  `container_manager::spawn` worktree mechanics `create_agent` uses; no spawn-path
+  change was needed — worktree provisioning keys off the child session's
+  `source_session_id`). Its commits land in the parent repo via the branch-merge
+  path, and parallel delegates each get their own isolated worktree.
+  - Unlike `create_agent`, a delegate is **contained**: its session lands with a NULL
+    messaging group + no copied `session_routing`, so it can report **only** back to
+    its spawning parent and can never post into the user's chat. Result rows use a
+    distinct `delegate_result` key.
+  - Permission-gated with the same `create_agent_users_table_check` (spawning a
+    write-capable container is at least as privileged) and depth-capped by the same
+    `depth.rs` gate as `create_agent`.
+  - `crates/copperclaw-mcp/src/context.rs`: `DelegateSpec` + `OutboundToolEffect::Delegate`.
+  - `crates/copperclaw-mcp/src/tools/agents.rs`: the `delegate` tool (no `channel` field —
+    never user-facing); registered in `tools/mod.rs`.
+  - `crates/copperclaw-runner/src/tools.rs`: `apply_delegate` writes the `{"delegate": …}`
+    system row; `crates/copperclaw-runner/src/policy.rs`: `delegate` joins `CODING_TOOLS`
+    (denied to guests, gated behind the coding profile).
+  - `crates/copperclaw-modules/src/agent_to_agent/create_agent.rs`: a `SpawnProfile`
+    (`Persistent` | `Delegate`) parameterises the shared spawn core;
+    `CreateAgentModule::new_delegate(…)` registers the `delegate` action.
+  - `crates/copperclaw-host/src/boot.rs`: the delegate-profile module is installed
+    alongside `create_agent`.
+  - **Deferred (follow-up):** single-call parallel fan-out orchestration (one `delegate`
+    call spawning N workers) and any automated join/merge — parents fan out today by
+    calling `delegate` once per independent piece of work, each contained + isolated.
+
 ### Added (M18 C5b — shared markdown → per-platform renderer, 2026-07-16)
 
 - New `crates/copperclaw-channels/core/src/markdown/` module — the single
