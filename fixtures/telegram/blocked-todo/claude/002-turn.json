@@ -1,0 +1,9 @@
+{
+  "events": [
+    {"type": "message_start", "message": {"id": "msg_replay_blocked_002"}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Not yet — that step is blocked on a verify failure. See the checklist."}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_stop"}
+  ]
+}

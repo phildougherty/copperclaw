@@ -1,0 +1,20 @@
+{
+  "name": "telegram-blocked-todo",
+  "channel": "telegram",
+  "description": "M19 F4 acceptance: a todo that auto-blocks (burned its verify fix-cycles while its project stayed dirty) renders as BLOCKED with the [!] glyph + one-line reason on the delivered todo list, not as an in-progress step. Driven under COPPERCLAW_DATA_ROOT (like the X2 verify-gate fixture) so the in-process runner's todo store + verify gate resolve real, writable state; the parent seeds a dirty project at the fix-cycle cap + a recorded last_failure + one in_progress todo, then the model attempts todo_update(completed) which auto-transitions to blocked. Registered in tests/replay.rs via a subprocess re-exec that sets the env var (forbid(unsafe_code) blocks std::env::set_var). See README.md.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 15000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"created_at\":\"[^\"]+\"": "\"created_at\":\"<TS>\"",
+    "\"updated_at\":\"[^\"]+\"": "\"updated_at\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\"",
+    "\\| [0-9]+:[0-9]{2}": "| <MMSS>",
+    "done in [0-9]+:[0-9]{2}": "done in <MMSS>"
+  }
+}

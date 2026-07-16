@@ -378,6 +378,93 @@ async fn matrix_room_message_round_trip() {
     run_fixture("matrix", "room-message").await;
 }
 
+/// M19 F1 acceptance (matrix live HUD edit): F1 reconciled matrix's trait
+/// `edit_message` with its long-standing `EDIT_CAPABLE_CHANNELS` listing,
+/// so the runner's Task HUD now runs *live* on matrix — it posts one
+/// breadcrumb chip at the first tool call and edits that chip in place on
+/// every later frame instead of degrading to new-message spam.
+///
+/// The replay harness substitutes a `MockAdapter` for the real matrix
+/// adapter, so `model_rich_breadcrumbs` in the manifest makes the wrapper
+/// model matrix's real `deliver_breadcrumb` contract (post once, edit in
+/// place). Beyond the byte-stable JSONL diff this pins the point of the
+/// card: exactly ONE breadcrumb chip is posted, and every subsequent HUD
+/// frame is an in-place `edit_message` against that single anchor — the
+/// host delivery pipeline (`dispatch_breadcrumb` +
+/// `handle_update_breadcrumb` + `lookup_prior_breadcrumb_external_id`)
+/// threads the anchor id through so the chip is edited, never re-posted.
+/// Combined with F1's drift guard (matrix really overrides trait
+/// `edit_message`) and the matrix adapter's own unit tests, this closes
+/// the "advertised edit-capable but silently re-posts" gap. See the
+/// fixture's README.md.
+#[tokio::test]
+async fn matrix_hud_live_edit_edits_one_chip_in_place() {
+    // Fixture-authoring path: regenerate expected/*.jsonl from a real run.
+    // Never taken under a normal `cargo test`.
+    if std::env::var_os("COPPERCLAW_XR1_GENERATE").is_some() {
+        let path = fixture_path("matrix", "hud-live-edit");
+        let fixture = Fixture::load(&path).expect("load fixture");
+        let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+        harness.run().await.expect("run harness");
+        harness.dump_expected_jsonl();
+        return;
+    }
+
+    let harness = run_fixture_into_harness("matrix", "hud-live-edit").await;
+    let mx = mock_for(&harness, "matrix");
+
+    // The HUD posts exactly ONE breadcrumb chip (a `Breadcrumb`-kind
+    // delivery). Anything more would be the re-post spam F1 kills.
+    let deliveries = mx.deliveries();
+    let posts: Vec<_> = deliveries
+        .iter()
+        .filter(|d| d.message.kind.as_str() == "breadcrumb")
+        .collect();
+    assert_eq!(
+        posts.len(),
+        1,
+        "the live HUD must post exactly one breadcrumb chip on matrix, got {}: {deliveries:?}",
+        posts.len(),
+    );
+    assert_eq!(
+        posts[0].platform_id, "!a:m.org",
+        "the chip must land in the originating matrix room",
+    );
+
+    // Every later frame is an in-place edit of that ONE chip: at least one
+    // edit, all addressed to a single anchor id (never a fresh post).
+    let edits = mx.edits();
+    assert!(
+        !edits.is_empty(),
+        "the live HUD must edit the chip in place at least once, got zero edits",
+    );
+    let anchors: std::collections::BTreeSet<&str> =
+        edits.iter().map(|e| e.external_id.as_str()).collect();
+    assert_eq!(
+        anchors.len(),
+        1,
+        "every HUD edit must target the SINGLE posted chip (one anchor), got {anchors:?}",
+    );
+    for e in &edits {
+        assert_eq!(
+            e.platform_id, "!a:m.org",
+            "each edit must target the originating matrix room",
+        );
+    }
+
+    // Sanity: the model's final answer still reaches the user as its own
+    // chat message (the HUD chip is progress, not the reply).
+    assert!(
+        deliveries.iter().any(|d| d.message.kind.as_str() == "chat"
+            && d.message
+                .content
+                .get("text")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t.contains("build is fine"))),
+        "the final chat answer must be delivered alongside the HUD chip: {deliveries:?}",
+    );
+}
+
 #[tokio::test]
 async fn github_webhook_issue_comment_round_trip() {
     run_fixture("github", "webhook-issue-comment").await;
@@ -998,5 +1085,474 @@ async fn run_verify_gate_child(dump: bool) {
         !dirty.exists(),
         "passing verify must clear the dirty marker at {}",
         dirty.display(),
+    );
+}
+
+// ---- M19 F4 (X-rider W1): a blocked todo renders as blocked, not in-progress ----
+//
+// F4 gave `copperclaw_channels_core::TodoItemStatus` a real `Blocked`
+// variant (glyph `[!]` + a one-line reason) and mapped the runner's
+// storage-side `TodoStatus::Blocked` onto it in `status_to_wire`, so a
+// step that auto-blocked after burning its verify fix-cycles renders as
+// blocked on every adapter — instead of the misleading "in progress
+// forever" the pre-F4 wire enum forced (`Blocked -> InProgress`).
+//
+// This fixture drives the GENUINE auto-block path end to end: a project
+// that is dirty AND already at the fix-cycle cap, with a recorded verify
+// failure, plus one `in_progress` todo. When the model attempts
+// `todo_update(status="completed")` the gate auto-transitions the todo to
+// `blocked` (never silently completed, never permanently refusing),
+// attaches the recorded failure as the reason, and emits the post-mutation
+// `TodoList`. The delivery loop degrades `deliver_todo_list` to its text
+// fallback on the harness mock — the exact surface F4 taught the `[!]`
+// glyph — so the delivered checklist must show the step blocked with its
+// reason, and NOT with the in-progress glyph.
+//
+// Like the X2 verify-gate fixture, the todo store + verify gate resolve
+// against `COPPERCLAW_DATA_ROOT`, which `forbid(unsafe_code)` forbids us
+// from setting via `std::env::set_var`. So we re-exec THIS test binary as
+// a child with the var set through the safe `Command::env`; the child runs
+// the real `ReplayHarness` against pre-seeded, writable project state.
+
+/// Fixed data root for the blocked-todo fixture. Distinct from the X2
+/// verify-gate root so the two re-exec fixtures never collide.
+const XR1_BLOCKED_DATA_ROOT: &str = "/tmp/copperclaw-xr1-blocked-todo";
+/// Set on the re-exec'd child so it runs the scenario instead of
+/// re-spawning itself.
+const XR1_BLOCKED_CHILD_ENV: &str = "COPPERCLAW_XR1_BLOCKED_TODO_CHILD";
+/// `assert` (default) or `dump` — the latter prints the captured actual
+/// streams so `expected/*.jsonl` can be regenerated from a real run.
+const XR1_BLOCKED_MODE_ENV: &str = "COPPERCLAW_XR1_BLOCKED_TODO_MODE";
+/// The recorded verify failure that becomes the blocked todo's reason.
+const XR1_BLOCKED_REASON: &str = "app.py: SyntaxError: invalid syntax (line 3)";
+
+#[tokio::test]
+async fn telegram_blocked_todo_renders_as_blocked() {
+    // Child leg: env already set by the parent's re-exec. Run the real
+    // scenario against the todo store / gate rooted at XR1_BLOCKED_DATA_ROOT.
+    if std::env::var_os(XR1_BLOCKED_CHILD_ENV).is_some() {
+        let dump = std::env::var(XR1_BLOCKED_MODE_ENV).ok().as_deref() == Some("dump");
+        run_blocked_todo_child(dump).await;
+        return;
+    }
+
+    // Parent leg: seed a dirty project at the fix-cycle cap + a recorded
+    // failure + one in_progress todo, then re-exec ourselves with
+    // COPPERCLAW_DATA_ROOT set (via the safe Command::env).
+    let _ = std::fs::remove_dir_all(XR1_BLOCKED_DATA_ROOT);
+    let root = std::path::Path::new(XR1_BLOCKED_DATA_ROOT);
+    let state = root.join("proj/.copperclaw");
+    std::fs::create_dir_all(&state).expect("create blocked-todo project state dir");
+    // Dirty marker so the completion gate finds a dirty project.
+    std::fs::write(state.join("dirty"), b"").expect("write dirty marker");
+    // Fix-cycle count already at the cap (2) so the gate auto-BLOCKS the
+    // todo rather than refusing-with-cycles-remaining.
+    std::fs::write(state.join("fix_cycles"), b"2").expect("write fix_cycles");
+    // The recorded verify failure that becomes the blocked reason.
+    std::fs::write(state.join("last_failure"), XR1_BLOCKED_REASON.as_bytes())
+        .expect("write last_failure");
+    // One in_progress todo the model will attempt to complete.
+    std::fs::write(
+        root.join("agent_todos.json"),
+        br#"[{"id":1,"text":"Verify the build passes","status":"in_progress","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}]"#,
+    )
+    .expect("seed agent_todos.json");
+
+    let mode = if std::env::var_os("COPPERCLAW_XR1_GENERATE").is_some() {
+        "dump"
+    } else {
+        "assert"
+    };
+    let exe = std::env::current_exe().expect("current_exe");
+    let output = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "telegram_blocked_todo_renders_as_blocked",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(XR1_BLOCKED_CHILD_ENV, "1")
+        .env(XR1_BLOCKED_MODE_ENV, mode)
+        .env("COPPERCLAW_DATA_ROOT", XR1_BLOCKED_DATA_ROOT)
+        .output()
+        .expect("spawn blocked-todo re-exec child");
+
+    let _ = std::fs::remove_dir_all(XR1_BLOCKED_DATA_ROOT);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if mode == "dump" {
+        println!("{stdout}");
+    }
+    assert!(
+        output.status.success(),
+        "blocked-todo child failed (status {:?})\n\
+         --- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}",
+        output.status.code(),
+    );
+}
+
+/// The child scenario: drive the `blocked-todo` fixture through the real
+/// harness. In `dump` mode, print the captured actuals (fixture
+/// authoring). Otherwise diff against the committed `expected/*.jsonl` and
+/// assert the blocked step genuinely rendered as blocked (not in-progress)
+/// on the delivered checklist.
+async fn run_blocked_todo_child(dump: bool) {
+    let path = fixture_path("telegram", "blocked-todo");
+    assert!(
+        path.exists(),
+        "fixture missing at {} — see docs/replay-fixtures.md",
+        path.display()
+    );
+    let fixture = Fixture::load(&path).expect("load blocked-todo fixture");
+    let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+    harness.run().await.expect("run harness");
+
+    if dump {
+        harness.dump_expected_jsonl();
+        return;
+    }
+
+    // Byte-stable pipeline diff first (expected/*.jsonl).
+    let report = harness.compare().expect("compare");
+    assert!(report.is_clean(), "{report}");
+
+    // The delivered todo checklist must show the auto-blocked step with the
+    // `[!]` glyph AND its reason — never the in-progress glyph `[~]` for
+    // that step. The mock degrades `deliver_todo_list` to its text
+    // fallback, so the checklist rides a plain chat delivery.
+    let tg = mock_for(&harness, "telegram");
+    let deliveries = tg.deliveries();
+    let checklist = deliveries
+        .iter()
+        .filter_map(|d| d.message.content.get("text").and_then(|t| t.as_str()))
+        .find(|t| t.contains("Verify the build passes"))
+        .expect("the post-mutation todo checklist must be delivered");
+    assert!(
+        checklist.contains("[!] Verify the build passes"),
+        "the auto-blocked step must render with the [!] blocked glyph: {checklist}",
+    );
+    assert!(
+        checklist.contains(XR1_BLOCKED_REASON),
+        "the blocked step must carry its one-line failure reason: {checklist}",
+    );
+    assert!(
+        !checklist.contains("[~] Verify the build passes"),
+        "the blocked step must NOT render as in-progress (the pre-F4 bug): {checklist}",
+    );
+    assert!(
+        checklist.contains("1 blocked"),
+        "the checklist footer must count the blocked step: {checklist}",
+    );
+
+    // Corroborate against the on-disk todo store the tool wrote under the
+    // data root: the item genuinely auto-transitioned to `blocked` with the
+    // recorded reason attached (proof the wire render reflects real state,
+    // not a hand-built list).
+    let store = std::path::Path::new(XR1_BLOCKED_DATA_ROOT).join("agent_todos.json");
+    let raw = std::fs::read_to_string(&store)
+        .unwrap_or_else(|e| panic!("todo store missing at {}: {e}", store.display()));
+    let todos: serde_json::Value = serde_json::from_str(&raw).expect("todo store is JSON");
+    let first = &todos.as_array().expect("todo store is an array")[0];
+    assert_eq!(
+        first["status"], "blocked",
+        "the todo must have auto-transitioned to blocked: {todos}",
+    );
+    assert_eq!(
+        first["blocked_reason"], XR1_BLOCKED_REASON,
+        "the recorded verify failure must be attached as the block reason: {todos}",
+    );
+}
+
+// ---- M19 F5 (X-rider W1): pre-first-tool "thinking…" HUD frame ----
+//
+// F5 made the live HUD post an initial "thinking…" frame after a short
+// threshold (`hud::THINKING_THRESHOLD` = 6s) so a multi-minute
+// pure-reasoning answer on an edit-capable channel stops looking like a
+// hang, while a fast turn stays byte-stable (posts nothing).
+//
+// Why a targeted paused-clock test, not a replay fixture: the F5 frame is
+// driven purely by WALL-CLOCK timing *before the first tool call*, and the
+// replay harness (real time, a wiremock provider, a 200ms provider
+// deadline) has no seam to inject a deterministic 6s+ pure-reasoning wait
+// — a real 6s sleep would be slow and jittery around the threshold. So
+// this drives the real `run_loop` end to end under tokio's paused clock
+// with a controllable provider. It goes *beyond* the runner-crate unit
+// tests (which construct `TaskHud` directly): here the frame flows through
+// the real `run_loop` → `drive_turn` arm/finalize → the session's outbound
+// DB, and carries the originating-channel routing the delivery loop needs
+// to reach the wire. The delivery leg itself (a breadcrumb → adapter edit)
+// is locked by the F1 `matrix/hud-live-edit` fixture.
+
+/// Controllable provider for the F5 tests: on the first (and only)
+/// streamed event it sleeps `delay` — the pure-reasoning "thinking" wait —
+/// then emits the final answer text. Under a paused clock the test decides
+/// exactly when that wait elapses relative to the HUD's threshold.
+struct F5PausedProvider {
+    delay: std::time::Duration,
+    text: String,
+}
+
+#[async_trait::async_trait]
+impl copperclaw_providers::AgentProvider for F5PausedProvider {
+    fn name(&self) -> &'static str {
+        "f5-paused"
+    }
+    async fn query(
+        &self,
+        _input: copperclaw_providers::QueryInput,
+    ) -> Result<Box<dyn copperclaw_providers::AgentQuery>, copperclaw_providers::ProviderError>
+    {
+        Ok(Box::new(F5PausedQuery {
+            delay: self.delay,
+            text: Some(self.text.clone()),
+        }))
+    }
+    fn is_session_invalid(&self, _err: &copperclaw_providers::ProviderError) -> bool {
+        false
+    }
+}
+
+struct F5PausedQuery {
+    delay: std::time::Duration,
+    text: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl copperclaw_providers::AgentQuery for F5PausedQuery {
+    async fn push(&mut self, _message: String) -> Result<(), copperclaw_providers::ProviderError> {
+        Ok(())
+    }
+    async fn end(&mut self) -> Result<(), copperclaw_providers::ProviderError> {
+        Ok(())
+    }
+    async fn next_event(&mut self) -> Option<copperclaw_types::ProviderEvent> {
+        // The pure-reasoning wait: block for `delay`, then emit the final
+        // answer text exactly once (a zero-tool turn).
+        let text = self.text.take()?;
+        tokio::time::sleep(self.delay).await;
+        Some(copperclaw_types::ProviderEvent::Result { text: Some(text) })
+    }
+    async fn abort(&mut self) {}
+}
+
+/// Build a one-turn `run_loop` deps + shared outbound handle for the F5
+/// tests, seeded with a single pending TELEGRAM chat inbound (an
+/// edit-capable channel → the HUD resolves to `Behavior::Live`). The
+/// provider sleeps `delay` before answering; `provider_deadline` is set
+/// well past `delay` so the deadline never trips.
+async fn f5_build(
+    paths: &copperclaw_db::session::SessionPaths,
+    delay: std::time::Duration,
+) -> (
+    copperclaw_runner::RunnerDeps,
+    std::sync::Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+) {
+    use copperclaw_db::session::{open_inbound, open_outbound};
+    use copperclaw_db::tables::messages_in::{self, WriteInbound};
+
+    let inbound = std::sync::Arc::new(tokio::sync::Mutex::new(open_inbound(paths).unwrap()));
+    let outbound = std::sync::Arc::new(tokio::sync::Mutex::new(open_outbound(paths).unwrap()));
+
+    {
+        let g = inbound.lock().await;
+        messages_in::insert(
+            &g,
+            &WriteInbound {
+                id: copperclaw_types::MessageId::new(),
+                kind: copperclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "think hard about this"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("100".into()),
+                channel_type: Some(copperclaw_types::ChannelType::new("telegram")),
+                thread_id: None,
+                source_session_id: None,
+                reply_to: None,
+                is_group: None,
+            },
+        )
+        .unwrap();
+    }
+
+    let tool_ctx: std::sync::Arc<dyn copperclaw_mcp::ToolContext> = std::sync::Arc::new(
+        copperclaw_runner::RunnerToolCtx::new(outbound.clone(), paths.outbox.clone()),
+    );
+    let provider: std::sync::Arc<dyn copperclaw_providers::AgentProvider> =
+        std::sync::Arc::new(F5PausedProvider {
+            delay,
+            text: "Here is the carefully-reasoned answer.".into(),
+        });
+    let mut deps = copperclaw_runner::RunnerDeps::minimal(
+        provider,
+        tool_ctx,
+        inbound,
+        outbound.clone(),
+        paths.outbox.join("_compactions"),
+    );
+    deps.max_turns = Some(1);
+    deps.idle_sleep = std::time::Duration::from_millis(1);
+    deps.provider_deadline = std::time::Duration::from_secs(600);
+    (deps, outbound)
+}
+
+/// Yield repeatedly so spawned tasks (the HUD ticker, the `run_loop` task)
+/// can make progress under the paused clock between `advance` calls.
+async fn f5_settle() {
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Snapshot the session's outbound `Breadcrumb`-kind rows via a fresh read
+/// connection (the runner holds its own write handle).
+fn f5_breadcrumb_summaries(paths: &copperclaw_db::session::SessionPaths) -> Vec<String> {
+    let conn = copperclaw_db::session::open_outbound(paths).unwrap();
+    copperclaw_db::tables::messages_out::list_due(&conn)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.kind == copperclaw_types::MessageKind::Breadcrumb)
+        .filter_map(|r| {
+            r.content
+                .get("breadcrumb")
+                .and_then(|b| b.get("summary"))
+                .and_then(|s| s.as_str())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn f5_thinking_frame_posts_after_threshold_via_run_loop() {
+    use copperclaw_runner::run_loop;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = copperclaw_db::session::SessionPaths::new(
+        tmp.path(),
+        copperclaw_types::AgentGroupId::new(),
+        copperclaw_types::SessionId::new(),
+    );
+    // A 5-minute pure-reasoning wait before the answer lands.
+    let (deps, _outbound) = f5_build(&paths, std::time::Duration::from_secs(300)).await;
+
+    let handle = tokio::spawn(run_loop(deps));
+    // Let run_loop reach `drive_turn` (arm the HUD ticker) and park on the
+    // provider's pure-reasoning sleep before we touch the clock.
+    f5_settle().await;
+
+    // Just before the threshold: nothing has posted — a fast turn would
+    // have finalized by now and stayed byte-stable.
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    f5_settle().await;
+    assert!(
+        f5_breadcrumb_summaries(&paths).is_empty(),
+        "no HUD frame may post before the {}s thinking threshold",
+        6,
+    );
+
+    // Past the threshold: exactly one "thinking…" breadcrumb chip posts,
+    // even though no tool has run yet.
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    f5_settle().await;
+    let summaries = f5_breadcrumb_summaries(&paths);
+    assert_eq!(
+        summaries.len(),
+        1,
+        "exactly one pre-first-tool thinking frame; got {summaries:?}",
+    );
+    assert!(
+        summaries[0].starts_with("thinking…"),
+        "the pre-first-tool frame must read as thinking…; got {:?}",
+        summaries[0],
+    );
+
+    // Let the reasoning wait elapse; the turn answers and run_loop returns.
+    tokio::time::advance(std::time::Duration::from_secs(300)).await;
+    f5_settle().await;
+    handle.await.expect("run_loop task").expect("run_loop ok");
+
+    // The thinking frame did not dangle: finalize collapsed it to a
+    // "done in M:SS" update (a zero-tool turn omits the tool count), and
+    // the model's answer was delivered as its own chat row.
+    let conn = copperclaw_db::session::open_outbound(&paths).unwrap();
+    let rows = copperclaw_db::tables::messages_out::list_due(&conn).unwrap();
+    let collapsed = rows.iter().find_map(|r| {
+        r.content
+            .get("update_breadcrumb")
+            .and_then(|u| u.get("breadcrumb"))
+            .and_then(|b| {
+                let done = b.get("status").and_then(|s| s.as_str()) == Some("done");
+                let summary = b.get("summary").and_then(|s| s.as_str()).unwrap_or("");
+                (done && summary.starts_with("done in")).then(|| summary.to_owned())
+            })
+    });
+    assert!(
+        collapsed.is_some(),
+        "finalize must collapse the thinking frame to a done summary: {rows:?}",
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.kind == copperclaw_types::MessageKind::Chat
+                && r.content.get("text").and_then(|t| t.as_str())
+                    == Some("Here is the carefully-reasoned answer.")),
+        "the model's final answer must be emitted: {rows:?}",
+    );
+    // The thinking frame carried the originating-channel routing the
+    // delivery loop needs to reach the wire (telegram, chat 100).
+    let thinking = rows
+        .iter()
+        .find(|r| r.kind == copperclaw_types::MessageKind::Breadcrumb)
+        .expect("a thinking breadcrumb row exists");
+    assert_eq!(
+        thinking
+            .channel_type
+            .as_ref()
+            .map(copperclaw_types::ChannelType::as_str),
+        Some("telegram"),
+    );
+    assert_eq!(thinking.platform_id.as_deref(), Some("100"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn f5_fast_turn_posts_no_thinking_frame_via_run_loop() {
+    use copperclaw_runner::run_loop;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = copperclaw_db::session::SessionPaths::new(
+        tmp.path(),
+        copperclaw_types::AgentGroupId::new(),
+        copperclaw_types::SessionId::new(),
+    );
+    // A fast answer: the provider returns immediately, well under the
+    // thinking threshold, so the armed ticker is aborted by finalize
+    // before it ever posts.
+    let (deps, _outbound) = f5_build(&paths, std::time::Duration::ZERO).await;
+
+    let handle = tokio::spawn(run_loop(deps));
+    f5_settle().await;
+    handle.await.expect("run_loop task").expect("run_loop ok");
+
+    // Advance well past the threshold to prove the aborted ticker is truly
+    // dead and never fires a late frame.
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    f5_settle().await;
+
+    assert!(
+        f5_breadcrumb_summaries(&paths).is_empty(),
+        "a sub-threshold pure-reasoning turn must post no HUD frame (byte-stable)",
+    );
+    // Sanity: the fast turn still answered.
+    let conn = copperclaw_db::session::open_outbound(&paths).unwrap();
+    let rows = copperclaw_db::tables::messages_out::list_due(&conn).unwrap();
+    assert!(
+        rows.iter()
+            .any(|r| r.kind == copperclaw_types::MessageKind::Chat
+                && r.content.get("text").and_then(|t| t.as_str())
+                    == Some("Here is the carefully-reasoned answer.")),
+        "the fast turn must still deliver its answer: {rows:?}",
     );
 }

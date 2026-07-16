@@ -105,7 +105,13 @@ copperclaw-cclaw = { path = "../copperclaw-cclaw" }
 copperclaw-runner = { workspace = true }
 copperclaw-mcp = { workspace = true }
 copperclaw-providers = { workspace = true }
-tokio = { workspace = true }
+# Test-only: `test-util` unlocks tokio's paused-clock controls
+# (`tokio::time::advance` / `#[tokio::test(start_paused = true)]`) so the
+# M19 F5 X-rider tests in `tests/replay.rs` can drive the timing-driven
+# "thinking…" HUD frame deterministically without a real 6s wall-clock
+# wait. Mirrors the same dev-dep the runner crate added for its F5 unit
+# tests.
+tokio = { workspace = true, features = ["test-util"] }
 wiremock = "=0.6.2"
 regex = "1"
 tower = { version = "0.5", features = ["util"] }
