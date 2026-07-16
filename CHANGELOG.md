@@ -38,6 +38,53 @@ adheres to [Semantic Versioning](https://semver.org/).
   - Unit + mock-server tests on both adapters cover the field/button mapping,
     HTML escaping, URL-vs-callback button rendering, and the text fallback.
 
+### Added (M19 U5 — bare-adapter rich floor for deltachat + line, LINE postback inbound, 2026-07-16)
+
+- Two genuinely interactive chat surfaces — `deltachat` (full chat, inbound
+  files) and `line` (Messaging API) — had **zero** rich-surface support: the
+  M18 HUD / diff / todo / approval cards all fell through to the trait's plain
+  text-fallback. Both now render the U5-mandated floor natively (metered with
+  `inc_adapter_rich_render`):
+  - `deltachat` gains `crates/copperclaw-channels/deltachat/src/render.rs` and
+    trait overrides for `deliver_card`, `deliver_diff`, and `deliver_todo_list`
+    (`.../deltachat/src/adapter.rs`). Delta Chat is an e-mail transport with no
+    reliable Markdown and no edit API, so the renderers emit clean, markdown-free
+    plaintext (mirroring the Signal floor) and each surface posts a fresh chip.
+  - `line` gains `crates/copperclaw-channels/line/src/render.rs` and the same
+    three trait overrides (`.../line/src/adapter.rs`). A `Card` **with buttons**
+    becomes a LINE `buttons` **template** message so the buttons are actually
+    tappable — a callback button maps to a `postback` action carrying its `value`
+    as `data`, a URL button to a `uri` action, a label-only button to a `message`
+    action; the full card text rides `altText`. LINE's caps are enforced (<= 4
+    actions, label <= 20, title <= 40, text <= 160/60). Diff and todo render as
+    fence-free plaintext. The api (`.../line/src/api.rs`) gains
+    `reply_message` / `push_message` (arbitrary message objects) + a
+    `text_message` helper; the adapter now depends on `copperclaw-metrics`.
+  - Both `deliver_todo_list` implementations render the F4
+    `TodoItemStatus::Blocked` state with the `[!]` glyph plus the item's
+    `blocked_reason` inline (`— blocked: <reason>`), so an auto-blocked step reads
+    as blocked, not stuck "in progress".
+- **LINE postback inbound is now wired** (`crates/copperclaw-channels/line/src/router.rs`,
+  previously stubbed — a `type: "postback"` event was dropped with a `// For now
+  ack` at line ~146). A postback event is now normalized into a `Chat`
+  `InboundEvent` carrying `content.callback = { id, data }` (where `data` is the
+  action's `postback.data`), mirroring the Telegram/Slack callback convention so
+  it whitelists past the router's mention gate and reaches the approval
+  interceptor — in-chat Approve/Deny taps route for the first time. The reply
+  token is cached so the resolution reply uses the cheap reply path. The message
+  and postback paths share an `emit_inbound` helper.
+- **Outbound-only adapters left bare, deliberately** (so it isn't rediscovered):
+  `resend`, `github`, `linear`, `x`, `webhooks`, `wechat`, `emacs`, and
+  `imessage` are not interactive chat surfaces and were **not** touched — their
+  surface doesn't warrant a rich floor (matches the M19 plan's deferred list).
+- **Fixture note.** The replay harness injects pre-normalized `InboundEvent`
+  JSON, bypassing adapter webhook parsing — so it cannot drive a raw LINE
+  postback through the code that changed. Per the U5 card's documented
+  alternative, the postback parse is covered by adapter-level router unit tests
+  that POST a signed LINE postback webhook body through the real axum handler and
+  assert the normalized callback event (`.../line/src/router.rs` tests). No
+  `tests/replay.rs` registration was added.
+
 ### Added (M19 U2 — Teams in-place edit + reactions, 2026-07-16)
 
 - The `teams` adapter rendered every rich surface (cards / diffs / collapsible /

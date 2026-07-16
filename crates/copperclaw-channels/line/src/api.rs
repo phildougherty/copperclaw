@@ -19,6 +19,7 @@
 use copperclaw_channels_core::AdapterError;
 use reqwest::Client;
 use serde::Serialize;
+use serde_json::{Value, json};
 
 /// LINE REST client. One per adapter; cheap to clone.
 #[derive(Clone, Debug)]
@@ -40,34 +41,34 @@ impl LineApi {
         }
     }
 
-    /// `POST /v2/bot/message/reply`. Returns Ok(()) on success — LINE
-    /// does not surface a message id for replies.
+    /// `POST /v2/bot/message/reply` with a plain-text message. Returns
+    /// Ok(()) on success — LINE does not surface a message id for replies.
     pub async fn reply(&self, reply_token: &str, text: &str) -> Result<(), AdapterError> {
-        #[derive(Serialize)]
-        struct Body<'a> {
-            #[serde(rename = "replyToken")]
-            reply_token: &'a str,
-            messages: Vec<TextMessage<'a>>,
-        }
-        let body = Body {
-            reply_token,
-            messages: vec![TextMessage::new(text)],
-        };
+        self.reply_message(reply_token, text_message(text)).await
+    }
+
+    /// `POST /v2/bot/message/push` with a plain-text message. Used when no
+    /// reply token is available (or it's stale).
+    pub async fn push(&self, to: &str, text: &str) -> Result<(), AdapterError> {
+        self.push_message(to, text_message(text)).await
+    }
+
+    /// `POST /v2/bot/message/reply` with an arbitrary LINE message object
+    /// (e.g. a buttons `template` for a rich card). The `message` must be a
+    /// single valid LINE Messaging-API message object; it is wrapped in the
+    /// one-element `messages` array LINE expects.
+    pub async fn reply_message(
+        &self,
+        reply_token: &str,
+        message: Value,
+    ) -> Result<(), AdapterError> {
+        let body = json!({ "replyToken": reply_token, "messages": [message] });
         self.post("/v2/bot/message/reply", &body).await
     }
 
-    /// `POST /v2/bot/message/push`. Used when no reply token is
-    /// available (or it's stale).
-    pub async fn push(&self, to: &str, text: &str) -> Result<(), AdapterError> {
-        #[derive(Serialize)]
-        struct Body<'a> {
-            to: &'a str,
-            messages: Vec<TextMessage<'a>>,
-        }
-        let body = Body {
-            to,
-            messages: vec![TextMessage::new(text)],
-        };
+    /// `POST /v2/bot/message/push` with an arbitrary LINE message object.
+    pub async fn push_message(&self, to: &str, message: Value) -> Result<(), AdapterError> {
+        let body = json!({ "to": to, "messages": [message] });
         self.post("/v2/bot/message/push", &body).await
     }
 
@@ -88,17 +89,10 @@ impl LineApi {
     }
 }
 
-#[derive(Serialize)]
-struct TextMessage<'a> {
-    #[serde(rename = "type")]
-    kind: &'a str,
-    text: &'a str,
-}
-
-impl<'a> TextMessage<'a> {
-    fn new(text: &'a str) -> Self {
-        Self { kind: "text", text }
-    }
+/// Build a LINE `text` message object (`{"type":"text","text":…}`).
+#[must_use]
+pub fn text_message(text: &str) -> Value {
+    json!({ "type": "text", "text": text })
 }
 
 async fn map_error(status: reqwest::StatusCode, res: reqwest::Response) -> AdapterError {
