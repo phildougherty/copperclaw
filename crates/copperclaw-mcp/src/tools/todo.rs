@@ -37,10 +37,13 @@ use crate::context::{EmitTodoListSpec, OutboundToolEffect, ToolContext};
 use crate::error::ToolError;
 use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args, success_json};
 
-/// Default location of the per-session todo file. The session dir is
-/// bind-mounted to `/data`, so todos persist across runner restarts of
-/// the same session but never bleed across sessions.
-const TODO_DEFAULT_PATH: &str = "/data/agent_todos.json";
+/// File name of the per-session todo store, resolved under the data
+/// root (see [`crate::tools::verify_gate::data_root`]). The session dir
+/// is bind-mounted to `/data`, so todos persist across runner restarts
+/// of the same session but never bleed across sessions. Consulting the
+/// shared data root means the `COPPERCLAW_DATA_ROOT` override moves the
+/// todo store in lockstep with the verify gate.
+const TODO_FILE_NAME: &str = "agent_todos.json";
 
 #[cfg(test)]
 static TODO_TEST_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<PathBuf>>> =
@@ -81,7 +84,7 @@ fn todo_path() -> PathBuf {
     if let Some(p) = todo_test_override() {
         return p;
     }
-    PathBuf::from(TODO_DEFAULT_PATH)
+    crate::tools::verify_gate::data_root().join(TODO_FILE_NAME)
 }
 
 /// Wipe the per-session todo store. Used by the runner's `/clear`

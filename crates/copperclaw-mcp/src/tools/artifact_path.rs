@@ -127,12 +127,45 @@ mod tests {
     use super::*;
     use crate::context::MockToolContext;
 
+    /// Both tests share the global `HOST_PATH_FILE_TEST_OVERRIDE`; without
+    /// serialization a parallel `cargo test` run can leak one test's
+    /// override into the other's assertions (a confirmed latent race).
+    /// Same shape as `todo.rs`'s `TodoGuard` / `verify_gate.rs`'s
+    /// `DataRootGuard`: the lock lives as a struct field (not a bare
+    /// local) so it can be held across `.await` without tripping
+    /// clippy's `await_holding_lock`, and the override is cleared on
+    /// drop even if a test panics.
+    fn host_path_file_test_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    struct HostPathGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl HostPathGuard {
+        fn new(path: PathBuf) -> Self {
+            let lock = host_path_file_test_lock()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            host_path_file_test_override_set(path);
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for HostPathGuard {
+        fn drop(&mut self) {
+            host_path_file_test_override_clear();
+        }
+    }
+
     #[tokio::test]
     async fn returns_host_path_from_discovery_file() {
         let td = tempfile::tempdir().unwrap();
         let f = td.path().join(".host_path");
         std::fs::write(&f, "/home/phil/projects/foo").unwrap();
-        host_path_file_test_override_set(f);
+        let _guard = HostPathGuard::new(f);
         let ctx = MockToolContext::new();
         let result = handle(None, &ctx).await.unwrap();
         let text = result
@@ -145,13 +178,12 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("/home/phil/projects/foo"));
         assert!(text.contains("/data"));
-        host_path_file_test_override_clear();
     }
 
     #[tokio::test]
     async fn error_when_discovery_file_missing() {
         let td = tempfile::tempdir().unwrap();
-        host_path_file_test_override_set(td.path().join("nope"));
+        let _guard = HostPathGuard::new(td.path().join("nope"));
         let ctx = MockToolContext::new();
         let err = handle(None, &ctx).await.unwrap_err();
         match err {
@@ -161,6 +193,5 @@ mod tests {
             }
             other => panic!("expected Internal, got {other:?}"),
         }
-        host_path_file_test_override_clear();
     }
 }
