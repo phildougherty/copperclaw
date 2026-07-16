@@ -74,7 +74,9 @@ pub mod render;
 
 pub use crate::capture::{CaptureOptions, DOWNGRADE_JPEG_QUALITY, ImageFormat, ViewportPreset};
 pub use crate::cdp::{
-    CdpBrowserDriver, CdpTransport, DEFAULT_NAV_TIMEOUT, WsCdpTransport, serialize_ax_tree,
+    BoxModel, CONSOLE_BUFFER_CAP, CURATED_STYLE_PROPS, CdpBrowserDriver, CdpTransport,
+    ConsoleEntry, ConsoleLevel, ConsoleSummary, DEFAULT_NAV_TIMEOUT, ElementInspection,
+    WsCdpTransport, inspect_element, serialize_ax_tree, summarize_console,
 };
 pub use crate::container::{
     BrowserContainerParams, BrowserToolConfig, FORBIDDEN_ENV_KEYS, browser_env,
@@ -84,10 +86,10 @@ pub use crate::driver::{BrowserDriver, DriverRender, Navigation, RenderedArtifac
 pub use crate::error::BrowserError;
 pub use crate::guard::{GuardResult, NavigationGuard};
 pub use crate::incontainer::{
-    CHROMIUM_BINARY_CANDIDATES, ChromiumSingleton, DEFAULT_CDP_PORT,
-    MAX_WAIT_MS as UI_SCREENSHOT_MAX_WAIT_MS, SIZE_SAFETY_CAP_BYTES, ScreenshotRequest,
-    SizeSafeCapture, capture, capture_with_size_safety, find_chromium_binary,
-    find_chromium_binary_in, global as chromium_singleton,
+    CHROMIUM_BINARY_CANDIDATES, ChromiumSingleton, DEFAULT_CDP_PORT, InspectOutcome,
+    InspectRequest, MAX_WAIT_MS as UI_SCREENSHOT_MAX_WAIT_MS, SIZE_SAFETY_CAP_BYTES,
+    ScreenshotRequest, SizeSafeCapture, capture, capture_with_size_safety, find_chromium_binary,
+    find_chromium_binary_in, global as chromium_singleton, inspect,
 };
 pub use crate::interactive::{
     InteractRequest, InteractiveAction, InteractiveDriver, MAX_ACTIONS, MAX_TYPE_LEN, interact,
