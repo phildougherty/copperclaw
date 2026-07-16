@@ -48,6 +48,17 @@ URL.
 - **"Preview capacity reached"** — close a preview you no longer need
   with `close_preview`, then retry.
 
+## Preview as the demo hand-off
+
+A live preview link is the strongest way to end a build the operator can
+try from their phone. When you finish an HTTP prototype, `expose_preview`
+it and send the URL as *part of your delivery*, alongside the downloadable
+artifact (`send_file`) and the `artifact_path` host path — see
+[[coding-task]] and [[send-file]]. That file-plus-path-plus-link trio is
+the "prototype ready" close. `close_preview` once the operator has seen
+it. (A single richer close card is a forthcoming card, P3; until it
+lands, the link plus the file is the hand-off.)
+
 ## Limits to keep in mind
 
 - The preview expires after 30 minutes idle; re-expose if it lapsed.
