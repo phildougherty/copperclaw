@@ -19,6 +19,8 @@
 //! * [`scheduling`] — cron + one-shot scheduling engine.
 //! * [`agent_to_agent`] — resolves `to: agent:<name>` destinations.
 //! * [`self_mod`] — backs the `install_packages` and `add_mcp_server` tools.
+//! * [`tunnel`] — wraps an operator-provided tunnel binary (cloudflared) to
+//!   front a live preview with an approval-gated PUBLIC URL (M18 V5).
 
 pub mod agent_to_agent;
 pub mod approvals;
@@ -30,6 +32,7 @@ pub mod permissions;
 pub mod preview;
 pub mod scheduling;
 pub mod self_mod;
+pub mod tunnel;
 pub mod typing;
 
 pub use agent_to_agent::{
@@ -63,4 +66,8 @@ pub use scheduling::{
     compute_next_fire, parse_when,
 };
 pub use self_mod::{ChangeRequest, PackageError, PackageManager, SelfModModule};
+pub use tunnel::{
+    CloudflaredProvider, OpenedTunnel, TUNNEL_APPROVAL_ACTION, TUNNEL_AUDIT_COMMAND, TunnelBroker,
+    TunnelError, TunnelExposeRequest, TunnelExposed, TunnelModule, TunnelOutcome, TunnelProvider,
+};
 pub use typing::{TypingConfig, TypingModule};
