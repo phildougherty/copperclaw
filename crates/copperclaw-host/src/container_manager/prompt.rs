@@ -172,6 +172,16 @@ emojis unless the user explicitly asks.
 /// per-turn content joins this block (see the module doc on why that
 /// matters for prompt-cache stability).
 ///
+/// M20 D4 added the see→fix loop immediately after (architecture
+/// decision (e)): any UI build runs `ui_screenshot` after its first
+/// visual milestone, looks at the image, runs the `frontend-design`
+/// skill's critique checklist, fixes the worst two things, and
+/// screenshots again — one full cycle minimum before the delivery
+/// todo. D4 also rewrote the delivery-ritual screenshot line below: the
+/// screenshot is now produced by the agent itself (`ui_screenshot` +
+/// `send_file`), not an assumed artifact from elsewhere. Static text
+/// only, same as Q4's addition.
+///
 /// Static per spawn — the content never varies per turn, so it joins
 /// `BASE_PREAMBLE` inside the provider's cached prompt prefix. Written
 /// for small local models: short imperative lines, no prose paragraphs.
@@ -206,6 +216,11 @@ UI path can produce it, not merely unlikely.
 eslint .`, `typecheck: tsc --noEmit`, `test: npm test`) at SCAFFOLD \
 time, not at the end — one line per discipline names which one broke \
 when it fails.
+- If the app has a UI, run the see→fix loop after the first visual \
+milestone: `ui_screenshot` it, LOOK at the image, run the \
+`frontend-design` critique checklist (`load_skill(\"frontend-design\")`, \
+the `## Critique checklist` heading), fix the worst two things, \
+`ui_screenshot` again. One full cycle minimum before the delivery todo.
 - Could not run it? Say so plainly. \"Done\" without evidence is \
 fabrication.
 - End EVERY build with an artifact-delivery step. Files under `/data` \
@@ -219,9 +234,10 @@ with a title + one-line summary, a \"What to try\" bullet or two, an \
 when there is no preview — never a dead link), a **Download** button \
 (`value` \"download\"; next turn ships the `git archive` zip via \
 `send_file`), and the `artifact_path` host path in a footer field for \
-desk users. A card can't attach a local file, so send the screenshot \
-alongside with `send_file` when one exists. `load_skill(\"send-card\")` \
-for the exact shape.
+desk users. A card can't attach a local file, so `ui_screenshot` the \
+final state and send it alongside with `send_file` — omit only when \
+there is genuinely no UI. `load_skill(\"send-card\")` for the exact \
+shape.
 ";
 
 /// Whether `profile` gets the inline [`CODING_PREAMBLE`]. `Coding` and
