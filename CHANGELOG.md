@@ -149,6 +149,47 @@ adheres to [Semantic Versioning](https://semver.org/).
   (`ui_screenshot_docker_end_to_end` in `ui_screenshot.rs`) is `#[ignore]`d
   per the `session_install_docker_end_to_end` precedent (`self_mod.rs`).
 
+### Added (M20 Q3 — `diagnostics`: structured lint/typecheck output)
+
+- All code feedback previously went through `shell`, whose stdout/stderr are
+  head-truncated at 32 KiB per stream
+  (`crates/copperclaw-mcp/src/tools/computer_use.rs::SHELL_OUTPUT_CAP`) — a
+  long `tsc` error list truncated exactly where the useful errors were, and
+  the model burned turns re-running with `tail_bytes` to see what it missed.
+  A new first-party `diagnostics` MCP tool
+  (`crates/copperclaw-mcp/src/tools/diagnostics.rs`) fixes this: given a
+  project path, it detects which of eslint/tsc/ruff apply (config-file
+  presence or a bounded file-extension sniff via `ignore::WalkBuilder`, same
+  crate `glob`/`grep` already use), runs each in machine-readable mode
+  (`eslint -f json`, `tsc --pretty false`, `ruff --output-format json`), and
+  returns a **structured, capped digest** — per-file error/warning counts,
+  the first N (default 40, caller-tunable up to 200 via `max_findings`) full
+  diagnostics with message/`file:line`/rule, and totals — never a raw dump.
+- **Read-only analysis with no gate interaction.** `.copperclaw/verify`
+  (M20 Q2's multi-stage gate) remains the sole enforcement path;
+  `diagnostics` never touches the dirty/stage/fix-cycle markers — it's a
+  fix-cycle accelerator, and the tool description says so explicitly.
+- A tool whose binary isn't on `PATH` (probed at CALL TIME via `command -v`,
+  mirroring `ui_screenshot`'s chromium probe — never a registration-time
+  check) degrades to a per-tool `"not_available"` note naming the
+  `prototyping` image profile, never a hard tool-call error; a project with
+  no applicable tool at all reports a single clean "nothing to run" note
+  instead of erroring.
+- **Registered in Coding/Full tool profiles** (`crates/copperclaw-runner/src/policy.rs`:
+  `CODING_TOOLS`), guest-denied like `ui_screenshot` (spawning
+  linter/typechecker subprocesses is a resource cost a read-only sender
+  shouldn't get for free) and NOT a credentialed external action (purely
+  in-container subprocess analysis, no taint/autonomy gating needed).
+- Unit-tested against captured JSON/text samples (no live `eslint`/`tsc`/
+  `ruff` needed, so CI is green without the `prototyping` image): a 40-error
+  synthetic `tsc` run digests to well under the 32 KiB shell-truncation cap;
+  a Python-only fixture routes to `ruff` only; a fixture with no applicable
+  tool reports cleanly; a nonexistent binary name degrades via `probe_binary`
+  determinism. Two `#[ignore]`d live integration tests
+  (`diagnostics_live_tsc_end_to_end`, `diagnostics_live_ruff_end_to_end`)
+  exercise the real subprocess + parse path against a genuine `tsc`/`ruff`
+  on `PATH`, per the `ui_screenshot_docker_end_to_end` precedent.
+
 ### Added (M19 A3 — Public-tunnel model verb: activate V5)
 
 - The merged-but-dormant V5 public-tunnel module now has an agent-facing verb.

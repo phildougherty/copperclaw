@@ -28,6 +28,7 @@ pub mod compact_now;
 pub mod computer_use;
 pub mod copy_file;
 pub mod core;
+pub mod diagnostics;
 pub(crate) mod diff_util;
 pub mod edit_file;
 pub mod explore;
@@ -112,6 +113,12 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         // handler itself probes for chromium at call time so the minimal
         // image profile degrades cleanly instead of crashing.
         ui_screenshot::entry(),
+        // M20 Q3: structured lint/typecheck digest — a read-only fix-cycle
+        // accelerator with no `.copperclaw/verify` gate interaction (that
+        // stays Q2's enforcement path). Registered alongside `ui_screenshot`
+        // in the Coding/Full profile tier; degrades per-tool when
+        // eslint/tsc/ruff aren't baked into the image (pre-Q1 / minimal).
+        diagnostics::entry(),
         view_image::entry(),
         // Git inspection tools — read-only structured access to a
         // libgit2-backed repository view. Registered alphabetically.
@@ -239,6 +246,7 @@ mod tests {
             "web_fetch",
             "browser_render",
             "ui_screenshot",
+            "diagnostics",
             "view_image",
             "git_blame",
             "git_diff",
