@@ -55,6 +55,64 @@ adheres to [Semantic Versioning](https://semver.org/).
     without a real override fails the build (same spirit as the R0
     tool-name-drift guard).
 
+### Changed (M19 F6 — richer bare-channel status row + intermediate stuck signal, 2026-07-16)
+
+- On bare / edit-incapable channels the only progress signal was the 60s
+  "still working" status row — a fixed string with no detail — and nothing
+  bridged the gap between it and the 5-minute apology, so a slow build
+  looked fine for five minutes then abruptly apologised.
+  `crates/copperclaw-runner/src/run/hud.rs` now composes that row through a
+  pure `compose_status_row` helper that folds in the current todo step (the
+  same `step N/M: …` detail the Live HUD shows) so bare channels get real
+  progress, and past `INTERMEDIATE_STATUS_AFTER` (150s, well short of the
+  sweep's `APOLOGY_AFTER_SECS = 300`) softens the closing line to "This is
+  taking longer than usual, but I'm still going." so the run degrades
+  gracefully toward the apology instead of cliff-edging into it. The emit
+  path and cadence are unchanged, so child-agent sessions still skip the
+  row inside `RunnerToolCtx::emit_status` (no sub-agent status spam).
+
+### Added (M19 F5 — HUD covers the pre-first-tool / pure-reasoning wait, 2026-07-16)
+
+- The Task HUD used to post only at the first tool call and skip finalize
+  entirely on a zero-tool turn, so a multi-minute pure-reasoning answer on
+  an edit-capable channel showed nothing until the answer landed —
+  indistinguishable from a hang. `crates/copperclaw-runner/src/run/hud.rs`
+  now arms a single background HUD task at turn start (live HUD only, via
+  `TaskHud::arm`, called from `drive_turn`): it waits a short
+  `THINKING_THRESHOLD` (6s) so fast turns finalize first and post nothing
+  (byte-stable), then posts an initial "thinking… | M:SS" frame and
+  continues as the elapsed-clock ticker. `finalize` now collapses a
+  zero-tool turn that posted a thinking frame (to a clean "done in M:SS",
+  no "0 tool calls" tail) instead of leaving it dangling; a turn that never
+  posted still finalizes to nothing. `hud_mode=off` / `final` and the
+  no-op-edit suppression are unchanged. (The old per-batch `ensure_ticker`
+  spawn is folded into the one armed task, so tool-first turns still get a
+  ticker with no duplicate HUD message.)
+
+### Added (M19 F2 — actionable "I'm blocked" wall cards, 2026-07-16)
+
+- Tool errors and policy / provenance / verify-gate / egress denials used
+  to render only into the model's history (`Tool { is_error: true }`) — the
+  user never saw them, so when the model then looped or gave up the HUD
+  just stopped, indistinguishable from a hang. The runner now watches the
+  tail of each turn's tool results (`crates/copperclaw-runner/src/run/blocker.rs`,
+  new module): when a turn ends **without** a user-facing reply and its
+  tail is a *run* of denials on the **same** blocker (≥2, not a single
+  recovered error), the terminal-failure path swaps its generic apology for
+  **one** curated `ErrorCard` naming what is blocked and the actionable next
+  step (egress-allow command, write a `.copperclaw/verify`, this needs
+  approval, needs a person, not permitted here). Wiring:
+  `crates/copperclaw-runner/src/run/drive_turn.rs` folds each result into a
+  `BlockerRun` tail tracker (a mid-turn `send_message` latches suppression —
+  the turn isn't a silent wall) and attaches the category to `TurnResult`;
+  `finalize_messages` / `emit_terminal_failure_apologies` in
+  `crates/copperclaw-runner/src/run/mod.rs` render the wall card. Card text
+  is **curated per category** and carries no `details` block, so no raw
+  tool-error string (or content injected via a tool result) reaches the
+  user. A recovered error, a normal answer, and a non-blocker terminal
+  failure are all unchanged (the generic apology still fires off the
+  blocker categories).
+
 ### Fixed (M18 — Task HUD no-op edit / Telegram "message is not modified", 2026-07-16)
 
 - The H1 Task HUD and R6 progressive-final-answer edit a pinned status

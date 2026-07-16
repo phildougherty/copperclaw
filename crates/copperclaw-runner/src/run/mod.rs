@@ -9,6 +9,7 @@
 //! small DB-side helpers that need a `&RunnerDeps` and a mutex lock on
 //! the inbound/outbound connections.
 
+pub(super) mod blocker;
 pub(super) mod drive_turn;
 pub mod external_mcp;
 pub(super) mod formatting;
@@ -809,7 +810,7 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
         .await?;
         state.continuation = turn.continuation.or(state.continuation);
 
-        finalize_messages(&deps, &formatted.rows, turn.outcome).await?;
+        finalize_messages(&deps, &formatted.rows, turn.outcome, turn.blocker).await?;
         // Clear the originating routing so the next iteration's
         // emit-outbound calls don't accidentally inherit a stale
         // channel (e.g. a system-kind row written by save_state).
@@ -1204,7 +1205,7 @@ async fn handle_slash_command(
 
     // Mark the batch's inbound rows as completed so the host doesn't
     // re-deliver them, then update the processing_ack rows.
-    finalize_messages(deps, &formatted.rows, TurnOutcome::Done).await?;
+    finalize_messages(deps, &formatted.rows, TurnOutcome::Done, None).await?;
     deps.tool_ctx.clear_originating();
     Ok(())
 }
@@ -1213,6 +1214,7 @@ async fn finalize_messages(
     deps: &RunnerDeps,
     rows: &[MessageInRow],
     outcome: TurnOutcome,
+    blocker: Option<blocker::BlockerCategory>,
 ) -> Result<()> {
     let ack_status = match outcome {
         TurnOutcome::Done => processing_ack::ProcessingStatus::Done,
@@ -1270,7 +1272,7 @@ async fn finalize_messages(
     // `thread_id`) are copied from the inbound so the delivery loop
     // dispatches the apology back to the originating chat.
     if let TurnOutcome::Failed(reason) = &outcome {
-        if let Err(err) = emit_terminal_failure_apologies(deps, rows, reason).await {
+        if let Err(err) = emit_terminal_failure_apologies(deps, rows, reason, blocker).await {
             tracing::warn!(?err, "could not emit terminal-failure apology");
         }
     }
@@ -1344,6 +1346,7 @@ async fn emit_terminal_failure_apologies(
     deps: &RunnerDeps,
     rows: &[MessageInRow],
     reason: &str,
+    blocker: Option<blocker::BlockerCategory>,
 ) -> Result<()> {
     use copperclaw_db::tables::messages_out::{WriteOutbound, insert as insert_out};
     if rows.is_empty() {
@@ -1358,8 +1361,24 @@ async fn emit_terminal_failure_apologies(
     //     is another LLM, not a person, and giving an LLM a structured
     //     ErrorCard hands it a side-channel signal that's harder to
     //     handle than a sentence. Keep the existing prose.
-    let user_summary = apology_text(reason);
-    let user_card = build_terminal_failure_error_card(&user_summary, reason);
+    // F2: when the turn walled on a run of same-blocker denials and
+    // never produced a user-facing reply, swap the generic apology for
+    // ONE curated, actionable wall card keyed by blocker category. The
+    // card is fully curated — it never echoes the raw denial text, so no
+    // internal detail (or injected content) reaches the user. Any other
+    // terminal failure keeps the existing generic apology, byte-stable.
+    let user_card = if let Some(cat) = blocker {
+        tracing::info!(
+            target: "copperclaw_runner",
+            agent_group_id = %deps.agent_group_id,
+            blocker = cat.metric_label(),
+            "F2: surfacing actionable wall card for blocked turn",
+        );
+        cat.to_error_card()
+    } else {
+        let user_summary = apology_text(reason);
+        build_terminal_failure_error_card(&user_summary, reason)
+    };
     let agent_text = agent_apology_text(reason);
     let outbound = deps.outbound.lock().await;
     let conn: &rusqlite::Connection = &outbound;
@@ -3682,5 +3701,212 @@ mod tests {
     fn resolve_max_task_tokens_rejects_garbage() {
         let env = crate::config::MapEnv::from_pairs([(MAX_TASK_TOKENS_ENV, "lots")]);
         assert_eq!(resolve_max_task_tokens(&env), DEFAULT_MAX_TASK_TOKENS);
+    }
+
+    // ── F2: actionable "I'm blocked" wall cards ─────────────────────────
+    //
+    // These drive the full run_loop pipeline (drive_turn → finalize →
+    // apology emit) so the assertion is about what lands in `messages_out`
+    // — the exact rows the delivery loop would route to the user.
+
+    /// A tool that always fails with the deny-default egress hint the real
+    /// `install_packages` surfaces (`self_mod::egress_allow_hint`), so a
+    /// run of these produces a tail run of `Egress` denials.
+    struct EgressDenyTool;
+
+    #[async_trait]
+    impl copperclaw_mcp::ToolHandler for EgressDenyTool {
+        async fn call(
+            &self,
+            _arguments: Option<rmcp::model::JsonObject>,
+            _ctx: &dyn copperclaw_mcp::ToolContext,
+        ) -> Result<rmcp::model::CallToolResult, copperclaw_mcp::ToolError> {
+            Err(copperclaw_mcp::ToolError::Context(
+                "session install failed. `npm` could not reach its package registry — \
+                 container egress is denied by default. Ask an operator to allow the \
+                 registry, then retry: `cclaw groups config set-egress-allow abc \
+                 --allow registry.npmjs.org:443`"
+                    .into(),
+            ))
+        }
+    }
+
+    /// Register a single mock tool named `name` on `deps.tool_map`.
+    fn install_mock_tool(
+        deps: &mut RunnerDeps,
+        name: &'static str,
+        handler: Box<dyn copperclaw_mcp::ToolHandler>,
+    ) {
+        let mut map: std::collections::HashMap<String, Arc<copperclaw_mcp::ToolEntry>> =
+            std::collections::HashMap::new();
+        map.insert(
+            name.to_string(),
+            Arc::new(copperclaw_mcp::ToolEntry {
+                tool: rmcp::model::Tool {
+                    name: std::borrow::Cow::Borrowed(name),
+                    description: None,
+                    input_schema: Arc::new(rmcp::model::JsonObject::new()),
+                    annotations: None,
+                },
+                handler,
+            }),
+        );
+        deps.tool_map = Arc::new(map);
+    }
+
+    /// One scripted turn that calls `install_packages` with identical args
+    /// (so a run trips the content-loop breaker) — the same shape a model
+    /// wedged against a hard wall produces.
+    fn install_packages_turn() -> Vec<ProviderEvent> {
+        vec![ProviderEvent::ToolCall {
+            id: "tu_install".into(),
+            name: "install_packages".into(),
+            input: serde_json::json!({ "ecosystem": "npm", "packages": ["left-pad"] }),
+        }]
+    }
+
+    #[tokio::test]
+    async fn egress_wall_produces_exactly_one_curated_card() {
+        // Six identical egress-denied install turns: the content-loop
+        // breaker trips at the fourth, the turn ends Failed with no
+        // user-facing reply, and its tail is a run of Egress denials — so
+        // finalize surfaces ONE curated wall card instead of the generic
+        // apology, and never leaks the raw denial text.
+        let scripts: Vec<Vec<ProviderEvent>> = (0..6).map(|_| install_packages_turn()).collect();
+        let mut setup = build_setup(scripts);
+        install_mock_tool(
+            &mut setup.deps,
+            "install_packages",
+            Box::new(EgressDenyTool),
+        );
+        setup.deps.max_tool_turns = 50;
+        setup.deps.max_turns = Some(1);
+        {
+            let g = setup.deps.inbound.lock().await;
+            insert_pending(&g, "please add left-pad and build the app");
+        }
+        run_loop(setup.deps).await.unwrap();
+
+        let outbound = open_outbound(&setup.paths).unwrap();
+        let rows = messages_out::list_due(&outbound).unwrap();
+        // Exactly one Error-kind row (the wall card) — no generic apology
+        // in addition, and no user-facing Chat reply.
+        let error_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == copperclaw_types::MessageKind::Error)
+            .collect();
+        assert_eq!(
+            error_rows.len(),
+            1,
+            "exactly one wall card must land; got {} error rows",
+            error_rows.len()
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.kind == copperclaw_types::MessageKind::Chat),
+            "a silently-walled turn must not also emit a chat reply"
+        );
+        let card: copperclaw_channels_core::ErrorCard =
+            serde_json::from_value(error_rows[0].content["error"].clone()).unwrap();
+        assert_eq!(card.title, "Blocked: can't reach a package registry");
+        assert!(
+            card.summary.contains("set-egress-allow"),
+            "the curated card teaches the egress-allow remediation: {}",
+            card.summary
+        );
+        // No RAW denial text (or its `details` block) reaches the user.
+        assert!(
+            card.details.is_none(),
+            "wall card must carry no raw details"
+        );
+        let serialized = serde_json::to_string(&card).unwrap();
+        assert!(
+            !serialized.contains("session install failed")
+                && !serialized.contains("registry.npmjs.org:443"),
+            "raw ToolError text must never reach the user: {serialized}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovered_egress_error_produces_no_wall_card() {
+        // One egress denial, then the model recovers and answers normally.
+        // The turn ends Done with a chat reply — no wall card, byte-stable.
+        let scripts: Vec<Vec<ProviderEvent>> = vec![
+            install_packages_turn(),
+            vec![ProviderEvent::Result {
+                text: Some("I couldn't install it, but here's a workaround: …".into()),
+            }],
+        ];
+        let mut setup = build_setup(scripts);
+        install_mock_tool(
+            &mut setup.deps,
+            "install_packages",
+            Box::new(EgressDenyTool),
+        );
+        setup.deps.max_tool_turns = 50;
+        setup.deps.max_turns = Some(1);
+        {
+            let g = setup.deps.inbound.lock().await;
+            insert_pending(&g, "add left-pad");
+        }
+        run_loop(setup.deps).await.unwrap();
+
+        let outbound = open_outbound(&setup.paths).unwrap();
+        let rows = messages_out::list_due(&outbound).unwrap();
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.kind == copperclaw_types::MessageKind::Error),
+            "a recovered turn must emit no wall card"
+        );
+        let chat = rows
+            .iter()
+            .find(|r| r.kind == copperclaw_types::MessageKind::Chat)
+            .expect("the recovered turn must emit its normal answer");
+        assert!(
+            chat.content["text"]
+                .as_str()
+                .unwrap()
+                .contains("workaround")
+        );
+    }
+
+    #[tokio::test]
+    async fn non_blocker_failure_keeps_generic_apology() {
+        // A turn that fails for a reason with NO recognized blocker (an
+        // unknown tool looping into the breaker) must keep the existing
+        // generic apology card — the F2 path is byte-stable off the
+        // blocker categories.
+        let scripts: Vec<Vec<ProviderEvent>> = (0..6)
+            .map(|_| {
+                vec![ProviderEvent::ToolCall {
+                    id: "tu_x".into(),
+                    name: "noop_loop".into(),
+                    input: serde_json::json!({}),
+                }]
+            })
+            .collect();
+        let mut setup = build_setup(scripts);
+        setup.deps.max_tool_turns = 50;
+        setup.deps.max_turns = Some(1);
+        {
+            let g = setup.deps.inbound.lock().await;
+            insert_pending(&g, "do the thing");
+        }
+        run_loop(setup.deps).await.unwrap();
+
+        let outbound = open_outbound(&setup.paths).unwrap();
+        let rows = messages_out::list_due(&outbound).unwrap();
+        let error_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == copperclaw_types::MessageKind::Error)
+            .collect();
+        assert_eq!(error_rows.len(), 1, "one generic apology card");
+        let card: copperclaw_channels_core::ErrorCard =
+            serde_json::from_value(error_rows[0].content["error"].clone()).unwrap();
+        // The generic terminal-failure card, unchanged by F2.
+        assert_eq!(card.title, "I couldn't finish that reply");
+        assert!(!card.title.starts_with("Blocked:"));
     }
 }
