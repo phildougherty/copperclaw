@@ -1382,11 +1382,16 @@ merged — the golden fixture NOW covers the verify-gate refuse→fix→pass leg
 security sign-off). What remains for the live half:
 - The **live telegram smoke** (the phone-driven end-to-end above) has still
   never been run — it needs a message from the operator's device, so the
-  autonomous session cannot complete it. The automatable **cli-channel proxy**
-  is the substitute an unattended run can drive; a green cli smoke is
-  corroborating, not a full substitute for the phone demo (cli is not
-  edit-capable, so it exercises the `StatusRows` HUD path, not the in-place
-  edited HUD the phone sees).
+  autonomous session cannot complete it. A **cli-channel connectivity smoke WAS
+  run (2026-07-16, eighth session)** against the rebuilt completed code: a
+  message through the fifo bridge returned `agent> OK 2026-07-16` in ~10s,
+  proving the full inbound→router→runner→outbound→delivery pipeline + provider
+  path are healthy end-to-end on `main` @ `02e3087`. That is connectivity
+  corroboration ONLY — it does NOT exercise the behavioral demo (in-place edited
+  HUD, `/stop`+resteer, verify-gate block, preview link, ritual card +
+  screenshot), which needs a real "build me X" run on a capable model, and for
+  the edited-HUD/preview legs specifically the telegram channel from a phone
+  (cli is not edit-capable → `StatusRows` path only).
 - **V5 #55** merge after security sign-off.
 These are the only two things between here and "program done"; neither is card
 work.
