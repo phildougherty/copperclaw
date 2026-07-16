@@ -468,6 +468,116 @@ pub struct SubagentResult {
     pub tools_called: Vec<SubagentToolCall>,
 }
 
+/// Hard cap on the number of workers a single `delegate_batch` may fan
+/// out. A batch is a *bounded* join: each worker is a full container with
+/// its own writable `sib/<id>` worktree, and the parent blocks on all of
+/// them and folds every report into its context — so an unbounded width
+/// would swamp the host and blow the parent's context on join. The looser,
+/// unbounded async fan-out (`delegate` called N times, results arriving
+/// asynchronously) is still available for wider spreads.
+pub const MAX_DELEGATE_BATCH_WIDTH: usize = 6;
+
+/// Default wall-clock budget for a `delegate_batch` join when the caller
+/// omits `timeout_secs`. Bounded well under the runner's per-tool deadline
+/// so the join returns a partial aggregate (per-worker timeout errors)
+/// rather than being hard-aborted mid-call.
+pub const DEFAULT_DELEGATE_BATCH_TIMEOUT_SECS: u64 = 300;
+
+/// Hard ceiling on the `delegate_batch` join budget. A caller may not ask
+/// to block longer than this; still comfortably under the runner's
+/// per-tool deadline (`DEFAULT_TOOL_DEADLINE_SECS`).
+pub const MAX_DELEGATE_BATCH_TIMEOUT_SECS: u64 = 600;
+
+/// One worker in a [`DelegateBatchRequest`]. Same two fields as a single
+/// `delegate` (no channel — a delegate is never user-facing).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateBatchWorker {
+    /// Display name / folder-slug seed for the worker.
+    pub name: String,
+    /// Build instructions for the worker (point it at `/workspace`).
+    pub instructions: String,
+}
+
+/// Request handed to [`ToolContext::run_delegate_batch`] by the
+/// `delegate_batch` tool. Widths and budgets are already validated /
+/// clamped by the tool handler before this is constructed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateBatchRequest {
+    /// The workers to fan out (1..=[`MAX_DELEGATE_BATCH_WIDTH`]).
+    pub workers: Vec<DelegateBatchWorker>,
+    /// Wall-clock join budget in seconds (clamped to
+    /// [`MAX_DELEGATE_BATCH_TIMEOUT_SECS`]).
+    pub timeout_secs: u64,
+}
+
+/// Terminal status of one worker in a joined [`DelegateBatchOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerStatus {
+    /// The worker spawned, ran, and reported back within budget.
+    Ok,
+    /// The host refused to spawn the worker (depth cap, permission gate,
+    /// or an invalid spawn) — the worker never ran.
+    SpawnFailed,
+    /// The worker spawned but did not report within the join budget.
+    Timeout,
+}
+
+/// One worker's outcome in a joined [`DelegateBatchOutcome`], in request
+/// order. A failed worker surfaces as an `error` here rather than losing
+/// the whole batch turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerOutcome {
+    /// The worker name the caller supplied.
+    pub name: String,
+    /// Terminal status.
+    pub status: WorkerStatus,
+    /// The worker's consolidated report (its single `send_message` back to
+    /// the parent). `Some` iff `status == Ok`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
+    /// A short reason when the worker did not produce a report
+    /// (spawn-gate refusal or timeout).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The spawned child session id, when one was assigned (for the
+    /// caller to `git diff main..sib/<id>` / merge the worker's branch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+/// The aggregated result of a `delegate_batch` join: one [`WorkerOutcome`]
+/// per requested worker, in request order. Returned as ONE tool response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateBatchOutcome {
+    /// Per-worker outcomes, in request order.
+    pub workers: Vec<WorkerOutcome>,
+}
+
+impl DelegateBatchOutcome {
+    /// True when EVERY worker failed to spawn (e.g. the whole batch was
+    /// refused by the subagent depth cap). The `delegate_batch` tool
+    /// surfaces this as a tool error — a clean refusal — rather than a
+    /// partial aggregate.
+    #[must_use]
+    pub fn all_spawn_failed(&self) -> bool {
+        !self.workers.is_empty()
+            && self
+                .workers
+                .iter()
+                .all(|w| w.status == WorkerStatus::SpawnFailed)
+    }
+
+    /// Count of workers that reported successfully.
+    #[must_use]
+    pub fn completed(&self) -> usize {
+        self.workers
+            .iter()
+            .filter(|w| w.status == WorkerStatus::Ok)
+            .count()
+    }
+}
+
 /// Channel routing of the inbound currently being processed, as exposed
 /// through [`ToolContext::originating_channel`]. A read-only snapshot of
 /// what [`ToolContext::set_originating`] stashed — consumers (the Task
@@ -515,6 +625,37 @@ pub trait ToolContext: Send + Sync {
         let _ = req;
         Err(ToolError::Context(
             "subagent not supported in this context".into(),
+        ))
+    }
+
+    /// Spawn a bounded batch of `delegate` workers in isolated `sib/<id>`
+    /// worktrees and BLOCK until all report (or the join budget elapses),
+    /// returning one [`WorkerOutcome`] per worker in request order.
+    ///
+    /// This is the runner-side JOIN SEAM behind the `delegate_batch` tool
+    /// (M19 A1). It reuses the exact single-`delegate` spawn machinery —
+    /// same depth/permission caps, same containment (each worker lands
+    /// with a NULL messaging group and reports ONLY back to the parent,
+    /// never into the user's chat) — but adds a synchronous gather so a
+    /// parent can fan out N parallel builds and assemble their joined
+    /// output in ONE turn, rather than the N-separate-`delegate` calls
+    /// whose results arrive asynchronously on later turns.
+    ///
+    /// The implementation block-polls the parent's own `inbound.db` for
+    /// each worker's spawn result and its final report, exactly analogous
+    /// to how an external-MCP call block-polls the host's response
+    /// (`run::external_mcp`).
+    ///
+    /// Default impl returns `ToolError::Context` so mock / subagent
+    /// contexts (which cannot poll the parent's inbound.db) compile
+    /// unchanged — only the runner's `RunnerToolCtx` overrides it.
+    async fn run_delegate_batch(
+        &self,
+        req: DelegateBatchRequest,
+    ) -> Result<DelegateBatchOutcome, ToolError> {
+        let _ = req;
+        Err(ToolError::Context(
+            "delegate_batch not supported in this context".into(),
         ))
     }
 
@@ -830,6 +971,14 @@ struct MockInner {
     /// override value tests want returned.
     #[allow(clippy::option_option)]
     check_command_override: Option<Option<String>>,
+    /// `delegate_batch` requests recorded in order.
+    delegate_batch_calls: Vec<DelegateBatchRequest>,
+    /// Pre-seeded outcome returned by the next `run_delegate_batch`. When
+    /// `None`, the mock returns a canned all-`ok` outcome (one report per
+    /// worker) so happy-path tool tests work without wiring.
+    next_delegate_batch_outcome: Option<DelegateBatchOutcome>,
+    /// If set, the next `run_delegate_batch` returns this Err instead.
+    next_delegate_batch_err: Option<ToolError>,
 }
 
 impl MockToolContext {
@@ -950,6 +1099,31 @@ impl MockToolContext {
             .expect("MockToolContext mutex poisoned")
             .check_command_override = Some(cmd);
     }
+
+    /// Snapshot of `delegate_batch` requests recorded so far.
+    pub fn delegate_batch_calls(&self) -> Vec<DelegateBatchRequest> {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .delegate_batch_calls
+            .clone()
+    }
+
+    /// Override the outcome returned by the next `run_delegate_batch`.
+    pub fn set_next_delegate_batch_outcome(&self, outcome: DelegateBatchOutcome) {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .next_delegate_batch_outcome = Some(outcome);
+    }
+
+    /// Cause the *next* `run_delegate_batch` to fail.
+    pub fn fail_next_delegate_batch(&self, err: ToolError) {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .next_delegate_batch_err = Some(err);
+    }
 }
 
 #[async_trait]
@@ -986,6 +1160,32 @@ impl ToolContext for MockToolContext {
         let result = g.next_subagent_result.take().unwrap_or(canned);
         g.subagent_calls.push(req);
         Ok(result)
+    }
+
+    async fn run_delegate_batch(
+        &self,
+        req: DelegateBatchRequest,
+    ) -> Result<DelegateBatchOutcome, ToolError> {
+        let mut g = self.inner.lock().expect("MockToolContext mutex poisoned");
+        if let Some(err) = g.next_delegate_batch_err.take() {
+            return Err(err);
+        }
+        let canned = DelegateBatchOutcome {
+            workers: req
+                .workers
+                .iter()
+                .map(|w| WorkerOutcome {
+                    name: w.name.clone(),
+                    status: WorkerStatus::Ok,
+                    report: Some(format!("mock report from {}", w.name)),
+                    error: None,
+                    session_id: None,
+                })
+                .collect(),
+        };
+        let outcome = g.next_delegate_batch_outcome.take().unwrap_or(canned);
+        g.delegate_batch_calls.push(req);
+        Ok(outcome)
     }
 
     async fn emit_diff(&self, diff: copperclaw_channels_core::DiffCard) {

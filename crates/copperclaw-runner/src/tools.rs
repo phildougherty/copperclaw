@@ -60,10 +60,11 @@ use copperclaw_db::DbError;
 use copperclaw_db::attachments::safe_attachment_name;
 use copperclaw_db::tables::messages_out::{self, WriteOutbound};
 use copperclaw_mcp::{
-    AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec, DelegateSpec,
-    EditMessageSpec, EmitTodoListSpec, InstallSpec, OutboundToolEffect, Recipient, ScheduleSpec,
-    SendCardSpec, SendFileSpec, SendMessageSpec, SubagentRequest, SubagentResult, TaskSummary,
-    ToolContext, ToolEffectAck, ToolEntry, ToolError, UpdateTaskSpec,
+    AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec, DelegateBatchOutcome,
+    DelegateBatchRequest, DelegateSpec, EditMessageSpec, EmitTodoListSpec, InstallSpec,
+    OutboundToolEffect, Recipient, ScheduleSpec, SendCardSpec, SendFileSpec, SendMessageSpec,
+    SubagentRequest, SubagentResult, TaskSummary, ToolContext, ToolEffectAck, ToolEntry, ToolError,
+    UpdateTaskSpec,
 };
 use copperclaw_providers::AgentProvider;
 use copperclaw_types::{Effort, MessageId, MessageKind};
@@ -75,6 +76,12 @@ use crate::subagent::{SubagentDeps, SubagentInputs, run_inner_loop};
 
 /// Shared, async-safe handle to the runner's `outbound.db` connection.
 pub type SharedOutbound = Arc<Mutex<Connection>>;
+
+/// Shared, async-safe handle to the runner's `inbound.db` connection.
+/// Wired onto [`RunnerToolCtx`] (via [`RunnerToolCtx::with_join`]) so the
+/// A1 `delegate_batch` join seam can block-poll for worker spawn results
+/// and reports.
+pub type SharedInbound = Arc<Mutex<Connection>>;
 
 /// Bundle of dependencies the [`RunnerToolCtx::spawn_subagent`] impl
 /// needs in addition to the outbound-write set. Populated at runner
@@ -226,6 +233,13 @@ pub struct RunnerToolCtx {
     /// verify command. Set by [`Self::with_verify_gate`] from
     /// `container_configs.check_command`.
     check_command_override: Option<String>,
+    /// A1 `delegate_batch` join seam: a handle to this session's
+    /// `inbound.db`, so `run_delegate_batch` can block-poll for each
+    /// spawned worker's `delegate_result` row and its final report. Wired
+    /// by [`Self::with_join`] from the runner binary; `None` in the mock /
+    /// minimal contexts that never fan out a batch (the batch then refuses
+    /// with a context error rather than silently no-op).
+    inbound: Option<SharedInbound>,
 }
 
 /// Stable pseudo tool-name the per-inbound Task HUD message rides
@@ -255,7 +269,18 @@ impl RunnerToolCtx {
             external_approved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             verify_gate_enabled: true,
             check_command_override: None,
+            inbound: None,
         }
+    }
+
+    /// Wire this session's `inbound.db` handle so the A1 `delegate_batch`
+    /// tool's [`ToolContext::run_delegate_batch`] join seam can block-poll
+    /// for each worker's spawn result + report. Without it, `delegate_batch`
+    /// refuses with a context error (mock / minimal contexts never fan out).
+    #[must_use]
+    pub fn with_join(mut self, inbound: SharedInbound) -> Self {
+        self.inbound = Some(inbound);
+        self
     }
 
     /// True when this session is a child of another session (was
@@ -741,6 +766,46 @@ impl ToolContext for RunnerToolCtx {
             ToolError::Internal(format!("list_tasks: parse {}: {err}", path.display()))
         })?;
         Ok(tasks)
+    }
+
+    /// A1 JOIN SEAM: spawn each worker via the exact single-`delegate`
+    /// machinery (a `Delegate` effect → `{"delegate": {...}}` System row the
+    /// host's delegate handler picks up: own container, writable `sib/<id>`
+    /// worktree, NULL messaging group so the worker reports ONLY back to us),
+    /// then BLOCK-poll our own inbound.db until every worker reports or the
+    /// budget elapses. Mirrors how `run::external_mcp` block-polls the host's
+    /// response — a bounded per-session-DB poll loop — so the parent turn
+    /// yields (the tokio runtime keeps the HUD ticker + heartbeat alive) and
+    /// resumes on the joined result.
+    async fn run_delegate_batch(
+        &self,
+        req: DelegateBatchRequest,
+    ) -> Result<DelegateBatchOutcome, ToolError> {
+        let Some(inbound) = self.inbound.clone() else {
+            return Err(ToolError::Context(
+                "delegate_batch join is not wired in this context".into(),
+            ));
+        };
+        // Snapshot the inbound high-water mark BEFORE spawning so the join
+        // only observes rows the host writes in response to THIS batch.
+        let start_seq = {
+            let conn = inbound.lock().await;
+            copperclaw_db::tables::messages_in::max_seq(&conn).unwrap_or(i64::MAX)
+        };
+        // Spawn every worker through the standard `Delegate` effect — same
+        // depth/permission caps + containment as a lone `delegate`.
+        for w in &req.workers {
+            self.emit_outbound(OutboundToolEffect::Delegate(DelegateSpec {
+                name: w.name.clone(),
+                instructions: w.instructions.clone(),
+            }))
+            .await?;
+        }
+        let timeout = std::time::Duration::from_secs(req.timeout_secs);
+        let outcome =
+            crate::run::delegate_batch::join_workers(&inbound, &req.workers, start_seq, timeout)
+                .await;
+        Ok(outcome)
     }
 
     fn set_originating(

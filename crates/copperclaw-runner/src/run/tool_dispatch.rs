@@ -785,4 +785,261 @@ mod tests {
         };
         assert!(queued.is_empty(), "blocked call must not queue a request");
     }
+
+    // ── delegate_batch (A1): fan-out + join end-to-end through invoke_tool ─────
+
+    use copperclaw_db::tables::messages_in::{self, WriteInbound};
+    use copperclaw_db::tables::messages_out;
+
+    /// Build deps whose `RunnerToolCtx` has BOTH the inbound and outbound
+    /// handles wired (`with_join`), so `delegate_batch` can spawn `Delegate`
+    /// rows to outbound and block-poll inbound for the join. Returns the
+    /// inbound/outbound handles so a fake host can drive the round-trip.
+    fn deps_with_join() -> (
+        tempfile::TempDir,
+        RunnerDeps,
+        Arc<Mutex<rusqlite::Connection>>,
+        Arc<Mutex<rusqlite::Connection>>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let inbound = Arc::new(Mutex::new(open_inbound(&paths).unwrap()));
+        let outbound = Arc::new(Mutex::new(open_outbound(&paths).unwrap()));
+        let ctx =
+            RunnerToolCtx::new(outbound.clone(), paths.outbox.clone()).with_join(inbound.clone());
+        let tool_ctx: Arc<dyn ToolContext> = Arc::new(ctx);
+        let provider: Arc<dyn AgentProvider> = Arc::new(NoopProvider);
+        let archive_dir = paths.outbox.join("_compactions");
+        let mut deps = RunnerDeps::minimal(
+            provider,
+            tool_ctx,
+            inbound.clone(),
+            outbound.clone(),
+            archive_dir,
+        );
+        let mut map: HashMap<String, Arc<copperclaw_mcp::ToolEntry>> = HashMap::new();
+        for e in copperclaw_mcp::build_tool_set() {
+            map.insert(e.tool.name.to_string(), Arc::new(e));
+        }
+        deps.tool_map = Arc::new(map);
+        deps.policy = ToolPolicy::new(ToolProfile::Full, None);
+        (tmp, deps, inbound, outbound)
+    }
+
+    /// Fake host: for every `{"delegate": {...}}` System row the runner
+    /// writes to outbound (not yet handled), write a `created`
+    /// `delegate_result` into inbound (detail = the worker's instructions, so
+    /// the join can attribute it) and then the worker's Chat report keyed by
+    /// its child `session_id`. Optionally, `fail` forces a `rejected` result
+    /// instead of `created` (models the depth cap).
+    async fn fake_host_answer_delegates(
+        inbound: &Arc<Mutex<rusqlite::Connection>>,
+        outbound: &Arc<Mutex<rusqlite::Connection>>,
+        fail: bool,
+    ) {
+        let mut handled: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let rows = {
+                let conn = outbound.lock().await;
+                messages_out::list_due(&conn).unwrap()
+            };
+            for row in rows {
+                let Some(d) = row.content.get("delegate") else {
+                    continue;
+                };
+                let key = row.id.as_uuid().to_string();
+                if !handled.insert(key) {
+                    continue;
+                }
+                let instructions = d
+                    .get("instructions")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let name = d
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("w")
+                    .to_owned();
+                if fail {
+                    write_inbound(
+                        inbound,
+                        copperclaw_types::MessageKind::System,
+                        serde_json::json!({"delegate_result": {
+                            "status": "rejected",
+                            "detail": "nested create_agent (max depth = 3)"
+                        }}),
+                        None,
+                    )
+                    .await;
+                    continue;
+                }
+                let sid = SessionId::new().as_uuid().to_string();
+                write_inbound(
+                    inbound,
+                    copperclaw_types::MessageKind::System,
+                    serde_json::json!({"delegate_result": {
+                        "status": "created",
+                        "session_id": sid,
+                        "detail": instructions,
+                    }}),
+                    None,
+                )
+                .await;
+                write_inbound(
+                    inbound,
+                    copperclaw_types::MessageKind::Chat,
+                    serde_json::json!({"text": format!("{name} finished")}),
+                    Some(sid),
+                )
+                .await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn write_inbound(
+        inbound: &Arc<Mutex<rusqlite::Connection>>,
+        kind: copperclaw_types::MessageKind,
+        content: serde_json::Value,
+        source_session_id: Option<String>,
+    ) {
+        let conn = inbound.lock().await;
+        let msg = WriteInbound {
+            id: copperclaw_types::MessageId::new(),
+            kind,
+            timestamp: chrono::Utc::now(),
+            content,
+            trigger: matches!(kind, copperclaw_types::MessageKind::Chat),
+            on_wake: false,
+            process_after: None,
+            recurrence: None,
+            series_id: None,
+            platform_id: None,
+            channel_type: None,
+            thread_id: None,
+            source_session_id,
+            reply_to: None,
+            is_group: None,
+        };
+        messages_in::insert(&conn, &msg).unwrap();
+    }
+
+    #[tokio::test]
+    async fn delegate_batch_fans_out_three_and_joins_one_result() {
+        // Headline A1 acceptance: a parent `delegate_batch` of 3 workers
+        // spawns three isolated delegates and returns ONE aggregated result
+        // after all three report — through the real invoke_tool dispatch.
+        let (_tmp, deps, inbound, outbound) = deps_with_join();
+        let host = tokio::spawn({
+            let inbound = inbound.clone();
+            let outbound = outbound.clone();
+            async move { fake_host_answer_delegates(&inbound, &outbound, false).await }
+        });
+
+        let (content, imgs, is_error) = invoke_tool(
+            &deps,
+            &call_with(
+                "delegate_batch",
+                serde_json::json!({
+                    "workers": [
+                        {"name": "api", "instructions": "build api under /workspace"},
+                        {"name": "cli", "instructions": "build cli under /workspace"},
+                        {"name": "docs", "instructions": "write docs under /workspace"}
+                    ],
+                    "timeout_secs": 10
+                }),
+            ),
+        )
+        .await;
+        host.abort();
+
+        assert!(
+            !is_error,
+            "a completed batch is not a tool error; got: {content}"
+        );
+        assert!(imgs.is_empty());
+        // ONE aggregated response carrying every worker's report.
+        assert!(content.contains("api finished"), "got: {content}");
+        assert!(content.contains("cli finished"), "got: {content}");
+        assert!(content.contains("docs finished"), "got: {content}");
+
+        // Three isolated `Delegate` spawn rows were written to outbound —
+        // each becomes its own container + `sib/<id>` worktree host-side.
+        let spawn_rows = {
+            let conn = outbound.lock().await;
+            messages_out::list_due(&conn)
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.content.get("delegate").is_some())
+                .count()
+        };
+        assert_eq!(
+            spawn_rows, 3,
+            "delegate_batch must spawn one delegate per worker"
+        );
+
+        // The join consumed every spawn-result + report row it owned — none
+        // linger to re-trigger a spurious parent turn.
+        let pending = {
+            let conn = inbound.lock().await;
+            messages_in::get_pending(&conn, true, 50).unwrap()
+        };
+        assert!(
+            pending.is_empty(),
+            "batch rows must be consumed; got {pending:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_batch_from_max_depth_child_is_refused() {
+        // Depth-cap acceptance: when the host rejects every spawn (a batch
+        // from a max-depth child), the tool surfaces a refusal (is_error),
+        // not a partial aggregate.
+        let (_tmp, deps, inbound, outbound) = deps_with_join();
+        let host = tokio::spawn({
+            let inbound = inbound.clone();
+            let outbound = outbound.clone();
+            async move { fake_host_answer_delegates(&inbound, &outbound, true).await }
+        });
+
+        let (content, _imgs, is_error) = invoke_tool(
+            &deps,
+            &call_with(
+                "delegate_batch",
+                serde_json::json!({
+                    "workers": [
+                        {"name": "a", "instructions": "x"},
+                        {"name": "b", "instructions": "y"}
+                    ],
+                    "timeout_secs": 10
+                }),
+            ),
+        )
+        .await;
+        host.abort();
+
+        assert!(is_error, "a fully-refused batch must be a tool error");
+        assert!(
+            content.contains("refused") && content.contains("max depth"),
+            "refusal must name the depth cap; got: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_batch_without_join_wiring_refuses_cleanly() {
+        // A ctx with no inbound handle (never wired `with_join`) must refuse
+        // rather than hang or panic — proves the batch never silently no-ops.
+        let (_tmp, deps, _ctx) = deps_with_runner_ctx();
+        let (content, _imgs, is_error) = invoke_tool(
+            &deps,
+            &call_with(
+                "delegate_batch",
+                serde_json::json!({"workers": [{"name": "a", "instructions": "x"}]}),
+            ),
+        )
+        .await;
+        assert!(is_error);
+        assert!(content.contains("not wired"), "got: {content}");
+    }
 }
