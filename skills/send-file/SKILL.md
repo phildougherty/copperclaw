@@ -60,6 +60,21 @@ Practical ceilings observed in current adapters:
 If you suspect you are near a limit, send a download link via
 `send_message` instead.
 
+## Delivering a whole project (the build hand-off)
+
+For a multi-file build, don't `send_file` each file — ship one archive.
+Build it with `git archive` so build junk is excluded, then send it:
+
+```bash
+git -C /data/<project> archive --format=zip -o /data/<project>.zip HEAD
+```
+
+`git archive HEAD` naturally omits `.git` and anything gitignored (e.g.
+`node_modules`), so commit first to make HEAD current. Pair the zip with
+the `artifact_path` host path (for desk users) and, when the app serves
+HTTP, an `expose_preview` link — see [[coding-task]] and [[preview]].
+That file-plus-path-plus-link trio is the "prototype ready" hand-off.
+
 ## Multiple files in one message
 
 A single tool call carries one file. To attach several to the same

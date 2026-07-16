@@ -32,6 +32,20 @@ lives at `<data_dir>/logs/copperclaw.out.log` (and `.err.log`) and
 the `cclaw` socket is the only way into the central DB. Both are
 operator-side.
 
+### Reading long logs without losing the error
+
+Errors usually sit at the END of a log, but `shell` keeps the FIRST
+32 KiB of output by default — the tail is exactly what gets cut. Two
+idioms:
+
+- **`shell` with `tail_bytes`** keeps the LAST N bytes instead:
+  `{command:"tail -n 500 /data/app.log", tail_bytes:16384}` (or run the
+  failing command directly with `tail_bytes` set to capture its tail).
+- **Paged `read_file`** for an on-disk log: `{path:"/data/app.log",
+  mode:"lines", offset:1, limit:200}` reports `total_lines`; advance
+  `offset` (201, 401, …) to walk the whole file. Byte windows work too
+  (`mode:"bytes"` with `offset` + `limit`).
+
 ## Step 3 — route the rest to the operator
 
 Print these commands and ask the operator to paste the results

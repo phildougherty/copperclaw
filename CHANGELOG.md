@@ -6,6 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (M18 P2 — skills refresh for the verify + delivery contract, 2026-07-15)
+
+- Updated five agent-facing skills to teach the post-M18 coding workflow
+  instead of the pre-M18 one (`skills/{coding-task,testing,debug,preview,send-file}/SKILL.md`):
+  the R3 verification contract (record a project's one-line check command
+  in `/data/<project>/.copperclaw/verify`, or via a per-group
+  `check_command` override; the `todo_update(status="completed")`
+  completion gate refuses while a project is dirty, quoting the actual
+  refusal wording, and auto-`blocked`s after two fix cycles), T1's
+  `shell tail_bytes` idiom for reading the END of a truncated build log,
+  T1's paged `read_file` (`mode:"lines"` + `offset`/`limit` +
+  `total_lines`), and the artifact-delivery close (`send_file` a
+  `git archive` zip, the `artifact_path` host path, and an
+  `expose_preview` link) as the mandatory final build step. The fuller
+  P3 "prototype ready" `send_card` ritual is noted as forthcoming rather
+  than taught, since P3 is not yet implemented. Skills are docs but
+  operator-visible: stale skills actively teach the pre-M18 workflow.
+
 ### Added (M18 X1 — golden-path program fixture, 2026-07-15)
 
 - New replay fixture `fixtures/cli/prototype-golden/` (registered as

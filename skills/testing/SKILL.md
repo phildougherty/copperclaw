@@ -66,6 +66,33 @@ Fixing a failing test is a loop, not one shot:
 Don't widen to the full suite until the narrow scope is green; then
 run it once to catch anything you knocked over elsewhere.
 
+## The verify contract (`.copperclaw/verify`)
+
+Copperclaw *enforces* verification for coding agents — the check you run
+is the check the runner watches. On your first edit inside a
+`/data/<project>`, record the project's one-line check command in
+`/data/<project>/.copperclaw/verify` (`npm test`, `cargo check`,
+`python -m pytest`, `go test ./...`, or a smoke `curl` for a server). A
+per-group `check_command` config can override it.
+
+After any edit the project is **dirty** until that exact command runs
+green, and `todo_update(status="completed")` is refused while dirty (the
+error names the project and the recorded command). To clear it, run the
+recorded command via `shell` with `cwd` set to the project dir — exit 0
+clears dirty; a nonzero exit records a fix cycle. Two failing cycles
+auto-`blocked` the todo. So the command you put in `.copperclaw/verify`
+is the one that has to pass: make it the real suite, not a stub that
+always exits 0.
+
+## Reading the end of a long test log
+
+A failing suite prints its error at the END, but `shell` keeps the FIRST
+32 KiB of output by default — the tail gets cut off. Re-run keeping the
+tail instead with `tail_bytes`: `{command:"npm test", tail_bytes:16384}`.
+For a log already on disk, page it with `read_file` (`mode:"lines"`; the
+result reports `total_lines`, so advance `offset` window by window) or
+`shell tail -n 200 <path>`.
+
 ## Adding tests
 
 **Add tests when the change introduces new behaviour without
