@@ -61,9 +61,9 @@ use copperclaw_db::attachments::safe_attachment_name;
 use copperclaw_db::tables::messages_out::{self, WriteOutbound};
 use copperclaw_mcp::{
     AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec, DelegateSpec,
-    EditMessageSpec, EmitTodoListSpec, InstallSpec, OutboundToolEffect, Recipient, ScheduleSpec,
-    SendCardSpec, SendFileSpec, SendMessageSpec, SubagentRequest, SubagentResult, TaskSummary,
-    ToolContext, ToolEffectAck, ToolEntry, ToolError, UpdateTaskSpec,
+    EditMessageSpec, EmitTodoListSpec, InstallSpec, OutboundToolEffect, Recipient, SaveSkillSpec,
+    ScheduleSpec, SendCardSpec, SendFileSpec, SendMessageSpec, SubagentRequest, SubagentResult,
+    TaskSummary, ToolContext, ToolEffectAck, ToolEntry, ToolError, UpdateTaskSpec,
 };
 use copperclaw_providers::AgentProvider;
 use copperclaw_types::{Effort, MessageId, MessageKind};
@@ -1069,6 +1069,7 @@ fn apply_effect(
         OutboundToolEffect::Delegate(spec) => apply_delegate(conn, spec),
         OutboundToolEffect::InstallPackages(spec) => apply_install_packages(conn, spec),
         OutboundToolEffect::AddMcpServer(spec) => apply_add_mcp_server(conn, spec),
+        OutboundToolEffect::SaveSkill(spec) => apply_save_skill(conn, spec),
         OutboundToolEffect::ScheduleTask(spec) => apply_schedule_create(conn, spec),
         OutboundToolEffect::ListTasks => apply_schedule_list(conn),
         OutboundToolEffect::CancelTask { id } => apply_schedule_simple(conn, "cancel", &id),
@@ -1615,6 +1616,26 @@ fn apply_add_mcp_server(
         "add_mcp_server": {
             "name": spec.name,
             "transport": spec.transport,
+            "reason": spec.reason,
+        }
+    });
+    insert_row(conn, MessageKind::System, payload)?;
+    Ok(ToolEffectAck::Accepted)
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn apply_save_skill(
+    conn: &mut Connection,
+    spec: SaveSkillSpec,
+) -> Result<ToolEffectAck, ToolApplyError> {
+    // The host's delivery `save_skill` handler parses this row: it raises an
+    // approval and, on approval, validates + writes the SKILL.md into the
+    // group's per-group skills override dir (M19 A4). The agent-facing
+    // validation already happened in the `save_skill` tool.
+    let payload = serde_json::json!({
+        "save_skill": {
+            "name": spec.name,
+            "content": spec.content,
             "reason": spec.reason,
         }
     });

@@ -128,6 +128,23 @@ pub struct AddMcpServerSpec {
     pub reason: String,
 }
 
+/// Spec for `save_skill` (M19 A4). The agent proposes a reusable skill; the
+/// runner records it and the host raises an approval. On approval the host
+/// validates and writes the `SKILL.md` into the group's per-group skills
+/// override directory, where the next container spawn discovers it. This is a
+/// per-group capability, never cross-group sharing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveSkillSpec {
+    /// Kebab-case skill name; becomes the on-disk directory slug and must
+    /// equal the frontmatter `name`.
+    pub name: String,
+    /// The full `SKILL.md` text including its YAML frontmatter. Validated by
+    /// the tool before emission and again host-side before the write.
+    pub content: String,
+    /// Human-readable reason for saving the skill (audited on the approval).
+    pub reason: String,
+}
+
 /// Spec for `create_agent`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateAgentSpec {
@@ -336,6 +353,9 @@ pub enum OutboundToolEffect {
     InstallPackages(InstallSpec),
     /// `add_mcp_server`.
     AddMcpServer(AddMcpServerSpec),
+    /// `save_skill` — persist an agent-authored skill into the group's
+    /// per-group skills override (approval-gated host-side).
+    SaveSkill(SaveSkillSpec),
     /// `schedule_task`.
     ScheduleTask(ScheduleSpec),
     /// `list_tasks`.
@@ -374,6 +394,7 @@ impl OutboundToolEffect {
             Self::Delegate(_) => "delegate",
             Self::InstallPackages(_) => "install_packages",
             Self::AddMcpServer(_) => "add_mcp_server",
+            Self::SaveSkill(_) => "save_skill",
             Self::ScheduleTask(_) => "schedule_task",
             Self::ListTasks => "list_tasks",
             Self::CancelTask { .. } => "cancel_task",
@@ -1205,6 +1226,14 @@ mod tests {
                     reason: "r".into(),
                 }),
                 "add_mcp_server",
+            ),
+            (
+                OutboundToolEffect::SaveSkill(SaveSkillSpec {
+                    name: "my-skill".into(),
+                    content: "---\nname: my-skill\ndescription: d\n---\nb\n".into(),
+                    reason: "r".into(),
+                }),
+                "save_skill",
             ),
             (
                 OutboundToolEffect::ScheduleTask(ScheduleSpec {

@@ -42,6 +42,7 @@ pub mod load_skill;
 pub mod memory;
 pub mod multi_edit;
 pub mod net_guard;
+pub mod save_skill;
 pub mod scheduling;
 pub mod self_mod;
 pub mod sentinel;
@@ -86,6 +87,7 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         agents::delegate::entry(),
         self_mod::install_packages::entry(),
         self_mod::add_mcp_server::entry(),
+        save_skill::entry(),
         scheduling::schedule_task::entry(),
         scheduling::list_tasks::entry(),
         scheduling::cancel_task::entry(),
@@ -198,6 +200,7 @@ mod tests {
             "delegate",
             "install_packages",
             "add_mcp_server",
+            "save_skill",
             "schedule_task",
             "list_tasks",
             "cancel_task",

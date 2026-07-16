@@ -125,8 +125,16 @@ const CODING_TOOLS: &[&str] = &[
 
 /// Self-modification tools, layered on only by the `full` profile. These
 /// re-wire the agent's own capabilities (installing packages, attaching
-/// MCP servers) and are the most privileged class.
-const SELF_MOD_TOOLS: &[&str] = &["install_packages", "add_mcp_server"];
+/// MCP servers, saving reusable skills) and are the most privileged class.
+///
+/// `save_skill` (M19 A4) persists an agent-authored skill into the group's
+/// per-group skills override for the next spawn to discover. It is self-mod
+/// (it durably changes the agent's own capability surface) but — unlike
+/// `install_packages` / `add_mcp_server` — it does NOT egress, so it is
+/// deliberately absent from [`CREDENTIALED_EXTERNAL_TOOLS`]. Its
+/// secure-by-default gate is the host-side operator approval raised before
+/// the skill is ever written.
+const SELF_MOD_TOOLS: &[&str] = &["install_packages", "add_mcp_server", "save_skill"];
 
 /// Tools that take a **credentialed external action** — they reach outside the
 /// container over the network (the egress path the credential broker meters)

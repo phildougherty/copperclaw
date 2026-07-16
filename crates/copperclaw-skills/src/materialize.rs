@@ -135,7 +135,11 @@ fn link_one(skill: &Skill, link: &Path, allowed_roots: &[PathBuf]) -> Result<(),
     }
 }
 
-fn is_under_any(path: &Path, roots: &[PathBuf]) -> bool {
+/// Whether `path` lies under at least one of `roots` (prefix containment).
+/// Shared by [`materialize`]'s per-link check and [`crate::save`]'s
+/// write-destination check so both enforce the same allowed-roots rule
+/// (the defense-in-depth guard described in the crate docs, lib.rs:26-29).
+pub(crate) fn is_under_any(path: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|root| path.starts_with(root))
 }
 

@@ -50,6 +50,7 @@ const REGISTRY_TOOLS: &[&str] = &[
     "create_agent",
     "install_packages",
     "add_mcp_server",
+    "save_skill",
     "schedule_task",
     "list_tasks",
     "cancel_task",
