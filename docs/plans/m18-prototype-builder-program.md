@@ -1376,25 +1376,50 @@ ritual card + screenshot file → `cclaw audit list` shows the approval and
 preview rows.
 
 **Status as of 2026-07-16 (eighth session, all card work done):** X1+X2 are
-merged — the golden fixture NOW covers the verify-gate refuse→fix→pass leg
-(X2 #48) and the P3 ritual-card shape, so the fixture half of acceptance is
-**met**. Every implementing card is merged (V5 #55 excepted — held for human
-security sign-off). What remains for the live half:
-- The **live telegram smoke** (the phone-driven end-to-end above) has still
-  never been run — it needs a message from the operator's device, so the
-  autonomous session cannot complete it. A **cli-channel connectivity smoke WAS
-  run (2026-07-16, eighth session)** against the rebuilt completed code: a
-  message through the fifo bridge returned `agent> OK 2026-07-16` in ~10s,
-  proving the full inbound→router→runner→outbound→delivery pipeline + provider
-  path are healthy end-to-end on `main` @ `02e3087`. That is connectivity
-  corroboration ONLY — it does NOT exercise the behavioral demo (in-place edited
-  HUD, `/stop`+resteer, verify-gate block, preview link, ritual card +
-  screenshot), which needs a real "build me X" run on a capable model, and for
-  the edited-HUD/preview legs specifically the telegram channel from a phone
-  (cli is not edit-capable → `StatusRows` path only).
-- **V5 #55** merge after security sign-off.
-These are the only two things between here and "program done"; neither is card
-work.
+merged — the golden fixture covers the verify-gate refuse→fix→pass leg (X2 #48)
+and the P3 ritual-card shape, so the fixture half is **met**. Every
+implementing card is merged (V5 #55 excepted — held for security sign-off).
+
+**LIVE TELEGRAM SMOKE — PASSED (2026-07-16, operator's phone).** The full
+demo-moment path ran end-to-end on the telegram dev group with model
+`z-ai/glm-5.2` (OpenRouter-brokered), session `019f6b3a-…`: prompt *"Research
+app ideas related to the outdoors then build me a prototype"* → **H1 HUD**
+appeared and self-edited live (`[~] task · step 1/6 … last: write_file ok — 32
+tool calls | 2:04`) then finalized (`[ok] task — done in 6:06, 71 tool calls`)
+→ **pinned todo plan** (6 steps) → built **TrailPost** (Flask+SQLite+Leaflet)
+→ **R3 verify gate actually ran** (card shows `Verified: GET / → 200,
+/api/reports returns 9, POST creates (201)`; its test POST appears in the live
+feed) → **P3 ritual card** (What-to-try bullets, Verified line, artifact-path
+footer, Download button) → **preview** `http://<lan>:8100/__preview/<token>`
+opened live on the phone (fully working app) → *"Tear it down I'm done"* →
+preview closed + server stopped. This is the program-acceptance demo the plan
+called for. Screenshots archived in the eighth-session chat.
+
+**Log post-mortem of that run (3 buckets; "lots of failed tool calls"):**
+1. **REAL BUG — todo-store write race (~12 events).** `todo.rs::write_all`
+   uses a FIXED `.tmp` sibling filename, so concurrent `todo_update`/`todo_add`
+   in one R2 parallel batch clobber the shared tempfile → corrupt JSON
+   (`trailing characters at line 10`), then the read path can't quarantine a
+   file a racing writer already renamed (`No such file or directory`). Store
+   self-heals ("starting fresh") but todo state was repeatedly reset mid-build.
+   **Fix (a post-M18 hardening card, lane T): serialize the todo
+   read-modify-write (async Mutex) and/or use a unique per-write tempfile name.**
+2. **WORKING AS DESIGNED — provenance/taint denials (4).** The "research …
+   then build" request web-tainted the turn, so the M16 gate denied
+   `expose_preview` ×2, `web_search`, `web_fetch` (credentialed external
+   actions) on the tainted turn; preview exposed fine on the fresh follow-up
+   turn. Not a bug. **UX refinement to consider: does exposing a LAN preview
+   warrant the same taint gate as `web_search`?** (candidate M19 item.)
+3. **Benign/recovered (2):** one transient provider `sse decode … retryable`
+   (retried, recovered); one Telegram `message is not modified` HUD re-edit
+   (H1/R6 should skip an edit when content is unchanged — small guard).
+   Also: only 1 git commit vs the commit-per-increment discipline (prompt
+   adherence, not a system bug).
+
+**Remaining to call the program fully done:** merge **V5 #55** after security
+sign-off. (The live smoke is now PASSED; the todo-store race + the two minor
+guards + the preview-taint UX question are post-M18 hardening follow-ups, none
+blocking.)
 
 ## Deferred / rejected (don't re-litigate)
 
