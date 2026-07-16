@@ -142,6 +142,19 @@ const CODING_TOOLS: &[&str] = &[
     // (spawning a local chromium process is a resource cost a read-only
     // sender shouldn't get for free) via [`is_mutating`].
     "ui_screenshot",
+    // M20 D5: console errors + element geometry for the agent's own app —
+    // the loopback-only diagnostic sibling of `ui_screenshot` above. Same
+    // rationale for riding the coding profile rather than `READONLY_TOOLS`:
+    // it spawns/reuses the same local chromium process (a resource cost a
+    // guest sender shouldn't get for free), is loopback-only (refuses any
+    // non-loopback URL at the tool layer, so it is NOT a credentialed
+    // external action — see [`CREDENTIALED_EXTERNAL_TOOLS`], deliberately
+    // absent), and is part of the same build-test-iterate loop. Unlike
+    // `ui_screenshot`, it unconditionally taints the turn (page-originated
+    // console text) — that is a TAINT it CAUSES, not a gate that BLOCKS it;
+    // it is still not itself gated by a tainted turn (see the "untainted"
+    // test below, mirroring `ui_screenshot`'s).
+    "ui_inspect",
     // M20 Q3: structured lint/typecheck digest (eslint/tsc/ruff). It is
     // read-only analysis with NO `.copperclaw/verify` gate interaction —
     // `explore` is the precedent for a read-only-but-coding-scoped tool
@@ -1365,6 +1378,52 @@ mod tests {
             autonomous: false,
         });
         assert!(tainted.evaluate("ui_screenshot").is_allow());
+    }
+
+    // ── M20 D5: ui_inspect policy ─────────────────────────────────────────
+
+    #[test]
+    fn ui_inspect_is_coding_profile_only() {
+        assert!(ToolProfile::Coding.allows("ui_inspect"));
+        assert!(ToolProfile::Full.allows("ui_inspect"));
+        assert!(!ToolProfile::Minimal.allows("ui_inspect"));
+        assert!(!ToolProfile::Messaging.allows("ui_inspect"));
+    }
+
+    #[test]
+    fn ui_inspect_is_not_credentialed_external() {
+        // Loopback-only and no container spawn, exactly like `ui_screenshot`:
+        // it never reaches outside the session container, so it must not
+        // ride the taint/autonomy gate a real egress-bearing tool would.
+        assert!(!is_credentialed_external("ui_inspect"));
+    }
+
+    #[test]
+    fn ui_inspect_denied_to_guest_even_under_full() {
+        let guest = ToolPolicy::new(ToolProfile::Full, Some(SenderRole::Guest));
+        let d = guest.evaluate("ui_inspect");
+        assert!(!d.is_allow());
+        assert!(d.deny_reason().unwrap().contains("guest"));
+    }
+
+    #[test]
+    fn ui_inspect_allowed_for_member_under_coding() {
+        let member = ToolPolicy::new(ToolProfile::Coding, Some(SenderRole::Member));
+        assert!(member.evaluate("ui_inspect").is_allow());
+    }
+
+    #[test]
+    fn ui_inspect_untainted_by_a_tainted_turn() {
+        // `ui_inspect` itself CAUSES taint (page-originated console text),
+        // but is not ITSELF blocked by a turn some other tool already
+        // tainted — it isn't a credentialed external action, so there is
+        // nothing here for the confused-deputy gate to protect.
+        let tainted = ToolPolicy::new(ToolProfile::Full, None).with_trust(TurnTrust {
+            tainted: true,
+            approved: false,
+            autonomous: false,
+        });
+        assert!(tainted.evaluate("ui_inspect").is_allow());
     }
 
     // ── M20 Q3: diagnostics policy ───────────────────────────────────────

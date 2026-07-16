@@ -290,6 +290,77 @@ adheres to [Semantic Versioning](https://semver.org/).
   `viewport: "mobile"` capture reports different dimensions (390x844) than
   the `desktop` default (1280x800) against the same vite page.
 
+### Added (M20 D5 — `ui_inspect`: console errors + element geometry)
+
+- New `ui_inspect` MCP tool (`crates/copperclaw-mcp/src/tools/ui_inspect.rs`),
+  the loopback-only diagnostic sibling of `ui_screenshot`: given a `url` (same
+  loopback-only validation as `ui_screenshot`, reused verbatim via
+  `crate::tools::ui_screenshot::validate_loopback_url`), returns the full
+  buffered browser console — `console.*` calls, uncaught JS exceptions, and
+  `Log.entryAdded` diagnostics captured during that navigation — and, when a
+  `selector` arg is given, that element's box model (width/height) plus a
+  CURATED subset of its computed style (`display`, `position`, `overflow`,
+  `width`, `height`, `font-family` — never the ~300-property
+  `CSS.getComputedStyleForNode` dump). Registered by default in the
+  Coding/Full profiles alongside `ui_screenshot`/`diagnostics`/`self_review`
+  (`crates/copperclaw-mcp/src/tools/mod.rs`); the minimal profile (no
+  chromium) returns the same clean, actionable error `ui_screenshot` does.
+- `crates/copperclaw-browser/src/cdp.rs` gains the shared CDP-layer pieces:
+  `ConsoleEntry`/`ConsoleLevel`/`ConsoleSummary` + `parse_console_event` (maps
+  `Runtime.consoleAPICalled` / `Runtime.exceptionThrown` / `Log.entryAdded`
+  raw events to a normalized entry), `push_capped` (keeps the MOST RECENT
+  `CONSOLE_BUFFER_CAP` = 50 entries), and `summarize_console` (counts by
+  level + first error text); a new default `CdpTransport::console_entries()`
+  method (empty by default so every existing mock transport in the test
+  suite keeps compiling unchanged) that the live `WsCdpTransport` overrides
+  by buffering the three console-related CDP events alongside its existing
+  redirect/status event tracking. Also gains `inspect_element` — a pure CDP
+  orchestration (`DOM.getDocument` → `DOM.querySelector` → `DOM.getBoxModel` +
+  `CSS.getComputedStyleForNode`, the selector riding as a plain JSON command
+  param, not spliced into a JS-evaluate string) plus the
+  `CURATED_STYLE_PROPS` whitelist and `BoxModel`/`ElementInspection` types.
+- `crates/copperclaw-browser/src/incontainer.rs`'s `capture()` (used by
+  `ui_screenshot`) now sends `Runtime.enable` + `Log.enable` alongside its
+  existing `Page.enable`/`Network.enable`, so console buffering is active on
+  every `ui_screenshot` call too. New `InspectRequest`/`InspectOutcome` +
+  `inspect()` function drives the same navigate/enable sequence for
+  `ui_inspect`, then reads back `transport.console_entries()` and (if a
+  selector was given) `cdp::inspect_element`.
+- `ui_screenshot` (`crates/copperclaw-mcp/src/tools/ui_screenshot.rs`) folds a
+  console-error count + the first error's text into its own text response
+  (via `copperclaw_browser::summarize_console`) so the common case — a page
+  that threw on load — needs no second `ui_inspect` call to at least learn a
+  crash happened.
+- **Security review (2nd `security-review`-rider card after D1, per plan rule
+  5).** No-new-privilege argument: `ui_inspect` reuses the exact same
+  in-container chromium singleton and loopback-only refusal as
+  `ui_screenshot` — it adds no new process class, widens no egress, and
+  cannot reach the LAN/host/public internet, so it carries forward D1's
+  registration-by-default argument unchanged. Untrusted-content argument:
+  console text is page-originated (a page's own `console.*` calls can echo
+  fetched/attacker-influenced content), so `ui_inspect` calls
+  `ToolContext::mark_untrusted_context` **unconditionally**, before driving
+  the navigation — mirroring `browser_render`'s "tag the turn up front"
+  ordering — since an empty console on one call is no guarantee the next
+  identical call stays empty. `ui_screenshot`'s fold-in only taints
+  **conditionally** (when it actually includes a console error's text),
+  since the common clean-console case still adds no page-derived text to the
+  transcript, matching its pre-D5 "not tainted" posture. A non-loopback URL
+  is refused before either tool touches chromium or marks any taint.
+- Unit tests (mock `CdpTransport`/mock in-container transport, reusing
+  D1/D2's mock seams): console-event parsing for all three CDP event kinds
+  plus an unrelated-method no-op; buffer-cap eviction keeps the most recent
+  entries; `summarize_console` counts + first-error extraction;
+  `curate_computed_style` returns exactly the whitelist in whitelist order
+  (never the full dump), including when a whitelisted property is absent;
+  `inspect_element`'s CDP call sequence and its "no element for selector"
+  error path; `ui_inspect`'s loopback refusal happens before any taint call;
+  `ui_screenshot`'s console fold-in note is empty with no errors or
+  warnings-only, and includes the count/first-error text/`ui_inspect`
+  pointer when an error is present. Live smoke (`#[ignore]`d, per the D1
+  precedent): a page that throws on load surfaces full console detail via
+  `ui_inspect`, and a `body` selector query returns its box + curated style.
+
 ### Added (M20 Q8 — Compaction preserves build knowledge)
 
 - The pinned project-facts header compaction re-generates on every round

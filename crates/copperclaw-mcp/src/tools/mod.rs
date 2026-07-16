@@ -50,6 +50,7 @@ pub mod self_mod;
 pub mod self_review;
 pub mod sentinel;
 pub mod todo;
+pub mod ui_inspect;
 pub mod ui_screenshot;
 pub mod verify_gate;
 pub mod view_image;
@@ -114,6 +115,12 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         // handler itself probes for chromium at call time so the minimal
         // image profile degrades cleanly instead of crashing.
         ui_screenshot::entry(),
+        // M20 D5: console errors + element geometry for the agent's own app
+        // — the loopback-only diagnostic sibling of `ui_screenshot` (full
+        // console detail + a selector's box/curated computed style).
+        // Registered alongside it in the Coding/Full profile tier; same
+        // call-time chromium probe degrades cleanly on the minimal profile.
+        ui_inspect::entry(),
         // M20 Q3: structured lint/typecheck digest — a read-only fix-cycle
         // accelerator with no `.copperclaw/verify` gate interaction (that
         // stays Q2's enforcement path). Registered alongside `ui_screenshot`
@@ -253,6 +260,7 @@ mod tests {
             "web_fetch",
             "browser_render",
             "ui_screenshot",
+            "ui_inspect",
             "diagnostics",
             "self_review",
             "view_image",

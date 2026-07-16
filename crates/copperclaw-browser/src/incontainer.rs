@@ -171,6 +171,12 @@ pub async fn capture(
 ) -> Result<Vec<u8>, BrowserError> {
     transport.send("Page.enable", json!({})).await?;
     transport.send("Network.enable", json!({})).await?;
+    // M20 D5: enable console/log observation so a buggy page's console
+    // errors are available afterward via `transport.console_entries()` —
+    // `ui_screenshot` folds a count + first error into its text response,
+    // and `ui_inspect` (see `inspect` below) surfaces the full buffer.
+    transport.send("Runtime.enable", json!({})).await?;
+    transport.send("Log.enable", json!({})).await?;
     capture::apply_viewport(transport, req.capture.viewport).await?;
 
     let nav = transport
@@ -244,6 +250,89 @@ pub async fn capture_with_size_safety(
         bytes: retry_bytes,
         capture: downgraded_opts,
         downgraded: true,
+    })
+}
+
+// ── M20 D5: `ui_inspect` — console buffer + element inspection ─────────
+
+/// One `ui_inspect` request against an already-connected CDP transport (M20
+/// D5): navigate, optionally wait, then read back the buffered console
+/// entries and — when `selector` is set — that element's box model + curated
+/// computed style. Mirrors [`ScreenshotRequest`]/[`capture`]'s shape and CDP
+/// domain-enable sequence so `ui_screenshot` and `ui_inspect` see identical
+/// console buffering behavior.
+#[derive(Debug, Clone)]
+pub struct InspectRequest {
+    /// The (already loopback-validated, by the caller) navigation target.
+    pub url: String,
+    /// When set, also fetch this CSS selector's box model + curated style.
+    pub selector: Option<String>,
+    /// Extra fixed delay after load before inspecting, in milliseconds
+    /// (clamped to [`MAX_WAIT_MS`]).
+    pub wait_ms: Option<u64>,
+    /// Poll until this CSS selector exists before inspecting (independent of
+    /// `selector` — e.g. wait for a spinner to clear before reading the
+    /// console, without necessarily inspecting the spinner itself).
+    pub wait_for_selector: Option<String>,
+    /// Navigation/load timeout.
+    pub nav_timeout: Duration,
+}
+
+/// Result of one [`inspect`] call.
+#[derive(Debug, Clone)]
+pub struct InspectOutcome {
+    /// Buffered console entries observed during this navigation (M20 D5),
+    /// capped at [`crate::cdp::CONSOLE_BUFFER_CAP`]. PAGE-ORIGINATED — the
+    /// `ui_inspect` tool marks the turn's context untrusted before returning
+    /// these (see the tool's module docs).
+    pub console: Vec<crate::cdp::ConsoleEntry>,
+    /// `req.selector`'s box model + curated computed style, when requested.
+    pub element: Option<crate::cdp::ElementInspection>,
+}
+
+/// Drive one `ui_inspect` call over `transport`: enable the same domains
+/// [`capture`] does (so console buffering behaves identically), navigate,
+/// optionally wait, then gather the console buffer and — if `req.selector`
+/// is set — the element inspection ([`crate::cdp::inspect_element`]). Pure
+/// CDP-command orchestration against the [`CdpTransport`] seam — fully
+/// unit-tested with a mock transport, exactly like [`capture`].
+pub async fn inspect(
+    transport: &dyn CdpTransport,
+    req: &InspectRequest,
+) -> Result<InspectOutcome, BrowserError> {
+    transport.send("Page.enable", json!({})).await?;
+    transport.send("Network.enable", json!({})).await?;
+    transport.send("Runtime.enable", json!({})).await?;
+    transport.send("Log.enable", json!({})).await?;
+
+    let nav = transport
+        .send("Page.navigate", json!({ "url": req.url }))
+        .await?;
+    if let Some(err) = nav.get("errorText").and_then(Value::as_str) {
+        if !err.is_empty() {
+            return Err(BrowserError::Driver(format!(
+                "navigation to `{}` failed: {err}",
+                req.url
+            )));
+        }
+    }
+    transport.wait_for_load(req.nav_timeout).await?;
+
+    if let Some(selector) = &req.wait_for_selector {
+        wait_for_selector(transport, selector, DEFAULT_SELECTOR_TIMEOUT).await?;
+    }
+    if let Some(ms) = req.wait_ms {
+        tokio::time::sleep(Duration::from_millis(ms.min(MAX_WAIT_MS))).await;
+    }
+
+    let element = match &req.selector {
+        Some(sel) => Some(crate::cdp::inspect_element(transport, sel).await?),
+        None => None,
+    };
+
+    Ok(InspectOutcome {
+        console: transport.console_entries(),
+        element,
     })
 }
 
@@ -531,11 +620,20 @@ mod tests {
         results: HashMap<String, Value>,
         calls: StdMutex<Vec<String>>,
         metrics_calls: StdMutex<Vec<Value>>,
+        /// M20 D5: canned console buffer this mock reports back — a stand-in
+        /// for the live `WsCdpTransport`'s real buffering (tested directly in
+        /// `cdp.rs`).
+        console: Vec<crate::cdp::ConsoleEntry>,
     }
 
     impl MockTransport {
         fn with(mut self, method: &str, result: Value) -> Self {
             self.results.insert(method.to_string(), result);
+            self
+        }
+
+        fn console(mut self, entries: Vec<crate::cdp::ConsoleEntry>) -> Self {
+            self.console = entries;
             self
         }
     }
@@ -561,6 +659,9 @@ mod tests {
         }
         fn main_status(&self) -> Option<u16> {
             Some(200)
+        }
+        fn console_entries(&self) -> Vec<crate::cdp::ConsoleEntry> {
+            self.console.clone()
         }
     }
 
@@ -590,6 +691,10 @@ AAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         assert!(calls.contains(&"Emulation.setDeviceMetricsOverride".to_string()));
         assert!(calls.contains(&"Page.navigate".to_string()));
         assert!(calls.contains(&"Page.captureScreenshot".to_string()));
+        // M20 D5: console/log observation is enabled on every capture so
+        // `ui_screenshot`'s fold-in note has something to read.
+        assert!(calls.contains(&"Runtime.enable".to_string()));
+        assert!(calls.contains(&"Log.enable".to_string()));
 
         let metrics = transport.metrics_calls.lock().unwrap().clone();
         assert_eq!(metrics.len(), 1);
@@ -825,5 +930,111 @@ AAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
         assert!(!result.downgraded);
         assert_eq!(result.bytes.len(), 4096, "still returns the oversize bytes");
         assert_eq!(transport.capture_calls.lock().unwrap().len(), 1);
+    }
+
+    // ── M20 D5: `inspect()` orchestration against a mock transport ───────
+
+    fn inspect_req(url: &str) -> InspectRequest {
+        InspectRequest {
+            url: url.to_string(),
+            selector: None,
+            wait_ms: None,
+            wait_for_selector: None,
+            nav_timeout: Duration::from_secs(5),
+        }
+    }
+
+    #[tokio::test]
+    async fn inspect_enables_console_domains_and_navigates() {
+        let transport = MockTransport::default();
+        let out = inspect(&transport, &inspect_req("http://127.0.0.1:5173"))
+            .await
+            .unwrap();
+        assert!(out.console.is_empty());
+        assert!(out.element.is_none(), "no selector requested");
+
+        let calls = transport.calls.lock().unwrap().clone();
+        for expected in [
+            "Page.enable",
+            "Network.enable",
+            "Runtime.enable",
+            "Log.enable",
+        ] {
+            assert!(
+                calls.contains(&expected.to_string()),
+                "missing {expected}: {calls:?}"
+            );
+        }
+        assert!(calls.contains(&"Page.navigate".to_string()));
+    }
+
+    #[tokio::test]
+    async fn inspect_returns_the_buffered_console_entries() {
+        let transport = MockTransport::default().console(vec![
+            crate::cdp::ConsoleEntry {
+                level: crate::cdp::ConsoleLevel::Error,
+                text: "TypeError: boom".to_string(),
+            },
+            crate::cdp::ConsoleEntry {
+                level: crate::cdp::ConsoleLevel::Warning,
+                text: "deprecated".to_string(),
+            },
+        ]);
+        let out = inspect(&transport, &inspect_req("http://127.0.0.1:5173"))
+            .await
+            .unwrap();
+        assert_eq!(out.console.len(), 2);
+        assert_eq!(out.console[0].text, "TypeError: boom");
+    }
+
+    #[tokio::test]
+    async fn inspect_with_selector_returns_element_inspection() {
+        let transport = MockTransport::default()
+            .with("DOM.getDocument", json!({ "root": { "nodeId": 1 } }))
+            .with("DOM.querySelector", json!({ "nodeId": 7 }))
+            .with(
+                "DOM.getBoxModel",
+                json!({ "model": { "width": 10.0, "height": 5.0, "content": [], "padding": [], "border": [], "margin": [] } }),
+            )
+            .with(
+                "CSS.getComputedStyleForNode",
+                json!({ "computedStyle": [{ "name": "display", "value": "grid" }] }),
+            );
+        let mut req = inspect_req("http://127.0.0.1:5173");
+        req.selector = Some("#app".to_string());
+        let out = inspect(&transport, &req).await.unwrap();
+        let element = out.element.expect("selector was requested");
+        assert_eq!(element.selector, "#app");
+        assert!((element.box_model.width - 10.0).abs() < f64::EPSILON);
+        assert_eq!(
+            element.computed_style,
+            vec![("display".to_string(), "grid".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_selector_not_found_is_a_driver_error() {
+        let transport = MockTransport::default()
+            .with("DOM.getDocument", json!({ "root": { "nodeId": 1 } }))
+            .with("DOM.querySelector", json!({ "nodeId": 0 }));
+        let mut req = inspect_req("http://127.0.0.1:5173");
+        req.selector = Some("#missing".to_string());
+        let err = inspect(&transport, &req).await.unwrap_err();
+        assert!(matches!(err, BrowserError::Driver(_)));
+    }
+
+    #[tokio::test]
+    async fn inspect_surfaces_navigation_error() {
+        let transport = MockTransport::default().with(
+            "Page.navigate",
+            json!({ "errorText": "net::ERR_CONNECTION_REFUSED" }),
+        );
+        let err = inspect(&transport, &inspect_req("http://127.0.0.1:5173"))
+            .await
+            .unwrap_err();
+        match err {
+            BrowserError::Driver(m) => assert!(m.contains("ERR_CONNECTION_REFUSED"), "{m}"),
+            other => panic!("expected driver error, got {other:?}"),
+        }
     }
 }

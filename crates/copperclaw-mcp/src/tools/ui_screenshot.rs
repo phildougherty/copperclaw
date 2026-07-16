@@ -27,16 +27,19 @@
 //!     reach the LAN, the host, or the public internet. That is the argument
 //!     for registering it by DEFAULT in the Coding/Full profiles (the one
 //!     default change in M20; recorded again in this crate's PR/commit).
-//!   * **Not tainted untrusted.** Unlike `browser_render` (a general
+//!   * **Conditionally tainted (M20 D5).** Unlike `browser_render` (a general
 //!     web-browsing tool over attacker-influenceable content), the page this
 //!     tool screenshots is the agent's OWN in-progress build, reachable only
 //!     on loopback. The IMAGE block itself follows the same path as
-//!     `view_image` (which also does not taint) — no page-derived TEXT is
-//!     ever added to the transcript by this tool, only a trusted,
-//!     host-generated save path. If a future extension (e.g. M20 D5's
-//!     `ui_inspect` console-error surfacing) adds page-originated TEXT to the
-//!     transcript, THAT call must `mark_untrusted_context` — this tool does
-//!     not need to because it doesn't.
+//!     `view_image` (which does not taint) — a screenshot with a clean
+//!     console adds no page-derived TEXT to the transcript, only a trusted,
+//!     host-generated save path. D5 folds a console-error count + the first
+//!     error's TEXT into the response so the common case needs no second
+//!     `ui_inspect` call — that text IS page-originated (the page's own
+//!     console could echo fetched/attacker-influenced content), so whenever
+//!     it is non-empty this handler calls `mark_untrusted_context` before
+//!     returning. Full console detail always lives behind `ui_inspect`,
+//!     which taints unconditionally (see its module docs).
 //!   * **Minimal-profile degradation.** Chromium is probed for at CALL TIME
 //!     (`copperclaw_browser::incontainer::find_chromium_binary`); its
 //!     absence (the minimal image profile) returns one clean, actionable
@@ -119,9 +122,11 @@ pub fn schema() -> Tool {
          checking responsive layout), `full_page` (default false), `format` (`png` default | \
          `jpeg`, with optional `quality`). If a capture ever exceeds the size cap, it is \
          automatically retried once as a lower-fidelity jpeg and the response notes the \
-         downgrade — it never just errors. Requires chromium, which is baked into the \
-         `prototyping` image profile; on a minimal-profile container this returns a clear, \
-         actionable error instead of failing silently.",
+         downgrade — it never just errors. The text response also reports a console error/warning \
+         count (plus the first error's text) when the page logged any during this navigation — \
+         call `ui_inspect` for full console detail and element geometry. Requires chromium, which \
+         is baked into the `prototyping` image profile; on a minimal-profile container this \
+         returns a clear, actionable error instead of failing silently.",
         json!({
             "type": "object",
             "additionalProperties": false,
@@ -142,8 +147,10 @@ pub fn schema() -> Tool {
 
 /// Validate that `raw` is an `http`/`https` URL whose host is a loopback
 /// address, returning the parsed URL. This is the whole security posture of
-/// this tool: it refuses to become a general browsing surface.
-fn validate_loopback_url(raw: &str) -> Result<reqwest::Url, ToolError> {
+/// this tool: it refuses to become a general browsing surface. `pub(crate)`
+/// so `ui_inspect` (M20 D5) reuses the exact same check rather than
+/// duplicating it.
+pub(crate) fn validate_loopback_url(raw: &str) -> Result<reqwest::Url, ToolError> {
     let parsed = reqwest::Url::parse(raw)
         .map_err(|e| ToolError::Validation(format!("ui_screenshot: invalid url `{raw}`: {e}")))?;
     if parsed.scheme() != "http" && parsed.scheme() != "https" {
@@ -177,8 +184,9 @@ fn validate_loopback_url(raw: &str) -> Result<reqwest::Url, ToolError> {
 
 /// The clean, actionable error the minimal image profile hits: chromium is
 /// simply not installed there. Never a crash — this is the whole point of
-/// probing at call time (see the module docs).
-fn chromium_missing_error() -> ToolError {
+/// probing at call time (see the module docs). `pub(crate)` so `ui_inspect`
+/// (M20 D5) reuses the exact same message.
+pub(crate) fn chromium_missing_error() -> ToolError {
     ToolError::Validation(
         "ui_screenshot: chromium is not installed in this container. It ships with the \
          `prototyping` image profile — switch this group to it and restart, e.g. \
@@ -260,9 +268,34 @@ fn prepare(input: &Input) -> Result<Prepared, ToolError> {
     })
 }
 
+/// Format the optional console-error fold-in note appended to `ui_screenshot`'s
+/// text response (M20 D5) — the common case (a page that threw on load, or
+/// logged an error) needs no second `ui_inspect` call to at least learn a
+/// crash happened. Empty when there were no console errors. Pure so this is
+/// unit-tested without a live transport.
+fn console_fold_in_note(summary: &copperclaw_browser::ConsoleSummary) -> String {
+    if summary.error_count == 0 {
+        return String::new();
+    }
+    let warn_part = if summary.warning_count > 0 {
+        format!(", {} warning(s)", summary.warning_count)
+    } else {
+        String::new()
+    };
+    let first = summary
+        .first_error
+        .as_deref()
+        .map(|e| format!(": {e}"))
+        .unwrap_or_default();
+    format!(
+        " Console: {} error(s){warn_part}{first} — call `ui_inspect` for full detail.",
+        summary.error_count
+    )
+}
+
 pub async fn handle(
     arguments: Option<JsonObject>,
-    _ctx: &dyn ToolContext,
+    ctx: &dyn ToolContext,
 ) -> Result<CallToolResult, ToolError> {
     let input: Input = parse_args(arguments)?;
     let prepared = prepare(&input)?;
@@ -345,11 +378,25 @@ pub async fn handle(
         String::new()
     };
 
+    // M20 D5: fold a console-error count + first error into the response so
+    // the common case needs no second `ui_inspect` call. Runtime/Log
+    // observation was enabled by `capture()` itself; this just reads back
+    // what it buffered on the same tab this call navigated.
+    let console_summary = copperclaw_browser::summarize_console(&transport.console_entries());
+    if console_summary.error_count > 0 {
+        // The folded-in text is page-originated (the page's own console
+        // could echo fetched/attacker-influenced content) — taint the turn
+        // exactly when such text is actually included, per this tool's
+        // module docs.
+        ctx.mark_untrusted_context(&format!("ui_screenshot:console:{}", prepared.url));
+    }
+    let console_note = console_fold_in_note(&console_summary);
+
     let b64 = bytes_b64::encode(&result.bytes);
     Ok(CallToolResult::success(vec![
         Content::text(format!(
             "Captured a {width}x{height} {} screenshot of {} ({} bytes){downgrade_note}; saved to \
-             {} (use `send_file` to share it) — it is attached below for you to see.",
+             {} (use `send_file` to share it) — it is attached below for you to see.{console_note}",
             result.capture.format.as_cdp_str(),
             prepared.url,
             result.bytes.len(),
@@ -538,6 +585,54 @@ mod tests {
         assert!(desc.contains("loopback"), "{desc}");
         assert!(desc.contains("browser_render"), "{desc}");
         assert!(desc.contains("prototyping"), "{desc}");
+        assert!(desc.contains("ui_inspect"), "{desc}");
+    }
+
+    // ── M20 D5: console fold-in note ─────────────────────────────────────
+
+    #[test]
+    fn console_fold_in_note_is_empty_with_no_errors() {
+        let summary = copperclaw_browser::ConsoleSummary::default();
+        assert_eq!(console_fold_in_note(&summary), "");
+    }
+
+    #[test]
+    fn console_fold_in_note_is_empty_with_only_warnings() {
+        let summary = copperclaw_browser::ConsoleSummary {
+            error_count: 0,
+            warning_count: 3,
+            first_error: None,
+        };
+        assert_eq!(
+            console_fold_in_note(&summary),
+            "",
+            "warnings alone must not trigger the fold-in (or the taint)"
+        );
+    }
+
+    #[test]
+    fn console_fold_in_note_reports_count_and_first_error() {
+        let summary = copperclaw_browser::ConsoleSummary {
+            error_count: 2,
+            warning_count: 0,
+            first_error: Some("TypeError: x is not a function".to_string()),
+        };
+        let note = console_fold_in_note(&summary);
+        assert!(note.contains("2 error(s)"), "{note}");
+        assert!(note.contains("TypeError: x is not a function"), "{note}");
+        assert!(note.contains("ui_inspect"), "{note}");
+    }
+
+    #[test]
+    fn console_fold_in_note_includes_warning_count_alongside_errors() {
+        let summary = copperclaw_browser::ConsoleSummary {
+            error_count: 1,
+            warning_count: 2,
+            first_error: Some("boom".to_string()),
+        };
+        let note = console_fold_in_note(&summary);
+        assert!(note.contains("1 error(s)"), "{note}");
+        assert!(note.contains("2 warning(s)"), "{note}");
     }
 
     #[test]
