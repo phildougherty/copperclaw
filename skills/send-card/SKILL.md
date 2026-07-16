@@ -95,6 +95,42 @@ Status with fields and image:
 } }
 ```
 
+## The "prototype ready" close (the build hand-off)
+
+The mandatory final step of every build (see [[coding-task]]) is ONE
+card that hands the operator a working prototype. Full shape, with a
+live preview:
+
+```json
+{ "card": {
+    "title": "Todo app — ready to try",
+    "body":  "A Flask todo list with add/complete/delete.\n\n*What to try:*\n- Add a task, then tick it off.\n- Reload — it persists to SQLite.",
+    "fields": [
+      { "label": "Artifact path", "value": "/home/you/.local/share/copperclaw/data/sessions/<ag>/<sess>/todo-app" }
+    ],
+    "buttons": [
+      { "label": "Open preview", "url": "https://host:8412/__preview/AbC…", "style": "primary" },
+      { "label": "Download",     "value": "download" }
+    ]
+} }
+```
+
+- **Open preview** is a `url` button carrying the *exact* string
+  `expose_preview` returned. Omit it when the build serves no HTTP —
+  never invent or shorten the URL.
+- **Download** is a `value` button; the tap comes back as your next
+  inbound reading `download`, and you answer it by shipping the
+  `git archive` zip via `send_file` (see [[send-file]]).
+- The **artifact path** goes in a field, for desk operators.
+- **Screenshot rides alongside, not in the card.** `image_url` must be
+  http(s), so a local PNG cannot attach to the card — send it as its own
+  `send_file` next to this card when the browser render produced one.
+
+**Degrade by capability, never break.** No preview → drop the Open-preview
+button. No screenshot → drop the `send_file` PNG. A card with only a
+title, body, Download button, and artifact-path field is a perfectly
+valid close; a card with a dead link is not.
+
 ## When to use vs `send_message`
 
 - `send_card`: choices ("Pick one"), structured info (status reports,

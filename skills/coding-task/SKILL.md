@@ -111,27 +111,27 @@ paged `read_file`).
 Files you write under `/data/` are invisible to the operator unless
 you do one of these. Pick one for every artifact you produce:
 
-1. **`send_file`** — pushes the file through the channel adapter
-   (Telegram shows it as an attachment, etc.). Good for small
-   deliverables the operator wants on their phone.
-2. **`artifact_path`** — returns the host-side filesystem path
-   corresponding to `/data`. Include that path verbatim in your
-   reply so the operator can `cd` to it. Good for many-file
-   projects (entire repo, build output, etc.).
-3. **A live preview link** — when the thing you built serves HTTP,
-   `expose_preview` the running server and send the URL verbatim so the
-   operator can open it from their phone. See [[preview]].
+1. **`send_file`** — pushes the file through the channel adapter (a
+   phone attachment). Good for small deliverables.
+2. **`artifact_path`** — returns the host-side path for `/data`; paste
+   it verbatim so the operator can `cd` there. Good for many-file projects.
+3. **A live preview link** — `expose_preview` an HTTP server and send the
+   returned URL verbatim. See [[preview]].
 
-Without one of these, you've effectively built nothing the operator can
-use. Saying "the files are at `/data/foo.html`" is wrong — `/data`
-is the *container*'s path, not the operator's.
+Without one of these you've built nothing the operator can use: `/data`
+is the *container*'s path, not theirs.
 
-**End every build with this delivery — the mandatory final step.** The
-last todo is the hand-off: for a multi-file build, ship one zip
-(`git archive` drops `.git`/`node_modules` — see [[send-file]]) plus the
-`artifact_path` path, and the preview link when the app serves HTTP. That
-"prototype ready" close is the goal. (A richer close card is forthcoming
-— P3; until then, deliver with the tools above.)
+**End every build with the "prototype ready" close — the mandatory
+final step.** The last todo is the hand-off: ONE `send_card` bearing a
+title, one-line summary, a "What to try" bullet, an **Open preview**
+`url` button (the exact `expose_preview` URL, only when the app serves
+HTTP), a **Download** button (`value: "download"` — the tap returns as
+your next inbound, which you answer by shipping the `git archive` zip via
+`send_file`), and the `artifact_path` host path in a footer field. Send
+the screenshot alongside with its own `send_file` when a browser render
+exists (a card can't attach a local file). It **degrades by capability**:
+no preview → no button, no screenshot → no PNG; never a dead link. The
+full worked card is in [[send-card]]; the zip idiom is in [[send-file]].
 
 ## Don't fabricate
 

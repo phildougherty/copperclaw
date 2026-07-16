@@ -45,6 +45,63 @@ adheres to [Semantic Versioning](https://semver.org/).
     millisecond replay never crosses). X2 did not add a clock seam; both
     fixture READMEs document why an edit-capable channel is the right vehicle.
 
+### Changed (M18 V4 — screenshot-the-preview path, 2026-07-16)
+
+- `browser_render` now lands its screenshot where the in-container agent can
+  relay it, and can reach the prototype's own preview under deny-default
+  egress — so the P3 "prototype ready" ritual can render the live app and
+  attach the PNG via `send_file`.
+  - `crates/copperclaw-mcp/src/tools/browser_render.rs`: the default screenshot
+    output dir is refined from a host temp dir to `<data_root>/screenshots`
+    (`/data/screenshots` in production), reusing the shared
+    `COPPERCLAW_DATA_ROOT`-aware `verify_gate::data_root()` so the PNG is
+    readable in-container for `send_file`. An explicit
+    `COPPERCLAW_BROWSER_OUTPUT_DIR` still wins.
+  - Egress allow-list injection: a new `COPPERCLAW_BROWSER_PREVIEW_ALLOW`
+    (comma-separated `host:port`) is folded into the browser child's
+    deny-default egress allow-list in `prepare` (deduped, malformed entries
+    dropped). The host sets it at browser-child spawn from the live
+    `PreviewEntry` (`container_ip:container_port`, read-only). **Render-target
+    decision:** the render targets the prototype's own session container
+    directly on the Docker bridge (`http://<container_ip>:<container_port>`),
+    NOT the host preview-proxy URL — the V1 proxy 403s any cookieless request,
+    and the child + app container already share the bridge. Unset → target-only
+    allow-list, byte-identical to pre-V4.
+  - `send_card` cannot attach a local file (its image field is an http(s)
+    `image_url`), so the screenshot reaches the user via `send_file` sent
+    alongside the ritual card — not embedded in it.
+  - When `COPPERCLAW_BROWSER_ENABLED` is unset the tool stays disabled, so the
+    ritual simply omits the screenshot — never an error.
+  - Tests: preview-allow parsing/filtering + the deny-default-egress injection
+    fixture (`browser_render.rs`); a mock-driver screenshot e2e proving a PNG
+    lands under the configured `/data` output dir
+    (`crates/copperclaw-browser/src/live.rs`).
+
+### Changed (M18 P3 — the "prototype ready" ritual, 2026-07-16)
+
+- Every build now ends with one concrete `send_card` hand-off instead of
+  whatever prose the model chose, so a "build me X" run finishes with a
+  coherent demo the operator can open, download, and steer.
+  - `crates/copperclaw-host/src/container_manager/prompt.rs`: the static
+    `CODING_PREAMBLE` floor block (active only for `Coding` / `Full` profiles)
+    gains one closing bullet mandating the ritual card — title + one-line
+    summary, a "What to try" bullet, an **Open preview** URL button (only when
+    the app serves HTTP), a **Download** button (`value: "download"`, answered
+    next turn with the `git archive` zip via `send_file`), the `artifact_path`
+    host path in a footer field, and the screenshot sent alongside via
+    `send_file` (a card can't attach a local file — `image_url` must be
+    http(s)). The block stays a compile-time const, so the prompt-cache prefix
+    is unchanged per spawn and `Messaging` / `Minimal` profiles gain zero bytes
+    (pinned by the existing cache-stability / zero-new-bytes tests).
+  - `skills/coding-task/SKILL.md`: dropped the "a richer close card is
+    forthcoming — P3" hedge and taught the actual `send_card` ritual as the
+    mandatory final step, with capability-based degradation (no preview → no
+    button, no screenshot → no PNG; never a dead link); trimmed the surrounding
+    delivery prose to stay under the 8 KiB skill-body cap.
+  - `skills/send-card/SKILL.md`: added a worked "prototype ready" close example
+    (URL + `value` buttons, artifact-path field, screenshot-alongside note) and
+    the degradation rules, rather than duplicating the schema into coding-task.
+
 ### Added (M18 G1 — in-chat approvals, 2026-07-16)
 
 - Approval cards can now be resolved by tapping **Approve** / **Deny** from
