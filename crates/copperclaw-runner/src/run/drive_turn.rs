@@ -9,6 +9,7 @@ use copperclaw_db::tables::messages_in;
 use copperclaw_providers::HistoryMessage;
 
 use super::RunnerDeps;
+use super::blocker::{BlockerCategory, BlockerRun};
 use super::hud::TaskHud;
 use super::provider_call::{HeartbeatTicker, run_llm_turn};
 use super::tool_dispatch::{ToolImage, invoke_tool};
@@ -18,6 +19,13 @@ use crate::state::save_state;
 pub(super) struct TurnResult {
     pub(super) continuation: Option<String>,
     pub(super) outcome: TurnOutcome,
+    /// F2: the blocker whose denial run filled the tail of this turn,
+    /// when the turn ended WITHOUT a user-facing reply. Set only by the
+    /// outer [`drive_turn`] from the per-turn [`BlockerRun`]; every
+    /// construction site in `drive_turn_inner` leaves it `None`. On a
+    /// `Failed` outcome the terminal-failure path swaps its generic
+    /// apology for this category's curated wall card.
+    pub(super) blocker: Option<BlockerCategory>,
 }
 
 /// Outcome of one per-inbound drive. Public because the host's
@@ -280,7 +288,20 @@ pub(super) async fn drive_turn(
     // collapsed to a one-line summary here — on the failure paths too,
     // so a budget/loop/parse abort never strands a "Running" HUD.
     let hud = TaskHud::new(deps);
-    let result = drive_turn_inner(deps, history, previous_continuation, context_block, &hud).await;
+    // F2: track the tail run of same-blocker denials across the whole
+    // inbound so the outer function can attach the wall category to the
+    // result once the loop resolves (only consulted on a `Failed`
+    // outcome — i.e. a turn that ended without a user-facing reply).
+    let mut blocker_run = BlockerRun::default();
+    let mut result = drive_turn_inner(
+        deps,
+        history,
+        previous_continuation,
+        context_block,
+        &hud,
+        &mut blocker_run,
+    )
+    .await;
     let ok = matches!(
         &result,
         Ok(TurnResult {
@@ -288,6 +309,12 @@ pub(super) async fn drive_turn(
             ..
         })
     );
+    // Attach the tail blocker (if the run reached the threshold and no
+    // user-facing reply went out) so `finalize_messages` can surface the
+    // curated wall card instead of the generic apology.
+    if let Ok(tr) = &mut result {
+        tr.blocker = blocker_run.tail_blocker();
+    }
     hud.finalize(ok).await;
     result
 }
@@ -303,6 +330,7 @@ async fn drive_turn_inner(
     previous_continuation: Option<&str>,
     context_block: Option<&str>,
     hud: &TaskHud,
+    blocker_run: &mut BlockerRun,
 ) -> Result<TurnResult> {
     let mut continuation: Option<String> = previous_continuation.map(str::to_string);
     // Reset per-turn context state (the coarse-provenance taint flag)
@@ -369,6 +397,7 @@ async fn drive_turn_inner(
             return Ok(TurnResult {
                 continuation,
                 outcome: TurnOutcome::Failed(reason),
+                blocker: None,
             });
         }
 
@@ -418,6 +447,7 @@ async fn drive_turn_inner(
                          a different model or lower the reasoning effort."
                             .to_string(),
                     ),
+                    blocker: None,
                 });
             }
             // M18 R6: progressive final answers. On a rich (edit-capable)
@@ -446,6 +476,7 @@ async fn drive_turn_inner(
                 return Ok(TurnResult {
                     continuation,
                     outcome: TurnOutcome::Done,
+                    blocker: None,
                 });
             }
             copperclaw_metrics::inc_progressive_final(&progressive_ag, "single_emit");
@@ -468,6 +499,7 @@ async fn drive_turn_inner(
             return Ok(TurnResult {
                 continuation,
                 outcome: TurnOutcome::Done,
+                blocker: None,
             });
         }
 
@@ -529,6 +561,10 @@ async fn drive_turn_inner(
             cumulative_tool_runs += 1;
             last_tool_name = Some(call.name.clone());
             batch_all_ok &= !is_error;
+            // F2: fold this result into the tail-run tracker in call
+            // order — a run of same-blocker denials at the tail of a
+            // silent turn surfaces one curated wall card at finalize.
+            blocker_run.observe(&call.name, is_error, &content);
             history.push(HistoryMessage::Tool {
                 tool_use_id: call.id.clone(),
                 content,
@@ -579,6 +615,7 @@ async fn drive_turn_inner(
             return Ok(TurnResult {
                 continuation,
                 outcome: stopped,
+                blocker: None,
             });
         }
 
@@ -613,6 +650,7 @@ async fn drive_turn_inner(
             return Ok(TurnResult {
                 continuation,
                 outcome: TurnOutcome::Failed(reason),
+                blocker: None,
             });
         }
 
@@ -630,6 +668,7 @@ async fn drive_turn_inner(
                 outcome: TurnOutcome::Failed(format!(
                     "model produced malformed tool-call JSON {consecutive_parse_error_turns} turns in a row"
                 )),
+                blocker: None,
             });
         }
 
@@ -659,6 +698,7 @@ async fn drive_turn_inner(
                 outcome: TurnOutcome::Failed(format!(
                     "task budget reached: {task_tokens_spent} tokens; stopping"
                 )),
+                blocker: None,
             });
         }
     }
@@ -673,6 +713,7 @@ async fn drive_turn_inner(
         outcome: TurnOutcome::Failed(format!(
             "the agent ran out of turns after {cap} tool calls without finishing the task"
         )),
+        blocker: None,
     })
 }
 

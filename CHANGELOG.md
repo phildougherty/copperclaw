@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M19 F2 — actionable "I'm blocked" wall cards, 2026-07-16)
+
+- Tool errors and policy / provenance / verify-gate / egress denials used
+  to render only into the model's history (`Tool { is_error: true }`) — the
+  user never saw them, so when the model then looped or gave up the HUD
+  just stopped, indistinguishable from a hang. The runner now watches the
+  tail of each turn's tool results (`crates/copperclaw-runner/src/run/blocker.rs`,
+  new module): when a turn ends **without** a user-facing reply and its
+  tail is a *run* of denials on the **same** blocker (≥2, not a single
+  recovered error), the terminal-failure path swaps its generic apology for
+  **one** curated `ErrorCard` naming what is blocked and the actionable next
+  step (egress-allow command, write a `.copperclaw/verify`, this needs
+  approval, needs a person, not permitted here). Wiring:
+  `crates/copperclaw-runner/src/run/drive_turn.rs` folds each result into a
+  `BlockerRun` tail tracker (a mid-turn `send_message` latches suppression —
+  the turn isn't a silent wall) and attaches the category to `TurnResult`;
+  `finalize_messages` / `emit_terminal_failure_apologies` in
+  `crates/copperclaw-runner/src/run/mod.rs` render the wall card. Card text
+  is **curated per category** and carries no `details` block, so no raw
+  tool-error string (or content injected via a tool result) reaches the
+  user. A recovered error, a normal answer, and a non-blocker terminal
+  failure are all unchanged (the generic apology still fires off the
+  blocker categories).
+
 ### Fixed (M18 — Task HUD no-op edit / Telegram "message is not modified", 2026-07-16)
 
 - The H1 Task HUD and R6 progressive-final-answer edit a pinned status
