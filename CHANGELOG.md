@@ -221,6 +221,38 @@ adheres to [Semantic Versioning](https://semver.org/).
   `coding-task` cross-reference pointer back to this skill is deferred to
   the M20 integrator per the lane-P sequencing (Q4 lands `coding-task`
   first).
+### Added (M20 X-rider Wave 1 — foundation fixtures, testing)
+
+- New replay fixture `fixtures/cli/prototype-verify-gate-multistage/`
+  (sibling to the M18 X2 `prototype-verify-gate` fixture, which pins the
+  pre-Q2 single-command gate) pins the Q2 multi-stage verify gate's
+  refuse -> narrow -> pass shape: a `.copperclaw/verify` with three named
+  stages (`lint`/`typecheck`/`test`); a `todo_update` completion attempt is
+  refused naming exactly the stages not yet recorded green (never
+  re-naming a stage that already passed), the refusal narrows as each
+  stage turns green, and completion is allowed only once every stage
+  reads green. Registered in `crates/copperclaw-host/tests/replay.rs` as
+  `cli_prototype_verify_gate_multistage_refuse_narrow_pass`, using the
+  same `COPPERCLAW_DATA_ROOT` re-exec seam (rooted at a distinct `/tmp`
+  path) M18 X2 built to work around `forbid(unsafe_code)` blocking
+  `std::env::set_var` in this integration-test target.
+- The X-rider's other card, a `ui_screenshot` replay fixture proving a
+  `RawContent::Image` tool result round-trips into a provider image block,
+  was investigated and found **not expressible as a replay fixture**:
+  `ui_screenshot::handle()` (`crates/copperclaw-mcp/src/tools/ui_screenshot.rs`)
+  calls `copperclaw_browser::find_chromium_binary()` (reads the real
+  process `PATH`) and `chromium_singleton().get_transport()` (spawns a
+  real chromium process, connects over a real WebSocket) directly, with no
+  `ToolContext`-level or env-var seam analogous to `verify_gate`'s
+  `COPPERCLAW_DATA_ROOT` override — and the replay harness dispatches
+  through the real `copperclaw_mcp::build_tool_set()`, not a mockable
+  registry, so there is no way to inject a canned `CdpTransport` without a
+  product-code change (out of scope for this fixtures-only lane). The
+  generic `RawContent::Image` -> provider image-block conversion this tool
+  depends on is already covered by a dedicated unit test added in D1,
+  `ui_screenshot_tool_result_image_converts_to_provider_image_block` in
+  `crates/copperclaw-providers/src/anthropic.rs`; see the new fixture's
+  README.md for the full reasoning.
 
 ### Added (M19 A3 — Public-tunnel model verb: activate V5)
 

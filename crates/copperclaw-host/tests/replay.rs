@@ -1098,6 +1098,191 @@ async fn run_verify_gate_child(dump: bool) {
     );
 }
 
+// ---- M20 X-rider (Wave 1): the Q2 multi-stage verify gate's refuse ->
+// narrow -> pass loop ----
+//
+// Sibling to the M18 X2 fixture above, which pins the pre-Q2 single-
+// command gate byte-for-byte. This one proves the Q2 extension: a
+// `.copperclaw/verify` with THREE named stages (lint/typecheck/test),
+// where the todo-completion refusal narrows to name only the stages that
+// haven't yet recorded green — not a single project-wide pass/fail bit.
+// Uses the identical re-exec seam (`COPPERCLAW_DATA_ROOT`) X2 built,
+// since `forbid(unsafe_code)` still blocks `std::env::set_var` here.
+
+/// Fixed data root for the multi-stage verify fixture — a distinct `/tmp`
+/// path from [`X2_VERIFY_DATA_ROOT`] so the two fixtures' re-exec'd child
+/// processes never collide if a future change runs them concurrently.
+const M20X1_STAGES_DATA_ROOT: &str = "/tmp/copperclaw-m20x1-verify-stages";
+/// Set on the re-exec'd child so it runs the scenario instead of
+/// re-spawning itself.
+const M20X1_CHILD_ENV: &str = "COPPERCLAW_M20X1_VERIFY_STAGES_CHILD";
+/// `assert` (default) or `dump` — the latter prints the captured actual
+/// streams as JSONL so `expected/*.jsonl` can be regenerated from a real
+/// run (`COPPERCLAW_X2_GENERATE=1 cargo test ... cli_prototype_verify_gate_multistage`).
+const M20X1_MODE_ENV: &str = "COPPERCLAW_M20X1_VERIFY_STAGES_MODE";
+
+#[tokio::test]
+async fn cli_prototype_verify_gate_multistage_refuse_narrow_pass() {
+    // Child leg: env already set by the parent's re-exec. Run the real
+    // scenario against the gate rooted at M20X1_STAGES_DATA_ROOT.
+    if std::env::var_os(M20X1_CHILD_ENV).is_some() {
+        let dump = std::env::var(M20X1_MODE_ENV).ok().as_deref() == Some("dump");
+        run_verify_gate_multistage_child(dump).await;
+        return;
+    }
+
+    // Parent leg: re-exec ourselves with COPPERCLAW_DATA_ROOT set (via the
+    // safe Command::env — set_var is unavailable under forbid(unsafe_code)).
+    let _ = std::fs::remove_dir_all(M20X1_STAGES_DATA_ROOT);
+    std::fs::create_dir_all(M20X1_STAGES_DATA_ROOT).expect("create m20x1 verify-stages data root");
+
+    let mode = if std::env::var_os("COPPERCLAW_X2_GENERATE").is_some() {
+        "dump"
+    } else {
+        "assert"
+    };
+    let exe = std::env::current_exe().expect("current_exe");
+    let output = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "cli_prototype_verify_gate_multistage_refuse_narrow_pass",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(M20X1_CHILD_ENV, "1")
+        .env(M20X1_MODE_ENV, mode)
+        .env("COPPERCLAW_DATA_ROOT", M20X1_STAGES_DATA_ROOT)
+        .output()
+        .expect("spawn verify-stages re-exec child");
+
+    let _ = std::fs::remove_dir_all(M20X1_STAGES_DATA_ROOT);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if mode == "dump" {
+        // Generation run: surface the child's dumped JSONL to the operator.
+        println!("{stdout}");
+    }
+    assert!(
+        output.status.success(),
+        "verify-stages child failed (status {:?})\n\
+         --- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}",
+        output.status.code(),
+    );
+}
+
+/// The child scenario: drive the `prototype-verify-gate-multistage`
+/// fixture through the real harness. In `dump` mode, print the captured
+/// actuals (fixture authoring). Otherwise diff against the committed
+/// `expected/*.jsonl` and assert the refuse -> narrow -> pass shape
+/// genuinely occurred.
+async fn run_verify_gate_multistage_child(dump: bool) {
+    let path = fixture_path("cli", "prototype-verify-gate-multistage");
+    assert!(
+        path.exists(),
+        "fixture missing at {} — see docs/replay-fixtures.md",
+        path.display()
+    );
+    let fixture = Fixture::load(&path).expect("load verify-gate-multistage fixture");
+    let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+    harness.run().await.expect("run harness");
+
+    if dump {
+        harness.dump_expected_jsonl();
+        return;
+    }
+
+    // Byte-stable pipeline diff first (expected/*.jsonl).
+    let report = harness.compare().expect("compare");
+    assert!(report.is_clean(), "{report}");
+
+    // The refusal messages are handed back to the model as tool_result
+    // blocks, so they ride along in the provider request bodies captured
+    // by the wiremock server. Concatenate every received request body and
+    // assert the refuse -> narrow -> pass shape.
+    let reqs = harness
+        .anthropic_server
+        .received_requests()
+        .await
+        .expect("wiremock recorded received requests");
+    let bodies: String = reqs
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(
+        bodies.contains("unverified changes"),
+        "expected the verify-gate refusal in a tool_result body",
+    );
+    // First refusal (only `lint` has recorded green): names the two
+    // stages still missing/failing, and both their exact commands, but
+    // never re-names the stage that already passed.
+    assert!(
+        bodies.contains("missing/failing stage(s): typecheck, test"),
+        "first refusal must name exactly the two unmet stages: {bodies}",
+    );
+    // (Command text is matched by a quote-agnostic prefix rather than the
+    // full string: the refusal rides inside a `tool_result` JSON string, so
+    // the embedded `"` in each command is JSON-escaped as `\"` in the raw
+    // request body — matching only up to the first quote sidesteps that
+    // escaping entirely.)
+    assert!(
+        bodies.contains("typecheck: `python3 -c"),
+        "first refusal must cite the typecheck stage's exact command: {bodies}",
+    );
+    assert!(
+        bodies.contains("test: `python3 -c"),
+        "first refusal must cite the test stage's exact command: {bodies}",
+    );
+    // Second refusal (lint + typecheck both green): narrows to naming
+    // ONLY `test` — proof the gate re-evaluates per-stage state on each
+    // attempt rather than caching the first refusal's stage list.
+    assert!(
+        bodies.contains("missing/failing stage(s): test ("),
+        "second refusal must narrow to naming only the remaining stage: {bodies}",
+    );
+    assert!(
+        !bodies.contains("missing/failing stage(s): lint"),
+        "a stage that already recorded green must never be (re-)named as pending: {bodies}",
+    );
+
+    // The pass: the todo store (also resolved under COPPERCLAW_DATA_ROOT)
+    // shows the item genuinely completed once every stage read green.
+    let todo_store = std::path::Path::new(M20X1_STAGES_DATA_ROOT).join("agent_todos.json");
+    let raw = std::fs::read_to_string(&todo_store)
+        .unwrap_or_else(|e| panic!("todo store missing at {}: {e}", todo_store.display()));
+    let todos: serde_json::Value = serde_json::from_str(&raw).expect("todo store is JSON");
+    let first = &todos.as_array().expect("todo store is an array")[0];
+    assert_eq!(
+        first["status"], "completed",
+        "the todo must end completed once every stage passed: {todos}",
+    );
+
+    // The passing final stage cleared the project's dirty marker (Q2:
+    // only once ALL stages read green, not on any single stage's pass).
+    let dirty = std::path::Path::new(M20X1_STAGES_DATA_ROOT).join("proj/.copperclaw/dirty");
+    assert!(
+        !dirty.exists(),
+        "the project must clear dirty once every stage has passed at {}",
+        dirty.display(),
+    );
+
+    // Every stage genuinely ran and recorded green — proof of the
+    // per-stage state file (`.copperclaw/stages`), not just the absence
+    // of a dirty marker.
+    let stages_file = std::path::Path::new(M20X1_STAGES_DATA_ROOT).join("proj/.copperclaw/stages");
+    let stages_raw = std::fs::read_to_string(&stages_file)
+        .unwrap_or_else(|e| panic!("stages file missing at {}: {e}", stages_file.display()));
+    let stages: serde_json::Value = serde_json::from_str(&stages_raw).expect("stages is JSON");
+    for name in ["lint", "typecheck", "test"] {
+        assert_eq!(
+            stages[name]["passed"], true,
+            "stage `{name}` must be recorded passed: {stages}",
+        );
+    }
+}
+
 // ---- M19 F4 (X-rider W1): a blocked todo renders as blocked, not in-progress ----
 //
 // F4 gave `copperclaw_channels_core::TodoItemStatus` a real `Blocked`

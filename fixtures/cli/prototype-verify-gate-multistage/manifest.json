@@ -1,0 +1,19 @@
+{
+  "name": "cli-prototype-verify-gate-multistage",
+  "channel": "cli",
+  "description": "M20 X-rider (Wave 1): the Q2 multi-stage verify gate's refuse -> narrow -> pass loop, sibling to M18 X2's cli/prototype-verify-gate (which pins the pre-Q2 single-command gate). One CLI inbound drives a scripted tool loop: record a 3-stage `.copperclaw/verify` (lint/typecheck/test), write a correct app.py, run the lint stage, attempt todo completion (REFUSED naming `typecheck, test`), run the typecheck stage, attempt completion again (REFUSED naming only `test`), run the test stage (all stages now green, dirty cleared), attempt completion (ALLOWED). Proves the refusal narrows as individual stages turn green rather than gating on a single pass/fail bit. Registered in tests/replay.rs via the same subprocess re-exec X2 used (forbid(unsafe_code) blocks std::env::set_var). See README.md.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 15000
+  },
+  "max_tool_turns": 14,
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"created_at\":\"[^\"]+\"": "\"created_at\":\"<TS>\"",
+    "\"updated_at\":\"[^\"]+\"": "\"updated_at\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}
