@@ -6,6 +6,48 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M19 A2 — Interactive browser, Phase 5b, demand-pull + opt-in)
+
+- The headless browser gains interactive actions (click / type / scroll /
+  wait-for-selector) as an incremental extension of the existing read-only
+  live path — behind a STRICTER, SEPARATE opt-in flag,
+  `COPPERCLAW_BROWSER_INTERACTIVE`, distinct from `COPPERCLAW_BROWSER_ENABLED`.
+  Both must be truthy for the capability to exist; with the interactive flag
+  unset the new `browser_interact` tool is **not even registered** (see
+  `crates/copperclaw-mcp/src/tools/mod.rs::build_tool_set`), so the tool set,
+  schemas, and behaviour are byte-identical to the read-only baseline.
+  - New `crates/copperclaw-browser/src/interactive.rs`: `InteractiveAction`
+    (`click` / `type` / `scroll` / `wait_for_selector`, capped at 32 actions
+    per call, 8 KiB typed-text cap), the `InteractiveDriver` seam, and the
+    `interact` orchestration. `interact` re-runs the SSRF `NavigationGuard` on
+    **every** navigation an action can trigger — the settled
+    `document.location.href` (async, DNS-resolving `guard_target`, catching a
+    redirect-less JS navigation to an internal address) **and** every redirect
+    hop — before the post-interaction DOM is ever read or returned.
+  - `crates/copperclaw-browser/src/cdp.rs`: `InteractiveDriver` impl for
+    `CdpBrowserDriver` (`Page.enable`/`Network.enable`/`Page.navigate` +
+    `Runtime.evaluate`-driven click/type/scroll/wait, selector + typed text
+    JSON-encoded into the JS expression so a hostile selector cannot inject
+    code). `crates/copperclaw-browser/src/live.rs`: `interact_live` — spawns
+    the SAME locked-down child container (no broker token, deny-default egress
+    scoped to the target, unprivileged user, hardened sandbox), drives the
+    interaction, and tears the container down unconditionally.
+  - New `crates/copperclaw-mcp/src/tools/browser_interact.rs` MCP tool:
+    demand-pull only (one call, one page, one bounded action list — no
+    autonomous browsing loop), output tagged `Provenance::Untrusted` (the turn
+    is marked untrusted up front like `browser_render`), and the initial
+    target SSRF-pre-flighted before any spawn. Non-goals kept explicit in code
+    + docs: NO always-on interactive browsing, NO browser-writes-memory.
+  - No egress-policy weakening: the child container spec is reused verbatim
+    from `build_browser_container_spec`. Like the read-only `browser_render`,
+    the interactive verb is a `Full`-profile-only tool (it appears in no lower
+    profile tier), so restricted-profile and guest senders never receive it.
+  - Metrics reuse the existing browser counters (`inc_browser_ssrf_block` with
+    new `interactive_*` stage labels; `inc_browser_render{mode="interactive"}`;
+    the child spawn/teardown/CDP-connect counters via `interact_live`); a
+    dedicated `browser_interactive_actions_total{action,outcome}` counter is a
+    noted metric wish for a future `copperclaw-metrics` change.
+
 ### Added (M19 A6 — Durable scheduled-task fire lifecycle, migration 028)
 
 - Scheduled tasks now carry a durable, queryable record of their firing

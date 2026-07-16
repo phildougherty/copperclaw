@@ -149,6 +149,90 @@ async fn render_after_spawn(
     out
 }
 
+/// Run one INTERACTIVE session live (Phase 5b): spawn `spec`, connect CDP,
+/// drive `req` (navigate + scripted actions + read) through the interactive
+/// SSRF orchestration ([`crate::interactive::interact`], which re-guards every
+/// navigation), and tear the container down unconditionally.
+///
+/// Mirrors [`render_live`] exactly on the container lifecycle + safety
+/// invariants — the caller MUST have passed the STRICTER interactive opt-in
+/// gate (separate from the read-only enable flag) and built `spec` from
+/// [`crate::build_browser_container_spec`]. `guard` is the production
+/// `net_guard`-backed [`NavigationGuard`].
+pub async fn interact_live(
+    req: &crate::interactive::InteractRequest,
+    spec: ContainerSpec,
+    guard: &dyn NavigationGuard,
+    runtime: &dyn ContainerRuntime,
+    connector: &dyn CdpConnector,
+    opts: &LiveRenderOptions,
+) -> Result<RenderOutput, BrowserError> {
+    req.validate()?;
+    let name = spec.name.clone();
+
+    // SSRF pre-flight on the INITIAL target BEFORE we spend a container spawn.
+    // The orchestration re-runs this and additionally re-guards the settled URL
+    // + every redirect hop after EACH action.
+    guard.guard_target(&req.url).await.map_err(|e| {
+        copperclaw_metrics::inc_browser_ssrf_block("interactive_target_preflight");
+        BrowserError::Blocked(e)
+    })?;
+
+    match runtime.spawn(spec).await {
+        Ok(_) => copperclaw_metrics::inc_browser_child_spawn("ok"),
+        Err(e) => {
+            copperclaw_metrics::inc_browser_child_spawn("error");
+            return Err(BrowserError::Container(format!(
+                "spawn browser child `{name}`: {e}"
+            )));
+        }
+    }
+
+    let outcome = interact_after_spawn(req, guard, runtime, connector, opts, &name).await;
+
+    match runtime.remove(&name).await {
+        Ok(()) => copperclaw_metrics::inc_browser_child_teardown("ok"),
+        Err(e) => {
+            copperclaw_metrics::inc_browser_child_teardown("error");
+            tracing::warn!(container = %name, error = %e, "browser child teardown failed (orphan sweep will reclaim)");
+        }
+    }
+
+    outcome
+}
+
+/// The interactive render steps that run while the child container is up. Split
+/// out so [`interact_live`] can guarantee teardown regardless of the outcome.
+async fn interact_after_spawn(
+    req: &crate::interactive::InteractRequest,
+    guard: &dyn NavigationGuard,
+    runtime: &dyn ContainerRuntime,
+    connector: &dyn CdpConnector,
+    opts: &LiveRenderOptions,
+    name: &str,
+) -> Result<RenderOutput, BrowserError> {
+    let ip = runtime
+        .container_ip(name)
+        .await
+        .map_err(|e| BrowserError::Container(format!("resolve browser child ip: {e}")))?
+        .ok_or_else(|| {
+            BrowserError::Container(format!(
+                "browser child `{name}` has no bridge IP (cannot reach CDP endpoint)"
+            ))
+        })?;
+
+    let http_base = format!("http://{ip}:{}", opts.cdp_port);
+    let transport = connector.connect(&http_base).await.inspect_err(|_e| {
+        copperclaw_metrics::inc_browser_cdp_connect_failure();
+    })?;
+    let driver = CdpBrowserDriver::new(transport, opts.screenshot_dir.clone(), opts.nav_timeout);
+
+    let started = std::time::Instant::now();
+    let out = crate::interactive::interact(req, guard, &driver).await;
+    copperclaw_metrics::observe_browser_render_duration_seconds(started.elapsed().as_secs_f64());
+    out
+}
+
 /// The production [`CdpConnector`]: discovers a page-level CDP WebSocket via the
 /// browser's HTTP `/json/new` endpoint, then connects a [`WsCdpTransport`].
 pub struct WsCdpConnector {
@@ -549,6 +633,96 @@ AAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 
         // Cleanup.
         let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    // ── interactive live path (Phase 5b) ────────────────────────────────
+
+    #[tokio::test]
+    async fn interact_live_happy_path_spawns_drives_and_tears_down() {
+        use crate::interactive::{InteractRequest, InteractiveAction};
+        let runtime = MockRuntime {
+            ip: Some("172.17.0.9".into()),
+            ..Default::default()
+        };
+        // MockConnector's transport answers Runtime.evaluate with "rendered
+        // body" for every eval (location read, click effect, innerText read).
+        let connector = MockConnector {
+            connected: Mutex::new(Vec::new()),
+            fail: false,
+        };
+        let guard = RecordingGuard::default();
+        let req = InteractRequest {
+            url: "https://example.com".into(),
+            actions: vec![InteractiveAction::Click {
+                selector: "#go".into(),
+            }],
+            mode: RenderMode::DomText,
+            timeout_secs: None,
+        };
+        let out = interact_live(&req, enabled_spec(), &guard, &runtime, &connector, &opts())
+            .await
+            .unwrap();
+        assert!(out.is_untrusted());
+        assert_eq!(out.text.as_deref(), Some("rendered body"));
+        assert_eq!(runtime.spawned.lock().unwrap().len(), 1);
+        assert_eq!(runtime.removed.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn interact_live_blocks_ssrf_target_before_spawning() {
+        use crate::interactive::{InteractRequest, InteractiveAction};
+        let runtime = MockRuntime {
+            ip: Some("172.17.0.9".into()),
+            ..Default::default()
+        };
+        let connector = MockConnector {
+            connected: Mutex::new(Vec::new()),
+            fail: false,
+        };
+        let guard = RecordingGuard::blocking(&["169.254.169.254"]);
+        let req = InteractRequest {
+            url: "http://169.254.169.254/latest/meta-data/".into(),
+            actions: vec![InteractiveAction::Click {
+                selector: "#go".into(),
+            }],
+            mode: RenderMode::DomText,
+            timeout_secs: None,
+        };
+        let err = interact_live(&req, enabled_spec(), &guard, &runtime, &connector, &opts())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BrowserError::Blocked(_)));
+        // Never spawned, never connected, nothing to tear down.
+        assert!(runtime.spawned.lock().unwrap().is_empty());
+        assert!(connector.connected.lock().unwrap().is_empty());
+        assert!(runtime.removed.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn interact_live_tears_down_when_connect_fails() {
+        use crate::interactive::{InteractRequest, InteractiveAction};
+        let runtime = MockRuntime {
+            ip: Some("172.17.0.9".into()),
+            ..Default::default()
+        };
+        let connector = MockConnector {
+            connected: Mutex::new(Vec::new()),
+            fail: true,
+        };
+        let guard = RecordingGuard::default();
+        let req = InteractRequest {
+            url: "https://example.com".into(),
+            actions: vec![InteractiveAction::Click {
+                selector: "#go".into(),
+            }],
+            mode: RenderMode::DomText,
+            timeout_secs: None,
+        };
+        let err = interact_live(&req, enabled_spec(), &guard, &runtime, &connector, &opts())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BrowserError::Container(_)));
+        assert_eq!(runtime.removed.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
