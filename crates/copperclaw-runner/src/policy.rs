@@ -151,6 +151,14 @@ const CODING_TOOLS: &[&str] = &[
     // `ui_screenshot`'s chromium spawn), and because it's part of the same
     // build-test-iterate loop those tools serve.
     "diagnostics",
+    // M20 Q6: enforced self-review gate before final delivery. Rides the
+    // coding profile (not `READONLY_TOOLS`) for the same reason
+    // `diagnostics` does — it's part of the build-test-iterate/deliver
+    // loop, not a general-purpose read tool a guest sender should get for
+    // free — even though its read phase is itself read-only; its submit
+    // phase writes `.copperclaw/reviewed`, a real state mutation gating
+    // delivery.
+    "self_review",
 ];
 
 /// Self-modification tools, layered on only by the `full` profile. These
@@ -1413,5 +1421,48 @@ mod tests {
         let d = p.evaluate("shell");
         assert!(!d.is_allow());
         assert!(d.deny_reason().unwrap().contains("messaging"));
+    }
+
+    // ── M20 Q6: self_review policy ────────────────────────────────────────
+
+    #[test]
+    fn self_review_is_coding_profile_only() {
+        assert!(ToolProfile::Coding.allows("self_review"));
+        assert!(ToolProfile::Full.allows("self_review"));
+        assert!(!ToolProfile::Minimal.allows("self_review"));
+        assert!(!ToolProfile::Messaging.allows("self_review"));
+    }
+
+    #[test]
+    fn self_review_is_not_credentialed_external() {
+        // Purely in-container git-diff analysis + a local marker-file
+        // write; never reaches outside the session container.
+        assert!(!is_credentialed_external("self_review"));
+    }
+
+    #[test]
+    fn self_review_denied_to_guest_even_under_full() {
+        let guest = ToolPolicy::new(ToolProfile::Full, Some(SenderRole::Guest));
+        let d = guest.evaluate("self_review");
+        assert!(!d.is_allow());
+        assert!(d.deny_reason().unwrap().contains("guest"));
+    }
+
+    #[test]
+    fn self_review_allowed_for_member_under_coding() {
+        let member = ToolPolicy::new(ToolProfile::Coding, Some(SenderRole::Member));
+        assert!(member.evaluate("self_review").is_allow());
+    }
+
+    #[test]
+    fn self_review_untainted_by_a_tainted_turn() {
+        // In-container git-diff analysis over the agent's own project —
+        // nothing for the confused-deputy taint gate to protect against.
+        let tainted = ToolPolicy::new(ToolProfile::Full, None).with_trust(TurnTrust {
+            tainted: true,
+            approved: false,
+            autonomous: false,
+        });
+        assert!(tainted.evaluate("self_review").is_allow());
     }
 }

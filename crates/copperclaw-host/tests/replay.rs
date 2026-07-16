@@ -1283,6 +1283,179 @@ async fn run_verify_gate_multistage_child(dump: bool) {
     }
 }
 
+// ---- M20 Q6: the enforced self-review gate before final delivery ----
+//
+// Sibling to the two verify-gate fixtures above, exercising the SEPARATE
+// M20 Q6 gate: completing the final/delivery todo of a never-reviewed
+// project refuses, naming `self_review` and `load_skill("code-review")`;
+// calling `self_review` (read, then submit `no_findings: true`) records
+// the review; completion then succeeds. Uses the identical re-exec seam
+// (`COPPERCLAW_DATA_ROOT`) X2/M20X1 built, since `forbid(unsafe_code)`
+// still blocks `std::env::set_var` here.
+
+/// Fixed data root for the self-review-gate fixture — a distinct `/tmp`
+/// path from [`X2_VERIFY_DATA_ROOT`]/[`M20X1_STAGES_DATA_ROOT`] so the
+/// three fixtures' re-exec'd child processes never collide.
+const M20Q6_SELF_REVIEW_DATA_ROOT: &str = "/tmp/copperclaw-q6-self-review-gate";
+/// Set on the re-exec'd child so it runs the scenario instead of
+/// re-spawning itself.
+const M20Q6_CHILD_ENV: &str = "COPPERCLAW_M20Q6_SELF_REVIEW_CHILD";
+/// `assert` (default) or `dump` — the latter prints the captured actual
+/// streams as JSONL so `expected/*.jsonl` can be regenerated from a real
+/// run (`COPPERCLAW_X2_GENERATE=1 cargo test ... cli_prototype_self_review_gate`).
+const M20Q6_MODE_ENV: &str = "COPPERCLAW_M20Q6_SELF_REVIEW_MODE";
+
+#[tokio::test]
+async fn cli_prototype_self_review_gate_refuse_review_pass() {
+    // Child leg: env already set by the parent's re-exec. Run the real
+    // scenario against the gate rooted at M20Q6_SELF_REVIEW_DATA_ROOT.
+    if std::env::var_os(M20Q6_CHILD_ENV).is_some() {
+        let dump = std::env::var(M20Q6_MODE_ENV).ok().as_deref() == Some("dump");
+        run_self_review_gate_child(dump).await;
+        return;
+    }
+
+    // Parent leg: re-exec ourselves with COPPERCLAW_DATA_ROOT set (via the
+    // safe Command::env — set_var is unavailable under forbid(unsafe_code)).
+    let _ = std::fs::remove_dir_all(M20Q6_SELF_REVIEW_DATA_ROOT);
+    std::fs::create_dir_all(M20Q6_SELF_REVIEW_DATA_ROOT)
+        .expect("create m20q6 self-review-gate data root");
+
+    let mode = if std::env::var_os("COPPERCLAW_X2_GENERATE").is_some() {
+        "dump"
+    } else {
+        "assert"
+    };
+    let exe = std::env::current_exe().expect("current_exe");
+    let output = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "cli_prototype_self_review_gate_refuse_review_pass",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(M20Q6_CHILD_ENV, "1")
+        .env(M20Q6_MODE_ENV, mode)
+        .env("COPPERCLAW_DATA_ROOT", M20Q6_SELF_REVIEW_DATA_ROOT)
+        .output()
+        .expect("spawn self-review-gate re-exec child");
+
+    let _ = std::fs::remove_dir_all(M20Q6_SELF_REVIEW_DATA_ROOT);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if mode == "dump" {
+        // Generation run: surface the child's dumped JSONL to the operator.
+        println!("{stdout}");
+    }
+    assert!(
+        output.status.success(),
+        "self-review-gate child failed (status {:?})\n\
+         --- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}",
+        output.status.code(),
+    );
+}
+
+/// The child scenario: drive the `prototype-self-review-gate` fixture
+/// through the real harness. In `dump` mode, print the captured actuals
+/// (fixture authoring). Otherwise diff against the committed
+/// `expected/*.jsonl` and assert the refuse -> `self_review` (read) ->
+/// `self_review` (submit) -> completion shape genuinely occurred.
+async fn run_self_review_gate_child(dump: bool) {
+    let path = fixture_path("cli", "prototype-self-review-gate");
+    assert!(
+        path.exists(),
+        "fixture missing at {} — see docs/replay-fixtures.md",
+        path.display()
+    );
+    let fixture = Fixture::load(&path).expect("load self-review-gate fixture");
+    let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+    harness.run().await.expect("run harness");
+
+    if dump {
+        harness.dump_expected_jsonl();
+        return;
+    }
+
+    // Byte-stable pipeline diff first (expected/*.jsonl).
+    let report = harness.compare().expect("compare");
+    assert!(report.is_clean(), "{report}");
+
+    // The refusal message is handed back to the model as a tool_result
+    // block, so it rides along in the provider request bodies captured by
+    // the wiremock server. Concatenate every received request body and
+    // assert the refuse -> review -> pass shape.
+    let reqs = harness
+        .anthropic_server
+        .received_requests()
+        .await
+        .expect("wiremock recorded received requests");
+    let bodies: String = reqs
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // The refusal names the gate, the teaching hint, and the review-cycle
+    // budget — never-reviewed is refusal cycle 1 of REVIEW_CYCLE_CAP (2).
+    assert!(
+        bodies.contains("has not been self-reviewed"),
+        "expected the self-review-gate refusal in a tool_result body: {bodies}",
+    );
+    assert!(
+        bodies.contains("final/delivery todo"),
+        "refusal must name this as the final/delivery todo: {bodies}",
+    );
+    assert!(
+        bodies.contains("self_review"),
+        "refusal must teach the self_review tool: {bodies}",
+    );
+    assert!(
+        bodies.contains("load_skill(\\\"code-review\\\")"),
+        "refusal must teach load_skill(\"code-review\"): {bodies}",
+    );
+    assert!(
+        bodies.contains("1 review cycle(s) remaining"),
+        "first refusal must report the review-cycle budget: {bodies}",
+    );
+
+    // The self_review READ phase's diff-since-first-commit reached the
+    // model, proving the tool actually ran the real git diff rather than
+    // being a stub.
+    assert!(
+        bodies.contains("def greet(name)"),
+        "self_review's read-phase diff must reach the model: {bodies}",
+    );
+    assert!(
+        bodies.contains("\\\"mode\\\": \\\"submit\\\""),
+        "self_review's submit-phase acknowledgement must reach the model: {bodies}",
+    );
+
+    // The pass: the todo store (also resolved under
+    // COPPERCLAW_DATA_ROOT) shows the item genuinely completed once the
+    // review was recorded.
+    let todo_store = std::path::Path::new(M20Q6_SELF_REVIEW_DATA_ROOT).join("agent_todos.json");
+    let raw = std::fs::read_to_string(&todo_store)
+        .unwrap_or_else(|e| panic!("todo store missing at {}: {e}", todo_store.display()));
+    let todos: serde_json::Value = serde_json::from_str(&raw).expect("todo store is JSON");
+    let first = &todos.as_array().expect("todo store is an array")[0];
+    assert_eq!(
+        first["status"], "completed",
+        "the todo must end completed once the review was recorded: {todos}",
+    );
+
+    // The submitted review actually wrote the marker `self_review` owns.
+    let reviewed_marker = std::path::Path::new(M20Q6_SELF_REVIEW_DATA_ROOT)
+        .join("proj")
+        .join(".copperclaw")
+        .join("reviewed");
+    assert!(
+        reviewed_marker.is_file(),
+        "self_review's submit phase must write .copperclaw/reviewed at {}",
+        reviewed_marker.display(),
+    );
+}
+
 // ---- M19 F4 (X-rider W1): a blocked todo renders as blocked, not in-progress ----
 //
 // F4 gave `copperclaw_channels_core::TodoItemStatus` a real `Blocked`

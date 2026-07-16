@@ -1,0 +1,19 @@
+{
+  "name": "cli-prototype-self-review-gate",
+  "channel": "cli",
+  "description": "M20 Q6: the enforced self-review gate before final delivery. One CLI inbound drives a scripted tool loop: scaffold and commit a tiny project (git init), make a further uncommitted edit, record and run a one-stage `.copperclaw/verify` (so the PRE-EXISTING M20 Q2 verify gate reads clean and only the NEW Q6 review gate is under test), attempt to complete the only (therefore final) todo (REFUSED: never self-reviewed), call `self_review` to read the diff since the project's first commit, submit `no_findings: true` (writes `.copperclaw/reviewed`), then attempt completion again (ALLOWED). Proves the refuse -> self_review (read) -> self_review (submit) -> completion shape genuinely occurs through the real pipeline. Registered in tests/replay.rs via the same subprocess re-exec X2/M20X1 used (forbid(unsafe_code) blocks std::env::set_var). See README.md.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 15000
+  },
+  "max_tool_turns": 14,
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"created_at\":\"[^\"]+\"": "\"created_at\":\"<TS>\"",
+    "\"updated_at\":\"[^\"]+\"": "\"updated_at\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

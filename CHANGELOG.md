@@ -324,6 +324,58 @@ adheres to [Semantic Versioning](https://semver.org/).
   exercise the real subprocess + parse path against a genuine `tsc`/`ruff`
   on `PATH`, per the `ui_screenshot_docker_end_to_end` precedent.
 
+### Added (M20 Q6 — Enforced self-review gate before final delivery)
+
+- `skills/code-review/SKILL.md` carried real diff-review discipline but was
+  orphaned — nothing in the build loop ever invoked it, and nothing forced
+  the agent to read its own diff before declaring a prototype ready. A new
+  first-party `self_review` MCP tool
+  (`crates/copperclaw-mcp/src/tools/self_review.rs`) finally wires it in,
+  two-phase: **READ** (`project` only) returns the project's diff since the
+  last review marker (or since the project's first commit, if never
+  reviewed), capped/chunked via `offset`/`limit` bytes so the model actually
+  reads it; **SUBMIT** (`findings`, a non-empty array of concrete issue
+  strings, or an explicit `no_findings: true`) writes
+  `<project>/.copperclaw/reviewed`.
+- **Enforced, not a prompt ritual.** `crates/copperclaw-mcp/src/tools/todo.rs`'s
+  completion gate refuses to mark the **final/delivery todo** (the last
+  remaining `pending`/`in_progress` item) `completed` while its project is
+  dirty-since-review, naming `self_review` and `load_skill("code-review")`
+  in the refusal — same enforcement mechanics as the M18 R3 / M20 Q2 verify
+  gate. Non-final todos are never review-gated (per-increment review stays a
+  prompt-level habit, M20 Q4). `REVIEW_CYCLE_CAP = 2`: two refused
+  completion attempts burn the budget, and a third attempt while still
+  dirty-since-review auto-transitions the todo to `blocked` instead of
+  refusing forever, mirroring `FIX_CYCLE_CAP`'s cap-exhaustion behaviour.
+  `verify_gate=off` groups skip this gate too — one escape hatch, not two.
+- **Dirty-since-review is a content hash, not a new marker-file flag.**
+  `.copperclaw/reviewed` records the commit the review was anchored to
+  (`base`) plus a sha256 of the diff from that base to the working tree at
+  submission time; a later check recomputes the same diff and compares
+  hashes. This needed zero edits to `verify_gate.rs`'s
+  `mark_dirty_for_write` or any of the write-family tools
+  (`edit_file.rs`/`computer_use.rs`/`multi_edit.rs`/`apply_patch.rs`) —
+  "findings the agent fixes re-dirty the project" falls out for free, since
+  an edit changes the working tree and thus the recomputed hash. A project
+  that isn't a git repository (or is a bare repo) is never gated by this at
+  all — fails open rather than newly blocking a project that skipped `git
+  init`.
+- **Registered in Coding/Full tool profiles**
+  (`crates/copperclaw-runner/src/policy.rs`: `CODING_TOOLS`), guest-denied
+  like `diagnostics`/`ui_screenshot` and NOT a credentialed external action
+  (in-container git-diff analysis plus a local marker-file write only).
+- Unit-tested end to end against real tempdir git repos (no live provider
+  needed): never-reviewed refusal with the teaching hint; completion
+  succeeding after a submission; a post-review edit re-dirtying and
+  re-refusing; the cap auto-blocking on the third attempt; non-final todos
+  never gated; `verify_gate=off` byte-stable; a non-git project never
+  gated. A new replay fixture,
+  `fixtures/cli/prototype-self-review-gate/` (registered in
+  `crates/copperclaw-host/tests/replay.rs` as
+  `cli_prototype_self_review_gate_refuse_review_pass`), pins the
+  refuse → `self_review` (read) → `self_review` (submit) → completion
+  shape through the real pipeline.
+
 ### Added (M19 A3 — Public-tunnel model verb: activate V5)
 
 - The merged-but-dormant V5 public-tunnel module now has an agent-facing verb.

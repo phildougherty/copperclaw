@@ -47,6 +47,7 @@ pub mod net_guard;
 pub mod save_skill;
 pub mod scheduling;
 pub mod self_mod;
+pub mod self_review;
 pub mod sentinel;
 pub mod todo;
 pub mod ui_screenshot;
@@ -119,6 +120,12 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         // in the Coding/Full profile tier; degrades per-tool when
         // eslint/tsc/ruff aren't baked into the image (pre-Q1 / minimal).
         diagnostics::entry(),
+        // M20 Q6: enforced self-review gate before final delivery — see the
+        // module docs. Registered alongside `ui_screenshot`/`diagnostics` in
+        // the Coding/Full profile tier; the `todo.rs` completion gate is
+        // what actually enforces it, this tool is just the read/submit
+        // surface the agent calls.
+        self_review::entry(),
         view_image::entry(),
         // Git inspection tools — read-only structured access to a
         // libgit2-backed repository view. Registered alphabetically.
@@ -247,6 +254,7 @@ mod tests {
             "browser_render",
             "ui_screenshot",
             "diagnostics",
+            "self_review",
             "view_image",
             "git_blame",
             "git_diff",
