@@ -84,7 +84,7 @@ main..<branch> --oneline` yourself first.
 | P1 | Merged | #26 |
 | R2 | Merged | #31 |
 | R3 | **Code-complete, not yet a PR.** Branch `m18/r3-verification-gate`, pushed through part 1/2 (`b53ce57`); part 2/2 (the gate itself) committed locally as `e7c65fa`, **not yet pushed**. Full workspace `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo test --workspace --no-fail-fast` all green (one known-flaky `copperclaw-skills --test coverage` failure under full-workspace parallel runs, pre-existing, see "Facts" below — reruns clean in isolation). Next step is `git push` + open the PR, then the "Acceptance to hand-verify" item below (needs a live mock-provider or manual run, not done this session) before merge. | — |
-| C3 | Not started | — |
+| C3 | **Code-complete, PR open.** Recovered an earlier session's uncommitted WIP (checkpointed as `c97a620`), verified it carefully rather than trusting it, fixed two clippy issues (`route_impl`'s `#[allow(clippy::unused_async)]`, an underscore-prefixed test field that was actually in use), added the missing e2e replay fixture (`fixtures/telegram/inbound-document-attachment/`) plus a file-readability test, and confirmed the read-only touch on `container_manager/spawn.rs` needed no changes. Full workspace `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo test --workspace --no-fail-fast` all green (6,977 passed, 0 failed). | #33 |
 | All others | Not started | — |
 
 ### R3 status (read this first if you're picking up R3)
