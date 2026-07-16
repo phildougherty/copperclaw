@@ -6,6 +6,59 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M18 X1 — golden-path program fixture, 2026-07-15)
+
+- New replay fixture `fixtures/cli/prototype-golden/` (registered as
+  `cli_prototype_golden_path` in `crates/copperclaw-host/tests/replay.rs`):
+  the M18 program's acceptance test. A scripted 8-round tool loop drives
+  "build me a tiny HTTP todo app" end to end through the real
+  inbound → router → runner → outbound → delivery pipeline: `git init` a
+  project, scaffold + verify (`python3 -m py_compile`) a small stdlib-only
+  Python HTTP todo server, commit, expose a mock-brokered preview
+  (`expose_preview`), send the P3 ritual `send_card`, and close with a
+  summary. Byte-stable `expected/*.jsonl` committed; every later card that
+  changes this path updates the fixture in its own PR per the program plan.
+- Two harness additions in-lane for the card (`crates/copperclaw-host/tests/replay/{fixture.rs,harness.rs}`):
+  `manifest.gates: ["preview"]` wires a deterministic `FixturePreviewBroker`
+  onto `DeliveryService` (via the already-public `set_preview_broker`, the
+  same seam `copperclaw-host-delivery`'s own unit tests use) and advertises
+  the M17 `expose_preview` / `close_preview` tools to the per-step runner;
+  a background delivery-poller now runs for the duration of a preview-
+  gated turn so the M17 external-MCP relay's 120s blocking poll
+  (`EXTERNAL_MCP_DEADLINE_SECS`) actually gets serviced within the same
+  turn instead of always timing out (the harness's normal per-step
+  sequencing runs the whole turn before ever calling `deliver_session`,
+  which production's concurrent delivery loop doesn't have to worry
+  about). `manifest.max_tool_turns` is now overridable per fixture
+  (default unchanged at 5) for scripted sequences with more tool rounds.
+- **Two explicit, diagnosed limitations** (see `fixtures/cli/prototype-golden/README.md`
+  for the full writeup) — the fixture does NOT exercise the R3
+  verification gate or the H1 live Task HUD, and why not:
+  - `verify_gate.rs`'s `data_root()` and `todo.rs`'s `todo_path()`
+    hardcode the literal `/data` container mount, with only a
+    `#[cfg(test)]`-gated override invisible to `copperclaw-host`'s
+    separate integration-test binary — and `/data` is a real, unwritable,
+    root-owned path on every host that would run this test suite. The
+    smallest fix (un-gating the existing override, `#[doc(hidden)] pub`,
+    zero production call sites) was attempted and reverted after the
+    security review correctly flagged it as a genuine capability
+    weakening needing the user's own explicit sign-off — out of this
+    card's authorization. Root cause of R3's own "build-verify-loop"
+    e2e fixture being left as an incomplete stretch goal; a `test-support`
+    Cargo feature or an unconditional env-var override (mirroring the
+    shell tool's already-shipped, non-test-gated `COPPERCLAW_SHELL_STATE_FILE`)
+    is the right, small, explicitly-authorized follow-up.
+  - `cli` is not in `capabilities::EDIT_CAPABLE_CHANNELS`, so the HUD's
+    `Behavior` is always `StatusRows` there (never `Live`/`FinalOnly`),
+    and even that fallback's 60s-gated heartbeat has no "done in M:SS"
+    finalize arm — a live/finalized HUD fixture needs an edit-capable
+    channel (telegram/slack/discord/matrix/webex), not cli.
+- **Metrics wish (for M1):** a counter for preview-expose calls serviced
+  vs. timed out (label: `outcome=served|timeout`) would make the M17
+  relay's real-world latency visible in `cclaw usage` — this fixture's
+  own diagnosis of the 120s blocking-poll behavior is exactly the kind
+  of thing such a counter would have surfaced sooner.
+
 ### Added (verification gate — M18 R3, 2026-07-15)
 
 - **Todos can no longer be marked `completed` on vibes.** The runner now tracks "dirty since last verify" per project directory under `/data`: any successful `write_file` / `edit_file` / `multi_edit` / `apply_patch`, or any `shell` call with an explicit `cwd` resolving to a project, marks that project dirty (file markers under `<project>/.copperclaw/`, best-effort I/O — a marker-write failure never fails the underlying tool call). `todo_update(status: "completed")` now runs a session-wide dirty scan (todos aren't linked to a specific project in the store, so any dirty project blocks completion) after its existing evidence check: a dirty project refuses the completion with a structured error naming the project, its recorded verify command (or a hint to write one to `.copperclaw/verify`), and fix-cycles remaining. Running the recorded verify command via `shell` (exit 0) clears dirty; a failing run records the failure tail and increments a fix-cycle counter (cap 2). After the cap is burned and the project is *still* dirty, the gate stops refusing and instead auto-transitions the todo to a new `blocked` status (with the failure text attached) and returns success — never silently completed, but never permanently stuck refusing either. Per-group escape hatch: `container_configs.verify_gate = 0` (via `cclaw groups config update --field verify_gate=false`) restores byte-identical pre-R3 behaviour (evidence-only check, no dirty-tracking) — a pure-chat group that never touches `/data/<project>/...` never engages the gate regardless. `container_configs.check_command` optionally overrides whatever verify command the agent itself recorded. New crate module `crates/copperclaw-mcp/src/tools/verify_gate.rs` (dirty-tracking primitives + the trickiest bit, `project_root_of`, resolving a container path to its owning `/data/<project>` root); hooked into `crates/copperclaw-mcp/src/tools/{computer_use,edit_file,multi_edit,apply_patch,todo}.rs`. Config plumbing: `container_configs.check_command` / `.verify_gate` (migration 026, part 1/2) → `runner.json`'s `check_command` / `verify_gate` (`crates/copperclaw-runner/src/config.rs`) → two new `ToolContext` trait methods (`verify_gate_enabled` / `check_command_override`, default on/`None` so mocks and subagent contexts are unaffected) that the `copperclaw-mcp` tool handlers consult directly, since they only see `&dyn ToolContext`, not the runner's own config.
