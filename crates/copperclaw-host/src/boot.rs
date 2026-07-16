@@ -489,12 +489,12 @@ pub fn assemble(
     // (not through a module) because the closure needs both the central DB and
     // the delivery dispatcher, and the type lives in `copperclaw-modules` so
     // the router holds the hook slot without a circular dependency.
-    router.hooks().set_approval_interceptor(
-        crate::approval_intercept::build_approval_interceptor(
+    router
+        .hooks()
+        .set_approval_interceptor(crate::approval_intercept::build_approval_interceptor(
             central.clone(),
             Arc::clone(&dispatcher),
-        ),
-    );
+        ));
 
     let delivery = DeliveryService::new(central.clone(), delivery_root, adapters, dispatcher);
 

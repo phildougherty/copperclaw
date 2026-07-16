@@ -1211,7 +1211,10 @@ impl DeliveryService {
                     approval_id,
                     pmid,
                 ) {
-                    warn!(?err, "approvals: could not persist card platform_message_id");
+                    warn!(
+                        ?err,
+                        "approvals: could not persist card platform_message_id"
+                    );
                 }
             }
         } else {

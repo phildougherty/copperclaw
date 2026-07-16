@@ -1354,14 +1354,18 @@ mod tests {
         let fx = fixture(SessionMode::Shared);
         let calls = Arc::new(AtomicUsize::new(0));
         let calls2 = Arc::clone(&calls);
-        fx.router.hooks().set_approval_interceptor(Arc::new(move |ctx| {
-            calls2.fetch_add(1, Ordering::SeqCst);
-            if ctx.callback_data.starts_with("approve:") || ctx.callback_data.starts_with("deny:") {
-                copperclaw_modules::context::ApprovalInterceptDecision::Handled
-            } else {
-                copperclaw_modules::context::ApprovalInterceptDecision::Passthrough
-            }
-        }));
+        fx.router
+            .hooks()
+            .set_approval_interceptor(Arc::new(move |ctx| {
+                calls2.fetch_add(1, Ordering::SeqCst);
+                if ctx.callback_data.starts_with("approve:")
+                    || ctx.callback_data.starts_with("deny:")
+                {
+                    copperclaw_modules::context::ApprovalInterceptDecision::Handled
+                } else {
+                    copperclaw_modules::context::ApprovalInterceptDecision::Passthrough
+                }
+            }));
         let mut ev = event(None, "cb-1");
         ev.message.content = serde_json::json!({
             "text": "approve:abc",

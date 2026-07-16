@@ -357,7 +357,12 @@ mod tests {
         .approval_id
     }
 
-    fn ctx(id: ApprovalId, verb: &str, ag: AgentGroupId, sender_identity: &str) -> ApprovalInterceptCtx {
+    fn ctx(
+        id: ApprovalId,
+        verb: &str,
+        ag: AgentGroupId,
+        sender_identity: &str,
+    ) -> ApprovalInterceptCtx {
         ApprovalInterceptCtx {
             callback_data: format!("{verb}:{}", id.as_uuid()),
             event_sender: Some(SenderIdentity {
@@ -485,10 +490,7 @@ mod tests {
         let interceptor = build_approval_interceptor(db.clone(), dispatcher);
         let mut c = ctx(ApprovalId::new(), "approve", ag, "x");
         c.callback_data = "expand:42".into();
-        assert_eq!(
-            interceptor(c),
-            ApprovalInterceptDecision::Passthrough
-        );
+        assert_eq!(interceptor(c), ApprovalInterceptDecision::Passthrough);
     }
 
     #[test]

@@ -146,12 +146,10 @@ async fn telegram_approval_callback_round_trip() {
 
     let harness = run_fixture_into_harness("telegram", "approval-callback").await;
 
-    let approved = ApprovalId(
-        uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000b1").unwrap(),
-    );
-    let refused = ApprovalId(
-        uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000b2").unwrap(),
-    );
+    let approved =
+        ApprovalId(uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000b1").unwrap());
+    let refused =
+        ApprovalId(uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000b2").unwrap());
 
     // Owner tap: approval resolved through the shared DB path, decision names
     // the human approver (not "host").
@@ -209,12 +207,10 @@ async fn slack_approval_block_action_round_trip() {
 
     let harness = run_fixture_into_harness("slack", "approval-block-action").await;
 
-    let approved = ApprovalId(
-        uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000c1").unwrap(),
-    );
-    let refused = ApprovalId(
-        uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000c2").unwrap(),
-    );
+    let approved =
+        ApprovalId(uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000c1").unwrap());
+    let refused =
+        ApprovalId(uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000c2").unwrap());
 
     let row = pending_approvals::get(&harness.central, approved).unwrap();
     assert_eq!(row.status, ApprovalStatus::Approved);
