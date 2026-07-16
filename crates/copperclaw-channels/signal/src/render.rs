@@ -29,83 +29,13 @@ use copperclaw_channels_core::{
     Breadcrumb, BreadcrumbStatus, Card, DiffCard, ErrorCard, ThinkingBlock, TodoList,
 };
 
-/// Render a [`Card`] as clean Signal plaintext — title on its own line
-/// (no `**` markdown), body, `Label: value` field lines, a
-/// `- label -> target` button list, and an `[image: url]` marker. Mirrors
-/// the structure of [`Card::to_text_fallback`] but drops the Markdown
-/// emphasis Signal would render literally.
+/// Render a [`Card`] as clean Signal plaintext via the shared markdown-free
+/// [`Card::to_plaintext`] — title on its own line (no `**` markdown), body,
+/// `Label: value` field lines, a `- label -> target` button list, and an
+/// `[image: url]` marker. Drops the Markdown emphasis Signal would render
+/// literally.
 pub fn render_card(card: &Card) -> String {
-    let mut out = String::new();
-    if let Some(t) = card
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-    {
-        out.push_str(t);
-        out.push('\n');
-    }
-    if let Some(b) = card
-        .body
-        .as_deref()
-        .map(str::trim)
-        .filter(|b| !b.is_empty())
-    {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(b);
-        out.push('\n');
-    }
-    if !card.fields.is_empty() {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        for f in &card.fields {
-            out.push_str(f.label.trim());
-            out.push_str(": ");
-            out.push_str(f.value.trim());
-            out.push('\n');
-        }
-    }
-    if !card.buttons.is_empty() {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        for b in &card.buttons {
-            out.push_str("- ");
-            out.push_str(b.label.trim());
-            match (b.value.as_deref(), b.url.as_deref()) {
-                (_, Some(url)) => {
-                    out.push_str(" -> ");
-                    out.push_str(url.trim());
-                }
-                (Some(v), None) => {
-                    out.push_str(" -> ");
-                    out.push_str(v.trim());
-                }
-                (None, None) => {}
-            }
-            out.push('\n');
-        }
-    }
-    if let Some(img) = card
-        .image_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|i| !i.is_empty())
-    {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str("[image: ");
-        out.push_str(img);
-        out.push_str("]\n");
-    }
-    while out.ends_with('\n') {
-        out.pop();
-    }
-    out
+    card.to_plaintext()
 }
 
 /// Stable ASCII status marker for a breadcrumb chip. Words, not emoji —
@@ -186,34 +116,13 @@ fn render_activity(b: &Breadcrumb) -> String {
     out
 }
 
-/// Render a [`DiffCard`] as a structured Signal plaintext diff: a
-/// glanceable `path (+adds / -removes)` header line, then the unified
-/// hunks with `@@` ranges and `+` / `-` / ` ` gutters. No ` ```diff `
-/// fence (Signal would show literal backticks) and no redundant `--- a/`
-/// / `+++ b/` git file header — the path already leads the block.
+/// Render a [`DiffCard`] as a structured Signal plaintext diff via the
+/// shared fence-free [`DiffCard::to_plaintext`]: a glanceable
+/// `path (+adds / -removes)` header line, then the unified hunks with `@@`
+/// ranges and `+` / `-` / ` ` gutters. Signal would show literal
+/// backticks, so there's no ` ```diff ` fence.
 pub fn render_diff(diff: &DiffCard) -> String {
-    let mut out = String::with_capacity(64 + diff.hunks.len() * 48);
-    out.push_str(diff.path.trim());
-    out.push_str(" (+");
-    out.push_str(&diff.added.to_string());
-    out.push_str(" / -");
-    out.push_str(&diff.removed.to_string());
-    if diff.truncated {
-        out.push_str(", truncated");
-    }
-    out.push(')');
-    for h in &diff.hunks {
-        out.push_str(&format!(
-            "\n@@ -{},{} +{},{} @@",
-            h.old_start, h.old_lines, h.new_start, h.new_lines
-        ));
-        for line in &h.lines {
-            out.push('\n');
-            out.push(line.kind.unified_prefix());
-            out.push_str(&line.text);
-        }
-    }
-    out
+    diff.to_plaintext()
 }
 
 /// Render a [`TodoList`] as a structured Signal checklist: a

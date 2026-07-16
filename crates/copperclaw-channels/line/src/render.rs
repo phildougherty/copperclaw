@@ -122,137 +122,33 @@ fn button_action(b: &CardButton) -> Value {
 }
 
 /// The structured plaintext rendering of a [`Card`] — used for `altText`
-/// and as the whole message when the card has no buttons. Markdown-free
-/// (LINE renders none): title line, body, `Label: value` fields, a
-/// `- label -> target` button list, and an `[image: url]` marker.
+/// and as the whole message when the card has no buttons. Delegates to the
+/// shared markdown-free [`Card::to_plaintext`] (LINE renders no Markdown):
+/// title line, body, `Label: value` fields, a `- label -> target` button
+/// list, and an `[image: url]` marker.
 #[must_use]
 pub fn render_card_text(card: &Card) -> String {
-    let mut out = String::new();
-    if let Some(t) = card
-        .title
-        .as_deref()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-    {
-        out.push_str(t);
-        out.push('\n');
-    }
-    if let Some(b) = card
-        .body
-        .as_deref()
-        .map(str::trim)
-        .filter(|b| !b.is_empty())
-    {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(b);
-        out.push('\n');
-    }
-    if !card.fields.is_empty() {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        for f in &card.fields {
-            out.push_str(f.label.trim());
-            out.push_str(": ");
-            out.push_str(f.value.trim());
-            out.push('\n');
-        }
-    }
-    if !card.buttons.is_empty() {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        for b in &card.buttons {
-            out.push_str("- ");
-            out.push_str(b.label.trim());
-            match (b.value.as_deref(), b.url.as_deref()) {
-                (_, Some(url)) => {
-                    out.push_str(" -> ");
-                    out.push_str(url.trim());
-                }
-                (Some(v), None) => {
-                    out.push_str(" -> ");
-                    out.push_str(v.trim());
-                }
-                (None, None) => {}
-            }
-            out.push('\n');
-        }
-    }
-    if let Some(img) = card
-        .image_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|i| !i.is_empty())
-    {
-        if !out.is_empty() {
-            out.push('\n');
-        }
-        out.push_str("[image: ");
-        out.push_str(img);
-        out.push_str("]\n");
-    }
-    while out.ends_with('\n') {
-        out.pop();
-    }
-    out
+    card.to_plaintext()
 }
 
-/// Render a [`DiffCard`] as fence-free LINE plaintext: a
-/// `path (+adds / -removes)` header then unified hunks with `+` / `-` / ` `
-/// gutters (LINE shows literal backticks, so no ` ```diff ` fence).
+/// Render a [`DiffCard`] as fence-free LINE plaintext via the shared
+/// [`DiffCard::to_plaintext`]: a `path (+adds / -removes)` header then
+/// unified hunks with `+` / `-` / ` ` gutters (LINE shows literal
+/// backticks, so no ` ```diff ` fence).
 #[must_use]
 pub fn render_diff(diff: &DiffCard) -> String {
-    let mut out = String::with_capacity(64 + diff.hunks.len() * 48);
-    out.push_str(diff.path.trim());
-    out.push_str(" (+");
-    out.push_str(&diff.added.to_string());
-    out.push_str(" / -");
-    out.push_str(&diff.removed.to_string());
-    if diff.truncated {
-        out.push_str(", truncated");
-    }
-    out.push(')');
-    for h in &diff.hunks {
-        out.push_str(&format!(
-            "\n@@ -{},{} +{},{} @@",
-            h.old_start, h.old_lines, h.new_start, h.new_lines
-        ));
-        for line in &h.lines {
-            out.push('\n');
-            out.push(line.kind.unified_prefix());
-            out.push_str(&line.text);
-        }
-    }
-    out
+    diff.to_plaintext()
 }
 
-/// Render a [`TodoList`] as a LINE plaintext checklist: a
-/// `title (done/total)` header then one `[x]` / `[~]` / `[!]` / `[ ]` line
-/// per item. A [`TodoItemStatus::Blocked`](copperclaw_channels_core::TodoItemStatus::Blocked)
-/// item carries the `[!]` glyph plus its `blocked_reason` inline
-/// (`— blocked: <reason>`) so a stalled step reads as blocked, not stuck
-/// "in progress".
+/// Render a [`TodoList`] as a LINE plaintext checklist via the shared
+/// [`TodoList::to_chip_plaintext`]: a `title (done/total)` header then one
+/// `[x]` / `[~]` / `[!]` / `[ ]` line per item. A
+/// [`TodoItemStatus::Blocked`](copperclaw_channels_core::TodoItemStatus::Blocked)
+/// item carries the `[!]` glyph plus its `blocked_reason` inline so a
+/// stalled step reads as blocked, not stuck "in progress".
 #[must_use]
 pub fn render_todo_list(list: &TodoList) -> String {
-    let done = list.completed_count();
-    let total = list.items.len();
-    let mut out = String::with_capacity(64 + list.items.len() * 32);
-    out.push_str(list.title_or_default());
-    out.push_str(&format!(" ({done}/{total})"));
-    for item in &list.items {
-        out.push('\n');
-        out.push_str(item.status.glyph());
-        out.push(' ');
-        out.push_str(item.text.trim());
-        if let Some(reason) = item.blocked_reason_text() {
-            out.push_str(" — blocked: ");
-            out.push_str(reason.trim());
-        }
-    }
-    out
+    list.to_chip_plaintext()
 }
 
 /// Truncate `s` to at most `max` characters, appending an ellipsis when it

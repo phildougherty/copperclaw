@@ -354,6 +354,32 @@ impl TodoList {
         }
         out
     }
+
+    /// Compact pinned-chip plaintext rendering for bare adapters (Delta
+    /// Chat, LINE): a `title (done/total)` header with the counter hoisted
+    /// up top for the glance, then one glyph-prefixed line per item. A
+    /// [`TodoItemStatus::Blocked`] item carries its `blocked_reason` inline
+    /// (`— blocked: <reason>`) so a stalled step reads as blocked, not
+    /// stuck "in progress". No footer — the header counter carries the
+    /// summary. No trailing newline.
+    pub fn to_chip_plaintext(&self) -> String {
+        let done = self.completed_count();
+        let total = self.items.len();
+        let mut out = String::with_capacity(64 + self.items.len() * 32);
+        out.push_str(self.title_or_default());
+        out.push_str(&format!(" ({done}/{total})"));
+        for item in &self.items {
+            out.push('\n');
+            out.push_str(item.status.glyph());
+            out.push(' ');
+            out.push_str(item.text.trim());
+            if let Some(reason) = item.blocked_reason_text() {
+                out.push_str(" — blocked: ");
+                out.push_str(reason.trim());
+            }
+        }
+        out
+    }
 }
 
 impl Default for TodoList {

@@ -370,6 +370,37 @@ impl DiffCard {
         }
         out
     }
+
+    /// Compact, fence-free plaintext rendering for adapters whose surface
+    /// shows Markdown / backticks literally (Signal, Delta Chat, LINE
+    /// text). A glanceable `path (+adds / -removes)` header leads the block
+    /// (so no redundant `--- a/` / `+++ b/` git file header), then the
+    /// unified hunks with `@@` ranges and `+` / `-` / ` ` gutters — no
+    /// ` ```diff ` fence. `truncated` is flagged inline in the header.
+    pub fn to_plaintext(&self) -> String {
+        let mut out = String::with_capacity(64 + self.hunks.len() * 48);
+        out.push_str(self.path.trim());
+        out.push_str(" (+");
+        out.push_str(&self.added.to_string());
+        out.push_str(" / -");
+        out.push_str(&self.removed.to_string());
+        if self.truncated {
+            out.push_str(", truncated");
+        }
+        out.push(')');
+        for h in &self.hunks {
+            out.push_str(&format!(
+                "\n@@ -{},{} +{},{} @@",
+                h.old_start, h.old_lines, h.new_start, h.new_lines
+            ));
+            for line in &h.lines {
+                out.push('\n');
+                out.push(line.kind.unified_prefix());
+                out.push_str(&line.text);
+            }
+        }
+        out
+    }
 }
 
 // serde's `skip_serializing_if` invokes the predicate with `&T` even
