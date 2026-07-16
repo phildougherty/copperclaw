@@ -5,6 +5,7 @@
 //! - `create_post` → `POST /api/v4/posts`
 //! - `update_post` → `PUT /api/v4/posts/{post_id}/patch`
 //! - `add_reaction` → `POST /api/v4/reactions`
+//! - `post_typing` → `POST /api/v4/users/{user_id}/typing`
 //!
 //! Every call uses bearer auth with the configured Personal Access
 //! Token. HTTP-error → [`AdapterError`] translation matches the
@@ -177,6 +178,45 @@ impl MattermostApi {
                 user_id,
                 post_id,
                 emoji_name,
+            })
+            .send()
+            .await
+            .map_err(|e| transport(&e))?;
+        let status = res.status();
+        if !status.is_success() {
+            return Err(map_error(status, res).await);
+        }
+        Ok(())
+    }
+
+    /// `POST /api/v4/users/{user_id}/typing` — publish a `user_typing`
+    /// websocket event server-side so channel members see the bot's
+    /// "…is typing" indicator. `user_id` may be `me` (the token owner);
+    /// `channel_id` is required and `parent_id` scopes the indicator to a
+    /// thread root when present (empty string ⇒ the whole channel).
+    ///
+    /// This is the REST shortcut for the websocket `user_typing` action —
+    /// the server fans it out to connected clients — so the adapter needs
+    /// no persistent websocket just to signal liveness during a run.
+    pub async fn post_typing(
+        &self,
+        user_id: &str,
+        channel_id: &str,
+        parent_id: Option<&str>,
+    ) -> Result<(), AdapterError> {
+        #[derive(Serialize)]
+        struct Typing<'a> {
+            channel_id: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            parent_id: Option<&'a str>,
+        }
+        let res = self
+            .client
+            .post(format!("{}/api/v4/users/{user_id}/typing", self.base_url))
+            .bearer_auth(&self.token)
+            .json(&Typing {
+                channel_id,
+                parent_id,
             })
             .send()
             .await
@@ -402,6 +442,51 @@ mod tests {
         assert!(matches!(
             api.add_reaction("u", "p", "fake").await.unwrap_err(),
             AdapterError::BadRequest(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn post_typing_succeeds_on_200() {
+        let mock = server().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/users/me/typing"))
+            .and(header("authorization", "Bearer t"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock)
+            .await;
+        let api = MattermostApi::new(&mock.uri(), "t");
+        api.post_typing("me", "chan-1", None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_typing_scopes_to_thread_parent() {
+        let mock = server().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/users/bot-9/typing"))
+            .and(wiremock::matchers::body_string_contains(
+                "\"parent_id\":\"root-1\"",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock)
+            .await;
+        let api = MattermostApi::new(&mock.uri(), "t");
+        api.post_typing("bot-9", "chan-1", Some("root-1"))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn post_typing_propagates_403() {
+        let mock = server().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/users/me/typing"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("forbidden"))
+            .mount(&mock)
+            .await;
+        let api = MattermostApi::new(&mock.uri(), "t");
+        assert!(matches!(
+            api.post_typing("me", "c", None).await.unwrap_err(),
+            AdapterError::Auth(_)
         ));
     }
 
