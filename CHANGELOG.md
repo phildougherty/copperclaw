@@ -6,6 +6,45 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M18 X2 — close the golden-fixture gaps, 2026-07-16)
+
+- The M18 program-acceptance golden fixture now covers the two legs X1
+  shipped without a genuine end-to-end exercise.
+  - `fixtures/cli/prototype-verify-gate/` (new, registered in
+    `crates/copperclaw-host/tests/replay.rs` as
+    `cli_prototype_verify_gate_refuse_fix_pass`): the R3 verification-gate
+    **refuse → fix → pass** loop, genuinely exercised — a scripted mock
+    provider records a verify command, writes a broken file, is REFUSED at
+    `todo_update completed` (dirty, `2 fix cycle(s) remaining`), runs a
+    failing verify (Python `SyntaxError`, refused again with
+    `1 fix cycle(s) remaining`), writes the fix, runs a passing verify, and is
+    then ALLOWED to complete. X1 could not cover this because
+    `verify_gate::data_root()` / `todo.rs` were hardcoded to `/data`; **T2's
+    `COPPERCLAW_DATA_ROOT` override** points the in-process runner's gate at a
+    writable per-run dir. Because `forbid(unsafe_code)` blocks
+    `std::env::set_var`, the registered test **re-execs itself** as a child
+    process with the env var set via the safe `std::process::Command::env` —
+    no production source change (T2 already shipped the seam). Refusal shapes
+    are asserted from the wiremock server's captured request bodies (the
+    `tool_result`s handed back to the model); the pass is asserted from the
+    on-disk todo store (`status: completed`) and the cleared `.copperclaw/dirty`
+    marker.
+  - `fixtures/cli/prototype-golden/`: extended to emit the P3 "prototype
+    ready" ritual in full — a `send_file` **screenshot delivered alongside**
+    the `send_card` (cards can't attach a local file), and the card's
+    `artifact_path` host-path footer. New `cli_prototype_golden_ritual_card_and_screenshot_shape`
+    test asserts the delivered card shape (title, one-liner, "What to try",
+    the host-path footer, the Open-preview URL button) and the screenshot,
+    on top of the byte-stable JSONL diff. Expected streams regenerated.
+  - `crates/copperclaw-host/tests/replay/harness.rs`: new `dump_expected_jsonl`
+    fixture-authoring aid — prints each captured actual stream as
+    substituted JSONL so `expected/*.jsonl` can be generated from a real run
+    (`COPPERCLAW_X2_GENERATE=1`) instead of hand-guessed.
+  - The **HUD status-row leg remains uncovered** on `cli` (not edit-capable →
+    always `StatusRows`, gated behind a 60 s real-wall-clock first fire a
+    millisecond replay never crosses). X2 did not add a clock seam; both
+    fixture READMEs document why an edit-capable channel is the right vehicle.
+
 ### Changed (M18 V4 — screenshot-the-preview path, 2026-07-16)
 
 - `browser_render` now lands its screenshot where the in-container agent can
