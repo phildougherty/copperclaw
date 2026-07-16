@@ -12,6 +12,11 @@ use crate::hooks::HookChain;
 use crate::mention::{MentionDecision, MentionGate};
 use crate::session::SessionRoot;
 
+use copperclaw_channels_core::inbound_file::{
+    ATTACHMENT_PATH_KEY, STAGED_PATH_KEY, container_inbox_path, remove_staged_file,
+    sanitize_filename,
+};
+use copperclaw_db::attachments::extract_to_inbox;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::dropped_messages::{InsertDroppedMessage, insert as insert_dropped};
 use copperclaw_db::tables::messages_in::{WriteInbound, count_due, insert as insert_in};
@@ -31,6 +36,7 @@ use copperclaw_types::{
     AgentGroupId, InboundEvent, MessageId, MessageKind, MessagingGroupId, SessionId, SessionMode,
 };
 use dashmap::DashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Instant;
@@ -222,6 +228,20 @@ impl Router {
     /// `unused_async` lint is suppressed accordingly.
     #[allow(clippy::unused_async)]
     pub async fn route(&self, event: InboundEvent) -> Result<RouteOutcome, RouterError> {
+        // Inbound-file contract (M18 C3): whatever the route outcome —
+        // delivered, dropped, debounced, pending, or an error — the
+        // adapter's staged attachment file is consumed here. Successful
+        // fanouts copy the bytes into each target session's inbox before
+        // this cleanup runs (see `materialized_content`).
+        let staged = staged_attachment_path(&event);
+        let outcome = self.route_impl(&event).await;
+        if let Some(path) = staged {
+            remove_staged_file(&path);
+        }
+        outcome
+    }
+
+    async fn route_impl(&self, event: &InboundEvent) -> Result<RouteOutcome, RouterError> {
         // 1. Debounce.
         let dkey = DebounceKey {
             channel_type: event.channel_type.clone(),
@@ -238,14 +258,14 @@ impl Router {
         // 2. Resolve messaging group.
         let Some(mg) = get_by_platform(&self.central, &event.channel_type, &event.platform_id)?
         else {
-            self.record_drop(&event, None, None, "no_messaging_group")?;
+            self.record_drop(event, None, None, "no_messaging_group")?;
             return Ok(RouteOutcome::Dropped {
                 reason: DropReason::NoMessagingGroup,
             });
         };
 
         // 3. Resolve sender to a UserId (if any).
-        let user_id = self.hooks.run_sender_resolver(&event);
+        let user_id = self.hooks.run_sender_resolver(event);
 
         // 4. Optional channel-request gate (applies before the per-wiring
         //    fanout because a Deny / Pending here applies to all agents).
@@ -259,7 +279,7 @@ impl Router {
             };
             match self.hooks.run_channel_request_gate(ctx) {
                 Some(GateDecision::Deny(reason)) => {
-                    self.record_drop(&event, Some(mg.id), None, &reason)?;
+                    self.record_drop(event, Some(mg.id), None, &reason)?;
                     return Ok(RouteOutcome::Dropped {
                         reason: DropReason::AccessDenied(reason),
                     });
@@ -271,7 +291,7 @@ impl Router {
         // 5. List wirings.
         let wirings = list_wirings(&self.central, mg.id)?;
         if wirings.is_empty() {
-            self.record_drop(&event, Some(mg.id), None, "no_agents")?;
+            self.record_drop(event, Some(mg.id), None, "no_agents")?;
             return Ok(RouteOutcome::Dropped {
                 reason: DropReason::NoAgents,
             });
@@ -280,7 +300,7 @@ impl Router {
         // 6. End-user slash-command detection (M18 R1). Detected once per
         //    event; every wiring below takes the same command path. See
         //    [`crate::commands`] for the per-command routing contract.
-        let command = SlashCommand::detect(&event);
+        let command = SlashCommand::detect(event);
 
         // 7. Fanout to each wiring.
         let mut sessions = Vec::with_capacity(wirings.len());
@@ -288,12 +308,12 @@ impl Router {
         let mut last_pending: Option<PendingReason> = None;
         for wiring in wirings {
             self.fanout_seq.fetch_add(1, Ordering::Relaxed);
-            match self.route_one(&event, &mg.id, mg.is_group, &wiring, user_id, command)? {
+            match self.route_one(event, &mg.id, mg.is_group, &wiring, user_id, command)? {
                 FanoutOutcome::Delivered(d) => sessions.push(d),
                 FanoutOutcome::Answered(d) => answered.push(d),
                 FanoutOutcome::Dropped(reason) => {
                     self.record_drop(
-                        &event,
+                        event,
                         Some(mg.id),
                         Some(wiring.agent_group_id),
                         &drop_reason_label(&reason),
@@ -456,6 +476,15 @@ impl Router {
             return self.answer_status(event, &session);
         }
 
+        // Inbound-file contract (M18 C3): if the adapter staged an
+        // attachment download (`content.attachment.staged_path`), copy the
+        // bytes into THIS session's `inbox/<msg_id>/<safe_name>` and
+        // rewrite the attachment to carry the container-visible `path`
+        // (`/data/inbox/...`) before the row content is shaped below. The
+        // staged source file itself is removed by `route` once every
+        // wiring has been fanned out.
+        let event_content = self.materialized_content(event, &session)?;
+
         // Open inbound.db and write the row.
         let pool = self
             .session_paths
@@ -498,13 +527,12 @@ impl Router {
             ),
             Some(cmd @ (SlashCommand::Compact | SlashCommand::Clear)) => (
                 event.message.kind,
-                commands::passthrough_content(cmd, &event.message.content, original_text),
+                commands::passthrough_content(cmd, &event_content, original_text),
                 true,
             ),
-            // `/status` returned above; everything else routes unchanged.
-            Some(SlashCommand::Status) | None => {
-                (event.message.kind, event.message.content.clone(), true)
-            }
+            // `/status` returned above; everything else routes unchanged
+            // (modulo attachment materialization above).
+            Some(SlashCommand::Status) | None => (event.message.kind, event_content, true),
         };
         let write = WriteInbound {
             id: message_id,
@@ -592,6 +620,100 @@ impl Router {
             message_id,
             seq,
         }))
+    }
+
+    /// Session-local materialization of a staged inbound attachment
+    /// (M18 C3 — see [`copperclaw_channels_core::inbound_file`] for the
+    /// full contract).
+    ///
+    /// Returns the content value to persist for this wiring's session:
+    ///
+    /// - No `content.attachment.staged_path` marker: the event content,
+    ///   cloned unchanged (the common case — plain text, callbacks,
+    ///   adapters not yet migrated to the contract).
+    /// - Marker present: the staged bytes are copied into
+    ///   `<session_dir>/inbox/<msg_id>/<safe_name>` (re-sanitizing both
+    ///   untrusted components and writing through
+    ///   `copperclaw_db::attachments::extract_to_inbox`, which rejects
+    ///   traversal and symlinks), `staged_path` is stripped, and
+    ///   `attachment.path` is set to the container-visible
+    ///   `/data/inbox/<msg_id>/<safe_name>` — the session dir is mounted
+    ///   at `/data`, so that path resolves to exactly the file written
+    ///   here.
+    /// - Marker present but the copy failed (staged file vanished, disk
+    ///   error): the message still routes; the attachment keeps its
+    ///   metadata, loses `staged_path`, gains an `error` note, and gets
+    ///   no `path` key. The failure is logged, never fatal — the text of
+    ///   the message must reach the agent regardless.
+    ///
+    /// Fanout note: this runs once per wiring, so every target session
+    /// receives its own copy of the file; the shared staged source is
+    /// deleted by [`Self::route`] after the fanout completes.
+    fn materialized_content(
+        &self,
+        event: &InboundEvent,
+        session: &TargetSession,
+    ) -> Result<serde_json::Value, RouterError> {
+        let mut content = event.message.content.clone();
+        let Some(att) = content
+            .get_mut("attachment")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            return Ok(content);
+        };
+        let Some(staged) = att
+            .get(STAGED_PATH_KEY)
+            .and_then(serde_json::Value::as_str)
+            .map(PathBuf::from)
+        else {
+            return Ok(content);
+        };
+        // The staged host path never reaches per-session storage: it is
+        // meaningless (and misleading) inside the container.
+        att.remove(STAGED_PATH_KEY);
+
+        // Both components are sender-controlled: re-sanitize here even
+        // though migrated adapters already sanitize the filename.
+        let msg_component = sanitize_filename(Some(&event.message.id), "message");
+        let supplied_name = att
+            .get("filename")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let safe_name = sanitize_filename(
+            Some(supplied_name),
+            copperclaw_channels_core::inbound_file::FALLBACK_FILENAME,
+        );
+
+        let session_root = self
+            .session_paths
+            .ensure_session_dir(&session.agent_group_id, &session.id)?;
+        let inbox_root = session_root.join("inbox");
+        match copy_staged_into_inbox(&inbox_root, &msg_component, &safe_name, &staged) {
+            Ok(()) => {
+                let container_path = container_inbox_path(&msg_component, &safe_name);
+                att.insert(
+                    "filename".to_owned(),
+                    serde_json::Value::String(safe_name.clone()),
+                );
+                att.insert(
+                    ATTACHMENT_PATH_KEY.to_owned(),
+                    serde_json::Value::String(container_path),
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    staged = %staged.display(),
+                    session_id = %session.id.as_uuid(),
+                    "inbound attachment materialization failed; routing message without file"
+                );
+                att.insert(
+                    "error".to_owned(),
+                    serde_json::Value::String(format!("attachment file unavailable: {err}")),
+                );
+            }
+        }
+        Ok(content)
     }
 
     /// Resolve the target session for a given wiring, creating one if
@@ -744,6 +866,40 @@ fn scope_reason(decision: Option<&SenderScopeDecision>) -> String {
         Some(SenderScopeDecision::Pending(r)) => format!("scope_pending:{r}"),
         Some(SenderScopeDecision::Allow) => "scope_allow".to_owned(),
         Some(SenderScopeDecision::Defer) | None => "unknown_sender".to_owned(),
+    }
+}
+
+/// Host path of a staged inbound attachment, if the event carries the
+/// contract's `content.attachment.staged_path` marker.
+fn staged_attachment_path(event: &InboundEvent) -> Option<PathBuf> {
+    event
+        .message
+        .content
+        .get("attachment")?
+        .get(STAGED_PATH_KEY)?
+        .as_str()
+        .map(PathBuf::from)
+}
+
+/// Copy staged bytes into `<inbox_root>/<msg_id>/<filename>` via the
+/// hardened `extract_to_inbox` writer. An `AlreadyExists` failure is
+/// treated as success: the same platform message re-routed to the same
+/// session (e.g. multiple wirings resolving to one session, or a
+/// re-delivery outside the debounce window) has already materialized the
+/// file at the exact path the rewritten content names.
+fn copy_staged_into_inbox(
+    inbox_root: &Path,
+    msg_id: &str,
+    filename: &str,
+    staged: &Path,
+) -> Result<(), String> {
+    let bytes = std::fs::read(staged).map_err(|e| format!("read staged file: {e}"))?;
+    match extract_to_inbox(inbox_root, msg_id, filename, &bytes) {
+        Ok(_) => Ok(()),
+        Err(copperclaw_db::DbError::Io(e)) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(())
+        }
+        Err(e) => Err(format!("write inbox file: {e}")),
     }
 }
 
@@ -1975,5 +2131,232 @@ mod tests {
         assert_eq!(rows[0].kind, MessageKind::Chat);
         assert!(rows[0].content.get("control").is_none());
         assert_eq!(rows[0].content["text"], "/stop the build");
+    }
+
+    // ---- inbound-file contract: session-local materialization (M18 C3) ----
+
+    /// Session root dir for a routed target, via the fixture's tempdir
+    /// layout (`FsSessionRoot` mirrors `SessionPaths`).
+    fn session_dir(fx: &Fixture, target: &DeliveredTo) -> std::path::PathBuf {
+        fx._tmp
+            .path()
+            .join("sessions")
+            .join(target.agent_group_id.as_uuid().to_string())
+            .join(target.session_id.as_uuid().to_string())
+    }
+
+    /// Build an inbound chat event carrying a staged attachment whose
+    /// bytes live at `staged` (per the channels-core contract).
+    fn staged_event(message_id: &str, filename: &str, staged: &std::path::Path) -> InboundEvent {
+        let mut ev = event(None, message_id);
+        ev.message.content = serde_json::json!({
+            "text": "here is the file",
+            "attachment": {
+                "kind": "telegram.document",
+                "file_id": "F-1",
+                "filename": filename,
+                "staged_path": staged.to_string_lossy(),
+                "mime_type": "text/csv",
+                "size": 9,
+            },
+        });
+        ev
+    }
+
+    /// Stage bytes the way an adapter would (unique dir + file).
+    fn stage_bytes(dir: &std::path::Path, filename: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let staging = dir.join("staging").join("u1");
+        std::fs::create_dir_all(&staging).unwrap();
+        let p = staging.join(filename);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn staged_attachment_materializes_into_session_inbox() {
+        let fx = fixture(SessionMode::Shared);
+        let staging_root = tempfile::tempdir().unwrap();
+        let staged = stage_bytes(staging_root.path(), "spec.csv", b"id,qty\n1,2");
+
+        let out = fx
+            .router
+            .route(staged_event("777", "spec.csv", &staged))
+            .await
+            .unwrap();
+        let RouteOutcome::Delivered { sessions } = out else {
+            panic!("expected delivered, got {out:?}");
+        };
+        let target = &sessions[0];
+
+        // The persisted row carries the CONTAINER path and no staged_path.
+        let rows = inbound_rows(&fx, target);
+        assert_eq!(rows.len(), 1);
+        let att = &rows[0].content["attachment"];
+        assert_eq!(att["path"], "/data/inbox/777/spec.csv");
+        assert!(att.get("staged_path").is_none(), "staged_path stripped");
+        assert_eq!(att["filename"], "spec.csv");
+        assert_eq!(att["kind"], "telegram.document");
+
+        // The bytes are on disk at the host path corresponding to the
+        // container path under the /data session-dir mount.
+        let on_disk = session_dir(&fx, target).join("inbox/777/spec.csv");
+        assert_eq!(std::fs::read(&on_disk).unwrap(), b"id,qty\n1,2");
+
+        // The staged source (and its unique dir) was consumed.
+        assert!(!staged.exists(), "staged file must be removed after route");
+        assert!(
+            !staged.parent().unwrap().exists(),
+            "unique staging dir must be removed after route"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_attachment_sanitizes_hostile_filename_and_msg_id() {
+        let fx = fixture(SessionMode::Shared);
+        let staging_root = tempfile::tempdir().unwrap();
+        let staged = stage_bytes(staging_root.path(), "payload", b"x");
+
+        // Hostile message id and filename: neither may traverse out of
+        // the session inbox or smuggle a path separator.
+        let out = fx
+            .router
+            .route(staged_event("../../../etc", "../../evil.sh", &staged))
+            .await
+            .unwrap();
+        let RouteOutcome::Delivered { sessions } = out else {
+            panic!("expected delivered, got {out:?}");
+        };
+        let target = &sessions[0];
+        let rows = inbound_rows(&fx, target);
+        let att = &rows[0].content["attachment"];
+        let path = att["path"].as_str().unwrap();
+        assert_eq!(path, "/data/inbox/etc/evil.sh", "sanitized components");
+        let inbox = session_dir(&fx, target).join("inbox");
+        let on_disk = inbox.join("etc").join("evil.sh");
+        assert!(on_disk.exists(), "file lands inside the session inbox");
+        // Nothing escaped the inbox root.
+        let canonical = on_disk.canonicalize().unwrap();
+        assert!(canonical.starts_with(inbox.canonicalize().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn staged_attachment_missing_file_routes_with_error_note() {
+        let fx = fixture(SessionMode::Shared);
+        let out = fx
+            .router
+            .route(staged_event(
+                "778",
+                "gone.bin",
+                std::path::Path::new("/nonexistent/staging/gone.bin"),
+            ))
+            .await
+            .unwrap();
+        let RouteOutcome::Delivered { sessions } = out else {
+            panic!("materialization failure must not drop the message: {out:?}");
+        };
+        let rows = inbound_rows(&fx, &sessions[0]);
+        let att = &rows[0].content["attachment"];
+        assert!(att.get("path").is_none(), "no path when bytes unavailable");
+        assert!(att.get("staged_path").is_none(), "staged_path stripped");
+        let err = att["error"].as_str().unwrap();
+        assert!(err.contains("attachment file unavailable"), "{err}");
+        // Message text still reached the session.
+        assert_eq!(rows[0].content["text"], "here is the file");
+    }
+
+    #[tokio::test]
+    async fn staged_attachment_fans_out_a_copy_per_session() {
+        let fx = fixture(SessionMode::Shared);
+        // Second agent group wired to the same messaging group.
+        let ag2 = create_ag(
+            fx.router.central(),
+            CreateAgentGroup {
+                name: "second".into(),
+                folder: "second".into(),
+                agent_provider: None,
+            },
+        )
+        .unwrap();
+        upsert_wire(
+            fx.router.central(),
+            UpsertWiring {
+                messaging_group_id: fx.mg_id,
+                agent_group_id: ag2.id,
+                engage_mode: EngageMode::Mention,
+                engage_pattern: None,
+                sender_scope: "all".into(),
+                ignored_message_policy: "drop".into(),
+                session_mode: SessionMode::Shared,
+                priority: 0,
+            },
+        )
+        .unwrap();
+
+        let staging_root = tempfile::tempdir().unwrap();
+        let staged = stage_bytes(staging_root.path(), "spec.csv", b"fanout");
+        let out = fx
+            .router
+            .route(staged_event("779", "spec.csv", &staged))
+            .await
+            .unwrap();
+        let RouteOutcome::Delivered { sessions } = out else {
+            panic!("expected delivered, got {out:?}");
+        };
+        assert_eq!(sessions.len(), 2);
+        for target in &sessions {
+            let on_disk = session_dir(&fx, target).join("inbox/779/spec.csv");
+            assert_eq!(
+                std::fs::read(&on_disk).unwrap(),
+                b"fanout",
+                "each fanned-out session gets its own copy"
+            );
+            let rows = inbound_rows(&fx, target);
+            assert_eq!(rows[0].content["attachment"]["path"], "/data/inbox/779/spec.csv");
+        }
+        assert!(!staged.exists(), "staged source consumed after fanout");
+    }
+
+    #[tokio::test]
+    async fn staged_attachment_cleaned_up_even_when_route_drops() {
+        // No messaging group: the route drops before any fanout, but the
+        // staged file must still be consumed so adapters never leak
+        // staging state.
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let root: Arc<dyn SessionRoot + Send + Sync> = Arc::new(FsSessionRoot::new(tmp.path()));
+        let router = Router::new(db, root);
+        let staging_root = tempfile::tempdir().unwrap();
+        let staged = stage_bytes(staging_root.path(), "a.txt", b"x");
+        let out = router
+            .route(staged_event("780", "a.txt", &staged))
+            .await
+            .unwrap();
+        assert!(matches!(
+            out,
+            RouteOutcome::Dropped {
+                reason: DropReason::NoMessagingGroup
+            }
+        ));
+        assert!(!staged.exists(), "staged file removed on dropped route");
+    }
+
+    #[tokio::test]
+    async fn non_staged_attachment_content_is_untouched() {
+        // An attachment WITHOUT the staged_path marker (e.g. a legacy
+        // metadata-only payload, or an inline-base64 image from an
+        // unmigrated adapter) must route byte-identical.
+        let fx = fixture(SessionMode::Shared);
+        let mut ev = event(None, "781");
+        let content = serde_json::json!({
+            "text": "look",
+            "attachment": {"kind": "telegram.photo", "data_base64": "aGk=", "mime_type": "image/jpeg"},
+        });
+        ev.message.content = content.clone();
+        let out = fx.router.route(ev).await.unwrap();
+        let RouteOutcome::Delivered { sessions } = out else {
+            panic!("expected delivered, got {out:?}");
+        };
+        let rows = inbound_rows(&fx, &sessions[0]);
+        assert_eq!(rows[0].content, content);
     }
 }

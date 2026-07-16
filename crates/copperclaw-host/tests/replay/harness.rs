@@ -245,7 +245,8 @@ impl ReplayHarness {
         self.apply_pre_delivery_failures()?;
 
         let events: Vec<InboundEvent> = self.fixture.inbound.clone();
-        for event in events {
+        for (step, mut event) in events.into_iter().enumerate() {
+            self.stage_fixture_files(&mut event, step)?;
             self.played_inbound.push(event.clone());
             let outcome = self
                 .router
@@ -363,6 +364,49 @@ impl ReplayHarness {
             }
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
+        Ok(())
+    }
+
+    /// Inbound-file contract support (M18 C3): a fixture's inbound event
+    /// may carry `content.attachment.staged_path = "fixture://<name>"`.
+    /// Before routing, the harness copies `fixtures/<channel>/<scenario>/
+    /// files/<name>` into a per-step staging dir under the tempdir (the
+    /// same "adapter staged a download" precondition production creates
+    /// via `copperclaw_channels_core::inbound_file::stage_inbound_file`)
+    /// and rewrites `staged_path` to that real host path. The router
+    /// then materializes and consumes it exactly as in production.
+    /// Events without the marker (or with an absolute `staged_path`,
+    /// which no fixture should use) pass through untouched.
+    fn stage_fixture_files(&self, event: &mut InboundEvent, step: usize) -> Result<()> {
+        let Some(att) = event
+            .message
+            .content
+            .get_mut("attachment")
+            .and_then(|v| v.as_object_mut())
+        else {
+            return Ok(());
+        };
+        let Some(spec) = att.get("staged_path").and_then(|v| v.as_str()) else {
+            return Ok(());
+        };
+        let Some(name) = spec.strip_prefix("fixture://") else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            !name.is_empty() && !name.contains('/') && !name.contains(".."),
+            "fixture staged file name must be a bare filename, got {name:?}"
+        );
+        let src = self.fixture.root.join("files").join(name);
+        let bytes = std::fs::read(&src)
+            .with_context(|| format!("read fixture staged file {}", src.display()))?;
+        let dir = self.tempdir.path().join("staging").join(step.to_string());
+        std::fs::create_dir_all(&dir).context("create harness staging dir")?;
+        let dest = dir.join(name);
+        std::fs::write(&dest, bytes).context("write harness staged file")?;
+        att.insert(
+            "staged_path".to_owned(),
+            serde_json::Value::String(dest.to_string_lossy().into_owned()),
+        );
         Ok(())
     }
 

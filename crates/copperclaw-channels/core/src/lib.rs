@@ -47,6 +47,13 @@
 //!   `collapsibleSection`, Matrix `<details>`) and degraded to a
 //!   `[reasoning] > quoted text` block everywhere else. Default is
 //!   off — surfacing model reasoning has privacy implications.
+//! - [`inbound_file`] — the inbound-file staging contract (M18 C3):
+//!   adapters stage attachment downloads to a unique temp path
+//!   ([`inbound_file::stage_inbound_file`]) and mark the attachment with
+//!   [`inbound_file::STAGED_PATH_KEY`]; the router materializes the bytes
+//!   into the resolved session's `inbox/<msg_id>/<safe_name>` at route
+//!   time and rewrites the attachment `path` to the container-visible
+//!   `/data/inbox/...`. See the module docs for the full contract.
 //! - [`testing`] — reusable [`testing::MockAdapter`] / [`testing::MockFactory`]
 //!   for downstream tests.
 
@@ -63,6 +70,7 @@ mod setup;
 mod thinking;
 mod todo_list;
 
+pub mod inbound_file;
 pub mod testing;
 
 pub use adapter::{ChannelAdapter, ChannelFactory, render_collapsible_text_fallback};
