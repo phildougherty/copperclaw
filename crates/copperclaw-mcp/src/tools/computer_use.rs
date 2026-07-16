@@ -374,18 +374,23 @@ pub mod shell {
         )
     }
 
-    /// M18 R3 verification gate. Runs after a foreground command
-    /// completes (never on timeout/background — those paths use
-    /// [`mark_dirty_for_shell_cwd`] instead since we don't have a
+    /// M18 R3 / M20 Q2 verification gate. Runs after a foreground
+    /// command completes (never on timeout/background — those paths
+    /// use [`mark_dirty_for_shell_cwd`] instead since we don't have a
     /// trustworthy exit status). No-op when the gate is off, `cwd`
     /// wasn't passed, or `cwd` doesn't resolve to a project.
     ///
-    /// When `command` matches the project's recorded verify command
-    /// (trimmed, exact match), this *is* the verify run: success
-    /// clears dirty, failure records a fix cycle with the tail output
-    /// attached. Any other command conservatively marks the project
-    /// dirty — it could have written files (`npm install` touching
-    /// `package-lock.json`, etc).
+    /// Q2: `.copperclaw/verify` may declare multiple independent
+    /// stages (see `verify_gate::recorded_stages`). When `command`
+    /// (trimmed) matches ANY recorded stage's command exactly, this
+    /// *is* that stage's verify run: success records the stage as
+    /// green and, once EVERY recorded stage reads green, clears the
+    /// project's dirty marker (this is the single-stage case's exact
+    /// pre-Q2 behavior when there is only one stage); failure records
+    /// a project-wide fix cycle with the stage-attributed tail output
+    /// attached. Any command matching no stage conservatively marks
+    /// the project dirty — it could have written files (`npm install`
+    /// touching `package-lock.json`, etc).
     async fn apply_verify_gate(
         ctx: &dyn crate::context::ToolContext,
         cwd: Option<&str>,
@@ -401,26 +406,36 @@ pub mod shell {
         let Some(project_root) = crate::tools::verify_gate::project_root_of(cwd) else {
             return;
         };
-        let recorded = crate::tools::verify_gate::recorded_verify_command(
+        let stages = crate::tools::verify_gate::recorded_stages(
             &project_root,
             ctx.check_command_override().as_deref(),
         )
         .await;
-        if recorded.as_deref() == Some(command.trim()) {
-            if success {
+        let trimmed = command.trim();
+        let Some(stage) = stages.iter().find(|s| s.command == trimmed) else {
+            crate::tools::verify_gate::mark_dirty(&project_root).await;
+            return;
+        };
+        if success {
+            copperclaw_metrics::inc_verify_run("pass");
+            crate::tools::verify_gate::record_stage_result(&project_root, &stage.name, true).await;
+            if crate::tools::verify_gate::all_stages_passed(&project_root, &stages).await {
                 // R3/X2: record the fix-cycle count at the moment the dirty
                 // marker clears (clear_dirty resets it, so read it first).
                 let cycles = crate::tools::verify_gate::fix_cycles(&project_root).await;
                 copperclaw_metrics::observe_verify_gate_fix_cycles(cycles);
-                copperclaw_metrics::inc_verify_run("pass");
                 crate::tools::verify_gate::clear_dirty(&project_root).await;
-            } else {
-                copperclaw_metrics::inc_verify_run("fail");
-                let tail = format!("stdout:\n{stdout}\n\nstderr:\n{stderr}");
-                crate::tools::verify_gate::record_verify_failure(&project_root, &tail).await;
             }
         } else {
-            crate::tools::verify_gate::mark_dirty(&project_root).await;
+            copperclaw_metrics::inc_verify_run("fail");
+            let tail = format!("stdout:\n{stdout}\n\nstderr:\n{stderr}");
+            crate::tools::verify_gate::record_stage_verify_failure(
+                &project_root,
+                &stage.name,
+                &tail,
+            )
+            .await;
+            crate::tools::verify_gate::record_stage_result(&project_root, &stage.name, false).await;
         }
     }
 
@@ -3042,5 +3057,105 @@ mod tests {
         }));
         shell::handle(Some(args), &mock).await.unwrap();
         assert!(crate::tools::verify_gate::is_dirty(&proj).await);
+    }
+
+    // ── M20 Q2: multi-stage verify ────────────────────────────────
+
+    #[tokio::test]
+    async fn shell_multistage_verify_stays_dirty_until_every_stage_passes() {
+        let _shell_g = ShellTestGuard::new();
+        let g = DataRootGuard::new();
+        let proj = g.path().join("proj");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(
+            proj.join(".copperclaw").join("verify"),
+            "lint: true\ntest: true\n",
+        )
+        .unwrap();
+        crate::tools::verify_gate::mark_dirty(&proj).await;
+
+        let mock = crate::context::MockToolContext::new();
+        // Only the "lint" stage runs.
+        let args = obj(&json!({"command": "true", "cwd": proj.to_string_lossy()}));
+        shell::handle(Some(args), &mock).await.unwrap();
+        // Both stages share the literal command "true", so this single run
+        // matches the FIRST stage in file order ("lint") and marks it green
+        // — but "test" hasn't run, so the project must still read dirty.
+        assert!(crate::tools::verify_gate::is_dirty(&proj).await);
+    }
+
+    #[tokio::test]
+    async fn shell_multistage_verify_clears_dirty_once_every_stage_is_distinctly_green() {
+        let _shell_g = ShellTestGuard::new();
+        let g = DataRootGuard::new();
+        let proj = g.path().join("proj");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(
+            proj.join(".copperclaw").join("verify"),
+            "lint: true\ntest: echo ok\n",
+        )
+        .unwrap();
+        crate::tools::verify_gate::mark_dirty(&proj).await;
+
+        let mock = crate::context::MockToolContext::new();
+        let lint_args = obj(&json!({"command": "true", "cwd": proj.to_string_lossy()}));
+        shell::handle(Some(lint_args), &mock).await.unwrap();
+        // Only "lint" ran — "test" hasn't, so the project must stay dirty.
+        assert!(crate::tools::verify_gate::is_dirty(&proj).await);
+
+        let test_args = obj(&json!({"command": "echo ok", "cwd": proj.to_string_lossy()}));
+        shell::handle(Some(test_args), &mock).await.unwrap();
+        // Both stages are now independently green: dirty clears.
+        assert!(!crate::tools::verify_gate::is_dirty(&proj).await);
+    }
+
+    #[tokio::test]
+    async fn shell_multistage_verify_failure_keeps_project_dirty() {
+        let _shell_g = ShellTestGuard::new();
+        let g = DataRootGuard::new();
+        let proj = g.path().join("proj");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(
+            proj.join(".copperclaw").join("verify"),
+            "lint: true\ntest: false\n",
+        )
+        .unwrap();
+        crate::tools::verify_gate::mark_dirty(&proj).await;
+
+        let mock = crate::context::MockToolContext::new();
+        let lint_args = obj(&json!({"command": "true", "cwd": proj.to_string_lossy()}));
+        shell::handle(Some(lint_args), &mock).await.unwrap();
+
+        let test_args = obj(&json!({"command": "false", "cwd": proj.to_string_lossy()}));
+        shell::handle(Some(test_args), &mock).await.unwrap();
+        assert!(crate::tools::verify_gate::is_dirty(&proj).await);
+        let failure = crate::tools::verify_gate::last_failure(&proj).await;
+        assert!(
+            failure
+                .as_deref()
+                .is_some_and(|f| f.starts_with("stage 'test' failed:")),
+            "got: {failure:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_stage_failure_prefixes_last_failure_with_stage_name() {
+        let _shell_g = ShellTestGuard::new();
+        let g = DataRootGuard::new();
+        let proj = g.path().join("proj");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(proj.join(".copperclaw").join("verify"), "typecheck: false").unwrap();
+        crate::tools::verify_gate::mark_dirty(&proj).await;
+
+        let mock = crate::context::MockToolContext::new();
+        let args = obj(&json!({"command": "false", "cwd": proj.to_string_lossy()}));
+        shell::handle(Some(args), &mock).await.unwrap();
+        let failure = crate::tools::verify_gate::last_failure(&proj).await;
+        assert!(
+            failure
+                .as_deref()
+                .is_some_and(|f| f.starts_with("stage 'typecheck' failed:")),
+            "got: {failure:?}"
+        );
     }
 }

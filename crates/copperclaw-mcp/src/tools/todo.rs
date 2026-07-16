@@ -700,16 +700,38 @@ pub mod update {
                     let cycles = crate::tools::verify_gate::fix_cycles(project_root).await;
                     if cycles < crate::tools::verify_gate::FIX_CYCLE_CAP {
                         copperclaw_metrics::inc_verify_gate_completion("refused_dirty");
-                        let cmd_hint = match crate::tools::verify_gate::recorded_verify_command(
+                        // M20 Q2: every recorded stage must read green since
+                        // the last dirty mark, not just "a" verify command.
+                        // With no verify recorded at all this degrades to
+                        // the pre-Q2 message byte-for-byte; with exactly one
+                        // (possibly derived-name) stage it still names that
+                        // stage's exact command, so a legacy single-line
+                        // `.copperclaw/verify` reads the same as before.
+                        let stages = crate::tools::verify_gate::recorded_stages(
                             project_root,
                             ctx.check_command_override().as_deref(),
                         )
-                        .await
-                        {
-                            Some(cmd) => format!("recorded verify command: `{cmd}`"),
-                            None => "no verify command recorded — write one to \
-                                     `.copperclaw/verify` (one shell line, e.g. `npm test`)"
-                                .to_string(),
+                        .await;
+                        let cmd_hint = if stages.is_empty() {
+                            "no verify command recorded — write one to \
+                             `.copperclaw/verify` (one shell line per stage, e.g. `npm test` \
+                             or `lint: npx eslint .`)"
+                                .to_string()
+                        } else {
+                            let pending =
+                                crate::tools::verify_gate::pending_stages(project_root, &stages)
+                                    .await;
+                            let names = pending
+                                .iter()
+                                .map(|s| s.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let commands = pending
+                                .iter()
+                                .map(|s| format!("{}: `{}`", s.name, s.command))
+                                .collect::<Vec<_>>()
+                                .join("; ");
+                            format!("missing/failing stage(s): {names} (commands — {commands})")
                         };
                         let remaining =
                             crate::tools::verify_gate::FIX_CYCLE_CAP.saturating_sub(cycles);
@@ -1743,5 +1765,119 @@ mod tests {
         update::handle(obj(json!({"id": id, "status": "in_progress"})), &ctx)
             .await
             .unwrap();
+    }
+
+    // ── M20 Q2: multi-stage verify ────────────────────────────────
+
+    #[tokio::test]
+    async fn completion_refused_names_missing_and_failing_stages_only() {
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(
+            proj.join(".copperclaw").join("verify"),
+            "lint: npx eslint .\ntypecheck: npx tsc --noEmit\ntest: npm test\n",
+        )
+        .unwrap();
+        crate::tools::verify_gate::mark_dirty(&proj).await;
+        // Only "lint" ran (and passed) since the dirty mark.
+        crate::tools::verify_gate::record_stage_result(&proj, "lint", true).await;
+
+        let ctx = MockToolContext::new();
+        let added = body_json(&add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap());
+        let id = added["id"].as_u64().unwrap();
+        let err = update::handle(
+            obj(json!({
+                "id": id,
+                "status": "completed",
+                "evidence": substantive_evidence(),
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        match err {
+            ToolError::Validation(msg) => {
+                assert!(msg.contains("typecheck, test"), "got: {msg}");
+                assert!(!msg.contains("lint"), "lint already passed, got: {msg}");
+                assert!(msg.contains("npx tsc --noEmit"), "got: {msg}");
+                assert!(msg.contains("npm test"), "got: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_succeeds_once_every_stage_is_green() {
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(
+            proj.join(".copperclaw").join("verify"),
+            "lint: npx eslint .\ntest: npm test\n",
+        )
+        .unwrap();
+        crate::tools::verify_gate::mark_dirty(&proj).await;
+        crate::tools::verify_gate::record_stage_result(&proj, "lint", true).await;
+        crate::tools::verify_gate::record_stage_result(&proj, "test", true).await;
+        // Recording every stage green (matching the pre-Q2 single-command
+        // "clear_dirty" moment) requires the caller — here, the fixture —
+        // to also clear the project's dirty marker, exactly as
+        // `apply_verify_gate` does once `all_stages_passed` is true.
+        assert!(
+            crate::tools::verify_gate::all_stages_passed(
+                &proj,
+                &crate::tools::verify_gate::recorded_stages(&proj, None).await
+            )
+            .await
+        );
+        crate::tools::verify_gate::clear_dirty(&proj).await;
+
+        let ctx = MockToolContext::new();
+        let added = body_json(&add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap());
+        let id = added["id"].as_u64().unwrap();
+        let updated = body_json(
+            &update::handle(
+                obj(json!({
+                    "id": id,
+                    "status": "completed",
+                    "evidence": substantive_evidence(),
+                })),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(updated["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn completion_refused_message_still_names_legacy_single_stage_command() {
+        // A legacy one-line unprefixed `.copperclaw/verify` still names
+        // the exact recorded command in the refusal, matching the pre-Q2
+        // shape byte-for-byte from the model's point of view.
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(proj.join(".copperclaw").join("verify"), "npm test").unwrap();
+        crate::tools::verify_gate::mark_dirty(&proj).await;
+
+        let ctx = MockToolContext::new();
+        let added = body_json(&add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap());
+        let id = added["id"].as_u64().unwrap();
+        let err = update::handle(
+            obj(json!({
+                "id": id,
+                "status": "completed",
+                "evidence": substantive_evidence(),
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        match err {
+            ToolError::Validation(msg) => assert!(msg.contains("npm test"), "got: {msg}"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
     }
 }
