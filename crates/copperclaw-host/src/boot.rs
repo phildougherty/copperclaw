@@ -481,6 +481,21 @@ pub fn assemble(
     };
     let dispatcher: Arc<dyn copperclaw_modules::DeliveryDispatcher> =
         Arc::new(copperclaw_host_delivery::HostDispatcher::new(resolver));
+
+    // M18 G1: wire the in-chat approvals interceptor onto the router. It
+    // recognises `approve:<id>` / `deny:<id>` button taps before the mention
+    // gate, resolves them via the same DB path the CLI uses, and edits the
+    // card via the same dispatcher the delivery loop uses. Registered here
+    // (not through a module) because the closure needs both the central DB and
+    // the delivery dispatcher, and the type lives in `copperclaw-modules` so
+    // the router holds the hook slot without a circular dependency.
+    router.hooks().set_approval_interceptor(
+        crate::approval_intercept::build_approval_interceptor(
+            central.clone(),
+            Arc::clone(&dispatcher),
+        ),
+    );
+
     let delivery = DeliveryService::new(central.clone(), delivery_root, adapters, dispatcher);
 
     let sweep_root: Arc<dyn copperclaw_host_sweep::SessionRoot> =

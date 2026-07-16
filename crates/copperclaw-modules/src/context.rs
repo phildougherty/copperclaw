@@ -214,6 +214,67 @@ impl InterceptorDecision {
 }
 
 // ---------------------------------------------------------------------------
+// Approval interception (M18 G1 — in-chat approvals)
+// ---------------------------------------------------------------------------
+
+/// Closure registered on the router's approval-interceptor hook. It recognises
+/// an in-chat approval button tap (`approve:<id>` / `deny:<id>` callback),
+/// verifies the tapping identity against the group's operator/approver set,
+/// resolves the approval via the SAME DB path the CLI uses, writes the audit
+/// row, and edits the card. Non-approver taps get a short "not authorized"
+/// reply and the card stays live.
+///
+/// The closure is supplied by the host (which owns the central DB, the roles
+/// table, and the CLI resolution path); the type lives in the modules crate so
+/// the router can hold the hook slot without a circular dependency on the host.
+pub type ApprovalInterceptor =
+    Arc<dyn Fn(ApprovalInterceptCtx) -> ApprovalInterceptDecision + Send + Sync>;
+
+/// Input to the [`ApprovalInterceptor`] hook. The router populates this for a
+/// callback-carrying inbound event just before the mention gate.
+#[derive(Debug, Clone)]
+pub struct ApprovalInterceptCtx {
+    /// Raw callback payload carried on the tap (`content.callback.data`),
+    /// e.g. `approve:0190...` / `deny:0190...`.
+    pub callback_data: String,
+    /// The identity that tapped the button.
+    pub event_sender: Option<SenderIdentity>,
+    /// Resolved user id for `event_sender`, if the sender resolver matched a
+    /// row in the central `users` table.
+    pub resolved_user: Option<UserId>,
+    /// The agent group whose wiring the tap arrived on.
+    pub agent_group_id: AgentGroupId,
+    /// The messaging group the tap arrived on, if known.
+    pub messaging_group_id: Option<MessagingGroupId>,
+    /// Channel coordinates of the card being tapped — used to edit the card
+    /// in place and to deliver a "not authorized" reply on the same surface.
+    pub channel_type: ChannelType,
+    pub platform_id: String,
+    pub thread_id: Option<String>,
+}
+
+/// Outcome of the [`ApprovalInterceptor`] hook.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalInterceptDecision {
+    /// The tap WAS an approval callback and the interceptor handled it
+    /// (resolved, refused, or a race no-op). The router must not write an
+    /// inbound row or wake the runner for this event.
+    Handled,
+    /// The tap was not an approval callback the interceptor recognises; the
+    /// router continues routing it as an ordinary event.
+    Passthrough,
+}
+
+impl ApprovalInterceptDecision {
+    pub fn is_handled(&self) -> bool {
+        matches!(self, Self::Handled)
+    }
+    pub fn is_passthrough(&self) -> bool {
+        matches!(self, Self::Passthrough)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Channel-request gate
 // ---------------------------------------------------------------------------
 
@@ -336,6 +397,14 @@ pub trait DeliveryDispatcher: Send + Sync {
 
     /// Push a synthetic outbound message through the normal delivery path.
     fn dispatch(&self, target: &DispatchTarget, message: &OutboundMessage);
+
+    /// Best-effort: ask the channel adapter to edit a previously delivered
+    /// message in place, addressed by its platform-side message id. Used by
+    /// the in-chat approvals flow (M18 G1) to stamp a resolved card
+    /// "Approved by <name>" / "Denied by <name>". The default is a no-op so
+    /// dispatchers that don't support editing (test doubles) need not override
+    /// it; the host's real dispatcher drives `ChannelAdapter::edit_message`.
+    fn edit_message(&self, _target: &DispatchTarget, _platform_message_id: &str, _text: &str) {}
 }
 
 // ---------------------------------------------------------------------------
@@ -431,6 +500,8 @@ mod mock {
     pub struct MockDispatcher {
         pub typing_calls: Mutex<Vec<DispatchTarget>>,
         pub dispatched: Mutex<Vec<(DispatchTarget, OutboundMessage)>>,
+        /// Recorded `edit_message` calls: `(target, platform_message_id, text)`.
+        pub edits: Mutex<Vec<(DispatchTarget, String, String)>>,
     }
 
     impl MockDispatcher {
@@ -442,6 +513,9 @@ mod mock {
         }
         pub fn dispatched_count(&self) -> usize {
             self.dispatched.lock().unwrap().len()
+        }
+        pub fn edit_count(&self) -> usize {
+            self.edits.lock().unwrap().len()
         }
     }
 
@@ -458,6 +532,13 @@ mod mock {
                 .lock()
                 .unwrap()
                 .push((target.clone(), message.clone()));
+        }
+        fn edit_message(&self, target: &DispatchTarget, platform_message_id: &str, text: &str) {
+            self.edits.lock().unwrap().push((
+                target.clone(),
+                platform_message_id.to_owned(),
+                text.to_owned(),
+            ));
         }
     }
 }

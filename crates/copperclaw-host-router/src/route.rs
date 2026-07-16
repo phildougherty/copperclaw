@@ -30,7 +30,8 @@ use copperclaw_db::tables::unregistered_senders::{
     UpsertUnregisteredSender, upsert as upsert_unregistered,
 };
 use copperclaw_modules::context::{
-    ChannelRequestCtx, GateCtx, GateDecision, SenderScopeCtx, SenderScopeDecision,
+    ApprovalInterceptCtx, ApprovalInterceptDecision, ChannelRequestCtx, GateCtx, GateDecision,
+    SenderScopeCtx, SenderScopeDecision,
 };
 use copperclaw_types::{
     AgentGroupId, InboundEvent, MessageId, MessageKind, MessagingGroupId, SessionId, SessionMode,
@@ -106,6 +107,12 @@ pub enum PendingReason {
     /// The channel-request gate asked the host to defer until the operator
     /// approves; the inbound row was not written.
     ChannelRequestPending(String),
+    /// The event was an in-chat approval button tap (`approve:<id>` /
+    /// `deny:<id>`) that the approvals interceptor consumed (resolved the
+    /// approval, refused a non-approver, or a race no-op). No inbound row was
+    /// written and the runner was not woken; the platform should still ack the
+    /// tap so the user isn't shown an error. (M18 G1.)
+    ApprovalHandled,
 }
 
 /// Inbound router. Resolves messaging groups, fans out per wiring, writes
@@ -419,6 +426,38 @@ impl Router {
                 return Ok(FanoutOutcome::Pending(PendingReason::SenderUnregistered));
             }
             Some(SenderScopeDecision::Allow | SenderScopeDecision::Defer) | None => {}
+        }
+
+        // In-chat approval interception (M18 G1). A button tap arrives as a
+        // Chat event carrying `content.callback.data` (whitelisted past the
+        // mention gate by `is_interaction_payload`). If the payload is an
+        // `approve:<id>` / `deny:<id>` approval callback, the host-supplied
+        // interceptor resolves it against the SAME DB path the CLI uses,
+        // writes the audit row, and edits the card — all without ever writing
+        // an inbound row or waking the runner. A non-approval callback (some
+        // other module's button) falls through to normal routing.
+        //
+        // This sits AFTER the sender-scope gate (only senders the group
+        // already trusts reach it) and BEFORE the mention gate, per the G1
+        // insertion contract.
+        if self.hooks.has_approval_interceptor() {
+            if let Some(callback_data) = approval_callback_data(event) {
+                let ctx = ApprovalInterceptCtx {
+                    callback_data,
+                    event_sender: event.sender.clone(),
+                    resolved_user: user_id,
+                    agent_group_id: wiring.agent_group_id,
+                    messaging_group_id: Some(*mg_id),
+                    channel_type: event.channel_type.clone(),
+                    platform_id: event.platform_id.clone(),
+                    thread_id: event.thread_id.clone(),
+                };
+                if let Some(ApprovalInterceptDecision::Handled) =
+                    self.hooks.run_approval_interceptor(ctx)
+                {
+                    return Ok(FanoutOutcome::Pending(PendingReason::ApprovalHandled));
+                }
+            }
         }
 
         // Mention gate. Ambient group-chat text that doesn't engage the agent
@@ -900,6 +939,23 @@ fn copy_staged_into_inbox(
     }
 }
 
+/// Extract the callback payload of a button-tap event (M18 G1).
+///
+/// Adapters synthesize button taps as `Chat` events carrying a `callback`
+/// object whose payload key differs per platform: telegram's `callback_query`
+/// stores it under `data`, slack's `block_actions` under `value`. This returns
+/// whichever is present (preferring `data`) so the approval interceptor can
+/// decide whether it's an `approve:<id>` / `deny:<id>` tap. Anything else
+/// yields `None` (routed as ordinary text).
+fn approval_callback_data(event: &InboundEvent) -> Option<String> {
+    let callback = event.message.content.get("callback")?;
+    callback
+        .get("data")
+        .or_else(|| callback.get("value"))
+        .and_then(serde_json::Value::as_str)
+        .map(std::borrow::ToOwned::to_owned)
+}
+
 fn source_session_for(event: &InboundEvent) -> Option<String> {
     // The agent-to-agent module sets `event.message.content["source_session_id"]`
     // when emitting cross-session traffic. Strings are accepted as-is; non-strings
@@ -1288,6 +1344,61 @@ mod tests {
             "require_in_groups=false must process unmentioned group text: {out:?}"
         );
         assert!(!fx.router.mention_gate().require_in_groups);
+    }
+
+    #[tokio::test]
+    async fn approval_interceptor_consumes_approve_callback() {
+        // M18 G1: an `approve:<id>` callback tap that the interceptor handles
+        // yields `Pending(ApprovalHandled)` and writes NO inbound row.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let fx = fixture(SessionMode::Shared);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = Arc::clone(&calls);
+        fx.router.hooks().set_approval_interceptor(Arc::new(move |ctx| {
+            calls2.fetch_add(1, Ordering::SeqCst);
+            if ctx.callback_data.starts_with("approve:") || ctx.callback_data.starts_with("deny:") {
+                copperclaw_modules::context::ApprovalInterceptDecision::Handled
+            } else {
+                copperclaw_modules::context::ApprovalInterceptDecision::Passthrough
+            }
+        }));
+        let mut ev = event(None, "cb-1");
+        ev.message.content = serde_json::json!({
+            "text": "approve:abc",
+            "callback": {"id": "cb-1", "data": "approve:abc"},
+        });
+        let out = fx.router.route(ev).await.unwrap();
+        assert!(
+            matches!(
+                out,
+                RouteOutcome::Pending {
+                    reason: PendingReason::ApprovalHandled
+                }
+            ),
+            "approval tap must be handled: {out:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "interceptor ran once");
+    }
+
+    #[tokio::test]
+    async fn approval_interceptor_passthrough_routes_normally() {
+        // A callback the interceptor does NOT recognise falls through to
+        // ordinary routing (delivered), and a plain text message never even
+        // reaches the interceptor.
+        let fx = fixture(SessionMode::Shared);
+        fx.router.hooks().set_approval_interceptor(Arc::new(|_ctx| {
+            copperclaw_modules::context::ApprovalInterceptDecision::Passthrough
+        }));
+        let mut ev = event(None, "cb-2");
+        ev.message.content = serde_json::json!({
+            "text": "expand",
+            "callback": {"id": "cb-2", "data": "expand:99"},
+        });
+        let out = fx.router.route(ev).await.unwrap();
+        assert!(
+            matches!(out, RouteOutcome::Delivered { .. }),
+            "unrecognised callback must route normally: {out:?}"
+        );
     }
 
     #[tokio::test]

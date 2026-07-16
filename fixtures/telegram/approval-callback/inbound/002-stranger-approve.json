@@ -1,0 +1,25 @@
+{
+  "channel_type": "telegram",
+  "platform_id": "100",
+  "thread_id": null,
+  "message": {
+    "id": "tg-cb-b2",
+    "kind": "chat",
+    "content": {
+      "text": "approve:00000000-0000-0000-0000-0000000000b2",
+      "callback": {
+        "id": "tg-cb-b2",
+        "data": "approve:00000000-0000-0000-0000-0000000000b2"
+      }
+    },
+    "timestamp": "2026-01-01T00:00:02Z",
+    "is_mention": null,
+    "is_group": true
+  },
+  "reply_to": null,
+  "sender": {
+    "channel_type": "telegram",
+    "identity": "300",
+    "display_name": "Stranger Sam"
+  }
+}

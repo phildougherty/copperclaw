@@ -1147,6 +1147,20 @@ impl DeliveryService {
         if handler_target.agent_group_id.is_none() {
             handler_target.agent_group_id = Some(sess.agent_group_id);
         }
+        // Capture what we need after the handler consumes the action (M18 G1:
+        // the approval-card action carries the `approval_id` so we can persist
+        // the delivered card's platform message id into `pending_approvals`).
+        let action_name = action.name.clone();
+        let approval_id_for_card = (action_name == "approval_card")
+            .then(|| {
+                action
+                    .payload
+                    .get("approval_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|s| uuid::Uuid::parse_str(s).ok())
+                    .map(copperclaw_types::ApprovalId)
+            })
+            .flatten();
         let input = DeliveryActionInput {
             action: action.name,
             payload: action.payload,
@@ -1177,7 +1191,7 @@ impl DeliveryService {
                 .get(&channel_type)
                 .map(|r| r.clone())
                 .ok_or_else(|| DeliveryError::NoAdapter(channel_type.clone()))?;
-            let platform_message_id = call_adapter(
+            let platform_message_id = deliver_action_message(
                 adapter.as_ref(),
                 &platform_id,
                 dispatch_target.thread_id.as_deref(),
@@ -1186,6 +1200,20 @@ impl DeliveryService {
             .await?;
             let in_conn = inbound_pool.connect()?;
             delivered::insert(&in_conn, row.id, platform_message_id.as_deref(), "ok")?;
+            // M18 G1: remember where the approval card landed so the in-chat
+            // approvals interceptor can later edit it to "Approved by <name>".
+            // Best-effort — a failure here must not fail the delivery.
+            if let (Some(approval_id), Some(pmid)) =
+                (approval_id_for_card, platform_message_id.as_deref())
+            {
+                if let Err(err) = copperclaw_db::tables::pending_approvals::set_platform_message_id(
+                    &self.central,
+                    approval_id,
+                    pmid,
+                ) {
+                    warn!(?err, "approvals: could not persist card platform_message_id");
+                }
+            }
         } else {
             let in_conn = inbound_pool.connect()?;
             delivered::insert(&in_conn, row.id, None, "ok")?;
@@ -2752,6 +2780,43 @@ async fn call_adapter(
     }
 }
 
+/// Deliver a delivery-action's output message (M18 G1). `MessageKind::Card`
+/// messages — the approval card, which carries `approve:<id>` / `deny:<id>`
+/// buttons — render through the adapter's native `deliver_card` hook so the
+/// buttons appear; an adapter that reports `Unsupported`, or a payload that
+/// isn't a canonical card, degrades to a plain-text `deliver`. Every other
+/// kind goes straight through [`call_adapter`] (unchanged behaviour, including
+/// its formatting-bad-request fallback).
+async fn deliver_action_message(
+    adapter: &dyn ChannelAdapter,
+    platform_id: &str,
+    thread_id: Option<&str>,
+    message: &OutboundMessage,
+) -> Result<Option<String>, DeliveryError> {
+    if message.kind == MessageKind::Card {
+        if let Some(card_val) = message.content.get("card") {
+            if let Ok(card) = serde_json::from_value::<Card>(card_val.clone()) {
+                match adapter
+                    .deliver_card(platform_id, thread_id, &card, None)
+                    .await
+                {
+                    Ok(id) => return Ok(id),
+                    Err(AdapterError::Unsupported(_)) => {
+                        let fallback = OutboundMessage {
+                            kind: MessageKind::Chat,
+                            content: serde_json::json!({ "text": card.to_text_fallback() }),
+                            files: vec![],
+                        };
+                        return call_adapter(adapter, platform_id, thread_id, &fallback).await;
+                    }
+                    Err(other) => return Err(DeliveryError::Adapter(other)),
+                }
+            }
+        }
+    }
+    call_adapter(adapter, platform_id, thread_id, message).await
+}
+
 /// Return `true` when the `BadRequest` message text matches a known
 /// formatting-validation signature. The delivery loop uses this to gate
 /// the plain-text retry: only formatting rejections fall back, everything
@@ -4258,6 +4323,58 @@ mod tests {
         let rpt = service.process_session_once(&sess).await.unwrap();
         assert_eq!(rpt.delivered, 1);
         assert_eq!(mock.deliveries().len(), 1);
+    }
+
+    /// M18 G1: delivering the `approval_card` action renders the card (buttons)
+    /// and persists the delivered card's platform message id back onto the
+    /// `pending_approvals` row, so the in-chat interceptor can later edit it.
+    #[tokio::test]
+    async fn approval_card_action_persists_platform_message_id() {
+        use copperclaw_db::tables::pending_approvals::{self, UpsertPendingApproval};
+        let (service, _root, sess, mock) = make_service().await;
+        service.register_action(
+            "approval_card",
+            Arc::new(copperclaw_modules::approvals::ApprovalCardHandler),
+        );
+        // Seed a pending approval for this session's agent group.
+        let approval = pending_approvals::upsert(
+            service.central(),
+            UpsertPendingApproval {
+                request_id: "req-card".into(),
+                action: "sender".into(),
+                agent_group_id: Some(sess.agent_group_id),
+                title: "Approve sender?".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(approval.platform_message_id.is_none());
+
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let row = make_row(
+            MessageKind::System,
+            json!({
+                "approval_card": {
+                    "approval_id": approval.approval_id.as_uuid().to_string(),
+                    "title": "Approve sender?",
+                    "to": { "channel_type": "mock", "platform_id": "P1" }
+                }
+            }),
+        );
+        write_row(&out_pool, &row);
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.delivered, 1);
+        // Card rendered (mock's default deliver_card routes to deliver).
+        assert_eq!(mock.deliveries().len(), 1);
+        // Its platform message id landed on the approval row.
+        let after = pending_approvals::get(service.central(), approval.approval_id).unwrap();
+        assert!(
+            after.platform_message_id.is_some(),
+            "approval card platform_message_id must be persisted"
+        );
     }
 
     #[tokio::test]

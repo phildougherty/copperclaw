@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod approval_intercept;
 pub mod attestation;
 pub mod boot;
 pub mod channels_init;

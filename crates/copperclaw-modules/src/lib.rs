@@ -43,9 +43,10 @@ pub use approvals::{
     NewPendingNotifier, PairingNotifier,
 };
 pub use context::{
-    ChannelRequestCtx, DeliveryActionHandler, DeliveryActionInput, DeliveryActionOutput,
-    DeliveryDispatcher, DispatchTarget, GateCtx, GateDecision, InterceptorCtx, InterceptorDecision,
-    Module, ModuleContext, MountHostContext, SenderResolver, SenderScopeCtx, SenderScopeDecision,
+    ApprovalInterceptCtx, ApprovalInterceptDecision, ApprovalInterceptor, ChannelRequestCtx,
+    DeliveryActionHandler, DeliveryActionInput, DeliveryActionOutput, DeliveryDispatcher,
+    DispatchTarget, GateCtx, GateDecision, InterceptorCtx, InterceptorDecision, Module,
+    ModuleContext, MountHostContext, SenderResolver, SenderScopeCtx, SenderScopeDecision,
     TypingOutcome,
 };
 pub use error::ModuleError;

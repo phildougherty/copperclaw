@@ -1,0 +1,15 @@
+{
+  "name": "telegram-approval-callback",
+  "channel": "telegram",
+  "description": "M18 G1 in-chat approvals. An Owner taps the Approve button (callback `approve:<id>`): the router-side interceptor resolves the pending approval via the same DB path the CLI uses and edits the card. A second, un-privileged sender taps Approve on another pending approval: refused with a 'not authorized' reply, the approval stays live. Neither tap writes an inbound row or wakes a runner.",
+  "schema": 1,
+  "gates": ["approvals"],
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\""
+  }
+}

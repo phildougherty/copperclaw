@@ -133,6 +133,110 @@ async fn telegram_inbound_document_attachment_file_readable_from_session_dir() {
     assert_eq!(bytes, b"id,qty\n1,2\n");
 }
 
+/// M18 G1 acceptance (telegram callback): an Owner taps the Approve button
+/// (`approve:<id>` callback) — the router-side interceptor resolves the
+/// approval via the same DB path the CLI uses, edits the card in place, and
+/// audits it; a second tap from a registered-but-unprivileged sender is
+/// refused with a "not authorized" reply, and that approval stays live. No
+/// inbound row is written for either tap. See the fixture's README.md.
+#[tokio::test]
+async fn telegram_approval_callback_round_trip() {
+    use copperclaw_db::tables::pending_approvals::{self, ApprovalStatus};
+    use copperclaw_types::ApprovalId;
+
+    let harness = run_fixture_into_harness("telegram", "approval-callback").await;
+
+    let approved = ApprovalId(
+        uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000b1").unwrap(),
+    );
+    let refused = ApprovalId(
+        uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000b2").unwrap(),
+    );
+
+    // Owner tap: approval resolved through the shared DB path, decision names
+    // the human approver (not "host").
+    let row = pending_approvals::get(&harness.central, approved).unwrap();
+    assert_eq!(row.status, ApprovalStatus::Approved);
+    let decs = pending_approvals::list_decisions(&harness.central, Some(approved), 10).unwrap();
+    assert_eq!(decs.len(), 1);
+    assert_eq!(decs[0].decided_by, "Owner Olivia");
+
+    // Stranger tap: approval stays live, no decision logged.
+    let live = pending_approvals::get(&harness.central, refused).unwrap();
+    assert_eq!(live.status, ApprovalStatus::Pending);
+    assert!(
+        pending_approvals::list_decisions(&harness.central, Some(refused), 10)
+            .unwrap()
+            .is_empty()
+    );
+
+    // The Owner's card was edited in place to "Approved by <name>", addressed
+    // by the persisted platform_message_id.
+    let tg = mock_for(&harness, "telegram");
+    let edits = tg.edits();
+    assert_eq!(edits.len(), 1, "exactly one card edit");
+    assert_eq!(edits[0].external_id, "tg-card-b1");
+    assert_eq!(edits[0].new_text, "Approved by Owner Olivia");
+
+    // Both taps are audited (one ok, one unauthorized) and neither wrote an
+    // inbound row (asserted by the empty messages-in stream in the diff).
+    let audits = copperclaw_db::tables::audit_log::list_recent(
+        &harness.central,
+        chrono::Utc::now() - chrono::Duration::hours(1),
+        50,
+    )
+    .unwrap();
+    assert!(
+        audits
+            .iter()
+            .any(|a| a.command == "approvals.approve" && a.result == "ok")
+    );
+    assert!(
+        audits
+            .iter()
+            .any(|a| a.result == "error" && a.error_code.as_deref() == Some("unauthorized"))
+    );
+}
+
+/// M18 G1 acceptance (slack block_action): the same Owner-approves /
+/// stranger-refused flow as the telegram fixture, but the callback payload
+/// arrives under `content.callback.value` (Slack's shape) instead of `data`.
+/// See the fixture's README.md.
+#[tokio::test]
+async fn slack_approval_block_action_round_trip() {
+    use copperclaw_db::tables::pending_approvals::{self, ApprovalStatus};
+    use copperclaw_types::ApprovalId;
+
+    let harness = run_fixture_into_harness("slack", "approval-block-action").await;
+
+    let approved = ApprovalId(
+        uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000c1").unwrap(),
+    );
+    let refused = ApprovalId(
+        uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000c2").unwrap(),
+    );
+
+    let row = pending_approvals::get(&harness.central, approved).unwrap();
+    assert_eq!(row.status, ApprovalStatus::Approved);
+    let decs = pending_approvals::list_decisions(&harness.central, Some(approved), 10).unwrap();
+    assert_eq!(decs.len(), 1);
+    assert_eq!(decs[0].decided_by, "Owner Olivia");
+
+    let live = pending_approvals::get(&harness.central, refused).unwrap();
+    assert_eq!(live.status, ApprovalStatus::Pending);
+    assert!(
+        pending_approvals::list_decisions(&harness.central, Some(refused), 10)
+            .unwrap()
+            .is_empty()
+    );
+
+    let slack = mock_for(&harness, "slack");
+    let edits = slack.edits();
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].external_id, "slack-ts-c1");
+    assert_eq!(edits[0].new_text, "Approved by Owner Olivia");
+}
+
 #[tokio::test]
 async fn slack_event_message_round_trip() {
     run_fixture("slack", "event-message").await;

@@ -13,7 +13,8 @@
 //! callback invocation inside `route`.
 
 use copperclaw_modules::context::{
-    AccessGate, ChannelRequestCtx, ChannelRequestGate, GateCtx, GateDecision, InterceptorCtx,
+    AccessGate, ApprovalInterceptCtx, ApprovalInterceptDecision, ApprovalInterceptor,
+    ChannelRequestCtx, ChannelRequestGate, GateCtx, GateDecision, InterceptorCtx,
     InterceptorDecision, MessageInterceptor, SenderResolver, SenderScopeCtx, SenderScopeDecision,
     SenderScopeGate,
 };
@@ -33,6 +34,7 @@ pub struct HookChain {
     sender_scope_gate: Mutex<Option<SenderScopeGate>>,
     message_interceptor: Mutex<Option<MessageInterceptor>>,
     channel_request_gate: Mutex<Option<ChannelRequestGate>>,
+    approval_interceptor: Mutex<Option<ApprovalInterceptor>>,
 }
 
 impl HookChain {
@@ -77,6 +79,14 @@ impl HookChain {
             .expect("channel_request_gate mutex") = Some(f);
     }
 
+    /// Install (or replace) the approval-interceptor hook (M18 G1).
+    pub fn set_approval_interceptor(&self, f: ApprovalInterceptor) {
+        *self
+            .approval_interceptor
+            .lock()
+            .expect("approval_interceptor mutex") = Some(f);
+    }
+
     /// True if any sender-resolver is currently registered.
     pub fn has_sender_resolver(&self) -> bool {
         self.sender_resolver
@@ -114,6 +124,14 @@ impl HookChain {
         self.channel_request_gate
             .lock()
             .expect("channel_request_gate mutex")
+            .is_some()
+    }
+
+    /// True if an approval interceptor is currently registered.
+    pub fn has_approval_interceptor(&self) -> bool {
+        self.approval_interceptor
+            .lock()
+            .expect("approval_interceptor mutex")
             .is_some()
     }
 
@@ -200,6 +218,23 @@ impl HookChain {
         Some(cb(ctx))
     }
 
+    /// Run the approval-interceptor hook (if any). `None` => no interceptor
+    /// registered; the caller routes the event normally. The lock is released
+    /// before invoking the (potentially DB-touching) closure so the hot path
+    /// never holds the chain mutex across the interceptor's work.
+    pub fn run_approval_interceptor(
+        &self,
+        ctx: ApprovalInterceptCtx,
+    ) -> Option<ApprovalInterceptDecision> {
+        let guard = self
+            .approval_interceptor
+            .lock()
+            .expect("approval_interceptor mutex");
+        let cb = guard.as_ref()?.clone();
+        drop(guard);
+        Some(cb(ctx))
+    }
+
     /// Take an owned snapshot of the message-interceptor closure (or `None`
     /// if no interceptor is registered). Used by the delivery crate to grab
     /// a reference without holding the chain's mutex across the call.
@@ -219,6 +254,7 @@ impl std::fmt::Debug for HookChain {
             .field("sender_scope_gate", &self.has_sender_scope_gate())
             .field("message_interceptor", &self.has_message_interceptor())
             .field("channel_request_gate", &self.has_channel_request_gate())
+            .field("approval_interceptor", &self.has_approval_interceptor())
             .finish()
     }
 }

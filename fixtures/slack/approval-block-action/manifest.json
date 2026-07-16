@@ -1,0 +1,15 @@
+{
+  "name": "slack-approval-block-action",
+  "channel": "slack",
+  "description": "M18 G1 in-chat approvals over Slack block_actions. An Owner taps Approve (callback carried under `content.callback.value`): the router-side interceptor resolves the pending approval via the same DB path the CLI uses and edits the card. An un-privileged sender's tap on another approval is refused with a 'not authorized' reply and the approval stays live. Neither tap writes an inbound row.",
+  "schema": 1,
+  "gates": ["approvals"],
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\""
+  }
+}

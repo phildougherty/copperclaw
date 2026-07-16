@@ -369,6 +369,28 @@ pub fn update_status(
     Ok(())
 }
 
+/// Record the platform-side message id of the delivered approval card
+/// (M18 G1). The delivery service calls this once the `approval_card` action's
+/// card lands in chat, so the in-chat approvals interceptor can later edit that
+/// exact message to "Approved by <name>". `NotFound` if the approval row is
+/// gone (e.g. already swept). Idempotent — re-recording the same id is a no-op
+/// beyond touching the row.
+pub fn set_platform_message_id(
+    db: &CentralDb,
+    id: ApprovalId,
+    platform_message_id: &str,
+) -> Result<(), DbError> {
+    let conn = db.conn()?;
+    let n = conn.execute(
+        "UPDATE pending_approvals SET platform_message_id = ?1 WHERE approval_id = ?2",
+        params![platform_message_id, id.as_uuid().to_string()],
+    )?;
+    if n == 0 {
+        return Err(DbError::NotFound);
+    }
+    Ok(())
+}
+
 pub fn delete(db: &CentralDb, id: ApprovalId) -> Result<(), DbError> {
     let conn = db.conn()?;
     let n = conn.execute(
@@ -678,6 +700,22 @@ mod tests {
     fn update_status_missing_is_not_found() {
         let db = db();
         let err = update_status(&db, ApprovalId::new(), ApprovalStatus::Approved).unwrap_err();
+        assert!(matches!(err, DbError::NotFound));
+    }
+
+    #[test]
+    fn set_platform_message_id_updates_row() {
+        let db = db();
+        let a = upsert(&db, sample("r-pmid")).unwrap();
+        set_platform_message_id(&db, a.approval_id, "tg-777").unwrap();
+        let after = get(&db, a.approval_id).unwrap();
+        assert_eq!(after.platform_message_id.as_deref(), Some("tg-777"));
+    }
+
+    #[test]
+    fn set_platform_message_id_missing_is_not_found() {
+        let db = db();
+        let err = set_platform_message_id(&db, ApprovalId::new(), "x").unwrap_err();
         assert!(matches!(err, DbError::NotFound));
     }
 
