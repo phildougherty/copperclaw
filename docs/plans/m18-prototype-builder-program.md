@@ -48,18 +48,19 @@ except where noted. Do not implement an absorbed card from the M17 text alone
    fixture under `fixtures/` per `docs/replay-fixtures.md`.
 6. **PR per card, branch off `main`, one card per branch.**
 
-## Execution status (updated 2026-07-15, end of fourth session)
+## Execution status (updated 2026-07-16, start of fifth session)
 
-Wave 1 is **complete and merged**. Wave 2 is underway: R2 merged (#31), R3
-is **code-complete on its branch (both parts), not yet a PR** — see "R3
-status" below for what's left before it can merge (PR + hand-verify only;
-the code itself, including tests, is done and green). A fresh session
-should read this section first, then either open R3's PR (fastest path —
-nothing else to build) or take the next unblocked card per the wave
-summary. The operator has directed merges of agent-authored PRs to `main`
-each time so far (2026-07-15); merges use merge commits (house style).
-CHANGELOG keep-both conflicts between card branches are the norm — resolve
-by keeping both entries, then merge.
+Wave 1 is **complete and merged**. Wave 2: R2 merged (#31), **R3 merged
+(#32)** — the verification gate is live on `main`. The "R3 status" section
+below is now historical; its "Next session" checklist is done except the
+live hand-verify smoke test, which the PR explicitly shipped without
+(tracked as a follow-up, see "Program-level acceptance"). Next free
+migration is **027**. A fresh session should take the next unblocked card
+per the wave summary — R3 no longer blocks anything. The operator has
+directed merges of agent-authored PRs to `main` each time so far
+(2026-07-15/16); merges use merge commits (house style). CHANGELOG
+keep-both conflicts between card branches are the norm — resolve by
+keeping both entries, then merge.
 
 Two housekeeping traps that bit this session, worth checking early in any
 fresh session: (1) local `main` can silently drift behind `origin/main` by
@@ -83,7 +84,7 @@ main..<branch> --oneline` yourself first.
 | T1 | Merged | #25 |
 | P1 | Merged | #26 |
 | R2 | Merged | #31 |
-| R3 | **Code-complete, not yet a PR.** Branch `m18/r3-verification-gate`, pushed through part 1/2 (`b53ce57`); part 2/2 (the gate itself) committed locally as `e7c65fa`, **not yet pushed**. Full workspace `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo test --workspace --no-fail-fast` all green (one known-flaky `copperclaw-skills --test coverage` failure under full-workspace parallel runs, pre-existing, see "Facts" below — reruns clean in isolation). Next step is `git push` + open the PR, then the "Acceptance to hand-verify" item below (needs a live mock-provider or manual run, not done this session) before merge. | — |
+| R3 | **Merged.** Verification gate is live on `main`. Live hand-verify smoke test was NOT run before merge (PR body left it unchecked) — still owed, see program-level acceptance. | #32 |
 | C3 | Not started | — |
 | All others | Not started | — |
 
