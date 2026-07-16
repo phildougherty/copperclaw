@@ -11,11 +11,16 @@
 //!   /api/v4/reactions`. Requires the configured `bot_user_id`,
 //!   because Mattermost binds reactions to a user.
 //!
-//! `subscribe`, `set_typing`, and `open_dm` use the trait defaults:
-//! Mattermost has no "subscribe to channel" call for bots (the
-//! outgoing webhook decides what flows in), typing indicators
-//! require WebSocket auth we don't bother with, and DMs are just a
-//! private channel id the caller already has.
+//! `subscribe` and `open_dm` use the trait defaults: Mattermost has no
+//! "subscribe to channel" call for bots (the outgoing webhook decides
+//! what flows in), and DMs are just a private channel id the caller
+//! already has.
+//!
+//! `set_typing` publishes the bot's "…is typing" indicator via `POST
+//! /api/v4/users/me/typing` (the REST shortcut for the websocket
+//! `user_typing` action — no persistent socket needed). `add_reaction`
+//! (the host-driven trait hook) and `deliver_breadcrumb` (an in-place
+//! edited tool-progress chip) are native overrides too.
 //!
 //! File attachments aren't yet implemented; an outbound with files
 //! returns [`AdapterError::Unsupported`] explicitly rather than
@@ -25,7 +30,7 @@ use crate::api::MattermostApi;
 use crate::render;
 use async_trait::async_trait;
 use copperclaw_channels_core::{
-    AdapterError, Card, ChannelAdapter, DiffCard, ErrorCard, ThinkingBlock, TodoList,
+    AdapterError, Breadcrumb, Card, ChannelAdapter, DiffCard, ErrorCard, ThinkingBlock, TodoList,
 };
 use copperclaw_types::{ChannelType, OutboundMessage};
 use std::sync::Mutex;
@@ -101,6 +106,21 @@ impl ChannelAdapter for MattermostAdapter {
 
     fn supports_threads(&self) -> bool {
         true
+    }
+
+    /// Publish the bot's typing indicator via `POST
+    /// /api/v4/users/me/typing`. The server fans the `user_typing` event
+    /// out to connected clients, giving users an "agent is working"
+    /// signal during a run. `thread_id`, when present, scopes the
+    /// indicator to that thread root (`parent_id`); otherwise it targets
+    /// the whole channel. Best-effort: a failure here is surfaced to the
+    /// caller (the delivery loop treats typing as advisory).
+    async fn set_typing(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+    ) -> Result<(), AdapterError> {
+        self.api.post_typing("me", platform_id, thread_id).await
     }
 
     async fn deliver(
@@ -211,6 +231,48 @@ impl ChannelAdapter for MattermostAdapter {
                 Err(e)
             }
         }
+    }
+
+    /// Native tool-progress breadcrumb — a compact Markdown chip
+    /// (`[~] `shell` · cargo check`, see [`render::render_breadcrumb`]).
+    /// When `existing_message_id` is known we edit the original chip in
+    /// place via `PUT /api/v4/posts/{id}/patch` so the user sees
+    /// `Running…` → `Done`; otherwise we post a fresh chip. `thread_id`
+    /// threads the initial post as usual.
+    async fn deliver_breadcrumb(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        breadcrumb: &Breadcrumb,
+        existing_message_id: Option<&str>,
+    ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type().as_str(), "breadcrumb");
+        let text = render::render_breadcrumb(breadcrumb);
+        if let Some(existing) = existing_message_id {
+            self.api.update_post(existing, &text).await?;
+            return Ok(Some(existing.to_owned()));
+        }
+        let id = self.api.create_post(platform_id, &text, thread_id).await?;
+        Ok(Some(id))
+    }
+
+    /// Host-driven reaction — the trait hook the delivery service calls
+    /// (distinct from the `reaction` egress action on [`Self::deliver`]).
+    /// Routes to `POST /api/v4/reactions` on behalf of the configured
+    /// `bot_user_id` (Mattermost binds reactions to a user). Falls
+    /// through to [`AdapterError::Unsupported`] when no bot id is
+    /// configured so the host can post a fresh message instead.
+    async fn add_reaction(
+        &self,
+        _platform_id: &str,
+        _thread_id: Option<&str>,
+        external_id: &str,
+        emoji: &str,
+    ) -> Result<(), AdapterError> {
+        let user = self.bot_user_id.as_deref().ok_or_else(|| {
+            AdapterError::Unsupported("reaction requires bot_user_id in mattermost config".into())
+        })?;
+        self.api.add_reaction(user, external_id, emoji).await
     }
 
     /// Native card — a Mattermost Markdown post (heading + body + field
@@ -509,12 +571,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn defaults_are_no_ops() {
+    async fn subscribe_and_open_dm_are_no_ops() {
         let mock = MockServer::start().await;
         let a = make(&mock, None);
         a.subscribe("c", None).await.unwrap();
-        a.set_typing("c", None).await.unwrap();
         assert!(a.open_dm("u").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn set_typing_posts_to_users_me_typing() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/users/me/typing"))
+            .and(wiremock::matchers::body_string_contains(
+                "\"channel_id\":\"c1\"",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock)
+            .await;
+        let a = make(&mock, None);
+        a.set_typing("c1", None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn set_typing_scopes_to_thread_parent() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/users/me/typing"))
+            .and(wiremock::matchers::body_string_contains(
+                "\"parent_id\":\"root-2\"",
+            ))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock)
+            .await;
+        let a = make(&mock, None);
+        a.set_typing("c1", Some("root-2")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_reaction_trait_hook_hits_reactions_api_with_bot() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/reactions"))
+            .and(wiremock::matchers::body_string_contains(
+                "\"post_id\":\"p-9\"",
+            ))
+            .and(wiremock::matchers::body_string_contains(
+                "\"user_id\":\"bot\"",
+            ))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"emoji_name":"+1"})))
+            .mount(&mock)
+            .await;
+        let a = make(&mock, Some("bot"));
+        a.add_reaction("c1", None, "p-9", "+1").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_reaction_trait_hook_without_bot_is_unsupported() {
+        let mock = MockServer::start().await;
+        let a = make(&mock, None);
+        match a.add_reaction("c1", None, "p-9", "+1").await.unwrap_err() {
+            AdapterError::Unsupported(m) => assert!(m.contains("bot_user_id")),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deliver_breadcrumb_posts_chip_when_no_existing_id() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/posts"))
+            .and(wiremock::matchers::body_string_contains("[~] `shell`"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "bc-1"})))
+            .mount(&mock)
+            .await;
+        let a = make(&mock, None);
+        let bc = Breadcrumb::running("shell").with_detail("cargo check");
+        let id = a.deliver_breadcrumb("c1", None, &bc, None).await.unwrap();
+        assert_eq!(id.as_deref(), Some("bc-1"));
+    }
+
+    #[tokio::test]
+    async fn deliver_breadcrumb_edits_chip_in_place_when_id_known() {
+        let mock = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v4/posts/bc-7/patch"))
+            .and(wiremock::matchers::body_string_contains("[ok] `shell`"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "bc-7"})))
+            .mount(&mock)
+            .await;
+        let a = make(&mock, None);
+        let bc = Breadcrumb::running("shell")
+            .with_detail("cargo check")
+            .finished(true, Some("passed".into()));
+        let id = a
+            .deliver_breadcrumb("c1", None, &bc, Some("bc-7"))
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("bc-7"));
     }
 
     #[tokio::test]

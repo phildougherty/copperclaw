@@ -214,6 +214,33 @@ adheres to [Semantic Versioning](https://semver.org/).
     markdown-free plaintext shape and carries no in-place-edit id to
     improve on.
 
+### Added (M19 U3 — Mattermost breadcrumb + reaction + typing)
+
+- The Mattermost adapter now overrides three rich-surface hooks it
+  previously left on the trait defaults, bringing it in line with the
+  other edit-capable adapters (Discord/Matrix/Slack/Telegram):
+  - **`deliver_breadcrumb`** (`crates/copperclaw-channels/mattermost/src/adapter.rs`,
+    renderer in `src/render.rs::render_breadcrumb`) — tool-progress chips
+    now render as a compact Markdown chip (`` [~] `shell` · cargo check ``,
+    ASCII status markers per the no-emoji rule) and are *edited in place*
+    via `PUT /api/v4/posts/{id}/patch` when the host passes the prior
+    chip's `existing_message_id`, so the user sees `Running…` → `Done`
+    rather than a new row per tool boundary. Rolling `steps` aggregates
+    render a bold summary line + a Markdown bullet per step. Previously
+    breadcrumbs degraded to the plain-text fallback row.
+  - **`add_reaction`** (the host-driven trait hook) — routes to the
+    existing `POST /api/v4/reactions` on behalf of the configured
+    `bot_user_id`; falls through to `Unsupported` (so the host posts a
+    fresh message) when no bot id is configured. Previously reactions were
+    reachable only via the `reaction` egress action on `deliver`, not the
+    trait method the delivery service calls.
+  - **`set_typing`** (`src/api.rs::post_typing`) — publishes the bot's
+    "…is typing" indicator via `POST /api/v4/users/me/typing` (the REST
+    shortcut for the websocket `user_typing` action — no persistent socket
+    needed), scoped to a thread root via `parent_id` when a `thread_id` is
+    present. Previously typing was a silent no-op, leaving no "agent is
+    working" signal during a run.
+
 ### Fixed (M18 — Task HUD no-op edit / Telegram "message is not modified", 2026-07-16)
 
 - The H1 Task HUD and R6 progressive-final-answer edit a pinned status
