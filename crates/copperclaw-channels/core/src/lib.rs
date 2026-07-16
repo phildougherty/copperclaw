@@ -78,6 +78,7 @@ mod todo_list;
 
 pub mod inbound_file;
 pub mod markdown;
+pub mod reaction;
 pub mod testing;
 
 pub use adapter::{ChannelAdapter, ChannelFactory, render_collapsible_text_fallback};
@@ -106,6 +107,10 @@ pub use error::AdapterError;
 pub use error_card::{
     ErrorCard, ErrorCardError, ErrorCardKind, MAX_DETAILS_CHARS as MAX_ERROR_DETAILS_CHARS,
     MAX_SUMMARY_CHARS as MAX_ERROR_SUMMARY_CHARS, MAX_TITLE_CHARS as MAX_ERROR_TITLE_CHARS,
+};
+pub use reaction::{
+    InboundReaction, REACTION_KEY, ReactionSignal, classify as classify_reaction,
+    is_reaction_content, parse_reaction, reaction_content,
 };
 pub use registry::ChannelRegistry;
 pub use setup::ChannelSetup;

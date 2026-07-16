@@ -258,6 +258,41 @@ pub struct Update {
     /// [`copperclaw_channels_core::Card`] schema.
     #[serde(default)]
     pub callback_query: Option<CallbackQuery>,
+    /// Update payload sent when a user changes their reaction to a message
+    /// (M19 U7). Requires the bot to subscribe to the `message_reaction`
+    /// update type via `allowed_updates`. Parsed into the shared inbound-
+    /// reaction contract by [`crate::ingress::updates_to_events`].
+    #[serde(default)]
+    pub message_reaction: Option<MessageReactionUpdated>,
+}
+
+/// Telegram `MessageReactionUpdated` — emitted when a user adds or removes a
+/// reaction on a message (M19 U7). We surface an ADDED emoji reaction (present
+/// in `new_reaction`, absent from `old_reaction`) as an inbound-reaction event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageReactionUpdated {
+    pub chat: Chat,
+    pub message_id: i64,
+    /// The user who changed the reaction (absent for anonymous channel/admin
+    /// reactions, which arrive under `actor_chat` instead).
+    #[serde(default)]
+    pub user: Option<User>,
+    #[serde(default)]
+    pub date: i64,
+    #[serde(default)]
+    pub old_reaction: Vec<ReactionType>,
+    #[serde(default)]
+    pub new_reaction: Vec<ReactionType>,
+}
+
+/// Telegram `ReactionType`. Only `emoji` reactions carry a steering signal;
+/// custom-emoji and paid reactions are captured but ignored by the parser.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReactionType {
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub emoji: Option<String>,
 }
 
 /// Telegram `CallbackQuery` — emitted when a user taps an `inline_keyboard`
@@ -456,6 +491,7 @@ mod tests {
             edited_message: None,
             channel_post: None,
             callback_query: None,
+            message_reaction: None,
         };
         let json = serde_json::to_string(&u).unwrap();
         let back: Update = serde_json::from_str(&json).unwrap();
