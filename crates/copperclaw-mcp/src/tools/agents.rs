@@ -339,6 +339,8 @@ pub mod delegate_batch {
         // it as a tool error so the model sees a clear "refused", not an
         // aggregate of failures it might try to consume.
         if outcome.all_spawn_failed() {
+            // M19 A1: whole-batch refusal (every worker failed to spawn).
+            copperclaw_metrics::inc_delegate_batch_refused();
             let reason = outcome
                 .workers
                 .first()

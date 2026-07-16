@@ -468,6 +468,10 @@ impl TaskHud {
                 if record_and_should_emit(&shared, &frame, first) {
                     if first {
                         copperclaw_metrics::inc_hud_post(&agent_group);
+                        // M19 F5: this armed-task first post is the pre-first-tool
+                        // "thinking…" frame (distinct from the tool-triggered post
+                        // in emit_live_update).
+                        copperclaw_metrics::inc_hud_thinking_frame(&agent_group);
                     } else {
                         copperclaw_metrics::inc_hud_edits(&agent_group, "ticker");
                     }

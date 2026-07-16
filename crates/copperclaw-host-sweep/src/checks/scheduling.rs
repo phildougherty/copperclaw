@@ -36,6 +36,10 @@ pub fn check(
     now: DateTime<Utc>,
 ) -> Result<Vec<SeriesFanout>, SweepError> {
     let due = tasks::list_due(central, now)?;
+    // M19 A6: publish the count of active scheduled tasks each sweep pass.
+    if let Ok(active) = tasks::count_active(central) {
+        copperclaw_metrics::set_scheduled_tasks_active(active);
+    }
     let mut out = Vec::with_capacity(due.len());
     for task in due {
         // Build the inbound row.
@@ -70,6 +74,18 @@ pub fn check(
         // metrics rider can see autonomous activity without a scan.
         tasks::mark_fired(central, &task.id, now)?;
 
+        // M19 A6: fire latency — how late this task fired relative to its
+        // scheduled `next_fire` (bounded by the sweep's ~60s cadence).
+        if let Some(scheduled) = task.next_fire {
+            let latency = (now - scheduled).num_milliseconds();
+            if latency >= 0 {
+                #[allow(clippy::cast_precision_loss)]
+                copperclaw_metrics::observe_scheduled_task_fire_latency_seconds(
+                    latency as f64 / 1000.0,
+                );
+            }
+        }
+
         // Re-arm or complete. Recurring tasks always re-arm using the
         // recurrence expression; one-shot tasks transition to
         // `completed` and clear `next_fire` so they never fire again.
@@ -79,9 +95,13 @@ pub fn check(
             .and_then(|rec| next_fire_for(&task.when_spec, Some(rec), now));
         if let Some(next) = next_fire {
             tasks::set_next_fire(central, &task.id, Some(next))?;
+            // M19 A6: recurring task re-armed its next occurrence.
+            copperclaw_metrics::inc_scheduled_task_fire("recurring_rearm");
         } else {
             tasks::set_status(central, &task.id, TaskStatus::Completed)?;
             tasks::set_next_fire(central, &task.id, None)?;
+            // M19 A6: one-shot task transitioned to completed.
+            copperclaw_metrics::inc_scheduled_task_fire("one_shot_complete");
         }
 
         out.push(SeriesFanout {

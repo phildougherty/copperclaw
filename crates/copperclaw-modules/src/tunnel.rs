@@ -597,6 +597,8 @@ impl TunnelBroker {
                 &req.upstream,
                 "blocked-not-enabled",
             );
+            // M19 A3: refused by the opt-in gate.
+            copperclaw_metrics::inc_public_tunnel("denied", "not_enabled");
             return Err(TunnelError::NotEnabled {
                 group: req.agent_group_id.as_uuid().to_string(),
             });
@@ -625,9 +627,13 @@ impl TunnelBroker {
         let now = Utc::now();
         match existing {
             Some(row) if row.status == ApprovalStatus::Approved => self.stand_up(&req, &row).await,
-            Some(row) if row.status == ApprovalStatus::Denied => Err(TunnelError::Denied {
-                approval_id: row.approval_id.as_uuid().to_string(),
-            }),
+            Some(row) if row.status == ApprovalStatus::Denied => {
+                // M19 A3: operator denied the exposure.
+                copperclaw_metrics::inc_public_tunnel("denied", "approval_denied");
+                Err(TunnelError::Denied {
+                    approval_id: row.approval_id.as_uuid().to_string(),
+                })
+            }
             Some(row) if row.is_actionable_at(now) => Ok(TunnelOutcome::Pending {
                 approval_id: row.approval_id.as_uuid().to_string(),
                 note: pending_note(),
@@ -700,6 +706,8 @@ impl TunnelBroker {
             &upstream,
             "opened",
         );
+        // M19 A3: a public tunnel stood up on an approved grant.
+        copperclaw_metrics::inc_public_tunnel("opened", "");
         info!(
             session = %req.session_id.as_uuid(),
             host_port = req.host_port,
@@ -776,6 +784,8 @@ impl TunnelBroker {
             &req.upstream,
             "pending-approval",
         );
+        // M19 A3: a pending-approval card was raised for the exposure.
+        copperclaw_metrics::inc_public_tunnel("approval_raised", "");
         info!(
             session = %req.session_id.as_uuid(),
             host_port = req.host_port,
@@ -847,6 +857,8 @@ impl TunnelBroker {
                     "",
                     reason,
                 );
+                // M19 A3: tunnel torn down; `reason` names the cause.
+                copperclaw_metrics::inc_public_tunnel("torn_down", reason);
                 info!(
                     session = %session_id.as_uuid(),
                     host_port,

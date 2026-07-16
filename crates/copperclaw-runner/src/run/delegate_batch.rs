@@ -78,6 +78,8 @@ pub(crate) async fn join_workers(
     start_seq: i64,
     timeout: Duration,
 ) -> DelegateBatchOutcome {
+    // M19 A1: record the fan-out width of this batch.
+    copperclaw_metrics::observe_delegate_batch_width(workers.len() as u64);
     let mut joins: Vec<WorkerJoin> = workers
         .iter()
         .map(|w| WorkerJoin {
@@ -219,6 +221,12 @@ fn finalize_worker(j: WorkerJoin) -> WorkerOutcome {
     } else {
         WorkerStatus::SpawnFailed
     };
+    // M19 A1: per-worker terminal outcome.
+    copperclaw_metrics::inc_delegate_batch_worker(match status {
+        WorkerStatus::Ok => "ok",
+        WorkerStatus::Timeout => "timeout",
+        WorkerStatus::SpawnFailed => "spawn_failed",
+    });
     WorkerOutcome {
         name: j.name,
         status,

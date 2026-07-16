@@ -1453,16 +1453,32 @@ impl DeliveryService {
             _ => return Ok(ActionAdapterOutcome::FallThrough),
         };
 
+        // M19 U3: meter outbound emoji reactions centrally (covers every
+        // adapter). Typing is metered on the dispatcher's set_typing path.
+        let is_reaction = action_name == "reaction";
         match call_result {
-            Ok(()) => Ok(ActionAdapterOutcome::Done),
+            Ok(()) => {
+                if is_reaction {
+                    copperclaw_metrics::inc_adapter_reaction(channel_type.as_str(), "ok");
+                }
+                Ok(ActionAdapterOutcome::Done)
+            }
             Err(AdapterError::Unsupported(reason)) => {
+                if is_reaction {
+                    copperclaw_metrics::inc_adapter_reaction(channel_type.as_str(), "unsupported");
+                }
                 info!(
                     action = action_name,
                     reason, "adapter unsupported; falling back"
                 );
                 Ok(ActionAdapterOutcome::FallThrough)
             }
-            Err(other) => Err(DeliveryError::Adapter(other)),
+            Err(other) => {
+                if is_reaction {
+                    copperclaw_metrics::inc_adapter_reaction(channel_type.as_str(), "error");
+                }
+                Err(DeliveryError::Adapter(other))
+            }
         }
     }
 
@@ -2201,6 +2217,17 @@ impl DeliveryService {
         // - Otherwise → false (leave existing pin state alone).
         let pin_hint = prior_external_id.is_none() || combined.is_fully_completed();
 
+        // M19 U1/U2: record the edit-in-place-vs-create intent for the pinned
+        // rich surface (a prior anchor → edit; none → fresh create).
+        copperclaw_metrics::inc_adapter_surface_write(
+            channel_type.as_str(),
+            if prior_external_id.is_some() {
+                "edit"
+            } else {
+                "create"
+            },
+        );
+
         let platform_message_id = match adapter
             .deliver_todo_list(
                 &platform_id,
@@ -2271,6 +2298,14 @@ impl DeliveryService {
             (None, false) => {}
         }
         delivered::insert(&in_conn, row.id, platform_message_id.as_deref(), "ok")?;
+        // M19 F4: a blocked-todo chip was actually rendered on this channel.
+        if combined.blocked_count() > 0 {
+            let has_reason = combined
+                .items
+                .iter()
+                .any(|item| item.blocked_reason_text().is_some());
+            copperclaw_metrics::inc_blocked_todo_render(channel_type.as_str(), has_reason);
+        }
         Ok(())
     }
 

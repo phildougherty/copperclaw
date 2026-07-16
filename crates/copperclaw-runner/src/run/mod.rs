@@ -1419,6 +1419,9 @@ async fn emit_terminal_failure_apologies(
         let user_summary = apology_text(reason);
         build_terminal_failure_error_card(&user_summary, reason)
     };
+    // M19 F2 metric: label for the wall card, counted per user-facing card
+    // actually written to a channel below.
+    let wall_blocker = blocker.map(blocker::BlockerCategory::metric_label);
     let agent_text = agent_apology_text(reason);
     let outbound = deps.outbound.lock().await;
     let conn: &rusqlite::Connection = &outbound;
@@ -1439,6 +1442,10 @@ async fn emit_terminal_failure_apologies(
         let apology = if let (Some(channel_type), Some(platform_id)) =
             (row.channel_type.as_ref(), row.platform_id.as_ref())
         {
+            // M19 F2: a curated wall card is actually reaching a user channel.
+            if let Some(lbl) = wall_blocker {
+                copperclaw_metrics::inc_wall_card(lbl);
+            }
             WriteOutbound {
                 id: copperclaw_types::MessageId::new(),
                 in_reply_to: Some(row.id),

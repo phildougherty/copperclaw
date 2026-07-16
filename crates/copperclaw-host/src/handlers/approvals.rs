@@ -122,7 +122,7 @@ pub fn expire_and_edit_cards(
         // edit-capable adapter.
         let target = DispatchTarget::channel(channel, platform, None);
         dispatcher.edit_message(&target, &message_id, EXPIRED_CARD_TEXT);
-        copperclaw_metrics::inc_approval_tap("expired_card");
+        copperclaw_metrics::inc_approval_card_outcome("expired_card");
         tracing::info!(
             approval_id = %row.approval_id.as_uuid(),
             "approvals: stamped expired approval card terminal"
@@ -731,10 +731,22 @@ fn apply_save_skill(row: &pending_approvals::PendingApproval) -> Result<Value, E
 
     let dest = std::path::PathBuf::from(dest_dir);
     let roots = [std::path::PathBuf::from(allowed_root)];
-    let written = copperclaw_skills::save_group_skill(&dest, &roots, name, content)
+    let written = match copperclaw_skills::save_group_skill(&dest, &roots, name, content) {
+        Ok(written) => {
+            // M19 A4: dedicated saved/rejected counter at the true write site.
+            copperclaw_metrics::inc_skills_saved("saved");
+            written
+        }
         // A well-formed but invalid skill (bad frontmatter, name mismatch,
         // containment escape) surfaces the precise skills-crate error.
-        .map_err(|e| ErrorPayload::new("bad_request", format!("save_skill rejected: {e}")))?;
+        Err(e) => {
+            copperclaw_metrics::inc_skills_saved("rejected");
+            return Err(ErrorPayload::new(
+                "bad_request",
+                format!("save_skill rejected: {e}"),
+            ));
+        }
+    };
 
     Ok(json!({
         "kind": "save_skill",
