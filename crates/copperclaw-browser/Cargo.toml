@@ -13,6 +13,13 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
+tokio = { workspace = true }
+futures = { workspace = true }
+reqwest = { workspace = true }
+# Same version + TLS backend the discord adapter already pins, so the CDP
+# WebSocket transport reuses a dependency tree already in the lock.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+base64 = "0.22"
 
 [dev-dependencies]
 tokio = { workspace = true }
