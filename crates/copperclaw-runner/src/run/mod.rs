@@ -14,6 +14,7 @@ pub mod external_mcp;
 pub(super) mod formatting;
 pub mod hud;
 pub mod preview;
+pub(super) mod progressive;
 pub(super) mod prompt;
 pub(super) mod provider_call;
 pub(super) mod tool_dispatch;
@@ -3540,6 +3541,105 @@ mod tests {
             ),
             TurnOutcome::Done => panic!("expected the max-turns breaker to stop the loop"),
         }
+    }
+
+    // ── M18 R6: progressive final answers ───────────────────────────────
+
+    /// A long answer, revealed via [`progressive::grow_final_answer`],
+    /// lands as ONE `Chat` row (the first chunk) plus a run of `System`
+    /// `edit` rows all anchored to that Chat row's `seq`, the last of
+    /// which carries the complete text. This is the "assert edit cadence"
+    /// half of the acceptance — the >30s + rich-adapter gate itself is
+    /// covered by `progressive::should_grow` unit tests (which can name an
+    /// elapsed duration a wall-clock test cannot fake).
+    #[tokio::test]
+    async fn progressive_growth_posts_then_edits_to_full_text() {
+        let setup = build_setup(vec![]);
+        setup
+            .deps
+            .tool_ctx
+            .set_originating(Some("telegram"), Some("t-1"), None, None);
+        // ~500 chars, single line → growable but not expander-scale.
+        let answer = "The prototype is built and verified. ".repeat(14);
+        assert!(super::progressive::worth_growing(&answer));
+
+        super::progressive::grow_final_answer(&setup.deps, answer.clone(), Duration::ZERO)
+            .await
+            .unwrap();
+
+        let outbound = open_outbound(&setup.paths).unwrap();
+        let rows = messages_out::list_due(&outbound).unwrap();
+        let chat: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == copperclaw_types::MessageKind::Chat)
+            .collect();
+        assert_eq!(chat.len(), 1, "exactly one Chat row anchors the reveal");
+        let anchor_seq = chat[0].seq;
+        // First chunk is a genuine, strictly-shorter prefix of the answer.
+        let first_text = chat[0].content["text"].as_str().unwrap();
+        assert!(answer.starts_with(first_text));
+        assert!(
+            first_text.chars().count() < answer.chars().count(),
+            "the first post must be a partial reveal, not the whole answer"
+        );
+
+        let edits: Vec<_> = rows
+            .iter()
+            .filter(|r| r.content.get("edit").is_some())
+            .collect();
+        assert!(!edits.is_empty(), "growth must emit at least one edit row");
+        for e in &edits {
+            assert_eq!(
+                e.content["edit"]["seq"].as_i64().unwrap(),
+                anchor_seq,
+                "every edit must target the first message's seq"
+            );
+        }
+        assert_eq!(
+            edits.last().unwrap().content["edit"]["text"]
+                .as_str()
+                .unwrap(),
+            answer,
+            "the terminal edit must carry the complete answer"
+        );
+    }
+
+    /// A sub-30s turn on a rich adapter keeps today's single terminal
+    /// emit: exactly one `Chat` row with the full text and NOT a single
+    /// `edit` row — byte-identical to the pre-R6 path. (Real time in a
+    /// unit test is ~0s, so `drive_turn` naturally exercises the
+    /// "elapsed < MIN_ELAPSED" arm even on an edit-capable channel.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn short_turn_keeps_single_terminal_emit_on_rich_adapter() {
+        let long = "All done — here is the full writeup. ".repeat(14); // ~500 chars
+        let setup = build_setup(vec![vec![ProviderEvent::Result {
+            text: Some(long.clone()),
+        }]]);
+        // Edit-capable origin: proves the fallback is the *turn length*,
+        // not the adapter, that keeps the single emit here.
+        setup
+            .deps
+            .tool_ctx
+            .set_originating(Some("telegram"), Some("t-1"), None, None);
+
+        let mut history = Vec::new();
+        let turn = drive_turn(&setup.deps, &mut history, None, None)
+            .await
+            .unwrap();
+        assert!(matches!(turn.outcome, TurnOutcome::Done));
+
+        let outbound = open_outbound(&setup.paths).unwrap();
+        let rows = messages_out::list_due(&outbound).unwrap();
+        let chat: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == copperclaw_types::MessageKind::Chat)
+            .collect();
+        assert_eq!(chat.len(), 1, "one terminal Chat row, as before R6");
+        assert_eq!(chat[0].content["text"].as_str().unwrap(), long);
+        assert!(
+            rows.iter().all(|r| r.content.get("edit").is_none()),
+            "a sub-30s turn must NOT grow the answer via edits"
+        );
     }
 
     // ── resolve_max_task_tokens ────────────────────────────────────────

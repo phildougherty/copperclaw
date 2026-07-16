@@ -33,8 +33,8 @@ except where noted. Do not implement an absorbed card from the M17 text alone
      `## [Unreleased]`. The changelog is a merge hotspot — write your line
      last and keep it to your card only.
    - Never edit a released migration. New DB state = new numbered migration
-     in `crates/copperclaw-db/migrations/` (next free: **026** — verify at
-     branch time).
+     in `crates/copperclaw-db/migrations/` (next free: **028** — verify at
+     branch time; E2 took 027, and was the only remaining card known to need one).
 2. **No stubs in tree.** If a card can't be finished whole, deliver a smaller
    whole thing. A registered tool works end-to-end.
 3. **Secure-by-default.** New capability is opt-in unless the card explicitly
@@ -48,19 +48,104 @@ except where noted. Do not implement an absorbed card from the M17 text alone
    fixture under `fixtures/` per `docs/replay-fixtures.md`.
 6. **PR per card, branch off `main`, one card per branch.**
 
-## Execution status (updated 2026-07-16, start of fifth session)
+## Execution status (updated 2026-07-16, seventh session — Wave 3 batch merged)
 
-Wave 1 is **complete and merged**. Wave 2: R2 merged (#31), **R3 merged
-(#32)** — the verification gate is live on `main`. The "R3 status" section
-below is now historical; its "Next session" checklist is done except the
-live hand-verify smoke test, which the PR explicitly shipped without
-(tracked as a follow-up, see "Program-level acceptance"). Next free
-migration is **027**. A fresh session should take the next unblocked card
-per the wave summary — R3 no longer blocks anything. The operator has
-directed merges of agent-authored PRs to `main` each time so far
-(2026-07-15/16); merges use merge commits (house style). CHANGELOG
-keep-both conflicts between card branches are the norm — resolve by
-keeping both entries, then merge.
+**Wave 3 launched via six parallel worktree agents (seventh session) and all
+six are now MERGED to `main`:** **T2** (#40), **V1** (#41), **V3** (#42),
+**E2** (#43), **R5** (#44), **G1** (#45) — merged in that order (merge commits,
+house style). Local `main` = `origin/main` at `0f26247`. Migration **027** is
+TAKEN by E2 (`027_container_config_image_profile.sql`) — next free is **028**.
+
+**Integration was verified, not assumed.** Each PR passed its own gate on its
+branch, but several auto-merged into overlapping files that never compiled
+together until now: `runner_config.rs` (E2+R5), `preview.rs` (E2+V1),
+`service.rs` / `handlers/approvals.rs` (E2+G1), `tests/replay/harness.rs`
+(R5+G1), plus the usual CHANGELOG keep-both across all six and a clean
+Cargo.lock auto-merge (V1+V3 both added `tokio-tungstenite`). After all six
+merged, the full gate was run on the integrated tree: **fmt / check / clippy
+-D warnings clean, 7096 passed / 0 failed** (the `copperclaw-skills` coverage
+suite that flaked for G1 under isolation-load passed clean here). One
+post-merge fixup was required and landed directly on `main` as `0f26247`:
+**G1 (#45) shipped several >100-char lines rustfmt wanted wrapped** (incl. its
+new `approval_intercept.rs`), so the merged `main` initially failed
+`cargo fmt --all -- --check` despite G1's PR claiming fmt-clean — a fmt-only,
+no-logic commit fixed it. Lesson for future sessions: re-run the *integrated*
+gate after a multi-PR merge; a green per-branch gate does not prove the union
+is green (or even fmt-clean).
+
+Housekeeping: three of the six agents each accidentally ran a `git checkout -b`
+in the shared checkout before working in their worktree and self-corrected; the
+shared checkout was re-verified clean after each. The finished agent worktrees
+under `.claude/worktrees/agent-*` were pruned during the merge.
+
+**Waves 1 and 2 are complete and merged** (R4 #39, C4a #37, C4b #38 landed
+since the previous update; local `main` = `origin/main` at `544f12e`).
+Next free migration is **028** (E2's PR #43 takes 027). Test baseline is
+~7,000 (gate = zero
+failures, not a fixed count). Every remaining card was re-audited against
+`main` on 2026-07-16 (five parallel subsystem audits: preview/browser,
+approvals, runner, environment, channels); stale anchors were corrected
+and each remaining card now carries a "**Verified state (2026-07-16)**"
+block — where that block disagrees with the original card prose, the
+block wins. Two owed follow-ups are now real cards: **T2** (unconditional
+data-root env override + a test-race fix) and **X2** (extend the golden
+fixture over the verify gate), both at the end of the Wave 2 section.
+
+Next unblocked cards by lane (prerequisites now MERGED, so all of these are
+ready to start): **E1** (lane T, T2 merged), **X2** (lane X, T2 merged),
+**V4** (lane V, V1+V3 merged), **V2** (lane V, G1 merged), **P3** (lane P,
+prefers V4 — now available), **C5** sub-cards (lane C). M1 stays last. The
+seventh-session batch (T2 #40, V1 #41, V3 #42, E2 #43, R5 #44, G1 #45 — all
+merged) covered every card that was unblocked at session start. The operator has directed merges
+of agent-authored PRs to
+`main` each time so far (2026-07-15/16); merges use merge commits (house
+style). CHANGELOG keep-both conflicts between card branches are the norm
+— resolve by keeping both entries, then merge.
+
+### Eighth session — wave 3 (in flight) + teed-up wave 4
+
+**Wave A — MERGED (eighth session):** **P3** (#46), **V4** (#47), **X2** (#48),
+**E1** (#49) — four parallel worktree agents on disjoint lanes (V/P/X/T), all
+merged in that order. Integrated gate on `main` after merge: **fmt / check /
+clippy -D warnings clean, 7121 passed / 0 failed** (no flakes this run; all
+four agents self-verified `cargo fmt --check`, so no G1-style post-merge fmt
+fixup was needed). Only CHANGELOG conflicted within the wave (V4/E1 touch
+different `copperclaw-mcp` files; P3 is prompt+skills; X2 is fixtures) —
+resolved keep-both. Notable: V4 renders **host-side container-direct**
+(`http://<container_ip>:<port>`, not the cookie-gated proxy URL) so it left
+`preview.rs` untouched — meaning **V2 no longer has a preview.rs conflict with
+V4** and could in principle have run alongside it; kept the sequencing anyway.
+E1's "works now" install runs **in-container** (the tool surface's process),
+not host-side, because `ContainerRuntime` exposes no host→container exec
+primitive — a documented correction to the card's framing. Local `main` =
+`origin/main` at `599a05e`.
+
+**Wave B — READY TO FIRE (Wave A is merged).** All on disjoint lanes, launch in
+parallel:
+- **V2** (lane V) — one-tap preview enablement + expired-link tombstone
+  re-expose. Held out of Wave A ONLY because it writes `preview.rs`, which V4
+  reads — so it MUST land after V4 merges (else preview.rs conflict). Its part
+  2 was AMENDED (see the V2 "Verified state" block — the 30-min figure is the
+  idle reaper, not a token TTL; the amended tombstone-listener design is
+  authoritative). Depends on G1 (merged) for the approval-card enablement path.
+- **C5** (lane C) — adapter floor (signal/whatsapp/mattermost, three disjoint
+  sub-cards) + shared markdown renderer in `channels/core`, absorbing C2's
+  `fence.rs`. P2, large; deliver a smaller whole thing if needed (e.g. the
+  three floors first, renderer second). Ready now (C4a/C4b merged) but held for
+  batch size. Also owes the two stale-doc-comment fixes flagged in PR #30
+  (`host-delivery/src/service.rs:1707`, `:2378`). Keep `EDIT_CAPABLE_CHANNELS`
+  (`capabilities.rs`) in sync in the SAME PR when an adapter gains
+  `edit_message`.
+- **R6** (lane R) — progressive final answers (edit-based growth of long final
+  text on >30s turns, rich adapters, default ON). Ready now (R5 merged, H1
+  machinery shipped); held only to keep lane R serialized behind the R5 merge.
+  Reuse H1's `emit_task_hud` anchor per the R6 "Verified state" block.
+
+**Wave C — the tail, after Wave B:** **R7** (lane R, after R6 — subagent
+fan-out middle tier), **V5** (lane V, after V2 — public tunnel module, security
+review required before merge), then **M1** (lane M, ABSOLUTE LAST — sweep every
+merged PR's "Metrics wishes" incl. #40-#45 and all Wave A/B/C PRs). After Wave
+C, the only program-acceptance item left is the live telegram smoke test.
 
 Two housekeeping traps that bit this session, worth checking early in any
 fresh session: (1) local `main` can silently drift behind `origin/main` by
@@ -85,19 +170,28 @@ main..<branch> --oneline` yourself first.
 | P1 | Merged | #26 |
 | R2 | Merged | #31 |
 | R3 | **Merged.** Verification gate is live on `main`. Live hand-verify smoke test was NOT run before merge (PR body left it unchecked) — still owed, see program-level acceptance. | #32 |
-| R4 | **PR open.** Compaction that survives long builds: calibrated ~3.5-chars/token whitespace-collapsed estimator (no `tiktoken-rs` dep — rationale + error bounds in `compaction.rs`), profile-conditional soft target (Coding/Full 80K, chat 40K, still config-clamped), and a verbatim-pinned project-facts header sourced from R3 verify-gate state + the todo list (survives 3+ compactions losslessly). `pair_safe_pivot` unchanged. Full workspace gate green. | #39 |
+| R4 | **Merged.** Compaction that survives long builds: calibrated ~3.5-chars/token whitespace-collapsed estimator (no `tiktoken-rs` dep — rationale + error bounds in `compaction.rs`), profile-conditional soft target (Coding/Full 80K, chat 40K, still config-clamped), and a verbatim-pinned project-facts header sourced from R3 verify-gate state + the todo list (survives 3+ compactions losslessly). `pair_safe_pivot` unchanged. Full workspace gate green. | #39 |
 | C3 | **Merged.** Recovered an earlier session's uncommitted WIP (checkpointed as `c97a620`), verified it carefully rather than trusting it, fixed two clippy issues (`route_impl`'s `#[allow(clippy::unused_async)]`, an underscore-prefixed test field that was actually in use), added the missing e2e replay fixture (`fixtures/telegram/inbound-document-attachment/`) plus a file-readability test, and confirmed the read-only touch on `container_manager/spawn.rs` needed no changes. Full workspace `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo test --workspace --no-fail-fast` all green (6,977 passed, 0 failed). Unblocks C4a/C4b. | #33 |
-| C4b | **PR open.** Discord inbound files: `DiscordRest::download_cdn_file` (auth-header-free GET — Discord CDN URLs are public, unlike Slack's `url_private`), `events::message_create_to_inbound_downloaded` fetches the first attachment, enforces the new `max_attachment_bytes` config (default 25 MiB), stages via the C3 `stage_inbound_file` (`staged_path` only, never `path`), and inlines small images as `data_base64` for vision parity. `too_large` / `download_failed` system-row taxonomy mirrors Telegram; never a silent drop. New fixture `fixtures/discord/inbound-file-attachment/` (+ 2 replay tests) mirrors the C3 telegram fixture. `channels/core` and the router consumed unchanged. Full workspace gate green (6,999 passed, 0 failed). | #38 |
+| C4b | **Merged.** Discord inbound files: `DiscordRest::download_cdn_file` (auth-header-free GET — Discord CDN URLs are public, unlike Slack's `url_private`), `events::message_create_to_inbound_downloaded` fetches the first attachment, enforces the new `max_attachment_bytes` config (default 25 MiB), stages via the C3 `stage_inbound_file` (`staged_path` only, never `path`), and inlines small images as `data_base64` for vision parity. `too_large` / `download_failed` system-row taxonomy mirrors Telegram; never a silent drop. New fixture `fixtures/discord/inbound-file-attachment/` (+ 2 replay tests) mirrors the C3 telegram fixture. `channels/core` and the router consumed unchanged. Full workspace gate green (6,999 passed, 0 failed). | #38 |
 | X1 | **Merged.** `fixtures/cli/prototype-golden/` — scripted mock-provider e2e for the golden path, real end-to-end pipeline exercise. Two pieces explicitly NOT covered, each root-caused precisely in the PR/fixture README: the R3 verify-gate/todo mechanic (`/data` is hardcoded in `verify_gate.rs`/`todo.rs` with only a `#[cfg(test)]`-gated override invisible to the `copperclaw-host` integration-test binary, and `/data` is a real unwritable root-owned path on any host running the suite — the minimal un-gating fix was attempted and reverted after security review correctly flagged it as a capability weakening needing explicit sign-off) and the H1 live Task HUD (`cli` isn't edit-capable, so `Behavior` is always `StatusRows`, which needs 60s real wall-clock to fire once and has no finalize arm at all). Follow-up worth a dedicated card: an unconditional (non-`#[cfg(test)]`) env-var override for the `/data` root, mirroring the shell tool's `COPPERCLAW_SHELL_STATE_FILE` precedent, would let a future fixture close both gaps. Full workspace check suite green (6,964 passed, 0 failed). | #34 |
 | P2 | **Merged.** Skills refresh — five coding skills (`coding-task`, `testing`, `debug`, `preview`, `send-file`) now teach the R3 verify contract (`.copperclaw/verify` + completion gate, quoting R3's actual refusal wording), T1's `shell tail_bytes` + paged `read_file`, and the artifact-delivery close. Copy only, no `crates/**` changes. P3's fuller `send_card` ritual is noted as forthcoming (P3 unimplemented), not taught. Skills coverage validation 9/9 green in isolation; full gate green. | #36 |
-| C4a | **PR open.** Slack inbound files: `SlackApi::download_file` fetches `url_private` with the bot token (reused `SlackApi`'s existing `.bearer_auth`); events router downloads a message's first file, enforces a new `SlackConfig.max_attachment_bytes` (default 20 MB), stages per the frozen C3 contract (`staged_path`, never `path`), inlines `data_base64` for small images, and downgrades size/transport failures to `too_large` / `download_failed` system rows (never a silent drop). Adapter unit tests (mock Slack server) + new e2e fixture `fixtures/slack/inbound-file-attachment/`. Full workspace gate green (6,991 passed, 0 failed). Lane-C/Slack-only; channels/core, router, telegram, discord untouched. | #37 |
-| All others | Not started | — |
+| C4a | **Merged.** Slack inbound files: `SlackApi::download_file` fetches `url_private` with the bot token (reused `SlackApi`'s existing `.bearer_auth`); events router downloads a message's first file, enforces a new `SlackConfig.max_attachment_bytes` (default 20 MB), stages per the frozen C3 contract (`staged_path`, never `path`), inlines `data_base64` for small images, and downgrades size/transport failures to `too_large` / `download_failed` system rows (never a silent drop). Adapter unit tests (mock Slack server) + new e2e fixture `fixtures/slack/inbound-file-attachment/`. Full workspace gate green (6,991 passed, 0 failed). Lane-C/Slack-only; channels/core, router, telegram, discord untouched. | #37 |
+| T2 | **Merged.** `COPPERCLAW_DATA_ROOT` unconditional override (precedence: test-override > env > `/data`); todo store resolves under the shared root; `artifact_path.rs` test race fixed with a `Mutex` guard. Env-branch tested via a pure `resolve_data_root` helper (workspace `forbid(unsafe_code)` blocks `set_var`). Security threat-model sign-off in PR body. Gate green (7025 passed, 0 failed). Unblocks E1, X2. | #40 |
+| V1 | **Merged.** WebSocket pass-through in the preview proxy: axum `WebSocketUpgrade` + `tokio-tungstenite` bridge to `container_ip:port`; cookie gate runs ahead of upgrade (403 without cookie); idle-reaper bumped on frames + a 60s keepalive tick so live tabs aren't reaped. `skills/preview/SKILL.md` polling caveat removed. HTTP paths byte-identical. Gate green (0 failures). | #41 |
+| V3 | **Merged.** Live browser driver: hand-rolled minimal CDP client over `tokio-tungstenite` (chromiumoxide/headless_chrome rejected — they launch a local process, we connect to a child *container*), behind a mockable `CdpTransport` seam; the deferred live spawn path is wired; `browser_render.handle()` drives it. Safety preserved (SSRF preflight, deny-default egress, `COPPERCLAW_BROWSER_ENABLED` opt-in, output stays `Untrusted`). Live path compiles+wired but not CI-exercised (needs a real Docker + Chromium image). Screenshot temp-dir placement (`COPPERCLAW_BROWSER_OUTPUT_DIR`) is refined by V4. Gate green (7037 passed, 0 failed). | #42 |
+| E2 | **Merged.** Per-group `image_profile = minimal\|prototyping` (default minimal). Prototyping bakes `sqlite3`/`chromium`/`zip` (apt) + global `vite`/`create-vite` (npm). `ImageProfile` lives in `copperclaw-types` (shared by db + container-rt). Migration **027** (`027_container_config_image_profile.sql`). Fingerprint fold is *conditional* (only non-minimal contributes hash bytes) so existing minimal groups aren't force-rebuilt on upgrade. Gate green (7047 passed, 0 failed). | #43 |
+| R5 | **Merged.** Hot in-session provider failover: host resolves the ordered healthy chain at spawn → `runner.json` `failover_chain` → runner walks `[primary, ...chain]` in `provider_call.rs`'s exhaustion branch, retries the *current* call, HUD notes "switched to <provider>", per-attempt `usage_report` keeps host-side health authoritative. Security boundary: chain limited to entries the container could already reach (no new credentials shipped in); a distinct-key second Anthropic account is excluded + test-pinned. Empty chain = byte-identical pre-R5. Gate green (7034 passed, 0 failed). | #44 |
+| G1 | **Merged.** In-chat approvals: approval card emits `approve:<id>`/`deny:<id>` buttons; router interceptor in `route_one` (between sender-scope and mention gate, via the `hooks.rs` pattern — no circular dep) resolves the tapping identity against the Owner/Admin **roles** infra (global or agent-group-scoped), routes through the CLI DB decision path (`decided_by` threaded), persists `pending_approvals.platform_message_id` at delivery and edits the card to "Approved/Denied by <name>". Non-approver taps refused + audited. Race-safe (first resolution wins). Explicit refusal arms added for `one_cli`/`credentialed_external_action`. Slack needed no adapter edit (`build_card_blocks` already emits `actions`). Two fixtures (telegram callback, slack block_action). Own-branch gate: 7013 passed, 9 failed = the known `copperclaw-skills` coverage flake (9/9 pass in isolation). Post-merge fixup `0f26247` rustfmt-wrapped several >100-char lines G1 shipped unformatted (incl. new `approval_intercept.rs`) — the PR's fmt-clean claim was inaccurate; caught by the integrated-gate re-run. | #45 |
+| X2 | **Merged.** Golden-fixture gaps closed: new `fixtures/cli/prototype-verify-gate/` genuinely exercises the R3 refuse→fix→pass loop (real gate refusing on cycle counts, then allowing) via T2's `COPPERCLAW_DATA_ROOT` — set through a self-re-exec child (`forbid(unsafe_code)` blocks `set_var`), no product-code change; and `prototype-golden` extended to assert P3's ritual `send_card` + `send_file` screenshot shape. HUD status-row leg stays uncovered (cli not edit-capable; 60s wall-clock) and documented. Gate 7098/0, fmt clean. | #48 |
+| V4 | **Merged.** Screenshot-the-preview: renders **host-side container-direct** (`http://<container_ip>:<port>`, NOT the cookie-gated proxy URL — a cookieless render would 403), leaving `preview.rs` untouched (reads `PreviewEntry.container_ip/port`). PNG lands under `<data_root>/screenshots` (`COPPERCLAW_DATA_ROOT`-aware) for in-container `send_file`; new `COPPERCLAW_BROWSER_PREVIEW_ALLOW` injects the bridge IP:port into the child's deny-default egress allow-list; unset `COPPERCLAW_BROWSER_ENABLED` → ritual omits screenshot, never errors. No replay fixture (live path needs Docker/Chromium, same as V3). Gate 7105/0, fmt clean. | #47 |
+| P3 | **Merged.** The "prototype ready" ritual: one closing bullet in the static `CODING_PREAMBLE` (Coding/Full only, cache-prefix unchanged, Messaging/Minimal +0 bytes) mandating one `send_card` (title + one-liner + "What to try" + Open-preview URL button + Download `value` button answered next turn with a `git archive` zip via `send_file` + `artifact_path` footer + screenshot alongside via `send_file`). `skills/coding-task` hedge dropped; `skills/send-card` ritual example added. Copy + skills + one prompt line, no new tools. Skills lint 86/0 isolated; gate 7096/0, fmt clean. | #46 |
+| E1 | **Merged.** `install_packages` gains `scope: session` (default `image`): runs the ecosystem-local install now (`pip` into `/data/.venv`, `npm --prefix /data/.npm-global -g`) AND records the package into pending image config to bake next spawn; ack text states pending-approval vs done; NEW deny-default-egress-failure detection appends the `cclaw set-egress-allow` hint. Design correction: the "works now" install runs **in-container** (the tool surface's process), not host-side — `ContainerRuntime` has no host→container exec primitive. Real pip/npm e2e is an `#[ignore]`d Docker test; skill teaching deferred (lane P owned skills this wave). Gate 7110/0, fmt clean. | #49 |
+| All others (R6-R7, V2, V5, C5, M1) | Not started | — |
 
-### R3 status (read this first if you're picking up R3)
+### R3 history (merged as #32 — skip unless you're touching the gate)
 
-**Where things stand:** `git checkout m18/r3-verification-gate` (pushed
-through `b53ce57`; `e7c65fa` — part 2/2 — is committed locally on top and
-needs `git push`). The gate itself is fully implemented and tested:
+R3 is fully merged. This section is preserved as the implementation map
+for anyone touching the verify gate later. The gate as merged:
 
 - `crates/copperclaw-mcp/src/tools/verify_gate.rs` (new): marker-file
   dirty-tracking primitives (`project_root_of`, `mark_dirty`, `is_dirty`,
@@ -151,21 +245,10 @@ needs `git push`). The gate itself is fully implemented and tested:
   stretch goal in the card — "don't let it block merging") and the
   program's live hand-verify smoke test.
 
-**Next session, in order:**
-1. `git push` the `m18/r3-verification-gate` branch (currently 1 commit
-   ahead of origin locally).
-2. Open the PR.
-3. Hand-verify per "Acceptance to hand-verify once built" below (needs
-   either a scripted mock-provider e2e or a manual run against a real
-   session per the program-level acceptance smoke test) — not done this
-   session, flag in the PR description as an open item if skipped.
-4. Once merged: next free migration is unchanged at **027** (026 stays
-   taken by this card). Unblocks C4a+C4b (after C3, itself still
-   unstarted), X1, P2 — see "Wave summary" below.
-
-The original part-1 design note is preserved below for anyone re-deriving
-or auditing the approach; the "Where things stand" bullets above are now
-authoritative for what's actually in the tree.
+The original two-part design note is preserved below for anyone
+re-deriving or auditing the approach; the bullets above are authoritative
+for what's in the tree. The live hand-verify smoke test the PR shipped
+without is still owed (see "Program-level acceptance").
 
 **Done (part 1/2):**
 - Migration `026_container_config_verify_gate.sql`: `container_configs`
@@ -335,22 +418,6 @@ order:**
    failing verify command → refused with stderr attached; runs a passing
    verify → allowed. `verify_gate=off` → today's behaviour, byte-stable.
 
-**Correction (2026-07-15, later session):** the prior session's claim that
-R2 and C3 had agents "in flight" on `m18/r2-mid-turn-steering` /
-`m18/c3-inbound-file-contract` was stale — both branches, on inspection,
-contained zero card-specific commits (only merge-catchups of already-merged
-cards). Whatever ran on them didn't land any work. R2 was re-implemented
-from scratch this session on a fresh branch (old branch left alone,
-untouched, in case it holds context worth recovering later). C3 is still
-genuinely unstarted.
-
-R3 is code-complete on its branch and just needs a PR + merge (see "R3
-status" above); R4 (next in lane R, after R3) can start once R3 merges.
-Once R3 merges: C4a + C4b (after C3 merges — C3 itself is still fully open
-and unstarted), X1 (after R3), P2 (after R3). Wave 3's V1, V3, and G1 have
-no unmerged prerequisites and can start any time lanes are free — a
-reasonable pick if R3's PR is out for review and you'd rather not wait on it.
-
 R2 shipped without its "e2e fixture pairing with R1's" — the shared replay
 harness drives one `inbound/NNN-*.json` step fully (including its whole
 multi-turn tool loop) before the next step is injected, so it structurally
@@ -380,9 +447,10 @@ global-static test override (`HOST_PATH_FILE_TEST_OVERRIDE`) with no
 pre-existing latent race, not something R3 introduced, just more likely to
 surface under full-workspace parallel load. Cheap fix for whoever's next
 in that file: add a `static LOCK: OnceLock<Mutex<()>>` guard around both
-tests, same shape as `todo_env_lock()`.
+tests, same shape as `todo_env_lock()`. Confirmed still unfixed on
+2026-07-16 — T2 now owns this rider.
 
-### Facts later cards need (learned during Wave 1 — trust these over the audit anchors)
+### Facts later cards need (learned during Waves 1-2 — trust these over the audit anchors)
 
 - **R2:** the control-row contract is documented in
   `crates/copperclaw-host-router/src/commands.rs` (new in R1). `/stop` writes
@@ -394,7 +462,8 @@ tests, same shape as `todo_env_lock()`.
   hook).
 - **R3:** migration 026 is now TAKEN (`container_configs.check_command` /
   `.verify_gate`, added by R3 part 1/2 — see the "R3 status" section
-  above). Next free migration is **027**.
+  above). Migration 027 is now TAKEN by E2
+  (`container_config_image_profile`); next free migration is **028**.
 - **R3 (from R2):** the mid-turn steering check lives in
   `drive_turn.rs`'s `check_mid_turn_steering`, called right after
   `hud.on_batch_end` on every batch iteration. In the end R3 did NOT need
@@ -423,8 +492,9 @@ tests, same shape as `todo_env_lock()`.
 - **Replay fixtures** are registered explicitly in
   `crates/copperclaw-host/tests/replay.rs` — a fixture dir without a
   registration there is dead data. Replies >30 lines bypass the splitter via
-  the runner's collapsible expander (`EXPANDER_LINE_THRESHOLD`,
-  `copperclaw-runner/src/tools.rs:1482`) — keep splitter fixtures under it.
+  the runner's collapsible expander (`EXPANDER_LINE_THRESHOLD` = 30,
+  `copperclaw-runner/src/tools.rs:1198` — anchor drifted from :1482 as the
+  file grew) — keep splitter fixtures under it.
 - **T1 correction:** `read_file` already had `offset`/`limit`/`mode` on main;
   T1 added `total_lines` (lines mode only), `shell tail_bytes` (clamped to
   the 32 KiB cap), and truncation hints. Card prose elsewhere assuming "no
@@ -433,10 +503,11 @@ tests, same shape as `todo_env_lock()`.
   `copperclaw-host/src/container_manager/runner_config.rs:78` and
   `copperclaw-db/src/tables/container_configs.rs:155` — clean up
   opportunistically from the owning lanes.
-- **Test baseline** is now ~6,860+ (CLAUDE.md's ~6,660 is stale; the suite
-  grew with each card). Gate = zero failures, not a fixed count.
+- **Test baseline** is now ~7,000 (C4b's gate run: 6,999 passed; CLAUDE.md's
+  ~6,660 is stale). Gate = zero failures, not a fixed count.
 - **Process:** each merged PR's description records "Metrics wishes (for
-  M1)" — M1 must sweep PR #24-#30 descriptions (and later ones) when it runs.
+  M1)". PRs #24-#39 have been swept into the M1 card below (2026-07-16);
+  M1 must additionally sweep any PR merged after that date.
 
 ## Scope / conflict map (lanes)
 
@@ -446,13 +517,13 @@ within a lane are **sequential**; lanes run in **parallel**.
 | Lane | Owns | Cards |
 |---|---|---|
 | **R — Runner core** | `crates/copperclaw-runner/src/**` (except `policy.rs` where noted) | R0, H1, R2, R3, R4, R5, R6, R7 |
-| **T — Tool surface** | `crates/copperclaw-mcp/src/tools/**` | T1, E1 |
+| **T — Tool surface** | `crates/copperclaw-mcp/src/tools/**` | T1, T2, E1 |
 | **P — Prompt + skills** | `crates/copperclaw-host/src/container_manager/prompt.rs`, `skills/**` | P1, P2, P3 |
 | **C — Channels + delivery** | `crates/copperclaw-channels/**`, `crates/copperclaw-host-delivery/**`, `crates/copperclaw-host-router/**` | C1, C2, C3, C4a, C4b, R1(router), C5 |
 | **V — Preview + browser** | `crates/copperclaw-host/src/preview.rs`, `crates/copperclaw-modules/src/preview.rs`, `crates/copperclaw-browser/**` | V1, V2, V3, V4, V5 |
 | **G — Approvals** | `crates/copperclaw-modules/src/approvals.rs`, `crates/copperclaw-host/src/handlers/**` (approvals), approval routing glue | G1 |
 | **E — Environment** | `crates/copperclaw-setup/src/steps/image.rs`, `crates/copperclaw-container-rt/**` | E2 |
-| **X — Program verification** | `fixtures/**`, new e2e harness files only | X1 |
+| **X — Program verification** | `fixtures/**`, new e2e harness files only | X1, X2 |
 | **M — Metrics rider** | `crates/copperclaw-metrics` | M1 (single card, last) |
 
 Cross-lane touches are declared on the card ("+ read-only touch" or "one
@@ -682,6 +753,31 @@ not die at minute 18 because one gateway hiccuped. Acceptance/tests per
 M17-A4, plus: the H1 HUD notes "switched provider" so the user isn't confused
 by a style change.
 
+**Verified state (2026-07-16) — the card needs a plumbing design the
+original text glossed over.** `FallbackChain` + health live HOST-side and
+are hydrated from the central DB per host operation
+(`copperclaw-providers/src/failover.rs:94` chain, `:112` `HealthStatus`,
+`:374` `HealthMap`; `select` `:477`, `record_failure` `:527`,
+`record_success` `:550`; host hydrate/persist in
+`container_manager/provider_failover.rs:86`/`:111`). The in-container
+runner has NO handle to the chain: mid-turn it only retries the SAME
+provider (two retry layers, `provider_call.rs:105` and `:176`,
+`MAX_PROVIDER_ATTEMPTS`), then `TurnOutcome::Failed`
+(`provider_call.rs:153`, stream path `:302-318`) → apology
+(`run/mod.rs:1319`). Failover today happens only *between* turns via the
+host's `fold_recent_turns` error classification. So R5's first decision
+is the plumbing: recommended shape — the host resolves the ordered
+healthy chain at spawn and writes it into `runner.json`; the runner walks
+it in `provider_call.rs`'s exhaustion branch (`:130-156`) and reports
+which entry served the turn back through `agent_turns` so host-side
+health stays authoritative. **Security flag for the PR:** shipping
+multiple providers' credentials into the container enlarges the
+in-container secret surface — prefer limiting the in-container chain to
+entries the group could already reach (same credential or
+gateway-brokered), and say so in the PR. `TaskHud::add_note()` is already
+shipped and tested awaiting exactly this caller (`hud.rs:188`, doc
+`:181-187`). Effort re-rated M → L if the runner.json plumbing is chosen.
+
 ### C3. Inbound-file contract: session-local materialization — P0, M — lane C (channels/core + router; + read-only touch on `container_manager/spawn.rs` to confirm mounts)
 
 **Problem.** Telegram downloads attachments to the **channel's**
@@ -743,6 +839,43 @@ Byte-stable expected output committed under `fixtures/cli/prototype-golden/`.
 Every later card that changes this path updates the fixture **in its own PR**
 — the fixture is the regression tripwire for the whole program.
 
+### T2 (new, follow-up from X1). Unconditional data-root override + mcp test-race fix — P1, S — lane T, before E1
+
+**Problem.** The verify-gate/todo data root is hardcoded `/data` with a
+`#[cfg(test)]`-only override (`verify_gate.rs:32` + `:75-78`; `todo.rs:43`
++ `:75-78` — verified 2026-07-16), so the R3 gate is invisible to the
+`copperclaw-host` integration-test binary and the X1 golden fixture ships
+with the verify-gate leg explicitly uncovered. A previous minimal
+un-gating attempt was reverted after security review correctly flagged it
+as a capability weakening needing explicit sign-off — that sign-off is
+this card's gate, not an afterthought.
+
+**Change.** Mirror the `COPPERCLAW_SHELL_STATE_FILE` precedent
+(`computer_use.rs:69-77`, resolver `shell_state_path`): one unconditional
+env var (suggest `COPPERCLAW_DATA_ROOT`) consulted by
+`verify_gate::data_root()` and `todo.rs`'s path resolution. The PR must
+document the threat model (the runner process env is host-controlled at
+spawn; an in-container agent's `shell` calls cannot alter it) and record
+explicit security sign-off. Rider: serialize `artifact_path.rs`'s two
+tests with a `Mutex` guard (same shape as `todo_env_lock()`) — a
+confirmed latent race, still unfixed as of 2026-07-16.
+
+**Acceptance.** A host-side integration test can point the gate at a
+tempdir and exercise refusal/pass shapes; production behavior with the
+var unset is byte-identical; security sign-off recorded in the PR body.
+
+### X2 (new). Close the golden-fixture gaps — P1, S — lane X, after T2
+
+Extend `fixtures/cli/prototype-golden/` (registered at
+`crates/copperclaw-host/tests/replay.rs:569` — registration is explicit,
+a fixture dir alone is dead data) to cover the two legs X1 shipped
+without: the verify-gate refuse → fix → pass loop (testable once T2's
+override exists) and, if the harness gains a clock seam, one HUD
+status-row emission (the `cli` channel is not edit-capable, so
+`Behavior` is always `StatusRows` with a 60s real-wall-clock first fire —
+that seam is the hard part; do not block the verify-gate leg on it).
+Update the fixture README's "not covered" section to match reality.
+
 ---
 
 ## Wave 3 — "the demo moment"
@@ -765,6 +898,21 @@ edit with lane P (single-file touch, sequence after P2).
 listener), client connects through the proxy with the cookie, echoes
 round-trip; without cookie → 403 before upgrade. HTTP paths byte-identical.
 
+**Verified state (2026-07-16).** All anchors confirmed in
+`crates/copperclaw-host/src/preview.rs`: upgrade detection `is_upgrade()`
+`:582-588`; the 501 refusal in `proxy_handler` `:634-640` (fires after
+the cookie gate, so only authenticated requests reach it); axum **0.7**
+`Router::new().fallback(proxy_handler)` served at `:449-459`, upstream
+via `reqwest` with redirects disabled `:444-447`. Cookie gate: cookie
+`cclaw_preview` (`:75`), mint path `/__preview/<token>` sets
+HttpOnly/SameSite=Lax and 302s (`:611-625`), constant-time compare
+(`:659-669`). Gotcha the card text missed: `last_activity` is bumped ONLY
+on successfully proxied requests (`:642-643`) — the WS bridge must bump
+it on frame traffic (both directions) or an active socket gets reaped at
+the 30-min idle timeout (`PREVIEW_IDLE_TIMEOUT` `:71`, reaper `:156-191`).
+`skills/preview/SKILL.md:66-69` still teaches "prefer polling" (P2 left
+it intact) — remove it in this card's skill touch.
+
 ### V2. One-tap preview enablement + auto re-expose — P1, S — lane V, after G1
 
 **Problem.** Preview is off per group until the operator runs a `cclaw`
@@ -780,14 +928,60 @@ re-mints (re-exposes the same session:port if the container is still up)
 instead of 403, once per token.
 
 **Acceptance.** e2e: disabled group → agent expose attempt → approval card →
-approve → retry succeeds. Expired-link unit: one re-mint, second reuse 403s.
+approve → retry succeeds. Expired-link unit: one recovery per token;
+second reuse gets the terminal "ask the agent to re-expose" page.
+
+**Verified state (2026-07-16) — part 2 of the card as originally written
+cannot work; amended.** There is no 30-minute token TTL: the "30 min" is
+the *idle reaper* (`preview.rs:71`, `:156-191`), and reaping cancels the
+whole per-preview axum listener (`entry.cancel.cancel()`, `preview.rs:240`)
+— the host port closes, a stale link gets connection-refused (never a
+403), and a "tokened GET re-mints" handler has no listener to run on.
+Other facts: `PreviewError::Disabled` arises in `PreviewManager::expose`
+(`preview.rs:379-383`) when the group's `container_configs` row is absent
+or `preview_enabled=false`; its Display (`modules/preview.rs:77-82`)
+already carries the copy-pasteable cclaw fix commands — reuse that text
+on the approval card. `preview_enabled` flips via `set_preview_enabled`
+(`container_configs.rs:880-900`); the cclaw path is `EDITABLE_SCALAR_FIELDS`
+(`cclaw/src/lib.rs:1958`). Live previews already re-expose idempotently
+(`preview.rs:390-400`).
+
+**Amended change for part 2 (expired links).** On idle-reap, don't drop
+the listener: tear down only the upstream proxying (freeing the
+container-side resources the reaper exists to reclaim) and leave the
+bound port serving a static "preview expired" tombstone page. A GET of
+the original `/__preview/<token>` against the tombstone re-exposes the
+same session:port **once per token** iff the session container is still
+up (same audit row as a fresh expose); otherwise the page says to ask
+the agent to re-expose. Full teardown (port released) still happens on
+session stop/close/shutdown, exactly as today. Cookie gate and
+constant-time comparison unchanged.
 
 ### V3 (= M17-B2). Live browser driver — P0, L — lane V (browser crate), parallel with V1
 
-As M17-B2, unchanged: implement the concrete Chromium/CDP `BrowserDriver`
-behind the existing trait, SSRF preflight and sandbox spec already in place
-(`copperclaw-browser/src/lib.rs:21-26`, `spec.rs:142-343`). This is the
-screenshot supply for P3. Acceptance/tests per M17-B2.
+As M17-B2, unchanged in intent: implement the concrete Chromium/CDP
+`BrowserDriver` behind the existing trait. This is the screenshot supply
+for P3. Acceptance/tests per M17-B2.
+
+**Verified state (2026-07-16) — the M17 anchors were wrong; corrected.**
+The trait is `BrowserDriver` at `copperclaw-browser/src/driver.rs:57-66`;
+only a `#[cfg(test)]` `MockDriver` exists (`driver.rs:123-146`) — no CDP
+code anywhere in the crate. The SSRF preflight orchestration is
+`render()` at `driver.rs:74-113` (target preflight `:82-85`,
+per-redirect re-guard `:97-99`) — NOT `lib.rs:21-26`, which is the doc
+comment describing the deferred runtime path. There is no `spec.rs` in
+this crate (the plan conflated `copperclaw-container-rt`'s): the child
+sandbox spec is `build_browser_container_spec()` at
+`container.rs:126-156` — deny-default egress `:143-144`, forbidden-env
+allow-list `:35-47`, unprivileged user 65534, `copperclaw.role=browser`
+orphan-sweep labels `:136-137`. The MCP tool is named **`browser_render`**
+(`copperclaw-mcp/src/tools/browser_render.rs`), gated by
+`COPPERCLAW_BROWSER_ENABLED` (`:54`, `:125-135`, `:200-203`); today it
+runs every safety step then errors "driver not provisioned" (`:290-295`).
+V3 therefore has three concrete legs: (a) the CDP driver impl behind the
+trait, (b) the privileged spawn path that actually runs the built spec
+(explicitly deferred at `container.rs:23-25` — no `runtime.spawn` call
+exists), (c) replace `handle()`'s terminal error with the live render.
 
 ### V4. Screenshot-the-preview path — P1, S — lane V, after V1 + V3
 
@@ -799,10 +993,24 @@ Resulting PNG lands under `/data`, agent relays via `send_file`. If
 `COPPERCLAW_BROWSER_ENABLED` is unset, the P3 ritual degrades to no
 screenshot — never an error.
 
-**Acceptance.** e2e with mock driver: expose → render → PNG exists → ritual
-card carries it. Deny-default egress fixture proves the allow-list injection.
+**Acceptance.** e2e with mock driver: expose → render → PNG exists →
+ritual close carries it (via `send_file`, see verified note). Deny-default
+egress fixture proves the allow-list injection.
 
-### G1. In-chat approvals — P0, M — lane G
+**Verified state (2026-07-16).** `egress_allow_for()`
+(`browser_render.rs:180-188`) currently allow-lists only the navigation
+target's host:port (one entry, port defaulting to 443); the injection
+point for the preview host:port is the `egress_allow` vec built at
+`browser_render.rs:231-237` and consumed at `container.rs:144`. The
+preview's host port lives on `PreviewEntry.host_port` (`preview.rs:113`).
+One correction to the card prose: `send_card` cannot attach a local
+file — its image field is `image_url` and must be http(s)
+(`interactive.rs:210`) — so the screenshot PNG reaches the user via
+`send_file`, sent alongside the P3 ritual card (P3's text is amended to
+match). "Screenshot in the card" would require serving the PNG over the
+preview URL; don't build that for v1.
+
+### G1. In-chat approvals — P0, L (re-rated from M after audit) — lane G
 
 **Problem.** Approval cards are informational; resolution is CLI-only
 (`cclaw approvals approve`), so a phone-only operator cannot admit a new
@@ -825,6 +1033,50 @@ ephemeral/short "not authorized" reply and the card stays live. Every
 approver tap resolves + card edits; stranger tap refused + audited; CLI path
 still works and races safely (first resolution wins, second is a no-op).
 
+**Verified state (2026-07-16) — the "plumbing exists on both ends" claim
+is half true; the card grew, hence the re-rate.** What exists: button-tap
+*ingestion* is fully plumbed — telegram `callback_query_to_event`
+(`ingress/mod.rs:111-175`) and slack `parse_block_actions`
+(`events/router.rs:263-380`) both synthesize `Chat` rows carrying
+`content.callback`, and the mention gate whitelists them
+(`mention.rs:157-163`, `is_interaction_payload`). What does NOT exist,
+each a required leg of this card:
+
+- **The approval card is buttonless today.** `ApprovalCardHandler`
+  (`approvals.rs:373-424`, registered as delivery action `"approval_card"`
+  at `:488`) emits `{card:{type:"approval",approval_id,title}}` — no
+  buttons, no callback payloads. G1 adds `approve:<id>` / `deny:<id>`
+  buttons here. On Slack the card path additionally doesn't emit
+  `actions` blocks at all yet (`slack/adapter.rs:745-747`) — G1 adds
+  that (ADAPTER-slack file: coordinate the single-file touch with lane C).
+- **No approver identity.** CLI resolutions hardcode `decided_by="host"`
+  (`handlers/approvals.rs:146-147`), and the "approver resolution the
+  notifier does" is really just "post to the agent group's primary
+  messaging group" (`boot.rs:63-156`) — no operator/approver set exists.
+  G1 must define the check (recommended: reuse the Owner/Admin roles
+  infra in `handlers/roles.rs`; fall back to registered-sender-in-
+  primary-group only if roles prove too coarse — decide and document)
+  and thread the tapping identity into `record_decision`.
+- **No card-edit round-trip.** `edit_message` edits TEXT only and is
+  keyed by outbound seq (`host-delivery/src/service.rs:1278-1310`); the
+  approvals module never learns its card's seq or platform id. The
+  `pending_approvals.platform_message_id` column already exists
+  (surfaced at `handlers/approvals.rs:582`) but nothing writes it — G1
+  persists the card's message id there at delivery time, and the
+  "Approved by <name>" update is a text edit (native buttons vanish on
+  edit on most platforms — acceptable: the disabled state IS the text).
+- **Two decision logs exist** — the in-memory `ApprovalsModule`
+  (`approvals.rs:291-349`) and the DB `pending_approvals` the CLI writes.
+  Route the interceptor through the same DB path as the CLI handler
+  (`handlers/approvals.rs:92-154`) so they can't diverge. While in that
+  dispatcher: it switches on action *strings* (`:131-143`) and has no
+  arms for `one_cli` / `credentialed_external_action` — add explicit
+  refusals at minimum (V5 needs the latter arm for real).
+- **Interceptor insertion point confirmed:** `host-router/src/route.rs`,
+  between the sender-scope gate (ends `:422`) and the mention gate
+  (`:424`), registered via the `hooks.rs` gate pattern so the modules
+  crate supplies it without a circular dep.
+
 ### P3. The "prototype ready" ritual — P0, S — lane P, after P2; graceful w.r.t. V-lane timing
 
 **Problem.** Even with preview + files + cards all shipped, nothing makes the
@@ -833,15 +1085,34 @@ the model felt like.
 
 **Change.** Prompt (P1 block) + `skills/coding-task` make the final step of
 every build todo list mandatory and concrete — one `send_card`:
-title + one-liner, "What to try" bullets, screenshot attached (when V4
-available), buttons: **Open preview** (URL), **Download** (triggers
+title + one-liner, "What to try" bullets, screenshot sent alongside via
+`send_file` (when V4 available — see verified note: cards cannot attach
+local files), buttons: **Open preview** (URL), **Download** (triggers
 `send_file` zip of the project, sans `node_modules`/`.git` — document the
 `git archive` idiom), and the `artifact_path` host path in the footer for
 desk users. Card degrades by capability: no preview → no button, never a
 broken link. This card is copy + skill + one prompt line — no new tools.
 
-**Acceptance.** X1 golden fixture asserts the ritual card shape. Skill lint
-green.
+**Acceptance.** X1 golden fixture asserts the ritual card shape (new
+`#[tokio::test]` registration in `tests/replay.rs` if a new fixture is
+added — registration is explicit). Skill lint green.
+
+**Verified state (2026-07-16).** Everything needed exists: `send_card`
+(`copperclaw-mcp/src/tools/interactive.rs:107`, schema `:138-217` —
+title/body/fields/buttons, each button exactly one of `value` (≤64 bytes)
+or `url`; validated via `Card::validate()`). Its image field is
+`image_url` and must be http(s) (`interactive.rs:210`) — a local PNG
+cannot ride the card, hence the `send_file`-alongside wording above.
+`artifact_path` returns JSON `{container_path, host_path, note}`
+(`artifact_path.rs:99-103`). `skills/coding-task/SKILL.md:129-134`
+already teaches the mandatory tool-based close and names this card:
+"(A richer close card is forthcoming — P3 ...)" — drop that hedge and
+teach the `send_card` ritual in its place. `skills/send-card/SKILL.md`
+(pre-M18) documents the schema, per-channel rendering, and degradation
+(text fallback via `Card::to_text_fallback`, `card.rs:349-410` — a URL
+button degrades to a `- [Label] -> https://...` text line, never a broken
+native button); extend it with the ritual example rather than
+duplicating schema docs into coding-task.
 
 ---
 
@@ -868,6 +1139,27 @@ egress failures return the allow-list hint. Skill update rides P2's file
 install of a pip + an npm package → import/require succeeds in the same
 session; image config diff contains the package.
 
+**Verified state (2026-07-16) — two corrections.** Current flow:
+`install_packages` (`self_mod.rs:6`, handler `:47-76`; schema is
+apt/npm/reason only — no `scope` field exists) emits an approval request
+(`OutboundToolEffect::InstallPackages`); on approval,
+`apply_install_packages` (`handlers/approvals.rs:392-432`) merges into
+`container_configs.packages_apt/_npm` and deliberately does NOT rebuild —
+the rebuild is lazy at next spawn via the `config_fingerprint` compare
+(`spawn.rs:274-343`; fingerprint over apt+npm+skills+mcp_servers,
+`container_configs.rs:640-664`). `HOME=/data` confirmed at
+`spawn.rs:623-624`. Corrections: (1) session-scope installs still ride
+the same approval kind — the "works now" install executes only after the
+approval resolves (or instantly once G1's in-chat approve exists); the
+tool's ack text must say which state it's in. (2) "Deny-default egress
+failures return the allow-list hint" — **no such hint exists anywhere
+today**: denial is a raw network failure at the DNS/nftables layer
+(`egress.rs:78-84`, spec `EgressMode` at `container-rt/src/spec.rs:121`;
+the only agent-facing network message is the SSRF guard in
+`net_guard.rs`, which is unrelated). The hint is NEW work in this card:
+detect the failure in the session-scope install path and append the
+`cclaw` egress-allow command to the tool error.
+
 ### E2. Warm "prototyping" image variant — P1, M — lane E
 
 **Problem.** The default bake is deliberately minimal (`setup/src/steps/
@@ -886,6 +1178,21 @@ remains `minimal` (tenet 3); setup asks once.
 **Acceptance.** Setup step unit (idempotent re-run), bake test renders the
 expected Dockerfile, fingerprint changes exactly when the profile changes.
 
+**Verified state (2026-07-16).** `DEFAULT_BASE_APT_PACKAGES` is exactly
+at `image.rs:184-215` (anchor still good; base `debian:trixie-slim`,
+`:33`); the no-apt-egress-at-runtime rationale is the comment at
+`image.rs:209-213`. There is NO `image_profile` anywhere — net-new. Two
+design constraints the card text implied but didn't state: (a) it lives
+per-group in `container_configs` alongside `packages_apt`/`packages_npm`,
+so **this card takes migration 027** (verify at branch time); (b) it MUST
+be folded into `compute_fingerprint` (`container_configs.rs:640-664`) or
+profile changes won't trigger rebuilds — note `tool_profile` is
+deliberately fingerprint-EXCLUDED (runner-config-only); do not copy that
+precedent. `packages_npm` merges via `add_package_npm`
+(`container_configs.rs:611-631`). Two distinct fingerprints exist — the
+setup/base-image Docker label (`image.rs:51`, pull-verification only) and
+the per-group config fingerprint; this card touches the latter.
+
 ### R6 (= M17-A3, re-scoped). Progressive final answers — P2, M — lane R, after R5
 
 M17-A3 shrinks once H1 exists: the HUD already covers "something is
@@ -893,12 +1200,41 @@ happening." What remains is long *final* text landing all at once. Implement
 A3's edit-based growth only for the final answer of turns that already ran
 >30s, rich adapters only, default ON, same acceptance as M17-A3 otherwise.
 
+**Verified state (2026-07-16).** The final answer is one terminal
+`SendMessageSpec` emit in `drive_turn.rs:392-430` (when
+`output.tool_calls.is_empty()`); no incremental growth exists. The
+machinery to reuse is H1's post-once-then-edit anchor:
+`ToolContext::emit_task_hud(breadcrumb, first)` (`context.rs:634`, doc
+`:625-633` — `first:false` becomes an `edit_message` on edit-capable
+adapters, anchored by the stable `tool_name`), driven from
+`hud.rs:307` (`emit_live_update`) / `:259` (`finalize`). Rich-adapter
+detection is `copperclaw_channels_core::capabilities::supports_message_edit`
+(`capabilities.rs:45`). Elapsed time already exists as
+`TaskHud.started_at` (`hud.rs:110`, read at `:278`) — thread it, don't
+re-track.
+
 ### R7 (= M17-A6). Subagent fan-out + write-capable delegation — P1, L — lane R, after R6
 
 As M17-A6 (unchanged): `explore` stays read-only; the gap between it and full
 `create_agent` containers gets a middle tier for parallel build work using
-the existing worktree mechanics (`spawn.rs:702-708`). Sequenced last in lane
-R because everything earlier changes `drive_turn` under it.
+the existing worktree mechanics. Sequenced last in lane R because everything
+earlier changes `drive_turn` under it.
+
+**Verified state (2026-07-16) — anchors corrected.** The two ends of the
+gap: `explore` (`copperclaw-mcp/src/tools/explore.rs`) is an in-process,
+ephemeral, bounded LLM loop — read-only allowlist
+`["grep","glob","read_file","web_fetch"]`, max 5 turns / 50K tokens / 60s
+defaults, nesting refused, returns one string, touches no DB/container.
+`create_agent` (`copperclaw-modules/src/agent_to_agent/create_agent.rs`)
+is a persistent sibling: own `agent_groups`/`sessions` rows, own
+container via the reconcile loop, permission-gated, depth-capped
+(`depth.rs`), writable git worktree of the parent repo on branch
+`sib/<session-id>`. The worktree mechanics drifted from the M17 anchor:
+call site `apply_parent_workspace(...)` at `spawn.rs:708`, the functions
+at `spawn.rs:1280` (`apply_parent_workspace`) and `spawn.rs:1546`
+(`provision_parent_worktree`, worktree dir
+`<repo>/.copperclaw/wt/<sibling_sid>`). There is no middle tier and no
+parallel-explore orchestration primitive today — that's the card.
 
 ### V5. Public tunnel module — P2, L — lane V, after V2
 
@@ -916,6 +1252,17 @@ in ritual card → teardown on preview close. Absent binary → clean actionable
 error. Security review sign-off required before merge (touches the
 outward-facing surface).
 
+**Verified state (2026-07-16).** Zero tunnel-related code exists anywhere
+(repo-wide grep: no tunnel/cloudflare/ngrok/frp hits) — fully greenfield.
+`ApprovalKind::CredentialedExternalAction` exists
+(`copperclaw-types/src/approval.rs:19`), but note the CLI approve
+dispatcher switches on action *strings* and has no arm for it
+(`handlers/approvals.rs:131-143`) — G1 adds at least a refusal arm; V5
+adds the real one. Module shape to follow: implement the `Module` trait
+(`modules/src/context.rs:21`, `install` at `:26`), `pub mod` in
+`modules/src/lib.rs:23-33`, registered in the host boot sequence in
+priority order.
+
 ### C5 (= M17-C5 + C6). Adapter floor + shared markdown renderer — P2 — lane C, after C4a/C4b
 
 Unchanged from M17: raise signal/whatsapp/mattermost to the rich-surface
@@ -925,36 +1272,104 @@ because C2/C3 change the surfaces it would render onto. M18 addition: the
 renderer must own the fence-handling logic from C2 when it lands (C2's
 splitter hooks migrate into it; note in both PRs).
 
-### M1. Metrics rider — P2, S — lane M, absolute last
+**Verified state (2026-07-16).** Per-adapter gaps (all three fall through
+to the trait-default text fallbacks for `deliver_card` / `deliver_diff` /
+`deliver_collapsible` / `deliver_todo_list` / `deliver_thinking` /
+`deliver_error`, and none overrides the `edit_message` trait method — so
+none gets the H1 HUD): **signal** overrides only `set_typing`
+(`adapter.rs:283`; edit rides `deliver_action`, `:332`);
+**whatsapp-cloud** overrides only a `set_typing` read-receipt shim
+(`:165`; edit explicitly Unsupported); **mattermost** overrides nothing
+rich (deliver-only; edit via a `deliver` action PATCH). The floor is the
+trait-default set in `channels/core/src/adapter.rs:124-429`. When an
+adapter gains `edit_message`, add its channel to `EDIT_CAPABLE_CHANNELS`
+(`capabilities.rs:38`, currently 5 entries) **in the same PR** — the
+module carries an explicit keep-in-sync rule (`:26-32`). The shared
+renderer is fully greenfield: no markdown module exists in
+`channels/core` (each adapter formats its own — telegram
+`markdown_to_html`, discord `escape_discord_markdown`, slack mrkdwn); the
+only shared piece is `Card::to_text_fallback` (`card.rs:349`). `fence.rs`
+is ready to absorb as planned — self-contained, dependency-free, with an
+explicit C5 migration note at `fence.rs:22-24`. Also owed here (PR #30
+flag, confirmed still present): fix the two stale doc comments naming the
+removed `emit_breadcrumb`/`emit_breadcrumb_finish` at
+`host-delivery/src/service.rs:1707` and `:2378`.
+
+### M1. Metrics rider — P2, M — lane M, absolute last
 
 Sweep the metrics wishes recorded in each merged PR's description into
-`copperclaw-metrics` in one card: HUD edit counts, verify-gate
-refusals/passes, interjections consumed, preview WS upgrades, approval taps
-(approved/denied/unauthorized), inbound files materialized per channel,
-session-scope installs. One PR, no other card touches the crate.
+`copperclaw-metrics` in one card. One PR, no other card touches the crate.
+The wishes from PRs #24-#39 were swept on 2026-07-16 and are inlined
+below (M1 must re-sweep any PR merged after that date, including the
+Wave 3/4 PRs, which will add: preview WS upgrades, approval taps
+approved/denied/unauthorized, session-scope installs, tunnel exposures):
+
+- **#24 (C1):** `slack_typing_skipped_total{reason="non_assistant_surface"}`;
+  `slack_typing_set_status_total{result}`; HUD-decision counts labeled by
+  `typing_indicator_visible`.
+- **#25 (T1):** shell truncation events by mode (head/tail); `read_file`
+  lines-mode calls + pages-per-file distribution; histogram of pre-cap
+  stream size on truncated shell calls.
+- **#26 (P1):** sessions spawned per tool profile;
+  `load_skill("coding-task")` invocations with the inline block present
+  vs absent; system-prompt byte size per spawn by profile.
+- **#27 (R0):** policy denials labeled by layer (role/skill/profile/
+  provenance) and tool name; "Unknown tool" dispatch errors by tool name.
+- **#28 (C2):** `copperclaw_delivery_fence_split_total{channel_type,kind}`;
+  `copperclaw_delivery_fence_unbalanced_input_total{channel_type}`.
+- **#29 (R1):** `copperclaw_slash_commands_total{command,channel_type}`;
+  `copperclaw_control_rows_pending` gauge;
+  `copperclaw_status_answer_seconds` histogram.
+- **#30 (H1):** `copperclaw_hud_posts_total{agent_group}`;
+  `copperclaw_hud_edits_total{agent_group,trigger}`;
+  `copperclaw_hud_degraded_total{channel_type,reason}`;
+  `copperclaw_hud_finalize_seconds` histogram.
+- **#31 (R2):** counter for mid-turn stops vs interjections consumed.
+- **#32 (R3):** verify-gate counter labeled
+  `outcome=refused|blocked|passed` (+ verify-run pass/fail).
+- **#33/#37/#38 (C3/C4a/C4b):** per-channel inbound files materialized +
+  failures (`channel`, `outcome=ok|too_large|download_failed`); histogram
+  of downloaded attachment bytes per channel (tunes
+  `max_attachment_bytes` defaults).
+- **#34 (X1):** preview-expose calls served vs timed out
+  (`outcome=served|timeout`).
+- **#39 (R4):** `compaction_triggered_total{profile}`;
+  `compaction_estimated_tokens` histogram at trigger;
+  `compaction_facts_header_bytes` histogram.
+- (#35, #36 recorded no wishes.)
 
 ---
 
 ## Wave summary
 
-| Wave | Cards | Parallel lanes |
+| Wave | Cards | Status / parallel lanes |
 |---|---|---|
-| 1 | R0→H1 (R); R1→ (C router); C1, C2 (C); T1 (T); P1 (P) | 5 |
-| 2 | R2→R3→R4→R5 (R); C3→C4a+C4b (C); P2 (P); X1 (X) | 4 |
-| 3 | V1‖V3→V4→ (V); G1 (G); V2 (V, after G1); P3 (P) | 3-4 |
-| 4 | E1 (T); E2 (E); R6→R7 (R); V5 (V); C5 (C); M1 last | 5 |
+| 1 | R0→H1 (R); R1 (C router); C1, C2 (C); T1 (T); P1 (P) | **Done** — all merged |
+| 2 | R2→R3→R4 (R); C3→C4a+C4b (C); P2 (P); X1 (X) | **Done** — all merged; T2 #40 merged, X2 now unblocked |
+| 3 | V1‖V3→V4 (V); G1 (G); V2 (V, after G1); P3 (P); R5 (R); T2→X2 | **V1 #41, V3 #42, R5 #44, T2 #40, G1 #45 all merged.** V4/V2/P3/X2 now unblocked; V4 (needs V1+V3) is the next critical-path card |
+| 4 | E1 (T, after T2); E2 (E); R6→R7 (R); V5 (V); C5 (C); M1 last | E2 #43 merged (migration 027); E1 (needs T2 — now merged) + rest ready |
 
-Critical path: **H1 → R2 → R3 → X1** (steer → verify → prove). Everything
-else parallelizes around it.
+Remaining critical path to the demo moment: **V3 → V4 → P3** (V3 is the
+long pole — the only L-sized greenfield build left on the path), with
+**G1 → V2** required for the phone-only enablement leg and **T2 → X2**
+required for program acceptance. R5-R7, E1/E2, C5, V5 parallelize around
+it. (R5 was originally sequenced in Wave 2's lane R; it remains unstarted
+and now runs alongside Wave 3 — nothing depends on it.)
 
 ## Program-level acceptance
 
-The X1 golden fixture passes, and a live smoke on the telegram dev group
-(`CLAUDE.md` "Operating a live agent") demonstrates end-to-end: "build me a
-tiny web todo app" → HUD visible within seconds → `/stop` + resteer honored →
+The X1 golden fixture passes (extended by X2 to actually cover the
+verify-gate leg), and a live smoke on the telegram dev group (`CLAUDE.md`
+"Operating a live agent") demonstrates end-to-end: "build me a tiny web
+todo app" → HUD visible within seconds → `/stop` + resteer honored →
 verify gate blocks a fake completion → preview link opens from the phone →
-ritual card with screenshot → `cclaw audit list` shows the approval and
+ritual card + screenshot file → `cclaw audit list` shows the approval and
 preview rows.
+
+Still owed as of 2026-07-16: the live smoke test has never been run (R3
+merged without it; nothing since has run it either), and X2 is what makes
+the fixture cover the gate. Neither blocks card work; both block calling
+the program done.
 
 ## Deferred / rejected (don't re-litigate)
 

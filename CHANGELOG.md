@@ -41,6 +41,39 @@ adheres to [Semantic Versioning](https://semver.org/).
     (`Live` | `Tombstone`) with a one-shot `recovery_used` budget; the reaper
     tombstones in place instead of tearing down.
 
+### Added (M18 R6 — progressive final answers, 2026-07-16)
+
+- On a rich (edit-capable) channel, a long final answer to a turn that already
+  ran past 30s now *grows* in place via a bounded run of `edit_message` rows
+  instead of landing all at once — the H1 HUD already covers "something is
+  happening" during the build, so this relieves the wait for the answer itself.
+  Default ON; no config, no new channel-adapter surface. There is no token
+  streaming through the transport (rejected in the M18 plan): the model's
+  answer is complete when we reach the final emit, so the growth is a paced
+  reveal of the finished text.
+  - `crates/copperclaw-runner/src/run/progressive.rs` (new): the R6 gate and
+    reveal driver. `should_grow(edit_capable, elapsed, answer)` requires all of
+    a `supports_message_edit` channel, `elapsed >= 30s`, and an answer that is
+    at least 280 chars but NOT already expander-scale (`build_expander_decorator`
+    is `None`) — so pages-of-output answers keep their slice-3.4 collapsible chip
+    and never overlap. `grow_final_answer` posts the first chunk as a
+    `send_message` (whose `ToolEffectAck::Message { seq }` is the edit anchor)
+    then emits `edit_message` rows keyed to that `seq`, pacing `STEP_INTERVAL`
+    (800ms) between them; `char`-boundary chunking, `MAX_STEPS` cap (6),
+    best-effort after the first emit.
+  - `crates/copperclaw-runner/src/run/hud.rs`: `TaskHud` now exposes
+    `answer_edit_capable()` (the raw `supports_message_edit` gate, kept distinct
+    from the HUD `Behavior` because R6 is independent of `hud_mode`) and
+    `elapsed()` — the progressive gate reads the ONE clock the HUD already
+    tracks (`started_at`) rather than re-deriving elapsed time.
+  - `crates/copperclaw-runner/src/run/drive_turn.rs`: the terminal final-answer
+    emit now routes through the R6 gate; every non-growth case (bare adapter,
+    sub-30s turn, short/huge answer) falls through to the pre-R6 single
+    `send_message`, byte-identical.
+  - `crates/copperclaw-runner/src/tools.rs`: `strip_reasoning_blocks` is now
+    `pub(crate)` so the gate measures the reasoning-stripped text the user
+    actually sees (no `<thinking>` leak in the grown copy).
+
 ### Added (M18 E1 — session-local installs that work *this* turn, 2026-07-16)
 
 - `install_packages` gains a `scope` field (`"image"` default — unchanged — or
