@@ -229,12 +229,12 @@ async fn interact_prepared_live(
     guard: &dyn NavigationGuard,
     env: &dyn EnvLookup,
 ) -> Result<CallToolResult, ToolError> {
-    let mode_label = "interactive".to_owned();
+    let mode_label = "interactive";
 
     let runtime = match copperclaw_container_rt::detect().await {
         Ok(rt) => rt,
         Err(e) => {
-            copperclaw_metrics::inc_browser_render(&mode_label, "unavailable");
+            copperclaw_metrics::inc_browser_render(mode_label, "unavailable");
             return Err(ToolError::Internal(format!(
                 "browser_interact: target `{}` passed the SSRF + opt-in checks and a locked-down \
                  child-container spec was constructed (egress={:?}), but no container runtime is \
@@ -269,7 +269,7 @@ async fn interact_prepared_live(
         Err(BrowserError::Blocked(_)) => "blocked",
         Err(_) => "driver_error",
     };
-    copperclaw_metrics::inc_browser_render(&mode_label, outcome);
+    copperclaw_metrics::inc_browser_render(mode_label, outcome);
 
     match result {
         Ok(out) => Ok(success_json(&out)),

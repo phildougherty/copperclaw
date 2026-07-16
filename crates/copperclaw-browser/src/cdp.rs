@@ -36,6 +36,7 @@ use serde_json::{Value, json};
 
 use crate::driver::{BrowserDriver, DriverRender, Navigation, RenderedArtifact};
 use crate::error::BrowserError;
+use crate::interactive::InteractiveDriver;
 use crate::render::RenderMode;
 
 /// Default navigation/idle timeout when the caller does not specify one.
@@ -447,61 +448,15 @@ impl crate::interactive::InteractiveDriver for CdpBrowserDriver {
 #[async_trait]
 impl BrowserDriver for CdpBrowserDriver {
     async fn render(&self, url: &str, mode: RenderMode) -> Result<DriverRender, BrowserError> {
-        // Enable the domains we need: Page (load event), Network (redirect +
-        // status observation for the SSRF re-guard).
-        self.transport.send("Page.enable", json!({})).await?;
-        self.transport.send("Network.enable", json!({})).await?;
-
-        // Navigate. Chromium reports a hard navigation failure via `errorText`.
-        let nav = self
-            .transport
-            .send("Page.navigate", json!({ "url": url }))
-            .await?;
-        if let Some(err) = nav.get("errorText").and_then(Value::as_str) {
-            if !err.is_empty() {
-                return Err(BrowserError::Driver(format!(
-                    "navigation to `{url}` failed: {err}"
-                )));
-            }
-        }
-
-        // Wait for load (best-effort; a timeout still lets us render what
-        // loaded), then read the settled state.
-        self.transport.wait_for_load(self.nav_timeout).await?;
-
-        let final_url = self
-            .eval_string("document.location.href")
-            .await?
-            .unwrap_or_else(|| url.to_string());
-        let redirect_chain = self.transport.redirect_hops();
-        let status = self.transport.main_status();
-
-        let artifact = match mode {
-            RenderMode::Screenshot => {
-                RenderedArtifact::ScreenshotPath(self.capture_screenshot().await?)
-            }
-            RenderMode::DomText => {
-                let text = self
-                    .eval_string("document.body ? document.body.innerText : ''")
-                    .await?
-                    .unwrap_or_default();
-                RenderedArtifact::Text(text)
-            }
-            RenderMode::AriaSnapshot => {
-                let tree = self
-                    .transport
-                    .send("Accessibility.getFullAXTree", json!({}))
-                    .await?;
-                RenderedArtifact::Text(serialize_ax_tree(&tree))
-            }
-        };
-
+        // `navigate` enables the Page + Network domains (redirect + status
+        // observation for the SSRF re-guard), drives the navigation, waits for
+        // load, and observes the settled state (final URL falls back to `url`).
+        // `read_artifact` then reads the requested surface — the same two steps
+        // the interactive path composes, shared verbatim.
+        let navigation = self.navigate(url).await?;
+        let artifact = self.read_artifact(mode).await?;
         Ok(DriverRender {
-            navigation: Navigation {
-                redirect_chain,
-                final_url,
-                status,
-            },
+            navigation,
             artifact,
         })
     }
