@@ -1,0 +1,20 @@
+{
+  "name": "deltachat-card-and-todo",
+  "channel": "deltachat",
+  "description": "M19 U5 acceptance (X-rider W2): deltachat is a genuine interactive chat surface that had zero rich-surface support — HUD/diff/todo/cards all rendered as plain prose. U5 gave it a render.rs covering deliver_card, deliver_todo_list, deliver_diff natively. This fixture drives a send_card + a todo list through the pipeline to deltachat: with model_rich_cards the card reaches the channel as a STRUCTURED card (buttons intact), and the todo chip reaches it through deliver_todo_list carrying the correct glyphs + footer counts. Driven under COPPERCLAW_DATA_ROOT (like blocked-todo) so the in-process runner's todo store resolves writable state. The deltachat native wire rendering is proven in the deltachat adapter's own unit tests. See README.md.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 15000
+  },
+  "model_rich_cards": true,
+  "max_tool_turns": 6,
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"created_at\":\"[^\"]+\"": "\"created_at\":\"<TS>\"",
+    "\"updated_at\":\"[^\"]+\"": "\"updated_at\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

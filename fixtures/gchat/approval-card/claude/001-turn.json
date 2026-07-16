@@ -1,0 +1,9 @@
+{
+  "events": [
+    {"type": "message_start", "message": {"id": "msg_gchat_card_001"}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_gchat_card_001", "name": "send_card", "input": {}}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"card\": {\"title\": \"Ready to ship\", \"body\": \"The deploy is built and verified. Approve to roll it out.\", \"fields\": [{\"label\": \"Change\", \"value\": \"v1.4.2 - 3 commits\"}], \"buttons\": [{\"label\": \"Approve\", \"value\": \"approve:deploy-42\", \"style\": \"primary\"}, {\"label\": \"View diff\", \"url\": \"http://192.0.2.10:8100/diff\"}]}}"}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_stop"}
+  ]
+}

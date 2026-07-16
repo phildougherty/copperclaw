@@ -1,0 +1,19 @@
+{
+  "channel_type": "teams",
+  "platform_id": "19:teamschat@thread.v2",
+  "thread_id": null,
+  "message": {
+    "id": "teams-msg-001",
+    "kind": "chat",
+    "content": {"text": "check the build"},
+    "timestamp": "2026-01-01T00:00:00Z",
+    "is_mention": false,
+    "is_group": true
+  },
+  "reply_to": null,
+  "sender": {
+    "channel_type": "teams",
+    "identity": "29:user-alice",
+    "display_name": "Alice"
+  }
+}

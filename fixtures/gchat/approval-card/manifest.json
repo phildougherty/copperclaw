@@ -1,0 +1,18 @@
+{
+  "name": "gchat-approval-card",
+  "channel": "gchat",
+  "description": "M19 U4 acceptance (X-rider W2): neither gchat nor matrix overrode the trait deliver_card, so M18 approval/ritual cards degraded to plain text on both. U4 gave gchat a native Cards-v2 deliver_card (and matrix an HTML formatted_body one). This fixture drives a send_card through the pipeline to gchat and, with model_rich_cards modelling gchat's card-capable contract, asserts the card reaches the channel as a STRUCTURED card (content.card with its buttons intact) rather than a flattened prose blob. The gchat Cards-v2 wire rendering itself is proven in the gchat adapter's own unit tests. See README.md.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 10000
+  },
+  "model_rich_cards": true,
+  "max_tool_turns": 4,
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

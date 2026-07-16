@@ -1,0 +1,1 @@
+{"id":"<UUID>","seq":2,"kind":"chat","timestamp":"<TS>","status":"completed","process_after":null,"recurrence":null,"series_id":null,"tries":0,"trigger":true,"platform_id":"account/1/chat/10","channel_type":"deltachat","thread_id":null,"content":{"text":"plan and stage the demo"},"source_session_id":null,"on_wake":false}

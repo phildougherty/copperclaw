@@ -1,0 +1,1 @@
+{"id":"<UUID>","seq":2,"kind":"chat","timestamp":"<TS>","status":"pending","process_after":null,"recurrence":null,"series_id":null,"tries":0,"trigger":false,"platform_id":"C123ABC","channel_type":"slack","thread_id":null,"content":{"text":"[reaction] ✅","reaction":{"emoji":"✅","target_seq":"88","actor":"U200"}},"source_session_id":null,"on_wake":false}
