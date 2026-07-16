@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M18 V1 — WebSocket pass-through in the preview proxy, 2026-07-16)
+
+- `crates/copperclaw-host/src/preview.rs`: the session-preview reverse proxy
+  now bridges WebSocket upgrades instead of refusing them with 501. On a
+  cookie-authenticated upgrade, the axum side completes the handshake with the
+  browser and a `tokio-tungstenite` client opens `ws://<container_ip>:<port>`
+  to the container app, forwarding frames both ways (subprotocol mirrored, e.g.
+  Vite's `vite-hmr`); the upstream socket is opened first so a container not
+  serving a socket at that path fails fast with 502. The cookie gate applies to
+  the upgrade exactly as to HTTP (no cookie → 403 before any upgrade). The idle
+  reaper now treats an open socket as activity — every frame in either
+  direction and a 60s keep-alive tick bump `last_activity` — so a live browser
+  tab is never reaped mid-session (HTTP requests only bump per-request). Adds
+  `axum`'s `ws` feature plus `tokio-tungstenite` (0.24, the version the discord
+  channel already pins) and `futures` to `copperclaw-host`.
+- `skills/preview/SKILL.md`: dropped the "WebSockets are not proxied — prefer
+  polling" caveat; agents can now build Vite dev servers, live reload, and
+  realtime apps behind the preview link.
+
 ### Added (M18 V3 — live headless-browser driver, 2026-07-16)
 
 - `crates/copperclaw-browser/src/cdp.rs` (new): the concrete Chromium/CDP

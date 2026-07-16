@@ -86,7 +86,17 @@ sha2                   = { workspace = true }
 hex                    = { workspace = true }
 rand                   = { workspace = true }
 reqwest                = { workspace = true }
-axum                   = { workspace = true }
+# `ws` feature: the preview proxy (V1) bridges browser WebSocket upgrades to
+# the container app. axum 0.7's `ws` extractor pins tokio-tungstenite 0.24 —
+# the same version the discord channel already uses — so this adds no new
+# tungstenite version to the build graph.
+axum                   = { workspace = true, features = ["ws"] }
+# Client half of the preview WS bridge: connect to the container app's
+# `ws://<container_ip>:<port>` upstream. Default features (`connect`,
+# `handshake`) only — the proxy talks plain ws to the Docker bridge, no TLS.
+tokio-tungstenite      = "0.24"
+# `SinkExt`/`StreamExt` for the frame-forwarding bridge loop.
+futures                = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
