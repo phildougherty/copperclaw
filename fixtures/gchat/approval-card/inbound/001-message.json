@@ -1,0 +1,19 @@
+{
+  "channel_type": "gchat",
+  "platform_id": "spaces/AAAAq.replay",
+  "thread_id": null,
+  "message": {
+    "id": "gchat-msg-001",
+    "kind": "chat",
+    "content": {"text": "is the deploy ready to ship?"},
+    "timestamp": "2026-01-01T00:00:00Z",
+    "is_mention": false,
+    "is_group": true
+  },
+  "reply_to": null,
+  "sender": {
+    "channel_type": "gchat",
+    "identity": "users/112233",
+    "display_name": "Alice"
+  }
+}

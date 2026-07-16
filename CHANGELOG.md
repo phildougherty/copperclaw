@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M19 X-rider Wave 2 — channel-parity replay fixtures)
+
+- Test-only. Five replay fixtures locking the host-delivery-pipeline half of
+  the Wave-2 adapter-floor cards, each registered in
+  `crates/copperclaw-host/tests/replay.rs`: `fixtures/signal/hud-breadcrumb`
+  (U1 — live HUD posts one breadcrumb chip + edits it in place on signal),
+  `fixtures/teams/hud-live-edit` (U2 — teams now edit-capable, one message
+  edited not N posted), `fixtures/gchat/approval-card` (U4 — a `send_card`
+  reaches `deliver_card` as a structured card, buttons intact, not flattened
+  prose), `fixtures/deltachat/card-and-todo` (U5 — native card + todo chip on
+  a formerly-bare interactive surface; re-execs under `COPPERCLAW_DATA_ROOT`
+  like the F4/X2 fixtures so the todo store is writable), and
+  `fixtures/slack/reaction-inbound` (U7 — a normalized `reaction_added`
+  bypasses the mention gate as a non-trigger `content.reaction` row, proving
+  the router reaction leg is channel-agnostic, complementing the telegram
+  twin). Adds a `model_rich_cards` manifest flag + `CappedAdapter` modelling
+  (mirroring `model_rich_breadcrumbs`) so the harness can prove a card is
+  delivered structurally rather than degraded host-side. Per-adapter *wire*
+  rendering stays the adapters' own unit-test concern.
+
 ### Added (M19 A6 — Durable scheduled-task fire lifecycle, migration 028)
 
 - Scheduled tasks now carry a durable, queryable record of their firing

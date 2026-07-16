@@ -193,6 +193,7 @@ impl ReplayHarness {
                 mock.clone(),
                 cap,
                 fixture.manifest.model_rich_breadcrumbs,
+                fixture.manifest.model_rich_cards,
             ));
             initial.push((ct.clone(), wrapped));
             adapters.push((ct, mock));
@@ -1457,6 +1458,10 @@ struct CappedAdapter {
     /// HUD breadcrumb surface (post once, edit in place) instead of the
     /// bare-mock degrade-to-text. See `Manifest::model_rich_breadcrumbs`.
     model_rich_breadcrumbs: bool,
+    /// M19 U4/U5: when true, model a card-capable rich adapter for the
+    /// `deliver_card` surface (structured card on the wire) instead of the
+    /// bare-mock degrade-to-text. See `Manifest::model_rich_cards`.
+    model_rich_cards: bool,
 }
 
 impl CappedAdapter {
@@ -1464,11 +1469,13 @@ impl CappedAdapter {
         inner: Arc<MockAdapter>,
         max_message_chars: Option<usize>,
         model_rich_breadcrumbs: bool,
+        model_rich_cards: bool,
     ) -> Self {
         Self {
             inner,
             max_message_chars,
             model_rich_breadcrumbs,
+            model_rich_cards,
         }
     }
 }
@@ -1519,9 +1526,28 @@ impl ChannelAdapter for CappedAdapter {
         card: &Card,
         to: Option<&str>,
     ) -> Result<Option<String>, AdapterError> {
-        self.inner
-            .deliver_card(platform_id, thread_id, card, to)
-            .await
+        // Default (bare-mock) behaviour: the trait default flattens the
+        // card to a `Chat` text row (buttons become `- [Label] -> url`
+        // prose). This is what a genuinely card-incapable adapter does.
+        if !self.model_rich_cards {
+            return self
+                .inner
+                .deliver_card(platform_id, thread_id, card, to)
+                .await;
+        }
+        // M19 U4/U5: card-capable rich-adapter modelling. Record the card
+        // as a `MessageKind::Card`-kind delivery whose `content.card`
+        // preserves the full structured card (title / body / fields /
+        // buttons) — so `snapshot_delivered` shows a native card on the
+        // wire, not a flattened prose blob. Route through the inner mock's
+        // `deliver` so it lands in `MockAdapter::deliveries()` reachable via
+        // the harness's `Arc<MockAdapter>` handle.
+        let msg = OutboundMessage {
+            kind: copperclaw_types::MessageKind::Card,
+            content: serde_json::json!({ "card": card }),
+            files: vec![],
+        };
+        self.inner.deliver(platform_id, thread_id, &msg).await
     }
 
     async fn deliver_breadcrumb(

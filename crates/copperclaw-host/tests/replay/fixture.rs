@@ -28,6 +28,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Top-level fixture metadata loaded from `manifest.json`.
+///
+/// The `model_rich_*` / `trigger_sweep` / `runner_drain` flags are
+/// independent, orthogonal opt-in toggles the harness reads directly off
+/// the manifest — a plain deserialized config record, not a state machine.
+/// Collapsing them into enums would only obscure the 1:1 JSON mapping.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct Manifest {
     pub name: String,
@@ -137,6 +143,29 @@ pub struct Manifest {
     /// the byte-identical degrade-to-text behaviour. Default `false`.
     #[serde(default)]
     pub model_rich_breadcrumbs: bool,
+    /// M19 U4/U5 (X-rider W2): model the harness's wrapped `MockAdapter`
+    /// as a *rich* adapter for the [`Card`](copperclaw_channels_core::Card)
+    /// surface.
+    ///
+    /// The bare `MockAdapter` overrides no rich surface, so the trait
+    /// default `deliver_card` flattens every card to a plain
+    /// `MessageKind::Chat` text row via `Card::to_text_fallback` — buttons
+    /// become `- [Label] -> url` prose. Real card-capable adapters
+    /// (Google Chat Cards v2, Matrix `formatted_body`, Slack Block Kit,
+    /// deltachat/line's `render.rs`) instead render the card
+    /// *structurally*, keeping its buttons as real actionable elements.
+    /// When this is `true` the harness's `CappedAdapter` models that
+    /// contract: `deliver_card` records a `MessageKind::Card`-kind
+    /// delivery whose `content.card` preserves the full structured card
+    /// (title / body / fields / buttons) instead of the flattened text —
+    /// so `snapshot_delivered` shows a native card on the wire, not prose.
+    /// The per-adapter *wire* rendering (gchat Cards-v2 JSON, matrix HTML,
+    /// …) is proven by each adapter crate's own unit tests; this flag lets
+    /// the pipeline fixture prove the host routes a card to `deliver_card`
+    /// with its structure intact rather than degrading it host-side. Only
+    /// the U4/U5 card parity fixtures set this. Default `false`.
+    #[serde(default)]
+    pub model_rich_cards: bool,
 }
 
 /// Script one `MockAdapter::fail_next_deliver` call. `kind` decides the

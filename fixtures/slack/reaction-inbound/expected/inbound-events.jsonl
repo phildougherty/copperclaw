@@ -1,0 +1,1 @@
+{"channel_type":"slack","platform_id":"C123ABC","thread_id":null,"message":{"id":"slackreact:C123ABC:88:✅","kind":"chat","content":{"text":"[reaction] ✅","reaction":{"emoji":"✅","target_seq":"88","actor":"U200"}},"timestamp":"2026-01-01T00:00:00Z","is_mention":null,"is_group":true},"reply_to":null,"sender":{"channel_type":"slack","identity":"U200","display_name":"Test User"}}
