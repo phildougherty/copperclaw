@@ -33,11 +33,17 @@
 //!
 //! Inbound `document`, `photo` (largest variant), `audio`, `video`,
 //! `voice`, `video_note`, and `sticker` attachments are downloaded
-//! eagerly via `getFile` + the file endpoint and written under
-//! `data_dir/inbox/<msg_id>/<filename>`. The resulting event is a
+//! eagerly via `getFile` + the file endpoint and STAGED under
+//! `data_dir/staging/<unique>/<filename>` per the channels-core
+//! inbound-file contract ([`copperclaw_channels_core::inbound_file`]).
+//! The resulting event is a
 //! [`MessageKind::Chat`](copperclaw_types::MessageKind::Chat) with the
 //! caption (or text) plus a `content.attachment` object carrying
-//! `{kind, file_id, filename, path, mime_type, size}`.
+//! `{kind, file_id, filename, staged_path, mime_type, size}`. The router
+//! materializes the staged bytes into the resolved session's
+//! `inbox/<msg_id>/<filename>` at route time and rewrites the attachment
+//! to carry the container-visible `path` (`/data/inbox/...`), so the
+//! agent can actually read the file it was told about.
 //!
 //! Two knobs control this:
 //!

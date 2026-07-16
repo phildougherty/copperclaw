@@ -85,7 +85,7 @@ main..<branch> --oneline` yourself first.
 | P1 | Merged | #26 |
 | R2 | Merged | #31 |
 | R3 | **Merged.** Verification gate is live on `main`. Live hand-verify smoke test was NOT run before merge (PR body left it unchecked) — still owed, see program-level acceptance. | #32 |
-| C3 | Not started | — |
+| C3 | **Code-complete, PR open.** Recovered an earlier session's uncommitted WIP (checkpointed as `c97a620`), verified it carefully rather than trusting it, fixed two clippy issues (`route_impl`'s `#[allow(clippy::unused_async)]`, an underscore-prefixed test field that was actually in use), added the missing e2e replay fixture (`fixtures/telegram/inbound-document-attachment/`) plus a file-readability test, and confirmed the read-only touch on `container_manager/spawn.rs` needed no changes. Full workspace `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo test --workspace --no-fail-fast` all green (6,977 passed, 0 failed). | #33 |
 | All others | Not started | — |
 
 ### R3 status (read this first if you're picking up R3)

@@ -99,6 +99,40 @@ async fn telegram_inbound_text_message_round_trip() {
     run_fixture("telegram", "inbound-text-message").await;
 }
 
+/// M18 C3 acceptance: telegram document attachment → staged →
+/// router-materialized into the session inbox with a container-visible
+/// `/data/inbox/...` path; a second, oversized document still yields
+/// the `too_large` system fallback. See the fixture's README.md.
+#[tokio::test]
+async fn telegram_inbound_document_attachment_round_trip() {
+    run_fixture("telegram", "inbound-document-attachment").await;
+}
+
+/// M18 C3 acceptance, file-readability half: beyond the JSONL diff
+/// above, actually read the materialized bytes back off disk at the
+/// exact host path `container_manager::spawn::build_spec` bind-mounts
+/// as `/data` in production (`<session_root>/inbox/<msg_id>/<file>` ==
+/// `/data/inbox/<msg_id>/<file>` once mounted) — the closest an
+/// in-process harness (no real container) can get to "a runner reads
+/// the file at /data/inbox/...".
+#[tokio::test]
+async fn telegram_inbound_document_attachment_file_readable_from_session_dir() {
+    let harness = run_fixture_into_harness("telegram", "inbound-document-attachment").await;
+    let (ag, sess) = harness.touched_sessions[0];
+    let on_disk = harness
+        .tempdir
+        .path()
+        .join("sessions")
+        .join(ag.as_uuid().to_string())
+        .join(sess.as_uuid().to_string())
+        .join("inbox")
+        .join("tg-doc-001")
+        .join("spec.csv");
+    let bytes = std::fs::read(&on_disk)
+        .unwrap_or_else(|e| panic!("materialized attachment missing at {on_disk:?}: {e}"));
+    assert_eq!(bytes, b"id,qty\n1,2\n");
+}
+
 #[tokio::test]
 async fn slack_event_message_round_trip() {
     run_fixture("slack", "event-message").await;

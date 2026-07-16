@@ -1,0 +1,26 @@
+{
+  "channel_type": "telegram",
+  "platform_id": "100",
+  "thread_id": null,
+  "message": {
+    "id": "tg-doc-002",
+    "kind": "system",
+    "content": {
+      "kind": "telegram.document",
+      "file_id": "F-2",
+      "file_name": "giant.zip",
+      "mime_type": "application/zip",
+      "file_size": 999999999,
+      "reason": "too_large",
+      "limit": 20971520,
+      "reported_size": 999999999
+    },
+    "timestamp": "2026-01-01T00:00:01Z"
+  },
+  "reply_to": null,
+  "sender": {
+    "channel_type": "telegram",
+    "identity": "200",
+    "display_name": "Test User"
+  }
+}

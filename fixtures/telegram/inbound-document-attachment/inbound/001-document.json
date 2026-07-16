@@ -1,0 +1,27 @@
+{
+  "channel_type": "telegram",
+  "platform_id": "100",
+  "thread_id": null,
+  "message": {
+    "id": "tg-doc-001",
+    "kind": "chat",
+    "content": {
+      "text": "here is the spec",
+      "attachment": {
+        "kind": "telegram.document",
+        "file_id": "F-1",
+        "filename": "spec.csv",
+        "staged_path": "fixture://spec.csv",
+        "mime_type": "text/csv",
+        "size": 11
+      }
+    },
+    "timestamp": "2026-01-01T00:00:00Z"
+  },
+  "reply_to": null,
+  "sender": {
+    "channel_type": "telegram",
+    "identity": "200",
+    "display_name": "Test User"
+  }
+}
