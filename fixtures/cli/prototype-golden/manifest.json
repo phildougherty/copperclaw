@@ -1,0 +1,18 @@
+{
+  "name": "cli-prototype-golden",
+  "channel": "cli",
+  "description": "M18 program acceptance fixture: 'build me a tiny HTTP todo app' drives a scripted 8-turn tool loop (git-init a project, scaffold + verify a stdlib Python HTTP todo server, commit, expose a mock-brokered preview, send the P3 ritual card, close with a summary). See README.md for the two explicitly out-of-scope pieces (R3 verify-gate, H1 live HUD) and why.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 10000
+  },
+  "gates": ["preview"],
+  "max_tool_turns": 10,
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}
