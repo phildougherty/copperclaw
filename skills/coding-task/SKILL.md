@@ -54,8 +54,9 @@ can safely edit in parallel.
 
 ## Choosing dependencies: baked beats fetched beats hand-rolled
 
-1. **Baked first.** `create-vite` scaffolds a real project (don't
-   hand-write `index.html` + script tags past a single static page);
+1. **Baked first.** `create-vite` scaffolds a real project — see the
+   `web-app-scaffold` skill for the full golden path (don't hand-write
+   `index.html` + script tags past a single static page);
    `typescript` once scaffolded; `sqlite3` for real storage, not a
    hand-rolled JSON-file "database".
 2. **Fetched second.** `npm install <pkg>` / `pip install <pkg>` for
