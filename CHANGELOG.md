@@ -63,6 +63,36 @@ adheres to [Semantic Versioning](https://semver.org/).
   `Prototyping` image (three font packages, four new global npm packages,
   and the ~11MB `ruff` binary; the pre-existing `chromium` line item still
   dominates the total). `Minimal` is unaffected.
+### Added (M20 Q4 — Code-quality floor: prompt block + `coding-task` rewrite)
+
+- `CODING_PREAMBLE` (`crates/copperclaw-host/src/container_manager/prompt.rs`)
+  gained four static bullets — decompose before you type (name modules/files
+  and their single responsibility first), prefer a baked tool over
+  hand-rolling one (`create-vite`, `typescript`, `sqlite3`), handle the
+  errors a *user* will actually hit (bad input, empty state, network
+  failure) even in a prototype, and write the M20 Q2 multi-stage
+  `.copperclaw/verify` at scaffold time rather than at the end. The block
+  stays a static const (no per-turn/dynamic content, per program rule 8);
+  `Messaging`/`Minimal` profiles still gain zero bytes — the existing
+  byte-stability tests (`messaging_and_minimal_profiles_gain_zero_new_bytes`,
+  `coding_block_is_static_per_spawn_for_cache_stability`) pass unmodified,
+  and a new `coding_preamble_appears_exactly_once_in_coding_profile_prompt`
+  test pins the block appearing exactly once in the assembled prompt.
+- `skills/coding-task/SKILL.md` rewritten as the depth reference the floor
+  points at: a new "Decompose before you build" section (one responsibility
+  per file, module boundaries follow what changes together, split on job
+  collision not line count); a new "Choosing dependencies" section (baked >
+  fetched > hand-rolled, with a probe-first rule for anything not baked); a
+  new "Robustness" section that explicitly bounds the old "no error handling
+  for impossible cases" line — impossible now means no code path can produce
+  the input, not merely unlikely, and user-reachable paths (bad input, empty
+  state, network/IO failure) are always in scope; and the verify-contract
+  section rewritten to teach the Q2 named-stage `.copperclaw/verify` format
+  (`lint: npx eslint .` / `typecheck: tsc --noEmit` / `test: npm test`)
+  including probing for a stage's tool with `command -v` before writing it.
+  The rewrite stays under the 8 KiB per-skill body cap enforced by
+  `crates/copperclaw-skills/tests/coverage.rs` (8,013 bytes), verified via
+  the full skill coverage suite (name/registry/size/marker checks all pass).
 ### Changed (M20 Q2 — Multi-stage verify: named stages, per-stage state, stage-attributed failures)
 
 - `.copperclaw/verify` may now contain MULTIPLE lines, each an independent
