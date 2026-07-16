@@ -1,0 +1,9 @@
+{
+  "events": [
+    {"type": "message_start", "message": {"id": "msg_share_003"}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_share_003", "name": "send_card", "input": {}}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"card\": {\"title\": \"Todo app is live and public\", \"body\": \"Your stdlib-only HTTP todo server is exposed on your LAN and now also published to the public internet via a tunnel.\", \"fields\": [{\"label\": \"Heads up\", \"value\": \"The public link is reachable by anyone on the internet who has it. It tears down automatically when the preview closes.\"}], \"buttons\": [{\"label\": \"Open preview\", \"url\": \"http://192.0.2.10:8100/__preview/fixture-tok-8000\"}, {\"label\": \"Open the public link\", \"url\": \"https://fixture-tunnel.example/__preview/fixture-tok-8000\"}]}}"}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_stop"}
+  ]
+}

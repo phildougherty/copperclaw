@@ -67,7 +67,8 @@ use copperclaw_host_router::{
 use copperclaw_host_sweep::service::FilesystemSessionRoot as SweepRoot;
 use copperclaw_host_sweep::{SessionRoot as SweepSessionRoot, SweepService};
 use copperclaw_modules::{
-    ApprovalsModule, Module, PreviewBroker, PreviewError, PreviewExposed, SessionInfoLite,
+    ApprovalsModule, Module, PreviewBroker, PreviewError, PreviewExposed, PublicTunnelBroker,
+    PublicTunnelReply, SessionInfoLite,
 };
 use copperclaw_providers::AnthropicProvider;
 use copperclaw_runner::{RunnerDeps, RunnerToolCtx, compaction::CompactionCfg, run_loop};
@@ -87,6 +88,12 @@ use crate::diff::{DiffReport, Substitutions, diff_stream};
 use crate::fixture::{ClaudeTurn, Fixture, ProviderResponseSpec};
 
 /// Booted harness.
+///
+/// The `use_*_gate` fields are independent, orthogonal opt-in toggles read
+/// straight off the manifest's `gates` list — a plain set of flags, not a
+/// state machine. Collapsing them into an enum would obscure the 1:1
+/// gate-name → flag mapping.
+#[allow(clippy::struct_excessive_bools)]
 pub struct ReplayHarness {
     pub fixture: Fixture,
     pub tempdir: TempDir,
@@ -133,6 +140,19 @@ pub struct ReplayHarness {
     /// public API, the same one `copperclaw-host-delivery`'s own unit
     /// tests use.
     use_preview_gate: bool,
+    /// True when the manifest's `gates` includes `"tunnel"` (M19 A3 /
+    /// X-rider W3). Wires a [`FixtureTunnelBroker`] onto `delivery` via
+    /// the already-public `DeliveryService::set_tunnel_broker`, so a
+    /// `make_preview_public` call relayed through the reserved `__preview`
+    /// server routes to a canned public-URL reply instead of the
+    /// "no tunnel support wired" error. The `make_preview_public` tool is
+    /// already advertised by `preview_tool_defs()` (under the preview
+    /// gate) and routes via `run::preview::is_preview_tool`, so this gate
+    /// only supplies the host-side broker. Isolated from `"preview"` so
+    /// the existing preview fixtures (`prototype-golden`, `-verify-gate`)
+    /// keep no tunnel broker and their behaviour is byte-unchanged. Used
+    /// by the `prototype-public-share` fixture (A3 public-verb ritual card).
+    use_tunnel_gate: bool,
     /// Cached container manager for budget-gate fixtures. Reused
     /// across inbound steps so its per-agent-group dedup map survives
     /// (otherwise every step would post a fresh budget-exhausted reply,
@@ -226,6 +246,14 @@ impl ReplayHarness {
         if use_preview_gate {
             delivery.set_preview_broker(Arc::new(FixturePreviewBroker));
         }
+        let use_tunnel_gate = fixture
+            .manifest
+            .gates
+            .iter()
+            .any(|g| g.eq_ignore_ascii_case("tunnel"));
+        if use_tunnel_gate {
+            delivery.set_tunnel_broker(Arc::new(FixtureTunnelBroker));
+        }
 
         Ok(Self {
             fixture,
@@ -241,6 +269,7 @@ impl ReplayHarness {
             use_approvals_gate,
             use_budget_gate,
             use_preview_gate,
+            use_tunnel_gate,
             container_manager: tokio::sync::Mutex::new(None),
         })
     }
@@ -792,7 +821,7 @@ impl ReplayHarness {
         // of a timeout. Aborted once the turn (either branch below)
         // resolves; a no-op for every fixture that doesn't set
         // `gates: ["preview"]`.
-        let delivery_poller = if self.use_preview_gate {
+        let delivery_poller = if self.use_preview_gate || self.use_tunnel_gate {
             let delivery = Arc::clone(&self.delivery);
             let central = self.central.clone();
             Some(tokio::spawn(async move {
@@ -1420,6 +1449,44 @@ impl PreviewBroker for FixturePreviewBroker {
 
     async fn close(&self, _session_id: SessionId, _port: u16) -> Result<(), PreviewError> {
         Ok(())
+    }
+}
+
+/// Deterministic [`PublicTunnelBroker`] for fixtures that opt into
+/// `gates: ["tunnel"]` (M19 A3 / X-rider W3). Mirrors
+/// `copperclaw-host-delivery`'s own `MockTunnelBroker` test double (see
+/// `service.rs`'s `make_public_exposed_renders_url_and_note`): a canned
+/// live public URL, no real cloudflared binary, container IP, or approval
+/// round-trip involved. This models the state AFTER an operator has
+/// approved the exposure (the second `make_preview_public` call, which
+/// returns the shareable public link) — the approval plumbing itself is
+/// exercised by A3's host-handler unit tests + the `tunnel.rs` module
+/// tests, not by a replay fixture. Good enough to pin "the agent calls
+/// `make_preview_public`, gets a PUBLIC URL back, and puts it on the
+/// prototype-ready ritual card as an 'Open the public link' button"
+/// through the real inbound→router→runner→outbound→delivery pipeline.
+///
+/// The `https://` scheme + off-network host make the returned link
+/// visibly PUBLIC — the contrast with `FixturePreviewBroker`'s LAN
+/// `http://192.0.2.10:8100/...` URL that the ritual card also carries.
+#[derive(Debug, Default)]
+struct FixtureTunnelBroker;
+
+#[async_trait]
+impl PublicTunnelBroker for FixtureTunnelBroker {
+    async fn make_public(
+        &self,
+        _session: SessionInfoLite,
+        container_port: u16,
+    ) -> PublicTunnelReply {
+        PublicTunnelReply::Exposed {
+            public_url: format!(
+                "https://fixture-tunnel.example/__preview/fixture-tok-{container_port}"
+            ),
+            note: "This link is PUBLIC — anyone on the internet with it can open your app. \
+                   It is torn down automatically when the preview closes."
+                .into(),
+        }
     }
 }
 

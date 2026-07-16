@@ -1951,3 +1951,75 @@ async fn run_deltachat_card_todo_child(dump: bool) {
 async fn slack_reaction_inbound_bypasses_mention_gate() {
     run_fixture("slack", "reaction-inbound").await;
 }
+
+// ─── X-rider W3: capability fixtures (A1 / A3 / A7) ──────────────────────────
+
+/// Fixture-authoring gate for the W3 capability fixtures. When
+/// `COPPERCLAW_XR3_GENERATE` is set the harness regenerates `expected/*.jsonl`
+/// from a real run and the caller returns before asserting. Never taken under
+/// a normal `cargo test`.
+async fn xr3_maybe_generate(channel: &str, scenario: &str) -> bool {
+    if std::env::var_os("COPPERCLAW_XR3_GENERATE").is_none() {
+        return false;
+    }
+    let path = fixture_path(channel, scenario);
+    let fixture = Fixture::load(&path).expect("load fixture");
+    let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+    harness.run().await.expect("run harness");
+    harness.dump_expected_jsonl();
+    true
+}
+
+/// M19 A3 (X-rider W3): the public-verb ritual card. After `make_preview_public`
+/// returns a PUBLIC https URL (relayed through the reserved `__preview` server
+/// to the harness's `FixtureTunnelBroker`), the agent's prototype-ready ritual
+/// card gains an "Open the public link" button pointing at that public URL —
+/// alongside the LAN "Open preview" button. This locks the card-with-public-URL
+/// button shape at the pipeline level (inbound → router → runner → outbound →
+/// delivery), on top of the byte-stable JSONL diff. A3's approval round-trip +
+/// tunnel-broker internals are covered by its host-handler `preview.rs` tests
+/// and the `tunnel.rs` module tests; here the FixtureTunnelBroker models the
+/// post-approval `Exposed` reply so the fixture can prove the surfaced card.
+/// See the fixture's README.
+#[tokio::test]
+async fn cli_prototype_public_share_ritual_card_has_public_button() {
+    if xr3_maybe_generate("cli", "prototype-public-share").await {
+        return;
+    }
+    let harness = run_fixture_into_harness("cli", "prototype-public-share").await;
+    let cli = mock_for(&harness, "cli");
+    let deliveries = cli.deliveries();
+
+    // The ritual card renders through the cli text-fallback carrying BOTH the
+    // LAN "Open preview" button (from the M17 preview broker) and the new A3
+    // "Open the public link" button (from the tunnel broker) — the public verb
+    // added a button to the same prototype-ready card, it did not replace it.
+    let card_text = deliveries
+        .iter()
+        .filter_map(|d| d.message.content.get("text").and_then(|t| t.as_str()))
+        .find(|t| t.contains("Todo app is live and public"))
+        .expect("the public-share ritual card must be delivered");
+    assert!(
+        card_text.contains("**Todo app is live and public**"),
+        "card must carry the title as a headline: {card_text}",
+    );
+    // The LAN button is still present (the public verb augments, not replaces).
+    assert!(
+        card_text.contains("[Open preview] -> http://192.0.2.10:8100/__preview/fixture-tok-8000"),
+        "card must still carry the LAN Open-preview button: {card_text}",
+    );
+    // The headline A3 assertion: the public-URL button, pointing at the PUBLIC
+    // https tunnel URL the FixtureTunnelBroker returned for make_preview_public.
+    assert!(
+        card_text.contains(
+            "[Open the public link] -> https://fixture-tunnel.example/__preview/fixture-tok-8000"
+        ),
+        "card must carry the A3 public-URL button: {card_text}",
+    );
+    // The public URL is genuinely public (https, off-network host) — the
+    // contrast with the LAN http URL that shares the card.
+    assert!(
+        card_text.contains("https://fixture-tunnel.example/"),
+        "the public link must be an https tunnel URL, not the LAN address: {card_text}",
+    );
+}

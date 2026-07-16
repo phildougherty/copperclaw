@@ -1,0 +1,18 @@
+{
+  "name": "cli-prototype-public-share",
+  "channel": "cli",
+  "description": "M19 A3 (X-rider W3) capability fixture: after a preview is exposed on the LAN, the agent calls `make_preview_public` (relayed through the reserved `__preview` server to the FixtureTunnelBroker), gets a PUBLIC https URL back, and emits the prototype-ready ritual card — which now carries an 'Open the public link' button pointing at that public URL alongside the LAN 'Open preview' button. Locks the public-verb ritual-card shape end-to-end through inbound->router->runner->outbound->delivery. The make_public approval round-trip itself is covered by A3's host-handler + tunnel.rs unit tests; this fixture models the post-approval reply.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 10000
+  },
+  "gates": ["preview", "tunnel"],
+  "max_tool_turns": 8,
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

@@ -812,6 +812,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tainted_turn_exposes_lan_preview_but_is_blocked_from_public() {
+        // X-rider W3 (A7): the reclassification driven end-to-end through the
+        // real `invoke_tool` dispatch gate (A7's own tests are pure-policy unit
+        // tests; this is the e2e-flavored complement the X-rider asks for).
+        //
+        // A web-tainted "research then build" turn:
+        //   1. CAN `expose_preview` to the LAN — the M19 A7 carve-out exempts a
+        //      LAN-only preview from the taint gate, so the relay actually runs
+        //      and returns the shareable URL (before A7 this was denied as a
+        //      credentialed external action, the M18 papercut).
+        //   2. STILL CANNOT `make_preview_public` on the same tainted turn — the
+        //      outward public verb is NOT in the LAN carve-out, so it is blocked
+        //      at the policy gate BEFORE it can queue a `__preview` relay row.
+        let (_tmp, deps, ctx) = deps_with_runner_ctx();
+        // Taint the turn exactly as a web_fetch body / untrusted memory hit
+        // would (the "research then build" case).
+        ctx.mark_untrusted_context("web_fetch:https://research.example");
+        assert!(
+            ctx.is_context_tainted(),
+            "turn must be tainted for the case"
+        );
+
+        // A fake host answers the ONE expected `__preview` relay (expose_preview)
+        // with a LAN URL, then stops. `make_preview_public` must never reach the
+        // relay, so the host only ever sees the expose request.
+        let outbound = deps.outbound.clone();
+        let inbound = deps.inbound.clone();
+        let host = tokio::spawn(async move {
+            loop {
+                let pending = {
+                    let conn = outbound.lock().await;
+                    mcp_calls::list_requests(&conn).unwrap()
+                };
+                if let Some(req) = pending.into_iter().next() {
+                    assert_eq!(req.server, "__preview");
+                    assert_eq!(
+                        req.tool, "expose_preview",
+                        "only the LAN verb may reach the relay on a tainted turn"
+                    );
+                    let conn = inbound.lock().await;
+                    mcp_calls::insert_response(
+                        &conn,
+                        &McpCallResponse {
+                            request_id: req.request_id,
+                            is_error: false,
+                            result: "http://192.168.1.9:8100/__preview/tok\nLAN only".into(),
+                        },
+                    )
+                    .unwrap();
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+
+        // 1. LAN expose SUCCEEDS despite the taint (A7 carve-out).
+        let (exposed, _i, expose_err) = invoke_tool(
+            &deps,
+            &call_with("expose_preview", serde_json::json!({ "port": 3000 })),
+        )
+        .await;
+        host.await.unwrap();
+        assert!(
+            !expose_err,
+            "a LAN expose_preview must succeed on a tainted turn (A7); got: {exposed}"
+        );
+        assert!(
+            !exposed.contains("untrusted-provenance"),
+            "expose_preview must NOT be taint-gated (A7); got: {exposed}"
+        );
+        assert!(
+            exposed.contains("/__preview/tok"),
+            "expose_preview must return the LAN URL; got: {exposed}"
+        );
+
+        // 2. The outward public verb on the SAME tainted turn is BLOCKED at the
+        //    gate — untrusted-provenance deny, and it never queues a relay row.
+        let (blocked, _i, public_err) = invoke_tool(
+            &deps,
+            &call_with("make_preview_public", serde_json::json!({ "port": 3000 })),
+        )
+        .await;
+        assert!(
+            public_err,
+            "make_preview_public must be blocked on a tainted turn"
+        );
+        assert!(
+            blocked.contains("untrusted-provenance"),
+            "make_preview_public must be taint-gated (contrast to expose_preview); got: {blocked}"
+        );
+        let queued = {
+            let conn = deps.outbound.lock().await;
+            mcp_calls::list_requests(&conn).unwrap()
+        };
+        assert!(
+            queued.is_empty(),
+            "the blocked public verb must not queue a __preview relay row; got: {queued:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn external_mcp_call_blocked_on_tainted_turn_before_dispatch() {
         // Defense-in-depth: an external MCP call is a credentialed external
         // action, so a turn already tainted by untrusted-provenance content
@@ -1041,6 +1142,146 @@ mod tests {
 
         // The join consumed every spawn-result + report row it owned — none
         // linger to re-trigger a spurious parent turn.
+        let pending = {
+            let conn = inbound.lock().await;
+            messages_in::get_pending(&conn, true, 50).unwrap()
+        };
+        assert!(
+            pending.is_empty(),
+            "batch rows must be consumed; got {pending:?}"
+        );
+    }
+
+    /// Fake host that answers a MIXED batch: every delegate row whose
+    /// worker `name` is in `fail_names` gets a `rejected` spawn result (no
+    /// child, no report — a per-worker spawn failure); every other worker is
+    /// `created` and then reports. Models "one of N workers couldn't be
+    /// spawned while the rest succeed" — the partial-failure case A1's join
+    /// aggregates without losing the turn.
+    async fn fake_host_answer_delegates_mixed(
+        inbound: &Arc<Mutex<rusqlite::Connection>>,
+        outbound: &Arc<Mutex<rusqlite::Connection>>,
+        fail_names: &[&str],
+    ) {
+        let mut handled: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let rows = {
+                let conn = outbound.lock().await;
+                messages_out::list_due(&conn).unwrap()
+            };
+            for row in rows {
+                let Some(d) = row.content.get("delegate") else {
+                    continue;
+                };
+                let key = row.id.as_uuid().to_string();
+                if !handled.insert(key) {
+                    continue;
+                }
+                let instructions = d
+                    .get("instructions")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let name = d
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("w")
+                    .to_owned();
+                if fail_names.contains(&name.as_str()) {
+                    // A per-worker spawn failure: rejected result, no child.
+                    write_inbound(
+                        inbound,
+                        copperclaw_types::MessageKind::System,
+                        serde_json::json!({"delegate_result": {
+                            "status": "rejected",
+                            "detail": format!("worker `{name}` failed to spawn (disk full)")
+                        }}),
+                        None,
+                    )
+                    .await;
+                    continue;
+                }
+                let sid = SessionId::new().as_uuid().to_string();
+                write_inbound(
+                    inbound,
+                    copperclaw_types::MessageKind::System,
+                    serde_json::json!({"delegate_result": {
+                        "status": "created",
+                        "session_id": sid,
+                        "detail": instructions,
+                    }}),
+                    None,
+                )
+                .await;
+                write_inbound(
+                    inbound,
+                    copperclaw_types::MessageKind::Chat,
+                    serde_json::json!({"text": format!("{name} finished")}),
+                    Some(sid),
+                )
+                .await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_batch_partial_worker_failure_surfaces_in_aggregate() {
+        // X-rider W3 (A1): the partial-failure acceptance driven end-to-end
+        // through the REAL `invoke_tool` dispatch (A1's own mixed test is at
+        // the `join_workers` unit level / the mock-ctx handler level; this is
+        // the runner-dispatch complement). A batch of 3 workers where ONE
+        // fails to spawn while the other two build + report must return ONE
+        // aggregated result — NOT a tool error (partial != total refusal), NOT
+        // a lost turn — carrying both successful reports AND the failed
+        // worker's per-worker error.
+        let (_tmp, deps, inbound, outbound) = deps_with_join();
+        let host = tokio::spawn({
+            let inbound = inbound.clone();
+            let outbound = outbound.clone();
+            async move { fake_host_answer_delegates_mixed(&inbound, &outbound, &["docs"]).await }
+        });
+
+        let (content, imgs, is_error) = invoke_tool(
+            &deps,
+            &call_with(
+                "delegate_batch",
+                serde_json::json!({
+                    "workers": [
+                        {"name": "api", "instructions": "build api under /workspace"},
+                        {"name": "cli", "instructions": "build cli under /workspace"},
+                        {"name": "docs", "instructions": "write docs under /workspace"}
+                    ],
+                    "timeout_secs": 10
+                }),
+            ),
+        )
+        .await;
+        host.abort();
+
+        // A partial failure is NOT a tool error — the parent still gets the
+        // two successful reports to assemble.
+        assert!(
+            !is_error,
+            "a partial failure must still return an aggregate, not a tool error; got: {content}"
+        );
+        assert!(imgs.is_empty());
+        // Both successful workers' reports are in the ONE aggregate.
+        assert!(content.contains("api finished"), "got: {content}");
+        assert!(content.contains("cli finished"), "got: {content}");
+        // …and the failed worker surfaces as a per-worker error, not silence.
+        assert!(
+            content.contains("docs") && content.contains("failed to spawn"),
+            "the failed worker must surface in the aggregate as a per-worker error; got: {content}"
+        );
+        // The docs worker never produced a success report.
+        assert!(
+            !content.contains("docs finished"),
+            "the failed worker must not report success; got: {content}"
+        );
+
+        // Every batch row (2 created + 2 reports + 1 rejected) was consumed —
+        // none linger to re-trigger a spurious parent turn.
         let pending = {
             let conn = inbound.lock().await;
             messages_in::get_pending(&conn, true, 50).unwrap()
