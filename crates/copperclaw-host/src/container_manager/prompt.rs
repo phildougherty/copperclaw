@@ -164,6 +164,14 @@ emojis unless the user explicitly asks.
 /// the long-form skill stays the depth reference and the block points
 /// at it.
 ///
+/// M20 Q4 added the code-quality floor: decompose before typing, prefer
+/// a baked tool (`create-vite`/`typescript`/`sqlite3`) over hand-rolling,
+/// handle user-reachable errors even in a prototype, and write the
+/// multi-stage `.copperclaw/verify` (M20 Q2's named-stage format) at
+/// scaffold time rather than at the end. Still static text only — no
+/// per-turn content joins this block (see the module doc on why that
+/// matters for prompt-cache stability).
+///
 /// Static per spawn — the content never varies per turn, so it joins
 /// `BASE_PREAMBLE` inside the provider's cached prompt prefix. Written
 /// for small local models: short imperative lines, no prose paragraphs.
@@ -175,16 +183,29 @@ pub const CODING_PREAMBLE: &str = "
 These rules always apply when you write code. For the full discipline, \
 `load_skill(\"coding-task\")` before starting real coding work.
 
+- Decompose before you type: name the modules/files and each one's \
+single responsibility BEFORE writing code. \"Build X\" as the whole \
+plan becomes a god-file; named parts stay reviewable and splittable.
 - Every project is a git repo, and `git init` comes FIRST: \
 `mkdir -p /data/<project> && cd /data/<project> && git init`.
 - One repo per project dir under `/data`; never pile projects into one.
 - Commit after EACH working increment — not one commit at the end.
+- Prefer a baked tool over hand-rolling one: `create-vite` to scaffold \
+a web app, `typescript` once one's scaffolded, `sqlite3` for storage. \
+Baked beats fetched beats hand-rolled.
 - Verify before you claim done. Run the code (`python3 x.py`, \
 `node x.js`, curl the running server), and run the project's own check \
 command (its tests / build / lint) before marking a code todo \
 `completed`. \"It compiles\" is not the bar.
 - Use the project's canonical whole-project build (`cargo build`, \
 `go build ./...`, `npm run build`) — never an ad-hoc per-file check.
+- Handle the errors a *user* will actually hit — bad input, an empty \
+state, a network failure — even in a prototype. \"Impossible\" means no \
+UI path can produce it, not merely unlikely.
+- Write `.copperclaw/verify` as multiple named stages (`lint: npx \
+eslint .`, `typecheck: tsc --noEmit`, `test: npm test`) at SCAFFOLD \
+time, not at the end — one line per discipline names which one broke \
+when it fails.
 - Could not run it? Say so plainly. \"Done\" without evidence is \
 fabrication.
 - End EVERY build with an artifact-delivery step. Files under `/data` \
@@ -1540,7 +1561,32 @@ mod tests {
             assert!(prompt.contains("`send_file`"));
             assert!(prompt.contains("`artifact_path`"));
             assert!(prompt.contains("`expose_preview`"));
+            // M20 Q4: the code-quality floor block — decomposition, baked
+            // tools over hand-rolling, user-reachable error handling, and
+            // the multi-stage verify file written at scaffold time.
+            assert!(prompt.contains("Decompose before you type"));
+            assert!(prompt.contains("`create-vite`"));
+            assert!(prompt.contains("`sqlite3`"));
+            assert!(prompt.contains("Handle the errors a *user* will actually hit"));
+            assert!(prompt.contains("multiple named stages"));
+            assert!(prompt.contains("SCAFFOLD"));
         }
+    }
+
+    #[test]
+    fn coding_preamble_appears_exactly_once_in_coding_profile_prompt() {
+        // M20 Q4 acceptance: the static block is spliced in once, not
+        // duplicated by any later concatenation step (e.g. if a future
+        // card appends another block that accidentally re-includes it).
+        let session = copperclaw_types::SessionId::new();
+        let ag = AgentGroupId::new();
+        let prompt = assemble_for_profile(ToolProfile::Coding, session, ag);
+        let occurrences = prompt.matches(CODING_PREAMBLE).count();
+        assert_eq!(
+            occurrences, 1,
+            "CODING_PREAMBLE must appear exactly once in the coding-profile prompt, \
+             found {occurrences}"
+        );
     }
 
     #[test]
