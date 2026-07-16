@@ -241,6 +241,9 @@ impl Router {
         outcome
     }
 
+    // Same forward-compatibility rationale as `route`'s `#[allow]` above:
+    // kept `async` for hook closures that may need to issue I/O later.
+    #[allow(clippy::unused_async)]
     async fn route_impl(&self, event: &InboundEvent) -> Result<RouteOutcome, RouterError> {
         // 1. Debounce.
         let dkey = DebounceKey {
@@ -937,8 +940,10 @@ mod tests {
 
     struct Fixture {
         router: Router,
-        // Keep tempdir alive for the duration of the test.
-        _tmp: tempfile::TempDir,
+        // Kept alive for the duration of the test; the M18 C3 inbound-file
+        // tests also read paths under it directly (`session_dir`), so it's
+        // no longer purely an RAII guard — not underscore-prefixed.
+        tmp: tempfile::TempDir,
         mg_id: MessagingGroupId,
         ag_id: AgentGroupId,
     }
@@ -986,7 +991,7 @@ mod tests {
         let router = Router::new(db, root);
         Fixture {
             router,
-            _tmp: tmp,
+            tmp,
             mg_id: mg.id,
             ag_id: ag.id,
         }
@@ -1065,7 +1070,7 @@ mod tests {
         }
         Fixture {
             router,
-            _tmp: tmp,
+            tmp,
             mg_id: mg.id,
             ag_id: ag.id,
         }
@@ -2138,7 +2143,7 @@ mod tests {
     /// Session root dir for a routed target, via the fixture's tempdir
     /// layout (`FsSessionRoot` mirrors `SessionPaths`).
     fn session_dir(fx: &Fixture, target: &DeliveredTo) -> std::path::PathBuf {
-        fx._tmp
+        fx.tmp
             .path()
             .join("sessions")
             .join(target.agent_group_id.as_uuid().to_string())
@@ -2311,7 +2316,10 @@ mod tests {
                 "each fanned-out session gets its own copy"
             );
             let rows = inbound_rows(&fx, target);
-            assert_eq!(rows[0].content["attachment"]["path"], "/data/inbox/779/spec.csv");
+            assert_eq!(
+                rows[0].content["attachment"]["path"],
+                "/data/inbox/779/spec.csv"
+            );
         }
         assert!(!staged.exists(), "staged source consumed after fanout");
     }

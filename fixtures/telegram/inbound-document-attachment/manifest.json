@@ -1,0 +1,17 @@
+{
+  "name": "telegram-inbound-document-attachment",
+  "channel": "telegram",
+  "description": "M18 C3 acceptance: a telegram document attachment is staged by the adapter, materialized by the router into the resolved session's inbox with a container-visible /data/inbox path, then a second oversized document still yields the too_large system fallback (no staging, no materialization).",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\"",
+    "\"staged_path\":\"[^\"]*\"": "\"staged_path\":\"<STAGED>\""
+  }
+}

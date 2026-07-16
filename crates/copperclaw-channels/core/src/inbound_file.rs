@@ -183,7 +183,10 @@ mod tests {
     fn sanitize_replaces_unsafe_characters() {
         assert_eq!(sanitize_filename(Some("a b.c"), "x"), "a_b.c");
         assert_eq!(sanitize_filename(Some("weird?name!"), "x"), "weird_name_");
-        assert_eq!(sanitize_filename(Some("../../etc/passwd"), "x"), "etc_passwd");
+        assert_eq!(
+            sanitize_filename(Some("../../etc/passwd"), "x"),
+            "etc_passwd"
+        );
         assert_eq!(sanitize_filename(Some("nul\0byte"), "x"), "nul_byte");
         assert_eq!(sanitize_filename(Some("ctrl\x07bell"), "x"), "ctrl_bell");
     }
@@ -204,8 +207,12 @@ mod tests {
     #[tokio::test]
     async fn stage_writes_bytes_under_unique_dir() {
         let tmp = tempfile::tempdir().unwrap();
-        let a = stage_inbound_file(tmp.path(), "a.txt", b"one").await.unwrap();
-        let b = stage_inbound_file(tmp.path(), "a.txt", b"two").await.unwrap();
+        let a = stage_inbound_file(tmp.path(), "a.txt", b"one")
+            .await
+            .unwrap();
+        let b = stage_inbound_file(tmp.path(), "a.txt", b"two")
+            .await
+            .unwrap();
         assert_ne!(a, b, "same filename must stage to distinct paths");
         assert_eq!(std::fs::read(&a).unwrap(), b"one");
         assert_eq!(std::fs::read(&b).unwrap(), b"two");
@@ -226,10 +233,7 @@ mod tests {
     async fn stage_falls_back_on_unusable_name() {
         let tmp = tempfile::tempdir().unwrap();
         let p = stage_inbound_file(tmp.path(), "....", b"x").await.unwrap();
-        assert_eq!(
-            p.file_name().unwrap().to_str().unwrap(),
-            FALLBACK_FILENAME
-        );
+        assert_eq!(p.file_name().unwrap().to_str().unwrap(), FALLBACK_FILENAME);
     }
 
     #[tokio::test]
