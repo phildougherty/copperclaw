@@ -199,6 +199,28 @@ adheres to [Semantic Versioning](https://semver.org/).
   decisions-tail, cap-overflow, and an end-to-end `compact()` test asserting
   all three new sections survive a real compaction round). `pair_safe_pivot`
   and all pre-existing pinned-header tests are unchanged and green.
+### Added (M20 Q5 — `web-app-scaffold` skill)
+
+- New `skills/web-app-scaffold/SKILL.md`: the golden path for starting a web
+  app prototype now that Q1 bakes `create-vite`/`vite`/`typescript`/`eslint`/
+  `prettier`/`tailwindcss` as global npm packages. Teaches `npm create
+  vite@latest` (offline-safe — no registry fetch needed) with `vanilla-ts` as
+  the default template and `react-ts` only when the user names the
+  framework; seeding `tsconfig.json`, a flat `eslint.config.js`, and a
+  `.prettierrc` in the same scaffolding step rather than deferring them;
+  writing the matching Q2-format multi-stage `.copperclaw/verify`
+  (`lint: npx eslint .`, `typecheck: tsc --noEmit`, `build: npm run build`)
+  at scaffold time, with probing (`command -v eslint`) taught before writing
+  any stage a pre-Q1 image can't satisfy; and, once the dev server is up,
+  the `ui_screenshot` see-it habit with a forward-pointer to the
+  `frontend-design` skill (lands separately in Wave 3) for the critique
+  loop. Discovered automatically by `SkillRegistry::scan` (directory-based —
+  no registry file to edit); validated by the existing
+  `crates/copperclaw-skills/tests/coverage.rs` suite (name/dir match,
+  substantive description, size cap, no stray template markers). The
+  `coding-task` cross-reference pointer back to this skill is deferred to
+  the M20 integrator per the lane-P sequencing (Q4 lands `coding-task`
+  first).
 
 ### Added (M19 A3 — Public-tunnel model verb: activate V5)
 
