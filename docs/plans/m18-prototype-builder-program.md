@@ -48,14 +48,27 @@ except where noted. Do not implement an absorbed card from the M17 text alone
    fixture under `fixtures/` per `docs/replay-fixtures.md`.
 6. **PR per card, branch off `main`, one card per branch.**
 
-## Execution status (updated 2026-07-15, end of first session)
+## Execution status (updated 2026-07-15, end of third session)
 
-Wave 1 is **complete and merged**; Wave 2 is underway. A fresh session should
-read this section first, then take the next unblocked card per the wave
-summary. The operator approved merging agent-authored PRs to `main` without
-human review (2026-07-15); merges use merge commits (house style). CHANGELOG
+Wave 1 is **complete and merged**. Wave 2 is underway: R2 merged (#31), R3 is
+**in progress — part 1/2 committed, part 2/2 not started** (see "R3
+continuation" below — read it first if you're the one picking R3 back up).
+A fresh session should read this section first, then either finish R3 (if
+left mid-flight) or take the next unblocked card per the wave summary. The
+operator has directed merges of agent-authored PRs to `main` each time so
+far (2026-07-15); merges use merge commits (house style). CHANGELOG
 keep-both conflicts between card branches are the norm — resolve by keeping
 both entries, then merge.
+
+Two housekeeping traps that bit this session, worth checking early in any
+fresh session: (1) local `main` can silently drift behind `origin/main` by
+many commits (it was 21 behind at one point) if a prior session's PRs merged
+on GitHub without a local `git pull` after — always `git fetch && git log
+HEAD..origin/main --oneline` before trusting local `main`. (2) A prior
+session's "agent in flight on branch X" claim in this doc turned out to be
+false for both R2 and C3 — the branches existed but held zero card-specific
+commits. Don't trust an "in flight" claim without checking `git log
+main..<branch> --oneline` yourself first.
 
 ### Card status
 
@@ -68,9 +81,191 @@ both entries, then merge.
 | C2 | Merged | #28 |
 | T1 | Merged | #25 |
 | P1 | Merged | #26 |
-| R2 | Implemented, branch `m18/r2-mid-turn-steering-v2` | — |
+| R2 | Merged | #31 |
+| R3 | **In progress — part 1/2 done, part 2/2 not started.** Branch `m18/r3-verification-gate`, pushed, WIP commit `b53ce57`. Not a PR yet. | — |
 | C3 | Not started | — |
 | All others | Not started | — |
+
+### R3 continuation (read this first if you're picking up R3)
+
+**Where things stand:** `git checkout m18/r3-verification-gate` (already pushed
+to origin). The tree compiles clean, `cargo fmt --all -- --check` passes,
+`cargo clippy --workspace --all-targets -- -D warnings` passes, and
+`cargo test -p copperclaw-db -p copperclaw-host -p copperclaw-modules -p
+copperclaw-host-delivery --lib` is green. This checkpoint is **DB layer +
+host plumbing only** — the actual gate (dirty tracking, the `todo_update`
+refusal, the bounded fix loop) does not exist yet. Read the card text
+(above, "R3 (amends M17-A7)") for the acceptance criteria; the design below
+is the concrete plan already worked out — follow it rather than
+re-deriving, unless you find a reason it's wrong.
+
+**Done (part 1/2):**
+- Migration `026_container_config_verify_gate.sql`: `container_configs`
+  gets `check_command TEXT` (nullable, per-group verify-command override)
+  and `verify_gate INTEGER` (nullable; `NULL`/unset = gate ON (default), `0`
+  = off — there is no explicit "1" state, see the migration's doc comment).
+  Registered in `crates/copperclaw-db/src/migrate.rs`'s `CENTRAL` list.
+- `crates/copperclaw-db/src/tables/container_configs.rs`: `ContainerConfig`
+  / `UpsertContainerConfig` gained `check_command: Option<String>` and
+  `verify_gate: bool`; `row_to_container_config`, `get`, `upsert` updated;
+  narrow setters `set_check_command` / `set_verify_gate` added (mirroring
+  `set_preview_enabled`/`set_preview_bind`); tests added. Both structs
+  needed `#[allow(clippy::struct_excessive_bools)]` (4 bools now:
+  `coding_enabled`/`surface_thinking`/`preview_enabled`/`verify_gate` — a
+  legitimate flag-bag, not a state-machine candidate; don't fight the lint
+  with a refactor here).
+- `crates/copperclaw-host/src/container_manager/runner_config.rs`:
+  `RunnerConfigForFile` gained `check_command: Option<String>` and
+  `verify_gate: Option<bool>` (only emits `Some(false)`, skip-if-default
+  like `surface_thinking`/`tool_profile` — both stay OUTSIDE
+  `compute_fingerprint`, runner-config-only like `tool_profile`).
+  `runner_config_for` resolves both from `cc` with no env fallback (unlike
+  `hud_mode`/`temperature` — these are per-group only, no host-wide knob).
+- `crates/copperclaw-host/src/handlers/groups.rs`'s `config_update` (the
+  `cclaw groups config update --field key=value` handler) gained
+  `"check_command"` / `"verify_gate"` match arms, so operators can already
+  set both from the CLI ahead of the runner honoring them.
+- `crates/copperclaw-modules/src/agent_to_agent/create_agent.rs`'s
+  `inherit_parent_container_config` copies both fields to a spawned child
+  agent (same verification contract as the parent).
+- A pile of mechanical `UpsertContainerConfig{...}` / `ContainerConfig{...}`
+  struct-literal call sites across `copperclaw-host`, `copperclaw-host-
+  delivery`, and `copperclaw-modules` (test fixtures + a few production
+  default-row constructors) got the two new fields (`check_command: None`,
+  `verify_gate: true`) added so the workspace compiles. If you add a THIRD
+  new `container_configs` field later, expect the same fan-out — `grep -rn
+  "UpsertContainerConfig {" --include=*.rs` / `"ContainerConfig {"` to find
+  them all.
+
+**Not done (part 2/2 — the actual gate). Concrete design, work it in this
+order:**
+
+1. **`copperclaw-runner` config plumbing.** `crates/copperclaw-runner/src/
+   config.rs`: parse `check_command`/`verify_gate` out of `runner.json`
+   into the runner's own config struct (mirror how `hud_mode`/
+   `surface_thinking` are already parsed there). `RunnerDeps` (`run/
+   mod.rs`) gets two new fields: `verify_gate: bool` (default `true`) and
+   `check_command_override: Option<String>`. Wire both through `main.rs`
+   and `RunnerDeps::minimal` (test default: gate on, no override — tests
+   opt out explicitly, same convention as `hud_mode`/`policy`).
+
+2. **`ToolContext` capability (`crates/copperclaw-mcp/src/context.rs`).**
+   Add two default-impl trait methods, same shape as `is_context_tainted`
+   / `is_autonomous_turn`:
+   ```rust
+   fn verify_gate_enabled(&self) -> bool { true }
+   fn check_command_override(&self) -> Option<String> { None }
+   ```
+   `RunnerToolCtx` (in `copperclaw-runner`, the real impl) overrides both
+   from `RunnerDeps`. `MockToolCtx` (the `copperclaw-mcp` test double)
+   keeps the defaults unless a test overrides them explicitly.
+
+3. **New module: `crates/copperclaw-mcp/src/tools/verify_gate.rs`** — the
+   file-marker-based dirty-tracking primitives (mirrors `todo.rs`'s own
+   `todo_path()` / `#[cfg(test)]` override pattern for testability). All
+   state lives under `<project_root>/.copperclaw/`:
+   - `verify` — the recorded command, one line (already spec'd; the agent
+     writes this itself per P1's prompt guidance — this module only
+     *reads* it).
+   - `dirty` — presence = dirty; content irrelevant (empty file is fine).
+   - `fix_cycles` — plain integer text, absent = `0`.
+   - `last_failure` — tail text of the most recent failed verify run.
+
+   Functions needed (all `async`, best-effort — I/O errors log+swallow,
+   they must never abort a tool call):
+   - `fn project_root_of(path: &str) -> Option<PathBuf>` — `/data/<name>/
+     ...` → `/data/<name>`; `/data/<name>` itself → `/data/<name>`; a bare
+     top-level `/data/<file>` (no subdirectory) or anything outside
+     `/data` → `None` (no project, no gate). **This is the trickiest
+     function to get right — write its unit tests first.**
+   - `async fn mark_dirty(project_root: &Path)` — creates the `dirty`
+     marker AND resets `fix_cycles` to `0`. Resetting on every fresh edit
+     is deliberate: a new edit after a bad stretch deserves a fresh
+     2-strike budget, not a permanently doomed todo.
+   - `async fn is_dirty(project_root: &Path) -> bool`
+   - `async fn clear_dirty(project_root: &Path)` — successful verify run:
+     removes the `dirty` marker, resets `fix_cycles` to `0`.
+   - `async fn record_verify_failure(project_root: &Path, tail: &str) ->
+     u32` — increments `fix_cycles`, writes `last_failure`, returns the
+     new count. Does NOT touch `dirty` (a failed verify leaves the
+     project dirty — nothing to clear).
+   - `async fn fix_cycles(project_root: &Path) -> u32`
+   - `async fn last_failure(project_root: &Path) -> Option<String>`
+   - `async fn recorded_verify_command(project_root: &Path, override_cmd:
+     Option<&str>) -> Option<String>` — `override_cmd` (from
+     `ctx.check_command_override()`) wins when `Some`; else read+trim
+     `verify`, `None` if missing/empty.
+   - `const FIX_CYCLE_CAP: u32 = 2;`
+
+4. **Hook into `computer_use.rs`.** The edit-family list already exists as
+   `EDIT_FAMILY_TOOLS` in `copperclaw-runner/src/run/drive_turn.rs` — that
+   one's for R2's serialization concern, not directly reusable from
+   `copperclaw-mcp` (wrong crate/purpose), but mirror its tool-name list.
+   - `write_file` / `edit_file` / `multi_edit` / `apply_patch` handlers:
+     after a **successful** write, if `project_root_of(path)` resolves,
+     call `verify_gate::mark_dirty` (best-effort, ignore errors — don't
+     let a marker-file write failure fail the actual edit).
+   - `shell` handler (`computer_use.rs`'s `shell::handle`): after the
+     command completes, only when `input.cwd` is **explicitly `Some`**
+     (documented limitation — a `cwd`-less call isn't attributed to any
+     project; models pass `cwd` explicitly for project-scoped commands in
+     practice) and `project_root_of(cwd)` resolves:
+     - If `input.command.trim()` equals
+       `recorded_verify_command(project_root, ctx.check_command_override())`
+       — this IS the verify run: exit code `0` → `clear_dirty`; nonzero →
+       `record_verify_failure(project_root, tail_of(stdout+stderr))`.
+     - Otherwise (any other command) → `mark_dirty` (conservative: it
+       could have written files, e.g. `npm install` touching
+       `package-lock.json`).
+
+5. **The gate itself — `crates/copperclaw-mcp/src/tools/todo.rs`,
+   `update::handle`.** After the existing evidence-≥40-chars anti-
+   fabrication check (unchanged, still required) and only when
+   `ctx.verify_gate_enabled()`:
+   - Add a `TodoStatus::Blocked` variant (+ carry the failure text —
+     reuse the existing `evidence` field's slot or add one; check how
+     `TodoItem` serializes to `todo_list()`'s tool-facing JSON and update
+     that too).
+   - **Design simplification (deliberate, matches the single-project-
+     per-session golden path the whole M18 program targets — flag if you
+     find a reason to generalize):** todos are NOT linked to a specific
+     project directory in the store. The gate check is session-wide: scan
+     `/data/*/.copperclaw/dirty` (glob one level under `/data`) for ANY
+     dirty project, not "the project this todo belongs to". So:
+     - No project dirty → proceed exactly as today (evidence-only). This
+       is also how "no git repo / no verify file" degrades per the card
+       spec — a pure-chat group never touches `/data/<name>/...`, so
+       nothing is ever marked dirty, so the strict gate never engages.
+     - Some project dirty, its `fix_cycles < FIX_CYCLE_CAP` → refuse
+       (`ToolError::Validation`) naming the project, the recorded verify
+       command (or "none recorded — write one to `.copperclaw/verify`"
+       if `recorded_verify_command` is `None`), and cycles-remaining.
+     - Some project dirty, its `fix_cycles >= FIX_CYCLE_CAP` (the model
+       already burned its two fix attempts and is STILL dirty) → instead
+       of refusing again, auto-transition status to `Blocked` with
+       `last_failure` attached, and return **success** (not an error) —
+       "never silently completed" but also never permanently stuck
+       refusing forever.
+   - `verify_gate_enabled() == false` → skip all of the above, byte-
+     identical to pre-R3 behaviour.
+
+6. **Tests.** Runner/mcp unit tests per the card's "Tests" line: dirty
+   tracking (including the "parallel batch edits" case R2's
+   `execute_tool_batch` already proves can happen — two edits to
+   different files in one batch should both mark their respective
+   projects dirty without racing), gate refusal shapes, the fix-cycle→
+   blocked transition, `verify_gate=off` byte-stable behaviour. Use
+   `deps_with_mocks`-style test scaffolding (see R2's tests in
+   `drive_turn.rs` for the pattern) or `copperclaw-mcp`'s own
+   `MockToolCtx`. An e2e replay fixture ("build-verify-loop" on cli, per
+   the card) is a stretch goal — if the harness limitation R2 hit
+   (documented above) also blocks this, note it the same way and don't
+   let it block merging.
+
+7. **Acceptance to hand-verify once built:** mock-provider e2e — scripted
+   turn edits a file, attempts `todo_update completed` → refused; runs a
+   failing verify command → refused with stderr attached; runs a passing
+   verify → allowed. `verify_gate=off` → today's behaviour, byte-stable.
 
 **Correction (2026-07-15, later session):** the prior session's claim that
 R2 and C3 had agents "in flight" on `m18/r2-mid-turn-steering` /
@@ -81,9 +276,12 @@ from scratch this session on a fresh branch (old branch left alone,
 untouched, in case it holds context worth recovering later). C3 is still
 genuinely unstarted.
 
-Next unblocked: R3 (after R2 merges — done above), C4a + C4b (after C3
-merges — still open), X1 (after R3), P2 (after R3). Wave 3's V1, V3, and G1
-have no unmerged prerequisites and can start any time lanes are free.
+R3 is in progress (see "R3 continuation" above — finish that before starting
+anything else in lane R). Once R3 merges: C4a + C4b (after C3 merges — C3
+itself is still fully open and unstarted), X1 (after R3), P2 (after R3).
+Wave 3's V1, V3, and G1 have no unmerged prerequisites and can start any
+time lanes are free — a reasonable pick if you'd rather not pick up R3
+mid-flight.
 
 R2 shipped without its "e2e fixture pairing with R1's" — the shared replay
 harness drives one `inbound/NNN-*.json` step fully (including its whole
@@ -113,9 +311,9 @@ file. Worth a look if it keeps showing up.
   "steering noted" is `TaskHud::add_note()` in
   `crates/copperclaw-runner/src/run/hud.rs` (also the R5 "switched provider"
   hook).
-- **R3:** migration **026 is still free** — H1 shipped `hud_mode` as host-wide
-  env config (`COPPERCLAW_HUD_MODE` -> `runner.json.hud_mode`), not a DB
-  column.
+- **R3:** migration 026 is now TAKEN (`container_configs.check_command` /
+  `.verify_gate`, added by R3 part 1/2 — see the "R3 continuation" section
+  above). Next free migration is **027**.
 - **R3 (from R2):** the mid-turn steering check lives in
   `drive_turn.rs`'s `check_mid_turn_steering`, called right after
   `hud.on_batch_end` on every batch iteration — R3's verification gate
