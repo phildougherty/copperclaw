@@ -19,7 +19,7 @@
 //! | `image` / `document` / `audio` / `video` | `MessageKind::Chat`, content with `attachment` metadata. |
 //! | `button` | `MessageKind::Chat`, content `{"button","payload"}`. |
 //! | `interactive` | `MessageKind::Chat`, content `{"interactive": ...}`. |
-//! | `reaction` | accepted (200) but no inbound event. |
+//! | `reaction` | `MessageKind::Chat`, content `{"reaction": {emoji, target_seq, actor}}` (M19 U7); an empty emoji (reaction removed) is a no-op. |
 //!
 //! `statuses[]` items (delivery/read receipts) are accepted with no
 //! inbound event. Top-level body shapes that fail to parse return `400`.
@@ -261,9 +261,23 @@ async fn convert_message(
             let interactive = msg.get("interactive").cloned().unwrap_or(json!({}));
             json!({"interactive": interactive})
         }
-        // `reaction` (user-reacted-to-our-message) and any other unrecognised
-        // type are acknowledged at the HTTP layer but produce no inbound
-        // event in v1.
+        // M19 U7: a reaction on one of the agent's messages. WhatsApp sends
+        // `reaction.message_id` (the reacted-to message — the platform id the
+        // runner matches against its `delivered` table) and `reaction.emoji`.
+        // An empty emoji means the user REMOVED their reaction → no event.
+        "reaction" => {
+            let reaction = msg.get("reaction");
+            let emoji = reaction
+                .and_then(|r| r.get("emoji"))
+                .and_then(Value::as_str)
+                .filter(|e| !e.is_empty())?;
+            let target = reaction
+                .and_then(|r| r.get("message_id"))
+                .and_then(Value::as_str);
+            copperclaw_channels_core::reaction_content(emoji, target, None)
+        }
+        // Any other unrecognised type is acknowledged at the HTTP layer but
+        // produces no inbound event in v1.
         _ => return None,
     };
 
@@ -473,6 +487,64 @@ mod tests {
                 }]
             }]
         })
+    }
+
+    #[tokio::test]
+    async fn reaction_message_emits_inbound_reaction() {
+        // M19 U7: a 👍 on the agent's message wamid.PARENT becomes a
+        // normalized reaction inbound row.
+        let (state, mut rx) = make_state();
+        let app = build_events_router("/wh", state.clone());
+        let env = make_envelope(
+            &json!([{
+                "from":"15551234",
+                "id":"wamid.R",
+                "timestamp":"1700000002",
+                "type":"reaction",
+                "reaction":{"message_id":"wamid.PARENT","emoji":"\u{1F44D}"}
+            }]),
+            &json!([{"profile":{"name":"Alice"},"wa_id":"15551234"}]),
+            "PNID",
+        );
+        let body = serde_json::to_vec(&env).unwrap();
+        let req = signed_post(&state, "/wh", &body);
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let evt = rx.recv().await.unwrap();
+        assert_eq!(evt.message.kind, copperclaw_types::MessageKind::Chat);
+        let r = copperclaw_channels_core::parse_reaction(&evt.message.content).unwrap();
+        assert_eq!(r.emoji, "\u{1F44D}");
+        assert_eq!(r.target_seq.as_deref(), Some("wamid.PARENT"));
+        assert_eq!(evt.sender.unwrap().identity, "15551234");
+    }
+
+    #[tokio::test]
+    async fn removed_reaction_emits_nothing() {
+        // Empty emoji = the user removed their reaction → no inbound event
+        // (the HTTP layer still ACKs 200).
+        let (state, mut rx) = make_state();
+        let app = build_events_router("/wh", state.clone());
+        let env = make_envelope(
+            &json!([{
+                "from":"15551234",
+                "id":"wamid.R2",
+                "timestamp":"1700000003",
+                "type":"reaction",
+                "reaction":{"message_id":"wamid.PARENT","emoji":""}
+            }]),
+            &json!([{"profile":{"name":"Alice"},"wa_id":"15551234"}]),
+            "PNID",
+        );
+        let body = serde_json::to_vec(&env).unwrap();
+        let req = signed_post(&state, "/wh", &body);
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "a removed reaction must not emit an inbound event"
+        );
     }
 
     #[tokio::test]

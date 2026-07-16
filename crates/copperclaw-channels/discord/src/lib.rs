@@ -61,8 +61,9 @@ mod tests {
 
     #[test]
     fn default_intents_constant_matches_spec() {
-        // Bitwise sum of `(1<<0)|(1<<9)|(1<<10)|(1<<12)|(1<<15)`.
-        assert_eq!(DEFAULT_INTENTS, 38_401);
+        // Bitwise sum of `(1<<0)|(1<<9)|(1<<10)|(1<<12)|(1<<13)|(1<<15)`
+        // (the 1<<13 DIRECT_MESSAGE_REACTIONS bit added in M19 U7).
+        assert_eq!(DEFAULT_INTENTS, 46_593);
     }
 
     #[test]

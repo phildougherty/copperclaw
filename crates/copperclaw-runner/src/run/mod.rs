@@ -18,6 +18,7 @@ pub mod preview;
 pub(super) mod progressive;
 pub(super) mod prompt;
 pub(super) mod provider_call;
+pub(super) mod reaction;
 pub(super) mod tool_dispatch;
 
 use std::path::PathBuf;
@@ -597,6 +598,31 @@ fn is_prompt_already_in_history(history: &[HistoryMessage], prompt: &str) -> boo
         .unwrap_or(false)
 }
 
+/// M19 U7: mark every reaction row in a freshly-polled batch completed and
+/// return the non-reaction rows. Called before formatting so a reaction never
+/// drives a fresh turn or reaches the model as raw JSON (the mid-turn steering
+/// seam in `drive_turn` is where a reaction that lands during a turn actually
+/// steers).
+async fn consume_fresh_reaction_rows(
+    deps: &RunnerDeps,
+    pending: Vec<copperclaw_types::MessageInRow>,
+) -> Vec<copperclaw_types::MessageInRow> {
+    let (reactions, rest): (Vec<_>, Vec<_>) =
+        pending.into_iter().partition(reaction::is_reaction_row);
+    if !reactions.is_empty() {
+        let inbound = deps.inbound.lock().await;
+        for row in &reactions {
+            if let Err(err) = messages_in::mark_completed(&inbound, row.id) {
+                tracing::warn!(
+                    ?err,
+                    "U7: consuming a lapsed reaction row failed; continuing"
+                );
+            }
+        }
+    }
+    rest
+}
+
 /// Drive the poll loop until `max_turns` turns have been executed (or
 /// forever, if `max_turns` is `None`). The function is `async` and may be
 /// awaited from any tokio runtime.
@@ -645,6 +671,19 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
         };
         first_poll = false;
 
+        if pending.is_empty() {
+            sleep(deps.idle_sleep).await;
+            continue;
+        }
+
+        // M19 U7: reactions are lightweight steering for an IN-PROGRESS turn,
+        // never a fresh turn of their own. A reaction that lands mid-turn is
+        // consumed and (if curated + on the agent's own message) folded in by
+        // `drive_turn`'s R2 steering seam. One that surfaces here — picked up
+        // between turns — is a lapsed signal: consume it so it can neither
+        // drive a spurious turn nor reach the model as raw reaction JSON, and
+        // never fold it into a fresh prompt.
+        let pending = consume_fresh_reaction_rows(&deps, pending).await;
         if pending.is_empty() {
             sleep(deps.idle_sleep).await;
             continue;

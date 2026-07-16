@@ -1,0 +1,14 @@
+{
+  "name": "telegram-reaction-steer",
+  "channel": "telegram",
+  "description": "M19 U7: a 👍 reaction in a mention-gated telegram group bypasses the gate (interaction payload) and persists a non-trigger reaction row (kind=chat, trigger=0, content.reaction, pending for the runner's R2 steering seam); no runner turn, no outbound, no delivery.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\""
+  }
+}

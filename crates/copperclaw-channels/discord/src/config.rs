@@ -22,12 +22,15 @@ pub const DEFAULT_API_BASE: &str = "https://discord.com/api/v10";
 /// Default Discord gateway URL.
 pub const DEFAULT_GATEWAY_URL: &str = "wss://gateway.discord.gg/?v=10&encoding=json";
 
-/// `GUILDS | GUILD_MESSAGES | GUILD_MESSAGE_REACTIONS | DIRECT_MESSAGES | MESSAGE_CONTENT`.
+/// `GUILDS | GUILD_MESSAGES | GUILD_MESSAGE_REACTIONS | DIRECT_MESSAGES |
+/// DIRECT_MESSAGE_REACTIONS | MESSAGE_CONTENT`.
 ///
-/// Equivalent to `(1<<0) | (1<<9) | (1<<10) | (1<<12) | (1<<15) = 38_401`.
-/// (The PLAN text quoted `33_281`; the actual sum of those five bits is
-/// `38_401`. We use the literal bit-OR so the constant stays correct.)
-pub const DEFAULT_INTENTS: u64 = (1 << 0) | (1 << 9) | (1 << 10) | (1 << 12) | (1 << 15);
+/// Equivalent to `(1<<0) | (1<<9) | (1<<10) | (1<<12) | (1<<13) | (1<<15) =
+/// 46_593`. `DIRECT_MESSAGE_REACTIONS` (1<<13) was added in M19 U7 so a user
+/// can steer the agent with a 👍/✅/👀/❌/👎 reaction in a DM as well as a
+/// guild channel. We use the literal bit-OR so the constant stays correct.
+pub const DEFAULT_INTENTS: u64 =
+    (1 << 0) | (1 << 9) | (1 << 10) | (1 << 12) | (1 << 13) | (1 << 15);
 
 /// Default cap on the size of an inbound attachment we download from the
 /// Discord CDN and stage for the router. Discord's default (non-Nitro)
@@ -156,14 +159,16 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn default_intents_value_is_38401() {
-        // 1 + 512 + 1024 + 4096 + 32768 = 38_401.
-        assert_eq!(DEFAULT_INTENTS, 38_401);
+    fn default_intents_value_is_46593() {
+        // 1 + 512 + 1024 + 4096 + 8192 + 32768 = 46_593 (M19 U7 added the
+        // DIRECT_MESSAGE_REACTIONS bit, 1<<13, for DM reaction steering).
+        assert_eq!(DEFAULT_INTENTS, 46_593);
         // Sanity-check each contributing bit.
         assert_eq!(DEFAULT_INTENTS & (1 << 0), 1);
         assert_eq!(DEFAULT_INTENTS & (1 << 9), 512);
         assert_eq!(DEFAULT_INTENTS & (1 << 10), 1024);
         assert_eq!(DEFAULT_INTENTS & (1 << 12), 4096);
+        assert_eq!(DEFAULT_INTENTS & (1 << 13), 8192);
         assert_eq!(DEFAULT_INTENTS & (1 << 15), 32_768);
     }
 

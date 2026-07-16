@@ -153,13 +153,18 @@ impl MentionGate {
 /// Whether the event carries an interaction / command payload that should
 /// bypass mention gating. Matches the concrete content markers channel
 /// adapters set: a Telegram-style `callback` object, a WhatsApp-style
-/// `button` reply, or a slash `command`.
+/// `button` reply, a slash `command`, or a `reaction` (M19 U7 — a user
+/// reacting on the agent's own message is a direct address, exactly like a
+/// button tap).
 fn is_interaction_payload(event: &InboundEvent) -> bool {
     let content = &event.message.content;
     let Some(obj) = content.as_object() else {
         return false;
     };
-    obj.contains_key("callback") || obj.contains_key("button") || obj.contains_key("command")
+    obj.contains_key("callback")
+        || obj.contains_key("button")
+        || obj.contains_key("command")
+        || obj.contains_key(copperclaw_channels_core::REACTION_KEY)
 }
 
 /// Best-effort regex match of `pattern` against the event's text content.
@@ -310,6 +315,21 @@ mod tests {
                 "{key} payload must bypass the gate"
             );
         }
+    }
+
+    #[test]
+    fn reaction_payload_bypasses_gate() {
+        // A reaction lands as a Chat-kind event carrying `content.reaction`
+        // (M19 U7). It must bypass the mention gate exactly like a callback.
+        let g = MentionGate::default();
+        let mut ev = chat_event("[reaction] \u{1F44D}");
+        ev.message.content =
+            copperclaw_channels_core::reaction_content("\u{1F44D}", Some("42"), Some("alice"));
+        assert_eq!(
+            g.decide(&ev, true, EngageMode::Mention, None),
+            MentionDecision::Process,
+            "a reaction payload must bypass the mention gate"
+        );
     }
 
     #[test]

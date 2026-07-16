@@ -53,6 +53,11 @@ pub struct LongPollConfig {
     pub limit: u32,
 
     /// Optional `allowed_updates` filter forwarded verbatim to Telegram.
+    ///
+    /// M19 U7: Telegram never delivers `message_reaction` updates under the
+    /// default (empty) filter — that update type must be listed explicitly.
+    /// To let users steer the agent with reactions (👍/✅/👀/❌/👎), set e.g.
+    /// `["message", "callback_query", "message_reaction"]`.
     #[serde(default)]
     pub allowed_updates: Vec<String>,
 }

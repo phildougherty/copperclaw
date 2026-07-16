@@ -168,6 +168,71 @@ pub fn message_create_to_inbound(
     })
 }
 
+/// Convert a `MESSAGE_REACTION_ADD` dispatch payload (the `d` field of a
+/// gateway frame) into an inbound-reaction event (M19 U7).
+///
+/// Only unicode emoji reactions (`emoji.id == null`) carry a steering signal;
+/// custom-guild-emoji reactions produce no event. `target_seq` is the reacted-
+/// to `message_id`, which the runner matches against its `delivered` table to
+/// decide the reaction landed on its own message. Returns `Ok(None)` for a
+/// custom emoji or a payload missing the routing fields.
+pub fn message_reaction_add_to_inbound(d: &Value) -> Result<Option<InboundEvent>, AdapterError> {
+    let obj = d.as_object().ok_or_else(|| {
+        AdapterError::BadRequest("MESSAGE_REACTION_ADD.d is not an object".into())
+    })?;
+
+    let channel_id = extract_string(obj, "channel_id").ok_or_else(|| {
+        AdapterError::BadRequest("MESSAGE_REACTION_ADD.d.channel_id missing".into())
+    })?;
+    let message_id = extract_string(obj, "message_id").ok_or_else(|| {
+        AdapterError::BadRequest("MESSAGE_REACTION_ADD.d.message_id missing".into())
+    })?;
+
+    let emoji_obj = obj.get("emoji").and_then(Value::as_object);
+    // Custom guild emoji carry an `id`; only unicode emoji (id null/absent)
+    // have a steerable `name`.
+    let is_custom = emoji_obj
+        .and_then(|e| e.get("id"))
+        .is_some_and(|id| !id.is_null());
+    let emoji = emoji_obj
+        .and_then(|e| e.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let (Some(emoji), false) = (emoji, is_custom) else {
+        return Ok(None);
+    };
+
+    let is_group = Some(extract_string(obj, "guild_id").is_some());
+    let user_id = extract_string(obj, "user_id");
+
+    Ok(Some(InboundEvent {
+        channel_type: ChannelType::new(CHANNEL_TYPE_STR),
+        platform_id: channel_id,
+        thread_id: None,
+        message: InboundMessage {
+            id: format!(
+                "dcreact:{message_id}:{}:{emoji}",
+                user_id.as_deref().unwrap_or("?")
+            ),
+            kind: MessageKind::Chat,
+            content: copperclaw_channels_core::reaction_content(
+                &emoji,
+                Some(&message_id),
+                user_id.as_deref(),
+            ),
+            timestamp: Utc::now(),
+            is_mention: None,
+            is_group,
+        },
+        reply_to: None,
+        sender: user_id.map(|id| SenderIdentity {
+            channel_type: ChannelType::new(CHANNEL_TYPE_STR),
+            identity: id,
+            display_name: None,
+        }),
+    }))
+}
+
 /// Convert a `MESSAGE_CREATE` payload into an `InboundEvent`, additionally
 /// downloading and staging the message's first attachment when
 /// `settings.attachment_download` is set.
@@ -860,6 +925,49 @@ mod tests {
             "embeds": [],
             "attachments": []
         })
+    }
+
+    fn reaction_payload(emoji_name: &str, emoji_id: Option<&str>) -> Value {
+        json!({
+            "user_id": "u1",
+            "channel_id": "c1",
+            "message_id": "m9",
+            "guild_id": "g1",
+            "emoji": { "id": emoji_id, "name": emoji_name },
+        })
+    }
+
+    #[test]
+    fn reaction_add_maps_to_inbound_reaction_event() {
+        // M19 U7: a 👍 on message m9 becomes a normalized reaction inbound row.
+        let evt = message_reaction_add_to_inbound(&reaction_payload("\u{1F44D}", None))
+            .unwrap()
+            .expect("unicode reaction routes");
+        assert_eq!(evt.channel_type.as_str(), "discord");
+        assert_eq!(evt.platform_id, "c1");
+        assert_eq!(evt.message.kind, MessageKind::Chat);
+        assert_eq!(evt.message.is_group, Some(true));
+        let r = copperclaw_channels_core::parse_reaction(&evt.message.content).unwrap();
+        assert_eq!(r.emoji, "\u{1F44D}");
+        assert_eq!(r.target_seq.as_deref(), Some("m9"));
+        assert_eq!(r.actor.as_deref(), Some("u1"));
+        assert_eq!(evt.sender.unwrap().identity, "u1");
+    }
+
+    #[test]
+    fn custom_emoji_reaction_produces_no_event() {
+        // A custom guild emoji carries an id → not a steerable unicode emoji.
+        let out =
+            message_reaction_add_to_inbound(&reaction_payload("partyblob", Some("123456789")))
+                .unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn reaction_missing_message_id_is_bad_request() {
+        let mut p = reaction_payload("\u{1F44D}", None);
+        p.as_object_mut().unwrap().remove("message_id");
+        assert!(message_reaction_add_to_inbound(&p).is_err());
     }
 
     #[test]

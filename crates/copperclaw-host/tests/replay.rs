@@ -564,6 +564,16 @@ async fn telegram_slash_status_host_answer_bypasses_mention_gate() {
     run_fixture("telegram", "slash-status").await;
 }
 
+/// M19 U7: a 👍 reaction in a mention-gated telegram group bypasses the gate
+/// (interaction payload) and persists a non-trigger `content.reaction` row —
+/// pending for the runner's R2 steering seam — with no runner turn, outbound,
+/// or delivery. The runner-side steering is covered by drive_turn unit tests;
+/// this fixture owns the inbound → router leg (twin of `slash-stop`).
+#[tokio::test]
+async fn telegram_reaction_steer_bypasses_mention_gate() {
+    run_fixture("telegram", "reaction-steer").await;
+}
+
 /// Telegram twin of `cli_slash_clear_runner_sentinel`; also pins the
 /// `@BotName` suffix + case normalisation (`/CLEAR@ReplayBot`).
 #[tokio::test]

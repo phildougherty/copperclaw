@@ -85,6 +85,55 @@ adheres to [Semantic Versioning](https://semver.org/).
   assert the normalized callback event (`.../line/src/router.rs` tests). No
   `tests/replay.rs` registration was added.
 
+### Added (M19 U7 — inbound reactions as agent-visible input, 2026-07-16)
+
+- No adapter parsed inbound reaction events, so a user reacting 👍/✅/👀/❌/👎
+  produced zero agent-visible signal — the most natural lightweight steering
+  input was inert. M19 U7 wires reactions end-to-end (inbound → router →
+  runner) as a lightweight steering signal, never a full turn:
+  - New inbound-reaction contract
+    (`crates/copperclaw-channels/core/src/reaction.rs`): a reaction is a
+    `MessageKind::Chat` event whose `content.reaction { emoji, target_seq, actor }`
+    carries the platform reaction token, the reacted-to message's platform id
+    (`target_seq`), and who reacted. `reaction_content` builds it, `parse_reaction`
+    reads it, and `classify_reaction` maps both unicode emoji (Telegram, Discord,
+    WhatsApp) and Slack shortcodes onto the curated `ReactionSignal`
+    (✅/👍 affirmative, 👀 looking, ❌/👎 negative); everything else carries no
+    signal.
+  - Four adapters parse their native reaction events into the contract:
+    `telegram` `message_reaction` (`ingress/mod.rs` + new `MessageReactionUpdated`
+    /`ReactionType` types; only genuinely-added emoji reactions emit — needs
+    `"message_reaction"` in `allowed_updates`), `slack` `reaction_added`
+    (`events/router.rs::convert_reaction` + `ReactionEvent`/`ReactionItem`),
+    `discord` `MESSAGE_REACTION_ADD` (`events.rs::message_reaction_add_to_inbound`;
+    unicode-emoji only, and `DEFAULT_INTENTS` gains `DIRECT_MESSAGE_REACTIONS`
+    (1<<13) for DM reactions), and `whatsapp-cloud` `type:"reaction"` messages
+    (`events/router.rs`; empty emoji = removed reaction = no event).
+  - The router whitelists reactions past the mention gate exactly like button
+    callbacks (`mention.rs::is_interaction_payload` now checks `content.reaction`)
+    and persists them as **non-trigger** rows (`route.rs`), so a reaction never
+    spawns a container on its own — it can never drive a spurious full turn.
+  - The runner (`crates/copperclaw-runner/src/run/reaction.rs` +
+    `run/drive_turn.rs`) treats a curated reaction on the agent's OWN last
+    message — resolved by matching `target_seq` against the per-session
+    `delivered` table's `platform_message_id` — as a one-line interjection
+    folded in via the M18 R2 mid-turn steering seam (`check_mid_turn_steering`),
+    within one tool-batch boundary. A reaction on an unrelated message, or an
+    uncurated emoji, is consumed and ignored. A folded reaction marks the turn
+    untrusted (`ToolContext::mark_untrusted_context`) — external content cannot
+    launder trust into a credentialed external action. `run_loop` also consumes
+    any reaction row picked up between turns so it never reaches the model as
+    raw JSON.
+  - Fixture `fixtures/telegram/reaction-steer` (registered in
+    `crates/copperclaw-host/tests/replay.rs`) proves the inbound → router leg (a
+    reaction bypasses a mention-gated group and lands as a pending non-trigger
+    `content.reaction` row with no turn); the runner-side steering + ignore legs
+    are covered by `mid_turn_reaction_on_own_message_folds_affirmative` /
+    `mid_turn_reaction_on_unrelated_message_is_ignored` in `drive_turn.rs`.
+  - Metric wish (for the M1 rider): inbound reactions by emoji/outcome
+    (curated-affirmative/looking/negative vs. ignored-unrelated/uncurated). The
+    mid-turn fold currently reuses `inc_midturn_control(_, "reaction")`.
+
 ### Added (M19 U2 — Teams in-place edit + reactions, 2026-07-16)
 
 - The `teams` adapter rendered every rich surface (cards / diffs / collapsible /

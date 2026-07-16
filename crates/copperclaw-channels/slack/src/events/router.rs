@@ -15,7 +15,9 @@
 
 use crate::api::SlackApi;
 use crate::config::DEFAULT_MAX_ATTACHMENT_BYTES;
-use crate::events::types::{MessageEvent, SlackEvent, SlackEventEnvelope, SlackFile};
+use crate::events::types::{
+    MessageEvent, ReactionEvent, SlackEvent, SlackEventEnvelope, SlackFile,
+};
 use crate::signature::verify_signature;
 use axum::{
     Router,
@@ -199,6 +201,10 @@ async fn handle_events(
             let event = match cb.event {
                 SlackEvent::Message(m) => convert_message(&state, &m, false).await,
                 SlackEvent::AppMention(m) => convert_message(&state, &m, true).await,
+                SlackEvent::ReactionAdded(r) => match convert_reaction(&state, &r) {
+                    Some(e) => e,
+                    None => return StatusCode::OK.into_response(),
+                },
                 SlackEvent::Other => return StatusCode::OK.into_response(),
             };
             if let Err(err) = state.inbound_tx.send(event).await {
@@ -527,6 +533,59 @@ async fn convert_message(
     }
 }
 
+/// Map a Slack `reaction_added` event to an inbound-reaction event (M19 U7).
+///
+/// Returns `None` when the reaction targets a non-message item or the event
+/// lacks the channel/ts routing fields. `target_seq` is the reacted-to
+/// message's `ts` — the runner matches it against its `delivered` table to
+/// decide the reaction landed on its own message. The reaction is Slack's
+/// shortcode NAME (`thumbsup`, `white_check_mark`, …), which the shared
+/// [`copperclaw_channels_core::classify_reaction`] accepts directly.
+fn convert_reaction(state: &SlackEventsState, r: &ReactionEvent) -> Option<InboundEvent> {
+    if r.reaction.is_empty() {
+        return None;
+    }
+    let item = r.item.as_ref()?;
+    // Only message reactions carry a routable target.
+    if item.kind.as_deref() != Some("message") {
+        return None;
+    }
+    let channel = item.channel.clone()?;
+    let ts = item.ts.clone()?;
+    let is_group = Some(item.is_group_channel());
+    let sender = r.user.as_ref().map(|uid| SenderIdentity {
+        channel_type: state.channel_type.clone(),
+        identity: uid.clone(),
+        display_name: None,
+    });
+    Some(InboundEvent {
+        channel_type: state.channel_type.clone(),
+        platform_id: channel,
+        thread_id: None,
+        message: InboundMessage {
+            // Stable per (channel, message, reactor, emoji) so a re-sent
+            // event dedups.
+            id: format!(
+                "slackreact:{}:{}:{}",
+                ts,
+                r.user.as_deref().unwrap_or("?"),
+                r.reaction
+            ),
+            kind: MessageKind::Chat,
+            content: copperclaw_channels_core::reaction_content(
+                &r.reaction,
+                Some(&ts),
+                r.user.as_deref(),
+            ),
+            timestamp: chrono::Utc::now(),
+            is_mention: None,
+            is_group,
+        },
+        reply_to: None,
+        sender,
+    })
+}
+
 /// Outcome of downloading one inbound Slack file.
 enum FileOutcome {
     /// Downloaded + staged; the map is the `content.attachment` object
@@ -723,6 +782,49 @@ mod tests {
         let mut s = SlackEventsState::new(SECRET, tx, bot, ChannelType::new("slack"));
         s.now_secs_override = Some(TS.parse().unwrap());
         (s, rx)
+    }
+
+    #[test]
+    fn convert_reaction_maps_message_reaction_to_inbound() {
+        // M19 U7: a 👍 on message ts 1700.5 in channel C1 becomes a normalized
+        // reaction inbound event carrying the shared contract.
+        let (state, _rx) = make_state(None);
+        let r = ReactionEvent {
+            user: Some("U1".into()),
+            reaction: "thumbsup".into(),
+            item: Some(crate::events::types::ReactionItem {
+                kind: Some("message".into()),
+                channel: Some("C1".into()),
+                ts: Some("1700.5".into()),
+            }),
+            item_user: Some("UBOT".into()),
+        };
+        let e = convert_reaction(&state, &r).expect("message reaction routes");
+        assert_eq!(e.channel_type.as_str(), "slack");
+        assert_eq!(e.platform_id, "C1");
+        assert_eq!(e.message.kind, MessageKind::Chat);
+        assert_eq!(e.message.is_group, Some(true));
+        let parsed = copperclaw_channels_core::parse_reaction(&e.message.content).unwrap();
+        assert_eq!(parsed.emoji, "thumbsup");
+        assert_eq!(parsed.target_seq.as_deref(), Some("1700.5"));
+        assert_eq!(parsed.actor.as_deref(), Some("U1"));
+        assert_eq!(e.sender.as_ref().unwrap().identity, "U1");
+    }
+
+    #[test]
+    fn convert_reaction_ignores_non_message_items() {
+        let (state, _rx) = make_state(None);
+        let r = ReactionEvent {
+            user: Some("U1".into()),
+            reaction: "thumbsup".into(),
+            item: Some(crate::events::types::ReactionItem {
+                kind: Some("file".into()),
+                channel: None,
+                ts: None,
+            }),
+            item_user: None,
+        };
+        assert!(convert_reaction(&state, &r).is_none());
     }
 
     fn signed_request(state: &SlackEventsState, path: &str, body: &[u8]) -> Request<Body> {

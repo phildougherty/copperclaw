@@ -318,6 +318,22 @@ impl DiscordAdapter {
                     }
                 }
             }
+            "MESSAGE_REACTION_ADD" => {
+                // M19 U7: a user reacted on a message. Surface unicode-emoji
+                // reactions as inbound-reaction events; the runner decides
+                // whether it landed on the agent's own message.
+                match events::message_reaction_add_to_inbound(data) {
+                    Ok(Some(evt)) => {
+                        if self.inbound_tx.send(evt).await.is_err() {
+                            tracing::warn!("inbound channel closed; dropping reaction event");
+                        }
+                    }
+                    Ok(None) => {} // custom emoji / non-steerable
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to map MESSAGE_REACTION_ADD");
+                    }
+                }
+            }
             "INTERACTION_CREATE" => {
                 let bot_id = self.bot_user_id.lock().await.clone();
                 match events::interaction_create_to_inbound(data, bot_id.as_deref()) {

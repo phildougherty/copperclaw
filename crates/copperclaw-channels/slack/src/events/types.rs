@@ -47,9 +47,59 @@ pub enum SlackEvent {
     /// `app_mention`.
     #[serde(rename = "app_mention")]
     AppMention(MessageEvent),
+    /// `reaction_added` (M19 U7) — a user added an emoji reaction to a
+    /// message. Surfaced as an inbound-reaction event when it lands on one of
+    /// the agent's own messages.
+    #[serde(rename = "reaction_added")]
+    ReactionAdded(ReactionEvent),
     /// Anything else — we ignore but still accept.
     #[serde(other)]
     Other,
+}
+
+/// Slack `reaction_added` event. Slack sends the reaction as a shortcode NAME
+/// (`thumbsup`, `white_check_mark`, `eyes`, `-1`, …), which
+/// [`copperclaw_channels_core::classify_reaction`] accepts directly.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReactionEvent {
+    /// The user who reacted.
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Shortcode name of the reaction emoji. Defaulted so a malformed
+    /// `reaction_added` payload never fails the whole envelope parse (it just
+    /// routes to nothing).
+    #[serde(default)]
+    pub reaction: String,
+    /// The message (or other item) the reaction landed on.
+    #[serde(default)]
+    pub item: Option<ReactionItem>,
+    /// The author of the item reacted to (Slack fills this for messages).
+    #[serde(default)]
+    pub item_user: Option<String>,
+}
+
+/// The `item` a Slack reaction targets. Only `message` items carry a `ts` /
+/// `channel` we can route by.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReactionItem {
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub channel: Option<String>,
+    /// The reacted-to message's ts — the platform-side message id the runner
+    /// matches against its `delivered` table.
+    #[serde(default)]
+    pub ts: Option<String>,
+}
+
+impl ReactionItem {
+    /// Whether the item's channel id looks like a group/channel (`C`/`G`).
+    #[must_use]
+    pub fn is_group_channel(&self) -> bool {
+        self.channel
+            .as_deref()
+            .is_some_and(|c| c.starts_with('C') || c.starts_with('G'))
+    }
 }
 
 /// Fields that every message-shaped event carries (message + `app_mention`).
@@ -243,13 +293,42 @@ mod tests {
         let v = json!({
             "type":"event_callback",
             "event_id":"Ev3",
-            "event": {"type":"reaction_added"}
+            "event": {"type":"channel_created"}
         });
         let env: SlackEventEnvelope = serde_json::from_value(v).unwrap();
         let SlackEventEnvelope::EventCallback(cb) = env else {
             panic!("expected callback");
         };
         assert!(matches!(cb.event, SlackEvent::Other));
+    }
+
+    #[test]
+    fn parses_reaction_added_event() {
+        let v = json!({
+            "type":"event_callback",
+            "event_id":"Ev4",
+            "event": {
+                "type":"reaction_added",
+                "user":"U1",
+                "reaction":"thumbsup",
+                "item":{"type":"message","channel":"C1","ts":"1700.0"},
+                "item_user":"UBOT"
+            }
+        });
+        let env: SlackEventEnvelope = serde_json::from_value(v).unwrap();
+        let SlackEventEnvelope::EventCallback(cb) = env else {
+            panic!("expected callback");
+        };
+        match cb.event {
+            SlackEvent::ReactionAdded(r) => {
+                assert_eq!(r.reaction, "thumbsup");
+                assert_eq!(r.user.as_deref(), Some("U1"));
+                let item = r.item.expect("item");
+                assert_eq!(item.ts.as_deref(), Some("1700.0"));
+                assert!(item.is_group_channel());
+            }
+            other => panic!("got {other:?}"),
+        }
     }
 
     #[test]
