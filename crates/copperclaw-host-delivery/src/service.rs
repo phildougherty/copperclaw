@@ -3231,6 +3231,8 @@ fn ensure_config_row(
             tool_profile: None,
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
         },
     )?;
     Ok(())
@@ -4706,6 +4708,8 @@ mod tests {
                 tool_profile: None,
                 preview_enabled: false,
                 preview_bind: None,
+                check_command: None,
+                verify_gate: true,
             },
         )
         .unwrap();
@@ -4746,6 +4750,8 @@ mod tests {
                 tool_profile: None,
                 preview_enabled: false,
                 preview_bind: None,
+                check_command: None,
+                verify_gate: true,
             },
         )
         .unwrap();

@@ -17,15 +17,19 @@ that isn't prose.
 ## Decision tree (first match wins)
 
 1. **Invoking a slow tool** (`shell`, `web_search`, `read_file`, …).
-   → Do nothing. The runner auto-emits a `MessageKind::Breadcrumb`
-   chip on tool start and edits it to `Done`/`Failed` on completion
-   (native chips on telegram/slack/discord/gchat/matrix). Default ON
-   — operators can disable via `COPPERCLAW_TOOL_BREADCRUMBS=0`. Don't
-   pre-announce; that's a duplicate chip.
+   → Do nothing. The runner maintains ONE self-editing Task HUD
+   message per inbound task: posted at your first tool call and edited
+   in place after every tool batch with the current todo step, the
+   last tool, the tool count, and elapsed time, then collapsed to a
+   one-line "done in M:SS, N tool calls" (edit-capable channels:
+   telegram/slack/discord/matrix/webex; bare channels get a periodic
+   status row instead). Default ON — operators can set
+   `COPPERCLAW_HUD_MODE=final|off`. Don't pre-announce tool calls;
+   that duplicates the HUD.
 
 2. **Editing a file** (`edit_file`, `multi_edit`, `apply_patch`,
    `write_file`). → The runner auto-emits a `MessageKind::Diff` card
-   alongside the breadcrumb (native diff renderers on
+   alongside the Task HUD update (native diff renderers on
    telegram/slack/discord/gchat/matrix; text fallback elsewhere).
    Don't send the diff manually.
 

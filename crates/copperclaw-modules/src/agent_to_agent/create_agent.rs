@@ -633,6 +633,11 @@ impl CreateAgentHandler {
             tool_profile: cfg.tool_profile,
             preview_enabled: cfg.preview_enabled,
             preview_bind: cfg.preview_bind,
+            // Inherit the parent's verify-gate override/switch so a
+            // child agent building in the same project is held to the
+            // same completion-verification contract.
+            check_command: cfg.check_command,
+            verify_gate: cfg.verify_gate,
         };
         if let Err(err) = container_configs::upsert(central, req) {
             warn!(
@@ -928,6 +933,8 @@ mod tests {
                 tool_profile: None,
                 preview_enabled: false,
                 preview_bind: None,
+                check_command: None,
+                verify_gate: true,
             },
         )
         .unwrap();

@@ -353,14 +353,11 @@ pub(super) async fn pump_events(
                 // synthesises the model-facing refusal. We always push
                 // the PendingToolCall here so the model sees a matching
                 // `tool_result` on the next turn even when it's denied.
-                // Optional `[tool detail]` chat breadcrumb for
-                // user-visible observability during long agent turns.
-                // Default no-op via the trait; the RunnerToolCtx impl
-                // gates on `COPPERCLAW_TOOL_BREADCRUMBS=1`, the tool
-                // allowlist, and extracts a per-tool detail (command
-                // for shell, query for web_search, path for
-                // write_file, etc.) from the input.
-                deps.tool_ctx.emit_breadcrumb(&name, Some(&input)).await;
+                // User-visible progress for the batch is surfaced by
+                // the Task HUD in `drive_turn` (one self-editing status
+                // message per inbound) once the batch executes — the
+                // old per-tool breadcrumb chip emit that lived here was
+                // removed with the M18 H1 HUD work.
                 out.tool_calls.push(PendingToolCall {
                     id,
                     name,

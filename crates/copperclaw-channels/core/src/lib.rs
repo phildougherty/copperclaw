@@ -59,6 +59,7 @@
 
 mod adapter;
 mod breadcrumb;
+pub mod capabilities;
 mod card;
 mod container;
 mod diff;

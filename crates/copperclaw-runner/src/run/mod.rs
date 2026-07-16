@@ -12,6 +12,7 @@
 pub(super) mod drive_turn;
 pub mod external_mcp;
 pub(super) mod formatting;
+pub mod hud;
 pub mod preview;
 pub(super) mod prompt;
 pub(super) mod provider_call;
@@ -433,6 +434,35 @@ pub struct RunnerDeps {
     /// profile with no role/skill scope, so groups that don't set a
     /// profile keep their historical full tool surface.
     pub policy: crate::policy::ToolPolicy,
+    /// M18 Task HUD mode (`full` / `final` / `off`). Plumbed in from
+    /// `runner.json`'s `hud_mode` (sourced host-side from the
+    /// `COPPERCLAW_HUD_MODE` env var). Default [`HudMode::Full`]: the
+    /// HUD is ON by default on channels whose adapter supports in-place
+    /// message edits; bare channels always degrade to the legacy
+    /// periodic status rows regardless of mode. See [`hud::TaskHud`].
+    pub hud_mode: crate::config::HudMode,
+    /// In-container path of the per-session todo store the Task HUD
+    /// reads its "current step" line from. Production is
+    /// [`hud::TODO_STORE_DEFAULT_PATH`] (`/data/agent_todos.json`, the
+    /// same file the `todo_*` MCP tools maintain); tests point it at a
+    /// tempdir.
+    pub todo_path: PathBuf,
+    /// M18 R3 verification gate: whether the `todo_update(completed)`
+    /// gate is enforced for this group. Mirrors
+    /// `crate::config::RunnerConfig::verify_gate`. The live enforcement
+    /// path is [`copperclaw_mcp::ToolContext::verify_gate_enabled`],
+    /// consulted directly by the `copperclaw-mcp` tool handlers (they
+    /// only see `&dyn ToolContext`, not `RunnerDeps`) — this field
+    /// exists for parity with the resolved config and for test
+    /// scaffolding, same convention as [`Self::hud_mode`] /
+    /// [`Self::policy`]. Default `true` (gate on).
+    pub verify_gate: bool,
+    /// M18 R3 verification gate: per-group override for the project
+    /// verify command. Mirrors
+    /// `crate::config::RunnerConfig::check_command_override`. See
+    /// [`Self::verify_gate`] for why this is also surfaced here rather
+    /// than solely on the `ToolContext`.
+    pub check_command_override: Option<String>,
 }
 
 /// Default per-tool-call deadline. Comfortably above an `npm install`
@@ -506,6 +536,16 @@ impl RunnerDeps {
             // The host overrides this from the group config + sender
             // role; tests opt into a tighter policy explicitly.
             policy: crate::policy::ToolPolicy::default(),
+            // HUD on by default (the live behaviour); tests that assert
+            // HUD emissions set the originating channel explicitly —
+            // with no channel routing the HUD degrades to the legacy
+            // status-row path, so existing tests see no new rows.
+            hud_mode: crate::config::HudMode::default(),
+            todo_path: PathBuf::from(hud::TODO_STORE_DEFAULT_PATH),
+            // Test default: gate on, no override — same convention as
+            // hud_mode/policy above; tests opt out explicitly.
+            verify_gate: true,
+            check_command_override: None,
         }
     }
 }

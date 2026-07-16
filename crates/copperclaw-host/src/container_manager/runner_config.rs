@@ -117,6 +117,45 @@ pub(crate) struct RunnerConfigForFile {
     /// when None, leaving the runner's built-in default (4096).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) max_tokens: Option<u32>,
+    /// M18 Task HUD mode (`"full"` / `"final"` / `"off"`). Sourced from
+    /// `COPPERCLAW_HUD_MODE` in `.env` (host-wide). Skipped when unset so
+    /// existing `runner.json` shapes stay bit-identical and the runner
+    /// applies its `full` default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) hud_mode: Option<String>,
+    /// M18 R3 completion-gate verify-command override. Plumbed in from
+    /// `container_configs.check_command`; wins over whatever the agent
+    /// discovered and wrote to `.copperclaw/verify`. Skipped when unset
+    /// (no override — the agent-discovered command applies).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) check_command: Option<String>,
+    /// M18 R3 completion-gate master switch. Only emitted as `Some(false)`
+    /// when the group has explicitly turned it off
+    /// (`container_configs.verify_gate = 0`); skipped otherwise so the
+    /// runner applies its own default (gate ON) and unconfigured groups'
+    /// `runner.json` shape stays bit-identical to the pre-R3 shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) verify_gate: Option<bool>,
+}
+
+/// Validate a raw `COPPERCLAW_HUD_MODE` value down to the three modes the
+/// runner understands. Unknown values WARN and resolve to `None` (the
+/// runner's `full` default) rather than shipping a typo into every
+/// session's `runner.json`.
+fn validate_hud_mode(raw: Option<String>) -> Option<String> {
+    let raw = raw?;
+    let trimmed = raw.trim();
+    match trimmed {
+        "" => None,
+        "full" | "final" | "off" => Some(trimmed.to_string()),
+        other => {
+            warn!(
+                hud_mode = other,
+                "unknown COPPERCLAW_HUD_MODE; ignoring (runner defaults to `full`)"
+            );
+            None
+        }
+    }
 }
 
 impl ContainerManager {
@@ -445,6 +484,23 @@ impl ContainerManager {
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok());
 
+        // Host-wide Task HUD mode from `COPPERCLAW_HUD_MODE` (`.env`).
+        // Unset → the runner's `full` default (HUD on). Follows the same
+        // env-var pattern as temperature / max_tokens above; a per-group
+        // container-config column is deferred (migration 026 is reserved
+        // by a later M18 card).
+        let hud_mode = validate_hud_mode(std::env::var("COPPERCLAW_HUD_MODE").ok());
+
+        // M18 R3: per-group verify-command override + gate switch. Both
+        // are plain `container_configs` columns (no env fallback, unlike
+        // the host-wide knobs above) — an operator overrides per group
+        // via `cclaw groups config edit`. `verify_gate` only emits when
+        // explicitly off; `true` (the default) is left unset so the
+        // runner's own default applies and unconfigured groups keep a
+        // stable `runner.json` shape.
+        let check_command = cc.and_then(|c| c.check_command.clone());
+        let verify_gate = cc.map(|c| c.verify_gate).filter(|on| !on).map(|_| false);
+
         RunnerConfigForFile {
             session_id: session.id.as_uuid().to_string(),
             agent_group_id: session.agent_group_id.as_uuid().to_string(),
@@ -468,6 +524,9 @@ impl ContainerManager {
             effort,
             temperature,
             max_tokens,
+            hud_mode,
+            check_command,
+            verify_gate,
         }
     }
 
@@ -625,6 +684,27 @@ mod tests {
     }
 
     #[test]
+    fn validate_hud_mode_accepts_known_modes_and_drops_garbage() {
+        assert_eq!(super::validate_hud_mode(None), None);
+        assert_eq!(super::validate_hud_mode(Some(String::new())), None);
+        assert_eq!(super::validate_hud_mode(Some("  ".into())), None);
+        assert_eq!(
+            super::validate_hud_mode(Some("full".into())).as_deref(),
+            Some("full")
+        );
+        assert_eq!(
+            super::validate_hud_mode(Some(" final ".into())).as_deref(),
+            Some("final")
+        );
+        assert_eq!(
+            super::validate_hud_mode(Some("off".into())).as_deref(),
+            Some("off")
+        );
+        // Typos must not ship into every session's runner.json.
+        assert_eq!(super::validate_hud_mode(Some("fulll".into())), None);
+    }
+
+    #[test]
     fn runner_config_uses_session_then_container_config_then_defaults() {
         let tmp = tempfile::tempdir().unwrap();
         let db = CentralDb::open_in_memory().unwrap();
@@ -681,6 +761,8 @@ mod tests {
             tool_profile: None,
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -739,6 +821,8 @@ mod tests {
             tool_profile: None,
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -790,6 +874,8 @@ mod tests {
             tool_profile: None,
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -834,6 +920,8 @@ mod tests {
             tool_profile: None,
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -964,6 +1052,8 @@ mod tests {
             tool_profile: None,
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
             updated_at: chrono::Utc::now(),
         };
         let cfg = mgr.runner_config_for(&session, Some(&cc), None);
@@ -1002,6 +1092,8 @@ mod tests {
             tool_profile: None,
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
             updated_at: chrono::Utc::now(),
         }
     }
@@ -1396,6 +1488,8 @@ mod tests {
             tool_profile: tool_profile.map(str::to_string),
             preview_enabled: false,
             preview_bind: None,
+            check_command: None,
+            verify_gate: true,
             updated_at: chrono::Utc::now(),
         }
     }

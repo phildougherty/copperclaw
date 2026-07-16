@@ -412,6 +412,20 @@ pub struct SubagentResult {
     pub tools_called: Vec<SubagentToolCall>,
 }
 
+/// Channel routing of the inbound currently being processed, as exposed
+/// through [`ToolContext::originating_channel`]. A read-only snapshot of
+/// what [`ToolContext::set_originating`] stashed — consumers (the Task
+/// HUD) key channel-capability decisions off it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OriginatingChannel {
+    /// Channel type string (`"telegram"`, `"slack"`, `"cli"`, …).
+    pub channel_type: String,
+    /// Platform-native conversation id, when the inbound carried one.
+    pub platform_id: Option<String>,
+    /// Platform-native thread id, when the inbound carried one.
+    pub thread_id: Option<String>,
+}
+
 /// The contract that every tool handler relies on for side effects.
 ///
 /// Implementations: the runner (writes to outbound.db, mutates scheduler);
@@ -588,46 +602,37 @@ pub trait ToolContext: Send + Sync {
         false
     }
 
-    /// Optional UX-observability hook: emit a brief
-    /// `[tool_name detail]` chat message to the originating channel
-    /// right before a tool call fires, so users see what the agent
-    /// is working on during long turns. `input` is the model's full
-    /// tool-call argument JSON (when available) — the runner-side
-    /// implementation pulls per-tool detail strings out of it
-    /// (command for `shell`, query for `web_search`, path for
-    /// `write_file`, etc.) and appends them. Default no-op so most
-    /// contexts opt-out. The runner's `RunnerToolCtx` enables this
-    /// when `COPPERCLAW_TOOL_BREADCRUMBS` is set; the implementation
-    /// filters by a hard-coded allowlist of "visible" tools and
-    /// only emits when there's real channel routing.
-    async fn emit_breadcrumb(&self, tool_name: &str, input: Option<&serde_json::Value>) {
-        let _ = (tool_name, input);
-    }
-
-    /// Mark the start of a new turn for rolling-activity breadcrumbs:
-    /// implementations clear any accumulated tool steps so the next tool
-    /// opens a fresh aggregate chip. Called by the runner at the top of
-    /// each `drive_turn`. Default no-op (legacy per-tool chips and mocks
-    /// don't aggregate).
+    /// Mark the start of a new per-inbound turn. Called by the runner at
+    /// the top of each `drive_turn`; implementations reset any per-turn
+    /// state (notably the coarse-provenance taint flag — see
+    /// [`Self::mark_untrusted_context`]). Default no-op so mock /
+    /// subagent contexts compile unchanged.
     fn begin_activity(&self) {}
 
-    /// Finalisation half of [`Self::emit_breadcrumb`] — called once
-    /// the tool returns (or fails). `ok` indicates success, `summary`
-    /// is the optional post-completion blurb (`"passed (0.4s)"`,
-    /// `"wrote 12 lines"`, `"timeout"`). Implementations route this
-    /// through whatever update mechanism their target supports —
-    /// the runner writes a `MessageKind::System`
-    /// `update_breadcrumb` row that the host's delivery loop
-    /// translates into an in-place edit of the original chip on
-    /// adapters that expose an edit API. Default no-op.
-    async fn emit_breadcrumb_finish(
-        &self,
-        tool_name: &str,
-        input: Option<&serde_json::Value>,
-        ok: bool,
-        summary: Option<&str>,
-    ) {
-        let _ = (tool_name, input, ok, summary);
+    /// Channel routing of the inbound currently being processed, when it
+    /// targets a real user channel. The Task HUD reads this to decide
+    /// whether the originating channel can edit messages in place
+    /// (`copperclaw_channels_core::capabilities`) and whether its typing
+    /// indicator is visible on this surface. Returns `None` for contexts
+    /// with no user-facing channel (mocks, subagent adapters, child-agent
+    /// sessions whose recipient is another LLM) — the HUD then stays
+    /// inactive. Default `None`.
+    fn originating_channel(&self) -> Option<OriginatingChannel> {
+        None
+    }
+
+    /// M18 Task HUD emit hook: one self-editing status message per
+    /// inbound task. `first: true` posts the HUD (the runner writes a
+    /// `MessageKind::Breadcrumb` row the delivery loop renders as a
+    /// chip); `first: false` updates it in place (a `MessageKind::System`
+    /// `update_breadcrumb` row the delivery loop resolves to an
+    /// `edit_message` on adapters with an edit API). The breadcrumb's
+    /// `tool_name` is the stable HUD anchor so every update edits the
+    /// same platform message. Default no-op so mock / subagent contexts
+    /// compile unchanged; best-effort in the runner impl (a failed write
+    /// never aborts the turn).
+    async fn emit_task_hud(&self, breadcrumb: &copperclaw_channels_core::Breadcrumb, first: bool) {
+        let _ = (breadcrumb, first);
     }
 
     /// Slice-3.5 opt-in: emit a structured `MessageKind::Thinking` row
@@ -695,6 +700,28 @@ pub trait ToolContext: Send + Sync {
     async fn emit_diff(&self, diff: copperclaw_channels_core::DiffCard) {
         let _ = diff;
     }
+
+    /// M18 R3 verification gate: whether the `todo_update(completed)`
+    /// gate is enforced for this session. `false` restores byte-
+    /// identical pre-R3 behaviour (evidence-only anti-fabrication
+    /// check, no dirty-tracking). Default `true` (gate on) so contexts
+    /// that don't opt out (mocks, subagent adapters) get the stricter,
+    /// safer default; the runner's `RunnerToolCtx` overrides this from
+    /// `container_configs.verify_gate` (via `RunnerDeps`/`RunnerConfig`).
+    fn verify_gate_enabled(&self) -> bool {
+        true
+    }
+
+    /// M18 R3 verification gate: per-group override for the shell
+    /// command that verifies a project, winning over whatever the
+    /// agent itself recorded at `<project>/.copperclaw/verify`.
+    /// `None` means "no override — use the agent-recorded command."
+    /// Default `None` so contexts that don't configure one (mocks,
+    /// subagent adapters) compile unchanged; the runner's
+    /// `RunnerToolCtx` overrides this from `container_configs.check_command`.
+    fn check_command_override(&self) -> Option<String> {
+        None
+    }
 }
 
 /// In-memory recording implementation used by tests.
@@ -738,6 +765,15 @@ struct MockInner {
     /// with an explicit scope.
     #[allow(clippy::option_option)]
     active_skill_allowed: Option<Option<Vec<String>>>,
+    /// Test override for `verify_gate_enabled`. `None` falls through
+    /// to the trait default (`true`).
+    verify_gate_enabled: Option<bool>,
+    /// Test override for `check_command_override`. Same double-`Option`
+    /// shape as `active_skill_allowed`: `None` = not overridden (falls
+    /// through to the trait default of `None`), `Some(inner)` = the
+    /// override value tests want returned.
+    #[allow(clippy::option_option)]
+    check_command_override: Option<Option<String>>,
 }
 
 impl MockToolContext {
@@ -841,6 +877,23 @@ impl MockToolContext {
             .active_skill_allowed
             .clone()
     }
+
+    /// Override the value `verify_gate_enabled()` returns. Tests use
+    /// this to exercise the `verify_gate=off` byte-stable path.
+    pub fn set_verify_gate_enabled(&self, enabled: bool) {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .verify_gate_enabled = Some(enabled);
+    }
+
+    /// Override the value `check_command_override()` returns.
+    pub fn set_check_command_override(&self, cmd: Option<String>) {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .check_command_override = Some(cmd);
+    }
 }
 
 #[async_trait]
@@ -894,6 +947,23 @@ impl ToolContext for MockToolContext {
             .lock()
             .expect("MockToolContext mutex poisoned")
             .active_skill_allowed
+            .clone()
+            .flatten()
+    }
+
+    fn verify_gate_enabled(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .verify_gate_enabled
+            .unwrap_or(true)
+    }
+
+    fn check_command_override(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .check_command_override
             .clone()
             .flatten()
     }

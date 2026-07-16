@@ -46,6 +46,7 @@ pub mod scheduling;
 pub mod self_mod;
 pub mod sentinel;
 pub mod todo;
+pub mod verify_gate;
 pub mod view_image;
 pub mod web_search;
 
