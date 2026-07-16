@@ -5,13 +5,28 @@
 //! container's bind-mounted session dir). State lives under
 //! `<project_root>/.copperclaw/`:
 //!
-//! - `verify`       — the recorded verify command, one line. The agent
-//!   writes this itself (see the `coding-task` skill); this module
-//!   only *reads* it.
+//! - `verify`       — the recorded verify command(s). The agent writes
+//!   this itself (see the `coding-task` skill); this module only
+//!   *reads* it. M20 Q2: may now hold MULTIPLE lines, each an
+//!   independent stage, with an optional `name:` prefix (`lint: npx
+//!   eslint .`); an unprefixed line gets a derived name (`stage<N>`,
+//!   1-indexed by position). A single unprefixed line is exactly the
+//!   pre-Q2 shape — see [`recorded_stages`].
 //! - `dirty`         — presence = dirty since the last successful
 //!   verify run; content is irrelevant (an empty file is fine).
 //! - `fix_cycles`    — plain integer text; absent means `0`.
 //! - `last_failure`  — tail text of the most recent failed verify run.
+//!   Q2: when a stage-aware caller records a failure via
+//!   [`record_stage_verify_failure`], the tail is prefixed with the
+//!   stage name (`stage 'typecheck' failed: <tail>`); the underlying
+//!   [`record_verify_failure`] itself stays byte-identical for direct
+//!   callers.
+//! - `stages`        — Q2: JSON map of stage name -> `{"passed":
+//!   bool, "at": "<RFC3339>"}`, one entry per stage that has run at
+//!   least once since the last dirty mark. [`mark_dirty`] resets it (a
+//!   fresh edit invalidates every prior stage result); a passing
+//!   verify run of a stage does NOT reset it — the file accumulates
+//!   the "last known result" per stage until the next edit.
 //!
 //! Every mutator here is best-effort: I/O errors are logged and
 //! swallowed rather than propagated, because a marker-file write
@@ -22,7 +37,10 @@
 //! it's pure path/fs-metadata logic with no I/O side effects, so it
 //! returns a plain `Option<PathBuf>`.
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
 
 /// Hard cap on verify-fix cycles per todo before the gate auto-
 /// transitions the todo to `blocked` (with the failure attached)
@@ -46,6 +64,8 @@ const VERIFY_FILE: &str = "verify";
 const DIRTY_FILE: &str = "dirty";
 const FIX_CYCLES_FILE: &str = "fix_cycles";
 const LAST_FAILURE_FILE: &str = "last_failure";
+/// Q2: per-project per-stage pass/fail + timestamp state.
+const STAGES_FILE: &str = "stages";
 /// Safety cap on the stored `last_failure` tail so a single
 /// pathological verify run can't grow `.copperclaw/last_failure`
 /// without bound. Callers are expected to already pass a pre-
@@ -211,10 +231,13 @@ async fn reset_fix_cycles(project_root: &Path) {
 /// Mark `project_root` dirty (an edit landed since the last successful
 /// verify) and reset its fix-cycle count to 0 — a fresh edit after a
 /// bad stretch deserves a fresh [`FIX_CYCLE_CAP`]-attempt budget, not
-/// a permanently doomed todo.
+/// a permanently doomed todo. Q2: also resets every stage's recorded
+/// pass/fail state — a fresh edit invalidates all prior stage runs,
+/// not just the one that happened to touch this file.
 pub async fn mark_dirty(project_root: &Path) {
     write_best_effort(&state_dir(project_root).join(DIRTY_FILE), b"").await;
     reset_fix_cycles(project_root).await;
+    remove_if_present(&state_dir(project_root).join(STAGES_FILE)).await;
 }
 
 /// Whether `project_root` is dirty since its last successful verify.
@@ -280,6 +303,177 @@ pub async fn recorded_verify_command(
         .await
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+// ── M20 Q2: multi-stage verify ──────────────────────────────────────
+
+/// One independent verify stage: a name (user-given via a `name:`
+/// prefix, or derived) and the exact shell command that runs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stage {
+    pub name: String,
+    pub command: String,
+}
+
+/// On-disk shape of one entry in `.copperclaw/stages`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StageRecord {
+    passed: bool,
+    at: String,
+}
+
+/// Split one trimmed, non-empty verify-file line into an optional
+/// `name:` prefix and the remaining command. The prefix syntax is
+/// deliberately narrow — the name must be a bare
+/// `[A-Za-z][A-Za-z0-9_-]*` token immediately followed by `:` — so
+/// ordinary shell commands that happen to contain a colon (a URL, a
+/// `docker run -p 8080:80`, a `key: value`-shaped grep pattern) are
+/// never misparsed as a stage prefix: any of those either has the
+/// colon past the first whitespace-delimited token (name would
+/// contain a space, rejected) or nothing following the colon once
+/// trimmed (rejected). Returns `None` when the line has no valid
+/// prefix, in which case the whole trimmed line is the command and
+/// the caller derives a name.
+fn split_stage_prefix(line: &str) -> Option<(&str, &str)> {
+    let colon = line.find(':')?;
+    let name = &line[..colon];
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        || name.chars().next().is_some_and(|c| c.is_ascii_digit())
+    {
+        return None;
+    }
+    let rest = line[colon + 1..].trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    Some((name, rest))
+}
+
+/// Parse the raw `.copperclaw/verify` text into an ordered list of
+/// stages. Blank lines are skipped. A single unprefixed line yields
+/// exactly one stage (`stage1`, the pre-Q2 shape byte-for-byte from
+/// the matching caller's point of view — see `apply_verify_gate`).
+fn parse_stages(text: &str) -> Vec<Stage> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .enumerate()
+        .map(|(i, line)| {
+            if let Some((name, cmd)) = split_stage_prefix(line) {
+                Stage {
+                    name: name.to_string(),
+                    command: cmd.to_string(),
+                }
+            } else {
+                Stage {
+                    name: format!("stage{}", i + 1),
+                    command: line.to_string(),
+                }
+            }
+        })
+        .collect()
+}
+
+/// Resolve the effective list of verify stages for `project_root`.
+/// `override_cmd` (from `ToolContext::check_command_override`) wins
+/// when `Some` — mirroring [`recorded_verify_command`], it collapses
+/// to a single stage using the override text verbatim, ignoring
+/// whatever the recorded `.copperclaw/verify` file contains. With no
+/// override, reads and parses the marker file via [`parse_stages`];
+/// a missing/empty file yields an empty stage list (no verify
+/// recorded at all).
+pub async fn recorded_stages(project_root: &Path, override_cmd: Option<&str>) -> Vec<Stage> {
+    if let Some(cmd) = override_cmd {
+        let trimmed = cmd.trim();
+        return if trimmed.is_empty() {
+            Vec::new()
+        } else {
+            vec![Stage {
+                name: "verify".to_string(),
+                command: trimmed.to_string(),
+            }]
+        };
+    }
+    match read_best_effort(&state_dir(project_root).join(VERIFY_FILE)).await {
+        Some(text) => parse_stages(&text),
+        None => Vec::new(),
+    }
+}
+
+async fn read_stage_state(project_root: &Path) -> HashMap<String, StageRecord> {
+    match read_best_effort(&state_dir(project_root).join(STAGES_FILE)).await {
+        Some(s) => serde_json::from_str(&s).unwrap_or_default(),
+        None => HashMap::new(),
+    }
+}
+
+async fn write_stage_state(project_root: &Path, state: &HashMap<String, StageRecord>) {
+    match serde_json::to_string_pretty(state) {
+        Ok(json) => {
+            write_best_effort(&state_dir(project_root).join(STAGES_FILE), json.as_bytes()).await;
+        }
+        Err(e) => {
+            tracing::warn!(
+                project_root = %project_root.display(),
+                error = %e,
+                "verify_gate: failed to serialize stage state"
+            );
+        }
+    }
+}
+
+/// Record the pass/fail outcome of one stage's run, timestamped now.
+/// Best-effort, same style as every other marker mutator here.
+pub async fn record_stage_result(project_root: &Path, stage_name: &str, passed: bool) {
+    let mut state = read_stage_state(project_root).await;
+    state.insert(
+        stage_name.to_string(),
+        StageRecord {
+            passed,
+            at: chrono::Utc::now().to_rfc3339(),
+        },
+    );
+    write_stage_state(project_root, &state).await;
+}
+
+/// Record a stage's failed verify run: prefixes `tail` with the stage
+/// name (`stage 'typecheck' failed: <tail>`) and delegates to
+/// [`record_verify_failure`] so the project-wide fix-cycle counter and
+/// `last_failure` marker keep working exactly as before — stage
+/// attribution rides along in the tail text rather than changing that
+/// function's signature or behavior for its existing direct callers.
+pub async fn record_stage_verify_failure(project_root: &Path, stage_name: &str, tail: &str) -> u32 {
+    let attributed = format!("stage '{stage_name}' failed: {tail}");
+    record_verify_failure(project_root, &attributed).await
+}
+
+/// Whether every stage in `stages` currently reads as passed in the
+/// project's stage-state file. An empty `stages` list (no verify
+/// recorded at all) is never "all passed" — there is nothing to be
+/// green about.
+pub async fn all_stages_passed(project_root: &Path, stages: &[Stage]) -> bool {
+    if stages.is_empty() {
+        return false;
+    }
+    let state = read_stage_state(project_root).await;
+    stages
+        .iter()
+        .all(|s| state.get(&s.name).is_some_and(|r| r.passed))
+}
+
+/// The stages in `stages` (file order preserved) that have NOT yet
+/// been recorded as passed — missing (never run since the last dirty
+/// mark) or recorded as failed.
+pub async fn pending_stages(project_root: &Path, stages: &[Stage]) -> Vec<Stage> {
+    let state = read_stage_state(project_root).await;
+    stages
+        .iter()
+        .filter(|s| !state.get(&s.name).is_some_and(|r| r.passed))
+        .cloned()
+        .collect()
 }
 
 /// Shared post-write hook for the edit-family tools (`write_file`,
@@ -607,5 +801,201 @@ mod tests {
         let truncated = tail_truncate(&multibyte, 4);
         assert!(truncated.is_char_boundary(0));
         assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+
+    // ── M20 Q2: multi-stage verify ───────────────────────────────
+
+    #[test]
+    fn parse_stages_single_unprefixed_line_is_one_derived_stage() {
+        let stages = parse_stages("npm test\n");
+        assert_eq!(
+            stages,
+            vec![Stage {
+                name: "stage1".into(),
+                command: "npm test".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_stages_reads_named_and_derived_stages_in_order() {
+        let stages = parse_stages("lint: npx eslint .\n\ntypecheck: npx tsc --noEmit\nnpm test\n");
+        assert_eq!(
+            stages,
+            vec![
+                Stage {
+                    name: "lint".into(),
+                    command: "npx eslint .".into(),
+                },
+                Stage {
+                    name: "typecheck".into(),
+                    command: "npx tsc --noEmit".into(),
+                },
+                Stage {
+                    name: "stage3".into(),
+                    command: "npm test".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_stages_does_not_misparse_a_colon_inside_the_command() {
+        // A command whose first token contains a space before any colon
+        // never matches the prefix syntax — the whole line is the command.
+        let stages = parse_stages("curl http://localhost:3000/health\n");
+        assert_eq!(
+            stages,
+            vec![Stage {
+                name: "stage1".into(),
+                command: "curl http://localhost:3000/health".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn parse_stages_empty_text_yields_no_stages() {
+        assert!(parse_stages("").is_empty());
+        assert!(parse_stages("   \n\n  ").is_empty());
+    }
+
+    #[tokio::test]
+    async fn recorded_stages_none_when_no_verify_file() {
+        let g = DataRootGuard::new();
+        let proj = g.path().join("p");
+        std::fs::create_dir_all(&proj).unwrap();
+        assert!(recorded_stages(&proj, None).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recorded_stages_override_collapses_to_one_stage() {
+        let g = DataRootGuard::new();
+        let proj = g.path().join("p");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(
+            proj.join(".copperclaw").join("verify"),
+            "lint: npx eslint .\ntypecheck: npx tsc --noEmit\n",
+        )
+        .unwrap();
+        let stages = recorded_stages(&proj, Some("cargo check")).await;
+        assert_eq!(
+            stages,
+            vec![Stage {
+                name: "verify".into(),
+                command: "cargo check".into(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn record_stage_result_then_all_stages_passed_round_trips() {
+        let g = DataRootGuard::new();
+        let proj = g.path().join("p");
+        std::fs::create_dir_all(&proj).unwrap();
+        let stages = vec![
+            Stage {
+                name: "lint".into(),
+                command: "npx eslint .".into(),
+            },
+            Stage {
+                name: "test".into(),
+                command: "npm test".into(),
+            },
+        ];
+        assert!(!all_stages_passed(&proj, &stages).await);
+        record_stage_result(&proj, "lint", true).await;
+        assert!(!all_stages_passed(&proj, &stages).await);
+        record_stage_result(&proj, "test", true).await;
+        assert!(all_stages_passed(&proj, &stages).await);
+    }
+
+    #[tokio::test]
+    async fn all_stages_passed_false_when_a_stage_is_recorded_failed() {
+        let g = DataRootGuard::new();
+        let proj = g.path().join("p");
+        std::fs::create_dir_all(&proj).unwrap();
+        let stages = vec![Stage {
+            name: "test".into(),
+            command: "npm test".into(),
+        }];
+        record_stage_result(&proj, "test", false).await;
+        assert!(!all_stages_passed(&proj, &stages).await);
+    }
+
+    #[tokio::test]
+    async fn all_stages_passed_false_for_empty_stage_list() {
+        let g = DataRootGuard::new();
+        let proj = g.path().join("p");
+        std::fs::create_dir_all(&proj).unwrap();
+        assert!(!all_stages_passed(&proj, &[]).await);
+    }
+
+    #[tokio::test]
+    async fn pending_stages_lists_only_the_unfinished_ones_in_order() {
+        let g = DataRootGuard::new();
+        let proj = g.path().join("p");
+        std::fs::create_dir_all(&proj).unwrap();
+        let stages = vec![
+            Stage {
+                name: "lint".into(),
+                command: "npx eslint .".into(),
+            },
+            Stage {
+                name: "typecheck".into(),
+                command: "npx tsc --noEmit".into(),
+            },
+            Stage {
+                name: "test".into(),
+                command: "npm test".into(),
+            },
+        ];
+        record_stage_result(&proj, "lint", true).await;
+        let pending = pending_stages(&proj, &stages).await;
+        assert_eq!(
+            pending.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["typecheck", "test"]
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_dirty_resets_all_stage_state() {
+        let g = DataRootGuard::new();
+        let proj = g.path().join("p");
+        std::fs::create_dir_all(&proj).unwrap();
+        let stages = vec![Stage {
+            name: "test".into(),
+            command: "npm test".into(),
+        }];
+        record_stage_result(&proj, "test", true).await;
+        assert!(all_stages_passed(&proj, &stages).await);
+        mark_dirty(&proj).await;
+        assert!(!all_stages_passed(&proj, &stages).await);
+        assert!(pending_stages(&proj, &stages).await.len() == 1);
+    }
+
+    #[tokio::test]
+    async fn record_stage_verify_failure_prefixes_tail_with_stage_name() {
+        let g = DataRootGuard::new();
+        let proj = g.path().join("p");
+        std::fs::create_dir_all(&proj).unwrap();
+        record_stage_verify_failure(&proj, "typecheck", "2 errors found").await;
+        assert_eq!(
+            last_failure(&proj).await.as_deref(),
+            Some("stage 'typecheck' failed: 2 errors found")
+        );
+    }
+
+    #[tokio::test]
+    async fn record_stage_verify_failure_still_increments_project_fix_cycles() {
+        // Stage attribution rides in the tail text only — the underlying
+        // project-wide fix-cycle counter (and FIX_CYCLE_CAP mechanics)
+        // keep working exactly as before.
+        let g = DataRootGuard::new();
+        let proj = g.path().join("p");
+        std::fs::create_dir_all(&proj).unwrap();
+        let n1 = record_stage_verify_failure(&proj, "lint", "boom").await;
+        assert_eq!(n1, 1);
+        let n2 = record_stage_verify_failure(&proj, "test", "boom again").await;
+        assert_eq!(n2, 2);
     }
 }

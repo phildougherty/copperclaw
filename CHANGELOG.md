@@ -63,6 +63,38 @@ adheres to [Semantic Versioning](https://semver.org/).
   `Prototyping` image (three font packages, four new global npm packages,
   and the ~11MB `ruff` binary; the pre-existing `chromium` line item still
   dominates the total). `Minimal` is unaffected.
+### Changed (M20 Q2 — Multi-stage verify: named stages, per-stage state, stage-attributed failures)
+
+- `.copperclaw/verify` may now contain MULTIPLE lines, each an independent
+  verify stage, with an optional `name:` prefix (`lint: npx eslint .`); an
+  unprefixed line gets a derived name (`stage1`, `stage2`, ... by position).
+  A single unprefixed line behaves byte-for-byte as before — full backward
+  compatibility, no format flag
+  (`crates/copperclaw-mcp/src/tools/verify_gate.rs`: `parse_stages`,
+  `recorded_stages`).
+- `apply_verify_gate` (`crates/copperclaw-mcp/src/tools/computer_use.rs`)
+  now matches the trimmed shell command against ANY recorded stage and
+  records that stage's pass/fail + RFC3339 timestamp in a new per-project
+  `.copperclaw/stages` JSON marker file
+  (`verify_gate::record_stage_result`); best-effort I/O, same swallow-and-log
+  style as the existing markers. The project's dirty marker only clears once
+  EVERY recorded stage reads green (`verify_gate::all_stages_passed`) — with
+  a single stage this is exactly the pre-Q2 clear-on-pass behavior.
+- `mark_dirty` now also resets all per-stage state — a fresh edit
+  invalidates every prior stage result, not just the file that was touched.
+- The `todo_update` completion gate
+  (`crates/copperclaw-mcp/src/tools/todo.rs`) now requires every recorded
+  stage to be green since the last dirty mark; its refusal message names the
+  missing/failing stages and their exact commands
+  (`verify_gate::pending_stages`).
+- Failed stage-aware verify runs are attributed: `last_failure`'s tail is
+  prefixed with the stage name (`stage 'typecheck' failed: <tail>`) via the
+  new `verify_gate::record_stage_verify_failure`, which wraps the existing
+  `record_verify_failure` without changing its signature or behavior for
+  direct callers (project-wide `fix_cycles`/`FIX_CYCLE_CAP` mechanics are
+  unchanged).
+- The M18 golden verify-gate fixture (`fixtures/cli/prototype-verify-gate/`)
+  passes unchanged, confirming the legacy single-line shape is untouched.
 
 ### Added (M19 A3 — Public-tunnel model verb: activate V5)
 
