@@ -10,6 +10,13 @@ pub enum ApprovalKind {
     InstallPackages,
     AddMcpServer,
     OneCli,
+    /// Enable the session-preview reverse proxy for an agent group (M18 V2).
+    /// Raised host-side when the agent calls `expose_preview` on a group that
+    /// has not opted into previews: instead of a dead `PreviewError::Disabled`,
+    /// the operator gets a one-tap approval card. Approving it flips
+    /// `container_configs.preview_enabled` — the same effect as the operator
+    /// running `cclaw groups config update --field preview_enabled=true`.
+    EnablePreview,
     /// A credentialed external action (web fetch/search, package install,
     /// remote MCP attach) requested on a turn whose context contains
     /// untrusted-provenance content (M16 Phase 3 coarse provenance gate). The

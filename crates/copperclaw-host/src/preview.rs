@@ -44,6 +44,7 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::OnceLock;
 
 use axum::Router;
 use axum::body::Body;
@@ -57,9 +58,13 @@ use chrono::Utc;
 use copperclaw_container_rt::ContainerRuntime;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::audit_log::{self, AuditEntry};
-use copperclaw_db::tables::container_configs;
-use copperclaw_modules::{PreviewBroker, PreviewError, PreviewExposed, SessionInfoLite};
-use copperclaw_types::{AgentGroupId, SessionId};
+use copperclaw_db::tables::pending_approvals::{self, ApprovalStatus, UpsertPendingApproval};
+use copperclaw_db::tables::{container_configs, messaging_group_agents, messaging_groups};
+use copperclaw_modules::{
+    DeliveryDispatcher, DispatchTarget, PreviewBroker, PreviewError, PreviewExposed,
+    SessionInfoLite,
+};
+use copperclaw_types::{AgentGroupId, MessageKind, OutboundMessage, SessionId};
 use futures::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
@@ -94,6 +99,8 @@ const PREVIEW_COOKIE: &str = "cclaw_preview";
 const PREVIEW_TOKEN_PATH: &str = "/__preview/";
 /// Audit command recorded for preview mutations.
 const PREVIEW_AUDIT_COMMAND: &str = "preview";
+/// Title shown on the one-tap enable-preview approval card (V2).
+const ENABLE_PREVIEW_CARD_TITLE: &str = "Enable previews for this group?";
 
 /// Why a preview was torn down — recorded in the audit row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -119,7 +126,7 @@ impl TeardownReason {
     }
 }
 
-/// One live preview.
+/// One live (or idle-tombstoned) preview.
 struct PreviewEntry {
     session_id: SessionId,
     agent_group_id: AgentGroupId,
@@ -135,15 +142,158 @@ struct PreviewEntry {
     last_activity: Arc<StdMutex<Instant>>,
     /// Cancels this preview's axum server task on teardown.
     cancel: CancellationToken,
+    /// The shared proxy state the axum serving task holds. Kept here too so the
+    /// idle reaper can flip it to [`PreviewPhase::Tombstone`] WITHOUT dropping
+    /// the listener (V2): the bound port keeps serving an "expired" page that
+    /// offers a single tokened re-expose.
+    proxy: Arc<ProxyState>,
 }
 
-/// Shared state handed to the axum proxy handler for one preview.
+/// Which phase a preview's bound host port is serving (V2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreviewPhase {
+    /// Reverse-proxying live to the container upstream.
+    Live,
+    /// Idle-reaped: the upstream proxying is torn down (freeing the
+    /// container-side resources the reaper exists to reclaim) but the port
+    /// stays bound, serving the static "preview expired" tombstone page. A
+    /// tokened `GET /__preview/<token>` re-exposes the same session:port once.
+    Tombstone,
+}
+
+/// Mutable, lock-guarded part of one preview's proxy state. Shared between the
+/// axum serving task, the idle reaper (which flips `phase` to `Tombstone`), and
+/// the tombstone recovery path (which flips it back to `Live`).
+struct ProxyStateInner {
+    phase: PreviewPhase,
+    /// `http://<container_ip>:<container_port>` — the upstream base. Only
+    /// meaningful while `phase == Live`; re-resolved on a tombstone recovery
+    /// (the container IP may have changed across a restart).
+    upstream: String,
+    /// A tombstone offers exactly ONE tokened re-expose per token. Once a
+    /// recovery succeeds this is set; a subsequent reap→tombstone→GET then
+    /// shows the terminal "ask the agent to re-expose" page rather than
+    /// recovering a second time. An explicit agent `expose_preview` re-lease
+    /// resets it (a fresh, deliberate exposure earns a fresh recovery budget).
+    recovery_used: bool,
+}
+
+/// Shared state handed to the axum proxy handler for one preview. The static
+/// fields are the token gate + HTTP client; [`ProxyStateInner`] holds the
+/// phase-dependent bits. The recovery inputs (`runtime`, `central`, identity)
+/// let a tombstone re-expose the same session:port without going back through
+/// [`PreviewManager`].
 struct ProxyState {
     token: String,
-    /// `http://<container_ip>:<container_port>` — the upstream base.
-    upstream: String,
     last_activity: Arc<StdMutex<Instant>>,
     client: reqwest::Client,
+    inner: StdMutex<ProxyStateInner>,
+    runtime: Arc<dyn ContainerRuntime>,
+    central: CentralDb,
+    session_id: SessionId,
+    agent_group_id: AgentGroupId,
+    /// `copperclaw-<session-uuid>` — the container the reaper freed the proxy
+    /// to, re-resolved on recovery to confirm it is still up.
+    container_name: String,
+    container_port: u16,
+    host_port: u16,
+}
+
+impl ProxyState {
+    /// Current phase (cheap read).
+    fn phase(&self) -> PreviewPhase {
+        self.inner.lock().unwrap().phase
+    }
+
+    /// The live upstream base (`http://<ip>:<port>`). Snapshot-cloned so the
+    /// caller doesn't hold the inner lock across an await.
+    fn upstream(&self) -> String {
+        self.inner.lock().unwrap().upstream.clone()
+    }
+
+    /// Idle-reap this preview: drop the upstream proxying and leave the port
+    /// serving the tombstone page. A no-op if it is already tombstoned. Does
+    /// NOT cancel the listener or release the port — that stays for
+    /// session-stop / close / shutdown teardown.
+    fn tombstone(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.phase == PreviewPhase::Live {
+            inner.phase = PreviewPhase::Tombstone;
+        }
+    }
+
+    /// Attempt the single tokened re-expose a tombstone allows. Returns `true`
+    /// when the preview is Live afterwards (either it just recovered, or a
+    /// racing request already recovered it); `false` for the terminal case
+    /// (recovery already used, or the container is no longer up). On a genuine
+    /// recovery this re-resolves the container IP, flips to `Live`, bumps the
+    /// idle clock, and writes the same audit row a fresh expose does.
+    async fn try_recover(&self) -> bool {
+        {
+            let inner = self.inner.lock().unwrap();
+            if inner.phase == PreviewPhase::Live {
+                return true;
+            }
+            if inner.recovery_used {
+                return false;
+            }
+        }
+        // Container still up? (async — must not hold the inner lock across it.)
+        let Ok(Some(ip)) = self.runtime.container_ip(&self.container_name).await else {
+            return false;
+        };
+        let mut inner = self.inner.lock().unwrap();
+        if inner.phase == PreviewPhase::Live {
+            return true;
+        }
+        if inner.recovery_used {
+            return false;
+        }
+        inner.recovery_used = true;
+        inner.upstream = format!("http://{ip}:{}", self.container_port);
+        inner.phase = PreviewPhase::Live;
+        drop(inner);
+        *self.last_activity.lock().unwrap() = Instant::now();
+        write_preview_audit(
+            &self.central,
+            self.session_id,
+            self.agent_group_id,
+            "expose",
+            Some(self.host_port),
+            self.container_port,
+            "reopened",
+        );
+        true
+    }
+
+    /// Agent-initiated re-lease of a tombstoned preview (an explicit
+    /// `expose_preview` on a port whose proxy was idle-reaped). Re-resolves the
+    /// container IP, flips back to `Live`, and resets the one-shot recovery
+    /// budget. Best-effort: returns `false` (leaving it tombstoned) when the
+    /// container is gone, in which case the shareable URL still works via the
+    /// tombstone's own recovery path.
+    async fn revive(&self) -> bool {
+        let Ok(Some(ip)) = self.runtime.container_ip(&self.container_name).await else {
+            return false;
+        };
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.recovery_used = false;
+            inner.upstream = format!("http://{ip}:{}", self.container_port);
+            inner.phase = PreviewPhase::Live;
+        }
+        *self.last_activity.lock().unwrap() = Instant::now();
+        write_preview_audit(
+            &self.central,
+            self.session_id,
+            self.agent_group_id,
+            "expose",
+            Some(self.host_port),
+            self.container_port,
+            "reopened",
+        );
+        true
+    }
 }
 
 /// The host-side preview manager. Constructed once at boot with the container
@@ -153,6 +303,13 @@ pub struct PreviewManager {
     central: CentralDb,
     runtime: Arc<dyn ContainerRuntime>,
     entries: AsyncMutex<Vec<PreviewEntry>>,
+    /// Delivery dispatcher, wired at boot via
+    /// [`PreviewManager::set_approval_dispatcher`]. Used to post the one-tap
+    /// "Enable previews for this group" approval card (V2) when an
+    /// `expose_preview` hits [`PreviewError::Disabled`]. `None` (never wired —
+    /// e.g. a host with no delivery loop, or the unit tests) means the disabled
+    /// path stays a plain error with no card, exactly as before V2.
+    approval_dispatcher: OnceLock<Arc<dyn DeliveryDispatcher>>,
 }
 
 impl PreviewManager {
@@ -164,7 +321,15 @@ impl PreviewManager {
             central,
             runtime,
             entries: AsyncMutex::new(Vec::new()),
+            approval_dispatcher: OnceLock::new(),
         })
+    }
+
+    /// Wire the delivery dispatcher used to post the one-tap enable-preview
+    /// approval card (V2). Called once at boot after the delivery service is
+    /// up. Returns `false` if a dispatcher was already set (idempotent guard).
+    pub fn set_approval_dispatcher(&self, dispatcher: Arc<dyn DeliveryDispatcher>) -> bool {
+        self.approval_dispatcher.set(dispatcher).is_ok()
     }
 
     /// Spawn the idle reaper. It scans every [`PREVIEW_REAPER_TICK`] and tears
@@ -187,23 +352,43 @@ impl PreviewManager {
         });
     }
 
-    /// Tear down every preview whose last activity is older than `idle`
+    /// Tombstone every LIVE preview whose last activity is older than `idle`
     /// relative to `now`. Factored out of the reaper loop so it is testable
     /// with an explicit clock.
+    ///
+    /// V2: reaping no longer cancels the listener / releases the port. It tears
+    /// down only the upstream proxying and leaves the bound port serving the
+    /// "preview expired" tombstone page (which offers a single tokened
+    /// re-expose). Full teardown — cancel + port release — still happens on
+    /// session stop / close / shutdown via [`Self::teardown`], exactly as
+    /// before. Already-tombstoned entries are skipped so they are not
+    /// re-audited every tick.
     async fn reap_idle(&self, now: Instant, idle: Duration) {
-        let stale: Vec<(SessionId, u16)> = {
-            let entries = self.entries.lock().await;
-            entries
-                .iter()
-                .filter(|e| {
-                    let last = *e.last_activity.lock().unwrap();
-                    now.saturating_duration_since(last) >= idle
-                })
-                .map(|e| (e.session_id, e.container_port))
-                .collect()
-        };
-        for (session_id, port) in stale {
-            self.teardown(session_id, port, TeardownReason::Idle).await;
+        let entries = self.entries.lock().await;
+        for e in entries.iter() {
+            if e.proxy.phase() != PreviewPhase::Live {
+                continue;
+            }
+            let last = *e.last_activity.lock().unwrap();
+            if now.saturating_duration_since(last) < idle {
+                continue;
+            }
+            e.proxy.tombstone();
+            write_preview_audit(
+                &self.central,
+                e.session_id,
+                e.agent_group_id,
+                "tombstone",
+                Some(e.host_port),
+                e.container_port,
+                TeardownReason::Idle.as_str(),
+            );
+            info!(
+                session = %e.session_id.as_uuid(),
+                host_port = e.host_port,
+                container_port = e.container_port,
+                "preview idle-tombstoned (port kept for one tokened re-expose)"
+            );
         }
     }
 
@@ -278,8 +463,9 @@ impl PreviewManager {
         }
     }
 
-    /// Write an audit row for a preview mutation. Best-effort (a DB error is
-    /// logged + swallowed, matching the attestation / dispatch audit contract).
+    /// Write an audit row for a preview mutation. Thin method wrapper over the
+    /// free [`write_preview_audit`] so the axum-side recovery path (which has no
+    /// `&PreviewManager`) can audit with identical shape.
     fn audit(
         &self,
         session_id: SessionId,
@@ -289,34 +475,190 @@ impl PreviewManager {
         container_port: u16,
         reason: &str,
     ) {
-        let args = serde_json::json!({
-            "action": action,
-            "session_id": session_id.as_uuid().to_string(),
-            "container_port": container_port,
-            "host_port": host_port,
-            "reason": reason,
-        })
-        .to_string();
-        let entry = AuditEntry {
-            ts: Utc::now(),
-            caller_kind: "host".to_string(),
-            caller_session: Some(session_id.as_uuid().to_string()),
-            caller_agent_group: Some(agent_group_id.as_uuid().to_string()),
-            command: PREVIEW_AUDIT_COMMAND.to_string(),
-            args,
-            result: "ok".to_string(),
-            error_code: None,
-            error_message: None,
-            latency_ms: 0,
-        };
-        if let Err(err) = audit_log::insert(&self.central, &entry) {
-            warn!(?err, "could not write preview audit row");
-        }
+        write_preview_audit(
+            &self.central,
+            session_id,
+            agent_group_id,
+            action,
+            host_port,
+            container_port,
+            reason,
+        );
     }
 
-    /// Number of live previews (test / introspection helper).
+    /// V2 one-tap enablement: raise a G1 approval card that flips
+    /// `preview_enabled` when tapped. Called from the `expose` group-gate when
+    /// the group has not opted into previews, so a phone-only operator can
+    /// enable previews without a terminal — secure-by-default is preserved
+    /// (previews stay OFF until an authorised operator taps Enable).
+    ///
+    /// Best-effort and idempotent:
+    /// * If a live `enable_preview` approval already exists for this group, no
+    ///   second card is raised (agents retry `expose_preview` repeatedly).
+    /// * The card is posted to the group's primary messaging channel (the first
+    ///   wiring — the same "primary" rule the pending-sender notifier uses).
+    /// * The card body reuses [`PreviewError::Disabled`]'s copy-pasteable
+    ///   `cclaw` fix text, so a desk operator still sees the CLI equivalent.
+    /// * The tap routes through G1's merged interceptor + DB decision path
+    ///   (`approve:<id>` → [`crate::handlers::approvals::resolve_approve`] →
+    ///   the `enable_preview` apply arm).
+    fn request_enable_approval(&self, session: &SessionInfoLite) {
+        let ag = session.agent_group_id;
+
+        // Idempotent: skip if a still-actionable enable-preview card is already
+        // outstanding for this group.
+        let now = Utc::now();
+        match pending_approvals::list(
+            &self.central,
+            Some("enable_preview"),
+            Some(ApprovalStatus::Pending),
+        ) {
+            Ok(rows) => {
+                if rows
+                    .iter()
+                    .any(|r| r.agent_group_id == Some(ag) && r.is_actionable_at(now))
+                {
+                    return;
+                }
+            }
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "preview: could not check for an existing enable-preview approval"
+                );
+                return;
+            }
+        }
+
+        let Some(dispatcher) = self.approval_dispatcher.get() else {
+            info!(
+                agent_group_id = %ag.as_uuid(),
+                "preview: no approval dispatcher wired; skipping enable-preview card"
+            );
+            return;
+        };
+
+        // Resolve the group's primary messaging channel (first wiring, ordered
+        // priority desc then created_at — same as the sender notifier).
+        let wirings = match messaging_group_agents::list_for_ag(&self.central, ag) {
+            Ok(w) => w,
+            Err(err) => {
+                info!(agent_group_id = %ag.as_uuid(), ?err, "preview: could not list wirings for enable-preview card; skipping");
+                return;
+            }
+        };
+        let Some(wiring) = wirings.first() else {
+            info!(agent_group_id = %ag.as_uuid(), "preview: agent group has no messaging groups; skipping enable-preview card");
+            return;
+        };
+        let mg = match messaging_groups::get(&self.central, wiring.messaging_group_id) {
+            Ok(g) => g,
+            Err(err) => {
+                info!(messaging_group_id = %wiring.messaging_group_id.as_uuid(), ?err, "preview: could not fetch messaging group; skipping enable-preview card");
+                return;
+            }
+        };
+
+        // Persist the pending approval (stable request_id → the ON CONFLICT
+        // partial index keeps retries from stacking duplicate pending rows).
+        let body = PreviewError::Disabled {
+            group: ag.as_uuid().to_string(),
+        }
+        .to_string();
+        let approval = match pending_approvals::upsert(
+            &self.central,
+            UpsertPendingApproval {
+                request_id: format!("enable-preview:{}", ag.as_uuid()),
+                action: "enable_preview".to_string(),
+                payload: serde_json::json!({}),
+                agent_group_id: Some(ag),
+                channel_type: Some(mg.channel_type.clone()),
+                platform_id: Some(mg.platform_id.clone()),
+                title: ENABLE_PREVIEW_CARD_TITLE.to_string(),
+                options: vec![],
+                ..Default::default()
+            },
+        ) {
+            Ok(a) => a,
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "preview: could not persist enable-preview approval row"
+                );
+                return;
+            }
+        };
+
+        // Emit the card (same canonical Card shape `ApprovalCardHandler` builds,
+        // so every adapter renders it natively and G1's interceptor recognises
+        // the `approve:<id>` / `deny:<id>` callbacks).
+        let approval_id = approval.approval_id.as_uuid().to_string();
+        let target = DispatchTarget::channel(mg.channel_type.clone(), mg.platform_id.clone(), None);
+        let card = OutboundMessage {
+            kind: MessageKind::Card,
+            content: serde_json::json!({
+                "card": {
+                    "title": ENABLE_PREVIEW_CARD_TITLE,
+                    "body": body,
+                    "buttons": [
+                        { "label": "Enable previews for this group", "value": format!("approve:{approval_id}"), "style": "primary" },
+                        { "label": "Not now", "value": format!("deny:{approval_id}"), "style": "danger" },
+                    ],
+                },
+            }),
+            files: vec![],
+        };
+        dispatcher.dispatch(&target, &card);
+        info!(
+            agent_group_id = %ag.as_uuid(),
+            approval_id = %approval_id,
+            notify_channel = mg.channel_type.as_str(),
+            "preview: raised one-tap enable-preview approval card"
+        );
+    }
+
+    /// Number of tracked previews — live AND idle-tombstoned (both still hold a
+    /// bound host port until teardown). Test / introspection helper.
     pub async fn active_count(&self) -> usize {
         self.entries.lock().await.len()
+    }
+}
+
+/// Write an audit row for a preview mutation. Best-effort (a DB error is
+/// logged + swallowed, matching the attestation / dispatch audit contract).
+/// Free function so both [`PreviewManager`] and the axum-side tombstone
+/// recovery path can call it.
+fn write_preview_audit(
+    central: &CentralDb,
+    session_id: SessionId,
+    agent_group_id: AgentGroupId,
+    action: &str,
+    host_port: Option<u16>,
+    container_port: u16,
+    reason: &str,
+) {
+    let args = serde_json::json!({
+        "action": action,
+        "session_id": session_id.as_uuid().to_string(),
+        "container_port": container_port,
+        "host_port": host_port,
+        "reason": reason,
+    })
+    .to_string();
+    let entry = AuditEntry {
+        ts: Utc::now(),
+        caller_kind: "host".to_string(),
+        caller_session: Some(session_id.as_uuid().to_string()),
+        caller_agent_group: Some(agent_group_id.as_uuid().to_string()),
+        command: PREVIEW_AUDIT_COMMAND.to_string(),
+        args,
+        result: "ok".to_string(),
+        error_code: None,
+        error_message: None,
+        latency_ms: 0,
+    };
+    if let Err(err) = audit_log::insert(central, &entry) {
+        warn!(?err, "could not write preview audit row");
     }
 }
 
@@ -389,11 +731,14 @@ impl PreviewBroker for PreviewManager {
             ));
         }
 
-        // 1. Group gate. No config row or disabled → refuse with the operator
-        //    command (copy-pasteable) that turns it on.
+        // 1. Group gate. No config row or disabled → still refuse (secure by
+        //    default: previews stay OFF), but ALSO raise a one-tap G1 approval
+        //    card so a phone-only operator can enable them without a terminal
+        //    (V2). The agent gets the copy-pasteable `cclaw` fix text as before.
         let cfg = container_configs::get(&self.central, session.agent_group_id)
             .map_err(|e| PreviewError::Internal(format!("read group config: {e}")))?;
         let Some(cfg) = cfg.filter(|c| c.preview_enabled) else {
+            self.request_enable_approval(session);
             return Err(PreviewError::Disabled {
                 group: session.agent_group_id.as_uuid().to_string(),
             });
@@ -405,13 +750,23 @@ impl PreviewBroker for PreviewManager {
         let mut entries = self.entries.lock().await;
 
         // 2. Idempotent re-expose: an existing preview for this
-        //    (session, container_port) returns its current URL unchanged.
+        //    (session, container_port) returns its current URL unchanged. If it
+        //    was idle-tombstoned (V2), revive it in place first so the same URL
+        //    proxies live again — an explicit re-expose earns a fresh lease
+        //    (and a fresh one-shot recovery budget).
         if let Some(existing) = entries
             .iter()
             .find(|e| e.session_id == session.session_id && e.container_port == port)
         {
+            let url = preview_url(&display_host(bind), existing.host_port, &existing.token);
+            let proxy = Arc::clone(&existing.proxy);
+            if proxy.phase() == PreviewPhase::Tombstone {
+                // Best-effort: if the container is gone the URL still recovers
+                // via the tombstone's own path, so we return it regardless.
+                let _ = proxy.revive().await;
+            }
             return Ok(PreviewExposed {
-                url: preview_url(&display_host(bind), existing.host_port, &existing.token),
+                url,
                 note: exposure_note(),
             });
         }
@@ -456,14 +811,27 @@ impl PreviewBroker for PreviewManager {
         let upstream = format!("http://{container_ip}:{port}");
         let state = Arc::new(ProxyState {
             token: token.clone(),
-            upstream,
             last_activity: Arc::clone(&last_activity),
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .map_err(|e| PreviewError::Internal(format!("build proxy client: {e}")))?,
+            inner: StdMutex::new(ProxyStateInner {
+                phase: PreviewPhase::Live,
+                upstream,
+                recovery_used: false,
+            }),
+            runtime: Arc::clone(&self.runtime),
+            central: self.central.clone(),
+            session_id: session.session_id,
+            agent_group_id: session.agent_group_id,
+            container_name: name_c,
+            container_port: port,
+            host_port,
         });
-        let app = Router::new().fallback(proxy_handler).with_state(state);
+        let app = Router::new()
+            .fallback(proxy_handler)
+            .with_state(Arc::clone(&state));
         let serve_cancel = cancel.clone();
         tokio::spawn(async move {
             let shutdown = async move { serve_cancel.cancelled().await };
@@ -488,6 +856,7 @@ impl PreviewBroker for PreviewManager {
             container_ip,
             last_activity,
             cancel,
+            proxy: state,
         });
         drop(entries);
 
@@ -621,23 +990,19 @@ fn cookie_token(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-/// The axum fallback handler: token gate + reverse proxy.
+/// The axum fallback handler: token gate + reverse proxy. When the preview has
+/// been idle-tombstoned (V2) it routes to [`tombstone_handler`] instead.
 async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Response {
+    if state.phase() == PreviewPhase::Tombstone {
+        return tombstone_handler(&state, req).await;
+    }
+
     let path = req.uri().path().to_string();
 
     // Token-mint path: set the cookie and redirect to the app root.
     if let Some(token) = path.strip_prefix(PREVIEW_TOKEN_PATH) {
         if constant_time_eq(token, &state.token) {
-            let cookie = format!(
-                "{PREVIEW_COOKIE}={}; Path=/; HttpOnly; SameSite=Lax",
-                state.token
-            );
-            return Response::builder()
-                .status(StatusCode::FOUND)
-                .header(header::SET_COOKIE, cookie)
-                .header(header::LOCATION, "/")
-                .body(Body::empty())
-                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            return cookie_mint_redirect(&state.token);
         }
         return forbidden();
     }
@@ -658,6 +1023,57 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
     *state.last_activity.lock().unwrap() = Instant::now();
 
     proxy_upstream(&state, req).await
+}
+
+/// Build the 302 that mints the gating cookie and redirects to the app root.
+/// Shared by the live token-mint path and a successful tombstone recovery.
+fn cookie_mint_redirect(token: &str) -> Response {
+    let cookie = format!("{PREVIEW_COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax");
+    Response::builder()
+        .status(StatusCode::FOUND)
+        .header(header::SET_COOKIE, cookie)
+        .header(header::LOCATION, "/")
+        .body(Body::empty())
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Handler for a tombstoned preview (V2). The upstream proxying is gone but the
+/// port stays bound. A tokened `GET /__preview/<token>` attempts the single
+/// re-expose the tombstone allows (constant-time token check unchanged); every
+/// other request — and a token whose one recovery is already spent, or whose
+/// container is gone — gets the static "preview expired" page.
+async fn tombstone_handler(state: &Arc<ProxyState>, req: Request) -> Response {
+    let path = req.uri().path();
+    if let Some(token) = path.strip_prefix(PREVIEW_TOKEN_PATH) {
+        if !constant_time_eq(token, &state.token) {
+            return forbidden();
+        }
+        if state.try_recover().await {
+            // Re-exposed: mint the cookie + redirect to the (now live) app.
+            return cookie_mint_redirect(&state.token);
+        }
+        // One recovery already used, or the container is no longer up.
+        return tombstone_page(true);
+    }
+    tombstone_page(false)
+}
+
+/// The static "preview expired" page a tombstoned port serves. `terminal` picks
+/// the copy: the non-terminal page points the operator back at their original
+/// link (which recovers the preview once); the terminal page tells them to ask
+/// the agent to re-expose. Plain text, no emojis. Served 200 so browsers render
+/// the body rather than a generic error chrome.
+fn tombstone_page(terminal: bool) -> Response {
+    let body = if terminal {
+        "This preview has expired and can no longer be reopened automatically \
+         (its one-time reopen was already used, or the app's container has \
+         stopped). Ask the agent to run `expose_preview` again for a fresh link.\n"
+    } else {
+        "This preview has expired after being idle. Open the original preview \
+         link the agent gave you once more to reopen it, or ask the agent to run \
+         `expose_preview` again for a fresh link.\n"
+    };
+    (StatusCode::OK, body).into_response()
 }
 
 /// A 403 explaining how to obtain access.
@@ -691,7 +1107,7 @@ async fn proxy_upstream(state: &ProxyState, req: Request) -> Response {
         .uri()
         .path_and_query()
         .map_or_else(|| "/".to_string(), std::string::ToString::to_string);
-    let url = format!("{}{path_and_query}", state.upstream);
+    let url = format!("{}{path_and_query}", state.upstream());
     let req_headers = filter_headers(req.headers(), true);
 
     let body = req.into_body();
@@ -772,7 +1188,8 @@ async fn proxy_ws(state: &ProxyState, req: Request) -> Response {
     };
 
     // Open the upstream socket first (fail-fast 502 + subprotocol mirroring).
-    let ws_url = ws_upstream_url(&state.upstream, &path_and_query);
+    let upstream = state.upstream();
+    let ws_url = ws_upstream_url(&upstream, &path_and_query);
     let mut client_req = match ws_url.into_client_request() {
         Ok(r) => r,
         Err(err) => return bad_gateway_ws(&err.to_string()),
@@ -1410,8 +1827,13 @@ mod manager_tests {
     // Deterministic clock injection: `reap_idle` takes an explicit `now`, so
     // the idle-timeout boundary is exercised without depending on wall-clock
     // time (equivalent determinism to a paused tokio clock, no extra feature).
+    //
+    // V2: idle-reaping TOMBSTONES the preview (drops upstream proxying, keeps
+    // the port) rather than tearing it down — so the entry stays tracked and
+    // its phase flips to `Tombstone`. Full teardown still comes from
+    // close/session-stop/shutdown.
     #[tokio::test]
-    async fn idle_reaper_tears_down_after_timeout() {
+    async fn idle_reaper_tombstones_after_timeout_but_keeps_port() {
         let db = central();
         let ag = group_with_preview(&db, true, None);
         let mgr = manager(db, Some("127.0.0.1".into()));
@@ -1419,15 +1841,37 @@ mod manager_tests {
         mgr.expose(&sess, 7000, None).await.unwrap();
         assert_eq!(mgr.active_count().await, 1);
 
-        // Just under the timeout: still alive.
+        // Just under the timeout: still live.
         let now = Instant::now();
         mgr.reap_idle(now + StdDuration::from_secs(29 * 60), PREVIEW_IDLE_TIMEOUT)
             .await;
         assert_eq!(mgr.active_count().await, 1);
+        {
+            let entries = mgr.entries.lock().await;
+            assert_eq!(entries[0].proxy.phase(), PreviewPhase::Live);
+        }
 
-        // Past the timeout: reaped.
+        // Past the timeout: tombstoned, but still tracked (port kept for the
+        // one-shot re-expose).
         mgr.reap_idle(now + StdDuration::from_secs(31 * 60), PREVIEW_IDLE_TIMEOUT)
             .await;
+        assert_eq!(
+            mgr.active_count().await,
+            1,
+            "tombstoned entry stays tracked"
+        );
+        {
+            let entries = mgr.entries.lock().await;
+            assert_eq!(entries[0].proxy.phase(), PreviewPhase::Tombstone);
+        }
+
+        // A second reap over an already-tombstoned entry is a no-op.
+        mgr.reap_idle(now + StdDuration::from_secs(62 * 60), PREVIEW_IDLE_TIMEOUT)
+            .await;
+        assert_eq!(mgr.active_count().await, 1);
+
+        // Teardown (close) still releases the port.
+        mgr.close(sess.session_id, 7000).await.unwrap();
         assert_eq!(mgr.active_count().await, 0);
     }
 
@@ -1450,5 +1894,286 @@ mod manager_tests {
             tokio::time::sleep(StdDuration::from_millis(10)).await;
         }
         assert_eq!(mgr.active_count().await, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // V2 part 1: one-tap enable-preview approval card.
+    // -----------------------------------------------------------------------
+
+    use copperclaw_db::tables::messaging_group_agents::{UpsertWiring, upsert as upsert_wiring};
+    use copperclaw_db::tables::messaging_groups::{UpsertMessagingGroup, upsert as upsert_mg};
+    use copperclaw_types::{ChannelType, EngageMode, SessionMode};
+
+    /// Wire the group to a primary messaging group so the enable-preview card
+    /// has somewhere to go. Returns the messaging group's platform id.
+    fn wire_primary_channel(db: &CentralDb, ag: AgentGroupId) -> String {
+        let mg = upsert_mg(
+            db,
+            UpsertMessagingGroup {
+                channel_type: ChannelType::new("telegram"),
+                platform_id: "chat-1".into(),
+                name: Some("primary".into()),
+                is_group: true,
+                unknown_sender_policy: "strict".into(),
+            },
+        )
+        .unwrap();
+        upsert_wiring(
+            db,
+            UpsertWiring {
+                messaging_group_id: mg.id,
+                agent_group_id: ag,
+                engage_mode: EngageMode::Mention,
+                engage_pattern: None,
+                sender_scope: "all".into(),
+                ignored_message_policy: "drop".into(),
+                session_mode: SessionMode::Shared,
+                priority: 0,
+            },
+        )
+        .unwrap();
+        mg.platform_id
+    }
+
+    #[tokio::test]
+    async fn disabled_expose_raises_card_then_approve_lets_retry_succeed() {
+        use copperclaw_modules::context::MockDispatcher;
+
+        let db = central();
+        let ag = group_with_preview(&db, false, None); // previews OFF
+        let platform_id = wire_primary_channel(&db, ag);
+        let mgr = manager(db.clone(), Some("127.0.0.1".into()));
+        let mock = MockDispatcher::new();
+        let d: Arc<dyn DeliveryDispatcher> = mock.clone();
+        mgr.set_approval_dispatcher(d);
+        let sess = SessionInfoLite::new(SessionId::new(), ag);
+
+        // 1. Disabled expose → still refused (secure by default), but a card
+        //    and a pending approval are raised.
+        let err = mgr.expose(&sess, 3000, None).await.unwrap_err();
+        assert!(matches!(err, PreviewError::Disabled { .. }));
+        let rows =
+            pending_approvals::list(&db, Some("enable_preview"), Some(ApprovalStatus::Pending))
+                .unwrap();
+        assert_eq!(rows.len(), 1, "one enable_preview approval raised");
+        let approval_id = rows[0].approval_id;
+        assert_eq!(rows[0].agent_group_id, Some(ag));
+        // Card dispatched to the primary channel, carrying approve/deny buttons.
+        assert_eq!(mock.dispatched_count(), 1);
+        {
+            let dispatched = mock.dispatched.lock().unwrap();
+            let (target, msg) = &dispatched[0];
+            assert_eq!(target.platform_id.as_deref(), Some(platform_id.as_str()));
+            assert_eq!(msg.kind, MessageKind::Card);
+            let buttons = msg.content["card"]["buttons"].as_array().unwrap();
+            assert_eq!(
+                buttons[0]["value"],
+                format!("approve:{}", approval_id.as_uuid())
+            );
+            // Body reuses the copy-pasteable cclaw fix text.
+            assert!(
+                msg.content["card"]["body"]
+                    .as_str()
+                    .unwrap()
+                    .contains("preview_enabled=true")
+            );
+        }
+
+        // 2. A retry while still disabled must NOT raise a second card.
+        let _ = mgr.expose(&sess, 3000, None).await.unwrap_err();
+        assert_eq!(mock.dispatched_count(), 1, "no duplicate card on retry");
+        assert_eq!(
+            pending_approvals::list(&db, Some("enable_preview"), Some(ApprovalStatus::Pending))
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // 3. Operator taps Enable → resolves through the shared CLI DB path.
+        crate::handlers::approvals::resolve_approve(&db, approval_id, "owner-1").unwrap();
+        assert!(
+            container_configs::get(&db, ag)
+                .unwrap()
+                .unwrap()
+                .preview_enabled
+        );
+
+        // 4. The agent's retry now succeeds.
+        let ok = mgr.expose(&sess, 3000, None).await.unwrap();
+        assert!(ok.url.contains("/__preview/"));
+        mgr.close(sess.session_id, 3000).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disabled_expose_without_dispatcher_is_plain_error() {
+        // No dispatcher wired (pre-V2 behaviour): the disabled path stays a
+        // plain error with no card and no approval row.
+        let db = central();
+        let ag = group_with_preview(&db, false, None);
+        wire_primary_channel(&db, ag);
+        let mgr = manager(db.clone(), Some("127.0.0.1".into()));
+        let sess = SessionInfoLite::new(SessionId::new(), ag);
+        let err = mgr.expose(&sess, 3000, None).await.unwrap_err();
+        assert!(matches!(err, PreviewError::Disabled { .. }));
+        assert!(
+            pending_approvals::list(&db, Some("enable_preview"), None)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // V2 part 2: tombstone recovery — one re-expose per token, then terminal.
+    // -----------------------------------------------------------------------
+
+    /// Build a bare `ProxyState` in Tombstone phase for unit-testing the
+    /// recovery state machine directly (no bound port needed).
+    fn tombstoned_state(runtime: Arc<dyn ContainerRuntime>) -> ProxyState {
+        ProxyState {
+            token: "tok".into(),
+            last_activity: Arc::new(StdMutex::new(Instant::now())),
+            client: reqwest::Client::new(),
+            inner: StdMutex::new(ProxyStateInner {
+                phase: PreviewPhase::Tombstone,
+                upstream: String::new(),
+                recovery_used: false,
+            }),
+            runtime,
+            central: central(),
+            session_id: SessionId::new(),
+            agent_group_id: AgentGroupId::new(),
+            container_name: "copperclaw-x".into(),
+            container_port: 3000,
+            host_port: 8100,
+        }
+    }
+
+    #[tokio::test]
+    async fn try_recover_is_one_shot_per_token() {
+        let rt: Arc<dyn ContainerRuntime> = Arc::new(IpRuntime {
+            ip: Some("127.0.0.1".into()),
+        });
+        let state = tombstoned_state(rt);
+        // First recovery succeeds and flips to Live.
+        assert!(state.try_recover().await);
+        assert_eq!(state.phase(), PreviewPhase::Live);
+        // Simulate a second idle-reap.
+        state.tombstone();
+        assert_eq!(state.phase(), PreviewPhase::Tombstone);
+        // The one recovery is spent → terminal.
+        assert!(!state.try_recover().await);
+        assert_eq!(state.phase(), PreviewPhase::Tombstone);
+    }
+
+    #[tokio::test]
+    async fn try_recover_terminal_when_container_gone() {
+        // Container no longer up → recovery refused, but the one-shot budget is
+        // NOT consumed (a later attempt after the container returns can still
+        // recover).
+        let rt: Arc<dyn ContainerRuntime> = Arc::new(IpRuntime { ip: None });
+        let state = tombstoned_state(rt);
+        assert!(!state.try_recover().await);
+        assert_eq!(state.phase(), PreviewPhase::Tombstone);
+        assert!(!state.inner.lock().unwrap().recovery_used);
+    }
+
+    #[tokio::test]
+    async fn tombstone_serves_page_and_recovers_once_end_to_end() {
+        let upstream_port = spawn_upstream().await;
+        let db = central();
+        let ag = group_with_preview(&db, true, None);
+        let mgr = manager(db, Some("127.0.0.1".into()));
+        let sess = SessionInfoLite::new(SessionId::new(), ag);
+        let exposed = mgr
+            .expose(&sess, upstream_port, Some("demo".into()))
+            .await
+            .unwrap();
+        let token = exposed.url.split("/__preview/").nth(1).unwrap().to_string();
+        let base = exposed.url.split("/__preview/").next().unwrap().to_string();
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap();
+
+        // Prime the cookie and confirm the app proxies live.
+        assert_eq!(client.get(&exposed.url).send().await.unwrap().status(), 302);
+        let cookied = |path: String| {
+            let c = client.clone();
+            let tok = token.clone();
+            async move {
+                c.get(path)
+                    .header(reqwest::header::COOKIE, format!("cclaw_preview={tok}"))
+                    .send()
+                    .await
+                    .unwrap()
+            }
+        };
+        let r = cookied(format!("{base}/")).await;
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.text().await.unwrap(), "hello from the app");
+
+        // Idle-reap → tombstone. Port stays; a normal request shows the page.
+        mgr.reap_idle(
+            Instant::now() + StdDuration::from_secs(31 * 60),
+            PREVIEW_IDLE_TIMEOUT,
+        )
+        .await;
+        assert_eq!(mgr.active_count().await, 1);
+        let r = cookied(format!("{base}/")).await;
+        assert_eq!(r.status(), 200);
+        assert!(r.text().await.unwrap().contains("expired"));
+
+        // Tokened GET recovers it ONCE → 302 mint + redirect, live again.
+        assert_eq!(client.get(&exposed.url).send().await.unwrap().status(), 302);
+        let r = cookied(format!("{base}/")).await;
+        assert_eq!(r.status(), 200);
+        assert_eq!(r.text().await.unwrap(), "hello from the app");
+
+        // Reap again → tombstone; the second tokened GET is terminal (200 page,
+        // NOT a 302), telling the user to ask the agent to re-expose.
+        mgr.reap_idle(
+            Instant::now() + StdDuration::from_secs(31 * 60),
+            PREVIEW_IDLE_TIMEOUT,
+        )
+        .await;
+        let r = client.get(&exposed.url).send().await.unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(r.text().await.unwrap().contains("expose_preview"));
+
+        // Full teardown still releases the port.
+        mgr.close(sess.session_id, upstream_port).await.unwrap();
+        assert_eq!(mgr.active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn agent_reexpose_revives_a_tombstoned_preview() {
+        let upstream_port = spawn_upstream().await;
+        let db = central();
+        let ag = group_with_preview(&db, true, None);
+        let mgr = manager(db, Some("127.0.0.1".into()));
+        let sess = SessionInfoLite::new(SessionId::new(), ag);
+        let a = mgr.expose(&sess, upstream_port, None).await.unwrap();
+
+        // Reap → tombstone.
+        mgr.reap_idle(
+            Instant::now() + StdDuration::from_secs(31 * 60),
+            PREVIEW_IDLE_TIMEOUT,
+        )
+        .await;
+        {
+            let entries = mgr.entries.lock().await;
+            assert_eq!(entries[0].proxy.phase(), PreviewPhase::Tombstone);
+        }
+
+        // The agent explicitly re-exposes the same port: same URL, revived Live,
+        // fresh recovery budget.
+        let b = mgr.expose(&sess, upstream_port, None).await.unwrap();
+        assert_eq!(a.url, b.url, "re-expose is idempotent on the URL");
+        {
+            let entries = mgr.entries.lock().await;
+            assert_eq!(entries[0].proxy.phase(), PreviewPhase::Live);
+            assert!(!entries[0].proxy.inner.lock().unwrap().recovery_used);
+        }
+        mgr.close(sess.session_id, upstream_port).await.unwrap();
     }
 }

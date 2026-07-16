@@ -152,6 +152,11 @@ pub fn resolve_approve(
         "channel" => apply_channel(central, &row)?,
         "install_packages" => apply_install_packages(central, &row)?,
         "add_mcp_server" => apply_add_mcp_server(central, &row)?,
+        // M18 V2: flip the group's `preview_enabled` master switch — the same
+        // effect as `cclaw groups config update --field preview_enabled=true`.
+        // The pending row is raised host-side by the preview manager when the
+        // agent hits `PreviewError::Disabled`.
+        "enable_preview" => apply_enable_preview(central, &row)?,
         // Explicit refusal arms (M18 G1). These approval families exist in the
         // kind vocabulary but have no side-effect applier yet:
         //   - `one_cli`: Agent Vault credential grants are never applied via
@@ -582,6 +587,35 @@ fn apply_add_mcp_server(
     }))
 }
 
+/// `enable_preview` family (M18 V2): flip the group's `preview_enabled`
+/// master switch on. Effect-identical to the operator running
+/// `cclaw groups config update --field preview_enabled=true <ag>` — the
+/// preview manager consults `container_configs.preview_enabled` on the next
+/// `expose_preview`, so no rebuild/restart is required for it to take effect.
+/// A defaults-only config row is created first when the group has none (the
+/// "no config row" case is one of the two ways `PreviewError::Disabled` is
+/// raised), so the narrow `set_preview_enabled` setter always has a row to
+/// update.
+fn apply_enable_preview(
+    central: &CentralDb,
+    row: &pending_approvals::PendingApproval,
+) -> Result<Value, ErrorPayload> {
+    let ag_id = row.agent_group_id.ok_or_else(|| {
+        ErrorPayload::new(
+            "bad_request",
+            "enable_preview approval row is missing `agent_group_id`",
+        )
+    })?;
+    ensure_config_row(central, ag_id)?;
+    container_configs::set_preview_enabled(central, ag_id, true).map_err(db_err)?;
+    Ok(json!({
+        "kind": "enable_preview",
+        "agent_group_id": ag_id.as_uuid().to_string(),
+        "preview_enabled": true,
+        "note": "previews enabled for this group; the agent can retry `expose_preview` now",
+    }))
+}
+
 /// Helper: read `payload[key]` as an array of non-empty strings.
 fn json_str_array(payload: &Value, key: &str) -> Vec<String> {
     payload
@@ -994,6 +1028,82 @@ mod tests {
         let servers = container_configs::get_mcp_servers(&db, ag).unwrap();
         let linear = servers.get("linear").unwrap();
         assert_eq!(linear["command"], "npx");
+    }
+
+    #[test]
+    fn approve_enable_preview_flips_switch_and_creates_row_if_missing() {
+        // M18 V2: the disabled-group case where NO config row exists yet. The
+        // apply arm must create a defaults row then flip preview_enabled on.
+        use copperclaw_db::tables::container_configs;
+        let db = db();
+        let ag = seed_ag(&db);
+        // No container_configs row for `ag` yet.
+        assert!(container_configs::get(&db, ag).unwrap().is_none());
+        let id = insert_pending(
+            &db,
+            "enable_preview",
+            UpsertPendingApproval {
+                request_id: "r-preview".into(),
+                payload: json!({}),
+                agent_group_id: Some(ag),
+                title: "Enable previews for this group?".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        let v = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap();
+        assert_eq!(v["applied"], true);
+        assert_eq!(v["side_effect"]["kind"], "enable_preview");
+        assert_eq!(v["side_effect"]["preview_enabled"], true);
+        // The row now exists with preview_enabled = true.
+        let cfg = container_configs::get(&db, ag).unwrap().unwrap();
+        assert!(cfg.preview_enabled);
+        // Decision log names "host" for the CLI path.
+        let decs = pending_approvals::list_decisions(&db, Some(id), 10).unwrap();
+        assert_eq!(decs.len(), 1);
+        assert_eq!(decs[0].outcome, DecisionOutcome::Approve);
+    }
+
+    #[test]
+    fn approve_enable_preview_missing_agent_group_is_bad_request() {
+        let db = db();
+        let id = insert_pending(
+            &db,
+            "enable_preview",
+            UpsertPendingApproval {
+                request_id: "r-preview-noag".into(),
+                payload: json!({}),
+                agent_group_id: None,
+                title: "x".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        let err = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap_err();
+        assert_eq!(err.code, "bad_request");
+    }
+
+    #[test]
+    fn deny_enable_preview_leaves_switch_off() {
+        // Denying the card must NOT enable previews.
+        use copperclaw_db::tables::container_configs;
+        let db = db();
+        let ag = seed_ag(&db);
+        let id = insert_pending(
+            &db,
+            "enable_preview",
+            UpsertPendingApproval {
+                request_id: "r-preview-deny".into(),
+                payload: json!({}),
+                agent_group_id: Some(ag),
+                title: "x".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        deny(&json!({"id": id.as_uuid().to_string()}), &db).unwrap();
+        // No row was created / enabled by a deny.
+        assert!(container_configs::get(&db, ag).unwrap().is_none());
     }
 
     #[test]
