@@ -8,6 +8,7 @@ version.workspace = true
 [dependencies]
 copperclaw-types = { workspace = true }
 copperclaw-channels-core = { workspace = true }
+copperclaw-metrics = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }

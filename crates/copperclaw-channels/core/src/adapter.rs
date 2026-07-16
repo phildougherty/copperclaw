@@ -916,11 +916,13 @@ mod tests {
                     id: 1,
                     text: "Wash dishes".into(),
                     status: crate::todo_list::TodoItemStatus::Completed,
+                    blocked_reason: None,
                 },
                 crate::todo_list::TodoListItem {
                     id: 2,
                     text: "Dry dishes".into(),
                     status: crate::todo_list::TodoItemStatus::Pending,
+                    blocked_reason: None,
                 },
             ],
             title: Some("Kitchen".into()),
@@ -955,6 +957,7 @@ mod tests {
                 id: 1,
                 text: "single".into(),
                 status: crate::todo_list::TodoItemStatus::Pending,
+                blocked_reason: None,
             }],
             title: None,
         };

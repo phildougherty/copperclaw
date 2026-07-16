@@ -2913,11 +2913,16 @@ fn family_children(central: &CentralDb, root_id: SessionId) -> Vec<Session> {
 }
 
 /// Collapse a child's per-item statuses into one header status:
-/// `Completed` iff every item is; `InProgress` once any work has started
-/// (an item in progress, or some-but-not-all completed); else `Pending`.
+/// `Completed` iff every item is; `Blocked` if any item is stuck (the most
+/// actionable signal — a blocked step stalls the whole child); `InProgress`
+/// once any work has started (an item in progress, or some-but-not-all
+/// completed); else `Pending`.
 fn aggregate_status(items: &[TodoListItem]) -> TodoItemStatus {
     if !items.is_empty() && items.iter().all(|i| i.status == TodoItemStatus::Completed) {
         return TodoItemStatus::Completed;
+    }
+    if items.iter().any(|i| i.status == TodoItemStatus::Blocked) {
+        return TodoItemStatus::Blocked;
     }
     if items.iter().any(|i| {
         matches!(
@@ -2948,6 +2953,7 @@ fn build_combined(root: Option<TodoList>, children: &[(String, TodoList)]) -> To
             id: next_id,
             text: format!("↳ {name}"),
             status: aggregate_status(&child.items),
+            blocked_reason: None,
         });
         next_id = next_id.wrapping_add(1);
         for it in &child.items {
@@ -2955,6 +2961,7 @@ fn build_combined(root: Option<TodoList>, children: &[(String, TodoList)]) -> To
                 id: next_id,
                 text: format!("    {}", it.text),
                 status: it.status,
+                blocked_reason: None,
             });
             next_id = next_id.wrapping_add(1);
         }
@@ -5881,6 +5888,7 @@ mod tests {
                 id: 1,
                 text: "Reply with order status".into(),
                 status: copperclaw_channels_core::TodoItemStatus::Pending,
+                blocked_reason: None,
             }],
             title: None,
         }
@@ -6012,6 +6020,7 @@ mod tests {
             id: 0,
             text: "x".into(),
             status: s,
+            blocked_reason: None,
         };
         assert_eq!(aggregate_status(&[]), S::Pending);
         assert_eq!(
@@ -6029,6 +6038,13 @@ mod tests {
             S::InProgress
         );
         assert_eq!(aggregate_status(&[it(S::InProgress)]), S::InProgress);
+        // F4: a blocked item wins over in-progress/pending — the child is
+        // stalled, and the rolled-up header must say so.
+        assert_eq!(
+            aggregate_status(&[it(S::InProgress), it(S::Blocked)]),
+            S::Blocked
+        );
+        assert_eq!(aggregate_status(&[it(S::Blocked)]), S::Blocked);
     }
 
     #[test]
@@ -6040,6 +6056,7 @@ mod tests {
                 id: 1,
                 text: "Spawn A".into(),
                 status: S::InProgress,
+                blocked_reason: None,
             }],
         };
         let child = TodoList {
@@ -6049,11 +6066,13 @@ mod tests {
                     id: 1,
                     text: "Read".into(),
                     status: S::Completed,
+                    blocked_reason: None,
                 },
                 Item {
                     id: 2,
                     text: "Write".into(),
                     status: S::InProgress,
+                    blocked_reason: None,
                 },
             ],
         };
@@ -6118,6 +6137,7 @@ mod tests {
                 id: 1,
                 text: "Implement feature".into(),
                 status: TodoItemStatus::InProgress,
+                blocked_reason: None,
             }],
         };
         let child_pool = service
@@ -6136,6 +6156,7 @@ mod tests {
                 id: 1,
                 text: "Spawn builder".into(),
                 status: TodoItemStatus::InProgress,
+                blocked_reason: None,
             }],
         };
         let parent_pool = service

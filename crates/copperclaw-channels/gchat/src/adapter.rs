@@ -816,15 +816,22 @@ pub(crate) fn build_todo_list_card(list: &TodoList) -> Value {
             let marker = match item.status {
                 TodoItemStatus::Completed => "[x]",
                 TodoItemStatus::InProgress => "[~]",
+                TodoItemStatus::Blocked => "[!]",
                 TodoItemStatus::Pending => "[ ]",
             };
             let escaped = escape_html_gchat(item.text.trim());
-            let body = if item.status == TodoItemStatus::Completed {
+            let mut body = if item.status == TodoItemStatus::Completed {
                 // <s> = strikethrough; muted grey reinforces "done".
                 format!("{marker} <font color=\"#808080\"><s>{escaped}</s></font>")
             } else {
                 format!("{marker} {escaped}")
             };
+            if let Some(reason) = item.blocked_reason_text() {
+                body.push_str(&format!(
+                    " <font color=\"#d93025\"><i>(blocked: {})</i></font>",
+                    escape_html_gchat(reason)
+                ));
+            }
             json!({
                 "decoratedText": {
                     "text": body,
@@ -1999,11 +2006,13 @@ mod tests {
                     id: 1,
                     text: "Wash dishes".into(),
                     status: copperclaw_channels_core::TodoItemStatus::Completed,
+                    blocked_reason: None,
                 },
                 copperclaw_channels_core::TodoListItem {
                     id: 2,
                     text: "Dry dishes".into(),
                     status: copperclaw_channels_core::TodoItemStatus::InProgress,
+                    blocked_reason: None,
                 },
             ],
             title: Some("Kitchen".into()),

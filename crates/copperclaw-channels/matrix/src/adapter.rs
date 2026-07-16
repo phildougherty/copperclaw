@@ -429,6 +429,36 @@ impl ChannelAdapter for MatrixAdapter {
         // must configure the room and pass it as `platform_id`.
         Ok(None)
     }
+
+    /// In-place edit via an `m.replace` relation — the same path the
+    /// internal `deliver_action("edit", …)` arm uses, exposed on the trait
+    /// so the host's HUD / approval-card edit path
+    /// (`host-delivery`) actually reaches it. matrix is listed in
+    /// `EDIT_CAPABLE_CHANNELS`, so without this override the trait default
+    /// would return `Unsupported` and the HUD would silently never edit
+    /// (F1). `external_id` is the target event id.
+    async fn edit_message(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        external_id: &str,
+        new_text: &str,
+    ) -> Result<(), AdapterError> {
+        let ct = self.channel_type().as_str();
+        let room_id = self.resolve_room(platform_id).await?;
+        match self.api.edit_message(&room_id, external_id, new_text).await {
+            Ok(_) => {
+                copperclaw_metrics::inc_hud_edit(ct, "ok");
+                copperclaw_metrics::inc_adapter_edit_message(ct, "ok");
+                Ok(())
+            }
+            Err(e) => {
+                copperclaw_metrics::inc_hud_edit(ct, "error");
+                copperclaw_metrics::inc_adapter_edit_message(ct, "error");
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Render a [`Breadcrumb`] as Matrix HTML — `<code>tool</code> · detail`
@@ -804,6 +834,7 @@ pub(crate) fn render_todo_list_html_matrix(list: &TodoList) -> String {
         let glyph = match item.status {
             TodoItemStatus::Completed => "[x]",
             TodoItemStatus::InProgress => "[~]",
+            TodoItemStatus::Blocked => "[!]",
             TodoItemStatus::Pending => "[ ]",
         };
         out.push_str("<li>");
@@ -815,6 +846,11 @@ pub(crate) fn render_todo_list_html_matrix(list: &TodoList) -> String {
             out.push_str("</s>");
         } else {
             out.push_str(&escape_html_matrix(item.text.trim()));
+        }
+        if let Some(reason) = item.blocked_reason_text() {
+            out.push_str(" <i>(blocked: ");
+            out.push_str(&escape_html_matrix(reason));
+            out.push_str(")</i>");
         }
         out.push_str("</li>");
     }
@@ -1137,6 +1173,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(id.as_deref(), Some("$e:m.org"));
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trait_edit_message_uses_m_replace() {
+        // F1: the host HUD / approval edit path calls the *trait*
+        // `edit_message`, not the internal `action:"edit"` deliver arm. matrix
+        // is in EDIT_CAPABLE_CHANNELS, so this must route to the same
+        // `m.replace` edit and succeed against the mock rather than fall
+        // through to the trait default (`Unsupported`).
+        let s = MockServer::start().await;
+        mount_empty_sync(&s).await;
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
+            .and(wiremock::matchers::body_string_contains("\"m.replace\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "event_id": "$edited:m.org"
+            })))
+            .mount(&s)
+            .await;
+        let (adapter, _dir, _rx) = build_adapter(&s.uri());
+        adapter
+            .edit_message("!a:m.org", None, "$tgt:m.org", "updated via trait")
+            .await
+            .expect("matrix trait edit_message succeeds against the mock");
+        // And the static capability mirror agrees the channel is edit-capable.
+        assert!(
+            copperclaw_channels_core::capabilities::supports_message_edit(
+                adapter.channel_type().as_str()
+            )
+        );
         adapter.shutdown().await;
     }
 
@@ -2039,11 +2108,13 @@ mod tests {
                     id: 1,
                     text: "Wash dishes".into(),
                     status: copperclaw_channels_core::TodoItemStatus::Completed,
+                    blocked_reason: None,
                 },
                 copperclaw_channels_core::TodoListItem {
                     id: 2,
                     text: "Dry dishes".into(),
                     status: copperclaw_channels_core::TodoItemStatus::Pending,
+                    blocked_reason: None,
                 },
             ],
             title: Some("Kitchen".into()),

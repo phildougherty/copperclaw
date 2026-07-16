@@ -995,15 +995,19 @@ pub(crate) fn build_todo_list_blocks(list: &TodoList) -> Value {
             // render as colourful emoji in the client.
             TodoItemStatus::Completed => "[x]",
             TodoItemStatus::InProgress => "[~]",
+            TodoItemStatus::Blocked => "[!]",
             TodoItemStatus::Pending => "[ ]",
         };
         let escaped = escape_mrkdwn(item.text.trim());
-        let body = if item.status == TodoItemStatus::Completed {
+        let mut body = if item.status == TodoItemStatus::Completed {
             // mrkdwn `~text~` renders as strikethrough.
             format!("{emoji} ~{escaped}~")
         } else {
             format!("{emoji} {escaped}")
         };
+        if let Some(reason) = item.blocked_reason_text() {
+            body.push_str(&format!(" _(blocked: {})_", escape_mrkdwn(reason)));
+        }
         blocks.push(json!({
             "type": "section",
             "text": { "type": "mrkdwn", "text": body },
@@ -2389,11 +2393,13 @@ mod tests {
                     id: 1,
                     text: "Wash dishes".into(),
                     status: TodoItemStatus::Completed,
+                    blocked_reason: None,
                 },
                 TodoListItem {
                     id: 2,
                     text: "Dry dishes".into(),
                     status: TodoItemStatus::InProgress,
+                    blocked_reason: None,
                 },
             ],
             title: Some("Kitchen".into()),

@@ -614,6 +614,7 @@ mod tests {
                 id: 1,
                 text: "task".into(),
                 status: copperclaw_channels_core::TodoItemStatus::InProgress,
+                blocked_reason: None,
             }],
             title: Some("Plan".into()),
         };
