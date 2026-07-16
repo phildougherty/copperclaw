@@ -6,6 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (M19 F6 — richer bare-channel status row + intermediate stuck signal, 2026-07-16)
+
+- On bare / edit-incapable channels the only progress signal was the 60s
+  "still working" status row — a fixed string with no detail — and nothing
+  bridged the gap between it and the 5-minute apology, so a slow build
+  looked fine for five minutes then abruptly apologised.
+  `crates/copperclaw-runner/src/run/hud.rs` now composes that row through a
+  pure `compose_status_row` helper that folds in the current todo step (the
+  same `step N/M: …` detail the Live HUD shows) so bare channels get real
+  progress, and past `INTERMEDIATE_STATUS_AFTER` (150s, well short of the
+  sweep's `APOLOGY_AFTER_SECS = 300`) softens the closing line to "This is
+  taking longer than usual, but I'm still going." so the run degrades
+  gracefully toward the apology instead of cliff-edging into it. The emit
+  path and cadence are unchanged, so child-agent sessions still skip the
+  row inside `RunnerToolCtx::emit_status` (no sub-agent status spam).
+
 ### Added (M19 F5 — HUD covers the pre-first-tool / pure-reasoning wait, 2026-07-16)
 
 - The Task HUD used to post only at the first tool call and skip finalize

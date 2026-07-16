@@ -51,6 +51,16 @@ use crate::tools::TASK_HUD_TOOL;
 /// preserved verbatim for adapters without an in-place edit API.
 const STATUS_INTERVAL: Duration = Duration::from_secs(60);
 
+/// F6: how long a bare-channel run must go before the periodic status row
+/// upgrades from "I'll keep going." to a softer "this is taking longer
+/// than usual, still going" reassurance. Sized well short of the 5-minute
+/// terminal apology (`copperclaw-host-sweep`'s `APOLOGY_AFTER_SECS = 300`)
+/// so a slow build degrades gracefully into "still going" instead of
+/// cliff-edging straight from a fixed heartbeat into an apology. Because
+/// status rows only fire on the [`STATUS_INTERVAL`] cadence, the first row
+/// past this mark is the ~180s one.
+const INTERMEDIATE_STATUS_AFTER: Duration = Duration::from_secs(150);
+
 /// Minimum wall-clock edit cadence for the live HUD. Between tool-batch
 /// boundaries a background ticker refreshes the elapsed clock at this
 /// interval so a single long tool call (or a long silent reasoning
@@ -468,13 +478,18 @@ impl TaskHud {
         }));
     }
 
-    /// Bare-channel fallback: the pre-HUD "still working" heartbeat,
-    /// preserved verbatim (text, cadence, and Chat-row emit path) so
-    /// adapters without an edit API — and `hud_mode = off` — behave
-    /// exactly as before this change. The emit goes direct to outbound
-    /// as a Chat row via `emit_status`; it does NOT touch the model's
-    /// history, and child-agent sessions skip inside
-    /// `RunnerToolCtx::emit_status`.
+    /// Bare-channel fallback: the periodic "still working" heartbeat for
+    /// adapters without an edit API (and `hud_mode = off`). The emit goes
+    /// direct to outbound as a Chat row via `emit_status`; it does NOT
+    /// touch the model's history, and child-agent sessions skip inside
+    /// `RunnerToolCtx::emit_status`, so this stays quiet for sub-agents.
+    ///
+    /// F6 enriches the row: it now carries the current todo step (the same
+    /// `step N/M: …` detail the Live HUD shows) so bare channels get real
+    /// progress rather than a fixed string, and past
+    /// [`INTERMEDIATE_STATUS_AFTER`] it softens to a "taking longer than
+    /// usual, still going" reassurance so the run degrades gracefully
+    /// toward the 5-minute apology instead of cliff-edging into it.
     async fn maybe_emit_status_row(&self, tool_runs: usize, last_tool: Option<&str>) {
         let due = self
             .last_status_emit_at
@@ -485,18 +500,43 @@ impl TaskHud {
             return;
         }
         let elapsed_secs = self.started_at.elapsed().as_secs();
-        let last = last_tool.unwrap_or("thinking");
-        let plural = if tool_runs == 1 { "" } else { "s" };
-        let status = format!(
-            "Still working on this — {elapsed_secs}s in, \
-             {tool_runs} tool call{plural} so far (latest: {last}). \
-             I'll keep going."
-        );
+        let todo_step = current_todo_step(&self.todo_path);
+        let status = compose_status_row(elapsed_secs, tool_runs, last_tool, todo_step);
         self.ctx.emit_status(&status).await;
         if let Ok(mut at) = self.last_status_emit_at.lock() {
             *at = Instant::now();
         }
     }
+}
+
+/// Compose one bare-channel status row (F6). Carries the elapsed clock,
+/// the cumulative tool count, the latest tool, and — when the session's
+/// todo store has one — the current `step N/M: …` detail so bare channels
+/// show real progress. Past [`INTERMEDIATE_STATUS_AFTER`] the closing
+/// reassurance softens to "taking longer than usual, still going". Pure
+/// so the folding + threshold can be unit-tested without wall-clock waits.
+fn compose_status_row(
+    elapsed_secs: u64,
+    tool_runs: usize,
+    last_tool: Option<&str>,
+    todo_step: Option<String>,
+) -> String {
+    let last = last_tool.unwrap_or("thinking");
+    let plural = if tool_runs == 1 { "" } else { "s" };
+    let mut status = format!(
+        "Still working on this — {elapsed_secs}s in, \
+         {tool_runs} tool call{plural} so far (latest: {last})"
+    );
+    if let Some(step) = todo_step {
+        status.push_str(" — ");
+        status.push_str(&step);
+    }
+    if elapsed_secs >= INTERMEDIATE_STATUS_AFTER.as_secs() {
+        status.push_str(". This is taking longer than usual, but I'm still going.");
+    } else {
+        status.push_str(". I'll keep going.");
+    }
+    status
 }
 
 impl Drop for TaskHud {
@@ -654,6 +694,52 @@ mod tests {
         assert_eq!(fmt_mmss(9), "0:09");
         assert_eq!(fmt_mmss(83), "1:23");
         assert_eq!(fmt_mmss(600), "10:00");
+    }
+
+    // ── F6: richer bare-channel status row + intermediate signal ────────
+
+    #[test]
+    fn status_row_carries_todo_step_when_present() {
+        let with = compose_status_row(65, 3, Some("shell"), Some("step 2/5: build the UI".into()));
+        assert!(
+            with.contains("step 2/5: build the UI"),
+            "bare status must fold in the current todo step: {with}"
+        );
+        assert!(with.contains("3 tool calls"));
+        assert!(with.contains("latest: shell"));
+        // No todo store → no step segment, and it stays a clean sentence.
+        let without = compose_status_row(65, 1, Some("read_file"), None);
+        assert!(
+            !without.contains("step "),
+            "no step clause when absent: {without}"
+        );
+        assert!(
+            without.contains("1 tool call "),
+            "singular tool count: {without}"
+        );
+    }
+
+    #[test]
+    fn intermediate_message_fires_past_threshold_not_before() {
+        // Before the threshold: the plain "I'll keep going." tail.
+        let before = compose_status_row(120, 4, Some("shell"), None);
+        assert!(before.ends_with("I'll keep going."), "got: {before}");
+        assert!(!before.contains("taking longer"), "premature: {before}");
+        // At/past the threshold (the ~180s row): the softened reassurance.
+        let after = compose_status_row(
+            INTERMEDIATE_STATUS_AFTER.as_secs(),
+            9,
+            Some("cargo"),
+            Some("step 3/6: wire it up".into()),
+        );
+        assert!(
+            after.contains("This is taking longer than usual, but I'm still going."),
+            "intermediate signal must fire past the threshold: {after}"
+        );
+        assert!(
+            after.contains("step 3/6: wire it up"),
+            "the todo step still rides the intermediate row: {after}"
+        );
     }
 
     #[test]
