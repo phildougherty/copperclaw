@@ -48,6 +48,7 @@ pub mod scheduling;
 pub mod self_mod;
 pub mod sentinel;
 pub mod todo;
+pub mod ui_screenshot;
 pub mod verify_gate;
 pub mod view_image;
 pub mod web_search;
@@ -105,6 +106,12 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         computer_use::write_file::entry(),
         computer_use::web_fetch::entry(),
         browser_render::entry(),
+        // M20 D1: in-container screenshot of the agent's own app. Always
+        // registered (unlike `browser_interact`'s stricter opt-in) — the
+        // `coding`/`full` profile allow-list gates who can reach it, and the
+        // handler itself probes for chromium at call time so the minimal
+        // image profile degrades cleanly instead of crashing.
+        ui_screenshot::entry(),
         view_image::entry(),
         // Git inspection tools — read-only structured access to a
         // libgit2-backed repository view. Registered alphabetically.
@@ -231,6 +238,7 @@ mod tests {
             "write_file",
             "web_fetch",
             "browser_render",
+            "ui_screenshot",
             "view_image",
             "git_blame",
             "git_diff",

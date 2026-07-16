@@ -133,6 +133,15 @@ const CODING_TOOLS: &[&str] = &[
     // ABSENT from [`LAN_PREVIEW_TOOLS`] (no taint exemption). Its real gate is
     // the host-side operator approval the tunnel broker raises.
     "make_preview_public",
+    // M20 D1: in-container screenshot of the agent's own app, part of the
+    // build-test-iterate loop like the preview verbs above. Unlike those it
+    // is loopback-only (refuses any non-loopback URL at the tool layer) and
+    // spawns no container, so it is NOT a credentialed external action (see
+    // [`CREDENTIALED_EXTERNAL_TOOLS`] — deliberately absent) and needs no
+    // taint/autonomy gating; it still rides the guest-denied mutating floor
+    // (spawning a local chromium process is a resource cost a read-only
+    // sender shouldn't get for free) via [`is_mutating`].
+    "ui_screenshot",
 ];
 
 /// Self-modification tools, layered on only by the `full` profile. These
@@ -1291,6 +1300,54 @@ mod tests {
         let clean = ToolPolicy::new(ToolProfile::Coding, Some(SenderRole::Member));
         assert!(clean.evaluate("expose_preview").is_allow());
         assert!(clean.evaluate("close_preview").is_allow());
+    }
+
+    // ── M20 D1: ui_screenshot policy ─────────────────────────────────────
+
+    #[test]
+    fn ui_screenshot_is_coding_profile_only() {
+        // The one default change M20 makes: registered by default, but
+        // still gated behind the coding/full profile ceiling like the rest
+        // of the build-loop surface.
+        assert!(ToolProfile::Coding.allows("ui_screenshot"));
+        assert!(ToolProfile::Full.allows("ui_screenshot"));
+        assert!(!ToolProfile::Minimal.allows("ui_screenshot"));
+        assert!(!ToolProfile::Messaging.allows("ui_screenshot"));
+    }
+
+    #[test]
+    fn ui_screenshot_is_not_credentialed_external() {
+        // Loopback-only and no container spawn: it never reaches outside the
+        // session container, so it must not ride the taint/autonomy gate the
+        // way web_fetch / browser_render's operator-opt-in path would.
+        assert!(!is_credentialed_external("ui_screenshot"));
+    }
+
+    #[test]
+    fn ui_screenshot_denied_to_guest_even_under_full() {
+        let guest = ToolPolicy::new(ToolProfile::Full, Some(SenderRole::Guest));
+        let d = guest.evaluate("ui_screenshot");
+        assert!(!d.is_allow());
+        assert!(d.deny_reason().unwrap().contains("guest"));
+    }
+
+    #[test]
+    fn ui_screenshot_allowed_for_member_under_coding() {
+        let member = ToolPolicy::new(ToolProfile::Coding, Some(SenderRole::Member));
+        assert!(member.evaluate("ui_screenshot").is_allow());
+    }
+
+    #[test]
+    fn ui_screenshot_untainted_by_a_tainted_turn() {
+        // Unlike web_fetch/browser_render, a tainted turn must not block it —
+        // it never leaves the loopback interface, so there is nothing for
+        // the confused-deputy gate to protect against here.
+        let tainted = ToolPolicy::new(ToolProfile::Full, None).with_trust(TurnTrust {
+            tainted: true,
+            approved: false,
+            autonomous: false,
+        });
+        assert!(tainted.evaluate("ui_screenshot").is_allow());
     }
 
     #[test]
