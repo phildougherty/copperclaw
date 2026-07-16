@@ -36,6 +36,10 @@ pub fn check(
     now: DateTime<Utc>,
 ) -> Result<Vec<SeriesFanout>, SweepError> {
     let due = tasks::list_due(central, now)?;
+    // M19 A6: publish the count of active scheduled tasks each sweep pass.
+    if let Ok(active) = tasks::count_active(central) {
+        copperclaw_metrics::set_scheduled_tasks_active(active);
+    }
     let mut out = Vec::with_capacity(due.len());
     for task in due {
         // Build the inbound row.
@@ -64,6 +68,24 @@ pub fn check(
         let mut inbound = root.inbound_pool(&task.agent_group_id, &task.session_id)?;
         insert_in(inbound.conn_mut(), &write)?;
 
+        // Record the fire (durable lifecycle: `last_fired_at` + `fire_count`)
+        // before re-arming/completing so a recurring task accrues one count
+        // per occurrence. Independent of the message-log so operators and the
+        // metrics rider can see autonomous activity without a scan.
+        tasks::mark_fired(central, &task.id, now)?;
+
+        // M19 A6: fire latency — how late this task fired relative to its
+        // scheduled `next_fire` (bounded by the sweep's ~60s cadence).
+        if let Some(scheduled) = task.next_fire {
+            let latency = (now - scheduled).num_milliseconds();
+            if latency >= 0 {
+                #[allow(clippy::cast_precision_loss)]
+                copperclaw_metrics::observe_scheduled_task_fire_latency_seconds(
+                    latency as f64 / 1000.0,
+                );
+            }
+        }
+
         // Re-arm or complete. Recurring tasks always re-arm using the
         // recurrence expression; one-shot tasks transition to
         // `completed` and clear `next_fire` so they never fire again.
@@ -73,9 +95,13 @@ pub fn check(
             .and_then(|rec| next_fire_for(&task.when_spec, Some(rec), now));
         if let Some(next) = next_fire {
             tasks::set_next_fire(central, &task.id, Some(next))?;
+            // M19 A6: recurring task re-armed its next occurrence.
+            copperclaw_metrics::inc_scheduled_task_fire("recurring_rearm");
         } else {
             tasks::set_status(central, &task.id, TaskStatus::Completed)?;
             tasks::set_next_fire(central, &task.id, None)?;
+            // M19 A6: one-shot task transitioned to completed.
+            copperclaw_metrics::inc_scheduled_task_fire("one_shot_complete");
         }
 
         out.push(SeriesFanout {
@@ -245,6 +271,64 @@ mod tests {
         let t = tasks::get(&central, "t-once").unwrap().unwrap();
         assert_eq!(t.status, TaskStatus::Completed);
         assert!(t.next_fire.is_none());
+    }
+
+    #[test]
+    fn firing_records_last_fired_and_bumps_fire_count() {
+        let (central, root, sess, now) = fixture();
+        tasks::insert(
+            &central,
+            NewTask {
+                id: "t-recur".into(),
+                agent_group_id: sess.agent_group_id,
+                session_id: sess.id,
+                name: None,
+                prompt: "daily ping".into(),
+                when_spec: "daily at 09:00".into(),
+                recurrence: Some("0 9 * * *".into()),
+                next_fire: Some(now - ChDuration::minutes(1)),
+            },
+        )
+        .unwrap();
+        // First occurrence.
+        check(&central, &root, now).unwrap();
+        let t = tasks::get(&central, "t-recur").unwrap().unwrap();
+        assert_eq!(t.fire_count, 1);
+        assert_eq!(t.last_fired_at.unwrap().timestamp(), now.timestamp());
+        // Force a second occurrence to be due and sweep again.
+        tasks::set_next_fire(&central, "t-recur", Some(now - ChDuration::seconds(1))).unwrap();
+        let later = now + ChDuration::hours(1);
+        check(&central, &root, later).unwrap();
+        let t = tasks::get(&central, "t-recur").unwrap().unwrap();
+        assert_eq!(
+            t.fire_count, 2,
+            "recurring task accrues one fire per occurrence"
+        );
+        assert_eq!(t.last_fired_at.unwrap().timestamp(), later.timestamp());
+    }
+
+    #[test]
+    fn one_shot_fire_records_single_count() {
+        let (central, root, sess, now) = fixture();
+        tasks::insert(
+            &central,
+            NewTask {
+                id: "t-once".into(),
+                agent_group_id: sess.agent_group_id,
+                session_id: sess.id,
+                name: None,
+                prompt: "once".into(),
+                when_spec: "in 1s".into(),
+                recurrence: None,
+                next_fire: Some(now - ChDuration::seconds(1)),
+            },
+        )
+        .unwrap();
+        check(&central, &root, now).unwrap();
+        let t = tasks::get(&central, "t-once").unwrap().unwrap();
+        assert_eq!(t.status, TaskStatus::Completed);
+        assert_eq!(t.fire_count, 1);
+        assert!(t.last_fired_at.is_some());
     }
 
     #[test]

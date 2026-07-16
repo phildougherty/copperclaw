@@ -2,6 +2,7 @@
 
 use crate::api::{CompleteUploadEntry, SlackApi, build_card_blocks};
 use async_trait::async_trait;
+use copperclaw_channels_core::markdown::{Flavor, render as render_markdown};
 use copperclaw_channels_core::{
     AdapterError, Breadcrumb, BreadcrumbStatus, Card, ChannelAdapter, DiffCard, DmHandle,
     ErrorCard, ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList,
@@ -180,13 +181,22 @@ impl ChannelAdapter for SlackAdapter {
         thread_id: Option<&str>,
         message: &OutboundMessage,
     ) -> Result<Option<String>, AdapterError> {
-        let text = message
+        let raw_text = message
             .content
             .get("text")
             .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
+            .unwrap_or("");
         let blocks = message.content.get("blocks").cloned();
+        // Plain-text path only: when the agent supplied explicit Block Kit
+        // `blocks` (a U1–U5 rich surface) the `text` is a notification
+        // fallback and is left verbatim. Otherwise route the canonical
+        // Markdown through the shared renderer (U6) so `**bold**` → `*bold*`,
+        // headings degrade to bold, links become `<url|text>`, etc.
+        let text = if blocks.is_some() {
+            raw_text.to_owned()
+        } else {
+            render_markdown(raw_text, Flavor::Slack)
+        };
         let ephemeral_to = message.content.get("ephemeral_to").and_then(Value::as_str);
 
         let ts = if let Some(user) = ephemeral_to {
@@ -995,15 +1005,19 @@ pub(crate) fn build_todo_list_blocks(list: &TodoList) -> Value {
             // render as colourful emoji in the client.
             TodoItemStatus::Completed => "[x]",
             TodoItemStatus::InProgress => "[~]",
+            TodoItemStatus::Blocked => "[!]",
             TodoItemStatus::Pending => "[ ]",
         };
         let escaped = escape_mrkdwn(item.text.trim());
-        let body = if item.status == TodoItemStatus::Completed {
+        let mut body = if item.status == TodoItemStatus::Completed {
             // mrkdwn `~text~` renders as strikethrough.
             format!("{emoji} ~{escaped}~")
         } else {
             format!("{emoji} {escaped}")
         };
+        if let Some(reason) = item.blocked_reason_text() {
+            body.push_str(&format!(" _(blocked: {})_", escape_mrkdwn(reason)));
+        }
         blocks.push(json!({
             "type": "section",
             "text": { "type": "mrkdwn", "text": body },
@@ -2389,11 +2403,13 @@ mod tests {
                     id: 1,
                     text: "Wash dishes".into(),
                     status: TodoItemStatus::Completed,
+                    blocked_reason: None,
                 },
                 TodoListItem {
                     id: 2,
                     text: "Dry dishes".into(),
                     status: TodoItemStatus::InProgress,
+                    blocked_reason: None,
                 },
             ],
             title: Some("Kitchen".into()),

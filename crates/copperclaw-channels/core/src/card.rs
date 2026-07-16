@@ -415,6 +415,88 @@ impl Card {
         }
         out
     }
+
+    /// Markdown-free plaintext rendering for adapters whose surface shows
+    /// Markdown markers literally (Signal, Delta Chat, LINE text). Same
+    /// structure as [`Self::to_text_fallback`] but drops the `**` emphasis
+    /// and the `Buttons:` / `callback:` decorations: title on its own line,
+    /// body, `Label: value` field lines, a `- label -> target` button list
+    /// (callback buttons surface their `value` as the target since these
+    /// surfaces have no interactive buttons), and an `[image: url]` marker.
+    /// Fields and button targets are trimmed. No trailing newline.
+    pub fn to_plaintext(&self) -> String {
+        let mut out = String::new();
+        if let Some(t) = self
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            out.push_str(t);
+            out.push('\n');
+        }
+        if let Some(b) = self
+            .body
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+        {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(b);
+            out.push('\n');
+        }
+        if !self.fields.is_empty() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            for f in &self.fields {
+                out.push_str(f.label.trim());
+                out.push_str(": ");
+                out.push_str(f.value.trim());
+                out.push('\n');
+            }
+        }
+        if !self.buttons.is_empty() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            for b in &self.buttons {
+                out.push_str("- ");
+                out.push_str(b.label.trim());
+                match (b.value.as_deref(), b.url.as_deref()) {
+                    (_, Some(url)) => {
+                        out.push_str(" -> ");
+                        out.push_str(url.trim());
+                    }
+                    (Some(v), None) => {
+                        out.push_str(" -> ");
+                        out.push_str(v.trim());
+                    }
+                    (None, None) => {}
+                }
+                out.push('\n');
+            }
+        }
+        if let Some(img) = self
+            .image_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|i| !i.is_empty())
+        {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str("[image: ");
+            out.push_str(img);
+            out.push_str("]\n");
+        }
+        while out.ends_with('\n') {
+            out.pop();
+        }
+        out
+    }
 }
 
 #[cfg(test)]

@@ -306,6 +306,22 @@ impl ProxyState {
     }
 }
 
+/// The live proxy backing a `(session, container_port)` preview: the host port
+/// it is bound to and the token that gates it. Returned by
+/// [`PreviewManager::live_proxy_for`] so the M19 A3 public-tunnel broker can
+/// front the preview's host port and compose the tokened public URL. Only ever
+/// describes a [`PreviewPhase::Live`] preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LivePreviewProxy {
+    /// The host port the preview proxy is bound to (what the public tunnel
+    /// fronts, and the tunnel's teardown key).
+    pub host_port: u16,
+    /// The 128-bit hex gating token. The public tunnel fronts the token-gated
+    /// proxy, so the shareable public URL must carry `.../__preview/<token>` —
+    /// public exposure stays token-gated (defence in depth).
+    pub token: String,
+}
+
 /// The host-side preview manager. Constructed once at boot with the container
 /// runtime + central DB; wired into the delivery service as a
 /// [`PreviewBroker`] and into the container manager for session-stop teardown.
@@ -320,6 +336,14 @@ pub struct PreviewManager {
     /// e.g. a host with no delivery loop, or the unit tests) means the disabled
     /// path stays a plain error with no card, exactly as before V2.
     approval_dispatcher: OnceLock<Arc<dyn DeliveryDispatcher>>,
+    /// V5 public-tunnel broker (M19 A3), wired at boot via
+    /// [`PreviewManager::set_tunnel_broker`]. When a preview is fully torn down
+    /// (close / session-stop / shutdown) OR idle-tombstoned, the manager asks
+    /// this broker to tear down any public tunnel fronting the preview's host
+    /// port — "auto-teardown with the preview" so no public tunnel outlives the
+    /// app it fronted. `None` (never wired — a host without public-tunnel
+    /// support, or the unit tests) means there is nothing to tear down.
+    tunnel_broker: OnceLock<Arc<copperclaw_modules::TunnelBroker>>,
 }
 
 impl PreviewManager {
@@ -332,6 +356,7 @@ impl PreviewManager {
             runtime,
             entries: AsyncMutex::new(Vec::new()),
             approval_dispatcher: OnceLock::new(),
+            tunnel_broker: OnceLock::new(),
         })
     }
 
@@ -340,6 +365,53 @@ impl PreviewManager {
     /// up. Returns `false` if a dispatcher was already set (idempotent guard).
     pub fn set_approval_dispatcher(&self, dispatcher: Arc<dyn DeliveryDispatcher>) -> bool {
         self.approval_dispatcher.set(dispatcher).is_ok()
+    }
+
+    /// Wire the V5 public-tunnel broker (M19 A3) so preview teardown also tears
+    /// down any public tunnel fronting the preview. Called once at boot; a
+    /// second call is a no-op (the `OnceLock` keeps the first). Returns whether
+    /// it was set.
+    pub fn set_tunnel_broker(&self, broker: Arc<copperclaw_modules::TunnelBroker>) -> bool {
+        self.tunnel_broker.set(broker).is_ok()
+    }
+
+    /// Ask the wired tunnel broker (if any) to tear down a public tunnel
+    /// fronting `(session, host_port)`. Best-effort: returns immediately when no
+    /// broker is wired or no tunnel exists. The tunnel broker keys teardown on
+    /// the preview's HOST port (the local port cloudflared fronted).
+    async fn teardown_tunnel(&self, session_id: SessionId, host_port: u16) {
+        if let Some(broker) = self.tunnel_broker.get() {
+            if broker.close_for_preview(session_id, host_port).await {
+                info!(
+                    session = %session_id.as_uuid(),
+                    host_port,
+                    "public tunnel torn down with its preview"
+                );
+            }
+        }
+    }
+
+    /// Look up the live proxy backing `(session, container_port)`: its bound
+    /// host port + gating token, but only while the preview is [`PreviewPhase::Live`]
+    /// (a tombstoned or absent preview yields `None`). Used by the M19 A3
+    /// public-tunnel broker to front the live preview's host port and compose the
+    /// tokened public URL. Returns `None` when there is nothing live to front.
+    pub async fn live_proxy_for(
+        &self,
+        session_id: SessionId,
+        container_port: u16,
+    ) -> Option<LivePreviewProxy> {
+        let entries = self.entries.lock().await;
+        let entry = entries
+            .iter()
+            .find(|e| e.session_id == session_id && e.container_port == container_port)?;
+        if entry.proxy.phase() != PreviewPhase::Live {
+            return None;
+        }
+        Some(LivePreviewProxy {
+            host_port: entry.host_port,
+            token: entry.token.clone(),
+        })
     }
 
     /// Spawn the idle reaper. It scans every [`PREVIEW_REAPER_TICK`] and tears
@@ -384,6 +456,11 @@ impl PreviewManager {
                 continue;
             }
             e.proxy.tombstone();
+            // A3: a tombstoned preview no longer proxies to the container, so
+            // any public tunnel fronting it would serve the "expired" page to
+            // the public internet. Tear the tunnel down on idle — re-exposing
+            // publicly later earns a FRESH approval (the grant is one-shot).
+            self.teardown_tunnel(e.session_id, e.host_port).await;
             write_preview_audit(
                 &self.central,
                 e.session_id,
@@ -454,6 +531,10 @@ impl PreviewManager {
                 if entry.proxy.phase() == PreviewPhase::Tombstone {
                     copperclaw_metrics::dec_preview_tombstoned();
                 }
+                // A3: auto-teardown any public tunnel fronting this preview's
+                // host port — no public tunnel outlives the app it fronted.
+                self.teardown_tunnel(entry.session_id, entry.host_port)
+                    .await;
                 entry.cancel.cancel();
                 self.audit(
                     entry.session_id,
@@ -910,6 +991,136 @@ impl PreviewBroker for PreviewManager {
             Ok(())
         } else {
             Err(PreviewError::NotFound { port })
+        }
+    }
+}
+
+/// The host-side implementation of the M19 A3 public-tunnel verb
+/// (`make_preview_public`). It bridges the M17 preview subsystem (which owns the
+/// mapping from a container port to a live preview's HOST port + gating token)
+/// and the merged V5 [`TunnelBroker`] (which owns the approval gate + the
+/// operator-provided cloudflared binary). Wired into the delivery service as a
+/// [`copperclaw_modules::PublicTunnelBroker`] so a `make_preview_public` relay
+/// call routes here.
+///
+/// Secure-by-default posture (every guard fail-closed):
+/// * **Off unless the operator opted in.** `enabled` is the host env master
+///   switch (`COPPERCLAW_PUBLIC_TUNNEL_ENABLED`, default false); combined with
+///   the group's per-group `preview_enabled`, both must be true or the tunnel
+///   broker returns [`copperclaw_modules::TunnelError::NotEnabled`].
+/// * **A live preview must already exist.** Making a preview public requires an
+///   `expose_preview` first — there is no path that stands up a fresh listener.
+/// * **Every exposure is approval-gated.** The tunnel broker raises a
+///   `CredentialedExternalAction` approval and stands nothing up until an
+///   operator taps Approve (the runner-side taint gate also blocks the verb on a
+///   tainted turn — it is NOT a LAN-exempt verb).
+/// * **The public tunnel stays token-gated.** It fronts the token-gated preview
+///   proxy, so the shareable URL carries `.../__preview/<token>` — defence in
+///   depth: a public URL without the token 403s.
+pub struct PublicPreviewTunnel {
+    preview: Arc<PreviewManager>,
+    tunnel: Arc<copperclaw_modules::TunnelBroker>,
+    central: CentralDb,
+    /// Host env master switch (`COPPERCLAW_PUBLIC_TUNNEL_ENABLED`). `false`
+    /// (default) ⇒ the public capability is off host-wide regardless of any
+    /// per-group setting; the tunnel broker returns `NotEnabled`.
+    enabled: bool,
+}
+
+impl PublicPreviewTunnel {
+    /// Wire the broker over the preview manager + V5 tunnel broker. `enabled` is
+    /// the host env master switch, resolved once at boot.
+    #[must_use]
+    pub fn new(
+        preview: Arc<PreviewManager>,
+        tunnel: Arc<copperclaw_modules::TunnelBroker>,
+        central: CentralDb,
+        enabled: bool,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            preview,
+            tunnel,
+            central,
+            enabled,
+        })
+    }
+
+    /// Resolve the group's primary messaging channel (first wiring — the same
+    /// "primary" rule the enable-preview card + pending-sender notifier use) so
+    /// the approval card lands where the operator will see it. `None` when the
+    /// group has no wiring (the approval is still raised; it just won't post a
+    /// card to a channel).
+    fn primary_notify(&self, ag: AgentGroupId) -> Option<(copperclaw_types::ChannelType, String)> {
+        let wirings = messaging_group_agents::list_for_ag(&self.central, ag).ok()?;
+        let wiring = wirings.first()?;
+        let mg = messaging_groups::get(&self.central, wiring.messaging_group_id).ok()?;
+        Some((mg.channel_type.clone(), mg.platform_id.clone()))
+    }
+}
+
+#[async_trait::async_trait]
+impl copperclaw_modules::PublicTunnelBroker for PublicPreviewTunnel {
+    async fn make_public(
+        &self,
+        session: SessionInfoLite,
+        container_port: u16,
+    ) -> copperclaw_modules::PublicTunnelReply {
+        use copperclaw_modules::{PublicTunnelReply, TunnelExposeRequest, TunnelOutcome};
+
+        // 1. There must be a LIVE preview on this container port — the public
+        //    tunnel fronts an existing preview, it never stands up a listener.
+        let Some(proxy) = self
+            .preview
+            .live_proxy_for(session.session_id, container_port)
+            .await
+        else {
+            return PublicTunnelReply::Error(format!(
+                "There is no live preview on container port {container_port} to make public. Run \
+                 `expose_preview` with port {container_port} first (confirm it returns a working \
+                 URL), then call `make_preview_public` with the same port."
+            ));
+        };
+
+        // 2. Per-group opt-in: the group must still have previews enabled. The
+        //    env master switch is ANDed in; both feed the tunnel broker's own
+        //    fail-closed `enabled` gate (a false value ⇒ NotEnabled, audited).
+        let preview_enabled = container_configs::get(&self.central, session.agent_group_id)
+            .ok()
+            .flatten()
+            .is_some_and(|c| c.preview_enabled);
+        let enabled = self.enabled && preview_enabled;
+
+        // 3. cloudflared runs on the host and fronts the preview proxy's host
+        //    port over loopback (the proxy binds loopback or 0.0.0.0, both
+        //    reachable via 127.0.0.1). Fronting the token-gated proxy keeps the
+        //    public tunnel token-gated too.
+        let upstream = format!("http://127.0.0.1:{}", proxy.host_port);
+        let notify = self.primary_notify(session.agent_group_id);
+
+        let req = TunnelExposeRequest {
+            session_id: session.session_id,
+            agent_group_id: session.agent_group_id,
+            host_port: proxy.host_port,
+            upstream,
+            enabled,
+            notify,
+        };
+
+        match self.tunnel.expose(req).await {
+            Ok(TunnelOutcome::Exposed(exposed)) => {
+                // Compose the tokened public URL: the tunnel fronts the
+                // token-gated proxy, so the shareable link must carry the token
+                // path (a tokenless hit 403s). This is what the agent relays and
+                // puts on the ritual card's public-URL button.
+                let base = exposed.public_url.trim_end_matches('/');
+                let public_url = format!("{base}{PREVIEW_TOKEN_PATH}{}", proxy.token);
+                PublicTunnelReply::Exposed {
+                    public_url,
+                    note: exposed.note,
+                }
+            }
+            Ok(TunnelOutcome::Pending { note, .. }) => PublicTunnelReply::Pending { note },
+            Err(e) => PublicTunnelReply::Error(e.to_string()),
         }
     }
 }
@@ -2218,5 +2429,197 @@ mod manager_tests {
             assert!(!entries[0].proxy.inner.lock().unwrap().recovery_used);
         }
         mgr.close(sess.session_id, upstream_port).await.unwrap();
+    }
+
+    // ── M19 A3: public-tunnel verb (PublicPreviewTunnel) ─────────────────
+
+    use copperclaw_modules::{
+        CloudflaredProvider, PublicTunnelBroker, PublicTunnelReply, TUNNEL_APPROVAL_ACTION,
+        TunnelBroker,
+    };
+
+    /// Write an executable mock cloudflared that answers `--version` instantly
+    /// and, on `tunnel`, prints a quick-tunnel URL then lingers like the real
+    /// binary. Returns the tempdir guard + the binary path.
+    fn mock_cloudflared(url: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mock-cloudflared");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "#!/bin/sh").unwrap();
+        writeln!(f, "if [ \"$1\" = \"--version\" ]; then").unwrap();
+        writeln!(f, "  echo 'cloudflared version 0.0.0-mock'; exit 0").unwrap();
+        writeln!(f, "fi").unwrap();
+        writeln!(f, "echo 'INF |  {url}  |'").unwrap();
+        writeln!(f, "sleep 30").unwrap();
+        drop(f);
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        (dir, path)
+    }
+
+    /// Seed a real session row for `ag` so the tunnel approval row's FKs
+    /// (`pending_approvals.session_id → sessions`) are satisfiable.
+    fn seed_session(db: &CentralDb, ag: AgentGroupId) -> SessionId {
+        use copperclaw_db::tables::sessions::{CreateSession, create as create_session};
+        create_session(
+            db,
+            CreateSession {
+                agent_group_id: ag,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap()
+        .id
+    }
+
+    /// Approve the single outstanding tunnel approval row (mirrors the host
+    /// `resolve_approve` apply arm: flip status + record the decision).
+    fn approve_tunnel(db: &CentralDb) {
+        use copperclaw_db::tables::pending_approvals::{
+            self, ApprovalStatus, DecisionOutcome, record_decision, update_status,
+        };
+        let rows = pending_approvals::list(db, Some(TUNNEL_APPROVAL_ACTION), None).unwrap();
+        let row = rows.first().expect("a pending tunnel approval");
+        update_status(db, row.approval_id, ApprovalStatus::Approved).unwrap();
+        record_decision(
+            db,
+            row.approval_id,
+            TUNNEL_APPROVAL_ACTION,
+            DecisionOutcome::Approve,
+            "operator",
+            None,
+        )
+        .unwrap();
+    }
+
+    fn public_tunnel(
+        preview: &Arc<PreviewManager>,
+        db: &CentralDb,
+        binary: &std::path::Path,
+        enabled: bool,
+    ) -> Arc<PublicPreviewTunnel> {
+        let provider: Arc<dyn copperclaw_modules::TunnelProvider> = Arc::new(
+            CloudflaredProvider::with_binary(binary).with_open_timeout(StdDuration::from_secs(30)),
+        );
+        let broker = TunnelBroker::new(db.clone(), provider);
+        preview.set_tunnel_broker(Arc::clone(&broker));
+        PublicPreviewTunnel::new(Arc::clone(preview), broker, db.clone(), enabled)
+    }
+
+    #[tokio::test]
+    async fn make_public_full_flow_approve_surface_url_teardown() {
+        let upstream_port = spawn_upstream().await;
+        let db = central();
+        let ag = group_with_preview(&db, true, None);
+        let session_id = seed_session(&db, ag);
+        let mgr = manager(db.clone(), Some("127.0.0.1".into()));
+        let sess = SessionInfoLite::new(session_id, ag);
+
+        // A live LAN preview first, so the tunnel has a host port to front.
+        let exposed = mgr.expose(&sess, upstream_port, None).await.unwrap();
+        let token = exposed.url.split("/__preview/").nth(1).unwrap().to_string();
+
+        let (_guard, bin) = mock_cloudflared("https://cofounder-demo.trycloudflare.com");
+        let pt = public_tunnel(&mgr, &db, &bin, true);
+
+        // 1. First make_public ⇒ pending approval (no tunnel yet).
+        match pt.make_public(sess, upstream_port).await {
+            PublicTunnelReply::Pending { note } => assert!(note.contains("approval")),
+            other => panic!("expected Pending, got {other:?}"),
+        }
+        assert_eq!(mgr.tunnel_broker.get().unwrap().active_count().await, 0);
+
+        // 2. Operator approves.
+        approve_tunnel(&db);
+
+        // 3. Re-call ⇒ the tokened PUBLIC url is surfaced.
+        let public_url = match pt.make_public(sess, upstream_port).await {
+            PublicTunnelReply::Exposed { public_url, note } => {
+                assert!(note.contains("PUBLIC"));
+                public_url
+            }
+            other => panic!("expected Exposed, got {other:?}"),
+        };
+        assert_eq!(
+            public_url,
+            format!("https://cofounder-demo.trycloudflare.com/__preview/{token}"),
+            "public url fronts the token-gated proxy"
+        );
+        assert_eq!(mgr.tunnel_broker.get().unwrap().active_count().await, 1);
+
+        // 4. Closing the preview tears the tunnel down with it (A3 auto-teardown).
+        mgr.close(session_id, upstream_port).await.unwrap();
+        assert_eq!(mgr.tunnel_broker.get().unwrap().active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn make_public_without_live_preview_is_clean_error() {
+        let db = central();
+        let ag = group_with_preview(&db, true, None);
+        let session_id = seed_session(&db, ag);
+        let mgr = manager(db.clone(), Some("127.0.0.1".into()));
+        let (_guard, bin) = mock_cloudflared("https://x.trycloudflare.com");
+        let pt = public_tunnel(&mgr, &db, &bin, true);
+        let sess = SessionInfoLite::new(session_id, ag);
+
+        // No expose_preview first ⇒ nothing live to front.
+        match pt.make_public(sess, 3000).await {
+            PublicTunnelReply::Error(msg) => {
+                assert!(msg.contains("no live preview"), "got {msg}");
+                assert!(msg.contains("expose_preview"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn make_public_off_by_default_is_not_enabled() {
+        let upstream_port = spawn_upstream().await;
+        let db = central();
+        let ag = group_with_preview(&db, true, None);
+        let session_id = seed_session(&db, ag);
+        let mgr = manager(db.clone(), Some("127.0.0.1".into()));
+        let sess = SessionInfoLite::new(session_id, ag);
+        mgr.expose(&sess, upstream_port, None).await.unwrap();
+
+        let (_guard, bin) = mock_cloudflared("https://x.trycloudflare.com");
+        // Host env master switch OFF ⇒ NotEnabled, no approval raised.
+        let pt = public_tunnel(&mgr, &db, &bin, false);
+        match pt.make_public(sess, upstream_port).await {
+            PublicTunnelReply::Error(msg) => assert!(msg.contains("OFF"), "got {msg}"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+        assert!(
+            pending_approvals::list(&db, Some(TUNNEL_APPROVAL_ACTION), None)
+                .unwrap()
+                .is_empty(),
+            "an off-by-default request raises no approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn make_public_absent_binary_is_clean_error() {
+        let upstream_port = spawn_upstream().await;
+        let db = central();
+        let ag = group_with_preview(&db, true, None);
+        let session_id = seed_session(&db, ag);
+        let mgr = manager(db.clone(), Some("127.0.0.1".into()));
+        let sess = SessionInfoLite::new(session_id, ag);
+        mgr.expose(&sess, upstream_port, None).await.unwrap();
+
+        let pt = public_tunnel(&mgr, &db, std::path::Path::new("/nonexistent/cf"), true);
+        match pt.make_public(sess, upstream_port).await {
+            PublicTunnelReply::Error(msg) => {
+                assert!(msg.contains("was not found"), "got {msg}");
+                assert!(msg.contains("cloudflared"));
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
     }
 }

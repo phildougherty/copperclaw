@@ -14,6 +14,10 @@
 //! 4. Materializing the chosen skills into a destination directory by
 //!    creating symlinks at `<dest>/<skill_id>` pointing to each skill's
 //!    source directory.
+//! 5. Validating and persisting an agent-authored skill into a group's
+//!    per-group override directory (M19 A4, [`save::save_group_skill`]) so
+//!    the next spawn discovers it — closing the `write_file` → discovery
+//!    loop with an approval-gated, per-group-only capability.
 //!
 //! ## Validation rules
 //! - Skill names must match `[a-z0-9][a-z0-9-]{0,63}` (kebab-case,
@@ -33,10 +37,12 @@ pub mod frontmatter;
 pub mod materialize;
 pub mod name;
 pub mod registry;
+pub mod save;
 pub mod tool_names;
 
 pub use error::SkillError;
 pub use frontmatter::{Frontmatter, skip_frontmatter};
 pub use materialize::{MaterializeOutcome, MaterializeReport, materialize};
 pub use registry::{Skill, SkillId, SkillRegistry, SkillSource, SkillsSelector, read_skill_body};
+pub use save::{save_group_skill, validate_skill_content};
 pub use tool_names::normalize as normalize_allowed_tools;

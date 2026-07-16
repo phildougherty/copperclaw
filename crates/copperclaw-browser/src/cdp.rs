@@ -36,6 +36,7 @@ use serde_json::{Value, json};
 
 use crate::driver::{BrowserDriver, DriverRender, Navigation, RenderedArtifact};
 use crate::error::BrowserError;
+use crate::interactive::InteractiveDriver;
 use crate::render::RenderMode;
 
 /// Default navigation/idle timeout when the caller does not specify one.
@@ -226,15 +227,177 @@ pub fn main_status_from_events(events: &[Value]) -> Option<u16> {
         })
 }
 
-#[async_trait]
-impl BrowserDriver for CdpBrowserDriver {
-    async fn render(&self, url: &str, mode: RenderMode) -> Result<DriverRender, BrowserError> {
-        // Enable the domains we need: Page (load event), Network (redirect +
-        // status observation for the SSRF re-guard).
+/// Encode a Rust string as a JavaScript string literal via JSON (a JSON string
+/// is a valid JS string). This is the injection guard for embedding a
+/// caller-supplied CSS selector / typed text into a `Runtime.evaluate`
+/// expression — the value can never break out of the string and inject code.
+fn js_string(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
+}
+
+impl CdpBrowserDriver {
+    /// Enable the CDP domains the interactive/render paths need (idempotent).
+    async fn enable_domains(&self) -> Result<(), BrowserError> {
         self.transport.send("Page.enable", json!({})).await?;
         self.transport.send("Network.enable", json!({})).await?;
+        Ok(())
+    }
 
-        // Navigate. Chromium reports a hard navigation failure via `errorText`.
+    /// Read the settled navigation state (final URL, redirect hops, status) so
+    /// the interactive orchestration can re-guard it. `fallback_url` is used
+    /// only if `document.location.href` cannot be read.
+    async fn observe_navigation(&self, fallback_url: &str) -> Result<Navigation, BrowserError> {
+        let final_url = self
+            .eval_string("document.location.href")
+            .await?
+            .unwrap_or_else(|| fallback_url.to_string());
+        Ok(Navigation {
+            redirect_chain: self.transport.redirect_hops(),
+            final_url,
+            status: self.transport.main_status(),
+        })
+    }
+
+    /// Evaluate an expression purely for effect, surfacing a thrown JS error
+    /// (e.g. "no element for selector") as a [`BrowserError::Driver`].
+    async fn eval_effect(&self, expr: &str) -> Result<(), BrowserError> {
+        let out = self
+            .transport
+            .send(
+                "Runtime.evaluate",
+                json!({
+                    "expression": expr,
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                }),
+            )
+            .await?;
+        if let Some(details) = out.get("exceptionDetails") {
+            return Err(BrowserError::Driver(format!(
+                "interactive action failed: {}",
+                details
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown exception")
+            )));
+        }
+        Ok(())
+    }
+
+    /// Click the first element matching `selector` (scrolled into view first).
+    async fn do_click(&self, selector: &str) -> Result<(), BrowserError> {
+        let expr = format!(
+            "(function(){{const el=document.querySelector({sel});\
+             if(!el){{throw new Error(\"no element for selector \"+{sel});}}\
+             el.scrollIntoView({{block:'center'}});el.click();return true;}})()",
+            sel = js_string(selector)
+        );
+        self.eval_effect(&expr).await
+    }
+
+    /// Focus the element matching `selector` and set its value/text to `text`,
+    /// dispatching `input` + `change` so page handlers fire.
+    async fn do_type(&self, selector: &str, text: &str) -> Result<(), BrowserError> {
+        let expr = format!(
+            "(function(){{const el=document.querySelector({sel});\
+             if(!el){{throw new Error(\"no element for selector \"+{sel});}}\
+             el.focus();if('value' in el){{el.value={txt};}}else{{el.textContent={txt};}}\
+             el.dispatchEvent(new Event('input',{{bubbles:true}}));\
+             el.dispatchEvent(new Event('change',{{bubbles:true}}));return true;}})()",
+            sel = js_string(selector),
+            txt = js_string(text)
+        );
+        self.eval_effect(&expr).await
+    }
+
+    /// Scroll: element into view if `selector` is set, else window by `(dx,dy)`.
+    async fn do_scroll(
+        &self,
+        selector: Option<&str>,
+        dx: f64,
+        dy: f64,
+    ) -> Result<(), BrowserError> {
+        let expr = match selector {
+            Some(sel) => format!(
+                "(function(){{const el=document.querySelector({sel});\
+                 if(!el){{throw new Error(\"no element for selector \"+{sel});}}\
+                 el.scrollIntoView({{block:'center'}});return true;}})()",
+                sel = js_string(sel)
+            ),
+            // dx/dy are validated finite upstream; format as plain JS numbers.
+            None => format!("(function(){{window.scrollBy({dx},{dy});return true;}})()"),
+        };
+        self.eval_effect(&expr).await
+    }
+
+    /// Poll until an element matching `selector` exists or the (clamped) budget
+    /// elapses.
+    async fn do_wait_for_selector(
+        &self,
+        selector: &str,
+        timeout_ms: Option<u64>,
+    ) -> Result<(), BrowserError> {
+        let budget = Duration::from_millis(
+            timeout_ms
+                .unwrap_or(crate::interactive::DEFAULT_WAIT_MS)
+                .clamp(1, crate::interactive::MAX_WAIT_MS),
+        );
+        let expr = format!("!!document.querySelector({sel})", sel = js_string(selector));
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            let out = self
+                .transport
+                .send(
+                    "Runtime.evaluate",
+                    json!({ "expression": expr, "returnByValue": true }),
+                )
+                .await?;
+            let present = out
+                .get("result")
+                .and_then(|r| r.get("value"))
+                .and_then(Value::as_bool)
+                == Some(true);
+            if present {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(BrowserError::Driver(format!(
+                    "wait_for_selector `{selector}` timed out after {budget:?}"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Read the final artifact for `mode` (no navigation, no mutation). Shared
+    /// by the read-only render and the interactive read step.
+    async fn read_artifact(&self, mode: RenderMode) -> Result<RenderedArtifact, BrowserError> {
+        match mode {
+            RenderMode::Screenshot => Ok(RenderedArtifact::ScreenshotPath(
+                self.capture_screenshot().await?,
+            )),
+            RenderMode::DomText => {
+                let text = self
+                    .eval_string("document.body ? document.body.innerText : ''")
+                    .await?
+                    .unwrap_or_default();
+                Ok(RenderedArtifact::Text(text))
+            }
+            RenderMode::AriaSnapshot => {
+                let tree = self
+                    .transport
+                    .send("Accessibility.getFullAXTree", json!({}))
+                    .await?;
+                Ok(RenderedArtifact::Text(serialize_ax_tree(&tree)))
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl crate::interactive::InteractiveDriver for CdpBrowserDriver {
+    async fn navigate(&self, url: &str) -> Result<Navigation, BrowserError> {
+        self.enable_domains().await?;
         let nav = self
             .transport
             .send("Page.navigate", json!({ "url": url }))
@@ -246,44 +409,54 @@ impl BrowserDriver for CdpBrowserDriver {
                 )));
             }
         }
-
-        // Wait for load (best-effort; a timeout still lets us render what
-        // loaded), then read the settled state.
         self.transport.wait_for_load(self.nav_timeout).await?;
+        self.observe_navigation(url).await
+    }
 
-        let final_url = self
-            .eval_string("document.location.href")
-            .await?
-            .unwrap_or_else(|| url.to_string());
-        let redirect_chain = self.transport.redirect_hops();
-        let status = self.transport.main_status();
+    async fn act(
+        &self,
+        action: &crate::interactive::InteractiveAction,
+    ) -> Result<Navigation, BrowserError> {
+        use crate::interactive::InteractiveAction as A;
+        match action {
+            A::Click { selector } => self.do_click(selector).await?,
+            A::Type { selector, text } => self.do_type(selector, text).await?,
+            A::Scroll { selector, dx, dy } => {
+                self.do_scroll(selector.as_deref(), *dx, *dy).await?;
+            }
+            A::WaitForSelector {
+                selector,
+                timeout_ms,
+            } => self.do_wait_for_selector(selector, *timeout_ms).await?,
+        }
+        // An action may have navigated (click/submit/location change). Give the
+        // load a best-effort chance to settle, then observe so the caller can
+        // re-guard. (`wait_for_selector` is the caller's explicit settle knob
+        // for a navigation that outlives this best-effort wait.)
+        self.transport.wait_for_load(self.nav_timeout).await?;
+        // No fallback URL: on a failed href read we keep an empty final_url,
+        // which the guard treats as an invalid (non-public) target and blocks —
+        // fail closed rather than trust an unknown post-action location.
+        self.observe_navigation("").await
+    }
 
-        let artifact = match mode {
-            RenderMode::Screenshot => {
-                RenderedArtifact::ScreenshotPath(self.capture_screenshot().await?)
-            }
-            RenderMode::DomText => {
-                let text = self
-                    .eval_string("document.body ? document.body.innerText : ''")
-                    .await?
-                    .unwrap_or_default();
-                RenderedArtifact::Text(text)
-            }
-            RenderMode::AriaSnapshot => {
-                let tree = self
-                    .transport
-                    .send("Accessibility.getFullAXTree", json!({}))
-                    .await?;
-                RenderedArtifact::Text(serialize_ax_tree(&tree))
-            }
-        };
+    async fn read(&self, mode: RenderMode) -> Result<RenderedArtifact, BrowserError> {
+        self.read_artifact(mode).await
+    }
+}
 
+#[async_trait]
+impl BrowserDriver for CdpBrowserDriver {
+    async fn render(&self, url: &str, mode: RenderMode) -> Result<DriverRender, BrowserError> {
+        // `navigate` enables the Page + Network domains (redirect + status
+        // observation for the SSRF re-guard), drives the navigation, waits for
+        // load, and observes the settled state (final URL falls back to `url`).
+        // `read_artifact` then reads the requested surface — the same two steps
+        // the interactive path composes, shared verbatim.
+        let navigation = self.navigate(url).await?;
+        let artifact = self.read_artifact(mode).await?;
         Ok(DriverRender {
-            navigation: Navigation {
-                redirect_chain,
-                final_url,
-                status,
-            },
+            navigation,
             artifact,
         })
     }
@@ -738,5 +911,347 @@ mod tests {
             { "role": { "value": "link" }, "name": { "value": "Home" } }
         ] });
         assert_eq!(serialize_ax_tree(&tree), "link: Home");
+    }
+
+    // ── interactive driver (Phase 5b) — CDP command sequence ─────────────
+    //
+    // These exercise the concrete `InteractiveDriver` impl against a scripted
+    // transport that inspects the `Runtime.evaluate` expression so click / type
+    // / scroll / wait / read each get a plausible reply. They prove the CDP
+    // command sequence WITHOUT a live Chromium (the acceptance's mock-CDP tier).
+
+    use crate::interactive::{InteractRequest, InteractiveAction, InteractiveDriver, interact};
+
+    /// A transport that replies to `Runtime.evaluate` by inspecting the
+    /// expression: the location read yields `final_url`, a `!!querySelector`
+    /// presence poll yields `true`, an `innerText` read yields `dom`, and any
+    /// other effect expression yields an empty (no-exception) result. Records
+    /// every method + evaluate-expression it saw.
+    struct ScriptedTransport {
+        final_url: String,
+        dom: String,
+        hops: Vec<String>,
+        status: Option<u16>,
+        calls: Mutex<Vec<String>>,
+        exprs: Mutex<Vec<String>>,
+    }
+
+    impl ScriptedTransport {
+        fn new(final_url: &str, dom: &str) -> Self {
+            Self {
+                final_url: final_url.to_string(),
+                dom: dom.to_string(),
+                hops: Vec::new(),
+                status: Some(200),
+                calls: Mutex::new(Vec::new()),
+                exprs: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl CdpTransport for ScriptedTransport {
+        async fn send(&self, method: &str, params: Value) -> Result<Value, BrowserError> {
+            self.calls.lock().unwrap().push(method.to_string());
+            if method == "Runtime.evaluate" {
+                let expr = params
+                    .get("expression")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                self.exprs.lock().unwrap().push(expr.clone());
+                if expr.contains("location.href") {
+                    return Ok(json!({ "result": { "value": self.final_url } }));
+                }
+                if expr.starts_with("!!document.querySelector") {
+                    return Ok(json!({ "result": { "value": true } }));
+                }
+                if expr.contains("innerText") {
+                    return Ok(json!({ "result": { "value": self.dom } }));
+                }
+                // A click/type/scroll effect expression: no exception → success.
+                return Ok(json!({ "result": { "value": true } }));
+            }
+            Ok(json!({}))
+        }
+        async fn wait_for_load(&self, _timeout: Duration) -> Result<(), BrowserError> {
+            Ok(())
+        }
+        fn redirect_hops(&self) -> Vec<String> {
+            self.hops.clone()
+        }
+        fn main_status(&self) -> Option<u16> {
+            self.status
+        }
+    }
+
+    fn scripted_driver(final_url: &str, dom: &str) -> CdpBrowserDriver {
+        CdpBrowserDriver::new(
+            Box::new(ScriptedTransport::new(final_url, dom)),
+            tmp_dir(),
+            DEFAULT_NAV_TIMEOUT,
+        )
+    }
+
+    /// A thin adapter forwarding to a shared [`ScriptedTransport`] Arc so a test
+    /// can inspect the recorded `Runtime.evaluate` expressions after driving it.
+    struct Forward(std::sync::Arc<ScriptedTransport>);
+
+    #[async_trait]
+    impl CdpTransport for Forward {
+        async fn send(&self, method: &str, params: Value) -> Result<Value, BrowserError> {
+            self.0.send(method, params).await
+        }
+        async fn wait_for_load(&self, t: Duration) -> Result<(), BrowserError> {
+            self.0.wait_for_load(t).await
+        }
+        fn redirect_hops(&self) -> Vec<String> {
+            self.0.redirect_hops()
+        }
+        fn main_status(&self) -> Option<u16> {
+            self.0.main_status()
+        }
+    }
+
+    /// A transport that answers `Page.captureScreenshot` with a 1x1 PNG and any
+    /// `Runtime.evaluate` with a plausible reply, so the screenshot read path
+    /// writes a real file.
+    struct ShotTransport;
+
+    #[async_trait]
+    impl CdpTransport for ShotTransport {
+        async fn send(&self, method: &str, params: Value) -> Result<Value, BrowserError> {
+            match method {
+                "Page.captureScreenshot" => Ok(json!({
+                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+                })),
+                "Runtime.evaluate" => {
+                    let expr = params
+                        .get("expression")
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    if expr.starts_with("!!") {
+                        Ok(json!({ "result": { "value": true } }))
+                    } else {
+                        Ok(json!({ "result": { "value": "https://example.com/" } }))
+                    }
+                }
+                _ => Ok(json!({})),
+            }
+        }
+        async fn wait_for_load(&self, _t: Duration) -> Result<(), BrowserError> {
+            Ok(())
+        }
+        fn redirect_hops(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn main_status(&self) -> Option<u16> {
+            Some(200)
+        }
+    }
+
+    /// A transport whose `.click()` evaluate throws — to prove a missing element
+    /// surfaces as a driver error.
+    struct ThrowTransport;
+
+    #[async_trait]
+    impl CdpTransport for ThrowTransport {
+        async fn send(&self, method: &str, params: Value) -> Result<Value, BrowserError> {
+            if method == "Runtime.evaluate" {
+                let expr = params
+                    .get("expression")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if expr.contains(".click()") {
+                    return Ok(
+                        json!({ "exceptionDetails": { "text": "no element for selector" } }),
+                    );
+                }
+                return Ok(json!({ "result": { "value": "https://example.com/" } }));
+            }
+            Ok(json!({}))
+        }
+        async fn wait_for_load(&self, _t: Duration) -> Result<(), BrowserError> {
+            Ok(())
+        }
+        fn redirect_hops(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn main_status(&self) -> Option<u16> {
+            Some(200)
+        }
+    }
+
+    #[tokio::test]
+    async fn interactive_click_then_read_runs_expected_cdp_sequence() {
+        let driver = scripted_driver("https://example.com/next", "post-click DOM");
+        let guard = RecordingGuard::default();
+        let req = InteractRequest {
+            url: "https://example.com".into(),
+            actions: vec![InteractiveAction::Click {
+                selector: "#go".into(),
+            }],
+            mode: RenderMode::DomText,
+            timeout_secs: None,
+        };
+        let out = interact(&req, &guard, &driver).await.unwrap();
+        assert_eq!(out.provenance, crate::render::Provenance::Untrusted);
+        assert_eq!(out.text.as_deref(), Some("post-click DOM"));
+        assert_eq!(out.final_url, "https://example.com/next");
+    }
+
+    #[tokio::test]
+    async fn interactive_actions_emit_injection_safe_expressions() {
+        // Drive the effect helpers directly against a scripted transport we keep
+        // a handle to, so we can inspect the emitted expressions.
+        let transport = std::sync::Arc::new(ScriptedTransport::new("https://example.com/", "dom"));
+        let driver = CdpBrowserDriver::new(
+            Box::new(Forward(std::sync::Arc::clone(&transport))),
+            tmp_dir(),
+            DEFAULT_NAV_TIMEOUT,
+        );
+        driver
+            .act(&InteractiveAction::Click {
+                selector: "#a\"b".into(), // a selector with a quote — must be escaped
+            })
+            .await
+            .unwrap();
+        driver
+            .act(&InteractiveAction::Type {
+                selector: "#in".into(),
+                text: "hi\"there".into(),
+            })
+            .await
+            .unwrap();
+        driver
+            .act(&InteractiveAction::Scroll {
+                selector: None,
+                dx: 0.0,
+                dy: 250.0,
+            })
+            .await
+            .unwrap();
+        driver
+            .act(&InteractiveAction::WaitForSelector {
+                selector: ".done".into(),
+                timeout_ms: Some(1000),
+            })
+            .await
+            .unwrap();
+        let exprs = transport.exprs.lock().unwrap().clone();
+        // The click selector's quote is JSON-escaped, not raw — no injection.
+        assert!(
+            exprs
+                .iter()
+                .any(|e| e.contains("querySelector(\"#a\\\"b\")") && e.contains(".click()")),
+            "click expr must query the escaped selector and click: {exprs:?}"
+        );
+        // Typed text is JSON-encoded into the expression.
+        assert!(
+            exprs.iter().any(|e| e.contains("\"hi\\\"there\"")),
+            "type expr must embed the escaped text: {exprs:?}"
+        );
+        // Window scroll uses scrollBy with the numeric delta.
+        assert!(
+            exprs.iter().any(|e| e.contains("window.scrollBy(0,250)")),
+            "scroll expr must scroll the window: {exprs:?}"
+        );
+        // Wait polls the selector presence.
+        assert!(
+            exprs
+                .iter()
+                .any(|e| e.starts_with("!!document.querySelector(\".done\")")),
+            "wait expr must poll presence: {exprs:?}"
+        );
+        // A2 security follow-up F2: a SINGLE-quote in the selector must not break
+        // out of the thrown Error string. The selector is JSON-encoded into a
+        // double-quoted JS string literal, and the error message concatenates
+        // that literal (`"..."+sel`) rather than splicing the raw selector into
+        // a single-quoted `Error('...')`. So the hostile selector — including
+        // its `');` — must appear only WITHIN one complete double-quoted literal,
+        // never as bare code, and no single-quoted `Error('` literal may exist.
+        driver
+            .act(&InteractiveAction::Click {
+                selector: "#x');globalThis.pwned=1//".into(),
+            })
+            .await
+            .unwrap();
+        let exprs = transport.exprs.lock().unwrap().clone();
+        let click = exprs
+            .iter()
+            .find(|e| e.contains("globalThis.pwned=1"))
+            .expect("the hostile-selector click expr should be recorded");
+        // The whole selector rides inside one double-quoted JSON literal, so its
+        // single-quote is inert data, not a string terminator.
+        assert!(
+            click.contains("\"#x');globalThis.pwned=1//\""),
+            "hostile selector must be one escaped double-quoted literal: {click}"
+        );
+        // The Error message never uses a single-quoted literal the selector
+        // could terminate.
+        assert!(
+            !click.contains("Error('"),
+            "error message must not splice the selector into a single-quoted literal: {click}"
+        );
+    }
+
+    #[tokio::test]
+    async fn interactive_screenshot_read_writes_png() {
+        // Read-back in screenshot mode writes a PNG through the shared
+        // read_artifact path.
+        let dir = tmp_dir();
+        let driver = CdpBrowserDriver::new(Box::new(ShotTransport), &dir, DEFAULT_NAV_TIMEOUT);
+        let guard = RecordingGuard::default();
+        let req = InteractRequest {
+            url: "https://example.com".into(),
+            actions: vec![InteractiveAction::Scroll {
+                selector: None,
+                dx: 0.0,
+                dy: 100.0,
+            }],
+            mode: RenderMode::Screenshot,
+            timeout_secs: None,
+        };
+        let out = interact(&req, &guard, &driver).await.unwrap();
+        let Some(path) = out.screenshot_path else {
+            panic!("screenshot mode must yield a path");
+        };
+        assert!(std::path::Path::new(&path).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn interactive_ssrf_blocks_post_action_internal_navigation() {
+        // The scripted transport reports an internal address as the settled
+        // location after the click; the orchestration's post-nav re-guard blocks
+        // before the DOM is read.
+        let driver = scripted_driver("http://169.254.169.254/latest/meta-data/", "SECRET");
+        let guard = RecordingGuard::blocking(&["169.254.169.254"]);
+        let req = InteractRequest {
+            url: "https://example.com".into(),
+            actions: vec![InteractiveAction::Click {
+                selector: "#go".into(),
+            }],
+            mode: RenderMode::DomText,
+            timeout_secs: None,
+        };
+        let err = interact(&req, &guard, &driver).await.unwrap_err();
+        assert!(matches!(err, BrowserError::Blocked(_)));
+    }
+
+    #[tokio::test]
+    async fn interactive_click_missing_element_is_driver_error() {
+        let driver =
+            CdpBrowserDriver::new(Box::new(ThrowTransport), tmp_dir(), DEFAULT_NAV_TIMEOUT);
+        let err = driver
+            .act(&InteractiveAction::Click {
+                selector: "#missing".into(),
+            })
+            .await
+            .unwrap_err();
+        match err {
+            BrowserError::Driver(m) => assert!(m.contains("no element"), "{m}"),
+            other => panic!("expected driver error, got {other:?}"),
+        }
     }
 }

@@ -67,7 +67,8 @@ use copperclaw_host_router::{
 use copperclaw_host_sweep::service::FilesystemSessionRoot as SweepRoot;
 use copperclaw_host_sweep::{SessionRoot as SweepSessionRoot, SweepService};
 use copperclaw_modules::{
-    ApprovalsModule, Module, PreviewBroker, PreviewError, PreviewExposed, SessionInfoLite,
+    ApprovalsModule, Module, PreviewBroker, PreviewError, PreviewExposed, PublicTunnelBroker,
+    PublicTunnelReply, SessionInfoLite,
 };
 use copperclaw_providers::AnthropicProvider;
 use copperclaw_runner::{RunnerDeps, RunnerToolCtx, compaction::CompactionCfg, run_loop};
@@ -87,6 +88,12 @@ use crate::diff::{DiffReport, Substitutions, diff_stream};
 use crate::fixture::{ClaudeTurn, Fixture, ProviderResponseSpec};
 
 /// Booted harness.
+///
+/// The `use_*_gate` fields are independent, orthogonal opt-in toggles read
+/// straight off the manifest's `gates` list — a plain set of flags, not a
+/// state machine. Collapsing them into an enum would obscure the 1:1
+/// gate-name → flag mapping.
+#[allow(clippy::struct_excessive_bools)]
 pub struct ReplayHarness {
     pub fixture: Fixture,
     pub tempdir: TempDir,
@@ -133,6 +140,19 @@ pub struct ReplayHarness {
     /// public API, the same one `copperclaw-host-delivery`'s own unit
     /// tests use.
     use_preview_gate: bool,
+    /// True when the manifest's `gates` includes `"tunnel"` (M19 A3 /
+    /// X-rider W3). Wires a [`FixtureTunnelBroker`] onto `delivery` via
+    /// the already-public `DeliveryService::set_tunnel_broker`, so a
+    /// `make_preview_public` call relayed through the reserved `__preview`
+    /// server routes to a canned public-URL reply instead of the
+    /// "no tunnel support wired" error. The `make_preview_public` tool is
+    /// already advertised by `preview_tool_defs()` (under the preview
+    /// gate) and routes via `run::preview::is_preview_tool`, so this gate
+    /// only supplies the host-side broker. Isolated from `"preview"` so
+    /// the existing preview fixtures (`prototype-golden`, `-verify-gate`)
+    /// keep no tunnel broker and their behaviour is byte-unchanged. Used
+    /// by the `prototype-public-share` fixture (A3 public-verb ritual card).
+    use_tunnel_gate: bool,
     /// Cached container manager for budget-gate fixtures. Reused
     /// across inbound steps so its per-agent-group dedup map survives
     /// (otherwise every step would post a fresh budget-exhausted reply,
@@ -189,7 +209,12 @@ impl ReplayHarness {
                 .get(ct.as_str())
                 .copied()
                 .or_else(|| default_cap_for(ct.as_str()));
-            let wrapped: Arc<dyn ChannelAdapter> = Arc::new(CappedAdapter::new(mock.clone(), cap));
+            let wrapped: Arc<dyn ChannelAdapter> = Arc::new(CappedAdapter::new(
+                mock.clone(),
+                cap,
+                fixture.manifest.model_rich_breadcrumbs,
+                fixture.manifest.model_rich_cards,
+            ));
             initial.push((ct.clone(), wrapped));
             adapters.push((ct, mock));
         }
@@ -221,6 +246,14 @@ impl ReplayHarness {
         if use_preview_gate {
             delivery.set_preview_broker(Arc::new(FixturePreviewBroker));
         }
+        let use_tunnel_gate = fixture
+            .manifest
+            .gates
+            .iter()
+            .any(|g| g.eq_ignore_ascii_case("tunnel"));
+        if use_tunnel_gate {
+            delivery.set_tunnel_broker(Arc::new(FixtureTunnelBroker));
+        }
 
         Ok(Self {
             fixture,
@@ -236,6 +269,7 @@ impl ReplayHarness {
             use_approvals_gate,
             use_budget_gate,
             use_preview_gate,
+            use_tunnel_gate,
             container_manager: tokio::sync::Mutex::new(None),
         })
     }
@@ -787,7 +821,7 @@ impl ReplayHarness {
         // of a timeout. Aborted once the turn (either branch below)
         // resolves; a no-op for every fixture that doesn't set
         // `gates: ["preview"]`.
-        let delivery_poller = if self.use_preview_gate {
+        let delivery_poller = if self.use_preview_gate || self.use_tunnel_gate {
             let delivery = Arc::clone(&self.delivery);
             let central = self.central.clone();
             Some(tokio::spawn(async move {
@@ -1418,6 +1452,44 @@ impl PreviewBroker for FixturePreviewBroker {
     }
 }
 
+/// Deterministic [`PublicTunnelBroker`] for fixtures that opt into
+/// `gates: ["tunnel"]` (M19 A3 / X-rider W3). Mirrors
+/// `copperclaw-host-delivery`'s own `MockTunnelBroker` test double (see
+/// `service.rs`'s `make_public_exposed_renders_url_and_note`): a canned
+/// live public URL, no real cloudflared binary, container IP, or approval
+/// round-trip involved. This models the state AFTER an operator has
+/// approved the exposure (the second `make_preview_public` call, which
+/// returns the shareable public link) — the approval plumbing itself is
+/// exercised by A3's host-handler unit tests + the `tunnel.rs` module
+/// tests, not by a replay fixture. Good enough to pin "the agent calls
+/// `make_preview_public`, gets a PUBLIC URL back, and puts it on the
+/// prototype-ready ritual card as an 'Open the public link' button"
+/// through the real inbound→router→runner→outbound→delivery pipeline.
+///
+/// The `https://` scheme + off-network host make the returned link
+/// visibly PUBLIC — the contrast with `FixturePreviewBroker`'s LAN
+/// `http://192.0.2.10:8100/...` URL that the ritual card also carries.
+#[derive(Debug, Default)]
+struct FixtureTunnelBroker;
+
+#[async_trait]
+impl PublicTunnelBroker for FixtureTunnelBroker {
+    async fn make_public(
+        &self,
+        _session: SessionInfoLite,
+        container_port: u16,
+    ) -> PublicTunnelReply {
+        PublicTunnelReply::Exposed {
+            public_url: format!(
+                "https://fixture-tunnel.example/__preview/fixture-tok-{container_port}"
+            ),
+            note: "This link is PUBLIC — anyone on the internet with it can open your app. \
+                   It is torn down automatically when the preview closes."
+                .into(),
+        }
+    }
+}
+
 /// Built-in `max_message_chars` cap per channel type. Mirrors the
 /// production `ChannelAdapter::max_message_chars` overrides shipped
 /// by the slice-1 cohesive-UX baseline (see `CHANGELOG.md`
@@ -1449,13 +1521,28 @@ fn default_cap_for(channel_type: &str) -> Option<usize> {
 struct CappedAdapter {
     inner: Arc<MockAdapter>,
     max_message_chars: Option<usize>,
+    /// M19 F1: when true, model an edit-capable rich adapter for the
+    /// HUD breadcrumb surface (post once, edit in place) instead of the
+    /// bare-mock degrade-to-text. See `Manifest::model_rich_breadcrumbs`.
+    model_rich_breadcrumbs: bool,
+    /// M19 U4/U5: when true, model a card-capable rich adapter for the
+    /// `deliver_card` surface (structured card on the wire) instead of the
+    /// bare-mock degrade-to-text. See `Manifest::model_rich_cards`.
+    model_rich_cards: bool,
 }
 
 impl CappedAdapter {
-    fn new(inner: Arc<MockAdapter>, max_message_chars: Option<usize>) -> Self {
+    fn new(
+        inner: Arc<MockAdapter>,
+        max_message_chars: Option<usize>,
+        model_rich_breadcrumbs: bool,
+        model_rich_cards: bool,
+    ) -> Self {
         Self {
             inner,
             max_message_chars,
+            model_rich_breadcrumbs,
+            model_rich_cards,
         }
     }
 }
@@ -1506,9 +1593,73 @@ impl ChannelAdapter for CappedAdapter {
         card: &Card,
         to: Option<&str>,
     ) -> Result<Option<String>, AdapterError> {
-        self.inner
-            .deliver_card(platform_id, thread_id, card, to)
-            .await
+        // Default (bare-mock) behaviour: the trait default flattens the
+        // card to a `Chat` text row (buttons become `- [Label] -> url`
+        // prose). This is what a genuinely card-incapable adapter does.
+        if !self.model_rich_cards {
+            return self
+                .inner
+                .deliver_card(platform_id, thread_id, card, to)
+                .await;
+        }
+        // M19 U4/U5: card-capable rich-adapter modelling. Record the card
+        // as a `MessageKind::Card`-kind delivery whose `content.card`
+        // preserves the full structured card (title / body / fields /
+        // buttons) — so `snapshot_delivered` shows a native card on the
+        // wire, not a flattened prose blob. Route through the inner mock's
+        // `deliver` so it lands in `MockAdapter::deliveries()` reachable via
+        // the harness's `Arc<MockAdapter>` handle.
+        let msg = OutboundMessage {
+            kind: copperclaw_types::MessageKind::Card,
+            content: serde_json::json!({ "card": card }),
+            files: vec![],
+        };
+        self.inner.deliver(platform_id, thread_id, &msg).await
+    }
+
+    async fn deliver_breadcrumb(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        breadcrumb: &copperclaw_channels_core::Breadcrumb,
+        existing_message_id: Option<&str>,
+    ) -> Result<Option<String>, AdapterError> {
+        // Default (bare-mock) behaviour: degrade to a plain text deliver,
+        // ignoring `existing_message_id` — every frame re-posts. This is
+        // what the real `MockAdapter` does via the trait default.
+        if !self.model_rich_breadcrumbs {
+            return self
+                .inner
+                .deliver_breadcrumb(platform_id, thread_id, breadcrumb, existing_message_id)
+                .await;
+        }
+        // M19 F1: edit-capable rich-adapter modelling. The HUD posts the
+        // chip once (no anchor) and edits it in place on every later frame
+        // (`existing_message_id = Some(anchor)`).
+        let text = breadcrumb.to_text_fallback();
+        match existing_message_id {
+            // First frame: post. Record it as a `Breadcrumb`-kind delivery
+            // so `snapshot_delivered` shows exactly one HUD post, and return
+            // the mock's stable id as the anchor future edits target.
+            None => {
+                let msg = OutboundMessage {
+                    kind: copperclaw_types::MessageKind::Breadcrumb,
+                    content: serde_json::json!({ "text": text }),
+                    files: vec![],
+                };
+                self.inner.deliver(platform_id, thread_id, &msg).await
+            }
+            // Later frame: edit the anchor in place. Route through the inner
+            // mock's `edit_message` so it lands in `MockAdapter::edits()`,
+            // and return the SAME anchor so the delivery loop keeps editing
+            // the one chip (never re-posts).
+            Some(anchor) => {
+                self.inner
+                    .edit_message(platform_id, thread_id, anchor, &text)
+                    .await?;
+                Ok(Some(anchor.to_owned()))
+            }
+        }
     }
 
     async fn open_dm(&self, user_id: &str) -> Result<Option<DmHandle>, AdapterError> {

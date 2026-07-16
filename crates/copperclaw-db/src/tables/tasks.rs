@@ -58,6 +58,11 @@ pub struct Task {
     pub recurrence: Option<String>,
     pub next_fire: Option<DateTime<Utc>>,
     pub status: TaskStatus,
+    /// RFC-3339 instant of the most recent fire; `None` until the task has
+    /// fired at least once. Written by the sweep's due-task fan-out.
+    pub last_fired_at: Option<DateTime<Utc>>,
+    /// Monotonically increasing count of fires (0 until the first fire).
+    pub fire_count: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -117,6 +122,23 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
                 })?,
         ),
     };
+    // Same empty-string defence as `next_fire`: a `last_fired_at = ''` row
+    // would otherwise crash the RFC-3339 parser.
+    let last_fired_str: Option<String> = row.get("last_fired_at")?;
+    let last_fired_at = match last_fired_str.as_deref() {
+        None | Some("") => None,
+        Some(ts) => Some(
+            DateTime::parse_from_rfc3339(ts)
+                .map(|d| d.with_timezone(&Utc))
+                .map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+        ),
+    };
     Ok(Task {
         id: row.get("id")?,
         agent_group_id: AgentGroupId(ag_uuid),
@@ -127,6 +149,8 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         recurrence: row.get("recurrence")?,
         next_fire,
         status,
+        last_fired_at,
+        fire_count: row.get("fire_count")?,
         created_at,
         updated_at,
     })
@@ -164,6 +188,8 @@ pub fn insert(db: &CentralDb, task: NewTask) -> Result<Task, DbError> {
         recurrence: task.recurrence,
         next_fire: task.next_fire,
         status: TaskStatus::Active,
+        last_fired_at: None,
+        fire_count: 0,
         created_at: now,
         updated_at: now,
     })
@@ -175,7 +201,7 @@ pub fn get(db: &CentralDb, id: &str) -> Result<Option<Task>, DbError> {
     Ok(conn
         .query_row(
             "SELECT id, agent_group_id, session_id, name, prompt, when_spec,
-                    recurrence, next_fire, status, created_at, updated_at
+                    recurrence, next_fire, status, last_fired_at, fire_count, created_at, updated_at
              FROM tasks
              WHERE id = ?1",
             params![id],
@@ -189,7 +215,7 @@ pub fn list_for_session(db: &CentralDb, session_id: SessionId) -> Result<Vec<Tas
     let conn = db.conn()?;
     let mut stmt = conn.prepare(
         "SELECT id, agent_group_id, session_id, name, prompt, when_spec,
-                recurrence, next_fire, status, created_at, updated_at
+                recurrence, next_fire, status, last_fired_at, fire_count, created_at, updated_at
          FROM tasks
          WHERE session_id = ?1
          ORDER BY created_at",
@@ -203,7 +229,7 @@ pub fn list_due(db: &CentralDb, now: DateTime<Utc>) -> Result<Vec<Task>, DbError
     let conn = db.conn()?;
     let mut stmt = conn.prepare(
         "SELECT id, agent_group_id, session_id, name, prompt, when_spec,
-                recurrence, next_fire, status, created_at, updated_at
+                recurrence, next_fire, status, last_fired_at, fire_count, created_at, updated_at
          FROM tasks
          WHERE status = 'active'
            AND next_fire IS NOT NULL
@@ -212,6 +238,18 @@ pub fn list_due(db: &CentralDb, now: DateTime<Utc>) -> Result<Vec<Task>, DbError
     )?;
     let rows = stmt.query_map(params![now.to_rfc3339()], row_to_task)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Count all tasks in `active` status (regardless of `next_fire`). Feeds the
+/// M19 A6 `copperclaw_scheduled_tasks_active` gauge the sweep sets each pass.
+pub fn count_active(db: &CentralDb) -> Result<u64, DbError> {
+    let conn = db.conn()?;
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tasks WHERE status = 'active'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(u64::try_from(n).unwrap_or(0))
 }
 
 /// Update status only.
@@ -240,6 +278,27 @@ pub fn set_next_fire(
     let n = conn.execute(
         "UPDATE tasks SET next_fire = ?1, updated_at = ?2 WHERE id = ?3",
         params![next_fire.map(|t| t.to_rfc3339()), now, id],
+    )?;
+    if n == 0 {
+        return Err(DbError::NotFound);
+    }
+    Ok(())
+}
+
+/// Record that a task fired: stamp `last_fired_at = fired_at` and bump
+/// `fire_count`. Called by the sweep's due-task fan-out on every fire (both
+/// one-shot and each recurring occurrence). Keeps a durable, queryable record
+/// of autonomous activity independent of the message log.
+pub fn mark_fired(db: &CentralDb, id: &str, fired_at: DateTime<Utc>) -> Result<(), DbError> {
+    let conn = db.conn()?;
+    let now = Utc::now().to_rfc3339();
+    let n = conn.execute(
+        "UPDATE tasks
+            SET last_fired_at = ?1,
+                fire_count = fire_count + 1,
+                updated_at = ?2
+          WHERE id = ?3",
+        params![fired_at.to_rfc3339(), now, id],
     )?;
     if n == 0 {
         return Err(DbError::NotFound);
@@ -434,6 +493,48 @@ mod tests {
             assert_eq!(parsed.as_str(), s);
         }
         assert!("bogus".parse::<TaskStatus>().is_err());
+    }
+
+    #[test]
+    fn insert_defaults_fire_lifecycle_to_zero() {
+        let db = db();
+        let ag = mk_ag(&db, "g");
+        let sess = SessionId::new();
+        let t = insert(&db, mk_task(ag, sess, "a")).unwrap();
+        assert!(t.last_fired_at.is_none());
+        assert_eq!(t.fire_count, 0);
+        // Round-trips through the row mapper too.
+        let back = get(&db, "a").unwrap().unwrap();
+        assert!(back.last_fired_at.is_none());
+        assert_eq!(back.fire_count, 0);
+    }
+
+    #[test]
+    fn mark_fired_stamps_and_increments() {
+        let db = db();
+        let ag = mk_ag(&db, "g");
+        let sess = SessionId::new();
+        insert(&db, mk_task(ag, sess, "a")).unwrap();
+        let fired = Utc::now();
+        mark_fired(&db, "a", fired).unwrap();
+        let t = get(&db, "a").unwrap().unwrap();
+        assert_eq!(t.fire_count, 1);
+        assert_eq!(t.last_fired_at.unwrap().timestamp(), fired.timestamp());
+        // A second fire increments again and re-stamps.
+        let fired2 = fired + chrono::Duration::hours(1);
+        mark_fired(&db, "a", fired2).unwrap();
+        let t = get(&db, "a").unwrap().unwrap();
+        assert_eq!(t.fire_count, 2);
+        assert_eq!(t.last_fired_at.unwrap().timestamp(), fired2.timestamp());
+    }
+
+    #[test]
+    fn mark_fired_unknown_id_errors() {
+        let db = db();
+        assert!(matches!(
+            mark_fired(&db, "ghost", Utc::now()).unwrap_err(),
+            DbError::NotFound
+        ));
     }
 
     #[test]

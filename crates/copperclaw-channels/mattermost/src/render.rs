@@ -12,8 +12,106 @@
 //! glyphs, fences) is added here.
 
 use copperclaw_channels_core::{
-    Card, DiffCard, ErrorCard, ThinkingBlock, TodoItemStatus, TodoList,
+    Breadcrumb, BreadcrumbStatus, Card, DiffCard, ErrorCard, ThinkingBlock, TodoItemStatus,
+    TodoList,
 };
+
+/// Render a [`Breadcrumb`] as a compact Mattermost Markdown chip. The
+/// tool name rides an inline-code span (`` `shell` ``) — the closest
+/// metadata-chip aesthetic Mattermost offers without committing a full
+/// attachment — prefixed by an ASCII status marker (`[~]` running,
+/// `[ok]` done, `[x]` failed) so it survives every client's text
+/// encoding and honours the no-emoji rule.
+///
+/// A single tool renders one line:
+/// - `[~] `shell` · cargo check`
+/// - `[ok] `shell` · cargo check — passed (0.4s)`
+/// - `[x] `shell` · cargo check — failed: timeout`
+///
+/// A rolling *activity* aggregate (`steps` non-empty) renders a bold
+/// summary line plus one Markdown bullet per step, each styled with the
+/// same chip shape — Mattermost has no disclosure widget, so the steps
+/// stay visible (low-churn since the whole chip is edited in place).
+pub fn render_breadcrumb(b: &Breadcrumb) -> String {
+    if !b.steps.is_empty() {
+        return render_breadcrumb_aggregate(b);
+    }
+    render_breadcrumb_line(b)
+}
+
+/// One chip line: `<marker> `tool` · detail — summary`.
+fn render_breadcrumb_line(b: &Breadcrumb) -> String {
+    let mut out = String::with_capacity(64);
+    out.push_str(breadcrumb_marker(b.status));
+    out.push_str(" `");
+    out.push_str(&sanitize_inline_code(&b.tool_name));
+    out.push('`');
+    if let Some(d) = b.detail.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        out.push_str(" · ");
+        out.push_str(&sanitize_inline_code(d));
+    }
+    if let Some(s) = b
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if b.status == BreadcrumbStatus::Failed {
+            out.push_str(" — failed: ");
+        } else {
+            out.push_str(" — ");
+        }
+        out.push_str(&sanitize_inline_code(s));
+    }
+    out
+}
+
+/// Rolling aggregate: a bold collapsed summary line + a Markdown bullet
+/// list of the individual tool steps.
+fn render_breadcrumb_aggregate(b: &Breadcrumb) -> String {
+    let head = b
+        .detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .unwrap_or("working");
+    let mut out = String::with_capacity(96 + b.steps.len() * 48);
+    out.push_str("**");
+    out.push_str(&sanitize_inline_code(head));
+    out.push_str("**");
+    if let Some(s) = b
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        out.push_str(" · ");
+        out.push_str(&sanitize_inline_code(s));
+    }
+    for step in &b.steps {
+        out.push_str("\n- ");
+        out.push_str(&render_breadcrumb_line(step));
+    }
+    out
+}
+
+/// ASCII-only status marker (no-emoji rule): Mattermost renders bare
+/// Unicode check/cross glyphs as coloured emoji on mobile.
+fn breadcrumb_marker(status: BreadcrumbStatus) -> &'static str {
+    match status {
+        BreadcrumbStatus::Running => "[~]",
+        BreadcrumbStatus::Done => "[ok]",
+        BreadcrumbStatus::Failed => "[x]",
+    }
+}
+
+/// A Mattermost inline-code span terminates on the next backtick, so a
+/// stray backtick in an agent's command string would prematurely close
+/// the chip. Swap backticks for apostrophes; also fold newlines so a
+/// multi-line detail can't break the one-line chip.
+fn sanitize_inline_code(s: &str) -> String {
+    s.replace('`', "'").replace(['\n', '\r'], " ")
+}
 
 /// Render a [`Card`] as a Mattermost Markdown post: an `###` heading for
 /// the title, the body paragraph, a `**Label:** value` list for fields,
@@ -163,6 +261,18 @@ pub fn render_todo_list(list: &TodoList) -> String {
                 out.push_str("- [ ] ");
                 out.push_str(text);
                 out.push_str(" _(in progress)_");
+            }
+            TodoItemStatus::Blocked => {
+                out.push_str("- [!] ");
+                out.push_str(text);
+                match item.blocked_reason_text() {
+                    Some(reason) => {
+                        out.push_str(" _(blocked: ");
+                        out.push_str(reason);
+                        out.push_str(")_");
+                    }
+                    None => out.push_str(" _(blocked)_"),
+                }
             }
             TodoItemStatus::Pending => {
                 out.push_str("- [ ] ");
@@ -358,16 +468,19 @@ mod tests {
                     id: 1,
                     text: "Scaffold".into(),
                     status: TodoItemStatus::Completed,
+                    blocked_reason: None,
                 },
                 TodoListItem {
                     id: 2,
                     text: "Wire routes".into(),
                     status: TodoItemStatus::InProgress,
+                    blocked_reason: None,
                 },
                 TodoListItem {
                     id: 3,
                     text: "Deploy".into(),
                     status: TodoItemStatus::Pending,
+                    blocked_reason: None,
                 },
             ],
             title: Some("Build".into()),
@@ -394,6 +507,60 @@ mod tests {
         let out = render_thinking(&t);
         assert!(out.contains("(redacted reasoning)"));
         assert!(!out.contains("secret-blob"));
+    }
+
+    #[test]
+    fn breadcrumb_running_wraps_tool_in_inline_code_with_marker() {
+        let b = Breadcrumb::running("shell").with_detail("cargo check");
+        let out = render_breadcrumb(&b);
+        assert_eq!(out, "[~] `shell` · cargo check");
+    }
+
+    #[test]
+    fn breadcrumb_done_with_summary_uses_em_dash() {
+        let b = Breadcrumb::running("shell")
+            .with_detail("cargo check")
+            .finished(true, Some("passed (0.4s)".into()));
+        let out = render_breadcrumb(&b);
+        assert_eq!(out, "[ok] `shell` · cargo check — passed (0.4s)");
+    }
+
+    #[test]
+    fn breadcrumb_failed_prefixes_summary_with_failed() {
+        let b = Breadcrumb::running("shell")
+            .with_detail("cargo check")
+            .finished(false, Some("timeout".into()));
+        let out = render_breadcrumb(&b);
+        assert_eq!(out, "[x] `shell` · cargo check — failed: timeout");
+    }
+
+    #[test]
+    fn breadcrumb_sanitizes_backticks_in_tool_and_detail() {
+        let b = Breadcrumb::running("sh`ell").with_detail("echo `id`");
+        let out = render_breadcrumb(&b);
+        assert!(!out.contains("sh`ell"));
+        assert!(out.contains("`sh'ell`"));
+        assert!(out.contains("echo 'id'"));
+    }
+
+    #[test]
+    fn breadcrumb_aggregate_renders_bold_summary_and_step_bullets() {
+        let steps = vec![
+            Breadcrumb::running("read_file")
+                .with_detail("a.rs")
+                .finished(true, Some("10 lines".into())),
+            Breadcrumb::running("shell").with_detail("cargo build"),
+        ];
+        let agg = Breadcrumb::running("activity")
+            .with_detail("shell cargo build")
+            .with_steps(steps);
+        let out = render_breadcrumb(&agg);
+        assert!(out.starts_with("**shell cargo build**"), "{out}");
+        assert!(
+            out.contains("\n- [ok] `read_file` · a.rs — 10 lines"),
+            "{out}"
+        );
+        assert!(out.contains("\n- [~] `shell` · cargo build"), "{out}");
     }
 
     #[test]

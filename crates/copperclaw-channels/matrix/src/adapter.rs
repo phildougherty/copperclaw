@@ -9,9 +9,10 @@ use crate::config::MatrixConfig;
 use crate::factory::CHANNEL_TYPE_STR;
 use crate::sync::{NEXT_BATCH_FILENAME, run_sync_loop};
 use async_trait::async_trait;
+use copperclaw_channels_core::markdown::{Flavor, render as render_markdown};
 use copperclaw_channels_core::{
-    AdapterError, Breadcrumb, BreadcrumbStatus, ChannelAdapter, DiffCard, DmHandle, ErrorCard,
-    ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList,
+    AdapterError, Breadcrumb, BreadcrumbStatus, Card, ChannelAdapter, DiffCard, DmHandle,
+    ErrorCard, ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList,
 };
 use copperclaw_types::{ChannelType, InboundEvent, OutboundMessage};
 use serde_json::Value;
@@ -241,12 +242,47 @@ impl ChannelAdapter for MatrixAdapter {
                 text.as_str()
             };
             self.api.send_html(&room_id, plain, &html).await?
-        } else if let Some(thread) = thread_id {
-            self.api.send_threaded(&room_id, thread, &text).await?
         } else {
-            self.api.send_text(&room_id, &text).await?
+            // U6: no agent-supplied HTML — render the canonical Markdown
+            // into Matrix's `org.matrix.custom.html` via the shared
+            // renderer ([`Flavor::Html`]) and carry it as `formatted_body`
+            // (with the raw text as the plaintext fallback `body`).
+            let rendered = render_markdown(&text, Flavor::Html);
+            if let Some(thread) = thread_id {
+                self.api
+                    .send_threaded_html(&room_id, thread, &text, &rendered)
+                    .await?
+            } else {
+                self.api.send_html(&room_id, &text, &rendered).await?
+            }
         };
         Ok(Some(sent.event_id))
+    }
+
+    /// Native portable-card renderer — Matrix has no interactive-button
+    /// primitive, so the card degrades to an `m.text` HTML event whose
+    /// `formatted_body` carries the title / body / fields, with buttons
+    /// rendered as labelled links (the "buttons-as-links fallback"):
+    /// `url` buttons become real `<a href>` anchors, `value` (callback)
+    /// buttons degrade to a labelled `callback:<value>` line — the same
+    /// shape as [`Card::to_text_fallback`] but HTML. Before this override
+    /// the M18 approval / ritual cards fell through to the trait-level
+    /// text fallback and rendered as flat prose. The plain-text `body`
+    /// field carries the canonical text fallback so non-HTML clients
+    /// still render sensibly. `m.text` (not `m.notice`) so approval cards
+    /// raise a notification — same reasoning as the error-card renderer.
+    async fn deliver_card(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        card: &Card,
+        _to: Option<&str>,
+    ) -> Result<Option<String>, AdapterError> {
+        let room_id = self.resolve_room(platform_id).await?;
+        let html = render_card_html_matrix(card);
+        let plain = card.to_text_fallback();
+        let resp = self.api.send_html(&room_id, &plain, &html).await?;
+        Ok(Some(resp.event_id))
     }
 
     /// Native breadcrumb chip — rendered as an `m.notice` HTML event
@@ -428,6 +464,36 @@ impl ChannelAdapter for MatrixAdapter {
         // Matrix has no separate DM concept at the protocol level; callers
         // must configure the room and pass it as `platform_id`.
         Ok(None)
+    }
+
+    /// In-place edit via an `m.replace` relation — the same path the
+    /// internal `deliver_action("edit", …)` arm uses, exposed on the trait
+    /// so the host's HUD / approval-card edit path
+    /// (`host-delivery`) actually reaches it. matrix is listed in
+    /// `EDIT_CAPABLE_CHANNELS`, so without this override the trait default
+    /// would return `Unsupported` and the HUD would silently never edit
+    /// (F1). `external_id` is the target event id.
+    async fn edit_message(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        external_id: &str,
+        new_text: &str,
+    ) -> Result<(), AdapterError> {
+        let ct = self.channel_type().as_str();
+        let room_id = self.resolve_room(platform_id).await?;
+        match self.api.edit_message(&room_id, external_id, new_text).await {
+            Ok(_) => {
+                copperclaw_metrics::inc_hud_edit(ct, "ok");
+                copperclaw_metrics::inc_adapter_edit_message(ct, "ok");
+                Ok(())
+            }
+            Err(e) => {
+                copperclaw_metrics::inc_hud_edit(ct, "error");
+                copperclaw_metrics::inc_adapter_edit_message(ct, "error");
+                Err(e)
+            }
+        }
     }
 }
 
@@ -804,6 +870,7 @@ pub(crate) fn render_todo_list_html_matrix(list: &TodoList) -> String {
         let glyph = match item.status {
             TodoItemStatus::Completed => "[x]",
             TodoItemStatus::InProgress => "[~]",
+            TodoItemStatus::Blocked => "[!]",
             TodoItemStatus::Pending => "[ ]",
         };
         out.push_str("<li>");
@@ -816,9 +883,116 @@ pub(crate) fn render_todo_list_html_matrix(list: &TodoList) -> String {
         } else {
             out.push_str(&escape_html_matrix(item.text.trim()));
         }
+        if let Some(reason) = item.blocked_reason_text() {
+            out.push_str(" <i>(blocked: ");
+            out.push_str(&escape_html_matrix(reason));
+            out.push_str(")</i>");
+        }
         out.push_str("</li>");
     }
     out.push_str("</ul>");
+    out
+}
+
+/// Render the canonical portable [`Card`] as Matrix HTML
+/// `formatted_body`. Matrix has no native button widget, so the layout
+/// mirrors [`Card::to_text_fallback`]'s section ordering (title, body,
+/// fields, buttons, image) but in HTML:
+///
+/// - `title` → `<b>…</b>`.
+/// - `body` → escaped text, `\n` → `<br>`.
+/// - `fields` → a `<ul>` of `<li><b>label</b>: value</li>`.
+/// - `buttons` → a `<b>Buttons:</b>` list; `url` buttons become real
+///   `<a href>` anchors (the "buttons-as-links" degrade), `value`
+///   (callback) buttons render `label — <code>callback:value</code>`
+///   since Matrix can't wire a tap back.
+/// - `image_url` → a labelled `[image]` link.
+///
+/// Every dynamic field is HTML-escaped individually; the quote-escaping
+/// in [`escape_html_matrix`] also prevents a button `url` from breaking
+/// out of the `href` attribute (the [`Card`] validator already restricts
+/// URLs to http/https upstream).
+pub(crate) fn render_card_html_matrix(card: &Card) -> String {
+    let mut out = String::with_capacity(160);
+    if let Some(t) = card
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        out.push_str("<b>");
+        out.push_str(&escape_html_matrix(t));
+        out.push_str("</b>");
+    }
+    if let Some(b) = card
+        .body
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+    {
+        if !out.is_empty() {
+            out.push_str("<br>");
+        }
+        out.push_str(&escape_html_matrix(b).replace('\n', "<br>"));
+    }
+    if !card.fields.is_empty() {
+        if !out.is_empty() {
+            out.push_str("<br>");
+        }
+        out.push_str("<ul>");
+        for f in &card.fields {
+            out.push_str("<li><b>");
+            out.push_str(&escape_html_matrix(f.label.trim()));
+            out.push_str("</b>: ");
+            out.push_str(&escape_html_matrix(&f.value));
+            out.push_str("</li>");
+        }
+        out.push_str("</ul>");
+    }
+    if !card.buttons.is_empty() {
+        if !out.is_empty() {
+            out.push_str("<br>");
+        }
+        out.push_str("<b>Buttons:</b><ul>");
+        for b in &card.buttons {
+            out.push_str("<li>");
+            match (b.value.as_deref(), b.url.as_deref()) {
+                (None, Some(u)) => {
+                    out.push_str("<a href=\"");
+                    out.push_str(&escape_html_matrix(u));
+                    out.push_str("\">");
+                    out.push_str(&escape_html_matrix(b.label.trim()));
+                    out.push_str("</a>");
+                }
+                (Some(v), None) => {
+                    out.push_str(&escape_html_matrix(b.label.trim()));
+                    out.push_str(" — <code>callback:");
+                    out.push_str(&escape_html_matrix(v));
+                    out.push_str("</code>");
+                }
+                // Malformed shapes the validator rejects upstream — render
+                // just the label rather than panic.
+                (Some(_), Some(_)) | (None, None) => {
+                    out.push_str(&escape_html_matrix(b.label.trim()));
+                }
+            }
+            out.push_str("</li>");
+        }
+        out.push_str("</ul>");
+    }
+    if let Some(img) = card
+        .image_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    {
+        if !out.is_empty() {
+            out.push_str("<br>");
+        }
+        out.push_str("<a href=\"");
+        out.push_str(&escape_html_matrix(img));
+        out.push_str("\">[image]</a>");
+    }
     out
 }
 
@@ -979,13 +1153,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_text_routes_to_send_text() {
+    async fn deliver_text_renders_markdown_to_formatted_html() {
+        // U6: the plain-text path now routes the agent's canonical
+        // Markdown through the shared renderer and carries the result as
+        // `formatted_body` (raw text remains the fallback `body`).
         let s = MockServer::start().await;
         mount_empty_sync(&s).await;
         Mock::given(method("PUT"))
             .and(path_regex(
                 r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
             ))
+            .and(wiremock::matchers::body_string_contains(
+                "\"formatted_body\"",
+            ))
+            .and(wiremock::matchers::body_string_contains("<b>bold</b>"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$x:m.org"
             })))
@@ -998,7 +1179,7 @@ mod tests {
                 None,
                 &OutboundMessage {
                     kind: MessageKind::Chat,
-                    content: json!({ "text": "hi" }),
+                    content: json!({ "text": "say **bold**" }),
                     files: vec![],
                 },
             )
@@ -1009,7 +1190,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn deliver_with_thread_id_routes_to_send_threaded() {
+    async fn deliver_with_thread_id_routes_to_threaded_html() {
+        // U6: threaded plain text also renders via the shared renderer,
+        // carrying both the `m.thread` relation and `formatted_body`.
         let s = MockServer::start().await;
         mount_empty_sync(&s).await;
         Mock::given(method("PUT"))
@@ -1017,6 +1200,9 @@ mod tests {
                 r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
             ))
             .and(wiremock::matchers::body_string_contains("\"m.thread\""))
+            .and(wiremock::matchers::body_string_contains(
+                "\"formatted_body\"",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "event_id": "$t:m.org"
             })))
@@ -1105,6 +1291,102 @@ mod tests {
         adapter.shutdown().await;
     }
 
+    // ── Native portable card (U4) rendering ───────────────────────
+
+    fn approval_card() -> Card {
+        Card {
+            title: Some("Approve deploy?".into()),
+            body: Some("Runner wants to push to prod.".into()),
+            fields: vec![copperclaw_channels_core::CardField {
+                label: "Service".into(),
+                value: "api".into(),
+                inline: false,
+            }],
+            buttons: vec![
+                copperclaw_channels_core::CardButton {
+                    label: "Approve".into(),
+                    value: Some("approve:1".into()),
+                    url: None,
+                    style: Some("primary".into()),
+                },
+                copperclaw_channels_core::CardButton {
+                    label: "Diff".into(),
+                    value: None,
+                    url: Some("https://example.com/diff".into()),
+                    style: None,
+                },
+            ],
+            image_url: None,
+        }
+    }
+
+    #[test]
+    fn render_card_html_matrix_maps_all_sections() {
+        let html = super::render_card_html_matrix(&approval_card());
+        assert!(html.contains("<b>Approve deploy?</b>"));
+        assert!(html.contains("Runner wants to push to prod."));
+        // Field row.
+        assert!(html.contains("<li><b>Service</b>: api</li>"));
+        // URL button → real anchor.
+        assert!(html.contains("<a href=\"https://example.com/diff\">Diff</a>"));
+        // Callback button → labelled callback code, no anchor.
+        assert!(html.contains("Approve — <code>callback:approve:1</code>"));
+    }
+
+    #[test]
+    fn render_card_html_matrix_escapes_and_breaks() {
+        let card = Card {
+            title: Some("<t>".into()),
+            body: Some("l1\n<b>x</b>".into()),
+            image_url: Some("https://ex.com/i.png".into()),
+            ..Card::default()
+        };
+        let html = super::render_card_html_matrix(&card);
+        assert!(html.contains("<b>&lt;t&gt;</b>"));
+        // `\n` → `<br>`, inner markup escaped.
+        assert!(html.contains("l1<br>&lt;b&gt;x&lt;/b&gt;"));
+        // Image degrades to a labelled link.
+        assert!(html.contains("<a href=\"https://ex.com/i.png\">[image]</a>"));
+    }
+
+    #[tokio::test]
+    async fn deliver_card_sends_html_and_text_fallback() {
+        let s = MockServer::start().await;
+        mount_empty_sync(&s).await;
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
+            .and(wiremock::matchers::body_string_contains("\"m.text\""))
+            .and(wiremock::matchers::body_string_contains(
+                "\"formatted_body\"",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "event_id": "$card:m.org"
+            })))
+            .mount(&s)
+            .await;
+        let (adapter, _dir, _rx) = build_adapter(&s.uri());
+        let id = adapter
+            .deliver_card("!a:m.org", None, &approval_card(), None)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("$card:m.org"));
+        // Plain-text `body` carries the canonical text fallback. Select
+        // the message-send PUT specifically — the mock also fields
+        // background `/sync` GETs, so `.last()` can race onto a sync poll.
+        let req = s.received_requests().await.unwrap();
+        let sent = req
+            .iter()
+            .rfind(|r| r.method == wiremock::http::Method::PUT)
+            .expect("a message-send PUT was recorded");
+        let body: serde_json::Value = serde_json::from_slice(&sent.body).unwrap();
+        let plain = body["body"].as_str().unwrap();
+        assert!(plain.contains("**Approve deploy?**"));
+        assert!(plain.contains("[Approve] -> callback:approve:1"));
+        adapter.shutdown().await;
+    }
+
     #[tokio::test]
     async fn deliver_edit_action_uses_m_replace() {
         let s = MockServer::start().await;
@@ -1137,6 +1419,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(id.as_deref(), Some("$e:m.org"));
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn trait_edit_message_uses_m_replace() {
+        // F1: the host HUD / approval edit path calls the *trait*
+        // `edit_message`, not the internal `action:"edit"` deliver arm. matrix
+        // is in EDIT_CAPABLE_CHANNELS, so this must route to the same
+        // `m.replace` edit and succeed against the mock rather than fall
+        // through to the trait default (`Unsupported`).
+        let s = MockServer::start().await;
+        mount_empty_sync(&s).await;
+        Mock::given(method("PUT"))
+            .and(path_regex(
+                r"^/_matrix/client/v3/rooms/.+/send/m\.room\.message/.+",
+            ))
+            .and(wiremock::matchers::body_string_contains("\"m.replace\""))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "event_id": "$edited:m.org"
+            })))
+            .mount(&s)
+            .await;
+        let (adapter, _dir, _rx) = build_adapter(&s.uri());
+        adapter
+            .edit_message("!a:m.org", None, "$tgt:m.org", "updated via trait")
+            .await
+            .expect("matrix trait edit_message succeeds against the mock");
+        // And the static capability mirror agrees the channel is edit-capable.
+        assert!(
+            copperclaw_channels_core::capabilities::supports_message_edit(
+                adapter.channel_type().as_str()
+            )
+        );
         adapter.shutdown().await;
     }
 
@@ -2039,11 +2354,13 @@ mod tests {
                     id: 1,
                     text: "Wash dishes".into(),
                     status: copperclaw_channels_core::TodoItemStatus::Completed,
+                    blocked_reason: None,
                 },
                 copperclaw_channels_core::TodoListItem {
                     id: 2,
                     text: "Dry dishes".into(),
                     status: copperclaw_channels_core::TodoItemStatus::Pending,
+                    blocked_reason: None,
                 },
             ],
             title: Some("Kitchen".into()),

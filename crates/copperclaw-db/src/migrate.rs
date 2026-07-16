@@ -109,6 +109,10 @@ const CENTRAL: &[Migration] = &[
         name: "027_container_config_image_profile",
         sql: include_str!("../migrations/027_container_config_image_profile.sql"),
     },
+    Migration {
+        name: "028_tasks_fire_lifecycle",
+        sql: include_str!("../migrations/028_tasks_fire_lifecycle.sql"),
+    },
 ];
 
 const SESSION_INBOUND: &[Migration] = &[
@@ -305,6 +309,60 @@ mod tests {
                 .unwrap();
             assert_eq!(exists, 1, "expected table `{table}` to exist");
         }
+    }
+
+    #[test]
+    fn migration_028_adds_fire_lifecycle_columns_and_backfills() {
+        // Migration 028 layers `last_fired_at` / `fire_count` onto the
+        // pre-existing first-class `tasks` table (migration 010) without
+        // disturbing existing rows: a row inserted with only the original
+        // columns must read back with the defaulted lifecycle values, so a
+        // recurring task carried across the migration continues to fire
+        // unchanged.
+        let mut conn = fresh();
+        run_migrations(&mut conn, MigrationSet::Central).unwrap();
+
+        // The new columns exist on `tasks`.
+        let cols: std::collections::HashSet<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(tasks)").unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            rows
+        };
+        assert!(cols.contains("last_fired_at"), "missing last_fired_at");
+        assert!(cols.contains("fire_count"), "missing fire_count");
+
+        // A row written the "old" way (no lifecycle columns) backfills to
+        // NULL / 0 via the column defaults.
+        conn.execute(
+            "INSERT INTO agent_groups (id, name, folder, created_at)
+             VALUES ('11111111-1111-1111-1111-111111111111', 'g', 'g', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks
+               (id, agent_group_id, session_id, prompt, when_spec, recurrence,
+                next_fire, status, created_at, updated_at)
+             VALUES ('legacy', '11111111-1111-1111-1111-111111111111',
+                     '22222222-2222-2222-2222-222222222222', 'p', '0 9 * * *',
+                     '0 9 * * *', '2026-01-01T09:00:00Z', 'active',
+                     '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        let (last_fired, fire_count): (Option<String>, i64) = conn
+            .query_row(
+                "SELECT last_fired_at, fire_count FROM tasks WHERE id = 'legacy'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(last_fired, None);
+        assert_eq!(fire_count, 0);
     }
 
     #[test]

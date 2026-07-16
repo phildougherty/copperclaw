@@ -1,0 +1,19 @@
+{
+  "name": "teams-hud-live-edit",
+  "channel": "teams",
+  "description": "M19 U2 acceptance (X-rider W2): teams overrode cards/diff/todo/thinking/error but NOT the trait edit_message, so it was absent from EDIT_CAPABLE_CHANNELS, got no live HUD, and every 'edit' became new-message spam. U2 added the trait edit_message override + put teams in EDIT_CAPABLE_CHANNELS. Now the Task HUD runs LIVE: it posts ONE breadcrumb chip at the first tool call and edits that ONE message in place on every later frame instead of posting N. The harness models teams' real edit-in-place via model_rich_breadcrumbs; replay.rs asserts exactly one breadcrumb post + >=1 edit, all targeting that single anchor. See README.md.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "model_rich_breadcrumbs": true,
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\"",
+    "\\| [0-9]+:[0-9]{2}": "| <MMSS>",
+    "done in [0-9]+:[0-9]{2}": "done in <MMSS>"
+  }
+}

@@ -6,6 +6,827 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M19 A3 — Public-tunnel model verb: activate V5)
+
+- The merged-but-dormant V5 public-tunnel module now has an agent-facing verb.
+  A new first-party `make_preview_public` tool lets the agent publish a **live**
+  session preview (one already exposed with `expose_preview`) to the public
+  internet through an operator-provided cloudflared tunnel — the "send it to my
+  cofounder" hand-off. It relays through the SAME reserved `__preview` MCP path
+  as `expose_preview` (`crates/copperclaw-runner/src/run/preview.rs`:
+  `MAKE_PREVIEW_PUBLIC`, `is_preview_tool`, `preview_tool_defs`), but the
+  delivery loop routes it to a new host-side broker
+  (`crates/copperclaw-host-delivery/src/service.rs`: `execute_preview_call`'s
+  `make_preview_public` arm → `copperclaw_modules::PublicTunnelBroker`) instead
+  of the preview broker.
+- The host implementation (`crates/copperclaw-host/src/preview.rs`:
+  `PublicPreviewTunnel`) bridges the preview subsystem (which owns the container-
+  port → live host-port + gating-token mapping, via the new
+  `PreviewManager::live_proxy_for`) and the merged V5 `TunnelBroker` (which owns
+  the approval gate + the cloudflared binary). On the first call it raises the
+  `CredentialedExternalAction` approval V5 already implements and returns a
+  "pending approval" note; after an operator taps Approve, the retry stands up
+  the tunnel and returns the shareable **tokened** public URL
+  (`https://<tunnel>/__preview/<token>` — the public tunnel fronts the
+  token-gated proxy, so a tokenless hit 403s: defence in depth). The agent puts
+  that URL on its "prototype ready" delivery card as an "Open the public link"
+  button.
+- **Secure-by-default, fail-closed.** Public tunnels are OFF unless the host env
+  master switch `COPPERCLAW_PUBLIC_TUNNEL_ENABLED` is set AND the group has
+  previews enabled; every public exposure still requires an explicit operator
+  approval (no auto-exposure). `make_preview_public` is a
+  `CredentialedExternalAction` in `crates/copperclaw-runner/src/policy.rs`
+  (`CODING_TOOLS` + `CREDENTIALED_EXTERNAL_TOOLS`) — taint-gated AND
+  autonomy-gated, and deliberately **NOT** in `LAN_PREVIEW_TOOLS` (the A7 LAN
+  taint exemption never reaches it: the outward-facing contrast to
+  `expose_preview`). An absent cloudflared binary yields a clean, copy-pasteable
+  install error, never a panic or hang.
+- **Auto-teardown with the preview.** `PreviewManager` now holds the tunnel
+  broker (`set_tunnel_broker`) and tears down any public tunnel fronting a
+  preview when the preview is closed, session-stopped, shut down, or
+  idle-tombstoned — no public tunnel outlives the app it fronted; re-sharing
+  later earns a fresh approval (V5's grant is one-shot). Wired at boot in
+  `crates/copperclaw-host/src/boot.rs`. The `preview` skill
+  (`skills/preview/SKILL.md`) teaches the verb, the approval ritual, and the
+  ritual-card public-URL button. Metric wish (M1 rider): public-tunnel
+  exposures/pending/denied counts.
+
+### Changed (M19 A7 — Preview-exposure provenance refinement)
+
+- Exposing a **LAN-only** session preview (`expose_preview` / `close_preview`)
+  is no longer blocked by the M16 coarse **taint** gate. M18's live post-mortem
+  found that a "research … then build" request web-tainted the turn, so the
+  provenance gate denied `expose_preview` as a credentialed external action —
+  the operator's preview didn't appear until a fresh untainted turn, a felt UX
+  papercut. A LAN preview stands up a listener reachable only on the operator's
+  own machine / LAN: a *local surface*, not the same risk class as
+  `web_search` / `web_fetch` / a public tunnel routing the agent's credentials
+  at an attacker-chosen target. New `LAN_PREVIEW_TOOLS` const + `is_lan_preview`
+  helper in `crates/copperclaw-runner/src/policy.rs` carve the two LAN verbs out
+  of the taint half of the provenance/autonomy gate; a web-tainted turn can now
+  `expose_preview` without a fresh approval. The verbs stay gated by every other
+  layer — the guest role floor (they are mutating), the coding/full profile
+  ceiling, the per-group preview opt-in (host-side), and the **autonomy** gate
+  (an autonomous/heartbeat turn still may not stand up a listener with no human
+  present). The durable boundary is documented in code: **LAN preview = local
+  surface** (taint-exempt); **public tunnel = external** (NOT exempt). An
+  outward-facing public/tunnel verb such as `make_preview_public` (M19 A3) is
+  deliberately absent from the carve-out and stays fully taint-gated even though
+  it rides the same preview subsystem — a robustness test asserts the public
+  verb is never taint-exempt so A3's verb inherits full gating the moment it
+  lands. Audit rows and approval flows are unchanged.
+
+### Added (M19 A2 — Interactive browser, Phase 5b, demand-pull + opt-in)
+
+- The headless browser gains interactive actions (click / type / scroll /
+  wait-for-selector) as an incremental extension of the existing read-only
+  live path — behind a STRICTER, SEPARATE opt-in flag,
+  `COPPERCLAW_BROWSER_INTERACTIVE`, distinct from `COPPERCLAW_BROWSER_ENABLED`.
+  Both must be truthy for the capability to exist; with the interactive flag
+  unset the new `browser_interact` tool is **not even registered** (see
+  `crates/copperclaw-mcp/src/tools/mod.rs::build_tool_set`), so the tool set,
+  schemas, and behaviour are byte-identical to the read-only baseline.
+  - New `crates/copperclaw-browser/src/interactive.rs`: `InteractiveAction`
+    (`click` / `type` / `scroll` / `wait_for_selector`, capped at 32 actions
+    per call, 8 KiB typed-text cap), the `InteractiveDriver` seam, and the
+    `interact` orchestration. `interact` re-runs the SSRF `NavigationGuard` on
+    **every** navigation an action can trigger — the settled
+    `document.location.href` (async, DNS-resolving `guard_target`, catching a
+    redirect-less JS navigation to an internal address) **and** every redirect
+    hop — before the post-interaction DOM is ever read or returned.
+  - `crates/copperclaw-browser/src/cdp.rs`: `InteractiveDriver` impl for
+    `CdpBrowserDriver` (`Page.enable`/`Network.enable`/`Page.navigate` +
+    `Runtime.evaluate`-driven click/type/scroll/wait, selector + typed text
+    JSON-encoded into the JS expression so a hostile selector cannot inject
+    code). `crates/copperclaw-browser/src/live.rs`: `interact_live` — spawns
+    the SAME locked-down child container (no broker token, deny-default egress
+    scoped to the target, unprivileged user, hardened sandbox), drives the
+    interaction, and tears the container down unconditionally.
+  - New `crates/copperclaw-mcp/src/tools/browser_interact.rs` MCP tool:
+    demand-pull only (one call, one page, one bounded action list — no
+    autonomous browsing loop), output tagged `Provenance::Untrusted` (the turn
+    is marked untrusted up front like `browser_render`), and the initial
+    target SSRF-pre-flighted before any spawn. Non-goals kept explicit in code
+    + docs: NO always-on interactive browsing, NO browser-writes-memory.
+  - No egress-policy weakening: the child container spec is reused verbatim
+    from `build_browser_container_spec`. Like the read-only `browser_render`,
+    the interactive verb is a `Full`-profile-only tool (it appears in no lower
+    profile tier), so restricted-profile and guest senders never receive it.
+  - Metrics reuse the existing browser counters (`inc_browser_ssrf_block` with
+    new `interactive_*` stage labels; `inc_browser_render{mode="interactive"}`;
+    the child spawn/teardown/CDP-connect counters via `interact_live`); a
+    dedicated `browser_interactive_actions_total{action,outcome}` counter is a
+    noted metric wish for a future `copperclaw-metrics` change.
+
+### Added (M19 X-rider Wave 2 — channel-parity replay fixtures)
+
+- Test-only. Five replay fixtures locking the host-delivery-pipeline half of
+  the Wave-2 adapter-floor cards, each registered in
+  `crates/copperclaw-host/tests/replay.rs`: `fixtures/signal/hud-breadcrumb`
+  (U1 — live HUD posts one breadcrumb chip + edits it in place on signal),
+  `fixtures/teams/hud-live-edit` (U2 — teams now edit-capable, one message
+  edited not N posted), `fixtures/gchat/approval-card` (U4 — a `send_card`
+  reaches `deliver_card` as a structured card, buttons intact, not flattened
+  prose), `fixtures/deltachat/card-and-todo` (U5 — native card + todo chip on
+  a formerly-bare interactive surface; re-execs under `COPPERCLAW_DATA_ROOT`
+  like the F4/X2 fixtures so the todo store is writable), and
+  `fixtures/slack/reaction-inbound` (U7 — a normalized `reaction_added`
+  bypasses the mention gate as a non-trigger `content.reaction` row, proving
+  the router reaction leg is channel-agnostic, complementing the telegram
+  twin). Adds a `model_rich_cards` manifest flag + `CappedAdapter` modelling
+  (mirroring `model_rich_breadcrumbs`) so the harness can prove a card is
+  delivered structurally rather than degraded host-side. Per-adapter *wire*
+  rendering stays the adapters' own unit-test concern.
+
+### Added (M19 X-rider Wave 3 — capability fixtures)
+
+- Test-only. Fixtures/tests locking the Wave-3 capability cards (A1/A3/A7).
+  **A3** (public-verb ritual card): a new replay fixture
+  `fixtures/cli/prototype-public-share` (registered in
+  `crates/copperclaw-host/tests/replay.rs` as
+  `cli_prototype_public_share_ritual_card_has_public_button`) drives
+  `expose_preview` → `make_preview_public` → `send_card` end-to-end and pins the
+  prototype-ready ritual card gaining an "Open the public link" button pointing
+  at the public tunnel URL. Adds a `"tunnel"` harness gate + `FixtureTunnelBroker`
+  (mirroring the `"preview"` gate + `FixturePreviewBroker`) so `make_preview_public`
+  routes to a canned post-approval public-URL reply. **A1** (fan-out aggregate):
+  `delegate_batch_partial_worker_failure_surfaces_in_aggregate` in
+  `crates/copperclaw-runner/src/run/tool_dispatch.rs` drives a mixed batch (2
+  workers report, 1 fails to spawn) through the real `invoke_tool` dispatch and
+  asserts ONE aggregate carrying both reports + the failed worker's per-worker
+  error, not a lost turn or total refusal. **A7** (preview-taint reclassification):
+  `tainted_turn_exposes_lan_preview_but_is_blocked_from_public` drives a
+  web-tainted turn through dispatch, proving `expose_preview` (LAN) succeeds
+  without a fresh approval while `make_preview_public` stays taint-gated and never
+  queues a relay row. A1/A3/A7 approval + tunnel-broker internals remain covered
+  by their own host-handler / policy unit tests; these are the pipeline-level
+  and dispatch-level X-rider complements.
+
+### Added (M19 A6 — Durable scheduled-task fire lifecycle, migration 028)
+
+- Scheduled tasks now carry a durable, queryable record of their firing
+  history. The first-class `tasks` table (migration `010_tasks`) already
+  backs all six scheduling tools (`schedule_task` / `list_tasks` /
+  `cancel_task` / `pause_task` / `resume_task` / `update_task`) via the
+  `SchedulingModule` → `SqliteTaskStore` write path and the sweep's due-task
+  fan-out (`copperclaw-host-sweep::checks::scheduling`), but it recorded no
+  trace of a *fire* — the sweep bumped `next_fire` (recurring) or flipped
+  `status` to `completed` (one-shot) and moved on. Migration
+  `028_tasks_fire_lifecycle` adds two columns the sweep now writes on every
+  fire:
+  - `last_fired_at` — RFC-3339 instant of the most recent fire (`NULL` until
+    first fire).
+  - `fire_count` — monotonically increasing fire count (`0` until first
+    fire); a recurring task accrues one per occurrence.
+  Wired in `crates/copperclaw-db/src/tables/tasks.rs` (new `mark_fired`
+  helper; `Task` gains the two fields) and
+  `crates/copperclaw-host-sweep/src/checks/scheduling.rs` (calls `mark_fired`
+  on each fire). Existing rows backfill to `NULL` / `0` via the column
+  defaults and continue to fire unchanged (proved by a migration test in
+  `crates/copperclaw-db/src/migrate.rs` and sweep tests). This gives
+  operators, the metrics rider (M1's "scheduled-task lifecycle" wish), and a
+  future event-driven-trigger follow-up a durable view of autonomous activity
+  without scanning the message log. Event-driven triggers themselves remain a
+  follow-up (the seam is the `tasks` table itself — a future trigger source
+  writes rows and the same sweep fan-out fires them).
+
+### Added (M19 A5 — Agent-facing memory write, `memory_save`)
+
+- The M16 Phase-3 group memory store (per-group `memory.db`, FTS5 + cosine,
+  provenance-tagged) was in-container READ-ONLY (`memory_search` / `memory_get`);
+  the agent could recall but not deliberately remember. New `memory_save` tool
+  closes the loop, letting the agent persist a fact into the group store on
+  purpose so it survives across sessions.
+  - Pure handler + schema + registration in
+    `crates/copperclaw-mcp/src/tools/memory.rs` (new `memory_save` module) and
+    one line in `crates/copperclaw-mcp/src/tools/mod.rs`. New `MemorySaveSpec`
+    (`key`, `body`, optional `source` — deliberately NO caller-supplied
+    provenance), `MemorySaveOutcome`, and the shared `resolve_save_provenance`
+    taint→provenance rule in `crates/copperclaw-mcp/src/context.rs`, plus a new
+    `ToolContext::memory_save` trait method (default returns a Context error, so
+    mock / subagent contexts are unchanged).
+  - The write reaches the same per-group `MemoryStore` the runner already reads:
+    `RunnerToolCtx::memory_save` in `crates/copperclaw-runner/src/tools.rs`
+    upserts via `MemoryStore::upsert` (text-only embedding, exactly as
+    `memory_search` reads text-only today — vector generation stays deferred
+    until the embedding broker lands).
+  - SECURITY (provenance stays honest): the agent cannot request a provenance.
+    The runner's impl decides it from its OWN per-turn taint flag
+    (`is_context_tainted`, the same signal the coarse provenance gate reads): a
+    turn tainted by untrusted-provenance content (a `web_fetch` body, an
+    untrusted memory hit) is honestly DOWNGRADED to `untrusted` — nothing lets an
+    untrusted turn launder external content into trusted memory. The taint
+    decision is the store-side impl's, not the caller's, so a future handler bug
+    cannot bypass it. `memory_save` is also classified mutating in
+    `crates/copperclaw-runner/src/policy.rs` (new `MEMORY_WRITE_TOOLS`), so a
+    read-only guest sender is denied it (a guest must not write a trusted fact).
+  - Caps: `body` ≤ 8 KiB (rejected in the pure handler, the load-bearing guard
+    against dumping a document / injection payload into the store), `key` ≤ 256
+    chars, `source` ≤ 256 chars, and a per-session rate cap of 100 writes
+    enforced by the runner ctx (`MAX_SAVES_PER_SESSION`).
+  - Tests: mcp unit tests (`tools/memory.rs`) exercise write→retrieve with
+    `trusted` provenance, tainted-turn downgrade to `untrusted`, the oversized-body
+    cap, empty key/body rejection, and the per-session rate cap against a stateful
+    reference context; runner tests cover the real store round-trip + downgrade
+    (`run/tool_dispatch.rs`) and the guest mutating floor (`policy.rs`).
+
+### Changed (M19 U6 — Adopt the shared `core/markdown` renderer in adapters, 2026-07-16)
+
+- `copperclaw_channels_core::markdown::render(md, Flavor)` existed and was
+  tested but **no adapter consumed it** — every adapter either hand-rolled its
+  own markdown→flavor formatter or passed the agent's canonical Markdown to the
+  wire raw, leaving `Flavor::{Discord,Slack,Mattermost,WhatsApp}` as dead
+  capability and a standing drift risk. U6 routes each adapter's plain-text
+  outbound path through the shared renderer (the U1–U5 rich-surface renderers /
+  field escapers are unchanged):
+  - **telegram** (`crates/copperclaw-channels/telegram/src/adapter.rs`): the
+    bespoke `markdown_to_html` renderer (plus its `find_fence_close`,
+    `replace_paired`, `replace_italic_paired`, `replace_inline_links` helpers)
+    is deleted; the HTML send path now calls `render(_, Flavor::Html)`. Behaviour
+    is byte-identical for bold/italic/strike/code/links/fences; the shared
+    renderer additionally formats headings (`# x` → `<b>x</b>`), blockquotes, and
+    normalises `-`/`*`/`+` bullets to the `•` glyph (previously left literal) —
+    the affected unit test was updated to pin the new bullet output.
+    `escape_markdown_v2` (`api.rs`) is kept: it escapes the MarkdownV2 photo
+    caption, a dialect the renderer has no `Flavor` for.
+  - **discord** (`adapter.rs` `render_outbound_text`): now
+    `render(_, Flavor::Discord)` — CommonMark passes through with `*`/`+` bullets
+    normalised to `-`. `escape_discord_markdown` (rich tool-summary escaper) kept.
+  - **slack** (`adapter.rs` `deliver`): the plain-text send now calls
+    `render(_, Flavor::Slack)` (`**bold**` → `*bold*`, headings degrade to bold,
+    links → `<url|text>`); skipped when the agent supplied explicit Block Kit
+    `blocks` (a rich surface). `escape_mrkdwn` (rich field escaper) kept.
+  - **mattermost** (`adapter.rs` `deliver` "post" action):
+    `render(_, Flavor::Mattermost)`. The `render.rs` rich-card renderers unchanged.
+  - **whatsapp-cloud** (`adapter.rs` `deliver`): `render(_, Flavor::WhatsApp)`
+    (`*bold*`/`_italic_`/`~strike~`/monospace), replacing the raw passthrough.
+    The `render.rs` rich-card renderers unchanged.
+  - **matrix** (`adapter.rs` `deliver` + new `api.rs` `send_threaded_html`): the
+    plain-text path with no agent-supplied HTML now renders
+    `render(_, Flavor::Html)` and carries it as `formatted_body` (raw text as the
+    fallback `body`), for both top-level and threaded sends. The rich-surface
+    `escape_html_matrix` helpers are unchanged.
+- **gchat** is intentionally left on raw passthrough: Google Chat text formatting
+  (`*bold*`/`_italic_`/`~strike~`, no headings, no `[text](url)` links) matches no
+  existing `Flavor` exactly, and adding a `Gchat` flavor is out of U6 scope (the
+  card is "consume the renderer, don't rewrite it"). Its `escape_html_gchat`
+  helper is rich-surface (Cards v2 HTML) and unaffected. Follow-up: add a `Gchat`
+  flavor to `core/markdown` so it can adopt the shared path too.
+
+### Added (M19 A1 — Single-call parallel fan-out with a join, 2026-07-16)
+
+- New `delegate_batch` MCP tool: spawn N `delegate` build workers IN PARALLEL
+  and BLOCK the parent turn until they all report (or a budget elapses),
+  returning the aggregated per-worker results as ONE tool response. Closes the
+  biggest structural capability gap M18 left — fan-out today is N separate
+  `delegate` calls whose results arrive asynchronously on later turns, with no
+  single-call "spawn N workers and await their joined results" primitive. A
+  parent that wants to build three components in parallel and assemble them can
+  now block on all three in one turn.
+  - Tool half (lane T): `delegate_batch` schema + validation + aggregation
+    in `crates/copperclaw-mcp/src/tools/agents.rs`, registered in
+    `build_tool_set`. Input is a `workers: [{name, instructions}]` list plus an
+    optional `timeout_secs`. Fan-out is **capped at 6 workers per call**
+    (`MAX_DELEGATE_BATCH_WIDTH`); the join budget defaults to 300s and is capped
+    at 600s (`DEFAULT_/MAX_DELEGATE_BATCH_TIMEOUT_SECS`), both comfortably under
+    the runner's per-tool deadline so the join returns a partial aggregate rather
+    than being hard-aborted. The request/outcome types + a new
+    `ToolContext::run_delegate_batch` trait method (default: unsupported) live in
+    `crates/copperclaw-mcp/src/context.rs`; `MockToolContext` implements it for
+    handler tests.
+  - Runner join seam (lane R): `RunnerToolCtx::run_delegate_batch`
+    (`crates/copperclaw-runner/src/tools.rs`) reuses the EXACT single-`delegate`
+    spawn machinery — it emits N `OutboundToolEffect::Delegate` rows (same
+    depth/permission caps, same containment: each worker lands with a NULL
+    messaging group and reports ONLY back to the parent, never into the user's
+    chat) — then hands off to `crate::run::delegate_batch::join_workers`
+    (`crates/copperclaw-runner/src/run/delegate_batch.rs`), which BLOCK-POLLS the
+    parent's own `inbound.db` for each worker's `delegate_result` spawn row and
+    its final report (a `Chat` row keyed by the worker's child
+    `source_session_id`), marking every consumed row `completed` so it never
+    re-triggers a spurious parent turn. This mirrors the external-MCP block-poll
+    pattern (`run::external_mcp`) — the parent turn yields to the tokio runtime
+    (HUD ticker + heartbeat stay alive) and resumes on the joined result. Wired
+    via a new `RunnerToolCtx::with_join(inbound)` in
+    `crates/copperclaw-runner/src/main.rs`.
+  - Isolation + failure handling: each worker still gets its OWN container +
+    writable `sib/<id>` git worktree (no cross-write), exactly as a lone
+    `delegate`. A worker that fails to spawn (depth cap / permission gate) or
+    never reports in time surfaces as a per-worker `error` in the aggregate — it
+    never loses the whole batch turn. A batch where EVERY worker was refused
+    (e.g. a `delegate_batch` from a max-depth child) surfaces as a single tool
+    error ("delegate_batch refused: …"), not a partial aggregate. Coverage:
+    handler + join unit tests, plus an end-to-end `invoke_tool` fan-out/join
+    integration test with a fake host (3 workers → one aggregated result;
+    per-worker failure aggregation; depth-cap refusal) in
+    `crates/copperclaw-runner/src/run/tool_dispatch.rs`.
+
+### Added (M19 A4 — Agent-authored persistent skills, `save_skill`)
+
+- Closed the `write_file` → discovery loop: an agent can now durably save a
+  reusable skill for its FUTURE sessions via a guarded, approval-gated
+  `save_skill` capability. Skills remain host-discovered and symlink-
+  materialized at spawn, so a saved skill lands where discovery already scans
+  and is picked up on the next session — no new discovery machinery.
+  - New capability core in `copperclaw-skills`
+    (`crates/copperclaw-skills/src/save.rs`): `validate_skill_content` (pure —
+    reuses the discovery-time rules: frontmatter parse + `name`/`description`
+    required, kebab-case name, frontmatter `name == dir`) and `save_group_skill`
+    (validate + write `<group_skills_dir>/<name>/SKILL.md`). Containment reuses
+    the same allowed-roots guard `materialize` applies (lib.rs:26-29): the
+    canonical destination must lie under the configured root or the write is
+    refused with `SkillError::EscapedRoot`.
+  - New thin MCP tool `save_skill`
+    (`crates/copperclaw-mcp/src/tools/save_skill.rs`, registered in
+    `tools/mod.rs`; new `OutboundToolEffect::SaveSkill` +
+    `SaveSkillSpec` in `context.rs`). It validates the proposed `SKILL.md`
+    synchronously — an invalid one is refused HERE with the precise validation
+    error, before any approval is raised — then emits the effect. Added to the
+    runner's `SELF_MOD_TOOLS` (`copperclaw-runner/src/policy.rs`) so it is
+    `full`-profile-only and barred from guests; it is deliberately NOT a
+    credentialed-external tool (no egress).
+  - Runner records the effect as a `save_skill` `MessageKind::System` row
+    (`copperclaw-runner/src/tools.rs::apply_save_skill`).
+  - Host delivery (`copperclaw-host-delivery/src/service.rs`) intercepts the
+    row inline: it raises a `pending_approvals` row (action `save_skill`,
+    idempotent on `(agent_group, name)`) carrying the validated body plus the
+    host-computed `dest_dir` (`<groups_dir>/<ag>/skills`) and containment
+    `allowed_root`, and dispatches an approve/deny card to the originating
+    channel. Nothing is written to disk until approval. A new
+    `set_groups_dir` (wired in `copperclaw-host/src/boot.rs`) supplies the
+    per-group data root; with none configured the request is refused with a
+    `self_mod_error` inbound rather than silently dropped.
+  - On approval, the host's approvals handler
+    (`copperclaw-host/src/handlers/approvals.rs::apply_save_skill`) re-validates
+    and writes the `SKILL.md` (defense-in-depth at the security boundary); the
+    next container spawn's skill scan discovers and exposes it — no rebuild.
+  - New `skills/save-skill/SKILL.md` teaches the capability;
+    `save_skill` added to the curated `REGISTRY_TOOLS` coverage mirror.
+  - This is a capability, not a registry: skills are per-group only — no
+    cross-group sharing, no ClawHub (a standing non-goal).
+  - Metric wish (deferred to the M1 metrics rider — this card must not touch
+    `copperclaw-metrics`): `copperclaw_skills_saved_total{outcome}`
+    (saved / rejected). The save/refuse paths currently reuse the existing
+    `inc_self_mod_succeeded` / `inc_self_mod_failed("save_skill")` counters.
+
+### Added (M19 U4 — Native cards on gchat + matrix, 2026-07-16)
+
+- Neither `gchat` nor `matrix` overrode the trait
+  `ChannelAdapter::deliver_card`, so the M18 approval / ritual cards fell through
+  to the trait-level `Card::to_text_fallback` and rendered as flat prose on both.
+  Both now render the canonical [`Card`] natively:
+  - `GchatAdapter` overrides trait `deliver_card`
+    (`crates/copperclaw-channels/gchat/src/adapter.rs`), building a Google Chat
+    Cards v2 card via the new `build_portable_card` helper and POSTing it through
+    the existing `send_card` path (`cardId = "card"`). `title` → card
+    `header.title`; `body` → a `textParagraph` widget (HTML-escaped, `\n` →
+    `<br>`); `fields` → one `decoratedText` widget each; `image_url` → an `image`
+    widget; `buttons` → a native `buttonList` — URL buttons open the link
+    (`onClick.openLink`), callback buttons fire a `CARD_CLICKED` whose
+    `onClick.action.function` carries the value (surfaced inbound by the events
+    router), with `primary` / `danger` styles mapped to a button `color`. The
+    `CardField.inline` hint has no Cards-v2 analog, so fields stay full-width —
+    the one field that degrades to its text-fallback shape.
+  - `MatrixAdapter` overrides trait `deliver_card`
+    (`crates/copperclaw-channels/matrix/src/adapter.rs`), rendering the card as an
+    `m.text` HTML event whose `formatted_body` is built by the new
+    `render_card_html_matrix` helper. Matrix has no native button primitive, so
+    buttons degrade to labelled links (the buttons-as-links fallback): `url`
+    buttons become real `<a href>` anchors, `value` buttons render
+    `label — <code>callback:value</code>` — the same shape as
+    `Card::to_text_fallback` but HTML. `m.text` (not `m.notice`) so approval
+    cards raise a notification, matching the error-card renderer; the plain-text
+    `body` field carries the canonical text fallback for non-HTML clients. Builds
+    on the F1 `edit_message` override already present on matrix (unchanged).
+  - Unit + mock-server tests on both adapters cover the field/button mapping,
+    HTML escaping, URL-vs-callback button rendering, and the text fallback.
+
+### Added (M19 U5 — bare-adapter rich floor for deltachat + line, LINE postback inbound, 2026-07-16)
+
+- Two genuinely interactive chat surfaces — `deltachat` (full chat, inbound
+  files) and `line` (Messaging API) — had **zero** rich-surface support: the
+  M18 HUD / diff / todo / approval cards all fell through to the trait's plain
+  text-fallback. Both now render the U5-mandated floor natively (metered with
+  `inc_adapter_rich_render`):
+  - `deltachat` gains `crates/copperclaw-channels/deltachat/src/render.rs` and
+    trait overrides for `deliver_card`, `deliver_diff`, and `deliver_todo_list`
+    (`.../deltachat/src/adapter.rs`). Delta Chat is an e-mail transport with no
+    reliable Markdown and no edit API, so the renderers emit clean, markdown-free
+    plaintext (mirroring the Signal floor) and each surface posts a fresh chip.
+  - `line` gains `crates/copperclaw-channels/line/src/render.rs` and the same
+    three trait overrides (`.../line/src/adapter.rs`). A `Card` **with buttons**
+    becomes a LINE `buttons` **template** message so the buttons are actually
+    tappable — a callback button maps to a `postback` action carrying its `value`
+    as `data`, a URL button to a `uri` action, a label-only button to a `message`
+    action; the full card text rides `altText`. LINE's caps are enforced (<= 4
+    actions, label <= 20, title <= 40, text <= 160/60). Diff and todo render as
+    fence-free plaintext. The api (`.../line/src/api.rs`) gains
+    `reply_message` / `push_message` (arbitrary message objects) + a
+    `text_message` helper; the adapter now depends on `copperclaw-metrics`.
+  - Both `deliver_todo_list` implementations render the F4
+    `TodoItemStatus::Blocked` state with the `[!]` glyph plus the item's
+    `blocked_reason` inline (`— blocked: <reason>`), so an auto-blocked step reads
+    as blocked, not stuck "in progress".
+- **LINE postback inbound is now wired** (`crates/copperclaw-channels/line/src/router.rs`,
+  previously stubbed — a `type: "postback"` event was dropped with a `// For now
+  ack` at line ~146). A postback event is now normalized into a `Chat`
+  `InboundEvent` carrying `content.callback = { id, data }` (where `data` is the
+  action's `postback.data`), mirroring the Telegram/Slack callback convention so
+  it whitelists past the router's mention gate and reaches the approval
+  interceptor — in-chat Approve/Deny taps route for the first time. The reply
+  token is cached so the resolution reply uses the cheap reply path. The message
+  and postback paths share an `emit_inbound` helper.
+- **Outbound-only adapters left bare, deliberately** (so it isn't rediscovered):
+  `resend`, `github`, `linear`, `x`, `webhooks`, `wechat`, `emacs`, and
+  `imessage` are not interactive chat surfaces and were **not** touched — their
+  surface doesn't warrant a rich floor (matches the M19 plan's deferred list).
+- **Fixture note.** The replay harness injects pre-normalized `InboundEvent`
+  JSON, bypassing adapter webhook parsing — so it cannot drive a raw LINE
+  postback through the code that changed. Per the U5 card's documented
+  alternative, the postback parse is covered by adapter-level router unit tests
+  that POST a signed LINE postback webhook body through the real axum handler and
+  assert the normalized callback event (`.../line/src/router.rs` tests). No
+  `tests/replay.rs` registration was added.
+
+### Added (M19 U7 — inbound reactions as agent-visible input, 2026-07-16)
+
+- No adapter parsed inbound reaction events, so a user reacting 👍/✅/👀/❌/👎
+  produced zero agent-visible signal — the most natural lightweight steering
+  input was inert. M19 U7 wires reactions end-to-end (inbound → router →
+  runner) as a lightweight steering signal, never a full turn:
+  - New inbound-reaction contract
+    (`crates/copperclaw-channels/core/src/reaction.rs`): a reaction is a
+    `MessageKind::Chat` event whose `content.reaction { emoji, target_seq, actor }`
+    carries the platform reaction token, the reacted-to message's platform id
+    (`target_seq`), and who reacted. `reaction_content` builds it, `parse_reaction`
+    reads it, and `classify_reaction` maps both unicode emoji (Telegram, Discord,
+    WhatsApp) and Slack shortcodes onto the curated `ReactionSignal`
+    (✅/👍 affirmative, 👀 looking, ❌/👎 negative); everything else carries no
+    signal.
+  - Four adapters parse their native reaction events into the contract:
+    `telegram` `message_reaction` (`ingress/mod.rs` + new `MessageReactionUpdated`
+    /`ReactionType` types; only genuinely-added emoji reactions emit — needs
+    `"message_reaction"` in `allowed_updates`), `slack` `reaction_added`
+    (`events/router.rs::convert_reaction` + `ReactionEvent`/`ReactionItem`),
+    `discord` `MESSAGE_REACTION_ADD` (`events.rs::message_reaction_add_to_inbound`;
+    unicode-emoji only, and `DEFAULT_INTENTS` gains `DIRECT_MESSAGE_REACTIONS`
+    (1<<13) for DM reactions), and `whatsapp-cloud` `type:"reaction"` messages
+    (`events/router.rs`; empty emoji = removed reaction = no event).
+  - The router whitelists reactions past the mention gate exactly like button
+    callbacks (`mention.rs::is_interaction_payload` now checks `content.reaction`)
+    and persists them as **non-trigger** rows (`route.rs`), so a reaction never
+    spawns a container on its own — it can never drive a spurious full turn.
+  - The runner (`crates/copperclaw-runner/src/run/reaction.rs` +
+    `run/drive_turn.rs`) treats a curated reaction on the agent's OWN last
+    message — resolved by matching `target_seq` against the per-session
+    `delivered` table's `platform_message_id` — as a one-line interjection
+    folded in via the M18 R2 mid-turn steering seam (`check_mid_turn_steering`),
+    within one tool-batch boundary. A reaction on an unrelated message, or an
+    uncurated emoji, is consumed and ignored. A folded reaction marks the turn
+    untrusted (`ToolContext::mark_untrusted_context`) — external content cannot
+    launder trust into a credentialed external action. `run_loop` also consumes
+    any reaction row picked up between turns so it never reaches the model as
+    raw JSON.
+  - Fixture `fixtures/telegram/reaction-steer` (registered in
+    `crates/copperclaw-host/tests/replay.rs`) proves the inbound → router leg (a
+    reaction bypasses a mention-gated group and lands as a pending non-trigger
+    `content.reaction` row with no turn); the runner-side steering + ignore legs
+    are covered by `mid_turn_reaction_on_own_message_folds_affirmative` /
+    `mid_turn_reaction_on_unrelated_message_is_ignored` in `drive_turn.rs`.
+  - Metric wish (for the M1 rider): inbound reactions by emoji/outcome
+    (curated-affirmative/looking/negative vs. ignored-unrelated/uncurated). The
+    mid-turn fold currently reuses `inc_midturn_control(_, "reaction")`.
+
+### Added (M19 U2 — Teams in-place edit + reactions, 2026-07-16)
+
+- The `teams` adapter rendered every rich surface (cards / diffs / collapsible /
+  todo / thinking / errors) but never overrode the trait
+  `ChannelAdapter::edit_message`, so it was absent from `EDIT_CAPABLE_CHANNELS`.
+  The host HUD / approval path calls the **trait** method
+  (`copperclaw-host-delivery/src/dispatch.rs`); with no override it fell through
+  to the trait default (`AdapterError::Unsupported`) and every HUD "edit"
+  degraded into a fresh message — new-message spam. Now:
+  - `TeamsAdapter` overrides trait `edit_message`
+    (`crates/copperclaw-channels/teams/src/adapter.rs`), resolving the
+    `platform_id` to a channel post or chat message and PATCHing it in place via
+    Microsoft Graph (`edit_channel_message` / `edit_chat_message`,
+    `PATCH .../messages/{id}`). It emits the same
+    `inc_hud_edit` / `inc_adapter_edit_message` metrics as the other
+    edit-capable adapters (mirrors mattermost). N status updates now become N
+    in-place PATCHes against one message id, not N POSTs.
+  - `teams` is added to `EDIT_CAPABLE_CHANNELS`
+    (`crates/copperclaw-channels/core/src/capabilities.rs`) in the same change,
+    per the module's keep-in-sync rule, so the delivery loop routes HUD edits to
+    the Teams edit path. The F1 drift guard
+    (`copperclaw-host-delivery/tests/edit_capable_edit_message_drift.rs`) still
+    passes with Teams listed.
+  - `TeamsAdapter` overrides trait `add_reaction` (Graph `setReaction`, shortcode
+    mapped by `emoji::shortcode_to_reaction_type`; unmapped shortcodes surface as
+    `Unsupported`) so host-driven reactions reach Teams, and adds
+    `plain_text_fallback` (strips the rich `html` content field, marks the body
+    `[reduced formatting]`) so a body that trips a Graph formatting rejection can
+    be redelivered as plain text.
+
+### Added (M19 X-rider Wave 1 — feedback replay fixtures, 2026-07-16)
+
+- Locked the new Wave-1 feedback surfaces in the replay harness
+  (`crates/copperclaw-host/tests/replay.rs` + `fixtures/`):
+  - **F1 matrix live HUD edit** — `fixtures/matrix/hud-live-edit`: on matrix
+    (now genuinely edit-capable) the Task HUD posts one breadcrumb chip and
+    edits it in place, never re-posting. A new manifest flag
+    `model_rich_breadcrumbs` makes the harness's `CappedAdapter` model matrix's
+    real edit-in-place `deliver_breadcrumb`; the test asserts exactly one
+    breadcrumb post and ≥1 edit, all addressed to that single anchor.
+  - **F4 blocked-todo rendering** — `fixtures/telegram/blocked-todo`: a todo
+    that genuinely auto-blocks (dirty project at the fix-cycle cap) renders on
+    the delivered checklist with the `[!]` glyph + reason and a `1 blocked`
+    footer, never the in-progress glyph. Driven under `COPPERCLAW_DATA_ROOT`
+    via a subprocess re-exec (the X2 verify-gate pattern).
+  - **F5 thinking-frame emission** — two `#[tokio::test(start_paused = true)]`
+    tests drive the real `run_loop` under a paused clock: a pure-reasoning
+    turn on an edit-capable channel posts one "thinking…" HUD frame after the
+    threshold and finalizes it, and a sub-threshold turn stays byte-stable
+    (posts nothing). Verified as a targeted paused-clock test rather than a
+    replay fixture because the frame is wall-clock-driven pre-first-tool and
+    the replay harness has no timing seam; needs tokio's `test-util` dev-dep
+    (mirrors the runner crate's F5 tests).
+
+### Added (M19 F4 — `blocked` todo state visible to users, 2026-07-16)
+
+- The runner has a real `TodoStatus::Blocked` (+ `blocked_reason`) for a step
+  that auto-blocked after burning its verify fix-cycles, but the portable wire
+  enum `copperclaw_channels_core::TodoItemStatus` had no `Blocked` variant, so
+  `status_to_wire` (`crates/copperclaw-mcp/src/tools/todo.rs`) mapped
+  `Blocked -> InProgress` — a user watching the pinned checklist saw the step
+  stuck "in progress" forever. Now:
+  - `TodoItemStatus` gains a `Blocked` variant (`crates/copperclaw-channels/core/src/todo_list.rs`)
+    with a distinct `[!]` glyph, `"blocked"` serde tag, and a new
+    `TodoListItem.blocked_reason: Option<String>` (serde-default so older rows
+    decode). `TodoListItem::blocked_reason_text()` centralizes the "show the
+    reason only when actually blocked" gate; `TodoList::blocked_count()` feeds
+    the text-fallback footer (inserted only when non-zero, so blocked-free
+    lists stay byte-stable). `status_to_wire` now maps `Blocked -> Blocked` and
+    carries the reason onto the wire item.
+  - Every adapter that exhaustively renders todo status now shows the blocked
+    chip + one-line reason: `matrix`, `slack`, `telegram`, `discord`, `gchat`,
+    `teams`, `webex` (Adaptive-Card `Attention` colour), `mattermost`,
+    `whatsapp-cloud`, plus the shared text fallback. The host-delivery
+    child-rollup `aggregate_status` (`crates/copperclaw-host-delivery/src/service.rs`)
+    surfaces `Blocked` as the header status when any child item is stuck.
+
+### Fixed (M19 F1 — edit-capability drift on matrix/webex, 2026-07-16)
+
+- `matrix` and `webex` were listed in `EDIT_CAPABLE_CHANNELS`
+  (`crates/copperclaw-channels/core/src/capabilities.rs`), so
+  `supports_message_edit()` promised the M18 Task HUD they could edit in
+  place — but neither adapter overrode the trait `ChannelAdapter::edit_message`.
+  They edited only through their internal deliver-action `"edit"` arm, while
+  the host HUD / approval path calls the **trait** method
+  (`copperclaw-host-delivery/src/dispatch.rs`), which fell through to the
+  trait default → `AdapterError::Unsupported`. The HUD therefore silently
+  never edited on those two channels. Fix:
+  - `crates/copperclaw-channels/matrix/src/adapter.rs` and
+    `crates/copperclaw-channels/webex/src/adapter.rs` now override the trait
+    `edit_message`, routing to their existing `api.edit_message` path
+    (matrix `m.replace`, webex `PUT /messages/{id}`). Webex requires a
+    `roomId`, so a person handle is returned as `Unsupported` (the HUD only
+    edits room messages). Both record the same `inc_hud_edit` /
+    `inc_adapter_edit_message` outcome metrics the other rich adapters do.
+  - Drift guard: new
+    `crates/copperclaw-host-delivery/tests/edit_capable_edit_message_drift.rs`
+    walks `copperclaw_channels_core::capabilities::edit_capable_channels()`
+    (new accessor) and asserts every listed channel's adapter source
+    overrides the trait `edit_message`, so a channel added to the list
+    without a real override fails the build (same spirit as the R0
+    tool-name-drift guard).
+
+### Changed (M19 F6 — richer bare-channel status row + intermediate stuck signal, 2026-07-16)
+
+- On bare / edit-incapable channels the only progress signal was the 60s
+  "still working" status row — a fixed string with no detail — and nothing
+  bridged the gap between it and the 5-minute apology, so a slow build
+  looked fine for five minutes then abruptly apologised.
+  `crates/copperclaw-runner/src/run/hud.rs` now composes that row through a
+  pure `compose_status_row` helper that folds in the current todo step (the
+  same `step N/M: …` detail the Live HUD shows) so bare channels get real
+  progress, and past `INTERMEDIATE_STATUS_AFTER` (150s, well short of the
+  sweep's `APOLOGY_AFTER_SECS = 300`) softens the closing line to "This is
+  taking longer than usual, but I'm still going." so the run degrades
+  gracefully toward the apology instead of cliff-edging into it. The emit
+  path and cadence are unchanged, so child-agent sessions still skip the
+  row inside `RunnerToolCtx::emit_status` (no sub-agent status spam).
+
+### Added (M19 F5 — HUD covers the pre-first-tool / pure-reasoning wait, 2026-07-16)
+
+- The Task HUD used to post only at the first tool call and skip finalize
+  entirely on a zero-tool turn, so a multi-minute pure-reasoning answer on
+  an edit-capable channel showed nothing until the answer landed —
+  indistinguishable from a hang. `crates/copperclaw-runner/src/run/hud.rs`
+  now arms a single background HUD task at turn start (live HUD only, via
+  `TaskHud::arm`, called from `drive_turn`): it waits a short
+  `THINKING_THRESHOLD` (6s) so fast turns finalize first and post nothing
+  (byte-stable), then posts an initial "thinking… | M:SS" frame and
+  continues as the elapsed-clock ticker. `finalize` now collapses a
+  zero-tool turn that posted a thinking frame (to a clean "done in M:SS",
+  no "0 tool calls" tail) instead of leaving it dangling; a turn that never
+  posted still finalizes to nothing. `hud_mode=off` / `final` and the
+  no-op-edit suppression are unchanged. (The old per-batch `ensure_ticker`
+  spawn is folded into the one armed task, so tool-first turns still get a
+  ticker with no duplicate HUD message.)
+
+### Added (M19 F2 — actionable "I'm blocked" wall cards, 2026-07-16)
+
+- Tool errors and policy / provenance / verify-gate / egress denials used
+  to render only into the model's history (`Tool { is_error: true }`) — the
+  user never saw them, so when the model then looped or gave up the HUD
+  just stopped, indistinguishable from a hang. The runner now watches the
+  tail of each turn's tool results (`crates/copperclaw-runner/src/run/blocker.rs`,
+  new module): when a turn ends **without** a user-facing reply and its
+  tail is a *run* of denials on the **same** blocker (≥2, not a single
+  recovered error), the terminal-failure path swaps its generic apology for
+  **one** curated `ErrorCard` naming what is blocked and the actionable next
+  step (egress-allow command, write a `.copperclaw/verify`, this needs
+  approval, needs a person, not permitted here). Wiring:
+  `crates/copperclaw-runner/src/run/drive_turn.rs` folds each result into a
+  `BlockerRun` tail tracker (a mid-turn `send_message` latches suppression —
+  the turn isn't a silent wall) and attaches the category to `TurnResult`;
+  `finalize_messages` / `emit_terminal_failure_apologies` in
+  `crates/copperclaw-runner/src/run/mod.rs` render the wall card. Card text
+  is **curated per category** and carries no `details` block, so no raw
+  tool-error string (or content injected via a tool result) reaches the
+  user. A recovered error, a normal answer, and a non-blocker terminal
+  failure are all unchanged (the generic apology still fires off the
+  blocker categories).
+
+### Fixed (M19 F3 — approval-card correctness + blocked-on-approval legibility, 2026-07-16)
+
+- **Approval card no longer stuck live after resolution (fallback-id path).**
+  `crates/copperclaw-host/src/approval_intercept.rs`: an approval card is
+  stamped "Approved/Denied by <name>" in place using the `platform_message_id`
+  persisted at delivery. Root cause of the stuck-card bug: that id is only
+  persisted when the delivering adapter reports one (`host-delivery`
+  `set_platform_message_id`); adapters that return no id (or where the card
+  degraded to a text fallback) left the row's `platform_message_id` NULL, and
+  `edit_card` then *silently skipped* — leaving live Approve/Deny buttons on an
+  already-decided request. `edit_card` now posts the resolution as a short
+  follow-up reply on the tapping surface when there is no editable anchor, so
+  the outcome is always visible.
+- **Losing tapper in a resolution race is no longer silent.**
+  `approval_intercept.rs`: a second (losing) tap on an already-resolved approval
+  — same verb (`applied = false`) or opposite verb (`conflict`) — now gets a
+  short "This request was already resolved by <name>." reply (or an
+  "expired … ask the agent to try again" line when it lapsed), read from the
+  decision log, instead of the old no-reply no-op that looked broken.
+- **Silent approval expiry now stamps the card terminal.**
+  `crates/copperclaw-host/src/handlers/approvals.rs` adds
+  `expire_and_edit_cards`, which sweeps overdue pending approvals to `expired`
+  and edits each lapsed card to a terminal "expired — ask the agent to try
+  again" state (idempotent; only rows the sweep actually flips are stamped). It
+  is run opportunistically at the top of the in-chat approval interceptor (the
+  one host surface that both fires on approval activity and holds the delivery
+  dispatcher) and is `pub` so a periodic host sweep can call it later.
+- **Blocked-on-approval legibility.** `crates/copperclaw-modules/src/approvals.rs`
+  `ApprovalCardHandler` now appends a "The agent is paused, waiting for your
+  approval." line to the card body so an approval-gated agent is legible rather
+  than looking hung. (The in-HUD `TaskHud::add_note` seam lives in the *runner*,
+  a separate process — `hud.rs`, `pub(super)` — so lane G surfaces the waiting
+  state on the operator-facing card it owns.)
+- Replay fixtures: `fixtures/telegram/approval-resolution` (fallback-id reply +
+  expiry stamp) and `fixtures/slack/approval-conflict` (already-resolved loser
+  reply, `block_actions` shape), registered in
+  `crates/copperclaw-host/tests/replay.rs`.
+
+### Added (M19 U1 — Signal rich-surface floor)
+
+- The Signal adapter now renders five of the six portable rich surfaces
+  natively instead of falling through to the plain-text trait default, so
+  the Task HUD, diffs, todo lists, reasoning, and errors arrive as
+  structured Signal plaintext rather than bare prose. New renderers live in
+  `crates/copperclaw-channels/signal/src/render.rs`; the `deliver_*`
+  overrides are in `crates/copperclaw-channels/signal/src/adapter.rs`.
+  - **`deliver_breadcrumb` (marquee win) — in-place edit.** A compact
+    `[status] tool · detail — summary` chip; the runner's completion emit
+    is fed through signal-cli's `sendEditMessage` so `[running] shell ·
+    cargo check` becomes `[done] … — passed (0.4s)` on the *same* message
+    instead of stacking a fresh line on every tool boundary. Subsequent
+    edits keep targeting the original timestamp; a non-numeric id or edit
+    failure degrades gracefully to a fresh chip.
+  - **`deliver_todo_list` — in-place edit.** A `title (done/total)`
+    checklist with ASCII `[x]`/`[~]`/`[ ]` glyphs, edited in place via
+    `sendEditMessage` when the prior chip id is known. Signal has no pin
+    API, so `pin_hint` is a silent no-op.
+  - **`deliver_diff`** — a glanceable `path (+a / -r)` header plus unified
+    hunks with `+`/`-` gutters, fence-free (Signal renders backticks
+    literally) and without the redundant `--- a/` / `+++ b/` git header.
+  - **`deliver_thinking`** — a `reasoning (model)` header + plain body
+    lines with no `> ` quote markers (Signal shows them literally);
+    redacted blocks emit only the placeholder, never the raw blob.
+  - **`deliver_error`** — an `[ERROR: kind] title` banner, summary, an
+    indented `details:` block, and a retry footer, all markdown-free.
+  - `deliver_collapsible` is intentionally left on the trait default:
+    Signal has no disclosure/expandable primitive, so the fallback
+    (summary + preview + `…(N more lines)`) is already the optimal
+    markdown-free plaintext shape and carries no in-place-edit id to
+    improve on.
+
+### Added (M19 U3 — Mattermost breadcrumb + reaction + typing)
+
+- The Mattermost adapter now overrides three rich-surface hooks it
+  previously left on the trait defaults, bringing it in line with the
+  other edit-capable adapters (Discord/Matrix/Slack/Telegram):
+  - **`deliver_breadcrumb`** (`crates/copperclaw-channels/mattermost/src/adapter.rs`,
+    renderer in `src/render.rs::render_breadcrumb`) — tool-progress chips
+    now render as a compact Markdown chip (`` [~] `shell` · cargo check ``,
+    ASCII status markers per the no-emoji rule) and are *edited in place*
+    via `PUT /api/v4/posts/{id}/patch` when the host passes the prior
+    chip's `existing_message_id`, so the user sees `Running…` → `Done`
+    rather than a new row per tool boundary. Rolling `steps` aggregates
+    render a bold summary line + a Markdown bullet per step. Previously
+    breadcrumbs degraded to the plain-text fallback row.
+  - **`add_reaction`** (the host-driven trait hook) — routes to the
+    existing `POST /api/v4/reactions` on behalf of the configured
+    `bot_user_id`; falls through to `Unsupported` (so the host posts a
+    fresh message) when no bot id is configured. Previously reactions were
+    reachable only via the `reaction` egress action on `deliver`, not the
+    trait method the delivery service calls.
+  - **`set_typing`** (`src/api.rs::post_typing`) — publishes the bot's
+    "…is typing" indicator via `POST /api/v4/users/me/typing` (the REST
+    shortcut for the websocket `user_typing` action — no persistent socket
+    needed), scoped to a thread root via `parent_id` when a `thread_id` is
+    present. Previously typing was a silent no-op, leaving no "agent is
+    working" signal during a run.
+
+### Added (M19 M1 — metrics rider: sweep the M19 metric wishes into `copperclaw-metrics`, 2026-07-16)
+
+- One card, absolute last in the program, sweeps every metric "wish" the merged
+  M19 cards (F1–F5, U1–U7, A1–A6) recorded in their PR descriptions into
+  `crates/copperclaw-metrics/src/lib.rs` (the workspace hotspot — no other M19
+  card touches it). Each new counter/gauge/histogram is registered with a helper
+  following the crate's naming (`copperclaw_` prefix, `_total`/`_seconds` suffix,
+  snake_case labels) and wired to a real emit site; new tests extend the
+  prefix/suffix invariants and render-with-labels coverage to the additions.
+  - **F1** `copperclaw_edit_drift_fallthrough_total{channel_type}` — a dedicated
+    edit-drift alarm emitted alongside the existing
+    `inc_hud_edit(_, "unsupported_fallthrough")` from the core trait default
+    `edit_message` (`copperclaw-channels/core/src/adapter.rs`).
+  - **F2** `copperclaw_wall_card_total{blocker}` — a curated wall card actually
+    written to a user channel, labeled by `BlockerCategory::metric_label()`
+    (`copperclaw-runner/src/run/mod.rs::emit_terminal_failure_apologies`).
+  - **F3** `copperclaw_approval_card_outcome_total{outcome}`
+    (`resolved_edit|resolved_fallback_reply|conflict_notified|expired_card`) —
+    a dedicated approval-*card* lifecycle counter; the M19 cards had reused
+    `inc_approval_tap` with these new label values, polluting its documented
+    `approved|denied|unauthorized|race_noop` set. Those five call sites in
+    `copperclaw-host/src/approval_intercept.rs` + `.../handlers/approvals.rs`
+    are switched to the new counter (and a `resolved_edit` emit added at the
+    in-place edit branch, previously unmetered); `inc_approval_tap` is restored
+    to its original four outcomes.
+  - **F4** `copperclaw_blocked_todo_render_total{channel_type, has_reason}` —
+    a delivered todo checklist carried ≥1 `blocked` item; emitted from the
+    central `dispatch_todo_list` (`copperclaw-host-delivery/src/service.rs`).
+  - **F5** `copperclaw_hud_thinking_frame_total{agent_group}` — the pre-first-tool
+    "thinking…" HUD frame, distinct from the tool-triggered `inc_hud_post`
+    (`copperclaw-runner/src/run/hud.rs::arm`).
+  - **U1/U2** `copperclaw_adapter_surface_write_total{channel_type, mode}`
+    (`edit|create`) — the pinned rich-surface edit-vs-create intent, emitted
+    from `dispatch_todo_list`.
+  - **U3** `copperclaw_adapter_typing_total{channel_type, result}` (central
+    dispatcher `set_typing`, `copperclaw-host-delivery/src/dispatch.rs`) and
+    `copperclaw_adapter_reaction_total{channel_type, result}` (central reaction
+    system-action path in `service.rs`) — both cover every adapter from one site.
+  - **U6** `copperclaw_shared_renderer_adoption{channel_type}` gauge, set from the
+    const `SHARED_RENDERER_ADOPTED_ADAPTERS` list inside `maybe_start_server`
+    (self-contained, no external call site) — coverage of `core::markdown::render`
+    adoption.
+  - **U7** `copperclaw_inbound_reaction_total{signal, outcome}`
+    (`affirmative|looking|negative|none` × `folded|ignored`) — replaces the
+    generic `inc_midturn_control(_, "reaction")` proxy at the runner's steering
+    seam (`copperclaw-runner/src/run/drive_turn.rs`).
+  - **A1** `copperclaw_delegate_batch_width` histogram + `…_worker_total{outcome}`
+    (`ok|timeout|spawn_failed`) from the runner join
+    (`copperclaw-runner/src/run/delegate_batch.rs`) + `…_refused_total` from the
+    pure handler (`copperclaw-mcp/src/tools/agents.rs`).
+  - **A2** `copperclaw_browser_interactive_actions_total{action, outcome}` per
+    scripted action (`copperclaw-browser/src/interactive.rs`); the interactive
+    SSRF *stage* labels were already live via `inc_browser_ssrf_block`.
+  - **A3** `copperclaw_public_tunnel_total{outcome, reason}`
+    (`opened|approval_raised|denied|torn_down`) wired at the five state
+    transitions in `copperclaw-modules/src/tunnel.rs`.
+  - **A4** `copperclaw_skills_saved_total{outcome}` (`saved|rejected`) — a
+    dedicated counter at the true write site
+    (`copperclaw-host/src/handlers/approvals.rs::apply_save_skill`), which had no
+    metric; the save-skill paths previously proxied through `inc_self_mod_*`
+    (those remain as the request-raise signal).
+  - **A5** `copperclaw_memory_writes_total{provenance}` (`trusted|untrusted`) +
+    `copperclaw_memory_write_rate_capped_total` at the runner `memory_save` impl
+    (`copperclaw-runner/src/tools.rs`).
+  - **A6** `copperclaw_scheduled_task_fires_total{kind}`
+    (`recurring_rearm|one_shot_complete`), `copperclaw_scheduled_tasks_active`
+    gauge (new `tasks::count_active` query in `copperclaw-db`), and
+    `copperclaw_scheduled_task_fire_latency_seconds` histogram, all set/emitted
+    from the sweep's due-task fan-out
+    (`copperclaw-host-sweep/src/checks/scheduling.rs`).
+
 ### Fixed (M18 — Task HUD no-op edit / Telegram "message is not modified", 2026-07-16)
 
 - The H1 Task HUD and R6 progressive-final-answer edit a pinned status

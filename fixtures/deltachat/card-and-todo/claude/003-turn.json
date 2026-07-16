@@ -1,0 +1,9 @@
+{
+  "events": [
+    {"type": "message_start", "message": {"id": "msg_dc_003"}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_dc_card", "name": "send_card", "input": {}}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"card\": {\"title\": \"Demo staged\", \"body\": \"The demo is scaffolded and ready for your go-ahead.\", \"fields\": [{\"label\": \"Status\", \"value\": \"2 steps queued\"}], \"buttons\": [{\"label\": \"Approve\", \"value\": \"approve:demo\", \"style\": \"primary\"}, {\"label\": \"Open preview\", \"url\": \"http://192.0.2.10:8100/preview\"}]}}"}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_stop"}
+  ]
+}

@@ -16,7 +16,11 @@
 //! 4. **Coarse provenance / autonomy gate.** Credentialed external
 //!    actions (see [`is_credentialed_external`]) are blocked on a
 //!    tainted turn until a fresh approval, and blocked outright on an
-//!    autonomous turn (see [`TurnTrust`]).
+//!    autonomous turn (see [`TurnTrust`]). One carve-out (M19 A7):
+//!    LAN-only preview verbs (see [`is_lan_preview`]) are a *local*
+//!    surface, so they are exempt from the taint half of this gate —
+//!    but not the autonomy half, and public/tunnel verbs stay fully
+//!    taint-gated.
 //!
 //! Layers 1-3 are a positive allow-list (default-deny intersection);
 //! layer 4 is a conditional gate over a small set of external actions.
@@ -121,12 +125,50 @@ const CODING_TOOLS: &[&str] = &[
     // (and is denied to a guest via the mutating floor — see `is_mutating`).
     "expose_preview",
     "close_preview",
+    // M19 A3: publish a live preview to the public internet via the V5 tunnel.
+    // Part of the same build-test-share loop, so it rides the coding profile
+    // and the guest mutating floor. UNLIKE the two LAN verbs above it is an
+    // OUTWARD-facing credentialed external action — see
+    // [`CREDENTIALED_EXTERNAL_TOOLS`] (it is taint-gated) and it is deliberately
+    // ABSENT from [`LAN_PREVIEW_TOOLS`] (no taint exemption). Its real gate is
+    // the host-side operator approval the tunnel broker raises.
+    "make_preview_public",
 ];
 
 /// Self-modification tools, layered on only by the `full` profile. These
 /// re-wire the agent's own capabilities (installing packages, attaching
-/// MCP servers) and are the most privileged class.
-const SELF_MOD_TOOLS: &[&str] = &["install_packages", "add_mcp_server"];
+/// MCP servers, saving reusable skills) and are the most privileged class.
+///
+/// `save_skill` (M19 A4) persists an agent-authored skill into the group's
+/// per-group skills override for the next spawn to discover. It is self-mod
+/// (it durably changes the agent's own capability surface) but — unlike
+/// `install_packages` / `add_mcp_server` — it does NOT egress, so it is
+/// deliberately absent from [`CREDENTIALED_EXTERNAL_TOOLS`]. Its
+/// secure-by-default gate is the host-side operator approval raised before
+/// the skill is ever written.
+const SELF_MOD_TOOLS: &[&str] = &["install_packages", "add_mcp_server", "save_skill"];
+
+/// Memory-*write* tools (M19 A5). `memory_search` / `memory_get` are read-only
+/// and live outside every profile list (Full-only, like their write sibling),
+/// but `memory_save` MUTATES the group memory store, so it is classified as
+/// mutating here: a [`SenderRole::Guest`] sender is denied it (see
+/// [`is_mutating`]) — a guest must not be able to write a `trusted` fact into
+/// the store. Provenance honesty against content-taint is enforced separately
+/// in the runner's `memory_save` impl (a tainted turn is forced to
+/// `untrusted`).
+const MEMORY_WRITE_TOOLS: &[&str] = &["memory_save"];
+
+/// Browser tools that perform *writes* to a remote page (M19 A2). Read-only
+/// `browser_render` observes; `browser_interact` clicks / types / submits
+/// forms against external sites, so it is classified as mutating here: a
+/// [`SenderRole::Guest`] sender is denied it (see [`is_mutating`]) — a guest
+/// must not be able to drive an outward-facing, write-capable browser.
+/// Deliberately NOT in [`PROFILE_TOOL_LISTS`]: like `browser_render`, this tool
+/// is only registered when its opt-in flag is set, so it can never appear in
+/// the default `build_tool_set()` inventory the drift guard checks against; it
+/// stays `Full`-profile-only via the open allow-list, exactly as its read-only
+/// sibling does.
+const BROWSER_WRITE_TOOLS: &[&str] = &["browser_interact"];
 
 /// Tools that take a **credentialed external action** — they reach outside the
 /// container over the network (the egress path the credential broker meters)
@@ -151,17 +193,51 @@ const CREDENTIALED_EXTERNAL_TOOLS: &[&str] = &[
     "web_search",
     "install_packages",
     "add_mcp_server",
-    // M17 session-preview proxy: `expose_preview` stands up a LAN-reachable
-    // listener on the operator's network — an external action. It obeys the
-    // same provenance / autonomy gate as `web_fetch`: blocked outright on an
-    // autonomous turn, and blocked on a tainted turn until a fresh approval
-    // clears it, so a prompt-injected turn can't publish an attacker-chosen
-    // app to the LAN. `close_preview` is the paired teardown; gating it too
-    // keeps the pair symmetric and harmless (tearing down is safe, but the
-    // block only bites on already-tainted/autonomous turns).
+    // M17 session-preview proxy: `expose_preview` stands up a listener on the
+    // operator's own LAN. It rides the **autonomy** half of this gate (blocked
+    // outright on an autonomous/heartbeat turn — no human present to stand up a
+    // listener), but M19 A7 EXEMPTS it (and `close_preview`) from the **taint**
+    // half — see [`LAN_PREVIEW_TOOLS`] and the taint check in
+    // [`ToolPolicy::evaluate`]. A LAN preview is a *local* surface (the
+    // operator's own network), not an outward credentialed action like
+    // `web_fetch` or a public tunnel, so a web-tainted "research then build"
+    // turn must be able to show the operator the app it just built without a
+    // fresh approval. `close_preview` is the paired teardown; keeping it in the
+    // same class keeps the pair symmetric.
     "expose_preview",
     "close_preview",
+    // M19 A3: `make_preview_public` publishes a live preview to the PUBLIC
+    // internet through the V5 tunnel. This is the outward-facing contrast to the
+    // two LAN verbs above: it IS a credentialed external action in the full
+    // sense, so it is gated on BOTH halves here — blocked outright on an
+    // autonomous/heartbeat turn, and blocked on a tainted turn until a fresh
+    // approval clears it. It is intentionally NOT in [`LAN_PREVIEW_TOOLS`], so
+    // the A7 taint exemption never reaches it (see the CONTRAST note there).
+    "make_preview_public",
 ];
+
+/// LAN-only preview verbs (M17 `expose_preview` / `close_preview`) that are
+/// EXEMPT from the coarse **taint** gate (M19 A7). Exposing a preview reachable
+/// only on the operator's own machine / LAN is a *local surface* — not the same
+/// risk class as `web_search` / `web_fetch` / a public tunnel routing the
+/// agent's credentials at an attacker-chosen target. The M18 live post-mortem
+/// found a "research … then build" request web-tainted the turn, so the M16
+/// provenance gate denied `expose_preview` as a credentialed external action and
+/// the operator's preview didn't appear until a fresh untainted turn — a felt UX
+/// papercut. These verbs stay gated by every OTHER layer: the guest role floor
+/// (they are mutating, see [`is_mutating`]), the coding/full profile ceiling,
+/// the per-group preview opt-in (enforced host-side), and the **autonomy** gate
+/// (an autonomous/heartbeat turn still may not stand up a listener — see
+/// [`CREDENTIALED_EXTERNAL_TOOLS`]). Only the taint block is lifted.
+///
+/// CONTRAST — the durable boundary: **LAN preview = local surface** (exempt);
+/// **public tunnel = external** (NOT exempt). An outward-facing public/tunnel
+/// verb such as `make_preview_public` (M19 A3) publishes to the public internet
+/// and is deliberately NOT on this list, so it stays FULLY taint-gated even
+/// though it too routes through the preview subsystem. Keeping this list a tight
+/// allow-list of the two LAN verbs (never a "preview*"-style prefix match)
+/// ensures a future public verb cannot silently inherit the taint exemption.
+const LAN_PREVIEW_TOOLS: &[&str] = &["expose_preview", "close_preview"];
 
 /// Every tool-name list this policy references, labelled for diagnostics.
 ///
@@ -181,6 +257,7 @@ pub const PROFILE_TOOL_LISTS: &[(&str, &[&str])] = &[
     ("SCHEDULING_MUTATION_TOOLS", SCHEDULING_MUTATION_TOOLS),
     ("CODING_TOOLS", CODING_TOOLS),
     ("SELF_MOD_TOOLS", SELF_MOD_TOOLS),
+    ("MEMORY_WRITE_TOOLS", MEMORY_WRITE_TOOLS),
     ("CREDENTIALED_EXTERNAL_TOOLS", CREDENTIALED_EXTERNAL_TOOLS),
 ];
 
@@ -203,6 +280,18 @@ pub const EXTERNAL_MCP_PREFIX: &str = "mcp__";
 #[must_use]
 pub fn is_credentialed_external(tool: &str) -> bool {
     CREDENTIALED_EXTERNAL_TOOLS.contains(&tool) || tool.starts_with(EXTERNAL_MCP_PREFIX)
+}
+
+/// True when `tool` is a LAN-only preview verb EXEMPT from the coarse **taint**
+/// gate (M19 A7 — see [`LAN_PREVIEW_TOOLS`]). This is the precise, durable
+/// boundary between a *local* preview surface (exempt) and an *external*
+/// credentialed action (not): a public/tunnel verb like `make_preview_public`
+/// is deliberately absent here, so it stays fully taint-gated. The autonomy gate
+/// and all positive allow-list layers still apply to these verbs — only the
+/// taint block is lifted.
+#[must_use]
+pub fn is_lan_preview(tool: &str) -> bool {
+    LAN_PREVIEW_TOOLS.contains(&tool)
 }
 
 /// A group's tool profile: the positive allow-list the agent is scoped
@@ -334,6 +423,8 @@ fn is_mutating(tool: &str) -> bool {
     SCHEDULING_MUTATION_TOOLS.contains(&tool)
         || CODING_TOOLS.contains(&tool)
         || SELF_MOD_TOOLS.contains(&tool)
+        || MEMORY_WRITE_TOOLS.contains(&tool)
+        || BROWSER_WRITE_TOOLS.contains(&tool)
 }
 
 /// Outcome of a policy evaluation.
@@ -512,8 +603,15 @@ impl ToolPolicy {
             }
             // A tainted turn (context touched untrusted-provenance content,
             // e.g. a web_fetch body or an untrusted memory hit) blocks
-            // credentialed external actions until a FRESH approval clears it.
-            if self.trust.tainted && !self.trust.approved {
+            // credentialed external actions until a FRESH approval clears it —
+            // EXCEPT LAN-only preview verbs (M19 A7). Exposing a preview
+            // reachable only on the operator's own LAN is a *local surface*, not
+            // an outward credentialed action, so a web-tainted "research then
+            // build" turn can show the operator the app it just built without a
+            // fresh approval. Public/tunnel verbs (e.g. `make_preview_public`,
+            // A3) are NOT in `is_lan_preview` and stay fully taint-gated. The
+            // autonomy block above still bites on these LAN verbs.
+            if self.trust.tainted && !self.trust.approved && !is_lan_preview(tool) {
                 copperclaw_metrics::inc_policy_denied("provenance", tool);
                 return PolicyDecision::Deny(format!(
                     "Tool `{tool}` takes a credentialed external action, but this turn's context contains untrusted-provenance content (e.g. a fetched page or an untrusted memory entry). Fresh approval is required before a credentialed external action can run on a tainted turn."
@@ -537,7 +635,7 @@ mod tests {
 
     #[test]
     fn profile_tool_lists_cover_every_policy_list() {
-        // The drift-guard export must carry all six lists (the
+        // The drift-guard export must carry all lists (the
         // `tool_name_drift` integration test iterates it; a list missing
         // here escapes the guard).
         let labels: Vec<&str> = PROFILE_TOOL_LISTS.iter().map(|(l, _)| *l).collect();
@@ -549,6 +647,7 @@ mod tests {
                 "SCHEDULING_MUTATION_TOOLS",
                 "CODING_TOOLS",
                 "SELF_MOD_TOOLS",
+                "MEMORY_WRITE_TOOLS",
                 "CREDENTIALED_EXTERNAL_TOOLS",
             ]
         );
@@ -845,6 +944,37 @@ mod tests {
     }
 
     #[test]
+    fn memory_save_is_mutating_and_denied_to_guests() {
+        // A5: memory_save writes the group store, so a guest (read-only) sender
+        // is denied it even under the open Full profile — a guest must not
+        // launder a `trusted` fact into memory. memory_search/get stay allowed.
+        assert!(is_mutating("memory_save"));
+        assert!(!is_mutating("memory_search"));
+        let guest = ToolPolicy::new(ToolProfile::Full, Some(SenderRole::Guest));
+        assert!(!guest.evaluate("memory_save").is_allow());
+        assert!(guest.evaluate("memory_search").is_allow());
+        // A full member can write.
+        let member = ToolPolicy::new(ToolProfile::Full, None);
+        assert!(member.evaluate("memory_save").is_allow());
+    }
+
+    #[test]
+    fn browser_interact_is_mutating_and_denied_to_guests() {
+        // A2 security follow-up F1: browser_interact clicks/types/submits forms
+        // against external pages, so a guest (read-only) sender is denied it
+        // even under the open Full profile. Read-only browser_render is not a
+        // write and stays available to whoever the profile admits.
+        assert!(is_mutating("browser_interact"));
+        assert!(!is_mutating("browser_render"));
+        let guest = ToolPolicy::new(ToolProfile::Full, Some(SenderRole::Guest));
+        assert!(!guest.evaluate("browser_interact").is_allow());
+        // A full member can drive the interactive browser (when the opt-in
+        // flag is set and the tool is registered).
+        let member = ToolPolicy::new(ToolProfile::Full, None);
+        assert!(member.evaluate("browser_interact").is_allow());
+    }
+
+    #[test]
     fn untrusted_context_blocks_credentialed_external_without_approval() {
         // Headline Phase 3 case: a turn whose context touched untrusted
         // content blocks a credentialed external action absent fresh approval.
@@ -1018,24 +1148,130 @@ mod tests {
     }
 
     #[test]
-    fn preview_expose_denied_on_tainted_turn_without_approval() {
+    fn preview_expose_allowed_on_tainted_turn_without_approval() {
+        // M19 A7: the headline papercut. A web-tainted "research then build"
+        // turn must be able to expose a LAN preview WITHOUT a fresh approval —
+        // a LAN listener is a local surface, exempt from the taint gate. (Before
+        // A7 this same turn was denied as a credentialed external action.)
         let tainted =
             ToolPolicy::new(ToolProfile::Coding, Some(SenderRole::Admin)).with_trust(TurnTrust {
                 tainted: true,
                 approved: false,
                 autonomous: false,
             });
-        let d = tainted.evaluate("expose_preview");
+        assert!(
+            tainted.evaluate("expose_preview").is_allow(),
+            "a LAN preview is exempt from the taint gate"
+        );
+        assert!(
+            tainted.evaluate("close_preview").is_allow(),
+            "the paired teardown is exempt too"
+        );
+        // But an outward credentialed action on the SAME tainted turn is still
+        // blocked — the carve-out is precise to LAN preview, nothing else.
+        let d = tainted.evaluate("web_fetch");
         assert!(!d.is_allow());
         assert!(d.deny_reason().unwrap().contains("untrusted-provenance"));
-        // A fresh approval clears it.
-        let approved =
-            ToolPolicy::new(ToolProfile::Coding, Some(SenderRole::Admin)).with_trust(TurnTrust {
-                tainted: true,
-                approved: true,
-                autonomous: false,
-            });
-        assert!(approved.evaluate("expose_preview").is_allow());
+    }
+
+    #[test]
+    fn lan_preview_classification_is_the_two_local_verbs() {
+        // The taint carve-out (A7) is a tight allow-list of exactly the two
+        // LAN verbs — never a prefix match, never anything outward-facing.
+        assert!(is_lan_preview("expose_preview"));
+        assert!(is_lan_preview("close_preview"));
+        for t in [
+            "web_fetch",
+            "web_search",
+            "install_packages",
+            "add_mcp_server",
+            "mcp__weather__forecast",
+            "read_file",
+        ] {
+            assert!(!is_lan_preview(t), "{t} must not be LAN-preview-exempt");
+        }
+    }
+
+    #[test]
+    fn lan_preview_verbs_are_a_subset_of_credentialed_external() {
+        // Coherence invariant: the carve-out only ever RELAXES a verb that was
+        // otherwise taint-gated — an exempt verb that wasn't credentialed
+        // external in the first place would be a meaningless (or misleading)
+        // entry. If this fails, someone added a non-gated verb to the exempt
+        // list.
+        for t in LAN_PREVIEW_TOOLS {
+            assert!(
+                is_credentialed_external(t),
+                "{t} is taint-exempt but not otherwise credentialed-external"
+            );
+        }
+    }
+
+    #[test]
+    fn public_tunnel_verb_stays_taint_gated() {
+        // A7 robustness / A3 contract: the public/tunnel verb
+        // (`make_preview_public`) must REMAIN taint-gated even though it rides
+        // the same preview subsystem as the exempt LAN verbs. It is a
+        // credentialed external action and is NOT in the LAN carve-out.
+        assert!(
+            is_credentialed_external("make_preview_public"),
+            "the outward public verb is a credentialed external action"
+        );
+        assert!(
+            !is_lan_preview("make_preview_public"),
+            "the outward public verb must never be taint-exempt"
+        );
+        // On a tainted turn without approval it is blocked, exactly like
+        // `web_fetch` — the outward-facing contrast to `expose_preview`.
+        let tainted = ToolPolicy::new(ToolProfile::Full, None).with_trust(TurnTrust {
+            tainted: true,
+            approved: false,
+            autonomous: false,
+        });
+        for t in [
+            "make_preview_public",
+            "web_fetch",
+            "web_search",
+            "add_mcp_server",
+        ] {
+            assert!(is_credentialed_external(t) && !is_lan_preview(t));
+            let d = tainted.evaluate(t);
+            assert!(!d.is_allow(), "{t} must stay taint-gated");
+            assert!(d.deny_reason().unwrap().contains("untrusted-provenance"));
+        }
+        // A fresh approval clears the taint block; a clean turn allows it.
+        let approved = ToolPolicy::new(ToolProfile::Full, None).with_trust(TurnTrust {
+            tainted: true,
+            approved: true,
+            autonomous: false,
+        });
+        assert!(approved.evaluate("make_preview_public").is_allow());
+        // …and it is blocked outright on an autonomous turn (no human to approve).
+        let auto = ToolPolicy::new(ToolProfile::Full, None).with_trust(TurnTrust {
+            tainted: false,
+            approved: false,
+            autonomous: true,
+        });
+        assert!(
+            auto.evaluate("make_preview_public")
+                .deny_reason()
+                .unwrap()
+                .contains("autonomous")
+        );
+    }
+
+    #[test]
+    fn make_preview_public_is_coding_profile_and_guest_denied() {
+        // A3: `make_preview_public` rides the coding profile (build-test-share
+        // loop) and is mutating, so a guest sender is denied it even under Full.
+        assert!(ToolProfile::Coding.allows("make_preview_public"));
+        assert!(ToolProfile::Full.allows("make_preview_public"));
+        assert!(!ToolProfile::Minimal.allows("make_preview_public"));
+        assert!(!ToolProfile::Messaging.allows("make_preview_public"));
+        let guest = ToolPolicy::new(ToolProfile::Full, Some(SenderRole::Guest));
+        let d = guest.evaluate("make_preview_public");
+        assert!(!d.is_allow());
+        assert!(d.deny_reason().unwrap().contains("guest"));
     }
 
     #[test]

@@ -113,7 +113,9 @@ impl EnvLookup for MapEnv {
 }
 
 /// Parse a truthy opt-in value (`1` / `true` / `on` / `yes`, case-insensitive).
-fn truthy(v: &str) -> bool {
+/// Shared with the interactive browser tool so the two opt-in flags parse
+/// identically.
+pub fn truthy(v: &str) -> bool {
     matches!(
         v.trim().to_ascii_lowercase().as_str(),
         "1" | "true" | "on" | "yes"
@@ -189,7 +191,7 @@ fn parse_mode(raw: Option<&str>) -> Result<RenderMode, ToolError> {
 /// Build the navigation-target egress allow-list (`host:port`) for the child
 /// container from the request URL. The child gets exactly this one entry —
 /// nothing broader. Returns a validation error for a URL with no host.
-fn egress_allow_for(url: &str) -> Result<Vec<String>, ToolError> {
+pub fn egress_allow_for(url: &str) -> Result<Vec<String>, ToolError> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| ToolError::Validation(format!("browser_render: invalid url: {e}")))?;
     let host = parsed
@@ -216,7 +218,7 @@ fn is_host_port(s: &str) -> bool {
 /// Unset → empty (byte-identical to pre-V4). This is the V4 injection: the host
 /// scopes the browser child's deny-default egress to the prototype's own
 /// preview origin so the screenshot render can actually reach it.
-fn preview_egress_allow(env: &dyn EnvLookup) -> Vec<String> {
+pub fn preview_egress_allow(env: &dyn EnvLookup) -> Vec<String> {
     env.get(PREVIEW_ALLOW_ENV)
         .map(|raw| {
             raw.split(',')
@@ -348,7 +350,7 @@ const SCREENSHOT_SUBDIR: &str = "screenshots";
 /// in-container agent for `send_file`. Reuses the shared,
 /// `COPPERCLAW_DATA_ROOT`-aware [`crate::tools::verify_gate::data_root`] so a
 /// host/test override of the data root moves screenshots with it.
-fn screenshot_dir(env: &dyn EnvLookup) -> std::path::PathBuf {
+pub fn screenshot_dir(env: &dyn EnvLookup) -> std::path::PathBuf {
     env.get(OUTPUT_DIR_ENV).map_or_else(
         || crate::tools::verify_gate::data_root().join(SCREENSHOT_SUBDIR),
         std::path::PathBuf::from,

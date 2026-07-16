@@ -90,7 +90,59 @@ pub async fn updates_to_events(
             out.push(evt);
         }
     }
+    if let Some(mr) = update.message_reaction.as_ref() {
+        if let Some(evt) = message_reaction_to_event(mr) {
+            out.push(evt);
+        }
+    }
     out
+}
+
+/// Synthesise an inbound-reaction event (M19 U7) from a `message_reaction`
+/// update. Emits an event only for a genuinely ADDED emoji reaction (present
+/// in `new_reaction`, absent from `old_reaction`); a removed reaction or a
+/// custom/paid reaction produces no event. `target_seq` is the reacted-to
+/// message id, which the runner matches against its `delivered` table to
+/// decide the reaction landed on its own message.
+fn message_reaction_to_event(mr: &crate::types::MessageReactionUpdated) -> Option<InboundEvent> {
+    let is_added = |r: &crate::types::ReactionType| -> bool {
+        r.kind == "emoji" && r.emoji.is_some() && !mr.old_reaction.contains(r)
+    };
+    let added = mr.new_reaction.iter().find(|r| is_added(r))?;
+    let emoji = added.emoji.as_deref()?;
+
+    let channel_type = ChannelType::new(crate::CHANNEL_TYPE_STR);
+    let is_group = matches!(mr.chat.kind.as_str(), "group" | "supergroup");
+    let target = mr.message_id.to_string();
+    let actor = mr
+        .user
+        .as_ref()
+        .and_then(|u| u.username.clone().or_else(|| u.first_name.clone()));
+
+    Some(InboundEvent {
+        channel_type: channel_type.clone(),
+        platform_id: mr.chat.id.to_string(),
+        thread_id: None,
+        message: InboundMessage {
+            // Stable per (chat, message, emoji) so a re-sent update dedups.
+            id: format!("tgreact:{}:{}:{emoji}", mr.chat.id, mr.message_id),
+            kind: MessageKind::Chat,
+            content: copperclaw_channels_core::reaction_content(
+                emoji,
+                Some(&target),
+                actor.as_deref(),
+            ),
+            timestamp: ts_to_datetime(mr.date),
+            is_mention: None,
+            is_group: Some(is_group),
+        },
+        reply_to: None,
+        sender: mr.user.as_ref().map(|u| SenderIdentity {
+            channel_type,
+            identity: u.id.to_string(),
+            display_name: u.username.clone().or_else(|| u.first_name.clone()),
+        }),
+    })
 }
 
 /// Synthesise an inbound chat event from a `callback_query` update and
@@ -644,7 +696,7 @@ fn ts_to_datetime(date: i64) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{Chat, Document, MessageEntity, User};
+    use crate::types::{Chat, Document, MessageEntity, MessageReactionUpdated, ReactionType, User};
     use copperclaw_types::MessageKind as Mk;
     use tempfile::TempDir;
     use wiremock::matchers::{method, path};
@@ -715,6 +767,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let dir = TempDir::new().unwrap();
@@ -750,6 +803,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let dir = TempDir::new().unwrap();
@@ -775,6 +829,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+                message_reaction: None,
                 callback_query: None,
             },
             &api,
@@ -796,6 +851,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+                message_reaction: None,
                 callback_query: None,
             },
             &api,
@@ -817,6 +873,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+                message_reaction: None,
                 callback_query: None,
             },
             &api,
@@ -833,6 +890,7 @@ mod tests {
             message: None,
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let dir = TempDir::new().unwrap();
@@ -857,6 +915,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+                message_reaction: None,
                 callback_query: None,
             },
             &api,
@@ -885,6 +944,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+                message_reaction: None,
                 callback_query: None,
             },
             &api,
@@ -913,6 +973,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+                message_reaction: None,
                 callback_query: None,
             },
             &api,
@@ -947,6 +1008,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+                message_reaction: None,
                 callback_query: None,
             },
             &api,
@@ -975,6 +1037,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+                message_reaction: None,
                 callback_query: None,
             },
             &api,
@@ -995,6 +1058,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+                message_reaction: None,
                 callback_query: None,
             },
             &api,
@@ -1023,6 +1087,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+                message_reaction: None,
                 callback_query: None,
             },
             &api,
@@ -1046,6 +1111,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+                message_reaction: None,
                 callback_query: None,
             },
             &api,
@@ -1090,6 +1156,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+                message_reaction: None,
                 callback_query: None,
             },
             &api,
@@ -1121,6 +1188,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+                message_reaction: None,
                 callback_query: None,
             },
             &api,
@@ -1144,6 +1212,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+                message_reaction: None,
                 callback_query: None,
             },
             &api,
@@ -1151,6 +1220,87 @@ mod tests {
         )
         .await;
         assert!(evts[0].reply_to.is_none());
+    }
+
+    fn reaction_update(new: Vec<ReactionType>, old: Vec<ReactionType>) -> Update {
+        Update {
+            update_id: 9,
+            message: None,
+            edited_message: None,
+            channel_post: None,
+            callback_query: None,
+            message_reaction: Some(MessageReactionUpdated {
+                chat: base_chat("supergroup"),
+                message_id: 555,
+                user: Some(User {
+                    id: 200,
+                    is_bot: false,
+                    first_name: Some("Alice".into()),
+                    last_name: None,
+                    username: Some("alice".into()),
+                }),
+                date: 1_700_000_000,
+                old_reaction: old,
+                new_reaction: new,
+            }),
+        }
+    }
+
+    fn emoji_reaction(e: &str) -> ReactionType {
+        ReactionType {
+            kind: "emoji".into(),
+            emoji: Some(e.into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn message_reaction_maps_to_inbound_reaction_event() {
+        // M19 U7: a 👍 added to the agent's message 555 becomes a normalized
+        // reaction inbound row carrying the shared contract.
+        let update = reaction_update(vec![emoji_reaction("\u{1F44D}")], vec![]);
+        let dir = TempDir::new().unwrap();
+        let (api, _s) = dummy_api().await;
+        let evts = updates_to_events(&update, &api, &default_settings(dir.path())).await;
+        assert_eq!(evts.len(), 1);
+        let e = &evts[0];
+        assert_eq!(e.channel_type.as_str(), "telegram");
+        assert_eq!(e.message.kind, Mk::Chat);
+        assert_eq!(e.platform_id, "100");
+        assert_eq!(e.message.is_group, Some(true));
+        let r = copperclaw_channels_core::parse_reaction(&e.message.content).expect("reaction");
+        assert_eq!(r.emoji, "\u{1F44D}");
+        assert_eq!(r.target_seq.as_deref(), Some("555"));
+        assert_eq!(r.actor.as_deref(), Some("alice"));
+        assert_eq!(e.sender.as_ref().unwrap().identity, "200");
+    }
+
+    #[tokio::test]
+    async fn removed_reaction_produces_no_event() {
+        // new_reaction empty (the user cleared their reaction) → nothing added.
+        let update = reaction_update(vec![], vec![emoji_reaction("\u{1F44D}")]);
+        let dir = TempDir::new().unwrap();
+        let (api, _s) = dummy_api().await;
+        assert!(
+            updates_to_events(&update, &api, &default_settings(dir.path()))
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn already_present_reaction_is_not_re_added() {
+        // Emoji present in BOTH old and new → not a newly-added reaction.
+        let update = reaction_update(
+            vec![emoji_reaction("\u{1F44D}")],
+            vec![emoji_reaction("\u{1F44D}")],
+        );
+        let dir = TempDir::new().unwrap();
+        let (api, _s) = dummy_api().await;
+        assert!(
+            updates_to_events(&update, &api, &default_settings(dir.path()))
+                .await
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1193,6 +1343,7 @@ mod tests {
                 message: Some(m),
                 edited_message: None,
                 channel_post: None,
+                message_reaction: None,
                 callback_query: None,
             },
             &api,
@@ -1257,6 +1408,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
@@ -1297,6 +1449,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
@@ -1323,6 +1476,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
@@ -1345,6 +1499,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
@@ -1371,6 +1526,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
@@ -1402,6 +1558,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
@@ -1429,6 +1586,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
@@ -1475,6 +1633,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
@@ -1513,6 +1672,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
@@ -1547,6 +1707,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
@@ -1579,6 +1740,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
@@ -1609,6 +1771,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
@@ -1645,6 +1808,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
@@ -1680,6 +1844,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
@@ -1714,6 +1879,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
@@ -1745,6 +1911,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
@@ -1765,6 +1932,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
@@ -1788,6 +1956,7 @@ mod tests {
             message: Some(m),
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: None,
         };
         let evts = updates_to_events(&update, &api, &settings).await;
@@ -1843,6 +2012,7 @@ mod tests {
             message: None,
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: Some(CallbackQuery {
                 id: "cb-1".into(),
                 from: User {
@@ -1885,6 +2055,7 @@ mod tests {
             message: None,
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: Some(CallbackQuery {
                 id: "cb-2".into(),
                 from: User {
@@ -1921,6 +2092,7 @@ mod tests {
             message: None,
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: Some(CallbackQuery {
                 id: "cb-3".into(),
                 from: User {
@@ -1964,6 +2136,7 @@ mod tests {
             message: None,
             edited_message: None,
             channel_post: None,
+            message_reaction: None,
             callback_query: Some(CallbackQuery {
                 id: "cb-4".into(),
                 from: User {

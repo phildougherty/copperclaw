@@ -252,14 +252,13 @@ fn next_id(items: &[TodoItem]) -> u32 {
 fn status_to_wire(s: TodoStatus) -> TodoItemStatus {
     match s {
         TodoStatus::Pending => TodoItemStatus::Pending,
-        // The portable wire schema (shared by every channel adapter's
-        // rendered checklist) has no `blocked` state — rendering it as
-        // `in_progress` keeps the chip accurate ("not done") without a
-        // fan-out schema change across every adapter crate. The MCP
-        // tool-facing JSON (what the agent itself sees via `todo_list`
-        // / `todo_update`'s response, a direct `TodoItem` serialize)
-        // carries the real `blocked` status plus `blocked_reason`.
-        TodoStatus::InProgress | TodoStatus::Blocked => TodoItemStatus::InProgress,
+        TodoStatus::InProgress => TodoItemStatus::InProgress,
+        // M19 F4: the portable wire schema now carries a real `Blocked`
+        // state (plus the reason, on `TodoListItem::blocked_reason`), so a
+        // step that auto-blocked after burning its verify fix-cycles renders
+        // as blocked on every adapter's chip and text fallback instead of a
+        // misleading "in progress forever".
+        TodoStatus::Blocked => TodoItemStatus::Blocked,
         TodoStatus::Completed => TodoItemStatus::Completed,
     }
 }
@@ -290,10 +289,19 @@ fn build_wire_list(items: &[TodoItem]) -> Option<TodoList> {
                 } else {
                     trimmed.to_owned()
                 };
+            // Carry the block reason onto the wire item only when the item
+            // is actually blocked — the renderer surfaces it next to the
+            // blocked glyph.
+            let blocked_reason = if matches!(it.status, TodoStatus::Blocked) {
+                it.blocked_reason.clone()
+            } else {
+                None
+            };
             TodoListItem {
                 id: it.id,
                 text,
                 status: status_to_wire(it.status),
+                blocked_reason,
             }
         })
         .collect();

@@ -81,6 +81,7 @@ pub mod api;
 pub mod config;
 pub mod factory;
 pub mod parse;
+pub mod render;
 pub mod rpc;
 
 pub use adapter::DeltaChatAdapter;

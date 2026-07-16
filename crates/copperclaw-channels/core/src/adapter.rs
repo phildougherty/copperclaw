@@ -437,6 +437,10 @@ pub trait ChannelAdapter: Send + Sync {
         // C5: an adapter without a native edit API falls through here; the
         // host then posts a fresh message instead of editing the HUD in place.
         copperclaw_metrics::inc_hud_edit(self.channel_type().as_str(), "unsupported_fallthrough");
+        // M19 F1: dedicated edit-drift alarm — a non-zero rate on a channel
+        // that is (or should be) in EDIT_CAPABLE_CHANNELS means an adapter lost
+        // its `edit_message` override.
+        copperclaw_metrics::inc_edit_drift_fallthrough(self.channel_type().as_str());
         Err(AdapterError::Unsupported("edit_message".into()))
     }
 
@@ -916,11 +920,13 @@ mod tests {
                     id: 1,
                     text: "Wash dishes".into(),
                     status: crate::todo_list::TodoItemStatus::Completed,
+                    blocked_reason: None,
                 },
                 crate::todo_list::TodoListItem {
                     id: 2,
                     text: "Dry dishes".into(),
                     status: crate::todo_list::TodoItemStatus::Pending,
+                    blocked_reason: None,
                 },
             ],
             title: Some("Kitchen".into()),
@@ -955,6 +961,7 @@ mod tests {
                 id: 1,
                 text: "single".into(),
                 status: crate::todo_list::TodoItemStatus::Pending,
+                blocked_reason: None,
             }],
             title: None,
         };

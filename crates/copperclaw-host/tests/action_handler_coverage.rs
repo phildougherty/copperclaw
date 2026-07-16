@@ -59,6 +59,11 @@ fn runner_emit_set() -> HashSet<&'static str> {
         // Self-modification (apply_install_packages, apply_add_mcp_server).
         "install_packages",
         "add_mcp_server",
+        // M19 A4: agent-authored persistent skill (apply_save_skill). The
+        // host's delivery service intercepts it inline (see
+        // `inline_handler_set`), raises an approval, and writes the SKILL.md
+        // on approval.
+        "save_skill",
         // Scheduling — every op (create / list / cancel / pause / resume /
         // update) emits the same top-level "schedule" key with an inner `op`.
         "schedule",
@@ -83,6 +88,10 @@ fn inline_handler_set() -> HashSet<&'static str> {
         "usage_report",
         "install_packages",
         "add_mcp_server",
+        // M19 A4: `save_skill` is intercepted inline so the delivery service
+        // can raise a pending approval (with `self.central`) and dispatch the
+        // approval card, then write the skill only on operator approval.
+        "save_skill",
         // `update_breadcrumb` is the finalisation half of the runner's
         // tool-progress chip pipeline. Intercepted inline (rather than
         // via the module registry) so the host can resolve the prior

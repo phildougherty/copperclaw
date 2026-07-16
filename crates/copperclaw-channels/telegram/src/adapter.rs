@@ -7,6 +7,7 @@ use crate::api::{InlineKeyboardButton, TelegramApi, escape_markdown_v2};
 use crate::config::{IngressMode, TelegramConfig};
 use crate::ingress::{IngressSettings, long_poll, webhook};
 use async_trait::async_trait;
+use copperclaw_channels_core::markdown::{Flavor, render as render_markdown};
 use copperclaw_channels_core::{
     AdapterError, Breadcrumb, BreadcrumbStatus, Card, ChannelAdapter, DiffCard, DmHandle,
     ErrorCard, ErrorCardKind, ThinkingBlock, TodoItemStatus, TodoList,
@@ -26,9 +27,10 @@ pub const CHANNEL_TYPE_STR: &str = "telegram";
 /// `parse_mode` used by `sendMessage` when none is supplied in the outbound
 /// payload. We default to `HTML` and pre-convert a small subset of common
 /// markdown syntax (`**bold**`, `*italic*` / `_italic_`, `` `code` ``,
-/// ``` ```block``` ```) to HTML tags in [`markdown_to_html`] before send.
-/// All other text is HTML-escaped so unbalanced angle brackets / ampersands
-/// in agent prose don't break the parse.
+/// ``` ```block``` ```) to HTML tags via the shared
+/// [`copperclaw_channels_core::markdown::render`] renderer ([`Flavor::Html`])
+/// before send. All other text is HTML-escaped so unbalanced angle brackets /
+/// ampersands in agent prose don't break the parse.
 ///
 /// Why HTML rather than `MarkdownV2`: `MarkdownV2` reserves `!`, `.`, `-`,
 /// `(`, `)`, `[`, `]`, `=`, `|`, `{`, `}`, `~`, `>`, `#`, `+`, `_`, `*`
@@ -259,7 +261,7 @@ impl ChannelAdapter for TelegramAdapter {
         // unbalanced `<` / `>` / `&` don't break the parse. Agents that
         // supplied their own `parse_mode` get their text passed verbatim.
         let body: String = if parse_mode.is_none() && effective_mode == "HTML" {
-            markdown_to_html(&text)
+            render_markdown(&text, Flavor::Html)
         } else {
             text.clone()
         };
@@ -1104,6 +1106,7 @@ pub(crate) fn render_todo_list_markdown(list: &TodoList) -> String {
         let glyph_raw = match item.status {
             TodoItemStatus::Completed => "[x]",
             TodoItemStatus::InProgress => "[~]",
+            TodoItemStatus::Blocked => "[!]",
             TodoItemStatus::Pending => "[ ]",
         };
         out.push_str(&escape_markdown_v2(glyph_raw));
@@ -1115,6 +1118,12 @@ pub(crate) fn render_todo_list_markdown(list: &TodoList) -> String {
         } else {
             out.push_str(&escape_markdown_v2(item.text.trim()));
         }
+        if let Some(reason) = item.blocked_reason_text() {
+            // `_italic_` in MarkdownV2; the reason text itself is escaped.
+            out.push_str(" _\\(blocked: ");
+            out.push_str(&escape_markdown_v2(reason));
+            out.push_str("\\)_");
+        }
         out.push('\n');
     }
     let done = list.completed_count();
@@ -1122,268 +1131,6 @@ pub(crate) fn render_todo_list_markdown(list: &TodoList) -> String {
     out.push('_');
     out.push_str(&escape_markdown_v2(&format!("{done}/{total} done")));
     out.push('_');
-    out
-}
-
-/// Convert a small subset of markdown syntax to Telegram-compatible HTML.
-///
-/// Handles, in order:
-/// - Fenced code blocks ``` ```lang\n...\n``` ``` → `<pre><code class="language-lang">...</code></pre>`
-/// - Inline code `` `x` `` → `<code>x</code>`
-/// - Bold `**x**` → `<b>x</b>` (also `__x__`)
-/// - Italic `*x*` / `_x_` → `<i>x</i>` (only when surrounded by word boundaries
-///   to avoid matching inside identifiers like `foo_bar_baz`)
-/// - Strikethrough `~~x~~` → `<s>x</s>`
-/// - Inline links `[text](url)` → `<a href="url">text</a>`
-///
-/// Everything else is HTML-escaped (`<`, `>`, `&`, `"`, `'`). The output is
-/// safe to send with `parse_mode=HTML` — Telegram's tolerant HTML parser
-/// only cares about the five XML escapes and a small allow-list of tags.
-///
-/// Designed for natural-language agent prose: stays correct under
-/// unbalanced markers (e.g. a stray `*` becomes a literal asterisk), and
-/// preserves leading whitespace + newlines so list-style replies still
-/// look like lists.
-pub(crate) fn markdown_to_html(input: &str) -> String {
-    // Pass 1: extract fenced code blocks and inline code into placeholder
-    // tokens so the bold/italic passes don't run inside them. Token
-    // format: `\x00<idx>\x00` (NULs never appear in agent output).
-    //
-    // Byte-indexing on `&str` is safe for ASCII markers (`` ` ``, `\n`)
-    // because every byte of a multi-byte UTF-8 sequence has the
-    // high bit set — none of them match the ASCII markers we look for.
-    // We only push to the output via `&str` slicing (`&input[a..b]`)
-    // which preserves UTF-8 boundaries; we never coerce a single byte
-    // back to a `char`.
-    let mut frozen: Vec<String> = Vec::new();
-    let mut text = String::with_capacity(input.len());
-    let bytes = input.as_bytes();
-    let mut i = 0;
-    let mut chunk_start = 0;
-    while i < bytes.len() {
-        // Fenced code block: ```lang?\n...\n```
-        if i + 2 < bytes.len() && &bytes[i..i + 3] == b"```" {
-            if let Some(close) = find_fence_close(bytes, i + 3) {
-                // Flush any pending text before the fence.
-                if chunk_start < i {
-                    text.push_str(&input[chunk_start..i]);
-                }
-                let header_end = bytes[i + 3..close]
-                    .iter()
-                    .position(|&b| b == b'\n')
-                    .map_or(close, |p| i + 3 + p);
-                let lang = input[i + 3..header_end].trim();
-                let body_start = if header_end < close {
-                    header_end + 1
-                } else {
-                    header_end
-                };
-                let body = &input[body_start..close];
-                let body_escaped = escape_html(body.trim_end_matches('\n'));
-                let token = if lang.is_empty() {
-                    format!("<pre><code>{body_escaped}</code></pre>")
-                } else {
-                    let lang_safe = escape_html(lang);
-                    format!("<pre><code class=\"language-{lang_safe}\">{body_escaped}</code></pre>")
-                };
-                frozen.push(token);
-                text.push('\0');
-                text.push_str(&(frozen.len() - 1).to_string());
-                text.push('\0');
-                i = close + 3;
-                chunk_start = i;
-                continue;
-            }
-        }
-        // Inline code: `x`
-        if bytes[i] == b'`' {
-            if let Some(rel) = bytes[i + 1..].iter().position(|&b| b == b'`') {
-                let inner = &input[i + 1..i + 1 + rel];
-                if !inner.is_empty() && !inner.contains('\n') {
-                    // Flush any pending text before the backtick.
-                    if chunk_start < i {
-                        text.push_str(&input[chunk_start..i]);
-                    }
-                    frozen.push(format!("<code>{}</code>", escape_html(inner)));
-                    text.push('\0');
-                    text.push_str(&(frozen.len() - 1).to_string());
-                    text.push('\0');
-                    i += rel + 2;
-                    chunk_start = i;
-                    continue;
-                }
-            }
-        }
-        i += 1;
-    }
-    // Flush trailing text.
-    if chunk_start < bytes.len() {
-        text.push_str(&input[chunk_start..]);
-    }
-
-    // Pass 2: escape HTML in the body (NUL tokens carry through the escape).
-    let mut escaped = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
-            _ => escaped.push(c),
-        }
-    }
-    text = escaped;
-
-    // Pass 3: bold (**x**), strikethrough (~~x~~), italic (*x*/_x_),
-    // inline links [text](url). Order matters — bold before italic so
-    // `**foo**` doesn't get partially consumed.
-    text = replace_paired(&text, "**", "<b>", "</b>");
-    text = replace_paired(&text, "__", "<b>", "</b>");
-    text = replace_paired(&text, "~~", "<s>", "</s>");
-    text = replace_italic_paired(&text, '*');
-    text = replace_italic_paired(&text, '_');
-    text = replace_inline_links(&text);
-
-    // Pass 4: substitute placeholder tokens back with their HTML.
-    let mut out = String::with_capacity(text.len());
-    let mut it = text.chars().peekable();
-    while let Some(c) = it.next() {
-        if c != '\0' {
-            out.push(c);
-            continue;
-        }
-        let mut digits = String::new();
-        while let Some(&d) = it.peek() {
-            if d.is_ascii_digit() {
-                digits.push(d);
-                it.next();
-            } else {
-                break;
-            }
-        }
-        // Consume closing NUL.
-        if it.peek() == Some(&'\0') {
-            it.next();
-        }
-        if let Ok(idx) = digits.parse::<usize>() {
-            if let Some(token) = frozen.get(idx) {
-                out.push_str(token);
-            }
-        }
-    }
-    out
-}
-
-/// Find the byte offset of the closing fence (the leading backticks of
-/// the closing ```` ``` ````). Returns `None` if unbalanced.
-fn find_fence_close(bytes: &[u8], from: usize) -> Option<usize> {
-    let mut j = from;
-    while j + 2 < bytes.len() {
-        if &bytes[j..j + 3] == b"```" {
-            // Must be at line start (or string start) — protects against
-            // mid-line backtick triplets.
-            if j == 0 || bytes[j - 1] == b'\n' {
-                return Some(j);
-            }
-        }
-        j += 1;
-    }
-    None
-}
-
-/// Replace `delim ... delim` with `open ... close`. `delim` must be a
-/// multi-char marker like `**`. Non-greedy.
-fn replace_paired(input: &str, delim: &str, open: &str, close: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-    while let Some(start) = rest.find(delim) {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + delim.len()..];
-        if let Some(end) = after.find(delim) {
-            out.push_str(open);
-            out.push_str(&after[..end]);
-            out.push_str(close);
-            rest = &after[end + delim.len()..];
-        } else {
-            // No close — leave the marker literal.
-            out.push_str(delim);
-            rest = after;
-            break;
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-/// Italic replacement for `*x*` / `_x_`. Only matches when the marker
-/// isn't doubled (which would already be bold) and the content is
-/// non-whitespace. Conservative: skips word-internal `_` like `foo_bar`.
-fn replace_italic_paired(input: &str, delim: char) -> String {
-    let chars: Vec<char> = input.chars().collect();
-    let mut out = String::with_capacity(input.len());
-    let mut i = 0;
-    while i < chars.len() {
-        if chars[i] == delim && (i == 0 || !chars[i - 1].is_alphanumeric()) {
-            // Find closing delim at a word boundary too.
-            let mut j = i + 1;
-            let mut found_end = None;
-            while j < chars.len() {
-                if chars[j] == delim && (j + 1 == chars.len() || !chars[j + 1].is_alphanumeric()) {
-                    found_end = Some(j);
-                    break;
-                }
-                if chars[j] == '\n' {
-                    break;
-                }
-                j += 1;
-            }
-            if let Some(end) = found_end {
-                let inner: String = chars[i + 1..end].iter().collect();
-                if !inner.trim().is_empty() {
-                    out.push_str("<i>");
-                    out.push_str(&inner);
-                    out.push_str("</i>");
-                    i = end + 1;
-                    continue;
-                }
-            }
-        }
-        out.push(chars[i]);
-        i += 1;
-    }
-    out
-}
-
-/// `[text](url)` → `<a href="url">text</a>`. URL is left as-is (already
-/// HTML-escaped from pass 2); text is also already escaped.
-fn replace_inline_links(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-    while let Some(open) = rest.find('[') {
-        out.push_str(&rest[..open]);
-        let after_open = &rest[open + 1..];
-        if let Some(close_bracket) = after_open.find(']') {
-            let after_bracket = &after_open[close_bracket + 1..];
-            if after_bracket.starts_with('(') {
-                if let Some(close_paren) = after_bracket.find(')') {
-                    let text = &after_open[..close_bracket];
-                    let url = &after_bracket[1..close_paren];
-                    out.push_str("<a href=\"");
-                    out.push_str(url);
-                    out.push_str("\">");
-                    out.push_str(text);
-                    out.push_str("</a>");
-                    rest = &after_bracket[close_paren + 1..];
-                    continue;
-                }
-            }
-        }
-        // No valid link — leave the bracket literal.
-        out.push('[');
-        rest = after_open;
-    }
-    out.push_str(rest);
     out
 }
 
@@ -1481,7 +1228,17 @@ mod tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    // ── markdown_to_html ──────────────────────────────────────────
+    // ── shared markdown renderer (Flavor::Html) adoption ─────────────
+    // The telegram outbound text path now delegates to the shared
+    // `copperclaw_channels_core::markdown::render(_, Flavor::Html)`
+    // renderer (U6). These tests pin that the HTML-flavour output the
+    // adapter sends is what telegram's tolerant HTML parser expects; the
+    // renderer's own exhaustive per-construct table lives in
+    // `core/src/markdown/render.rs`.
+
+    fn markdown_to_html(input: &str) -> String {
+        render_markdown(input, Flavor::Html)
+    }
 
     #[test]
     fn markdown_html_bold_and_italic() {
@@ -1549,9 +1306,11 @@ mod tests {
     }
 
     #[test]
-    fn markdown_html_preserves_newlines_and_lists() {
+    fn markdown_html_renders_lists_as_bullets() {
+        // U6: the shared renderer normalises `-`/`*`/`+` bullets to the
+        // `•` glyph (the old bespoke telegram formatter left them literal).
         let out = markdown_to_html("- one\n- two\n- three");
-        assert!(out.contains("- one\n- two\n- three"), "got: {out}");
+        assert_eq!(out, "\u{2022} one\n\u{2022} two\n\u{2022} three");
     }
 
     #[test]
@@ -3497,16 +3256,19 @@ mod tests {
                     id: 1,
                     text: "Wash dishes".into(),
                     status: copperclaw_channels_core::TodoItemStatus::Completed,
+                    blocked_reason: None,
                 },
                 copperclaw_channels_core::TodoListItem {
                     id: 2,
                     text: "Dry dishes".into(),
                     status: copperclaw_channels_core::TodoItemStatus::InProgress,
+                    blocked_reason: None,
                 },
                 copperclaw_channels_core::TodoListItem {
                     id: 3,
                     text: "Put dishes away".into(),
                     status: copperclaw_channels_core::TodoItemStatus::Pending,
+                    blocked_reason: None,
                 },
             ],
             title: Some("Kitchen".into()),
@@ -3540,6 +3302,7 @@ mod tests {
                 id: 1,
                 text: "ship it!".into(),
                 status: copperclaw_channels_core::TodoItemStatus::Pending,
+                blocked_reason: None,
             }],
             title: None,
         };

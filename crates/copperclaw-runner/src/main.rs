@@ -170,6 +170,11 @@ async fn main() -> Result<()> {
     };
     let mut tool_ctx_inner = RunnerToolCtx::new(outbound.clone(), paths.outbox.clone())
         .with_subagent(subagent_deps)
+        // A1 `delegate_batch` join seam: hand the ctx a handle to this
+        // session's inbound.db so `run_delegate_batch` can block-poll for
+        // each worker's spawn result + report. `inbound` is moved into
+        // `RunnerDeps` below, so clone the Arc here.
+        .with_join(inbound.clone())
         // Per-group searchable memory store: the host bind-mounts the group's
         // `memory/` dir at `/data/memory`, so the store lives at
         // `<session_dir>/memory/memory.db`. `MemoryStore::open` creates +

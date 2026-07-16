@@ -21,6 +21,11 @@
 //!   operator knows to run `cclaw groups restart <agent_group_id>`.
 //! - `"add_mcp_server"` — read `name`/`transport` from `payload`, insert
 //!   into `container_configs.mcp_servers`. Same no-auto-rebuild stance.
+//! - `"save_skill"` (M19 A4) — validate the agent-authored `SKILL.md` in
+//!   `payload.content` and write it under the host-computed
+//!   `payload.dest_dir` (`<groups_dir>/<ag>/skills/<name>`), enforcing the
+//!   frontmatter/name rules and containment under `payload.allowed_root`. The
+//!   next container spawn discovers it; no rebuild is required.
 //! - `"credentialed_external_action"` — grant one credentialed external action
 //!   on a taint-blocked or outward-facing request (M18 V5: the public-tunnel
 //!   broker's `expose`). Approving flips the row to `approved`; the requester
@@ -44,8 +49,88 @@ use copperclaw_cclaw::ErrorPayload;
 use copperclaw_db::central::CentralDb;
 use copperclaw_db::tables::pending_approvals::{ApprovalStatus, DecisionOutcome};
 use copperclaw_db::tables::{container_configs, messaging_groups, pending_approvals, users};
+use copperclaw_modules::{DeliveryDispatcher, DispatchTarget};
 use copperclaw_types::{AgentGroupId, ApprovalId};
 use serde_json::{Value, json};
+use std::sync::Arc;
+
+/// Terminal text stamped onto an approval card whose TTL lapsed before anyone
+/// resolved it (F3c). Kept short and actionable — the request is dead, so the
+/// only useful next step is to re-ask the agent.
+pub const EXPIRED_CARD_TEXT: &str =
+    "This approval request expired before anyone responded. Ask the agent to try again.";
+
+/// Sweep overdue pending approvals to `expired` AND stamp each lapsed card with
+/// a terminal "expired" edit, so a silently-lapsed approval never lingers in
+/// chat with live Approve/Deny buttons (F3c — "silent expiry").
+///
+/// Best-effort and idempotent: a card is edited exactly once (only for the rows
+/// this call actually flips from `pending` to `expired`), and a row without a
+/// recorded `platform_message_id` + channel coordinates is swept but not edited
+/// (there is no delivered card to stamp). Returns the number of cards edited.
+///
+/// Wired onto the in-chat approval interceptor (`approval_intercept.rs`) so any
+/// approval tap opportunistically clears stale cards on the surface that
+/// already holds the dispatcher; it is equally safe to call from a periodic
+/// host sweep (a lane-H follow-up) since the DB sweep is race-safe.
+#[must_use]
+pub fn expire_and_edit_cards(
+    central: &CentralDb,
+    dispatcher: &Arc<dyn DeliveryDispatcher>,
+) -> usize {
+    let now = chrono::Utc::now();
+    // Snapshot the cards about to lapse BEFORE the sweep flips them — after the
+    // flip we would have lost nothing (the row keeps its columns) but the
+    // snapshot also lets us skip the sweep entirely in the common no-op case.
+    let doomed: Vec<pending_approvals::PendingApproval> =
+        match pending_approvals::list(central, None, Some(ApprovalStatus::Pending)) {
+            Ok(rows) => rows.into_iter().filter(|r| r.is_expired_at(now)).collect(),
+            Err(err) => {
+                tracing::warn!(
+                    ?err,
+                    "approvals: could not list pending rows for expiry sweep"
+                );
+                return 0;
+            }
+        };
+    if doomed.is_empty() {
+        return 0;
+    }
+    let swept = match pending_approvals::sweep_expired(central, now) {
+        Ok(ids) => ids,
+        Err(err) => {
+            tracing::warn!(?err, "approvals: expiry sweep failed");
+            return 0;
+        }
+    };
+    let mut edited = 0;
+    for row in doomed {
+        // Only stamp rows this sweep actually flipped (guards against a
+        // concurrent resolve landing between the snapshot and the sweep).
+        if !swept.contains(&row.approval_id) {
+            continue;
+        }
+        let (Some(channel), Some(platform), Some(message_id)) = (
+            row.channel_type.clone(),
+            row.platform_id.clone(),
+            row.platform_message_id.clone(),
+        ) else {
+            continue; // no delivered card to stamp terminal
+        };
+        // The card's originating thread is not persisted on the row; edits key
+        // off (channel, platform_id, message_id), which is sufficient on every
+        // edit-capable adapter.
+        let target = DispatchTarget::channel(channel, platform, None);
+        dispatcher.edit_message(&target, &message_id, EXPIRED_CARD_TEXT);
+        copperclaw_metrics::inc_approval_card_outcome("expired_card");
+        tracing::info!(
+            approval_id = %row.approval_id.as_uuid(),
+            "approvals: stamped expired approval card terminal"
+        );
+        edited += 1;
+    }
+    edited
+}
 
 pub fn list(_args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     // Lapse any overdue pending rows first so the live list never includes
@@ -159,6 +244,10 @@ pub fn resolve_approve(
         "channel" => apply_channel(central, &row)?,
         "install_packages" => apply_install_packages(central, &row)?,
         "add_mcp_server" => apply_add_mcp_server(central, &row)?,
+        // M19 A4: write the agent-authored skill into the group's per-group
+        // skills override dir. Validates (frontmatter + name==dir) and enforces
+        // containment before the write; the next container spawn discovers it.
+        "save_skill" => apply_save_skill(&row)?,
         // M18 V2: flip the group's `preview_enabled` master switch — the same
         // effect as `cclaw groups config update --field preview_enabled=true`.
         // The pending row is raised host-side by the preview manager when the
@@ -602,6 +691,73 @@ fn apply_add_mcp_server(
     }))
 }
 
+/// `save_skill` family (M19 A4): validate and write an agent-authored skill
+/// into the group's per-group skills override directory. The pending row was
+/// raised by the delivery service, which stamped the host-computed
+/// `dest_dir` (`<groups_dir>/<ag>/skills`) and `allowed_root` (`<groups_dir>`)
+/// into the payload alongside the agent-supplied `name`/`content`. Approving
+/// validates the frontmatter + `name == dir` invariant and enforces
+/// containment (canonical dest under `allowed_root`) before writing
+/// `<dest_dir>/<name>/SKILL.md`. The next container spawn's skill scan
+/// discovers it — closing the write→discovery loop. No rebuild is needed
+/// (skills are read fresh at spawn, not baked into the image).
+///
+/// A4 metric wish: `copperclaw_skills_saved_total{outcome}` (saved / rejected)
+/// — recorded here and in the delivery raise path once the metrics crate gains
+/// the counter (out of scope for this card, which must not touch
+/// `copperclaw-metrics`).
+fn apply_save_skill(row: &pending_approvals::PendingApproval) -> Result<Value, ErrorPayload> {
+    let bad = |msg: &str| ErrorPayload::new("bad_request", msg.to_string());
+    let name = row
+        .payload
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("save_skill payload requires a string `name`"))?;
+    let content = row
+        .payload
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("save_skill payload requires a string `content`"))?;
+    let dest_dir = row
+        .payload
+        .get("dest_dir")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("save_skill payload requires a string `dest_dir`"))?;
+    let allowed_root = row
+        .payload
+        .get("allowed_root")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("save_skill payload requires a string `allowed_root`"))?;
+
+    let dest = std::path::PathBuf::from(dest_dir);
+    let roots = [std::path::PathBuf::from(allowed_root)];
+    let written = match copperclaw_skills::save_group_skill(&dest, &roots, name, content) {
+        Ok(written) => {
+            // M19 A4: dedicated saved/rejected counter at the true write site.
+            copperclaw_metrics::inc_skills_saved("saved");
+            written
+        }
+        // A well-formed but invalid skill (bad frontmatter, name mismatch,
+        // containment escape) surfaces the precise skills-crate error.
+        Err(e) => {
+            copperclaw_metrics::inc_skills_saved("rejected");
+            return Err(ErrorPayload::new(
+                "bad_request",
+                format!("save_skill rejected: {e}"),
+            ));
+        }
+    };
+
+    Ok(json!({
+        "kind": "save_skill",
+        "agent_group_id": row.agent_group_id.map(|g| g.as_uuid().to_string()),
+        "name": name,
+        "path": written.to_string_lossy(),
+        "note": "skill saved to the group's skills override; it is discovered and \
+                 available on the agent's NEXT session (no rebuild needed)",
+    }))
+}
+
 /// `enable_preview` family (M18 V2): flip the group's `preview_enabled`
 /// master switch on. Effect-identical to the operator running
 /// `cclaw groups config update --field preview_enabled=true <ag>` — the
@@ -1023,6 +1179,150 @@ mod tests {
         assert!(hint.contains("session-scope"));
         let cfg = container_configs::get(&db, ag).unwrap().unwrap();
         assert!(cfg.packages_npm.contains(&"typescript".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // M19 A4: save_skill approval → validate → write → discovery
+    // -----------------------------------------------------------------------
+
+    const A4_SKILL: &str =
+        "---\nname: my-skill\ndescription: A reusable procedure\n---\n# Steps\ndo it\n";
+
+    /// End-to-end: an approved `save_skill` writes the SKILL.md into the
+    /// group's per-group skills override dir, and a fresh `SkillRegistry::scan`
+    /// (what the next container spawn does) discovers and exposes it.
+    #[test]
+    fn approve_save_skill_writes_and_is_discovered_on_next_spawn() {
+        let db = db();
+        let ag = seed_ag(&db);
+        let td = tempfile::tempdir().unwrap();
+        let groups_dir = td.path().join("groups");
+        let dest_dir = groups_dir.join(ag.as_uuid().to_string()).join("skills");
+        let id = insert_pending(
+            &db,
+            "save_skill",
+            UpsertPendingApproval {
+                request_id: format!("save-skill:{}:my-skill", ag.as_uuid()),
+                payload: json!({
+                    "name": "my-skill",
+                    "content": A4_SKILL,
+                    "reason": "handy",
+                    "dest_dir": dest_dir.to_string_lossy(),
+                    "allowed_root": groups_dir.to_string_lossy(),
+                }),
+                agent_group_id: Some(ag),
+                title: "Save skill: my-skill".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        let v = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap();
+        assert_eq!(v["applied"], true);
+        assert_eq!(v["side_effect"]["kind"], "save_skill");
+        assert_eq!(v["side_effect"]["name"], "my-skill");
+
+        // The SKILL.md landed on disk.
+        let skill_md = dest_dir.join("my-skill").join("SKILL.md");
+        assert!(skill_md.is_file(), "SKILL.md should exist at {skill_md:?}");
+
+        // The next spawn's discovery scan finds it as a group-sourced skill.
+        let global = td.path().join("global");
+        std::fs::create_dir_all(&global).unwrap();
+        let reg = copperclaw_skills::SkillRegistry::scan(&global, Some((ag, &dest_dir))).unwrap();
+        let skill = reg.get("my-skill").expect("saved skill discovered");
+        assert_eq!(skill.description, "A reusable procedure");
+        assert_eq!(skill.source, copperclaw_skills::SkillSource::Group(ag));
+    }
+
+    /// Invalid frontmatter is refused at approve time with the precise
+    /// skills-crate validation error (defense-in-depth: the tool refuses it
+    /// first, but the write boundary re-validates).
+    #[test]
+    fn approve_save_skill_rejects_invalid_frontmatter() {
+        let db = db();
+        let ag = seed_ag(&db);
+        let td = tempfile::tempdir().unwrap();
+        let groups_dir = td.path().join("groups");
+        let dest_dir = groups_dir.join(ag.as_uuid().to_string()).join("skills");
+        let id = insert_pending(
+            &db,
+            "save_skill",
+            UpsertPendingApproval {
+                request_id: "r-bad-skill".into(),
+                payload: json!({
+                    "name": "my-skill",
+                    "content": "no frontmatter here\n",
+                    "reason": "x",
+                    "dest_dir": dest_dir.to_string_lossy(),
+                    "allowed_root": groups_dir.to_string_lossy(),
+                }),
+                agent_group_id: Some(ag),
+                title: "Save skill".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        let err = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap_err();
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("rejected"), "got: {}", err.message);
+        // Nothing was written and the row stays pending (not silently approved).
+        assert!(!dest_dir.join("my-skill").exists());
+        let row = get_row(&db, id).unwrap();
+        assert_eq!(row.status, ApprovalStatus::Pending);
+    }
+
+    /// A destination that canonically escapes the allowed root is refused —
+    /// the containment guard reused from the skills crate.
+    #[test]
+    fn approve_save_skill_rejects_containment_escape() {
+        let db = db();
+        let ag = seed_ag(&db);
+        let td = tempfile::tempdir().unwrap();
+        // allowed_root is a sibling of the destination — the write escapes it.
+        let allowed = td.path().join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let dest_dir = td.path().join("outside").join("skills");
+        let id = insert_pending(
+            &db,
+            "save_skill",
+            UpsertPendingApproval {
+                request_id: "r-escape-skill".into(),
+                payload: json!({
+                    "name": "my-skill",
+                    "content": A4_SKILL,
+                    "reason": "x",
+                    "dest_dir": dest_dir.to_string_lossy(),
+                    "allowed_root": allowed.to_string_lossy(),
+                }),
+                agent_group_id: Some(ag),
+                title: "Save skill".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        let err = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap_err();
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("escapes"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn approve_save_skill_missing_dest_is_bad_request() {
+        let db = db();
+        let ag = seed_ag(&db);
+        let id = insert_pending(
+            &db,
+            "save_skill",
+            UpsertPendingApproval {
+                request_id: "r-nodest".into(),
+                payload: json!({ "name": "my-skill", "content": A4_SKILL }),
+                agent_group_id: Some(ag),
+                title: "Save skill".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        let err = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap_err();
+        assert_eq!(err.code, "bad_request");
     }
 
     #[test]
@@ -1609,6 +1909,124 @@ mod tests {
         let scoped = decisions(&json!({"id": id.as_uuid().to_string()}), &db).unwrap();
         assert_eq!(scoped.as_array().unwrap().len(), 1);
         assert_eq!(scoped[0]["approval_id"], id.as_uuid().to_string());
+    }
+
+    // -----------------------------------------------------------------------
+    // F3c: expiry stamps the card terminal
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn expire_and_edit_cards_stamps_only_lapsed_cards() {
+        use copperclaw_modules::context::MockDispatcher;
+        let db = db();
+        // Overdue, has a delivered card → swept AND stamped.
+        let with_card = upsert(
+            &db,
+            UpsertPendingApproval {
+                request_id: "exp-card".into(),
+                action: "sender".into(),
+                payload: json!({}),
+                channel_type: Some(ChannelType::new("telegram")),
+                platform_id: Some("100".into()),
+                platform_message_id: Some("card-1".into()),
+                expires_at: Some(chrono::Utc::now() - chrono::Duration::minutes(5)),
+                title: "x".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .approval_id;
+        // Overdue, but NO delivered card → swept, not stamped (nothing to edit).
+        let no_card = upsert(
+            &db,
+            UpsertPendingApproval {
+                request_id: "exp-nocard".into(),
+                action: "sender".into(),
+                payload: json!({}),
+                channel_type: Some(ChannelType::new("telegram")),
+                platform_id: Some("100".into()),
+                platform_message_id: None,
+                expires_at: Some(chrono::Utc::now() - chrono::Duration::minutes(5)),
+                title: "x".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .approval_id;
+        // Live (not overdue) → untouched.
+        let live = upsert(
+            &db,
+            UpsertPendingApproval {
+                request_id: "exp-live".into(),
+                action: "sender".into(),
+                payload: json!({}),
+                channel_type: Some(ChannelType::new("telegram")),
+                platform_id: Some("100".into()),
+                platform_message_id: Some("card-live".into()),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                title: "x".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .approval_id;
+
+        let mock = MockDispatcher::new();
+        let dispatcher: std::sync::Arc<dyn DeliveryDispatcher> = mock.clone();
+        let edited = expire_and_edit_cards(&db, &dispatcher);
+        assert_eq!(
+            edited, 1,
+            "only the lapsed card with a message id is stamped"
+        );
+
+        // Both overdue rows are now expired; the live one stays pending.
+        assert_eq!(
+            get_row(&db, with_card).unwrap().status,
+            ApprovalStatus::Expired
+        );
+        assert_eq!(
+            get_row(&db, no_card).unwrap().status,
+            ApprovalStatus::Expired
+        );
+        assert_eq!(get_row(&db, live).unwrap().status, ApprovalStatus::Pending);
+
+        // Exactly one terminal edit, addressed by the recorded message id.
+        let edits = mock.edits.lock().unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].1, "card-1");
+        assert_eq!(edits[0].2, EXPIRED_CARD_TEXT);
+
+        // Idempotent: a second sweep finds nothing pending-overdue.
+        assert_eq!(expire_and_edit_cards(&db, &dispatcher), 0);
+    }
+
+    #[test]
+    fn expire_and_edit_cards_noop_when_nothing_overdue() {
+        use copperclaw_modules::context::MockDispatcher;
+        let db = db();
+        upsert(
+            &db,
+            UpsertPendingApproval {
+                request_id: "fresh".into(),
+                action: "sender".into(),
+                payload: json!({}),
+                channel_type: Some(ChannelType::new("telegram")),
+                platform_id: Some("100".into()),
+                platform_message_id: Some("card-f".into()),
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                title: "x".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mock = MockDispatcher::new();
+        let dispatcher: std::sync::Arc<dyn DeliveryDispatcher> = mock.clone();
+        assert_eq!(expire_and_edit_cards(&db, &dispatcher), 0);
+        assert_eq!(mock.edit_count(), 0);
     }
 
     #[test]

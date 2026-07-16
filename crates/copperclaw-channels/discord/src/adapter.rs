@@ -22,6 +22,7 @@ use crate::gateway::lifecycle::{NextAction, SessionState, decide_resume_or_ident
 use crate::gateway::{self, Frame, codec};
 use crate::rest::DiscordRest;
 use async_trait::async_trait;
+use copperclaw_channels_core::markdown::{Flavor, render as render_markdown};
 use copperclaw_channels_core::{
     AdapterError, Breadcrumb, BreadcrumbStatus, Card, CardButton, ChannelAdapter,
     ContainerContribution, DiffCard, DmHandle as CoreDmHandle, ErrorCard, ErrorCardKind,
@@ -315,6 +316,22 @@ impl DiscordAdapter {
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "failed to map MESSAGE_CREATE");
+                    }
+                }
+            }
+            "MESSAGE_REACTION_ADD" => {
+                // M19 U7: a user reacted on a message. Surface unicode-emoji
+                // reactions as inbound-reaction events; the runner decides
+                // whether it landed on the agent's own message.
+                match events::message_reaction_add_to_inbound(data) {
+                    Ok(Some(evt)) => {
+                        if self.inbound_tx.send(evt).await.is_err() {
+                            tracing::warn!("inbound channel closed; dropping reaction event");
+                        }
+                    }
+                    Ok(None) => {} // custom emoji / non-steerable
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to map MESSAGE_REACTION_ADD");
                     }
                 }
             }
@@ -1022,10 +1039,14 @@ fn render_step_line_content(s: &Breadcrumb) -> String {
 }
 
 /// Render an `OutboundMessage` to a plain string suitable for Discord's
-/// `content` field. Pull `content.text` when present; otherwise compact JSON.
+/// `content` field. Pull `content.text` when present and run it through the
+/// shared [`copperclaw_channels_core::markdown::render`] renderer with
+/// [`Flavor::Discord`] (U6) so the agent's canonical Markdown lands as
+/// Discord `CommonMark` (bullets normalised to `-`, headings/bold/fences
+/// preserved); otherwise fall back to compact JSON.
 pub fn render_outbound_text(message: &OutboundMessage) -> String {
     if let Some(t) = message.content.get("text").and_then(|v| v.as_str()) {
-        t.to_owned()
+        render_markdown(t, Flavor::Discord)
     } else {
         message.content.to_string()
     }
@@ -1374,16 +1395,21 @@ pub(crate) fn build_todo_list_payload(list: &TodoList) -> Value {
         let glyph = match item.status {
             TodoItemStatus::Completed => "[x]",
             TodoItemStatus::InProgress => "[~]",
+            TodoItemStatus::Blocked => "[!]",
             TodoItemStatus::Pending => "[ ]",
         };
         // Strip any backticks in user text so a value can't break out
         // of the embed; embed descriptions are not in a code fence
         // but defensive sanitisation keeps the rendering predictable.
         let safe_text = item.text.trim().replace("```", "'''");
+        let suffix = match item.blocked_reason_text() {
+            Some(reason) => format!(" *(blocked: {})*", reason.replace("```", "'''")),
+            None => String::new(),
+        };
         let line = if item.status == TodoItemStatus::Completed {
-            format!("{glyph} ~~{safe_text}~~\n")
+            format!("{glyph} ~~{safe_text}~~{suffix}\n")
         } else {
-            format!("{glyph} {safe_text}\n")
+            format!("{glyph} {safe_text}{suffix}\n")
         };
         if description.len() + line.len() > DESC_BUDGET {
             break;
@@ -2806,16 +2832,19 @@ mod tests {
                     id: 1,
                     text: "Wash dishes".into(),
                     status: TodoItemStatus::Completed,
+                    blocked_reason: None,
                 },
                 TodoListItem {
                     id: 2,
                     text: "Dry dishes".into(),
                     status: TodoItemStatus::InProgress,
+                    blocked_reason: None,
                 },
                 TodoListItem {
                     id: 3,
                     text: "Put dishes away".into(),
                     status: TodoItemStatus::Pending,
+                    blocked_reason: None,
                 },
             ],
             title: Some("Kitchen".into()),
@@ -2851,11 +2880,13 @@ mod tests {
                     id: 1,
                     text: "x".into(),
                     status: TodoItemStatus::Completed,
+                    blocked_reason: None,
                 },
                 TodoListItem {
                     id: 2,
                     text: "y".into(),
                     status: TodoItemStatus::Completed,
+                    blocked_reason: None,
                 },
             ],
             title: None,

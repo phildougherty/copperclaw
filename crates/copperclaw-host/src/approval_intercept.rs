@@ -173,6 +173,15 @@ pub fn build_approval_interceptor(
         let approval_id = ApprovalId(uuid);
         let agent_group_id = ctx.agent_group_id;
 
+        // F3(c): opportunistically stamp any card whose TTL lapsed terminal, so
+        // a silently-expired approval never lingers with live buttons. This is
+        // the one host surface that both runs on approval activity and holds the
+        // delivery dispatcher; a periodic sweep is a lane-H follow-up.
+        let expired = crate::handlers::approvals::expire_and_edit_cards(&central, &dispatcher);
+        if expired > 0 {
+            tracing::info!(expired, "approvals: stamped expired approval cards on tap");
+        }
+
         // Authorisation: only Owner/Admin (global or group-scoped) may resolve.
         let Some((_uid, approver)) = resolve_approver(&central, agent_group_id, &ctx) else {
             copperclaw_metrics::inc_approval_tap("unauthorized");
@@ -228,28 +237,42 @@ pub fn build_approval_interceptor(
                     edit_card(&central, &dispatcher, &ctx, approval_id, verb, &approver);
                 } else {
                     // Already resolved before this tap landed (CLI/in-chat
-                    // race, or a double-tap). First resolution won; this is a
-                    // deliberate no-op — no second edit, no error surfaced.
-                    copperclaw_metrics::inc_approval_tap("race_noop");
+                    // race, or a double-tap) with the SAME verb the winner used.
+                    // First resolution won; F3(b): tell the losing tapper who
+                    // resolved it instead of leaving their tap looking broken.
+                    copperclaw_metrics::inc_approval_card_outcome("conflict_notified");
                     tracing::info!(
                         approval_id = %approval_id.as_uuid(),
-                        "approvals: in-chat tap on an already-resolved approval; no-op"
+                        "approvals: in-chat tap on an already-resolved approval; notifying loser"
                     );
+                    reply(&dispatcher, &ctx, &resolved_note(&central, approval_id));
                 }
                 ApprovalInterceptDecision::Handled
             }
             Err(err) => {
-                copperclaw_metrics::inc_approval_tap("race_noop");
-                // `conflict` (row already denied/approved/expired) or
-                // `not_found` (swept). Either way the request is settled: the
-                // race loser must not crash and must not double-resolve.
+                // `conflict` (row already denied/approved/expired via the
+                // OPPOSITE verb, or lapsed) or `not_found` (swept entirely).
+                // Either way the request is settled: the race loser must not
+                // crash and must not double-resolve.
                 tracing::info!(
                     approval_id = %approval_id.as_uuid(),
                     code = %err.code,
                     "approvals: in-chat resolution not applied"
                 );
-                if err.code == "not_found" {
-                    reply(&dispatcher, &ctx, "That approval is no longer pending.");
+                match err.code.as_str() {
+                    // F3(b): the row settled under a conflicting decision — name
+                    // the resolver (or say it expired) rather than staying mute.
+                    "conflict" => {
+                        copperclaw_metrics::inc_approval_card_outcome("conflict_notified");
+                        reply(&dispatcher, &ctx, &resolved_note(&central, approval_id));
+                    }
+                    "not_found" => {
+                        copperclaw_metrics::inc_approval_card_outcome("conflict_notified");
+                        reply(&dispatcher, &ctx, "That approval is no longer pending.");
+                    }
+                    _ => {
+                        copperclaw_metrics::inc_approval_tap("race_noop");
+                    }
                 }
                 ApprovalInterceptDecision::Handled
             }
@@ -264,9 +287,15 @@ fn verb_label(verb: Verb) -> &'static str {
     }
 }
 
-/// Edit the delivered approval card to its terminal "<Verb> by <name>" text.
-/// Best-effort: a missing `platform_message_id` (card delivery never recorded
-/// one) simply skips the edit — the DB state is already authoritative.
+/// Stamp the delivered approval card with its terminal "<Verb> by <name>"
+/// state so it never keeps showing live Approve/Deny buttons after resolution.
+///
+/// F3(a): the card is edited in place when a `platform_message_id` was recorded
+/// at delivery. When it was NOT — the delivering adapter returned no id, or the
+/// card degraded to a plain-text fallback with no editable anchor — we do NOT
+/// silently skip (the old bug, which left live buttons). Instead we post the
+/// resolution as a short follow-up reply on the tapping surface, so the outcome
+/// is always visible even on the fallback-id path.
 fn edit_card(
     central: &CentralDb,
     dispatcher: &Arc<dyn DeliveryDispatcher>,
@@ -282,20 +311,50 @@ fn edit_card(
             None
         }
     };
-    let Some(pmid) = pmid else {
-        tracing::info!(
-            approval_id = %approval_id.as_uuid(),
-            "approvals: no platform_message_id recorded; skipping card edit"
-        );
-        return;
-    };
+    let text = format!("{} by {approver}", verb.past());
     let target = DispatchTarget::channel(
         ctx.channel_type.clone(),
         ctx.platform_id.clone(),
         ctx.thread_id.clone(),
     );
-    let text = format!("{} by {approver}", verb.past());
-    dispatcher.edit_message(&target, &pmid, &text);
+    if let Some(pmid) = pmid {
+        // M19 F3: card stamped terminal in place.
+        copperclaw_metrics::inc_approval_card_outcome("resolved_edit");
+        dispatcher.edit_message(&target, &pmid, &text);
+    } else {
+        // Fallback-id path: no editable anchor was recorded at delivery. Post
+        // the resolution as a follow-up reply rather than leaving the card live.
+        tracing::info!(
+            approval_id = %approval_id.as_uuid(),
+            "approvals: no platform_message_id recorded; posting resolution as a follow-up reply"
+        );
+        copperclaw_metrics::inc_approval_card_outcome("resolved_fallback_reply");
+        reply(dispatcher, ctx, &text);
+    }
+}
+
+/// Build the "already resolved" note shown to a losing tapper (F3b). Reads the
+/// most recent decision so it names the human (or system) that actually settled
+/// the request; an expiry gets a distinct, actionable line.
+fn resolved_note(central: &CentralDb, id: ApprovalId) -> String {
+    use copperclaw_db::tables::pending_approvals::DecisionOutcome;
+    match pending_approvals::list_decisions(central, Some(id), 1) {
+        Ok(decs) => match decs.first() {
+            Some(d) if d.outcome == DecisionOutcome::Expire => {
+                "This approval request expired before it was resolved. Ask the agent to try again."
+                    .to_owned()
+            }
+            Some(d) => format!("This request was already resolved by {}.", d.decided_by),
+            None => "That approval is no longer pending.".to_owned(),
+        },
+        Err(err) => {
+            tracing::warn!(
+                ?err,
+                "approvals: could not read decision log for loser note"
+            );
+            "That approval is no longer pending.".to_owned()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -498,6 +557,144 @@ mod tests {
         let mut c = ctx(ApprovalId::new(), "approve", ag, "x");
         c.callback_data = "expand:42".into();
         assert_eq!(interceptor(c), ApprovalInterceptDecision::Passthrough);
+    }
+
+    /// Seed a pending sender-approval with an explicit `platform_message_id`
+    /// (None models a card the delivering adapter reported no id for) and an
+    /// optional explicit deadline.
+    fn seed_pending_with(
+        db: &CentralDb,
+        ag: AgentGroupId,
+        req: &str,
+        pmid: Option<&str>,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> ApprovalId {
+        upsert(
+            db,
+            UpsertPendingApproval {
+                request_id: req.into(),
+                action: "sender".into(),
+                payload: serde_json::json!({}),
+                agent_group_id: Some(ag),
+                channel_type: Some(ChannelType::new("telegram")),
+                platform_id: Some("100".into()),
+                platform_message_id: pmid.map(str::to_owned),
+                expires_at,
+                title: "Approve sender?".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .approval_id
+    }
+
+    #[test]
+    fn approver_tap_falls_back_to_reply_when_no_platform_message_id() {
+        // F3(a): the delivering adapter recorded no platform_message_id (the
+        // old silent-skip bug left live buttons). The tap must still surface
+        // the resolution — as a follow-up reply — not vanish.
+        let db = db();
+        let ag = seed_ag(&db);
+        seed_user(&db, "owner-1", Some(Role::Owner), None);
+        let id = seed_pending_with(&db, ag, "req-nopmid", None, None);
+        let mock = MockDispatcher::new();
+        let dispatcher: Arc<dyn DeliveryDispatcher> = mock.clone();
+        let interceptor = build_approval_interceptor(db.clone(), dispatcher);
+
+        interceptor(ctx(id, "approve", ag, "owner-1"));
+
+        // Resolved in the DB, but there is no card to edit...
+        assert_eq!(get_row(&db, id).unwrap().status, ApprovalStatus::Approved);
+        assert_eq!(mock.edit_count(), 0, "no editable card");
+        // ...so the resolution lands as a follow-up reply instead.
+        let sent = mock.dispatched.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1.content["text"], "Approved by Tapper");
+    }
+
+    #[test]
+    fn conflict_loser_same_verb_is_told_who_resolved() {
+        // F3(b): CLI approved first; a chat Approve tap arrives second (same
+        // verb → Ok{applied:false}). The loser must be told, not left silent.
+        let db = db();
+        let ag = seed_ag(&db);
+        seed_user(&db, "owner-1", Some(Role::Owner), None);
+        let id = seed_sender_pending(&db, ag);
+        crate::handlers::approvals::resolve_approve(&db, id, "host").unwrap();
+        let mock = MockDispatcher::new();
+        let dispatcher: Arc<dyn DeliveryDispatcher> = mock.clone();
+        let interceptor = build_approval_interceptor(db.clone(), dispatcher);
+
+        interceptor(ctx(id, "approve", ag, "owner-1"));
+
+        assert_eq!(mock.edit_count(), 0, "winner already stamped; no re-edit");
+        let sent = mock.dispatched.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].1.content["text"],
+            "This request was already resolved by host."
+        );
+    }
+
+    #[test]
+    fn conflict_loser_opposite_verb_is_told_who_resolved() {
+        // F3(b): CLI approved first; a chat Deny tap arrives second (opposite
+        // verb → Err{conflict}). Same "already resolved by <name>" reply.
+        let db = db();
+        let ag = seed_ag(&db);
+        seed_user(&db, "owner-1", Some(Role::Owner), None);
+        let id = seed_sender_pending(&db, ag);
+        crate::handlers::approvals::resolve_approve(&db, id, "host").unwrap();
+        let mock = MockDispatcher::new();
+        let dispatcher: Arc<dyn DeliveryDispatcher> = mock.clone();
+        let interceptor = build_approval_interceptor(db.clone(), dispatcher);
+
+        interceptor(ctx(id, "deny", ag, "owner-1"));
+
+        let sent = mock.dispatched.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].1.content["text"],
+            "This request was already resolved by host."
+        );
+    }
+
+    #[test]
+    fn expired_card_is_stamped_terminal_on_a_later_tap() {
+        // F3(c): a separate approval lapsed its TTL with a live card. When any
+        // approval tap runs the interceptor, the opportunistic sweep stamps the
+        // stale card terminal (no live buttons left dangling).
+        let db = db();
+        let ag = seed_ag(&db);
+        seed_user(&db, "owner-1", Some(Role::Owner), None);
+        // Stale: overdue, has a delivered card.
+        let stale = seed_pending_with(
+            &db,
+            ag,
+            "req-stale",
+            Some("stale-card"),
+            Some(chrono::Utc::now() - chrono::Duration::minutes(5)),
+        );
+        // Live: the approval actually being tapped.
+        let live = seed_sender_pending(&db, ag);
+
+        let mock = MockDispatcher::new();
+        let dispatcher: Arc<dyn DeliveryDispatcher> = mock.clone();
+        let interceptor = build_approval_interceptor(db.clone(), dispatcher);
+
+        interceptor(ctx(live, "approve", ag, "owner-1"));
+
+        // The stale row lapsed and its card was stamped terminal.
+        assert_eq!(get_row(&db, stale).unwrap().status, ApprovalStatus::Expired);
+        let edits = mock.edits.lock().unwrap();
+        let stale_edit = edits
+            .iter()
+            .find(|e| e.1 == "stale-card")
+            .expect("card edit");
+        assert!(stale_edit.2.contains("expired"));
+        // The tapped approval resolved normally.
+        assert_eq!(get_row(&db, live).unwrap().status, ApprovalStatus::Approved);
     }
 
     #[test]

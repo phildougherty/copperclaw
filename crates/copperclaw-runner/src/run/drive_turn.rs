@@ -9,8 +9,10 @@ use copperclaw_db::tables::messages_in;
 use copperclaw_providers::HistoryMessage;
 
 use super::RunnerDeps;
+use super::blocker::{BlockerCategory, BlockerRun};
 use super::hud::TaskHud;
 use super::provider_call::{HeartbeatTicker, run_llm_turn};
+use super::reaction;
 use super::tool_dispatch::{ToolImage, invoke_tool};
 use crate::state::save_state;
 
@@ -18,6 +20,13 @@ use crate::state::save_state;
 pub(super) struct TurnResult {
     pub(super) continuation: Option<String>,
     pub(super) outcome: TurnOutcome,
+    /// F2: the blocker whose denial run filled the tail of this turn,
+    /// when the turn ended WITHOUT a user-facing reply. Set only by the
+    /// outer [`drive_turn`] from the per-turn [`BlockerRun`]; every
+    /// construction site in `drive_turn_inner` leaves it `None`. On a
+    /// `Failed` outcome the terminal-failure path swaps its generic
+    /// apology for this category's curated wall card.
+    pub(super) blocker: Option<BlockerCategory>,
 }
 
 /// Outcome of one per-inbound drive. Public because the host's
@@ -280,7 +289,24 @@ pub(super) async fn drive_turn(
     // collapsed to a one-line summary here — on the failure paths too,
     // so a budget/loop/parse abort never strands a "Running" HUD.
     let hud = TaskHud::new(deps);
-    let result = drive_turn_inner(deps, history, previous_continuation, context_block, &hud).await;
+    // F5: arm the background HUD task now (live HUD only) so the
+    // pre-first-tool / pure-reasoning wait is covered by a "thinking…"
+    // frame after a short threshold, not left blank until the first tool.
+    hud.arm();
+    // F2: track the tail run of same-blocker denials across the whole
+    // inbound so the outer function can attach the wall category to the
+    // result once the loop resolves (only consulted on a `Failed`
+    // outcome — i.e. a turn that ended without a user-facing reply).
+    let mut blocker_run = BlockerRun::default();
+    let mut result = drive_turn_inner(
+        deps,
+        history,
+        previous_continuation,
+        context_block,
+        &hud,
+        &mut blocker_run,
+    )
+    .await;
     let ok = matches!(
         &result,
         Ok(TurnResult {
@@ -288,6 +314,12 @@ pub(super) async fn drive_turn(
             ..
         })
     );
+    // Attach the tail blocker (if the run reached the threshold and no
+    // user-facing reply went out) so `finalize_messages` can surface the
+    // curated wall card instead of the generic apology.
+    if let Ok(tr) = &mut result {
+        tr.blocker = blocker_run.tail_blocker();
+    }
     hud.finalize(ok).await;
     result
 }
@@ -303,6 +335,7 @@ async fn drive_turn_inner(
     previous_continuation: Option<&str>,
     context_block: Option<&str>,
     hud: &TaskHud,
+    blocker_run: &mut BlockerRun,
 ) -> Result<TurnResult> {
     let mut continuation: Option<String> = previous_continuation.map(str::to_string);
     // Reset per-turn context state (the coarse-provenance taint flag)
@@ -369,6 +402,7 @@ async fn drive_turn_inner(
             return Ok(TurnResult {
                 continuation,
                 outcome: TurnOutcome::Failed(reason),
+                blocker: None,
             });
         }
 
@@ -418,6 +452,7 @@ async fn drive_turn_inner(
                          a different model or lower the reasoning effort."
                             .to_string(),
                     ),
+                    blocker: None,
                 });
             }
             // M18 R6: progressive final answers. On a rich (edit-capable)
@@ -446,6 +481,7 @@ async fn drive_turn_inner(
                 return Ok(TurnResult {
                     continuation,
                     outcome: TurnOutcome::Done,
+                    blocker: None,
                 });
             }
             copperclaw_metrics::inc_progressive_final(&progressive_ag, "single_emit");
@@ -468,6 +504,7 @@ async fn drive_turn_inner(
             return Ok(TurnResult {
                 continuation,
                 outcome: TurnOutcome::Done,
+                blocker: None,
             });
         }
 
@@ -529,6 +566,10 @@ async fn drive_turn_inner(
             cumulative_tool_runs += 1;
             last_tool_name = Some(call.name.clone());
             batch_all_ok &= !is_error;
+            // F2: fold this result into the tail-run tracker in call
+            // order — a run of same-blocker denials at the tail of a
+            // silent turn surfaces one curated wall card at finalize.
+            blocker_run.observe(&call.name, is_error, &content);
             history.push(HistoryMessage::Tool {
                 tool_use_id: call.id.clone(),
                 content,
@@ -579,6 +620,7 @@ async fn drive_turn_inner(
             return Ok(TurnResult {
                 continuation,
                 outcome: stopped,
+                blocker: None,
             });
         }
 
@@ -613,6 +655,7 @@ async fn drive_turn_inner(
             return Ok(TurnResult {
                 continuation,
                 outcome: TurnOutcome::Failed(reason),
+                blocker: None,
             });
         }
 
@@ -630,6 +673,7 @@ async fn drive_turn_inner(
                 outcome: TurnOutcome::Failed(format!(
                     "model produced malformed tool-call JSON {consecutive_parse_error_turns} turns in a row"
                 )),
+                blocker: None,
             });
         }
 
@@ -659,6 +703,7 @@ async fn drive_turn_inner(
                 outcome: TurnOutcome::Failed(format!(
                     "task budget reached: {task_tokens_spent} tokens; stopping"
                 )),
+                blocker: None,
             });
         }
     }
@@ -673,6 +718,7 @@ async fn drive_turn_inner(
         outcome: TurnOutcome::Failed(format!(
             "the agent ran out of turns after {cap} tool calls without finishing the task"
         )),
+        blocker: None,
     })
 }
 
@@ -732,10 +778,51 @@ async fn check_mid_turn_steering(
         return Ok(Some(TurnOutcome::Done));
     }
 
-    let interjections: Vec<_> = peeked
+    // M19 U7: reactions are lightweight steering, handled distinctly from
+    // plain-chat interjections. A curated reaction (✅/👍/👀/❌/👎) on the
+    // agent's OWN last message folds a one-line note into the transcript; any
+    // other reaction is consumed and ignored. Reaction rows must NOT reach the
+    // generic chat-folding path below (that would echo raw reaction JSON to
+    // the model as a user turn) — partition them out first.
+    let (reaction_rows, interjections): (Vec<_>, Vec<_>) = peeked
         .into_iter()
         .filter(|r| r.kind == copperclaw_types::MessageKind::Chat)
-        .collect();
+        .partition(reaction::is_reaction_row);
+
+    if !reaction_rows.is_empty() {
+        let own_ids = reaction::own_delivered_ids(deps).await;
+        let mut steered = false;
+        for row in &reaction_rows {
+            if let Some((signal, emoji)) = reaction::steer_for_row(row, &own_ids) {
+                // External content: taint the turn so a reaction can never
+                // launder trust into a credentialed external action (mirrors
+                // how a web_fetch body / untrusted memory hit taints).
+                deps.tool_ctx
+                    .mark_untrusted_context(&format!("reaction:{}", signal.label()));
+                history.push(HistoryMessage::User {
+                    content: signal.interjection_line(&emoji),
+                });
+                copperclaw_metrics::inc_midturn_control(
+                    &deps.agent_group_id.to_string(),
+                    "reaction",
+                );
+                // M19 U7: dedicated per-signal/outcome counter.
+                copperclaw_metrics::inc_inbound_reaction(signal.label(), "folded");
+                steered = true;
+            } else {
+                // Uncurated emoji, or a reaction on a message that isn't the
+                // agent's own last — consumed but not steered.
+                copperclaw_metrics::inc_inbound_reaction("none", "ignored");
+            }
+            // Consume every reaction row (steering or not) so it never
+            // re-surfaces as a spurious turn on a later poll.
+            mark_mid_turn_row_completed(deps, row.id).await;
+        }
+        if steered {
+            hud.add_note("reaction noted");
+        }
+    }
+
     if !interjections.is_empty() {
         copperclaw_metrics::inc_midturn_control(&deps.agent_group_id.to_string(), "interjection");
         let formatted = crate::formatter::format_messages(interjections.clone());
@@ -1754,6 +1841,43 @@ mod execute_tool_batch_tests {
         }
     }
 
+    /// M19 U7: a reaction inbound row (kind Chat, `content.reaction`),
+    /// mirroring what a channel adapter emits after parsing a native
+    /// reaction event.
+    fn reaction_row(emoji: &str, target_seq: Option<&str>) -> WriteInbound {
+        WriteInbound {
+            id: MessageId::new(),
+            kind: MessageKind::Chat,
+            timestamp: chrono::Utc::now(),
+            content: copperclaw_channels_core::reaction_content(emoji, target_seq, Some("alice")),
+            // Router persists reactions as non-trigger rows.
+            trigger: false,
+            on_wake: false,
+            process_after: None,
+            recurrence: None,
+            series_id: None,
+            platform_id: Some("chat-1".into()),
+            channel_type: Some(ChannelType::new("telegram")),
+            thread_id: None,
+            source_session_id: None,
+            reply_to: None,
+            is_group: None,
+        }
+    }
+
+    /// Seed a `delivered` row so a reaction targeting `platform_message_id`
+    /// resolves as landing on the agent's OWN message.
+    async fn seed_delivered(deps: &RunnerDeps, platform_message_id: &str) {
+        let conn = deps.inbound.lock().await;
+        copperclaw_db::tables::delivered::insert(
+            &conn,
+            MessageId::new(),
+            Some(platform_message_id),
+            "ok",
+        )
+        .unwrap();
+    }
+
     /// A mock tool whose execution simulates a row landing in
     /// `inbound.db` WHILE the current tool batch is in flight — exactly
     /// the race R2 exists to handle. Inserts once, on its first call.
@@ -1942,6 +2066,175 @@ mod execute_tool_batch_tests {
             }),
             "HUD must surface 'steering noted' on the frame after the interjection"
         );
+    }
+
+    // ----------------- M19 U7: inbound-reaction steering -----------------
+
+    /// Acceptance (U7): 👍 on the agent's OWN last message, landing mid-turn,
+    /// folds a one-line AFFIRMATIVE interjection into the transcript within one
+    /// tool-batch boundary — the turn keeps going (not a full turn), the
+    /// reaction row is consumed, the turn is marked untrusted (external
+    /// content), and the HUD picks up a "reaction noted" note.
+    #[tokio::test]
+    async fn mid_turn_reaction_on_own_message_folds_affirmative() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let (_tmp, mut deps) = deps_with_mocks(
+            vec![],
+            vec![
+                vec![ProviderEvent::ToolCall {
+                    id: "tu_0".into(),
+                    name: "inject".into(),
+                    input: serde_json::json!({}),
+                }],
+                vec![ProviderEvent::ToolCall {
+                    id: "tu_1".into(),
+                    name: "mock_read".into(),
+                    input: serde_json::json!({"id": "x", "delay_ms": 0}),
+                }],
+                vec![ProviderEvent::Result {
+                    text: Some("shipping it".into()),
+                }],
+            ],
+        );
+        // The agent's "shall I deploy?" was delivered as platform message
+        // "deploy-msg"; the 👍 targets exactly that.
+        seed_delivered(&deps, "deploy-msg").await;
+        let mut map: HashMap<String, Arc<ToolEntry>> = HashMap::new();
+        map.insert(
+            "inject".to_string(),
+            tool_entry(
+                "inject",
+                Box::new(InjectInboundRow {
+                    inbound: deps.inbound.clone(),
+                    row: StdMutex::new(Some(reaction_row("\u{1F44D}", Some("deploy-msg")))),
+                }),
+            ),
+        );
+        map.insert(
+            "mock_read".to_string(),
+            tool_entry("mock_read", Box::new(SlowEcho { tracker, log })),
+        );
+        deps.tool_map = Arc::new(map);
+        deps.tool_ctx
+            .set_originating(Some("telegram"), Some("chat-1"), None, None);
+
+        let mut history: Vec<HistoryMessage> = Vec::new();
+        let result = drive_turn(&deps, &mut history, None, None).await.unwrap();
+        assert!(matches!(result.outcome, TurnOutcome::Done), "{result:?}");
+
+        // The affirmative interjection landed as a one-line User entry that
+        // echoes the emoji — and the turn continued to the final text.
+        let line = history
+            .iter()
+            .find_map(|m| match m {
+                HistoryMessage::User { content } if content.contains("\u{1F44D}") => {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .expect("affirmative reaction must land in history");
+        assert!(
+            !line.contains('\n'),
+            "interjection must be one line: {line}"
+        );
+        assert!(
+            line.contains("affirmative"),
+            "must read as affirmative: {line}"
+        );
+
+        // External content: the turn is marked untrusted so the reaction can't
+        // launder trust into a credentialed external action.
+        assert!(
+            deps.tool_ctx.is_context_tainted(),
+            "a folded reaction must taint the turn untrusted"
+        );
+
+        // The reaction row is consumed (not left to double-process).
+        let inbound = deps.inbound.lock().await;
+        assert_eq!(messages_in::get_new_since(&inbound, 0).unwrap().len(), 0);
+        drop(inbound);
+
+        // HUD surfaces the one-shot "reaction noted" note.
+        let rows = outbound_rows(&deps).await;
+        let edits = hud_edits(&rows);
+        assert!(
+            edits.iter().any(|r| {
+                r.content["update_breadcrumb"]["breadcrumb"]["summary"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("reaction noted"))
+            }),
+            "HUD must surface 'reaction noted' after the reaction"
+        );
+    }
+
+    /// Acceptance (U7): a reaction on an UNRELATED message (not one the agent
+    /// delivered) is ignored — no interjection, the turn is not tainted, and
+    /// the row is still consumed so it can never become a spurious turn.
+    #[tokio::test]
+    async fn mid_turn_reaction_on_unrelated_message_is_ignored() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let log = Arc::new(StdMutex::new(Vec::new()));
+        let (_tmp, mut deps) = deps_with_mocks(
+            vec![],
+            vec![
+                vec![ProviderEvent::ToolCall {
+                    id: "tu_0".into(),
+                    name: "inject".into(),
+                    input: serde_json::json!({}),
+                }],
+                vec![ProviderEvent::ToolCall {
+                    id: "tu_1".into(),
+                    name: "mock_read".into(),
+                    input: serde_json::json!({"id": "x", "delay_ms": 0}),
+                }],
+                vec![ProviderEvent::Result {
+                    text: Some("done".into()),
+                }],
+            ],
+        );
+        // The agent delivered "deploy-msg"; the reaction targets some OTHER
+        // user's message the agent never sent.
+        seed_delivered(&deps, "deploy-msg").await;
+        let mut map: HashMap<String, Arc<ToolEntry>> = HashMap::new();
+        map.insert(
+            "inject".to_string(),
+            tool_entry(
+                "inject",
+                Box::new(InjectInboundRow {
+                    inbound: deps.inbound.clone(),
+                    row: StdMutex::new(Some(reaction_row("\u{1F44D}", Some("someone-elses-msg")))),
+                }),
+            ),
+        );
+        map.insert(
+            "mock_read".to_string(),
+            tool_entry("mock_read", Box::new(SlowEcho { tracker, log })),
+        );
+        deps.tool_map = Arc::new(map);
+        deps.tool_ctx
+            .set_originating(Some("telegram"), Some("chat-1"), None, None);
+
+        let mut history: Vec<HistoryMessage> = Vec::new();
+        let result = drive_turn(&deps, &mut history, None, None).await.unwrap();
+        assert!(matches!(result.outcome, TurnOutcome::Done), "{result:?}");
+
+        // No reaction interjection in the transcript.
+        assert!(
+            !history.iter().any(|m| matches!(
+                m,
+                HistoryMessage::User { content } if content.contains("reacted")
+            )),
+            "an unrelated reaction must not fold any interjection"
+        );
+        // And the turn is NOT tainted (nothing external was consumed).
+        assert!(
+            !deps.tool_ctx.is_context_tainted(),
+            "an ignored reaction must not taint the turn"
+        );
+        // The row is still consumed (never a spurious later turn).
+        let inbound = deps.inbound.lock().await;
+        assert_eq!(messages_in::get_new_since(&inbound, 0).unwrap().len(), 0);
     }
 }
 

@@ -128,6 +128,23 @@ pub struct AddMcpServerSpec {
     pub reason: String,
 }
 
+/// Spec for `save_skill` (M19 A4). The agent proposes a reusable skill; the
+/// runner records it and the host raises an approval. On approval the host
+/// validates and writes the `SKILL.md` into the group's per-group skills
+/// override directory, where the next container spawn discovers it. This is a
+/// per-group capability, never cross-group sharing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveSkillSpec {
+    /// Kebab-case skill name; becomes the on-disk directory slug and must
+    /// equal the frontmatter `name`.
+    pub name: String,
+    /// The full `SKILL.md` text including its YAML frontmatter. Validated by
+    /// the tool before emission and again host-side before the write.
+    pub content: String,
+    /// Human-readable reason for saving the skill (audited on the approval).
+    pub reason: String,
+}
+
 /// Spec for `create_agent`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateAgentSpec {
@@ -212,6 +229,56 @@ pub struct MemorySearchSpec {
     pub query: String,
     /// Maximum hits to return (the context clamps to a sane ceiling).
     pub limit: Option<usize>,
+}
+
+/// Spec for the `memory_save` tool: an agent-initiated write into the group
+/// memory store. Deliberately carries NO provenance field — the agent cannot
+/// request a provenance. The provenance is decided by the side-effecting
+/// context from the current turn's taint state (see
+/// [`resolve_save_provenance`]) so an untrusted turn can never launder content
+/// into `trusted` memory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySaveSpec {
+    /// Logical key to upsert under (overwrites an existing entry of the same
+    /// key). Trimmed; must be non-empty and within the key-length cap.
+    pub key: String,
+    /// The text body to remember. Must be non-empty and within the body-size
+    /// cap.
+    pub body: String,
+    /// Optional short source label recorded with the entry (e.g. `"agent"` or
+    /// a note about where the fact came from).
+    pub source: Option<String>,
+}
+
+/// Outcome of a `memory_save`, returned to the agent so it can see the honest
+/// provenance the store recorded (which may differ from `trusted` when the
+/// turn was tainted).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySaveOutcome {
+    /// The key that was written.
+    pub key: String,
+    /// The effective provenance recorded: `"trusted"` or `"untrusted"`.
+    pub provenance: String,
+    /// True when the requested `trusted` write was forced down to `untrusted`
+    /// because the current turn was tainted by untrusted-provenance content.
+    pub downgraded: bool,
+}
+
+/// Resolve the honest provenance for an agent-initiated memory write given the
+/// current turn's taint state. A tainted turn can NEVER write `trusted`
+/// memory: the entry is forced to `untrusted` (a downgrade) so external
+/// content pulled into the turn can't be laundered into trusted memory.
+///
+/// Returns `(provenance_wire, downgraded)`. This is the single reference for
+/// the taint→provenance rule; both the runner's `ToolContext` impl and the
+/// unit-test mock call it so the two can't drift.
+#[must_use]
+pub fn resolve_save_provenance(tainted: bool) -> (&'static str, bool) {
+    if tainted {
+        ("untrusted", true)
+    } else {
+        ("trusted", false)
+    }
 }
 
 /// Spec for `send_message`.
@@ -336,6 +403,9 @@ pub enum OutboundToolEffect {
     InstallPackages(InstallSpec),
     /// `add_mcp_server`.
     AddMcpServer(AddMcpServerSpec),
+    /// `save_skill` — persist an agent-authored skill into the group's
+    /// per-group skills override (approval-gated host-side).
+    SaveSkill(SaveSkillSpec),
     /// `schedule_task`.
     ScheduleTask(ScheduleSpec),
     /// `list_tasks`.
@@ -374,6 +444,7 @@ impl OutboundToolEffect {
             Self::Delegate(_) => "delegate",
             Self::InstallPackages(_) => "install_packages",
             Self::AddMcpServer(_) => "add_mcp_server",
+            Self::SaveSkill(_) => "save_skill",
             Self::ScheduleTask(_) => "schedule_task",
             Self::ListTasks => "list_tasks",
             Self::CancelTask { .. } => "cancel_task",
@@ -468,6 +539,116 @@ pub struct SubagentResult {
     pub tools_called: Vec<SubagentToolCall>,
 }
 
+/// Hard cap on the number of workers a single `delegate_batch` may fan
+/// out. A batch is a *bounded* join: each worker is a full container with
+/// its own writable `sib/<id>` worktree, and the parent blocks on all of
+/// them and folds every report into its context — so an unbounded width
+/// would swamp the host and blow the parent's context on join. The looser,
+/// unbounded async fan-out (`delegate` called N times, results arriving
+/// asynchronously) is still available for wider spreads.
+pub const MAX_DELEGATE_BATCH_WIDTH: usize = 6;
+
+/// Default wall-clock budget for a `delegate_batch` join when the caller
+/// omits `timeout_secs`. Bounded well under the runner's per-tool deadline
+/// so the join returns a partial aggregate (per-worker timeout errors)
+/// rather than being hard-aborted mid-call.
+pub const DEFAULT_DELEGATE_BATCH_TIMEOUT_SECS: u64 = 300;
+
+/// Hard ceiling on the `delegate_batch` join budget. A caller may not ask
+/// to block longer than this; still comfortably under the runner's
+/// per-tool deadline (`DEFAULT_TOOL_DEADLINE_SECS`).
+pub const MAX_DELEGATE_BATCH_TIMEOUT_SECS: u64 = 600;
+
+/// One worker in a [`DelegateBatchRequest`]. Same two fields as a single
+/// `delegate` (no channel — a delegate is never user-facing).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateBatchWorker {
+    /// Display name / folder-slug seed for the worker.
+    pub name: String,
+    /// Build instructions for the worker (point it at `/workspace`).
+    pub instructions: String,
+}
+
+/// Request handed to [`ToolContext::run_delegate_batch`] by the
+/// `delegate_batch` tool. Widths and budgets are already validated /
+/// clamped by the tool handler before this is constructed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateBatchRequest {
+    /// The workers to fan out (1..=[`MAX_DELEGATE_BATCH_WIDTH`]).
+    pub workers: Vec<DelegateBatchWorker>,
+    /// Wall-clock join budget in seconds (clamped to
+    /// [`MAX_DELEGATE_BATCH_TIMEOUT_SECS`]).
+    pub timeout_secs: u64,
+}
+
+/// Terminal status of one worker in a joined [`DelegateBatchOutcome`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerStatus {
+    /// The worker spawned, ran, and reported back within budget.
+    Ok,
+    /// The host refused to spawn the worker (depth cap, permission gate,
+    /// or an invalid spawn) — the worker never ran.
+    SpawnFailed,
+    /// The worker spawned but did not report within the join budget.
+    Timeout,
+}
+
+/// One worker's outcome in a joined [`DelegateBatchOutcome`], in request
+/// order. A failed worker surfaces as an `error` here rather than losing
+/// the whole batch turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerOutcome {
+    /// The worker name the caller supplied.
+    pub name: String,
+    /// Terminal status.
+    pub status: WorkerStatus,
+    /// The worker's consolidated report (its single `send_message` back to
+    /// the parent). `Some` iff `status == Ok`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub report: Option<String>,
+    /// A short reason when the worker did not produce a report
+    /// (spawn-gate refusal or timeout).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The spawned child session id, when one was assigned (for the
+    /// caller to `git diff main..sib/<id>` / merge the worker's branch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+/// The aggregated result of a `delegate_batch` join: one [`WorkerOutcome`]
+/// per requested worker, in request order. Returned as ONE tool response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DelegateBatchOutcome {
+    /// Per-worker outcomes, in request order.
+    pub workers: Vec<WorkerOutcome>,
+}
+
+impl DelegateBatchOutcome {
+    /// True when EVERY worker failed to spawn (e.g. the whole batch was
+    /// refused by the subagent depth cap). The `delegate_batch` tool
+    /// surfaces this as a tool error — a clean refusal — rather than a
+    /// partial aggregate.
+    #[must_use]
+    pub fn all_spawn_failed(&self) -> bool {
+        !self.workers.is_empty()
+            && self
+                .workers
+                .iter()
+                .all(|w| w.status == WorkerStatus::SpawnFailed)
+    }
+
+    /// Count of workers that reported successfully.
+    #[must_use]
+    pub fn completed(&self) -> usize {
+        self.workers
+            .iter()
+            .filter(|w| w.status == WorkerStatus::Ok)
+            .count()
+    }
+}
+
 /// Channel routing of the inbound currently being processed, as exposed
 /// through [`ToolContext::originating_channel`]. A read-only snapshot of
 /// what [`ToolContext::set_originating`] stashed — consumers (the Task
@@ -515,6 +696,37 @@ pub trait ToolContext: Send + Sync {
         let _ = req;
         Err(ToolError::Context(
             "subagent not supported in this context".into(),
+        ))
+    }
+
+    /// Spawn a bounded batch of `delegate` workers in isolated `sib/<id>`
+    /// worktrees and BLOCK until all report (or the join budget elapses),
+    /// returning one [`WorkerOutcome`] per worker in request order.
+    ///
+    /// This is the runner-side JOIN SEAM behind the `delegate_batch` tool
+    /// (M19 A1). It reuses the exact single-`delegate` spawn machinery —
+    /// same depth/permission caps, same containment (each worker lands
+    /// with a NULL messaging group and reports ONLY back to the parent,
+    /// never into the user's chat) — but adds a synchronous gather so a
+    /// parent can fan out N parallel builds and assemble their joined
+    /// output in ONE turn, rather than the N-separate-`delegate` calls
+    /// whose results arrive asynchronously on later turns.
+    ///
+    /// The implementation block-polls the parent's own `inbound.db` for
+    /// each worker's spawn result and its final report, exactly analogous
+    /// to how an external-MCP call block-polls the host's response
+    /// (`run::external_mcp`).
+    ///
+    /// Default impl returns `ToolError::Context` so mock / subagent
+    /// contexts (which cannot poll the parent's inbound.db) compile
+    /// unchanged — only the runner's `RunnerToolCtx` overrides it.
+    async fn run_delegate_batch(
+        &self,
+        req: DelegateBatchRequest,
+    ) -> Result<DelegateBatchOutcome, ToolError> {
+        let _ = req;
+        Err(ToolError::Context(
+            "delegate_batch not supported in this context".into(),
         ))
     }
 
@@ -590,6 +802,27 @@ pub trait ToolContext: Send + Sync {
     /// Same default + taint semantics as [`Self::memory_search`].
     async fn memory_get(&self, key: &str) -> Result<Option<MemoryHitView>, ToolError> {
         let _ = key;
+        Err(ToolError::Context(
+            "memory store not configured in this context".into(),
+        ))
+    }
+
+    /// Persist a fact into this group's memory store on the agent's behalf
+    /// (the write half of [`Self::memory_search`] / [`Self::memory_get`]).
+    ///
+    /// PROVENANCE (security-critical): the implementation decides the recorded
+    /// provenance from the current turn's taint state via
+    /// [`resolve_save_provenance`] — the agent cannot request a provenance and
+    /// a tainted turn is forced to `untrusted` (downgrade), so nothing lets an
+    /// untrusted turn launder content into trusted memory. The impl also owns
+    /// the per-session rate cap and embedding generation (deferred today — the
+    /// runner writes text-only, exactly as `memory_search` reads text-only).
+    ///
+    /// Default impl returns `ToolError::Context` so mock / subagent contexts
+    /// compile unchanged — only the runner's `RunnerToolCtx` (which knows the
+    /// per-group `memory.db` path) overrides it.
+    async fn memory_save(&self, spec: MemorySaveSpec) -> Result<MemorySaveOutcome, ToolError> {
+        let _ = spec;
         Err(ToolError::Context(
             "memory store not configured in this context".into(),
         ))
@@ -830,6 +1063,14 @@ struct MockInner {
     /// override value tests want returned.
     #[allow(clippy::option_option)]
     check_command_override: Option<Option<String>>,
+    /// `delegate_batch` requests recorded in order.
+    delegate_batch_calls: Vec<DelegateBatchRequest>,
+    /// Pre-seeded outcome returned by the next `run_delegate_batch`. When
+    /// `None`, the mock returns a canned all-`ok` outcome (one report per
+    /// worker) so happy-path tool tests work without wiring.
+    next_delegate_batch_outcome: Option<DelegateBatchOutcome>,
+    /// If set, the next `run_delegate_batch` returns this Err instead.
+    next_delegate_batch_err: Option<ToolError>,
 }
 
 impl MockToolContext {
@@ -950,6 +1191,31 @@ impl MockToolContext {
             .expect("MockToolContext mutex poisoned")
             .check_command_override = Some(cmd);
     }
+
+    /// Snapshot of `delegate_batch` requests recorded so far.
+    pub fn delegate_batch_calls(&self) -> Vec<DelegateBatchRequest> {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .delegate_batch_calls
+            .clone()
+    }
+
+    /// Override the outcome returned by the next `run_delegate_batch`.
+    pub fn set_next_delegate_batch_outcome(&self, outcome: DelegateBatchOutcome) {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .next_delegate_batch_outcome = Some(outcome);
+    }
+
+    /// Cause the *next* `run_delegate_batch` to fail.
+    pub fn fail_next_delegate_batch(&self, err: ToolError) {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .next_delegate_batch_err = Some(err);
+    }
 }
 
 #[async_trait]
@@ -986,6 +1252,32 @@ impl ToolContext for MockToolContext {
         let result = g.next_subagent_result.take().unwrap_or(canned);
         g.subagent_calls.push(req);
         Ok(result)
+    }
+
+    async fn run_delegate_batch(
+        &self,
+        req: DelegateBatchRequest,
+    ) -> Result<DelegateBatchOutcome, ToolError> {
+        let mut g = self.inner.lock().expect("MockToolContext mutex poisoned");
+        if let Some(err) = g.next_delegate_batch_err.take() {
+            return Err(err);
+        }
+        let canned = DelegateBatchOutcome {
+            workers: req
+                .workers
+                .iter()
+                .map(|w| WorkerOutcome {
+                    name: w.name.clone(),
+                    status: WorkerStatus::Ok,
+                    report: Some(format!("mock report from {}", w.name)),
+                    error: None,
+                    session_id: None,
+                })
+                .collect(),
+        };
+        let outcome = g.next_delegate_batch_outcome.take().unwrap_or(canned);
+        g.delegate_batch_calls.push(req);
+        Ok(outcome)
     }
 
     async fn emit_diff(&self, diff: copperclaw_channels_core::DiffCard) {
@@ -1205,6 +1497,14 @@ mod tests {
                     reason: "r".into(),
                 }),
                 "add_mcp_server",
+            ),
+            (
+                OutboundToolEffect::SaveSkill(SaveSkillSpec {
+                    name: "my-skill".into(),
+                    content: "---\nname: my-skill\ndescription: d\n---\nb\n".into(),
+                    reason: "r".into(),
+                }),
+                "save_skill",
             ),
             (
                 OutboundToolEffect::ScheduleTask(ScheduleSpec {

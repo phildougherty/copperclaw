@@ -21,6 +21,7 @@ use crate::error::ToolError;
 pub mod agents;
 pub mod apply_patch;
 pub mod artifact_path;
+pub mod browser_interact;
 pub mod browser_render;
 pub mod clear_history;
 pub mod compact_now;
@@ -42,6 +43,7 @@ pub mod load_skill;
 pub mod memory;
 pub mod multi_edit;
 pub mod net_guard;
+pub mod save_skill;
 pub mod scheduling;
 pub mod self_mod;
 pub mod sentinel;
@@ -75,7 +77,7 @@ pub trait ToolHandler: Send + Sync {
 /// Adding a tool here exposes it to the model on the *next* container
 /// spawn — no schema migration, no other wiring.
 pub fn build_tool_set() -> Vec<ToolEntry> {
-    vec![
+    let mut set = vec![
         core::send_message::entry(),
         core::send_file::entry(),
         core::edit_message::entry(),
@@ -84,8 +86,10 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         interactive::send_card::entry(),
         agents::create_agent::entry(),
         agents::delegate::entry(),
+        agents::delegate_batch::entry(),
         self_mod::install_packages::entry(),
         self_mod::add_mcp_server::entry(),
+        save_skill::entry(),
         scheduling::schedule_task::entry(),
         scheduling::list_tasks::entry(),
         scheduling::cancel_task::entry(),
@@ -115,6 +119,7 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         load_skill::entry(),
         memory::memory_search::entry(),
         memory::memory_get::entry(),
+        memory::memory_save::entry(),
         todo::add::entry(),
         todo::list::entry(),
         todo::update::entry(),
@@ -122,7 +127,18 @@ pub fn build_tool_set() -> Vec<ToolEntry> {
         compact_now::entry(),
         clear_history::entry(),
         artifact_path::entry(),
-    ]
+    ];
+
+    // A2 (Phase 5b): the interactive browser is registered ONLY when its
+    // stricter, SEPARATE opt-in is set (both COPPERCLAW_BROWSER_ENABLED and
+    // COPPERCLAW_BROWSER_INTERACTIVE truthy). With the flag off the tool is
+    // entirely absent — the tool set, schemas, and behaviour are byte-identical
+    // to the read-only baseline, so the model never sees the interactive verb.
+    if browser_interact::interactive_opt_in(&browser_render::SystemEnv) {
+        set.push(browser_interact::entry());
+    }
+
+    set
 }
 
 /// Lookup table form of [`build_tool_set`] for the server router.
@@ -196,8 +212,10 @@ mod tests {
             "send_card",
             "create_agent",
             "delegate",
+            "delegate_batch",
             "install_packages",
             "add_mcp_server",
+            "save_skill",
             "schedule_task",
             "list_tasks",
             "cancel_task",
@@ -225,6 +243,7 @@ mod tests {
             "load_skill",
             "memory_search",
             "memory_get",
+            "memory_save",
             "todo_add",
             "todo_list",
             "todo_update",

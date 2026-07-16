@@ -597,6 +597,8 @@ impl TunnelBroker {
                 &req.upstream,
                 "blocked-not-enabled",
             );
+            // M19 A3: refused by the opt-in gate.
+            copperclaw_metrics::inc_public_tunnel("denied", "not_enabled");
             return Err(TunnelError::NotEnabled {
                 group: req.agent_group_id.as_uuid().to_string(),
             });
@@ -625,9 +627,13 @@ impl TunnelBroker {
         let now = Utc::now();
         match existing {
             Some(row) if row.status == ApprovalStatus::Approved => self.stand_up(&req, &row).await,
-            Some(row) if row.status == ApprovalStatus::Denied => Err(TunnelError::Denied {
-                approval_id: row.approval_id.as_uuid().to_string(),
-            }),
+            Some(row) if row.status == ApprovalStatus::Denied => {
+                // M19 A3: operator denied the exposure.
+                copperclaw_metrics::inc_public_tunnel("denied", "approval_denied");
+                Err(TunnelError::Denied {
+                    approval_id: row.approval_id.as_uuid().to_string(),
+                })
+            }
             Some(row) if row.is_actionable_at(now) => Ok(TunnelOutcome::Pending {
                 approval_id: row.approval_id.as_uuid().to_string(),
                 note: pending_note(),
@@ -700,6 +706,8 @@ impl TunnelBroker {
             &upstream,
             "opened",
         );
+        // M19 A3: a public tunnel stood up on an approved grant.
+        copperclaw_metrics::inc_public_tunnel("opened", "");
         info!(
             session = %req.session_id.as_uuid(),
             host_port = req.host_port,
@@ -776,6 +784,8 @@ impl TunnelBroker {
             &req.upstream,
             "pending-approval",
         );
+        // M19 A3: a pending-approval card was raised for the exposure.
+        copperclaw_metrics::inc_public_tunnel("approval_raised", "");
         info!(
             session = %req.session_id.as_uuid(),
             host_port = req.host_port,
@@ -847,6 +857,8 @@ impl TunnelBroker {
                     "",
                     reason,
                 );
+                // M19 A3: tunnel torn down; `reason` names the cause.
+                copperclaw_metrics::inc_public_tunnel("torn_down", reason);
                 info!(
                     session = %session_id.as_uuid(),
                     host_port,
@@ -900,6 +912,53 @@ impl TunnelBroker {
             warn!(?err, "could not write tunnel audit row");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Agent-facing broker trait (M19 A3)
+// ---------------------------------------------------------------------------
+
+/// What the delivery loop renders back to the model for a `make_preview_public`
+/// relay call (M19 A3). The host-side implementation ([`PublicTunnelBroker`])
+/// maps the agent's container-port request onto a live preview's host port,
+/// enforces opt-in, and drives [`TunnelBroker::expose`]; this enum carries the
+/// three model-legible outcomes so the delivery branch never has to reason
+/// about tunnel internals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicTunnelReply {
+    /// The tunnel is live. `public_url` is the shareable link (the tokened
+    /// preview URL fronted by the public tunnel); `note` is the blunt
+    /// "this is PUBLIC" caveat the agent relays verbatim.
+    Exposed { public_url: String, note: String },
+    /// Awaiting an operator's approval tap. `note` tells the agent to try again
+    /// once approved — NOT an error (the request was accepted and is pending).
+    Pending { note: String },
+    /// A rendered, model-facing failure (not opted in, no live preview, binary
+    /// absent, approver declined, …). The delivery branch surfaces it as an
+    /// `is_error` tool result.
+    Error(String),
+}
+
+/// Host-side broker the delivery loop calls to service a `make_preview_public`
+/// (`__preview` relay) request (M19 A3). Implemented by the host, which owns the
+/// mapping from the agent's *container* port to the live preview's *host* port
+/// and the per-group opt-in — this trait keeps the delivery crate free of that
+/// wiring, exactly as [`crate::preview::PreviewBroker`] does for `expose_preview`.
+///
+/// Every outcome (including every failure) is a [`PublicTunnelReply`]: the
+/// runner's blocking poll is never left unanswered. The public exposure it
+/// drives stays approval-gated end to end via [`TunnelBroker::expose`] — this
+/// trait adds a verb, never a bypass.
+#[async_trait]
+pub trait PublicTunnelBroker: Send + Sync {
+    /// Make the live preview on `container_port` public. Resolves the preview's
+    /// host port, enforces opt-in, and raises / consults the
+    /// `CredentialedExternalAction` approval via [`TunnelBroker::expose`].
+    async fn make_public(
+        &self,
+        session: crate::preview::SessionInfoLite,
+        container_port: u16,
+    ) -> PublicTunnelReply;
 }
 
 // ---------------------------------------------------------------------------

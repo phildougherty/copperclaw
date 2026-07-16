@@ -1,0 +1,14 @@
+{
+  "name": "slack-reaction-inbound",
+  "channel": "slack",
+  "description": "M19 U7 (X-rider W2): parity twin of telegram/reaction-steer on a DIFFERENT adapter. A ✅ slack reaction (reaction_added, normalized) in a mention-gated slack channel bypasses the gate (interaction payload) and persists a non-trigger content.reaction row (kind=chat, trigger=0, pending for the runner's R2 steering seam); no runner turn, no outbound, no delivery. Proves the inbound → router reaction leg is channel-agnostic — it works for slack's identity/target shape, not just telegram's.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\""
+  }
+}

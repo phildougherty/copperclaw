@@ -10,7 +10,13 @@
 //! - `type: "message"` with `message.type: "text"` → text inbound
 //!   with `platform_id = source.{userId|groupId|roomId}` and
 //!   `thread_id = None` (LINE has no threads).
-//! - everything else → ack with 200, no inbound emitted.
+//! - `type: "postback"` → a button-tap inbound (M19 U5): a `Chat` event
+//!   carrying `content.callback = { id, data }` where `data` is the
+//!   template action's `postback.data`. This whitelists past the router's
+//!   mention gate exactly like Telegram/Slack callbacks, so in-chat
+//!   approval buttons (Approve/Deny) actually route to the approval
+//!   interceptor.
+//! - everything else (follow / unfollow / …) → ack with 200, no inbound.
 //!
 //! Each inbound event stashes the `replyToken` on the
 //! [`crate::adapter::LineAdapter`]'s reply-token cache keyed by
@@ -82,6 +88,14 @@ struct Event {
     source: Option<Source>,
     #[serde(default)]
     message: Option<Message>,
+    #[serde(default)]
+    postback: Option<Postback>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Postback {
+    #[serde(default)]
+    data: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,28 +156,83 @@ async fn handle(
 }
 
 async fn dispatch_event(state: &RouterState, event: Event) -> Result<(), &'static str> {
-    if event.kind != "message" {
-        // Future: handle follow / unfollow / postback. For now ack.
-        return Ok(());
+    match event.kind.as_str() {
+        "message" => dispatch_message(state, event).await,
+        "postback" => dispatch_postback(state, event).await,
+        // Future: handle follow / unfollow / join / leave. For now ack.
+        _ => Ok(()),
     }
+}
+
+/// A `type: "message"` event with `message.type: "text"` → text inbound.
+async fn dispatch_message(state: &RouterState, event: Event) -> Result<(), &'static str> {
     let message = event.message.ok_or("message event without message field")?;
     if message.kind != "text" {
         return Ok(());
     }
     let text = message.text.ok_or("text message without text body")?;
     let source = event.source.ok_or("event without source")?;
-    let (platform_id, is_group) = source_to_platform_id(&source);
+    emit_inbound(
+        state,
+        &source,
+        event.reply_token.as_deref(),
+        event.timestamp,
+        message.id,
+        serde_json::json!({ "text": text }),
+    )
+    .await
+}
+
+/// A `type: "postback"` event → a button-tap `Chat` inbound carrying a
+/// `content.callback` marker (M19 U5). The action's `postback.data` is
+/// surfaced both as the callback `data` (so the approval interceptor can
+/// read an `approve:<id>` / `deny:<id>` payload) and as the `text` (so a
+/// non-approval postback routes as an ordinary message the agent can read).
+/// The event whitelists past the mention gate because it carries a
+/// `callback` key — mirroring the Telegram/Slack callback convention.
+async fn dispatch_postback(state: &RouterState, event: Event) -> Result<(), &'static str> {
+    let postback = event
+        .postback
+        .ok_or("postback event without postback field")?;
+    let data = postback.data.ok_or("postback without data")?;
+    let source = event.source.ok_or("event without source")?;
+    let callback_id = Uuid::new_v4().to_string();
+    emit_inbound(
+        state,
+        &source,
+        event.reply_token.as_deref(),
+        event.timestamp,
+        Some(callback_id.clone()),
+        serde_json::json!({
+            "text": data,
+            "callback": { "id": callback_id, "data": data },
+        }),
+    )
+    .await
+}
+
+/// Build and enqueue a `Chat` [`InboundEvent`] shared by the message and
+/// postback paths: resolve the source to a `platform_id`, cache the reply
+/// token, stamp the timestamp, and attach the sender identity.
+async fn emit_inbound(
+    state: &RouterState,
+    source: &Source,
+    reply_token: Option<&str>,
+    timestamp_ms: Option<i64>,
+    message_id: Option<String>,
+    content: serde_json::Value,
+) -> Result<(), &'static str> {
+    let (platform_id, is_group) = source_to_platform_id(source);
     let platform_id = platform_id.ok_or("source had no usable id")?;
 
-    if let Some(rt) = event.reply_token.as_deref() {
+    if let Some(rt) = reply_token {
         state.reply_tokens.put(platform_id.clone(), rt.to_string());
     }
 
-    let timestamp = event
-        .timestamp
+    let timestamp = timestamp_ms
         .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
         .unwrap_or_else(Utc::now);
-    let inbound_id = message.id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let inbound_id = message_id.unwrap_or_else(|| Uuid::new_v4().to_string());
 
     let sender = source.user_id.clone().map(|uid| SenderIdentity {
         channel_type: state.channel_type.clone(),
@@ -178,7 +247,7 @@ async fn dispatch_event(state: &RouterState, event: Event) -> Result<(), &'stati
         message: InboundMessage {
             id: inbound_id,
             kind: MessageKind::Chat,
-            content: serde_json::json!({"text": text}),
+            content,
             timestamp,
             is_mention: None,
             is_group: Some(is_group),
@@ -338,6 +407,62 @@ mod tests {
         let body = b"not-json";
         let resp = post_signed(router, "/line/webhook", Some("secret"), body).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn postback_event_emits_callback_inbound() {
+        let (tx, mut rx) = mpsc::channel::<InboundEvent>(8);
+        let (router, cache) = router(tx);
+        let body = br#"{
+            "events": [{
+                "type": "postback",
+                "replyToken": "rt-pb",
+                "timestamp": 1700000000000,
+                "source": {"type": "user", "userId": "U9"},
+                "postback": {"data": "approve:42"}
+            }]
+        }"#;
+        let resp = post_signed(router, "/line/webhook", Some("secret"), body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.platform_id, "U9");
+        // Whitelisted-past-mention-gate callback marker + routable data.
+        assert_eq!(event.message.content["callback"]["data"], "approve:42");
+        assert_eq!(event.message.content["text"], "approve:42");
+        assert!(event.message.content["callback"]["id"].is_string());
+        // Reply token cached so the resolution reply can use it.
+        assert_eq!(cache.take(&"U9".to_string()).as_deref(), Some("rt-pb"));
+    }
+
+    #[tokio::test]
+    async fn postback_in_group_marks_is_group_and_carries_callback() {
+        let (tx, mut rx) = mpsc::channel::<InboundEvent>(8);
+        let (router, _cache) = router(tx);
+        let body = br#"{"events":[{
+            "type":"postback",
+            "source":{"type":"group","groupId":"G7"},
+            "postback":{"data":"deny:1"}
+        }]}"#;
+        let resp = post_signed(router, "/line/webhook", Some("secret"), body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let event = rx.try_recv().unwrap();
+        assert_eq!(event.platform_id, "G7");
+        assert_eq!(event.message.is_group, Some(true));
+        assert_eq!(event.message.content["callback"]["data"], "deny:1");
+    }
+
+    #[tokio::test]
+    async fn postback_without_data_is_dropped() {
+        let (tx, mut rx) = mpsc::channel::<InboundEvent>(8);
+        let (router, _cache) = router(tx);
+        let body = br#"{"events":[{
+            "type":"postback",
+            "source":{"type":"user","userId":"U"},
+            "postback":{}
+        }]}"#;
+        let resp = post_signed(router, "/line/webhook", Some("secret"), body).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

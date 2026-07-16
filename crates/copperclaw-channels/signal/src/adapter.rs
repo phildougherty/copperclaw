@@ -21,7 +21,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use copperclaw_channels_core::{AdapterError, Card, ChannelAdapter, DmHandle};
+use copperclaw_channels_core::{
+    AdapterError, Breadcrumb, Card, ChannelAdapter, DiffCard, DmHandle, ErrorCard, ThinkingBlock,
+    TodoList,
+};
 use copperclaw_types::{ChannelType, InboundEvent, OutboundFile, OutboundMessage};
 
 use crate::render;
@@ -363,11 +366,7 @@ impl ChannelAdapter for SignalAdapter {
     }
 
     /// Native card — clean Signal plaintext (no Markdown, which Signal
-    /// renders literally). Diff / todo / thinking / error / collapsible
-    /// intentionally keep the canonical plaintext trait default: their
-    /// `to_text_fallback` renderings are already optimal on a plaintext
-    /// surface, so a native override would duplicate them verbatim (see
-    /// `render.rs` module docs).
+    /// renders literally). See [`render::render_card`].
     async fn deliver_card(
         &self,
         platform_id: &str,
@@ -378,6 +377,110 @@ impl ChannelAdapter for SignalAdapter {
         copperclaw_metrics::inc_adapter_rich_render(self.channel_type().as_str(), "card");
         let target = parse_platform_id(platform_id)?;
         let text = render::render_card(card);
+        api::send_text(&self.transport, &target, &text).await
+    }
+
+    /// Native breadcrumb — a compact `[status] tool · detail — summary`
+    /// chip. When `existing_message_id` is `Some`, the completion is fed
+    /// through signal-cli's `sendEditMessage` so the chip is edited **in
+    /// place** (`[running] …` → `[done] …`) instead of stacking a fresh
+    /// message on every tool boundary. Subsequent edits keep targeting the
+    /// *original* timestamp, so the returned id is the original chip id (a
+    /// non-numeric or edit failure degrades gracefully to a fresh chip).
+    async fn deliver_breadcrumb(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        breadcrumb: &Breadcrumb,
+        existing_message_id: Option<&str>,
+    ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type().as_str(), "breadcrumb");
+        let target = parse_platform_id(platform_id)?;
+        let text = render::render_breadcrumb(breadcrumb);
+        if let Some(existing) = existing_message_id {
+            if let Ok(ts) = existing.parse::<i64>() {
+                api::send_edit(&self.transport, &target, ts, &text).await?;
+                return Ok(Some(existing.to_owned()));
+            }
+        }
+        api::send_text(&self.transport, &target, &text).await
+    }
+
+    /// Native diff — a structured `path (+a / -r)` header plus unified
+    /// hunks with `+` / `-` gutters, fence-free (Signal shows backticks
+    /// literally). See [`render::render_diff`]. Diffs are immutable, so
+    /// there is no in-place edit.
+    async fn deliver_diff(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        diff: &DiffCard,
+    ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type().as_str(), "diff");
+        let target = parse_platform_id(platform_id)?;
+        let text = render::render_diff(diff);
+        api::send_text(&self.transport, &target, &text).await
+    }
+
+    /// Native todo list — a structured `title (done/total)` checklist with
+    /// ASCII glyphs, edited in place via `sendEditMessage` when the prior
+    /// chip id is known so the live list updates one message rather than
+    /// posting a new one per mutation. Signal has no pin API, so `pin_hint`
+    /// is a silent no-op.
+    async fn deliver_todo_list(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        list: &TodoList,
+        existing_message_id: Option<&str>,
+        _pin_hint: bool,
+    ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type().as_str(), "todo");
+        let target = parse_platform_id(platform_id)?;
+        let text = render::render_todo_list(list);
+        if let Some(existing) = existing_message_id {
+            if let Ok(ts) = existing.parse::<i64>() {
+                api::send_edit(&self.transport, &target, ts, &text).await?;
+                return Ok(Some(existing.to_owned()));
+            }
+        }
+        api::send_text(&self.transport, &target, &text).await
+    }
+
+    /// Native thinking block — a `reasoning (model)` header + plain body
+    /// lines, no `> ` quote markers (Signal renders them literally).
+    /// Redacted blocks emit only the placeholder. See
+    /// [`render::render_thinking`].
+    async fn deliver_thinking(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        thinking: &ThinkingBlock,
+    ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type().as_str(), "thinking");
+        let target = parse_platform_id(platform_id)?;
+        let text = render::render_thinking(thinking);
+        api::send_text(&self.transport, &target, &text).await
+    }
+
+    /// Native error card — an `[ERROR: kind] title` banner, summary, an
+    /// indented `details:` block, and a retry footer, all markdown-free.
+    /// See [`render::render_error`]. Errors are immutable receipts, so
+    /// there is no in-place edit.
+    ///
+    /// `deliver_collapsible` is intentionally left on the trait default:
+    /// Signal has no disclosure primitive, so the fallback (summary +
+    /// preview + `…(N more lines)`) is already the optimal plaintext shape
+    /// (see `render.rs` module docs).
+    async fn deliver_error(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        err: &ErrorCard,
+    ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type().as_str(), "error");
+        let target = parse_platform_id(platform_id)?;
+        let text = render::render_error(err);
         api::send_text(&self.transport, &target, &text).await
     }
 }
@@ -1073,6 +1176,220 @@ mod tests {
         assert!(
             !msg.contains('*'),
             "Signal card must be markdown-free: {msg}"
+        );
+        adapter.shutdown().await;
+    }
+
+    // ------- rich-surface deliver_* tests (U1) -------
+
+    use copperclaw_channels_core::{
+        DiffHunk, DiffLine, DiffLineKind, ErrorCardKind, TodoItemStatus, TodoListItem,
+    };
+
+    #[tokio::test]
+    async fn deliver_breadcrumb_first_emit_sends_fresh_chip() {
+        let (adapter, ctl, _dir, _rx) = build_adapter().await;
+        ctl.expect_ok("send", json!({"timestamp": 100})).await;
+        let bc = Breadcrumb::running("shell").with_detail("cargo check");
+        let id = adapter
+            .deliver_breadcrumb("user:+1", None, &bc, None)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("100"));
+        let calls = ctl.calls().await;
+        assert_eq!(calls[0].0, "send");
+        assert_eq!(calls[0].1["message"], "[running] shell · cargo check");
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_breadcrumb_completion_edits_chip_in_place() {
+        // The HUD story: a `running` chip goes out first, then the
+        // `done` completion targets the SAME timestamp via sendEditMessage
+        // rather than posting a second stacked message. This is the U1
+        // marquee win — an in-place breadcrumb instead of stacked prose.
+        let (adapter, ctl, _dir, _rx) = build_adapter().await;
+        ctl.expect_ok("send", json!({"timestamp": 100})).await;
+        ctl.expect_ok("sendEditMessage", json!({"timestamp": 101}))
+            .await;
+
+        let running = Breadcrumb::running("shell").with_detail("cargo check");
+        let first = adapter
+            .deliver_breadcrumb("user:+1", None, &running, None)
+            .await
+            .unwrap();
+        assert_eq!(first.as_deref(), Some("100"));
+
+        let done = running.finished(true, Some("passed (0.4s)".into()));
+        let second = adapter
+            .deliver_breadcrumb("user:+1", None, &done, first.as_deref())
+            .await
+            .unwrap();
+        // Returns the ORIGINAL id so subsequent edits keep targeting it.
+        assert_eq!(second.as_deref(), Some("100"));
+
+        let calls = ctl.calls().await;
+        assert_eq!(calls.len(), 2, "must be one send + one edit, not two sends");
+        assert_eq!(calls[0].0, "send");
+        assert_eq!(calls[1].0, "sendEditMessage");
+        assert_eq!(calls[1].1["targetSentTimestamp"], 100);
+        assert_eq!(
+            calls[1].1["message"],
+            "[done] shell · cargo check — passed (0.4s)"
+        );
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_breadcrumb_non_numeric_existing_id_falls_back_to_send() {
+        let (adapter, ctl, _dir, _rx) = build_adapter().await;
+        ctl.expect_ok("send", json!({"timestamp": 5})).await;
+        let bc = Breadcrumb::running("web_search").finished(true, None);
+        adapter
+            .deliver_breadcrumb("user:+1", None, &bc, Some("not-a-ts"))
+            .await
+            .unwrap();
+        let calls = ctl.calls().await;
+        assert_eq!(calls[0].0, "send", "non-numeric id degrades to fresh chip");
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_diff_sends_fence_free_structured_diff() {
+        let (adapter, ctl, _dir, _rx) = build_adapter().await;
+        ctl.expect_ok("send", json!({"timestamp": 7})).await;
+        let diff = DiffCard {
+            path: "src/main.rs".into(),
+            language: Some("rust".into()),
+            hunks: vec![DiffHunk {
+                old_start: 1,
+                old_lines: 1,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![
+                    DiffLine {
+                        kind: DiffLineKind::Remove,
+                        text: "fn old() {}".into(),
+                    },
+                    DiffLine {
+                        kind: DiffLineKind::Add,
+                        text: "fn new() {}".into(),
+                    },
+                ],
+            }],
+            added: 1,
+            removed: 1,
+            truncated: false,
+        };
+        adapter.deliver_diff("user:+1", None, &diff).await.unwrap();
+        let msg = ctl.calls().await[0].1["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(msg.starts_with("src/main.rs (+1 / -1)"), "{msg}");
+        assert!(msg.contains("-fn old() {}"));
+        assert!(msg.contains("+fn new() {}"));
+        assert!(
+            !msg.contains("```"),
+            "signal diff must be fence-free: {msg}"
+        );
+        adapter.shutdown().await;
+    }
+
+    fn todo_fixture() -> TodoList {
+        TodoList {
+            items: vec![
+                TodoListItem {
+                    id: 1,
+                    text: "Scaffold".into(),
+                    status: TodoItemStatus::Completed,
+                    blocked_reason: None,
+                },
+                TodoListItem {
+                    id: 2,
+                    text: "Wire routes".into(),
+                    status: TodoItemStatus::InProgress,
+                    blocked_reason: None,
+                },
+            ],
+            title: Some("Build".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn deliver_todo_list_first_emit_sends_fresh_chip() {
+        let (adapter, ctl, _dir, _rx) = build_adapter().await;
+        ctl.expect_ok("send", json!({"timestamp": 200})).await;
+        let id = adapter
+            .deliver_todo_list("user:+1", None, &todo_fixture(), None, true)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("200"));
+        let msg = ctl.calls().await[0].1["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(msg.starts_with("Build (1/2)"), "{msg}");
+        assert!(msg.contains("[x] Scaffold"));
+        assert!(msg.contains("[~] Wire routes"));
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_todo_list_edits_in_place_when_id_known() {
+        let (adapter, ctl, _dir, _rx) = build_adapter().await;
+        ctl.expect_ok("sendEditMessage", json!({"timestamp": 201}))
+            .await;
+        let id = adapter
+            .deliver_todo_list("user:+1", None, &todo_fixture(), Some("200"), false)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("200"));
+        let calls = ctl.calls().await;
+        assert_eq!(calls[0].0, "sendEditMessage");
+        assert_eq!(calls[0].1["targetSentTimestamp"], 200);
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_thinking_is_markdown_free_and_redaction_safe() {
+        let (adapter, ctl, _dir, _rx) = build_adapter().await;
+        ctl.expect_ok("send", json!({"timestamp": 8})).await;
+        let t = ThinkingBlock::redacted("opaque-blob-secret");
+        adapter.deliver_thinking("user:+1", None, &t).await.unwrap();
+        let msg = ctl.calls().await[0].1["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(msg.contains("(redacted reasoning)"));
+        assert!(
+            !msg.contains("opaque-blob-secret"),
+            "raw redacted blob must never reach the wire: {msg}"
+        );
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_error_sends_structured_banner() {
+        let (adapter, ctl, _dir, _rx) = build_adapter().await;
+        ctl.expect_ok("send", json!({"timestamp": 9})).await;
+        let err = ErrorCard::new(ErrorCardKind::Delivery, "gateway 502")
+            .with_title("Could not deliver")
+            .retryable();
+        adapter.deliver_error("user:+1", None, &err).await.unwrap();
+        let msg = ctl.calls().await[0].1["message"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(
+            msg.starts_with("[ERROR: delivery] Could not deliver"),
+            "{msg}"
+        );
+        assert!(msg.contains("gateway 502"));
+        assert!(msg.contains("(will retry automatically)"));
+        assert!(
+            !msg.contains('*'),
+            "signal error must be markdown-free: {msg}"
         );
         adapter.shutdown().await;
     }

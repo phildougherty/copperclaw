@@ -38,6 +38,11 @@ rusqlite = { workspace = true }
 [dev-dependencies]
 copperclaw-channels-core = { workspace = true }
 tempfile = "3"
+# Test-only: `test-util` unlocks tokio's paused-clock controls
+# (`tokio::time::advance` / `start_paused`) so the F5 HUD tests can
+# drive the background "thinking…" timer deterministically without
+# real-time sleeps.
+tokio = { workspace = true, features = ["test-util"] }
 # Test-only: lets the per-task-budget tests install an isolated
 # Prometheus recorder and assert that crossing the ceiling actually
 # trips `copperclaw_task_budget_exhausted_total`, not just the abort.

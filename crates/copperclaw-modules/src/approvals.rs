@@ -397,11 +397,19 @@ impl DeliveryActionHandler for ApprovalCardHandler {
             .get("title")
             .and_then(|v| v.as_str())
             .unwrap_or("Approval required");
-        let body = input
+        let body_core = input
             .payload
             .get("description")
             .and_then(|v| v.as_str())
             .unwrap_or("Tap Approve to grant this request, or Deny to reject it.");
+        // F3(d): "blocked-on-approval" legibility. The card is the host-visible
+        // surface that says the run is gated on a human — an approval-blocked
+        // agent must not look hung. The true in-HUD `TaskHud::add_note` lives in
+        // the *runner* (a separate process; `hud.rs` is lane R and pub(super)),
+        // so lane G surfaces the waiting state here, on the card the operator
+        // actually sees. Appended to whatever body the requester supplied.
+        let body = format!("{body_core}\n\nThe agent is paused, waiting for your approval.");
+        let body = body.as_str();
         let to = input.payload.get("to");
         let channel_type = to
             .and_then(|t| t.get("channel_type"))
@@ -802,6 +810,13 @@ mod tests {
         assert_eq!(msg.kind, MessageKind::Card);
         let card = msg.content.get("card").unwrap();
         assert_eq!(card.get("title").unwrap(), "Please approve");
+        // F3(d): the card body carries the "blocked, waiting for approval"
+        // legibility line so an approval-gated agent never looks hung.
+        let body = card.get("body").unwrap().as_str().unwrap();
+        assert!(
+            body.contains("waiting for your approval"),
+            "card body must surface the blocked-on-approval waiting note; got: {body}"
+        );
         // Buttons carry `approve:<id>` / `deny:<id>` callback values.
         let buttons = card.get("buttons").unwrap().as_array().unwrap();
         assert_eq!(buttons.len(), 2);

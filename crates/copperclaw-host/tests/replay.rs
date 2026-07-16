@@ -233,6 +233,90 @@ async fn slack_approval_block_action_round_trip() {
     assert_eq!(edits[0].new_text, "Approved by Owner Olivia");
 }
 
+/// M19 F3 acceptance (a + c). Owner taps Approve on a card that recorded no
+/// `platform_message_id` (fallback-id path): the interceptor resolves it and
+/// posts the outcome as a follow-up reply (asserted via the fixture's
+/// `delivered` stream) rather than leaving live buttons. The same tap's
+/// opportunistic expiry sweep stamps a separately-lapsed card terminal.
+#[tokio::test]
+async fn telegram_approval_resolution_fallback_and_expiry() {
+    use copperclaw_db::tables::pending_approvals::{self, ApprovalStatus};
+    use copperclaw_types::ApprovalId;
+
+    let harness = run_fixture_into_harness("telegram", "approval-resolution").await;
+
+    let fallback =
+        ApprovalId(uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000d1").unwrap());
+    let expired =
+        ApprovalId(uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000d3").unwrap());
+
+    // (a) The fallback-id approval resolved via the shared DB path even though
+    // its card had no editable anchor (the follow-up reply is checked by the
+    // fixture's `delivered` diff).
+    assert_eq!(
+        pending_approvals::get(&harness.central, fallback)
+            .unwrap()
+            .status,
+        ApprovalStatus::Approved
+    );
+
+    // (c) The lapsed approval was swept to `expired` and its card stamped
+    // terminal by the opportunistic sweep the tap triggered.
+    assert_eq!(
+        pending_approvals::get(&harness.central, expired)
+            .unwrap()
+            .status,
+        ApprovalStatus::Expired
+    );
+    let tg = mock_for(&harness, "telegram");
+    let edits = tg.edits();
+    let stamped = edits
+        .iter()
+        .find(|e| e.external_id == "tg-exp-card")
+        .expect("expired card was stamped terminal");
+    assert!(
+        stamped.new_text.contains("expired"),
+        "expired card must carry a terminal 'expired' note; got: {}",
+        stamped.new_text
+    );
+    // The fallback-id approval had no card, so it is NOT edited — only the
+    // lapsed card is.
+    assert_eq!(edits.len(), 1, "exactly the one expired-card stamp");
+}
+
+/// M19 F3 acceptance (b). A tap on an already-resolved approval is not silent:
+/// the loser is told who resolved it. Asserted via the fixture's `delivered`
+/// stream ("This request was already resolved by host.").
+#[tokio::test]
+async fn slack_approval_conflict_already_resolved() {
+    use copperclaw_db::tables::pending_approvals::{self, ApprovalStatus};
+    use copperclaw_types::ApprovalId;
+
+    let harness = run_fixture_into_harness("slack", "approval-conflict").await;
+
+    let already =
+        ApprovalId(uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000e1").unwrap());
+    // Still exactly one decision (the original winner's); the loser tap did not
+    // re-resolve or re-edit.
+    assert_eq!(
+        pending_approvals::get(&harness.central, already)
+            .unwrap()
+            .status,
+        ApprovalStatus::Approved
+    );
+    assert_eq!(
+        pending_approvals::list_decisions(&harness.central, Some(already), 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    let slack = mock_for(&harness, "slack");
+    assert!(
+        slack.edits().is_empty(),
+        "loser tap must not re-edit the card"
+    );
+}
+
 #[tokio::test]
 async fn slack_event_message_round_trip() {
     run_fixture("slack", "event-message").await;
@@ -292,6 +376,93 @@ async fn discord_inbound_file_attachment_file_readable_from_session_dir() {
 #[tokio::test]
 async fn matrix_room_message_round_trip() {
     run_fixture("matrix", "room-message").await;
+}
+
+/// M19 F1 acceptance (matrix live HUD edit): F1 reconciled matrix's trait
+/// `edit_message` with its long-standing `EDIT_CAPABLE_CHANNELS` listing,
+/// so the runner's Task HUD now runs *live* on matrix — it posts one
+/// breadcrumb chip at the first tool call and edits that chip in place on
+/// every later frame instead of degrading to new-message spam.
+///
+/// The replay harness substitutes a `MockAdapter` for the real matrix
+/// adapter, so `model_rich_breadcrumbs` in the manifest makes the wrapper
+/// model matrix's real `deliver_breadcrumb` contract (post once, edit in
+/// place). Beyond the byte-stable JSONL diff this pins the point of the
+/// card: exactly ONE breadcrumb chip is posted, and every subsequent HUD
+/// frame is an in-place `edit_message` against that single anchor — the
+/// host delivery pipeline (`dispatch_breadcrumb` +
+/// `handle_update_breadcrumb` + `lookup_prior_breadcrumb_external_id`)
+/// threads the anchor id through so the chip is edited, never re-posted.
+/// Combined with F1's drift guard (matrix really overrides trait
+/// `edit_message`) and the matrix adapter's own unit tests, this closes
+/// the "advertised edit-capable but silently re-posts" gap. See the
+/// fixture's README.md.
+#[tokio::test]
+async fn matrix_hud_live_edit_edits_one_chip_in_place() {
+    // Fixture-authoring path: regenerate expected/*.jsonl from a real run.
+    // Never taken under a normal `cargo test`.
+    if std::env::var_os("COPPERCLAW_XR1_GENERATE").is_some() {
+        let path = fixture_path("matrix", "hud-live-edit");
+        let fixture = Fixture::load(&path).expect("load fixture");
+        let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+        harness.run().await.expect("run harness");
+        harness.dump_expected_jsonl();
+        return;
+    }
+
+    let harness = run_fixture_into_harness("matrix", "hud-live-edit").await;
+    let mx = mock_for(&harness, "matrix");
+
+    // The HUD posts exactly ONE breadcrumb chip (a `Breadcrumb`-kind
+    // delivery). Anything more would be the re-post spam F1 kills.
+    let deliveries = mx.deliveries();
+    let posts: Vec<_> = deliveries
+        .iter()
+        .filter(|d| d.message.kind.as_str() == "breadcrumb")
+        .collect();
+    assert_eq!(
+        posts.len(),
+        1,
+        "the live HUD must post exactly one breadcrumb chip on matrix, got {}: {deliveries:?}",
+        posts.len(),
+    );
+    assert_eq!(
+        posts[0].platform_id, "!a:m.org",
+        "the chip must land in the originating matrix room",
+    );
+
+    // Every later frame is an in-place edit of that ONE chip: at least one
+    // edit, all addressed to a single anchor id (never a fresh post).
+    let edits = mx.edits();
+    assert!(
+        !edits.is_empty(),
+        "the live HUD must edit the chip in place at least once, got zero edits",
+    );
+    let anchors: std::collections::BTreeSet<&str> =
+        edits.iter().map(|e| e.external_id.as_str()).collect();
+    assert_eq!(
+        anchors.len(),
+        1,
+        "every HUD edit must target the SINGLE posted chip (one anchor), got {anchors:?}",
+    );
+    for e in &edits {
+        assert_eq!(
+            e.platform_id, "!a:m.org",
+            "each edit must target the originating matrix room",
+        );
+    }
+
+    // Sanity: the model's final answer still reaches the user as its own
+    // chat message (the HUD chip is progress, not the reply).
+    assert!(
+        deliveries.iter().any(|d| d.message.kind.as_str() == "chat"
+            && d.message
+                .content
+                .get("text")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t.contains("build is fine"))),
+        "the final chat answer must be delivered alongside the HUD chip: {deliveries:?}",
+    );
 }
 
 #[tokio::test]
@@ -391,6 +562,16 @@ async fn telegram_slash_stop_control_row_bypasses_mention_gate() {
 #[tokio::test]
 async fn telegram_slash_status_host_answer_bypasses_mention_gate() {
     run_fixture("telegram", "slash-status").await;
+}
+
+/// M19 U7: a 👍 reaction in a mention-gated telegram group bypasses the gate
+/// (interaction payload) and persists a non-trigger `content.reaction` row —
+/// pending for the runner's R2 steering seam — with no runner turn, outbound,
+/// or delivery. The runner-side steering is covered by drive_turn unit tests;
+/// this fixture owns the inbound → router leg (twin of `slash-stop`).
+#[tokio::test]
+async fn telegram_reaction_steer_bypasses_mention_gate() {
+    run_fixture("telegram", "reaction-steer").await;
 }
 
 /// Telegram twin of `cli_slash_clear_runner_sentinel`; also pins the
@@ -914,5 +1095,931 @@ async fn run_verify_gate_child(dump: bool) {
         !dirty.exists(),
         "passing verify must clear the dirty marker at {}",
         dirty.display(),
+    );
+}
+
+// ---- M19 F4 (X-rider W1): a blocked todo renders as blocked, not in-progress ----
+//
+// F4 gave `copperclaw_channels_core::TodoItemStatus` a real `Blocked`
+// variant (glyph `[!]` + a one-line reason) and mapped the runner's
+// storage-side `TodoStatus::Blocked` onto it in `status_to_wire`, so a
+// step that auto-blocked after burning its verify fix-cycles renders as
+// blocked on every adapter — instead of the misleading "in progress
+// forever" the pre-F4 wire enum forced (`Blocked -> InProgress`).
+//
+// This fixture drives the GENUINE auto-block path end to end: a project
+// that is dirty AND already at the fix-cycle cap, with a recorded verify
+// failure, plus one `in_progress` todo. When the model attempts
+// `todo_update(status="completed")` the gate auto-transitions the todo to
+// `blocked` (never silently completed, never permanently refusing),
+// attaches the recorded failure as the reason, and emits the post-mutation
+// `TodoList`. The delivery loop degrades `deliver_todo_list` to its text
+// fallback on the harness mock — the exact surface F4 taught the `[!]`
+// glyph — so the delivered checklist must show the step blocked with its
+// reason, and NOT with the in-progress glyph.
+//
+// Like the X2 verify-gate fixture, the todo store + verify gate resolve
+// against `COPPERCLAW_DATA_ROOT`, which `forbid(unsafe_code)` forbids us
+// from setting via `std::env::set_var`. So we re-exec THIS test binary as
+// a child with the var set through the safe `Command::env`; the child runs
+// the real `ReplayHarness` against pre-seeded, writable project state.
+
+/// Fixed data root for the blocked-todo fixture. Distinct from the X2
+/// verify-gate root so the two re-exec fixtures never collide.
+const XR1_BLOCKED_DATA_ROOT: &str = "/tmp/copperclaw-xr1-blocked-todo";
+/// Set on the re-exec'd child so it runs the scenario instead of
+/// re-spawning itself.
+const XR1_BLOCKED_CHILD_ENV: &str = "COPPERCLAW_XR1_BLOCKED_TODO_CHILD";
+/// `assert` (default) or `dump` — the latter prints the captured actual
+/// streams so `expected/*.jsonl` can be regenerated from a real run.
+const XR1_BLOCKED_MODE_ENV: &str = "COPPERCLAW_XR1_BLOCKED_TODO_MODE";
+/// The recorded verify failure that becomes the blocked todo's reason.
+const XR1_BLOCKED_REASON: &str = "app.py: SyntaxError: invalid syntax (line 3)";
+
+#[tokio::test]
+async fn telegram_blocked_todo_renders_as_blocked() {
+    // Child leg: env already set by the parent's re-exec. Run the real
+    // scenario against the todo store / gate rooted at XR1_BLOCKED_DATA_ROOT.
+    if std::env::var_os(XR1_BLOCKED_CHILD_ENV).is_some() {
+        let dump = std::env::var(XR1_BLOCKED_MODE_ENV).ok().as_deref() == Some("dump");
+        run_blocked_todo_child(dump).await;
+        return;
+    }
+
+    // Parent leg: seed a dirty project at the fix-cycle cap + a recorded
+    // failure + one in_progress todo, then re-exec ourselves with
+    // COPPERCLAW_DATA_ROOT set (via the safe Command::env).
+    let _ = std::fs::remove_dir_all(XR1_BLOCKED_DATA_ROOT);
+    let root = std::path::Path::new(XR1_BLOCKED_DATA_ROOT);
+    let state = root.join("proj/.copperclaw");
+    std::fs::create_dir_all(&state).expect("create blocked-todo project state dir");
+    // Dirty marker so the completion gate finds a dirty project.
+    std::fs::write(state.join("dirty"), b"").expect("write dirty marker");
+    // Fix-cycle count already at the cap (2) so the gate auto-BLOCKS the
+    // todo rather than refusing-with-cycles-remaining.
+    std::fs::write(state.join("fix_cycles"), b"2").expect("write fix_cycles");
+    // The recorded verify failure that becomes the blocked reason.
+    std::fs::write(state.join("last_failure"), XR1_BLOCKED_REASON.as_bytes())
+        .expect("write last_failure");
+    // One in_progress todo the model will attempt to complete.
+    std::fs::write(
+        root.join("agent_todos.json"),
+        br#"[{"id":1,"text":"Verify the build passes","status":"in_progress","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}]"#,
+    )
+    .expect("seed agent_todos.json");
+
+    let mode = if std::env::var_os("COPPERCLAW_XR1_GENERATE").is_some() {
+        "dump"
+    } else {
+        "assert"
+    };
+    let exe = std::env::current_exe().expect("current_exe");
+    let output = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "telegram_blocked_todo_renders_as_blocked",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(XR1_BLOCKED_CHILD_ENV, "1")
+        .env(XR1_BLOCKED_MODE_ENV, mode)
+        .env("COPPERCLAW_DATA_ROOT", XR1_BLOCKED_DATA_ROOT)
+        .output()
+        .expect("spawn blocked-todo re-exec child");
+
+    let _ = std::fs::remove_dir_all(XR1_BLOCKED_DATA_ROOT);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if mode == "dump" {
+        println!("{stdout}");
+    }
+    assert!(
+        output.status.success(),
+        "blocked-todo child failed (status {:?})\n\
+         --- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}",
+        output.status.code(),
+    );
+}
+
+/// The child scenario: drive the `blocked-todo` fixture through the real
+/// harness. In `dump` mode, print the captured actuals (fixture
+/// authoring). Otherwise diff against the committed `expected/*.jsonl` and
+/// assert the blocked step genuinely rendered as blocked (not in-progress)
+/// on the delivered checklist.
+async fn run_blocked_todo_child(dump: bool) {
+    let path = fixture_path("telegram", "blocked-todo");
+    assert!(
+        path.exists(),
+        "fixture missing at {} — see docs/replay-fixtures.md",
+        path.display()
+    );
+    let fixture = Fixture::load(&path).expect("load blocked-todo fixture");
+    let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+    harness.run().await.expect("run harness");
+
+    if dump {
+        harness.dump_expected_jsonl();
+        return;
+    }
+
+    // Byte-stable pipeline diff first (expected/*.jsonl).
+    let report = harness.compare().expect("compare");
+    assert!(report.is_clean(), "{report}");
+
+    // The delivered todo checklist must show the auto-blocked step with the
+    // `[!]` glyph AND its reason — never the in-progress glyph `[~]` for
+    // that step. The mock degrades `deliver_todo_list` to its text
+    // fallback, so the checklist rides a plain chat delivery.
+    let tg = mock_for(&harness, "telegram");
+    let deliveries = tg.deliveries();
+    let checklist = deliveries
+        .iter()
+        .filter_map(|d| d.message.content.get("text").and_then(|t| t.as_str()))
+        .find(|t| t.contains("Verify the build passes"))
+        .expect("the post-mutation todo checklist must be delivered");
+    assert!(
+        checklist.contains("[!] Verify the build passes"),
+        "the auto-blocked step must render with the [!] blocked glyph: {checklist}",
+    );
+    assert!(
+        checklist.contains(XR1_BLOCKED_REASON),
+        "the blocked step must carry its one-line failure reason: {checklist}",
+    );
+    assert!(
+        !checklist.contains("[~] Verify the build passes"),
+        "the blocked step must NOT render as in-progress (the pre-F4 bug): {checklist}",
+    );
+    assert!(
+        checklist.contains("1 blocked"),
+        "the checklist footer must count the blocked step: {checklist}",
+    );
+
+    // Corroborate against the on-disk todo store the tool wrote under the
+    // data root: the item genuinely auto-transitioned to `blocked` with the
+    // recorded reason attached (proof the wire render reflects real state,
+    // not a hand-built list).
+    let store = std::path::Path::new(XR1_BLOCKED_DATA_ROOT).join("agent_todos.json");
+    let raw = std::fs::read_to_string(&store)
+        .unwrap_or_else(|e| panic!("todo store missing at {}: {e}", store.display()));
+    let todos: serde_json::Value = serde_json::from_str(&raw).expect("todo store is JSON");
+    let first = &todos.as_array().expect("todo store is an array")[0];
+    assert_eq!(
+        first["status"], "blocked",
+        "the todo must have auto-transitioned to blocked: {todos}",
+    );
+    assert_eq!(
+        first["blocked_reason"], XR1_BLOCKED_REASON,
+        "the recorded verify failure must be attached as the block reason: {todos}",
+    );
+}
+
+// ---- M19 F5 (X-rider W1): pre-first-tool "thinking…" HUD frame ----
+//
+// F5 made the live HUD post an initial "thinking…" frame after a short
+// threshold (`hud::THINKING_THRESHOLD` = 6s) so a multi-minute
+// pure-reasoning answer on an edit-capable channel stops looking like a
+// hang, while a fast turn stays byte-stable (posts nothing).
+//
+// Why a targeted paused-clock test, not a replay fixture: the F5 frame is
+// driven purely by WALL-CLOCK timing *before the first tool call*, and the
+// replay harness (real time, a wiremock provider, a 200ms provider
+// deadline) has no seam to inject a deterministic 6s+ pure-reasoning wait
+// — a real 6s sleep would be slow and jittery around the threshold. So
+// this drives the real `run_loop` end to end under tokio's paused clock
+// with a controllable provider. It goes *beyond* the runner-crate unit
+// tests (which construct `TaskHud` directly): here the frame flows through
+// the real `run_loop` → `drive_turn` arm/finalize → the session's outbound
+// DB, and carries the originating-channel routing the delivery loop needs
+// to reach the wire. The delivery leg itself (a breadcrumb → adapter edit)
+// is locked by the F1 `matrix/hud-live-edit` fixture.
+
+/// Controllable provider for the F5 tests: on the first (and only)
+/// streamed event it sleeps `delay` — the pure-reasoning "thinking" wait —
+/// then emits the final answer text. Under a paused clock the test decides
+/// exactly when that wait elapses relative to the HUD's threshold.
+struct F5PausedProvider {
+    delay: std::time::Duration,
+    text: String,
+}
+
+#[async_trait::async_trait]
+impl copperclaw_providers::AgentProvider for F5PausedProvider {
+    fn name(&self) -> &'static str {
+        "f5-paused"
+    }
+    async fn query(
+        &self,
+        _input: copperclaw_providers::QueryInput,
+    ) -> Result<Box<dyn copperclaw_providers::AgentQuery>, copperclaw_providers::ProviderError>
+    {
+        Ok(Box::new(F5PausedQuery {
+            delay: self.delay,
+            text: Some(self.text.clone()),
+        }))
+    }
+    fn is_session_invalid(&self, _err: &copperclaw_providers::ProviderError) -> bool {
+        false
+    }
+}
+
+struct F5PausedQuery {
+    delay: std::time::Duration,
+    text: Option<String>,
+}
+
+#[async_trait::async_trait]
+impl copperclaw_providers::AgentQuery for F5PausedQuery {
+    async fn push(&mut self, _message: String) -> Result<(), copperclaw_providers::ProviderError> {
+        Ok(())
+    }
+    async fn end(&mut self) -> Result<(), copperclaw_providers::ProviderError> {
+        Ok(())
+    }
+    async fn next_event(&mut self) -> Option<copperclaw_types::ProviderEvent> {
+        // The pure-reasoning wait: block for `delay`, then emit the final
+        // answer text exactly once (a zero-tool turn).
+        let text = self.text.take()?;
+        tokio::time::sleep(self.delay).await;
+        Some(copperclaw_types::ProviderEvent::Result { text: Some(text) })
+    }
+    async fn abort(&mut self) {}
+}
+
+/// Build a one-turn `run_loop` deps + shared outbound handle for the F5
+/// tests, seeded with a single pending TELEGRAM chat inbound (an
+/// edit-capable channel → the HUD resolves to `Behavior::Live`). The
+/// provider sleeps `delay` before answering; `provider_deadline` is set
+/// well past `delay` so the deadline never trips.
+async fn f5_build(
+    paths: &copperclaw_db::session::SessionPaths,
+    delay: std::time::Duration,
+) -> (
+    copperclaw_runner::RunnerDeps,
+    std::sync::Arc<tokio::sync::Mutex<rusqlite::Connection>>,
+) {
+    use copperclaw_db::session::{open_inbound, open_outbound};
+    use copperclaw_db::tables::messages_in::{self, WriteInbound};
+
+    let inbound = std::sync::Arc::new(tokio::sync::Mutex::new(open_inbound(paths).unwrap()));
+    let outbound = std::sync::Arc::new(tokio::sync::Mutex::new(open_outbound(paths).unwrap()));
+
+    {
+        let g = inbound.lock().await;
+        messages_in::insert(
+            &g,
+            &WriteInbound {
+                id: copperclaw_types::MessageId::new(),
+                kind: copperclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "think hard about this"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("100".into()),
+                channel_type: Some(copperclaw_types::ChannelType::new("telegram")),
+                thread_id: None,
+                source_session_id: None,
+                reply_to: None,
+                is_group: None,
+            },
+        )
+        .unwrap();
+    }
+
+    let tool_ctx: std::sync::Arc<dyn copperclaw_mcp::ToolContext> = std::sync::Arc::new(
+        copperclaw_runner::RunnerToolCtx::new(outbound.clone(), paths.outbox.clone()),
+    );
+    let provider: std::sync::Arc<dyn copperclaw_providers::AgentProvider> =
+        std::sync::Arc::new(F5PausedProvider {
+            delay,
+            text: "Here is the carefully-reasoned answer.".into(),
+        });
+    let mut deps = copperclaw_runner::RunnerDeps::minimal(
+        provider,
+        tool_ctx,
+        inbound,
+        outbound.clone(),
+        paths.outbox.join("_compactions"),
+    );
+    deps.max_turns = Some(1);
+    deps.idle_sleep = std::time::Duration::from_millis(1);
+    deps.provider_deadline = std::time::Duration::from_secs(600);
+    (deps, outbound)
+}
+
+/// Yield repeatedly so spawned tasks (the HUD ticker, the `run_loop` task)
+/// can make progress under the paused clock between `advance` calls.
+async fn f5_settle() {
+    for _ in 0..64 {
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Snapshot the session's outbound `Breadcrumb`-kind rows via a fresh read
+/// connection (the runner holds its own write handle).
+fn f5_breadcrumb_summaries(paths: &copperclaw_db::session::SessionPaths) -> Vec<String> {
+    let conn = copperclaw_db::session::open_outbound(paths).unwrap();
+    copperclaw_db::tables::messages_out::list_due(&conn)
+        .unwrap()
+        .into_iter()
+        .filter(|r| r.kind == copperclaw_types::MessageKind::Breadcrumb)
+        .filter_map(|r| {
+            r.content
+                .get("breadcrumb")
+                .and_then(|b| b.get("summary"))
+                .and_then(|s| s.as_str())
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn f5_thinking_frame_posts_after_threshold_via_run_loop() {
+    use copperclaw_runner::run_loop;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = copperclaw_db::session::SessionPaths::new(
+        tmp.path(),
+        copperclaw_types::AgentGroupId::new(),
+        copperclaw_types::SessionId::new(),
+    );
+    // A 5-minute pure-reasoning wait before the answer lands.
+    let (deps, _outbound) = f5_build(&paths, std::time::Duration::from_secs(300)).await;
+
+    let handle = tokio::spawn(run_loop(deps));
+    // Let run_loop reach `drive_turn` (arm the HUD ticker) and park on the
+    // provider's pure-reasoning sleep before we touch the clock.
+    f5_settle().await;
+
+    // Just before the threshold: nothing has posted — a fast turn would
+    // have finalized by now and stayed byte-stable.
+    tokio::time::advance(std::time::Duration::from_secs(5)).await;
+    f5_settle().await;
+    assert!(
+        f5_breadcrumb_summaries(&paths).is_empty(),
+        "no HUD frame may post before the {}s thinking threshold",
+        6,
+    );
+
+    // Past the threshold: exactly one "thinking…" breadcrumb chip posts,
+    // even though no tool has run yet.
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    f5_settle().await;
+    let summaries = f5_breadcrumb_summaries(&paths);
+    assert_eq!(
+        summaries.len(),
+        1,
+        "exactly one pre-first-tool thinking frame; got {summaries:?}",
+    );
+    assert!(
+        summaries[0].starts_with("thinking…"),
+        "the pre-first-tool frame must read as thinking…; got {:?}",
+        summaries[0],
+    );
+
+    // Let the reasoning wait elapse; the turn answers and run_loop returns.
+    tokio::time::advance(std::time::Duration::from_secs(300)).await;
+    f5_settle().await;
+    handle.await.expect("run_loop task").expect("run_loop ok");
+
+    // The thinking frame did not dangle: finalize collapsed it to a
+    // "done in M:SS" update (a zero-tool turn omits the tool count), and
+    // the model's answer was delivered as its own chat row.
+    let conn = copperclaw_db::session::open_outbound(&paths).unwrap();
+    let rows = copperclaw_db::tables::messages_out::list_due(&conn).unwrap();
+    let collapsed = rows.iter().find_map(|r| {
+        r.content
+            .get("update_breadcrumb")
+            .and_then(|u| u.get("breadcrumb"))
+            .and_then(|b| {
+                let done = b.get("status").and_then(|s| s.as_str()) == Some("done");
+                let summary = b.get("summary").and_then(|s| s.as_str()).unwrap_or("");
+                (done && summary.starts_with("done in")).then(|| summary.to_owned())
+            })
+    });
+    assert!(
+        collapsed.is_some(),
+        "finalize must collapse the thinking frame to a done summary: {rows:?}",
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.kind == copperclaw_types::MessageKind::Chat
+                && r.content.get("text").and_then(|t| t.as_str())
+                    == Some("Here is the carefully-reasoned answer.")),
+        "the model's final answer must be emitted: {rows:?}",
+    );
+    // The thinking frame carried the originating-channel routing the
+    // delivery loop needs to reach the wire (telegram, chat 100).
+    let thinking = rows
+        .iter()
+        .find(|r| r.kind == copperclaw_types::MessageKind::Breadcrumb)
+        .expect("a thinking breadcrumb row exists");
+    assert_eq!(
+        thinking
+            .channel_type
+            .as_ref()
+            .map(copperclaw_types::ChannelType::as_str),
+        Some("telegram"),
+    );
+    assert_eq!(thinking.platform_id.as_deref(), Some("100"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn f5_fast_turn_posts_no_thinking_frame_via_run_loop() {
+    use copperclaw_runner::run_loop;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = copperclaw_db::session::SessionPaths::new(
+        tmp.path(),
+        copperclaw_types::AgentGroupId::new(),
+        copperclaw_types::SessionId::new(),
+    );
+    // A fast answer: the provider returns immediately, well under the
+    // thinking threshold, so the armed ticker is aborted by finalize
+    // before it ever posts.
+    let (deps, _outbound) = f5_build(&paths, std::time::Duration::ZERO).await;
+
+    let handle = tokio::spawn(run_loop(deps));
+    f5_settle().await;
+    handle.await.expect("run_loop task").expect("run_loop ok");
+
+    // Advance well past the threshold to prove the aborted ticker is truly
+    // dead and never fires a late frame.
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    f5_settle().await;
+
+    assert!(
+        f5_breadcrumb_summaries(&paths).is_empty(),
+        "a sub-threshold pure-reasoning turn must post no HUD frame (byte-stable)",
+    );
+    // Sanity: the fast turn still answered.
+    let conn = copperclaw_db::session::open_outbound(&paths).unwrap();
+    let rows = copperclaw_db::tables::messages_out::list_due(&conn).unwrap();
+    assert!(
+        rows.iter()
+            .any(|r| r.kind == copperclaw_types::MessageKind::Chat
+                && r.content.get("text").and_then(|t| t.as_str())
+                    == Some("Here is the carefully-reasoned answer.")),
+        "the fast turn must still deliver its answer: {rows:?}",
+    );
+}
+
+// ---- M19 X-rider Wave 2: parity fixtures (U1/U2/U4/U5/U7) ----
+//
+// One fixture per newly-rich surface, each locking the *host delivery
+// pipeline* half of a Wave-2 adapter-floor card. The per-adapter *wire*
+// rendering (signal-cli, teams Bot Framework, gchat Cards-v2, matrix HTML,
+// deltachat JSON-RPC) lives in each adapter crate's own unit tests; these
+// fixtures prove the runner's rich surface reaches the adapter's rich hook
+// (breadcrumb edit-in-place / deliver_card / deliver_todo_list) instead of
+// degrading host-side. See each fixture's README.md.
+
+/// Fixture-authoring gate shared by the scripted-turn W2 parity fixtures
+/// (signal / teams / gchat). When `COPPERCLAW_XR2_GENERATE` is set the
+/// harness regenerates `expected/*.jsonl` from a real run and the caller
+/// returns before asserting. Never taken under a normal `cargo test`.
+async fn xr2_maybe_generate(channel: &str, scenario: &str) -> bool {
+    if std::env::var_os("COPPERCLAW_XR2_GENERATE").is_none() {
+        return false;
+    }
+    let path = fixture_path(channel, scenario);
+    let fixture = Fixture::load(&path).expect("load fixture");
+    let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+    harness.run().await.expect("run harness");
+    harness.dump_expected_jsonl();
+    true
+}
+
+/// Assert an edit-capable channel ran the live HUD: exactly ONE breadcrumb
+/// chip posted, >=1 in-place edit all targeting that single anchor in the
+/// originating conversation, and the model's final answer still delivered
+/// as its own chat message. Shared by the signal (U1) and teams (U2)
+/// breadcrumb parity fixtures — the same live-HUD contract the F1
+/// `matrix/hud-live-edit` fixture locks, one edit-capable channel over.
+fn assert_live_hud_edits_one_chip(
+    harness: &ReplayHarness,
+    channel: &str,
+    platform_id: &str,
+    final_answer_fragment: &str,
+) {
+    let mock = mock_for(harness, channel);
+
+    // Exactly ONE breadcrumb chip is posted (anything more is the
+    // re-post spam the live HUD exists to kill).
+    let deliveries = mock.deliveries();
+    let posts: Vec<_> = deliveries
+        .iter()
+        .filter(|d| d.message.kind.as_str() == "breadcrumb")
+        .collect();
+    assert_eq!(
+        posts.len(),
+        1,
+        "the live HUD must post exactly one breadcrumb chip on {channel}, got {}: {deliveries:?}",
+        posts.len(),
+    );
+    assert_eq!(
+        posts[0].platform_id, platform_id,
+        "the chip must land in the originating {channel} conversation",
+    );
+
+    // Every later frame is an in-place edit of that ONE chip.
+    let edits = mock.edits();
+    assert!(
+        !edits.is_empty(),
+        "the live HUD must edit the chip in place at least once on {channel}, got zero edits",
+    );
+    let anchors: std::collections::BTreeSet<&str> =
+        edits.iter().map(|e| e.external_id.as_str()).collect();
+    assert_eq!(
+        anchors.len(),
+        1,
+        "every HUD edit must target the SINGLE posted chip (one anchor) on {channel}, got {anchors:?}",
+    );
+    for e in &edits {
+        assert_eq!(
+            e.platform_id, platform_id,
+            "each edit must target the originating {channel} conversation",
+        );
+    }
+
+    // The model's final answer still reaches the user as its own chat row.
+    assert!(
+        deliveries.iter().any(|d| d.message.kind.as_str() == "chat"
+            && d.message
+                .content
+                .get("text")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t.contains(final_answer_fragment))),
+        "the final chat answer must be delivered alongside the HUD chip on {channel}: {deliveries:?}",
+    );
+}
+
+/// M19 U1 (X-rider W2): signal, raised to the rich-surface floor, now runs
+/// the live HUD — one breadcrumb chip posted, edited in place, never the
+/// stacked prose the pre-U1 fall-through produced. Twin of the F1 matrix
+/// fixture on a different edit-capable channel. See the fixture's README.
+#[tokio::test]
+async fn signal_hud_breadcrumb_edits_one_chip_in_place() {
+    if xr2_maybe_generate("signal", "hud-breadcrumb").await {
+        return;
+    }
+    let harness = run_fixture_into_harness("signal", "hud-breadcrumb").await;
+    assert_live_hud_edits_one_chip(&harness, "signal", "+15550001234", "build is fine");
+}
+
+/// M19 U2 (X-rider W2): teams gained a trait `edit_message` override and a
+/// slot in `EDIT_CAPABLE_CHANNELS`, so the HUD now edits ONE message in
+/// place instead of posting N (the new-message spam U2 kills). See the
+/// fixture's README.
+#[tokio::test]
+async fn teams_hud_live_edit_edits_one_chip_in_place() {
+    if xr2_maybe_generate("teams", "hud-live-edit").await {
+        return;
+    }
+    let harness = run_fixture_into_harness("teams", "hud-live-edit").await;
+    assert_live_hud_edits_one_chip(&harness, "teams", "19:teamschat@thread.v2", "build is fine");
+}
+
+/// M19 U4 (X-rider W2): a `send_card` reaches gchat's `deliver_card` as a
+/// STRUCTURED card (both buttons intact), not a host-flattened prose blob.
+/// `model_rich_cards` models gchat's card-capable contract; the gchat
+/// Cards-v2 wire JSON itself is proven in the gchat adapter's unit tests.
+/// Represents the U4 card surface (gchat + matrix) at the pipeline level.
+/// See the fixture's README.
+#[tokio::test]
+async fn gchat_approval_card_delivers_structured_card() {
+    if xr2_maybe_generate("gchat", "approval-card").await {
+        return;
+    }
+    let harness = run_fixture_into_harness("gchat", "approval-card").await;
+    let gchat = mock_for(&harness, "gchat");
+    let deliveries = gchat.deliveries();
+
+    // Exactly one native (Card-kind) card delivery in the originating space.
+    let cards: Vec<_> = deliveries
+        .iter()
+        .filter(|d| d.message.kind.as_str() == "card")
+        .collect();
+    assert_eq!(
+        cards.len(),
+        1,
+        "exactly one structured card must be delivered to gchat, got {}: {deliveries:?}",
+        cards.len(),
+    );
+    assert_eq!(cards[0].platform_id, "spaces/AAAAq.replay");
+
+    // The card kept its structure: title, body, field, and BOTH buttons as
+    // real structured elements (callback value + url preserved) — not the
+    // `- [Label] -> …` prose the text fallback would have produced.
+    let card = &cards[0].message.content["card"];
+    assert_eq!(
+        card["title"], "Ready to ship",
+        "card title preserved: {card}"
+    );
+    assert!(
+        card["body"]
+            .as_str()
+            .is_some_and(|b| b.contains("built and verified")),
+        "card body preserved: {card}",
+    );
+    let buttons = card["buttons"]
+        .as_array()
+        .expect("card carries a structured buttons array");
+    assert_eq!(
+        buttons.len(),
+        2,
+        "both buttons survive structurally: {card}"
+    );
+    assert!(
+        buttons
+            .iter()
+            .any(|b| b["value"] == "approve:deploy-42" && b["label"] == "Approve"),
+        "the Approve callback button survives as a structured element: {card}",
+    );
+    assert!(
+        buttons
+            .iter()
+            .any(|b| b["url"] == "http://192.0.2.10:8100/diff" && b["label"] == "View diff"),
+        "the url button survives as a structured element: {card}",
+    );
+
+    // Sanity: the card was NOT flattened to prose (no `Buttons:` text blob
+    // in any chat delivery).
+    assert!(
+        !deliveries.iter().any(|d| d.message.kind.as_str() == "chat"
+            && d.message
+                .content
+                .get("text")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t.contains("Buttons:"))),
+        "a native card must not degrade to a `Buttons:` prose block: {deliveries:?}",
+    );
+
+    // The closing text answer is still delivered as its own chat message.
+    assert!(
+        deliveries.iter().any(|d| d.message.kind.as_str() == "chat"
+            && d.message
+                .content
+                .get("text")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t.contains("tap Approve to roll out v1.4.2"))),
+        "the closing text answer must be delivered: {deliveries:?}",
+    );
+}
+
+// ---- M19 U5 (X-rider W2): deltachat native card + todo chip ----
+//
+// deltachat's `todo_*` tools persist under `COPPERCLAW_DATA_ROOT`, which
+// `forbid(unsafe_code)` forbids us from setting via `std::env::set_var`.
+// So — exactly like the X2 verify-gate and F4 blocked-todo fixtures — we
+// re-exec THIS test binary as a child with the var set via the safe
+// `Command::env`; the child runs the real `ReplayHarness` against a
+// writable, per-run todo store.
+
+/// Fixed data root for the deltachat card+todo fixture. Distinct from the
+/// X2 / blocked-todo roots so the re-exec fixtures never collide.
+const XR2_DELTACHAT_DATA_ROOT: &str = "/tmp/copperclaw-xr2-deltachat-card-todo";
+/// Set on the re-exec'd child so it runs the scenario instead of
+/// re-spawning itself.
+const XR2_DELTACHAT_CHILD_ENV: &str = "COPPERCLAW_XR2_DELTACHAT_CHILD";
+/// `assert` (default) or `dump` — the latter regenerates `expected/*.jsonl`.
+const XR2_DELTACHAT_MODE_ENV: &str = "COPPERCLAW_XR2_DELTACHAT_MODE";
+
+/// M19 U5 (X-rider W2): a `send_card` reaches deltachat's `deliver_card`
+/// as a STRUCTURED card, and a todo list is routed to `deliver_todo_list`
+/// carrying its glyphs + footer counts — on a formerly-bare interactive
+/// chat surface U5 raised to the rich floor. See the fixture's README.
+#[tokio::test]
+async fn deltachat_card_and_todo_native_surfaces() {
+    // Child leg: env already set by the parent's re-exec.
+    if std::env::var_os(XR2_DELTACHAT_CHILD_ENV).is_some() {
+        let dump = std::env::var(XR2_DELTACHAT_MODE_ENV).ok().as_deref() == Some("dump");
+        run_deltachat_card_todo_child(dump).await;
+        return;
+    }
+
+    // Parent leg: create a writable data root (the todo store lands here)
+    // and re-exec ourselves with COPPERCLAW_DATA_ROOT set.
+    let _ = std::fs::remove_dir_all(XR2_DELTACHAT_DATA_ROOT);
+    std::fs::create_dir_all(XR2_DELTACHAT_DATA_ROOT).expect("create deltachat data root");
+
+    let mode = if std::env::var_os("COPPERCLAW_XR2_GENERATE").is_some() {
+        "dump"
+    } else {
+        "assert"
+    };
+    let exe = std::env::current_exe().expect("current_exe");
+    let output = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "deltachat_card_and_todo_native_surfaces",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(XR2_DELTACHAT_CHILD_ENV, "1")
+        .env(XR2_DELTACHAT_MODE_ENV, mode)
+        .env("COPPERCLAW_DATA_ROOT", XR2_DELTACHAT_DATA_ROOT)
+        .output()
+        .expect("spawn deltachat card+todo re-exec child");
+
+    let _ = std::fs::remove_dir_all(XR2_DELTACHAT_DATA_ROOT);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if mode == "dump" {
+        println!("{stdout}");
+    }
+    assert!(
+        output.status.success(),
+        "deltachat card+todo child failed (status {:?})\n\
+         --- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}",
+        output.status.code(),
+    );
+}
+
+/// The child scenario: drive the `deltachat/card-and-todo` fixture through
+/// the real harness. In `dump` mode print the captured actuals (fixture
+/// authoring); otherwise diff against `expected/*.jsonl` and assert the
+/// native card + todo chip genuinely reached the deltachat delivery hooks.
+async fn run_deltachat_card_todo_child(dump: bool) {
+    let path = fixture_path("deltachat", "card-and-todo");
+    assert!(
+        path.exists(),
+        "fixture missing at {} — see docs/replay-fixtures.md",
+        path.display()
+    );
+    let fixture = Fixture::load(&path).expect("load deltachat card+todo fixture");
+    let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+    harness.run().await.expect("run harness");
+
+    if dump {
+        harness.dump_expected_jsonl();
+        return;
+    }
+
+    // Byte-stable pipeline diff first.
+    let report = harness.compare().expect("compare");
+    assert!(report.is_clean(), "{report}");
+
+    let dc = mock_for(&harness, "deltachat");
+    let deliveries = dc.deliveries();
+
+    // Exactly one native (Card-kind) card delivery to the deltachat chat,
+    // with its structure — title, body, field, and both buttons — intact.
+    let cards: Vec<_> = deliveries
+        .iter()
+        .filter(|d| d.message.kind.as_str() == "card")
+        .collect();
+    assert_eq!(
+        cards.len(),
+        1,
+        "exactly one structured card must be delivered to deltachat, got {}: {deliveries:?}",
+        cards.len(),
+    );
+    assert_eq!(cards[0].platform_id, "account/1/chat/10");
+    let card = &cards[0].message.content["card"];
+    assert_eq!(card["title"], "Demo staged", "card title preserved: {card}");
+    let buttons = card["buttons"]
+        .as_array()
+        .expect("card carries a structured buttons array");
+    assert_eq!(
+        buttons.len(),
+        2,
+        "both buttons survive structurally: {card}"
+    );
+    assert!(
+        buttons.iter().any(|b| b["value"] == "approve:demo"),
+        "the Approve callback button survives structurally: {card}",
+    );
+
+    // The todo chip reaches `deliver_todo_list` (text fallback on the bare
+    // mock) carrying BOTH items with their pending glyphs and the footer
+    // counts — the surface U5's native deltachat renderer replaces.
+    let todo_chip = deliveries
+        .iter()
+        .filter(|d| d.message.kind.as_str() == "chat")
+        .filter_map(|d| d.message.content.get("text").and_then(|t| t.as_str()))
+        .find(|t| t.contains("Wire the approval card"))
+        .expect("a todo chip carrying both items must be delivered to deltachat");
+    assert!(
+        todo_chip.contains("[ ] Scaffold the demo"),
+        "the first todo renders with its pending glyph: {todo_chip}",
+    );
+    assert!(
+        todo_chip.contains("[ ] Wire the approval card"),
+        "the second todo renders with its pending glyph: {todo_chip}",
+    );
+    assert!(
+        todo_chip.contains("(0/2 done, 0 in progress, 2 pending)"),
+        "the todo chip carries the footer counts: {todo_chip}",
+    );
+
+    // The closing text answer is delivered as its own chat message.
+    assert!(
+        deliveries.iter().any(|d| d.message.kind.as_str() == "chat"
+            && d.message
+                .content
+                .get("text")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| t.contains("tap Approve when ready"))),
+        "the closing text answer must be delivered: {deliveries:?}",
+    );
+
+    // Corroborate against the on-disk todo store the tool wrote under the
+    // data root: both items genuinely exist (proof the chip reflects real
+    // state, not a hand-built list).
+    let store = std::path::Path::new(XR2_DELTACHAT_DATA_ROOT).join("agent_todos.json");
+    let raw = std::fs::read_to_string(&store)
+        .unwrap_or_else(|e| panic!("todo store missing at {}: {e}", store.display()));
+    let todos: serde_json::Value = serde_json::from_str(&raw).expect("todo store is JSON");
+    let arr = todos.as_array().expect("todo store is an array");
+    assert_eq!(arr.len(), 2, "both todo items were persisted: {todos}");
+}
+
+/// M19 U7 (X-rider W2): the slack parity twin of `telegram/reaction-steer`.
+/// A ✅ slack reaction (normalized `content.reaction`) in a mention-gated
+/// slack channel bypasses the gate (interaction payload) and persists a
+/// non-trigger reaction row — pending for the runner's R2 steering seam —
+/// with no runner turn, outbound, or delivery. Proves the inbound → router
+/// reaction leg is channel-agnostic (slack's identity/target shape, not
+/// just telegram's). The runner-side steering is covered by drive_turn
+/// unit tests; this fixture owns the inbound → router leg. See README.
+#[tokio::test]
+async fn slack_reaction_inbound_bypasses_mention_gate() {
+    run_fixture("slack", "reaction-inbound").await;
+}
+
+// ─── X-rider W3: capability fixtures (A1 / A3 / A7) ──────────────────────────
+
+/// Fixture-authoring gate for the W3 capability fixtures. When
+/// `COPPERCLAW_XR3_GENERATE` is set the harness regenerates `expected/*.jsonl`
+/// from a real run and the caller returns before asserting. Never taken under
+/// a normal `cargo test`.
+async fn xr3_maybe_generate(channel: &str, scenario: &str) -> bool {
+    if std::env::var_os("COPPERCLAW_XR3_GENERATE").is_none() {
+        return false;
+    }
+    let path = fixture_path(channel, scenario);
+    let fixture = Fixture::load(&path).expect("load fixture");
+    let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+    harness.run().await.expect("run harness");
+    harness.dump_expected_jsonl();
+    true
+}
+
+/// M19 A3 (X-rider W3): the public-verb ritual card. After `make_preview_public`
+/// returns a PUBLIC https URL (relayed through the reserved `__preview` server
+/// to the harness's `FixtureTunnelBroker`), the agent's prototype-ready ritual
+/// card gains an "Open the public link" button pointing at that public URL —
+/// alongside the LAN "Open preview" button. This locks the card-with-public-URL
+/// button shape at the pipeline level (inbound → router → runner → outbound →
+/// delivery), on top of the byte-stable JSONL diff. A3's approval round-trip +
+/// tunnel-broker internals are covered by its host-handler `preview.rs` tests
+/// and the `tunnel.rs` module tests; here the FixtureTunnelBroker models the
+/// post-approval `Exposed` reply so the fixture can prove the surfaced card.
+/// See the fixture's README.
+#[tokio::test]
+async fn cli_prototype_public_share_ritual_card_has_public_button() {
+    if xr3_maybe_generate("cli", "prototype-public-share").await {
+        return;
+    }
+    let harness = run_fixture_into_harness("cli", "prototype-public-share").await;
+    let cli = mock_for(&harness, "cli");
+    let deliveries = cli.deliveries();
+
+    // The ritual card renders through the cli text-fallback carrying BOTH the
+    // LAN "Open preview" button (from the M17 preview broker) and the new A3
+    // "Open the public link" button (from the tunnel broker) — the public verb
+    // added a button to the same prototype-ready card, it did not replace it.
+    let card_text = deliveries
+        .iter()
+        .filter_map(|d| d.message.content.get("text").and_then(|t| t.as_str()))
+        .find(|t| t.contains("Todo app is live and public"))
+        .expect("the public-share ritual card must be delivered");
+    assert!(
+        card_text.contains("**Todo app is live and public**"),
+        "card must carry the title as a headline: {card_text}",
+    );
+    // The LAN button is still present (the public verb augments, not replaces).
+    assert!(
+        card_text.contains("[Open preview] -> http://192.0.2.10:8100/__preview/fixture-tok-8000"),
+        "card must still carry the LAN Open-preview button: {card_text}",
+    );
+    // The headline A3 assertion: the public-URL button, pointing at the PUBLIC
+    // https tunnel URL the FixtureTunnelBroker returned for make_preview_public.
+    assert!(
+        card_text.contains(
+            "[Open the public link] -> https://fixture-tunnel.example/__preview/fixture-tok-8000"
+        ),
+        "card must carry the A3 public-URL button: {card_text}",
+    );
+    // The public URL is genuinely public (https, off-network host) — the
+    // contrast with the LAN http URL that shares the card.
+    assert!(
+        card_text.contains("https://fixture-tunnel.example/"),
+        "the public link must be an https tunnel URL, not the LAN address: {card_text}",
     );
 }

@@ -7,9 +7,10 @@ use crate::api;
 use crate::config::DeltaChatConfig;
 use crate::factory::CHANNEL_TYPE_STR;
 use crate::parse::{build_send_payload, event_to_inbound, extract_incoming_msg, parse_platform_id};
+use crate::render;
 use crate::rpc::RpcTransport;
 use async_trait::async_trait;
-use copperclaw_channels_core::{AdapterError, ChannelAdapter, DmHandle};
+use copperclaw_channels_core::{AdapterError, Card, ChannelAdapter, DiffCard, DmHandle, TodoList};
 use copperclaw_types::{ChannelType, InboundEvent, OutboundFile, OutboundMessage};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -493,6 +494,54 @@ impl ChannelAdapter for DeltaChatAdapter {
         Ok(last_id)
     }
 
+    /// Native card — clean Delta Chat plaintext (no Markdown, which the
+    /// clients render literally; no interactive buttons). See
+    /// [`render::render_card`]. Delta Chat has no edit API, so a card is a
+    /// fresh message.
+    async fn deliver_card(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        card: &Card,
+        _to: Option<&str>,
+    ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type.as_str(), "card");
+        let text = render::render_card(card);
+        self.deliver_rendered(platform_id, &text).await
+    }
+
+    /// Native diff — a structured `path (+a / -r)` header plus unified
+    /// hunks with `+` / `-` gutters, fence-free (Delta Chat shows backticks
+    /// literally). See [`render::render_diff`].
+    async fn deliver_diff(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        diff: &DiffCard,
+    ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type.as_str(), "diff");
+        let text = render::render_diff(diff);
+        self.deliver_rendered(platform_id, &text).await
+    }
+
+    /// Native todo list — a structured `title (done/total)` checklist with
+    /// ASCII glyphs (including `[!]` + reason for a blocked step). Delta
+    /// Chat has no edit or pin API, so `existing_message_id` / `pin_hint`
+    /// are ignored and each mutation posts a fresh chip. See
+    /// [`render::render_todo_list`].
+    async fn deliver_todo_list(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        list: &TodoList,
+        _existing_message_id: Option<&str>,
+        _pin_hint: bool,
+    ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type.as_str(), "todo");
+        let text = render::render_todo_list(list);
+        self.deliver_rendered(platform_id, &text).await
+    }
+
     async fn open_dm(&self, _user_id: &str) -> Result<Option<DmHandle>, AdapterError> {
         // Delta Chat DMs require knowing the contact id; defer to admin
         // configuration of a `messaging_groups` row.
@@ -501,6 +550,37 @@ impl ChannelAdapter for DeltaChatAdapter {
 }
 
 impl DeltaChatAdapter {
+    /// Send a pre-rendered plaintext body to the chat named by
+    /// `platform_id`, validating the account matches the configured one.
+    /// Shared by the rich-surface `deliver_*` overrides so the
+    /// parse/validate/`send_msg` sequence has a single home.
+    async fn deliver_rendered(
+        &self,
+        platform_id: &str,
+        text: &str,
+    ) -> Result<Option<String>, AdapterError> {
+        let parsed = parse_platform_id(platform_id).ok_or_else(|| {
+            AdapterError::BadRequest(format!(
+                "deltachat platform_id must be `account/<id>/chat/<id>`, got `{platform_id}`"
+            ))
+        })?;
+        if parsed.account_id != self.config.account_id {
+            return Err(AdapterError::BadRequest(format!(
+                "deltachat platform_id account {} does not match configured account {}",
+                parsed.account_id, self.config.account_id
+            )));
+        }
+        let payload = build_send_payload(text, None);
+        let id = api::send_msg(
+            self.transport.as_ref(),
+            self.config.account_id,
+            parsed.chat_id,
+            payload,
+        )
+        .await?;
+        Ok(Some(id.to_string()))
+    }
+
     async fn deliver_action(
         &self,
         chat_id: i64,
@@ -701,6 +781,120 @@ mod tests {
         let calls = mock.observed().await;
         assert_eq!(calls[0].method, "send_msg");
         assert_eq!(calls[0].params, json!([1, 42, {"text": "hi"}]));
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_card_sends_rendered_plaintext() {
+        let mock = Arc::new(MockTransport::new());
+        mock.push_response(MockResponse::ok("send_msg", json!(303)))
+            .await;
+        let m: Arc<dyn RpcTransport> = mock.clone();
+        let (adapter, _dir, _rx) = build(m, 1);
+        let card = copperclaw_channels_core::Card {
+            title: Some("Approve deploy?".into()),
+            buttons: vec![copperclaw_channels_core::CardButton {
+                label: "Approve".into(),
+                value: Some("approve:9".into()),
+                url: None,
+                style: None,
+            }],
+            ..copperclaw_channels_core::Card::default()
+        };
+        let id = adapter
+            .deliver_card("account/1/chat/42", None, &card, None)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("303"));
+        let calls = mock.observed().await;
+        assert_eq!(calls[0].method, "send_msg");
+        let sent = calls[0].params[2]["text"].as_str().unwrap();
+        assert!(sent.starts_with("Approve deploy?"), "{sent}");
+        assert!(sent.contains("- Approve -> approve:9"), "{sent}");
+        assert!(!sent.contains("**"), "{sent}");
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_todo_list_renders_blocked_glyph_and_reason() {
+        let mock = Arc::new(MockTransport::new());
+        mock.push_response(MockResponse::ok("send_msg", json!(404)))
+            .await;
+        let m: Arc<dyn RpcTransport> = mock.clone();
+        let (adapter, _dir, _rx) = build(m, 1);
+        let list = copperclaw_channels_core::TodoList {
+            title: Some("Build".into()),
+            items: vec![copperclaw_channels_core::TodoListItem {
+                id: 1,
+                text: "Verify".into(),
+                status: copperclaw_channels_core::TodoItemStatus::Blocked,
+                blocked_reason: Some("out of fix-cycles".into()),
+            }],
+        };
+        adapter
+            .deliver_todo_list("account/1/chat/42", None, &list, None, true)
+            .await
+            .unwrap();
+        let calls = mock.observed().await;
+        let sent = calls[0].params[2]["text"].as_str().unwrap();
+        assert!(
+            sent.contains("[!] Verify — blocked: out of fix-cycles"),
+            "{sent}"
+        );
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_diff_sends_fence_free_diff() {
+        let mock = Arc::new(MockTransport::new());
+        mock.push_response(MockResponse::ok("send_msg", json!(505)))
+            .await;
+        let m: Arc<dyn RpcTransport> = mock.clone();
+        let (adapter, _dir, _rx) = build(m, 1);
+        let diff = copperclaw_channels_core::DiffCard {
+            path: "src/lib.rs".into(),
+            language: None,
+            hunks: vec![copperclaw_channels_core::DiffHunk {
+                old_start: 1,
+                old_lines: 0,
+                new_start: 1,
+                new_lines: 1,
+                lines: vec![copperclaw_channels_core::DiffLine {
+                    kind: copperclaw_channels_core::DiffLineKind::Add,
+                    text: "let x = 1;".into(),
+                }],
+            }],
+            added: 1,
+            removed: 0,
+            truncated: false,
+        };
+        adapter
+            .deliver_diff("account/1/chat/42", None, &diff)
+            .await
+            .unwrap();
+        let calls = mock.observed().await;
+        let sent = calls[0].params[2]["text"].as_str().unwrap();
+        assert!(sent.starts_with("src/lib.rs (+1 / -0)"), "{sent}");
+        assert!(sent.contains("+let x = 1;"), "{sent}");
+        assert!(!sent.contains("```"), "{sent}");
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_card_mismatched_account_errors() {
+        let mock = Arc::new(MockTransport::new());
+        let m: Arc<dyn RpcTransport> = mock;
+        let (adapter, _dir, _rx) = build(m, 1);
+        let err = adapter
+            .deliver_card(
+                "account/9/chat/42",
+                None,
+                &copperclaw_channels_core::Card::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AdapterError::BadRequest(m) if m.contains("does not match")));
         adapter.shutdown().await;
     }
 

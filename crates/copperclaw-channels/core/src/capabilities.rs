@@ -35,7 +35,7 @@
 /// [`crate::ChannelAdapter::edit_message`] (an in-place edit API), as
 /// verified against the in-tree adapter sources. Everything else falls
 /// back to the trait default (`AdapterError::Unsupported`).
-const EDIT_CAPABLE_CHANNELS: [&str; 7] = [
+const EDIT_CAPABLE_CHANNELS: [&str; 8] = [
     "telegram",
     "slack",
     "discord",
@@ -43,6 +43,7 @@ const EDIT_CAPABLE_CHANNELS: [&str; 7] = [
     "webex",
     "signal",
     "mattermost",
+    "teams",
 ];
 
 /// True when the named channel type's adapter can edit a previously
@@ -52,6 +53,17 @@ const EDIT_CAPABLE_CHANNELS: [&str; 7] = [
 #[must_use]
 pub fn supports_message_edit(channel_type: &str) -> bool {
     EDIT_CAPABLE_CHANNELS.contains(&channel_type)
+}
+
+/// The full edit-capable channel-type list, exposed so out-of-crate
+/// drift guards can iterate it. The F1 drift guard
+/// (`copperclaw-host-delivery/tests/edit_capable_edit_message_drift.rs`)
+/// walks this to assert every listed channel's adapter really overrides
+/// the trait `edit_message` — core itself can't see the adapter crates,
+/// so the reality check lives in `host-delivery`, which does.
+#[must_use]
+pub fn edit_capable_channels() -> &'static [&'static str] {
+    &EDIT_CAPABLE_CHANNELS
 }
 
 /// Static mirror of [`crate::ChannelAdapter::typing_indicator_visible`]
@@ -87,7 +99,8 @@ mod tests {
         // The adapters with a real in-place edit impl (see the
         // module-level sync rule). signal (`sendEditMessage`) and
         // mattermost (`PUT /posts/{id}/patch`) were raised to the
-        // rich-surface floor in M18-C5.
+        // rich-surface floor in M18-C5. teams (`PATCH .../messages/{id}`)
+        // gained a trait `edit_message` override in M19-U2.
         for ct in [
             "telegram",
             "slack",
@@ -96,6 +109,7 @@ mod tests {
             "webex",
             "signal",
             "mattermost",
+            "teams",
         ] {
             assert!(supports_message_edit(ct), "{ct} implements edit_message");
         }

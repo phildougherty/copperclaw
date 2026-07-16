@@ -1079,6 +1079,312 @@ pub fn observe_delegate_worktree_provision_seconds(secs: f64) {
     histogram!(DELEGATE_WORKTREE_PROVISION_SECONDS).record(secs);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// M19 metrics rider (card M1) — one sweep of the metric "wishes" the merged M19
+// cards (F1–F5, U1–U7, A1–A6) recorded in their PR descriptions. No other M19
+// card touches this crate; names/labels mirror each card's wish. The emit call
+// sites live in the crate each wish named (noted per helper). Grouped by card.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── F1 — edit-drift fallthrough ────────────────────────────────────────────
+pub const EDIT_DRIFT_FALLTHROUGH_TOTAL: &str = "copperclaw_edit_drift_fallthrough_total";
+
+/// Increment `copperclaw_edit_drift_fallthrough_total{channel_type}` — a HUD /
+/// approval edit hit the trait DEFAULT `edit_message` (the "not edit-capable"
+/// fallthrough) instead of a real per-adapter override. A dedicated drift alarm
+/// distinct from the generic `inc_hud_edit(_, "unsupported_fallthrough")` label:
+/// a non-zero rate on a channel that is (or is expected to be) in
+/// `EDIT_CAPABLE_CHANNELS` means an adapter lost its override. Emitted from the
+/// core trait default (`copperclaw-channels/core/src/adapter.rs`).
+pub fn inc_edit_drift_fallthrough(channel_type: &str) {
+    counter!(EDIT_DRIFT_FALLTHROUGH_TOTAL, "channel_type" => channel_type.to_owned()).increment(1);
+}
+
+// ── F2 — user-facing "wall" cards by blocker category ──────────────────────
+pub const WALL_CARD_TOTAL: &str = "copperclaw_wall_card_total";
+
+/// Increment `copperclaw_wall_card_total{blocker}` — a curated, user-facing
+/// "I'm blocked" wall card was emitted for a terminally-walled turn; `blocker`
+/// is the `BlockerCategory::metric_label()` value
+/// (`egress|verify_gate|provenance|autonomous|policy`). Emitted from the runner's
+/// `emit_terminal_failure_apologies` (`copperclaw-runner/src/run/mod.rs`) when a
+/// wall card is actually written back to a user channel.
+pub fn inc_wall_card(blocker: &str) {
+    counter!(WALL_CARD_TOTAL, "blocker" => blocker.to_owned()).increment(1);
+}
+
+// ── F3 — approval-card lifecycle outcomes ──────────────────────────────────
+pub const APPROVAL_CARD_OUTCOME_TOTAL: &str = "copperclaw_approval_card_outcome_total";
+
+/// Increment `copperclaw_approval_card_outcome_total{outcome}` — an approval
+/// *card* lifecycle event, distinct from the tap-resolution
+/// [`inc_approval_tap`] (`approved|denied|unauthorized|race_noop`). `outcome` is
+/// one of `resolved_edit` (card stamped terminal in place), `resolved_fallback_reply`
+/// (no editable anchor — resolution posted as a follow-up), `conflict_notified`
+/// (a losing tapper was told who settled it / that it lapsed), or `expired_card`
+/// (the TTL sweep stamped a delivered card expired). Emitted from
+/// `copperclaw-host/src/approval_intercept.rs` and `.../handlers/approvals.rs`.
+pub fn inc_approval_card_outcome(outcome: &str) {
+    counter!(APPROVAL_CARD_OUTCOME_TOTAL, "outcome" => outcome.to_owned()).increment(1);
+}
+
+// ── F4 — blocked-todo chips rendered ───────────────────────────────────────
+pub const BLOCKED_TODO_RENDER_TOTAL: &str = "copperclaw_blocked_todo_render_total";
+
+/// Increment `copperclaw_blocked_todo_render_total{channel_type, has_reason}` —
+/// a delivered todo checklist carried at least one `blocked` item; `has_reason`
+/// records whether any blocked item surfaced a reason string. Emitted once per
+/// successful todo delivery (`copperclaw-host-delivery/src/service.rs`
+/// `dispatch_todo_list`) when the combined list's `blocked_count() > 0`.
+pub fn inc_blocked_todo_render(channel_type: &str, has_reason: bool) {
+    counter!(
+        BLOCKED_TODO_RENDER_TOTAL,
+        "channel_type" => channel_type.to_owned(),
+        "has_reason" => if has_reason { "true" } else { "false" },
+    )
+    .increment(1);
+}
+
+// ── F5 — pre-first-tool "thinking…" HUD frames ─────────────────────────────
+pub const HUD_THINKING_FRAME_TOTAL: &str = "copperclaw_hud_thinking_frame_total";
+
+/// Increment `copperclaw_hud_thinking_frame_total{agent_group}` — the HUD posted
+/// its pre-first-tool "thinking…" frame (the armed background task's initial
+/// post, fired after `THINKING_THRESHOLD` on a turn that has not yet called a
+/// tool). Distinct from the tool-triggered first post counted by
+/// [`inc_hud_post`]; both share the `agent_group` label so an operator can see
+/// how often a turn surfaced a pure-reasoning wait. Emitted from
+/// `copperclaw-runner/src/run/hud.rs` (`TaskHud::arm`).
+pub fn inc_hud_thinking_frame(agent_group: &str) {
+    counter!(HUD_THINKING_FRAME_TOTAL, "agent_group" => agent_group.to_owned()).increment(1);
+}
+
+// ── U1/U2 — rich-surface in-place-edit vs create ───────────────────────────
+pub const ADAPTER_SURFACE_WRITE_TOTAL: &str = "copperclaw_adapter_surface_write_total";
+
+/// Increment `copperclaw_adapter_surface_write_total{channel_type, mode}` — a
+/// pinned rich surface (the rolled-up todo card / HUD anchor) was written;
+/// `mode` is `edit` when a prior anchor existed (edit-in-place intent) or
+/// `create` when a fresh card was posted. Lets an operator see the edit-vs-create
+/// ratio the U1/U2 rich-adapter upgrades exercise. Emitted from
+/// `copperclaw-host-delivery/src/service.rs` (`dispatch_todo_list`).
+pub fn inc_adapter_surface_write(channel_type: &str, mode: &str) {
+    counter!(
+        ADAPTER_SURFACE_WRITE_TOTAL,
+        "channel_type" => channel_type.to_owned(),
+        "mode" => mode.to_owned(),
+    )
+    .increment(1);
+}
+
+// ── U3 — typing indicators + outbound reactions ────────────────────────────
+pub const ADAPTER_TYPING_TOTAL: &str = "copperclaw_adapter_typing_total";
+pub const ADAPTER_REACTION_TOTAL: &str = "copperclaw_adapter_reaction_total";
+
+/// Increment `copperclaw_adapter_typing_total{channel_type, result}` — an
+/// adapter typing-indicator send resolved; `result` is `ok|rate_limited|unsupported|error`.
+/// Emitted from the host dispatcher's central `set_typing` path
+/// (`copperclaw-host-delivery/src/dispatch.rs`), so it covers every adapter.
+pub fn inc_adapter_typing(channel_type: &str, result: &str) {
+    counter!(
+        ADAPTER_TYPING_TOTAL,
+        "channel_type" => channel_type.to_owned(),
+        "result" => result.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Increment `copperclaw_adapter_reaction_total{channel_type, result}` — an
+/// outbound emoji-reaction send resolved; `result` is `ok|unsupported|error`.
+/// Emitted from the host delivery's central `reaction` system-action path
+/// (`copperclaw-host-delivery/src/service.rs`), so it covers every adapter.
+pub fn inc_adapter_reaction(channel_type: &str, result: &str) {
+    counter!(
+        ADAPTER_REACTION_TOTAL,
+        "channel_type" => channel_type.to_owned(),
+        "result" => result.to_owned(),
+    )
+    .increment(1);
+}
+
+// ── U6 — shared-renderer (`core::markdown::render`) adoption coverage ───────
+pub const SHARED_RENDERER_ADOPTION: &str = "copperclaw_shared_renderer_adoption";
+
+/// The adapters whose plain-text outbound path routes through the shared
+/// `copperclaw_channels_core::markdown::render` renderer (M19 U6). Kept here as
+/// the single source of truth the adoption gauge reflects; growing the shared
+/// renderer to a new adapter adds a name here. (gchat is deliberately absent —
+/// its text dialect matches no existing `Flavor`; see the U6 CHANGELOG entry.)
+pub const SHARED_RENDERER_ADOPTED_ADAPTERS: &[&str] = &[
+    "slack",
+    "discord",
+    "matrix",
+    "mattermost",
+    "whatsapp-cloud",
+    "telegram",
+];
+
+/// Set `copperclaw_shared_renderer_adoption{channel_type}` to 1 for every adapter
+/// in [`SHARED_RENDERER_ADOPTED_ADAPTERS`]. A static coverage signal (sum the
+/// series for the adopted-adapter count). Called once from [`maybe_start_server`]
+/// after the recorder is installed, so it needs no external call site.
+pub fn set_shared_renderer_adoption() {
+    for ct in SHARED_RENDERER_ADOPTED_ADAPTERS {
+        gauge!(SHARED_RENDERER_ADOPTION, "channel_type" => (*ct).to_owned()).set(1.0);
+    }
+}
+
+// ── U7 — inbound reactions by curated signal / outcome ─────────────────────
+pub const INBOUND_REACTION_TOTAL: &str = "copperclaw_inbound_reaction_total";
+
+/// Increment `copperclaw_inbound_reaction_total{signal, outcome}` — an inbound
+/// reaction reached the runner's mid-turn steering seam. `signal` is the curated
+/// meaning (`affirmative|looking|negative|uncurated`) and `outcome` is `folded`
+/// (steered the run as a one-line interjection on the agent's own last message)
+/// or `ignored` (uncurated emoji, or a reaction on an unrelated message). Distinct
+/// from the generic `inc_midturn_control(_, "reaction")`. Emitted from
+/// `copperclaw-runner/src/run/drive_turn.rs` (`check_mid_turn_steering`).
+pub fn inc_inbound_reaction(signal: &str, outcome: &str) {
+    counter!(
+        INBOUND_REACTION_TOTAL,
+        "signal" => signal.to_owned(),
+        "outcome" => outcome.to_owned(),
+    )
+    .increment(1);
+}
+
+// ── A1 — `delegate_batch` parallel fan-out ─────────────────────────────────
+pub const DELEGATE_BATCH_WIDTH: &str = "copperclaw_delegate_batch_width";
+pub const DELEGATE_BATCH_WORKER_TOTAL: &str = "copperclaw_delegate_batch_worker_total";
+pub const DELEGATE_BATCH_REFUSED_TOTAL: &str = "copperclaw_delegate_batch_refused_total";
+
+/// Record `copperclaw_delegate_batch_width` — the number of workers a single
+/// `delegate_batch` call fanned out (1..=`MAX_DELEGATE_BATCH_WIDTH`). Emitted from
+/// the runner join (`copperclaw-runner/src/run/delegate_batch.rs`).
+pub fn observe_delegate_batch_width(workers: u64) {
+    #[allow(clippy::cast_precision_loss)]
+    histogram!(DELEGATE_BATCH_WIDTH).record(workers as f64);
+}
+
+/// Increment `copperclaw_delegate_batch_worker_total{outcome}` — one joined
+/// `delegate_batch` worker's terminal status; `outcome` is `ok` (reported),
+/// `timeout` (spawned but silent past the join budget), or `spawn_failed`
+/// (never spawned — depth/permission gate). Emitted from `finalize_worker`
+/// (`copperclaw-runner/src/run/delegate_batch.rs`).
+pub fn inc_delegate_batch_worker(outcome: &str) {
+    counter!(DELEGATE_BATCH_WORKER_TOTAL, "outcome" => outcome.to_owned()).increment(1);
+}
+
+/// Increment `copperclaw_delegate_batch_refused_total` — a whole `delegate_batch`
+/// was refused (every worker failed to spawn, e.g. a batch from a max-depth
+/// child), surfaced to the model as one tool error rather than a partial
+/// aggregate. Emitted from the pure handler (`copperclaw-mcp/src/tools/agents.rs`).
+pub fn inc_delegate_batch_refused() {
+    counter!(DELEGATE_BATCH_REFUSED_TOTAL).increment(1);
+}
+
+// ── A2 — interactive browser actions ───────────────────────────────────────
+pub const BROWSER_INTERACTIVE_ACTIONS_TOTAL: &str = "copperclaw_browser_interactive_actions_total";
+
+/// Increment `copperclaw_browser_interactive_actions_total{action, outcome}` — one
+/// scripted interactive-browser action ran; `action` is
+/// `click|type|scroll|wait_for_selector` and `outcome` is `ok`, `blocked` (an
+/// SSRF re-guard refused the resulting navigation), or `driver_error`. Emitted
+/// per action from `copperclaw-browser/src/interactive.rs`. (The interactive
+/// SSRF *stage* labels — `interactive_target_preflight` / `interactive_post_nav`
+/// / `interactive_redirect_hop` — are already emitted via [`inc_browser_ssrf_block`].)
+pub fn inc_browser_interactive_action(action: &str, outcome: &str) {
+    counter!(
+        BROWSER_INTERACTIVE_ACTIONS_TOTAL,
+        "action" => action.to_owned(),
+        "outcome" => outcome.to_owned(),
+    )
+    .increment(1);
+}
+
+// ── A3 — public-tunnel exposures ───────────────────────────────────────────
+pub const PUBLIC_TUNNEL_TOTAL: &str = "copperclaw_public_tunnel_total";
+
+/// Increment `copperclaw_public_tunnel_total{outcome, reason}` — a public-tunnel
+/// (V5 `make_preview_public`) lifecycle event. `outcome` is `opened` (a tunnel
+/// stood up on an approved grant), `approval_raised` (a pending-approval card was
+/// raised), `denied` (refused — `reason` `not_enabled` for the opt-in gate or
+/// `approval_denied` for an operator deny), or `torn_down` (`reason` the teardown
+/// cause, e.g. `preview-closed` / `session-stop`). `reason` is empty for
+/// `opened` / `approval_raised`. Emitted from `copperclaw-modules/src/tunnel.rs`.
+pub fn inc_public_tunnel(outcome: &str, reason: &str) {
+    counter!(
+        PUBLIC_TUNNEL_TOTAL,
+        "outcome" => outcome.to_owned(),
+        "reason" => reason.to_owned(),
+    )
+    .increment(1);
+}
+
+// ── A4 — agent-authored skills saved ───────────────────────────────────────
+pub const SKILLS_SAVED_TOTAL: &str = "copperclaw_skills_saved_total";
+
+/// Increment `copperclaw_skills_saved_total{outcome}` — an approved `save_skill`
+/// write reached the disk; `outcome` is `saved` (the `SKILL.md` was written) or
+/// `rejected` (re-validation at the security boundary failed: bad frontmatter,
+/// name mismatch, containment escape). Dedicated counter replacing the reuse of
+/// `inc_self_mod_*("save_skill")` for the actual save outcome. Emitted from
+/// `copperclaw-host/src/handlers/approvals.rs` (`apply_save_skill`).
+pub fn inc_skills_saved(outcome: &str) {
+    counter!(SKILLS_SAVED_TOTAL, "outcome" => outcome.to_owned()).increment(1);
+}
+
+// ── A5 — agent memory writes by provenance ─────────────────────────────────
+pub const MEMORY_WRITES_TOTAL: &str = "copperclaw_memory_writes_total";
+pub const MEMORY_WRITE_RATE_CAPPED_TOTAL: &str = "copperclaw_memory_write_rate_capped_total";
+
+/// Increment `copperclaw_memory_writes_total{provenance}` — an agent-initiated
+/// `memory_save` committed to the per-group store; `provenance` is `trusted` or
+/// `untrusted` (a turn tainted by untrusted-provenance content is honestly
+/// downgraded). The provenance is decided store-side from the runner's own taint
+/// flag, never the caller. Emitted from `copperclaw-runner/src/tools.rs`.
+pub fn inc_memory_write(provenance: &str) {
+    counter!(MEMORY_WRITES_TOTAL, "provenance" => provenance.to_owned()).increment(1);
+}
+
+/// Increment `copperclaw_memory_write_rate_capped_total` — a `memory_save` was
+/// refused because the per-session write ceiling (`MAX_SAVES_PER_SESSION`) was
+/// reached. Emitted from `copperclaw-runner/src/tools.rs`.
+pub fn inc_memory_write_rate_capped() {
+    counter!(MEMORY_WRITE_RATE_CAPPED_TOTAL).increment(1);
+}
+
+// ── A6 — scheduled-task fire lifecycle ─────────────────────────────────────
+pub const SCHEDULED_TASK_FIRES_TOTAL: &str = "copperclaw_scheduled_task_fires_total";
+pub const SCHEDULED_TASKS_ACTIVE: &str = "copperclaw_scheduled_tasks_active";
+pub const SCHEDULED_TASK_FIRE_LATENCY_SECONDS: &str =
+    "copperclaw_scheduled_task_fire_latency_seconds";
+
+/// Increment `copperclaw_scheduled_task_fires_total{kind}` — a durable scheduled
+/// task fired; `kind` is `recurring_rearm` (a recurring task re-armed its next
+/// occurrence) or `one_shot_complete` (a one-shot task transitioned to
+/// completed). Emitted from the sweep's due-task fan-out
+/// (`copperclaw-host-sweep/src/checks/scheduling.rs`).
+pub fn inc_scheduled_task_fire(kind: &str) {
+    counter!(SCHEDULED_TASK_FIRES_TOTAL, "kind" => kind.to_owned()).increment(1);
+}
+
+/// Set `copperclaw_scheduled_tasks_active` — the count of `active` scheduled
+/// tasks in the central `tasks` table at the last sweep pass. Emitted from
+/// `copperclaw-host-sweep/src/checks/scheduling.rs`.
+pub fn set_scheduled_tasks_active(count: u64) {
+    #[allow(clippy::cast_precision_loss)]
+    gauge!(SCHEDULED_TASKS_ACTIVE).set(count as f64);
+}
+
+/// Record `copperclaw_scheduled_task_fire_latency_seconds` — how late a task
+/// fired relative to its scheduled `next_fire` (the sweep's coarse 60s cadence
+/// bounds the resolution). Emitted from
+/// `copperclaw-host-sweep/src/checks/scheduling.rs`.
+pub fn observe_scheduled_task_fire_latency_seconds(secs: f64) {
+    histogram!(SCHEDULED_TASK_FIRE_LATENCY_SECONDS).record(secs);
+}
+
 // ── Address parsing ────────────────────────────────────────────────────────
 
 /// Parse `COPPERCLAW_METRICS_ADDR`.  Accepts:
@@ -1146,6 +1452,10 @@ pub async fn maybe_start_server(shutdown: Option<CancellationToken>) {
     let handle = PrometheusBuilder::new()
         .install_recorder()
         .unwrap_or_else(|_| PrometheusBuilder::new().build_recorder().handle());
+
+    // M19 U6: publish the static shared-renderer adoption gauge now that a
+    // recorder is installed, so `/metrics` exposes per-adapter coverage.
+    set_shared_renderer_adoption();
 
     let listener = match TcpListener::bind(addr).await {
         Ok(l) => l,
@@ -1845,6 +2155,140 @@ mod tests {
         assert!(
             body.contains("outcome=\"unauthorized\""),
             "missing approval outcome:\n{body}"
+        );
+    }
+
+    // ── M19 metrics-rider (card M1) coverage ───────────────────────────────
+
+    /// Every new M19 metric name const, so the prefix / double-underscore
+    /// invariants extend to the rider's additions.
+    const M19_METRIC_NAMES: &[&str] = &[
+        EDIT_DRIFT_FALLTHROUGH_TOTAL,
+        WALL_CARD_TOTAL,
+        APPROVAL_CARD_OUTCOME_TOTAL,
+        BLOCKED_TODO_RENDER_TOTAL,
+        HUD_THINKING_FRAME_TOTAL,
+        ADAPTER_SURFACE_WRITE_TOTAL,
+        ADAPTER_TYPING_TOTAL,
+        ADAPTER_REACTION_TOTAL,
+        SHARED_RENDERER_ADOPTION,
+        INBOUND_REACTION_TOTAL,
+        DELEGATE_BATCH_WIDTH,
+        DELEGATE_BATCH_WORKER_TOTAL,
+        DELEGATE_BATCH_REFUSED_TOTAL,
+        BROWSER_INTERACTIVE_ACTIONS_TOTAL,
+        PUBLIC_TUNNEL_TOTAL,
+        SKILLS_SAVED_TOTAL,
+        MEMORY_WRITES_TOTAL,
+        MEMORY_WRITE_RATE_CAPPED_TOTAL,
+        SCHEDULED_TASK_FIRES_TOTAL,
+        SCHEDULED_TASKS_ACTIVE,
+        SCHEDULED_TASK_FIRE_LATENCY_SECONDS,
+    ];
+
+    #[test]
+    fn m19_metric_names_have_copperclaw_prefix_no_double_underscore() {
+        for name in M19_METRIC_NAMES {
+            assert!(
+                name.starts_with("copperclaw_"),
+                "metric name {name:?} does not start with 'copperclaw_'"
+            );
+            assert!(
+                !name.contains("__"),
+                "metric name {name:?} must not contain double underscores"
+            );
+        }
+    }
+
+    #[test]
+    fn m19_counter_names_end_with_total() {
+        for name in M19_METRIC_NAMES {
+            if name.contains("_seconds")
+                || name == &DELEGATE_BATCH_WIDTH
+                || name == &SHARED_RENDERER_ADOPTION
+                || name == &SCHEDULED_TASKS_ACTIVE
+            {
+                // histograms / gauges: exempt from the `_total` suffix rule.
+                continue;
+            }
+            assert!(
+                name.ends_with("_total"),
+                "counter {name:?} does not end with '_total'"
+            );
+        }
+    }
+
+    #[test]
+    fn m19_helpers_compile_and_do_not_panic() {
+        // No recorder installed → all of these no-op; smoke test that every
+        // rider helper is callable with its intended argument shape.
+        inc_edit_drift_fallthrough("webex");
+        inc_wall_card("egress");
+        inc_approval_card_outcome("resolved_edit");
+        inc_approval_card_outcome("conflict_notified");
+        inc_blocked_todo_render("telegram", true);
+        inc_blocked_todo_render("signal", false);
+        inc_hud_thinking_frame("ag-1");
+        inc_adapter_surface_write("mattermost", "edit");
+        inc_adapter_surface_write("deltachat", "create");
+        inc_adapter_typing("discord", "ok");
+        inc_adapter_typing("discord", "rate_limited");
+        inc_adapter_reaction("teams", "unsupported");
+        set_shared_renderer_adoption();
+        inc_inbound_reaction("affirmative", "folded");
+        inc_inbound_reaction("uncurated", "ignored");
+        observe_delegate_batch_width(3);
+        inc_delegate_batch_worker("ok");
+        inc_delegate_batch_worker("timeout");
+        inc_delegate_batch_worker("spawn_failed");
+        inc_delegate_batch_refused();
+        inc_browser_interactive_action("click", "ok");
+        inc_browser_interactive_action("type", "blocked");
+        inc_public_tunnel("opened", "");
+        inc_public_tunnel("torn_down", "session-stop");
+        inc_skills_saved("saved");
+        inc_skills_saved("rejected");
+        inc_memory_write("trusted");
+        inc_memory_write("untrusted");
+        inc_memory_write_rate_capped();
+        inc_scheduled_task_fire("recurring_rearm");
+        inc_scheduled_task_fire("one_shot_complete");
+        set_scheduled_tasks_active(7);
+        observe_scheduled_task_fire_latency_seconds(1.5);
+    }
+
+    #[test]
+    fn m19_labeled_counter_renders() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            inc_wall_card("egress");
+            inc_approval_card_outcome("expired_card");
+            inc_public_tunnel("denied", "not_enabled");
+            inc_scheduled_task_fire("recurring_rearm");
+            set_shared_renderer_adoption();
+        });
+        let body = handle.render();
+        assert!(body.contains(WALL_CARD_TOTAL), "missing wall card:\n{body}");
+        assert!(
+            body.contains("blocker=\"egress\""),
+            "missing blocker label:\n{body}"
+        );
+        assert!(
+            body.contains(APPROVAL_CARD_OUTCOME_TOTAL),
+            "missing approval card outcome:\n{body}"
+        );
+        assert!(
+            body.contains("outcome=\"expired_card\""),
+            "missing expired_card outcome:\n{body}"
+        );
+        assert!(
+            body.contains(PUBLIC_TUNNEL_TOTAL) && body.contains("reason=\"not_enabled\""),
+            "missing public tunnel reason:\n{body}"
+        );
+        assert!(
+            body.contains(SHARED_RENDERER_ADOPTION) && body.contains("channel_type=\"slack\""),
+            "missing shared-renderer adoption gauge:\n{body}"
         );
     }
 }

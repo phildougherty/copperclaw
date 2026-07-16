@@ -59,6 +59,12 @@ pub enum TodoItemStatus {
     Pending,
     /// Currently being worked on.
     InProgress,
+    /// Stuck — the agent hit a wall it can't clear on its own (e.g. it
+    /// burned its verify fix-cycles). Distinct from `InProgress` so a
+    /// user watching the pinned checklist sees the step is stalled, not
+    /// silently churning. The reason lives on
+    /// [`TodoListItem::blocked_reason`].
+    Blocked,
     /// Finished.
     Completed,
 }
@@ -70,6 +76,7 @@ impl TodoItemStatus {
         match self {
             Self::Pending => "pending",
             Self::InProgress => "in_progress",
+            Self::Blocked => "blocked",
             Self::Completed => "completed",
         }
     }
@@ -80,6 +87,7 @@ impl TodoItemStatus {
         Some(match s {
             "pending" => Self::Pending,
             "in_progress" => Self::InProgress,
+            "blocked" => Self::Blocked,
             "completed" => Self::Completed,
             _ => return None,
         })
@@ -92,6 +100,7 @@ impl TodoItemStatus {
         match self {
             Self::Pending => "[ ]",
             Self::InProgress => "[~]",
+            Self::Blocked => "[!]",
             Self::Completed => "[x]",
         }
     }
@@ -114,6 +123,29 @@ pub struct TodoListItem {
     pub text: String,
     /// Lifecycle status.
     pub status: TodoItemStatus,
+    /// One-line reason the item is [`TodoItemStatus::Blocked`], surfaced
+    /// to the user next to the blocked glyph on rich surfaces and in the
+    /// text fallback. `None` for every other status. `#[serde(default)]`
+    /// keeps older rows (which never carried the field) decoding cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+}
+
+impl TodoListItem {
+    /// The trimmed, non-empty block reason to surface to the user — but
+    /// only when the item is actually [`TodoItemStatus::Blocked`]. Returns
+    /// `None` for any other status (or a blank/absent reason), so every
+    /// adapter's renderer can uniformly decide whether to append a
+    /// "(blocked: …)" suffix without re-implementing the gate.
+    pub fn blocked_reason_text(&self) -> Option<&str> {
+        if self.status != TodoItemStatus::Blocked {
+            return None;
+        }
+        self.blocked_reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+    }
 }
 
 /// The portable todo-list schema. One instance per outbound row.
@@ -225,6 +257,14 @@ impl TodoList {
             .count()
     }
 
+    /// Count of items currently [`TodoItemStatus::Blocked`].
+    pub fn blocked_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|i| i.status == TodoItemStatus::Blocked)
+            .count()
+    }
+
     /// Apply every schema rule. Returns the first violation so callers
     /// can surface it directly to the runner / model.
     pub fn validate(&self) -> Result<(), TodoListError> {
@@ -288,15 +328,55 @@ impl TodoList {
             out.push_str(item.status.glyph());
             out.push(' ');
             out.push_str(item.text.trim());
+            // Surface the one-line block reason inline so a stuck step is
+            // legible even on bare / text-fallback surfaces.
+            if let Some(reason) = item.blocked_reason_text() {
+                out.push_str(" — ");
+                out.push_str(reason);
+            }
         }
         let done = self.completed_count();
         let in_prog = self.in_progress_count();
+        let blocked = self.blocked_count();
         let pending = self.pending_count();
         let total = self.items.len();
         if total > 0 {
+            // `blocked` is inserted only when non-zero so lists without a
+            // blocked item stay byte-identical to the pre-F4 footer.
+            let blocked_frag = if blocked > 0 {
+                format!(", {blocked} blocked")
+            } else {
+                String::new()
+            };
             out.push_str(&format!(
-                "\n({done}/{total} done, {in_prog} in progress, {pending} pending)"
+                "\n({done}/{total} done, {in_prog} in progress{blocked_frag}, {pending} pending)"
             ));
+        }
+        out
+    }
+
+    /// Compact pinned-chip plaintext rendering for bare adapters (Delta
+    /// Chat, LINE): a `title (done/total)` header with the counter hoisted
+    /// up top for the glance, then one glyph-prefixed line per item. A
+    /// [`TodoItemStatus::Blocked`] item carries its `blocked_reason` inline
+    /// (`— blocked: <reason>`) so a stalled step reads as blocked, not
+    /// stuck "in progress". No footer — the header counter carries the
+    /// summary. No trailing newline.
+    pub fn to_chip_plaintext(&self) -> String {
+        let done = self.completed_count();
+        let total = self.items.len();
+        let mut out = String::with_capacity(64 + self.items.len() * 32);
+        out.push_str(self.title_or_default());
+        out.push_str(&format!(" ({done}/{total})"));
+        for item in &self.items {
+            out.push('\n');
+            out.push_str(item.status.glyph());
+            out.push(' ');
+            out.push_str(item.text.trim());
+            if let Some(reason) = item.blocked_reason_text() {
+                out.push_str(" — blocked: ");
+                out.push_str(reason.trim());
+            }
         }
         out
     }
@@ -317,6 +397,16 @@ mod tests {
             id,
             text: text.into(),
             status,
+            blocked_reason: None,
+        }
+    }
+
+    fn blocked_item(id: u32, text: &str, reason: &str) -> TodoListItem {
+        TodoListItem {
+            id,
+            text: text.into(),
+            status: TodoItemStatus::Blocked,
+            blocked_reason: Some(reason.into()),
         }
     }
 
@@ -493,12 +583,71 @@ mod tests {
 
     #[test]
     fn status_glyphs_are_distinct() {
-        let pen = TodoItemStatus::Pending.glyph();
-        let prog = TodoItemStatus::InProgress.glyph();
-        let done = TodoItemStatus::Completed.glyph();
-        assert_ne!(pen, prog);
-        assert_ne!(prog, done);
-        assert_ne!(pen, done);
+        let glyphs = [
+            TodoItemStatus::Pending.glyph(),
+            TodoItemStatus::InProgress.glyph(),
+            TodoItemStatus::Blocked.glyph(),
+            TodoItemStatus::Completed.glyph(),
+        ];
+        let unique: HashSet<&str> = glyphs.iter().copied().collect();
+        assert_eq!(unique.len(), glyphs.len(), "every status glyph is distinct");
+    }
+
+    #[test]
+    fn blocked_status_round_trips_and_serdes() {
+        assert_eq!(
+            TodoItemStatus::parse_str("blocked"),
+            Some(TodoItemStatus::Blocked)
+        );
+        assert_eq!(TodoItemStatus::Blocked.as_str(), "blocked");
+        let s = serde_json::to_string(&TodoItemStatus::Blocked).unwrap();
+        assert_eq!(s, "\"blocked\"");
+    }
+
+    #[test]
+    fn text_fallback_renders_blocked_glyph_reason_and_footer() {
+        let list = TodoList {
+            items: vec![
+                item(1, "Wash dishes", TodoItemStatus::Completed),
+                item(2, "Dry dishes", TodoItemStatus::InProgress),
+                blocked_item(3, "Deploy", "verify failed after 3 fix cycles"),
+                item(4, "Sweep floor", TodoItemStatus::Pending),
+            ],
+            title: Some("Chores".into()),
+        };
+        let out = list.to_text_fallback();
+        assert!(
+            out.contains("[!] Deploy — verify failed after 3 fix cycles"),
+            "blocked line shows glyph + reason: {out}"
+        );
+        assert!(
+            out.ends_with("(1/4 done, 1 in progress, 1 blocked, 1 pending)"),
+            "footer counts blocked: {out}"
+        );
+        assert_eq!(list.blocked_count(), 1);
+    }
+
+    #[test]
+    fn text_fallback_footer_omits_blocked_when_none() {
+        // Byte-stability: a list with no blocked item keeps the pre-F4 footer.
+        let out = sample().to_text_fallback();
+        assert!(out.ends_with("(1/3 done, 1 in progress, 1 pending)"));
+    }
+
+    #[test]
+    fn blocked_item_serde_carries_reason() {
+        let list = TodoList {
+            items: vec![blocked_item(1, "Build", "compile error")],
+            title: None,
+        };
+        let s = serde_json::to_string(&list).unwrap();
+        assert!(s.contains("\"blocked_reason\":\"compile error\""), "{s}");
+        let back: TodoList = serde_json::from_str(&s).unwrap();
+        assert_eq!(back, list);
+        // Older rows without the field still decode (defaults to None).
+        let legacy = r#"{"items":[{"id":1,"text":"x","status":"blocked"}]}"#;
+        let decoded: TodoList = serde_json::from_str(legacy).unwrap();
+        assert_eq!(decoded.items[0].blocked_reason, None);
     }
 
     #[test]

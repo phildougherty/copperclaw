@@ -13,8 +13,9 @@
 //! attachment.
 
 use crate::api::LineApi;
+use crate::render;
 use async_trait::async_trait;
-use copperclaw_channels_core::{AdapterError, ChannelAdapter};
+use copperclaw_channels_core::{AdapterError, Card, ChannelAdapter, DiffCard, TodoList};
 use copperclaw_types::{ChannelType, OutboundMessage};
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard};
@@ -172,6 +173,78 @@ impl ChannelAdapter for LineAdapter {
         }
         Ok(None)
     }
+
+    /// Native card — a LINE `buttons` template when the card has buttons
+    /// (so callback buttons become tappable `postback` actions that route
+    /// back through the webhook), else a plain-text message. See
+    /// [`render::render_card_message`]. LINE surfaces no message id.
+    async fn deliver_card(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        card: &Card,
+        _to: Option<&str>,
+    ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type.as_str(), "card");
+        self.send_message(platform_id, render::render_card_message(card))
+            .await
+    }
+
+    /// Native diff — fence-free structured plaintext (LINE renders no
+    /// Markdown). See [`render::render_diff`].
+    async fn deliver_diff(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        diff: &DiffCard,
+    ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type.as_str(), "diff");
+        self.send_message(
+            platform_id,
+            crate::api::text_message(&render::render_diff(diff)),
+        )
+        .await
+    }
+
+    /// Native todo list — a structured `title (done/total)` checklist with
+    /// ASCII glyphs (including `[!]` + reason for a blocked step). LINE has
+    /// no edit or pin API, so `existing_message_id` / `pin_hint` are
+    /// ignored and each mutation posts a fresh chip. See
+    /// [`render::render_todo_list`].
+    async fn deliver_todo_list(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        list: &TodoList,
+        _existing_message_id: Option<&str>,
+        _pin_hint: bool,
+    ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type.as_str(), "todo");
+        self.send_message(
+            platform_id,
+            crate::api::text_message(&render::render_todo_list(list)),
+        )
+        .await
+    }
+}
+
+impl LineAdapter {
+    /// Send a single pre-built LINE message object, preferring the cheap
+    /// reply path when a fresh reply token is cached, else falling back to
+    /// push. Shared by the rich-surface `deliver_*` overrides. LINE returns
+    /// no message id, so the result is always `Ok(None)`.
+    async fn send_message(
+        &self,
+        platform_id: &str,
+        message: serde_json::Value,
+    ) -> Result<Option<String>, AdapterError> {
+        if let Some(token) = self.reply_tokens.take(&platform_id.to_string()) {
+            self.api.reply_message(&token, message).await?;
+        } else {
+            self.api.push_message(platform_id, message).await?;
+        }
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -226,6 +299,95 @@ mod tests {
         let (a, _cache) = make(&mock);
         let id = a.deliver("U1", None, &outbound("hi")).await.unwrap();
         assert!(id.is_none());
+    }
+
+    #[tokio::test]
+    async fn deliver_card_with_buttons_sends_postback_template() {
+        use copperclaw_channels_core::CardButton;
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/bot/message/push"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&mock)
+            .await;
+        let (a, _cache) = make(&mock);
+        let card = Card {
+            title: Some("Approve deploy?".into()),
+            body: Some("run deploy.sh".into()),
+            buttons: vec![
+                CardButton {
+                    label: "Approve".into(),
+                    value: Some("approve:1".into()),
+                    url: None,
+                    style: None,
+                },
+                CardButton {
+                    label: "Deny".into(),
+                    value: Some("deny:1".into()),
+                    url: None,
+                    style: None,
+                },
+            ],
+            ..Card::default()
+        };
+        // No reply token cached -> push path.
+        let id = a.deliver_card("U1", None, &card, None).await.unwrap();
+        assert!(id.is_none());
+        let reqs = mock.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        let msg = &body["messages"][0];
+        assert_eq!(msg["type"], "template");
+        assert_eq!(msg["template"]["type"], "buttons");
+        assert_eq!(msg["template"]["actions"][0]["type"], "postback");
+        assert_eq!(msg["template"]["actions"][0]["data"], "approve:1");
+        assert_eq!(msg["template"]["actions"][1]["data"], "deny:1");
+    }
+
+    #[tokio::test]
+    async fn deliver_card_prefers_reply_token() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/bot/message/reply"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&mock)
+            .await;
+        let (a, cache) = make(&mock);
+        cache.put("U1".into(), "rt-card".into());
+        let card = Card {
+            title: Some("Heads up".into()),
+            ..Card::default()
+        };
+        a.deliver_card("U1", None, &card, None).await.unwrap();
+        // Token consumed on the reply path.
+        assert!(cache.take(&"U1".to_string()).is_none());
+    }
+
+    #[tokio::test]
+    async fn deliver_todo_list_sends_blocked_text() {
+        use copperclaw_channels_core::{TodoItemStatus, TodoListItem};
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v2/bot/message/push"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&mock)
+            .await;
+        let (a, _cache) = make(&mock);
+        let list = TodoList {
+            title: Some("Build".into()),
+            items: vec![TodoListItem {
+                id: 1,
+                text: "Verify".into(),
+                status: TodoItemStatus::Blocked,
+                blocked_reason: Some("no script".into()),
+            }],
+        };
+        a.deliver_todo_list("U1", None, &list, None, true)
+            .await
+            .unwrap();
+        let reqs = mock.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        let text = body["messages"][0]["text"].as_str().unwrap();
+        assert!(text.contains("[!] Verify — blocked: no script"), "{text}");
     }
 
     #[tokio::test]

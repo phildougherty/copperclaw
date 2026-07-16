@@ -29,6 +29,7 @@ pub use destinations::{ResolvedRoute, resolve_recipient};
 pub use formatter::{ElisionCfg, FormattedTurn, elide_stale_tool_results, format_messages};
 pub use policy::{
     PolicyDecision, SenderRole, ToolPolicy, ToolProfile, TurnTrust, is_credentialed_external,
+    is_lan_preview,
 };
 pub use redact::{REDACTED, redact_secrets};
 pub use run::{

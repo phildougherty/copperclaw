@@ -585,6 +585,13 @@ impl Router {
             // (modulo attachment materialization above).
             Some(SlashCommand::Status) | None => (event.message.kind, event_content, true),
         };
+        // M19 U7: a reaction is a lightweight steering signal, NOT a task. It
+        // persists as a non-trigger row (like a `/stop` control row) so it
+        // never spawns a container on its own — an idle reaction is a no-op,
+        // and a reaction that lands mid-turn is consumed by the runner's R2
+        // steering seam. This guarantees "a reaction never drives a spurious
+        // full turn" (U7 acceptance) regardless of which message it targets.
+        let trigger = trigger && !copperclaw_channels_core::is_reaction_content(&content);
         let write = WriteInbound {
             id: message_id,
             kind,
@@ -2074,6 +2081,35 @@ mod tests {
         let waited =
             tokio::time::timeout(std::time::Duration::from_millis(50), wake.notified()).await;
         assert!(waited.is_err(), "control row must not store a wake permit");
+    }
+
+    #[tokio::test]
+    async fn reaction_bypasses_mention_gate_and_persists_non_trigger_row() {
+        // M19 U7: a reaction in a mention-gated group routes past the gate
+        // (interaction payload) and persists as a NON-trigger Chat row so it
+        // can never spawn a spurious container — the runner consumes it via
+        // the mid-turn steering seam.
+        let fx = group_fixture(EngageMode::Mention, None, None);
+        let wake = fx.router.inbound_wake();
+        let mut ev = group_event("react-1");
+        ev.message.is_mention = None;
+        ev.message.content =
+            copperclaw_channels_core::reaction_content("\u{1F44D}", Some("out-7"), Some("alice"));
+        let out = fx.router.route(ev).await.unwrap();
+        let RouteOutcome::Delivered { sessions } = out else {
+            panic!("unmentioned reaction in a gated group must route: {out:?}");
+        };
+        let rows = inbound_rows(&fx, &sessions[0]);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.kind, MessageKind::Chat, "reaction stays chat-kind");
+        assert!(!row.trigger, "reaction rows must not spawn a container");
+        assert_eq!(row.content["reaction"]["emoji"], "\u{1F44D}");
+        assert_eq!(row.content["reaction"]["target_seq"], "out-7");
+        // Like a control row, a non-trigger reaction must not store a wake.
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(50), wake.notified()).await;
+        assert!(waited.is_err(), "reaction row must not store a wake permit");
     }
 
     #[tokio::test]

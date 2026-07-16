@@ -797,19 +797,32 @@ pub fn build_adaptive_todo_list(list: &TodoList) -> Value {
         let (glyph, color) = match item.status {
             TodoItemStatus::Completed => ("[x]", "Good"),
             TodoItemStatus::InProgress => ("[~]", "Warning"),
+            TodoItemStatus::Blocked => ("[!]", "Attention"),
             TodoItemStatus::Pending => ("[ ]", "Default"),
+        };
+        let text = match item.blocked_reason_text() {
+            Some(reason) => format!("{glyph} {} (blocked: {reason})", item.text.trim()),
+            None => format!("{glyph} {}", item.text.trim()),
         };
         body.push(json!({
             "type": "TextBlock",
-            "text": format!("{glyph} {}", item.text.trim()),
+            "text": text,
             "color": color,
             "wrap": true,
             "spacing": "Small",
         }));
     }
+    let blocked = list.blocked_count();
+    let blocked_frag = if blocked > 0 {
+        format!(", {blocked} blocked")
+    } else {
+        String::new()
+    };
     body.push(json!({
         "type": "TextBlock",
-        "text": format!("({done}/{total} done, {in_prog} in progress, {pending} pending)"),
+        "text": format!(
+            "({done}/{total} done, {in_prog} in progress{blocked_frag}, {pending} pending)"
+        ),
         "size": "Small",
         "isSubtle": true,
         "spacing": "Medium",
