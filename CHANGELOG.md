@@ -380,6 +380,45 @@ adheres to [Semantic Versioning](https://semver.org/).
   exercise the real subprocess + parse path against a genuine `tsc`/`ruff`
   on `PATH`, per the `ui_screenshot_docker_end_to_end` precedent.
 
+### Added (M20 Q7 — `delegate_batch` contract + post-merge integration verify)
+
+- `delegate_batch` (`crates/copperclaw-mcp/src/tools/agents.rs`) gains two
+  OPTIONAL args. `contract`: a parent-authored shared brief (interfaces,
+  file-ownership map, naming conventions) prepended VERBATIM to every
+  worker's `instructions`, followed by a directive telling the worker to
+  persist it to `.copperclaw/CONTRACT.md` in its own `/workspace` before its
+  first edit — so the brief survives that worker's own compaction (the
+  state-dir dirty-mark exemption for this exact file was already anticipated
+  in `verify_gate.rs`'s M20 Q2 doc comment). `project`: the PARENT's own
+  project directory (the one it `cd`'d into before delegating); when set and
+  that project has a recorded `.copperclaw/verify`, the join marks it dirty
+  via the EXISTING Q2 verify-gate machinery (`verify_gate::project_root_of` +
+  `verify_gate::recorded_verify_command` + `verify_gate::mark_dirty`, all
+  already-public functions — no new gate machinery) — the parent cannot
+  complete its integration todo until every stage re-passes against the
+  MERGED worker branches, not just each worker's isolated branch. Dirty-
+  marking is skipped when `verify_gate_enabled()` is false (mirroring the
+  Q6 `verify_gate=off` escape hatch — one hatch, not two) and when the batch
+  fully spawn-failed (nothing ran, nothing to re-verify).
+- **Full back-compat.** Both args are optional and independently gated: a
+  batch called with neither behaves byte-identical to pre-Q7 (instructions
+  unchanged, no verify-gate state touched) — all pre-existing
+  `delegate_batch` tests pass unmodified.
+- The tool description and `skills/create-agent/SKILL.md` teach the
+  pattern: write the contract first, one component per worker (split by the
+  contract's file-ownership map so workers never collide), verify the union
+  by passing `project` so the merged tree gets re-verified, not just each
+  worker's isolated branch. No reviewer-role worker (deferred per the M20
+  plan — Q6's parent-side `self_review` covers the read).
+- Unit-tested (mirroring the existing `delegate_batch` mock-provider
+  harness): a 3-worker batch each receives the contract verbatim-prefixed
+  plus the `.copperclaw/CONTRACT.md` persistence directive; post-join a
+  named parent project with a recorded verify is marked dirty; a project
+  with no recorded verify, a batch with no `project`, a fully spawn-failed
+  batch, and a `verify_gate=off` session all leave the verify-gate state
+  untouched; a batch with no `contract` sends instructions byte-identical
+  to before.
+
 ### Added (M19 A3 — Public-tunnel model verb: activate V5)
 
 - The merged-but-dormant V5 public-tunnel module now has an agent-facing verb.

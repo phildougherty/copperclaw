@@ -217,12 +217,30 @@ pub mod delegate_batch {
     //! The runner's `ToolContext::run_delegate_batch` implements the join
     //! seam by block-polling the parent's inbound for each worker's spawn
     //! result and final report.
+    //!
+    //! M20 Q7: an OPTIONAL `contract` arg — a parent-authored shared brief
+    //! (interfaces, file-ownership map, naming conventions) — is prepended
+    //! VERBATIM to every worker's instructions, together with a directive
+    //! telling the worker to persist it to `.copperclaw/CONTRACT.md` in its
+    //! own `/workspace` before its first edit, so the brief survives the
+    //! worker's own compaction (`mark_dirty_for_write`'s state-dir exemption,
+    //! `verify_gate.rs`, already anticipates that file). An OPTIONAL
+    //! `project` arg names the PARENT's own project directory (the one it
+    //! `cd`'d into before delegating); when given and that project has a
+    //! recorded `.copperclaw/verify`, the join marks it dirty via the
+    //! existing Q2 verify-gate machinery (`verify_gate::mark_dirty`) — the
+    //! parent cannot complete its integration todo without re-running every
+    //! stage against the merged worker branches. Neither field's absence
+    //! changes anything: a batch with no `contract` sends instructions
+    //! byte-identical to before, and a batch with no `project` never touches
+    //! the verify-gate state — full back-compat with pre-Q7 callers.
 
     use crate::context::{
         DEFAULT_DELEGATE_BATCH_TIMEOUT_SECS, DelegateBatchRequest, DelegateBatchWorker,
         MAX_DELEGATE_BATCH_TIMEOUT_SECS, MAX_DELEGATE_BATCH_WIDTH, ToolContext,
     };
     use crate::error::ToolError;
+    use crate::tools::verify_gate;
     use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args, success_json};
     use rmcp::model::{CallToolResult, JsonObject, Tool};
     use serde::Deserialize;
@@ -232,12 +250,40 @@ pub mod delegate_batch {
         workers: Vec<InputWorker>,
         #[serde(default)]
         timeout_secs: Option<u64>,
+        /// M20 Q7: shared brief prepended verbatim to every worker's
+        /// instructions and persisted by each worker as
+        /// `.copperclaw/CONTRACT.md`.
+        #[serde(default)]
+        contract: Option<String>,
+        /// M20 Q7: the PARENT's own project directory. When set and that
+        /// project has a recorded `.copperclaw/verify`, the join marks it
+        /// dirty so the merged union gets re-verified before delivery.
+        #[serde(default)]
+        project: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]
     struct InputWorker {
         name: String,
         instructions: String,
+    }
+
+    /// Wrap `contract` (when present) around `instructions`: the contract
+    /// text lands FIRST, verbatim, so a caller can assert
+    /// `instructions.starts_with(&contract)`; a directive to persist it to
+    /// `.copperclaw/CONTRACT.md` follows before the worker's actual task.
+    /// `None` returns `instructions` unchanged — the pre-Q7 shape.
+    fn worker_instructions(contract: Option<&str>, instructions: String) -> String {
+        match contract {
+            None => instructions,
+            Some(contract) => format!(
+                "{contract}\n\n---\nThe text above is the SHARED CONTRACT for this batch: \
+                 interfaces, file ownership, and naming conventions every worker must follow. \
+                 Before your first edit, write it verbatim to `.copperclaw/CONTRACT.md` in your \
+                 /workspace root (so it survives your own compaction), then re-read that file if \
+                 you ever lose track of it. Now, your task:\n\n{instructions}"
+            ),
+        }
     }
 
     pub fn schema() -> Tool {
@@ -258,8 +304,16 @@ pub mod delegate_batch {
              fan-out whose results arrive asynchronously instead of joined. The call blocks up \
              to `timeout_secs` (default 300, max 600); a worker that fails to spawn or does not \
              report in time surfaces as a per-worker error in the aggregate — it never loses the \
-             whole batch. For a QUICK read-only lookup that shares your live workspace, prefer \
-             `explore`.",
+             whole batch. GOLDEN PATTERN for fan-out builds: (1) WRITE A CONTRACT — before \
+             fanning out, author a short shared brief (interfaces, file-ownership map, naming \
+             conventions) and pass it as `contract`; it's prepended verbatim to every worker's \
+             instructions and each worker persists it to `.copperclaw/CONTRACT.md` so it survives \
+             their own compaction. (2) ONE COMPONENT PER WORKER — split by file/module ownership \
+             so workers never touch the same files. (3) VERIFY THE UNION — pass `project` (the \
+             directory you're building in); if it has a `.copperclaw/verify`, the join marks it \
+             dirty so you cannot complete the integration todo until every stage re-passes on the \
+             merged tree, not just each worker's isolated branch. For a QUICK read-only lookup \
+             that shares your live workspace, prefer `explore`.",
             serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
@@ -283,6 +337,20 @@ pub mod delegate_batch {
                         "type": ["integer", "null"],
                         "minimum": 1,
                         "maximum": MAX_DELEGATE_BATCH_TIMEOUT_SECS
+                    },
+                    "contract": {
+                        "type": ["string", "null"],
+                        "minLength": 1,
+                        "description": "Shared brief (interfaces, file ownership, naming \
+                            conventions) prepended verbatim to every worker's instructions and \
+                            persisted by each worker as .copperclaw/CONTRACT.md."
+                    },
+                    "project": {
+                        "type": ["string", "null"],
+                        "minLength": 1,
+                        "description": "Your own project directory (the one you cd'd into before \
+                            delegating). When it has a .copperclaw/verify, the join marks it \
+                            dirty so the merged union must re-pass every stage before delivery."
                     }
                 }
             }),
@@ -306,6 +374,20 @@ pub mod delegate_batch {
                 input.workers.len()
             )));
         }
+        if let Some(contract) = input.contract.as_ref() {
+            if contract.trim().is_empty() {
+                return Err(ToolError::Validation(
+                    "`contract`, when present, must be non-empty".into(),
+                ));
+            }
+        }
+        if let Some(project) = input.project.as_ref() {
+            if project.trim().is_empty() {
+                return Err(ToolError::Validation(
+                    "`project`, when present, must be non-empty".into(),
+                ));
+            }
+        }
         let mut workers = Vec::with_capacity(input.workers.len());
         for w in input.workers {
             if w.name.trim().is_empty() {
@@ -318,9 +400,10 @@ pub mod delegate_batch {
                     "each worker `instructions` must be non-empty".into(),
                 ));
             }
+            let instructions = worker_instructions(input.contract.as_deref(), w.instructions);
             workers.push(DelegateBatchWorker {
                 name: w.name,
-                instructions: w.instructions,
+                instructions,
             });
         }
         let timeout_secs = input
@@ -349,6 +432,29 @@ pub mod delegate_batch {
             return Err(ToolError::Context(format!(
                 "delegate_batch refused: {reason}"
             )));
+        }
+
+        // M20 Q7 (b): at least one worker did real work (we didn't hit the
+        // all-spawn-failed refusal above) and the parent named its own
+        // project — if that project has a recorded verify, mark it dirty
+        // via the EXISTING Q2 gate so the parent cannot complete its
+        // integration todo without re-running every stage against the
+        // merged union. `verify_gate=off` sessions skip this too (one
+        // escape hatch, not two, mirroring Q6).
+        if ctx.verify_gate_enabled() {
+            if let Some(project) = input.project.as_deref() {
+                if let Some(project_root) = verify_gate::project_root_of(project) {
+                    let has_verify = verify_gate::recorded_verify_command(
+                        &project_root,
+                        ctx.check_command_override().as_deref(),
+                    )
+                    .await
+                    .is_some();
+                    if has_verify {
+                        verify_gate::mark_dirty(&project_root).await;
+                    }
+                }
+            }
         }
         Ok(success_json(&outcome))
     }
@@ -687,5 +793,280 @@ mod tests {
                 .get("channel")
                 .is_none()
         );
+        // M20 Q7: `contract` and `project` are both optional (not required).
+        assert!(v["properties"].get("contract").is_some());
+        assert!(v["properties"].get("project").is_some());
+    }
+
+    // ── delegate_batch contract + post-join verify (M20 Q7) ──────────────
+
+    /// RAII guard pointing `verify_gate`'s data root at a fresh tempdir,
+    /// mirroring `computer_use.rs`'s own `DataRootGuard` — shares
+    /// `verify_gate`'s test lock so these tests never race its own or
+    /// `computer_use.rs`'s / `todo.rs`'s data-root overrides.
+    struct DataRootGuard {
+        dir: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl DataRootGuard {
+        fn new() -> Self {
+            let lock = crate::tools::verify_gate::data_root_test_lock()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let dir = tempfile::tempdir().expect("tempdir");
+            crate::tools::verify_gate::data_root_test_override_set(dir.path().to_path_buf());
+            Self { dir, _lock: lock }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            self.dir.path()
+        }
+    }
+
+    impl Drop for DataRootGuard {
+        fn drop(&mut self) {
+            crate::tools::verify_gate::data_root_test_override_clear();
+        }
+    }
+
+    #[tokio::test]
+    async fn delegate_batch_contract_prepended_to_every_worker() {
+        // A 3-worker batch each receives the contract text: prepended
+        // VERBATIM to its instructions, plus a directive to persist it as
+        // `.copperclaw/CONTRACT.md` in its own worktree.
+        let ctx = MockToolContext::new();
+        let contract = "## Shared contract\n- API returns JSON\n- CLI owns src/cli/**";
+        super::delegate_batch::handle(
+            args_from(serde_json::json!({
+                "workers": [
+                    {"name": "api", "instructions": "build the API under /workspace"},
+                    {"name": "cli", "instructions": "build the CLI under /workspace"},
+                    {"name": "docs", "instructions": "write docs under /workspace"}
+                ],
+                "contract": contract
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let calls = ctx.delegate_batch_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].workers.len(), 3);
+        for w in &calls[0].workers {
+            assert!(
+                w.instructions.starts_with(contract),
+                "worker {} instructions must start with the contract verbatim, got: {}",
+                w.name,
+                w.instructions
+            );
+            assert!(
+                w.instructions.contains(".copperclaw/CONTRACT.md"),
+                "worker {} instructions must direct it to persist the contract, got: {}",
+                w.name,
+                w.instructions
+            );
+        }
+        // The worker's own task text still follows the contract.
+        assert!(calls[0].workers[0].instructions.contains("build the API"));
+        assert!(calls[0].workers[1].instructions.contains("build the CLI"));
+        assert!(calls[0].workers[2].instructions.contains("write docs"));
+    }
+
+    #[tokio::test]
+    async fn delegate_batch_no_contract_is_byte_identical_to_pre_q7() {
+        // Back-compat: a batch WITHOUT a contract sends instructions
+        // completely unchanged — no prefix, no directive text at all.
+        let ctx = MockToolContext::new();
+        super::delegate_batch::handle(
+            args_from(serde_json::json!({
+                "workers": [
+                    {"name": "api", "instructions": "build the API under /workspace"},
+                    {"name": "cli", "instructions": "build the CLI under /workspace"}
+                ]
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        let calls = ctx.delegate_batch_calls();
+        assert_eq!(
+            calls[0].workers[0].instructions,
+            "build the API under /workspace"
+        );
+        assert_eq!(
+            calls[0].workers[1].instructions,
+            "build the CLI under /workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_batch_empty_contract_rejected() {
+        let ctx = MockToolContext::new();
+        let err = super::delegate_batch::handle(
+            args_from(serde_json::json!({
+                "workers": [{"name": "a", "instructions": "x"}],
+                "contract": "   "
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ToolError::Validation(_)));
+        assert!(ctx.delegate_batch_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delegate_batch_empty_project_rejected() {
+        let ctx = MockToolContext::new();
+        let err = super::delegate_batch::handle(
+            args_from(serde_json::json!({
+                "workers": [{"name": "a", "instructions": "x"}],
+                "project": ""
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, ToolError::Validation(_)));
+        assert!(ctx.delegate_batch_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delegate_batch_post_join_marks_parent_project_dirty() {
+        // Post-join, a parent project with a recorded `.copperclaw/verify`
+        // is marked dirty so the integration todo can't complete until every
+        // stage re-passes on the merged union.
+        let g = DataRootGuard::new();
+        let proj = g.path().join("habit-tracker");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(
+            proj.join(".copperclaw").join("verify"),
+            "lint: npx eslint .\ntypecheck: tsc --noEmit\n",
+        )
+        .unwrap();
+        assert!(!crate::tools::verify_gate::is_dirty(&proj).await);
+
+        let ctx = MockToolContext::new();
+        super::delegate_batch::handle(
+            args_from(serde_json::json!({
+                "workers": [
+                    {"name": "api", "instructions": "build the API under /workspace"},
+                    {"name": "cli", "instructions": "build the CLI under /workspace"},
+                    {"name": "docs", "instructions": "write docs under /workspace"}
+                ],
+                "contract": "shared brief",
+                "project": proj.to_string_lossy()
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            crate::tools::verify_gate::is_dirty(&proj).await,
+            "the parent project must be dirty after the join so verify stages re-run \
+             against the merged tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_batch_no_project_leaves_verify_gate_untouched() {
+        // Back-compat: a batch without `project` never touches the
+        // verify-gate state at all — pre-Q7 callers see zero new behavior.
+        let g = DataRootGuard::new();
+        let proj = g.path().join("untouched");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(proj.join(".copperclaw").join("verify"), "test: true\n").unwrap();
+
+        let ctx = MockToolContext::new();
+        super::delegate_batch::handle(
+            args_from(serde_json::json!({
+                "workers": [{"name": "api", "instructions": "build the API under /workspace"}]
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(!crate::tools::verify_gate::is_dirty(&proj).await);
+    }
+
+    #[tokio::test]
+    async fn delegate_batch_project_without_verify_file_is_a_noop() {
+        // A named project with no recorded `.copperclaw/verify` is not
+        // marked dirty — there is nothing to re-verify.
+        let g = DataRootGuard::new();
+        let proj = g.path().join("no-verify-yet");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        let ctx = MockToolContext::new();
+        super::delegate_batch::handle(
+            args_from(serde_json::json!({
+                "workers": [{"name": "api", "instructions": "x"}],
+                "project": proj.to_string_lossy()
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(!crate::tools::verify_gate::is_dirty(&proj).await);
+    }
+
+    #[tokio::test]
+    async fn delegate_batch_all_spawn_failed_does_not_mark_project_dirty() {
+        // A fully-refused batch (nothing actually ran) must not dirty the
+        // parent project — there's no merged union to re-verify.
+        let g = DataRootGuard::new();
+        let proj = g.path().join("refused");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(proj.join(".copperclaw").join("verify"), "test: true\n").unwrap();
+
+        let ctx = MockToolContext::new();
+        ctx.set_next_delegate_batch_outcome(DelegateBatchOutcome {
+            workers: vec![WorkerOutcome {
+                name: "a".into(),
+                status: WorkerStatus::SpawnFailed,
+                report: None,
+                error: Some("nested create_agent (max depth = 3)".into()),
+                session_id: None,
+            }],
+        });
+        let _ = super::delegate_batch::handle(
+            args_from(serde_json::json!({
+                "workers": [{"name": "a", "instructions": "x"}],
+                "project": proj.to_string_lossy()
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(!crate::tools::verify_gate::is_dirty(&proj).await);
+    }
+
+    #[tokio::test]
+    async fn delegate_batch_verify_gate_off_skips_dirty_mark() {
+        // The `verify_gate=off` escape hatch (mirroring Q6) applies here
+        // too — one escape hatch, not two.
+        let g = DataRootGuard::new();
+        let proj = g.path().join("gate-off");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(proj.join(".copperclaw").join("verify"), "test: true\n").unwrap();
+
+        let ctx = MockToolContext::new();
+        ctx.set_verify_gate_enabled(false);
+        super::delegate_batch::handle(
+            args_from(serde_json::json!({
+                "workers": [{"name": "a", "instructions": "x"}],
+                "project": proj.to_string_lossy()
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap();
+
+        assert!(!crate::tools::verify_gate::is_dirty(&proj).await);
     }
 }
