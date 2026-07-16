@@ -54,6 +54,17 @@ pub fn supports_message_edit(channel_type: &str) -> bool {
     EDIT_CAPABLE_CHANNELS.contains(&channel_type)
 }
 
+/// The full edit-capable channel-type list, exposed so out-of-crate
+/// drift guards can iterate it. The F1 drift guard
+/// (`copperclaw-host-delivery/tests/edit_capable_edit_message_drift.rs`)
+/// walks this to assert every listed channel's adapter really overrides
+/// the trait `edit_message` — core itself can't see the adapter crates,
+/// so the reality check lives in `host-delivery`, which does.
+#[must_use]
+pub fn edit_capable_channels() -> &'static [&'static str] {
+    &EDIT_CAPABLE_CHANNELS
+}
+
 /// Static mirror of [`crate::ChannelAdapter::typing_indicator_visible`]
 /// for out-of-process consumers.
 ///

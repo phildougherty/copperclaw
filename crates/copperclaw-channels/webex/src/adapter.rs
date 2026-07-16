@@ -500,6 +500,48 @@ impl ChannelAdapter for WebexAdapter {
         Ok(Some(id))
     }
 
+    /// In-place edit via `PUT /messages/{id}` — the same path the internal
+    /// `deliver_system("edit", …)` arm uses, exposed on the trait so the
+    /// host's HUD / approval-card edit path (`host-delivery`) actually
+    /// reaches it. webex is listed in `EDIT_CAPABLE_CHANNELS`, so without
+    /// this override the trait default would return `Unsupported` and the
+    /// HUD would silently never edit (F1). Webex requires a `roomId` to
+    /// edit, so a person handle is unsupported — the HUD only edits room
+    /// messages. `external_id` is the target message id.
+    async fn edit_message(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        external_id: &str,
+        new_text: &str,
+    ) -> Result<(), AdapterError> {
+        let ct = self.channel_type().as_str();
+        let room_id = match DeliverTarget::parse(platform_id)? {
+            DeliverTarget::Room(room) => room,
+            DeliverTarget::Person(_) => {
+                return Err(AdapterError::Unsupported(
+                    "webex edit_message requires a roomId, not a person handle".into(),
+                ));
+            }
+        };
+        match self
+            .api
+            .edit_message(external_id, &room_id, Some(new_text), None)
+            .await
+        {
+            Ok(_) => {
+                copperclaw_metrics::inc_hud_edit(ct, "ok");
+                copperclaw_metrics::inc_adapter_edit_message(ct, "ok");
+                Ok(())
+            }
+            Err(e) => {
+                copperclaw_metrics::inc_hud_edit(ct, "error");
+                copperclaw_metrics::inc_adapter_edit_message(ct, "error");
+                Err(e)
+            }
+        }
+    }
+
     // `subscribe` and `set_typing` keep their trait defaults: Webex offers no
     // per-room subscription mechanism (webhooks are firehose) and no public
     // typing indicator API.
@@ -885,6 +927,46 @@ mod tests {
         };
         let id = a.deliver("R1", None, &msg).await.unwrap();
         assert_eq!(id.as_deref(), Some("M1"));
+    }
+
+    #[tokio::test]
+    async fn trait_edit_message_calls_put() {
+        // F1: the host HUD / approval edit path calls the *trait*
+        // `edit_message`, not the internal `action:"edit"` deliver arm. webex
+        // is in EDIT_CAPABLE_CHANNELS, so this must route to the same
+        // `PUT /messages/{id}` edit and succeed against the mock rather than
+        // fall through to the trait default (`Unsupported`).
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/messages/M1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id":"M1"})))
+            .mount(&server)
+            .await;
+        let a = adapter_for(&server);
+        a.edit_message("R1", None, "M1", "updated via trait")
+            .await
+            .expect("webex trait edit_message succeeds against the mock");
+        // And the static capability mirror agrees the channel is edit-capable.
+        assert!(
+            copperclaw_channels_core::capabilities::supports_message_edit(
+                a.channel_type().as_str()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn trait_edit_message_person_handle_is_unsupported() {
+        // Webex requires a roomId to edit; a person handle can't be edited.
+        let server = MockServer::start().await;
+        let a = adapter_for(&server);
+        match a
+            .edit_message("person:PER1", None, "M1", "nope")
+            .await
+            .unwrap_err()
+        {
+            AdapterError::Unsupported(m) => assert!(m.contains("roomId")),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 
     #[tokio::test]

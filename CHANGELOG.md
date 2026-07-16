@@ -6,6 +6,32 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (M19 F1 — edit-capability drift on matrix/webex, 2026-07-16)
+
+- `matrix` and `webex` were listed in `EDIT_CAPABLE_CHANNELS`
+  (`crates/copperclaw-channels/core/src/capabilities.rs`), so
+  `supports_message_edit()` promised the M18 Task HUD they could edit in
+  place — but neither adapter overrode the trait `ChannelAdapter::edit_message`.
+  They edited only through their internal deliver-action `"edit"` arm, while
+  the host HUD / approval path calls the **trait** method
+  (`copperclaw-host-delivery/src/dispatch.rs`), which fell through to the
+  trait default → `AdapterError::Unsupported`. The HUD therefore silently
+  never edited on those two channels. Fix:
+  - `crates/copperclaw-channels/matrix/src/adapter.rs` and
+    `crates/copperclaw-channels/webex/src/adapter.rs` now override the trait
+    `edit_message`, routing to their existing `api.edit_message` path
+    (matrix `m.replace`, webex `PUT /messages/{id}`). Webex requires a
+    `roomId`, so a person handle is returned as `Unsupported` (the HUD only
+    edits room messages). Both record the same `inc_hud_edit` /
+    `inc_adapter_edit_message` outcome metrics the other rich adapters do.
+  - Drift guard: new
+    `crates/copperclaw-host-delivery/tests/edit_capable_edit_message_drift.rs`
+    walks `copperclaw_channels_core::capabilities::edit_capable_channels()`
+    (new accessor) and asserts every listed channel's adapter source
+    overrides the trait `edit_message`, so a channel added to the list
+    without a real override fails the build (same spirit as the R0
+    tool-name-drift guard).
+
 ### Fixed (M18 — Task HUD no-op edit / Telegram "message is not modified", 2026-07-16)
 
 - The H1 Task HUD and R6 progressive-final-answer edit a pinned status
