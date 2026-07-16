@@ -117,6 +117,54 @@ adheres to [Semantic Versioning](https://semver.org/).
   helper is rich-surface (Cards v2 HTML) and unaffected. Follow-up: add a `Gchat`
   flavor to `core/markdown` so it can adopt the shared path too.
 
+### Added (M19 A1 — Single-call parallel fan-out with a join, 2026-07-16)
+
+- New `delegate_batch` MCP tool: spawn N `delegate` build workers IN PARALLEL
+  and BLOCK the parent turn until they all report (or a budget elapses),
+  returning the aggregated per-worker results as ONE tool response. Closes the
+  biggest structural capability gap M18 left — fan-out today is N separate
+  `delegate` calls whose results arrive asynchronously on later turns, with no
+  single-call "spawn N workers and await their joined results" primitive. A
+  parent that wants to build three components in parallel and assemble them can
+  now block on all three in one turn.
+  - Tool half (lane T): `delegate_batch` schema + validation + aggregation
+    in `crates/copperclaw-mcp/src/tools/agents.rs`, registered in
+    `build_tool_set`. Input is a `workers: [{name, instructions}]` list plus an
+    optional `timeout_secs`. Fan-out is **capped at 6 workers per call**
+    (`MAX_DELEGATE_BATCH_WIDTH`); the join budget defaults to 300s and is capped
+    at 600s (`DEFAULT_/MAX_DELEGATE_BATCH_TIMEOUT_SECS`), both comfortably under
+    the runner's per-tool deadline so the join returns a partial aggregate rather
+    than being hard-aborted. The request/outcome types + a new
+    `ToolContext::run_delegate_batch` trait method (default: unsupported) live in
+    `crates/copperclaw-mcp/src/context.rs`; `MockToolContext` implements it for
+    handler tests.
+  - Runner join seam (lane R): `RunnerToolCtx::run_delegate_batch`
+    (`crates/copperclaw-runner/src/tools.rs`) reuses the EXACT single-`delegate`
+    spawn machinery — it emits N `OutboundToolEffect::Delegate` rows (same
+    depth/permission caps, same containment: each worker lands with a NULL
+    messaging group and reports ONLY back to the parent, never into the user's
+    chat) — then hands off to `crate::run::delegate_batch::join_workers`
+    (`crates/copperclaw-runner/src/run/delegate_batch.rs`), which BLOCK-POLLS the
+    parent's own `inbound.db` for each worker's `delegate_result` spawn row and
+    its final report (a `Chat` row keyed by the worker's child
+    `source_session_id`), marking every consumed row `completed` so it never
+    re-triggers a spurious parent turn. This mirrors the external-MCP block-poll
+    pattern (`run::external_mcp`) — the parent turn yields to the tokio runtime
+    (HUD ticker + heartbeat stay alive) and resumes on the joined result. Wired
+    via a new `RunnerToolCtx::with_join(inbound)` in
+    `crates/copperclaw-runner/src/main.rs`.
+  - Isolation + failure handling: each worker still gets its OWN container +
+    writable `sib/<id>` git worktree (no cross-write), exactly as a lone
+    `delegate`. A worker that fails to spawn (depth cap / permission gate) or
+    never reports in time surfaces as a per-worker `error` in the aggregate — it
+    never loses the whole batch turn. A batch where EVERY worker was refused
+    (e.g. a `delegate_batch` from a max-depth child) surfaces as a single tool
+    error ("delegate_batch refused: …"), not a partial aggregate. Coverage:
+    handler + join unit tests, plus an end-to-end `invoke_tool` fan-out/join
+    integration test with a fake host (3 workers → one aggregated result;
+    per-worker failure aggregation; depth-cap refusal) in
+    `crates/copperclaw-runner/src/run/tool_dispatch.rs`.
+
 ### Added (M19 U4 — Native cards on gchat + matrix, 2026-07-16)
 
 - Neither `gchat` nor `matrix` overrode the trait

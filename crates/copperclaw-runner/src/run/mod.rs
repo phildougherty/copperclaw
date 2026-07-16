@@ -10,6 +10,7 @@
 //! the inbound/outbound connections.
 
 pub(super) mod blocker;
+pub mod delegate_batch;
 pub(super) mod drive_turn;
 pub mod external_mcp;
 pub(super) mod formatting;
