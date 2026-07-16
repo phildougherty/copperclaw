@@ -288,6 +288,10 @@ pub(super) async fn drive_turn(
     // collapsed to a one-line summary here — on the failure paths too,
     // so a budget/loop/parse abort never strands a "Running" HUD.
     let hud = TaskHud::new(deps);
+    // F5: arm the background HUD task now (live HUD only) so the
+    // pre-first-tool / pure-reasoning wait is covered by a "thinking…"
+    // frame after a short threshold, not left blank until the first tool.
+    hud.arm();
     // F2: track the tail run of same-blocker denials across the whole
     // inbound so the outer function can attach the wall category to the
     // result once the loop resolves (only consulted on a `Failed`

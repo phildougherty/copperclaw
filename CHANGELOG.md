@@ -6,6 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M19 F5 — HUD covers the pre-first-tool / pure-reasoning wait, 2026-07-16)
+
+- The Task HUD used to post only at the first tool call and skip finalize
+  entirely on a zero-tool turn, so a multi-minute pure-reasoning answer on
+  an edit-capable channel showed nothing until the answer landed —
+  indistinguishable from a hang. `crates/copperclaw-runner/src/run/hud.rs`
+  now arms a single background HUD task at turn start (live HUD only, via
+  `TaskHud::arm`, called from `drive_turn`): it waits a short
+  `THINKING_THRESHOLD` (6s) so fast turns finalize first and post nothing
+  (byte-stable), then posts an initial "thinking… | M:SS" frame and
+  continues as the elapsed-clock ticker. `finalize` now collapses a
+  zero-tool turn that posted a thinking frame (to a clean "done in M:SS",
+  no "0 tool calls" tail) instead of leaving it dangling; a turn that never
+  posted still finalizes to nothing. `hud_mode=off` / `final` and the
+  no-op-edit suppression are unchanged. (The old per-batch `ensure_ticker`
+  spawn is folded into the one armed task, so tool-first turns still get a
+  ticker with no duplicate HUD message.)
+
 ### Added (M19 F2 — actionable "I'm blocked" wall cards, 2026-07-16)
 
 - Tool errors and policy / provenance / verify-gate / egress denials used

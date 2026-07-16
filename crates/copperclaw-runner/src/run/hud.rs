@@ -62,6 +62,16 @@ const HUD_EDIT_INTERVAL: Duration = Duration::from_secs(30);
 /// so it must move faster than a human's "is it hung?" threshold.
 const HUD_EDIT_INTERVAL_NO_TYPING: Duration = Duration::from_secs(10);
 
+/// F5: how long a live-HUD turn must run *before its first tool call*
+/// before the runner posts an initial "thinking…" frame. Sized so a
+/// fast turn (a quick answer, a snappy tool call) resolves and finalizes
+/// before this fires — those turns post nothing new and stay
+/// byte-stable — while a multi-minute pure-reasoning answer stops
+/// looking like a hang within a few seconds. The background HUD task
+/// waits this long, then posts the first frame and continues as the
+/// elapsed-clock ticker.
+const THINKING_THRESHOLD: Duration = Duration::from_secs(6);
+
 /// Default in-container location of the per-session todo store written
 /// by the `todo_*` MCP tools. Mirrors `TODO_DEFAULT_PATH` in
 /// `copperclaw-mcp` (the session dir is bind-mounted at `/data`).
@@ -129,8 +139,12 @@ pub(super) struct TaskHud {
     ctx: Arc<dyn ToolContext>,
     todo_path: PathBuf,
     edit_interval: Duration,
-    /// Background elapsed-clock ticker (live HUD only; spawned on first
-    /// post). Aborted on finalize / drop.
+    /// Background HUD task (live HUD only; spawned once by [`Self::arm`]
+    /// at turn start). It first waits [`THINKING_THRESHOLD`] so a fast
+    /// turn finalizes before anything posts, then posts the initial
+    /// "thinking…" frame (F5: covers the pre-first-tool / pure-reasoning
+    /// wait) and continues as the elapsed-clock ticker, refreshing at
+    /// [`Self::edit_interval`]. Aborted on finalize / drop.
     ticker: StdMutex<Option<tokio::task::JoinHandle<()>>>,
     /// Bare-channel status-row cadence anchor. Starts at construction
     /// (== `drive_turn` entry), bumped after each status emit so the
@@ -272,7 +286,6 @@ impl TaskHud {
             s.activity = activity;
         }
         self.emit_live_update("batch_start").await;
-        self.ensure_ticker();
     }
 
     /// A tool batch finished. `tool_runs` is the cumulative executed
@@ -328,18 +341,23 @@ impl TaskHud {
             }
             Err(_) => return,
         };
-        if already_finalized || tool_runs == 0 {
-            // Nothing ran (or double finalize): no HUD to collapse and
-            // no final line worth posting.
+        if already_finalized || (tool_runs == 0 && !posted) {
+            // Double finalize, or a fast turn that never posted a frame:
+            // no HUD to collapse and no final line worth posting. (A
+            // zero-tool turn that DID post an F5 "thinking…" frame still
+            // collapses below, so the thinking frame never dangles.)
             return;
         }
         copperclaw_metrics::observe_hud_finalize_seconds(self.started_at.elapsed().as_secs_f64());
         let elapsed = fmt_mmss(self.started_at.elapsed().as_secs());
         let plural = if tool_runs == 1 { "" } else { "s" };
-        let summary = if ok {
-            format!("done in {elapsed}, {tool_runs} tool call{plural}")
-        } else {
-            format!("stopped after {elapsed}, {tool_runs} tool call{plural}")
+        // F5: a pure-reasoning turn collapses its "thinking…" frame to a
+        // clean "done in M:SS" (the "0 tool calls" tail would read oddly).
+        let summary = match (ok, tool_runs) {
+            (true, 0) => format!("done in {elapsed}"),
+            (false, 0) => format!("stopped after {elapsed}"),
+            (true, n) => format!("done in {elapsed}, {n} tool call{plural}"),
+            (false, n) => format!("stopped after {elapsed}, {n} tool call{plural}"),
         };
         let breadcrumb = Breadcrumb {
             tool_name: TASK_HUD_TOOL.to_owned(),
@@ -398,10 +416,22 @@ impl TaskHud {
         running_frame(&self.shared, self.started_at, &self.todo_path)
     }
 
-    /// Spawn the background elapsed-clock ticker once the HUD is
-    /// posted, guaranteeing an edit at least every `edit_interval`
-    /// even when a single tool call (or provider turn) runs long.
-    fn ensure_ticker(&self) {
+    /// F5: arm the background HUD task at turn start (live HUD only).
+    /// It waits [`THINKING_THRESHOLD`] — so a turn that finalizes first
+    /// posts nothing and stays byte-stable — then posts the initial
+    /// "thinking…" frame (covering the pre-first-tool / pure-reasoning
+    /// wait the HUD used to leave blank) and continues as the
+    /// elapsed-clock ticker at [`Self::edit_interval`].
+    ///
+    /// When a tool call arrives before the threshold, [`Self::on_batch_start`]
+    /// posts the first frame itself; this task's first post then simply
+    /// becomes an in-place edit (the no-op guard drops it if unchanged),
+    /// so there is never a duplicate HUD message. Idempotent: a second
+    /// call is a no-op once the task is spawned.
+    pub(super) fn arm(&self) {
+        if self.behavior != Behavior::Live {
+            return;
+        }
         let Ok(mut guard) = self.ticker.lock() else {
             return;
         };
@@ -415,21 +445,25 @@ impl TaskHud {
         let interval = self.edit_interval;
         let agent_group = self.agent_group.clone();
         *guard = Some(tokio::spawn(async move {
+            // Pre-first-tool wait: hold off the initial post so fast turns
+            // (which finalize before this elapses) never post.
+            tokio::time::sleep(THINKING_THRESHOLD).await;
             loop {
-                tokio::time::sleep(interval).await;
-                // The HUD is already posted by the time the ticker
-                // spawns, so every ticker frame is an in-place edit.
-                let Some((frame, _first)) = running_frame(&shared, started_at, &todo_path) else {
+                let Some((frame, first)) = running_frame(&shared, started_at, &todo_path) else {
                     break;
                 };
-                // A ticker frame that hasn't changed since the last emit
-                // (nothing ran and the rendered clock didn't advance) would
-                // be a no-op edit — suppress it.
-                if !record_and_should_emit(&shared, &frame, false) {
-                    continue;
+                // Suppress a frame byte-identical to the last one sent (a
+                // no-op edit Telegram 400s on) — but a `first` post always
+                // goes through.
+                if record_and_should_emit(&shared, &frame, first) {
+                    if first {
+                        copperclaw_metrics::inc_hud_post(&agent_group);
+                    } else {
+                        copperclaw_metrics::inc_hud_edits(&agent_group, "ticker");
+                    }
+                    ctx.emit_task_hud(&frame, first).await;
                 }
-                copperclaw_metrics::inc_hud_edits(&agent_group, "ticker");
-                ctx.emit_task_hud(&frame, false).await;
+                tokio::time::sleep(interval).await;
             }
         }));
     }
@@ -496,7 +530,15 @@ fn running_frame(
     };
     let elapsed = fmt_mmss(started_at.elapsed().as_secs());
     let plural = if tool_runs == 1 { "" } else { "s" };
-    let mut summary = format!("{tool_runs} tool call{plural} | {elapsed}");
+    // F5: before the first tool runs the frame is the pre-first-tool
+    // "thinking…" wait (posted by the armed background task after
+    // THINKING_THRESHOLD). Once a tool has run it's the usual tool-count
+    // summary.
+    let mut summary = if tool_runs == 0 && activity.is_none() {
+        format!("thinking… | {elapsed}")
+    } else {
+        format!("{tool_runs} tool call{plural} | {elapsed}")
+    };
     if let Some(n) = note {
         summary.push_str(" | ");
         summary.push_str(&n);
@@ -774,5 +816,195 @@ mod tests {
         )
         .unwrap();
         assert!(current_todo_step(&path).is_none(), "all completed");
+    }
+
+    // ── F5: pre-first-tool / pure-reasoning "thinking…" HUD frame ───────
+
+    use crate::run::RunnerDeps;
+    use crate::tools::{OriginatingRouting, RunnerToolCtx};
+    use async_trait::async_trait;
+    use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
+    use copperclaw_db::tables::messages_out;
+    use copperclaw_providers::{AgentProvider, AgentQuery, ProviderError, QueryInput};
+    use copperclaw_types::{AgentGroupId, MessageKind, ProviderEvent, SessionId};
+    use rusqlite::Connection;
+    use tokio::sync::Mutex;
+
+    struct NoopProvider;
+
+    #[async_trait]
+    impl AgentProvider for NoopProvider {
+        fn name(&self) -> &'static str {
+            "noop"
+        }
+        async fn query(&self, _input: QueryInput) -> Result<Box<dyn AgentQuery>, ProviderError> {
+            Ok(Box::new(NoopQuery))
+        }
+        fn is_session_invalid(&self, _err: &ProviderError) -> bool {
+            false
+        }
+    }
+
+    struct NoopQuery;
+
+    #[async_trait]
+    impl AgentQuery for NoopQuery {
+        async fn push(&mut self, _: String) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn end(&mut self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+        async fn next_event(&mut self) -> Option<ProviderEvent> {
+            None
+        }
+        async fn abort(&mut self) {}
+    }
+
+    /// Build `RunnerDeps` whose originating channel is `channel_type`
+    /// (set on the ctx the way the runner does from the inbound row) and
+    /// whose `hud_mode` is `mode`. Returns the shared outbound handle so
+    /// the test can inspect the HUD rows the ctx writes.
+    fn deps_for_channel(
+        channel_type: &str,
+        mode: crate::config::HudMode,
+    ) -> (tempfile::TempDir, Arc<Mutex<Connection>>, RunnerDeps) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let inbound = Arc::new(Mutex::new(open_inbound(&paths).unwrap()));
+        let outbound = Arc::new(Mutex::new(open_outbound(&paths).unwrap()));
+        let ctx = RunnerToolCtx::new(outbound.clone(), paths.outbox.clone());
+        ctx.set_originating(OriginatingRouting {
+            channel_type: Some(channel_type.to_string()),
+            platform_id: Some("chat-1".into()),
+            thread_id: None,
+            in_reply_to: None,
+            source_session_id: None,
+        });
+        let tool_ctx: Arc<dyn ToolContext> = Arc::new(ctx);
+        let provider: Arc<dyn AgentProvider> = Arc::new(NoopProvider);
+        let archive_dir = paths.outbox.join("_compactions");
+        let mut deps =
+            RunnerDeps::minimal(provider, tool_ctx, inbound, outbound.clone(), archive_dir);
+        deps.hud_mode = mode;
+        (tmp, outbound, deps)
+    }
+
+    async fn hud_rows(outbound: &Arc<Mutex<Connection>>) -> Vec<copperclaw_types::MessageOutRow> {
+        let conn = outbound.lock().await;
+        messages_out::list_due(&conn).unwrap()
+    }
+
+    /// Yield repeatedly so the spawned HUD task can run its emit (which
+    /// awaits the outbound lock + a sqlite write) under paused time.
+    async fn settle() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn thinking_frame_posts_after_threshold_then_finalizes() {
+        // A 20s pure-reasoning turn on an edit-capable channel: nothing
+        // posts before the threshold, a "thinking…" frame posts once past
+        // it, and finalize collapses that frame (even though zero tools
+        // ran) instead of leaving it dangling.
+        let (_tmp, outbound, deps) =
+            deps_for_channel("telegram", crate::config::HudMode::default());
+        let hud = TaskHud::new(&deps);
+        assert_eq!(hud.behavior, Behavior::Live, "telegram is edit-capable");
+        hud.arm();
+        // Let the spawned task run up to its first sleep so its timer is
+        // registered before we advance the paused clock.
+        tokio::task::yield_now().await;
+
+        // Before the threshold: still silent.
+        tokio::time::advance(THINKING_THRESHOLD - Duration::from_secs(1)).await;
+        settle().await;
+        assert!(
+            hud_rows(&outbound).await.is_empty(),
+            "no HUD frame may post before the thinking threshold"
+        );
+
+        // Past the threshold: exactly one "thinking…" Breadcrumb post.
+        tokio::time::advance(Duration::from_secs(2)).await;
+        settle().await;
+        let rows = hud_rows(&outbound).await;
+        let posts: Vec<_> = rows
+            .iter()
+            .filter(|r| r.kind == MessageKind::Breadcrumb)
+            .collect();
+        assert_eq!(
+            posts.len(),
+            1,
+            "one thinking frame; got {} rows",
+            rows.len()
+        );
+        let bc: Breadcrumb =
+            serde_json::from_value(posts[0].content["breadcrumb"].clone()).unwrap();
+        assert!(
+            bc.summary.as_deref().unwrap().starts_with("thinking…"),
+            "pre-first-tool frame reads as thinking…; got {:?}",
+            bc.summary
+        );
+
+        // Simulate the ~20s reasoning wait, then finalize a zero-tool turn.
+        tokio::time::advance(Duration::from_secs(13)).await;
+        hud.finalize(true).await;
+        let rows = hud_rows(&outbound).await;
+        let collapse = rows
+            .iter()
+            .filter(|r| r.kind == MessageKind::System)
+            .find_map(|r| {
+                serde_json::from_value::<Breadcrumb>(
+                    r.content["update_breadcrumb"]["breadcrumb"].clone(),
+                )
+                .ok()
+            })
+            .expect("finalize must collapse the thinking frame on a zero-tool turn");
+        assert_eq!(collapse.status, BreadcrumbStatus::Done);
+        assert!(
+            collapse.summary.as_deref().unwrap().starts_with("done in"),
+            "zero-tool collapse omits the tool count; got {:?}",
+            collapse.summary
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fast_pure_reasoning_turn_posts_nothing() {
+        // A turn that finalizes before the threshold (a quick answer) must
+        // post no HUD frame at all — byte-stable with today's behaviour.
+        let (_tmp, outbound, deps) =
+            deps_for_channel("telegram", crate::config::HudMode::default());
+        let hud = TaskHud::new(&deps);
+        hud.arm();
+        tokio::task::yield_now().await;
+        // Finish well under the threshold.
+        tokio::time::advance(Duration::from_secs(3)).await;
+        hud.finalize(true).await;
+        // Even if the armed task's timer would have fired later, it was
+        // aborted by finalize — advancing past the threshold posts nothing.
+        tokio::time::advance(THINKING_THRESHOLD).await;
+        settle().await;
+        assert!(
+            hud_rows(&outbound).await.is_empty(),
+            "a sub-threshold turn must post nothing"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn hud_mode_off_posts_no_thinking_frame() {
+        // hud_mode=off degrades to status rows: arm is a no-op and no
+        // thinking frame posts however long the turn reasons.
+        let (_tmp, outbound, deps) = deps_for_channel("telegram", crate::config::HudMode::Off);
+        let hud = TaskHud::new(&deps);
+        assert_eq!(hud.behavior, Behavior::StatusRows);
+        hud.arm();
+        tokio::time::advance(THINKING_THRESHOLD + Duration::from_secs(30)).await;
+        settle().await;
+        assert!(
+            hud_rows(&outbound).await.is_empty(),
+            "hud_mode=off must never post a thinking frame"
+        );
     }
 }
