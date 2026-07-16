@@ -27,7 +27,10 @@
 //! * Every other request must present the matching cookie, else 403.
 //! * Valid requests are proxied upstream, hop-by-hop headers stripped, bodies
 //!   streamed both ways.
-//! * A WebSocket upgrade is refused cleanly (501) — out of scope for v1.
+//! * A WebSocket upgrade is bridged (V1): the axum side completes the upgrade
+//!   with the browser and a `tokio-tungstenite` client opens `ws://` to the
+//!   container app, forwarding frames both ways. An open socket (and any frame
+//!   on it) counts as activity for the idle reaper.
 //!
 //! ## Lifecycle
 //!
@@ -44,7 +47,10 @@ use std::sync::Mutex as StdMutex;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::ws::{
+    CloseFrame as AxumCloseFrame, Message as AxumWsMessage, WebSocket, WebSocketUpgrade,
+};
+use axum::extract::{FromRequestParts, Request, State};
 use axum::http::{HeaderMap, HeaderName, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
@@ -54,8 +60,15 @@ use copperclaw_db::tables::audit_log::{self, AuditEntry};
 use copperclaw_db::tables::container_configs;
 use copperclaw_modules::{PreviewBroker, PreviewError, PreviewExposed, SessionInfoLite};
 use copperclaw_types::{AgentGroupId, SessionId};
+use futures::{SinkExt, StreamExt};
+use tokio::net::TcpStream;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::time::{Duration, Instant};
+use tokio::time::{Duration, Instant, MissedTickBehavior};
+use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame as TungsteniteCloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -71,6 +84,10 @@ pub const PREVIEW_MAX_PER_HOST: usize = 16;
 pub const PREVIEW_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// How often the reaper scans for idle previews.
 pub const PREVIEW_REAPER_TICK: Duration = Duration::from_secs(60);
+/// While a WebSocket bridge is open, `last_activity` is bumped at least this
+/// often even with no frame traffic — so the idle reaper treats an open socket
+/// as an in-use preview. Must stay well under [`PREVIEW_IDLE_TIMEOUT`].
+const PREVIEW_WS_ACTIVITY_TICK: Duration = Duration::from_secs(60);
 /// Cookie name the token gate sets / checks.
 const PREVIEW_COOKIE: &str = "cclaw_preview";
 /// URL path prefix that mints the gating cookie from a token.
@@ -578,7 +595,8 @@ fn filter_headers(src: &HeaderMap, drop_host: bool) -> HeaderMap {
     out
 }
 
-/// Does this request carry a WebSocket / protocol upgrade? Refused (501) in v1.
+/// Does this request carry a WebSocket / protocol upgrade? Bridged (V1) rather
+/// than refused — see [`proxy_ws`].
 fn is_upgrade(headers: &HeaderMap) -> bool {
     headers.get(header::UPGRADE).is_some_and(|v| !v.is_empty())
         || headers
@@ -630,13 +648,10 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
         _ => return forbidden(),
     }
 
-    // WebSocket / upgrade: refused cleanly in v1.
+    // WebSocket / protocol upgrade: bridge it to the container app. The cookie
+    // gate above has already passed, so only authenticated upgrades reach here.
     if is_upgrade(req.headers()) {
-        return (
-            StatusCode::NOT_IMPLEMENTED,
-            "This preview proxy does not support WebSocket / protocol upgrades in this version.",
-        )
-            .into_response();
+        return proxy_ws(&state, req).await;
     }
 
     // Mark activity so the idle reaper doesn't tear down a preview in use.
@@ -707,6 +722,177 @@ async fn proxy_upstream(state: &ProxyState, req: Request) -> Response {
             format!("Preview upstream error: the app in the container did not respond ({err}).\n"),
         )
             .into_response(),
+    }
+}
+
+/// The concrete type `tokio-tungstenite` hands back for a plain `ws://`
+/// connection — the container app is reached over the Docker bridge, no TLS.
+type UpstreamWs = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// Build the `ws://<ip>:<port><path?query>` upstream URL from the stored
+/// `http://<ip>:<port>` proxy base and the incoming request's path + query.
+fn ws_upstream_url(http_upstream: &str, path_and_query: &str) -> String {
+    let authority = http_upstream
+        .strip_prefix("http://")
+        .unwrap_or(http_upstream);
+    format!("ws://{authority}{path_and_query}")
+}
+
+/// A 502 for a failed upstream WebSocket handshake, mirroring the HTTP path's
+/// bad-gateway copy.
+fn bad_gateway_ws(err: &str) -> Response {
+    warn!(error = err, "preview WebSocket upstream connect failed");
+    (
+        StatusCode::BAD_GATEWAY,
+        "Preview upstream error: the app in the container did not accept the WebSocket connection.\n",
+    )
+        .into_response()
+}
+
+/// Handle a WebSocket upgrade: complete the upgrade toward the browser and
+/// bridge frames to/from the container app's `ws://` upstream.
+///
+/// The token cookie gate in [`proxy_handler`] has already passed, so only
+/// authenticated upgrades reach here. The upstream socket is opened *before*
+/// the browser-side upgrade is finalized, so a container that isn't serving a
+/// WebSocket at this path fails fast with a 502 (rather than leaving the
+/// browser holding a half-open upgrade), and so the subprotocol the container
+/// selected can be mirrored back to the browser.
+async fn proxy_ws(state: &ProxyState, req: Request) -> Response {
+    let (mut parts, _body) = req.into_parts();
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or_else(|| "/".to_string(), std::string::ToString::to_string);
+    let requested_protocol = parts.headers.get(header::SEC_WEBSOCKET_PROTOCOL).cloned();
+
+    let ws = match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
+        Ok(ws) => ws,
+        Err(rejection) => return rejection.into_response(),
+    };
+
+    // Open the upstream socket first (fail-fast 502 + subprotocol mirroring).
+    let ws_url = ws_upstream_url(&state.upstream, &path_and_query);
+    let mut client_req = match ws_url.into_client_request() {
+        Ok(r) => r,
+        Err(err) => return bad_gateway_ws(&err.to_string()),
+    };
+    if let Some(proto) = requested_protocol {
+        client_req
+            .headers_mut()
+            .insert(header::SEC_WEBSOCKET_PROTOCOL, proto);
+    }
+    let (upstream_ws, upstream_resp) = match connect_async(client_req).await {
+        Ok(pair) => pair,
+        Err(err) => return bad_gateway_ws(&err.to_string()),
+    };
+    let negotiated = upstream_resp
+        .headers()
+        .get(header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    // Opening the socket is itself activity; the bridge keeps bumping while it
+    // stays open so the reaper never tears a live preview out from under a tab.
+    *state.last_activity.lock().unwrap() = Instant::now();
+    let last_activity = Arc::clone(&state.last_activity);
+
+    let ws = match negotiated {
+        Some(proto) => ws.protocols([proto]),
+        None => ws,
+    };
+    ws.on_upgrade(move |client_ws| bridge_ws(client_ws, upstream_ws, last_activity))
+}
+
+/// Bridge frames between the browser-facing `client` socket and the container
+/// `upstream` socket until either side closes or errors. Every frame — plus a
+/// periodic tick while the socket is merely open — bumps `last_activity`, so
+/// the idle reaper treats an open WebSocket as an in-use preview (an HTTP
+/// request only bumps on each request, so a long-lived silent socket would
+/// otherwise be reaped mid-session).
+async fn bridge_ws(
+    mut client: WebSocket,
+    mut upstream: UpstreamWs,
+    last_activity: Arc<StdMutex<Instant>>,
+) {
+    let mut activity = tokio::time::interval(PREVIEW_WS_ACTIVITY_TICK);
+    activity.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = activity.tick() => {
+                *last_activity.lock().unwrap() = Instant::now();
+            }
+            from_client = client.next() => {
+                match from_client {
+                    Some(Ok(msg)) => {
+                        *last_activity.lock().unwrap() = Instant::now();
+                        let ts_msg = axum_msg_to_tungstenite(msg);
+                        let closing = matches!(ts_msg, TungsteniteMessage::Close(_));
+                        if upstream.send(ts_msg).await.is_err() {
+                            break;
+                        }
+                        if closing {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            from_upstream = upstream.next() => {
+                match from_upstream {
+                    Some(Ok(msg)) => {
+                        *last_activity.lock().unwrap() = Instant::now();
+                        let Some(ax_msg) = tungstenite_msg_to_axum(msg) else {
+                            continue;
+                        };
+                        let closing = matches!(ax_msg, AxumWsMessage::Close(_));
+                        if client.send(ax_msg).await.is_err() {
+                            break;
+                        }
+                        if closing {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+    let _ = client.close().await;
+    let _ = upstream.close(None).await;
+}
+
+/// Convert an axum inbound frame into the tungstenite frame sent upstream.
+/// Mirrors axum's own (private) `Message::into_tungstenite`.
+fn axum_msg_to_tungstenite(msg: AxumWsMessage) -> TungsteniteMessage {
+    match msg {
+        AxumWsMessage::Text(t) => TungsteniteMessage::Text(t),
+        AxumWsMessage::Binary(b) => TungsteniteMessage::Binary(b),
+        AxumWsMessage::Ping(p) => TungsteniteMessage::Ping(p),
+        AxumWsMessage::Pong(p) => TungsteniteMessage::Pong(p),
+        AxumWsMessage::Close(Some(cf)) => TungsteniteMessage::Close(Some(TungsteniteCloseFrame {
+            code: CloseCode::from(cf.code),
+            reason: cf.reason,
+        })),
+        AxumWsMessage::Close(None) => TungsteniteMessage::Close(None),
+    }
+}
+
+/// Convert a tungstenite upstream frame into the axum frame sent to the
+/// browser. Mirrors axum's own (private) `Message::from_tungstenite`; raw
+/// `Frame` frames are dropped as the tungstenite maintainers recommend.
+fn tungstenite_msg_to_axum(msg: TungsteniteMessage) -> Option<AxumWsMessage> {
+    match msg {
+        TungsteniteMessage::Text(t) => Some(AxumWsMessage::Text(t)),
+        TungsteniteMessage::Binary(b) => Some(AxumWsMessage::Binary(b)),
+        TungsteniteMessage::Ping(p) => Some(AxumWsMessage::Ping(p)),
+        TungsteniteMessage::Pong(p) => Some(AxumWsMessage::Pong(p)),
+        TungsteniteMessage::Close(Some(cf)) => Some(AxumWsMessage::Close(Some(AxumCloseFrame {
+            code: cf.code.into(),
+            reason: cf.reason,
+        }))),
+        TungsteniteMessage::Close(None) => Some(AxumWsMessage::Close(None)),
+        TungsteniteMessage::Frame(_) => None,
     }
 }
 
@@ -797,6 +983,50 @@ mod tests {
         let mut h2 = HeaderMap::new();
         h2.append(header::CONNECTION, "Upgrade".parse().unwrap());
         assert!(is_upgrade(&h2));
+    }
+
+    #[test]
+    fn ws_upstream_url_swaps_scheme_and_keeps_path() {
+        assert_eq!(
+            ws_upstream_url("http://172.17.0.2:3000", "/hmr?token=x"),
+            "ws://172.17.0.2:3000/hmr?token=x"
+        );
+        assert_eq!(
+            ws_upstream_url("http://127.0.0.1:8080", "/"),
+            "ws://127.0.0.1:8080/"
+        );
+    }
+
+    #[test]
+    fn ws_message_conversions_round_trip() {
+        // Text / binary survive both directions.
+        let t = axum_msg_to_tungstenite(AxumWsMessage::Text("hi".into()));
+        assert_eq!(
+            tungstenite_msg_to_axum(t),
+            Some(AxumWsMessage::Text("hi".into()))
+        );
+        let b = axum_msg_to_tungstenite(AxumWsMessage::Binary(vec![1, 2, 3]));
+        assert_eq!(
+            tungstenite_msg_to_axum(b),
+            Some(AxumWsMessage::Binary(vec![1, 2, 3]))
+        );
+        // Close code + reason are preserved.
+        let c = axum_msg_to_tungstenite(AxumWsMessage::Close(Some(AxumCloseFrame {
+            code: 1000,
+            reason: "bye".into(),
+        })));
+        match tungstenite_msg_to_axum(c) {
+            Some(AxumWsMessage::Close(Some(cf))) => {
+                assert_eq!(cf.code, 1000);
+                assert_eq!(cf.reason, "bye");
+            }
+            other => panic!("expected Close frame, got {other:?}"),
+        }
+        // Ping payloads survive upstream→browser.
+        assert_eq!(
+            tungstenite_msg_to_axum(TungsteniteMessage::Ping(vec![9])),
+            Some(AxumWsMessage::Ping(vec![9]))
+        );
     }
 
     #[test]
@@ -937,6 +1167,90 @@ mod manager_tests {
             let _ = axum::serve(listener, app).await;
         });
         port
+    }
+
+    /// Spawn a trivial upstream "container app" that upgrades `/` to a
+    /// WebSocket and echoes every data frame back until the peer closes.
+    async fn spawn_ws_upstream() -> u16 {
+        use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+
+        async fn echo(mut socket: WebSocket) {
+            while let Some(Ok(msg)) = socket.recv().await {
+                if matches!(msg, Message::Close(_)) {
+                    break;
+                }
+                if socket.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        }
+        async fn handler(ws: WebSocketUpgrade) -> Response {
+            ws.on_upgrade(echo)
+        }
+
+        let app = Router::new().route("/", axum::routing::get(handler));
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn websocket_bridge_echoes_with_cookie_and_refuses_without() {
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message as WsMsg;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let upstream_port = spawn_ws_upstream().await;
+        let db = central();
+        let ag = group_with_preview(&db, true, None); // loopback bind
+        let mgr = manager(db, Some("127.0.0.1".into()));
+        let sess = SessionInfoLite::new(SessionId::new(), ag);
+
+        let exposed = mgr
+            .expose(&sess, upstream_port, Some("ws-demo".into()))
+            .await
+            .unwrap();
+
+        // Parse the host port + token out of the shareable URL.
+        let token = exposed.url.split("/__preview/").nth(1).unwrap().to_string();
+        let base = exposed.url.split("/__preview/").next().unwrap();
+        let host_port: u16 = base.rsplit(':').next().unwrap().parse().unwrap();
+
+        // With the cookie: the upgrade proxies to the echo app and round-trips.
+        let mut req = format!("ws://127.0.0.1:{host_port}/")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut().insert(
+            axum::http::header::COOKIE,
+            format!("cclaw_preview={token}").parse().unwrap(),
+        );
+        let (mut ws, _resp) = tokio_tungstenite::connect_async(req).await.unwrap();
+        ws.send(WsMsg::Text("round-trip".into())).await.unwrap();
+        let got = ws.next().await.unwrap().unwrap();
+        assert_eq!(got, WsMsg::Text("round-trip".into()));
+        ws.close(None).await.unwrap();
+
+        // Without the cookie: the gate 403s before any upgrade.
+        let no_cookie = format!("ws://127.0.0.1:{host_port}/")
+            .into_client_request()
+            .unwrap();
+        let err = tokio_tungstenite::connect_async(no_cookie)
+            .await
+            .unwrap_err();
+        match err {
+            tokio_tungstenite::tungstenite::Error::Http(resp) => {
+                assert_eq!(resp.status().as_u16(), 403, "gate refuses before upgrade");
+            }
+            other => panic!("expected an HTTP 403 rejection, got {other:?}"),
+        }
+
+        mgr.close(sess.session_id, upstream_port).await.unwrap();
+        assert_eq!(mgr.active_count().await, 0);
     }
 
     #[tokio::test]

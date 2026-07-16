@@ -7,12 +7,32 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use copperclaw_providers::{AgentQuery, ProviderError, QueryInput};
+use copperclaw_providers::{AgentProvider, AgentQuery, ProviderError, QueryInput};
 use copperclaw_types::ProviderEvent;
 use tokio::time::{sleep, timeout};
 
 use super::drive_turn::{LlmTurnOutput, PendingToolCall, TurnOutcome};
+use super::hud::TaskHud;
 use super::{RunnerDeps, clear_current_tool, emit_usage_report, set_current_tool};
+
+/// One pre-built alternate provider for M18 R5 hot in-session failover.
+/// Constructed once at runner startup from `runner.json`'s host-resolved
+/// `failover_chain` (see [`crate::config::RunnerConfig::failover_chain`]).
+/// The runner walks these in priority order in [`run_llm_turn`] when the
+/// primary provider exhausts its in-provider retries mid-turn.
+pub struct FailoverProvider {
+    /// The alternate provider handle (already carrying its credential /
+    /// endpoint — the host only ships entries the container can already
+    /// reach, so building it needs no new secret).
+    pub provider: Arc<dyn AgentProvider>,
+    /// Provider-native model id to request from this entry.
+    pub model: String,
+    /// Canonical provider-kind name recorded on the `usage_report` for
+    /// this entry and shown in the HUD "switched to <name>" note. Kept
+    /// alongside the handle because a built provider's `.name()` can
+    /// normalise differently (e.g. the ollama-shim reports `ollama`).
+    pub provider_name: String,
+}
 
 /// Maximum number of `provider.query()` attempts (including the first)
 /// before the runner gives up and marks the inbound failed. Hard-coded
@@ -57,20 +77,33 @@ fn format_provider_failure_reason(err: &ProviderError) -> String {
     format!("{prefix}…")
 }
 
-/// Make one LLM call. Pumps the streamed provider events into
-/// per-turn buffers and returns when the stream ends.
+/// Make one LLM turn, with M18 R5 hot in-session provider failover.
+///
+/// The runner walks a candidate sequence — the primary
+/// (`deps.provider` / `deps.model`) followed by each host-resolved healthy
+/// fallback in `deps.failover_chain`, in priority order. Each candidate
+/// gets the same two-layer in-provider retry (see
+/// [`run_one_provider_attempt`]); on a terminal failure the runner records
+/// that failure against the failing entry (so the host's health fold
+/// degrades exactly it), notes the switch on the Task HUD, and retries the
+/// SAME call against the next entry. Only when the WHOLE chain is exhausted
+/// does it fall through with a failed [`LlmTurnOutput`] → the user-visible
+/// apology. An empty `failover_chain` (the default) is exactly the
+/// historical single-provider path — byte-identical behaviour.
 ///
 /// `context_block` is the per-inbound "Conversation context" paragraph
 /// (see `super::prompt::render_conversation_context`) appended to the
 /// static `deps.system` for this single turn. `None` keeps the
 /// historical behaviour (model sees only the static system prompt) so
 /// callers and tests that don't care about channel context aren't
-/// forced to populate the field.
+/// forced to populate the field. `hud` is the inbound's Task HUD, used
+/// to surface the "switched to <provider>" note on a mid-turn failover.
 pub(super) async fn run_llm_turn(
     deps: &RunnerDeps,
     history: &[copperclaw_providers::HistoryMessage],
     previous_continuation: Option<&str>,
     context_block: Option<&str>,
+    hud: &TaskHud,
 ) -> Result<LlmTurnOutput> {
     // Shrink the replayed transcript: stub stale, oversized tool-result
     // bodies (old file reads, command stdout, diffs) so they aren't
@@ -87,83 +120,209 @@ pub(super) async fn run_llm_turn(
     // back via `QueryInput::combined_system`, so their request bytes are
     // unchanged (same `\n\n` join the runner used to do inline here).
     let system_context = context_block.filter(|b| !b.is_empty()).map(str::to_string);
-    let input = QueryInput {
-        system: deps.system.clone(),
-        system_context,
-        model: deps.model.clone(),
-        effort: deps.effort,
-        previous_continuation: previous_continuation.map(str::to_string),
-        history,
-        tools: deps.tools.clone(),
-        max_tokens: deps.max_tokens,
-        temperature: deps.temperature,
-        assistant_name: deps.assistant_name.clone(),
-        display_name: None,
-    };
-    let turn_started_at = chrono::Utc::now();
 
-    // Two layers of retry surround the stream:
-    //   1. `query_with_retry` retries the initial HTTP call when it
-    //      fails before the stream starts (covers connect / TLS / 5xx /
-    //      timeout on the request).
-    //   2. The loop below retries the WHOLE (query + pump) pair when the
-    //      stream itself errors mid-way and the provider tagged the
-    //      `ProviderEvent::Error` as retryable. This catches transient
-    //      SSE-decode / dropped-connection cases that the initial query
-    //      can't see because the HTTP response already returned 200.
-    // Both layers cap at the same `MAX_PROVIDER_ATTEMPTS` budget so the
-    // worst-case wall time stays bounded.
+    // Candidate sequence: primary at index 0, then the fallback chain.
+    let total_candidates = 1 + deps.failover_chain.len();
+    for idx in 0..total_candidates {
+        let (provider, model, provider_name): (&dyn AgentProvider, &str, &str) = if idx == 0 {
+            (
+                deps.provider.as_ref(),
+                deps.model.as_str(),
+                deps.provider.name(),
+            )
+        } else {
+            let e = &deps.failover_chain[idx - 1];
+            (
+                e.provider.as_ref(),
+                e.model.as_str(),
+                e.provider_name.as_str(),
+            )
+        };
+
+        let input = QueryInput {
+            system: deps.system.clone(),
+            system_context: system_context.clone(),
+            model: model.to_string(),
+            effort: deps.effort,
+            previous_continuation: previous_continuation.map(str::to_string),
+            history: history.clone(),
+            tools: deps.tools.clone(),
+            max_tokens: deps.max_tokens,
+            temperature: deps.temperature,
+            assistant_name: deps.assistant_name.clone(),
+            display_name: None,
+        };
+        let turn_started_at = chrono::Utc::now();
+        let attempt = run_one_provider_attempt(deps, provider, input).await?;
+
+        // Per-call Prometheus metrics: observe only when the stream pump
+        // ran (success or stream-error), matching the pre-R5 placement — a
+        // query-time terminal failure observed nothing.
+        if attempt.reached_stream {
+            let elapsed_ms = (chrono::Utc::now() - turn_started_at)
+                .num_milliseconds()
+                .max(0);
+            // i64 -> f64 loses precision above ~2^53 ms (~285 years);
+            // acceptable for a call-duration measurement in seconds.
+            #[allow(clippy::cast_precision_loss)]
+            let elapsed_secs = elapsed_ms as f64 / 1000.0;
+            copperclaw_metrics::observe_llm_call_seconds(elapsed_secs.max(0.0));
+            if attempt.input_tokens > 0 {
+                copperclaw_metrics::observe_llm_tokens_input(attempt.input_tokens);
+            }
+            if attempt.output_tokens > 0 {
+                copperclaw_metrics::observe_llm_tokens_output(attempt.output_tokens);
+            }
+        }
+
+        let is_last = idx + 1 == total_candidates;
+        if attempt.out.failed {
+            // Record the failure against THIS provider/model (not
+            // deps.provider) so the host's degrade fold hits exactly the
+            // entry that failed. `usage_fail_reason` preserves the
+            // historical audit shapes (query-time = specific provider
+            // error; stream-time = generic "stream ended" sentinel).
+            let usage_reason = attempt
+                .usage_fail_reason
+                .clone()
+                .unwrap_or_else(|| "provider stream ended with an error event".to_string());
+            emit_usage_report(
+                deps,
+                provider_name,
+                model,
+                attempt.input_tokens,
+                attempt.output_tokens,
+                turn_started_at,
+                &TurnOutcome::Failed(usage_reason),
+            )
+            .await;
+
+            if is_last {
+                // Whole chain exhausted: surface the last entry's
+                // user-visible failure reason (drive_turn maps it into the
+                // apology). Byte-stable with the pre-R5 single-provider
+                // path when `failover_chain` is empty.
+                return Ok(attempt.out);
+            }
+
+            // Switch to the next healthy entry and retry the SAME call.
+            let next = &deps.failover_chain[idx];
+            tracing::warn!(
+                failed_provider = provider_name,
+                failed_model = model,
+                next_provider = %next.provider_name,
+                next_model = %next.model,
+                "provider exhausted its retries; failing over to next healthy entry"
+            );
+            // Note the switch on the Task HUD so the user isn't confused by
+            // a mid-run style change (H1 HUD note, R2/R5 hook).
+            hud.add_note(&format!("switched to {}", next.provider_name));
+            continue;
+        }
+
+        // Success against this candidate. Surface the per-call token counts
+        // on the returned output so `drive_turn` can accumulate them across
+        // the tool loop for the per-task ceiling.
+        let mut out = attempt.out;
+        out.input_tokens = attempt.input_tokens;
+        out.output_tokens = attempt.output_tokens;
+        emit_usage_report(
+            deps,
+            provider_name,
+            model,
+            attempt.input_tokens,
+            attempt.output_tokens,
+            turn_started_at,
+            &TurnOutcome::Done,
+        )
+        .await;
+        return Ok(out);
+    }
+
+    // `total_candidates >= 1`, so the loop always returns above.
+    unreachable!("failover candidate loop must return on the final entry")
+}
+
+/// Result of one full (query + stream-pump) attempt against a single
+/// provider, after its own two-layer in-provider retry budget is spent.
+struct AttemptResult {
+    /// Accumulated turn output. `out.failed` distinguishes success from a
+    /// terminal failure against this provider; `out.failure_reason` carries
+    /// the user-visible apology text on failure.
+    out: LlmTurnOutput,
+    input_tokens: u32,
+    output_tokens: u32,
+    /// Reason to record on the `usage_report` when this attempt failed;
+    /// `None` on success. Kept distinct from `out.failure_reason` to
+    /// preserve the historical audit shapes (query-time = the specific
+    /// provider error, stream-time = the generic sentinel).
+    usage_fail_reason: Option<String>,
+    /// True when the stream pump ran (success or stream-error); false when
+    /// the provider rejected the query before streaming. Gates the per-call
+    /// histogram observes to match the pre-R5 placement.
+    reached_stream: bool,
+}
+
+/// Run the two-layer in-provider retry against ONE provider and return the
+/// resulting [`AttemptResult`]. Does NOT emit metrics or a `usage_report` —
+/// the caller ([`run_llm_turn`]) owns those so it can attribute them to the
+/// entry that actually served (or failed) the turn.
+///
+/// Two layers of retry surround the stream, both capped at the same
+/// `MAX_PROVIDER_ATTEMPTS` budget:
+///
+/// 1. `query_with_retry` retries the initial HTTP call when it fails
+///    before the stream starts (connect / TLS / 5xx / timeout).
+/// 2. The loop below retries the WHOLE (query + pump) pair when the stream
+///    itself errors mid-way and the provider tagged the
+///    `ProviderEvent::Error` as retryable (transient SSE-decode /
+///    dropped-connection cases the initial query can't see behind an
+///    HTTP 200).
+async fn run_one_provider_attempt(
+    deps: &RunnerDeps,
+    provider: &dyn AgentProvider,
+    input: QueryInput,
+) -> Result<AttemptResult> {
     let mut stream_attempts: u32 = 0;
-    let (mut out, input_tokens, output_tokens) = loop {
+    let (out, input_tokens, output_tokens) = loop {
         stream_attempts += 1;
         // Keep the typing-indicator path (and the heartbeat-stale
         // supervisor) refreshed for the entire `query + pump_events`
-        // cycle, not just the initial HTTP call that `query_with_retry`
-        // covers with its own HeartbeatTicker. Without this, a 30s
-        // LLM stream that doesn't emit `Progress` / `Activity` events
-        // between chunks would let the typing bubble fade out on
-        // channels with a ~5s indicator window (Telegram, Slack,
-        // Discord). The pinger defaults to refreshing the heartbeat
-        // file (HeartbeatPinger), but is overridable via
+        // cycle, not just the initial HTTP call. Without this, a 30s
+        // silent stream would let the typing bubble fade out on channels
+        // with a ~5s indicator window. Overridable via
         // RunnerDeps::activity_pinger so tests can count pings.
         let _activity = ProviderActivityTicker::start(Arc::clone(&deps.activity_pinger));
-        let mut query = match query_with_retry(deps, input.clone()).await {
+        let mut query = match query_with_retry(deps, provider, input.clone()).await {
             Ok(q) => q,
             Err(err) => {
-                // All retries exhausted (or the failure was non-retryable).
-                // Mark this turn as a terminal failure so the caller flips
-                // the inbound to `failed` and emits a usage_report with
-                // status=error. Do NOT bubble — the runner must stay up.
-                // Redact the error body — a 401/403 from some gateways
-                // echoes the offending key/`Authorization` header.
+                // All retries exhausted (or non-retryable) for THIS
+                // provider. Return a terminal-failure attempt; the caller
+                // decides whether to fail over or surface the apology. Do
+                // NOT bubble — the runner must stay up. Redact the error
+                // body (some gateways echo the offending key on a 4xx).
                 tracing::error!(
                     error = %crate::redact::redact_secrets(&err.to_string()),
-                    provider = deps.provider.name(),
-                    "provider query failed terminally; marking turn as failed"
+                    provider = provider.name(),
+                    "provider query failed terminally"
                 );
-                // Include the underlying provider error in the
-                // failure_reason so the user-visible apology actually
-                // says WHY (e.g. "api error 400: prompt is too long:
-                // 250000 tokens, max 200000" instead of the bare
-                // "provider rejected the query"). Cap at 200 chars so
-                // a giant 4xx body doesn't overflow the apology.
-                // `ProviderError` derives Display via thiserror so
-                // `to_string()` gives a structured message ("api
-                // error 400: …", "transport error: …", etc.).
+                // Include the underlying provider error in the reason so
+                // the apology says WHY ("api error 400: prompt too long"
+                // rather than a bare "rejected the query"), capped so a
+                // giant 4xx body can't overflow it.
                 let reason = format_provider_failure_reason(&err);
                 let out = LlmTurnOutput {
                     failed: true,
                     failure_reason: reason.clone(),
                     ..LlmTurnOutput::default()
                 };
-                // Same SPECIFIC reason on the usage_report so the
-                // failure mode is greppable in the audit log instead
-                // of being conflated with the post-stream failure
-                // path below. `drive_turn` will preserve this reason
-                // verbatim when wrapping the per-turn output for the
-                // run loop (see #12 in code-review notes).
-                emit_usage_report(deps, 0, 0, turn_started_at, &TurnOutcome::Failed(reason)).await;
-                return Ok(out);
+                return Ok(AttemptResult {
+                    out,
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    usage_fail_reason: Some(reason),
+                    reached_stream: false,
+                });
             }
         };
 
@@ -171,58 +330,34 @@ pub(super) async fn run_llm_turn(
         query.abort().await;
 
         // Retry only if the failure was tagged retryable AND we have
-        // budget left. Use the same backoff schedule as query_with_retry
-        // for consistency.
+        // budget left, using the same backoff schedule as query_with_retry.
         if pumped.0.failed && pumped.0.retryable_failure && stream_attempts < MAX_PROVIDER_ATTEMPTS
         {
             tracing::warn!(
                 attempt = stream_attempts,
                 max = MAX_PROVIDER_ATTEMPTS,
-                provider = deps.provider.name(),
+                provider = provider.name(),
                 "retryable stream failure; backing off and retrying"
             );
-            copperclaw_metrics::inc_provider_retry(deps.provider.name());
+            copperclaw_metrics::inc_provider_retry(provider.name());
             backoff_for_attempt(stream_attempts).await;
             continue;
         }
         break pumped;
     };
-    let outcome = if out.failed {
-        // Specific reason for the usage report so the audit log shows
-        // *where* the failure happened (stream-time vs query-time —
-        // see the matching reason in the query_with_retry branch
-        // above). `drive_turn` overwrites this with a higher-level
-        // reason for the user-visible apology unless empty.
-        TurnOutcome::Failed("provider stream ended with an error event".into())
-    } else {
-        TurnOutcome::Done
-    };
-
-    // Emit Prometheus metrics for this LLM call.
-    let elapsed_ms = (chrono::Utc::now() - turn_started_at)
-        .num_milliseconds()
-        .max(0);
-    // i64 -> f64 loses precision for large values (> 2^53 ms = ~285 years);
-    // acceptable here since we're measuring LLM call durations in seconds.
-    #[allow(clippy::cast_precision_loss)]
-    let elapsed_secs = elapsed_ms as f64 / 1000.0;
-    copperclaw_metrics::observe_llm_call_seconds(elapsed_secs.max(0.0));
-    if input_tokens > 0 {
-        copperclaw_metrics::observe_llm_tokens_input(input_tokens);
-    }
-    if output_tokens > 0 {
-        copperclaw_metrics::observe_llm_tokens_output(output_tokens);
-    }
-
-    // Surface the per-call token counts on the returned output so
-    // `drive_turn` can accumulate them across the tool loop and enforce
-    // the per-task token ceiling. Independent of the histogram observes
-    // above (those feed Prometheus; these feed the abort decision).
-    out.input_tokens = input_tokens;
-    out.output_tokens = output_tokens;
-
-    emit_usage_report(deps, input_tokens, output_tokens, turn_started_at, &outcome).await;
-    Ok(out)
+    // Stream-time terminal failure records the generic sentinel (matching
+    // the historical usage_report shape); `out.failure_reason` still
+    // carries the spliced provider body for the apology.
+    let usage_fail_reason = out
+        .failed
+        .then(|| "provider stream ended with an error event".to_string());
+    Ok(AttemptResult {
+        out,
+        input_tokens,
+        output_tokens,
+        usage_fail_reason,
+        reached_stream: true,
+    })
 }
 
 /// Pump events off a live [`AgentQuery`] until the stream ends or
@@ -470,6 +605,7 @@ pub(super) async fn pump_events(
 /// `copperclaw_provider_deadline_total`.
 pub(super) async fn query_with_retry(
     deps: &RunnerDeps,
+    provider: &dyn AgentProvider,
     input: QueryInput,
 ) -> std::result::Result<Box<dyn AgentQuery>, ProviderError> {
     let mut attempt: u32 = 0;
@@ -490,7 +626,7 @@ pub(super) async fn query_with_retry(
         // attempt — backoff sleeps between attempts are short enough
         // (≤1s) that they don't need their own coverage.
         let _hb = HeartbeatTicker::start(deps.heartbeat_path.clone());
-        let result = timeout(deps.provider_deadline, deps.provider.query(input.clone())).await;
+        let result = timeout(deps.provider_deadline, provider.query(input.clone())).await;
 
         let err: ProviderError = match result {
             Ok(Ok(query)) => return Ok(query),
@@ -502,16 +638,16 @@ pub(super) async fn query_with_retry(
                     max = MAX_PROVIDER_ATTEMPTS,
                     deadline_ms = u64_from_dur(deps.provider_deadline),
                     elapsed_ms = u64_from_dur(attempt_started.elapsed()),
-                    provider = deps.provider.name(),
+                    provider = provider.name(),
                     "provider query deadline exceeded"
                 );
                 if attempt >= MAX_PROVIDER_ATTEMPTS {
-                    copperclaw_metrics::inc_provider_deadline(deps.provider.name());
+                    copperclaw_metrics::inc_provider_deadline(provider.name());
                     tracing::error!(
                         attempt,
                         max = MAX_PROVIDER_ATTEMPTS,
                         deadline_ms = u64_from_dur(deps.provider_deadline),
-                        provider = deps.provider.name(),
+                        provider = provider.name(),
                         "provider deadline exceeded after {ms}ms (attempt {attempt}/{max})",
                         ms = u64_from_dur(deps.provider_deadline),
                         attempt = attempt,
@@ -523,7 +659,7 @@ pub(super) async fn query_with_retry(
                     });
                 }
                 // Treat as retryable; fall through to backoff.
-                copperclaw_metrics::inc_provider_retry(deps.provider.name());
+                copperclaw_metrics::inc_provider_retry(provider.name());
                 backoff_for_attempt(attempt).await;
                 continue;
             }
@@ -538,11 +674,11 @@ pub(super) async fn query_with_retry(
             tracing::warn!(
                 attempt,
                 max = MAX_PROVIDER_ATTEMPTS,
-                provider = deps.provider.name(),
+                provider = provider.name(),
                 error = %redacted_err,
                 "provider query failed; retrying after backoff"
             );
-            copperclaw_metrics::inc_provider_retry(deps.provider.name());
+            copperclaw_metrics::inc_provider_retry(provider.name());
             backoff_for_attempt(attempt).await;
             continue;
         }
@@ -552,14 +688,14 @@ pub(super) async fn query_with_retry(
             tracing::error!(
                 attempt,
                 max = MAX_PROVIDER_ATTEMPTS,
-                provider = deps.provider.name(),
+                provider = provider.name(),
                 error = %redacted_err,
                 "provider query failed; retry budget exhausted"
             );
         } else {
             tracing::error!(
                 attempt,
-                provider = deps.provider.name(),
+                provider = provider.name(),
                 error = %redacted_err,
                 "provider query failed with non-retryable error"
             );
@@ -800,6 +936,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Mutex;
 
+    use crate::run::hud::TaskHud;
     use crate::run::{RunnerDeps, run_loop};
     use crate::tools::RunnerToolCtx;
 
@@ -1078,5 +1215,152 @@ mod tests {
             .find(|r| r.kind == MessageKind::Chat)
             .expect("expected the assistant Chat row to land despite container_state errors");
         assert_eq!(chat.content["text"], "survived the DB error");
+    }
+
+    // ---- M18 R5: hot in-session provider failover ---------------------------
+
+    /// Provider whose `query()` always fails terminally (non-retryable, so
+    /// the in-provider retry budget is spent on attempt 1 and the test is
+    /// fast). Stands in for a gateway that's hiccuping mid-build.
+    struct FailingProvider {
+        name: &'static str,
+    }
+
+    #[async_trait]
+    impl AgentProvider for FailingProvider {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        async fn query(
+            &self,
+            _input: QueryInput,
+        ) -> std::result::Result<Box<dyn AgentQuery>, ProviderError> {
+            Err(ProviderError::BadRequest("primary gateway is down".into()))
+        }
+        fn is_session_invalid(&self, _err: &ProviderError) -> bool {
+            false
+        }
+    }
+
+    /// Assemble a bare `RunnerDeps` (single-turn) with an explicit primary
+    /// provider + model, plus the outbound path so tests can read the
+    /// emitted `usage_report` rows.
+    fn failover_deps(
+        primary: Arc<dyn AgentProvider>,
+        model: &str,
+    ) -> (RunnerDeps, tempfile::TempDir, SessionPaths) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = SessionPaths::new(tmp.path(), AgentGroupId::new(), SessionId::new());
+        let inbound = Arc::new(Mutex::new(open_inbound(&paths).unwrap()));
+        let outbound = Arc::new(Mutex::new(open_outbound(&paths).unwrap()));
+        let tool_ctx: Arc<dyn copperclaw_mcp::ToolContext> =
+            Arc::new(RunnerToolCtx::new(outbound.clone(), paths.outbox.clone()));
+        let archive_dir = paths.outbox.join("_compactions");
+        let mut deps = RunnerDeps::minimal(primary, tool_ctx, inbound, outbound, archive_dir);
+        deps.model = model.to_string();
+        (deps, tmp, paths)
+    }
+
+    /// Read every `usage_report` system row as `(provider, model, status)`.
+    fn usage_reports(paths: &SessionPaths) -> Vec<(String, String, String)> {
+        let outbound = open_outbound(paths).unwrap();
+        copperclaw_db::tables::messages_out::list_due(&outbound)
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| {
+                let u = r.content.get("usage_report")?;
+                Some((
+                    u.get("provider")?.as_str()?.to_string(),
+                    u.get("model")?.as_str()?.to_string(),
+                    u.get("status")?.as_str()?.to_string(),
+                ))
+            })
+            .collect()
+    }
+
+    /// The core R5 acceptance: a mid-turn failure on provider A retries the
+    /// SAME call against provider B and completes the turn — instead of
+    /// failing the inbound with an apology. The HUD note fires on the
+    /// switch, and each entry is reported back through its own
+    /// `usage_report` (A error, B ok) so host-side health stays authoritative.
+    #[tokio::test]
+    async fn failover_switches_to_next_entry_and_completes() {
+        let primary: Arc<dyn AgentProvider> = Arc::new(FailingProvider { name: "anthropic" });
+        let (mut deps, _tmp, paths) = failover_deps(primary, "model-a");
+        let fallback: Arc<dyn AgentProvider> =
+            ScriptedProvider::new(vec![vec![ProviderEvent::Result {
+                text: Some("built by the fallback".into()),
+            }]]);
+        deps.failover_chain = vec![FailoverProvider {
+            provider: fallback,
+            model: "model-b".into(),
+            provider_name: "ollama".into(),
+        }];
+        let hud = TaskHud::new(&deps);
+
+        let out = run_llm_turn(&deps, &[], None, None, &hud).await.unwrap();
+        assert!(!out.failed, "the fallback served the turn, not a failure");
+        assert_eq!(out.text, "built by the fallback");
+
+        // The HUD note surfaced the switch for the user.
+        assert_eq!(hud.note_for_test().as_deref(), Some("switched to ollama"));
+
+        // Both entries reported back: primary errored, fallback ok.
+        let reports = usage_reports(&paths);
+        assert!(
+            reports
+                .iter()
+                .any(|(p, m, s)| p == "anthropic" && m == "model-a" && s == "error"),
+            "primary failure must be reported against its own entry: {reports:?}"
+        );
+        assert!(
+            reports
+                .iter()
+                .any(|(p, m, s)| p == "ollama" && m == "model-b" && s == "ok"),
+            "the serving fallback must be reported ok against its own entry: {reports:?}"
+        );
+    }
+
+    /// Whole-chain exhaustion still produces the terminal failure (→ the
+    /// user-visible apology in `drive_turn`): every candidate fails, so the
+    /// runner surfaces the last entry's reason and fires NO switch note past
+    /// the final entry.
+    #[tokio::test]
+    async fn whole_chain_exhaustion_still_fails() {
+        let primary: Arc<dyn AgentProvider> = Arc::new(FailingProvider { name: "anthropic" });
+        let (mut deps, _tmp, _paths) = failover_deps(primary, "model-a");
+        deps.failover_chain = vec![FailoverProvider {
+            provider: Arc::new(FailingProvider { name: "ollama" }),
+            model: "model-b".into(),
+            provider_name: "ollama".into(),
+        }];
+        let hud = TaskHud::new(&deps);
+
+        let out = run_llm_turn(&deps, &[], None, None, &hud).await.unwrap();
+        assert!(out.failed, "whole chain exhausted → terminal failure");
+        assert!(
+            out.failure_reason
+                .contains("provider rejected the query before streaming started"),
+            "apology carries the last entry's provider reason: {}",
+            out.failure_reason
+        );
+    }
+
+    /// Byte-stable single-provider path: an empty `failover_chain` is
+    /// exactly the pre-R5 behaviour — a failing provider yields the same
+    /// terminal-failure output, and NO switch note is set.
+    #[tokio::test]
+    async fn empty_chain_is_single_provider_behaviour() {
+        let primary: Arc<dyn AgentProvider> = Arc::new(FailingProvider { name: "anthropic" });
+        let (deps, _tmp, _paths) = failover_deps(primary, "model-a");
+        assert!(deps.failover_chain.is_empty());
+        let hud = TaskHud::new(&deps);
+
+        let out = run_llm_turn(&deps, &[], None, None, &hud).await.unwrap();
+        assert!(out.failed);
+        assert!(
+            hud.note_for_test().is_none(),
+            "no failover note without a chain"
+        );
     }
 }

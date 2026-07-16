@@ -133,7 +133,99 @@ fn persist_health(
     }
 }
 
+/// One healthy alternate entry for the R5 in-container failover chain: the
+/// chain entry's raw `(provider, model)` plus the `api_key_env` of its
+/// currently-selected key (`None` for the ambient credential). The runner-
+/// config assembler normalises the provider, applies the security boundary,
+/// and resolves the `runner.json` endpoint/key slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FailoverAlternate {
+    pub(crate) provider: String,
+    pub(crate) model: String,
+    pub(crate) key_env: Option<String>,
+}
+
+/// Pick the `api_key_env` of the first eligible key for `entry` as of `now`,
+/// mirroring `FallbackChain::pick_key`'s two-pass (strictly-healthy first,
+/// then re-probe-eligible) preference. `Some(key_env)` when the entry has an
+/// eligible key (`key_env` = `None` for the ambient credential); `None` when
+/// every key is still cooling down. Uses only the public `failover` API so
+/// `copperclaw-providers` stays read-only for this card.
+///
+/// The `Option<Option<_>>` is meaningful, not accidental: the OUTER option
+/// is eligibility (`None` = every key cooling down, skip the entry) and the
+/// INNER is the key's `api_key_env` (`None` = the ambient credential, which
+/// has no named env var).
+#[allow(clippy::option_option)]
+fn pick_eligible_key_env(
+    entry: &ChainEntry,
+    health: &HealthMap,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<Option<String>> {
+    use copperclaw_providers::failover::AMBIENT_KEY_ID;
+    let lookup = |key_id: &str| -> HealthEntry {
+        health
+            .get(&HealthKey::new(
+                entry.provider.as_str(),
+                entry.model.as_str(),
+                key_id,
+            ))
+            .cloned()
+            .unwrap_or_default()
+    };
+    if entry.keys.is_empty() {
+        return lookup(AMBIENT_KEY_ID).is_eligible(now).then_some(None);
+    }
+    for want_healthy in [true, false] {
+        for k in &entry.keys {
+            let h = lookup(&k.id);
+            let healthy = h.status == HealthStatus::Healthy;
+            if (want_healthy && healthy) || (!want_healthy && h.is_eligible(now)) {
+                return Some(k.api_key_env.clone());
+            }
+        }
+    }
+    None
+}
+
 impl ContainerManager {
+    /// The ordered, currently-healthy chain entries AFTER the primary
+    /// selection — the raw material for the R5 in-container failover chain.
+    ///
+    /// Walks the group's `FallbackChain` and returns every entry with a
+    /// chain index strictly greater than the primary's (a lower-priority
+    /// fallback) that has an eligible key as of `now`. Entries before the
+    /// primary are, by construction, the degraded ones the selector already
+    /// skipped, so they are never useful mid-turn failover targets. The
+    /// security filtering + endpoint/credential resolution happens in
+    /// [`Self::resolve_failover_chain_for_file`]. `Vec::new()` when the group
+    /// has no chain or no eligible alternate.
+    pub(crate) fn failover_alternates(
+        &self,
+        session: &Session,
+        primary: &Selection,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Vec<FailoverAlternate> {
+        let id = session.agent_group_id;
+        let Some(chain) = load_chain(&self.central, id) else {
+            return Vec::new();
+        };
+        let health = hydrate_health(&self.central, id);
+        chain
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx > primary.entry_index)
+            .filter_map(|(_, entry)| {
+                pick_eligible_key_env(entry, &health, now).map(|key_env| FailoverAlternate {
+                    provider: entry.provider.clone(),
+                    model: entry.model.clone(),
+                    key_env,
+                })
+            })
+            .collect()
+    }
+
     /// Resolve the triggering channel type for a session from its newest
     /// pending inbound, for per-channel model pinning. `None` for
     /// agent-to-agent traffic (no channel sender) or when the inbound DB
@@ -541,6 +633,51 @@ mod tests {
             m.resolve_provider_selection(&s, chrono::Utc::now())
                 .is_none()
         );
+    }
+
+    /// R5: `failover_alternates` returns the lower-priority entries that are
+    /// currently healthy, skipping a degraded one — the runner's in-turn
+    /// failover targets. Entry 1 (m2) is degraded by a 429; entry 2 (ollama)
+    /// stays healthy, so only ollama is offered as an alternate.
+    #[test]
+    fn failover_alternates_skips_degraded_lower_entry() {
+        let m = mgr();
+        let g = group(&m);
+        let s = session(&m, g);
+        set_chain(
+            &m,
+            g,
+            &json!([
+                {"provider": "anthropic", "model": "m1", "keys": [{"id": "k1"}]},
+                {"provider": "anthropic", "model": "m2", "keys": [{"id": "k2"}]},
+                {"provider": "ollama", "model": "m3"}
+            ]),
+            &json!({}),
+        );
+        let now = chrono::Utc::now();
+        // The runner reported a 429 on entry 1 (m2); the spawn-time fold
+        // degrades it. Entry 0 (m1) stays the healthy primary.
+        record_turn(
+            &m,
+            &s,
+            "anthropic",
+            "m2",
+            "error",
+            Some(
+                &ProviderError::Api {
+                    status: 429,
+                    message: "rl".into(),
+                }
+                .to_string(),
+            ),
+            now - chrono::Duration::seconds(1),
+        );
+        let primary = m.resolve_provider_selection(&s, now).unwrap();
+        assert_eq!(primary.entry_index, 0);
+        let alts = m.failover_alternates(&s, &primary, now);
+        assert_eq!(alts.len(), 1, "the degraded m2 entry is skipped: {alts:?}");
+        assert_eq!(alts[0].provider, "ollama");
+        assert_eq!(alts[0].model, "m3");
     }
 
     #[test]

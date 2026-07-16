@@ -51,7 +51,9 @@ pub use run::{UsageReportInputs, build_usage_report_payload};
 // runner binary constructs a HeartbeatPinger so each LLM stream
 // refreshes the heartbeat file (and thus the host's typing-ticker
 // stays willing to fire) across long provider calls.
-pub use run::provider_call::{HeartbeatPinger, NoopPinger, ProviderActivityPinger};
+pub use run::provider_call::{
+    FailoverProvider, HeartbeatPinger, NoopPinger, ProviderActivityPinger,
+};
 pub use state::{PersistedState, load_state, save_state};
 pub use subagent::{
     SUBAGENT_PREAMBLE, SubagentDeps, SubagentInputs, build_subagent_system, run_inner_loop,

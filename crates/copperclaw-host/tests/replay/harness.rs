@@ -748,6 +748,8 @@ impl ReplayHarness {
             // gate — default on, no override, same as production.
             verify_gate: true,
             check_command_override: None,
+            // Replay fixtures run a single provider — no R5 failover chain.
+            failover_chain: Vec::new(),
         };
         // The M17 preview relay (`expose_preview` / `close_preview`) writes
         // a request row to `outbound.db::mcp_call_requests` and BLOCK-POLLS
