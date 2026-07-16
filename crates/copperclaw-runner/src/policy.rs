@@ -142,6 +142,15 @@ const CODING_TOOLS: &[&str] = &[
     // (spawning a local chromium process is a resource cost a read-only
     // sender shouldn't get for free) via [`is_mutating`].
     "ui_screenshot",
+    // M20 Q3: structured lint/typecheck digest (eslint/tsc/ruff). It is
+    // read-only analysis with NO `.copperclaw/verify` gate interaction —
+    // `explore` is the precedent for a read-only-but-coding-scoped tool
+    // riding this list. It rides here (rather than `READONLY_TOOLS`)
+    // because it spawns linter/typechecker subprocesses, a resource cost a
+    // guest sender shouldn't get for free (same rationale as
+    // `ui_screenshot`'s chromium spawn), and because it's part of the same
+    // build-test-iterate loop those tools serve.
+    "diagnostics",
 ];
 
 /// Self-modification tools, layered on only by the `full` profile. These
@@ -1348,6 +1357,50 @@ mod tests {
             autonomous: false,
         });
         assert!(tainted.evaluate("ui_screenshot").is_allow());
+    }
+
+    // ── M20 Q3: diagnostics policy ───────────────────────────────────────
+
+    #[test]
+    fn diagnostics_is_coding_profile_only() {
+        assert!(ToolProfile::Coding.allows("diagnostics"));
+        assert!(ToolProfile::Full.allows("diagnostics"));
+        assert!(!ToolProfile::Minimal.allows("diagnostics"));
+        assert!(!ToolProfile::Messaging.allows("diagnostics"));
+    }
+
+    #[test]
+    fn diagnostics_is_not_credentialed_external() {
+        // Purely in-container subprocess analysis; never reaches outside
+        // the session container, so it must not ride the taint/autonomy
+        // gate the way an operator-opt-in external action would.
+        assert!(!is_credentialed_external("diagnostics"));
+    }
+
+    #[test]
+    fn diagnostics_denied_to_guest_even_under_full() {
+        let guest = ToolPolicy::new(ToolProfile::Full, Some(SenderRole::Guest));
+        let d = guest.evaluate("diagnostics");
+        assert!(!d.is_allow());
+        assert!(d.deny_reason().unwrap().contains("guest"));
+    }
+
+    #[test]
+    fn diagnostics_allowed_for_member_under_coding() {
+        let member = ToolPolicy::new(ToolProfile::Coding, Some(SenderRole::Member));
+        assert!(member.evaluate("diagnostics").is_allow());
+    }
+
+    #[test]
+    fn diagnostics_untainted_by_a_tainted_turn() {
+        // Read-only, in-container analysis — nothing for the
+        // confused-deputy taint gate to protect against here.
+        let tainted = ToolPolicy::new(ToolProfile::Full, None).with_trust(TurnTrust {
+            tainted: true,
+            approved: false,
+            autonomous: false,
+        });
+        assert!(tainted.evaluate("diagnostics").is_allow());
     }
 
     #[test]
