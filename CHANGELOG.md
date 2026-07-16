@@ -6,7 +6,33 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Added (M19 U4 — Native cards on gchat + matrix, 2026-07-16)
+### Added (M19 A6 — Durable scheduled-task fire lifecycle, migration 028)
+
+- Scheduled tasks now carry a durable, queryable record of their firing
+  history. The first-class `tasks` table (migration `010_tasks`) already
+  backs all six scheduling tools (`schedule_task` / `list_tasks` /
+  `cancel_task` / `pause_task` / `resume_task` / `update_task`) via the
+  `SchedulingModule` → `SqliteTaskStore` write path and the sweep's due-task
+  fan-out (`copperclaw-host-sweep::checks::scheduling`), but it recorded no
+  trace of a *fire* — the sweep bumped `next_fire` (recurring) or flipped
+  `status` to `completed` (one-shot) and moved on. Migration
+  `028_tasks_fire_lifecycle` adds two columns the sweep now writes on every
+  fire:
+  - `last_fired_at` — RFC-3339 instant of the most recent fire (`NULL` until
+    first fire).
+  - `fire_count` — monotonically increasing fire count (`0` until first
+    fire); a recurring task accrues one per occurrence.
+  Wired in `crates/copperclaw-db/src/tables/tasks.rs` (new `mark_fired`
+  helper; `Task` gains the two fields) and
+  `crates/copperclaw-host-sweep/src/checks/scheduling.rs` (calls `mark_fired`
+  on each fire). Existing rows backfill to `NULL` / `0` via the column
+  defaults and continue to fire unchanged (proved by a migration test in
+  `crates/copperclaw-db/src/migrate.rs` and sweep tests). This gives
+  operators, the metrics rider (M1's "scheduled-task lifecycle" wish), and a
+  future event-driven-trigger follow-up a durable view of autonomous activity
+  without scanning the message log. Event-driven triggers themselves remain a
+  follow-up (the seam is the `tasks` table itself — a future trigger source
+  writes rows and the same sweep fan-out fires them).
 
 - Neither `gchat` nor `matrix` overrode the trait
   `ChannelAdapter::deliver_card`, so the M18 approval / ritual cards fell through
