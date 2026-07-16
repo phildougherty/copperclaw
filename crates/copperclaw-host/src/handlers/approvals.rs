@@ -21,6 +21,11 @@
 //!   operator knows to run `cclaw groups restart <agent_group_id>`.
 //! - `"add_mcp_server"` — read `name`/`transport` from `payload`, insert
 //!   into `container_configs.mcp_servers`. Same no-auto-rebuild stance.
+//! - `"save_skill"` (M19 A4) — validate the agent-authored `SKILL.md` in
+//!   `payload.content` and write it under the host-computed
+//!   `payload.dest_dir` (`<groups_dir>/<ag>/skills/<name>`), enforcing the
+//!   frontmatter/name rules and containment under `payload.allowed_root`. The
+//!   next container spawn discovers it; no rebuild is required.
 //! - `"credentialed_external_action"` — grant one credentialed external action
 //!   on a taint-blocked or outward-facing request (M18 V5: the public-tunnel
 //!   broker's `expose`). Approving flips the row to `approved`; the requester
@@ -239,6 +244,10 @@ pub fn resolve_approve(
         "channel" => apply_channel(central, &row)?,
         "install_packages" => apply_install_packages(central, &row)?,
         "add_mcp_server" => apply_add_mcp_server(central, &row)?,
+        // M19 A4: write the agent-authored skill into the group's per-group
+        // skills override dir. Validates (frontmatter + name==dir) and enforces
+        // containment before the write; the next container spawn discovers it.
+        "save_skill" => apply_save_skill(&row)?,
         // M18 V2: flip the group's `preview_enabled` master switch — the same
         // effect as `cclaw groups config update --field preview_enabled=true`.
         // The pending row is raised host-side by the preview manager when the
@@ -682,6 +691,61 @@ fn apply_add_mcp_server(
     }))
 }
 
+/// `save_skill` family (M19 A4): validate and write an agent-authored skill
+/// into the group's per-group skills override directory. The pending row was
+/// raised by the delivery service, which stamped the host-computed
+/// `dest_dir` (`<groups_dir>/<ag>/skills`) and `allowed_root` (`<groups_dir>`)
+/// into the payload alongside the agent-supplied `name`/`content`. Approving
+/// validates the frontmatter + `name == dir` invariant and enforces
+/// containment (canonical dest under `allowed_root`) before writing
+/// `<dest_dir>/<name>/SKILL.md`. The next container spawn's skill scan
+/// discovers it — closing the write→discovery loop. No rebuild is needed
+/// (skills are read fresh at spawn, not baked into the image).
+///
+/// A4 metric wish: `copperclaw_skills_saved_total{outcome}` (saved / rejected)
+/// — recorded here and in the delivery raise path once the metrics crate gains
+/// the counter (out of scope for this card, which must not touch
+/// `copperclaw-metrics`).
+fn apply_save_skill(row: &pending_approvals::PendingApproval) -> Result<Value, ErrorPayload> {
+    let bad = |msg: &str| ErrorPayload::new("bad_request", msg.to_string());
+    let name = row
+        .payload
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("save_skill payload requires a string `name`"))?;
+    let content = row
+        .payload
+        .get("content")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("save_skill payload requires a string `content`"))?;
+    let dest_dir = row
+        .payload
+        .get("dest_dir")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("save_skill payload requires a string `dest_dir`"))?;
+    let allowed_root = row
+        .payload
+        .get("allowed_root")
+        .and_then(Value::as_str)
+        .ok_or_else(|| bad("save_skill payload requires a string `allowed_root`"))?;
+
+    let dest = std::path::PathBuf::from(dest_dir);
+    let roots = [std::path::PathBuf::from(allowed_root)];
+    let written = copperclaw_skills::save_group_skill(&dest, &roots, name, content)
+        // A well-formed but invalid skill (bad frontmatter, name mismatch,
+        // containment escape) surfaces the precise skills-crate error.
+        .map_err(|e| ErrorPayload::new("bad_request", format!("save_skill rejected: {e}")))?;
+
+    Ok(json!({
+        "kind": "save_skill",
+        "agent_group_id": row.agent_group_id.map(|g| g.as_uuid().to_string()),
+        "name": name,
+        "path": written.to_string_lossy(),
+        "note": "skill saved to the group's skills override; it is discovered and \
+                 available on the agent's NEXT session (no rebuild needed)",
+    }))
+}
+
 /// `enable_preview` family (M18 V2): flip the group's `preview_enabled`
 /// master switch on. Effect-identical to the operator running
 /// `cclaw groups config update --field preview_enabled=true <ag>` — the
@@ -1103,6 +1167,150 @@ mod tests {
         assert!(hint.contains("session-scope"));
         let cfg = container_configs::get(&db, ag).unwrap().unwrap();
         assert!(cfg.packages_npm.contains(&"typescript".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // M19 A4: save_skill approval → validate → write → discovery
+    // -----------------------------------------------------------------------
+
+    const A4_SKILL: &str =
+        "---\nname: my-skill\ndescription: A reusable procedure\n---\n# Steps\ndo it\n";
+
+    /// End-to-end: an approved `save_skill` writes the SKILL.md into the
+    /// group's per-group skills override dir, and a fresh `SkillRegistry::scan`
+    /// (what the next container spawn does) discovers and exposes it.
+    #[test]
+    fn approve_save_skill_writes_and_is_discovered_on_next_spawn() {
+        let db = db();
+        let ag = seed_ag(&db);
+        let td = tempfile::tempdir().unwrap();
+        let groups_dir = td.path().join("groups");
+        let dest_dir = groups_dir.join(ag.as_uuid().to_string()).join("skills");
+        let id = insert_pending(
+            &db,
+            "save_skill",
+            UpsertPendingApproval {
+                request_id: format!("save-skill:{}:my-skill", ag.as_uuid()),
+                payload: json!({
+                    "name": "my-skill",
+                    "content": A4_SKILL,
+                    "reason": "handy",
+                    "dest_dir": dest_dir.to_string_lossy(),
+                    "allowed_root": groups_dir.to_string_lossy(),
+                }),
+                agent_group_id: Some(ag),
+                title: "Save skill: my-skill".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        let v = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap();
+        assert_eq!(v["applied"], true);
+        assert_eq!(v["side_effect"]["kind"], "save_skill");
+        assert_eq!(v["side_effect"]["name"], "my-skill");
+
+        // The SKILL.md landed on disk.
+        let skill_md = dest_dir.join("my-skill").join("SKILL.md");
+        assert!(skill_md.is_file(), "SKILL.md should exist at {skill_md:?}");
+
+        // The next spawn's discovery scan finds it as a group-sourced skill.
+        let global = td.path().join("global");
+        std::fs::create_dir_all(&global).unwrap();
+        let reg = copperclaw_skills::SkillRegistry::scan(&global, Some((ag, &dest_dir))).unwrap();
+        let skill = reg.get("my-skill").expect("saved skill discovered");
+        assert_eq!(skill.description, "A reusable procedure");
+        assert_eq!(skill.source, copperclaw_skills::SkillSource::Group(ag));
+    }
+
+    /// Invalid frontmatter is refused at approve time with the precise
+    /// skills-crate validation error (defense-in-depth: the tool refuses it
+    /// first, but the write boundary re-validates).
+    #[test]
+    fn approve_save_skill_rejects_invalid_frontmatter() {
+        let db = db();
+        let ag = seed_ag(&db);
+        let td = tempfile::tempdir().unwrap();
+        let groups_dir = td.path().join("groups");
+        let dest_dir = groups_dir.join(ag.as_uuid().to_string()).join("skills");
+        let id = insert_pending(
+            &db,
+            "save_skill",
+            UpsertPendingApproval {
+                request_id: "r-bad-skill".into(),
+                payload: json!({
+                    "name": "my-skill",
+                    "content": "no frontmatter here\n",
+                    "reason": "x",
+                    "dest_dir": dest_dir.to_string_lossy(),
+                    "allowed_root": groups_dir.to_string_lossy(),
+                }),
+                agent_group_id: Some(ag),
+                title: "Save skill".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        let err = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap_err();
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("rejected"), "got: {}", err.message);
+        // Nothing was written and the row stays pending (not silently approved).
+        assert!(!dest_dir.join("my-skill").exists());
+        let row = get_row(&db, id).unwrap();
+        assert_eq!(row.status, ApprovalStatus::Pending);
+    }
+
+    /// A destination that canonically escapes the allowed root is refused —
+    /// the containment guard reused from the skills crate.
+    #[test]
+    fn approve_save_skill_rejects_containment_escape() {
+        let db = db();
+        let ag = seed_ag(&db);
+        let td = tempfile::tempdir().unwrap();
+        // allowed_root is a sibling of the destination — the write escapes it.
+        let allowed = td.path().join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let dest_dir = td.path().join("outside").join("skills");
+        let id = insert_pending(
+            &db,
+            "save_skill",
+            UpsertPendingApproval {
+                request_id: "r-escape-skill".into(),
+                payload: json!({
+                    "name": "my-skill",
+                    "content": A4_SKILL,
+                    "reason": "x",
+                    "dest_dir": dest_dir.to_string_lossy(),
+                    "allowed_root": allowed.to_string_lossy(),
+                }),
+                agent_group_id: Some(ag),
+                title: "Save skill".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        let err = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap_err();
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("escapes"), "got: {}", err.message);
+    }
+
+    #[test]
+    fn approve_save_skill_missing_dest_is_bad_request() {
+        let db = db();
+        let ag = seed_ag(&db);
+        let id = insert_pending(
+            &db,
+            "save_skill",
+            UpsertPendingApproval {
+                request_id: "r-nodest".into(),
+                payload: json!({ "name": "my-skill", "content": A4_SKILL }),
+                agent_group_id: Some(ag),
+                title: "Save skill".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        let err = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap_err();
+        assert_eq!(err.code, "bad_request");
     }
 
     #[test]

@@ -14,7 +14,7 @@ use copperclaw_db::central::CentralDb;
 use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
 use copperclaw_db::tables::{
     agent_groups, container_configs, delivered, mcp_calls, messages_in, messages_out,
-    session_routing, sessions,
+    pending_approvals, session_routing, sessions,
 };
 use copperclaw_modules::{
     DeliveryActionHandler, DeliveryActionInput, DeliveryDispatcher, DispatchTarget, PreviewBroker,
@@ -26,6 +26,7 @@ use copperclaw_types::{
 };
 use dashmap::DashMap;
 use rusqlite::{Connection, OptionalExtension};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -344,6 +345,14 @@ pub struct DeliveryService {
     /// this host has no preview support — a `__preview` request is answered with
     /// a clear `is_error` rather than being left to hang the runner's poll.
     preview_broker: std::sync::OnceLock<Arc<dyn PreviewBroker>>,
+    /// Per-agent-group data root (`COPPERCLAW_GROUPS_DIR`). When set, an
+    /// approved `save_skill` (M19 A4) writes into
+    /// `<groups_dir>/<agent_group_id>/skills/<name>/SKILL.md`, which the next
+    /// container spawn discovers. Set once at boot via
+    /// [`DeliveryService::set_groups_dir`]; `None` means this host has no
+    /// per-group skills root, so a `save_skill` request is refused with a
+    /// clear self-mod failure rather than silently dropped.
+    groups_dir: std::sync::OnceLock<PathBuf>,
 }
 
 impl DeliveryService {
@@ -380,6 +389,7 @@ impl DeliveryService {
             todo_anchors: DashMap::new(),
             mcp_drain_inflight: Arc::new(DashMap::new()),
             preview_broker: std::sync::OnceLock::new(),
+            groups_dir: std::sync::OnceLock::new(),
         })
     }
 
@@ -422,6 +432,7 @@ impl DeliveryService {
             todo_anchors: DashMap::new(),
             mcp_drain_inflight: Arc::new(DashMap::new()),
             preview_broker: std::sync::OnceLock::new(),
+            groups_dir: std::sync::OnceLock::new(),
         })
     }
 
@@ -436,6 +447,15 @@ impl DeliveryService {
     /// was set (a second call is a no-op — the `OnceLock` keeps the first).
     pub fn set_preview_broker(&self, broker: Arc<dyn PreviewBroker>) -> bool {
         self.preview_broker.set(broker).is_ok()
+    }
+
+    /// Wire the per-agent-group data root (`COPPERCLAW_GROUPS_DIR`) used by an
+    /// approved `save_skill` (M19 A4) to place the skill under
+    /// `<groups_dir>/<agent_group_id>/skills`. Called once at boot; a second
+    /// call is a no-op (the `OnceLock` keeps the first). Returns whether it was
+    /// set.
+    pub fn set_groups_dir(&self, dir: PathBuf) -> bool {
+        self.groups_dir.set(dir).is_ok()
     }
 
     /// Register or replace a delivery action handler.
@@ -1103,6 +1123,16 @@ impl DeliveryService {
             self.finish_self_mod("add_mcp_server", sess, row, inbound_pool, apply)?;
             return Ok(());
         }
+        // `save_skill` (M19 A4): the runner emits this when the agent calls the
+        // `save_skill` tool. Unlike `install_packages` / `add_mcp_server`, which
+        // apply immediately, this is APPROVAL-GATED — we raise a pending
+        // approval + dispatch a card here and only WRITE the SKILL.md when an
+        // operator approves (the `save_skill` apply arm in the host's approvals
+        // handler). Secure-by-default: nothing lands on disk without approval.
+        if action.name == "save_skill" {
+            self.raise_save_skill_approval(sess, row, target, inbound_pool, &action.payload)?;
+            return Ok(());
+        }
 
         // `update_breadcrumb` is the finalisation half of the runner's
         // tool-progress chip pipeline. The payload carries the new
@@ -1414,6 +1444,140 @@ impl DeliveryService {
                 Ok(())
             }
         }
+    }
+
+    /// Raise an approval for an agent-authored `save_skill` request (M19 A4)
+    /// and dispatch an approve/deny card to the originating channel.
+    ///
+    /// Nothing is written to disk here — the SKILL.md lands only when an
+    /// operator approves (the host's `save_skill` approval apply arm). The
+    /// pending row carries the validated skill body plus the host-computed
+    /// destination + containment root, so the apply arm needs no extra config.
+    /// Idempotent on `(agent_group, name)` via a stable `request_id`, so an
+    /// agent retrying `save_skill` for the same name doesn't stack cards.
+    ///
+    /// When no per-group skills root is configured (`groups_dir` unset), the
+    /// request is refused with a self-mod failure so the agent learns rather
+    /// than the row being silently dropped.
+    fn raise_save_skill_approval(
+        &self,
+        sess: &Session,
+        row: &MessageOutRow,
+        target: &DispatchTarget,
+        inbound_pool: &SessionPool,
+        payload: &serde_json::Value,
+    ) -> Result<(), DeliveryError> {
+        let ag = sess.agent_group_id;
+        let name = payload
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let content = payload
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let reason = payload
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        let Some(groups_dir) = self.groups_dir.get() else {
+            record_save_skill_failure(
+                sess,
+                row,
+                inbound_pool,
+                "this host has no per-group skills directory configured \
+                 (COPPERCLAW_GROUPS_DIR is unset), so save_skill cannot persist \
+                 a skill; ask an operator to configure it",
+            )?;
+            return Ok(());
+        };
+        if name.is_empty() || content.is_empty() {
+            record_save_skill_failure(
+                sess,
+                row,
+                inbound_pool,
+                "save_skill payload is missing `name` or `content`",
+            )?;
+            return Ok(());
+        }
+
+        let dest_dir = groups_dir.join(ag.as_uuid().to_string()).join("skills");
+        let payload_out = serde_json::json!({
+            "name": name,
+            "content": content,
+            "reason": reason,
+            // Host-computed (trusted) destination + containment root; the apply
+            // arm writes under `dest_dir` and refuses anything that canonically
+            // escapes `allowed_root`.
+            "dest_dir": dest_dir.to_string_lossy(),
+            "allowed_root": groups_dir.to_string_lossy(),
+        });
+
+        let approval = match pending_approvals::upsert(
+            &self.central,
+            pending_approvals::UpsertPendingApproval {
+                request_id: format!("save-skill:{}:{name}", ag.as_uuid()),
+                action: "save_skill".to_string(),
+                payload: payload_out,
+                agent_group_id: Some(ag),
+                channel_type: target.channel_type.clone(),
+                platform_id: target.platform_id.clone(),
+                title: format!("Save skill: {name}"),
+                ..Default::default()
+            },
+        ) {
+            Ok(a) => a,
+            Err(err) => {
+                // A DB failure here is transient-ish; surface it as a self-mod
+                // failure so the agent (and dropped-messages) see it.
+                record_save_skill_failure(
+                    sess,
+                    row,
+                    inbound_pool,
+                    &format!("could not record the save_skill approval: {err}"),
+                )?;
+                return Ok(());
+            }
+        };
+
+        // Best-effort card to the originating channel. The `approve:<id>` /
+        // `deny:<id>` buttons route through the same G1 interceptor + DB path
+        // the CLI `cclaw approvals approve <id>` uses, so the request is
+        // actionable even on channels without buttons (operator CLI).
+        if target.channel_type.is_some() && target.platform_id.is_some() {
+            let approval_id = approval.approval_id.as_uuid().to_string();
+            let body = if reason.trim().is_empty() {
+                format!("The agent wants to save a reusable skill `{name}` for future sessions.")
+            } else {
+                format!(
+                    "The agent wants to save a reusable skill `{name}` for future sessions.\n\nReason: {reason}"
+                )
+            };
+            let card = OutboundMessage {
+                kind: MessageKind::Card,
+                content: serde_json::json!({
+                    "card": {
+                        "title": format!("Save skill: {name}"),
+                        "body": body,
+                        "buttons": [
+                            { "label": "Save this skill", "value": format!("approve:{approval_id}"), "style": "primary" },
+                            { "label": "Not now", "value": format!("deny:{approval_id}"), "style": "danger" },
+                        ],
+                    },
+                }),
+                files: vec![],
+            };
+            self.dispatcher.dispatch(target, &card);
+        }
+
+        copperclaw_metrics::inc_self_mod_succeeded("save_skill");
+        let in_conn = inbound_pool.connect()?;
+        delivered::insert(&in_conn, row.id, None, "ok")?;
+        Ok(())
     }
 
     async fn dispatch_chat(
@@ -3140,6 +3304,62 @@ fn record_self_mod_failure(
             session = %sess.id.as_uuid(),
             ?insert_err,
             "self_mod_error inbound write failed; agent will not see the failure"
+        );
+    }
+    Ok(())
+}
+
+/// Record a `save_skill` request that could not even be queued for approval
+/// (missing config or a malformed payload): mark the delivery row failed and
+/// surface a `self_mod_error` inbound so the agent learns. Mirrors
+/// [`record_self_mod_failure`] but takes a plain reason string (the failure is
+/// a config / payload problem, not a `DbError`).
+fn record_save_skill_failure(
+    sess: &Session,
+    row: &MessageOutRow,
+    inbound_pool: &SessionPool,
+    reason: &str,
+) -> Result<(), DeliveryError> {
+    warn!(
+        session = %sess.id.as_uuid(),
+        agent_group = %sess.agent_group_id.as_uuid(),
+        reason,
+        "save_skill request refused before approval",
+    );
+    copperclaw_metrics::inc_self_mod_failed("save_skill");
+    let in_conn = inbound_pool.connect()?;
+    delivered::insert(&in_conn, row.id, Some(reason), "failed")?;
+    let inbound_row = messages_in::WriteInbound {
+        id: MessageId::new(),
+        kind: MessageKind::System,
+        timestamp: chrono::Utc::now(),
+        content: serde_json::json!({
+            "kind": "system",
+            "content": {
+                "self_mod_error": {
+                    "action": "save_skill",
+                    "error": reason,
+                    "guidance": "The skill could not be saved. Inspect the error; if it is a validation issue, correct the SKILL.md and retry.",
+                }
+            }
+        }),
+        trigger: false,
+        on_wake: false,
+        process_after: None,
+        recurrence: None,
+        series_id: None,
+        platform_id: None,
+        channel_type: None,
+        thread_id: None,
+        source_session_id: None,
+        reply_to: None,
+        is_group: None,
+    };
+    if let Err(insert_err) = messages_in::insert(&in_conn, &inbound_row) {
+        warn!(
+            session = %sess.id.as_uuid(),
+            ?insert_err,
+            "save_skill self_mod_error inbound write failed; agent will not see the failure"
         );
     }
     Ok(())
@@ -5003,6 +5223,88 @@ mod tests {
             })
             .unwrap();
         rows.map(Result::unwrap).collect()
+    }
+
+    // ── M19 A4: save_skill raises an approval (does NOT write on its own) ──
+
+    #[tokio::test]
+    async fn save_skill_row_raises_pending_approval_with_dest_and_content() {
+        let (service, tmp, sess, _mock) = make_service().await;
+        let groups_dir = tmp.path().join("groups");
+        service.set_groups_dir(groups_dir.clone());
+
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let content = "---\nname: greet\ndescription: Say hi\n---\n# Greet\n";
+        // A routed system row so the card has a target channel.
+        let mut row = make_row(
+            MessageKind::System,
+            json!({ "save_skill": {"name": "greet", "content": content, "reason": "handy"} }),
+        );
+        row.channel_type = Some(ChannelType::new("mock"));
+        row.platform_id = Some("plat-1".into());
+        write_row(&out_pool, &row);
+
+        let _ = service.process_session_once(&sess).await.unwrap();
+
+        // A pending approval was raised (nothing written to disk yet).
+        let rows = pending_approvals::list(service.central(), Some("save_skill"), None).unwrap();
+        assert_eq!(rows.len(), 1, "expected one save_skill approval");
+        let approval = &rows[0];
+        assert_eq!(approval.agent_group_id, Some(sess.agent_group_id));
+        assert_eq!(approval.payload["name"], "greet");
+        assert_eq!(approval.payload["content"], content);
+        let expected_dest = groups_dir
+            .join(sess.agent_group_id.as_uuid().to_string())
+            .join("skills");
+        assert_eq!(
+            approval.payload["dest_dir"],
+            expected_dest.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            approval.payload["allowed_root"],
+            groups_dir.to_string_lossy().as_ref()
+        );
+        // The skill must NOT exist yet — approval gates the write. (The
+        // approve→write→discovery half is covered end-to-end by the host's
+        // approvals handler test `approve_save_skill_writes_and_is_discovered
+        // _on_next_spawn`.) The approval card dispatch is best-effort and
+        // fire-and-forget on a spawned task, so it isn't asserted here.
+        assert!(!expected_dest.join("greet").exists());
+    }
+
+    #[tokio::test]
+    async fn save_skill_row_without_groups_dir_surfaces_self_mod_error() {
+        let (service, _tmp, sess, _mock) = make_service().await;
+        // Deliberately do NOT set groups_dir.
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let content = "---\nname: greet\ndescription: Say hi\n---\nbody\n";
+        let row = make_row(
+            MessageKind::System,
+            json!({ "save_skill": {"name": "greet", "content": content, "reason": "r"} }),
+        );
+        write_row(&out_pool, &row);
+
+        let _ = service.process_session_once(&sess).await.unwrap();
+
+        // No approval raised; the agent gets a self_mod_error explaining why.
+        let rows = pending_approvals::list(service.central(), Some("save_skill"), None).unwrap();
+        assert!(rows.is_empty());
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let sys_rows = list_inbound_system_rows(&in_pool);
+        assert_eq!(sys_rows.len(), 1);
+        assert_eq!(
+            sys_rows[0]["content"]["self_mod_error"]["action"],
+            "save_skill"
+        );
     }
 
     #[tokio::test]

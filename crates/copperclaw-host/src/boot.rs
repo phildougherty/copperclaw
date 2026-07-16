@@ -497,6 +497,12 @@ pub fn assemble(
         ));
 
     let delivery = DeliveryService::new(central.clone(), delivery_root, adapters, dispatcher);
+    // M19 A4: give the delivery service the per-group data root so an approved
+    // `save_skill` can write into `<groups_dir>/<ag>/skills`, which the next
+    // spawn discovers.
+    if let Some(groups_dir) = &cfg.groups_dir {
+        delivery.set_groups_dir(groups_dir.clone());
+    }
 
     let sweep_root: Arc<dyn copperclaw_host_sweep::SessionRoot> =
         Arc::new(FsSessionRoot::new(cfg.sessions_root()));
