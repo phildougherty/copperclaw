@@ -367,6 +367,10 @@ async fn run_one_turn(
         // (silent within this test's runtime).
         hud_mode: copperclaw_runner::config::HudMode::default(),
         todo_path: paths.root.join("agent_todos.json"),
+        // M18 R3 verification gate default; no test in this file
+        // exercises it.
+        verify_gate: true,
+        check_command_override: None,
     };
     run_loop(deps).await.context("runner one-turn")?;
     Ok(())

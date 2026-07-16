@@ -101,6 +101,7 @@ pub async fn handle(
     } else if let Some(card) = build_diff_card(&result.path, &result.before, &result.after) {
         ctx.emit_diff(card).await;
     }
+    crate::tools::verify_gate::mark_dirty_for_write(ctx, &result.path).await;
 
     Ok(success_json(&json!({
         "path": result.path,
@@ -956,5 +957,61 @@ mod tests {
         let body = serde_json::to_string(&s.input_schema).unwrap();
         assert!(body.contains("path"));
         assert!(body.contains("patch"));
+    }
+
+    /// M18 R3 verification gate: RAII guard pointing `verify_gate`'s
+    /// data root at a fresh tempdir, sharing its cross-file test lock.
+    struct DataRootGuard {
+        dir: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl DataRootGuard {
+        fn new() -> Self {
+            let lock = crate::tools::verify_gate::data_root_test_lock()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let dir = tempfile::tempdir().expect("tempdir");
+            crate::tools::verify_gate::data_root_test_override_set(dir.path().to_path_buf());
+            Self { dir, _lock: lock }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            self.dir.path()
+        }
+    }
+
+    impl Drop for DataRootGuard {
+        fn drop(&mut self) {
+            crate::tools::verify_gate::data_root_test_override_clear();
+        }
+    }
+
+    #[test]
+    fn successful_patch_marks_project_dirty() {
+        let g = DataRootGuard::new();
+        let proj = g.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let path = proj.join("a.txt");
+        std::fs::write(&path, "line1\nline2\nline3\n").unwrap();
+
+        let patch = "\
+@@ -1,3 +1,3 @@
+ line1
+-line2
++LINE2
+ line3
+";
+        call(&json!({
+            "path": path.to_string_lossy(),
+            "patch": patch,
+        }))
+        .unwrap();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        assert!(rt.block_on(crate::tools::verify_gate::is_dirty(&proj)));
     }
 }

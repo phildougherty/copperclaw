@@ -216,6 +216,16 @@ pub struct RunnerToolCtx {
     /// via [`Self::set_turn_provenance`] (today always `false` — the live
     /// approval wiring is a host follow-up; see the module / policy docs).
     external_approved: Arc<std::sync::atomic::AtomicBool>,
+    /// M18 R3 verification gate: whether the `todo_update(completed)`
+    /// gate is enforced for this session. Set by
+    /// [`Self::with_verify_gate`] from the resolved
+    /// `container_configs.verify_gate`. Default `true` (gate on) via
+    /// [`Self::new`], matching the DB-layer default.
+    verify_gate_enabled: bool,
+    /// M18 R3 verification gate: per-group override for the project
+    /// verify command. Set by [`Self::with_verify_gate`] from
+    /// `container_configs.check_command`.
+    check_command_override: Option<String>,
 }
 
 /// Stable pseudo tool-name the per-inbound Task HUD message rides
@@ -243,6 +253,8 @@ impl RunnerToolCtx {
             context_tainted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             autonomous_turn: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             external_approved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            verify_gate_enabled: true,
+            check_command_override: None,
         }
     }
 
@@ -575,6 +587,21 @@ impl RunnerToolCtx {
         self
     }
 
+    /// Wire the M18 R3 verification-gate config resolved from
+    /// `container_configs` (`verify_gate` / `check_command`). Without
+    /// this call the context keeps [`Self::new`]'s defaults (gate on,
+    /// no command override).
+    #[must_use]
+    pub fn with_verify_gate(
+        mut self,
+        enabled: bool,
+        check_command_override: Option<String>,
+    ) -> Self {
+        self.verify_gate_enabled = enabled;
+        self.check_command_override = check_command_override;
+        self
+    }
+
     /// True when this turn's context has been tainted by
     /// untrusted-provenance content (a `web_fetch` body or an untrusted
     /// memory hit). Read by the runner's dispatch gate to build the
@@ -748,6 +775,14 @@ impl ToolContext for RunnerToolCtx {
             .lock()
             .ok()
             .and_then(|guard| guard.clone())
+    }
+
+    fn verify_gate_enabled(&self) -> bool {
+        self.verify_gate_enabled
+    }
+
+    fn check_command_override(&self) -> Option<String> {
+        self.check_command_override.clone()
     }
 
     async fn memory_search(

@@ -145,6 +145,22 @@ pub struct RunnerConfigFile {
     /// logged for an unknown value).
     #[serde(default)]
     pub hud_mode: Option<String>,
+    /// M18 R3 verification gate: per-group override for the shell
+    /// command that verifies a code project (`npm test`, `cargo
+    /// check`, …), winning over whatever the agent itself recorded at
+    /// `<project>/.copperclaw/verify`. Plumbed in from
+    /// `container_configs.check_command` by the host's container
+    /// manager. `None` means no override — use the agent-recorded
+    /// command.
+    #[serde(default)]
+    pub check_command: Option<String>,
+    /// M18 R3 verification gate: whether the `todo_update(completed)`
+    /// gate is enforced for this group. Plumbed in from
+    /// `container_configs.verify_gate` by the host's container
+    /// manager. Unset means gate ON (matches the DB-layer default of
+    /// `NULL` = gate on); only an explicit `false` turns it off.
+    #[serde(default)]
+    pub verify_gate: Option<bool>,
 }
 
 /// How the per-inbound Task HUD behaves. See
@@ -257,6 +273,13 @@ pub struct RunnerConfig {
     /// Resolved Task HUD mode. Defaults to [`HudMode::Full`] when the
     /// JSON file omits `hud_mode` (or carries an unknown value).
     pub hud_mode: HudMode,
+    /// M18 R3 verification gate: per-group override for the project
+    /// verify command. See [`RunnerConfigFile::check_command`].
+    pub check_command_override: Option<String>,
+    /// M18 R3 verification gate: whether the `todo_update(completed)`
+    /// gate is enforced. Defaults to `true` when the JSON file omits
+    /// `verify_gate`. See [`RunnerConfigFile::verify_gate`].
+    pub verify_gate: bool,
 }
 
 impl RunnerConfig {
@@ -379,6 +402,8 @@ impl RunnerConfig {
             tool_profile,
             sender_role,
             hud_mode,
+            check_command_override: file.check_command,
+            verify_gate: file.verify_gate.unwrap_or(true),
         })
     }
 
@@ -485,6 +510,8 @@ mod tests {
             tool_profile: None,
             sender_role: None,
             hud_mode: None,
+            check_command: None,
+            verify_gate: None,
         }
     }
 
@@ -498,6 +525,32 @@ mod tests {
         assert_eq!(cfg.system, "you are an agent");
         assert_eq!(cfg.assistant_name.as_deref(), Some("Claude"));
         assert!((cfg.temperature.unwrap() - 0.7).abs() < 1e-6);
+    }
+
+    #[test]
+    fn verify_gate_defaults_to_on_when_unset() {
+        let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "k")]);
+        let cfg = RunnerConfig::from_file_struct(good_file(), &env).unwrap();
+        assert!(cfg.verify_gate);
+        assert!(cfg.check_command_override.is_none());
+    }
+
+    #[test]
+    fn verify_gate_can_be_turned_off() {
+        let mut file = good_file();
+        file.verify_gate = Some(false);
+        let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "k")]);
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert!(!cfg.verify_gate);
+    }
+
+    #[test]
+    fn check_command_override_passes_through_from_file() {
+        let mut file = good_file();
+        file.check_command = Some("npm test".into());
+        let env = MapEnv::from_pairs([("ANTHROPIC_API_KEY", "k")]);
+        let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
+        assert_eq!(cfg.check_command_override.as_deref(), Some("npm test"));
     }
 
     #[test]

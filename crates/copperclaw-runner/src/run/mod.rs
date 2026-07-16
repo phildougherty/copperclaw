@@ -447,6 +447,22 @@ pub struct RunnerDeps {
     /// same file the `todo_*` MCP tools maintain); tests point it at a
     /// tempdir.
     pub todo_path: PathBuf,
+    /// M18 R3 verification gate: whether the `todo_update(completed)`
+    /// gate is enforced for this group. Mirrors
+    /// `crate::config::RunnerConfig::verify_gate`. The live enforcement
+    /// path is [`copperclaw_mcp::ToolContext::verify_gate_enabled`],
+    /// consulted directly by the `copperclaw-mcp` tool handlers (they
+    /// only see `&dyn ToolContext`, not `RunnerDeps`) — this field
+    /// exists for parity with the resolved config and for test
+    /// scaffolding, same convention as [`Self::hud_mode`] /
+    /// [`Self::policy`]. Default `true` (gate on).
+    pub verify_gate: bool,
+    /// M18 R3 verification gate: per-group override for the project
+    /// verify command. Mirrors
+    /// `crate::config::RunnerConfig::check_command_override`. See
+    /// [`Self::verify_gate`] for why this is also surfaced here rather
+    /// than solely on the `ToolContext`.
+    pub check_command_override: Option<String>,
 }
 
 /// Default per-tool-call deadline. Comfortably above an `npm install`
@@ -526,6 +542,10 @@ impl RunnerDeps {
             // status-row path, so existing tests see no new rows.
             hud_mode: crate::config::HudMode::default(),
             todo_path: PathBuf::from(hud::TODO_STORE_DEFAULT_PATH),
+            // Test default: gate on, no override — same convention as
+            // hud_mode/policy above; tests opt out explicitly.
+            verify_gate: true,
+            check_command_override: None,
         }
     }
 }

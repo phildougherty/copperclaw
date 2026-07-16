@@ -109,6 +109,13 @@ enum TodoStatus {
     Pending,
     InProgress,
     Completed,
+    /// M18 R3 verification gate: the todo's project stayed dirty
+    /// through [`crate::tools::verify_gate::FIX_CYCLE_CAP`] verify-fix
+    /// attempts. Set only by the gate itself (`update::handle`), never
+    /// directly by the agent — it's the "never silently completed,
+    /// but also never permanently stuck refusing" escape valve. See
+    /// [`TodoItem::blocked_reason`] for the attached failure text.
+    Blocked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +125,11 @@ struct TodoItem {
     status: TodoStatus,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+    /// Tail of the verify failure that caused an auto-transition to
+    /// [`TodoStatus::Blocked`]. `None` for every other status. Older
+    /// on-disk stores predate this field, hence the serde default.
+    #[serde(default)]
+    blocked_reason: Option<String>,
 }
 
 async fn read_all() -> Result<Vec<TodoItem>, ToolError> {
@@ -203,7 +215,14 @@ fn next_id(items: &[TodoItem]) -> u32 {
 fn status_to_wire(s: TodoStatus) -> TodoItemStatus {
     match s {
         TodoStatus::Pending => TodoItemStatus::Pending,
-        TodoStatus::InProgress => TodoItemStatus::InProgress,
+        // The portable wire schema (shared by every channel adapter's
+        // rendered checklist) has no `blocked` state — rendering it as
+        // `in_progress` keeps the chip accurate ("not done") without a
+        // fan-out schema change across every adapter crate. The MCP
+        // tool-facing JSON (what the agent itself sees via `todo_list`
+        // / `todo_update`'s response, a direct `TodoItem` serialize)
+        // carries the real `blocked` status plus `blocked_reason`.
+        TodoStatus::InProgress | TodoStatus::Blocked => TodoItemStatus::InProgress,
         TodoStatus::Completed => TodoItemStatus::Completed,
     }
 }
@@ -332,6 +351,7 @@ pub mod add {
             status: TodoStatus::Pending,
             created_at: now,
             updated_at: now,
+            blocked_reason: None,
         };
         let item_for_response = item.clone();
         items.push(item);
@@ -592,6 +612,8 @@ pub mod update {
         // Anti-fabrication guard: when marking a todo `completed`,
         // require concrete evidence. Runs AFTER the id lookup so
         // unknown-id errors still surface first (more useful diag).
+        let mut effective_status = input.status;
+        let mut blocked_reason: Option<String> = None;
         if matches!(input.status, Some(TodoStatus::Completed)) {
             let Some(ev) = input.evidence.as_deref() else {
                 return Err(ToolError::Validation(
@@ -611,6 +633,49 @@ pub mod update {
                         .into(),
                 ));
             }
+            // M18 R3 verification gate: a project with unverified edits
+            // blocks completion session-wide (todos aren't linked to a
+            // specific project directory in the store, so any dirty
+            // project blocks any `completed` transition — see the
+            // module-level design note for the single-project-per-
+            // session rationale). `verify_gate_enabled() == false`
+            // skips this entirely, byte-identical to pre-R3 behaviour.
+            if ctx.verify_gate_enabled() {
+                let dirty = crate::tools::verify_gate::scan_dirty_projects().await;
+                if let Some(project_root) = dirty.first() {
+                    let cycles = crate::tools::verify_gate::fix_cycles(project_root).await;
+                    if cycles < crate::tools::verify_gate::FIX_CYCLE_CAP {
+                        let cmd_hint = match crate::tools::verify_gate::recorded_verify_command(
+                            project_root,
+                            ctx.check_command_override().as_deref(),
+                        )
+                        .await
+                        {
+                            Some(cmd) => format!("recorded verify command: `{cmd}`"),
+                            None => "no verify command recorded — write one to \
+                                     `.copperclaw/verify` (one shell line, e.g. `npm test`)"
+                                .to_string(),
+                        };
+                        let remaining =
+                            crate::tools::verify_gate::FIX_CYCLE_CAP.saturating_sub(cycles);
+                        return Err(ToolError::Validation(format!(
+                            "cannot mark todo {} completed: `{}` has unverified changes since \
+                             its last edit ({cmd_hint}). Run the verify command via `shell` and \
+                             confirm it passes before retrying ({remaining} fix cycle(s) \
+                             remaining before this todo auto-blocks instead).",
+                            input.id,
+                            project_root.display()
+                        )));
+                    }
+                    // Fix-cycle cap already burned and still dirty:
+                    // auto-transition to `blocked` with the failure
+                    // attached and return success — never silently
+                    // completed, but also never permanently stuck
+                    // refusing forever.
+                    effective_status = Some(TodoStatus::Blocked);
+                    blocked_reason = crate::tools::verify_gate::last_failure(project_root).await;
+                }
+            }
         }
         if let Some(text) = input.text {
             let trimmed = text.trim();
@@ -621,8 +686,13 @@ pub mod update {
             }
             items[pos].text = trimmed.to_string();
         }
-        if let Some(status) = input.status {
+        if let Some(status) = effective_status {
             items[pos].status = status;
+            items[pos].blocked_reason = if matches!(status, TodoStatus::Blocked) {
+                blocked_reason
+            } else {
+                None
+            };
         }
         items[pos].updated_at = Utc::now();
         let updated = items[pos].clone();
@@ -735,6 +805,15 @@ mod tests {
     struct TodoGuard {
         _dir: tempfile::TempDir,
         _lock: std::sync::MutexGuard<'static, ()>,
+        // `update::handle`'s completed-status path always calls
+        // `verify_gate::scan_dirty_projects()`, which reads the
+        // (possibly test-overridden) data root — a global static
+        // shared with `verify_gate`'s and `computer_use`'s own tests.
+        // Holding this lock for every `TodoGuard` (not just gate-
+        // focused tests) serializes the whole crate's test suite
+        // against that shared state so a concurrently-running gate
+        // test's override can never leak into an unrelated todo test.
+        _data_root_lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl TodoGuard {
@@ -742,11 +821,15 @@ mod tests {
             let lock = todo_env_lock()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let data_root_lock = crate::tools::verify_gate::data_root_test_lock()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let dir = tempfile::tempdir().expect("tempdir");
             todo_test_override_set(dir.path().join("agent_todos.json"));
             Self {
                 _dir: dir,
                 _lock: lock,
+                _data_root_lock: data_root_lock,
             }
         }
     }
@@ -754,6 +837,32 @@ mod tests {
     impl Drop for TodoGuard {
         fn drop(&mut self) {
             todo_test_override_clear();
+        }
+    }
+
+    /// Extends [`TodoGuard`] with a test-overridden data root so gate
+    /// tests can create dirty/clean project directories deterministically.
+    struct GateGuard {
+        _todo: TodoGuard,
+        dir: tempfile::TempDir,
+    }
+
+    impl GateGuard {
+        fn new() -> Self {
+            let todo = TodoGuard::new();
+            let dir = tempfile::tempdir().expect("tempdir");
+            crate::tools::verify_gate::data_root_test_override_set(dir.path().to_path_buf());
+            Self { _todo: todo, dir }
+        }
+
+        fn data_root(&self) -> &std::path::Path {
+            self.dir.path()
+        }
+    }
+
+    impl Drop for GateGuard {
+        fn drop(&mut self) {
+            crate::tools::verify_gate::data_root_test_override_clear();
         }
     }
 
@@ -1205,6 +1314,7 @@ mod tests {
             status: TodoStatus::Pending,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            blocked_reason: None,
         }];
         let list = super::build_wire_list(&items).expect("non-empty input");
         // Should fit within the schema cap.
@@ -1310,5 +1420,216 @@ mod tests {
         let arr = listed.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["text"], "new");
+    }
+
+    // ── M18 R3 verification gate ─────────────────────────────────
+
+    fn substantive_evidence() -> &'static str {
+        "wrote app/server.js and ran cargo test, all 4 tests passed"
+    }
+
+    #[tokio::test]
+    async fn completion_refused_while_project_dirty_with_cycles_remaining() {
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        std::fs::create_dir_all(&proj).unwrap();
+        crate::tools::verify_gate::mark_dirty(&proj).await;
+
+        let ctx = MockToolContext::new();
+        let added = body_json(
+            &add::handle(obj(json!({"text": "build app"})), &ctx)
+                .await
+                .unwrap(),
+        );
+        let id = added["id"].as_u64().unwrap();
+        let err = update::handle(
+            obj(json!({
+                "id": id,
+                "status": "completed",
+                "evidence": substantive_evidence(),
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        match err {
+            ToolError::Validation(msg) => {
+                assert!(msg.contains("unverified changes"), "got: {msg}");
+                assert!(msg.contains("app"), "got: {msg}");
+                assert!(msg.contains("no verify command recorded"), "got: {msg}");
+                assert!(msg.contains("2 fix cycle"), "got: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        // The todo itself must NOT have been mutated to completed.
+        let listed = body_json(&list::handle(obj(json!({})), &ctx).await.unwrap());
+        assert_eq!(listed[0]["status"], "pending");
+    }
+
+    #[tokio::test]
+    async fn completion_refused_names_recorded_verify_command() {
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(proj.join(".copperclaw").join("verify"), "npm test").unwrap();
+        crate::tools::verify_gate::mark_dirty(&proj).await;
+
+        let ctx = MockToolContext::new();
+        let added = body_json(&add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap());
+        let id = added["id"].as_u64().unwrap();
+        let err = update::handle(
+            obj(json!({
+                "id": id,
+                "status": "completed",
+                "evidence": substantive_evidence(),
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        match err {
+            ToolError::Validation(msg) => assert!(msg.contains("npm test"), "got: {msg}"),
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_succeeds_when_no_project_dirty() {
+        let g = GateGuard::new();
+        std::fs::create_dir_all(g.data_root().join("clean-app")).unwrap();
+
+        let ctx = MockToolContext::new();
+        let added = body_json(&add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap());
+        let id = added["id"].as_u64().unwrap();
+        let updated = body_json(
+            &update::handle(
+                obj(json!({
+                    "id": id,
+                    "status": "completed",
+                    "evidence": substantive_evidence(),
+                })),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(updated["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn completion_auto_blocks_after_fix_cycle_cap_exhausted() {
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        std::fs::create_dir_all(&proj).unwrap();
+        crate::tools::verify_gate::mark_dirty(&proj).await;
+        // Burn the fix-cycle budget.
+        for _ in 0..crate::tools::verify_gate::FIX_CYCLE_CAP {
+            crate::tools::verify_gate::record_verify_failure(&proj, "build failed: syntax error")
+                .await;
+        }
+
+        let ctx = MockToolContext::new();
+        let added = body_json(
+            &add::handle(obj(json!({"text": "build app"})), &ctx)
+                .await
+                .unwrap(),
+        );
+        let id = added["id"].as_u64().unwrap();
+        // No refusal this time — success, but auto-diverted to blocked.
+        let updated = body_json(
+            &update::handle(
+                obj(json!({
+                    "id": id,
+                    "status": "completed",
+                    "evidence": substantive_evidence(),
+                })),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(updated["status"], "blocked");
+        assert_eq!(updated["blocked_reason"], "build failed: syntax error");
+    }
+
+    #[tokio::test]
+    async fn verify_gate_off_restores_pre_r3_behaviour() {
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        std::fs::create_dir_all(&proj).unwrap();
+        crate::tools::verify_gate::mark_dirty(&proj).await;
+
+        let ctx = MockToolContext::new();
+        ctx.set_verify_gate_enabled(false);
+        let added = body_json(
+            &add::handle(obj(json!({"text": "build app"})), &ctx)
+                .await
+                .unwrap(),
+        );
+        let id = added["id"].as_u64().unwrap();
+        // Dirty project would normally refuse — gate off skips it
+        // entirely, byte-identical to pre-R3 behaviour.
+        let updated = body_json(
+            &update::handle(
+                obj(json!({
+                    "id": id,
+                    "status": "completed",
+                    "evidence": substantive_evidence(),
+                })),
+                &ctx,
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(updated["status"], "completed");
+    }
+
+    #[tokio::test]
+    async fn check_command_override_wins_in_refusal_message() {
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(proj.join(".copperclaw").join("verify"), "npm test").unwrap();
+        crate::tools::verify_gate::mark_dirty(&proj).await;
+
+        let ctx = MockToolContext::new();
+        ctx.set_check_command_override(Some("cargo check".into()));
+        let added = body_json(&add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap());
+        let id = added["id"].as_u64().unwrap();
+        let err = update::handle(
+            obj(json!({
+                "id": id,
+                "status": "completed",
+                "evidence": substantive_evidence(),
+            })),
+            &ctx,
+        )
+        .await
+        .unwrap_err();
+        match err {
+            ToolError::Validation(msg) => {
+                assert!(msg.contains("cargo check"), "got: {msg}");
+                assert!(!msg.contains("npm test"), "got: {msg}");
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn non_completed_status_updates_are_unaffected_by_dirty_projects() {
+        // The gate only engages on the completed transition — moving
+        // to in_progress (or any other status) is unaffected even
+        // with a dirty project sitting there.
+        let g = GateGuard::new();
+        let proj = g.data_root().join("app");
+        std::fs::create_dir_all(&proj).unwrap();
+        crate::tools::verify_gate::mark_dirty(&proj).await;
+
+        let ctx = MockToolContext::new();
+        let added = body_json(&add::handle(obj(json!({"text": "x"})), &ctx).await.unwrap());
+        let id = added["id"].as_u64().unwrap();
+        update::handle(obj(json!({"id": id, "status": "in_progress"})), &ctx)
+            .await
+            .unwrap();
     }
 }

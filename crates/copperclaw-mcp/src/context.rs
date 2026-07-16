@@ -700,6 +700,28 @@ pub trait ToolContext: Send + Sync {
     async fn emit_diff(&self, diff: copperclaw_channels_core::DiffCard) {
         let _ = diff;
     }
+
+    /// M18 R3 verification gate: whether the `todo_update(completed)`
+    /// gate is enforced for this session. `false` restores byte-
+    /// identical pre-R3 behaviour (evidence-only anti-fabrication
+    /// check, no dirty-tracking). Default `true` (gate on) so contexts
+    /// that don't opt out (mocks, subagent adapters) get the stricter,
+    /// safer default; the runner's `RunnerToolCtx` overrides this from
+    /// `container_configs.verify_gate` (via `RunnerDeps`/`RunnerConfig`).
+    fn verify_gate_enabled(&self) -> bool {
+        true
+    }
+
+    /// M18 R3 verification gate: per-group override for the shell
+    /// command that verifies a project, winning over whatever the
+    /// agent itself recorded at `<project>/.copperclaw/verify`.
+    /// `None` means "no override — use the agent-recorded command."
+    /// Default `None` so contexts that don't configure one (mocks,
+    /// subagent adapters) compile unchanged; the runner's
+    /// `RunnerToolCtx` overrides this from `container_configs.check_command`.
+    fn check_command_override(&self) -> Option<String> {
+        None
+    }
 }
 
 /// In-memory recording implementation used by tests.
@@ -743,6 +765,15 @@ struct MockInner {
     /// with an explicit scope.
     #[allow(clippy::option_option)]
     active_skill_allowed: Option<Option<Vec<String>>>,
+    /// Test override for `verify_gate_enabled`. `None` falls through
+    /// to the trait default (`true`).
+    verify_gate_enabled: Option<bool>,
+    /// Test override for `check_command_override`. Same double-`Option`
+    /// shape as `active_skill_allowed`: `None` = not overridden (falls
+    /// through to the trait default of `None`), `Some(inner)` = the
+    /// override value tests want returned.
+    #[allow(clippy::option_option)]
+    check_command_override: Option<Option<String>>,
 }
 
 impl MockToolContext {
@@ -846,6 +877,23 @@ impl MockToolContext {
             .active_skill_allowed
             .clone()
     }
+
+    /// Override the value `verify_gate_enabled()` returns. Tests use
+    /// this to exercise the `verify_gate=off` byte-stable path.
+    pub fn set_verify_gate_enabled(&self, enabled: bool) {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .verify_gate_enabled = Some(enabled);
+    }
+
+    /// Override the value `check_command_override()` returns.
+    pub fn set_check_command_override(&self, cmd: Option<String>) {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .check_command_override = Some(cmd);
+    }
 }
 
 #[async_trait]
@@ -899,6 +947,23 @@ impl ToolContext for MockToolContext {
             .lock()
             .expect("MockToolContext mutex poisoned")
             .active_skill_allowed
+            .clone()
+            .flatten()
+    }
+
+    fn verify_gate_enabled(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .verify_gate_enabled
+            .unwrap_or(true)
+    }
+
+    fn check_command_override(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .expect("MockToolContext mutex poisoned")
+            .check_command_override
             .clone()
             .flatten()
     }
