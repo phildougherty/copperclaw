@@ -373,7 +373,16 @@ impl ApprovalsModule {
 /// Handler that implements the `approval_card` delivery action. The agent
 /// sends a `System` message with `content == {"approval_id": "...", "title":
 /// "...", "to": {channel_type, platform_id, thread_id?}}` and this handler
-/// reshapes it into a `Chat`-kind card aimed at the approver.
+/// reshapes it into a canonical [`Card`](copperclaw_channels_core::Card)
+/// aimed at the approver.
+///
+/// M18 G1: the card carries `approve:<id>` / `deny:<id>` button callbacks.
+/// A tap comes back as a `Chat` event with `content.callback.data` set to that
+/// value, which the router's approval interceptor recognises and resolves. The
+/// message is emitted as [`MessageKind::Card`] so the delivery loop renders it
+/// through each adapter's native card hook (Slack Block Kit `actions`,
+/// Telegram inline keyboard); adapters without card support degrade to the
+/// card's text fallback, which still lists the choices as `[Label] -> value`.
 pub struct ApprovalCardHandler;
 
 impl DeliveryActionHandler for ApprovalCardHandler {
@@ -388,6 +397,11 @@ impl DeliveryActionHandler for ApprovalCardHandler {
             .get("title")
             .and_then(|v| v.as_str())
             .unwrap_or("Approval required");
+        let body = input
+            .payload
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Tap Approve to grant this request, or Deny to reject it.");
         let to = input.payload.get("to");
         let channel_type = to
             .and_then(|t| t.get("channel_type"))
@@ -405,13 +419,19 @@ impl DeliveryActionHandler for ApprovalCardHandler {
             (Some(ct), Some(pid)) => Some(DispatchTarget::channel(ct, pid, thread_id)),
             _ => None,
         };
+        // Emit a canonical Card shape (deserialised by the delivery loop into
+        // `copperclaw_channels_core::Card`). Buttons encode the decision +
+        // target approval id as the callback `value`.
         let card_message = OutboundMessage {
-            kind: MessageKind::Chat,
+            kind: MessageKind::Card,
             content: serde_json::json!({
                 "card": {
-                    "type": "approval",
-                    "approval_id": approval_id,
                     "title": title,
+                    "body": body,
+                    "buttons": [
+                        { "label": "Approve", "value": format!("approve:{approval_id}"), "style": "primary" },
+                        { "label": "Deny", "value": format!("deny:{approval_id}"), "style": "danger" },
+                    ],
                 },
             }),
             files: vec![],
@@ -778,9 +798,15 @@ mod tests {
         assert_eq!(dispatch.platform_id.as_deref(), Some("U-admin"));
         assert_eq!(dispatch.thread_id.as_deref(), Some("T-9"));
         let msg = out.message.unwrap();
+        // Emitted as a canonical Card so the delivery loop renders it natively.
+        assert_eq!(msg.kind, MessageKind::Card);
         let card = msg.content.get("card").unwrap();
-        assert_eq!(card.get("approval_id").unwrap(), "abc-123");
         assert_eq!(card.get("title").unwrap(), "Please approve");
+        // Buttons carry `approve:<id>` / `deny:<id>` callback values.
+        let buttons = card.get("buttons").unwrap().as_array().unwrap();
+        assert_eq!(buttons.len(), 2);
+        assert_eq!(buttons[0].get("value").unwrap(), "approve:abc-123");
+        assert_eq!(buttons[1].get("value").unwrap(), "deny:abc-123");
     }
 
     #[test]

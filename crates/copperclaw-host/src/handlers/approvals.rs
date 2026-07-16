@@ -88,9 +88,27 @@ pub fn approve_sender(args: &Value, central: &CentralDb) -> Result<Value, ErrorP
 /// Generic approve-by-id dispatcher. Looks up the row, dispatches per
 /// `action` family, applies the side effect, and marks the row
 /// `status = 'approved'`. Idempotent for already-approved rows
-/// (returns the resolved row unchanged).
+/// (returns the resolved row unchanged). The CLI socket handler records
+/// `decided_by = "host"`; the in-chat approvals interceptor (M18 G1) calls
+/// [`resolve_approve`] directly with the tapping approver's identity so the
+/// audit trail names the human who approved from chat.
 pub fn approve(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     let id = ApprovalId(parse_uuid(&req_str(args, "id")?)?);
+    resolve_approve(central, id, "host")
+}
+
+/// Resolve an approval by id, recording `decided_by` on the decision log.
+/// Shared by the CLI `approve` handler (`decided_by = "host"`) and the in-chat
+/// approvals interceptor (`decided_by = <approver display name>`). Both routes
+/// therefore write to the SAME `pending_approvals` row + `approval_decisions`
+/// log, so the in-memory and DB views can never diverge, and a CLI/in-chat
+/// race resolves once (first wins; the second sees `Approved` and returns
+/// `applied = false`).
+pub fn resolve_approve(
+    central: &CentralDb,
+    id: ApprovalId,
+    decided_by: &str,
+) -> Result<Value, ErrorPayload> {
     // Lapse any overdue pending rows first; this both keeps the audit log
     // honest and turns an expired-but-still-`pending` row into a deterministic
     // `expired` conflict below rather than a silently honoured late approval.
@@ -134,6 +152,24 @@ pub fn approve(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload>
         "channel" => apply_channel(central, &row)?,
         "install_packages" => apply_install_packages(central, &row)?,
         "add_mcp_server" => apply_add_mcp_server(central, &row)?,
+        // Explicit refusal arms (M18 G1). These approval families exist in the
+        // kind vocabulary but have no side-effect applier yet:
+        //   - `one_cli`: Agent Vault credential grants are never applied via
+        //     this generic dispatcher.
+        //   - `credentialed_external_action`: the real applier lands with V5
+        //     (clears the taint for one tool call); until then, approving one
+        //     here would silently no-op, which is worse than a clear refusal.
+        // We refuse rather than fall through to the `other` arm so the message
+        // is specific and the row is left `pending` (never a silent success).
+        "one_cli" | "credentialed_external_action" => {
+            return Err(ErrorPayload::new(
+                "bad_request",
+                format!(
+                    "approval action `{action}` cannot be resolved through the generic \
+                     dispatcher yet; no side-effect applier is wired for it"
+                ),
+            ));
+        }
         other => {
             return Err(ErrorPayload::new(
                 "bad_request",
@@ -143,8 +179,15 @@ pub fn approve(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload>
     };
 
     pending_approvals::update_status(central, id, ApprovalStatus::Approved).map_err(db_err)?;
-    pending_approvals::record_decision(central, id, action, DecisionOutcome::Approve, "host", None)
-        .map_err(db_err)?;
+    pending_approvals::record_decision(
+        central,
+        id,
+        action,
+        DecisionOutcome::Approve,
+        decided_by,
+        None,
+    )
+    .map_err(db_err)?;
     let after = pending_approvals::get(central, id).map_err(db_err)?;
     Ok(json!({
         "approval": approval_to_json(&after),
@@ -155,8 +198,21 @@ pub fn approve(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload>
 
 /// Mark a pending row `denied` without applying any side effects.
 /// Idempotent for already-denied rows. Conflicts with `approved`.
+/// CLI route records `decided_by = "host"`; see [`resolve_deny`] for the
+/// in-chat variant.
 pub fn deny(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
     let id = ApprovalId(parse_uuid(&req_str(args, "id")?)?);
+    resolve_deny(central, id, "host")
+}
+
+/// Deny an approval by id, recording `decided_by` on the decision log. Shared
+/// by the CLI `deny` handler and the in-chat approvals interceptor (M18 G1);
+/// see [`resolve_approve`] for the approve twin and the race-safety contract.
+pub fn resolve_deny(
+    central: &CentralDb,
+    id: ApprovalId,
+    decided_by: &str,
+) -> Result<Value, ErrorPayload> {
     pending_approvals::sweep_expired(central, chrono::Utc::now()).map_err(db_err)?;
     let row = pending_approvals::get(central, id).map_err(db_err)?;
     match row.status {
@@ -193,7 +249,7 @@ pub fn deny(args: &Value, central: &CentralDb) -> Result<Value, ErrorPayload> {
         id,
         row.action.as_str(),
         DecisionOutcome::Deny,
-        "host",
+        decided_by,
         None,
     )
     .map_err(db_err)?;

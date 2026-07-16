@@ -6,6 +6,51 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M18 G1 — in-chat approvals, 2026-07-16)
+
+- Approval cards can now be resolved by tapping **Approve** / **Deny** from
+  chat — a phone-only operator no longer needs `cclaw approvals approve`.
+  - `crates/copperclaw-modules/src/approvals.rs`: `ApprovalCardHandler` emits a
+    canonical `Card` (`MessageKind::Card`) with `approve:<id>` / `deny:<id>`
+    button callbacks; the delivery loop renders it via each adapter's native
+    card hook (Slack Block Kit `actions`, already present in
+    `slack/src/api.rs::build_card_blocks`; Telegram inline keyboard), degrading
+    to the card's text fallback elsewhere.
+  - `crates/copperclaw-modules/src/context.rs`: new `ApprovalInterceptor` hook
+    type (`ApprovalInterceptCtx` / `ApprovalInterceptDecision`) plus an
+    `edit_message` method on `DeliveryDispatcher` (default no-op; the host's
+    `HostDispatcher` drives `ChannelAdapter::edit_message`).
+  - `crates/copperclaw-host-router/src/{hooks,route}.rs`: the router holds an
+    approval-interceptor slot and runs it in `route_one` between the
+    sender-scope gate and the mention gate. An `approve:<id>` / `deny:<id>`
+    callback (telegram `content.callback.data` or slack `.value`) is consumed
+    as `Pending(ApprovalHandled)` — no inbound row, no runner wake.
+  - `crates/copperclaw-host/src/approval_intercept.rs` (new): builds the
+    interceptor closure. Approver identity reuses the **Owner/Admin roles**
+    infra (`user_roles`) — global or scoped to the approval's agent group —
+    resolved from the central `users` table (the router wires no sender
+    resolver). Resolution goes through the SAME DB path as the CLI
+    (`handlers::approvals::resolve_approve` / `resolve_deny`, refactored to
+    take a `decided_by` label), so the CLI and in-chat routes can't diverge and
+    a race resolves once (first wins; the loser no-ops). Non-approver taps get
+    a short "not authorized" reply and the card stays live; every tap writes an
+    `audit_log` row (`ok` / `unauthorized`).
+  - `crates/copperclaw-host/src/handlers/approvals.rs`: the generic approve
+    dispatcher gains explicit **refusal arms** for `one_cli` /
+    `credentialed_external_action` (no silent no-op; V5 wires the real
+    `credentialed_external_action` applier).
+  - `crates/copperclaw-db/src/tables/pending_approvals.rs`: new
+    `set_platform_message_id`; the delivery loop
+    (`crates/copperclaw-host-delivery/src/service.rs`) persists the delivered
+    approval card's platform message id onto the row so the interceptor can
+    later edit that exact message to "Approved by <name>".
+  - Fixtures: `fixtures/telegram/approval-callback/` and
+    `fixtures/slack/approval-block-action/` (registered in
+    `crates/copperclaw-host/tests/replay.rs`) exercise approver-tap → resolve +
+    card edit + audit, stranger-tap → refused + audited + card live, per
+    channel; a runner/mcp-free unit suite in `approval_intercept.rs` covers the
+    role checks and the CLI/in-chat race (first wins, second no-ops).
+
 ### Added (M18 E2 — warm "prototyping" image variant, 2026-07-16)
 
 - A second, per-group container image profile, `image_profile = minimal |

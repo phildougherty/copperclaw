@@ -1,0 +1,25 @@
+{
+  "channel_type": "slack",
+  "platform_id": "C100",
+  "thread_id": null,
+  "message": {
+    "id": "slack-cb-c1",
+    "kind": "chat",
+    "content": {
+      "text": "approve:00000000-0000-0000-0000-0000000000c1",
+      "callback": {
+        "value": "approve:00000000-0000-0000-0000-0000000000c1",
+        "action_id": "approve_btn"
+      }
+    },
+    "timestamp": "2026-01-01T00:00:01Z",
+    "is_mention": null,
+    "is_group": true
+  },
+  "reply_to": null,
+  "sender": {
+    "channel_type": "slack",
+    "identity": "U200",
+    "display_name": "Owner Olivia"
+  }
+}

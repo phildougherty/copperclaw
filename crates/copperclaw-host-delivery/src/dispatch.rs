@@ -107,6 +107,34 @@ impl DeliveryDispatcher for HostDispatcher {
             }
         });
     }
+
+    fn edit_message(&self, target: &DispatchTarget, platform_message_id: &str, text: &str) {
+        let Some(adapter) = self.resolve(target) else {
+            warn!(
+                channel = ?target.channel_type,
+                "dispatcher: no adapter for edit_message"
+            );
+            return;
+        };
+        let Some(platform_id) = target.platform_id.clone() else {
+            warn!("dispatcher: edit_message missing platform_id");
+            return;
+        };
+        let thread_id = target.thread_id.clone();
+        let external_id = platform_message_id.to_owned();
+        let text = text.to_owned();
+        self.runtime.spawn(async move {
+            // Editing is best-effort (used by in-chat approvals to stamp a
+            // resolved card): an `Unsupported` adapter or a transient failure
+            // is logged, never surfaced — the DB state is already authoritative.
+            if let Err(err) = adapter
+                .edit_message(&platform_id, thread_id.as_deref(), &external_id, &text)
+                .await
+            {
+                debug!(?err, "dispatcher: edit_message failed (best-effort)");
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -228,6 +256,31 @@ mod tests {
         dispatcher.dispatch(&target(), &outbound());
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         // Failure was consumed; no panic.
+    }
+
+    #[tokio::test]
+    async fn edit_message_calls_adapter() {
+        let mock: Arc<MockAdapter> = Arc::new(MockAdapter::new("mock"));
+        let resolver = make_resolver(mock.clone() as Arc<dyn ChannelAdapter>);
+        let dispatcher = HostDispatcher::new(resolver);
+        dispatcher.edit_message(&target(), "pmid-1", "Approved by Alice");
+        for _ in 0..50 {
+            if !mock.edits().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let edits = mock.edits();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].external_id, "pmid-1");
+        assert_eq!(edits[0].new_text, "Approved by Alice");
+    }
+
+    #[tokio::test]
+    async fn edit_message_without_adapter_is_silent() {
+        let dispatcher = HostDispatcher::new(empty_resolver());
+        dispatcher.edit_message(&target(), "pmid-1", "text");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 
     #[tokio::test]

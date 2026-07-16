@@ -61,7 +61,8 @@ use copperclaw_host_delivery::{
     DeliveryService, FsSessionRoot as DeliveryRoot, SessionRoot as DeliverySessionRoot,
 };
 use copperclaw_host_router::{
-    FsSessionRoot as RouterRoot, RouteOutcome, Router, SessionRoot as RouterSessionRoot,
+    FsSessionRoot as RouterRoot, PendingReason, RouteOutcome, Router,
+    SessionRoot as RouterSessionRoot,
 };
 use copperclaw_host_sweep::service::FilesystemSessionRoot as SweepRoot;
 use copperclaw_host_sweep::{SessionRoot as SweepSessionRoot, SweepService};
@@ -321,6 +322,14 @@ impl ReplayHarness {
                     anyhow::bail!("router dropped event: {reason:?}");
                 }
                 RouteOutcome::Pending { reason } => {
+                    // M18 G1: an in-chat approval tap is resolved entirely by
+                    // the router-side interceptor (DB + card edit via the
+                    // dispatcher). No session is created and no runner turn
+                    // exists, so skip straight to the next step; the fixture's
+                    // assertions read the resulting DB / adapter state.
+                    if matches!(reason, PendingReason::ApprovalHandled) {
+                        continue;
+                    }
                     if self.use_approvals_gate {
                         // Expected for the sender-not-approved fixture.
                         // The approvals module's notifier has already
@@ -501,6 +510,15 @@ impl ReplayHarness {
             .install(ctx)
             .await
             .map_err(|e| anyhow!("install ApprovalsModule: {e}"))?;
+
+        // M18 G1: wire the in-chat approval interceptor onto the router, using
+        // the same dispatcher the delivery service exposes (so a card edit /
+        // "not authorized" reply reaches the harness's MockAdapter set).
+        let interceptor = copperclaw_host::approval_intercept::build_approval_interceptor(
+            self.central.clone(),
+            self.delivery.dispatcher(),
+        );
+        self.router.hooks().set_approval_interceptor(interceptor);
         Ok(())
     }
 
