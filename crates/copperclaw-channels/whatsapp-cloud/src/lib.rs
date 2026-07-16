@@ -85,6 +85,7 @@ pub mod api;
 pub mod config;
 pub mod events;
 pub mod factory;
+pub mod render;
 pub mod signature;
 
 pub use adapter::WhatsappCloudAdapter;

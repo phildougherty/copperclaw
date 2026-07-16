@@ -6,6 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M18 C5 — adapter rich-surface floor: signal / whatsapp-cloud / mattermost, 2026-07-16)
+
+- Raised **signal**, **whatsapp-cloud**, and **mattermost** off the trait-default
+  text fallbacks to native rich renderings for the portable card surfaces
+  (`deliver_card` / `deliver_diff` / `deliver_collapsible` / `deliver_todo_list` /
+  `deliver_thinking` / `deliver_error`), each in its own platform vocabulary.
+  - `crates/copperclaw-channels/mattermost/src/render.rs` (new): full `CommonMark`
+    renderers (`###` headings, fenced ` ```diff `, `- [x]`/`~~strike~~` task lists,
+    `>` blockquotes). Wired in `adapter.rs` via `create_post` / `update_post`.
+  - `crates/copperclaw-channels/whatsapp-cloud/src/render.rs` (new): WhatsApp-flavoured
+    markdown (`*bold*`, `_italic_`, `~strike~`, ` ``` `-fenced mono). Wired via a shared
+    `send_rendered` helper (splits `<pnid>:<recipient>`, threads via `context.message_id`).
+  - `crates/copperclaw-channels/signal/src/render.rs` (new): markdown-free plaintext
+    `render_card` (Signal renders markdown literally). Signal keeps the canonical
+    plaintext trait default for diff/todo/thinking/error/collapsible — their
+    `to_text_fallback` is already optimal on a plaintext surface, so a native
+    override would duplicate it verbatim.
+- **`edit_message` (H1 Task HUD) for signal and mattermost.** signal overrides it via
+  signal-cli `sendEditMessage` (`external_id` = the message `targetSentTimestamp`);
+  mattermost via `PUT /api/v4/posts/{id}/patch`. whatsapp-cloud does **not** gain it —
+  the Cloud API cannot edit a previously sent message.
+  - `crates/copperclaw-channels/core/src/capabilities.rs`: `EDIT_CAPABLE_CHANNELS`
+    gains `signal` + `mattermost` (now 7 entries), kept in sync in the same change
+    per the module's explicit rule; the test asserts whatsapp-cloud stays
+    non-edit-capable.
+
+### Fixed (M18 C5)
+
+- `crates/copperclaw-host-delivery/src/service.rs`: two stale doc comments referenced
+  the removed `RunnerToolCtx::emit_breadcrumb` / `emit_breadcrumb_finish` (deleted in
+  H1, flagged in PR #30). Retargeted to the current emitter
+  `RunnerToolCtx::emit_task_hud` (via `insert_breadcrumb_row` /
+  `insert_update_breadcrumb_row`).
+
 ### Added (M18 V2 — one-tap preview enablement + expired-link recovery, 2026-07-16)
 
 - **One-tap enable previews (secure-by-default preserved).** Previews stay

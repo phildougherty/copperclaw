@@ -6,8 +6,11 @@
 //! `mark_read` of the last known message id).
 
 use crate::api::WhatsappCloudApi;
+use crate::render;
 use async_trait::async_trait;
-use copperclaw_channels_core::{AdapterError, ChannelAdapter, DmHandle};
+use copperclaw_channels_core::{
+    AdapterError, Card, ChannelAdapter, DiffCard, DmHandle, ErrorCard, ThinkingBlock, TodoList,
+};
 use copperclaw_types::{ChannelType, OutboundFile, OutboundMessage};
 use serde_json::Value;
 use std::sync::Mutex;
@@ -238,9 +241,103 @@ impl ChannelAdapter for WhatsappCloudAdapter {
         // no separate "open DM" handshake. Return `None`.
         Ok(None)
     }
+
+    /// Native card — `WhatsApp`-flavoured text ([`render::render_card`]).
+    async fn deliver_card(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        card: &Card,
+        _to: Option<&str>,
+    ) -> Result<Option<String>, AdapterError> {
+        self.send_rendered(platform_id, thread_id, &render::render_card(card))
+            .await
+    }
+
+    /// Native diff — fenced monospace block.
+    async fn deliver_diff(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        diff: &DiffCard,
+    ) -> Result<Option<String>, AdapterError> {
+        self.send_rendered(platform_id, thread_id, &render::render_diff(diff))
+            .await
+    }
+
+    /// Native long-output expander — italic summary + fenced preview.
+    async fn deliver_collapsible(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        text: &str,
+        summary: &str,
+        preview_lines: &[String],
+    ) -> Result<Option<String>, AdapterError> {
+        let body = render::render_collapsible(text, summary, preview_lines);
+        self.send_rendered(platform_id, thread_id, &body).await
+    }
+
+    /// Native todo list — a `WhatsApp`-formatted checklist. `WhatsApp`
+    /// Cloud cannot edit sent messages, so `existing_message_id` is
+    /// ignored and a fresh checklist is posted per mutation; there is no
+    /// pin API.
+    async fn deliver_todo_list(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        list: &TodoList,
+        _existing_message_id: Option<&str>,
+        _pin_hint: bool,
+    ) -> Result<Option<String>, AdapterError> {
+        self.send_rendered(platform_id, thread_id, &render::render_todo_list(list))
+            .await
+    }
+
+    /// Native thinking block — italic reasoning header + text.
+    async fn deliver_thinking(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        thinking: &ThinkingBlock,
+    ) -> Result<Option<String>, AdapterError> {
+        self.send_rendered(platform_id, thread_id, &render::render_thinking(thinking))
+            .await
+    }
+
+    /// Native error card — bold `[ERROR: kind]` header + fenced detail.
+    async fn deliver_error(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        err: &ErrorCard,
+    ) -> Result<Option<String>, AdapterError> {
+        self.send_rendered(platform_id, thread_id, &render::render_error(err))
+            .await
+    }
 }
 
 impl WhatsappCloudAdapter {
+    /// Split the platform id and send a pre-rendered text body, threading
+    /// via `context.message_id` when `thread_id` is present. Shared by all
+    /// the `deliver_*` rich overrides.
+    async fn send_rendered(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        text: &str,
+    ) -> Result<Option<String>, AdapterError> {
+        let (pnid, recipient) = self.split_platform_id(platform_id)?;
+        let id = if let Some(reply) = thread_id {
+            self.api
+                .send_text_reply(&pnid, recipient, text, reply)
+                .await?
+        } else {
+            self.api.send_text(&pnid, recipient, text).await?
+        };
+        Ok(Some(id))
+    }
+
     async fn handle_system_action(
         &self,
         phone_number_id: &str,
@@ -679,6 +776,71 @@ mod tests {
         assert!(s.contains("WhatsappCloudAdapter"));
         assert!(s.contains("whatsapp-cloud"));
         assert!(s.contains("DEFAULT"));
+    }
+
+    #[tokio::test]
+    async fn deliver_card_sends_whatsapp_text() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/PNID/messages"))
+            .and(body_partial_json(json!({"type":"text"})))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"messages":[{"id":"wamid.C"}]})),
+            )
+            .mount(&server)
+            .await;
+        let a = adapter_for(&server, None);
+        let card = copperclaw_channels_core::Card {
+            title: Some("Ready".into()),
+            body: Some("Preview is live".into()),
+            ..Default::default()
+        };
+        let id = a.deliver_card("PNID:+1", None, &card, None).await.unwrap();
+        assert_eq!(id.as_deref(), Some("wamid.C"));
+    }
+
+    #[tokio::test]
+    async fn deliver_diff_sends_fenced_block() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/PNID/messages"))
+            .and(wiremock::matchers::body_string_contains("```"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"messages":[{"id":"wamid.D"}]})),
+            )
+            .mount(&server)
+            .await;
+        let a = adapter_for(&server, None);
+        let diff = copperclaw_channels_core::DiffCard {
+            path: "x.rs".into(),
+            language: None,
+            hunks: vec![],
+            added: 0,
+            removed: 0,
+            truncated: false,
+        };
+        let id = a.deliver_diff("PNID:+1", None, &diff).await.unwrap();
+        assert_eq!(id.as_deref(), Some("wamid.D"));
+    }
+
+    #[tokio::test]
+    async fn deliver_error_sends_error_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/PNID/messages"))
+            .and(wiremock::matchers::body_string_contains("[ERROR: tool]"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"messages":[{"id":"wamid.E"}]})),
+            )
+            .mount(&server)
+            .await;
+        let a = adapter_for(&server, None);
+        let err = copperclaw_channels_core::ErrorCard::new(
+            copperclaw_channels_core::ErrorCardKind::Internal,
+            "boom",
+        );
+        let id = a.deliver_error("PNID:+1", None, &err).await.unwrap();
+        assert_eq!(id.as_deref(), Some("wamid.E"));
     }
 
     #[test]

@@ -1735,7 +1735,8 @@ impl DeliveryService {
 
     /// Dispatch a `MessageKind::Breadcrumb` row.
     ///
-    /// Row content shape (written by `RunnerToolCtx::emit_breadcrumb`):
+    /// Row content shape (written by `RunnerToolCtx::emit_task_hud` via
+    /// `insert_breadcrumb_row`):
     ///
     /// ```json
     /// { "breadcrumb": { ...canonical Breadcrumb... } }
@@ -2406,7 +2407,8 @@ impl DeliveryService {
     /// adapter the prior chip's platform message id so the chip can
     /// be edited in place.
     ///
-    /// Payload shape (from `RunnerToolCtx::emit_breadcrumb_finish`):
+    /// Payload shape (from `RunnerToolCtx::emit_task_hud` via
+    /// `insert_update_breadcrumb_row`):
     ///
     /// ```json
     /// { "tool_name": "shell", "breadcrumb": { ...canonical Breadcrumb... } }

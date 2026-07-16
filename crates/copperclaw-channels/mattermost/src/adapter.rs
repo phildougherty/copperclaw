@@ -22,8 +22,11 @@
 //! silently dropping the files.
 
 use crate::api::MattermostApi;
+use crate::render;
 use async_trait::async_trait;
-use copperclaw_channels_core::{AdapterError, ChannelAdapter};
+use copperclaw_channels_core::{
+    AdapterError, Card, ChannelAdapter, DiffCard, ErrorCard, ThinkingBlock, TodoList,
+};
 use copperclaw_types::{ChannelType, OutboundMessage};
 use std::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -182,6 +185,105 @@ impl ChannelAdapter for MattermostAdapter {
                 "unsupported mattermost action: {other}"
             ))),
         }
+    }
+
+    /// Edit a previously delivered post in place via
+    /// `PUT /api/v4/posts/{id}/patch`. `external_id` is the post id from
+    /// the original `deliver`. Enables the M18 Task HUD to self-edit one
+    /// status post rather than spam a new message per tool batch.
+    async fn edit_message(
+        &self,
+        _platform_id: &str,
+        _thread_id: Option<&str>,
+        external_id: &str,
+        new_text: &str,
+    ) -> Result<(), AdapterError> {
+        self.api.update_post(external_id, new_text).await
+    }
+
+    /// Native card — a Mattermost Markdown post (heading + body + field
+    /// list + button list + inline image). See [`render::render_card`].
+    async fn deliver_card(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        card: &Card,
+        _to: Option<&str>,
+    ) -> Result<Option<String>, AdapterError> {
+        let text = render::render_card(card);
+        let id = self.api.create_post(platform_id, &text, thread_id).await?;
+        Ok(Some(id))
+    }
+
+    /// Native diff — a fenced ` ```diff ` block Mattermost colourises.
+    async fn deliver_diff(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        diff: &DiffCard,
+    ) -> Result<Option<String>, AdapterError> {
+        let text = render::render_diff(diff);
+        let id = self.api.create_post(platform_id, &text, thread_id).await?;
+        Ok(Some(id))
+    }
+
+    /// Native long-output expander — bold summary + fenced preview.
+    async fn deliver_collapsible(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        text: &str,
+        summary: &str,
+        preview_lines: &[String],
+    ) -> Result<Option<String>, AdapterError> {
+        let body = render::render_collapsible(text, summary, preview_lines);
+        let id = self.api.create_post(platform_id, &body, thread_id).await?;
+        Ok(Some(id))
+    }
+
+    /// Native todo list — a Markdown task list, edited in place on
+    /// mutation when the prior post id is known. Mattermost bots have no
+    /// pin API we model, so `pin_hint` is a silent no-op.
+    async fn deliver_todo_list(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        list: &TodoList,
+        existing_message_id: Option<&str>,
+        _pin_hint: bool,
+    ) -> Result<Option<String>, AdapterError> {
+        let text = render::render_todo_list(list);
+        if let Some(existing) = existing_message_id {
+            self.api.update_post(existing, &text).await?;
+            return Ok(Some(existing.to_owned()));
+        }
+        let id = self.api.create_post(platform_id, &text, thread_id).await?;
+        Ok(Some(id))
+    }
+
+    /// Native thinking block — a Markdown blockquote. Redacted blocks
+    /// emit the placeholder only.
+    async fn deliver_thinking(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        thinking: &ThinkingBlock,
+    ) -> Result<Option<String>, AdapterError> {
+        let text = render::render_thinking(thinking);
+        let id = self.api.create_post(platform_id, &text, thread_id).await?;
+        Ok(Some(id))
+    }
+
+    /// Native error card — a bold `[ERROR: kind]` header + fenced detail.
+    async fn deliver_error(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        err: &ErrorCard,
+    ) -> Result<Option<String>, AdapterError> {
+        let text = render::render_error(err);
+        let id = self.api.create_post(platform_id, &text, thread_id).await?;
+        Ok(Some(id))
     }
 }
 
@@ -423,5 +525,102 @@ mod tests {
         let a = MattermostAdapter::new(ChannelType::new("mattermost"), api, None);
         let s = format!("{a:?}");
         assert!(s.contains("MattermostAdapter"));
+    }
+
+    #[tokio::test]
+    async fn deliver_card_posts_markdown() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/posts"))
+            .and(wiremock::matchers::body_string_contains("### Order"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "card-1"})))
+            .mount(&mock)
+            .await;
+        let a = make(&mock, None);
+        let card = copperclaw_channels_core::Card {
+            title: Some("Order".into()),
+            body: Some("Ready?".into()),
+            ..Default::default()
+        };
+        let id = a.deliver_card("c1", None, &card, None).await.unwrap();
+        assert_eq!(id.as_deref(), Some("card-1"));
+    }
+
+    #[tokio::test]
+    async fn deliver_diff_posts_fenced_diff() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/posts"))
+            .and(wiremock::matchers::body_string_contains("```diff"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "diff-1"})))
+            .mount(&mock)
+            .await;
+        let a = make(&mock, None);
+        let diff = copperclaw_channels_core::DiffCard {
+            path: "a.rs".into(),
+            language: None,
+            hunks: vec![],
+            added: 0,
+            removed: 0,
+            truncated: false,
+        };
+        let id = a.deliver_diff("c1", None, &diff).await.unwrap();
+        assert_eq!(id.as_deref(), Some("diff-1"));
+    }
+
+    #[tokio::test]
+    async fn edit_message_calls_patch_endpoint() {
+        let mock = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v4/posts/p-9/patch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "p-9"})))
+            .mount(&mock)
+            .await;
+        let a = make(&mock, None);
+        a.edit_message("c1", None, "p-9", "hud update")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn deliver_todo_list_edits_in_place_when_id_known() {
+        let mock = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/api/v4/posts/list-7/patch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"id": "list-7"})))
+            .mount(&mock)
+            .await;
+        let a = make(&mock, None);
+        let list = copperclaw_channels_core::TodoList {
+            items: vec![copperclaw_channels_core::TodoListItem {
+                id: 1,
+                text: "task".into(),
+                status: copperclaw_channels_core::TodoItemStatus::InProgress,
+            }],
+            title: Some("Plan".into()),
+        };
+        let id = a
+            .deliver_todo_list("c1", None, &list, Some("list-7"), false)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("list-7"));
+    }
+
+    #[tokio::test]
+    async fn deliver_error_posts_error_header() {
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/v4/posts"))
+            .and(wiremock::matchers::body_string_contains("[ERROR: tool]"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(json!({"id": "err-1"})))
+            .mount(&mock)
+            .await;
+        let a = make(&mock, None);
+        let err = copperclaw_channels_core::ErrorCard::new(
+            copperclaw_channels_core::ErrorCardKind::Internal,
+            "boom",
+        );
+        let id = a.deliver_error("c1", None, &err).await.unwrap();
+        assert_eq!(id.as_deref(), Some("err-1"));
     }
 }

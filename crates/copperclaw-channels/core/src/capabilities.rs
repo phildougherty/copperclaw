@@ -35,7 +35,15 @@
 /// [`crate::ChannelAdapter::edit_message`] (an in-place edit API), as
 /// verified against the in-tree adapter sources. Everything else falls
 /// back to the trait default (`AdapterError::Unsupported`).
-const EDIT_CAPABLE_CHANNELS: [&str; 5] = ["telegram", "slack", "discord", "matrix", "webex"];
+const EDIT_CAPABLE_CHANNELS: [&str; 7] = [
+    "telegram",
+    "slack",
+    "discord",
+    "matrix",
+    "webex",
+    "signal",
+    "mattermost",
+];
 
 /// True when the named channel type's adapter can edit a previously
 /// delivered message in place (see module docs for the sync rule).
@@ -76,13 +84,32 @@ mod tests {
 
     #[test]
     fn edit_capable_channels_match_in_tree_adapters() {
-        // The five adapters with a real `edit_message` impl (see the
-        // module-level sync rule).
-        for ct in ["telegram", "slack", "discord", "matrix", "webex"] {
+        // The adapters with a real in-place edit impl (see the
+        // module-level sync rule). signal (`sendEditMessage`) and
+        // mattermost (`PUT /posts/{id}/patch`) were raised to the
+        // rich-surface floor in M18-C5.
+        for ct in [
+            "telegram",
+            "slack",
+            "discord",
+            "matrix",
+            "webex",
+            "signal",
+            "mattermost",
+        ] {
             assert!(supports_message_edit(ct), "{ct} implements edit_message");
         }
         // Bare / webhook-ish channels degrade to periodic status rows.
-        for ct in ["cli", "webhooks", "github", "email", "unknown-new-channel"] {
+        // whatsapp-cloud is explicitly NOT edit-capable — the Cloud API
+        // cannot edit a previously sent message.
+        for ct in [
+            "cli",
+            "webhooks",
+            "github",
+            "email",
+            "whatsapp-cloud",
+            "unknown-new-channel",
+        ] {
             assert!(!supports_message_edit(ct), "{ct} has no edit_message");
         }
     }
