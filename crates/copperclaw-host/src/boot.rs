@@ -782,6 +782,10 @@ pub async fn run_host(
     state
         .delivery
         .set_preview_broker(Arc::clone(&preview) as Arc<dyn copperclaw_modules::PreviewBroker>);
+    // M18 V2: wire the delivery dispatcher so a `PreviewError::Disabled` raises
+    // a one-tap "Enable previews for this group" approval card instead of a
+    // dead error. The tap routes through the G1 in-chat approvals interceptor.
+    preview.set_approval_dispatcher(state.delivery.dispatcher());
 
     let spawned = spawn_container_manager(
         &cfg,

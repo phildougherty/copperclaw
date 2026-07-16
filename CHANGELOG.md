@@ -6,6 +6,41 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M18 V2 — one-tap preview enablement + expired-link recovery, 2026-07-16)
+
+- **One-tap enable previews (secure-by-default preserved).** Previews stay
+  opt-in per group, but a `PreviewError::Disabled` no longer dead-ends on a
+  phone: the host now raises a G1 in-chat approval card ("Enable previews for
+  this group") on the group's primary messaging channel. Tapping it routes
+  through G1's merged interceptor + shared DB decision path and flips
+  `container_configs.preview_enabled` — the same effect as
+  `cclaw groups config update --field preview_enabled=true`. The agent still
+  gets the copy-pasteable `cclaw` fix text, which is also the card body.
+  - `crates/copperclaw-types/src/approval.rs`: new `ApprovalKind::EnablePreview`.
+  - `crates/copperclaw-host/src/handlers/approvals.rs`: `"enable_preview"`
+    dispatcher arm + `apply_enable_preview` (creates a defaults config row when
+    the group has none, then `set_preview_enabled(true)`).
+  - `crates/copperclaw-host/src/preview.rs`: `PreviewManager::set_approval_dispatcher`
+    + `request_enable_approval` (idempotent — no duplicate card while one is
+    outstanding; skipped cleanly when no dispatcher / no messaging group).
+  - `crates/copperclaw-host/src/boot.rs`: wires the delivery dispatcher into the
+    preview manager at boot.
+- **Expired-link recovery via a tombstone (amended design).** The "30 minutes"
+  was always the idle *reaper*, not a token TTL — and reaping used to cancel the
+  whole per-preview listener, so a stale link got connection-refused with
+  nothing left to recover on. Idle-reaping now tears down only the upstream
+  proxying and leaves the bound port serving a static "preview expired" page.
+  A tokened `GET /__preview/<token>` against the tombstone re-exposes the same
+  session:port **once per token** (re-resolving the container IP, same audit row
+  as a fresh expose) when the container is still up; a spent recovery or a gone
+  container shows the terminal "ask the agent to re-expose" page. An explicit
+  agent `expose_preview` revives a tombstoned port with a fresh recovery budget.
+  Full teardown (port released) still happens on session stop / close /
+  shutdown. The cookie gate + constant-time token comparison are unchanged.
+  - `crates/copperclaw-host/src/preview.rs`: `ProxyState` gains a phase
+    (`Live` | `Tombstone`) with a one-shot `recovery_used` budget; the reaper
+    tombstones in place instead of tearing down.
+
 ### Added (M18 R6 — progressive final answers, 2026-07-16)
 
 - On a rich (edit-capable) channel, a long final answer to a turn that already
