@@ -128,6 +128,16 @@ const CODING_TOOLS: &[&str] = &[
 /// MCP servers) and are the most privileged class.
 const SELF_MOD_TOOLS: &[&str] = &["install_packages", "add_mcp_server"];
 
+/// Memory-*write* tools (M19 A5). `memory_search` / `memory_get` are read-only
+/// and live outside every profile list (Full-only, like their write sibling),
+/// but `memory_save` MUTATES the group memory store, so it is classified as
+/// mutating here: a [`SenderRole::Guest`] sender is denied it (see
+/// [`is_mutating`]) — a guest must not be able to write a `trusted` fact into
+/// the store. Provenance honesty against content-taint is enforced separately
+/// in the runner's `memory_save` impl (a tainted turn is forced to
+/// `untrusted`).
+const MEMORY_WRITE_TOOLS: &[&str] = &["memory_save"];
+
 /// Tools that take a **credentialed external action** — they reach outside the
 /// container over the network (the egress path the credential broker meters)
 /// to fetch data, run a search, install packages, or attach a remote MCP
@@ -181,6 +191,7 @@ pub const PROFILE_TOOL_LISTS: &[(&str, &[&str])] = &[
     ("SCHEDULING_MUTATION_TOOLS", SCHEDULING_MUTATION_TOOLS),
     ("CODING_TOOLS", CODING_TOOLS),
     ("SELF_MOD_TOOLS", SELF_MOD_TOOLS),
+    ("MEMORY_WRITE_TOOLS", MEMORY_WRITE_TOOLS),
     ("CREDENTIALED_EXTERNAL_TOOLS", CREDENTIALED_EXTERNAL_TOOLS),
 ];
 
@@ -334,6 +345,7 @@ fn is_mutating(tool: &str) -> bool {
     SCHEDULING_MUTATION_TOOLS.contains(&tool)
         || CODING_TOOLS.contains(&tool)
         || SELF_MOD_TOOLS.contains(&tool)
+        || MEMORY_WRITE_TOOLS.contains(&tool)
 }
 
 /// Outcome of a policy evaluation.
@@ -537,7 +549,7 @@ mod tests {
 
     #[test]
     fn profile_tool_lists_cover_every_policy_list() {
-        // The drift-guard export must carry all six lists (the
+        // The drift-guard export must carry all lists (the
         // `tool_name_drift` integration test iterates it; a list missing
         // here escapes the guard).
         let labels: Vec<&str> = PROFILE_TOOL_LISTS.iter().map(|(l, _)| *l).collect();
@@ -549,6 +561,7 @@ mod tests {
                 "SCHEDULING_MUTATION_TOOLS",
                 "CODING_TOOLS",
                 "SELF_MOD_TOOLS",
+                "MEMORY_WRITE_TOOLS",
                 "CREDENTIALED_EXTERNAL_TOOLS",
             ]
         );
@@ -842,6 +855,21 @@ mod tests {
                 "{t} must not be credentialed-external"
             );
         }
+    }
+
+    #[test]
+    fn memory_save_is_mutating_and_denied_to_guests() {
+        // A5: memory_save writes the group store, so a guest (read-only) sender
+        // is denied it even under the open Full profile — a guest must not
+        // launder a `trusted` fact into memory. memory_search/get stay allowed.
+        assert!(is_mutating("memory_save"));
+        assert!(!is_mutating("memory_search"));
+        let guest = ToolPolicy::new(ToolProfile::Full, Some(SenderRole::Guest));
+        assert!(!guest.evaluate("memory_save").is_allow());
+        assert!(guest.evaluate("memory_search").is_allow());
+        // A full member can write.
+        let member = ToolPolicy::new(ToolProfile::Full, None);
+        assert!(member.evaluate("memory_save").is_allow());
     }
 
     #[test]

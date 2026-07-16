@@ -29,11 +29,12 @@ pub mod tools;
 pub use client::{FilteredMcpClient, McpClient, McpToolTransport, RemoteTool, SharedMcpClient};
 pub use context::{
     AddMcpServerSpec, AddReactionSpec, AskUserQuestionSpec, CreateAgentSpec, DelegateSpec,
-    EditMessageSpec, EmitTodoListSpec, InstallScope, InstallSpec, MemoryHitView, MemorySearchSpec,
-    MockToolContext, OriginatingChannel, OutboundToolEffect, Recipient, SUBAGENT_MAX_TOKENS_LIMIT,
-    SUBAGENT_MAX_TURNS_LIMIT, SUBAGENT_WALL_CLOCK_SECS, ScheduleSpec, SendCardSpec, SendFileSpec,
-    SendMessageSpec, SubagentRequest, SubagentResult, SubagentToolCall, TaskSummary, ToolContext,
-    ToolEffectAck, UpdateTaskSpec,
+    EditMessageSpec, EmitTodoListSpec, InstallScope, InstallSpec, MemoryHitView, MemorySaveOutcome,
+    MemorySaveSpec, MemorySearchSpec, MockToolContext, OriginatingChannel, OutboundToolEffect,
+    Recipient, SUBAGENT_MAX_TOKENS_LIMIT, SUBAGENT_MAX_TURNS_LIMIT, SUBAGENT_WALL_CLOCK_SECS,
+    ScheduleSpec, SendCardSpec, SendFileSpec, SendMessageSpec, SubagentRequest, SubagentResult,
+    SubagentToolCall, TaskSummary, ToolContext, ToolEffectAck, UpdateTaskSpec,
+    resolve_save_provenance,
 };
 pub use error::{McpError, ToolError};
 pub use external::{call_external_tool, connect_filtered};

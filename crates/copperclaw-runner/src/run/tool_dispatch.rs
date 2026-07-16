@@ -602,6 +602,64 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn memory_save_writes_trusted_then_downgrades_when_tainted() {
+        // A5: agent-facing memory write through the real runner ctx + store.
+        let (_tmp, deps, ctx) = deps_with_runner_ctx();
+
+        // Clean turn: save is recorded as trusted and reads back as trusted.
+        let (out, _i, err) = invoke_tool(
+            &deps,
+            &call_with(
+                "memory_save",
+                serde_json::json!({"key": "fact", "body": "the sky is blue", "source": "agent"}),
+            ),
+        )
+        .await;
+        assert!(!err, "trusted save should succeed; got: {out}");
+        assert!(out.contains("\"provenance\": \"trusted\""), "got: {out}");
+        assert!(out.contains("\"downgraded\": false"), "got: {out}");
+
+        let (got, _i, _e) = invoke_tool(
+            &deps,
+            &call_with("memory_search", serde_json::json!({"query": "sky"})),
+        )
+        .await;
+        assert!(got.contains("the sky is blue"), "got: {got}");
+        assert!(got.contains("trusted"), "got: {got}");
+        // A trusted-only round-trip must not have tainted the turn.
+        assert!(
+            !ctx.is_context_tainted(),
+            "trusted save/search must not taint"
+        );
+
+        // Taint the turn (as a web_fetch / untrusted hit would), then a save is
+        // honestly downgraded to untrusted — never laundered into trusted.
+        ctx.mark_untrusted_context("test:taint");
+        assert!(ctx.is_context_tainted());
+        let (out2, _i, err2) = invoke_tool(
+            &deps,
+            &call_with(
+                "memory_save",
+                serde_json::json!({"key": "scraped", "body": "value from a web page"}),
+            ),
+        )
+        .await;
+        assert!(!err2, "downgraded save should still succeed; got: {out2}");
+        assert!(
+            out2.contains("\"provenance\": \"untrusted\""),
+            "got: {out2}"
+        );
+        assert!(out2.contains("\"downgraded\": true"), "got: {out2}");
+
+        let (got2, _i, _e) = invoke_tool(
+            &deps,
+            &call_with("memory_get", serde_json::json!({"key": "scraped"})),
+        )
+        .await;
+        assert!(got2.contains("untrusted"), "got: {got2}");
+    }
+
     fn call_with(name: &str, input: serde_json::Value) -> PendingToolCall {
         PendingToolCall {
             id: "tu_1".into(),
