@@ -42,6 +42,15 @@
 //! Default deployments are unaffected: with the tool disabled, nothing here
 //! spawns a container or opens a browser.
 //!
+//! ## M20 D1: the in-container `ui_screenshot` path
+//!
+//! [`incontainer`] is a THIRD path, distinct from both the above: instead of
+//! a dedicated child container reached over Docker, it launches chromium as
+//! a **local process inside the session container the runner itself runs
+//! in** and speaks CDP to it over loopback — see the module docs for why
+//! that's the right shape for a tool that only ever screenshots the agent's
+//! own already-running app (never a general browsing capability).
+//!
 //! ## SSRF guard reuse
 //!
 //! Navigation is guarded by the [`NavigationGuard`] trait. The production
@@ -57,6 +66,7 @@ pub mod container;
 pub mod driver;
 pub mod error;
 pub mod guard;
+pub mod incontainer;
 pub mod interactive;
 pub mod live;
 pub mod render;
@@ -71,6 +81,11 @@ pub use crate::container::{
 pub use crate::driver::{BrowserDriver, DriverRender, Navigation, RenderedArtifact, render};
 pub use crate::error::BrowserError;
 pub use crate::guard::{GuardResult, NavigationGuard};
+pub use crate::incontainer::{
+    CHROMIUM_BINARY_CANDIDATES, ChromiumSingleton, DEFAULT_CDP_PORT, DEFAULT_HEIGHT, DEFAULT_WIDTH,
+    MAX_WAIT_MS as UI_SCREENSHOT_MAX_WAIT_MS, ScreenshotRequest, capture, find_chromium_binary,
+    find_chromium_binary_in, global as chromium_singleton,
+};
 pub use crate::interactive::{
     InteractRequest, InteractiveAction, InteractiveDriver, MAX_ACTIONS, MAX_TYPE_LEN, interact,
 };

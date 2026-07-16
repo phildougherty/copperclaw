@@ -1510,6 +1510,53 @@ mod tests {
     }
 
     #[test]
+    fn ui_screenshot_tool_result_image_converts_to_provider_image_block() {
+        // M20 D1: `ui_screenshot` returns a `CallToolResult` carrying a text
+        // block (the saved-path note) plus an `rmcp::model::RawContent::Image`
+        // block, exactly like `view_image` — the runner's tool-dispatch layer
+        // (`tool_dispatch.rs::extract_tool_images` / `render_tool_result`)
+        // renders that into this SAME `HistoryMessage` shape: the tool_result
+        // text, then a follow-on `Image` entry. Prove that round-trips into a
+        // provider image block without a live chromium or Docker — this is
+        // the generic vision READ path D1 relies on (decision (a)); D1 only
+        // has to RETURN `RawContent::Image` and this conversion "just works".
+        let hist = vec![
+            HistoryMessage::ToolUse {
+                id: "tu_1".into(),
+                name: "ui_screenshot".into(),
+                input: json!({ "url": "http://127.0.0.1:5173/" }),
+            },
+            HistoryMessage::Tool {
+                tool_use_id: "tu_1".into(),
+                content: "Captured a 1280x800 screenshot of http://127.0.0.1:5173/ (4096 bytes); \
+                          saved to /data/myapp/.copperclaw/screenshots/ui-1.png"
+                    .into(),
+                is_error: false,
+            },
+            HistoryMessage::Image {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+            },
+        ];
+        let out = history_to_messages(&hist);
+        // assistant[tool_use], user[tool_result], user[image] — same shape as
+        // the `view_image` fixture above; the image never shares a message
+        // with the tool_result (minimax-style gateways reject that mix).
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0]["role"], "assistant");
+        assert_eq!(out[0]["content"][0]["type"], "tool_use");
+        assert_eq!(out[0]["content"][0]["name"], "ui_screenshot");
+        assert_eq!(out[1]["role"], "user");
+        assert_eq!(out[1]["content"][0]["type"], "tool_result");
+        assert_eq!(out[2]["role"], "user");
+        let image_block = &out[2]["content"][0];
+        assert_eq!(image_block["type"], "image");
+        assert_eq!(image_block["source"]["type"], "base64");
+        assert_eq!(image_block["source"]["media_type"], "image/png");
+        assert_eq!(image_block["source"]["data"], "QUJD");
+    }
+
+    #[test]
     fn null_tool_use_input_serializes_as_empty_object() {
         // Truncated/unparseable argument JSON is recorded as a null input;
         // it must serialize as `{}`, never `null`, for OpenAI-compatible gateways.

@@ -238,8 +238,13 @@ async fn interact_prepared_live(
             return Err(ToolError::Internal(format!(
                 "browser_interact: target `{}` passed the SSRF + opt-in checks and a locked-down \
                  child-container spec was constructed (egress={:?}), but no container runtime is \
-                 reachable here to spawn the headless-browser child ({e}). The interactive browser \
-                 runs where a Docker daemon is available.",
+                 reachable here to spawn the headless-browser child ({e}). This is the \
+                 in-container runner, which has no Docker socket by design (M18 V4's host-side \
+                 screenshot injection is superseded — see M20 D1). If you want to SEE your own \
+                 app's UI, use `ui_screenshot` instead: it renders locally in this container over \
+                 loopback and needs no container runtime (it is read-only, so it can't replace \
+                 click/type/scroll — for those, `browser_interact` itself runs only where the \
+                 operator has wired a reachable Docker daemon).",
                 prepared.req.url, prepared.spec.egress_allow,
             )));
         }

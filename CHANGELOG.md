@@ -6,6 +6,60 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M20 D1 — `ui_screenshot`: in-container screenshot of the agent's own app)
+
+- The generic vision READ path (`crates/copperclaw-runner/src/run/tool_dispatch.rs`
+  → `drive_turn.rs` → `crates/copperclaw-providers/src/anthropic.rs`) has been
+  fully wired since M18/M19, but the WRITE path was stranded: `browser_render`
+  needs a Docker socket the in-container runner does not have by design
+  (`crates/copperclaw-mcp/src/tools/browser_render.rs`), so in every default
+  deployment the agent had never once seen its own UI mid-build. A new
+  first-party `ui_screenshot` MCP tool
+  (`crates/copperclaw-mcp/src/tools/ui_screenshot.rs`) closes this: it launches
+  the prototyping image's already-baked chromium as a LOCAL PROCESS inside the
+  session container itself (`crates/copperclaw-browser/src/incontainer.rs`,
+  new module) and speaks CDP to it over loopback — no container spawn, no
+  Docker socket, no host round-trip. Returns `RawContent::Image` (PNG) directly
+  so the existing generic read path converts it to a provider image block with
+  zero new plumbing, plus a text line with the saved path under
+  `<project>/.copperclaw/screenshots/` so `send_file` can ship it later.
+- `url` is **loopback-only** (127.0.0.1 / `::1` / localhost); any other host is
+  refused with a hint pointing at `browser_render` for real web browsing — this
+  is deliberately NOT a general browsing capability.
+- A lazy, idle-reaped chromium singleton (`copperclaw_browser::incontainer::ChromiumSingleton`):
+  the first `ui_screenshot` call in a session spawns chromium
+  (`--headless=new --no-sandbox` — safe because the session container is
+  itself the sandbox boundary, see the module docs), later calls in the same
+  build-loop reuse the warm process, and a background reaper kills it after 5
+  minutes idle.
+- Default capture is a fixed 1280x800 WINDOWED viewport (never
+  `captureBeyondViewport`), which would blow the 5 MB `view_image`-class image
+  cap on anything but a very short page; a later M20 card (D2) generalises
+  viewport presets / formats.
+- **Registered by default in the Coding/Full tool profiles** — the one default
+  change M20 makes (`crates/copperclaw-runner/src/policy.rs`: `CODING_TOOLS`).
+  No-new-privilege argument: the agent already has an arbitrary `shell` tool
+  and this same chromium binary reachable from it on the prototyping image;
+  this tool refuses any non-loopback URL, so it cannot reach the LAN, the
+  host, or the public internet, and it does not touch the container's egress
+  posture. It is NOT a credentialed external action (no taint/autonomy gating)
+  because it never leaves the loopback interface, but it still rides the
+  guest-denied mutating floor (spawning a local process is a resource cost a
+  read-only sender shouldn't get for free). Security-review pass recorded in
+  this card's PR per the M20 program rules.
+- Chromium absent (minimal image profile): the tool probes for the binary at
+  call time and returns one clean, actionable error naming the `prototyping`
+  image profile — never a crash.
+- Rider: when no container runtime is reachable in-container, `browser_render`
+  and `browser_interact`'s error text now points at `ui_screenshot` instead of
+  a raw runtime error, and notes that M18 V4's host-side screenshot injection
+  is superseded by this card.
+- Extended the `anthropic.rs` image-block unit tests with a `ui_screenshot`-
+  shaped tool-result fixture proving the conversion to a provider image block
+  (no live chromium/Docker needed); the live in-container acceptance
+  (`ui_screenshot_docker_end_to_end` in `ui_screenshot.rs`) is `#[ignore]`d
+  per the `session_install_docker_end_to_end` precedent (`self_mod.rs`).
+
 ### Added (M19 A3 — Public-tunnel model verb: activate V5)
 
 - The merged-but-dormant V5 public-tunnel module now has an agent-facing verb.

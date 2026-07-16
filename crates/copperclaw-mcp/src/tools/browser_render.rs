@@ -394,8 +394,12 @@ async fn render_prepared_live(
             return Err(ToolError::Internal(format!(
                 "browser_render: navigation target `{}` passed the SSRF + opt-in checks and a \
                  locked-down child-container spec was constructed (egress={:?}), but no container \
-                 runtime is reachable here to spawn the headless-browser child ({e}). The browser \
-                 render runs where a Docker daemon is available.",
+                 runtime is reachable here to spawn the headless-browser child ({e}). This is the \
+                 in-container runner, which has no Docker socket by design (M18 V4's host-side \
+                 screenshot injection is superseded — see M20 D1). If you want to SEE your own \
+                 app's UI, use `ui_screenshot` instead: it renders locally in this container over \
+                 loopback and needs no container runtime. `browser_render` itself runs only where \
+                 the operator has wired a reachable Docker daemon (e.g. host-side tooling).",
                 prepared.req.url, prepared.spec.egress_allow,
             )));
         }
