@@ -48,17 +48,18 @@ except where noted. Do not implement an absorbed card from the M17 text alone
    fixture under `fixtures/` per `docs/replay-fixtures.md`.
 6. **PR per card, branch off `main`, one card per branch.**
 
-## Execution status (updated 2026-07-15, end of third session)
+## Execution status (updated 2026-07-15, end of fourth session)
 
-Wave 1 is **complete and merged**. Wave 2 is underway: R2 merged (#31), R3 is
-**in progress — part 1/2 committed, part 2/2 not started** (see "R3
-continuation" below — read it first if you're the one picking R3 back up).
-A fresh session should read this section first, then either finish R3 (if
-left mid-flight) or take the next unblocked card per the wave summary. The
-operator has directed merges of agent-authored PRs to `main` each time so
-far (2026-07-15); merges use merge commits (house style). CHANGELOG
-keep-both conflicts between card branches are the norm — resolve by keeping
-both entries, then merge.
+Wave 1 is **complete and merged**. Wave 2 is underway: R2 merged (#31), R3
+is **code-complete on its branch (both parts), not yet a PR** — see "R3
+status" below for what's left before it can merge (PR + hand-verify only;
+the code itself, including tests, is done and green). A fresh session
+should read this section first, then either open R3's PR (fastest path —
+nothing else to build) or take the next unblocked card per the wave
+summary. The operator has directed merges of agent-authored PRs to `main`
+each time so far (2026-07-15); merges use merge commits (house style).
+CHANGELOG keep-both conflicts between card branches are the norm — resolve
+by keeping both entries, then merge.
 
 Two housekeeping traps that bit this session, worth checking early in any
 fresh session: (1) local `main` can silently drift behind `origin/main` by
@@ -82,22 +83,83 @@ main..<branch> --oneline` yourself first.
 | T1 | Merged | #25 |
 | P1 | Merged | #26 |
 | R2 | Merged | #31 |
-| R3 | **In progress — part 1/2 done, part 2/2 not started.** Branch `m18/r3-verification-gate`, pushed, WIP commit `b53ce57`. Not a PR yet. | — |
+| R3 | **Code-complete, not yet a PR.** Branch `m18/r3-verification-gate`, pushed through part 1/2 (`b53ce57`); part 2/2 (the gate itself) committed locally as `e7c65fa`, **not yet pushed**. Full workspace `cargo fmt --all -- --check` / `cargo clippy --workspace --all-targets -- -D warnings` / `cargo test --workspace --no-fail-fast` all green (one known-flaky `copperclaw-skills --test coverage` failure under full-workspace parallel runs, pre-existing, see "Facts" below — reruns clean in isolation). Next step is `git push` + open the PR, then the "Acceptance to hand-verify" item below (needs a live mock-provider or manual run, not done this session) before merge. | — |
 | C3 | Not started | — |
 | All others | Not started | — |
 
-### R3 continuation (read this first if you're picking up R3)
+### R3 status (read this first if you're picking up R3)
 
-**Where things stand:** `git checkout m18/r3-verification-gate` (already pushed
-to origin). The tree compiles clean, `cargo fmt --all -- --check` passes,
-`cargo clippy --workspace --all-targets -- -D warnings` passes, and
-`cargo test -p copperclaw-db -p copperclaw-host -p copperclaw-modules -p
-copperclaw-host-delivery --lib` is green. This checkpoint is **DB layer +
-host plumbing only** — the actual gate (dirty tracking, the `todo_update`
-refusal, the bounded fix loop) does not exist yet. Read the card text
-(above, "R3 (amends M17-A7)") for the acceptance criteria; the design below
-is the concrete plan already worked out — follow it rather than
-re-deriving, unless you find a reason it's wrong.
+**Where things stand:** `git checkout m18/r3-verification-gate` (pushed
+through `b53ce57`; `e7c65fa` — part 2/2 — is committed locally on top and
+needs `git push`). The gate itself is fully implemented and tested:
+
+- `crates/copperclaw-mcp/src/tools/verify_gate.rs` (new): marker-file
+  dirty-tracking primitives (`project_root_of`, `mark_dirty`, `is_dirty`,
+  `clear_dirty`, `record_verify_failure`, `fix_cycles`, `last_failure`,
+  `recorded_verify_command`, `scan_dirty_projects`, `FIX_CYCLE_CAP = 2`).
+  21 unit tests, including a from-scratch battery for `project_root_of`
+  (the trickiest function, per the design note that was already worked
+  out below — still worth reading if you're touching this file).
+- Hooked into `write_file` / `edit_file` / `multi_edit` / `apply_patch`
+  (mark dirty on success) and `shell` (verify-run match clears/records;
+  any other command with a resolvable `cwd` conservatively marks dirty;
+  timeout and `background` paths also mark dirty conservatively since
+  their exit status isn't trustworthy).
+- `todo.rs`'s `update::handle` runs the gate after the existing
+  evidence-≥40-chars check: refuses with a structured message naming the
+  dirty project + recorded verify command + cycles remaining; after
+  `FIX_CYCLE_CAP` is burned, auto-transitions to a new `TodoStatus::Blocked`
+  (+ `blocked_reason` field, `#[serde(default)]` for old stores) and
+  returns success instead of refusing forever.
+- **Design decision worth flagging to reviewers:** `Blocked` was added
+  only to the local storage-side `TodoStatus` enum in `copperclaw-mcp`,
+  NOT to the portable wire schema (`copperclaw_channels_core::TodoItemStatus`,
+  which 8 channel-adapter crates exhaustively match on). Rendering maps
+  `Blocked -> TodoItemStatus::InProgress` for the chip UI ("not done" is
+  still accurate); the agent itself sees the real `blocked` status +
+  `blocked_reason` via `todo_list` / `todo_update`'s direct JSON response.
+  This avoided a fan-out across every adapter crate for a card that lives
+  in lane T's directory (`copperclaw-mcp/src/tools/**`) but was executed
+  as part of lane R's R3 card — flag if a reviewer wants the wire schema
+  extended properly later (would need coordination with lane C, since C5's
+  shared markdown renderer is due to land there anyway).
+- `ToolContext` gained `verify_gate_enabled()` / `check_command_override()`
+  (default `true` / `None`); `RunnerToolCtx::with_verify_gate(...)` wires
+  them from `RunnerConfig` in `main.rs`. `RunnerDeps` also carries
+  `verify_gate` / `check_command_override` fields for parity/test
+  scaffolding (same convention as `hud_mode`/`policy`) even though the
+  live enforcement path is entirely through `ToolContext` — the mcp tool
+  handlers never see `RunnerDeps`.
+- Tests: 21 in `verify_gate.rs`, ~17 gate-focused across
+  `todo.rs`/`computer_use.rs`/`edit_file.rs`/`multi_edit.rs`/`apply_patch.rs`
+  (refusal shapes, fix-cycle→blocked transition, `verify_gate=off`
+  byte-stable path, `check_command_override` precedence, parallel-batch
+  edits to different projects marking independently without racing,
+  timeout/background conservative marking). All test files that reach
+  `verify_gate`'s shared data-root override share one lock
+  (`verify_gate::data_root_test_lock()`) so parallel `cargo test` runs
+  can't leak one test's override into another's assertions — this cost
+  a real (now-fixed) flake during this session, worth preserving the
+  pattern if you add a fourth call site.
+- Not done: the "build-verify-loop" e2e replay fixture (flagged as a
+  stretch goal in the card — "don't let it block merging") and the
+  program's live hand-verify smoke test.
+
+**Next session, in order:**
+1. `git push` the `m18/r3-verification-gate` branch (currently 1 commit
+   ahead of origin locally).
+2. Open the PR.
+3. Hand-verify per "Acceptance to hand-verify once built" below (needs
+   either a scripted mock-provider e2e or a manual run against a real
+   session per the program-level acceptance smoke test) — not done this
+   session, flag in the PR description as an open item if skipped.
+4. Once merged: next free migration is unchanged at **027** (026 stays
+   taken by this card). Unblocks C4a+C4b (after C3, itself still
+   unstarted), X1, P2 — see "Wave summary" below.
+
+The original part-1 design note is preserved below for anyone re-deriving
+or auditing the approach; the "Where things stand" bullets above are now
+authoritative for what's actually in the tree.
 
 **Done (part 1/2):**
 - Migration `026_container_config_verify_gate.sql`: `container_configs`
@@ -276,12 +338,12 @@ from scratch this session on a fresh branch (old branch left alone,
 untouched, in case it holds context worth recovering later). C3 is still
 genuinely unstarted.
 
-R3 is in progress (see "R3 continuation" above — finish that before starting
-anything else in lane R). Once R3 merges: C4a + C4b (after C3 merges — C3
-itself is still fully open and unstarted), X1 (after R3), P2 (after R3).
-Wave 3's V1, V3, and G1 have no unmerged prerequisites and can start any
-time lanes are free — a reasonable pick if you'd rather not pick up R3
-mid-flight.
+R3 is code-complete on its branch and just needs a PR + merge (see "R3
+status" above); R4 (next in lane R, after R3) can start once R3 merges.
+Once R3 merges: C4a + C4b (after C3 merges — C3 itself is still fully open
+and unstarted), X1 (after R3), P2 (after R3). Wave 3's V1, V3, and G1 have
+no unmerged prerequisites and can start any time lanes are free — a
+reasonable pick if R3's PR is out for review and you'd rather not wait on it.
 
 R2 shipped without its "e2e fixture pairing with R1's" — the shared replay
 harness drives one `inbound/NNN-*.json` step fully (including its whole
@@ -301,6 +363,19 @@ test execution (the test resolves its fixture path via compile-time
 `CARGO_MANIFEST_DIR`, so it isn't a CWD/env race); unrelated to any R2
 file. Worth a look if it keeps showing up.
 
+Also observed during R3 part 2/2: `copperclaw_mcp::tools::artifact_path::
+tests::returns_host_path_from_discovery_file` failed once under a full
+`cargo test --workspace` run, passed clean in 5/5 reruns and in isolation.
+Root cause: `artifact_path.rs`'s two tests (`returns_host_path_from_
+discovery_file`, `error_when_discovery_file_missing`) both mutate a shared
+global-static test override (`HOST_PATH_FILE_TEST_OVERRIDE`) with no
+`Mutex`-based serialization between them (unlike `todo.rs`'s
+`todo_env_lock` / `verify_gate.rs`'s `data_root_test_lock` pattern) — a
+pre-existing latent race, not something R3 introduced, just more likely to
+surface under full-workspace parallel load. Cheap fix for whoever's next
+in that file: add a `static LOCK: OnceLock<Mutex<()>>` guard around both
+tests, same shape as `todo_env_lock()`.
+
 ### Facts later cards need (learned during Wave 1 — trust these over the audit anchors)
 
 - **R2:** the control-row contract is documented in
@@ -312,16 +387,21 @@ file. Worth a look if it keeps showing up.
   `crates/copperclaw-runner/src/run/hud.rs` (also the R5 "switched provider"
   hook).
 - **R3:** migration 026 is now TAKEN (`container_configs.check_command` /
-  `.verify_gate`, added by R3 part 1/2 — see the "R3 continuation" section
+  `.verify_gate`, added by R3 part 1/2 — see the "R3 status" section
   above). Next free migration is **027**.
 - **R3 (from R2):** the mid-turn steering check lives in
   `drive_turn.rs`'s `check_mid_turn_steering`, called right after
-  `hud.on_batch_end` on every batch iteration — R3's verification gate
-  should slot its dirty-tracking / completion-gate checks near there too
-  if it needs a similar "between tool batches" seam, rather than adding a
-  second one. `messages_in::get_new_since` / `max_seq` are the new
-  `copperclaw-db` primitives if R3 (or anything else) needs to peek
-  inbound mid-turn for its own purposes.
+  `hud.on_batch_end` on every batch iteration. In the end R3 did NOT need
+  a `drive_turn.rs` seam at all — dirty-tracking and the completion gate
+  live entirely tool-handler-side (`copperclaw-mcp/src/tools/{computer_use,
+  edit_file,multi_edit,apply_patch,todo}.rs`, via two new `ToolContext`
+  methods), since the natural trigger points (a successful edit-family
+  call, a `todo_update`) are already tool calls with `&dyn ToolContext` in
+  hand — no need to thread state through the runner's turn loop. Leaving
+  this note for whoever reads it looking for a `drive_turn.rs` hook that
+  isn't there. `messages_in::get_new_since` / `max_seq` are still the
+  `copperclaw-db` primitives if something else needs to peek inbound
+  mid-turn.
 - **C4a/C4b:** follow the contract C3 defines; C3's PR body will carry a
   "Note for C4a/C4b implementers".
 - **C5:** the fence logic to absorb lives in
