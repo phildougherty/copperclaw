@@ -6,6 +6,38 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (M18 V4 — screenshot-the-preview path, 2026-07-16)
+
+- `browser_render` now lands its screenshot where the in-container agent can
+  relay it, and can reach the prototype's own preview under deny-default
+  egress — so the P3 "prototype ready" ritual can render the live app and
+  attach the PNG via `send_file`.
+  - `crates/copperclaw-mcp/src/tools/browser_render.rs`: the default screenshot
+    output dir is refined from a host temp dir to `<data_root>/screenshots`
+    (`/data/screenshots` in production), reusing the shared
+    `COPPERCLAW_DATA_ROOT`-aware `verify_gate::data_root()` so the PNG is
+    readable in-container for `send_file`. An explicit
+    `COPPERCLAW_BROWSER_OUTPUT_DIR` still wins.
+  - Egress allow-list injection: a new `COPPERCLAW_BROWSER_PREVIEW_ALLOW`
+    (comma-separated `host:port`) is folded into the browser child's
+    deny-default egress allow-list in `prepare` (deduped, malformed entries
+    dropped). The host sets it at browser-child spawn from the live
+    `PreviewEntry` (`container_ip:container_port`, read-only). **Render-target
+    decision:** the render targets the prototype's own session container
+    directly on the Docker bridge (`http://<container_ip>:<container_port>`),
+    NOT the host preview-proxy URL — the V1 proxy 403s any cookieless request,
+    and the child + app container already share the bridge. Unset → target-only
+    allow-list, byte-identical to pre-V4.
+  - `send_card` cannot attach a local file (its image field is an http(s)
+    `image_url`), so the screenshot reaches the user via `send_file` sent
+    alongside the ritual card — not embedded in it.
+  - When `COPPERCLAW_BROWSER_ENABLED` is unset the tool stays disabled, so the
+    ritual simply omits the screenshot — never an error.
+  - Tests: preview-allow parsing/filtering + the deny-default-egress injection
+    fixture (`browser_render.rs`); a mock-driver screenshot e2e proving a PNG
+    lands under the configured `/data` output dir
+    (`crates/copperclaw-browser/src/live.rs`).
+
 ### Added (M18 G1 — in-chat approvals, 2026-07-16)
 
 - Approval cards can now be resolved by tapping **Approve** / **Deny** from
