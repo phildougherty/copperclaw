@@ -1159,7 +1159,7 @@ pub(crate) fn breadcrumb_detail(name: &str, input: &serde_json::Value) -> Option
 /// verbatim so we never accidentally swallow large chunks of
 /// legitimate prose. Case-insensitive open/close tags, multi-line
 /// content, leaves the surrounding text intact.
-fn strip_reasoning_blocks(text: &str) -> String {
+pub(crate) fn strip_reasoning_blocks(text: &str) -> String {
     // Hand-rolled scan instead of pulling in `regex` just for this.
     // Looking for `<thinking>` followed by anything up to `</thinking>`,
     // case-insensitive on the tag names only.
