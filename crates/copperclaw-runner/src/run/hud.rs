@@ -107,6 +107,12 @@ struct Shared {
 /// All methods are best-effort — the HUD never aborts the turn.
 pub(super) struct TaskHud {
     behavior: Behavior,
+    /// True when the originating channel's adapter can edit a delivered
+    /// message in place (`capabilities::supports_message_edit`). Kept
+    /// distinct from [`Behavior`], which also folds in `hud_mode`: the
+    /// R6 progressive final answer is independent of the HUD's own
+    /// on/off/final mode, so it keys off this raw capability instead.
+    answer_edit_capable: bool,
     started_at: Instant,
     shared: Arc<StdMutex<Shared>>,
     ctx: Arc<dyn ToolContext>,
@@ -166,9 +172,13 @@ impl TaskHud {
             }
             _ => HUD_EDIT_INTERVAL,
         };
+        let answer_edit_capable = origin
+            .as_ref()
+            .is_some_and(|oc| capabilities::supports_message_edit(&oc.channel_type));
         let now = Instant::now();
         Self {
             behavior,
+            answer_edit_capable,
             started_at: now,
             shared: Arc::new(StdMutex::new(Shared::default())),
             ctx: deps.tool_ctx.clone(),
@@ -196,6 +206,22 @@ impl TaskHud {
     #[cfg(test)]
     pub(super) fn note_for_test(&self) -> Option<String> {
         self.shared.lock().ok().and_then(|s| s.note.clone())
+    }
+
+    /// R6: whether this inbound's final answer may grow via in-place
+    /// edits — true only on an edit-capable originating channel (the
+    /// same `supports_message_edit` gate the HUD uses), and never for
+    /// child sessions (their `originating_channel()` is `None`).
+    pub(super) fn answer_edit_capable(&self) -> bool {
+        self.answer_edit_capable
+    }
+
+    /// R6: wall-clock elapsed since `drive_turn` entry. Threaded into
+    /// the progressive-final gate (>30s turns only) so it reads the ONE
+    /// clock the HUD already tracks (`started_at`) rather than the
+    /// caller re-deriving its own.
+    pub(super) fn elapsed(&self) -> Duration {
+        self.started_at.elapsed()
     }
 
     /// A tool batch is about to execute. Live HUD: post (first batch) or
