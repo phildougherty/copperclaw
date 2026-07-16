@@ -16,7 +16,7 @@ use crate::prompt::Prompt;
 use crate::state::SetupState;
 use crate::steps::{Step, StepError, StepResult};
 use copperclaw_container_rt::{ExtraFile, ImageBuildSpec};
-use copperclaw_types::ImageProfile;
+use copperclaw_types::{ImageProfile, PinnedBinary, PinnedBinaryTarget};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
@@ -94,7 +94,18 @@ impl Step for ImageBuildStep {
         let profile = resolve_image_profile(prompt)?;
         cfg.image_profile = profile.as_str().to_string();
 
-        let spec = default_spec(profile)?;
+        let mut spec = default_spec(profile)?;
+        // M20 Q1: bake any pinned prebuilt binaries the profile needs (today
+        // just `ruff` — no trixie apt package exists for it, verified at
+        // branch time; see `copperclaw_types::image::RUFF_PINNED_BINARY`).
+        // No-op for `Minimal` (empty list) and for a `Prototyping` re-run
+        // once the fetch is cached, so this stays idempotent.
+        bake_pinned_binaries(
+            &mut spec,
+            profile,
+            &RealPinnedBinaryFetcher,
+            &pinned_binary_cache_dir(&cfg.data_dir),
+        )?;
         let target_tag = spec.image_tag();
         let fingerprint = spec.fingerprint();
         let mut messages = Vec::new();
@@ -186,6 +197,192 @@ pub fn default_spec(profile: ImageProfile) -> Result<ImageBuildSpec, StepError> 
     spec.extra_files
         .push(ExtraFile::new(PathBuf::from(RUNNER_PATH_IN_IMAGE), bytes).with_mode(0o755));
     Ok(spec)
+}
+
+/// Cache directory the pinned-binary fetch (M20 Q1) keys its downloads
+/// under, so re-running setup against the same install doesn't re-fetch a
+/// tarball it already verified. Content-addressed by the cache-key inside
+/// [`fetch_pinned_binary`] (name + version + arch + sha256), so a version
+/// bump in `copperclaw_types::image` naturally invalidates the old entry
+/// rather than silently reusing stale bytes.
+pub fn pinned_binary_cache_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("cache").join("pinned-binaries")
+}
+
+/// Thin trait over the external commands needed to fetch, verify, and
+/// unpack a [`PinnedBinary`]'s release tarball. Mirrors [`DockerCli`]
+/// below: the real implementation shells out to `curl` / `sha256sum` /
+/// `tar` (all already required on any box that can run `install.sh`, which
+/// fetches + verifies + unpacks release tarballs the same way); tests
+/// inject a stub so no test hits the network.
+pub trait PinnedBinaryFetcher {
+    /// Download `url` to `dest`.
+    fn download(&self, url: &str, dest: &Path) -> Result<(), String>;
+    /// Verify `path`'s sha256 digest equals `sha256_hex` (case-insensitive).
+    fn verify_sha256(&self, path: &Path, sha256_hex: &str) -> Result<(), String>;
+    /// Extract a `.tar.gz` archive at `archive` into `dest_dir`.
+    fn extract_tar_gz(&self, archive: &Path, dest_dir: &Path) -> Result<(), String>;
+}
+
+/// Real-process implementation. Calls `curl`, `sha256sum`, and `tar` from
+/// `PATH` — the same tools `install.sh` already depends on for its own
+/// release-tarball fetch, so no new host prerequisite is introduced.
+struct RealPinnedBinaryFetcher;
+
+impl PinnedBinaryFetcher for RealPinnedBinaryFetcher {
+    fn download(&self, url: &str, dest: &Path) -> Result<(), String> {
+        let out = Command::new("curl")
+            .args(["-fsSL", "--retry", "2", "-o"])
+            .arg(dest)
+            .arg(url)
+            .output()
+            .map_err(|e| format!("spawn curl: {e}"))?;
+        check_status(&out, "curl download")
+    }
+
+    fn verify_sha256(&self, path: &Path, sha256_hex: &str) -> Result<(), String> {
+        let out = Command::new("sha256sum")
+            .arg(path)
+            .output()
+            .map_err(|e| format!("spawn sha256sum: {e}"))?;
+        check_status(&out, "sha256sum")?;
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let digest = stdout.split_whitespace().next().unwrap_or("");
+        if digest.eq_ignore_ascii_case(sha256_hex) {
+            Ok(())
+        } else {
+            Err(format!(
+                "checksum mismatch: expected {sha256_hex}, got {digest}"
+            ))
+        }
+    }
+
+    fn extract_tar_gz(&self, archive: &Path, dest_dir: &Path) -> Result<(), String> {
+        std::fs::create_dir_all(dest_dir)
+            .map_err(|e| format!("mkdir {}: {e}", dest_dir.display()))?;
+        let out = Command::new("tar")
+            .arg("-xzf")
+            .arg(archive)
+            .arg("-C")
+            .arg(dest_dir)
+            .output()
+            .map_err(|e| format!("spawn tar: {e}"))?;
+        check_status(&out, "tar extract")
+    }
+}
+
+/// Download, verify, and extract one [`PinnedBinaryTarget`] via `fetcher`,
+/// returning the extracted binary's bytes. Isolated from
+/// [`fetch_pinned_binary`]'s caching/cleanup so it stays independently
+/// testable.
+fn fetch_and_extract(
+    fetcher: &dyn PinnedBinaryFetcher,
+    target: &PinnedBinaryTarget,
+    binary_name: &str,
+    scratch: &Path,
+) -> Result<Vec<u8>, StepError> {
+    let archive_path = scratch.join(format!("{binary_name}.tar.gz"));
+    fetcher
+        .download(target.url, &archive_path)
+        .map_err(|e| StepError::Other(format!("download {}: {e}", target.url)))?;
+    fetcher
+        .verify_sha256(&archive_path, target.sha256)
+        .map_err(|e| StepError::Other(format!("verify {binary_name} checksum: {e}")))?;
+    let extract_dir = scratch.join("extracted");
+    fetcher
+        .extract_tar_gz(&archive_path, &extract_dir)
+        .map_err(|e| StepError::Other(format!("extract {binary_name}: {e}")))?;
+    let member_path = extract_dir.join(target.archive_member);
+    std::fs::read(&member_path).map_err(|e| {
+        StepError::Other(format!(
+            "read extracted {binary_name} at {}: {e}",
+            member_path.display()
+        ))
+    })
+}
+
+/// Fetch (or read from cache), verify, and unpack a [`PinnedBinary`] for
+/// the current host architecture, returning its raw executable bytes ready
+/// to embed as an [`ExtraFile`].
+///
+/// The target architecture is `std::env::consts::ARCH` — the machine
+/// running `copperclaw-setup`, which is also the machine `docker build`
+/// runs on, so this matches the image's actual architecture for a local
+/// (non-cross-arch) build. Caches the verified bytes under `cache_dir`
+/// keyed by name + version + arch + sha256 so re-running setup (idempotent
+/// per the E2/Q1 precedent) doesn't re-download every time; bumping
+/// [`PinnedBinary::version`] (or its sha256) naturally invalidates the old
+/// cache entry rather than silently reusing stale bytes.
+pub fn fetch_pinned_binary(
+    fetcher: &dyn PinnedBinaryFetcher,
+    cache_dir: &Path,
+    binary: &PinnedBinary,
+) -> Result<Vec<u8>, StepError> {
+    let arch = std::env::consts::ARCH;
+    let target = binary
+        .targets
+        .iter()
+        .find(|t| t.arch == arch)
+        .ok_or_else(|| {
+            StepError::Other(format!(
+                "no pinned `{}` build for host architecture `{arch}`",
+                binary.name
+            ))
+        })?;
+
+    let cache_path = cache_dir.join(format!(
+        "{}-{}-{arch}-{}",
+        binary.name, binary.version, target.sha256
+    ));
+    if let Ok(bytes) = std::fs::read(&cache_path) {
+        return Ok(bytes);
+    }
+
+    std::fs::create_dir_all(cache_dir).map_err(|e| {
+        StepError::Other(format!(
+            "create pinned-binary cache dir {}: {e}",
+            cache_dir.display()
+        ))
+    })?;
+
+    // Scratch dir for this one fetch, cleaned up on every exit path
+    // (success or failure) so a crashed prior run never leaves stale
+    // partial state that a retry could misread.
+    let scratch = cache_dir.join(format!(".fetch-{}-{}", std::process::id(), binary.name));
+    let _ = std::fs::remove_dir_all(&scratch);
+    std::fs::create_dir_all(&scratch)
+        .map_err(|e| StepError::Other(format!("create scratch dir {}: {e}", scratch.display())))?;
+
+    let result = fetch_and_extract(fetcher, target, binary.name, &scratch);
+    let _ = std::fs::remove_dir_all(&scratch);
+    let bytes = result?;
+
+    // Best-effort cache write: a failure here just means the next run
+    // re-fetches; it must never fail the build over cache I/O.
+    let _ = std::fs::write(&cache_path, &bytes);
+    Ok(bytes)
+}
+
+/// Fold `profile`'s pinned-binary bundle (M20 Q1 — today just `ruff`) into
+/// `spec.extra_files`, fetching + verifying + unpacking each one via
+/// `fetcher`. No-op for a profile with none (`Minimal` today).
+///
+/// Each embedded file participates in `ImageBuildSpec::fingerprint()`
+/// exactly like the runner binary and any other `extra_files` entry
+/// already do, so the base image's tag changes when a pinned binary's
+/// pinned version changes — no separate fingerprint plumbing needed here.
+pub fn bake_pinned_binaries(
+    spec: &mut ImageBuildSpec,
+    profile: ImageProfile,
+    fetcher: &dyn PinnedBinaryFetcher,
+    cache_dir: &Path,
+) -> Result<(), StepError> {
+    for binary in profile.extra_pinned_binaries() {
+        let bytes = fetch_pinned_binary(fetcher, cache_dir, binary)?;
+        spec.extra_files
+            .push(ExtraFile::new(PathBuf::from(binary.dest_path), bytes).with_mode(0o755));
+    }
+    Ok(())
 }
 
 /// Prompt key the base-image profile question is asked under
@@ -675,10 +872,24 @@ mod tests {
             .collect();
         spec.image_profile = ImageProfile::Prototyping;
         let df = spec.dockerfile();
-        for pkg in ["sqlite3", "chromium", "zip"] {
+        for pkg in [
+            "sqlite3",
+            "chromium",
+            "zip",
+            "fonts-inter",
+            "fonts-jetbrains-mono",
+            "fonts-noto-color-emoji",
+        ] {
             assert!(df.contains(pkg), "expected apt `{pkg}` in base bake");
         }
-        for pkg in ["vite", "create-vite"] {
+        for pkg in [
+            "vite",
+            "create-vite",
+            "typescript",
+            "eslint",
+            "prettier",
+            "tailwindcss",
+        ] {
             assert!(df.contains(pkg), "expected npm `{pkg}` in base bake");
         }
         // A minimal base spec bakes none of them.
@@ -808,5 +1019,243 @@ mod tests {
         // 2024 (unsafe is forbidden). Instead verify the default branch
         // by reading the constant directly.
         assert!(DEFAULT_PULL_REGISTRY.starts_with("ghcr.io/"));
+    }
+
+    // ---- pinned-binary fetch (M20 Q1) -----------------------------------
+
+    /// Trait-only stub: no real `curl`/`sha256sum`/`tar` process ever
+    /// spawns. `extract_tar_gz` writes canned bytes straight to the
+    /// archive-member path the test configured, standing in for a real
+    /// tarball's contents.
+    struct StubFetcher {
+        download_result: Result<(), String>,
+        verify_result: Result<(), String>,
+        extract_result: Result<(), String>,
+        member_bytes: Vec<u8>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl StubFetcher {
+        fn ok(member_bytes: impl Into<Vec<u8>>) -> Self {
+            Self {
+                download_result: Ok(()),
+                verify_result: Ok(()),
+                extract_result: Ok(()),
+                member_bytes: member_bytes.into(),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_verify(mut self, r: Result<(), String>) -> Self {
+            self.verify_result = r;
+            self
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl PinnedBinaryFetcher for StubFetcher {
+        fn download(&self, url: &str, dest: &Path) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!("download {url}"));
+            self.download_result.clone()?;
+            // A real download would leave archive bytes at `dest`; a
+            // placeholder is enough since the stub `extract_tar_gz`
+            // ignores the archive contents.
+            std::fs::write(dest, b"fake-tarball").map_err(|e| e.to_string())
+        }
+
+        fn verify_sha256(&self, _path: &Path, _sha256_hex: &str) -> Result<(), String> {
+            self.calls.lock().unwrap().push("verify".to_string());
+            self.verify_result.clone()
+        }
+
+        fn extract_tar_gz(&self, _archive: &Path, dest_dir: &Path) -> Result<(), String> {
+            self.calls.lock().unwrap().push("extract".to_string());
+            self.extract_result.clone()?;
+            // A real `tar` doesn't know `archive_member` either — it just
+            // unpacks whatever the tarball actually nests; the caller
+            // (`fetch_and_extract`) is the one that then joins
+            // `target.archive_member` onto `dest_dir`. So the stub writes
+            // under every plausible member path the tests use, matching
+            // the real ruff tarball's `<target-triple>/ruff` shape for
+            // both host architectures plus the synthetic `test_binary`
+            // member — cheap, and avoids the stub needing to know which
+            // `PinnedBinary` is in play.
+            for member in [
+                "stub-target/ruff",
+                "ruff-x86_64-unknown-linux-gnu/ruff",
+                "ruff-aarch64-unknown-linux-gnu/ruff",
+            ] {
+                let path = dest_dir.join(member);
+                std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
+                std::fs::write(&path, &self.member_bytes).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }
+    }
+
+    fn test_binary() -> PinnedBinary {
+        // A synthetic single-target binary keyed to the actual test-host
+        // architecture (`std::env::consts::ARCH` is itself a `'static`
+        // const, so no leaking/allocation is needed) so
+        // `fetch_pinned_binary`'s arch match succeeds regardless of which
+        // CI/dev architecture runs the suite.
+        PinnedBinary {
+            name: "stub-tool",
+            version: "1.2.3",
+            dest_path: "/usr/local/bin/stub-tool",
+            targets: &[PinnedBinaryTarget {
+                arch: std::env::consts::ARCH,
+                url: "https://example.invalid/stub-tool.tar.gz",
+                sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+                archive_member: "stub-target/ruff",
+            }],
+        }
+    }
+
+    #[test]
+    fn fetch_pinned_binary_happy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let fetcher = StubFetcher::ok(b"binary-bytes".to_vec());
+        let binary = test_binary();
+        let bytes = fetch_pinned_binary(&fetcher, dir.path(), &binary).unwrap();
+        assert_eq!(bytes, b"binary-bytes");
+        assert_eq!(
+            fetcher.calls(),
+            vec![
+                "download https://example.invalid/stub-tool.tar.gz",
+                "verify",
+                "extract"
+            ]
+        );
+        // Scratch dir is cleaned up; only the cache file remains.
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            entries.len(),
+            1,
+            "expected exactly one cached file, got {entries:?}"
+        );
+    }
+
+    #[test]
+    fn fetch_pinned_binary_is_cached_on_second_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = test_binary();
+        let fetcher = StubFetcher::ok(b"binary-bytes".to_vec());
+        let first = fetch_pinned_binary(&fetcher, dir.path(), &binary).unwrap();
+        assert_eq!(first, b"binary-bytes");
+        assert_eq!(
+            fetcher.calls().len(),
+            3,
+            "first call fetches over the network"
+        );
+
+        // A second fetcher that would fail if actually invoked — the cache
+        // hit must short-circuit before any of its methods are called.
+        let poison = StubFetcher {
+            download_result: Err("must not be called".to_string()),
+            verify_result: Err("must not be called".to_string()),
+            extract_result: Err("must not be called".to_string()),
+            member_bytes: Vec::new(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let second = fetch_pinned_binary(&poison, dir.path(), &binary).unwrap();
+        assert_eq!(second, b"binary-bytes");
+        assert!(
+            poison.calls().is_empty(),
+            "cache hit must skip the fetcher entirely"
+        );
+    }
+
+    #[test]
+    fn fetch_pinned_binary_fails_on_checksum_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let fetcher = StubFetcher::ok(b"binary-bytes".to_vec())
+            .with_verify(Err("checksum mismatch: expected X, got Y".to_string()));
+        let binary = test_binary();
+        let err = fetch_pinned_binary(&fetcher, dir.path(), &binary).unwrap_err();
+        match err {
+            StepError::Other(msg) => assert!(msg.contains("checksum mismatch"), "got: {msg}"),
+            other => panic!("expected Other, got {other:?}"),
+        }
+        // Nothing is cached on failure.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn fetch_pinned_binary_fails_for_unsupported_architecture() {
+        let dir = tempfile::tempdir().unwrap();
+        let fetcher = StubFetcher::ok(b"binary-bytes".to_vec());
+        let binary = PinnedBinary {
+            name: "stub-tool",
+            version: "1.2.3",
+            dest_path: "/usr/local/bin/stub-tool",
+            targets: &[PinnedBinaryTarget {
+                arch: "not-a-real-arch",
+                url: "https://example.invalid/stub-tool.tar.gz",
+                sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+                archive_member: "stub-target/ruff",
+            }],
+        };
+        let err = fetch_pinned_binary(&fetcher, dir.path(), &binary).unwrap_err();
+        match err {
+            StepError::Other(msg) => assert!(msg.contains("no pinned"), "got: {msg}"),
+            other => panic!("expected Other, got {other:?}"),
+        }
+        assert!(
+            fetcher.calls().is_empty(),
+            "must fail before touching the fetcher"
+        );
+    }
+
+    #[test]
+    fn bake_pinned_binaries_is_noop_for_minimal() {
+        let mut spec = fake_default_spec();
+        let fetcher = StubFetcher {
+            download_result: Err("must not be called for Minimal".to_string()),
+            verify_result: Err("must not be called for Minimal".to_string()),
+            extract_result: Err("must not be called for Minimal".to_string()),
+            member_bytes: Vec::new(),
+            calls: Mutex::new(Vec::new()),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let before = spec.extra_files.len();
+        bake_pinned_binaries(&mut spec, ImageProfile::Minimal, &fetcher, dir.path()).unwrap();
+        assert_eq!(
+            spec.extra_files.len(),
+            before,
+            "Minimal adds no pinned binaries"
+        );
+        assert!(fetcher.calls().is_empty());
+    }
+
+    #[test]
+    fn bake_pinned_binaries_embeds_ruff_for_prototyping() {
+        // Uses the real `ImageProfile::Prototyping` bundle (today just
+        // `ruff`) with a stub fetcher, verifying the embedded ExtraFile's
+        // path/mode/content end up on the spec and render into the
+        // Dockerfile via the existing generic extra_files mechanism.
+        let mut spec = fake_default_spec();
+        let fetcher = StubFetcher::ok(b"#!/bin/sh\necho fake-ruff".to_vec());
+        let dir = tempfile::tempdir().unwrap();
+        bake_pinned_binaries(&mut spec, ImageProfile::Prototyping, &fetcher, dir.path()).unwrap();
+        let ruff_file = spec
+            .extra_files
+            .iter()
+            .find(|f| f.path == PathBuf::from("/usr/local/bin/ruff"))
+            .expect("expected an embedded /usr/local/bin/ruff ExtraFile");
+        assert_eq!(ruff_file.mode, 0o755);
+        assert_eq!(ruff_file.contents, b"#!/bin/sh\necho fake-ruff");
+        let df = spec.dockerfile();
+        assert!(
+            df.contains("/usr/local/bin/ruff"),
+            "expected ruff COPY in dockerfile"
+        );
+        assert!(df.contains("chmod 755 /usr/local/bin/ruff"));
     }
 }

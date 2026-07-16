@@ -6,6 +6,64 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M20 Q1 — Bake the coding toolchain + design assets into the prototyping image)
+
+- The `Prototyping` image profile bundle (`crates/copperclaw-types/src/image.rs`)
+  now bakes a real lint/typecheck toolchain and UI fonts, not just
+  `sqlite3`/headless `chromium`/`zip`/`vite`/`create-vite`: npm gains
+  `typescript`, `eslint`, `prettier`, `tailwindcss`
+  (`PROTOTYPING_NPM_PACKAGES`); apt gains `fonts-inter`,
+  `fonts-jetbrains-mono`, `fonts-noto-color-emoji` (`PROTOTYPING_APT_PACKAGES`)
+  so deny-default-egress deployments render real UI fonts instead of browser
+  fallback serif/sans-serif. Package names were verified against
+  `packages.debian.org/trixie` at branch time (2026-07-16): all three font
+  packages exist under exactly these names, no substitution needed. The
+  `Minimal` profile's package lists are byte-identical (existing pinned test
+  `prototyping_bakes_expected_bundle` extended, not replaced).
+- `ruff` has **no** trixie apt package (verified via `packages.debian.org`
+  search — only unrelated `python-ruffus*`/`python3-scruffy` substring
+  matches exist), so it's baked via a new pinned-binary mechanism instead:
+  `copperclaw_types::image::{PinnedBinary, PinnedBinaryTarget,
+  RUFF_PINNED_BINARY, PROTOTYPING_PINNED_BINARIES}` declares an exact
+  upstream version (`0.15.22`) plus a per-architecture (x86_64/aarch64)
+  release-tarball URL and sha256 (both verified against the actual
+  downloaded assets, not just trusted from upstream's own `.sha256` files).
+  `crates/copperclaw-setup/src/steps/image.rs` gained
+  `PinnedBinaryFetcher`/`RealPinnedBinaryFetcher` (shells out to
+  `curl`/`sha256sum`/`tar`, mirroring `install.sh`'s own release-tarball
+  fetch — no new host prerequisite) and `fetch_pinned_binary` /
+  `bake_pinned_binaries`, which download, verify, unpack, and embed the
+  `ruff` binary as an `ExtraFile` at `/usr/local/bin/ruff` (mode 0o755) on
+  a `Prototyping` base-image build. Downloads are cached under
+  `<data_dir>/cache/pinned-binaries` keyed by name+version+arch+sha256, so
+  re-running setup doesn't re-fetch (idempotent per the E2 precedent).
+- The pinned binary's bytes are folded into `ImageBuildSpec::fingerprint()`
+  automatically via the existing generic `extra_files` hashing (same
+  mechanism the runner binary already uses) — no new fingerprint plumbing
+  needed. The per-group config fingerprint (`copperclaw-db`'s
+  `compute_fingerprint`) only hashes the `image_profile` *name*
+  conditionally (never the bundle contents, following the M18 E2 precedent),
+  so an existing group already on a pre-Q1 prototyping image is **not**
+  force-rebuilt mid-session; a fresh group's first build picks up the full
+  new bundle.
+- **Known scope gap (flagging for a follow-up, not fixed here — outside this
+  card's declared file scope):** the host's per-group mid-session rebuild
+  path (`crates/copperclaw-host/src/container_manager/spawn.rs:513-585`,
+  `rebuild_image`) constructs its own `ImageBuildSpec` from
+  `packages_apt`/`packages_npm`/`image_profile` only — it has no
+  `extra_files` channel, so it correctly inherits the new apt/npm additions
+  (they flow through the shared `ImageProfile` enum) but does **not**
+  independently embed the pinned `ruff` binary. In the common case (the
+  base image the operator built via `copperclaw-setup` is itself
+  `Prototyping`), `ruff` survives because `rebuild_image` layers on top of
+  that base; a group whose *own* profile is switched to `Prototyping` on a
+  `Minimal` base image will lint-tool-complete except for `ruff` until a
+  future card threads pinned-binary embedding into that path too.
+- Image-size growth is honest, not hidden: roughly **+100-170MB** to the
+  `Prototyping` image (three font packages, four new global npm packages,
+  and the ~11MB `ruff` binary; the pre-existing `chromium` line item still
+  dominates the total). `Minimal` is unaffected.
+
 ### Added (M19 A3 — Public-tunnel model verb: activate V5)
 
 - The merged-but-dormant V5 public-tunnel module now has an agent-facing verb.
