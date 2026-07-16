@@ -131,19 +131,24 @@ the shared markdown renderer + `fence.rs` migration were deferred as **C5b**
 meant V2 had no `preview.rs` conflict after all. Local `main` = `origin/main`
 at `10e473b`.
 
-**Wave C — IN FLIGHT (eighth session), three parallel agents:** **R7** (lane R,
-`m18/r7-subagent-fanout` — write-capable parallel-delegation middle tier reusing
-the worktree mechanics), **C5b** (lane C, `m18/c5b-shared-renderer` — the
-deferred shared markdown renderer + `fence.rs` migration from C2), **V5** (lane
-V, `m18/v5-public-tunnel` — public tunnel module). **V5 is HELD for explicit
-human security sign-off** — it touches the outward-facing surface, the plan
-mandates a security review before merge, and the launching session will NOT
-auto-merge it; the V5 agent runs `/security-review` and writes the threat model
-into its PR body for the human to sign off. After Wave C merges (V5 pending
-sign-off), **M1** (lane M, ABSOLUTE LAST) sweeps every merged PR's "Metrics
-wishes" (incl. #40-#52 and all Wave C PRs). Then the only program-acceptance
-item left is the live telegram smoke test (needs a message from the operator's
-phone; the automatable cli-channel proxy can be run in the meantime).
+**Wave C — MERGED (eighth session):** **C5b** (#53), **R7** (#54), then **M1**
+(#56) — merged in that order; integrated gate after each. **V5** (#55) is the
+lone exception: its code is complete and green (7180/0) but the PR is **HELD,
+NOT merged, pending explicit human security sign-off** (outward-facing tunnel;
+the plan mandates security review before merge). M1 (#56) merged after R7/C5b
+and swept #24-#54; final integrated gate on `main` after M1: **fmt / check /
+clippy -D warnings clean, 7206 passed** (one intermittent
+`orphan_depth_cap_rejection_emits_warn` failure under parallel load — the
+documented `copperclaw-modules` warn-capture flake, passes 3/3 in isolation).
+Local `main` = `origin/main` at `c6d1fbf`.
+
+**PROGRAM STATUS: every M18 card is merged except V5 (held for sign-off).** The
+runtime was rebuilt (`./rebuild.sh`) so the live host runs the completed code.
+Remaining to call the program fully done: (1) merge **V5** #55 after human
+security sign-off; (2) the live **telegram-from-phone** smoke (needs the
+operator's device); (3) the small **M1b** metrics follow-up (V2 tombstone-
+duration + R7 concurrent-delegates histograms + V5 tunnel metrics once V5
+merges). None blocks the demo-moment path, which is complete and gate-verified.
 
 Two housekeeping traps that bit this session, worth checking early in any
 fresh session: (1) local `main` can silently drift behind `origin/main` by
@@ -189,8 +194,8 @@ main..<branch> --oneline` yourself first.
 | C5 | **Merged (part 1; renderer split to C5b).** Adapter rich-surface floors for signal / whatsapp-cloud / mattermost (each a new `render.rs`): mattermost + signal gained `edit_message` → added to `EDIT_CAPABLE_CHANNELS`; whatsapp-cloud correctly stays non-edit-capable (Cloud API can't edit sent messages). Plus the two PR-#30 stale-doc-comment fixes (`emit_breadcrumb`→`emit_task_hud`). Shared markdown renderer + `fence.rs` migration deferred to **C5b** (Wave C). Gate 7148/0, fmt clean. | #52 |
 | C5b | **Merged.** Shared `channels/core::markdown` renderer (Html/Discord/Mattermost/Slack/WhatsApp/Plain flavors: headings, code, bold/italic/strike, links, nested lists, blockquotes) + C2's `fence.rs` migrated into it; `host-delivery` now delegates (`fence.rs` left a cfg(test) shim). C2's 17 splitter tests still pass through the relocated logic. Gate 7191/0, fmt clean. | #53 |
 | R7 | **Merged.** New `delegate` MCP tool → write-capable middle-tier build worker: permission-gated + depth-capped (reuses `create_agent` gates), each delegate in its own isolated `sib/<id>` worktree, contained (NULL messaging group → reports only to parent, can't post to user chat). No `spawn.rs` change (reused worktree mechanics via a `SpawnProfile` param). Single-call parallel fan-out orchestration deferred (parents fan out by calling `delegate` N times). Gate 7166/0, fmt clean. | #54 |
-| V5 | In flight (Wave C), **HELD for human security sign-off** — public tunnel module, `/security-review` + threat model in PR body (`m18/v5-public-tunnel`). | — |
-| M1 | In flight — metrics sweep of all merged PRs #24-#54 (V5 metrics deferred until it merges) (`m18/m1-metrics-rider`). | — |
+| V5 | **PR open — HELD for human security sign-off (NOT merged).** Public tunnel module (`copperclaw-modules/src/tunnel.rs`): `TunnelProvider` trait + `CloudflaredProvider` (operator-provided binary, anonymous quick tunnel — no Cloudflare credential read/stored), off-by-default/per-group opt-in, every exposure a `CredentialedExternalAction` `pending_approvals` row (single-use grant), audit-rowed, auto-teardown with the preview, absent-binary → clean `BinaryNotFound`. Real `credentialed_external_action` apply arm replaces G1's placeholder. `security-review` skill run: no HIGH findings; 2 sub-threshold gaps (reusable grant → single-use; payload/upstream confused-deputy → uses approved grant's stored upstream) found AND fixed pre-sign-off. Threat model in PR "## Security review". Gate 7180/0, fmt clean. | #55 |
+| M1 | **Merged.** Metrics rider: ~55 `copperclaw_*` metrics swept from merged PRs #24-#54, each registered + emitted at a verified call site (52 files: metrics crate + emit sites across channels/mcp/browser/modules/runner/host/router/delivery). Adapted: R1 gauge→counter (cross-process consumer). Dropped (no distinct code path, would misattribute): P3/X2 ritual-card metrics. Deferred to **M1b**: V2 tombstone-duration + R7 concurrent-delegates histograms (need runtime state not yet on `main`); V5 tunnel metrics (unmerged). Gate 7206/0, fmt clean. | #56 |
 
 ### R3 history (merged as #32 — skip unless you're touching the gate)
 
@@ -1370,10 +1375,21 @@ verify gate blocks a fake completion → preview link opens from the phone →
 ritual card + screenshot file → `cclaw audit list` shows the approval and
 preview rows.
 
-Still owed as of 2026-07-16: the live smoke test has never been run (R3
-merged without it; nothing since has run it either), and X2 is what makes
-the fixture cover the gate. Neither blocks card work; both block calling
-the program done.
+**Status as of 2026-07-16 (eighth session, all card work done):** X1+X2 are
+merged — the golden fixture NOW covers the verify-gate refuse→fix→pass leg
+(X2 #48) and the P3 ritual-card shape, so the fixture half of acceptance is
+**met**. Every implementing card is merged (V5 #55 excepted — held for human
+security sign-off). What remains for the live half:
+- The **live telegram smoke** (the phone-driven end-to-end above) has still
+  never been run — it needs a message from the operator's device, so the
+  autonomous session cannot complete it. The automatable **cli-channel proxy**
+  is the substitute an unattended run can drive; a green cli smoke is
+  corroborating, not a full substitute for the phone demo (cli is not
+  edit-capable, so it exercises the `StatusRows` HUD path, not the in-place
+  edited HUD the phone sees).
+- **V5 #55** merge after security sign-off.
+These are the only two things between here and "program done"; neither is card
+work.
 
 ## Deferred / rejected (don't re-litigate)
 
