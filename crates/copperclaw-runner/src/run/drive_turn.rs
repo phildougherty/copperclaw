@@ -420,6 +420,29 @@ async fn drive_turn_inner(
                     ),
                 });
             }
+            // M18 R6: progressive final answers. On a rich (edit-capable)
+            // channel, for a turn that already ran long (>30s), reveal a
+            // long final answer by growing the message via in-place edits
+            // instead of one terminal emit — the H1 HUD covers "something
+            // is happening" during the build; this relieves the wait for
+            // the *answer* itself. `answer` is the reasoning-stripped text
+            // the user actually sees (what `apply_send_message` would
+            // produce), so the gate measures the real length. Every other
+            // case (bare adapter, sub-30s turn, short/huge answer) falls
+            // through to today's single terminal emit, byte-identical.
+            let answer = crate::tools::strip_reasoning_blocks(&output.text);
+            if super::progressive::should_grow(hud.answer_edit_capable(), hud.elapsed(), &answer) {
+                super::progressive::grow_final_answer(
+                    deps,
+                    answer,
+                    super::progressive::STEP_INTERVAL,
+                )
+                .await?;
+                return Ok(TurnResult {
+                    continuation,
+                    outcome: TurnOutcome::Done,
+                });
+            }
             let spec = copperclaw_mcp::SendMessageSpec {
                 to: None,
                 text: output.text,
