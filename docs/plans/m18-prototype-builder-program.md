@@ -86,6 +86,7 @@ main..<branch> --oneline` yourself first.
 | R2 | Merged | #31 |
 | R3 | **Merged.** Verification gate is live on `main`. Live hand-verify smoke test was NOT run before merge (PR body left it unchecked) — still owed, see program-level acceptance. | #32 |
 | C3 | Not started | — |
+| X1 | **PR open.** `fixtures/cli/prototype-golden/` — scripted mock-provider e2e for the golden path, real end-to-end pipeline exercise. Two pieces explicitly NOT covered, each root-caused precisely in the PR/fixture README: the R3 verify-gate/todo mechanic (`/data` is hardcoded in `verify_gate.rs`/`todo.rs` with only a `#[cfg(test)]`-gated override invisible to the `copperclaw-host` integration-test binary, and `/data` is a real unwritable root-owned path on any host running the suite — the minimal un-gating fix was attempted and reverted after security review correctly flagged it as a capability weakening needing explicit sign-off) and the H1 live Task HUD (`cli` isn't edit-capable, so `Behavior` is always `StatusRows`, which needs 60s real wall-clock to fire once and has no finalize arm at all). Full workspace check suite green (6,964 passed, 0 failed). | #34 |
 | All others | Not started | — |
 
 ### R3 status (read this first if you're picking up R3)
