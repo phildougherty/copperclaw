@@ -240,7 +240,7 @@ pub fn build_approval_interceptor(
                     // race, or a double-tap) with the SAME verb the winner used.
                     // First resolution won; F3(b): tell the losing tapper who
                     // resolved it instead of leaving their tap looking broken.
-                    copperclaw_metrics::inc_approval_tap("conflict_notified");
+                    copperclaw_metrics::inc_approval_card_outcome("conflict_notified");
                     tracing::info!(
                         approval_id = %approval_id.as_uuid(),
                         "approvals: in-chat tap on an already-resolved approval; notifying loser"
@@ -263,11 +263,11 @@ pub fn build_approval_interceptor(
                     // F3(b): the row settled under a conflicting decision — name
                     // the resolver (or say it expired) rather than staying mute.
                     "conflict" => {
-                        copperclaw_metrics::inc_approval_tap("conflict_notified");
+                        copperclaw_metrics::inc_approval_card_outcome("conflict_notified");
                         reply(&dispatcher, &ctx, &resolved_note(&central, approval_id));
                     }
                     "not_found" => {
-                        copperclaw_metrics::inc_approval_tap("conflict_notified");
+                        copperclaw_metrics::inc_approval_card_outcome("conflict_notified");
                         reply(&dispatcher, &ctx, "That approval is no longer pending.");
                     }
                     _ => {
@@ -318,6 +318,8 @@ fn edit_card(
         ctx.thread_id.clone(),
     );
     if let Some(pmid) = pmid {
+        // M19 F3: card stamped terminal in place.
+        copperclaw_metrics::inc_approval_card_outcome("resolved_edit");
         dispatcher.edit_message(&target, &pmid, &text);
     } else {
         // Fallback-id path: no editable anchor was recorded at delivery. Post
@@ -326,7 +328,7 @@ fn edit_card(
             approval_id = %approval_id.as_uuid(),
             "approvals: no platform_message_id recorded; posting resolution as a follow-up reply"
         );
-        copperclaw_metrics::inc_approval_tap("resolved_fallback_reply");
+        copperclaw_metrics::inc_approval_card_outcome("resolved_fallback_reply");
         reply(dispatcher, ctx, &text);
     }
 }

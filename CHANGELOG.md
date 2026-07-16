@@ -732,6 +732,77 @@ adheres to [Semantic Versioning](https://semver.org/).
     present. Previously typing was a silent no-op, leaving no "agent is
     working" signal during a run.
 
+### Added (M19 M1 — metrics rider: sweep the M19 metric wishes into `copperclaw-metrics`, 2026-07-16)
+
+- One card, absolute last in the program, sweeps every metric "wish" the merged
+  M19 cards (F1–F5, U1–U7, A1–A6) recorded in their PR descriptions into
+  `crates/copperclaw-metrics/src/lib.rs` (the workspace hotspot — no other M19
+  card touches it). Each new counter/gauge/histogram is registered with a helper
+  following the crate's naming (`copperclaw_` prefix, `_total`/`_seconds` suffix,
+  snake_case labels) and wired to a real emit site; new tests extend the
+  prefix/suffix invariants and render-with-labels coverage to the additions.
+  - **F1** `copperclaw_edit_drift_fallthrough_total{channel_type}` — a dedicated
+    edit-drift alarm emitted alongside the existing
+    `inc_hud_edit(_, "unsupported_fallthrough")` from the core trait default
+    `edit_message` (`copperclaw-channels/core/src/adapter.rs`).
+  - **F2** `copperclaw_wall_card_total{blocker}` — a curated wall card actually
+    written to a user channel, labeled by `BlockerCategory::metric_label()`
+    (`copperclaw-runner/src/run/mod.rs::emit_terminal_failure_apologies`).
+  - **F3** `copperclaw_approval_card_outcome_total{outcome}`
+    (`resolved_edit|resolved_fallback_reply|conflict_notified|expired_card`) —
+    a dedicated approval-*card* lifecycle counter; the M19 cards had reused
+    `inc_approval_tap` with these new label values, polluting its documented
+    `approved|denied|unauthorized|race_noop` set. Those five call sites in
+    `copperclaw-host/src/approval_intercept.rs` + `.../handlers/approvals.rs`
+    are switched to the new counter (and a `resolved_edit` emit added at the
+    in-place edit branch, previously unmetered); `inc_approval_tap` is restored
+    to its original four outcomes.
+  - **F4** `copperclaw_blocked_todo_render_total{channel_type, has_reason}` —
+    a delivered todo checklist carried ≥1 `blocked` item; emitted from the
+    central `dispatch_todo_list` (`copperclaw-host-delivery/src/service.rs`).
+  - **F5** `copperclaw_hud_thinking_frame_total{agent_group}` — the pre-first-tool
+    "thinking…" HUD frame, distinct from the tool-triggered `inc_hud_post`
+    (`copperclaw-runner/src/run/hud.rs::arm`).
+  - **U1/U2** `copperclaw_adapter_surface_write_total{channel_type, mode}`
+    (`edit|create`) — the pinned rich-surface edit-vs-create intent, emitted
+    from `dispatch_todo_list`.
+  - **U3** `copperclaw_adapter_typing_total{channel_type, result}` (central
+    dispatcher `set_typing`, `copperclaw-host-delivery/src/dispatch.rs`) and
+    `copperclaw_adapter_reaction_total{channel_type, result}` (central reaction
+    system-action path in `service.rs`) — both cover every adapter from one site.
+  - **U6** `copperclaw_shared_renderer_adoption{channel_type}` gauge, set from the
+    const `SHARED_RENDERER_ADOPTED_ADAPTERS` list inside `maybe_start_server`
+    (self-contained, no external call site) — coverage of `core::markdown::render`
+    adoption.
+  - **U7** `copperclaw_inbound_reaction_total{signal, outcome}`
+    (`affirmative|looking|negative|none` × `folded|ignored`) — replaces the
+    generic `inc_midturn_control(_, "reaction")` proxy at the runner's steering
+    seam (`copperclaw-runner/src/run/drive_turn.rs`).
+  - **A1** `copperclaw_delegate_batch_width` histogram + `…_worker_total{outcome}`
+    (`ok|timeout|spawn_failed`) from the runner join
+    (`copperclaw-runner/src/run/delegate_batch.rs`) + `…_refused_total` from the
+    pure handler (`copperclaw-mcp/src/tools/agents.rs`).
+  - **A2** `copperclaw_browser_interactive_actions_total{action, outcome}` per
+    scripted action (`copperclaw-browser/src/interactive.rs`); the interactive
+    SSRF *stage* labels were already live via `inc_browser_ssrf_block`.
+  - **A3** `copperclaw_public_tunnel_total{outcome, reason}`
+    (`opened|approval_raised|denied|torn_down`) wired at the five state
+    transitions in `copperclaw-modules/src/tunnel.rs`.
+  - **A4** `copperclaw_skills_saved_total{outcome}` (`saved|rejected`) — a
+    dedicated counter at the true write site
+    (`copperclaw-host/src/handlers/approvals.rs::apply_save_skill`), which had no
+    metric; the save-skill paths previously proxied through `inc_self_mod_*`
+    (those remain as the request-raise signal).
+  - **A5** `copperclaw_memory_writes_total{provenance}` (`trusted|untrusted`) +
+    `copperclaw_memory_write_rate_capped_total` at the runner `memory_save` impl
+    (`copperclaw-runner/src/tools.rs`).
+  - **A6** `copperclaw_scheduled_task_fires_total{kind}`
+    (`recurring_rearm|one_shot_complete`), `copperclaw_scheduled_tasks_active`
+    gauge (new `tasks::count_active` query in `copperclaw-db`), and
+    `copperclaw_scheduled_task_fire_latency_seconds` histogram, all set/emitted
+    from the sweep's due-task fan-out
+    (`copperclaw-host-sweep/src/checks/scheduling.rs`).
+
 ### Fixed (M18 — Task HUD no-op edit / Telegram "message is not modified", 2026-07-16)
 
 - The H1 Task HUD and R6 progressive-final-answer edit a pinned status

@@ -806,7 +806,13 @@ async fn check_mid_turn_steering(
                     &deps.agent_group_id.to_string(),
                     "reaction",
                 );
+                // M19 U7: dedicated per-signal/outcome counter.
+                copperclaw_metrics::inc_inbound_reaction(signal.label(), "folded");
                 steered = true;
+            } else {
+                // Uncurated emoji, or a reaction on a message that isn't the
+                // agent's own last — consumed but not steered.
+                copperclaw_metrics::inc_inbound_reaction("none", "ignored");
             }
             // Consume every reaction row (steering or not) so it never
             // re-surfaces as a spurious turn on a later poll.

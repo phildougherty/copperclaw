@@ -63,8 +63,13 @@ impl DeliveryDispatcher for HostDispatcher {
         let thread_id = target.thread_id.clone();
         let (tx, rx) = oneshot::channel();
         self.runtime.spawn(async move {
+            // M19 U3: meter typing-indicator sends centrally (covers every adapter).
+            let ct = adapter.channel_type().as_str().to_owned();
             let outcome = match adapter.set_typing(&platform_id, thread_id.as_deref()).await {
-                Ok(()) => TypingOutcome::Ok,
+                Ok(()) => {
+                    copperclaw_metrics::inc_adapter_typing(&ct, "ok");
+                    TypingOutcome::Ok
+                }
                 Err(err) => {
                     // Typing is documented best-effort; a rate-limit or transient
                     // adapter error must never be WARN-level noise. The ticker
@@ -72,9 +77,17 @@ impl DeliveryDispatcher for HostDispatcher {
                     debug!(?err, "dispatcher: set_typing failed (best-effort)");
                     match err {
                         AdapterError::Rate { retry_after } => {
+                            copperclaw_metrics::inc_adapter_typing(&ct, "rate_limited");
                             TypingOutcome::RateLimited { retry_after }
                         }
-                        _ => TypingOutcome::Ok,
+                        AdapterError::Unsupported(_) => {
+                            copperclaw_metrics::inc_adapter_typing(&ct, "unsupported");
+                            TypingOutcome::Ok
+                        }
+                        _ => {
+                            copperclaw_metrics::inc_adapter_typing(&ct, "error");
+                            TypingOutcome::Ok
+                        }
                     }
                 }
             };

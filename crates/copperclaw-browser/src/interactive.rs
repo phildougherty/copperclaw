@@ -254,8 +254,26 @@ pub async fn interact(
     //    resulting navigation state — this is the per-navigation SSRF re-guard
     //    that mid-interaction navigation demands.
     for action in &req.actions {
-        nav = driver.act(action).await?;
-        reguard_navigation(guard, &nav).await?;
+        // M19 A2: meter each scripted action with its outcome. `blocked` is an
+        // SSRF re-guard refusal on the resulting navigation; any other error is
+        // a driver_error.
+        match driver.act(action).await {
+            Ok(next) => nav = next,
+            Err(e) => {
+                let outcome = if matches!(e, BrowserError::Blocked(_)) {
+                    "blocked"
+                } else {
+                    "driver_error"
+                };
+                copperclaw_metrics::inc_browser_interactive_action(action.kind(), outcome);
+                return Err(e);
+            }
+        }
+        if let Err(e) = reguard_navigation(guard, &nav).await {
+            copperclaw_metrics::inc_browser_interactive_action(action.kind(), "blocked");
+            return Err(e);
+        }
+        copperclaw_metrics::inc_browser_interactive_action(action.kind(), "ok");
     }
 
     // 4. Only now — after every navigation has been re-guarded — read the

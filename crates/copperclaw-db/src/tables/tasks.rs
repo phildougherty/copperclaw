@@ -240,6 +240,18 @@ pub fn list_due(db: &CentralDb, now: DateTime<Utc>) -> Result<Vec<Task>, DbError
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
+/// Count all tasks in `active` status (regardless of `next_fire`). Feeds the
+/// M19 A6 `copperclaw_scheduled_tasks_active` gauge the sweep sets each pass.
+pub fn count_active(db: &CentralDb) -> Result<u64, DbError> {
+    let conn = db.conn()?;
+    let n: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM tasks WHERE status = 'active'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(u64::try_from(n).unwrap_or(0))
+}
+
 /// Update status only.
 pub fn set_status(db: &CentralDb, id: &str, status: TaskStatus) -> Result<(), DbError> {
     let conn = db.conn()?;

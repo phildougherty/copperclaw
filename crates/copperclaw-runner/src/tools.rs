@@ -928,6 +928,8 @@ impl ToolContext for RunnerToolCtx {
         // Per-session rate cap: refuse once the ceiling is reached. The counter
         // is incremented only on an accepted write below.
         if self.memory_saves.load(std::sync::atomic::Ordering::Acquire) >= MAX_SAVES_PER_SESSION {
+            // M19 A5: rate-cap rejection.
+            copperclaw_metrics::inc_memory_write_rate_capped();
             return Err(ToolError::Validation(format!(
                 "memory_save rate cap reached ({MAX_SAVES_PER_SESSION} writes this session)"
             )));
@@ -962,6 +964,8 @@ impl ToolContext for RunnerToolCtx {
                 embedding: &[],
             })
             .map_err(|e| ToolError::Internal(format!("memory save: {e}")))?;
+        // M19 A5: accepted write, labeled by the store-side provenance decision.
+        copperclaw_metrics::inc_memory_write(if tainted { "untrusted" } else { "trusted" });
         self.memory_saves
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(copperclaw_mcp::MemorySaveOutcome {
