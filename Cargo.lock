@@ -1308,6 +1308,7 @@ dependencies = [
  "clap",
  "copperclaw-container-rt",
  "copperclaw-db",
+ "copperclaw-metrics",
  "copperclaw-onecli",
  "copperclaw-types",
  "dialoguer",

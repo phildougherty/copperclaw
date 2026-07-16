@@ -613,6 +613,15 @@ pub async fn handle(
     }
 
     if no_findings || !findings.is_empty() {
+        // M20 Q6: findings-count histogram + the no_findings-vs-findings split
+        // the card asked for, recorded from the count we already have before
+        // `findings` moves into the blocking closure.
+        copperclaw_metrics::observe_self_review_findings(findings.len() as u64);
+        copperclaw_metrics::inc_self_review_submission(if findings.is_empty() {
+            "no_findings"
+        } else {
+            "findings"
+        });
         let value = tokio::task::spawn_blocking(move || submit_blocking(&project_root, &findings))
             .await
             .map_err(|e| ToolError::Internal(format!("self_review join: {e}")))??;

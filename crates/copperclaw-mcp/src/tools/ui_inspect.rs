@@ -190,12 +190,22 @@ pub async fn handle(
     ctx: &dyn ToolContext,
 ) -> Result<CallToolResult, ToolError> {
     let input: Input = parse_args(arguments)?;
-    let prepared = prepare(&input)?;
+    let prepared = match prepare(&input) {
+        Ok(p) => p,
+        Err(e) => {
+            copperclaw_metrics::inc_ui_inspect("refused_url");
+            copperclaw_metrics::inc_ui_screenshot_refused_url();
+            return Err(e);
+        }
+    };
 
     // Probe for chromium AT CALL TIME (not registration time — the tool is
     // always registered under Coding/Full; the minimal profile degrades
     // here, cleanly), same as `ui_screenshot`.
-    let binary = copperclaw_browser::find_chromium_binary().ok_or_else(chromium_missing_error)?;
+    let Some(binary) = copperclaw_browser::find_chromium_binary() else {
+        copperclaw_metrics::inc_ui_inspect("chromium_missing");
+        return Err(chromium_missing_error());
+    };
 
     // M20 D5: this tool's whole purpose is to surface page-originated
     // console text, so it taints the turn unconditionally, before driving
@@ -223,6 +233,14 @@ pub async fn handle(
     let outcome = copperclaw_browser::inspect(transport.as_ref(), &req)
         .await
         .map_err(|e| ToolError::Internal(format!("ui_inspect: {e}")))?;
+
+    copperclaw_metrics::inc_ui_inspect("success");
+    let error_count = outcome
+        .console
+        .iter()
+        .filter(|e| e.level == ConsoleLevel::Error)
+        .count();
+    copperclaw_metrics::observe_ui_inspect_console_errors(error_count as u64);
 
     let mut sections = vec![format_console_section(&outcome.console)];
     if let Some(element) = &outcome.element {

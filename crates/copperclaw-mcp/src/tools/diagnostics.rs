@@ -699,6 +699,7 @@ async fn diagnose_project(project_root: &Path, max_findings: usize) -> Value {
         if !probe_binary(tool.binary()).await {
             results.insert(tool.name().to_string(), not_available_note(*tool));
             tools_unavailable.push(tool.name());
+            copperclaw_metrics::inc_diagnostics_run(tool.name(), "not_available");
             continue;
         }
         match run_tool(*tool, project_root, max_findings).await {
@@ -710,9 +711,11 @@ async fn diagnose_project(project_root: &Path, max_findings: usize) -> Value {
                     tool.name().to_string(),
                     serde_json::to_value(&digest).unwrap_or(Value::Null),
                 );
+                copperclaw_metrics::inc_diagnostics_run(tool.name(), "ran");
             }
             Err(message) => {
                 results.insert(tool.name().to_string(), error_note(&message));
+                copperclaw_metrics::inc_diagnostics_run(tool.name(), "error");
             }
         }
     }

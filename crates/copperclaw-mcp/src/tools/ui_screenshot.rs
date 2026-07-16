@@ -298,21 +298,42 @@ pub async fn handle(
     ctx: &dyn ToolContext,
 ) -> Result<CallToolResult, ToolError> {
     let input: Input = parse_args(arguments)?;
-    let prepared = prepare(&input)?;
+    let prepared = match prepare(&input) {
+        Ok(p) => p,
+        Err(e) => {
+            // M20 M1: `prepare` only fails over URL validation (parse error,
+            // bad scheme, or non-loopback host) — all three collapse to the
+            // same refused-URL outcome/counter.
+            copperclaw_metrics::inc_ui_screenshot("blocked_non_loopback", "desktop");
+            copperclaw_metrics::inc_ui_screenshot_refused_url();
+            return Err(e);
+        }
+    };
+    let viewport_label = match prepared.capture.viewport {
+        Some(ViewportPreset::Mobile) => "mobile",
+        _ => "desktop",
+    };
 
     // Probe for chromium AT CALL TIME (not registration time — the tool is
     // always registered under Coding/Full; the minimal profile degrades
     // here, cleanly).
-    let binary = copperclaw_browser::find_chromium_binary().ok_or_else(chromium_missing_error)?;
+    let Some(binary) = copperclaw_browser::find_chromium_binary() else {
+        copperclaw_metrics::inc_ui_screenshot("chromium_missing", viewport_label);
+        return Err(chromium_missing_error());
+    };
 
-    let transport = copperclaw_browser::chromium_singleton()
+    let transport = match copperclaw_browser::chromium_singleton()
         .get_transport(&binary, NAV_TIMEOUT)
         .await
-        .map_err(|e| {
-            ToolError::Internal(format!(
+    {
+        Ok(t) => t,
+        Err(e) => {
+            copperclaw_metrics::inc_ui_screenshot("driver_error", viewport_label);
+            return Err(ToolError::Internal(format!(
                 "ui_screenshot: could not start the local chromium: {e}"
-            ))
-        })?;
+            )));
+        }
+    };
 
     let req = copperclaw_browser::ScreenshotRequest {
         url: prepared.url.to_string(),
@@ -323,15 +344,24 @@ pub async fn handle(
     };
     // M20 D2 size safety: an oversize capture auto-retries once as a
     // lower-fidelity jpeg rather than erroring outright.
-    let result = copperclaw_browser::capture_with_size_safety(
+    let started = std::time::Instant::now();
+    let result = match copperclaw_browser::capture_with_size_safety(
         transport.as_ref(),
         &req,
         MAX_SCREENSHOT_BYTES,
     )
     .await
-    .map_err(|e| ToolError::Internal(format!("ui_screenshot: {e}")))?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            copperclaw_metrics::inc_ui_screenshot("driver_error", viewport_label);
+            return Err(ToolError::Internal(format!("ui_screenshot: {e}")));
+        }
+    };
+    copperclaw_metrics::observe_ui_screenshot_capture_seconds(started.elapsed().as_secs_f64());
 
     if result.bytes.len() as u64 > MAX_SCREENSHOT_BYTES {
+        copperclaw_metrics::inc_ui_screenshot("oversize", viewport_label);
         return Err(ToolError::Internal(format!(
             "ui_screenshot: the capture of `{}` was {} bytes, over the {MAX_SCREENSHOT_BYTES}-byte \
              cap even after an automatic retry at a lower-fidelity jpeg — unusual; try again after \
@@ -341,6 +371,18 @@ pub async fn handle(
             result.bytes.len()
         )));
     }
+    copperclaw_metrics::inc_ui_screenshot(
+        if result.downgraded {
+            "downgraded"
+        } else {
+            "ok"
+        },
+        viewport_label,
+    );
+    copperclaw_metrics::inc_browser_output_format(
+        "ui_screenshot",
+        result.capture.format.as_cdp_str(),
+    );
 
     tokio::fs::create_dir_all(&prepared.screenshot_dir)
         .await

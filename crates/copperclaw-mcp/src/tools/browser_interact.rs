@@ -275,6 +275,13 @@ async fn interact_prepared_live(
         Err(_) => "driver_error",
     };
     copperclaw_metrics::inc_browser_render(mode_label, outcome);
+    if result.is_ok() && prepared.req.mode == copperclaw_browser::RenderMode::Screenshot {
+        // M20 M1: `browser_interact`'s screenshot mode has no format arg — it
+        // is always a PNG (see `RenderMode::Screenshot`'s doc comment) — so
+        // this counter's `format` label is always `png` here, unlike
+        // `ui_screenshot`/`browser_render` which can downgrade to jpeg.
+        copperclaw_metrics::inc_browser_output_format("browser_interact", "png");
+    }
 
     match result {
         Ok(out) => Ok(success_json(&out)),

@@ -252,12 +252,22 @@ impl ContainerManager {
         let cfg_row = container_configs::get(&self.central, session.agent_group_id)
             .map_err(ManagerError::Db)?;
         // E2: fleet-visibility gauge of each group's active image profile.
+        let image_profile = cfg_row
+            .as_ref()
+            .map_or(copperclaw_types::ImageProfile::Minimal, |c| c.image_profile);
         copperclaw_metrics::set_group_image_profile(
             &session.agent_group_id.to_string(),
-            cfg_row
-                .as_ref()
-                .map_or("minimal", |c| c.image_profile.as_str()),
+            image_profile.as_str(),
         );
+        // M20 Q1: fleet visibility on exactly which pinned-binary version
+        // this profile bakes (no-op for a profile with none, e.g. minimal).
+        for binary in image_profile.extra_pinned_binaries() {
+            copperclaw_metrics::set_image_bundle_version(
+                image_profile.as_str(),
+                binary.name,
+                binary.version,
+            );
+        }
         let runner_cfg =
             self.runner_config_for(session, cfg_row.as_ref(), Some(paths.root.as_path()));
         let runner_json = serde_json::to_vec_pretty(&runner_cfg).map_err(ManagerError::Json)?;

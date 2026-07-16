@@ -212,6 +212,16 @@ pub mod send_file {
                 ));
             }
             (Some(path), None) => {
+                // M20 D4/M1: the closest observable proxy for "the ritual
+                // screenshot was actually delivered" — D4's full see->fix
+                // cycle (look, critique, edit) has no runtime marker (it's a
+                // prompt-level habit), but a `send_file` whose path is a
+                // `ui_screenshot`-saved PNG/JPEG IS directly observable here,
+                // at the one call site that still has the raw disk path
+                // before it's reduced to a bare filename below.
+                if path.contains(".copperclaw/screenshots/") {
+                    copperclaw_metrics::inc_ritual_screenshot_delivery("delivered");
+                }
                 let metadata = std::fs::metadata(path).map_err(|e| {
                     ToolError::Validation(format!("send_file: stat `{path}` failed: {e}"))
                 })?;

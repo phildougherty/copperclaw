@@ -443,6 +443,7 @@ async fn render_prepared_live(
     // the render call below.
     let mode_label = prepared.req.mode.as_str().to_owned();
     let is_screenshot = prepared.req.mode.as_str() == "screenshot";
+    let format_label = prepared.req.capture.format.as_cdp_str();
 
     let runtime = match copperclaw_container_rt::detect().await {
         Ok(rt) => rt,
@@ -495,6 +496,7 @@ async fn render_prepared_live(
             copperclaw_metrics::observe_browser_screenshot_duration_seconds(
                 started.elapsed().as_secs_f64(),
             );
+            copperclaw_metrics::inc_browser_output_format("browser_render", format_label);
         }
     }
 

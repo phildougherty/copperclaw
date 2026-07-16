@@ -324,6 +324,7 @@ pub fn fetch_pinned_binary(
         .iter()
         .find(|t| t.arch == arch)
         .ok_or_else(|| {
+            copperclaw_metrics::inc_pinned_binary_fetch(binary.name, "arch_unsupported");
             StepError::Other(format!(
                 "no pinned `{}` build for host architecture `{arch}`",
                 binary.name
@@ -335,6 +336,7 @@ pub fn fetch_pinned_binary(
         binary.name, binary.version, target.sha256
     ));
     if let Ok(bytes) = std::fs::read(&cache_path) {
+        copperclaw_metrics::inc_pinned_binary_fetch(binary.name, "cache_hit");
         return Ok(bytes);
     }
 
@@ -355,7 +357,25 @@ pub fn fetch_pinned_binary(
 
     let result = fetch_and_extract(fetcher, target, binary.name, &scratch);
     let _ = std::fs::remove_dir_all(&scratch);
-    let bytes = result?;
+    let bytes = match result {
+        Ok(bytes) => {
+            copperclaw_metrics::inc_pinned_binary_fetch(binary.name, "fetch_ok");
+            bytes
+        }
+        Err(e) => {
+            // "checksum" only ever appears in the verify_sha256 error wrap
+            // (`fetch_and_extract`'s `"verify {binary_name} checksum: {e}"`)
+            // — every other download/extract/read failure gets the generic
+            // bucket.
+            let outcome = if e.to_string().contains("checksum") {
+                "checksum_fail"
+            } else {
+                "fetch_failed"
+            };
+            copperclaw_metrics::inc_pinned_binary_fetch(binary.name, outcome);
+            return Err(e);
+        }
+    };
 
     // Best-effort cache write: a failure here just means the next run
     // re-fetches; it must never fail the build over cache I/O.

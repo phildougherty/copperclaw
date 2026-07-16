@@ -473,6 +473,9 @@ const MAX_DECISIONS_LINES: usize = 30;
 /// `.copperclaw/verify` pins `(none recorded)`, exactly as before Q8.
 async fn push_verify_stages(body: &mut String, proj: &Path) {
     let stages = copperclaw_mcp::tools::verify_gate::recorded_stages(proj, None).await;
+    // M20 M1: verify-stage count pinned per project per compaction round
+    // (0 for a project with no recorded verify command).
+    copperclaw_metrics::observe_compaction_verify_stages_pinned(stages.len() as u64);
     if stages.is_empty() {
         body.push_str("  verify: (none recorded)\n");
         return;
@@ -509,6 +512,12 @@ async fn push_verify_stages(body: &mut String, proj: &Path) {
 /// Capped at [`MAX_INVENTORY_FILES`] paths.
 async fn push_file_inventory(body: &mut String, proj: &Path) {
     let files = git_ls_files(proj).await;
+    // M20 M1: file-inventory count + byte size (sum of path lengths) pinned
+    // per project per compaction round (0/0 for a non-git or empty project).
+    copperclaw_metrics::observe_compaction_file_inventory_count(files.len() as u64);
+    copperclaw_metrics::observe_compaction_file_inventory_bytes(
+        files.iter().map(String::len).sum(),
+    );
     if files.is_empty() {
         return;
     }
@@ -561,6 +570,9 @@ async fn git_ls_files(project_root: &Path) -> Vec<String> {
 async fn push_decisions_tail(body: &mut String, proj: &Path) {
     let path = proj.join(STATE_DIR_NAME).join(DECISIONS_FILE_NAME);
     let Ok(text) = tokio::fs::read_to_string(&path).await else {
+        // M20 M1: no DECISIONS.md — 0 lines pinned, compacts exactly as
+        // before Q8.
+        copperclaw_metrics::observe_compaction_decisions_tail_lines(0);
         return;
     };
     let lines: Vec<&str> = text
@@ -569,10 +581,13 @@ async fn push_decisions_tail(body: &mut String, proj: &Path) {
         .filter(|l| !l.is_empty())
         .collect();
     if lines.is_empty() {
+        copperclaw_metrics::observe_compaction_decisions_tail_lines(0);
         return;
     }
     let tail_start = lines.len().saturating_sub(MAX_DECISIONS_LINES);
     let tail = &lines[tail_start..];
+    // M20 M1: the number of DECISIONS.md lines actually pinned this round.
+    copperclaw_metrics::observe_compaction_decisions_tail_lines(tail.len() as u64);
     body.push_str("  decisions (last ");
     body.push_str(&tail.len().to_string());
     body.push_str("):\n");
