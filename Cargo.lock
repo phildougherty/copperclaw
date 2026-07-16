@@ -433,11 +433,15 @@ name = "copperclaw-browser"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "copperclaw-container-rt",
+ "futures",
+ "reqwest",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite",
  "tracing",
  "url",
 ]

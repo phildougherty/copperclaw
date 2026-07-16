@@ -30,6 +30,17 @@ use std::path::{Component, Path, PathBuf};
 pub const FIX_CYCLE_CAP: u32 = 2;
 
 const DATA_ROOT_DEFAULT: &str = "/data";
+/// Unconditional (non-`#[cfg(test)]`) override for the project-data
+/// root, mirroring the shell tool's `COPPERCLAW_SHELL_STATE_FILE`
+/// precedent (see `computer_use.rs`). When set on the runner process's
+/// environment it replaces `/data` as the root the R3 verify gate and
+/// the todo store resolve against; when unset, production behavior is
+/// byte-identical to the compiled-in `/data` default. The runner
+/// process env is host-controlled at spawn — an in-container agent's
+/// `shell` calls execute inside the container, not in the runner
+/// process, so they cannot mutate this var and cannot use it to escape
+/// the gate.
+const DATA_ROOT_ENV_OVERRIDE: &str = "COPPERCLAW_DATA_ROOT";
 const STATE_DIR_NAME: &str = ".copperclaw";
 const VERIFY_FILE: &str = "verify";
 const DIRTY_FILE: &str = "dirty";
@@ -77,10 +88,28 @@ fn data_root_override() -> Option<PathBuf> {
     None
 }
 
+/// Resolve the effective data root from its override sources, in
+/// priority order: the in-process `#[cfg(test)]` override, then the
+/// `COPPERCLAW_DATA_ROOT` env var, then the compiled-in `/data`
+/// default. Split out as a pure function so the env-var branch is
+/// unit-testable without mutating process env — `forbid(unsafe_code)`
+/// plus edition 2024 make `std::env::set_var` unavailable in tests.
+fn resolve_data_root(test_override: Option<PathBuf>, env: Option<std::ffi::OsString>) -> PathBuf {
+    if let Some(p) = test_override {
+        return p;
+    }
+    env.map_or_else(|| PathBuf::from(DATA_ROOT_DEFAULT), PathBuf::from)
+}
+
 /// Resolve the container's project-data root: `/data` in production,
-/// test-overridable via [`data_root_test_override_set`].
+/// overridable at runtime via the `COPPERCLAW_DATA_ROOT` env var and,
+/// in tests, via [`data_root_test_override_set`] (which wins over the
+/// env var). See [`resolve_data_root`] for the precedence.
 pub(crate) fn data_root() -> PathBuf {
-    data_root_override().unwrap_or_else(|| PathBuf::from(DATA_ROOT_DEFAULT))
+    resolve_data_root(
+        data_root_override(),
+        std::env::var_os(DATA_ROOT_ENV_OVERRIDE),
+    )
 }
 
 /// Cross-module lock so `verify_gate` / `computer_use` / `todo` tests
@@ -535,6 +564,37 @@ mod tests {
         let g = DataRootGuard::new();
         std::fs::create_dir_all(g.path().join("clean")).unwrap();
         assert!(scan_dirty_projects().await.is_empty());
+    }
+
+    #[test]
+    fn resolve_data_root_env_override_points_at_tempdir() {
+        // The COPPERCLAW_DATA_ROOT override redirects the gate's root at
+        // a caller-supplied directory. We exercise the resolver directly
+        // (rather than mutating process env, which forbid(unsafe_code) +
+        // edition 2024 disallow) so the env branch is covered honestly.
+        let td = tempfile::tempdir().unwrap();
+        let resolved = resolve_data_root(None, Some(td.path().as_os_str().to_os_string()));
+        assert_eq!(resolved, td.path());
+    }
+
+    #[test]
+    fn resolve_data_root_defaults_to_data_when_unset() {
+        // Production behavior with the var unset is byte-identical to the
+        // compiled-in default — no test override, no env value.
+        assert_eq!(resolve_data_root(None, None), PathBuf::from("/data"));
+    }
+
+    #[test]
+    fn resolve_data_root_test_override_wins_over_env() {
+        // The in-process test override takes precedence over the env var,
+        // preserving the existing #[cfg(test)] override mechanism.
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let resolved = resolve_data_root(
+            Some(a.path().to_path_buf()),
+            Some(b.path().as_os_str().to_os_string()),
+        );
+        assert_eq!(resolved, a.path());
     }
 
     #[test]
