@@ -6,6 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M19 U2 — Teams in-place edit + reactions, 2026-07-16)
+
+- The `teams` adapter rendered every rich surface (cards / diffs / collapsible /
+  todo / thinking / errors) but never overrode the trait
+  `ChannelAdapter::edit_message`, so it was absent from `EDIT_CAPABLE_CHANNELS`.
+  The host HUD / approval path calls the **trait** method
+  (`copperclaw-host-delivery/src/dispatch.rs`); with no override it fell through
+  to the trait default (`AdapterError::Unsupported`) and every HUD "edit"
+  degraded into a fresh message — new-message spam. Now:
+  - `TeamsAdapter` overrides trait `edit_message`
+    (`crates/copperclaw-channels/teams/src/adapter.rs`), resolving the
+    `platform_id` to a channel post or chat message and PATCHing it in place via
+    Microsoft Graph (`edit_channel_message` / `edit_chat_message`,
+    `PATCH .../messages/{id}`). It emits the same
+    `inc_hud_edit` / `inc_adapter_edit_message` metrics as the other
+    edit-capable adapters (mirrors mattermost). N status updates now become N
+    in-place PATCHes against one message id, not N POSTs.
+  - `teams` is added to `EDIT_CAPABLE_CHANNELS`
+    (`crates/copperclaw-channels/core/src/capabilities.rs`) in the same change,
+    per the module's keep-in-sync rule, so the delivery loop routes HUD edits to
+    the Teams edit path. The F1 drift guard
+    (`copperclaw-host-delivery/tests/edit_capable_edit_message_drift.rs`) still
+    passes with Teams listed.
+  - `TeamsAdapter` overrides trait `add_reaction` (Graph `setReaction`, shortcode
+    mapped by `emoji::shortcode_to_reaction_type`; unmapped shortcodes surface as
+    `Unsupported`) so host-driven reactions reach Teams, and adds
+    `plain_text_fallback` (strips the rich `html` content field, marks the body
+    `[reduced formatting]`) so a body that trips a Graph formatting rejection can
+    be redelivered as plain text.
+
 ### Added (M19 F4 — `blocked` todo state visible to users, 2026-07-16)
 
 - The runner has a real `TodoStatus::Blocked` (+ `blocked_reason`) for a step

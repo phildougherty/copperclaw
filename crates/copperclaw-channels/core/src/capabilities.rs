@@ -35,7 +35,7 @@
 /// [`crate::ChannelAdapter::edit_message`] (an in-place edit API), as
 /// verified against the in-tree adapter sources. Everything else falls
 /// back to the trait default (`AdapterError::Unsupported`).
-const EDIT_CAPABLE_CHANNELS: [&str; 7] = [
+const EDIT_CAPABLE_CHANNELS: [&str; 8] = [
     "telegram",
     "slack",
     "discord",
@@ -43,6 +43,7 @@ const EDIT_CAPABLE_CHANNELS: [&str; 7] = [
     "webex",
     "signal",
     "mattermost",
+    "teams",
 ];
 
 /// True when the named channel type's adapter can edit a previously
@@ -98,7 +99,8 @@ mod tests {
         // The adapters with a real in-place edit impl (see the
         // module-level sync rule). signal (`sendEditMessage`) and
         // mattermost (`PUT /posts/{id}/patch`) were raised to the
-        // rich-surface floor in M18-C5.
+        // rich-surface floor in M18-C5. teams (`PATCH .../messages/{id}`)
+        // gained a trait `edit_message` override in M19-U2.
         for ct in [
             "telegram",
             "slack",
@@ -107,6 +109,7 @@ mod tests {
             "webex",
             "signal",
             "mattermost",
+            "teams",
         ] {
             assert!(supports_message_edit(ct), "{ct} implements edit_message");
         }

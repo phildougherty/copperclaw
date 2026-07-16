@@ -811,6 +811,7 @@ dependencies = [
  "bytes",
  "chrono",
  "copperclaw-channels-core",
+ "copperclaw-metrics",
  "copperclaw-types",
  "hex",
  "hmac",
