@@ -6,6 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M18 C4a — Slack inbound files, 2026-07-15)
+
+- The Slack adapter now receives inbound files. Previously
+  `crates/copperclaw-channels/slack/src/events/router.rs` ignored a
+  message's `files[]` entirely, so "here's the CSV/spec, build around it"
+  never reached the agent. The events router now downloads a message's
+  first file from its `url_private` link with the bot token
+  (`Authorization: Bearer <bot-token>`, wired via the new
+  `SlackApi::download_file`), enforces the same `max_attachment_bytes`
+  config as Telegram (new `SlackConfig` field, default 20 MB), and stages
+  the bytes per the C3 channels-core inbound-file contract
+  (`stage_inbound_file` → `content.attachment.staged_path`, never `path` —
+  the router owns materialization into `/data/inbox/<msg_id>/<file>`).
+  Small images additionally inline `data_base64` for vision parity with
+  Telegram's `inline_image_base64`. Download/size failures downgrade to a
+  `MessageKind::System` row with the same `too_large` / `download_failed`
+  taxonomy Telegram emits — never a silent drop. New replay fixture
+  `fixtures/slack/inbound-file-attachment/` (registered as
+  `slack_inbound_file_attachment_round_trip` in
+  `crates/copperclaw-host/tests/replay.rs`) mirrors the C3 Telegram
+  fixture; the `url_private` download itself is unit-tested against a mock
+  Slack server in the adapter crate.
+
 ### Added (M18 X1 — golden-path program fixture, 2026-07-15)
 
 - New replay fixture `fixtures/cli/prototype-golden/` (registered as
