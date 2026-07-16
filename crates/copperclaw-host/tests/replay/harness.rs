@@ -65,7 +65,9 @@ use copperclaw_host_router::{
 };
 use copperclaw_host_sweep::service::FilesystemSessionRoot as SweepRoot;
 use copperclaw_host_sweep::{SessionRoot as SweepSessionRoot, SweepService};
-use copperclaw_modules::{ApprovalsModule, Module};
+use copperclaw_modules::{
+    ApprovalsModule, Module, PreviewBroker, PreviewError, PreviewExposed, SessionInfoLite,
+};
 use copperclaw_providers::AnthropicProvider;
 use copperclaw_runner::{RunnerDeps, RunnerToolCtx, compaction::CompactionCfg, run_loop};
 use copperclaw_types::{
@@ -117,6 +119,19 @@ pub struct ReplayHarness {
     /// True when the manifest's `gates` includes `"budget"`. Drives the
     /// container manager's spawn classifier instead of the runner.
     use_budget_gate: bool,
+    /// True when the manifest's `gates` includes `"preview"`. Wires a
+    /// [`FixturePreviewBroker`] onto `delivery` and advertises the M17
+    /// `expose_preview` / `close_preview` tools to the per-step runner
+    /// (mirrors `main.rs`'s wiring of `run::preview::preview_tool_defs`
+    /// plus the reserved `__preview` external-tool routes — the
+    /// harness's `run_one_turn` doesn't wire these by default because
+    /// no fixture needed them before X1). Used by the
+    /// `prototype-golden` fixture to exercise a mock-brokered
+    /// preview-expose end-to-end without any production source
+    /// changes: `DeliveryService::set_preview_broker` is an already-
+    /// public API, the same one `copperclaw-host-delivery`'s own unit
+    /// tests use.
+    use_preview_gate: bool,
     /// Cached container manager for budget-gate fixtures. Reused
     /// across inbound steps so its per-agent-group dedup map survives
     /// (otherwise every step would post a fresh budget-exhausted reply,
@@ -197,6 +212,14 @@ impl ReplayHarness {
             .gates
             .iter()
             .any(|g| g.eq_ignore_ascii_case("budget"));
+        let use_preview_gate = fixture
+            .manifest
+            .gates
+            .iter()
+            .any(|g| g.eq_ignore_ascii_case("preview"));
+        if use_preview_gate {
+            delivery.set_preview_broker(Arc::new(FixturePreviewBroker));
+        }
 
         Ok(Self {
             fixture,
@@ -211,6 +234,7 @@ impl ReplayHarness {
             runner_errors: Vec::new(),
             use_approvals_gate,
             use_budget_gate,
+            use_preview_gate,
             container_manager: tokio::sync::Mutex::new(None),
         })
     }
@@ -563,7 +587,7 @@ impl ReplayHarness {
         let tool_ctx: Arc<dyn copperclaw_mcp::ToolContext> = Arc::new(tool_ctx_inner);
 
         let tool_set = copperclaw_mcp::build_tool_set();
-        let tool_defs: Vec<copperclaw_providers::ToolDef> = tool_set
+        let mut tool_defs: Vec<copperclaw_providers::ToolDef> = tool_set
             .iter()
             .map(|e| copperclaw_providers::ToolDef {
                 name: e.tool.name.to_string(),
@@ -578,6 +602,32 @@ impl ReplayHarness {
                     .map(|e| (e.tool.name.to_string(), Arc::new(e)))
                     .collect(),
             );
+
+        // M17 session-preview tools (`expose_preview` / `close_preview`)
+        // aren't part of `build_tool_set()` — they're first-party tools
+        // serviced host-side through the reserved `__preview` external-
+        // tool relay (see `copperclaw_runner::run::preview`). `main.rs`
+        // always wires both the advertised `ToolDef`s and the
+        // `external_tools` routes unconditionally; the harness only
+        // does the same when a fixture opts in via `gates: ["preview"]`
+        // so every other fixture's advertised tool list stays
+        // unchanged (byte-stable prompt-cache-shape expectations, etc).
+        let mut external_tools: std::collections::HashMap<
+            String,
+            copperclaw_runner::run::external_mcp::ExternalToolRoute,
+        > = std::collections::HashMap::new();
+        if self.use_preview_gate {
+            tool_defs.extend(copperclaw_runner::run::preview::preview_tool_defs());
+            for name in [
+                copperclaw_runner::run::preview::EXPOSE_PREVIEW,
+                copperclaw_runner::run::preview::CLOSE_PREVIEW,
+            ] {
+                external_tools.insert(
+                    name.to_string(),
+                    copperclaw_runner::run::preview::preview_route(name),
+                );
+            }
+        }
 
         let deps = RunnerDeps {
             provider,
@@ -620,8 +670,11 @@ impl ReplayHarness {
             agent_group_id: ag,
             turn_seq: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             tool_map,
-            external_tools: Arc::new(std::collections::HashMap::new()),
-            max_tool_turns: 5,
+            external_tools: Arc::new(external_tools),
+            // Default stays 5 (every pre-X1 fixture's scripted turn
+            // count fits under it); `max_tool_turns` in the manifest
+            // raises it for scripted sequences with more tool rounds.
+            max_tool_turns: self.fixture.manifest.max_tool_turns.unwrap_or(5),
             // Replay fixtures bound the run via the tool-turn cap; the
             // per-task token ceiling is disabled (0) so deterministic
             // replays never trip the cost backstop.
@@ -651,6 +704,39 @@ impl ReplayHarness {
             verify_gate: true,
             check_command_override: None,
         };
+        // The M17 preview relay (`expose_preview` / `close_preview`) writes
+        // a request row to `outbound.db::mcp_call_requests` and BLOCK-POLLS
+        // `inbound.db::mcp_call_responses` for up to `EXTERNAL_MCP_DEADLINE_SECS`
+        // (120s) — in production that's fine because the delivery loop's
+        // active tick (1s cadence) runs concurrently in its own task and
+        // drains the request while the runner waits. This harness's normal
+        // per-step sequencing runs the ENTIRE runner turn to completion
+        // first and only calls `deliver_session` afterwards, so without
+        // help here a preview-gated fixture's `expose_preview` call would
+        // just burn the full 120s timeout waiting for a drain that never
+        // happens inside the same turn. Spawn a background poller that
+        // repeatedly drives `process_session_once` for the DURATION of the
+        // runner turn — mirroring production's concurrency instead of the
+        // sequential shortcut — so the fixture's `FixturePreviewBroker`
+        // actually gets invoked and the model sees a real response instead
+        // of a timeout. Aborted once the turn (either branch below)
+        // resolves; a no-op for every fixture that doesn't set
+        // `gates: ["preview"]`.
+        let delivery_poller = if self.use_preview_gate {
+            let delivery = Arc::clone(&self.delivery);
+            let central = self.central.clone();
+            Some(tokio::spawn(async move {
+                loop {
+                    if let Ok(session) = sessions::get(&central, sess) {
+                        let _ = delivery.process_session_once(&session).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }))
+        } else {
+            None
+        };
+
         if self.fixture.manifest.runner_drain {
             // The runner handles a pure slash-command batch synchronously
             // and `continue`s WITHOUT counting a turn, so `max_turns`
@@ -663,14 +749,24 @@ impl ReplayHarness {
             let watch_paths = SessionPaths::new(self.tempdir.path(), ag, sess);
             tokio::select! {
                 r = run_loop(deps) => {
+                    if let Some(h) = &delivery_poller {
+                        h.abort();
+                    }
                     r.context("runner drain-mode")?;
                 }
                 r = wait_for_inbound_drain(watch_paths) => {
+                    if let Some(h) = &delivery_poller {
+                        h.abort();
+                    }
                     r?;
                 }
             }
         } else {
-            run_loop(deps).await.context("runner one-turn")?;
+            let result = run_loop(deps).await;
+            if let Some(h) = &delivery_poller {
+                h.abort();
+            }
+            result.context("runner one-turn")?;
         }
         Ok(())
     }
@@ -1190,6 +1286,40 @@ impl ContainerRuntime for HarnessRuntime {
     }
     async fn build_image(&self, spec: ImageBuildSpec) -> Result<String, RtError> {
         Ok(spec.image_tag())
+    }
+}
+
+/// Deterministic [`PreviewBroker`] for fixtures that opt into
+/// `gates: ["preview"]`. Mirrors `copperclaw-host-delivery`'s own
+/// `MockPreviewBroker` test double (see `service.rs`'s
+/// `preview_expose_routes_to_broker_and_renders_url`): a canned
+/// success response, no real container IP / port / axum proxy
+/// involved. Good enough to pin "the golden-path agent calls
+/// `expose_preview` and gets a shareable URL back" without needing a
+/// real Docker container — the real broker (`copperclaw-host`'s
+/// `PreviewManager`) is exercised by its own unit tests, not replay
+/// fixtures.
+#[derive(Debug, Default)]
+struct FixturePreviewBroker;
+
+#[async_trait]
+impl PreviewBroker for FixturePreviewBroker {
+    async fn expose(
+        &self,
+        _session: &SessionInfoLite,
+        port: u16,
+        _name: Option<String>,
+    ) -> Result<PreviewExposed, PreviewError> {
+        Ok(PreviewExposed {
+            url: format!("http://192.0.2.10:8100/__preview/fixture-tok-{port}"),
+            note:
+                "Valid until idle for 30 minutes. Anyone on your network with the link can open it."
+                    .into(),
+        })
+    }
+
+    async fn close(&self, _session_id: SessionId, _port: u16) -> Result<(), PreviewError> {
+        Ok(())
     }
 }
 
