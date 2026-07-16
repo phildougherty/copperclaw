@@ -373,14 +373,18 @@ fn prepend_facts(facts: Option<String>, history: Vec<HistoryMessage>) -> Vec<His
 }
 
 /// Assemble the pinned **project-facts header** from on-disk state under
-/// `data_root`: the R3 verify-gate markers (`recorded_verify_command`) plus
-/// git branch per project, and the agent todo list (the running plan / key
-/// decisions). Returns `None` when there are no projects and no todos — a
-/// pure-chat session gets no header, byte-identical to pre-R4 behaviour.
+/// `data_root`: the R3 verify-gate markers (verify stages, M20 Q2) plus git
+/// branch, a generated file inventory (M20 Q8a), the `DECISIONS.md` tail
+/// (M20 Q8c), and the agent todo list (the running plan). Returns `None`
+/// when there are no projects and no todos — a pure-chat session gets no
+/// header, byte-identical to pre-R4 behaviour.
 ///
 /// Deterministic and read-only: called fresh on every compaction, it always
 /// renders the same bytes for the same on-disk state, which is what lets the
-/// header round-trip verbatim through repeated compactions.
+/// header round-trip verbatim through repeated compactions. Every
+/// per-project section below is best-effort — a missing git repo, a
+/// missing/unreadable `DECISIONS.md`, or a missing `.copperclaw/verify`
+/// pins nothing for that section rather than aborting the whole header.
 async fn build_project_facts_header(data_root: &Path) -> Option<String> {
     let mut body = String::new();
 
@@ -398,14 +402,9 @@ async fn build_project_facts_header(data_root: &Path) -> Option<String> {
             body.push(')');
         }
         body.push('\n');
-        match copperclaw_mcp::tools::verify_gate::recorded_verify_command(proj, None).await {
-            Some(cmd) => {
-                body.push_str("  verify: ");
-                body.push_str(&cmd);
-            }
-            None => body.push_str("  verify: (none recorded)"),
-        }
-        body.push('\n');
+        push_verify_stages(&mut body, proj).await;
+        push_file_inventory(&mut body, proj).await;
+        push_decisions_tail(&mut body, proj).await;
     }
 
     let todos = read_todos(data_root).await;
@@ -427,6 +426,161 @@ async fn build_project_facts_header(data_root: &Path) -> Option<String> {
         "{PROJECT_FACTS_MARKER}\n(pinned verbatim through compaction — do not \
          summarise or drop)\n{trimmed}"
     ))
+}
+
+/// Per-project state directory name, mirroring
+/// `copperclaw_mcp::tools::verify_gate`'s private `STATE_DIR_NAME` — kept as
+/// a local constant here since this crate only needs it for one path join
+/// ([`push_decisions_tail`]) and the verify-gate module doesn't export it.
+const STATE_DIR_NAME: &str = ".copperclaw";
+/// M20 Q8c: the decision-log convention file, agent-appended, one line per
+/// decision. No new tool — written with ordinary edit tools; see
+/// [`push_decisions_tail`]. Writes here are exempted from the R3 verify
+/// gate's dirty-marking (`verify_gate::mark_dirty_for_write`'s
+/// `.copperclaw/`-subtree exemption), so a decision-log append never
+/// invalidates an already-green verify.
+const DECISIONS_FILE_NAME: &str = "DECISIONS.md";
+
+/// Cap on the number of verify stages pinned per project (M20 Q8b). Purely
+/// a backstop against a pathological `.copperclaw/verify` — a real
+/// multi-stage file (Q2) is a handful of lines at most.
+const MAX_VERIFY_STAGES_PINNED: usize = 20;
+
+/// Cap on the number of file paths pinned per project's generated file
+/// inventory (M20 Q8a). `git ls-files` already excludes ignored build
+/// artifacts (`node_modules/`, `target/`, `dist/`), so a healthy
+/// prototype's tracked-file count is usually well under this; the cap is a
+/// backstop against a pathological project (a vendored dependency
+/// accidentally committed) blowing the pinned header past its soft-target
+/// budget.
+const MAX_INVENTORY_FILES: usize = 200;
+
+/// Cap on the number of trailing `DECISIONS.md` lines pinned per project
+/// (M20 Q8c). Only the tail survives a long build's repeated compactions —
+/// older decisions stay on disk in the file itself, just not re-pinned
+/// every round.
+const MAX_DECISIONS_LINES: usize = 30;
+
+/// Pin `proj`'s verify stages (M20 Q2's multi-line `.copperclaw/verify`,
+/// each line an independent stage with an optional `name:` prefix)
+/// **verbatim**, mirroring exactly how a single legacy verify command was
+/// pinned pre-Q8: a project with exactly one stage (the pre-Q2 shape, or a
+/// post-Q2 file that still has only one line) renders the identical
+/// `  verify: <command>` line byte-for-byte. Two or more stages each get
+/// their own `    <name>: <command>` line under a `  verify:` heading, so
+/// every stage — not just the first — survives compaction. Capped at
+/// [`MAX_VERIFY_STAGES_PINNED`]. Best-effort: a missing/unreadable
+/// `.copperclaw/verify` pins `(none recorded)`, exactly as before Q8.
+async fn push_verify_stages(body: &mut String, proj: &Path) {
+    let stages = copperclaw_mcp::tools::verify_gate::recorded_stages(proj, None).await;
+    if stages.is_empty() {
+        body.push_str("  verify: (none recorded)\n");
+        return;
+    }
+    if stages.len() == 1 {
+        body.push_str("  verify: ");
+        body.push_str(&stages[0].command);
+        body.push('\n');
+        return;
+    }
+    let total = stages.len();
+    let capped: Vec<_> = stages.into_iter().take(MAX_VERIFY_STAGES_PINNED).collect();
+    body.push_str("  verify:\n");
+    for s in &capped {
+        body.push_str("    ");
+        body.push_str(&s.name);
+        body.push_str(": ");
+        body.push_str(&s.command);
+        body.push('\n');
+    }
+    if total > capped.len() {
+        body.push_str(&format!(
+            "    … ({} more stages omitted)\n",
+            total - capped.len()
+        ));
+    }
+}
+
+/// Pin a capped, generated file inventory for `proj` (M20 Q8a), sourced
+/// from `git ls-files` — tracked files only, so build artifacts and
+/// dependency directories never appear (they're git-ignored). Nothing is
+/// pinned when the project has no git repo, `git` isn't on `PATH`, or the
+/// command fails for any reason — best-effort, never abort compaction.
+/// Capped at [`MAX_INVENTORY_FILES`] paths.
+async fn push_file_inventory(body: &mut String, proj: &Path) {
+    let files = git_ls_files(proj).await;
+    if files.is_empty() {
+        return;
+    }
+    let total = files.len();
+    let capped = &files[..total.min(MAX_INVENTORY_FILES)];
+    body.push_str("  files (");
+    body.push_str(&total.to_string());
+    body.push_str("):\n");
+    for f in capped {
+        body.push_str("    ");
+        body.push_str(f);
+        body.push('\n');
+    }
+    if total > capped.len() {
+        body.push_str(&format!(
+            "    … ({} more files omitted)\n",
+            total - capped.len()
+        ));
+    }
+}
+
+/// Run `git -C <project_root> ls-files` and return its stdout lines.
+/// Best-effort: a missing binary, a missing/non-git directory, or a
+/// non-zero exit all yield an empty list rather than an error.
+async fn git_ls_files(project_root: &Path) -> Vec<String> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .arg("ls-files")
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Pin the tail of `<proj>/.copperclaw/DECISIONS.md` (M20 Q8c): a new
+/// lightweight, tool-free convention where the agent appends one line per
+/// decision ("chose X over Y because Z") with ordinary edit tools. Only
+/// the last [`MAX_DECISIONS_LINES`] non-empty lines are pinned — the file
+/// itself keeps the full history on disk. Best-effort: a missing or
+/// unreadable file (or one with no decisions yet) pins nothing, so a
+/// project with no `DECISIONS.md` compacts exactly as it did before Q8
+/// except for the new inventory/stage sections.
+async fn push_decisions_tail(body: &mut String, proj: &Path) {
+    let path = proj.join(STATE_DIR_NAME).join(DECISIONS_FILE_NAME);
+    let Ok(text) = tokio::fs::read_to_string(&path).await else {
+        return;
+    };
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return;
+    }
+    let tail_start = lines.len().saturating_sub(MAX_DECISIONS_LINES);
+    let tail = &lines[tail_start..];
+    body.push_str("  decisions (last ");
+    body.push_str(&tail.len().to_string());
+    body.push_str("):\n");
+    for d in tail {
+        body.push_str("    - ");
+        body.push_str(d);
+        body.push('\n');
+    }
 }
 
 /// First-level directories under `data_root` that look like a project: they
@@ -1207,5 +1361,238 @@ mod tests {
             HistoryMessage::User { content } => assert!(content.starts_with("compact_boundary: ")),
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    // ---- M20 Q8: file inventory, all verify stages, decisions tail ----
+
+    /// Run `git` in `dir`, panicking on failure — test-only helper, real
+    /// `git` subprocess so `git ls-files` in `push_file_inventory` has a
+    /// real index to read.
+    fn run_git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(args)
+            .status()
+            .expect("git spawn");
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    /// Lay down a real git repo with `files` written and staged (`git add`
+    /// puts them in the index, which `git ls-files` reads — no commit
+    /// needed). Used by the Q8a file-inventory tests.
+    fn seed_git_project(root: &Path, name: &str, files: &[(&str, &str)]) -> PathBuf {
+        let proj = root.join(name);
+        std::fs::create_dir_all(&proj).unwrap();
+        run_git(&proj, &["init", "-q"]);
+        run_git(&proj, &["config", "user.email", "test@example.com"]);
+        run_git(&proj, &["config", "user.name", "test"]);
+        for (path, content) in files {
+            let file_path = proj.join(path);
+            if let Some(parent) = file_path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&file_path, content).unwrap();
+        }
+        run_git(&proj, &["add", "."]);
+        proj
+    }
+
+    #[tokio::test]
+    async fn facts_header_includes_file_inventory_from_git_ls_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_git_project(
+            tmp.path(),
+            "webapp",
+            &[
+                ("src/main.ts", "console.log('hi')"),
+                ("README.md", "# webapp"),
+            ],
+        );
+        let header = build_project_facts_header(tmp.path()).await.unwrap();
+        assert!(header.contains("files (2):"), "header:\n{header}");
+        assert!(header.contains("src/main.ts"));
+        assert!(header.contains("README.md"));
+    }
+
+    #[tokio::test]
+    async fn facts_header_no_file_inventory_when_not_a_git_repo() {
+        // A `.copperclaw`-only project (no `.git`) is still a project
+        // (`scan_projects` picks it up), but `git ls-files` has nothing to
+        // read — best-effort means the inventory section is simply absent,
+        // not an error.
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("bare");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        let header = build_project_facts_header(tmp.path()).await.unwrap();
+        assert!(header.contains("bare"));
+        assert!(!header.contains("files ("));
+    }
+
+    #[tokio::test]
+    async fn file_inventory_caps_at_max_files_and_notes_the_overflow() {
+        let tmp = tempfile::tempdir().unwrap();
+        let total = MAX_INVENTORY_FILES + 25;
+        let files: Vec<(String, String)> = (0..total)
+            .map(|i| (format!("file_{i:04}.txt"), "x".to_string()))
+            .collect();
+        let file_refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_str()))
+            .collect();
+        seed_git_project(tmp.path(), "big", &file_refs);
+        let header = build_project_facts_header(tmp.path()).await.unwrap();
+        assert!(
+            header.contains(&format!("files ({total}):")),
+            "header:\n{header}"
+        );
+        // Exactly MAX_INVENTORY_FILES path lines pinned, plus the overflow note.
+        let file_lines = header
+            .lines()
+            .filter(|l| l.trim_start().starts_with("file_"))
+            .count();
+        assert_eq!(file_lines, MAX_INVENTORY_FILES);
+        assert!(header.contains(&format!(
+            "{} more files omitted",
+            total - MAX_INVENTORY_FILES
+        )));
+    }
+
+    #[tokio::test]
+    async fn facts_header_pins_every_verify_stage_not_just_the_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("multi-stage-app");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(
+            proj.join(".copperclaw").join("verify"),
+            "lint: npx eslint .\ntypecheck: tsc --noEmit\nnpm test\n",
+        )
+        .unwrap();
+        let header = build_project_facts_header(tmp.path()).await.unwrap();
+        assert!(header.contains("verify:\n"), "header:\n{header}");
+        assert!(header.contains("lint: npx eslint ."));
+        assert!(header.contains("typecheck: tsc --noEmit"));
+        // The unprefixed third line gets the Q2-derived name `stage3`.
+        assert!(header.contains("stage3: npm test"));
+    }
+
+    #[tokio::test]
+    async fn facts_header_single_stage_verify_matches_pre_q8_format_exactly() {
+        // Back-compat: a project with exactly one verify line (the pre-Q2,
+        // and thus pre-Q8, common case) still renders the single
+        // `  verify: <command>` line, not the multi-stage heading shape.
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("simple-app");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(proj.join(".copperclaw").join("verify"), "npm test\n").unwrap();
+        let header = build_project_facts_header(tmp.path()).await.unwrap();
+        // No trailing-newline assumption: this project is the only content,
+        // so the header's final `trim_end()` strips it from the last line.
+        assert!(header.ends_with("  verify: npm test"), "header:\n{header}");
+        assert!(!header.contains("verify:\n"));
+    }
+
+    #[tokio::test]
+    async fn facts_header_includes_decisions_tail_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("decided-app");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(
+            proj.join(".copperclaw").join("DECISIONS.md"),
+            "chose sqlite over postgres because no server needed\n\
+             chose vite over webpack because it's baked and faster\n",
+        )
+        .unwrap();
+        let header = build_project_facts_header(tmp.path()).await.unwrap();
+        assert!(header.contains("decisions (last 2):"), "header:\n{header}");
+        assert!(header.contains("chose sqlite over postgres because no server needed"));
+        assert!(header.contains("chose vite over webpack because it's baked and faster"));
+    }
+
+    #[tokio::test]
+    async fn facts_header_no_decisions_section_when_decisions_md_absent() {
+        // The card's explicit acceptance case: a project with no
+        // DECISIONS.md compacts exactly as today, plus the inventory.
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("no-decisions-app");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(proj.join(".copperclaw").join("verify"), "npm test\n").unwrap();
+        let header = build_project_facts_header(tmp.path()).await.unwrap();
+        assert!(!header.contains("decisions ("));
+        // Everything else (verify, project name) is present as before.
+        assert!(header.contains("no-decisions-app"));
+        assert!(header.contains("verify: npm test"));
+    }
+
+    #[tokio::test]
+    async fn decisions_tail_caps_at_max_lines_keeping_the_most_recent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("chatty-app");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        let total = MAX_DECISIONS_LINES + 10;
+        let mut body = String::new();
+        for i in 0..total {
+            body.push_str(&format!("decision {i}\n"));
+        }
+        std::fs::write(proj.join(".copperclaw").join("DECISIONS.md"), body).unwrap();
+        let header = build_project_facts_header(tmp.path()).await.unwrap();
+        assert!(
+            header.contains(&format!("decisions (last {MAX_DECISIONS_LINES}):")),
+            "header:\n{header}"
+        );
+        // The oldest decisions are gone; the most recent one survives.
+        assert!(!header.contains("decision 0\n"));
+        assert!(header.contains(&format!("decision {}", total - 1)));
+    }
+
+    #[tokio::test]
+    async fn compacted_coding_session_pins_inventory_stages_and_decisions() {
+        // The card's headline acceptance case, exercised through the real
+        // `compact()` entry point rather than the header builder directly.
+        let data = tempfile::tempdir().unwrap();
+        seed_git_project(
+            data.path(),
+            "full-app",
+            &[("src/index.ts", "export {}"), ("package.json", "{}")],
+        );
+        let proj = data.path().join("full-app");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(
+            proj.join(".copperclaw").join("verify"),
+            "lint: npx eslint .\ntest: npm test\n",
+        )
+        .unwrap();
+        std::fs::write(
+            proj.join(".copperclaw").join("DECISIONS.md"),
+            "chose typescript over plain js because the scaffold bakes it\n",
+        )
+        .unwrap();
+
+        let archive = tempfile::tempdir().unwrap();
+        let cfg = CompactionCfg {
+            data_root: data.path().to_path_buf(),
+            ..cfg_with_dir(archive.path().to_path_buf())
+        };
+        let provider = StubProvider {
+            canned_summary: "SUMMARY".into(),
+        };
+        let out = compact(long_history(8), &provider, &cfg).await.unwrap();
+        let header = match &out[0] {
+            HistoryMessage::User { content } => content.clone(),
+            other => panic!("expected pinned header first, got {other:?}"),
+        };
+        assert!(header.contains("files (2):"));
+        assert!(header.contains("src/index.ts"));
+        assert!(header.contains("package.json"));
+        assert!(header.contains("lint: npx eslint ."));
+        assert!(header.contains("test: npm test"));
+        assert!(header.contains("chose typescript over plain js because the scaffold bakes it"));
+    }
+
+    #[test]
+    fn pair_safe_pivot_behavior_is_unchanged_by_q8() {
+        // Explicit acceptance check: Q8 touches only the facts-header
+        // assembly, never the pivot/summarisation path.
+        let h = vec![txt(), txt(), tu("a"), tr("a"), txt(), txt()];
+        assert_eq!(pair_safe_pivot(&h), 4);
     }
 }

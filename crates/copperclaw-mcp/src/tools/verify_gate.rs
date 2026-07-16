@@ -482,13 +482,45 @@ pub async fn pending_stages(project_root: &Path, stages: &[Stage]) -> Vec<Stage>
 /// project dirty. Best-effort and a no-op when the gate is off or the
 /// path isn't inside any `/data/<project>` — callers invoke this
 /// unconditionally after every successful write.
+///
+/// M20 Q8: a write anywhere under `<project>/.copperclaw/` is exempted
+/// — see [`is_under_state_dir`]. That directory is the gate's own
+/// bookkeeping (`verify`, `dirty`, `stages`, …) plus a growing set of
+/// agent-authored *metadata* files that must survive a green verify
+/// untouched: the Q8 `DECISIONS.md` decision log (append-only,
+/// consumed verbatim by compaction) and Q7's `CONTRACT.md`. None of
+/// those are source changes, so marking dirty here would mean a
+/// decision-log append invalidates an already-green verify — exactly
+/// backwards from the log's purpose.
 pub(crate) async fn mark_dirty_for_write(ctx: &dyn crate::context::ToolContext, path: &str) {
     if !ctx.verify_gate_enabled() {
+        return;
+    }
+    if is_under_state_dir(path) {
         return;
     }
     if let Some(root) = project_root_of(path) {
         mark_dirty(&root).await;
     }
+}
+
+/// True iff `path` (an absolute path under the data root) resolves to
+/// some project's `.copperclaw/` state directory, at any depth beneath
+/// it. Pure path logic, no I/O — mirrors [`project_root_of`]'s
+/// prefix-stripping but only needs to check one path component rather
+/// than resolve a directory on disk.
+fn is_under_state_dir(path: &str) -> bool {
+    let root = data_root();
+    let Ok(rel) = Path::new(path).strip_prefix(&root) else {
+        return false;
+    };
+    let mut comps = rel.components();
+    // First component is the project name itself, not part of the
+    // state-dir check.
+    if comps.next().is_none() {
+        return false;
+    }
+    matches!(comps.next(), Some(Component::Normal(name)) if name == STATE_DIR_NAME)
 }
 
 /// Session-wide scan for dirty projects: every first-level directory
@@ -997,5 +1029,77 @@ mod tests {
         assert_eq!(n1, 1);
         let n2 = record_stage_verify_failure(&proj, "test", "boom again").await;
         assert_eq!(n2, 2);
+    }
+
+    // ---- M20 Q8: `.copperclaw/` writes are exempt from dirty-marking --
+
+    #[test]
+    fn is_under_state_dir_true_for_direct_child() {
+        let g = DataRootGuard::new();
+        let path = g.path().join("p").join(".copperclaw").join("DECISIONS.md");
+        assert!(is_under_state_dir(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn is_under_state_dir_true_for_nested_state_file() {
+        let g = DataRootGuard::new();
+        let path = g
+            .path()
+            .join("p")
+            .join(".copperclaw")
+            .join("screenshots")
+            .join("shot.png");
+        assert!(is_under_state_dir(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn is_under_state_dir_false_for_ordinary_source_file() {
+        let g = DataRootGuard::new();
+        let path = g.path().join("p").join("src").join("main.rs");
+        assert!(!is_under_state_dir(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn is_under_state_dir_false_for_bare_project_root() {
+        let g = DataRootGuard::new();
+        let path = g.path().join("p");
+        assert!(!is_under_state_dir(path.to_str().unwrap()));
+    }
+
+    #[test]
+    fn is_under_state_dir_false_for_lookalike_name() {
+        // A file whose name merely starts with the state-dir name (not
+        // an exact component match) must not be exempted.
+        let g = DataRootGuard::new();
+        let path = g.path().join("p").join(".copperclaw-backup").join("x");
+        assert!(!is_under_state_dir(path.to_str().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn mark_dirty_for_write_skips_writes_under_state_dir() {
+        // The core Q8 regression: appending to the DECISIONS.md decision
+        // log (or any other file under `.copperclaw/`) must never mark
+        // the project dirty — that would invalidate an already-green
+        // verify on every decision-log append.
+        let g = DataRootGuard::new();
+        let proj = g.path().join("p");
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        let mock = crate::context::MockToolContext::new();
+        let decisions = proj.join(".copperclaw").join("DECISIONS.md");
+        mark_dirty_for_write(&mock, decisions.to_str().unwrap()).await;
+        assert!(!is_dirty(&proj).await);
+    }
+
+    #[tokio::test]
+    async fn mark_dirty_for_write_still_dirties_ordinary_source_writes() {
+        // Back-compat: a write to a real project file (not under
+        // `.copperclaw/`) still marks the project dirty as before.
+        let g = DataRootGuard::new();
+        let proj = g.path().join("p");
+        std::fs::create_dir_all(&proj).unwrap();
+        let mock = crate::context::MockToolContext::new();
+        let src = proj.join("main.rs");
+        mark_dirty_for_write(&mock, src.to_str().unwrap()).await;
+        assert!(is_dirty(&proj).await);
     }
 }
