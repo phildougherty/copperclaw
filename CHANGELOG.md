@@ -149,6 +149,57 @@ adheres to [Semantic Versioning](https://semver.org/).
   (`ui_screenshot_docker_end_to_end` in `ui_screenshot.rs`) is `#[ignore]`d
   per the `session_install_docker_end_to_end` precedent (`self_mod.rs`).
 
+### Added (M20 Q8 — Compaction preserves build knowledge)
+
+- The pinned project-facts header compaction re-generates on every round
+  (`crates/copperclaw-runner/src/compaction.rs`, `build_project_facts_header`)
+  now carries three new best-effort, capped sections per project, on top of
+  the existing branch/verify/todo facts:
+  - **A generated file inventory** (`push_file_inventory` / `git_ls_files`):
+    `git ls-files` run against the project root, capped at
+    `MAX_INVENTORY_FILES` (200) paths with an "N more files omitted" note
+    past the cap. Tracked files only, so build artifacts and dependency
+    directories never appear — they're git-ignored. No git repo, no `git`
+    binary, or a failed command all pin nothing (never abort compaction).
+  - **All verify stages, not just the first** (`push_verify_stages`): now
+    sourced from M20 Q2's `verify_gate::recorded_stages` instead of the raw
+    `recorded_verify_command` string, so a multi-stage `.copperclaw/verify`
+    survives compaction with every stage's name and command, not a single
+    flattened line. A project with exactly one (legacy or post-Q2
+    single-line) stage still renders the byte-identical pre-Q8
+    `  verify: <command>` line — full back-compat. Capped at
+    `MAX_VERIFY_STAGES_PINNED` (20) stages.
+  - **A `DECISIONS.md` tail** (`push_decisions_tail`): a new lightweight,
+    tool-free convention — the agent appends one line per decision ("chose
+    X over Y because Z") to `<project>/.copperclaw/DECISIONS.md` with
+    ordinary edit tools (no new tool; taught by the Q4 `coding-task` skill
+    rewrite). Compaction pins the last `MAX_DECISIONS_LINES` (30) non-empty
+    lines. A missing/unreadable/empty file pins nothing — a project with no
+    `DECISIONS.md` compacts exactly as it did pre-Q8, plus the new
+    inventory/stages sections.
+- **Bug found and fixed while implementing this card**: `verify_gate::
+  mark_dirty_for_write` (`crates/copperclaw-mcp/src/tools/verify_gate.rs`),
+  the shared post-write hook every edit-family tool calls
+  (`write_file`/`edit_file`/`multi_edit`/`apply_patch`), marked the whole
+  project dirty for *any* write under it, including writes inside
+  `<project>/.copperclaw/` itself — so an agent appending a line to the new
+  `DECISIONS.md` convention (or writing Q7's `CONTRACT.md`) would have
+  invalidated an already-green verify on every append, exactly backwards
+  from the log's purpose. Added `is_under_state_dir` and an exemption in
+  `mark_dirty_for_write`: any write whose path resolves under a project's
+  `.copperclaw/` subtree (at any depth) is now skipped entirely rather than
+  marking the project dirty. **Cross-lane note for integration**: Q2 and Q6
+  also touch `verify_gate.rs` on separate branches — this is a small,
+  additive, surgical change (one early-return + one new private helper
+  function) that should merge cleanly, but flag it for reconciliation.
+- Unit tests added/extended: `crates/copperclaw-mcp/src/tools/verify_gate.rs`
+  (`is_under_state_dir_*`, `mark_dirty_for_write_skips_writes_under_state_dir`,
+  `mark_dirty_for_write_still_dirties_ordinary_source_writes`) and
+  `crates/copperclaw-runner/src/compaction.rs` (file-inventory, multi-stage,
+  decisions-tail, cap-overflow, and an end-to-end `compact()` test asserting
+  all three new sections survive a real compaction round). `pair_safe_pivot`
+  and all pre-existing pinned-header tests are unchanged and green.
+
 ### Added (M19 A3 — Public-tunnel model verb: activate V5)
 
 - The merged-but-dormant V5 public-tunnel module now has an agent-facing verb.
