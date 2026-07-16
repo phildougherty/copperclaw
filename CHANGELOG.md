@@ -6,6 +6,48 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M18 V5 — public tunnel module, 2026-07-16)
+
+- **`crates/copperclaw-modules/src/tunnel.rs` (new): approval-gated public tunnel
+  module.** Fronts a live session-preview's host port with a *public* URL via an
+  **operator-provided** tunnel binary (cloudflared first; the `TunnelProvider`
+  trait is shaped so tailscale-funnel can slot in later), for the "send it to my
+  cofounder" moment the LAN-only preview can't serve. Every guard rail is
+  mandatory and fail-closed:
+  - **OFF by default, per-group opt-in** (`TunnelExposeRequest.enabled`, sourced
+    host-side): a group that has not opted in gets `TunnelError::NotEnabled` and
+    no tunnel is ever attempted.
+  - **Every exposure is G1-approval-gated.** `TunnelBroker::expose` raises a
+    `CredentialedExternalAction` pending approval and refuses to stand up a
+    tunnel until an approver taps Approve — there is no path from an agent
+    request to a public URL that skips a recorded human decision.
+  - **Audit-rowed.** Every request / exposure / teardown writes an `audit_log`
+    row (command `tunnel`).
+  - **Auto-teardown with the preview it fronts** via
+    `TunnelBroker::close_for_preview` / `close_all_for_session` (kills the tunnel
+    process — no orphaned public tunnels).
+  - **Never bundles binaries.** When the binary is absent,
+    `TunnelProvider::preflight` returns `TunnelError::BinaryNotFound` with
+    copy-pasteable install instructions — a clean actionable error, never a panic
+    or silent no-op. `CloudflaredProvider` handles no Cloudflare credentials (an
+    anonymous quick tunnel); any account token lives in the operator's own
+    `cloudflared` config, never read/stored/forwarded by this process.
+  - Registered types re-exported from `crates/copperclaw-modules/src/lib.rs`
+    (`pub mod tunnel;`). Mock-binary integration tests cover the full
+    expose → approval → URL surfaced → teardown-on-close flow and the
+    absent-binary error path.
+- **`crates/copperclaw-host/src/handlers/approvals.rs`: real
+  `credentialed_external_action` apply arm.** Replaces G1's placeholder refusal
+  arm — approving a `CredentialedExternalAction` row (a public-tunnel exposure)
+  now succeeds through the shared `resolve_approve` DB path, records the decision,
+  and echoes the exposure specifics; the requester (the tunnel broker on the
+  agent's retry) consults the approved grant. `one_cli` keeps its explicit
+  refusal arm. Denying grants nothing.
+- **Host integration seams (documented follow-up, not wired in this card to keep
+  its scope to `copperclaw-modules` + the approval arm):** boot registration of
+  `TunnelModule`, the `PreviewManager::teardown` → `TunnelBroker::close_for_preview`
+  call, the per-group opt-in config source, and the agent-facing expose relay.
+
 ### Fixed (M18 — todo store parallel-batch write race, 2026-07-16)
 
 - `crates/copperclaw-mcp/src/tools/todo.rs`: the `todo_*` store's

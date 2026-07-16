@@ -21,6 +21,13 @@
 //!   operator knows to run `cclaw groups restart <agent_group_id>`.
 //! - `"add_mcp_server"` — read `name`/`transport` from `payload`, insert
 //!   into `container_configs.mcp_servers`. Same no-auto-rebuild stance.
+//! - `"credentialed_external_action"` — grant one credentialed external action
+//!   on a taint-blocked or outward-facing request (M18 V5: the public-tunnel
+//!   broker's `expose`). Approving flips the row to `approved`; the requester
+//!   (e.g. `TunnelBroker::expose` on the agent's retry) consults that approved
+//!   grant and only then performs the action. The apply arm itself validates
+//!   the payload and records the grant — it never performs the external action,
+//!   so this dispatcher stays a pure DB mutation.
 //!
 //! ## Idempotency
 //!
@@ -160,16 +167,18 @@ pub fn resolve_approve(
             copperclaw_metrics::inc_preview_enable_card("approved");
             apply_enable_preview(central, &row)?
         }
-        // Explicit refusal arms (M18 G1). These approval families exist in the
-        // kind vocabulary but have no side-effect applier yet:
-        //   - `one_cli`: Agent Vault credential grants are never applied via
-        //     this generic dispatcher.
-        //   - `credentialed_external_action`: the real applier lands with V5
-        //     (clears the taint for one tool call); until then, approving one
-        //     here would silently no-op, which is worse than a clear refusal.
-        // We refuse rather than fall through to the `other` arm so the message
-        // is specific and the row is left `pending` (never a silent success).
-        "one_cli" | "credentialed_external_action" => {
+        // M18 V5: the REAL applier for a credentialed external action. Approving
+        // records the grant (the row flips to `approved` below); the requester —
+        // e.g. the public-tunnel broker on the agent's retry — consults that
+        // approved grant and only then performs the action. This arm never
+        // performs the action itself, so the dispatcher stays a pure DB mutation.
+        "credentialed_external_action" => apply_credentialed_external_action(&row),
+        // Explicit refusal arm (M18 G1). `one_cli` (Agent Vault credential
+        // grants) is never applied via this generic dispatcher; approving one
+        // here would silently no-op, which is worse than a clear refusal. We
+        // refuse rather than fall through to the `other` arm so the message is
+        // specific and the row is left `pending` (never a silent success).
+        "one_cli" => {
             return Err(ErrorPayload::new(
                 "bad_request",
                 format!(
@@ -620,6 +629,36 @@ fn apply_enable_preview(
         "preview_enabled": true,
         "note": "previews enabled for this group; the agent can retry `expose_preview` now",
     }))
+}
+
+/// `credentialed_external_action` family (M18 V5): record the grant. Approving
+/// authorizes ONE credentialed external action for the requester that raised the
+/// row (the public-tunnel broker's `expose`, or a future taint-clearing arm).
+/// The grant IS the row flipping to `approved` (done by the generic dispatcher
+/// after this returns); the requester consults that on its next attempt. This
+/// applier never performs the external action itself — it validates the payload
+/// and echoes an operator-legible side-effect so the approve response and audit
+/// name exactly what was authorized. Infallible: any well-formed approval row
+/// can be granted (a missing/partial payload just yields a sparser echo).
+fn apply_credentialed_external_action(row: &pending_approvals::PendingApproval) -> Value {
+    // The V5 tunnel broker stamps `kind = "tunnel"` plus the exposure specifics.
+    // Unknown/absent kinds still resolve — the grant semantics are the same.
+    let action_kind = row
+        .payload
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("credentialed_external_action");
+    json!({
+        "kind": "credentialed_external_action",
+        "action_kind": action_kind,
+        "agent_group_id": row.agent_group_id.map(|g| g.as_uuid().to_string()),
+        "session_id": row.session_id.map(|s| s.as_uuid().to_string()),
+        "host_port": row.payload.get("host_port").cloned().unwrap_or(Value::Null),
+        "upstream": row.payload.get("upstream").cloned().unwrap_or(Value::Null),
+        "note": "authorization granted for one credentialed external action; the \
+                 requester (e.g. the public-tunnel broker) consults this approved \
+                 grant before acting. No external action was performed by this approval.",
+    })
 }
 
 /// Helper: read `payload[key]` as an array of non-empty strings.
@@ -1110,6 +1149,87 @@ mod tests {
         deny(&json!({"id": id.as_uuid().to_string()}), &db).unwrap();
         // No row was created / enabled by a deny.
         assert!(container_configs::get(&db, ag).unwrap().is_none());
+    }
+
+    #[test]
+    fn approve_credentialed_external_action_grants_and_resolves_row() {
+        // M18 V5: the real apply arm. Approving a credentialed_external_action
+        // row (a public-tunnel exposure) must succeed, flip the row to approved,
+        // log the decision, and echo the exposure specifics — NOT refuse.
+        let db = db();
+        let ag = seed_ag(&db);
+        let id = insert_pending(
+            &db,
+            "credentialed_external_action",
+            UpsertPendingApproval {
+                request_id: "tunnel:sess:8100".into(),
+                payload: json!({
+                    "kind": "tunnel",
+                    "provider": "cloudflared",
+                    "host_port": 8100,
+                    "upstream": "http://127.0.0.1:8100",
+                }),
+                agent_group_id: Some(ag),
+                title: "Expose this preview to the public internet?".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        let v = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap();
+        assert_eq!(v["applied"], true);
+        assert_eq!(v["side_effect"]["kind"], "credentialed_external_action");
+        assert_eq!(v["side_effect"]["action_kind"], "tunnel");
+        assert_eq!(v["side_effect"]["host_port"], 8100);
+        assert_eq!(v["side_effect"]["upstream"], "http://127.0.0.1:8100");
+        // Row is approved and the decision is logged.
+        let after = get_row(&db, id).unwrap();
+        assert_eq!(after.status, ApprovalStatus::Approved);
+        let decs = pending_approvals::list_decisions(&db, Some(id), 10).unwrap();
+        assert_eq!(decs.len(), 1);
+        assert_eq!(decs[0].outcome, DecisionOutcome::Approve);
+    }
+
+    #[test]
+    fn deny_credentialed_external_action_leaves_no_grant() {
+        // Denying must NOT grant the action; the row settles denied.
+        let db = db();
+        let id = insert_pending(
+            &db,
+            "credentialed_external_action",
+            UpsertPendingApproval {
+                request_id: "tunnel:sess:8101".into(),
+                payload: json!({"kind": "tunnel", "host_port": 8101}),
+                title: "Expose this preview to the public internet?".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        deny(&json!({"id": id.as_uuid().to_string()}), &db).unwrap();
+        let after = get_row(&db, id).unwrap();
+        assert_eq!(after.status, ApprovalStatus::Denied);
+    }
+
+    #[test]
+    fn approve_one_cli_is_still_refused() {
+        // The refusal arm must survive V5 splitting it out from
+        // credentialed_external_action.
+        let db = db();
+        let id = insert_pending(
+            &db,
+            "one_cli",
+            UpsertPendingApproval {
+                request_id: "one-cli-x".into(),
+                payload: json!({}),
+                title: "x".into(),
+                options: vec![],
+                ..Default::default()
+            },
+        );
+        let err = approve(&json!({"id": id.as_uuid().to_string()}), &db).unwrap_err();
+        assert_eq!(err.code, "bad_request");
+        // Left pending (never a silent success).
+        let still = get_row(&db, id).unwrap();
+        assert_eq!(still.status, ApprovalStatus::Pending);
     }
 
     #[test]
