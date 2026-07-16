@@ -21,8 +21,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use copperclaw_channels_core::{AdapterError, ChannelAdapter, DmHandle};
+use copperclaw_channels_core::{AdapterError, Card, ChannelAdapter, DmHandle};
 use copperclaw_types::{ChannelType, InboundEvent, OutboundFile, OutboundMessage};
+
+use crate::render;
 use serde_json::Value;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::Sender;
@@ -325,6 +327,46 @@ impl ChannelAdapter for SignalAdapter {
             platform_id: format!("user:{user_id}"),
             channel_type: ChannelType::new(CHANNEL_TYPE_STR),
         }))
+    }
+
+    /// Edit a previously-sent message in place via signal-cli's
+    /// `sendEditMessage`. `external_id` is the original message's
+    /// `targetSentTimestamp` (the id `deliver` returned). Enables the
+    /// M18 Task HUD to self-edit one status message rather than posting a
+    /// fresh one per tool batch.
+    async fn edit_message(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        external_id: &str,
+        new_text: &str,
+    ) -> Result<(), AdapterError> {
+        let target = parse_platform_id(platform_id)?;
+        let ts: i64 = external_id.parse().map_err(|_| {
+            AdapterError::BadRequest(format!(
+                "signal: edit target id `{external_id}` is not a valid timestamp"
+            ))
+        })?;
+        api::send_edit(&self.transport, &target, ts, new_text).await?;
+        Ok(())
+    }
+
+    /// Native card — clean Signal plaintext (no Markdown, which Signal
+    /// renders literally). Diff / todo / thinking / error / collapsible
+    /// intentionally keep the canonical plaintext trait default: their
+    /// `to_text_fallback` renderings are already optimal on a plaintext
+    /// surface, so a native override would duplicate them verbatim (see
+    /// `render.rs` module docs).
+    async fn deliver_card(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        card: &Card,
+        _to: Option<&str>,
+    ) -> Result<Option<String>, AdapterError> {
+        let target = parse_platform_id(platform_id)?;
+        let text = render::render_card(card);
+        api::send_text(&self.transport, &target, &text).await
     }
 }
 
@@ -968,6 +1010,58 @@ mod tests {
         let (adapter, _ctl, dir, _rx) = build_adapter().await;
         let _ = adapter.transport();
         assert_eq!(adapter.data_dir(), dir.path());
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn edit_message_calls_send_edit_message() {
+        let (adapter, ctl, _dir, _rx) = build_adapter().await;
+        ctl.expect_ok("sendEditMessage", json!({"timestamp": 42}))
+            .await;
+        adapter
+            .edit_message("user:+1", None, "1700", "hud update")
+            .await
+            .unwrap();
+        let calls = ctl.calls().await;
+        assert_eq!(calls[0].0, "sendEditMessage");
+        assert_eq!(calls[0].1["targetSentTimestamp"], 1700);
+        assert_eq!(calls[0].1["message"], "hud update");
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn edit_message_rejects_non_numeric_external_id() {
+        let (adapter, _ctl, _dir, _rx) = build_adapter().await;
+        let err = adapter
+            .edit_message("user:+1", None, "not-a-ts", "x")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AdapterError::BadRequest(_)));
+        adapter.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn deliver_card_sends_markdown_free_text() {
+        let (adapter, ctl, _dir, _rx) = build_adapter().await;
+        ctl.expect_ok("send", json!({"timestamp": 7})).await;
+        let card = Card {
+            title: Some("Ready".into()),
+            body: Some("Live".into()),
+            ..Card::default()
+        };
+        let id = adapter
+            .deliver_card("user:+1", None, &card, None)
+            .await
+            .unwrap();
+        assert_eq!(id.as_deref(), Some("7"));
+        let calls = ctl.calls().await;
+        assert_eq!(calls[0].0, "send");
+        let msg = calls[0].1["message"].as_str().unwrap();
+        assert!(msg.starts_with("Ready"));
+        assert!(
+            !msg.contains('*'),
+            "Signal card must be markdown-free: {msg}"
+        );
         adapter.shutdown().await;
     }
 

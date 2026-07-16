@@ -38,6 +38,7 @@ pub mod adapter;
 pub mod api;
 pub mod config;
 pub mod factory;
+pub mod render;
 pub mod router;
 
 pub use adapter::MattermostAdapter;
