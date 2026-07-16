@@ -607,6 +607,7 @@ fn ensure_config_row(central: &CentralDb, ag_id: AgentGroupId) -> Result<(), Err
             preview_bind: None,
             check_command: None,
             verify_gate: true,
+            image_profile: copperclaw_types::ImageProfile::Minimal,
         },
     )
     .map_err(db_err)?;

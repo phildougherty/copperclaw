@@ -522,6 +522,13 @@ impl ContainerManager {
         let mut build_spec = ImageBuildSpec::new("copperclaw/session", &base);
         build_spec.apt_packages.clone_from(&cfg.packages_apt);
         build_spec.npm_packages.clone_from(&cfg.packages_npm);
+        // M18 E2: bake the group's image-profile bundle (prototyping adds
+        // sqlite3 / chromium / zip + global vite / create-vite). The spec
+        // renders the profile's extras on top of the explicit packages, and
+        // `container_configs::compute_fingerprint` folds `image_profile` in
+        // too, so the fingerprint gate above already forced this rebuild when
+        // the profile changed.
+        build_spec.image_profile = cfg.image_profile;
         // install_packages containment (Phase 6 supply-chain). The apt/npm
         // install + any package postinstall scripts run during this build are
         // third-party code. We dispatch the build under an explicit containment
@@ -2839,6 +2846,7 @@ mod tests {
             preview_bind: None,
             check_command: None,
             verify_gate: true,
+            image_profile: copperclaw_types::ImageProfile::Minimal,
             updated_at: chrono::Utc::now(),
         };
         let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg)).unwrap();
@@ -2882,6 +2890,7 @@ mod tests {
             preview_bind: None,
             check_command: None,
             verify_gate: true,
+            image_profile: copperclaw_types::ImageProfile::Minimal,
             updated_at: chrono::Utc::now(),
         };
         let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg)).unwrap();
@@ -2933,6 +2942,7 @@ mod tests {
             preview_bind: None,
             check_command: None,
             verify_gate: true,
+            image_profile: copperclaw_types::ImageProfile::Minimal,
             updated_at: chrono::Utc::now(),
         };
         let spec = mgr.build_spec(&session, &paths, "img", Some(&cfg)).unwrap();
@@ -3017,6 +3027,7 @@ mod tests {
             preview_bind: None,
             check_command: None,
             verify_gate: true,
+            image_profile: copperclaw_types::ImageProfile::Minimal,
             updated_at: chrono::Utc::now(),
         };
         let spec = mgr
@@ -3539,6 +3550,7 @@ mod tests {
             preview_bind: None,
             check_command: None,
             verify_gate: true,
+            image_profile: copperclaw_types::ImageProfile::Minimal,
             updated_at: chrono::Utc::now(),
         };
         // rebuild_image writes the new tag back to container_configs, so the
@@ -3569,6 +3581,7 @@ mod tests {
                 preview_bind: None,
                 check_command: None,
                 verify_gate: true,
+                image_profile: copperclaw_types::ImageProfile::Minimal,
             },
         )
         .unwrap();

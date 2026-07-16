@@ -51,6 +51,173 @@ adheres to [Semantic Versioning](https://semver.org/).
     channel; a runner/mcp-free unit suite in `approval_intercept.rs` covers the
     role checks and the CLI/in-chat race (first wins, second no-ops).
 
+### Added (M18 E2 — warm "prototyping" image variant, 2026-07-16)
+
+- A second, per-group container image profile, `image_profile = minimal |
+  prototyping` (default `minimal`, secure-by-default). `prototyping` bakes a
+  warm web-prototyping toolchain into the session image so the first "build me
+  a web app" doesn't burn its opening minutes bootstrapping (and, since
+  containers have no apt egress at runtime, so the tools are present rather
+  than un-installable): `sqlite3`, headless `chromium` (doubles as a
+  browser-render fallback), and `zip` via apt, plus global `vite` /
+  `create-vite` pre-seeded through the existing `npm install -g` mechanism.
+- `crates/copperclaw-types/src/image.rs` (new): the shared `ImageProfile`
+  enum + the `PROTOTYPING_APT_PACKAGES` / `PROTOTYPING_NPM_PACKAGES` bundles
+  (single source of truth; both `copperclaw-db` and `copperclaw-container-rt`
+  consume it without depending on each other).
+- Migration `027_container_config_image_profile.sql`: `container_configs`
+  gains a nullable `image_profile TEXT` column (NULL reads back as `minimal`,
+  so existing groups are untouched on upgrade). Registered in
+  `crates/copperclaw-db/src/migrate.rs`'s CENTRAL list.
+- `crates/copperclaw-db/src/tables/container_configs.rs`: `ContainerConfig` /
+  `UpsertContainerConfig` carry `image_profile: ImageProfile`; narrow setter
+  `set_image_profile`. UNLIKE `tool_profile` / `verify_gate` /
+  `surface_thinking`, `image_profile` IS folded into `compute_fingerprint`
+  (it changes baked packages, so it must trigger a rebuild) — folded
+  CONDITIONALLY so a `minimal` config hashes byte-identically to a pre-E2 one
+  (no mass rebuild on upgrade), while a profile change flips the fingerprint.
+- `crates/copperclaw-container-rt/src/build.rs`: `ImageBuildSpec` carries the
+  profile; `effective_apt_packages` / `effective_npm_packages` append the
+  profile's extras, and both `dockerfile()` and `fingerprint()` render/hash
+  through them. `crates/copperclaw-host/src/container_manager/spawn.rs`'s
+  `rebuild_image` threads `cfg.image_profile` into the build spec.
+- `crates/copperclaw-setup/src/steps/image.rs`: the image step asks once for
+  the base image's profile (`COPPERCLAW_SETUP_IMAGE_PROFILE`, default
+  `minimal`) and bakes it via `default_spec(profile)`; the choice is recorded
+  on `SetupConfig.image_profile`. Idempotent — the same answer maps to the
+  same fingerprint/tag.
+- Operators set it per group via
+  `cclaw groups config update --field 'image_profile="prototyping"' <id>`
+  (`crates/copperclaw-host/src/handlers/groups.rs`, validated against the
+  known profile names); a spawned child agent inherits its parent's profile.
+### Added (M18 R5 — hot in-session provider failover, 2026-07-16)
+
+- The in-container runner now fails over between providers **mid-turn**
+  instead of dying with an apology when a gateway hiccups: a 20-minute build
+  no longer dies at minute 18 because one provider rate-limited. When the
+  primary provider exhausts its two in-provider retry layers,
+  `crates/copperclaw-runner/src/run/provider_call.rs`'s `run_llm_turn` now
+  walks a host-resolved ordered chain of healthy fallbacks
+  (`RunnerDeps::failover_chain`), retries the SAME LLM call against the next
+  entry, and only surfaces the terminal apology once the WHOLE chain is
+  exhausted. Each attempt reports its OWN `usage_report`
+  (`emit_usage_report` now takes the serving provider/model), so the host's
+  degrade/restore health fold stays authoritative — the failed primary is
+  degraded and the fallback that served stays healthy. An empty chain (the
+  default, and every unconfigured group) is byte-identical to the pre-R5
+  single-provider path. The switch is surfaced on the H1 Task HUD via
+  `TaskHud::add_note("switched to <provider>")` so a mid-run style change
+  isn't mistaken for confusion.
+- Host: `crates/copperclaw-host/src/container_manager/runner_config.rs`'s
+  `runner_config_for` resolves the ordered healthy chain at spawn
+  (`resolve_failover_chain_for_file`, backed by
+  `container_manager/provider_failover.rs::failover_alternates`) and writes
+  it into `runner.json`'s new `failover_chain` field (skipped when
+  empty/unconfigured — bit-identical shape otherwise). The runner parses it
+  (`crates/copperclaw-runner/src/config.rs`: `failover_chain` /
+  `FailoverEntryFile` / `FailoverProviderConfig`) and pre-builds the
+  alternate providers at startup (`main.rs::build_failover_chain`).
+- **Security boundary (in the PR):** the in-container failover chain is
+  limited to entries the container can ALREADY reach WITHOUT shipping a new
+  credential — no-auth local providers (ollama/codex), Anthropic-envelope
+  entries brokered by the existing capability token when the credential
+  broker is on, or Anthropic entries reusing the SAME `api_key_env` the
+  primary already injected. An Anthropic entry that would require a DIFFERENT
+  real key (a second account, broker off) is excluded and logged. The
+  container secret surface is never broadened for failover; alternates reuse
+  the primary's already-injected credential slot + endpoint and vary only
+  the model (and possibly the provider kind, to a local model).
+
+### Added (M18 V1 — WebSocket pass-through in the preview proxy, 2026-07-16)
+
+- `crates/copperclaw-host/src/preview.rs`: the session-preview reverse proxy
+  now bridges WebSocket upgrades instead of refusing them with 501. On a
+  cookie-authenticated upgrade, the axum side completes the handshake with the
+  browser and a `tokio-tungstenite` client opens `ws://<container_ip>:<port>`
+  to the container app, forwarding frames both ways (subprotocol mirrored, e.g.
+  Vite's `vite-hmr`); the upstream socket is opened first so a container not
+  serving a socket at that path fails fast with 502. The cookie gate applies to
+  the upgrade exactly as to HTTP (no cookie → 403 before any upgrade). The idle
+  reaper now treats an open socket as activity — every frame in either
+  direction and a 60s keep-alive tick bump `last_activity` — so a live browser
+  tab is never reaped mid-session (HTTP requests only bump per-request). Adds
+  `axum`'s `ws` feature plus `tokio-tungstenite` (0.24, the version the discord
+  channel already pins) and `futures` to `copperclaw-host`.
+- `skills/preview/SKILL.md`: dropped the "WebSockets are not proxied — prefer
+  polling" caveat; agents can now build Vite dev servers, live reload, and
+  realtime apps behind the preview link.
+
+### Added (M18 V3 — live headless-browser driver, 2026-07-16)
+
+- `crates/copperclaw-browser/src/cdp.rs` (new): the concrete Chromium/CDP
+  `BrowserDriver` behind the existing trait. `CdpBrowserDriver` speaks the
+  Chrome DevTools Protocol over a WebSocket to the Chromium in the locked-down
+  child container and produces the requested read-only artifact
+  (`Page.captureScreenshot` PNG, `Runtime.evaluate` DOM text, or
+  `Accessibility.getFullAXTree` flattened to text). The command sequence sits
+  behind a small `CdpTransport` seam and is fully unit-tested with a mock
+  transport; the live `WsCdpTransport` (over `tokio-tungstenite`, already in
+  the workspace lock via the discord adapter) carries the real session and is
+  exercised only behind the opt-in gate. Redirect hops + main-document status
+  are observed from `Network.*` events (pure parsers `redirect_hops_from_events`
+  / `main_status_from_events`) so the SSRF per-redirect re-guard still fires
+  against a live chain. We hand-rolled the minimal CDP client rather than
+  pull `chromiumoxide`/`headless_chrome` because those spawn a *local*
+  Chromium process, whereas ours runs in a dedicated child *container* the
+  driver must *connect* to — and the seam keeps the crate `unsafe`-free,
+  clippy-clean, and unit-testable without a live browser.
+- `crates/copperclaw-browser/src/live.rs` (new): `render_live` — the
+  previously-deferred privileged spawn path (`container.rs:23-25`). It runs
+  the SSRF target pre-flight, `spawn`s the locked-down child spec via the
+  `ContainerRuntime` seam (the `runtime.spawn` call that did not exist
+  before), resolves the child's bridge IP, connects a CDP session
+  (`CdpConnector` / `WsCdpConnector` via the browser's `/json/new` endpoint),
+  renders through the same `driver::render` orchestration, and tears the
+  container down unconditionally. Unit-tested against a mock runtime + mock
+  connector (happy path, teardown-on-connect-failure, no-bridge-IP,
+  spawn-failure, and SSRF-target-blocked-before-spawn).
+- `crates/copperclaw-mcp/src/tools/browser_render.rs`: `handle()` no longer
+  returns the terminal "driver not provisioned" error. It now runs every
+  safety step (`prepare`), detects a container runtime, and drives
+  `copperclaw_browser::render_live` to return the real PNG path / DOM text /
+  ARIA snapshot. Still gated behind `COPPERCLAW_BROWSER_ENABLED`: unset →
+  byte-identical "disabled" validation error before any live path; enabled but
+  no container runtime reachable (e.g. the in-container runner, which has no
+  Docker socket by design) → a clean "renderer unavailable here" report, never
+  a panic. New optional `COPPERCLAW_BROWSER_OUTPUT_DIR` selects where
+  screenshots land (V4 refines this to the session `/data` dir). All SSRF /
+  deny-default-egress / forbidden-env / unprivileged-user / hardened-sandbox
+  properties are preserved unchanged.
+
+### Added (M18 T2 — unconditional data-root env override, 2026-07-16)
+
+- `COPPERCLAW_DATA_ROOT` env var, consulted by
+  `copperclaw-mcp`'s `verify_gate::data_root()` (and, through it,
+  `todo.rs`'s todo-store path). When set on the runner process's
+  environment it replaces `/data` as the root the R3 verify gate and the
+  per-session todo store resolve against; when unset, production behavior
+  is byte-identical to the compiled-in `/data` default. Mirrors the shell
+  tool's `COPPERCLAW_SHELL_STATE_FILE` precedent. This un-gates the R3
+  verify mechanic for host-side integration tests / fixtures, which run
+  outside a container where `/data` is an unwritable root-owned path
+  (the gap X1 flagged). Security: the runner process env is
+  host-controlled at spawn; an in-container agent's `shell` calls execute
+  inside the container, not the runner process, so they cannot mutate this
+  var and cannot use it to escape the gate. The pre-existing
+  `#[cfg(test)]` in-process override still wins over the env var, so the
+  gate's own test battery is unaffected.
+
+### Fixed (M18 T2 — artifact_path test race, 2026-07-16)
+
+- `copperclaw-mcp`'s `artifact_path.rs` unit tests
+  (`returns_host_path_from_discovery_file`,
+  `error_when_discovery_file_missing`) now serialize on a shared `Mutex`
+  guard (an RAII `HostPathGuard`, same shape as `todo.rs`'s `TodoGuard`).
+  They share the global `HOST_PATH_FILE_TEST_OVERRIDE` static; without
+  serialization a parallel `cargo test` run could leak one test's
+  override into the other's assertions — a confirmed latent race, more
+  likely to surface under full-workspace load.
+
 ### Changed (M18 R4 — compaction that survives long builds, 2026-07-16)
 
 - `crates/copperclaw-runner/src/compaction.rs`: (a) the token estimator

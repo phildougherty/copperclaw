@@ -345,7 +345,8 @@ async fn drive_turn_inner(
     };
 
     for tool_turn in 0..deps.max_tool_turns.max(1) {
-        let output = run_llm_turn(deps, history, continuation.as_deref(), context_block).await?;
+        let output =
+            run_llm_turn(deps, history, continuation.as_deref(), context_block, hud).await?;
         continuation = output.continuation.or(continuation);
         // Accumulate this round-trip's billed tokens before any
         // early-return below so the per-task total reflects every call

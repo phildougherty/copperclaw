@@ -638,6 +638,9 @@ impl CreateAgentHandler {
             // same completion-verification contract.
             check_command: cfg.check_command,
             verify_gate: cfg.verify_gate,
+            // Inherit the parent's image profile so a child building in the
+            // same project boots on the same warm (or minimal) toolchain.
+            image_profile: cfg.image_profile,
         };
         if let Err(err) = container_configs::upsert(central, req) {
             warn!(
@@ -935,6 +938,7 @@ mod tests {
                 preview_bind: None,
                 check_command: None,
                 verify_gate: true,
+                image_profile: copperclaw_types::ImageProfile::Prototyping,
             },
         )
         .unwrap();
@@ -974,6 +978,11 @@ mod tests {
         assert_eq!(child_cfg.packages_apt, vec!["jq".to_string()]);
         assert_eq!(child_cfg.packages_npm, vec!["typescript".to_string()]);
         assert!(child_cfg.coding_enabled);
+        // The parent's image profile is inherited (same warm toolchain).
+        assert_eq!(
+            child_cfg.image_profile,
+            copperclaw_types::ImageProfile::Prototyping
+        );
         // The parent's identity name is deliberately NOT inherited.
         assert_eq!(child_cfg.assistant_name, None);
     }

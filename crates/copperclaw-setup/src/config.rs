@@ -52,6 +52,11 @@ pub struct SetupConfig {
     pub env_report: EnvReport,
     /// Image tag from the container-image build step. Empty when skipped.
     pub image_tag: String,
+    /// Toolchain profile baked into the base image (`minimal` |
+    /// `prototyping`), recorded from the image step's one-time prompt.
+    /// Empty when the image step was skipped. Defaults to `minimal`.
+    #[serde(default)]
+    pub image_profile: String,
     /// Optional `OneCLI` wiring.
     pub onecli: Option<OneCliConfig>,
     /// Absolute path to the `.env` file written by the auth step.
@@ -162,6 +167,7 @@ mod tests {
                 ..EnvReport::default()
             },
             image_tag: "copperclaw/session:sha256-abc".into(),
+            image_profile: "prototyping".into(),
             onecli: None,
             env_file: PathBuf::from("/tmp/x/.env"),
             mount_paths: vec![PathBuf::from("/srv/data")],

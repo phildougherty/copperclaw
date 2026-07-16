@@ -235,6 +235,10 @@ async fn main() -> Result<()> {
         todo_path: std::path::PathBuf::from(copperclaw_runner::run::hud::TODO_STORE_DEFAULT_PATH),
         verify_gate: cfg.verify_gate,
         check_command_override: cfg.check_command_override.clone(),
+        // M18 R5: pre-build the host-resolved healthy fallback providers so
+        // the runner can switch to one mid-turn without any further env
+        // lookups. Empty for groups with no fallback chain configured.
+        failover_chain: build_failover_chain(&cfg, &env),
     };
 
     tracing::info!(
@@ -242,6 +246,7 @@ async fn main() -> Result<()> {
         agent_group_id = %cfg.agent_group_id,
         provider = %cfg.provider,
         model = %cfg.model,
+        failover_alternates = deps.failover_chain.len(),
         "copperclaw-runner starting"
     );
     run_loop(deps).await
@@ -325,10 +330,103 @@ pub(crate) fn build_provider(
     }
 }
 
+/// Build the ordered [`FailoverProvider`] list from the host-resolved
+/// `runner.json` failover chain (M18 R5). Each entry is an alternate the
+/// runner may switch to mid-turn when the primary exhausts its retries.
+///
+/// A single entry that fails to build (e.g. an anthropic alternate with no
+/// resolvable key — which the host should never emit, since it only ships
+/// entries the container can already reach) is logged and skipped rather
+/// than aborting startup: a broken fallback must not take the whole session
+/// down. The primary is unaffected — it is built separately by
+/// [`build_provider`].
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn build_failover_chain(
+    cfg: &RunnerConfig,
+    env: &dyn copperclaw_runner::config::EnvLookup,
+) -> Vec<copperclaw_runner::FailoverProvider> {
+    cfg.failover_chain
+        .iter()
+        .filter_map(|entry| match build_failover_provider(entry, env) {
+            Ok(provider) => Some(copperclaw_runner::FailoverProvider {
+                provider,
+                model: entry.model.clone(),
+                provider_name: entry.provider.clone(),
+            }),
+            Err(err) => {
+                tracing::warn!(
+                    provider = %entry.provider,
+                    model = %entry.model,
+                    error = %err,
+                    "skipping unbuildable failover chain entry"
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+/// Build one alternate [`AgentProvider`](copperclaw_providers::AgentProvider)
+/// from a resolved failover chain entry. Mirrors [`build_provider`]'s
+/// per-kind construction, but sources everything from the entry (its key was
+/// already resolved from the env at config time).
+#[cfg_attr(test, allow(dead_code))]
+fn build_failover_provider(
+    entry: &copperclaw_runner::config::FailoverProviderConfig,
+    env: &dyn copperclaw_runner::config::EnvLookup,
+) -> Result<Arc<dyn copperclaw_providers::AgentProvider>> {
+    match entry.provider.as_str() {
+        "ollama" => {
+            let base_url = env
+                .get("OLLAMA_BASE_URL")
+                .unwrap_or_else(|| "http://localhost:11434".to_string());
+            let model = (!entry.model.is_empty()).then(|| entry.model.clone());
+            Ok(Arc::new(OllamaProvider::new(base_url, model)))
+        }
+        "ollama-shim" => {
+            let base_url = entry
+                .api_base_url
+                .clone()
+                .or_else(|| env.get("OLLAMA_BASE_URL"))
+                .context("ollama-shim failover entry requires api_base_url or OLLAMA_BASE_URL")?;
+            let model = (!entry.model.is_empty()).then(|| entry.model.clone());
+            Ok(Arc::new(OllamaProvider::shim(base_url, model)))
+        }
+        "codex" => {
+            let binary = env
+                .get("COPPERCLAW_CODEX_BINARY")
+                .unwrap_or_else(|| "/usr/local/bin/codex".to_string());
+            let args = match env.get("COPPERCLAW_CODEX_ARGS") {
+                Some(raw) => raw
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>(),
+                None => vec!["--json".to_string()],
+            };
+            Ok(Arc::new(CodexProvider::new(
+                std::path::PathBuf::from(binary),
+                args,
+            )))
+        }
+        _ => {
+            let api_key = entry
+                .api_key
+                .clone()
+                .context("anthropic failover entry api key not set")?;
+            Ok(Arc::new(match entry.api_base_url.as_deref() {
+                Some(base) => AnthropicProvider::with_base_url(api_key, base),
+                None => AnthropicProvider::new(api_key),
+            }))
+        }
+    }
+}
+
 #[cfg(test)]
 mod build_provider_tests {
     use super::*;
-    use copperclaw_runner::config::MapEnv;
+    use copperclaw_runner::config::{FailoverProviderConfig, MapEnv};
     use copperclaw_types::{AgentGroupId, Effort, SessionId};
 
     fn base_cfg(provider: &str) -> RunnerConfig {
@@ -359,7 +457,59 @@ mod build_provider_tests {
             hud_mode: copperclaw_runner::config::HudMode::Full,
             check_command_override: None,
             verify_gate: true,
+            failover_chain: Vec::new(),
         }
+    }
+
+    #[test]
+    fn build_failover_chain_builds_each_reachable_entry() {
+        let mut cfg = base_cfg("anthropic");
+        cfg.failover_chain = vec![
+            FailoverProviderConfig {
+                provider: "anthropic".into(),
+                model: "claude-haiku-4-6".into(),
+                api_key: Some("k".into()),
+                api_base_url: None,
+            },
+            FailoverProviderConfig {
+                provider: "ollama".into(),
+                model: "qwen3.6:27b".into(),
+                api_key: None,
+                api_base_url: None,
+            },
+        ];
+        let env = MapEnv::default();
+        let chain = build_failover_chain(&cfg, &env);
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].provider.name(), "anthropic");
+        assert_eq!(chain[0].provider_name, "anthropic");
+        assert_eq!(chain[0].model, "claude-haiku-4-6");
+        assert_eq!(chain[1].provider.name(), "ollama");
+    }
+
+    #[test]
+    fn build_failover_chain_skips_unbuildable_entry() {
+        // An anthropic alternate with no resolvable key can't be built —
+        // it's skipped, not fatal (the host should never emit one).
+        let mut cfg = base_cfg("anthropic");
+        cfg.failover_chain = vec![
+            FailoverProviderConfig {
+                provider: "anthropic".into(),
+                model: "m".into(),
+                api_key: None, // unbuildable
+                api_base_url: None,
+            },
+            FailoverProviderConfig {
+                provider: "ollama".into(),
+                model: "m2".into(),
+                api_key: None,
+                api_base_url: None,
+            },
+        ];
+        let env = MapEnv::default();
+        let chain = build_failover_chain(&cfg, &env);
+        assert_eq!(chain.len(), 1, "unbuildable anthropic entry skipped");
+        assert_eq!(chain[0].provider.name(), "ollama");
     }
 
     #[test]

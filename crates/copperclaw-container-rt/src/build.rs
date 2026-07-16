@@ -6,6 +6,7 @@
 //! sha256 so two specs with identical contents map to the same image
 //! tag — building is then a no-op when the tag already exists.
 
+use copperclaw_types::ImageProfile;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 
@@ -116,6 +117,12 @@ pub struct ImageBuildSpec {
     pub apt_packages: Vec<String>,
     /// Global npm packages installed via `npm install -g`.
     pub npm_packages: Vec<String>,
+    /// Image profile. `Prototyping` bakes an extra apt + npm bundle
+    /// (`sqlite3`, headless `chromium`, `zip`, global `vite` / `create-vite`)
+    /// on top of [`Self::apt_packages`] / [`Self::npm_packages`]. `Minimal`
+    /// (the default) adds nothing — a minimal spec renders and fingerprints
+    /// byte-identically to one with no profile field at all.
+    pub image_profile: ImageProfile,
     /// Extra files copied into the image.
     pub extra_files: Vec<ExtraFile>,
     /// Extra labels to apply (in addition to `copperclaw.fingerprint`).
@@ -185,22 +192,54 @@ impl ImageBuildSpec {
         }
     }
 
+    /// Effective apt packages actually baked into the image: the explicit
+    /// [`Self::apt_packages`] followed by the profile's extras. `Minimal`
+    /// contributes no extras, so the effective list equals `apt_packages`.
+    #[must_use]
+    pub fn effective_apt_packages(&self) -> Vec<String> {
+        let mut out = self.apt_packages.clone();
+        out.extend(
+            self.image_profile
+                .extra_apt_packages()
+                .iter()
+                .map(|s| (*s).to_string()),
+        );
+        out
+    }
+
+    /// Effective global npm packages baked into the image: explicit
+    /// [`Self::npm_packages`] followed by the profile's extras.
+    #[must_use]
+    pub fn effective_npm_packages(&self) -> Vec<String> {
+        let mut out = self.npm_packages.clone();
+        out.extend(
+            self.image_profile
+                .extra_npm_packages()
+                .iter()
+                .map(|s| (*s).to_string()),
+        );
+        out
+    }
+
     /// Sha256 of all inputs that affect the rendered Dockerfile.
     ///
     /// Stable across runs: order-sensitive for vectors (the caller is
-    /// expected to keep order deterministic).
+    /// expected to keep order deterministic). The image profile is folded in
+    /// through the effective package lists, so a `Minimal` spec fingerprints
+    /// byte-identically to a pre-profile spec (no image-tag churn on
+    /// upgrade), while `Prototyping` gets a distinct tag.
     #[must_use]
     pub fn fingerprint(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(b"base=");
         hasher.update(self.base_image.as_bytes());
         hasher.update(b"\napt=");
-        for p in &self.apt_packages {
+        for p in &self.effective_apt_packages() {
             hasher.update(p.as_bytes());
             hasher.update(b",");
         }
         hasher.update(b"\nnpm=");
-        for p in &self.npm_packages {
+        for p in &self.effective_npm_packages() {
             hasher.update(p.as_bytes());
             hasher.update(b",");
         }
@@ -275,21 +314,23 @@ impl ImageBuildSpec {
         let mut out = String::new();
         out.push_str(&format!("FROM {}\n", self.base_image));
 
-        if !self.apt_packages.is_empty() {
+        let apt_packages = self.effective_apt_packages();
+        if !apt_packages.is_empty() {
             out.push_str(
                 "RUN apt-get update \\\n \
                  && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\\n",
             );
-            for pkg in &self.apt_packages {
+            for pkg in &apt_packages {
                 out.push_str(&format!("      {pkg} \\\n"));
             }
             out.push_str(" && rm -rf /var/lib/apt/lists/*\n");
         }
 
-        if !self.npm_packages.is_empty() {
+        let npm_packages = self.effective_npm_packages();
+        if !npm_packages.is_empty() {
             out.push_str("RUN npm install -g \\\n");
-            let last = self.npm_packages.len() - 1;
-            for (i, pkg) in self.npm_packages.iter().enumerate() {
+            let last = npm_packages.len() - 1;
+            for (i, pkg) in npm_packages.iter().enumerate() {
                 if i == last {
                     out.push_str(&format!("      {pkg}\n"));
                 } else {
@@ -543,6 +584,78 @@ mod tests {
         let apt_at = df.find("apt-get install").expect("apt block");
         let npm_at = df.find("npm install -g").expect("npm block");
         assert!(apt_at < npm_at);
+    }
+
+    // ── image profile (M18 E2) ─────────────────────────────────────
+
+    #[test]
+    fn minimal_profile_is_the_default_and_adds_nothing() {
+        let spec = ImageBuildSpec::new("r", "debian:trixie-slim");
+        assert_eq!(spec.image_profile, ImageProfile::Minimal);
+        assert!(spec.effective_apt_packages().is_empty());
+        assert!(spec.effective_npm_packages().is_empty());
+    }
+
+    #[test]
+    fn minimal_profile_fingerprint_matches_no_profile_field() {
+        // A minimal spec must fingerprint identically to how the spec
+        // fingerprinted before the profile field existed — i.e. purely from
+        // its explicit package lists — so upgrading doesn't churn image tags.
+        let mut spec = ImageBuildSpec::new("copperclaw/session", "debian:trixie-slim");
+        spec.apt_packages = vec!["git".into(), "curl".into()];
+        spec.npm_packages = vec!["typescript".into()];
+        let fp_default = spec.fingerprint();
+
+        let mut explicit_minimal = spec.clone();
+        explicit_minimal.image_profile = ImageProfile::Minimal;
+        assert_eq!(fp_default, explicit_minimal.fingerprint());
+    }
+
+    #[test]
+    fn prototyping_profile_bake_renders_expected_dockerfile() {
+        // The E2 bake test: a prototyping spec renders the warm toolchain
+        // (sqlite3, headless chromium, zip) via apt and (vite, create-vite)
+        // via npm, on top of the baseline packages, in one Dockerfile.
+        let mut spec = ImageBuildSpec::new("copperclaw/session", "debian:trixie-slim");
+        spec.apt_packages = vec!["git".into()];
+        spec.image_profile = ImageProfile::Prototyping;
+        let df = spec.dockerfile();
+
+        assert!(df.contains("FROM debian:trixie-slim"));
+        // Baseline package still present, profile extras appended after it.
+        assert!(df.contains("git"));
+        for pkg in ["chromium", "sqlite3", "zip"] {
+            assert!(df.contains(pkg), "expected apt pkg `{pkg}` in:\n{df}");
+        }
+        assert!(df.contains("npm install -g"));
+        for pkg in ["vite", "create-vite"] {
+            assert!(df.contains(pkg), "expected npm pkg `{pkg}` in:\n{df}");
+        }
+        // Explicit apt block precedes the npm block.
+        let apt_at = df.find("apt-get install").expect("apt block");
+        let npm_at = df.find("npm install -g").expect("npm block");
+        assert!(apt_at < npm_at);
+    }
+
+    #[test]
+    fn prototyping_profile_changes_fingerprint_and_tag() {
+        let mut minimal = ImageBuildSpec::new("copperclaw/session", "debian:trixie-slim");
+        minimal.apt_packages = vec!["git".into()];
+        let mut prototyping = minimal.clone();
+        prototyping.image_profile = ImageProfile::Prototyping;
+        assert_ne!(minimal.fingerprint(), prototyping.fingerprint());
+        assert_ne!(minimal.image_tag(), prototyping.image_tag());
+    }
+
+    #[test]
+    fn prototyping_profile_alone_renders_apt_and_npm_blocks() {
+        // Even with no explicit packages, the profile alone must produce
+        // both install blocks (the warm image is the whole point).
+        let mut spec = ImageBuildSpec::new("r", "debian:trixie-slim");
+        spec.image_profile = ImageProfile::Prototyping;
+        let df = spec.dockerfile();
+        assert!(df.contains("apt-get install"));
+        assert!(df.contains("npm install -g"));
     }
 
     #[test]
