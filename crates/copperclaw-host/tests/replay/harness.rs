@@ -1015,6 +1015,44 @@ impl ReplayHarness {
         }
         out
     }
+
+    /// Fixture-authoring aid: print each captured actual stream as
+    /// substituted JSONL, fenced with `===DUMP <stream>===` /
+    /// `===END <stream>===` markers so a generation step can slice the
+    /// blocks straight into `expected/*.jsonl`. Applies the manifest's
+    /// substitutions so the printed lines already carry the `<UUID>` /
+    /// `<TS>` placeholders the diff expects. Never called from a passing
+    /// assertion — it exists only so a new fixture's expected files can
+    /// be generated from a real run instead of guessed by hand.
+    pub fn dump_expected_jsonl(&self) {
+        let subs = Substitutions::compile(&self.fixture.manifest.substitutions)
+            .expect("compile substitutions for dump");
+        let inbound: Vec<serde_json::Value> = self
+            .played_inbound
+            .iter()
+            .map(|e| serde_json::to_value(e).expect("inbound to json"))
+            .collect();
+        let streams: [(&str, Vec<serde_json::Value>); 4] = [
+            ("inbound-events", inbound),
+            (
+                "messages-in",
+                self.snapshot_messages_in().expect("snapshot messages-in"),
+            ),
+            (
+                "messages-out",
+                self.snapshot_messages_out().expect("snapshot messages-out"),
+            ),
+            ("delivered", self.snapshot_delivered()),
+        ];
+        for (name, rows) in streams {
+            println!("===DUMP {name}===");
+            for row in rows {
+                let raw = serde_json::to_string(&row).expect("serialize dump row");
+                println!("{}", subs.apply(&raw));
+            }
+            println!("===END {name}===");
+        }
+    }
 }
 
 /// Mount one mock per `provider_responses` entry. Honors three kinds:

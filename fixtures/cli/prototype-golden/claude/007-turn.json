@@ -12,7 +12,7 @@
       "content_block": {
         "type": "tool_use",
         "id": "toolu_golden_007",
-        "name": "send_card",
+        "name": "send_file",
         "input": {}
       }
     },
@@ -21,7 +21,7 @@
       "index": 0,
       "delta": {
         "type": "input_json_delta",
-        "partial_json": "{\"card\": {\"title\": \"Todo app is ready\", \"body\": \"A tiny stdlib-only HTTP todo server is scaffolded, committed, and verified (python3 -m py_compile passed).\", \"fields\": [{\"label\": \"What to try\", \"value\": \"POST /todos {\\\"text\\\": \\\"...\\\"} to add an item; GET /todos to list them.\"}, {\"label\": \"Project\", \"value\": \"/tmp/copperclaw-x1-golden/todo-app\"}], \"buttons\": [{\"label\": \"Open preview\", \"url\": \"http://192.0.2.10:8100/__preview/fixture-tok-8000\"}]}}"
+        "partial_json": "{\"filename\": \"preview.png\", \"text\": \"Preview screenshot of the running todo app.\", \"data\": \"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==\"}"
       }
     },
     {

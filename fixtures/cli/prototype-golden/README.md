@@ -1,6 +1,6 @@
-## cli / prototype-golden (M18 X1 — program acceptance fixture)
+## cli / prototype-golden (M18 X1 — program acceptance fixture; X2 extended)
 
-One CLI inbound (`build me a tiny HTTP todo app`) drives an 8-round
+One CLI inbound (`build me a tiny HTTP todo app`) drives a 9-round
 scripted tool loop:
 
 1. `shell` — `mkdir` + `git init` a fresh project (no `cwd`; the
@@ -17,25 +17,51 @@ scripted tool loop:
    `MockPreviewBroker` test double) onto `DeliveryService` via the
    already-public `set_preview_broker` API, so the call gets back a
    real shareable-URL response without a real Docker container.
-7. `send_card` — the P3 "prototype ready" ritual shape: title,
-   one-liner body, a "what to try" field, a project-path field, and an
-   "Open preview" URL button.
-8. Final assistant text, closing the turn.
+7. `send_file` (M18 X2) — the P3 ritual screenshot, sent alongside the
+   card via in-memory `data` bytes (a 1x1 PNG). Cards can't attach a
+   local file, so the ritual sends the screenshot as its own message.
+8. `send_card` — the P3 "prototype ready" ritual shape: title,
+   one-liner body, a "What to try" field (bulleted), the `artifact_path`
+   host-path footer (the `Project path` field), and an "Open preview"
+   URL button.
+9. Final assistant text, closing the turn.
 
-Registered in `crates/copperclaw-host/tests/replay.rs` as
-`cli_prototype_golden_path`.
+Registered in `crates/copperclaw-host/tests/replay.rs` twice:
+`cli_prototype_golden_path` (the byte-stable JSONL diff) and
+`cli_prototype_golden_ritual_card_and_screenshot_shape` (M18 X2 — an
+explicit assertion of the delivered ritual card + screenshot shape).
+
+### Sibling fixture: the R3 verify gate (M18 X2)
+
+Gap #1 below (the verify-gate refuse → fix → pass loop) is now covered
+by the **sibling fixture `cli/prototype-verify-gate/`**, registered as
+`cli_prototype_verify_gate_refuse_fix_pass`. It uses T2's
+`COPPERCLAW_DATA_ROOT` override (set on a re-exec'd child process, since
+`forbid(unsafe_code)` blocks `std::env::set_var`) to point the gate at a
+writable per-run dir. See that fixture's README for the mechanism. The
+diagnosis below is preserved because it explains *why* the split was
+necessary and why this happy-path fixture deliberately does NOT engage
+the gate (its project lives outside any `COPPERCLAW_DATA_ROOT`).
 
 ### Two pieces of the card's acceptance line this fixture does NOT cover
 
 The X1 card describes the golden path as "creates `/data/todo-app` as
 a git repo, ... hits the verify gate, passes it, ... HUD finalizes."
-Two of those are **not exercised here**, for reasons specific to how
-the replay harness runs (in-process, no real container) rather than
-gaps in the underlying feature. Both are diagnosed precisely below so
-a future card doesn't have to re-derive them.
+Two of those are **not exercised in *this* fixture**, for reasons
+specific to how the replay harness runs (in-process, no real container)
+rather than gaps in the underlying feature. Both are diagnosed precisely
+below. **Status as of M18 X2:** gap #1 (the verify gate) is now covered
+by the sibling fixture `cli/prototype-verify-gate/` — read the diagnosis
+below for the *why*, then that fixture's README for the *how*. Gap #2
+(the live HUD) remains uncovered on `cli` and needs an edit-capable
+channel.
 
 **1. The R3 verification gate (`todo_update` refused while dirty, then
-succeeds) is not exercised.**
+succeeds) — NOW COVERED by the sibling `cli/prototype-verify-gate/`
+fixture (M18 X2); left out of *this* happy-path fixture on purpose.**
+
+The original X1 diagnosis (still accurate, and the reason X2 built a
+separate fixture rather than folding the gate into this one):
 
 `verify_gate.rs`'s `data_root()` and `todo.rs`'s `todo_path()` both
 hardcode the literal path `/data` (the container's bind-mounted
@@ -142,6 +168,9 @@ of the edit-capable channels, not `cli`.
   `FixturePreviewBroker`, not a real Docker container (the real
   broker, `copperclaw-host`'s `PreviewManager`, has its own unit
   tests).
-- The P3 ritual `send_card` shape (title, one-liner, a "what to try"
-  field, a project-path field, an "Open preview" button) rendering
-  through the cli channel's `deliver_card` → text-fallback path.
+- The P3 ritual `send_card` shape (title, one-liner, a "What to try"
+  field, the `artifact_path` host-path footer field, an "Open preview"
+  button) rendering through the cli channel's `deliver_card` →
+  text-fallback path — plus the screenshot delivered alongside it via
+  `send_file` (M18 X2). The `cli_prototype_golden_ritual_card_and_screenshot_shape`
+  test asserts the delivered shape explicitly, on top of the JSONL diff.
