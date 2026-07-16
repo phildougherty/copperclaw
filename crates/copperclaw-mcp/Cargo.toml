@@ -31,6 +31,7 @@ similar = { workspace = true }
 # minimal CI images). Vendored-libgit2 also pulls in `cc`/`cmake` at
 # build time only; the resulting binary statically links libgit2.
 git2 = { version = "0.19", default-features = false, features = ["vendored-libgit2"] }
+copperclaw-metrics.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }

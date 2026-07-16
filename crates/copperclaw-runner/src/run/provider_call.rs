@@ -202,11 +202,18 @@ pub(super) async fn run_llm_turn(
                 // user-visible failure reason (drive_turn maps it into the
                 // apology). Byte-stable with the pre-R5 single-provider
                 // path when `failover_chain` is empty.
+                if !deps.failover_chain.is_empty() {
+                    // R5: a real multi-entry failover chain was exhausted (a
+                    // plain single-provider failure has an empty chain).
+                    copperclaw_metrics::inc_provider_failover_chain_exhausted(provider_name);
+                }
                 return Ok(attempt.out);
             }
 
             // Switch to the next healthy entry and retry the SAME call.
             let next = &deps.failover_chain[idx];
+            // R5: count the hot failover switch (failed provider → next serving).
+            copperclaw_metrics::inc_provider_failover(provider_name, &next.provider_name);
             tracing::warn!(
                 failed_provider = provider_name,
                 failed_model = model,
@@ -326,7 +333,7 @@ async fn run_one_provider_attempt(
             }
         };
 
-        let pumped = pump_events(deps, query.as_mut()).await?;
+        let pumped = pump_events(deps, provider, query.as_mut()).await?;
         query.abort().await;
 
         // Retry only if the failure was tagged retryable AND we have
@@ -367,6 +374,7 @@ async fn run_one_provider_attempt(
 #[allow(clippy::too_many_lines)]
 pub(super) async fn pump_events(
     deps: &RunnerDeps,
+    provider: &dyn AgentProvider,
     query: &mut dyn AgentQuery,
 ) -> Result<(LlmTurnOutput, u32, u32)> {
     let mut out = LlmTurnOutput::default();
@@ -520,7 +528,10 @@ pub(super) async fn pump_events(
                     parse_error = %parse_error,
                     "tool_use input JSON did not parse; feeding error back to model"
                 );
-                copperclaw_metrics::inc_provider_retry(deps.provider.name());
+                // R5 label fix: attribute the retry to the ACTIVE candidate
+                // (which may be a failover entry), not the primary
+                // `deps.provider`.
+                copperclaw_metrics::inc_provider_retry(provider.name());
                 out.tool_calls.push(PendingToolCall {
                     id: tool_use_id,
                     name: tool_name,

@@ -82,6 +82,7 @@ impl CopperclawServer {
         arguments: Option<rmcp::model::JsonObject>,
     ) -> Result<CallToolResult, McpModelError> {
         let Some(entry) = self.inner.tools.get(name) else {
+            copperclaw_metrics::inc_unknown_tool(name);
             return Err(McpModelError::invalid_request(
                 format!("unknown tool: {name}"),
                 None,

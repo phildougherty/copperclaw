@@ -170,6 +170,16 @@ pub(super) async fn dispatch_external(
         let _ = mcp_calls::delete_request(&conn, &request_id);
     }
 
+    // X1: for the reserved preview relay, count host-answered (served) vs the
+    // runner's blocking-poll giving up (timeout).
+    if route.server == crate::run::preview::PREVIEW_SERVER {
+        match &outcome {
+            Ok(Some(_)) => copperclaw_metrics::inc_preview_expose("served"),
+            Ok(None) => copperclaw_metrics::inc_preview_expose("timeout"),
+            Err(_) => {}
+        }
+    }
+
     let resp = match outcome {
         Ok(Some(resp)) => resp,
         Ok(None) => timeout_response(&request_id, advertised),

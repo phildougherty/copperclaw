@@ -301,6 +301,18 @@ pub mod shell {
         let (stderr, stderr_truncated) =
             cap_shell_stream(&String::from_utf8_lossy(&output.stderr), cap, tail);
 
+        // T1: count shell truncation events by capping mode + the pre-cap
+        // stream size, so operators can tune SHELL_OUTPUT_CAP.
+        let cap_mode = if tail { "tail" } else { "head" };
+        if stdout_truncated {
+            copperclaw_metrics::inc_shell_truncated(cap_mode);
+            copperclaw_metrics::observe_shell_truncated_bytes(output.stdout.len());
+        }
+        if stderr_truncated {
+            copperclaw_metrics::inc_shell_truncated(cap_mode);
+            copperclaw_metrics::observe_shell_truncated_bytes(output.stderr.len());
+        }
+
         apply_verify_gate(
             ctx,
             input.cwd.as_deref(),
@@ -396,8 +408,14 @@ pub mod shell {
         .await;
         if recorded.as_deref() == Some(command.trim()) {
             if success {
+                // R3/X2: record the fix-cycle count at the moment the dirty
+                // marker clears (clear_dirty resets it, so read it first).
+                let cycles = crate::tools::verify_gate::fix_cycles(&project_root).await;
+                copperclaw_metrics::observe_verify_gate_fix_cycles(cycles);
+                copperclaw_metrics::inc_verify_run("pass");
                 crate::tools::verify_gate::clear_dirty(&project_root).await;
             } else {
+                copperclaw_metrics::inc_verify_run("fail");
                 let tail = format!("stdout:\n{stdout}\n\nstderr:\n{stderr}");
                 crate::tools::verify_gate::record_verify_failure(&project_root, &tail).await;
             }
@@ -849,6 +867,15 @@ pub mod read_file {
             Mode::Lines => {
                 let (body, truncated, bytes_read, total) =
                     read_lines_range(&plan.path, plan.offset, plan.limit).await?;
+                // T1: lines-mode call count + pages-per-file (how many windowed
+                // reads at this limit would cover the whole file).
+                copperclaw_metrics::inc_read_file_lines_mode();
+                let pages = if plan.limit == 0 || plan.limit == u64::MAX {
+                    1
+                } else {
+                    total.div_ceil(plan.limit)
+                };
+                copperclaw_metrics::observe_read_file_pages(pages);
                 (body, truncated, bytes_read, Some(total))
             }
         };

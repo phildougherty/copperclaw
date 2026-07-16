@@ -22,8 +22,12 @@
 //! ]
 //! ```
 //!
-//! The file is rewritten in full on every mutation; concurrency is bounded
-//! by the runner's single-threaded loop, so there is no inter-call locking.
+//! The file is rewritten in full on every mutation. R2 parallel
+//! tool-batch execution can fire two `todo_*` mutators from one batch
+//! concurrently, so every mutator serializes its whole read-modify-write
+//! cycle on the process-wide [`todo_write_lock`] (one session = one
+//! runner process = one todo file). See that accessor for the race it
+//! closes.
 
 use std::path::PathBuf;
 
@@ -173,16 +177,46 @@ async fn read_all() -> Result<Vec<TodoItem>, ToolError> {
     }
 }
 
+/// Process-wide serialization for the todo store's read-modify-write
+/// cycle. R2 shipped parallel tool-batch execution, so two `todo_*`
+/// mutators from a single batch can run concurrently. Without this lock
+/// both read the same pre-image (one add/update silently clobbers the
+/// other — a lost update) AND both write the sibling tempfile and
+/// rename it into place (bytes interleave → corrupt JSON). Seen live as
+/// ~12 `todo store was unparseable` + `could not quarantine corrupt
+/// todo store` warnings inside a single long build. Every mutator
+/// handler (`add`/`update`/`delete`) holds this across read+mutate+write
+/// so the whole cycle is atomic w.r.t. other mutators.
+///
+/// One session = one runner process = one todo file, so a process-wide
+/// mutex is the correct scope. It's a `tokio::sync::Mutex` (async,
+/// holdable across `.await`) rather than `std::sync::Mutex` so the
+/// guard can span the file I/O without tripping `clippy::await_holding_lock`.
+fn todo_write_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// Monotonic suffix source for [`write_all`]'s per-write tempfile name.
+/// Paired with the pid it gives every in-flight write a unique sibling
+/// target, so even an unlocked writer can never scribble over another's
+/// `.tmp` — belt-and-suspenders behind [`todo_write_lock`].
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 async fn write_all(items: &[TodoItem]) -> Result<(), ToolError> {
     let path = todo_path();
     let json_bytes = serde_json::to_vec_pretty(items)
         .map_err(|e| ToolError::Internal(format!("todo serialise failed: {e}")))?;
-    // Sibling tempfile + rename so a mid-write crash leaves either the
-    // old file intact (rename pending) or the new file intact (rename
-    // done) — never a truncated half. Same directory keeps the rename
-    // on one filesystem (cross-mount rename is EXDEV).
+    // Unique sibling tempfile + rename so a mid-write crash leaves either
+    // the old file intact (rename pending) or the new file intact (rename
+    // done) — never a truncated half. The pid + monotonic-counter suffix
+    // makes the tempfile name unique per write so two concurrent writers
+    // never collide on one shared `.tmp` (defence in depth behind
+    // `todo_write_lock`). Same directory keeps the rename on one
+    // filesystem (cross-mount rename is EXDEV).
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut tmp = path.clone().into_os_string();
-    tmp.push(".tmp");
+    tmp.push(format!(".tmp.{}.{seq}", std::process::id()));
     let tmp = PathBuf::from(tmp);
     if let Err(e) = tokio::fs::write(&tmp, &json_bytes).await {
         let _ = tokio::fs::remove_file(&tmp).await;
@@ -346,6 +380,10 @@ pub mod add {
         if trimmed.is_empty() {
             return Err(ToolError::Validation("`text` must be non-empty".into()));
         }
+        // Serialize the whole read-modify-write against concurrent
+        // mutators from the same parallel tool batch (see
+        // `super::todo_write_lock`). Held until this handler returns.
+        let _write_guard = super::todo_write_lock().lock().await;
         let mut items = read_all().await?;
         let now = Utc::now();
         let item = TodoItem {
@@ -607,6 +645,11 @@ pub mod update {
                 "must pass at least one of `text` or `status` to update".into(),
             ));
         }
+        // Serialize the whole read-modify-write against concurrent
+        // mutators from the same parallel tool batch (see
+        // `super::todo_write_lock`). Held until this handler returns —
+        // spans the verify-gate checks and the write below.
+        let _write_guard = super::todo_write_lock().lock().await;
         let mut items = read_all().await?;
         let pos = items
             .iter()
@@ -648,6 +691,7 @@ pub mod update {
                 if let Some(project_root) = dirty.first() {
                     let cycles = crate::tools::verify_gate::fix_cycles(project_root).await;
                     if cycles < crate::tools::verify_gate::FIX_CYCLE_CAP {
+                        copperclaw_metrics::inc_verify_gate_completion("refused_dirty");
                         let cmd_hint = match crate::tools::verify_gate::recorded_verify_command(
                             project_root,
                             ctx.check_command_override().as_deref(),
@@ -677,6 +721,10 @@ pub mod update {
                     // refusing forever.
                     effective_status = Some(TodoStatus::Blocked);
                     blocked_reason = crate::tools::verify_gate::last_failure(project_root).await;
+                    copperclaw_metrics::inc_verify_gate_completion("blocked_cycle_cap");
+                } else {
+                    // Gate enabled and no project is dirty: completion passes.
+                    copperclaw_metrics::inc_verify_gate_completion("passed");
                 }
             }
         }
@@ -759,6 +807,10 @@ pub mod delete {
         ctx: &dyn crate::context::ToolContext,
     ) -> Result<CallToolResult, ToolError> {
         let input: Input = parse_args(arguments)?;
+        // Serialize the whole read-modify-write against concurrent
+        // mutators from the same parallel tool batch (see
+        // `super::todo_write_lock`). Held until this handler returns.
+        let _write_guard = super::todo_write_lock().lock().await;
         let mut items = read_all().await?;
         let pos = items
             .iter()
@@ -1331,25 +1383,74 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_is_atomic_no_partial_file() {
+    async fn write_leaves_no_temp_file_behind() {
+        // `write_all` now names its tempfile `<store>.tmp.<pid>.<seq>`
+        // (unique per write, so concurrent writers can't collide) and
+        // renames it into place. After a successful write the store
+        // exists and no `<store>.tmp*` sibling is left behind.
         let _g = TodoGuard::new();
         let ctx = MockToolContext::new();
         let path = todo_path();
-        let mut tmp_os = path.clone().into_os_string();
-        tmp_os.push(".tmp");
-        let tmp_path = PathBuf::from(tmp_os);
-        // Pre-seed garbage at the temp path; write_all must overwrite
-        // and then rename it away.
-        tokio::fs::write(&tmp_path, b"garbage").await.unwrap();
         add::handle(obj(json!({"text": "atomic"})), &ctx)
             .await
             .unwrap();
-        assert!(
-            !tokio::fs::try_exists(&tmp_path).await.unwrap(),
-            "{} should have been renamed away after write_all",
-            tmp_path.display()
-        );
         assert!(tokio::fs::try_exists(&path).await.unwrap());
+        let parent = path.parent().unwrap();
+        let tmp_prefix = format!("{}.tmp", path.file_name().unwrap().to_string_lossy());
+        let mut entries = tokio::fs::read_dir(parent).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            assert!(
+                !name.starts_with(&tmp_prefix),
+                "unexpected leftover temp file after write_all: {name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_adds_never_corrupt_or_lose_updates() {
+        // Regression for the R2 parallel-batch write race. Two `todo_*`
+        // mutators from one tool batch run concurrently; without the
+        // process-wide `todo_write_lock` both read the same pre-image
+        // (only one add survives — a lost update) and both rename a
+        // shared sibling tempfile into place (interleaved bytes →
+        // corrupt JSON). `tokio::join!` polls these eight adds
+        // cooperatively, so every `read_all` completes before any
+        // `write_all` in the unlocked code — the lost update is
+        // deterministic. This test FAILS against the pre-fix
+        // fixed-`.tmp` code and PASSES with the lock held across the
+        // read-modify-write cycle.
+        let _g = TodoGuard::new();
+        let ctx = MockToolContext::new();
+        let results = tokio::join!(
+            add::handle(obj(json!({"text": "i0"})), &ctx),
+            add::handle(obj(json!({"text": "i1"})), &ctx),
+            add::handle(obj(json!({"text": "i2"})), &ctx),
+            add::handle(obj(json!({"text": "i3"})), &ctx),
+            add::handle(obj(json!({"text": "i4"})), &ctx),
+            add::handle(obj(json!({"text": "i5"})), &ctx),
+            add::handle(obj(json!({"text": "i6"})), &ctx),
+            add::handle(obj(json!({"text": "i7"})), &ctx),
+        );
+        let calls = [
+            results.0, results.1, results.2, results.3, results.4, results.5, results.6, results.7,
+        ];
+        for r in &calls {
+            r.as_ref().expect("each concurrent add must succeed");
+        }
+        // The store is still parseable — no interleaved-tempfile corruption.
+        let items = read_all().await.expect("store must remain parseable");
+        // No update was silently lost: all eight adds survived...
+        assert_eq!(
+            items.len(),
+            8,
+            "expected 8 items; updates were lost to the write race"
+        );
+        // ...each with a unique id (no two adds collided on `next_id`).
+        let mut ids: Vec<u32> = items.iter().map(|i| i.id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 8, "todo ids must be unique");
     }
 
     #[tokio::test]

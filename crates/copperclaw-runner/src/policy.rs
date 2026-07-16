@@ -115,6 +115,7 @@ const CODING_TOOLS: &[&str] = &[
     "copy_file",
     "explore",
     "create_agent",
+    "delegate",
     // M17 session-preview proxy: exposing / closing an HTTP app the agent
     // built is part of the build-test loop, so it rides the coding profile
     // (and is denied to a guest via the mutating floor — see `is_mutating`).
@@ -466,6 +467,7 @@ impl ToolPolicy {
         // tools, period — even under a permissive profile.
         if let Some(role) = self.sender_role {
             if role.denies_mutating() && is_mutating(tool) {
+                copperclaw_metrics::inc_policy_denied("role", tool);
                 return PolicyDecision::Deny(format!(
                     "Tool `{tool}` is not available to `{}` senders (read-only).",
                     role.as_str()
@@ -478,6 +480,7 @@ impl ToolPolicy {
         // housekeeping set) pass.
         if let Some(allowed) = &self.skill_allowed {
             if !ALWAYS_TOOLS.contains(&tool) && !allowed.iter().any(|t| t == tool) {
+                copperclaw_metrics::inc_policy_denied("skill", tool);
                 return PolicyDecision::Deny(format!(
                     "Tool `{tool}` is not in the active skill's allowed-tools list."
                 ));
@@ -486,6 +489,7 @@ impl ToolPolicy {
 
         // Layer 3: group profile ceiling.
         if !self.profile.allows(tool) {
+            copperclaw_metrics::inc_policy_denied("profile", tool);
             return PolicyDecision::Deny(format!(
                 "Tool `{tool}` is not permitted by the `{}` tool profile.",
                 self.profile.as_str()
@@ -501,6 +505,7 @@ impl ToolPolicy {
             // credentialed external action at all — no human is present to
             // authorise it. They may still search memory and propose.
             if self.trust.autonomous {
+                copperclaw_metrics::inc_policy_denied("provenance", tool);
                 return PolicyDecision::Deny(format!(
                     "Tool `{tool}` takes a credentialed external action, which is not permitted on an autonomous (heartbeat/scheduled) turn. Search memory and propose the action for a human turn to approve instead."
                 ));
@@ -509,6 +514,7 @@ impl ToolPolicy {
             // e.g. a web_fetch body or an untrusted memory hit) blocks
             // credentialed external actions until a FRESH approval clears it.
             if self.trust.tainted && !self.trust.approved {
+                copperclaw_metrics::inc_policy_denied("provenance", tool);
                 return PolicyDecision::Deny(format!(
                     "Tool `{tool}` takes a credentialed external action, but this turn's context contains untrusted-provenance content (e.g. a fetched page or an untrusted memory entry). Fresh approval is required before a credentialed external action can run on a tainted turn."
                 ));

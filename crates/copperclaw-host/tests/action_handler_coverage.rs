@@ -52,6 +52,10 @@ fn runner_emit_set() -> HashSet<&'static str> {
         "ask_user_question",
         // Agent-to-agent fan-out (apply_create_agent).
         "create_agent",
+        // Middle-tier write-capable build worker (apply_delegate). Shares
+        // the create_agent spawn + worktree machinery; handled by the
+        // delegate-profile CreateAgentModule (M18 R7).
+        "delegate",
         // Self-modification (apply_install_packages, apply_add_mcp_server).
         "install_packages",
         "add_mcp_server",
@@ -125,6 +129,16 @@ async fn install_built_in_modules_mock(ctx: Arc<MockModuleContext>) {
             copperclaw_db::central::CentralDb::open_in_memory().unwrap(),
             std::env::temp_dir().join(format!(
                 "copperclaw-action-coverage-{}",
+                uuid::Uuid::new_v4()
+            )),
+            create_agent_always_allow(),
+        )),
+        // Middle-tier `delegate` action (M18 R7) — a second install of
+        // the same module with the delegate profile.
+        Box::new(CreateAgentModule::new_delegate(
+            copperclaw_db::central::CentralDb::open_in_memory().unwrap(),
+            std::env::temp_dir().join(format!(
+                "copperclaw-action-coverage-delegate-{}",
                 uuid::Uuid::new_v4()
             )),
             create_agent_always_allow(),

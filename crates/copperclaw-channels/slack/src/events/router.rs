@@ -455,15 +455,20 @@ async fn convert_message(
     let mut kind = MessageKind::Chat;
     if let (Some(api), Some(data_dir)) = (state.api.as_ref(), state.data_dir.as_ref()) {
         if let Some(file) = m.files.as_ref().and_then(|files| files.first()) {
+            let channel = state.channel_type.as_str();
             match download_file(api, data_dir, state.max_attachment_bytes, file).await {
-                FileOutcome::Ok { attachment } => {
+                FileOutcome::Ok { attachment, bytes } => {
+                    copperclaw_metrics::inc_inbound_file(channel, "ok");
+                    copperclaw_metrics::observe_inbound_file_bytes(channel, bytes);
                     content["attachment"] = Value::Object(attachment);
                 }
                 FileOutcome::TooLarge { reported } => {
+                    copperclaw_metrics::inc_inbound_file(channel, "too_large");
                     kind = MessageKind::System;
                     content = too_large_content(file, state.max_attachment_bytes, reported);
                 }
                 FileOutcome::Failed { error } => {
+                    copperclaw_metrics::inc_inbound_file(channel, "download_failed");
                     kind = MessageKind::System;
                     content = download_failed_content(file, &error);
                 }
@@ -528,6 +533,8 @@ enum FileOutcome {
     /// (carries `staged_path`, never `path`).
     Ok {
         attachment: serde_json::Map<String, Value>,
+        /// Downloaded byte count (for `copperclaw_inbound_file_bytes`).
+        bytes: u64,
     },
     /// Reported or actual size exceeded `max_attachment_bytes`. `reported`
     /// is the byte count we compared against the cap, when known.
@@ -577,7 +584,10 @@ async fn download_file(
         Ok(path) => {
             let mut attachment = attachment_json(file, &filename, &path, bytes.len() as u64);
             inline_image_base64(&mut attachment, file, &bytes);
-            FileOutcome::Ok { attachment }
+            FileOutcome::Ok {
+                attachment,
+                bytes: bytes.len() as u64,
+            }
         }
         Err(error) => FileOutcome::Failed { error },
     }

@@ -434,6 +434,9 @@ pub trait ChannelAdapter: Send + Sync {
         new_text: &str,
     ) -> Result<(), AdapterError> {
         let _ = (platform_id, thread_id, external_id, new_text);
+        // C5: an adapter without a native edit API falls through here; the
+        // host then posts a fresh message instead of editing the HUD in place.
+        copperclaw_metrics::inc_hud_edit(self.channel_type().as_str(), "unsupported_fallthrough");
         Err(AdapterError::Unsupported("edit_message".into()))
     }
 

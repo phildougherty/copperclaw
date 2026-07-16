@@ -48,6 +48,134 @@ adheres to [Semantic Versioning](https://semver.org/).
   `TunnelModule`, the `PreviewManager::teardown` → `TunnelBroker::close_for_preview`
   call, the per-group opt-in config source, and the agent-facing expose relay.
 
+### Fixed (M18 — todo store parallel-batch write race, 2026-07-16)
+
+- `crates/copperclaw-mcp/src/tools/todo.rs`: the `todo_*` store's
+  read-modify-write cycle was not concurrency-safe. R2's parallel tool-batch
+  execution can fire two `todo_add` / `todo_update` mutators from one batch
+  concurrently; both read the same pre-image (one mutation silently clobbered
+  the other — a lost update) and both wrote `write_all`'s single fixed sibling
+  tempfile `agent_todos.json.tmp` then renamed it into place (bytes interleaved
+  → corrupt JSON). Seen live as ~12 `todo store was unparseable … trailing
+  characters` + `could not quarantine corrupt todo store … No such file or
+  directory` warnings inside one long build, resetting todo state mid-run.
+  Two-part fix: (1) a process-wide `todo_write_lock` (`tokio::sync::Mutex`,
+  held across the whole read+mutate+write in every mutator — `add`, `update`,
+  `delete`) serializes mutators, fixing both the corruption and the lost
+  updates; (2) `write_all` now names its tempfile `<store>.tmp.<pid>.<seq>`
+  (pid + monotonic `AtomicU64`) so even an unlocked writer can't collide, as
+  defence in depth. On-disk format, quarantine-on-corrupt-read behaviour,
+  atomic-rename crash-safety, and the public tool API are unchanged. New
+  `concurrent_adds_never_corrupt_or_lose_updates` test fires eight concurrent
+  adds and asserts the store stays parseable with all eight items — it fails
+  against the pre-fix code (only one item survives) and passes with the lock.
+
+### Added (M18 M1 — metrics rider: sweep of merged-PR metric wishes, 2026-07-16)
+
+- Swept the "Metrics wishes" recorded across merged M18 PRs #24-#54 into real
+  Prometheus metrics: ~55 new `copperclaw_*` counters / histograms / gauges
+  defined in `crates/copperclaw-metrics/src/lib.rs`, each emitted at a real
+  call site in the crate its wish named. One PR, single owner of the metrics
+  hotspot. Highlights by lane:
+  - **Channels:** slack typing skip / set-status / HUD-decision (C1);
+    per-channel inbound-file materialize + byte histogram across slack /
+    discord / telegram / deltachat (C3/C4); native rich-render + HUD self-edit
+    counters for signal / whatsapp-cloud / mattermost (C5); shared markdown
+    `render`/unbalanced-marker + the relocated fence-split / unbalanced-input
+    counters emitted from `markdown::split_into_chunks` (C2/C5b — the splitter
+    gained a `channel_type` label param, threaded from host-delivery).
+  - **Runner / providers:** mid-turn stop vs interjection (R2); verify-gate
+    completion + verify-run + fix-cycles histogram (R3/X2); compaction
+    triggered / estimated-tokens / facts-header-bytes (R4); provider failover
+    from→to + chain-exhausted, plus the `pump_events` retry-label accuracy fix
+    (R5); progressive-final grown/single-emit/skip-reason/steps/chars (R6);
+    Task-HUD posts / edits / degraded / finalize (H1); preview-expose
+    served/timeout (X1); policy denials by layer+tool (R0).
+  - **mcp:** shell truncation by mode + pre-cap bytes, read_file lines-mode +
+    pages (T1); unknown-tool + filter-deny layer (R0); load_skill inline vs
+    callable (P1); session-install by ecosystem/outcome + wall-clock +
+    image-scope rejection + egress-hint (E1); browser render by mode/outcome,
+    screenshot result + latency, preview-allow injection, SSRF blocks, CDP
+    connect failures, child spawn/teardown (V3/V4).
+  - **host / modules:** preview WS upgrades / active gauge / frames / bytes /
+    session-seconds (V1); enable-preview card outcomes + tombstone recovery +
+    tombstoned gauge (V2); in-chat approval taps (G1); image rebuild by profile
+    + per-group image-profile gauge (E2); sessions-spawned-per-profile +
+    system-prompt bytes (P1); delegate spawn-gate outcomes + depth rejections +
+    worktree-provision latency (R7); slash-commands + control-rows +
+    status-answer timing (R1, in `copperclaw-host-router`).
+  - **Adapted / dropped (documented, no dead metrics):** the wished
+    `control_rows_pending` gauge landed as a `..._written_total` counter (its
+    consumer is a separate process, so no in-registry decrement); P3's
+    "prototype ready" ritual metrics and X2's `ritual_card_sent_total` were
+    dropped — the ritual is model-driven with no distinct code path to key on;
+    V2's tombstone-duration histogram and R7's concurrent-delegates histogram
+    were deferred to an M1b follow-up (both need new runtime state to emit).
+  - **Deferred:** V5 (#55, tunnel exposures) is held for security sign-off and
+    is NOT on `main`; its metrics are an M1-followup once V5 merges.
+
+### Added (M18 R7 — `delegate`: write-capable middle-tier build worker, 2026-07-16)
+
+- New **`delegate`** tool + delivery-action: the middle tier between the read-only
+  in-process `explore` subagent and a full persistent `create_agent` sibling. A
+  delegate spawns a **write-capable** build worker in its own container that — when
+  the parent's current project is a git repo — gets a **writable git worktree** of
+  that repo at `/workspace` on its own `sib/<id>` branch (the exact
+  `container_manager::spawn` worktree mechanics `create_agent` uses; no spawn-path
+  change was needed — worktree provisioning keys off the child session's
+  `source_session_id`). Its commits land in the parent repo via the branch-merge
+  path, and parallel delegates each get their own isolated worktree.
+  - Unlike `create_agent`, a delegate is **contained**: its session lands with a NULL
+    messaging group + no copied `session_routing`, so it can report **only** back to
+    its spawning parent and can never post into the user's chat. Result rows use a
+    distinct `delegate_result` key.
+  - Permission-gated with the same `create_agent_users_table_check` (spawning a
+    write-capable container is at least as privileged) and depth-capped by the same
+    `depth.rs` gate as `create_agent`.
+  - `crates/copperclaw-mcp/src/context.rs`: `DelegateSpec` + `OutboundToolEffect::Delegate`.
+  - `crates/copperclaw-mcp/src/tools/agents.rs`: the `delegate` tool (no `channel` field —
+    never user-facing); registered in `tools/mod.rs`.
+  - `crates/copperclaw-runner/src/tools.rs`: `apply_delegate` writes the `{"delegate": …}`
+    system row; `crates/copperclaw-runner/src/policy.rs`: `delegate` joins `CODING_TOOLS`
+    (denied to guests, gated behind the coding profile).
+  - `crates/copperclaw-modules/src/agent_to_agent/create_agent.rs`: a `SpawnProfile`
+    (`Persistent` | `Delegate`) parameterises the shared spawn core;
+    `CreateAgentModule::new_delegate(…)` registers the `delegate` action.
+  - `crates/copperclaw-host/src/boot.rs`: the delegate-profile module is installed
+    alongside `create_agent`.
+  - **Deferred (follow-up):** single-call parallel fan-out orchestration (one `delegate`
+    call spawning N workers) and any automated join/merge — parents fan out today by
+    calling `delegate` once per independent piece of work, each contained + isolated.
+
+### Added (M18 C5b — shared markdown → per-platform renderer, 2026-07-16)
+
+- New `crates/copperclaw-channels/core/src/markdown/` module — the single
+  place canonical agent Markdown turns into each chat platform's flavor,
+  replacing the per-adapter duplication (telegram `markdown_to_html`, slack
+  `mrkdwn`, discord escaping) over time.
+  - `markdown::render(md, Flavor)` renders ATX headings, fenced + inline code,
+    bold/italic/strikethrough, links, unordered/ordered lists, and blockquotes
+    into `Flavor::{Html, Discord, Slack, Mattermost, WhatsApp, Plain}`. Forgiving
+    on unbalanced markers (emits the literal char, matching the adapters' current
+    behaviour on natural-language prose). Unit table proves per-platform output
+    for headings/bold/code/lists (+ links, quotes, HTML escaping, robustness).
+  - `markdown::split_into_chunks` / `markdown::is_balanced` — fence-aware
+    chunking of a long reply into cap-sized pieces that each parse with
+    balanced code fences.
+
+### Changed (M18 C5b — fence logic migrated out of host-delivery)
+
+- Migrated C2's fence scanner + splitter from `copperclaw-host-delivery` into
+  the shared renderer, per the explicit migration note C2 left at
+  `host-delivery/src/fence.rs:22-24`. `scan_fence_spans`, the
+  `FenceKind`/`FenceSpan` model, `is_balanced`, and the fence-aware
+  `split_into_chunks` now live in `copperclaw-channels-core::markdown`
+  (`fence.rs` + `split.rs`, moved verbatim). `copperclaw-host-delivery` now
+  **consumes** the renderer: `service::split_text_into_chunks` is a thin
+  delegate to `markdown::split_into_chunks`, and `host-delivery/src/fence.rs`
+  is a documented shim re-exporting `is_balanced` for its C2 splitter tests —
+  which still pass, now routed through the migrated logic.
+
 ### Added (M18 C5 — adapter rich-surface floor: signal / whatsapp-cloud / mattermost, 2026-07-16)
 
 - Raised **signal**, **whatsapp-cloud**, and **mattermost** off the trait-default

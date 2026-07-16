@@ -250,10 +250,12 @@ async fn apply_attachment_download(
     reported_path: &str,
 ) {
     let on_disk = resolve_blob_path(reported_path, settings.blob_dir.as_deref());
+    let channel = inbound.channel_type.as_str().to_owned();
 
     // Quick metadata-based gate before we read anything.
     if let Some(size) = msg.file_bytes {
         if size > settings.max_attachment_bytes {
+            copperclaw_metrics::inc_inbound_file(&channel, "too_large");
             mark_too_large(inbound, msg, Some(size), settings.max_attachment_bytes);
             return;
         }
@@ -262,6 +264,7 @@ async fn apply_attachment_download(
     let metadata = match tokio::fs::metadata(&on_disk).await {
         Ok(m) => m,
         Err(err) => {
+            copperclaw_metrics::inc_inbound_file(&channel, "download_failed");
             mark_download_failed(
                 inbound,
                 msg,
@@ -276,6 +279,7 @@ async fn apply_attachment_download(
 
     let on_disk_len = metadata.len();
     if on_disk_len > settings.max_attachment_bytes {
+        copperclaw_metrics::inc_inbound_file(&channel, "too_large");
         mark_too_large(
             inbound,
             msg,
@@ -290,6 +294,7 @@ async fn apply_attachment_download(
     // so a corrupt symlink/permission issue is caught before we hand the
     // path to the agent.
     if let Err(err) = tokio::fs::File::open(&on_disk).await {
+        copperclaw_metrics::inc_inbound_file(&channel, "download_failed");
         mark_download_failed(
             inbound,
             msg,
@@ -300,6 +305,9 @@ async fn apply_attachment_download(
         );
         return;
     }
+
+    copperclaw_metrics::inc_inbound_file(&channel, "ok");
+    copperclaw_metrics::observe_inbound_file_bytes(&channel, on_disk_len);
 
     let Value::Object(content) = &mut inbound.message.content else {
         return;

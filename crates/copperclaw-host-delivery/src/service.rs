@@ -1475,7 +1475,11 @@ impl DeliveryService {
         // body would exceed it. Returns a vec of contents to send in order;
         // the first element's platform_message_id is the one we record so
         // future `edit_message` / `add_reaction` calls target the anchor.
-        let parts = split_chat_content_if_needed(&row.content, adapter.max_message_chars());
+        let parts = split_chat_content_if_needed(
+            &row.content,
+            adapter.max_message_chars(),
+            adapter.channel_type().as_str(),
+        );
 
         // Resume mid-split: when a previous attempt for THIS row delivered
         // the first `chunks_sent` chunks but then failed retryably (rate-
@@ -2580,6 +2584,7 @@ impl DeliveryService {
 pub(crate) fn split_chat_content_if_needed(
     content: &serde_json::Value,
     max: Option<usize>,
+    channel_type: &str,
 ) -> Vec<serde_json::Value> {
     let Some(max) = max.filter(|m| *m > 0) else {
         return vec![content.clone()];
@@ -2590,7 +2595,7 @@ pub(crate) fn split_chat_content_if_needed(
     if text.chars().count() <= max {
         return vec![content.clone()];
     }
-    let chunks = split_text_into_chunks(text, max);
+    let chunks = split_text_into_chunks(text, max, channel_type);
     chunks
         .into_iter()
         .map(|chunk| {
@@ -2603,146 +2608,14 @@ pub(crate) fn split_chat_content_if_needed(
         .collect()
 }
 
-/// Greedy chunker honoring `max` chars per chunk. Preference order for
-/// each cut: paragraph boundary (`\n\n`) → sentence boundary → hard cut.
-/// Operates on `char` indices, never on bytes.
-///
-/// Fence-aware (M18/C2): a cut never lands inside a code fence —
-/// markdown backtick fences or Telegram HTML `<pre>` blocks, as scanned
-/// by [`crate::fence`] — because a split fence renders as garbage on
-/// Telegram / Discord. When the natural cut falls inside a fence the
-/// splitter prefers, in order:
-///
-/// 1. cutting right AFTER the fence, when the whole fence still fits the
-///    window (e.g. `find_cut` picked a blank line between two code
-///    paragraphs);
-/// 2. cutting right BEFORE the fence, when this chunk has pre-fence
-///    content (the fence then leads the next chunk);
-/// 3. closing the fence at the cut and reopening it — same info string /
-///    tag — at the start of the next chunk, when the fence itself
-///    outruns the cap.
-///
-/// Every emitted chunk therefore parses with balanced fences.
-fn split_text_into_chunks(text: &str, max: usize) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
-    let spans = crate::fence::scan_fence_spans(&chars);
-    let mut out: Vec<String> = Vec::new();
-    let mut start = 0usize;
-    // Reopen line for a fence the previous chunk had to close mid-block.
-    let mut reopen: Option<String> = None;
-    while start < chars.len() {
-        let prefix = reopen.take().unwrap_or_default();
-        let prefix_len = prefix.chars().count();
-        let budget = max.saturating_sub(prefix_len);
-        if budget == 0 {
-            // Degenerate cap: the reopen line alone fills the chunk. Emit
-            // it bare and continue un-prefixed (giving up on balance for
-            // this fence) rather than looping forever.
-            out.push(prefix);
-            continue;
-        }
-        let remaining = chars.len() - start;
-        if remaining <= budget {
-            let tail: String = chars[start..].iter().collect();
-            out.push(format!("{prefix}{tail}"));
-            break;
-        }
-        let window_end = start + budget;
-        let mut cut = find_cut(&chars, start, window_end);
-        // `Some(next_start)` when the cut closes a fence mid-block: the
-        // chunk was already pushed and `next_start` preserves the next
-        // code line's indentation (no generic whitespace skip).
-        let mut fence_resume: Option<usize> = None;
-        if let Some(span) = spans.iter().find(|s| s.start < cut && cut < s.end) {
-            if span.end <= window_end {
-                // Whole fence fits this window; `find_cut` just picked a
-                // boundary inside it. Cut right after the fence instead.
-                cut = span.end;
-            } else if span.start > start {
-                // A pre-fence cut exists within the limit: cut right
-                // before the fence and let it lead the next chunk.
-                cut = span.start;
-            } else {
-                // The chunk starts inside the fence and the fence outruns
-                // the window: close it at the cut, reopen on the next
-                // chunk. Reserve room for the closing marker.
-                let closer = span.kind.closer();
-                let closer_len = closer.chars().count();
-                if budget > closer_len {
-                    let content_end = start + (budget - closer_len);
-                    // Prefer cutting at a line break so code lines stay
-                    // whole; fall back to a hard mid-line cut. Consume
-                    // ONLY the newline — the generic whitespace skip
-                    // would eat the next code line's indentation.
-                    let (body_end, next_start) = (start + 1..=content_end)
-                        .rev()
-                        .find(|&j| chars[j] == '\n')
-                        .map_or((content_end, content_end), |j| (j, j + 1));
-                    let body: String = chars[start..body_end].iter().collect();
-                    out.push(format!("{prefix}{body}{closer}"));
-                    reopen = Some(span.kind.reopen());
-                    fence_resume = Some(next_start);
-                }
-                // else: cap too small to even fit the closing marker
-                // (sub-8-char caps) — keep the plain hard cut.
-            }
-        }
-        if let Some(next_start) = fence_resume {
-            start = next_start;
-            continue;
-        }
-        let chunk: String = chars[start..cut].iter().collect();
-        out.push(format!("{prefix}{}", chunk.trim_end()));
-        // Skip whitespace at the cut so the next chunk doesn't start with a
-        // leading newline or space.
-        start = cut;
-        while start < chars.len()
-            && (chars[start] == ' ' || chars[start] == '\n' || chars[start] == '\t')
-        {
-            start += 1;
-        }
-    }
-    out.retain(|s| !s.is_empty());
-    if out.is_empty() {
-        out.push(String::new());
-    }
-    out
-}
-
-/// Find the best cut point in `[lo, hi)` (char indices). Tries paragraph
-/// (`\n\n`) → sentence-ender then space (`. `, `! `, `? `, `。`, `！`,
-/// `？`) → fallback to `hi` (hard cut).
-fn find_cut(chars: &[char], lo: usize, hi: usize) -> usize {
-    // Look for the last `\n\n` in the window.
-    let mut i = hi.saturating_sub(1);
-    while i > lo + 1 {
-        if chars[i - 1] == '\n' && chars[i] == '\n' {
-            return i + 1;
-        }
-        i -= 1;
-    }
-    // Sentence boundary: `.`, `!`, `?` followed by space; or a CJK
-    // full-stop / exclamation / question mark.
-    let mut i = hi.saturating_sub(1);
-    while i > lo {
-        let c = chars[i];
-        if c == '。' || c == '！' || c == '？' {
-            return i + 1;
-        }
-        if i + 1 < chars.len() && (c == '.' || c == '!' || c == '?') && chars[i + 1] == ' ' {
-            return i + 1;
-        }
-        i -= 1;
-    }
-    // Last space before hi.
-    let mut i = hi.saturating_sub(1);
-    while i > lo {
-        if chars[i] == ' ' || chars[i] == '\n' {
-            return i;
-        }
-        i -= 1;
-    }
-    hi
+/// Greedy, fence-aware chunker honoring `max` chars per chunk. Migrated to
+/// [`copperclaw_channels_core::markdown`] in M18/C5b (the shared renderer
+/// absorbed C2's splitter + `fence.rs`); this thin delegate preserves the
+/// call site and keeps `host-delivery`'s C2 splitter tests exercising the
+/// migrated logic. See [`copperclaw_channels_core::markdown::split_into_chunks`]
+/// for the cut-preference and fence close/reopen rules.
+fn split_text_into_chunks(text: &str, max: usize, channel_type: &str) -> Vec<String> {
+    copperclaw_channels_core::markdown::split_into_chunks(text, max, channel_type)
 }
 
 /// Wrap an adapter `deliver` call so the `?` operator at the call sites can
@@ -3582,9 +3455,9 @@ mod tests {
     #[test]
     fn split_chat_passthrough_when_no_cap_or_short_text() {
         let v = json!({"text":"hello"});
-        let parts = split_chat_content_if_needed(&v, None);
+        let parts = split_chat_content_if_needed(&v, None, "test");
         assert_eq!(parts.len(), 1);
-        let parts = split_chat_content_if_needed(&v, Some(4096));
+        let parts = split_chat_content_if_needed(&v, Some(4096), "test");
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0], v);
     }
@@ -3592,7 +3465,7 @@ mod tests {
     #[test]
     fn split_chat_passthrough_when_no_text_field() {
         let v = json!({"foo":"bar"});
-        let parts = split_chat_content_if_needed(&v, Some(10));
+        let parts = split_chat_content_if_needed(&v, Some(10), "test");
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0], v);
     }
@@ -3601,7 +3474,7 @@ mod tests {
     fn split_chat_breaks_on_paragraph_when_possible() {
         let text = format!("{}\n\n{}", "a".repeat(50), "b".repeat(50));
         let v = json!({"text": text, "parse_mode": "MarkdownV2"});
-        let parts = split_chat_content_if_needed(&v, Some(60));
+        let parts = split_chat_content_if_needed(&v, Some(60), "test");
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["text"].as_str().unwrap(), "a".repeat(50));
         assert_eq!(parts[1]["text"].as_str().unwrap(), "b".repeat(50));
@@ -3614,7 +3487,7 @@ mod tests {
     fn split_chat_breaks_on_sentence_when_no_paragraph() {
         let text = format!("{}. {}", "a".repeat(40), "b".repeat(40));
         let v = json!({"text": text});
-        let parts = split_chat_content_if_needed(&v, Some(50));
+        let parts = split_chat_content_if_needed(&v, Some(50), "test");
         assert_eq!(parts.len(), 2);
         assert!(parts[0]["text"].as_str().unwrap().ends_with('.'));
     }
@@ -3623,7 +3496,7 @@ mod tests {
     fn split_chat_hard_cuts_when_no_natural_boundary() {
         let text = "x".repeat(100);
         let v = json!({"text": text});
-        let parts = split_chat_content_if_needed(&v, Some(30));
+        let parts = split_chat_content_if_needed(&v, Some(30), "test");
         assert!(parts.len() >= 4);
         for p in &parts {
             assert!(p["text"].as_str().unwrap().chars().count() <= 30);
@@ -3635,7 +3508,7 @@ mod tests {
         // CJK char is 3 bytes in UTF-8 but should count as 1.
         let text = "漢".repeat(20);
         let v = json!({"text": text});
-        let parts = split_chat_content_if_needed(&v, Some(10));
+        let parts = split_chat_content_if_needed(&v, Some(10), "test");
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["text"].as_str().unwrap().chars().count(), 10);
     }
@@ -3644,7 +3517,7 @@ mod tests {
     /// invariants: every chunk fits the cap and parses with balanced
     /// fences. Returns the chunks for case-specific assertions.
     fn split_balanced(text: &str, max: usize) -> Vec<String> {
-        let chunks = split_text_into_chunks(text, max);
+        let chunks = split_text_into_chunks(text, max, "test");
         for (i, c) in chunks.iter().enumerate() {
             assert!(
                 c.chars().count() <= max,
@@ -3788,7 +3661,7 @@ mod tests {
         });
         let text = format!("Here is the script:\n\n```python\n{code}```");
         let v = json!({"text": text, "parse_mode": "MarkdownV2"});
-        let parts = split_chat_content_if_needed(&v, Some(500));
+        let parts = split_chat_content_if_needed(&v, Some(500), "test");
         assert!(parts.len() > 2, "{}", parts.len());
         for p in &parts {
             let t = p["text"].as_str().unwrap();

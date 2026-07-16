@@ -325,6 +325,11 @@ pub async fn compact(
     // Regenerate the pinned header from current on-disk state. Verbatim,
     // never summarised — this is the whole point of the header.
     let facts = build_project_facts_header(&cfg.data_root).await;
+    if let Some(header) = &facts {
+        // R4: byte size of the verbatim project facts header carried across a
+        // compaction (absent for a pure-chat session).
+        copperclaw_metrics::observe_compaction_facts_header_bytes(header.len());
+    }
 
     let pivot = pair_safe_pivot(&history);
     if pivot == 0 || pivot >= history.len() {

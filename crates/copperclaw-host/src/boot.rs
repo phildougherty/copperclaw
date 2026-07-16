@@ -578,6 +578,17 @@ pub async fn install_modules(host_ctx: Arc<HostContext>, data_root: PathBuf) {
             data_root.clone(),
             create_agent_users_table_check(host_ctx.central().clone()),
         )),
+        // The middle-tier `delegate` action shares the same spawn +
+        // worktree machinery as `create_agent` (own container, writable
+        // `sib/<id>` worktree) but keeps the spawned worker CONTAINED: no
+        // channel wiring, reports only back to the parent. Gated by the
+        // same `users_table_check` — spawning a write-capable container
+        // is at least as privileged as `create_agent`. See M18 R7.
+        Box::new(CreateAgentModule::new_delegate(
+            host_ctx.central().clone(),
+            data_root.clone(),
+            create_agent_users_table_check(host_ctx.central().clone()),
+        )),
         // Handles `MessageKind::Agent` outbound rows — writes them into
         // the target session's inbound.db. Without this, children's
         // default `send_message` calls (which Phase 2 routes via Agent-

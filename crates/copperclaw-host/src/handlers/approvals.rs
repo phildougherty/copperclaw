@@ -163,7 +163,10 @@ pub fn resolve_approve(
         // effect as `cclaw groups config update --field preview_enabled=true`.
         // The pending row is raised host-side by the preview manager when the
         // agent hits `PreviewError::Disabled`.
-        "enable_preview" => apply_enable_preview(central, &row)?,
+        "enable_preview" => {
+            copperclaw_metrics::inc_preview_enable_card("approved");
+            apply_enable_preview(central, &row)?
+        }
         // M18 V5: the REAL applier for a credentialed external action. Approving
         // records the grant (the row flips to `approved` below); the requester —
         // e.g. the public-tunnel broker on the agent's retry — consults that
@@ -256,6 +259,9 @@ pub fn resolve_deny(
             ));
         }
         ApprovalStatus::Pending => {}
+    }
+    if row.action.as_str() == "enable_preview" {
+        copperclaw_metrics::inc_preview_enable_card("denied");
     }
     pending_approvals::update_status(central, id, ApprovalStatus::Denied).map_err(db_err)?;
     pending_approvals::record_decision(

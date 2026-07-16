@@ -29,6 +29,9 @@ impl CreateAgentHandler {
         agent_group_id: Option<AgentGroupId>,
         detail: Option<&str>,
     ) {
+        // R7: mirror every create_agent / delegate spawn-gate outcome, labelled
+        // by tier, so delegate vs create_agent usage is comparable.
+        copperclaw_metrics::inc_delegate_spawn(self.deps.profile.action_name(), status.as_str());
         let Some(parent) = parent else {
             info!(
                 ?status,
@@ -36,17 +39,22 @@ impl CreateAgentHandler {
             );
             return;
         };
+        let result_key = self.deps.profile.result_key();
         self.write_inbound_payload(
             parent.agent_group_id,
             parent.session_id,
             MessageKind::System,
-            Self::build_result_content(status, session_id, agent_group_id, detail),
+            Self::build_result_content(result_key, status, session_id, agent_group_id, detail),
             false,
         );
     }
 
-    /// Compose the JSON payload for a `create_agent_result` inbound row.
+    /// Compose the JSON payload for a spawn-result inbound row. `result_key`
+    /// is the top-level key (`create_agent_result` for the persistent tier,
+    /// `delegate_result` for the contained delegate tier) so the calling
+    /// agent can tell which tier's spawn it is reading.
     pub(super) fn build_result_content(
+        result_key: &str,
         status: ResultStatus,
         session_id: Option<SessionId>,
         agent_group_id: Option<AgentGroupId>,
@@ -69,7 +77,7 @@ impl CreateAgentHandler {
         if let Some(d) = detail {
             body.insert("detail".into(), serde_json::json!(d));
         }
-        serde_json::json!({ "create_agent_result": body })
+        serde_json::json!({ result_key: body })
     }
 
     /// Mirror the parent session's `session_routing` record into the

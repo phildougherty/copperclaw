@@ -125,6 +125,9 @@ pub async fn handle(
     let bytes = match tokio::fs::read(&path).await {
         Ok(b) => b,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // P1: the host is in inline-skills mode — the body is already in
+            // the system prompt, so this call is redundant.
+            copperclaw_metrics::inc_load_skill(name, "inline");
             return Err(ToolError::Internal(format!(
                 "skills catalogue not found at {} — this host is running in inline-skills mode, so skill bodies are already in your system prompt and load_skill is not needed",
                 path.display()
@@ -165,6 +168,9 @@ pub async fn handle(
                 known.join(", ")
             ))
         })?;
+
+    // P1: a catalogue-backed (callable-skills mode) load_skill invocation.
+    copperclaw_metrics::inc_load_skill(name, "callable");
 
     let description = entry
         .get("description")

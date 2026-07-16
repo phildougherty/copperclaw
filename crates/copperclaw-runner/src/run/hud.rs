@@ -113,6 +113,8 @@ pub(super) struct TaskHud {
     /// R6 progressive final answer is independent of the HUD's own
     /// on/off/final mode, so it keys off this raw capability instead.
     answer_edit_capable: bool,
+    /// Agent-group id string, for the H1 HUD metric labels.
+    agent_group: String,
     started_at: Instant,
     shared: Arc<StdMutex<Shared>>,
     ctx: Arc<dyn ToolContext>,
@@ -175,10 +177,24 @@ impl TaskHud {
         let answer_edit_capable = origin
             .as_ref()
             .is_some_and(|oc| capabilities::supports_message_edit(&oc.channel_type));
+        // H1: record when the HUD degrades to status-rows (bare channel,
+        // hud_mode=off, or no originating-channel routing).
+        if behavior == Behavior::StatusRows {
+            let ct = origin
+                .as_ref()
+                .map_or("none", |oc| oc.channel_type.as_str());
+            let reason = match (&origin, deps.hud_mode) {
+                (_, HudMode::Off) => "hud_mode_off",
+                (None, _) => "no_originating_channel",
+                _ => "no_message_edit",
+            };
+            copperclaw_metrics::inc_hud_degraded(ct, reason);
+        }
         let now = Instant::now();
         Self {
             behavior,
             answer_edit_capable,
+            agent_group: deps.agent_group_id.to_string(),
             started_at: now,
             shared: Arc::new(StdMutex::new(Shared::default())),
             ctx: deps.tool_ctx.clone(),
@@ -246,7 +262,7 @@ impl TaskHud {
         if let Ok(mut s) = self.shared.lock() {
             s.activity = activity;
         }
-        self.emit_live_update().await;
+        self.emit_live_update("batch_start").await;
         self.ensure_ticker();
     }
 
@@ -270,7 +286,7 @@ impl TaskHud {
                         format!("last: {t} {verdict}")
                     });
                 }
-                self.emit_live_update().await;
+                self.emit_live_update("batch_end").await;
             }
             Behavior::FinalOnly => {
                 if let Ok(mut s) = self.shared.lock() {
@@ -308,6 +324,7 @@ impl TaskHud {
             // no final line worth posting.
             return;
         }
+        copperclaw_metrics::observe_hud_finalize_seconds(self.started_at.elapsed().as_secs_f64());
         let elapsed = fmt_mmss(self.started_at.elapsed().as_secs());
         let plural = if tool_runs == 1 { "" } else { "s" };
         let summary = if ok {
@@ -328,19 +345,30 @@ impl TaskHud {
         };
         match self.behavior {
             // Collapse the live HUD in place.
-            Behavior::Live if posted => self.ctx.emit_task_hud(&breadcrumb, false).await,
+            Behavior::Live if posted => {
+                copperclaw_metrics::inc_hud_edits(&self.agent_group, "finalize");
+                self.ctx.emit_task_hud(&breadcrumb, false).await;
+            }
             // `final`: the one-liner is the only HUD emission at all.
-            Behavior::FinalOnly => self.ctx.emit_task_hud(&breadcrumb, true).await,
+            Behavior::FinalOnly => {
+                copperclaw_metrics::inc_hud_post(&self.agent_group);
+                self.ctx.emit_task_hud(&breadcrumb, true).await;
+            }
             _ => {}
         }
     }
 
     /// Compose + emit the current live-HUD frame (post on first call,
     /// in-place edit afterwards). Skipped after finalization.
-    async fn emit_live_update(&self) {
+    async fn emit_live_update(&self, trigger: &str) {
         let Some((breadcrumb, first)) = self.compose_running_frame() else {
             return;
         };
+        if first {
+            copperclaw_metrics::inc_hud_post(&self.agent_group);
+        } else {
+            copperclaw_metrics::inc_hud_edits(&self.agent_group, trigger);
+        }
         self.ctx.emit_task_hud(&breadcrumb, first).await;
     }
 
@@ -366,6 +394,7 @@ impl TaskHud {
         let todo_path = self.todo_path.clone();
         let started_at = self.started_at;
         let interval = self.edit_interval;
+        let agent_group = self.agent_group.clone();
         *guard = Some(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
@@ -374,6 +403,7 @@ impl TaskHud {
                 let Some((frame, _first)) = running_frame(&shared, started_at, &todo_path) else {
                     break;
                 };
+                copperclaw_metrics::inc_hud_edits(&agent_group, "ticker");
                 ctx.emit_task_hud(&frame, false).await;
             }
         }));

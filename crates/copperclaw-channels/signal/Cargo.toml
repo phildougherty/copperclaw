@@ -19,6 +19,7 @@ thiserror = { workspace = true }
 url = { workspace = true }
 uuid = { workspace = true }
 base64 = "0.22"
+copperclaw-metrics.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

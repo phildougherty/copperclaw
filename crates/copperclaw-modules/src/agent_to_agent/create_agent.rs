@@ -45,14 +45,75 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
-/// Companion module that registers the `create_agent` delivery action. The
-/// handler runs in-process against the central DB, so this module is the
-/// natural place to plumb DB handles into the host's hook surface.
+/// Which spawn tier the handler serves. The two tiers share the entire
+/// spawn core — permission gate, depth cap (`depth.rs`), central-DB
+/// inserts, container-config inheritance, and (via the child session's
+/// `source_session_id`) the writable git worktree provisioned in
+/// `container_manager::spawn` — and differ only in containment:
+///
+/// * [`SpawnProfile::Persistent`] is the `create_agent` sibling: a
+///   full, user-facing agent. It inherits the parent's channel routing
+///   (and an optional wiring) so it can also reply into the user's chat.
+/// * [`SpawnProfile::Delegate`] is the middle-tier build worker: it is
+///   NOT wired to any channel and its session lands with a NULL
+///   messaging group + no copied `session_routing`, so it can report
+///   ONLY back to its parent (via `source_session_id`) and can never
+///   post into the user's chat. It is otherwise identical — same
+///   depth/permission gate, same writable worktree — so parallel
+///   delegates each build in their own isolated `sib/<id>` branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SpawnProfile {
+    /// The `create_agent` sibling — persistent + user-facing.
+    #[default]
+    Persistent,
+    /// The `delegate` build worker — contained, reports only to parent.
+    Delegate,
+}
+
+impl SpawnProfile {
+    /// The delivery-action name (and MCP tool name) this profile serves.
+    pub(super) fn action_name(self) -> &'static str {
+        match self {
+            Self::Persistent => "create_agent",
+            Self::Delegate => "delegate",
+        }
+    }
+
+    /// The `Module::name()` returned for this profile.
+    pub(super) fn module_name(self) -> &'static str {
+        match self {
+            Self::Persistent => "create_agent",
+            Self::Delegate => "delegate",
+        }
+    }
+
+    /// Top-level key of the result row written back to the parent's
+    /// inbound.db so the calling agent can tell the two tiers apart.
+    pub(super) fn result_key(self) -> &'static str {
+        match self {
+            Self::Persistent => "create_agent_result",
+            Self::Delegate => "delegate_result",
+        }
+    }
+
+    /// Whether a spawned child of this profile may reach the user's chat.
+    /// Delegates are contained: they route only back to their parent.
+    pub(super) fn is_user_facing(self) -> bool {
+        matches!(self, Self::Persistent)
+    }
+}
+
+/// Companion module that registers the `create_agent` (or `delegate`)
+/// delivery action. The handler runs in-process against the central DB,
+/// so this module is the natural place to plumb DB handles into the
+/// host's hook surface.
 ///
 /// Installed alongside `AgentToAgentModule` in `boot::install_modules` —
 /// the two modules are intentionally separate: the unit-struct
 /// `AgentToAgentModule` is an interceptor only, this one carries the DB
-/// state needed by the `create_agent` handler.
+/// state needed by the spawn handler. The host installs it TWICE: once
+/// with [`SpawnProfile::Persistent`] (action `create_agent`) and once
+/// with [`SpawnProfile::Delegate`] (action `delegate`).
 pub struct CreateAgentModule {
     pub(super) deps: HandlerDeps,
 }
@@ -80,6 +141,10 @@ pub(super) struct HandlerDeps {
     /// Hard cap on subagent depth — see [`DEFAULT_MAX_SUBAGENT_DEPTH`].
     /// `1` reproduces the historical "no nested spawns at all" rule.
     pub(super) max_depth: u8,
+    /// Which spawn tier this handler serves (persistent sibling vs
+    /// contained delegate). Selects the action name, the result-row key,
+    /// and whether the child inherits user-facing channel routing.
+    pub(super) profile: SpawnProfile,
 }
 
 impl CreateAgentModule {
@@ -97,6 +162,36 @@ impl CreateAgentModule {
         data_root: impl Into<PathBuf>,
         permission_check: CreateAgentPermissionCheck,
     ) -> Self {
+        Self::with_profile(
+            central,
+            data_root,
+            permission_check,
+            SpawnProfile::Persistent,
+        )
+    }
+
+    /// Build a module serving the middle-tier `delegate` action: a
+    /// write-capable but CONTAINED build worker. Shares the entire spawn
+    /// core with `create_agent` (permission gate, depth cap, writable
+    /// worktree) but the spawned worker is never wired to a channel and
+    /// reports only back to its parent. Permission-gated with the same
+    /// closure as `create_agent` — spawning a write-capable container is
+    /// at least as privileged.
+    pub fn new_delegate(
+        central: CentralDb,
+        data_root: impl Into<PathBuf>,
+        permission_check: CreateAgentPermissionCheck,
+    ) -> Self {
+        Self::with_profile(central, data_root, permission_check, SpawnProfile::Delegate)
+    }
+
+    /// Shared constructor for both tiers.
+    fn with_profile(
+        central: CentralDb,
+        data_root: impl Into<PathBuf>,
+        permission_check: CreateAgentPermissionCheck,
+        profile: SpawnProfile,
+    ) -> Self {
         Self {
             deps: HandlerDeps {
                 central,
@@ -104,6 +199,7 @@ impl CreateAgentModule {
                 permission_check,
                 depth_gate: Arc::new(Mutex::new(())),
                 max_depth: DEFAULT_MAX_SUBAGENT_DEPTH,
+                profile,
             },
         }
     }
@@ -139,12 +235,12 @@ impl CreateAgentModule {
 #[async_trait]
 impl Module for CreateAgentModule {
     fn name(&self) -> &'static str {
-        "create_agent"
+        self.deps.profile.module_name()
     }
 
     async fn install(&self, ctx: Arc<dyn ModuleContext>) -> Result<(), ModuleError> {
         ctx.register_delivery_action(
-            "create_agent",
+            self.deps.profile.action_name(),
             Arc::new(CreateAgentHandler {
                 deps: self.deps.clone(),
             }),
@@ -322,6 +418,7 @@ impl DeliveryActionHandler for CreateAgentHandler {
                 name = %payload.name,
                 "create_agent rejected: would exceed subagent depth cap",
             );
+            copperclaw_metrics::inc_delegate_depth_rejection(self.deps.profile.action_name());
             self.write_parent_result(
                 parent_session.as_ref(),
                 ResultStatus::Rejected,
@@ -375,6 +472,7 @@ impl DeliveryActionHandler for CreateAgentHandler {
                 max_depth = self.deps.max_depth,
                 "create_agent rejected on lock re-check: concurrent spawn won",
             );
+            copperclaw_metrics::inc_delegate_depth_rejection(self.deps.profile.action_name());
             self.write_parent_result(
                 parent_session.as_ref(),
                 ResultStatus::Rejected,
@@ -445,14 +543,25 @@ impl DeliveryActionHandler for CreateAgentHandler {
         // messages); we just copy the addressing onto the new session.
         // Falls back to None when there's no resolvable parent
         // (administrative / scripted `create_agent` calls).
-        let (parent_messaging_group, parent_thread) = parent_session
-            .as_ref()
-            .and_then(|p| {
-                sessions::get(central, p.session_id)
-                    .ok()
-                    .map(|s| (s.messaging_group_id, s.thread_id))
-            })
-            .unwrap_or((None, None));
+        //
+        // A `Delegate` is deliberately CONTAINED: it lands with a NULL
+        // messaging group + thread so it has no channel identity of its
+        // own. Combined with skipping the `session_routing` copy below,
+        // this guarantees a delegate can only ever report back to its
+        // parent (via `source_session_id`) and can never post into the
+        // user's chat — the isolation property of the middle tier.
+        let (parent_messaging_group, parent_thread) = if self.deps.profile.is_user_facing() {
+            parent_session
+                .as_ref()
+                .and_then(|p| {
+                    sessions::get(central, p.session_id)
+                        .ok()
+                        .map(|s| (s.messaging_group_id, s.thread_id))
+                })
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
         // Persist the parent → child link so the runtime can route the
         // child's default `send_message` (no explicit `to:`) back into the
         // parent's `inbound.db` instead of dumping it into the user's chat.
@@ -489,13 +598,19 @@ impl DeliveryActionHandler for CreateAgentHandler {
         // `NoRoute` and the user never sees the reply. The router
         // normally writes session_routing on inbound arrival; spawned
         // sessions have no inbound event so we mirror it here.
-        if let Some(parent) = parent_session.as_ref() {
-            self.copy_parent_session_routing(
-                parent.agent_group_id,
-                parent.session_id,
-                group.id,
-                session.id,
-            );
+        // Skipped for a `Delegate`: a contained build worker must NOT be
+        // able to address the user's chat. Without a copied routing row
+        // its only outbound path is the default `send_message` back to
+        // the parent (via `source_session_id`).
+        if self.deps.profile.is_user_facing() {
+            if let Some(parent) = parent_session.as_ref() {
+                self.copy_parent_session_routing(
+                    parent.agent_group_id,
+                    parent.session_id,
+                    group.id,
+                    session.id,
+                );
+            }
         }
 
         // Seed the child's inbound.db with the operator's instructions
@@ -1750,5 +1865,249 @@ mod tests {
         // new value, not a cached 3.
         agent_groups::set_subagent_depth(&central, id, 1).unwrap();
         assert_eq!(handler.lookup_parent_depth(Some(&parent)), Some(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Delegate tier (M18 R7): the contained, write-capable middle tier.
+    // -----------------------------------------------------------------------
+
+    /// Read `delegate_result` rows from the parent's inbound.db.
+    fn read_inbound_delegate_results(
+        data_root: &std::path::Path,
+        parent: ParentSession,
+    ) -> Vec<serde_json::Value> {
+        let paths = SessionPaths::new(data_root, parent.agent_group_id, parent.session_id);
+        let conn = copperclaw_db::session::open_inbound(&paths).unwrap();
+        let pending = messages_in_read::get_pending(&conn, true, 100).unwrap();
+        pending
+            .into_iter()
+            .filter_map(|row| {
+                let v = &row.content;
+                v.get("delegate_result").is_some().then(|| v.clone())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn delegate_module_registers_delegate_action() {
+        // A delegate-profile module registers under the `delegate` action
+        // name and reports the `delegate` module name — distinct from the
+        // persistent `create_agent` module so the host can install both.
+        let central = CentralDb::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let m = CreateAgentModule::new_delegate(central, tmp.path().to_path_buf(), always_allow());
+        assert_eq!(m.name(), "delegate");
+    }
+
+    #[tokio::test]
+    async fn delegate_install_registers_delegate_action() {
+        let central = CentralDb::open_in_memory().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let m = CreateAgentModule::new_delegate(central, tmp.path().to_path_buf(), always_allow());
+        let ctx = MockModuleContext::new();
+        m.install(ctx.clone()).await.unwrap();
+        assert_eq!(ctx.delivery_actions(), vec!["delegate"]);
+    }
+
+    #[test]
+    fn delegate_spawns_contained_write_capable_worker() {
+        // The heart of R7: a delegate spawns a write-capable worker (its
+        // session carries `source_session_id`, which is exactly what
+        // triggers the writable git worktree in container_manager::spawn)
+        // but is CONTAINED — NULL messaging group, no copied
+        // session_routing — so it can only report back to its parent.
+        use copperclaw_db::tables::session_routing;
+        let (mut handler, central, tmp, parent, target) = make_handler(always_allow());
+        handler.deps.profile = SpawnProfile::Delegate;
+
+        // Seed parent routing so we can prove the delegate does NOT copy it.
+        let parent_paths = SessionPaths::new(tmp.path(), parent.agent_group_id, parent.session_id);
+        let parent_conn = copperclaw_db::session::open_inbound(&parent_paths).unwrap();
+        let parent_routing = copperclaw_types::routing::SessionRouting {
+            channel_type: Some(ChannelType::new("telegram")),
+            platform_id: Some("bot-123".into()),
+            thread_id: Some("chat-456".into()),
+        };
+        session_routing::write(&parent_conn, &parent_routing).unwrap();
+
+        let before: std::collections::HashSet<SessionId> = sessions::list_active(&central)
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        handler
+            .handle(DeliveryActionInput {
+                action: "delegate".into(),
+                payload: serde_json::json!({
+                    "name": "builder",
+                    "instructions": "implement X under /workspace and commit",
+                }),
+                target,
+                session_id: None,
+                row_id: None,
+            })
+            .unwrap();
+
+        let child = sessions::list_active(&central)
+            .unwrap()
+            .into_iter()
+            .find(|s| !before.contains(&s.id))
+            .expect("delegate created a child session");
+
+        // Write-capable: the child records the parent via source_session_id.
+        // This is the sole trigger for the writable worktree at spawn time.
+        assert_eq!(
+            child.source_session_id,
+            Some(parent.session_id),
+            "delegate child must record the parent so it gets the writable worktree",
+        );
+        // Contained: NULL messaging group + thread — no channel identity.
+        assert!(
+            child.messaging_group_id.is_none(),
+            "delegate must land with a NULL messaging group (contained)",
+        );
+        assert!(child.thread_id.is_none(), "delegate must have no thread");
+
+        // Contained: the parent's session_routing is NOT copied, so the
+        // delegate cannot address the user's chat.
+        let child_paths = SessionPaths::new(tmp.path(), child.agent_group_id, child.id);
+        let child_conn = copperclaw_db::session::open_inbound(&child_paths).unwrap();
+        assert!(
+            session_routing::read(&child_conn).unwrap().is_none(),
+            "delegate must NOT inherit the parent's routing (cannot reach the user's chat)",
+        );
+
+        // The parent is notified via a `delegate_result` row (not
+        // `create_agent_result`).
+        let results = read_inbound_delegate_results(tmp.path(), parent);
+        assert_eq!(results.len(), 1, "one delegate_result row landed in parent");
+        assert_eq!(results[0]["delegate_result"]["status"], "created");
+        assert!(results[0]["delegate_result"]["session_id"].is_string());
+    }
+
+    #[test]
+    fn delegate_is_permission_gated() {
+        let (mut handler, central, tmp, parent, target) = make_handler(always_deny());
+        handler.deps.profile = SpawnProfile::Delegate;
+        let before = agent_groups::list(&central).unwrap().len();
+        handler
+            .handle(DeliveryActionInput {
+                action: "delegate".into(),
+                payload: serde_json::json!({
+                    "name": "blocked",
+                    "instructions": "should not exist",
+                }),
+                target,
+                session_id: None,
+                row_id: None,
+            })
+            .unwrap();
+        assert_eq!(
+            agent_groups::list(&central).unwrap().len(),
+            before,
+            "denied delegate must not create rows",
+        );
+        let results = read_inbound_delegate_results(tmp.path(), parent);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["delegate_result"]["status"], "denied");
+    }
+
+    #[test]
+    fn delegate_is_depth_capped() {
+        // A delegate reuses the same depth cap as create_agent: a parent
+        // already at the cap cannot spawn a deeper worker.
+        let (mut handler, central, tmp, parent, target) = make_handler(always_allow());
+        handler.deps.profile = SpawnProfile::Delegate;
+        agent_groups::set_subagent_depth(
+            &central,
+            parent.agent_group_id,
+            DEFAULT_MAX_SUBAGENT_DEPTH,
+        )
+        .unwrap();
+        let before = agent_groups::list(&central).unwrap().len();
+        handler
+            .handle(DeliveryActionInput {
+                action: "delegate".into(),
+                payload: serde_json::json!({
+                    "name": "too-deep",
+                    "instructions": "would exceed the depth cap",
+                }),
+                target,
+                session_id: None,
+                row_id: None,
+            })
+            .unwrap();
+        assert_eq!(
+            agent_groups::list(&central).unwrap().len(),
+            before,
+            "delegate past the depth cap must not create rows",
+        );
+        let results = read_inbound_delegate_results(tmp.path(), parent);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["delegate_result"]["status"], "rejected");
+    }
+
+    #[test]
+    fn delegate_inherits_parent_container_config() {
+        // A delegate builds in the same project, so it must inherit the
+        // parent's model/provider/image just like create_agent — otherwise
+        // it boots on the weak host default and produces nothing.
+        let (mut handler, central, _tmp, parent, target) = make_handler(always_allow());
+        handler.deps.profile = SpawnProfile::Delegate;
+        container_configs::upsert(
+            &central,
+            UpsertContainerConfig {
+                agent_group_id: parent.agent_group_id,
+                provider: Some("anthropic".into()),
+                model: Some("qwen/qwen3.7-max".into()),
+                effort: Some(copperclaw_types::Effort::High),
+                image_tag: Some("copperclaw/session:test-tag".into()),
+                assistant_name: Some("ParentName".into()),
+                max_messages_per_prompt: Some(7),
+                skills: container_configs::SkillsSelector::All,
+                mcp_servers: serde_json::json!({}),
+                packages_apt: vec!["jq".into()],
+                packages_npm: vec!["typescript".into()],
+                additional_mounts: serde_json::json!([]),
+                cli_scope: container_configs::CliScope::Group,
+                config_fingerprint: Some("deadbeef".into()),
+                egress_allow: vec![],
+                resource_limits: serde_json::json!({}),
+                coding_enabled: true,
+                surface_thinking: false,
+                tool_profile: None,
+                preview_enabled: false,
+                preview_bind: None,
+                check_command: None,
+                verify_gate: true,
+                image_profile: copperclaw_types::ImageProfile::Prototyping,
+            },
+        )
+        .unwrap();
+        handler
+            .handle(DeliveryActionInput {
+                action: "delegate".into(),
+                payload: serde_json::json!({
+                    "name": "builder",
+                    "instructions": "implement under /workspace",
+                }),
+                target,
+                session_id: None,
+                row_id: None,
+            })
+            .unwrap();
+        let child = agent_groups::list(&central)
+            .unwrap()
+            .into_iter()
+            .find(|g| g.name == "builder")
+            .expect("child group present");
+        let cfg = container_configs::get(&central, child.id)
+            .unwrap()
+            .expect("delegate inherited a container config row");
+        assert_eq!(cfg.model.as_deref(), Some("qwen/qwen3.7-max"));
+        assert_eq!(
+            cfg.image_tag.as_deref(),
+            Some("copperclaw/session:test-tag")
+        );
     }
 }

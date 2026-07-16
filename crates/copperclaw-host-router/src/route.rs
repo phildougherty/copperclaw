@@ -511,11 +511,20 @@ impl Router {
             .enter(inflight_key)
             .ok_or_else(|| RouterError::invalid_wiring("re-entered in-flight session"))?;
 
+        // R1: count detected slash commands by op + channel (before `/status`
+        // returns early below, so status is counted too).
+        if let Some(cmd) = command {
+            copperclaw_metrics::inc_slash_command(cmd.op(), event.channel_type.as_str());
+        }
+
         // `/status` is answered by the host: synthesize the reply from
         // central-DB state and write it straight to `messages_out`. No
         // inbound row is written and the runner is never woken.
         if command == Some(SlashCommand::Status) {
-            return self.answer_status(event, &session);
+            let started = std::time::Instant::now();
+            let answered = self.answer_status(event, &session);
+            copperclaw_metrics::observe_status_answer_seconds(started.elapsed().as_secs_f64());
+            return answered;
         }
 
         // Inbound-file contract (M18 C3): if the adapter staged an
@@ -594,6 +603,11 @@ impl Router {
             is_group: event.message.is_group,
         };
         let seq = pool.with_conn(|c| insert_in(c, &write))?;
+
+        // R1: a `/stop` persists a CONTROL row for the runner to consume.
+        if command == Some(SlashCommand::Stop) {
+            copperclaw_metrics::inc_control_rows_written("stop");
+        }
 
         copperclaw_metrics::inc_messages_inbound(event.channel_type.as_str());
 

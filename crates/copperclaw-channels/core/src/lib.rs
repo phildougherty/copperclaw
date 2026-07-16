@@ -56,6 +56,11 @@
 //!   `/data/inbox/...`. See the module docs for the full contract.
 //! - [`testing`] — reusable [`testing::MockAdapter`] / [`testing::MockFactory`]
 //!   for downstream tests.
+//! - [`markdown`] — the shared markdown → per-platform renderer (M18 C5b):
+//!   [`markdown::render`] turns canonical Markdown into each platform's
+//!   flavor, and [`markdown::split_into_chunks`] does fence-aware chunking
+//!   of long replies (absorbed from `copperclaw-host-delivery`'s C2
+//!   splitter/`fence.rs`, which now consumes it).
 
 mod adapter;
 mod breadcrumb;
@@ -72,6 +77,7 @@ mod thinking;
 mod todo_list;
 
 pub mod inbound_file;
+pub mod markdown;
 pub mod testing;
 
 pub use adapter::{ChannelAdapter, ChannelFactory, render_collapsible_text_fallback};

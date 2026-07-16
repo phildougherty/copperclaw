@@ -120,32 +120,35 @@ not host-side, because `ContainerRuntime` exposes no host→container exec
 primitive — a documented correction to the card's framing. Local `main` =
 `origin/main` at `599a05e`.
 
-**Wave B — READY TO FIRE (Wave A is merged).** All on disjoint lanes, launch in
-parallel:
-- **V2** (lane V) — one-tap preview enablement + expired-link tombstone
-  re-expose. Held out of Wave A ONLY because it writes `preview.rs`, which V4
-  reads — so it MUST land after V4 merges (else preview.rs conflict). Its part
-  2 was AMENDED (see the V2 "Verified state" block — the 30-min figure is the
-  idle reaper, not a token TTL; the amended tombstone-listener design is
-  authoritative). Depends on G1 (merged) for the approval-card enablement path.
-- **C5** (lane C) — adapter floor (signal/whatsapp/mattermost, three disjoint
-  sub-cards) + shared markdown renderer in `channels/core`, absorbing C2's
-  `fence.rs`. P2, large; deliver a smaller whole thing if needed (e.g. the
-  three floors first, renderer second). Ready now (C4a/C4b merged) but held for
-  batch size. Also owes the two stale-doc-comment fixes flagged in PR #30
-  (`host-delivery/src/service.rs:1707`, `:2378`). Keep `EDIT_CAPABLE_CHANNELS`
-  (`capabilities.rs`) in sync in the SAME PR when an adapter gains
-  `edit_message`.
-- **R6** (lane R) — progressive final answers (edit-based growth of long final
-  text on >30s turns, rich adapters, default ON). Ready now (R5 merged, H1
-  machinery shipped); held only to keep lane R serialized behind the R5 merge.
-  Reuse H1's `emit_task_hud` anchor per the R6 "Verified state" block.
+**Wave B — MERGED (eighth session):** **R6** (#50), **V2** (#51), **C5** (#52) —
+three parallel agents on disjoint lanes (R/V/C), all merged. Integrated gate on
+`main` after merge: **fmt / check / clippy -D warnings clean, 7166 passed / 0
+failed**. Only CHANGELOG conflicted (the three cards touch disjoint code).
+**C5 was split:** part 1 (the three adapter rich-surface floors +
+`EDIT_CAPABLE_CHANNELS` sync + the two PR-#30 doc-comment fixes) landed in #52;
+the shared markdown renderer + `fence.rs` migration were deferred as **C5b**
+(now a Wave C card, in flight). Notable: V4's host-side-container-direct render
+meant V2 had no `preview.rs` conflict after all. Local `main` = `origin/main`
+at `10e473b`.
 
-**Wave C — the tail, after Wave B:** **R7** (lane R, after R6 — subagent
-fan-out middle tier), **V5** (lane V, after V2 — public tunnel module, security
-review required before merge), then **M1** (lane M, ABSOLUTE LAST — sweep every
-merged PR's "Metrics wishes" incl. #40-#45 and all Wave A/B/C PRs). After Wave
-C, the only program-acceptance item left is the live telegram smoke test.
+**Wave C — MERGED (eighth session):** **C5b** (#53), **R7** (#54), then **M1**
+(#56) — merged in that order; integrated gate after each. **V5** (#55) is the
+lone exception: its code is complete and green (7180/0) but the PR is **HELD,
+NOT merged, pending explicit human security sign-off** (outward-facing tunnel;
+the plan mandates security review before merge). M1 (#56) merged after R7/C5b
+and swept #24-#54; final integrated gate on `main` after M1: **fmt / check /
+clippy -D warnings clean, 7206 passed** (one intermittent
+`orphan_depth_cap_rejection_emits_warn` failure under parallel load — the
+documented `copperclaw-modules` warn-capture flake, passes 3/3 in isolation).
+Local `main` = `origin/main` at `c6d1fbf`.
+
+**PROGRAM STATUS: every M18 card is merged except V5 (held for sign-off).** The
+runtime was rebuilt (`./rebuild.sh`) so the live host runs the completed code.
+Remaining to call the program fully done: (1) merge **V5** #55 after human
+security sign-off; (2) the live **telegram-from-phone** smoke (needs the
+operator's device); (3) the small **M1b** metrics follow-up (V2 tombstone-
+duration + R7 concurrent-delegates histograms + V5 tunnel metrics once V5
+merges). None blocks the demo-moment path, which is complete and gate-verified.
 
 Two housekeeping traps that bit this session, worth checking early in any
 fresh session: (1) local `main` can silently drift behind `origin/main` by
@@ -186,7 +189,13 @@ main..<branch> --oneline` yourself first.
 | V4 | **Merged.** Screenshot-the-preview: renders **host-side container-direct** (`http://<container_ip>:<port>`, NOT the cookie-gated proxy URL — a cookieless render would 403), leaving `preview.rs` untouched (reads `PreviewEntry.container_ip/port`). PNG lands under `<data_root>/screenshots` (`COPPERCLAW_DATA_ROOT`-aware) for in-container `send_file`; new `COPPERCLAW_BROWSER_PREVIEW_ALLOW` injects the bridge IP:port into the child's deny-default egress allow-list; unset `COPPERCLAW_BROWSER_ENABLED` → ritual omits screenshot, never errors. No replay fixture (live path needs Docker/Chromium, same as V3). Gate 7105/0, fmt clean. | #47 |
 | P3 | **Merged.** The "prototype ready" ritual: one closing bullet in the static `CODING_PREAMBLE` (Coding/Full only, cache-prefix unchanged, Messaging/Minimal +0 bytes) mandating one `send_card` (title + one-liner + "What to try" + Open-preview URL button + Download `value` button answered next turn with a `git archive` zip via `send_file` + `artifact_path` footer + screenshot alongside via `send_file`). `skills/coding-task` hedge dropped; `skills/send-card` ritual example added. Copy + skills + one prompt line, no new tools. Skills lint 86/0 isolated; gate 7096/0, fmt clean. | #46 |
 | E1 | **Merged.** `install_packages` gains `scope: session` (default `image`): runs the ecosystem-local install now (`pip` into `/data/.venv`, `npm --prefix /data/.npm-global -g`) AND records the package into pending image config to bake next spawn; ack text states pending-approval vs done; NEW deny-default-egress-failure detection appends the `cclaw set-egress-allow` hint. Design correction: the "works now" install runs **in-container** (the tool surface's process), not host-side — `ContainerRuntime` has no host→container exec primitive. Real pip/npm e2e is an `#[ignore]`d Docker test; skill teaching deferred (lane P owned skills this wave). Gate 7110/0, fmt clean. | #49 |
-| All others (R6-R7, V2, V5, C5, M1) | Not started | — |
+| R6 | **Merged.** Progressive final answers: edit-based paced reveal of the FINAL answer only, gated on rich adapter AND elapsed ≥30s AND answer in `280..expander-scale` chars (excludes >30-line/>64KB answers so it never overlaps the long-output collapsible chip). First chunk is a `send_message` anchor, later chunks `edit_message` on that seq — exactly one Chat row, no double-post, reuses H1's `emit_task_hud` pattern. Byte-stable fallback for <30s/bare-adapter. No token streaming (rejected). Gate 7130/0, fmt clean. | #50 |
+| V2 | **Merged.** One-tap preview enablement: `PreviewError::Disabled` raises a G1 in-chat "Enable previews" approval card (new `ApprovalKind::EnablePreview` + `apply_enable_preview`, routed through G1's interceptor + shared DB path; flips `preview_enabled`, secure-by-default preserved, idempotent). Amended part 2: idle-reap keeps the listener as a `Live`/`Tombstone` phase machine serving an expired page + a one-shot per-token re-expose while the container is up (the original "re-mint expired token" was impossible — reaping cancels the listener). Gate 7130/0, fmt clean. | #51 |
+| C5 | **Merged (part 1; renderer split to C5b).** Adapter rich-surface floors for signal / whatsapp-cloud / mattermost (each a new `render.rs`): mattermost + signal gained `edit_message` → added to `EDIT_CAPABLE_CHANNELS`; whatsapp-cloud correctly stays non-edit-capable (Cloud API can't edit sent messages). Plus the two PR-#30 stale-doc-comment fixes (`emit_breadcrumb`→`emit_task_hud`). Shared markdown renderer + `fence.rs` migration deferred to **C5b** (Wave C). Gate 7148/0, fmt clean. | #52 |
+| C5b | **Merged.** Shared `channels/core::markdown` renderer (Html/Discord/Mattermost/Slack/WhatsApp/Plain flavors: headings, code, bold/italic/strike, links, nested lists, blockquotes) + C2's `fence.rs` migrated into it; `host-delivery` now delegates (`fence.rs` left a cfg(test) shim). C2's 17 splitter tests still pass through the relocated logic. Gate 7191/0, fmt clean. | #53 |
+| R7 | **Merged.** New `delegate` MCP tool → write-capable middle-tier build worker: permission-gated + depth-capped (reuses `create_agent` gates), each delegate in its own isolated `sib/<id>` worktree, contained (NULL messaging group → reports only to parent, can't post to user chat). No `spawn.rs` change (reused worktree mechanics via a `SpawnProfile` param). Single-call parallel fan-out orchestration deferred (parents fan out by calling `delegate` N times). Gate 7166/0, fmt clean. | #54 |
+| V5 | **PR open — HELD for human security sign-off (NOT merged).** Public tunnel module (`copperclaw-modules/src/tunnel.rs`): `TunnelProvider` trait + `CloudflaredProvider` (operator-provided binary, anonymous quick tunnel — no Cloudflare credential read/stored), off-by-default/per-group opt-in, every exposure a `CredentialedExternalAction` `pending_approvals` row (single-use grant), audit-rowed, auto-teardown with the preview, absent-binary → clean `BinaryNotFound`. Real `credentialed_external_action` apply arm replaces G1's placeholder. `security-review` skill run: no HIGH findings; 2 sub-threshold gaps (reusable grant → single-use; payload/upstream confused-deputy → uses approved grant's stored upstream) found AND fixed pre-sign-off. Threat model in PR "## Security review". Gate 7180/0, fmt clean. | #55 |
+| M1 | **Merged.** Metrics rider: ~55 `copperclaw_*` metrics swept from merged PRs #24-#54, each registered + emitted at a verified call site (52 files: metrics crate + emit sites across channels/mcp/browser/modules/runner/host/router/delivery). Adapted: R1 gauge→counter (cross-process consumer). Dropped (no distinct code path, would misattribute): P3/X2 ritual-card metrics. Deferred to **M1b**: V2 tombstone-duration + R7 concurrent-delegates histograms (need runtime state not yet on `main`); V5 tunnel metrics (unmerged). Gate 7206/0, fmt clean. | #56 |
 
 ### R3 history (merged as #32 — skip unless you're touching the gate)
 
@@ -1366,10 +1375,54 @@ verify gate blocks a fake completion → preview link opens from the phone →
 ritual card + screenshot file → `cclaw audit list` shows the approval and
 preview rows.
 
-Still owed as of 2026-07-16: the live smoke test has never been run (R3
-merged without it; nothing since has run it either), and X2 is what makes
-the fixture cover the gate. Neither blocks card work; both block calling
-the program done.
+**Status as of 2026-07-16 (eighth session, all card work done):** X1+X2 are
+merged — the golden fixture covers the verify-gate refuse→fix→pass leg (X2 #48)
+and the P3 ritual-card shape, so the fixture half is **met**. Every
+implementing card is merged (V5 #55 excepted — held for security sign-off).
+
+**LIVE TELEGRAM SMOKE — PASSED (2026-07-16, operator's phone).** The full
+demo-moment path ran end-to-end on the telegram dev group with model
+`z-ai/glm-5.2` (OpenRouter-brokered), session `019f6b3a-…`: prompt *"Research
+app ideas related to the outdoors then build me a prototype"* → **H1 HUD**
+appeared and self-edited live (`[~] task · step 1/6 … last: write_file ok — 32
+tool calls | 2:04`) then finalized (`[ok] task — done in 6:06, 71 tool calls`)
+→ **pinned todo plan** (6 steps) → built **TrailPost** (Flask+SQLite+Leaflet)
+→ **R3 verify gate actually ran** (card shows `Verified: GET / → 200,
+/api/reports returns 9, POST creates (201)`; its test POST appears in the live
+feed) → **P3 ritual card** (What-to-try bullets, Verified line, artifact-path
+footer, Download button) → **preview** `http://<lan>:8100/__preview/<token>`
+opened live on the phone (fully working app) → *"Tear it down I'm done"* →
+preview closed + server stopped. This is the program-acceptance demo the plan
+called for. Screenshots archived in the eighth-session chat.
+
+**Log post-mortem of that run (3 buckets; "lots of failed tool calls"):**
+1. **REAL BUG — todo-store write race (~12 events).** `todo.rs::write_all`
+   uses a FIXED `.tmp` sibling filename, so concurrent `todo_update`/`todo_add`
+   in one R2 parallel batch clobber the shared tempfile → corrupt JSON
+   (`trailing characters at line 10`), then the read path can't quarantine a
+   file a racing writer already renamed (`No such file or directory`). Store
+   self-heals ("starting fresh") but todo state was repeatedly reset mid-build.
+   **FIXED — PR #57 (`hardening/todo-store-write-race`, merged):** process-wide
+   `tokio::sync::Mutex` across the todo read-modify-write in `add`/`update`/
+   `delete` (fixes corruption AND lost updates) + unique `<store>.tmp.<pid>.<seq>`
+   tempfile. New test fails pre-fix (`left: 1, right: 8`), passes post-fix; gate
+   7207/0. Needs a `./rebuild.sh` to reach running agents (in-container surface).
+2. **WORKING AS DESIGNED — provenance/taint denials (4).** The "research …
+   then build" request web-tainted the turn, so the M16 gate denied
+   `expose_preview` ×2, `web_search`, `web_fetch` (credentialed external
+   actions) on the tainted turn; preview exposed fine on the fresh follow-up
+   turn. Not a bug. **UX refinement to consider: does exposing a LAN preview
+   warrant the same taint gate as `web_search`?** (candidate M19 item.)
+3. **Benign/recovered (2):** one transient provider `sse decode … retryable`
+   (retried, recovered); one Telegram `message is not modified` HUD re-edit
+   (H1/R6 should skip an edit when content is unchanged — small guard).
+   Also: only 1 git commit vs the commit-per-increment discipline (prompt
+   adherence, not a system bug).
+
+**Remaining to call the program fully done:** merge **V5 #55** after security
+sign-off. (The live smoke is now PASSED; the todo-store race + the two minor
+guards + the preview-taint UX question are post-M18 hardening follow-ups, none
+blocking.)
 
 ## Deferred / rejected (don't re-litigate)
 
