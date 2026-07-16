@@ -1,0 +1,29 @@
+{
+  "channel_type": "slack",
+  "platform_id": "C1",
+  "thread_id": null,
+  "message": {
+    "id": "1700000200.000001",
+    "kind": "chat",
+    "content": {
+      "text": "here is the spec",
+      "attachment": {
+        "kind": "slack.file",
+        "file_id": "F-1",
+        "filename": "spec.csv",
+        "staged_path": "fixture://spec.csv",
+        "mime_type": "text/csv",
+        "size": 11
+      }
+    },
+    "timestamp": "2026-01-01T00:00:00Z",
+    "is_mention": null,
+    "is_group": true
+  },
+  "reply_to": null,
+  "sender": {
+    "channel_type": "slack",
+    "identity": "U1",
+    "display_name": null
+  }
+}
