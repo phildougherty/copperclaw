@@ -525,6 +525,99 @@ adheres to [Semantic Versioning](https://semver.org/).
   refuse → `self_review` (read) → `self_review` (submit) → completion
   shape through the real pipeline.
 
+### Added (M20 X-rider Wave 2 — craft fixtures, testing)
+
+- Assessed all three Wave-2 X-rider fixture wishes (self-review gate / Q6,
+  `delegate_batch` contract + post-join dirty / Q7, compaction digest / Q8)
+  against the CLI replay harness (`crates/copperclaw-host/tests/replay.rs` +
+  `tests/replay/harness.rs`). **No new fixture added** — one wish was
+  already covered, the other two were investigated and found genuinely not
+  replay-expressible for two distinct, precise reasons (below). Per this
+  card's honesty rule, a smaller correct deliverable (this documentation)
+  beats a fixture that fakes the shape.
+  - **Wish 1 (self-review refuse → review → completion, Q6): already
+    shipped, verified, not duplicated.** Q6's own PR landed
+    `fixtures/cli/prototype-self-review-gate/`, registered as
+    `cli_prototype_self_review_gate_refuse_review_pass`. Re-confirmed it
+    exists, is registered, and passes (`cargo test -p copperclaw-host
+    --test replay cli_prototype_self_review_gate`) — 1 passed, 0 failed.
+    It already pins the exact refuse → `self_review` (read) → `self_review`
+    (submit) → completion shape the wish asks for; adding a second fixture
+    for the same shape (e.g. a `findings`-instead-of-`no_findings` variant)
+    would add turns without exercising a new pipeline path, the same
+    reasoning that fixture's own README already gives for not re-covering
+    the post-review re-dirty / cap-exhaustion legs.
+  - **Wish 2 (`delegate_batch` contract propagation + post-join dirty,
+    Q7): NOT replay-expressible — real worker spawn is structurally
+    outside the harness.** `delegate_batch`'s real implementation
+    (`RunnerToolCtx::run_delegate_batch`, `crates/copperclaw-runner/src/
+    tools.rs`) requires `ToolContext`'s inbound handle to be wired via
+    `.with_join(...)`; the replay harness's `run_one_turn`
+    (`tests/replay/harness.rs`) constructs `RunnerToolCtx::new(...)` and
+    never calls `.with_join(...)`, so a scripted `delegate_batch` call
+    would deterministically hit the "delegate_batch join is not wired in
+    this context" refusal rather than exercising the real path. Even if
+    wired, the real mechanism is a host-brokered Docker container spawn
+    per worker plus the parent block-polling its own `inbound.db` for each
+    worker's `delegate_result` row over real wall-clock time — exactly the
+    async, multi-process, real-timing infrastructure the harness (one
+    mocked runner turn per scripted step, wiremock standing in for the
+    provider) was built to bypass. It has no concept of a second,
+    concurrently-running worker session with its own scripted provider
+    turns. Fully unit-covered instead, correctly at the `MockToolContext`
+    layer, in `crates/copperclaw-mcp/src/tools/agents.rs`:
+    `delegate_batch_contract_prepended_to_every_worker`,
+    `delegate_batch_no_contract_is_byte_identical_to_pre_q7`, and
+    `delegate_batch_post_join_marks_parent_project_dirty` (plus five
+    sibling tests covering no-project/no-verify-file/all-spawn-failed/
+    verify-gate-off edge cases).
+  - **Wish 3 (compaction digest with stages + decisions, Q8): NOT
+    replay-expressible — but for a harness-wiring reason, not a
+    fundamental one.** Unlike Q7, compaction *can* be triggered
+    deterministically: both the `/compact` slash command and the
+    `compact_now` MCP tool call `compaction::compact()` directly,
+    bypassing the token-threshold check entirely (`crates/
+    copperclaw-runner/src/run/mod.rs`'s sentinel handling, lines ~781-807)
+    — the only gate left is `compact()`'s own `history.len() < 4` no-op
+    guard, so a handful of scripted turns is sufficient, and the
+    wiremock-captured request bodies on the following turn could in
+    principle show the pinned header verbatim, exactly the mechanism
+    `prototype-self-review-gate`'s own test already uses
+    (`harness.anthropic_server.received_requests()` + `.contains(...)` on
+    the concatenated bodies). The blocker is that `tests/replay/
+    harness.rs`'s `run_one_turn` wires `CompactionCfg.data_root` to the
+    harness's own internal `SessionPaths` root
+    (`self.tempdir.path()/sessions/<ag>/<sess>`) — and `self.tempdir` is a
+    fresh `tempfile::tempdir()` generated inside `ReplayHarness::new()`,
+    a different random path every test run (empirically confirmed: two
+    boots of the same fixture printed `/tmp/.tmpD1N6Km` and a different
+    path on a re-run). That root is structurally decoupled from
+    `COPPERCLAW_DATA_ROOT`, the env var `verify_gate`/`todo`/`self_review`
+    actually resolve project state against (and the only override those
+    tools honor) — so any project + multi-stage `.copperclaw/verify` +
+    `DECISIONS.md` a fixture scripts (the same way Q6's fixture does,
+    via the `COPPERCLAW_DATA_ROOT` re-exec seam) would be invisible to
+    `build_project_facts_header`'s `scan_projects`/`read_todos`, and
+    compaction would silently pin an empty/no-op header regardless of
+    what state was set up — a false-negative fixture, not a working one.
+    The existing re-exec workaround can't bridge this either: it needs
+    the target path known *before* spawning the child process, but the
+    harness's tempdir is only generated *after* `ReplayHarness::new()`
+    runs inside that very child — an unresolvable chicken-and-egg.
+    Closing the gap needs a `tests/replay/harness.rs` change (e.g.
+    threading a fixture-configurable data root into `CompactionCfg`,
+    or defaulting it to `COPPERCLAW_DATA_ROOT`) — out of this card's
+    declared scope (`fixtures/**` + `tests/replay.rs` registration only;
+    harness-file changes are the kind of pipeline-code change this card
+    is meant to surface, not make). Fully unit-covered instead, including
+    the exact "headline" case run through the real `compact()` entry
+    point, in `crates/copperclaw-runner/src/compaction.rs`:
+    `compacted_coding_session_pins_inventory_stages_and_decisions`,
+    `facts_header_includes_file_inventory_from_git_ls_files`,
+    `facts_header_pins_every_verify_stage_not_just_the_first`,
+    `facts_header_includes_decisions_tail_when_present`, and five
+    sibling cap/absence tests.
+
 ### Added (M19 A3 — Public-tunnel model verb: activate V5)
 
 - The merged-but-dormant V5 public-tunnel module now has an agent-facing verb.
