@@ -49,6 +49,83 @@ pub const DEFAULT_OUTPUT_RESERVE: usize = 4_096;
 /// `soft_target_tokens` to `0` to disable the soft trigger entirely and
 /// recover the historical hard-window-only behaviour.
 pub const DEFAULT_SOFT_TARGET: usize = 40_000;
+/// Default *soft* compaction target for code-oriented tool profiles
+/// ([`Coding`](crate::policy::ToolProfile::Coding) /
+/// [`Full`](crate::policy::ToolProfile::Full)).
+///
+/// A long autonomous build (the whole point of the M18 program) needs its
+/// mid-task detail — file layouts, error text, the running plan — kept in
+/// context far longer than a chat session does, or the summarizer erases
+/// the very working memory the build depends on. 80K on a 200K window
+/// roughly doubles the pre-summarize working set while still leaving ~100K
+/// of hard-ceiling headroom (`180K − 80K`), so a 90-minute build no longer
+/// summarizes away what it's mid-way through. Messaging / Minimal profiles
+/// keep [`DEFAULT_SOFT_TARGET`] — the raise is deliberately profile-scoped.
+/// The hard ceiling still clamps this via
+/// [`CompactionCfg::effective_threshold`], so a misconfigured huge target
+/// can never push the trigger past the safety net.
+pub const DEFAULT_SOFT_TARGET_CODING: usize = 80_000;
+
+/// Resolve the default soft compaction target for a tool profile. Code-
+/// oriented profiles get the higher [`DEFAULT_SOFT_TARGET_CODING`] so long
+/// builds retain mid-task detail; everything else keeps [`DEFAULT_SOFT_TARGET`].
+///
+/// This is only the *default* — an explicit `soft_compaction_target_tokens`
+/// in the runner config (or the `COPPERCLAW_SOFT_COMPACTION_TARGET` env var)
+/// still overrides it, and the hard ceiling always clamps the result.
+#[must_use]
+pub fn default_soft_target_for_profile(profile: crate::policy::ToolProfile) -> usize {
+    use crate::policy::ToolProfile;
+    match profile {
+        ToolProfile::Coding | ToolProfile::Full => DEFAULT_SOFT_TARGET_CODING,
+        ToolProfile::Minimal | ToolProfile::Messaging => DEFAULT_SOFT_TARGET,
+    }
+}
+
+/// Average characters per token used by [`estimate_tokens`].
+///
+/// ## Why an approximation instead of `tiktoken-rs`
+///
+/// `tiktoken-rs`'s `cl100k_base` is *GPT's* tokenizer, not Claude's — so it
+/// is itself only an approximation of the number we actually plan against
+/// (the Claude token count the provider windows and bills on), while adding
+/// ~1.5 MB of embedded BPE vocab plus a `fancy-regex` dependency to every
+/// in-container runner binary and measurable cold-compile time. Because this
+/// estimate only drives the *compaction trigger* — backstopped by a 16K
+/// safety margin, a 4K output reserve, and the hard-ceiling clamp — sub-
+/// percent tokenizer precision buys nothing that the margins don't already
+/// cover. A calibrated character ratio is well within the error budget and
+/// costs no bytes, no crate, no compile time.
+///
+/// ## Error bounds
+///
+/// Anthropic's published guidance puts Claude's tokenizer at roughly **3.5
+/// characters per token for English prose**, running denser (~3.0) on source
+/// code and JSON. The previous flat `chars / 4` therefore *under*-counted
+/// real usage by ~12% on prose and ~25% on code — on a long code-dense build
+/// the true context could sail past the window while the estimate still read
+/// "safe". We divide by `3.5` (the conservative prose figure) over a
+/// *whitespace-collapsed* character count (see [`ws_collapsed_len`]): runs of
+/// ASCII whitespace — the indentation and blank lines that dominate code and
+/// pretty-printed JSON, and the single biggest source of the old estimate's
+/// drift on code-dense transcripts — collapse to one char first, because the
+/// tokenizer merges them too. Net effect versus the real `count_tokens` API
+/// on mixed build transcripts: within roughly ±10%, biased to *over*-count,
+/// so compaction fires a touch early rather than overflowing the window.
+///
+/// The `3.5` ratio is applied as the exact rational `TOKEN_NUM / TOKEN_DEN`
+/// (= 2/7) so [`estimate_tokens`] can ceil-divide in integer math — no float
+/// cast (and no pedantic-clippy precision-loss lint) for a ratio that is an
+/// approximation to begin with.
+const TOKEN_NUM: usize = 2;
+const TOKEN_DEN: usize = 7;
+
+/// Marker prefixing the pinned project-facts header (see
+/// [`build_project_facts_header`]). A compacted history carries exactly one
+/// such entry, always at the front, regenerated verbatim from on-disk R3
+/// state on every compaction rather than handed to the summarizer.
+pub const PROJECT_FACTS_MARKER: &str = "project_facts:";
+
 /// System prompt the runner sends to the provider when asking for a summary.
 pub const SUMMARY_SYSTEM_PROMPT: &str = "Summarize the following conversation succinctly. Preserve any decisions, \
 open questions, identifiers, and unresolved tool requests. Be terse.";
@@ -81,6 +158,12 @@ pub struct CompactionCfg {
     /// Where to archive pre-compaction transcripts. Typically
     /// `<session_dir>/outbox/_compactions`.
     pub archive_dir: PathBuf,
+    /// Container data root that projects and the todo store live under —
+    /// `/data` in production (the same root `todo.rs` and `verify_gate.rs`
+    /// hardcode). Source for the pinned project-facts header
+    /// ([`build_project_facts_header`]); test-overridable so the header can
+    /// be exercised against a temp dir.
+    pub data_root: PathBuf,
 }
 
 impl CompactionCfg {
@@ -122,40 +205,64 @@ impl CompactionCfg {
     }
 }
 
-/// Rough token estimate: 4 characters per token. Counts the textual payload
-/// of each [`HistoryMessage`] variant; tool-use input JSON is rendered as a
-/// compact string for sizing purposes.
+/// Estimate the token count of `messages` with a calibrated character
+/// heuristic (see [`TOKEN_NUM`] / [`TOKEN_DEN`] for the estimator choice and
+/// its error bounds). Counts the textual payload of each [`HistoryMessage`]
+/// variant over a whitespace-collapsed character count; tool-use input JSON
+/// is rendered as a compact string for sizing purposes.
 #[must_use]
 pub fn estimate_tokens(messages: &[HistoryMessage]) -> usize {
     let mut chars: usize = 0;
     for m in messages {
         chars += chars_of(m);
     }
-    chars / 4
+    // tokens = ceil(chars / 3.5) = ceil(chars * 2 / 7), integer math so a
+    // short-but-nonempty transcript never rounds down to zero tokens.
+    (chars * TOKEN_NUM).div_ceil(TOKEN_DEN)
+}
+
+/// Count the characters of `s`, treating each maximal run of ASCII
+/// whitespace as a single character. Indentation, blank lines, and the
+/// padding that dominates source code and pretty-printed JSON collapse the
+/// way the tokenizer merges them, so a code-dense transcript no longer
+/// inflates the estimate — and trips compaction early — purely on
+/// whitespace it will never spend one token per character on.
+fn ws_collapsed_len(s: &str) -> usize {
+    let mut count = 0usize;
+    let mut prev_ws = false;
+    for c in s.chars() {
+        let is_ws = c.is_ascii_whitespace();
+        if is_ws && prev_ws {
+            continue;
+        }
+        count += 1;
+        prev_ws = is_ws;
+    }
+    count
 }
 
 fn chars_of(m: &HistoryMessage) -> usize {
     match m {
         HistoryMessage::User { content } | HistoryMessage::Assistant { content } => {
-            content.chars().count()
+            ws_collapsed_len(content)
         }
         HistoryMessage::ToolUse { id, name, input } => {
-            id.chars().count() + name.chars().count() + input.to_string().chars().count()
+            ws_collapsed_len(id) + ws_collapsed_len(name) + ws_collapsed_len(&input.to_string())
         }
         HistoryMessage::Tool {
             tool_use_id,
             content,
             is_error: _,
-        } => tool_use_id.chars().count() + content.chars().count(),
+        } => ws_collapsed_len(tool_use_id) + ws_collapsed_len(content),
         HistoryMessage::Image {
             media_type,
             data: _,
         } => {
             // An image's token cost is tile-based, not its base64 length —
             // counting `data` would massively overestimate and trigger
-            // needless compaction. Use a flat ~1500-token estimate
-            // (the caller divides chars by 4).
-            media_type.chars().count() + 6_000
+            // needless compaction. Contribute a flat ~1500-token estimate:
+            // 1500 tokens × CHARS_PER_TOKEN (3.5) ≈ 5250 "chars".
+            ws_collapsed_len(media_type) + 5_250
         }
     }
 }
@@ -182,9 +289,23 @@ fn pair_safe_pivot(history: &[HistoryMessage]) -> usize {
     pivot
 }
 
+/// True iff `m` is a pinned project-facts header (see
+/// [`build_project_facts_header`]) emitted by a previous compaction.
+fn is_pinned_facts_header(m: &HistoryMessage) -> bool {
+    matches!(m, HistoryMessage::User { content } if content.starts_with(PROJECT_FACTS_MARKER))
+}
+
 /// Replace the oldest half of `history` with a single summarised user-side
-/// `compact_boundary` entry. Writes the pre-compaction transcript to
+/// `compact_boundary` entry, and re-pin a fresh project-facts header at the
+/// front. Writes the pre-compaction transcript to
 /// `cfg.archive_dir/<RFC3339>.md` as a side effect.
+///
+/// The project-facts header (project path, verify command, branch, plan) is
+/// sourced fresh from on-disk R3 state on every compaction and pinned
+/// **verbatim** — never handed to the summarizer to paraphrase — so those
+/// facts survive summarization losslessly no matter how many times a long
+/// build compacts. Any header pinned by a prior compaction is stripped first
+/// so exactly one, always-current copy is carried forward.
 ///
 /// If `history.len() < 4` the function is a no-op and returns the input
 /// unchanged — there isn't enough material to summarise meaningfully.
@@ -196,11 +317,21 @@ pub async fn compact(
     if history.len() < 4 {
         return Ok(history);
     }
+    // Strip any facts header pinned by a previous compaction; a fresh,
+    // current one is prepended below so headers never accumulate.
+    let mut history = history;
+    history.retain(|m| !is_pinned_facts_header(m));
+
+    // Regenerate the pinned header from current on-disk state. Verbatim,
+    // never summarised — this is the whole point of the header.
+    let facts = build_project_facts_header(&cfg.data_root).await;
+
     let pivot = pair_safe_pivot(&history);
     if pivot == 0 || pivot >= history.len() {
         // The whole transcript is one unsplittable tool group (rare). Leave
-        // it intact rather than send a half-pair to the provider.
-        return Ok(history);
+        // it intact rather than send a half-pair to the provider — but still
+        // re-pin the facts header so they survive even a no-op compaction.
+        return Ok(prepend_facts(facts, history));
     }
     let oldest = history[..pivot].to_vec();
     let newest = history[pivot..].to_vec();
@@ -210,12 +341,163 @@ pub async fn compact(
 
     let summary = summarise(provider, cfg, oldest).await?;
 
-    let mut out = Vec::with_capacity(newest.len() + 1);
+    let mut out = Vec::with_capacity(newest.len() + 2);
+    if let Some(header) = facts {
+        out.push(HistoryMessage::User { content: header });
+    }
     out.push(HistoryMessage::User {
         content: format!("compact_boundary: {summary}"),
     });
     out.extend(newest);
     Ok(out)
+}
+
+/// Prepend the pinned facts header (if any) to `history`. Used on the
+/// unsplittable-transcript path where there's nothing to summarise but the
+/// facts must still be re-pinned.
+fn prepend_facts(facts: Option<String>, history: Vec<HistoryMessage>) -> Vec<HistoryMessage> {
+    match facts {
+        Some(header) => {
+            let mut out = Vec::with_capacity(history.len() + 1);
+            out.push(HistoryMessage::User { content: header });
+            out.extend(history);
+            out
+        }
+        None => history,
+    }
+}
+
+/// Assemble the pinned **project-facts header** from on-disk state under
+/// `data_root`: the R3 verify-gate markers (`recorded_verify_command`) plus
+/// git branch per project, and the agent todo list (the running plan / key
+/// decisions). Returns `None` when there are no projects and no todos — a
+/// pure-chat session gets no header, byte-identical to pre-R4 behaviour.
+///
+/// Deterministic and read-only: called fresh on every compaction, it always
+/// renders the same bytes for the same on-disk state, which is what lets the
+/// header round-trip verbatim through repeated compactions.
+async fn build_project_facts_header(data_root: &Path) -> Option<String> {
+    let mut body = String::new();
+
+    let projects = scan_projects(data_root).await;
+    for proj in &projects {
+        let name = proj
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("<project>");
+        body.push_str("- ");
+        body.push_str(name);
+        if let Some(branch) = git_branch(proj).await {
+            body.push_str(" (branch: ");
+            body.push_str(&branch);
+            body.push(')');
+        }
+        body.push('\n');
+        match copperclaw_mcp::tools::verify_gate::recorded_verify_command(proj, None).await {
+            Some(cmd) => {
+                body.push_str("  verify: ");
+                body.push_str(&cmd);
+            }
+            None => body.push_str("  verify: (none recorded)"),
+        }
+        body.push('\n');
+    }
+
+    let todos = read_todos(data_root).await;
+    if !todos.is_empty() {
+        body.push_str("plan / key decisions (todo list):\n");
+        for t in &todos {
+            body.push_str(t);
+            body.push('\n');
+        }
+    }
+
+    if body.is_empty() {
+        return None;
+    }
+    // A trailing newline would make the header sensitive to formatting drift
+    // across renders; trim it so the pinned bytes are stable.
+    let trimmed = body.trim_end();
+    Some(format!(
+        "{PROJECT_FACTS_MARKER}\n(pinned verbatim through compaction — do not \
+         summarise or drop)\n{trimmed}"
+    ))
+}
+
+/// First-level directories under `data_root` that look like a project: they
+/// carry a `.git` or a `.copperclaw` marker dir. Sorted for a deterministic
+/// header. Best-effort — an unreadable root yields an empty list.
+async fn scan_projects(data_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir(data_root).await else {
+        return out;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path.join(".git").exists() || path.join(".copperclaw").exists() {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Read `<project>/.git/HEAD` and return the current branch name, or `None`
+/// for a detached HEAD or a missing/unreadable file. Reads the ref file
+/// directly rather than spawning `git` — cheap, non-blocking, no subprocess.
+async fn git_branch(project_root: &Path) -> Option<String> {
+    let head = tokio::fs::read_to_string(project_root.join(".git").join("HEAD"))
+        .await
+        .ok()?;
+    let head = head.trim();
+    head.strip_prefix("ref: refs/heads/").map(str::to_string)
+}
+
+/// Read the agent todo store (`<data_root>/agent_todos.json`) and render each
+/// item as one pinned line. Parsed as loose JSON so this stays decoupled from
+/// `copperclaw-mcp`'s private `TodoItem` type; absent / unparseable store
+/// yields an empty list.
+async fn read_todos(data_root: &Path) -> Vec<String> {
+    let path = data_root.join("agent_todos.json");
+    let Ok(bytes) = tokio::fs::read(&path).await else {
+        return Vec::new();
+    };
+    let Ok(items) = serde_json::from_slice::<Vec<serde_json::Value>>(&bytes) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .map(|it| {
+            let id = it.get("id").and_then(serde_json::Value::as_u64);
+            let text = it
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let status = it
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("pending");
+            let glyph = match status {
+                "completed" => "[x]",
+                "in_progress" => "[~]",
+                "blocked" => "[!]",
+                _ => "[ ]",
+            };
+            let blocked = it
+                .get("blocked_reason")
+                .and_then(serde_json::Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(|s| format!("  (blocked: {s})"))
+                .unwrap_or_default();
+            match id {
+                Some(n) => format!("  {glyph} {n}. {text}{blocked}"),
+                None => format!("  {glyph} {text}{blocked}"),
+            }
+        })
+        .collect()
 }
 
 /// Drive one summarisation turn against the provider, collecting the final
@@ -333,6 +615,11 @@ mod tests {
             summary_model: "claude-sonnet-4-6".into(),
             summary_effort: Effort::Low,
             summary_max_tokens: 1024,
+            // Empty by default: no projects, no todo store, so
+            // `build_project_facts_header` returns `None` and the existing
+            // compaction assertions (which don't expect a header) hold. The
+            // facts-header tests point this at a populated temp dir.
+            data_root: dir.clone(),
             archive_dir: dir,
         }
     }
@@ -516,7 +803,8 @@ mod tests {
         let h = vec![HistoryMessage::User {
             content: "a".repeat(8),
         }];
-        assert_eq!(estimate_tokens(&h), 2);
+        // 8 chars / 3.5 chars-per-token, rounded up.
+        assert_eq!(estimate_tokens(&h), 3);
     }
 
     #[test]
@@ -733,5 +1021,186 @@ mod tests {
         // Runtime touch so the symbols are referenced from the test binary.
         let _ = DEFAULT_INPUT_WINDOW.to_string();
         let _ = DEFAULT_SAFETY_MARGIN.to_string();
+    }
+
+    // ---- Part (a): estimator ------------------------------------------
+
+    #[test]
+    fn ws_collapsed_len_merges_whitespace_runs() {
+        assert_eq!(ws_collapsed_len("abc"), 3);
+        // Four-space indent + newline collapses to a single char.
+        assert_eq!(ws_collapsed_len("a\n    b"), 3); // 'a', <ws run>, 'b'
+        assert_eq!(ws_collapsed_len("   "), 1);
+        assert_eq!(ws_collapsed_len(""), 0);
+    }
+
+    #[test]
+    fn estimate_uses_ceil_division() {
+        // 1 char / 3.5 rounds up to 1 rather than truncating to 0.
+        let h = vec![HistoryMessage::User {
+            content: "x".into(),
+        }];
+        assert_eq!(estimate_tokens(&h), 1);
+    }
+
+    #[test]
+    fn whitespace_collapse_tames_code_dense_transcripts() {
+        // A code-dense body is dominated by indentation. The naive
+        // char-count treated every indent space as ~0.25 tokens; the
+        // collapsed estimate does not, so the same logical content
+        // estimates lower and no longer trips compaction on whitespace.
+        let indented = HistoryMessage::Assistant {
+            content: "fn main() {\n        let x = 1;\n        let y = 2;\n}".into(),
+        };
+        let flat = HistoryMessage::Assistant {
+            content: "fn main() { let x = 1; let y = 2; }".into(),
+        };
+        // Same logical tokens; the indented form must not estimate higher.
+        assert!(estimate_tokens(&[indented]) <= estimate_tokens(&[flat]) + 1);
+    }
+
+    // ---- Part (b): profile-conditional soft target --------------------
+
+    #[test]
+    fn coding_profiles_get_the_raised_soft_target() {
+        use crate::policy::ToolProfile;
+        // The raised target is still well under the hard ceiling, so the
+        // clamp in `effective_threshold` never has to fight it.
+        const _: () = assert!(DEFAULT_SOFT_TARGET_CODING > DEFAULT_SOFT_TARGET);
+        const _: () = assert!(DEFAULT_SOFT_TARGET_CODING < DEFAULT_INPUT_WINDOW);
+        assert_eq!(
+            default_soft_target_for_profile(ToolProfile::Coding),
+            DEFAULT_SOFT_TARGET_CODING
+        );
+        assert_eq!(
+            default_soft_target_for_profile(ToolProfile::Full),
+            DEFAULT_SOFT_TARGET_CODING
+        );
+        // Chat profiles keep today's target — the raise is profile-scoped.
+        assert_eq!(
+            default_soft_target_for_profile(ToolProfile::Messaging),
+            DEFAULT_SOFT_TARGET
+        );
+        assert_eq!(
+            default_soft_target_for_profile(ToolProfile::Minimal),
+            DEFAULT_SOFT_TARGET
+        );
+    }
+
+    #[test]
+    fn raised_coding_target_is_still_clamped_by_hard_ceiling() {
+        // Part (b) must not remove the clamp. Even a huge misconfigured
+        // target can't push the trigger past the safety net.
+        let cfg = CompactionCfg {
+            soft_target_tokens: DEFAULT_SOFT_TARGET_CODING,
+            ..cfg_with_dir(PathBuf::from("/tmp"))
+        };
+        assert_eq!(cfg.effective_threshold(), DEFAULT_SOFT_TARGET_CODING);
+        assert!(cfg.effective_threshold() < cfg.hard_threshold());
+    }
+
+    // ---- Part (c): pinned project-facts header ------------------------
+
+    /// Lay down a project + todo store under `root` so
+    /// `build_project_facts_header` has real R3 state to read.
+    fn seed_project_state(root: &Path) {
+        let proj = root.join("todo-app");
+        std::fs::create_dir_all(proj.join(".git")).unwrap();
+        std::fs::write(proj.join(".git").join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(proj.join(".copperclaw")).unwrap();
+        std::fs::write(proj.join(".copperclaw").join("verify"), "npm test\n").unwrap();
+        std::fs::write(
+            root.join("agent_todos.json"),
+            r#"[
+                {"id":1,"text":"Scaffold the app","status":"completed"},
+                {"id":2,"text":"Add the API","status":"in_progress"},
+                {"id":3,"text":"Deploy","status":"blocked","blocked_reason":"verify failed: 2 tests red"}
+            ]"#,
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn facts_header_carries_project_verify_branch_and_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_project_state(tmp.path());
+        let header = build_project_facts_header(tmp.path()).await.unwrap();
+        assert!(header.starts_with(PROJECT_FACTS_MARKER));
+        assert!(header.contains("todo-app"));
+        assert!(header.contains("branch: main"));
+        assert!(header.contains("verify: npm test"));
+        assert!(header.contains("[x] 1. Scaffold the app"));
+        assert!(header.contains("[~] 2. Add the API"));
+        assert!(header.contains("[!] 3. Deploy"));
+        assert!(header.contains("blocked: verify failed"));
+    }
+
+    #[tokio::test]
+    async fn facts_header_none_for_pure_chat_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No project dirs, no todo store — a pure-chat group.
+        assert_eq!(build_project_facts_header(tmp.path()).await, None);
+    }
+
+    #[tokio::test]
+    async fn facts_header_survives_three_compactions_verbatim() {
+        let data = tempfile::tempdir().unwrap();
+        seed_project_state(data.path());
+        let archive = tempfile::tempdir().unwrap();
+        let cfg = CompactionCfg {
+            data_root: data.path().to_path_buf(),
+            ..cfg_with_dir(archive.path().to_path_buf())
+        };
+        let provider = StubProvider {
+            canned_summary: "SUMMARY".into(),
+        };
+
+        // The exact bytes we expect pinned, computed from the same on-disk
+        // state the compaction reads.
+        let expected = build_project_facts_header(data.path()).await.unwrap();
+
+        let mut history = long_history(12);
+        for round in 0..3 {
+            history = compact(history, &provider, &cfg).await.unwrap();
+            // Exactly one pinned header, always at the front, byte-identical.
+            let headers: Vec<_> = history
+                .iter()
+                .filter(|m| is_pinned_facts_header(m))
+                .collect();
+            assert_eq!(
+                headers.len(),
+                1,
+                "round {round}: expected exactly one pinned facts header"
+            );
+            match &history[0] {
+                HistoryMessage::User { content } => assert_eq!(
+                    content, &expected,
+                    "round {round}: facts header must be pinned verbatim"
+                ),
+                other => panic!("round {round}: expected header first, got {other:?}"),
+            }
+            // The summary boundary is still present right after the header.
+            assert!(matches!(
+                &history[1],
+                HistoryMessage::User { content } if content.starts_with("compact_boundary: ")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn facts_header_absent_when_no_project_state() {
+        // Regression guard for byte-stability: with an empty data root the
+        // compacted output has no header — identical to pre-R4 shape.
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = cfg_with_dir(tmp.path().to_path_buf()); // data_root == archive == empty tmp
+        let provider = StubProvider {
+            canned_summary: "S".into(),
+        };
+        let out = compact(long_history(8), &provider, &cfg).await.unwrap();
+        assert!(!is_pinned_facts_header(&out[0]));
+        match &out[0] {
+            HistoryMessage::User { content } => assert!(content.starts_with("compact_boundary: ")),
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 }

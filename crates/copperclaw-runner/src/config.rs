@@ -378,10 +378,15 @@ impl RunnerConfig {
             // precedence as the rest of the config: the JSON wins when
             // present, otherwise an operator env var configures every
             // session at once, otherwise the documented default applies.
+            // Default is profile-conditional: code-oriented profiles get the
+            // higher coding target so long builds keep mid-task detail; chat
+            // profiles keep the original 40K. An explicit file field or env
+            // var still overrides, and the hard ceiling always clamps.
             soft_compaction_target_tokens: file.soft_compaction_target_tokens.unwrap_or_else(
                 || {
-                    env_usize(env, "COPPERCLAW_SOFT_COMPACTION_TARGET")
-                        .unwrap_or(crate::compaction::DEFAULT_SOFT_TARGET)
+                    env_usize(env, "COPPERCLAW_SOFT_COMPACTION_TARGET").unwrap_or_else(|| {
+                        crate::compaction::default_soft_target_for_profile(tool_profile)
+                    })
                 },
             ),
             recent_tool_results_kept: file.recent_tool_results_kept.unwrap_or_else(|| {
@@ -830,9 +835,12 @@ mod tests {
         // their JSON.
         let env = MapEnv::default();
         let cfg = RunnerConfig::from_file_struct(good_file(), &env).unwrap();
+        // The soft-target default is profile-conditional (R4 part b): a
+        // code-oriented profile gets the higher coding target. `good_file()`
+        // omits `tool_profile`, so the resolved profile drives the default.
         assert_eq!(
             cfg.soft_compaction_target_tokens,
-            crate::compaction::DEFAULT_SOFT_TARGET
+            crate::compaction::default_soft_target_for_profile(cfg.tool_profile)
         );
         assert_eq!(
             cfg.recent_tool_results_kept,
@@ -883,9 +891,10 @@ mod tests {
     fn unparseable_env_knob_falls_through_to_default() {
         let env = MapEnv::from_pairs([("COPPERCLAW_SOFT_COMPACTION_TARGET", "not-a-number")]);
         let cfg = RunnerConfig::from_file_struct(good_file(), &env).unwrap();
+        // Unparseable env → the profile-conditional default (R4 part b).
         assert_eq!(
             cfg.soft_compaction_target_tokens,
-            crate::compaction::DEFAULT_SOFT_TARGET
+            crate::compaction::default_soft_target_for_profile(cfg.tool_profile)
         );
     }
 
@@ -896,6 +905,30 @@ mod tests {
         let env = MapEnv::default();
         let cfg = RunnerConfig::from_file_struct(file, &env).unwrap();
         assert_eq!(cfg.soft_compaction_target_tokens, 0);
+    }
+
+    #[test]
+    fn soft_target_default_is_profile_conditional() {
+        // R4 part (b): the coding profile gets the raised default; chat
+        // profiles keep the original 40K. No file field, no env — the
+        // profile alone decides.
+        let env = MapEnv::default();
+
+        let mut coding = good_file();
+        coding.tool_profile = Some("coding".into());
+        let cfg = RunnerConfig::from_file_struct(coding, &env).unwrap();
+        assert_eq!(
+            cfg.soft_compaction_target_tokens,
+            crate::compaction::DEFAULT_SOFT_TARGET_CODING
+        );
+
+        let mut messaging = good_file();
+        messaging.tool_profile = Some("messaging".into());
+        let cfg = RunnerConfig::from_file_struct(messaging, &env).unwrap();
+        assert_eq!(
+            cfg.soft_compaction_target_tokens,
+            crate::compaction::DEFAULT_SOFT_TARGET
+        );
     }
 
     #[test]

@@ -695,6 +695,7 @@ impl ReplayHarness {
                 summary_effort: Effort::Low,
                 summary_max_tokens: 1024,
                 archive_dir: paths.outbox.join("_compactions"),
+                data_root: paths.root.clone(),
             },
             elision: copperclaw_runner::ElisionCfg {
                 recent_results_kept: 0,
