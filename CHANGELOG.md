@@ -6,6 +6,46 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M19 A5 — Agent-facing memory write, `memory_save`)
+
+- The M16 Phase-3 group memory store (per-group `memory.db`, FTS5 + cosine,
+  provenance-tagged) was in-container READ-ONLY (`memory_search` / `memory_get`);
+  the agent could recall but not deliberately remember. New `memory_save` tool
+  closes the loop, letting the agent persist a fact into the group store on
+  purpose so it survives across sessions.
+  - Pure handler + schema + registration in
+    `crates/copperclaw-mcp/src/tools/memory.rs` (new `memory_save` module) and
+    one line in `crates/copperclaw-mcp/src/tools/mod.rs`. New `MemorySaveSpec`
+    (`key`, `body`, optional `source` — deliberately NO caller-supplied
+    provenance), `MemorySaveOutcome`, and the shared `resolve_save_provenance`
+    taint→provenance rule in `crates/copperclaw-mcp/src/context.rs`, plus a new
+    `ToolContext::memory_save` trait method (default returns a Context error, so
+    mock / subagent contexts are unchanged).
+  - The write reaches the same per-group `MemoryStore` the runner already reads:
+    `RunnerToolCtx::memory_save` in `crates/copperclaw-runner/src/tools.rs`
+    upserts via `MemoryStore::upsert` (text-only embedding, exactly as
+    `memory_search` reads text-only today — vector generation stays deferred
+    until the embedding broker lands).
+  - SECURITY (provenance stays honest): the agent cannot request a provenance.
+    The runner's impl decides it from its OWN per-turn taint flag
+    (`is_context_tainted`, the same signal the coarse provenance gate reads): a
+    turn tainted by untrusted-provenance content (a `web_fetch` body, an
+    untrusted memory hit) is honestly DOWNGRADED to `untrusted` — nothing lets an
+    untrusted turn launder external content into trusted memory. The taint
+    decision is the store-side impl's, not the caller's, so a future handler bug
+    cannot bypass it. `memory_save` is also classified mutating in
+    `crates/copperclaw-runner/src/policy.rs` (new `MEMORY_WRITE_TOOLS`), so a
+    read-only guest sender is denied it (a guest must not write a trusted fact).
+  - Caps: `body` ≤ 8 KiB (rejected in the pure handler, the load-bearing guard
+    against dumping a document / injection payload into the store), `key` ≤ 256
+    chars, `source` ≤ 256 chars, and a per-session rate cap of 100 writes
+    enforced by the runner ctx (`MAX_SAVES_PER_SESSION`).
+  - Tests: mcp unit tests (`tools/memory.rs`) exercise write→retrieve with
+    `trusted` provenance, tainted-turn downgrade to `untrusted`, the oversized-body
+    cap, empty key/body rejection, and the per-session rate cap against a stateful
+    reference context; runner tests cover the real store round-trip + downgrade
+    (`run/tool_dispatch.rs`) and the guest mutating floor (`policy.rs`).
+
 ### Added (M19 U4 — Native cards on gchat + matrix, 2026-07-16)
 
 - Neither `gchat` nor `matrix` overrode the trait

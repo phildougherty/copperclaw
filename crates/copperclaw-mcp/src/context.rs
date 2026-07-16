@@ -214,6 +214,56 @@ pub struct MemorySearchSpec {
     pub limit: Option<usize>,
 }
 
+/// Spec for the `memory_save` tool: an agent-initiated write into the group
+/// memory store. Deliberately carries NO provenance field — the agent cannot
+/// request a provenance. The provenance is decided by the side-effecting
+/// context from the current turn's taint state (see
+/// [`resolve_save_provenance`]) so an untrusted turn can never launder content
+/// into `trusted` memory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySaveSpec {
+    /// Logical key to upsert under (overwrites an existing entry of the same
+    /// key). Trimmed; must be non-empty and within the key-length cap.
+    pub key: String,
+    /// The text body to remember. Must be non-empty and within the body-size
+    /// cap.
+    pub body: String,
+    /// Optional short source label recorded with the entry (e.g. `"agent"` or
+    /// a note about where the fact came from).
+    pub source: Option<String>,
+}
+
+/// Outcome of a `memory_save`, returned to the agent so it can see the honest
+/// provenance the store recorded (which may differ from `trusted` when the
+/// turn was tainted).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemorySaveOutcome {
+    /// The key that was written.
+    pub key: String,
+    /// The effective provenance recorded: `"trusted"` or `"untrusted"`.
+    pub provenance: String,
+    /// True when the requested `trusted` write was forced down to `untrusted`
+    /// because the current turn was tainted by untrusted-provenance content.
+    pub downgraded: bool,
+}
+
+/// Resolve the honest provenance for an agent-initiated memory write given the
+/// current turn's taint state. A tainted turn can NEVER write `trusted`
+/// memory: the entry is forced to `untrusted` (a downgrade) so external
+/// content pulled into the turn can't be laundered into trusted memory.
+///
+/// Returns `(provenance_wire, downgraded)`. This is the single reference for
+/// the taint→provenance rule; both the runner's `ToolContext` impl and the
+/// unit-test mock call it so the two can't drift.
+#[must_use]
+pub fn resolve_save_provenance(tainted: bool) -> (&'static str, bool) {
+    if tainted {
+        ("untrusted", true)
+    } else {
+        ("trusted", false)
+    }
+}
+
 /// Spec for `send_message`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendMessageSpec {
@@ -590,6 +640,27 @@ pub trait ToolContext: Send + Sync {
     /// Same default + taint semantics as [`Self::memory_search`].
     async fn memory_get(&self, key: &str) -> Result<Option<MemoryHitView>, ToolError> {
         let _ = key;
+        Err(ToolError::Context(
+            "memory store not configured in this context".into(),
+        ))
+    }
+
+    /// Persist a fact into this group's memory store on the agent's behalf
+    /// (the write half of [`Self::memory_search`] / [`Self::memory_get`]).
+    ///
+    /// PROVENANCE (security-critical): the implementation decides the recorded
+    /// provenance from the current turn's taint state via
+    /// [`resolve_save_provenance`] — the agent cannot request a provenance and
+    /// a tainted turn is forced to `untrusted` (downgrade), so nothing lets an
+    /// untrusted turn launder content into trusted memory. The impl also owns
+    /// the per-session rate cap and embedding generation (deferred today — the
+    /// runner writes text-only, exactly as `memory_search` reads text-only).
+    ///
+    /// Default impl returns `ToolError::Context` so mock / subagent contexts
+    /// compile unchanged — only the runner's `RunnerToolCtx` (which knows the
+    /// per-group `memory.db` path) overrides it.
+    async fn memory_save(&self, spec: MemorySaveSpec) -> Result<MemorySaveOutcome, ToolError> {
+        let _ = spec;
         Err(ToolError::Context(
             "memory store not configured in this context".into(),
         ))

@@ -226,6 +226,12 @@ pub struct RunnerToolCtx {
     /// verify command. Set by [`Self::with_verify_gate`] from
     /// `container_configs.check_command`.
     check_command_override: Option<String>,
+    /// M19 A5: per-session count of agent-initiated `memory_save` writes,
+    /// capped at [`copperclaw_mcp::tools::memory::memory_save::MAX_SAVES_PER_SESSION`]
+    /// so a runaway or hostile turn can't spam the store. Session-scoped (not
+    /// reset per turn). `Arc<AtomicUsize>` so it survives `Arc<dyn ToolContext>`
+    /// erasure and is mutable from a shared ref.
+    memory_saves: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// Stable pseudo tool-name the per-inbound Task HUD message rides
@@ -255,6 +261,7 @@ impl RunnerToolCtx {
             external_approved: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             verify_gate_enabled: true,
             check_command_override: None,
+            memory_saves: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -839,6 +846,63 @@ impl ToolContext for RunnerToolCtx {
                 Some(entry_to_view(e, None))
             }
             None => None,
+        })
+    }
+
+    async fn memory_save(
+        &self,
+        spec: copperclaw_mcp::MemorySaveSpec,
+    ) -> Result<copperclaw_mcp::MemorySaveOutcome, ToolError> {
+        use copperclaw_mcp::tools::memory::memory_save::MAX_SAVES_PER_SESSION;
+
+        let Some(store) = self.open_memory()? else {
+            return Err(ToolError::Context(
+                "memory store not configured in this context".into(),
+            ));
+        };
+        // Per-session rate cap: refuse once the ceiling is reached. The counter
+        // is incremented only on an accepted write below.
+        if self.memory_saves.load(std::sync::atomic::Ordering::Acquire) >= MAX_SAVES_PER_SESSION {
+            return Err(ToolError::Validation(format!(
+                "memory_save rate cap reached ({MAX_SAVES_PER_SESSION} writes this session)"
+            )));
+        }
+        // PROVENANCE (security boundary): the recorded provenance is decided
+        // HERE from the runner's OWN taint flag — never from the caller — so an
+        // untrusted turn can't launder content into trusted memory. A tainted
+        // turn is honestly downgraded to `untrusted`.
+        let tainted = self.is_context_tainted();
+        let (prov_wire, downgraded) = copperclaw_mcp::resolve_save_provenance(tainted);
+        let provenance = if tainted {
+            copperclaw_db::memory::Provenance::Untrusted
+        } else {
+            copperclaw_db::memory::Provenance::Trusted
+        };
+        if downgraded {
+            tracing::info!(
+                target: "copperclaw_runner::provenance",
+                key = %spec.key,
+                "memory_save on a tainted turn downgraded to untrusted provenance"
+            );
+        }
+        // Embedding generation stays deferred (same as `memory_search`, which
+        // reads text-only today) — write text-only; the FTS5 half indexes it
+        // and the cosine pass activates automatically once embeddings land.
+        store
+            .upsert(&copperclaw_db::memory::MemoryWrite {
+                key: &spec.key,
+                body: &spec.body,
+                provenance,
+                source: spec.source.as_deref(),
+                embedding: &[],
+            })
+            .map_err(|e| ToolError::Internal(format!("memory save: {e}")))?;
+        self.memory_saves
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(copperclaw_mcp::MemorySaveOutcome {
+            key: spec.key,
+            provenance: prov_wire.to_string(),
+            downgraded,
         })
     }
 
