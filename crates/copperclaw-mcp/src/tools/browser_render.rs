@@ -60,6 +60,15 @@ const IMAGE_ENV: &str = "COPPERCLAW_BROWSER_IMAGE";
 /// Optional override for the requested sandbox runtime
 /// (`runsc` | `kata` | `firecracker` | `hardened-runc`).
 const RUNTIME_ENV: &str = "COPPERCLAW_BROWSER_SANDBOX";
+/// Host-supplied extra egress allow-list for the browser child (V4). A
+/// comma-separated list of `host:port` entries the locked-down child must be
+/// able to reach IN ADDITION to the navigation target, under deny-default
+/// egress. The host sets this at browser-child spawn from the live
+/// `PreviewEntry` (`container_ip:container_port`) so the child can reach the
+/// prototype's own session container directly on the Docker bridge — see the
+/// render-target rationale in [`prepare`]. Unset / empty → no extra entries,
+/// byte-identical to pre-V4.
+const PREVIEW_ALLOW_ENV: &str = "COPPERCLAW_BROWSER_PREVIEW_ALLOW";
 
 /// Lookup table for environment variables. Production uses [`SystemEnv`];
 /// tests build a [`MapEnv`]. (Mirrors the `web_search` pattern.)
@@ -190,6 +199,35 @@ fn egress_allow_for(url: &str) -> Result<Vec<String>, ToolError> {
     Ok(vec![format!("{host}:{port}")])
 }
 
+/// True for a well-formed `host:port` allow-list entry: a non-empty host and a
+/// port that parses as a `u16`. Deliberately strict — a malformed entry is
+/// dropped rather than widening the child's deny-default egress by accident.
+/// IPv4 literals + DNS names only (the preview target is always an IPv4 bridge
+/// address), so a single trailing `:port` split is sufficient.
+fn is_host_port(s: &str) -> bool {
+    match s.rsplit_once(':') {
+        Some((host, port)) => !host.is_empty() && port.parse::<u16>().is_ok(),
+        None => false,
+    }
+}
+
+/// Parse the host-supplied preview egress allow-list from [`PREVIEW_ALLOW_ENV`].
+/// Comma-separated `host:port` entries; blank / malformed entries are dropped.
+/// Unset → empty (byte-identical to pre-V4). This is the V4 injection: the host
+/// scopes the browser child's deny-default egress to the prototype's own
+/// preview origin so the screenshot render can actually reach it.
+fn preview_egress_allow(env: &dyn EnvLookup) -> Vec<String> {
+    env.get(PREVIEW_ALLOW_ENV)
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && is_host_port(s))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The safety-critical, fully-testable core: gate on opt-in, validate, tag the
 /// turn untrusted, run the SSRF pre-flight, and build the locked-down
 /// child-container spec. Returns the prepared request + the child spec the
@@ -231,7 +269,25 @@ pub async fn prepare(
     //    probes available sandbox runtimes; at this layer we pass an empty set
     //    so the spec resolves to the hardened-runc floor deterministically —
     //    the host's spawn path supplies the real availability probe.
-    let egress_allow = egress_allow_for(&req.url)?;
+    //
+    //    V4 render-target decision: the P3 "prototype ready" screenshot renders
+    //    the live preview by pointing the child at the prototype's OWN session
+    //    container directly on the Docker bridge
+    //    (`http://<container_ip>:<container_port>`) — NOT the host preview-proxy
+    //    URL. The proxy (V1) binds a host port and 403s any request lacking the
+    //    `cclaw_preview` cookie (minted only for the human user's external
+    //    browser), so a cookieless automated render against the proxy URL would
+    //    be refused; and the child + the app container already share the Docker
+    //    bridge, so the direct hop needs no host round-trip. The host passes
+    //    that `container_ip:container_port` (read from the live `PreviewEntry`)
+    //    via `PREVIEW_ALLOW_ENV`; we inject it into the deny-default allow-list
+    //    here so the child can reach it. Unset → target-only (pre-V4).
+    let mut egress_allow = egress_allow_for(&req.url)?;
+    for extra in preview_egress_allow(env) {
+        if !egress_allow.contains(&extra) {
+            egress_allow.push(extra);
+        }
+    }
     let params = BrowserContainerParams {
         name: "copperclaw-browser",
         install_slug: "copperclaw",
@@ -272,9 +328,26 @@ pub fn schema() -> Tool {
     )
 }
 
-/// Optional override for where rendered screenshots are written host-side.
-/// Defaults to a temp subdir; V4 refines this to the session `/data` dir.
+/// Optional override for where rendered screenshots are written.
+/// V4: defaults to `<data_root>/screenshots` (the session `/data` dir in
+/// production) so the in-container agent can read the PNG and relay it with
+/// `send_file` for the P3 ritual. An explicit value still wins.
 const OUTPUT_DIR_ENV: &str = "COPPERCLAW_BROWSER_OUTPUT_DIR";
+/// Subdirectory under the session data root where screenshots land by default.
+const SCREENSHOT_SUBDIR: &str = "screenshots";
+
+/// Resolve the directory rendered screenshots are written into. An explicit
+/// [`OUTPUT_DIR_ENV`] wins; otherwise (V4) they land under the session data
+/// root — `/data/screenshots` in production — so the PNG is readable by the
+/// in-container agent for `send_file`. Reuses the shared,
+/// `COPPERCLAW_DATA_ROOT`-aware [`crate::tools::verify_gate::data_root`] so a
+/// host/test override of the data root moves screenshots with it.
+fn screenshot_dir(env: &dyn EnvLookup) -> std::path::PathBuf {
+    env.get(OUTPUT_DIR_ENV).map_or_else(
+        || crate::tools::verify_gate::data_root().join(SCREENSHOT_SUBDIR),
+        std::path::PathBuf::from,
+    )
+}
 
 pub async fn handle(
     arguments: Option<JsonObject>,
@@ -314,14 +387,10 @@ async fn render_prepared_live(
         }
     };
 
-    let screenshot_dir = env.get(OUTPUT_DIR_ENV).map_or_else(
-        || std::env::temp_dir().join("copperclaw-browser"),
-        std::path::PathBuf::from,
-    );
     let nav_timeout =
         std::time::Duration::from_secs(prepared.req.timeout_secs.unwrap_or(30).clamp(1, 120));
     let opts = LiveRenderOptions {
-        screenshot_dir,
+        screenshot_dir: screenshot_dir(env),
         cdp_port: 9222,
         nav_timeout,
     };
@@ -590,6 +659,132 @@ mod tests {
         assert_eq!(
             egress_allow_for("http://example.com:8080/").unwrap(),
             vec!["example.com:8080".to_string()]
+        );
+    }
+
+    // ── V4: preview egress allow-list injection ──────────────────────────
+
+    #[test]
+    fn is_host_port_accepts_valid_and_rejects_malformed() {
+        assert!(is_host_port("127.0.0.1:8080"));
+        assert!(is_host_port("app.local:80"));
+        assert!(is_host_port("172.17.0.9:5173"));
+        // No port / empty host / out-of-range port / junk → rejected.
+        assert!(!is_host_port("127.0.0.1"));
+        assert!(!is_host_port(":8080"));
+        assert!(!is_host_port("host:99999")); // > u16::MAX
+        assert!(!is_host_port("host:notaport"));
+        assert!(!is_host_port(""));
+    }
+
+    #[test]
+    fn preview_egress_allow_parses_filters_and_trims() {
+        let e = env(&[(
+            "COPPERCLAW_BROWSER_PREVIEW_ALLOW",
+            " 127.0.0.1:8080 , junk , host:99999 , ok.host:443 ",
+        )]);
+        assert_eq!(
+            preview_egress_allow(&e),
+            vec!["127.0.0.1:8080".to_string(), "ok.host:443".to_string()]
+        );
+    }
+
+    #[test]
+    fn preview_egress_allow_empty_when_unset() {
+        assert!(preview_egress_allow(&env(&[])).is_empty());
+    }
+
+    /// The deny-default-egress fixture: with the host-supplied preview allow
+    /// entry present, `prepare` builds a child spec whose deny-default egress
+    /// permits BOTH the navigation target and the injected preview host:port —
+    /// proving the allow-list injection lands on the spec the spawn path
+    /// consumes.
+    #[tokio::test]
+    async fn prepare_injects_preview_allow_into_deny_default_egress() {
+        let ctx = TaintRecordingCtx::default();
+        let prepared = prepare(
+            input("https://8.8.8.8/", Some("screenshot")),
+            &env(&[
+                ("COPPERCLAW_BROWSER_ENABLED", "1"),
+                ("COPPERCLAW_BROWSER_PREVIEW_ALLOW", "172.17.0.9:5173"),
+            ]),
+            &NavGuard,
+            &ctx,
+        )
+        .await
+        .expect("public literal passes");
+        assert_eq!(
+            prepared.spec.egress_mode,
+            copperclaw_container_rt::EgressMode::DenyDefault
+        );
+        assert_eq!(
+            prepared.spec.egress_allow,
+            vec!["8.8.8.8:443".to_string(), "172.17.0.9:5173".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_without_preview_allow_is_target_only() {
+        let ctx = TaintRecordingCtx::default();
+        let prepared = prepare(
+            input("https://8.8.8.8/", Some("screenshot")),
+            &env(&[("COPPERCLAW_BROWSER_ENABLED", "1")]),
+            &NavGuard,
+            &ctx,
+        )
+        .await
+        .expect("public literal passes");
+        // Byte-identical to pre-V4: exactly the navigation target.
+        assert_eq!(prepared.spec.egress_allow, vec!["8.8.8.8:443".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn prepare_dedupes_preview_allow_equal_to_target() {
+        let ctx = TaintRecordingCtx::default();
+        // Preview allow == the navigation target → not duplicated. (Uses a
+        // public literal so the SSRF pre-flight passes; the real preview target
+        // is an RFC1918 bridge IP, but that would be refused by the guard, and
+        // dedupe is host-agnostic.)
+        let prepared = prepare(
+            input("http://93.184.216.34:5173/", Some("screenshot")),
+            &env(&[
+                ("COPPERCLAW_BROWSER_ENABLED", "1"),
+                ("COPPERCLAW_BROWSER_PREVIEW_ALLOW", "93.184.216.34:5173"),
+            ]),
+            &NavGuard,
+            &ctx,
+        )
+        .await
+        .expect("public literal passes");
+        assert_eq!(
+            prepared.spec.egress_allow,
+            vec!["93.184.216.34:5173".to_string()]
+        );
+    }
+
+    // ── V4: screenshot output dir defaults under the session data root ───
+
+    #[test]
+    fn screenshot_dir_prefers_explicit_override() {
+        let e = env(&[("COPPERCLAW_BROWSER_OUTPUT_DIR", "/custom/shots")]);
+        assert_eq!(
+            screenshot_dir(&e),
+            std::path::PathBuf::from("/custom/shots")
+        );
+    }
+
+    #[test]
+    fn screenshot_dir_defaults_under_data_root() {
+        // With no explicit override, screenshots land under the shared data
+        // root (so the in-container agent can send_file them). The concrete
+        // root is whatever `verify_gate::data_root()` resolves to in this
+        // process; the invariant is the `screenshots` leaf under it.
+        let got = screenshot_dir(&env(&[]));
+        let want = crate::tools::verify_gate::data_root().join(SCREENSHOT_SUBDIR);
+        assert_eq!(got, want);
+        assert_eq!(
+            got.file_name().and_then(|s| s.to_str()),
+            Some("screenshots")
         );
     }
 

@@ -1,0 +1,13 @@
+{
+  "channel_type": "cli",
+  "platform_id": "stdin",
+  "thread_id": null,
+  "message": {
+    "id": "fixture-prototype-verify-gate-001",
+    "kind": "chat",
+    "content": {"text": "build a tiny todo app, verify it, and mark the task done"},
+    "timestamp": "2026-01-01T00:00:00Z"
+  },
+  "reply_to": null,
+  "sender": null
+}

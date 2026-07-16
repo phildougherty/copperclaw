@@ -1,0 +1,19 @@
+{
+  "name": "cli-prototype-verify-gate",
+  "channel": "cli",
+  "description": "M18 X2 acceptance fixture: the R3 verify-gate refuse -> fix -> pass loop X1 could not exercise (/data was hardcoded). Driven under COPPERCLAW_DATA_ROOT (T2's unconditional override) pointed at a per-run dir, so the in-process runner's gate resolves real, writable project state. Scripted mock provider: record a verify command, write a BROKEN file, attempt todo_update completed (REFUSED, cycles remaining), run the verify command (FAILS, stderr recorded, fix cycle burned), attempt completion again (REFUSED again), write the FIXED file, run the verify command (PASSES, dirty cleared), attempt completion (ALLOWED). Registered in tests/replay.rs via a subprocess re-exec that sets the env var (forbid(unsafe_code) blocks std::env::set_var). See README.md.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 15000
+  },
+  "max_tool_turns": 14,
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"created_at\":\"[^\"]+\"": "\"created_at\":\"<TS>\"",
+    "\"updated_at\":\"[^\"]+\"": "\"updated_at\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

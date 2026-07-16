@@ -667,5 +667,252 @@ async fn telegram_rate_limited_retry_honours_retry_after() {
 /// reason for each.
 #[tokio::test]
 async fn cli_prototype_golden_path() {
+    if std::env::var_os("COPPERCLAW_X2_GENERATE").is_some() {
+        // Fixture-authoring path (X2): regenerate expected/*.jsonl from a
+        // real run. Never taken under a normal `cargo test`.
+        let path = fixture_path("cli", "prototype-golden");
+        let fixture = Fixture::load(&path).expect("load fixture");
+        let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+        harness.run().await.expect("run harness");
+        harness.dump_expected_jsonl();
+        return;
+    }
     run_fixture("cli", "prototype-golden").await;
+}
+
+/// M18 X2 (P3 ritual card shape): beyond the byte-stable JSONL diff, pin
+/// the exact shape of the closing "prototype ready" ritual — the P3
+/// `send_card` (title + one-liner body + a "What to try" field + the
+/// `artifact_path` host-path footer field + an Open-preview URL button)
+/// AND the screenshot delivered alongside it via `send_file`. P3 teaches
+/// this ritual in the prompt/skills; X2 owns asserting the delivered
+/// shape here (the coordination is one-way — P3 never touches
+/// fixtures/replay.rs).
+#[tokio::test]
+async fn cli_prototype_golden_ritual_card_and_screenshot_shape() {
+    let harness = run_fixture_into_harness("cli", "prototype-golden").await;
+    let cli = mock_for(&harness, "cli");
+    let deliveries = cli.deliveries();
+
+    // The screenshot rides its own message ahead of the card (cards can't
+    // attach a local PNG — P3's "send_file alongside" rule).
+    let screenshot = deliveries
+        .iter()
+        .find(|d| {
+            d.message
+                .content
+                .get("files")
+                .and_then(|f| f.as_array())
+                .is_some_and(|arr| {
+                    arr.iter()
+                        .any(|f| f.get("filename").and_then(|n| n.as_str()) == Some("preview.png"))
+                })
+        })
+        .expect("a preview.png screenshot must be delivered alongside the ritual card");
+    assert_eq!(
+        screenshot
+            .message
+            .content
+            .get("text")
+            .and_then(|t| t.as_str()),
+        Some("Preview screenshot of the running todo app."),
+        "screenshot caption",
+    );
+
+    // The ritual card renders through the cli text-fallback with every
+    // required element: title, one-liner, "What to try", the artifact_path
+    // host-path footer, and the Open-preview button.
+    let card_text = deliveries
+        .iter()
+        .filter_map(|d| d.message.content.get("text").and_then(|t| t.as_str()))
+        .find(|t| t.contains("Todo app is ready"))
+        .expect("the ritual card must be delivered");
+    assert!(
+        card_text.contains("**Todo app is ready**"),
+        "card must carry the title as a headline: {card_text}",
+    );
+    assert!(
+        card_text.contains("stdlib-only HTTP todo server"),
+        "card must carry the one-liner body: {card_text}",
+    );
+    assert!(
+        card_text.contains("What to try:"),
+        "card must carry the What-to-try field: {card_text}",
+    );
+    assert!(
+        card_text.contains("Project path: /tmp/copperclaw-x1-golden/todo-app"),
+        "card must carry the artifact_path host-path footer: {card_text}",
+    );
+    assert!(
+        card_text.contains("[Open preview] -> http://192.0.2.10:8100/__preview/fixture-tok-8000"),
+        "card must carry the Open-preview URL button: {card_text}",
+    );
+}
+
+// ---- M18 X2: the R3 verify-gate refuse -> fix -> pass loop ----
+//
+// X1 could not exercise this leg because `verify_gate::data_root()` /
+// `todo.rs`'s path resolution were hardcoded to `/data` (an unwritable
+// root-owned path on any host running the suite). T2 added the
+// unconditional `COPPERCLAW_DATA_ROOT` override; this test points the
+// in-process runner's gate at a writable per-run dir through it.
+//
+// The catch: the workspace `forbid(unsafe_code)` (applied to this
+// integration-test target via `[lints] workspace = true`) makes
+// `std::env::set_var` unavailable, and the gate reads its root from
+// process env at call time with no per-instance seam. So instead of
+// mutating our own env we re-exec THIS test binary as a child with the
+// var set via the safe `Command::env`, and the child runs the real
+// `ReplayHarness` against the `prototype-verify-gate` fixture. The gate
+// then genuinely engages against real, writable project state.
+
+/// Fixed data root for the verify-gate fixture. The fixture's claude
+/// turns hard-code project paths under this dir, so it must be a stable,
+/// known path (same `/tmp` convention `prototype-golden` already uses for
+/// its project dir).
+const X2_VERIFY_DATA_ROOT: &str = "/tmp/copperclaw-x2-verify-gate";
+/// Set on the re-exec'd child so it runs the scenario instead of
+/// re-spawning itself.
+const X2_CHILD_ENV: &str = "COPPERCLAW_X2_VERIFY_GATE_CHILD";
+/// `assert` (default) or `dump` — the latter prints the captured actual
+/// streams as JSONL so `expected/*.jsonl` can be regenerated from a real
+/// run (`COPPERCLAW_X2_GENERATE=1 cargo test ... cli_prototype_verify_gate`).
+const X2_MODE_ENV: &str = "COPPERCLAW_X2_VERIFY_GATE_MODE";
+
+#[tokio::test]
+async fn cli_prototype_verify_gate_refuse_fix_pass() {
+    // Child leg: env already set by the parent's re-exec. Run the real
+    // scenario against the gate rooted at X2_VERIFY_DATA_ROOT.
+    if std::env::var_os(X2_CHILD_ENV).is_some() {
+        let dump = std::env::var(X2_MODE_ENV).ok().as_deref() == Some("dump");
+        run_verify_gate_child(dump).await;
+        return;
+    }
+
+    // Parent leg: re-exec ourselves with COPPERCLAW_DATA_ROOT set (via the
+    // safe Command::env — set_var is unavailable under forbid(unsafe_code)).
+    let _ = std::fs::remove_dir_all(X2_VERIFY_DATA_ROOT);
+    std::fs::create_dir_all(X2_VERIFY_DATA_ROOT).expect("create x2 verify-gate data root");
+
+    let mode = if std::env::var_os("COPPERCLAW_X2_GENERATE").is_some() {
+        "dump"
+    } else {
+        "assert"
+    };
+    let exe = std::env::current_exe().expect("current_exe");
+    let output = std::process::Command::new(exe)
+        .args([
+            "--exact",
+            "cli_prototype_verify_gate_refuse_fix_pass",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(X2_CHILD_ENV, "1")
+        .env(X2_MODE_ENV, mode)
+        .env("COPPERCLAW_DATA_ROOT", X2_VERIFY_DATA_ROOT)
+        .output()
+        .expect("spawn verify-gate re-exec child");
+
+    let _ = std::fs::remove_dir_all(X2_VERIFY_DATA_ROOT);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if mode == "dump" {
+        // Generation run: surface the child's dumped JSONL to the operator.
+        println!("{stdout}");
+    }
+    assert!(
+        output.status.success(),
+        "verify-gate child failed (status {:?})\n\
+         --- child stdout ---\n{stdout}\n--- child stderr ---\n{stderr}",
+        output.status.code(),
+    );
+}
+
+/// The child scenario: drive the `prototype-verify-gate` fixture through
+/// the real harness. In `dump` mode, print the captured actuals (fixture
+/// authoring). Otherwise diff against the committed `expected/*.jsonl` and
+/// assert the refuse -> fix -> pass shape genuinely occurred.
+async fn run_verify_gate_child(dump: bool) {
+    let path = fixture_path("cli", "prototype-verify-gate");
+    assert!(
+        path.exists(),
+        "fixture missing at {} — see docs/replay-fixtures.md",
+        path.display()
+    );
+    let fixture = Fixture::load(&path).expect("load verify-gate fixture");
+    let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+    harness.run().await.expect("run harness");
+
+    if dump {
+        harness.dump_expected_jsonl();
+        return;
+    }
+
+    // Byte-stable pipeline diff first (expected/*.jsonl).
+    let report = harness.compare().expect("compare");
+    assert!(report.is_clean(), "{report}");
+
+    // The refusal messages are handed back to the model as tool_result
+    // blocks, so they ride along in the provider request bodies captured
+    // by the wiremock server. Concatenate every received request body and
+    // assert the refuse -> fix -> pass shape.
+    let reqs = harness
+        .anthropic_server
+        .received_requests()
+        .await
+        .expect("wiremock recorded received requests");
+    let bodies: String = reqs
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Completion refused while the project was dirty, naming the project
+    // and the recorded verify command.
+    assert!(
+        bodies.contains("unverified changes"),
+        "expected the verify-gate refusal in a tool_result body",
+    );
+    assert!(
+        bodies.contains("python3 -m py_compile app.py"),
+        "refusal must name the recorded verify command",
+    );
+    // The failing verify run's stderr (a Python SyntaxError) reached the
+    // model — "refused WITH stderr", per the card.
+    assert!(
+        bodies.contains("SyntaxError"),
+        "failing verify run's stderr must reach the model",
+    );
+    // Both fix-cycle counts appear across the two refusals (2 remaining,
+    // then 1) — proof the loop advanced through a failed verify rather
+    // than refusing statically.
+    assert!(
+        bodies.contains("2 fix cycle(s) remaining"),
+        "first refusal reports the full fix-cycle budget",
+    );
+    assert!(
+        bodies.contains("1 fix cycle(s) remaining"),
+        "second refusal reports the burned-down fix-cycle budget",
+    );
+
+    // The pass: the todo store (also resolved under COPPERCLAW_DATA_ROOT)
+    // shows the item genuinely completed once the verify passed.
+    let todo_store = std::path::Path::new(X2_VERIFY_DATA_ROOT).join("agent_todos.json");
+    let raw = std::fs::read_to_string(&todo_store)
+        .unwrap_or_else(|e| panic!("todo store missing at {}: {e}", todo_store.display()));
+    let todos: serde_json::Value = serde_json::from_str(&raw).expect("todo store is JSON");
+    let first = &todos.as_array().expect("todo store is an array")[0];
+    assert_eq!(
+        first["status"], "completed",
+        "the todo must end completed once the verify passed: {todos}",
+    );
+
+    // The passing verify run cleared the project's dirty marker.
+    let dirty = std::path::Path::new(X2_VERIFY_DATA_ROOT).join("proj/.copperclaw/dirty");
+    assert!(
+        !dirty.exists(),
+        "passing verify must clear the dirty marker at {}",
+        dirty.display(),
+    );
 }

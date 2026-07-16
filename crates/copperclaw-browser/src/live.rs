@@ -436,6 +436,107 @@ mod tests {
         assert!(runtime.removed.lock().unwrap().is_empty());
     }
 
+    /// A minimal 1x1 PNG, base64-encoded — what a real `Page.captureScreenshot`
+    /// hands back in its `data` field. The driver base64-decodes and writes the
+    /// bytes verbatim, so this is enough to prove a PNG lands on disk.
+    const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC\
+AAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+
+    /// A CDP transport that additionally answers `Page.captureScreenshot` with a
+    /// PNG payload, so the screenshot render path writes a real file.
+    struct ScreenshotTransport;
+
+    #[async_trait]
+    impl CdpTransport for ScreenshotTransport {
+        async fn send(&self, method: &str, _params: Value) -> Result<Value, BrowserError> {
+            match method {
+                "Page.captureScreenshot" => Ok(json!({ "data": TINY_PNG_B64 })),
+                // final_url eval + any other command.
+                "Runtime.evaluate" => Ok(json!({ "result": { "value": "https://preview.test/" } })),
+                _ => Ok(json!({})),
+            }
+        }
+        async fn wait_for_load(&self, _timeout: Duration) -> Result<(), BrowserError> {
+            Ok(())
+        }
+        fn redirect_hops(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn main_status(&self) -> Option<u16> {
+            Some(200)
+        }
+    }
+
+    struct ScreenshotConnector;
+
+    #[async_trait]
+    impl CdpConnector for ScreenshotConnector {
+        async fn connect(&self, _http_base: &str) -> Result<Box<dyn CdpTransport>, BrowserError> {
+            Ok(Box::new(ScreenshotTransport))
+        }
+    }
+
+    /// End-to-end with the mock driver stack (V3's mock runtime + mock CDP
+    /// transport), screenshot mode: spawn → render → a PNG file exists under the
+    /// configured output dir (which V4 defaults to the session `/data` dir), and
+    /// the render output carries its path. This is the supply the P3 ritual
+    /// relays with `send_file`.
+    #[tokio::test]
+    async fn render_live_screenshot_writes_png_under_output_dir() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        // Stand in for the session `/data/screenshots` dir.
+        let out_dir = std::env::temp_dir().join(format!("copperclaw-v4-shot-{nanos}"));
+
+        let runtime = MockRuntime {
+            ip: Some("172.17.0.9".into()),
+            ..Default::default()
+        };
+        let guard = RecordingGuard::default();
+        let req = RenderRequest {
+            url: "http://172.17.0.9:5173/".into(),
+            mode: RenderMode::Screenshot,
+            timeout_secs: None,
+        };
+        let opts = LiveRenderOptions {
+            screenshot_dir: out_dir.clone(),
+            cdp_port: 9222,
+            nav_timeout: Duration::from_secs(5),
+        };
+
+        let out = render_live(
+            &req,
+            enabled_spec(),
+            &guard,
+            &runtime,
+            &ScreenshotConnector,
+            &opts,
+        )
+        .await
+        .expect("screenshot render succeeds");
+
+        assert!(out.is_untrusted());
+        let path = out
+            .screenshot_path
+            .as_deref()
+            .expect("screenshot mode yields a path");
+        let path = std::path::Path::new(path);
+        assert!(path.exists(), "PNG must exist at {}", path.display());
+        assert!(
+            path.starts_with(&out_dir),
+            "PNG must land under the configured output dir"
+        );
+        assert_eq!(path.extension().and_then(|e| e.to_str()), Some("png"));
+        // The bytes are the decoded PNG, not empty.
+        let bytes = std::fs::read(path).expect("read back the PNG");
+        assert!(bytes.starts_with(b"\x89PNG"), "wrote a real PNG header");
+
+        // Cleanup.
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
     #[tokio::test]
     async fn render_live_blocks_ssrf_target_before_spawning() {
         // The SSRF target pre-flight runs BEFORE spawn: a refused target never

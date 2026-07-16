@@ -45,6 +45,102 @@ adheres to [Semantic Versioning](https://semver.org/).
     covered by ordinary unit tests, with the real pip/npm run gated behind an
     `#[ignore]`d Docker-integration test (opt in with `--ignored`).
 
+### Added (M18 X2 — close the golden-fixture gaps, 2026-07-16)
+
+- The M18 program-acceptance golden fixture now covers the two legs X1
+  shipped without a genuine end-to-end exercise.
+  - `fixtures/cli/prototype-verify-gate/` (new, registered in
+    `crates/copperclaw-host/tests/replay.rs` as
+    `cli_prototype_verify_gate_refuse_fix_pass`): the R3 verification-gate
+    **refuse → fix → pass** loop, genuinely exercised — a scripted mock
+    provider records a verify command, writes a broken file, is REFUSED at
+    `todo_update completed` (dirty, `2 fix cycle(s) remaining`), runs a
+    failing verify (Python `SyntaxError`, refused again with
+    `1 fix cycle(s) remaining`), writes the fix, runs a passing verify, and is
+    then ALLOWED to complete. X1 could not cover this because
+    `verify_gate::data_root()` / `todo.rs` were hardcoded to `/data`; **T2's
+    `COPPERCLAW_DATA_ROOT` override** points the in-process runner's gate at a
+    writable per-run dir. Because `forbid(unsafe_code)` blocks
+    `std::env::set_var`, the registered test **re-execs itself** as a child
+    process with the env var set via the safe `std::process::Command::env` —
+    no production source change (T2 already shipped the seam). Refusal shapes
+    are asserted from the wiremock server's captured request bodies (the
+    `tool_result`s handed back to the model); the pass is asserted from the
+    on-disk todo store (`status: completed`) and the cleared `.copperclaw/dirty`
+    marker.
+  - `fixtures/cli/prototype-golden/`: extended to emit the P3 "prototype
+    ready" ritual in full — a `send_file` **screenshot delivered alongside**
+    the `send_card` (cards can't attach a local file), and the card's
+    `artifact_path` host-path footer. New `cli_prototype_golden_ritual_card_and_screenshot_shape`
+    test asserts the delivered card shape (title, one-liner, "What to try",
+    the host-path footer, the Open-preview URL button) and the screenshot,
+    on top of the byte-stable JSONL diff. Expected streams regenerated.
+  - `crates/copperclaw-host/tests/replay/harness.rs`: new `dump_expected_jsonl`
+    fixture-authoring aid — prints each captured actual stream as
+    substituted JSONL so `expected/*.jsonl` can be generated from a real run
+    (`COPPERCLAW_X2_GENERATE=1`) instead of hand-guessed.
+  - The **HUD status-row leg remains uncovered** on `cli` (not edit-capable →
+    always `StatusRows`, gated behind a 60 s real-wall-clock first fire a
+    millisecond replay never crosses). X2 did not add a clock seam; both
+    fixture READMEs document why an edit-capable channel is the right vehicle.
+
+### Changed (M18 V4 — screenshot-the-preview path, 2026-07-16)
+
+- `browser_render` now lands its screenshot where the in-container agent can
+  relay it, and can reach the prototype's own preview under deny-default
+  egress — so the P3 "prototype ready" ritual can render the live app and
+  attach the PNG via `send_file`.
+  - `crates/copperclaw-mcp/src/tools/browser_render.rs`: the default screenshot
+    output dir is refined from a host temp dir to `<data_root>/screenshots`
+    (`/data/screenshots` in production), reusing the shared
+    `COPPERCLAW_DATA_ROOT`-aware `verify_gate::data_root()` so the PNG is
+    readable in-container for `send_file`. An explicit
+    `COPPERCLAW_BROWSER_OUTPUT_DIR` still wins.
+  - Egress allow-list injection: a new `COPPERCLAW_BROWSER_PREVIEW_ALLOW`
+    (comma-separated `host:port`) is folded into the browser child's
+    deny-default egress allow-list in `prepare` (deduped, malformed entries
+    dropped). The host sets it at browser-child spawn from the live
+    `PreviewEntry` (`container_ip:container_port`, read-only). **Render-target
+    decision:** the render targets the prototype's own session container
+    directly on the Docker bridge (`http://<container_ip>:<container_port>`),
+    NOT the host preview-proxy URL — the V1 proxy 403s any cookieless request,
+    and the child + app container already share the bridge. Unset → target-only
+    allow-list, byte-identical to pre-V4.
+  - `send_card` cannot attach a local file (its image field is an http(s)
+    `image_url`), so the screenshot reaches the user via `send_file` sent
+    alongside the ritual card — not embedded in it.
+  - When `COPPERCLAW_BROWSER_ENABLED` is unset the tool stays disabled, so the
+    ritual simply omits the screenshot — never an error.
+  - Tests: preview-allow parsing/filtering + the deny-default-egress injection
+    fixture (`browser_render.rs`); a mock-driver screenshot e2e proving a PNG
+    lands under the configured `/data` output dir
+    (`crates/copperclaw-browser/src/live.rs`).
+
+### Changed (M18 P3 — the "prototype ready" ritual, 2026-07-16)
+
+- Every build now ends with one concrete `send_card` hand-off instead of
+  whatever prose the model chose, so a "build me X" run finishes with a
+  coherent demo the operator can open, download, and steer.
+  - `crates/copperclaw-host/src/container_manager/prompt.rs`: the static
+    `CODING_PREAMBLE` floor block (active only for `Coding` / `Full` profiles)
+    gains one closing bullet mandating the ritual card — title + one-line
+    summary, a "What to try" bullet, an **Open preview** URL button (only when
+    the app serves HTTP), a **Download** button (`value: "download"`, answered
+    next turn with the `git archive` zip via `send_file`), the `artifact_path`
+    host path in a footer field, and the screenshot sent alongside via
+    `send_file` (a card can't attach a local file — `image_url` must be
+    http(s)). The block stays a compile-time const, so the prompt-cache prefix
+    is unchanged per spawn and `Messaging` / `Minimal` profiles gain zero bytes
+    (pinned by the existing cache-stability / zero-new-bytes tests).
+  - `skills/coding-task/SKILL.md`: dropped the "a richer close card is
+    forthcoming — P3" hedge and taught the actual `send_card` ritual as the
+    mandatory final step, with capability-based degradation (no preview → no
+    button, no screenshot → no PNG; never a dead link); trimmed the surrounding
+    delivery prose to stay under the 8 KiB skill-body cap.
+  - `skills/send-card/SKILL.md`: added a worked "prototype ready" close example
+    (URL + `value` buttons, artifact-path field, screenshot-alongside note) and
+    the degradation rules, rather than duplicating the schema into coding-task.
+
 ### Added (M18 G1 — in-chat approvals, 2026-07-16)
 
 - Approval cards can now be resolved by tapping **Approve** / **Deny** from

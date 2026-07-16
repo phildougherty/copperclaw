@@ -1,0 +1,9 @@
+{
+  "events": [
+    {"type": "message_start", "message": {"id": "msg_vg_004"}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_vg_004", "name": "todo_update", "input": {}}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"id\": 1, \"status\": \"completed\", \"evidence\": \"wrote proj/app.py and ran python3 -m py_compile app.py; it exited 0 and compiled clean\"}"}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_stop"}
+  ]
+}
