@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::capture::CaptureOptions;
+
 /// Which read-only artifact the caller wants back. Each maps to a distinct
 /// read-only CDP operation; none of them mutates page state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +49,14 @@ pub struct RenderRequest {
     /// Navigation timeout in seconds (clamped by the driver).
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// Screenshot capture fidelity (M20 D2): viewport preset, full-page vs.
+    /// windowed, format/quality. Only meaningful for [`RenderMode::Screenshot`].
+    /// Defaults to [`CaptureOptions::legacy_full_page`] — the pre-D2
+    /// hard-coded `browser_render`/`browser_interact` behavior — via
+    /// `#[serde(default)]`, so an omitted field on the wire reproduces it
+    /// byte-for-byte.
+    #[serde(default)]
+    pub capture: CaptureOptions,
 }
 
 impl RenderRequest {
@@ -191,6 +201,7 @@ mod tests {
             url: "   ".into(),
             mode: RenderMode::DomText,
             timeout_secs: None,
+            capture: CaptureOptions::default(),
         };
         assert!(matches!(
             req.validate(),
@@ -204,6 +215,7 @@ mod tests {
             url: "https://example.com".into(),
             mode: RenderMode::Screenshot,
             timeout_secs: Some(30),
+            capture: CaptureOptions::default(),
         };
         assert!(req.validate().is_ok());
     }

@@ -165,6 +165,7 @@ mod tests {
             url: url.into(),
             mode,
             timeout_secs: None,
+            capture: crate::capture::CaptureOptions::default(),
         }
     }
 

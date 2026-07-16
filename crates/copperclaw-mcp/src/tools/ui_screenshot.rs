@@ -49,18 +49,20 @@ use std::time::Duration;
 use crate::context::{ToolContext, bytes_b64};
 use crate::error::ToolError;
 use crate::tools::{ToolEntry, ToolHandler, make_tool, parse_args};
+use copperclaw_browser::{CaptureOptions, ImageFormat, ViewportPreset};
 use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
 use serde::Deserialize;
 use serde_json::json;
 
-/// Cap on the PNG this tool will attach. Mirrors `view_image`'s cap
+/// Cap on the image this tool will attach. Mirrors `view_image`'s cap
 /// (`crate::tools::view_image::MAX_IMAGE_BYTES`): the base64 lives in
 /// conversation history until compaction, so an oversized image just burns
 /// context budget for no vision benefit. The default 1280x800 windowed
-/// capture stays comfortably under this in practice; D2 (a later M20 card)
-/// adds an automatic jpeg-downgrade retry for the rare oversize case. For
-/// now an oversize capture is refused with a hint.
-const MAX_SCREENSHOT_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
+/// capture stays comfortably under this in practice; when it isn't (e.g. a
+/// tall page even at 1280x800, or `full_page: true`), [`copperclaw_browser::
+/// capture_with_size_safety`] automatically retries once as a lower-fidelity
+/// jpeg (M20 D2) rather than erroring outright.
+const MAX_SCREENSHOT_BYTES: u64 = copperclaw_browser::SIZE_SAFETY_CAP_BYTES;
 
 /// Navigation/load timeout for the in-container chromium.
 const NAV_TIMEOUT: Duration = Duration::from_secs(30);
@@ -84,6 +86,22 @@ struct Input {
     /// omitted.
     #[serde(default)]
     project: Option<String>,
+    /// M20 D2: `desktop` (1280x800, DEFAULT — byte-identical to D1's fixed
+    /// viewport) | `mobile` (390x844, touch + mobile UA). ONE mobile preset,
+    /// not a device matrix.
+    #[serde(default)]
+    viewport: Option<String>,
+    /// M20 D2: capture the whole scrollable page instead of just the
+    /// viewport. Defaults to `false` (D1's windowed behavior — full-page
+    /// would blow the image-attachment size cap on a long page).
+    #[serde(default)]
+    full_page: Option<bool>,
+    /// M20 D2: `png` (default) | `jpeg`.
+    #[serde(default)]
+    format: Option<String>,
+    /// M20 D2: jpeg quality (1-100). Ignored for png.
+    #[serde(default)]
+    quality: Option<u8>,
 }
 
 pub fn schema() -> Tool {
@@ -94,11 +112,16 @@ pub fn schema() -> Tool {
          building and iterate on it (pair with `load_skill(\"frontend-design\")` for the \
          critique checklist). `url` MUST be a loopback address (127.0.0.1 / ::1 / localhost) — \
          this is NOT a general web-browsing tool; for a real external site use `browser_render` \
-         instead. Captures a fixed 1280x800 WINDOWED viewport (not full-page — full-page would \
-         blow the image-attachment size cap) and returns the image directly, plus the path it \
-         was saved to under `.copperclaw/screenshots/` so you can `send_file` it later. Requires \
-         chromium, which is baked into the `prototyping` image profile; on a minimal-profile \
-         container this returns a clear, actionable error instead of failing silently.",
+         instead. Defaults to a 1280x800 WINDOWED viewport (not full-page — full-page would blow \
+         the image-attachment size cap) and returns the image directly, plus the path it was \
+         saved to under `.copperclaw/screenshots/` so you can `send_file` it later. Optional \
+         args: `viewport` (`desktop` default | `mobile` — 390x844 with touch + mobile UA, for \
+         checking responsive layout), `full_page` (default false), `format` (`png` default | \
+         `jpeg`, with optional `quality`). If a capture ever exceeds the size cap, it is \
+         automatically retried once as a lower-fidelity jpeg and the response notes the \
+         downgrade — it never just errors. Requires chromium, which is baked into the \
+         `prototyping` image profile; on a minimal-profile container this returns a clear, \
+         actionable error instead of failing silently.",
         json!({
             "type": "object",
             "additionalProperties": false,
@@ -107,7 +130,11 @@ pub fn schema() -> Tool {
                 "url": { "type": "string", "minLength": 1 },
                 "wait_ms": { "type": ["integer", "null"], "minimum": 0, "maximum": 10000 },
                 "wait_for_selector": { "type": ["string", "null"], "minLength": 1 },
-                "project": { "type": ["string", "null"], "minLength": 1 }
+                "project": { "type": ["string", "null"], "minLength": 1 },
+                "viewport": { "type": ["string", "null"], "enum": ["desktop", "mobile", null] },
+                "full_page": { "type": ["boolean", "null"] },
+                "format": { "type": ["string", "null"], "enum": ["png", "jpeg", null] },
+                "quality": { "type": ["integer", "null"], "minimum": 1, "maximum": 100 }
             }
         }),
     )
@@ -185,6 +212,29 @@ fn resolve_screenshot_dir(project: Option<&str>) -> PathBuf {
     root.join(".copperclaw").join("screenshots")
 }
 
+/// Resolve the screenshot-mode [`CaptureOptions`] from `input`. With NONE of
+/// `viewport`/`full_page`/`format`/`quality` set, this is byte-identical to
+/// [`CaptureOptions::ui_screenshot_default`] — D1's fixed windowed 1280x800
+/// PNG.
+fn resolve_capture_options(input: &Input) -> Result<CaptureOptions, ToolError> {
+    let viewport = match input.viewport.as_deref() {
+        Some(s) => ViewportPreset::parse(s)
+            .map_err(|e| ToolError::Validation(format!("ui_screenshot: {e}")))?,
+        None => ViewportPreset::Desktop,
+    };
+    let format = match input.format.as_deref() {
+        Some(s) => ImageFormat::parse(s)
+            .map_err(|e| ToolError::Validation(format!("ui_screenshot: {e}")))?,
+        None => ImageFormat::Png,
+    };
+    Ok(CaptureOptions {
+        viewport: Some(viewport),
+        full_page: input.full_page.unwrap_or(false),
+        format,
+        quality: input.quality.map(|q| q.clamp(1, 100)),
+    })
+}
+
 /// Everything up to (but not including) driving a real chromium: parse,
 /// loopback-validate, and resolve the save directory / capture knobs. Split
 /// out so the validation/resolution logic is unit-tested without touching a
@@ -194,16 +244,19 @@ struct Prepared {
     screenshot_dir: PathBuf,
     wait_ms: Option<u64>,
     wait_for_selector: Option<String>,
+    capture: CaptureOptions,
 }
 
 fn prepare(input: &Input) -> Result<Prepared, ToolError> {
     let url = validate_loopback_url(&input.url)?;
     let screenshot_dir = resolve_screenshot_dir(input.project.as_deref());
+    let capture = resolve_capture_options(input)?;
     Ok(Prepared {
         url,
         screenshot_dir,
         wait_ms: input.wait_ms,
         wait_for_selector: input.wait_for_selector.clone(),
+        capture,
     })
 }
 
@@ -230,23 +283,29 @@ pub async fn handle(
 
     let req = copperclaw_browser::ScreenshotRequest {
         url: prepared.url.to_string(),
-        width: copperclaw_browser::DEFAULT_WIDTH,
-        height: copperclaw_browser::DEFAULT_HEIGHT,
+        capture: prepared.capture.clone(),
         wait_ms: prepared.wait_ms,
         wait_for_selector: prepared.wait_for_selector.clone(),
         nav_timeout: NAV_TIMEOUT,
     };
-    let png = copperclaw_browser::capture(transport.as_ref(), &req)
-        .await
-        .map_err(|e| ToolError::Internal(format!("ui_screenshot: {e}")))?;
+    // M20 D2 size safety: an oversize capture auto-retries once as a
+    // lower-fidelity jpeg rather than erroring outright.
+    let result = copperclaw_browser::capture_with_size_safety(
+        transport.as_ref(),
+        &req,
+        MAX_SCREENSHOT_BYTES,
+    )
+    .await
+    .map_err(|e| ToolError::Internal(format!("ui_screenshot: {e}")))?;
 
-    if png.len() as u64 > MAX_SCREENSHOT_BYTES {
+    if result.bytes.len() as u64 > MAX_SCREENSHOT_BYTES {
         return Err(ToolError::Internal(format!(
             "ui_screenshot: the capture of `{}` was {} bytes, over the {MAX_SCREENSHOT_BYTES}-byte \
-             cap even at the default 1280x800 viewport — unusual; try again after the page \
-             settles (e.g. via `wait_for_selector`) or simplify the view.",
+             cap even after an automatic retry at a lower-fidelity jpeg — unusual; try again after \
+             the page settles (e.g. via `wait_for_selector`), or pass `full_page: false` / a \
+             smaller viewport.",
             prepared.url,
-            png.len()
+            result.bytes.len()
         )));
     }
 
@@ -262,23 +321,41 @@ pub async fn handle(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let path = prepared.screenshot_dir.join(format!("ui-{nanos}.png"));
-    tokio::fs::write(&path, &png).await.map_err(|e| {
+    let ext = result.capture.format.file_extension();
+    let path = prepared.screenshot_dir.join(format!("ui-{nanos}.{ext}"));
+    tokio::fs::write(&path, &result.bytes).await.map_err(|e| {
         ToolError::Internal(format!("ui_screenshot: write `{}`: {e}", path.display()))
     })?;
 
-    let b64 = bytes_b64::encode(&png);
+    let (width, height) = result.capture.viewport.map_or(
+        (
+            ViewportPreset::DESKTOP_WIDTH,
+            ViewportPreset::DESKTOP_HEIGHT,
+        ),
+        ViewportPreset::dimensions,
+    );
+    let downgrade_note = if result.downgraded {
+        format!(
+            " (note: auto-downgraded to jpeg q={} because the original {} capture exceeded the \
+             {MAX_SCREENSHOT_BYTES}-byte cap)",
+            copperclaw_browser::DOWNGRADE_JPEG_QUALITY,
+            prepared.capture.format.as_cdp_str(),
+        )
+    } else {
+        String::new()
+    };
+
+    let b64 = bytes_b64::encode(&result.bytes);
     Ok(CallToolResult::success(vec![
         Content::text(format!(
-            "Captured a {}x{} screenshot of {} ({} bytes); saved to {} (use `send_file` to \
-             share it) — it is attached below for you to see.",
-            copperclaw_browser::DEFAULT_WIDTH,
-            copperclaw_browser::DEFAULT_HEIGHT,
+            "Captured a {width}x{height} {} screenshot of {} ({} bytes){downgrade_note}; saved to \
+             {} (use `send_file` to share it) — it is attached below for you to see.",
+            result.capture.format.as_cdp_str(),
             prepared.url,
-            png.len(),
+            result.bytes.len(),
             path.display(),
         )),
-        Content::image(b64, "image/png".to_string()),
+        Content::image(b64, result.capture.format.mime_type().to_string()),
     ]))
 }
 
@@ -470,8 +547,103 @@ mod tests {
             wait_ms: None,
             wait_for_selector: None,
             project: None,
+            viewport: None,
+            full_page: None,
+            format: None,
+            quality: None,
         };
         assert!(prepare(&input).is_err());
+    }
+
+    // ── M20 D2: capture fidelity (viewport / format / full-page) ─────────
+
+    fn bare_input(url: &str) -> Input {
+        Input {
+            url: url.to_string(),
+            wait_ms: None,
+            wait_for_selector: None,
+            project: None,
+            viewport: None,
+            full_page: None,
+            format: None,
+            quality: None,
+        }
+    }
+
+    #[test]
+    fn resolve_capture_options_with_no_args_is_byte_identical_to_d1_default() {
+        // THE critical D1 back-compat property: no viewport/format/full_page
+        // args gets the EXACT pre-D2 capture options (1280x800 windowed png).
+        let opts = resolve_capture_options(&bare_input("http://127.0.0.1:5173/")).unwrap();
+        assert_eq!(opts, CaptureOptions::ui_screenshot_default());
+    }
+
+    #[test]
+    fn resolve_capture_options_mobile_preset() {
+        let mut i = bare_input("http://127.0.0.1:5173/");
+        i.viewport = Some("mobile".to_string());
+        let opts = resolve_capture_options(&i).unwrap();
+        assert_eq!(opts.viewport, Some(ViewportPreset::Mobile));
+        // full_page stays the ui_screenshot default (false) unless overridden.
+        assert!(!opts.full_page);
+    }
+
+    #[test]
+    fn resolve_capture_options_full_page_and_format_overrides() {
+        let mut i = bare_input("http://127.0.0.1:5173/");
+        i.full_page = Some(true);
+        i.format = Some("jpeg".to_string());
+        i.quality = Some(85);
+        let opts = resolve_capture_options(&i).unwrap();
+        assert!(opts.full_page);
+        assert_eq!(opts.format, ImageFormat::Jpeg);
+        assert_eq!(opts.quality, Some(85));
+        // Viewport still defaults to desktop even with other overrides set.
+        assert_eq!(opts.viewport, Some(ViewportPreset::Desktop));
+    }
+
+    #[test]
+    fn resolve_capture_options_rejects_unknown_viewport() {
+        let mut i = bare_input("http://127.0.0.1:5173/");
+        i.viewport = Some("tablet".to_string());
+        assert!(matches!(
+            resolve_capture_options(&i),
+            Err(ToolError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_capture_options_rejects_unknown_format() {
+        let mut i = bare_input("http://127.0.0.1:5173/");
+        i.format = Some("bmp".to_string());
+        assert!(matches!(
+            resolve_capture_options(&i),
+            Err(ToolError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_capture_options_clamps_quality_to_valid_range() {
+        let mut i = bare_input("http://127.0.0.1:5173/");
+        i.quality = Some(255);
+        let opts = resolve_capture_options(&i).unwrap();
+        assert_eq!(opts.quality, Some(100));
+    }
+
+    #[test]
+    fn prepare_with_no_args_yields_d1_default_capture() {
+        let prepared = prepare(&bare_input("http://127.0.0.1:5173/")).unwrap();
+        assert_eq!(prepared.capture, CaptureOptions::ui_screenshot_default());
+    }
+
+    #[test]
+    fn schema_advertises_capture_fidelity_args() {
+        let tool = schema();
+        let v: serde_json::Value = serde_json::to_value(&*tool.input_schema).unwrap();
+        let props = v.get("properties").unwrap();
+        for key in ["viewport", "full_page", "format", "quality"] {
+            assert!(props.get(key).is_some(), "schema missing `{key}`");
+        }
     }
 
     // ── live in-container acceptance (Docker/prototyping-image-gated) ────
@@ -499,5 +671,56 @@ mod tests {
             .iter()
             .any(|c| matches!(c.raw, rmcp::model::RawContent::Image(_)));
         assert!(has_image, "expected an image content block");
+    }
+
+    /// M20 D2 live smoke: a `viewport: "mobile"` capture reports different
+    /// dimensions than the `desktop` default against the SAME vite page —
+    /// proving the preset actually changes what gets captured, not just the
+    /// advertised default. Same gating as the D1 acceptance test above.
+    #[tokio::test]
+    #[ignore = "requires the prototyping image's chromium + a running dev server on 127.0.0.1; opt in with --ignored"]
+    async fn ui_screenshot_mobile_preset_differs_in_dimensions_from_desktop() {
+        let ctx = crate::context::MockToolContext::new();
+
+        let mut desktop_args = JsonObject::new();
+        desktop_args.insert("url".into(), "http://127.0.0.1:5173/".into());
+        let desktop_res = handle(Some(desktop_args), &ctx)
+            .await
+            .expect("desktop-default capture should succeed");
+        let desktop_text = desktop_res
+            .content
+            .iter()
+            .find_map(|c| match &c.raw {
+                rmcp::model::RawContent::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .expect("a text part");
+        assert!(
+            desktop_text.contains("1280x800"),
+            "desktop default should report 1280x800: {desktop_text}"
+        );
+
+        let mut mobile_args = JsonObject::new();
+        mobile_args.insert("url".into(), "http://127.0.0.1:5173/".into());
+        mobile_args.insert("viewport".into(), "mobile".into());
+        let mobile_res = handle(Some(mobile_args), &ctx)
+            .await
+            .expect("mobile-preset capture should succeed");
+        let mobile_text = mobile_res
+            .content
+            .iter()
+            .find_map(|c| match &c.raw {
+                rmcp::model::RawContent::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .expect("a text part");
+        assert!(
+            mobile_text.contains("390x844"),
+            "mobile preset should report 390x844: {mobile_text}"
+        );
+        assert_ne!(
+            desktop_text, mobile_text,
+            "mobile and desktop captures of the same page must differ"
+        );
     }
 }
