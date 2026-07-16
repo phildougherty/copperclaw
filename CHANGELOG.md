@@ -6,6 +6,51 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security (M20 D1/D5 — recorded security-review pass for the in-container vision tools, 2026-07-16)
+
+- **Reviewed and PASSED** the two M20 cards that change the default posture:
+  D1 (`ui_screenshot`, registered by default in Coding/Full — the one
+  default change in M20) and D5 (`ui_inspect`, which adds page-originated
+  console text to the transcript). The plan (decision (a)) required a
+  recorded `security-review` pass for both; this is that record. Verified
+  against the code on `main`:
+  - **Loopback boundary is sound.** `validate_loopback_url`
+    (`crates/copperclaw-mcp/src/tools/ui_screenshot.rs`, reused verbatim by
+    `ui_inspect`) parses with `reqwest::Url`, enforces an http/https scheme,
+    and validates the *host* via `IpAddr::is_loopback()` — not a string
+    match — so `10.x`, `169.254.169.254`, `0.0.0.0`, and `file://` are all
+    rejected, before chromium is ever touched.
+  - **No new privilege — confirmed at the network layer.** The in-container
+    chromium shares the session container's network namespace, so it is
+    bound by the *same* deny-default DNS/egress filter
+    (`crates/copperclaw-container-rt/src/dns.rs`) as `shell`/`curl` — it can
+    reach nothing the agent's existing shell could not. The CDP
+    remote-debugging port is bound to `--remote-debugging-address=127.0.0.1`
+    (`incontainer.rs`), so no other host or container can drive the browser.
+    `--no-sandbox` is safe because the container is the sandbox boundary and
+    the agent already has arbitrary `shell` inside it.
+  - **Untrusted-content marking is correct.** `ui_inspect` calls
+    `mark_untrusted_context` unconditionally, before navigating;
+    `ui_screenshot` calls it exactly when it folds a page-originated console
+    error into its text response (`error_count > 0`). Both mark the turn
+    before the content lands in history.
+  - **DoS bounds present.** Console buffer capped (`CONSOLE_BUFFER_CAP = 50`),
+    `wait_ms` clamped, screenshot capped at 5 MB with an automatic jpeg
+    downgrade, jpeg quality clamped, and the chromium singleton idle-reaped
+    (`IDLE_TIMEOUT = 5m`). Both tools are Coding/Full-only; Guest and Minimal
+    are denied (`copperclaw-runner/src/policy.rs`, with tests).
+  - **Accepted residual risks (documented, not defects).** (1) The
+    loopback check validates only the initial URL; chromium *will* follow an
+    HTTP redirect from a loopback page — this is contained by the container
+    netns egress (identical to `shell`), so it is not a new privilege, but
+    the "loopback-only" label is an intent guard, not an egress control; the
+    netns posture is. (2) Screenshot pixels are page-originated visual
+    content the vision model reads and are deliberately NOT tainted (decision
+    (a), `view_image` parity) — tainting every UI screenshot would defeat the
+    see→fix loop; the mitigating context is that it is the agent's own app.
+    Neither warrants a code change; both are recorded here so operators do
+    not over-trust the loopback label.
+
 ### Added (M20 M1 — metrics rider: sweep the M20 metric wishes into `copperclaw-metrics`, 2026-07-16)
 
 - One card, absolute last in the program, sweeps every metric "wish" the merged
