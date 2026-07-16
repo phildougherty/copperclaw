@@ -6,6 +6,51 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M19 A3 — Public-tunnel model verb: activate V5)
+
+- The merged-but-dormant V5 public-tunnel module now has an agent-facing verb.
+  A new first-party `make_preview_public` tool lets the agent publish a **live**
+  session preview (one already exposed with `expose_preview`) to the public
+  internet through an operator-provided cloudflared tunnel — the "send it to my
+  cofounder" hand-off. It relays through the SAME reserved `__preview` MCP path
+  as `expose_preview` (`crates/copperclaw-runner/src/run/preview.rs`:
+  `MAKE_PREVIEW_PUBLIC`, `is_preview_tool`, `preview_tool_defs`), but the
+  delivery loop routes it to a new host-side broker
+  (`crates/copperclaw-host-delivery/src/service.rs`: `execute_preview_call`'s
+  `make_preview_public` arm → `copperclaw_modules::PublicTunnelBroker`) instead
+  of the preview broker.
+- The host implementation (`crates/copperclaw-host/src/preview.rs`:
+  `PublicPreviewTunnel`) bridges the preview subsystem (which owns the container-
+  port → live host-port + gating-token mapping, via the new
+  `PreviewManager::live_proxy_for`) and the merged V5 `TunnelBroker` (which owns
+  the approval gate + the cloudflared binary). On the first call it raises the
+  `CredentialedExternalAction` approval V5 already implements and returns a
+  "pending approval" note; after an operator taps Approve, the retry stands up
+  the tunnel and returns the shareable **tokened** public URL
+  (`https://<tunnel>/__preview/<token>` — the public tunnel fronts the
+  token-gated proxy, so a tokenless hit 403s: defence in depth). The agent puts
+  that URL on its "prototype ready" delivery card as an "Open the public link"
+  button.
+- **Secure-by-default, fail-closed.** Public tunnels are OFF unless the host env
+  master switch `COPPERCLAW_PUBLIC_TUNNEL_ENABLED` is set AND the group has
+  previews enabled; every public exposure still requires an explicit operator
+  approval (no auto-exposure). `make_preview_public` is a
+  `CredentialedExternalAction` in `crates/copperclaw-runner/src/policy.rs`
+  (`CODING_TOOLS` + `CREDENTIALED_EXTERNAL_TOOLS`) — taint-gated AND
+  autonomy-gated, and deliberately **NOT** in `LAN_PREVIEW_TOOLS` (the A7 LAN
+  taint exemption never reaches it: the outward-facing contrast to
+  `expose_preview`). An absent cloudflared binary yields a clean, copy-pasteable
+  install error, never a panic or hang.
+- **Auto-teardown with the preview.** `PreviewManager` now holds the tunnel
+  broker (`set_tunnel_broker`) and tears down any public tunnel fronting a
+  preview when the preview is closed, session-stopped, shut down, or
+  idle-tombstoned — no public tunnel outlives the app it fronted; re-sharing
+  later earns a fresh approval (V5's grant is one-shot). Wired at boot in
+  `crates/copperclaw-host/src/boot.rs`. The `preview` skill
+  (`skills/preview/SKILL.md`) teaches the verb, the approval ritual, and the
+  ritual-card public-URL button. Metric wish (M1 rider): public-tunnel
+  exposures/pending/denied counts.
+
 ### Changed (M19 A7 — Preview-exposure provenance refinement)
 
 - Exposing a **LAN-only** session preview (`expose_preview` / `close_preview`)
