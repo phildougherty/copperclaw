@@ -141,7 +141,8 @@ mod tests {
     use copperclaw_types::AgentGroupId;
     use tempfile::TempDir;
 
-    const VALID: &str = "---\nname: my-skill\ndescription: A reusable procedure\n---\n# Steps\ndo the thing\n";
+    const VALID: &str =
+        "---\nname: my-skill\ndescription: A reusable procedure\n---\n# Steps\ndo the thing\n";
 
     #[test]
     fn writes_valid_skill_and_returns_dir() {
@@ -199,8 +200,8 @@ mod tests {
     fn missing_description_is_refused() {
         let td = TempDir::new().unwrap();
         let dest = td.path().join("skills");
-        let err =
-            save_group_skill(&dest, &[], "my-skill", "---\nname: my-skill\n---\nbody\n").unwrap_err();
+        let err = save_group_skill(&dest, &[], "my-skill", "---\nname: my-skill\n---\nbody\n")
+            .unwrap_err();
         assert!(matches!(err, SkillError::Frontmatter(_)));
     }
 
@@ -234,9 +235,8 @@ mod tests {
         let allowed = td.path().join("allowed");
         fs::create_dir_all(&allowed).unwrap();
         let outside = td.path().join("outside").join("skills");
-        let err =
-            save_group_skill(&outside, std::slice::from_ref(&allowed), "my-skill", VALID)
-                .unwrap_err();
+        let err = save_group_skill(&outside, std::slice::from_ref(&allowed), "my-skill", VALID)
+            .unwrap_err();
         assert!(matches!(err, SkillError::EscapedRoot { .. }));
     }
 
@@ -247,9 +247,13 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let dest = root.join("ag").join("skills");
         let canonical_root = root.canonicalize().unwrap();
-        let dir =
-            save_group_skill(&dest, std::slice::from_ref(&canonical_root), "my-skill", VALID)
-                .unwrap();
+        let dir = save_group_skill(
+            &dest,
+            std::slice::from_ref(&canonical_root),
+            "my-skill",
+            VALID,
+        )
+        .unwrap();
         assert!(dir.join("SKILL.md").is_file());
     }
 }

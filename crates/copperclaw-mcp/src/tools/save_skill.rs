@@ -19,7 +19,7 @@
 //!    where the next spawn discovers it.
 //!
 //! This is a **capability, not a registry**: a saved skill is per-group only.
-//! There is no cross-group sharing and no ClawHub (a standing non-goal).
+//! There is no cross-group sharing and no `ClawHub` (a standing non-goal).
 
 use rmcp::model::{CallToolResult, Content, JsonObject, Tool};
 use serde::Deserialize;
@@ -101,7 +101,8 @@ pub async fn handle(
         content: input.content,
         reason: input.reason,
     };
-    ctx.emit_outbound(OutboundToolEffect::SaveSkill(spec)).await?;
+    ctx.emit_outbound(OutboundToolEffect::SaveSkill(spec))
+        .await?;
 
     Ok(CallToolResult::success(vec![Content::text(format!(
         "Skill `{name}` validated and submitted for approval. Once an operator \
@@ -141,8 +142,7 @@ mod tests {
         }
     }
 
-    const VALID: &str =
-        "---\nname: greet\ndescription: Say hello nicely\n---\n# Greet\nSay hi.\n";
+    const VALID: &str = "---\nname: greet\ndescription: Say hello nicely\n---\n# Greet\nSay hi.\n";
 
     #[tokio::test]
     async fn valid_skill_emits_save_effect() {

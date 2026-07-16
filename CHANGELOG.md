@@ -6,6 +6,54 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M19 A4 — Agent-authored persistent skills, `save_skill`)
+
+- Closed the `write_file` → discovery loop: an agent can now durably save a
+  reusable skill for its FUTURE sessions via a guarded, approval-gated
+  `save_skill` capability. Skills remain host-discovered and symlink-
+  materialized at spawn, so a saved skill lands where discovery already scans
+  and is picked up on the next session — no new discovery machinery.
+  - New capability core in `copperclaw-skills`
+    (`crates/copperclaw-skills/src/save.rs`): `validate_skill_content` (pure —
+    reuses the discovery-time rules: frontmatter parse + `name`/`description`
+    required, kebab-case name, frontmatter `name == dir`) and `save_group_skill`
+    (validate + write `<group_skills_dir>/<name>/SKILL.md`). Containment reuses
+    the same allowed-roots guard `materialize` applies (lib.rs:26-29): the
+    canonical destination must lie under the configured root or the write is
+    refused with `SkillError::EscapedRoot`.
+  - New thin MCP tool `save_skill`
+    (`crates/copperclaw-mcp/src/tools/save_skill.rs`, registered in
+    `tools/mod.rs`; new `OutboundToolEffect::SaveSkill` +
+    `SaveSkillSpec` in `context.rs`). It validates the proposed `SKILL.md`
+    synchronously — an invalid one is refused HERE with the precise validation
+    error, before any approval is raised — then emits the effect. Added to the
+    runner's `SELF_MOD_TOOLS` (`copperclaw-runner/src/policy.rs`) so it is
+    `full`-profile-only and barred from guests; it is deliberately NOT a
+    credentialed-external tool (no egress).
+  - Runner records the effect as a `save_skill` `MessageKind::System` row
+    (`copperclaw-runner/src/tools.rs::apply_save_skill`).
+  - Host delivery (`copperclaw-host-delivery/src/service.rs`) intercepts the
+    row inline: it raises a `pending_approvals` row (action `save_skill`,
+    idempotent on `(agent_group, name)`) carrying the validated body plus the
+    host-computed `dest_dir` (`<groups_dir>/<ag>/skills`) and containment
+    `allowed_root`, and dispatches an approve/deny card to the originating
+    channel. Nothing is written to disk until approval. A new
+    `set_groups_dir` (wired in `copperclaw-host/src/boot.rs`) supplies the
+    per-group data root; with none configured the request is refused with a
+    `self_mod_error` inbound rather than silently dropped.
+  - On approval, the host's approvals handler
+    (`copperclaw-host/src/handlers/approvals.rs::apply_save_skill`) re-validates
+    and writes the `SKILL.md` (defense-in-depth at the security boundary); the
+    next container spawn's skill scan discovers and exposes it — no rebuild.
+  - New `skills/save-skill/SKILL.md` teaches the capability;
+    `save_skill` added to the curated `REGISTRY_TOOLS` coverage mirror.
+  - This is a capability, not a registry: skills are per-group only — no
+    cross-group sharing, no ClawHub (a standing non-goal).
+  - Metric wish (deferred to the M1 metrics rider — this card must not touch
+    `copperclaw-metrics`): `copperclaw_skills_saved_total{outcome}`
+    (saved / rejected). The save/refuse paths currently reuse the existing
+    `inc_self_mod_succeeded` / `inc_self_mod_failed("save_skill")` counters.
+
 ### Added (M19 U4 — Native cards on gchat + matrix, 2026-07-16)
 
 - Neither `gchat` nor `matrix` overrode the trait
