@@ -18,7 +18,7 @@ use copperclaw_db::tables::{
 };
 use copperclaw_modules::{
     DeliveryActionHandler, DeliveryActionInput, DeliveryDispatcher, DispatchTarget, PreviewBroker,
-    SessionInfoLite,
+    PublicTunnelBroker, PublicTunnelReply, SessionInfoLite,
 };
 use copperclaw_types::{
     AgentGroupId, ChannelType, ContainerStatus, MessageId, MessageKind, MessageOutRow,
@@ -345,6 +345,13 @@ pub struct DeliveryService {
     /// this host has no preview support — a `__preview` request is answered with
     /// a clear `is_error` rather than being left to hang the runner's poll.
     preview_broker: std::sync::OnceLock<Arc<dyn PreviewBroker>>,
+    /// Host-side broker for the M19 A3 public-tunnel verb (`make_preview_public`),
+    /// relayed through the SAME reserved `__preview` server. Set once at boot via
+    /// [`DeliveryService::set_tunnel_broker`]. `None` (unset — this host has no
+    /// tunnel support wired, e.g. no container runtime) answers a
+    /// `make_preview_public` relay with a clear `is_error` rather than hanging.
+    /// The exposure it drives stays approval-gated end to end.
+    tunnel_broker: std::sync::OnceLock<Arc<dyn PublicTunnelBroker>>,
     /// Per-agent-group data root (`COPPERCLAW_GROUPS_DIR`). When set, an
     /// approved `save_skill` (M19 A4) writes into
     /// `<groups_dir>/<agent_group_id>/skills/<name>/SKILL.md`, which the next
@@ -389,6 +396,7 @@ impl DeliveryService {
             todo_anchors: DashMap::new(),
             mcp_drain_inflight: Arc::new(DashMap::new()),
             preview_broker: std::sync::OnceLock::new(),
+            tunnel_broker: std::sync::OnceLock::new(),
             groups_dir: std::sync::OnceLock::new(),
         })
     }
@@ -432,6 +440,7 @@ impl DeliveryService {
             todo_anchors: DashMap::new(),
             mcp_drain_inflight: Arc::new(DashMap::new()),
             preview_broker: std::sync::OnceLock::new(),
+            tunnel_broker: std::sync::OnceLock::new(),
             groups_dir: std::sync::OnceLock::new(),
         })
     }
@@ -447,6 +456,14 @@ impl DeliveryService {
     /// was set (a second call is a no-op — the `OnceLock` keeps the first).
     pub fn set_preview_broker(&self, broker: Arc<dyn PreviewBroker>) -> bool {
         self.preview_broker.set(broker).is_ok()
+    }
+
+    /// Wire the host-side public-tunnel broker (M19 A3). Called once at boot
+    /// after the preview manager + tunnel broker are constructed. Returns
+    /// whether the broker was set (a second call is a no-op — the `OnceLock`
+    /// keeps the first).
+    pub fn set_tunnel_broker(&self, broker: Arc<dyn PublicTunnelBroker>) -> bool {
+        self.tunnel_broker.set(broker).is_ok()
     }
 
     /// Wire the per-agent-group data root (`COPPERCLAW_GROUPS_DIR`) used by an
@@ -766,6 +783,9 @@ impl DeliveryService {
         // broker instead of an external MCP server. Capture a clone for the
         // detached task (None => this host has no preview support).
         let preview_broker = self.preview_broker.get().map(Arc::clone);
+        // The M19 A3 `make_preview_public` verb rides the same `__preview` relay
+        // but routes to the tunnel broker instead of the preview broker.
+        let tunnel_broker = self.tunnel_broker.get().map(Arc::clone);
         let preview_session = SessionInfoLite::new(sess.id, sess.agent_group_id);
 
         // Claim the guard and hand everything to a detached task. The guard is
@@ -781,7 +801,13 @@ impl DeliveryService {
             let _guard = guard; // cleared on drop
             for req in todo {
                 let resp = if req.server == PREVIEW_SERVER {
-                    Self::execute_preview_call(preview_broker.as_ref(), preview_session, &req).await
+                    Self::execute_preview_call(
+                        preview_broker.as_ref(),
+                        tunnel_broker.as_ref(),
+                        preview_session,
+                        &req,
+                    )
+                    .await
                 } else {
                     Self::execute_mcp_call_bounded(&servers, &req).await
                 };
@@ -812,6 +838,7 @@ impl DeliveryService {
     /// hanging. An unknown reserved tool name is likewise an `is_error`.
     async fn execute_preview_call(
         broker: Option<&Arc<dyn PreviewBroker>>,
+        tunnel: Option<&Arc<dyn PublicTunnelBroker>>,
         session: SessionInfoLite,
         req: &mcp_calls::McpCallRequest,
     ) -> mcp_calls::McpCallResponse {
@@ -820,6 +847,41 @@ impl DeliveryService {
             is_error: true,
             result: msg,
         };
+        // M19 A3: `make_preview_public` routes to the tunnel broker (its own
+        // opt-in + approval gate), NOT the preview broker. Handled first so it
+        // does not depend on the preview-broker presence check below.
+        if req.tool.as_str() == "make_preview_public" {
+            let Some(port) = parse_preview_port(&req.input) else {
+                return err(
+                    "`make_preview_public` requires an integer `port` between 1 and 65535 (the \
+                     SAME container port you passed to `expose_preview`)."
+                        .to_string(),
+                );
+            };
+            let Some(tunnel) = tunnel else {
+                return err(
+                    "Public tunnels are not available on this host (no tunnel support wired). \
+                     The operator must run copperclaw on a Docker host with public tunnels \
+                     enabled to use `make_preview_public`."
+                        .to_string(),
+                );
+            };
+            return match tunnel.make_public(session, port).await {
+                // A live public URL, or a pending-approval note: both are
+                // successful (non-error) tool results the agent acts on.
+                PublicTunnelReply::Exposed { public_url, note } => mcp_calls::McpCallResponse {
+                    request_id: req.request_id.clone(),
+                    is_error: false,
+                    result: format!("{public_url}\n{note}"),
+                },
+                PublicTunnelReply::Pending { note } => mcp_calls::McpCallResponse {
+                    request_id: req.request_id.clone(),
+                    is_error: false,
+                    result: note,
+                },
+                PublicTunnelReply::Error(msg) => err(msg),
+            };
+        }
         let Some(broker) = broker else {
             return err(
                 "Preview is not available on this host (no container runtime / preview support). \
@@ -867,7 +929,7 @@ impl DeliveryService {
                 }
             }
             other => err(format!(
-                "Unknown preview action `{other}` (expected `expose_preview` or `close_preview`)."
+                "Unknown preview action `{other}` (expected `expose_preview`, `close_preview`, or `make_preview_public`)."
             )),
         }
     }
@@ -7035,6 +7097,7 @@ mod tests {
         let req = preview_req("expose_preview", json!({ "port": 3000 }));
         let resp = DeliveryService::execute_preview_call(
             None,
+            None,
             SessionInfoLite::new(SessionId::new(), AgentGroupId::new()),
             &req,
         )
@@ -7056,6 +7119,7 @@ mod tests {
         let req = preview_req("expose_preview", json!({ "port": 3000, "name": "demo" }));
         let resp = DeliveryService::execute_preview_call(
             Some(&broker),
+            None,
             SessionInfoLite::new(SessionId::new(), AgentGroupId::new()),
             &req,
         )
@@ -7080,6 +7144,7 @@ mod tests {
         let req = preview_req("expose_preview", json!({ "port": 3000 }));
         let resp = DeliveryService::execute_preview_call(
             Some(&broker),
+            None,
             SessionInfoLite::new(SessionId::new(), AgentGroupId::new()),
             &req,
         )
@@ -7100,6 +7165,7 @@ mod tests {
         let req = preview_req("expose_preview", json!({}));
         let resp = DeliveryService::execute_preview_call(
             Some(&broker),
+            None,
             SessionInfoLite::new(SessionId::new(), AgentGroupId::new()),
             &req,
         )
@@ -7120,12 +7186,142 @@ mod tests {
         let req = preview_req("frobnicate", json!({ "port": 1 }));
         let resp = DeliveryService::execute_preview_call(
             Some(&broker),
+            None,
             SessionInfoLite::new(SessionId::new(), AgentGroupId::new()),
             &req,
         )
         .await;
         assert!(resp.is_error);
         assert!(resp.result.contains("Unknown preview action"));
+    }
+
+    /// A mock public-tunnel broker returning a canned reply and recording the
+    /// container port it was asked to make public (M19 A3).
+    struct MockTunnelBroker {
+        reply: PublicTunnelReply,
+        calls: Arc<StdMutex<Vec<u16>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PublicTunnelBroker for MockTunnelBroker {
+        async fn make_public(
+            &self,
+            _session: SessionInfoLite,
+            container_port: u16,
+        ) -> PublicTunnelReply {
+            self.calls.lock().unwrap().push(container_port);
+            self.reply.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn make_public_without_tunnel_broker_is_error() {
+        // The `__preview` relay is present but no tunnel broker is wired: a
+        // `make_preview_public` gets a clean is_error, never a hang.
+        let broker: Arc<dyn PreviewBroker> = Arc::new(MockPreviewBroker {
+            expose_result: Ok(PreviewExposed {
+                url: "x".into(),
+                note: "y".into(),
+            }),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let req = preview_req("make_preview_public", json!({ "port": 3000 }));
+        let resp = DeliveryService::execute_preview_call(
+            Some(&broker),
+            None,
+            SessionInfoLite::new(SessionId::new(), AgentGroupId::new()),
+            &req,
+        )
+        .await;
+        assert!(resp.is_error);
+        assert!(resp.result.contains("Public tunnels are not available"));
+    }
+
+    #[tokio::test]
+    async fn make_public_pending_is_not_an_error() {
+        // First call → pending approval. That is a successful (non-error) result
+        // the agent acts on (wait for the tap), not a failure.
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let tunnel: Arc<dyn PublicTunnelBroker> = Arc::new(MockTunnelBroker {
+            reply: PublicTunnelReply::Pending {
+                note: "Public exposure needs operator approval. A card was sent.".into(),
+            },
+            calls: Arc::clone(&calls),
+        });
+        let req = preview_req("make_preview_public", json!({ "port": 8100 }));
+        let resp = DeliveryService::execute_preview_call(
+            None,
+            Some(&tunnel),
+            SessionInfoLite::new(SessionId::new(), AgentGroupId::new()),
+            &req,
+        )
+        .await;
+        assert!(!resp.is_error);
+        assert!(resp.result.contains("needs operator approval"));
+        assert_eq!(calls.lock().unwrap().as_slice(), [8100]);
+    }
+
+    #[tokio::test]
+    async fn make_public_exposed_renders_url_and_note() {
+        // After approval the broker returns the shareable PUBLIC url + caveat.
+        let tunnel: Arc<dyn PublicTunnelBroker> = Arc::new(MockTunnelBroker {
+            reply: PublicTunnelReply::Exposed {
+                public_url: "https://cofounder-demo.trycloudflare.com/__preview/tok".into(),
+                note:
+                    "This is a PUBLIC link — anyone on the internet who has it can reach this app."
+                        .into(),
+            },
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let req = preview_req("make_preview_public", json!({ "port": 8100 }));
+        let resp = DeliveryService::execute_preview_call(
+            None,
+            Some(&tunnel),
+            SessionInfoLite::new(SessionId::new(), AgentGroupId::new()),
+            &req,
+        )
+        .await;
+        assert!(!resp.is_error);
+        assert!(resp.result.contains("trycloudflare.com/__preview/tok"));
+        assert!(resp.result.contains("PUBLIC link"));
+    }
+
+    #[tokio::test]
+    async fn make_public_broker_error_is_surfaced() {
+        let tunnel: Arc<dyn PublicTunnelBroker> = Arc::new(MockTunnelBroker {
+            reply: PublicTunnelReply::Error(
+                "No live preview on port 8100. Run `expose_preview` first.".into(),
+            ),
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let req = preview_req("make_preview_public", json!({ "port": 8100 }));
+        let resp = DeliveryService::execute_preview_call(
+            None,
+            Some(&tunnel),
+            SessionInfoLite::new(SessionId::new(), AgentGroupId::new()),
+            &req,
+        )
+        .await;
+        assert!(resp.is_error);
+        assert!(resp.result.contains("No live preview"));
+    }
+
+    #[tokio::test]
+    async fn make_public_missing_port_is_error() {
+        let tunnel: Arc<dyn PublicTunnelBroker> = Arc::new(MockTunnelBroker {
+            reply: PublicTunnelReply::Pending { note: "x".into() },
+            calls: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let req = preview_req("make_preview_public", json!({}));
+        let resp = DeliveryService::execute_preview_call(
+            None,
+            Some(&tunnel),
+            SessionInfoLite::new(SessionId::new(), AgentGroupId::new()),
+            &req,
+        )
+        .await;
+        assert!(resp.is_error);
+        assert!(resp.result.contains("integer `port`"));
     }
 
     #[test]

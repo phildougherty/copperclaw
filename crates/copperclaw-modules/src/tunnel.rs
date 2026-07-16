@@ -903,6 +903,53 @@ impl TunnelBroker {
 }
 
 // ---------------------------------------------------------------------------
+// Agent-facing broker trait (M19 A3)
+// ---------------------------------------------------------------------------
+
+/// What the delivery loop renders back to the model for a `make_preview_public`
+/// relay call (M19 A3). The host-side implementation ([`PublicTunnelBroker`])
+/// maps the agent's container-port request onto a live preview's host port,
+/// enforces opt-in, and drives [`TunnelBroker::expose`]; this enum carries the
+/// three model-legible outcomes so the delivery branch never has to reason
+/// about tunnel internals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicTunnelReply {
+    /// The tunnel is live. `public_url` is the shareable link (the tokened
+    /// preview URL fronted by the public tunnel); `note` is the blunt
+    /// "this is PUBLIC" caveat the agent relays verbatim.
+    Exposed { public_url: String, note: String },
+    /// Awaiting an operator's approval tap. `note` tells the agent to try again
+    /// once approved — NOT an error (the request was accepted and is pending).
+    Pending { note: String },
+    /// A rendered, model-facing failure (not opted in, no live preview, binary
+    /// absent, approver declined, …). The delivery branch surfaces it as an
+    /// `is_error` tool result.
+    Error(String),
+}
+
+/// Host-side broker the delivery loop calls to service a `make_preview_public`
+/// (`__preview` relay) request (M19 A3). Implemented by the host, which owns the
+/// mapping from the agent's *container* port to the live preview's *host* port
+/// and the per-group opt-in — this trait keeps the delivery crate free of that
+/// wiring, exactly as [`crate::preview::PreviewBroker`] does for `expose_preview`.
+///
+/// Every outcome (including every failure) is a [`PublicTunnelReply`]: the
+/// runner's blocking poll is never left unanswered. The public exposure it
+/// drives stays approval-gated end to end via [`TunnelBroker::expose`] — this
+/// trait adds a verb, never a bypass.
+#[async_trait]
+pub trait PublicTunnelBroker: Send + Sync {
+    /// Make the live preview on `container_port` public. Resolves the preview's
+    /// host port, enforces opt-in, and raises / consults the
+    /// `CredentialedExternalAction` approval via [`TunnelBroker::expose`].
+    async fn make_public(
+        &self,
+        session: crate::preview::SessionInfoLite,
+        container_port: u16,
+    ) -> PublicTunnelReply;
+}
+
+// ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
 

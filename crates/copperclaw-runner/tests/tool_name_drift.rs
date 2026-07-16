@@ -16,7 +16,7 @@
 use std::collections::HashSet;
 
 use copperclaw_runner::policy::PROFILE_TOOL_LISTS;
-use copperclaw_runner::run::preview::{CLOSE_PREVIEW, EXPOSE_PREVIEW};
+use copperclaw_runner::run::preview::{CLOSE_PREVIEW, EXPOSE_PREVIEW, MAKE_PREVIEW_PUBLIC};
 
 /// The advertised names of every in-process tool.
 fn in_process_inventory() -> HashSet<String> {
@@ -27,11 +27,13 @@ fn in_process_inventory() -> HashSet<String> {
 }
 
 /// Policy-known tools that are deliberately NOT in the in-process tool
-/// map: the M17 preview pair rides the host-broker `__preview` relay
-/// (see `copperclaw-runner/src/run/preview.rs`), so `build_tool_set()`
-/// never registers a handler for them.
+/// map: the M17 preview pair and the M19 A3 public-tunnel verb all ride the
+/// host-broker `__preview` relay (see `copperclaw-runner/src/run/preview.rs`),
+/// so `build_tool_set()` never registers a handler for them.
 fn host_brokered() -> HashSet<&'static str> {
-    [EXPOSE_PREVIEW, CLOSE_PREVIEW].into_iter().collect()
+    [EXPOSE_PREVIEW, CLOSE_PREVIEW, MAKE_PREVIEW_PUBLIC]
+        .into_iter()
+        .collect()
 }
 
 #[test]

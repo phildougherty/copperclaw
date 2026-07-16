@@ -67,7 +67,8 @@ pub use scheduling::{
 };
 pub use self_mod::{ChangeRequest, PackageError, PackageManager, SelfModModule};
 pub use tunnel::{
-    CloudflaredProvider, OpenedTunnel, TUNNEL_APPROVAL_ACTION, TUNNEL_AUDIT_COMMAND, TunnelBroker,
-    TunnelError, TunnelExposeRequest, TunnelExposed, TunnelModule, TunnelOutcome, TunnelProvider,
+    CloudflaredProvider, OpenedTunnel, PublicTunnelBroker, PublicTunnelReply,
+    TUNNEL_APPROVAL_ACTION, TUNNEL_AUDIT_COMMAND, TunnelBroker, TunnelError, TunnelExposeRequest,
+    TunnelExposed, TunnelModule, TunnelOutcome, TunnelProvider,
 };
 pub use typing::{TypingConfig, TypingModule};

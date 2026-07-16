@@ -804,6 +804,32 @@ pub async fn run_host(
     // dead error. The tap routes through the G1 in-chat approvals interceptor.
     preview.set_approval_dispatcher(state.delivery.dispatcher());
 
+    // M19 A3: activate the merged V5 public-tunnel module. `make_preview_public`
+    // relays through the same reserved `__preview` path as `expose_preview`, but
+    // routes to this broker, which fronts a live preview's host port with an
+    // operator-provided cloudflared tunnel — approval-gated end to end. OFF by
+    // default: the host env master switch `COPPERCLAW_PUBLIC_TUNNEL_ENABLED`
+    // (combined with the group's per-group `preview_enabled`) must be set, and
+    // every exposure still needs an explicit operator approval. The tunnel
+    // broker is also handed to the preview manager so closing / idle-reaping a
+    // preview tears its public tunnel down with it (no public tunnel outlives
+    // the app it fronted).
+    let public_tunnel_enabled = parse_truthy_env("COPPERCLAW_PUBLIC_TUNNEL_ENABLED");
+    let tunnel_provider: Arc<dyn copperclaw_modules::TunnelProvider> =
+        Arc::new(copperclaw_modules::CloudflaredProvider::new());
+    let tunnel_broker =
+        copperclaw_modules::TunnelBroker::new(state.central.clone(), tunnel_provider);
+    preview.set_tunnel_broker(Arc::clone(&tunnel_broker));
+    let public_tunnel = crate::preview::PublicPreviewTunnel::new(
+        Arc::clone(&preview),
+        Arc::clone(&tunnel_broker),
+        state.central.clone(),
+        public_tunnel_enabled,
+    );
+    state
+        .delivery
+        .set_tunnel_broker(public_tunnel as Arc<dyn copperclaw_modules::PublicTunnelBroker>);
+
     let spawned = spawn_container_manager(
         &cfg,
         state.central.clone(),
