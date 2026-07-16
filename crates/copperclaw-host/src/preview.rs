@@ -1143,6 +1143,7 @@ mod manager_tests {
                 preview_bind: bind.map(str::to_string),
                 check_command: None,
                 verify_gate: true,
+                image_profile: copperclaw_types::ImageProfile::Minimal,
             },
         )
         .unwrap();

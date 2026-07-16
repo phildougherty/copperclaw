@@ -1,0 +1,30 @@
+-- Per-group container image profile (M18 E2).
+--
+-- Selects how much toolchain is baked into a group's session image beyond
+-- the minimal secure-by-default baseline (`DEFAULT_BASE_APT_PACKAGES` in
+-- `copperclaw-setup`'s image step). Two profiles today:
+--
+--   `minimal`     — baseline only. The default (secure-by-default tenet):
+--                   NULL in this column reads back as `minimal`, so existing
+--                   groups are untouched on upgrade.
+--   `prototyping` — adds a warm web-prototyping bundle: `sqlite3`,
+--                   headless `chromium` (doubles as the browser-render
+--                   fallback), `zip`, plus global `vite` / `create-vite`
+--                   pre-seeded through the existing npm mechanism. Containers
+--                   have no apt egress at runtime, so a prototype's tools must
+--                   be baked rather than installed on demand.
+--
+-- UNLIKE `tool_profile` / `verify_gate` / `surface_thinking` (which are
+-- runner-config-only and stay OUTSIDE `compute_fingerprint`), `image_profile`
+-- IS folded into `compute_fingerprint`: switching it changes the packages
+-- baked into the image, so it MUST trigger an image rebuild on the next
+-- spawn. Folding is conditional — a `minimal` profile hashes byte-identically
+-- to a pre-E2 config, so upgrading does NOT invalidate every existing group's
+-- cached image; only moving a group to (or between non-minimal) profiles
+-- rebuilds.
+--
+-- Operators set it via
+-- `cclaw groups config update --field 'image_profile="prototyping"' <id>`
+-- (or `cclaw groups config edit <id>`). The setup wizard also asks once for
+-- the base image's profile.
+ALTER TABLE container_configs ADD COLUMN image_profile TEXT;

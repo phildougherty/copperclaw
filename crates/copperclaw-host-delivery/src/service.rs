@@ -3233,6 +3233,7 @@ fn ensure_config_row(
             preview_bind: None,
             check_command: None,
             verify_gate: true,
+            image_profile: copperclaw_types::ImageProfile::Minimal,
         },
     )?;
     Ok(())
@@ -4710,6 +4711,7 @@ mod tests {
                 preview_bind: None,
                 check_command: None,
                 verify_gate: true,
+                image_profile: copperclaw_types::ImageProfile::Minimal,
             },
         )
         .unwrap();
@@ -4752,6 +4754,7 @@ mod tests {
                 preview_bind: None,
                 check_command: None,
                 verify_gate: true,
+                image_profile: copperclaw_types::ImageProfile::Minimal,
             },
         )
         .unwrap();

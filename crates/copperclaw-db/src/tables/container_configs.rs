@@ -3,7 +3,7 @@
 use crate::DbError;
 use crate::central::CentralDb;
 use chrono::{DateTime, Utc};
-use copperclaw_types::{AgentGroupId, Effort};
+use copperclaw_types::{AgentGroupId, Effort, ImageProfile};
 use rusqlite::{OptionalExtension, Row, params};
 use serde::de::{self, Deserializer};
 use serde::ser::Serializer;
@@ -195,6 +195,17 @@ pub struct ContainerConfig {
     /// Runner-config-only (mirrors `tool_profile`): stays OUTSIDE
     /// `compute_fingerprint`.
     pub verify_gate: bool,
+    /// Toolchain profile the group's session image is baked with
+    /// (`minimal` / `prototyping`). `Minimal` (the default, resolved from a
+    /// `NULL` column) is the secure-by-default baseline; `Prototyping` bakes
+    /// a warm web-prototyping bundle (`sqlite3`, headless `chromium`, `zip`,
+    /// global `vite` / `create-vite`).
+    ///
+    /// UNLIKE `tool_profile` / `verify_gate` / `surface_thinking`, this one
+    /// IS folded into `compute_fingerprint`: it changes the packages baked
+    /// into the image, so switching it MUST force an image rebuild on the
+    /// next spawn.
+    pub image_profile: ImageProfile,
     pub updated_at: DateTime<Utc>,
 }
 
@@ -224,6 +235,7 @@ pub struct UpsertContainerConfig {
     pub preview_bind: Option<String>,
     pub check_command: Option<String>,
     pub verify_gate: bool,
+    pub image_profile: ImageProfile,
 }
 
 fn effort_as_str(e: Effort) -> &'static str {
@@ -316,6 +328,19 @@ fn row_to_container_config(row: &Row<'_>) -> rusqlite::Result<ContainerConfig> {
     let check_command: Option<String> = row.get("check_command")?;
     let verify_gate_int: Option<i64> = row.get("verify_gate")?;
     let verify_gate = verify_gate_int != Some(0);
+    // NULL (unset — every group before migration 027) reads back as the
+    // secure-by-default `minimal`; an unknown stored string is a corrupt row.
+    let image_profile_str: Option<String> = row.get("image_profile")?;
+    let image_profile = match image_profile_str.as_deref() {
+        None => ImageProfile::Minimal,
+        Some(s) => ImageProfile::parse(s).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                0,
+                rusqlite::types::Type::Text,
+                format!("unknown image_profile {s}").into(),
+            )
+        })?,
+    };
     let updated_at_str: String = row.get("updated_at")?;
     let updated_at = DateTime::parse_from_rfc3339(&updated_at_str)
         .map_err(|e| {
@@ -346,6 +371,7 @@ fn row_to_container_config(row: &Row<'_>) -> rusqlite::Result<ContainerConfig> {
         preview_bind,
         check_command,
         verify_gate,
+        image_profile,
         updated_at,
     })
 }
@@ -362,7 +388,8 @@ pub fn get(
                     packages_npm, additional_mounts, cli_scope,
                     config_fingerprint, egress_allow, resource_limits,
                     coding_enabled, surface_thinking, tool_profile,
-                    preview_enabled, preview_bind, check_command, verify_gate, updated_at
+                    preview_enabled, preview_bind, check_command, verify_gate,
+                    image_profile, updated_at
              FROM container_configs
              WHERE agent_group_id = ?1",
             params![agent_group_id.as_uuid().to_string()],
@@ -388,8 +415,9 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
             packages_npm, additional_mounts, cli_scope,
             config_fingerprint, egress_allow, resource_limits,
             coding_enabled, surface_thinking, tool_profile,
-            preview_enabled, preview_bind, check_command, verify_gate, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24)
+            preview_enabled, preview_bind, check_command, verify_gate,
+            image_profile, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
          ON CONFLICT(agent_group_id) DO UPDATE SET
              provider = excluded.provider,
              model = excluded.model,
@@ -413,6 +441,7 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
              preview_bind = excluded.preview_bind,
              check_command = excluded.check_command,
              verify_gate = excluded.verify_gate,
+             image_profile = excluded.image_profile,
              updated_at = excluded.updated_at",
         params![
             req.agent_group_id.as_uuid().to_string(),
@@ -440,6 +469,7 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
             // NULL (the default, "on") vs 0 ("off") — see the migration's
             // doc comment for why there is no explicit "1" state.
             if req.verify_gate { None } else { Some(0i64) },
+            req.image_profile.as_str(),
             now.to_rfc3339(),
         ],
     )?;
@@ -467,6 +497,7 @@ pub fn upsert(db: &CentralDb, req: UpsertContainerConfig) -> Result<ContainerCon
         preview_bind: req.preview_bind,
         check_command: req.check_command,
         verify_gate: req.verify_gate,
+        image_profile: req.image_profile,
         updated_at: now,
     })
 }
@@ -633,10 +664,18 @@ pub fn remove_package_npm(
 /// Compute a deterministic sha256 fingerprint over the rebuild-relevant
 /// fields of a `ContainerConfig`.
 ///
-/// Any change to `packages_apt`, `packages_npm`, `skills`, or
-/// `mcp_servers` produces a different fingerprint. The container manager
-/// compares this against `image_tag` to decide whether a rebuild is needed
-/// before the next spawn.
+/// Any change to `packages_apt`, `packages_npm`, `skills`, `mcp_servers`,
+/// or `image_profile` produces a different fingerprint. The container
+/// manager compares this against `image_tag` to decide whether a rebuild is
+/// needed before the next spawn.
+///
+/// NOTE: `tool_profile` / `verify_gate` / `surface_thinking` are
+/// deliberately EXCLUDED (runner-config-only — they rewrite `runner.json`,
+/// not the image). `image_profile` is the opposite: it bakes extra packages,
+/// so it is included. It is folded CONDITIONALLY (only when non-`minimal`)
+/// so a `minimal` config hashes byte-identically to a pre-E2 one — upgrading
+/// past migration 027 does not invalidate every existing group's cached
+/// image.
 pub fn compute_fingerprint(cfg: &ContainerConfig) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -660,6 +699,13 @@ pub fn compute_fingerprint(cfg: &ContainerConfig) -> String {
     // Sort the JSON to get a stable serialization independent of key insertion
     // order. We normalise via serde_json's Display which sorts object keys.
     hasher.update(cfg.mcp_servers.to_string().as_bytes());
+    // Conditional fold: only a non-minimal profile contributes bytes, so a
+    // minimal config's fingerprint is byte-identical to a pre-E2 one (no
+    // mass rebuild on upgrade), while any profile change flips the hash.
+    if cfg.image_profile != ImageProfile::Minimal {
+        hasher.update(b"\nimage_profile=");
+        hasher.update(cfg.image_profile.as_str().as_bytes());
+    }
     hex::encode(hasher.finalize())
 }
 
@@ -978,6 +1024,31 @@ pub fn set_verify_gate(
     Ok(())
 }
 
+/// Narrow setter for the per-group `image_profile` (M18 E2). Stores the
+/// profile's lowercase string; folded into `compute_fingerprint`, so a
+/// change forces an image rebuild on the next spawn.
+pub fn set_image_profile(
+    db: &CentralDb,
+    agent_group_id: AgentGroupId,
+    profile: ImageProfile,
+) -> Result<(), DbError> {
+    let conn = db.conn()?;
+    let n = conn.execute(
+        "UPDATE container_configs
+         SET image_profile = ?1, updated_at = ?2
+         WHERE agent_group_id = ?3",
+        params![
+            profile.as_str(),
+            Utc::now().to_rfc3339(),
+            agent_group_id.as_uuid().to_string()
+        ],
+    )?;
+    if n == 0 {
+        return Err(DbError::NotFound);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1026,6 +1097,7 @@ mod tests {
             preview_bind: None,
             check_command: None,
             verify_gate: true,
+            image_profile: ImageProfile::Minimal,
         }
     }
 
@@ -1204,6 +1276,7 @@ mod tests {
             preview_bind: Some("0.0.0.0".into()),
             check_command: Some("cargo check".into()),
             verify_gate: false,
+            image_profile: ImageProfile::Prototyping,
         };
         let saved = upsert(&db, req.clone()).unwrap();
         let fetched = get(&db, ag).unwrap().unwrap();
@@ -1234,6 +1307,7 @@ mod tests {
         assert_eq!(fetched.preview_bind.as_deref(), Some("0.0.0.0"));
         assert_eq!(fetched.check_command.as_deref(), Some("cargo check"));
         assert!(!fetched.verify_gate);
+        assert_eq!(fetched.image_profile, ImageProfile::Prototyping);
     }
 
     #[test]
@@ -1768,5 +1842,91 @@ mod tests {
         let cfg2 = get(&db, ag).unwrap().unwrap();
         let fp_after = compute_fingerprint(&cfg2);
         assert_eq!(fp_before, fp_after);
+    }
+
+    #[test]
+    fn image_profile_defaults_to_minimal_via_sql_default() {
+        // Existing installs that upgrade past migration 027 must default to
+        // NULL image_profile, which reads back as the secure-by-default
+        // `minimal` — no group silently gains the prototyping toolchain.
+        let db = db();
+        let ag = make_agent_group(&db, "g");
+        let conn = db.conn().unwrap();
+        conn.execute(
+            "INSERT INTO container_configs (agent_group_id, updated_at)
+             VALUES (?1, ?2)",
+            params![ag.as_uuid().to_string(), Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+        drop(conn);
+        let cfg = get(&db, ag).unwrap().unwrap();
+        assert_eq!(cfg.image_profile, ImageProfile::Minimal);
+    }
+
+    #[test]
+    fn set_image_profile_roundtrips_and_back() {
+        let db = db();
+        let ag = make_agent_group(&db, "g");
+        upsert(&db, minimal_req(ag)).unwrap();
+        assert_eq!(
+            get(&db, ag).unwrap().unwrap().image_profile,
+            ImageProfile::Minimal
+        );
+        set_image_profile(&db, ag, ImageProfile::Prototyping).unwrap();
+        assert_eq!(
+            get(&db, ag).unwrap().unwrap().image_profile,
+            ImageProfile::Prototyping
+        );
+        set_image_profile(&db, ag, ImageProfile::Minimal).unwrap();
+        assert_eq!(
+            get(&db, ag).unwrap().unwrap().image_profile,
+            ImageProfile::Minimal
+        );
+    }
+
+    #[test]
+    fn set_image_profile_not_found_when_no_row() {
+        let db = db();
+        let err =
+            set_image_profile(&db, AgentGroupId::new(), ImageProfile::Prototyping).unwrap_err();
+        assert!(matches!(err, DbError::NotFound));
+    }
+
+    #[test]
+    fn image_profile_changes_fingerprint_exactly_when_profile_changes() {
+        // The whole point of E2's fingerprint fold: flipping the image
+        // profile MUST change the rebuild fingerprint (unlike tool_profile),
+        // and a minimal config must stay byte-identical to a pre-E2 one so
+        // upgrading doesn't force a mass rebuild.
+        let db = db();
+        let ag = make_agent_group(&db, "g");
+        let cfg = upsert(&db, minimal_req(ag)).unwrap();
+        let fp_minimal = compute_fingerprint(&cfg);
+
+        set_image_profile(&db, ag, ImageProfile::Prototyping).unwrap();
+        let cfg2 = get(&db, ag).unwrap().unwrap();
+        let fp_prototyping = compute_fingerprint(&cfg2);
+        assert_ne!(
+            fp_minimal, fp_prototyping,
+            "profile change must flip the fingerprint"
+        );
+
+        // Back to minimal reproduces the original fingerprint exactly.
+        set_image_profile(&db, ag, ImageProfile::Minimal).unwrap();
+        let cfg3 = get(&db, ag).unwrap().unwrap();
+        assert_eq!(fp_minimal, compute_fingerprint(&cfg3));
+    }
+
+    #[test]
+    fn minimal_profile_fingerprint_is_stable_across_toggle() {
+        // Two configs that differ in nothing but a no-op profile round-trip
+        // (minimal → minimal) must fingerprint identically.
+        let db = db();
+        let ag = make_agent_group(&db, "g");
+        let cfg = upsert(&db, minimal_req(ag)).unwrap();
+        let fp1 = compute_fingerprint(&cfg);
+        set_image_profile(&db, ag, ImageProfile::Minimal).unwrap();
+        let cfg2 = get(&db, ag).unwrap().unwrap();
+        assert_eq!(fp1, compute_fingerprint(&cfg2));
     }
 }

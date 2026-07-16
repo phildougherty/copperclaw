@@ -231,6 +231,29 @@ pub fn config_update(args: &Value, central: &CentralDb) -> Result<Value, ErrorPa
                 }
             };
         }
+        // M18 E2 image profile. Validated against the known profile names so
+        // a typo can't reach the image builder; `null` resets to the
+        // secure-by-default `minimal`. This IS a fingerprint input, so a
+        // change forces an image rebuild on the next spawn.
+        "image_profile" => {
+            existing.image_profile = match &value {
+                Value::Null => copperclaw_types::ImageProfile::Minimal,
+                Value::String(s) => copperclaw_types::ImageProfile::parse(s).ok_or_else(|| {
+                    ErrorPayload::new(
+                        "bad_request",
+                        format!(
+                            "unknown image_profile `{s}` (expected one of: minimal, prototyping, or null to reset)"
+                        ),
+                    )
+                })?,
+                _ => {
+                    return Err(ErrorPayload::new(
+                        "bad_request",
+                        "`image_profile` must be a profile name string or null",
+                    ));
+                }
+            };
+        }
         other => {
             return Err(ErrorPayload::new(
                 "bad_request",
@@ -264,6 +287,7 @@ pub fn config_update(args: &Value, central: &CentralDb) -> Result<Value, ErrorPa
             preview_bind: existing.preview_bind,
             check_command: existing.check_command,
             verify_gate: existing.verify_gate,
+            image_profile: existing.image_profile,
         },
     )
     .map_err(db_err)?;
@@ -474,6 +498,7 @@ fn default_config(id: AgentGroupId) -> container_configs::ContainerConfig {
         preview_bind: None,
         check_command: None,
         verify_gate: true,
+        image_profile: copperclaw_types::ImageProfile::Minimal,
         updated_at: chrono::Utc::now(),
     }
 }
@@ -510,6 +535,7 @@ fn ensure_config_row(central: &CentralDb, id: AgentGroupId) -> Result<(), ErrorP
                 preview_bind: row.preview_bind,
                 check_command: row.check_command,
                 verify_gate: row.verify_gate,
+                image_profile: row.image_profile,
             },
         )
         .map_err(db_err)?;
@@ -548,6 +574,7 @@ fn container_config_to_json(c: &container_configs::ContainerConfig) -> Value {
         "tool_profile": c.tool_profile,
         "preview_enabled": c.preview_enabled,
         "preview_bind": c.preview_bind,
+        "image_profile": c.image_profile.as_str(),
         "updated_at": c.updated_at.to_rfc3339(),
     })
 }
@@ -809,6 +836,67 @@ mod tests {
         )
         .unwrap();
         assert!(v["tool_profile"].is_null());
+    }
+
+    #[test]
+    fn config_update_sets_image_profile() {
+        // `cclaw groups config update --field 'image_profile="prototyping"'`
+        // lands the profile and surfaces it in the config JSON.
+        let db = db();
+        let g = make_group(&db, "g");
+        let v = config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "image_profile", "value": "prototyping"}),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["image_profile"], "prototyping");
+        let stored = container_configs::get(&db, g.id).unwrap().unwrap();
+        assert_eq!(
+            stored.image_profile,
+            copperclaw_types::ImageProfile::Prototyping
+        );
+    }
+
+    #[test]
+    fn config_update_image_profile_null_resets_to_minimal() {
+        let db = db();
+        let g = make_group(&db, "g");
+        config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "image_profile", "value": "prototyping"}),
+            &db,
+        )
+        .unwrap();
+        let v = config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "image_profile", "value": null}),
+            &db,
+        )
+        .unwrap();
+        assert_eq!(v["image_profile"], "minimal");
+    }
+
+    #[test]
+    fn config_update_image_profile_rejects_unknown_name() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let err = config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "image_profile", "value": "kitchen-sink"}),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("unknown image_profile"));
+    }
+
+    #[test]
+    fn config_update_image_profile_rejects_non_string() {
+        let db = db();
+        let g = make_group(&db, "g");
+        let err = config_update(
+            &json!({"id": g.id.as_uuid().to_string(), "field": "image_profile", "value": 3}),
+            &db,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
     }
 
     #[test]

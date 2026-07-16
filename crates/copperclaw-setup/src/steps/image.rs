@@ -16,6 +16,7 @@ use crate::prompt::Prompt;
 use crate::state::SetupState;
 use crate::steps::{Step, StepError, StepResult};
 use copperclaw_container_rt::{ExtraFile, ImageBuildSpec};
+use copperclaw_types::ImageProfile;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;
@@ -85,7 +86,15 @@ impl Step for ImageBuildStep {
             ));
         }
 
-        let spec = default_spec()?;
+        // Ask once which toolchain profile to bake into the base image.
+        // Default `minimal` (secure-by-default tenet); `prototyping` adds the
+        // warm web-prototyping bundle. Persisted on `cfg` so a re-run is
+        // idempotent — the same answer produces the same fingerprint/tag and
+        // the build is a no-op.
+        let profile = resolve_image_profile(prompt)?;
+        cfg.image_profile = profile.as_str().to_string();
+
+        let spec = default_spec(profile)?;
         let target_tag = spec.image_tag();
         let fingerprint = spec.fingerprint();
         let mut messages = Vec::new();
@@ -148,8 +157,13 @@ pub const RUNNER_PATH_IN_IMAGE: &str = "/usr/local/bin/copperclaw-runner";
 /// runner sibling cannot be located (e.g. setup is being run before
 /// the workspace has been built), the step returns an error rather
 /// than producing a broken image.
-pub fn default_spec() -> Result<ImageBuildSpec, StepError> {
+pub fn default_spec(profile: ImageProfile) -> Result<ImageBuildSpec, StepError> {
     let mut spec = ImageBuildSpec::new(DEFAULT_REPO, DEFAULT_BASE_IMAGE);
+    // Bake the chosen image profile. `Minimal` adds nothing; `Prototyping`
+    // renders the warm apt + npm bundle on top of the baseline packages, so
+    // groups that opt into prototyping boot on a warm base with no per-group
+    // rebuild.
+    spec.image_profile = profile;
     // Baseline runtime layer: every session agent can run Python or
     // Node code it writes, hit HTTP endpoints, and clone repos out of
     // the box. Without these the agent confabulates "production-ready"
@@ -172,6 +186,27 @@ pub fn default_spec() -> Result<ImageBuildSpec, StepError> {
     spec.extra_files
         .push(ExtraFile::new(PathBuf::from(RUNNER_PATH_IN_IMAGE), bytes).with_mode(0o755));
     Ok(spec)
+}
+
+/// Prompt key the base-image profile question is asked under
+/// (`COPPERCLAW_SETUP_IMAGE_PROFILE` in headless mode).
+pub const IMAGE_PROFILE_KEY: &str = "IMAGE_PROFILE";
+
+/// Ask (once) which toolchain profile to bake into the base image.
+///
+/// Defaults to [`ImageProfile::Minimal`] (secure-by-default tenet). An
+/// unknown answer degrades to `minimal` rather than erroring — a typo must
+/// never silently produce the *heavier* image. Idempotent: the same answer
+/// always maps to the same profile.
+pub fn resolve_image_profile(prompt: &dyn Prompt) -> Result<ImageProfile, StepError> {
+    let answer = prompt
+        .input(
+            IMAGE_PROFILE_KEY,
+            "Base image profile (minimal | prototyping)",
+            Some(ImageProfile::Minimal.as_str()),
+        )
+        .map_err(|e| StepError::Other(format!("image profile prompt: {e}")))?;
+    Ok(ImageProfile::parse(answer.trim()).unwrap_or(ImageProfile::Minimal))
 }
 
 /// Apt packages installed in every session image by default. The list
@@ -582,6 +617,98 @@ mod tests {
                 .iter()
                 .any(|m| m.contains("no container runtime"))
         );
+    }
+
+    // ---- image profile (M18 E2) ---------------------------------------
+
+    #[test]
+    fn resolve_image_profile_defaults_to_minimal() {
+        // No scripted answer → the prompt's default (`minimal`) is used.
+        let prompt = Scripted::new();
+        assert_eq!(
+            resolve_image_profile(&prompt).unwrap(),
+            ImageProfile::Minimal
+        );
+    }
+
+    #[test]
+    fn resolve_image_profile_reads_prototyping() {
+        let prompt = Scripted::new().with(IMAGE_PROFILE_KEY, "prototyping");
+        assert_eq!(
+            resolve_image_profile(&prompt).unwrap(),
+            ImageProfile::Prototyping
+        );
+    }
+
+    #[test]
+    fn resolve_image_profile_unknown_degrades_to_minimal() {
+        // A typo must never silently produce the heavier image.
+        let prompt = Scripted::new().with(IMAGE_PROFILE_KEY, "kitchen-sink");
+        assert_eq!(
+            resolve_image_profile(&prompt).unwrap(),
+            ImageProfile::Minimal
+        );
+    }
+
+    #[test]
+    fn resolve_image_profile_is_idempotent() {
+        // The same answer maps to the same profile on repeated runs — a
+        // re-run of setup doesn't drift the baked profile.
+        let prompt = Scripted::new()
+            .with(IMAGE_PROFILE_KEY, "prototyping")
+            .with(IMAGE_PROFILE_KEY, "prototyping");
+        let first = resolve_image_profile(&prompt).unwrap();
+        let second = resolve_image_profile(&prompt).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first, ImageProfile::Prototyping);
+    }
+
+    #[test]
+    fn prototyping_base_spec_bakes_the_warm_toolchain() {
+        // Bake test at the setup layer: a prototyping base spec renders the
+        // warm apt + npm bundle on top of the baseline packages.
+        let mut spec = fake_default_spec();
+        spec.apt_packages = DEFAULT_BASE_APT_PACKAGES
+            .iter()
+            .copied()
+            .map(String::from)
+            .collect();
+        spec.image_profile = ImageProfile::Prototyping;
+        let df = spec.dockerfile();
+        for pkg in ["sqlite3", "chromium", "zip"] {
+            assert!(df.contains(pkg), "expected apt `{pkg}` in base bake");
+        }
+        for pkg in ["vite", "create-vite"] {
+            assert!(df.contains(pkg), "expected npm `{pkg}` in base bake");
+        }
+        // A minimal base spec bakes none of them.
+        let mut minimal = spec.clone();
+        minimal.image_profile = ImageProfile::Minimal;
+        let mdf = minimal.dockerfile();
+        assert!(!mdf.contains("sqlite3"));
+        assert!(!mdf.contains("npm install -g"));
+        // The two profiles produce different image tags.
+        assert_ne!(spec.image_tag(), minimal.image_tag());
+    }
+
+    #[test]
+    fn step_reruns_without_runtime_are_idempotent() {
+        // Re-running the step (opt-in + profile answered) with no runtime
+        // must not mutate config or duplicate state — same noop both times.
+        let s = ImageBuildStep;
+        let prompt = Scripted::new()
+            .with("BUILD_IMAGE", "yes")
+            .with("BUILD_IMAGE", "yes")
+            .with(IMAGE_PROFILE_KEY, "prototyping")
+            .with(IMAGE_PROFILE_KEY, "prototyping");
+        let mut cfg = SetupConfig::default();
+        let mut state = SetupState::new();
+        let a = s.run(&mut cfg, &prompt, &mut state).unwrap();
+        let cfg_after_first = cfg.clone();
+        let b = s.run(&mut cfg, &prompt, &mut state).unwrap();
+        assert!(!a.config_changed);
+        assert!(!b.config_changed);
+        assert_eq!(cfg, cfg_after_first, "re-run must not drift config");
     }
 
     #[test]
