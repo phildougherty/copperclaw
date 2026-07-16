@@ -1,0 +1,15 @@
+{
+  "name": "telegram-approval-resolution",
+  "channel": "telegram",
+  "description": "M19 F3 a+c. Owner taps Approve on a card whose delivering adapter recorded no platform_message_id (fallback-id path): the interceptor resolves it and posts the outcome as a follow-up reply instead of leaving live buttons. The same tap's opportunistic expiry sweep stamps a separately-lapsed card terminal. Neither tap writes an inbound row or wakes a runner.",
+  "schema": 1,
+  "gates": ["approvals"],
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\""
+  }
+}

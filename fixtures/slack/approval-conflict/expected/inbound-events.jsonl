@@ -1,0 +1,1 @@
+{"channel_type":"slack","platform_id":"C100","thread_id":null,"message":{"id":"slack-cb-e1","kind":"chat","content":{"text":"approve:<UUID>","callback":{"value":"approve:<UUID>","action_id":"approve_btn"}},"timestamp":"<TS>","is_mention":null,"is_group":true},"reply_to":null,"sender":{"channel_type":"slack","identity":"U200","display_name":"Owner Olivia"}}
