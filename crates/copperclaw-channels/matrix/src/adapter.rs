@@ -834,6 +834,7 @@ pub(crate) fn render_todo_list_html_matrix(list: &TodoList) -> String {
         let glyph = match item.status {
             TodoItemStatus::Completed => "[x]",
             TodoItemStatus::InProgress => "[~]",
+            TodoItemStatus::Blocked => "[!]",
             TodoItemStatus::Pending => "[ ]",
         };
         out.push_str("<li>");
@@ -845,6 +846,11 @@ pub(crate) fn render_todo_list_html_matrix(list: &TodoList) -> String {
             out.push_str("</s>");
         } else {
             out.push_str(&escape_html_matrix(item.text.trim()));
+        }
+        if let Some(reason) = item.blocked_reason_text() {
+            out.push_str(" <i>(blocked: ");
+            out.push_str(&escape_html_matrix(reason));
+            out.push_str(")</i>");
         }
         out.push_str("</li>");
     }
@@ -2102,11 +2108,13 @@ mod tests {
                     id: 1,
                     text: "Wash dishes".into(),
                     status: copperclaw_channels_core::TodoItemStatus::Completed,
+                    blocked_reason: None,
                 },
                 copperclaw_channels_core::TodoListItem {
                     id: 2,
                     text: "Dry dishes".into(),
                     status: copperclaw_channels_core::TodoItemStatus::Pending,
+                    blocked_reason: None,
                 },
             ],
             title: Some("Kitchen".into()),

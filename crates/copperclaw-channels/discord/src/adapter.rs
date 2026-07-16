@@ -1374,16 +1374,21 @@ pub(crate) fn build_todo_list_payload(list: &TodoList) -> Value {
         let glyph = match item.status {
             TodoItemStatus::Completed => "[x]",
             TodoItemStatus::InProgress => "[~]",
+            TodoItemStatus::Blocked => "[!]",
             TodoItemStatus::Pending => "[ ]",
         };
         // Strip any backticks in user text so a value can't break out
         // of the embed; embed descriptions are not in a code fence
         // but defensive sanitisation keeps the rendering predictable.
         let safe_text = item.text.trim().replace("```", "'''");
+        let suffix = match item.blocked_reason_text() {
+            Some(reason) => format!(" *(blocked: {})*", reason.replace("```", "'''")),
+            None => String::new(),
+        };
         let line = if item.status == TodoItemStatus::Completed {
-            format!("{glyph} ~~{safe_text}~~\n")
+            format!("{glyph} ~~{safe_text}~~{suffix}\n")
         } else {
-            format!("{glyph} {safe_text}\n")
+            format!("{glyph} {safe_text}{suffix}\n")
         };
         if description.len() + line.len() > DESC_BUDGET {
             break;
@@ -2806,16 +2811,19 @@ mod tests {
                     id: 1,
                     text: "Wash dishes".into(),
                     status: TodoItemStatus::Completed,
+                    blocked_reason: None,
                 },
                 TodoListItem {
                     id: 2,
                     text: "Dry dishes".into(),
                     status: TodoItemStatus::InProgress,
+                    blocked_reason: None,
                 },
                 TodoListItem {
                     id: 3,
                     text: "Put dishes away".into(),
                     status: TodoItemStatus::Pending,
+                    blocked_reason: None,
                 },
             ],
             title: Some("Kitchen".into()),
@@ -2851,11 +2859,13 @@ mod tests {
                     id: 1,
                     text: "x".into(),
                     status: TodoItemStatus::Completed,
+                    blocked_reason: None,
                 },
                 TodoListItem {
                     id: 2,
                     text: "y".into(),
                     status: TodoItemStatus::Completed,
+                    blocked_reason: None,
                 },
             ],
             title: None,

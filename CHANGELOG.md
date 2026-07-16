@@ -6,6 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M19 F4 — `blocked` todo state visible to users, 2026-07-16)
+
+- The runner has a real `TodoStatus::Blocked` (+ `blocked_reason`) for a step
+  that auto-blocked after burning its verify fix-cycles, but the portable wire
+  enum `copperclaw_channels_core::TodoItemStatus` had no `Blocked` variant, so
+  `status_to_wire` (`crates/copperclaw-mcp/src/tools/todo.rs`) mapped
+  `Blocked -> InProgress` — a user watching the pinned checklist saw the step
+  stuck "in progress" forever. Now:
+  - `TodoItemStatus` gains a `Blocked` variant (`crates/copperclaw-channels/core/src/todo_list.rs`)
+    with a distinct `[!]` glyph, `"blocked"` serde tag, and a new
+    `TodoListItem.blocked_reason: Option<String>` (serde-default so older rows
+    decode). `TodoListItem::blocked_reason_text()` centralizes the "show the
+    reason only when actually blocked" gate; `TodoList::blocked_count()` feeds
+    the text-fallback footer (inserted only when non-zero, so blocked-free
+    lists stay byte-stable). `status_to_wire` now maps `Blocked -> Blocked` and
+    carries the reason onto the wire item.
+  - Every adapter that exhaustively renders todo status now shows the blocked
+    chip + one-line reason: `matrix`, `slack`, `telegram`, `discord`, `gchat`,
+    `teams`, `webex` (Adaptive-Card `Attention` colour), `mattermost`,
+    `whatsapp-cloud`, plus the shared text fallback. The host-delivery
+    child-rollup `aggregate_status` (`crates/copperclaw-host-delivery/src/service.rs`)
+    surfaces `Blocked` as the header status when any child item is stuck.
+
 ### Fixed (M19 F1 — edit-capability drift on matrix/webex, 2026-07-16)
 
 - `matrix` and `webex` were listed in `EDIT_CAPABLE_CHANNELS`

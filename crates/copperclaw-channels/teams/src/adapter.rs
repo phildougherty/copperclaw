@@ -1526,16 +1526,19 @@ mod tests {
                     id: 1,
                     text: "first".into(),
                     status: TodoItemStatus::Completed,
+                    blocked_reason: None,
                 },
                 TodoListItem {
                     id: 2,
                     text: "second".into(),
                     status: TodoItemStatus::InProgress,
+                    blocked_reason: None,
                 },
                 TodoListItem {
                     id: 3,
                     text: "third".into(),
                     status: TodoItemStatus::Pending,
+                    blocked_reason: None,
                 },
             ],
             title: Some("Plan A".into()),
@@ -1573,6 +1576,7 @@ mod tests {
                 id: 1,
                 text: "first".into(),
                 status: TodoItemStatus::Completed,
+                blocked_reason: None,
             }],
             title: None,
         };

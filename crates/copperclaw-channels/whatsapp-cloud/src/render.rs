@@ -155,6 +155,18 @@ pub fn render_todo_list(list: &TodoList) -> String {
                 out.push_str(text);
                 out.push_str(" _(in progress)_");
             }
+            TodoItemStatus::Blocked => {
+                out.push_str("[!] ");
+                out.push_str(text);
+                match item.blocked_reason_text() {
+                    Some(reason) => {
+                        out.push_str(" _(blocked: ");
+                        out.push_str(reason);
+                        out.push_str(")_");
+                    }
+                    None => out.push_str(" _(blocked)_"),
+                }
+            }
             TodoItemStatus::Pending => {
                 out.push_str("[ ] ");
                 out.push_str(text);
@@ -311,11 +323,13 @@ mod tests {
                     id: 1,
                     text: "done".into(),
                     status: TodoItemStatus::Completed,
+                    blocked_reason: None,
                 },
                 TodoListItem {
                     id: 2,
                     text: "now".into(),
                     status: TodoItemStatus::InProgress,
+                    blocked_reason: None,
                 },
             ],
             title: None,

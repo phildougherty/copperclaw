@@ -1104,6 +1104,7 @@ pub(crate) fn render_todo_list_markdown(list: &TodoList) -> String {
         let glyph_raw = match item.status {
             TodoItemStatus::Completed => "[x]",
             TodoItemStatus::InProgress => "[~]",
+            TodoItemStatus::Blocked => "[!]",
             TodoItemStatus::Pending => "[ ]",
         };
         out.push_str(&escape_markdown_v2(glyph_raw));
@@ -1114,6 +1115,12 @@ pub(crate) fn render_todo_list_markdown(list: &TodoList) -> String {
             out.push('~');
         } else {
             out.push_str(&escape_markdown_v2(item.text.trim()));
+        }
+        if let Some(reason) = item.blocked_reason_text() {
+            // `_italic_` in MarkdownV2; the reason text itself is escaped.
+            out.push_str(" _\\(blocked: ");
+            out.push_str(&escape_markdown_v2(reason));
+            out.push_str("\\)_");
         }
         out.push('\n');
     }
@@ -3497,16 +3504,19 @@ mod tests {
                     id: 1,
                     text: "Wash dishes".into(),
                     status: copperclaw_channels_core::TodoItemStatus::Completed,
+                    blocked_reason: None,
                 },
                 copperclaw_channels_core::TodoListItem {
                     id: 2,
                     text: "Dry dishes".into(),
                     status: copperclaw_channels_core::TodoItemStatus::InProgress,
+                    blocked_reason: None,
                 },
                 copperclaw_channels_core::TodoListItem {
                     id: 3,
                     text: "Put dishes away".into(),
                     status: copperclaw_channels_core::TodoItemStatus::Pending,
+                    blocked_reason: None,
                 },
             ],
             title: Some("Kitchen".into()),
@@ -3540,6 +3550,7 @@ mod tests {
                 id: 1,
                 text: "ship it!".into(),
                 status: copperclaw_channels_core::TodoItemStatus::Pending,
+                blocked_reason: None,
             }],
             title: None,
         };
