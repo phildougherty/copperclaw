@@ -781,7 +781,7 @@ impl ReplayHarness {
             None
         };
 
-        if self.fixture.manifest.runner_drain {
+        let run_result: Result<()> = if self.fixture.manifest.runner_drain {
             // The runner handles a pure slash-command batch synchronously
             // and `continue`s WITHOUT counting a turn, so `max_turns`
             // can never bound the loop. Instead, race the (unbounded)
@@ -792,26 +792,18 @@ impl ReplayHarness {
             // so cancelling at drain time never races the reply write.
             let watch_paths = SessionPaths::new(self.tempdir.path(), ag, sess);
             tokio::select! {
-                r = run_loop(deps) => {
-                    if let Some(h) = &delivery_poller {
-                        h.abort();
-                    }
-                    r.context("runner drain-mode")?;
-                }
-                r = wait_for_inbound_drain(watch_paths) => {
-                    if let Some(h) = &delivery_poller {
-                        h.abort();
-                    }
-                    r?;
-                }
+                r = run_loop(deps) => r.context("runner drain-mode"),
+                r = wait_for_inbound_drain(watch_paths) => r,
             }
         } else {
-            let result = run_loop(deps).await;
-            if let Some(h) = &delivery_poller {
-                h.abort();
-            }
-            result.context("runner one-turn")?;
+            run_loop(deps).await.context("runner one-turn")
+        };
+        // Whichever branch ran, stop the preview-gate poller before
+        // propagating the turn's result.
+        if let Some(h) = delivery_poller {
+            h.abort();
         }
+        run_result?;
         Ok(())
     }
 

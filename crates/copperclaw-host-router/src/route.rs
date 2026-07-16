@@ -13,8 +13,8 @@ use crate::mention::{MentionDecision, MentionGate};
 use crate::session::SessionRoot;
 
 use copperclaw_channels_core::inbound_file::{
-    ATTACHMENT_PATH_KEY, STAGED_PATH_KEY, container_inbox_path, remove_staged_file,
-    sanitize_filename,
+    ATTACHMENT_PATH_KEY, FALLBACK_FILENAME, STAGED_PATH_KEY, container_inbox_path,
+    remove_staged_file, sanitize_filename,
 };
 use copperclaw_db::attachments::extract_to_inbox;
 use copperclaw_db::central::CentralDb;
@@ -682,10 +682,7 @@ impl Router {
             .get("filename")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("");
-        let safe_name = sanitize_filename(
-            Some(supplied_name),
-            copperclaw_channels_core::inbound_file::FALLBACK_FILENAME,
-        );
+        let safe_name = sanitize_filename(Some(supplied_name), FALLBACK_FILENAME);
 
         let session_root = self
             .session_paths
@@ -694,10 +691,7 @@ impl Router {
         match copy_staged_into_inbox(&inbox_root, &msg_component, &safe_name, &staged) {
             Ok(()) => {
                 let container_path = container_inbox_path(&msg_component, &safe_name);
-                att.insert(
-                    "filename".to_owned(),
-                    serde_json::Value::String(safe_name.clone()),
-                );
+                att.insert("filename".to_owned(), serde_json::Value::String(safe_name));
                 att.insert(
                     ATTACHMENT_PATH_KEY.to_owned(),
                     serde_json::Value::String(container_path),
