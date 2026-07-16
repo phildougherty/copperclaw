@@ -388,6 +388,10 @@ pub mod delegate_batch {
                 ));
             }
         }
+        // M20 M1: contract-presence counter — one increment per call, not per
+        // worker, so the ratio reads as "batches with a contract" not
+        // "workers under a contract".
+        copperclaw_metrics::inc_delegate_batch_contract(input.contract.is_some());
         let mut workers = Vec::with_capacity(input.workers.len());
         for w in input.workers {
             if w.name.trim().is_empty() {
@@ -424,6 +428,11 @@ pub mod delegate_batch {
         if outcome.all_spawn_failed() {
             // M19 A1: whole-batch refusal (every worker failed to spawn).
             copperclaw_metrics::inc_delegate_batch_refused();
+            // M20 M1: the post-join dirty-mark code below is structurally
+            // unreachable on this path (nothing merged, nothing to
+            // re-verify) — record that under the same outcome metric so a
+            // dashboard built on it doesn't need a separate refusal join.
+            copperclaw_metrics::inc_delegate_batch_post_join_dirty("skipped_all_spawn_failed");
             let reason = outcome
                 .workers
                 .first()
@@ -452,9 +461,18 @@ pub mod delegate_batch {
                     .is_some();
                     if has_verify {
                         verify_gate::mark_dirty(&project_root).await;
+                        copperclaw_metrics::inc_delegate_batch_post_join_dirty("marked");
+                    } else {
+                        copperclaw_metrics::inc_delegate_batch_post_join_dirty("skipped_no_verify");
                     }
+                } else {
+                    copperclaw_metrics::inc_delegate_batch_post_join_dirty("skipped_no_project");
                 }
+            } else {
+                copperclaw_metrics::inc_delegate_batch_post_join_dirty("skipped_no_project");
             }
+        } else {
+            copperclaw_metrics::inc_delegate_batch_post_join_dirty("skipped_gate_off");
         }
         Ok(success_json(&outcome))
     }

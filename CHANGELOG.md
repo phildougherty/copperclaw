@@ -6,6 +6,92 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M20 M1 — metrics rider: sweep the M20 metric wishes into `copperclaw-metrics`, 2026-07-16)
+
+- One card, absolute last in the program, sweeps every metric "wish" the merged
+  M20 cards (Q1–Q8, D1–D5) recorded into `crates/copperclaw-metrics/src/lib.rs`
+  (the workspace hotspot — no other M20 card touches it). Each new
+  counter/gauge/histogram follows the crate's established convention
+  (`copperclaw_` prefix, `_total`/`_seconds`/`_bytes`/etc. suffix, snake_case
+  labels) and is wired to a real emit site; new tests extend the
+  prefix/no-double-underscore/`_total`-suffix invariants, a helpers-compile
+  smoke test, and a labeled-counter-renders test to the additions.
+  - **Q1** `copperclaw_image_bundle_version{profile, pinned_binary, version}`
+    gauge — exactly which pinned-binary version a profile bakes, set at spawn
+    alongside the existing `copperclaw_group_image_profile`
+    (`copperclaw-host/src/container_manager/spawn.rs`). Plus
+    `copperclaw_pinned_binary_fetch_total{binary, outcome}`
+    (`cache_hit|fetch_ok|checksum_fail|arch_unsupported|fetch_failed`) at every
+    exit path of `fetch_pinned_binary` (`copperclaw-setup/src/steps/image.rs`).
+  - **Q2** `copperclaw_verify_run_stage_total{stage, result}` — a stage-labeled
+    sibling of the pre-Q2 `inc_verify_run` (kept, both fire together so
+    existing dashboards don't break), from `apply_verify_gate`
+    (`copperclaw-mcp/src/tools/computer_use.rs`).
+    `copperclaw_verify_gate_pending_stages_total{pending}` (`"1"|"2+"`) at the
+    todo-completion refusal (`copperclaw-mcp/src/tools/todo.rs`).
+    `copperclaw_verify_stages_declared` histogram (declared stage count per
+    project) from the same `apply_verify_gate` call site.
+  - **Q3** `copperclaw_diagnostics_run_total{tool, outcome}`
+    (`eslint|tsc|ruff` × `ran|not_available|error`) from the per-tool loop in
+    `diagnose_project` (`copperclaw-mcp/src/tools/diagnostics.rs`).
+  - **Q6** `copperclaw_review_gate_completion_total{outcome}`
+    (`refused_never_reviewed|refused_dirty|passed|blocked_cycle_cap`),
+    mirroring `inc_verify_gate_completion` one layer up the delivery pipeline
+    (`copperclaw-mcp/src/tools/todo.rs`, distinguishing `NeverReviewed` from
+    `Dirty` via `self_review::review_state`).
+    `copperclaw_self_review_findings` histogram +
+    `copperclaw_self_review_submission_total{kind}` (`no_findings|findings`)
+    from `self_review::handle` (`copperclaw-mcp/src/tools/self_review.rs`).
+  - **Q7** `copperclaw_delegate_batch_contract_total{present}` — one increment
+    per `delegate_batch` call (not per worker), and
+    `copperclaw_delegate_batch_post_join_dirty_total{outcome}`
+    (`marked|skipped_no_project|skipped_no_verify|skipped_gate_off|skipped_all_spawn_failed`)
+    covering every branch of the post-join integration-verify decision
+    (`copperclaw-mcp/src/tools/agents.rs`).
+  - **Q8** `copperclaw_compaction_file_inventory_count` /
+    `..._file_inventory_bytes` / `..._verify_stages_pinned` /
+    `..._decisions_tail_lines` histograms — one observation per project per
+    compaction round from `push_file_inventory` / `push_verify_stages` /
+    `push_decisions_tail` (`copperclaw-runner/src/compaction.rs`).
+  - **D1/D2** `copperclaw_ui_screenshot_total{outcome, viewport}`
+    (`ok|blocked_non_loopback|chromium_missing|driver_error|oversize|downgraded`
+    × `desktop|mobile`) + `copperclaw_ui_screenshot_refused_url_total` (shared
+    with `ui_inspect`) + `copperclaw_ui_screenshot_capture_seconds` histogram,
+    all from `ui_screenshot::handle`
+    (`copperclaw-mcp/src/tools/ui_screenshot.rs`).
+    `copperclaw_chromium_singleton_spawn_total{result}` +
+    `copperclaw_chromium_singleton_idle_reap_total` from the lazy singleton
+    launcher/reaper (`copperclaw-browser/src/incontainer.rs`).
+    `copperclaw_browser_output_format_total{tool, format}`
+    (`ui_screenshot|browser_render|browser_interact` × `png|jpeg`) — the last
+    two wired at their existing outcome-emission points
+    (`copperclaw-mcp/src/tools/browser_render.rs`,
+    `.../browser_interact.rs`; the latter is always `png` since interactive
+    screenshot mode has no format arg).
+  - **D4** `copperclaw_see_fix_screenshots_per_build` histogram (count of
+    `ui_screenshot` calls per inbound, threaded out of `drive_turn_inner` via
+    a new `&mut u32` out-param alongside the existing `BlockerRun`,
+    `copperclaw-runner/src/run/drive_turn.rs`) and
+    `copperclaw_ritual_screenshot_delivery_total{outcome}` — **only
+    `"delivered"` is emitted** (a `send_file` call whose `path` is under
+    `.copperclaw/screenshots/`, `copperclaw-mcp/src/tools/core.rs`). The
+    card's other wished outcome, `"omitted"` (a ready-card sent with no
+    screenshot on a UI project), is a **documented gap**: `send_card` and
+    `send_file` carry no "this is the ready card" / provenance tag today, so
+    detecting an omission needs new cross-tool-call turn state and a new
+    marker on both specs — out of scope for a metrics-only rider. See the
+    doc comment on `inc_ritual_screenshot_delivery` in
+    `crates/copperclaw-metrics/src/lib.rs` for the full reasoning. Likewise,
+    the histogram is an honest proxy (call *count*), not proof a
+    critique/edit cycle actually happened between calls — that step is
+    prompt-level with no runtime marker.
+  - **D5** `copperclaw_ui_inspect_total{outcome}`
+    (`success|refused_url|chromium_missing`) + `copperclaw_ui_inspect_console_errors`
+    histogram, from `ui_inspect::handle`
+    (`copperclaw-mcp/src/tools/ui_inspect.rs`).
+  - `copperclaw-setup` gained a new workspace dependency on `copperclaw-metrics`
+    (previously the only crate compiling a first-party binary without it).
+
 ### Added (M20 X-rider Wave 3 — vision-loop fixtures, testing)
 
 - Assessed all three Wave-3 X-rider fixture wishes (see→fix transcript

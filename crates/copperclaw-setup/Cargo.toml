@@ -18,6 +18,7 @@ copperclaw-types = { workspace = true }
 copperclaw-db = { workspace = true }
 copperclaw-onecli = { workspace = true }
 copperclaw-container-rt = { workspace = true }
+copperclaw-metrics = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

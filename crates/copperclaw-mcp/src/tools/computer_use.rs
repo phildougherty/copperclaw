@@ -411,6 +411,9 @@ pub mod shell {
             ctx.check_command_override().as_deref(),
         )
         .await;
+        // M20 Q2: declared-stage-count histogram (1 for a legacy unprefixed
+        // single-line file, or the override synthetic stage).
+        copperclaw_metrics::observe_verify_stages_declared(stages.len() as u64);
         let trimmed = command.trim();
         let Some(stage) = stages.iter().find(|s| s.command == trimmed) else {
             crate::tools::verify_gate::mark_dirty(&project_root).await;
@@ -418,6 +421,7 @@ pub mod shell {
         };
         if success {
             copperclaw_metrics::inc_verify_run("pass");
+            copperclaw_metrics::inc_verify_run_stage(&stage.name, "pass");
             crate::tools::verify_gate::record_stage_result(&project_root, &stage.name, true).await;
             if crate::tools::verify_gate::all_stages_passed(&project_root, &stages).await {
                 // R3/X2: record the fix-cycle count at the moment the dirty
@@ -428,6 +432,7 @@ pub mod shell {
             }
         } else {
             copperclaw_metrics::inc_verify_run("fail");
+            copperclaw_metrics::inc_verify_run_stage(&stage.name, "fail");
             let tail = format!("stdout:\n{stdout}\n\nstderr:\n{stderr}");
             crate::tools::verify_gate::record_stage_verify_failure(
                 &project_root,

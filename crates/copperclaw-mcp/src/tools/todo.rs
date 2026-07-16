@@ -721,6 +721,12 @@ pub mod update {
                             let pending =
                                 crate::tools::verify_gate::pending_stages(project_root, &stages)
                                     .await;
+                            // M20 Q2: bucket the refusal by how many stages are
+                            // still outstanding — "1 more to go" vs "barely
+                            // started" are different operator signals.
+                            copperclaw_metrics::inc_verify_gate_pending_stages(
+                                if pending.len() <= 1 { "1" } else { "2+" },
+                            );
                             let names = pending
                                 .iter()
                                 .map(|s| s.name.as_str())
@@ -778,6 +784,17 @@ pub mod update {
                     if let Some(project_root) = needing_review.first() {
                         let cycles = crate::tools::self_review::review_cycles(project_root).await;
                         if cycles < crate::tools::self_review::REVIEW_CYCLE_CAP {
+                            // M20 M1: distinguish "no marker at all yet" from
+                            // "reviewed once, then edited again" — mirrors the
+                            // verify gate's `inc_verify_gate_completion`.
+                            let outcome =
+                                match crate::tools::self_review::review_state(project_root).await {
+                                    crate::tools::self_review::ReviewState::NeverReviewed => {
+                                        "refused_never_reviewed"
+                                    }
+                                    _ => "refused_dirty",
+                                };
+                            copperclaw_metrics::inc_review_gate_completion(outcome);
                             let new_cycles =
                                 crate::tools::self_review::record_review_refusal(project_root)
                                     .await;
@@ -808,6 +825,9 @@ pub mod update {
                             project_root.display(),
                             crate::tools::self_review::REVIEW_CYCLE_CAP
                         ));
+                        copperclaw_metrics::inc_review_gate_completion("blocked_cycle_cap");
+                    } else {
+                        copperclaw_metrics::inc_review_gate_completion("passed");
                     }
                 }
             }

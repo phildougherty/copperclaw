@@ -1385,6 +1385,366 @@ pub fn observe_scheduled_task_fire_latency_seconds(secs: f64) {
     histogram!(SCHEDULED_TASK_FIRE_LATENCY_SECONDS).record(secs);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// M20 metrics rider (card M1) — one sweep of the metric "wishes" the merged M20
+// cards (Q1-Q8, D1-D5) recorded in their PR descriptions. No other M20 card
+// touches this crate; names/labels mirror each card's wish where one exists,
+// noting any proxy/gap. The emit call sites live in the crate each wish named
+// (noted per helper). Grouped by card.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── Q1 — image profile bundle version + pinned-binary fetch outcomes ──────
+pub const IMAGE_BUNDLE_VERSION: &str = "copperclaw_image_bundle_version";
+pub const PINNED_BINARY_FETCH_TOTAL: &str = "copperclaw_pinned_binary_fetch_total";
+
+/// Set `copperclaw_image_bundle_version{profile, pinned_binary, version}` to 1
+/// — fleet visibility on exactly which pinned-binary version a spawning
+/// group's image profile bakes (e.g. `profile="prototyping"`,
+/// `pinned_binary="ruff"`, `version="0.15.22"`). Complements the M18
+/// `copperclaw_group_image_profile` gauge (profile only, no binary version).
+/// Emitted from `copperclaw-host/src/container_manager/spawn.rs` at the same
+/// spawn point as [`set_group_image_profile`], once per
+/// [`ImageProfile::extra_pinned_binaries`] entry (no-op for a profile with
+/// none, e.g. `minimal`).
+///
+/// [`ImageProfile::extra_pinned_binaries`]: https://docs.rs/copperclaw-types
+pub fn set_image_bundle_version(profile: &str, pinned_binary: &str, version: &str) {
+    gauge!(
+        IMAGE_BUNDLE_VERSION,
+        "profile" => profile.to_owned(),
+        "pinned_binary" => pinned_binary.to_owned(),
+        "version" => version.to_owned(),
+    )
+    .set(1.0);
+}
+
+/// Increment `copperclaw_pinned_binary_fetch_total{binary, outcome}` — one
+/// `fetch_pinned_binary` call during an image build/rebuild step. `outcome` is
+/// `cache_hit` (verified bytes already on disk under the cache dir), `fetch_ok`
+/// (downloaded + checksum-verified + extracted), `checksum_fail` (the
+/// downloaded tarball's sha256 didn't match the pin), `arch_unsupported` (no
+/// [`PinnedBinaryTarget`] for `std::env::consts::ARCH`), or `fetch_failed` (any
+/// other download/extract/read error — network blip, corrupt archive, missing
+/// archive member). Emitted from
+/// `copperclaw-setup/src/steps/image.rs` (`fetch_pinned_binary`).
+///
+/// [`PinnedBinaryTarget`]: https://docs.rs/copperclaw-types
+pub fn inc_pinned_binary_fetch(binary: &str, outcome: &str) {
+    counter!(
+        PINNED_BINARY_FETCH_TOTAL,
+        "binary" => binary.to_owned(),
+        "outcome" => outcome.to_owned(),
+    )
+    .increment(1);
+}
+
+// ── Q2 — multi-stage verify: per-stage runs + gate refusals by pending count ─
+pub const VERIFY_RUN_STAGE_TOTAL: &str = "copperclaw_verify_run_stage_total";
+pub const VERIFY_GATE_PENDING_STAGES_TOTAL: &str = "copperclaw_verify_gate_pending_stages_total";
+pub const VERIFY_STAGES_DECLARED: &str = "copperclaw_verify_stages_declared";
+
+/// Increment `copperclaw_verify_run_stage_total{stage, result}` — a matched
+/// verify command ran, attributed to the named stage it satisfied (a legacy
+/// one-line unprefixed file derives a single stage name); `result` is `pass`
+/// or `fail`. Distinct from the pre-Q2, stage-unaware
+/// [`inc_verify_run`] (kept for the legacy single-stage-file back-compat
+/// path — both fire together so existing dashboards built on `inc_verify_run`
+/// don't need to change). Emitted from
+/// `copperclaw-mcp/src/tools/computer_use.rs` (`apply_verify_gate`).
+pub fn inc_verify_run_stage(stage: &str, result: &str) {
+    counter!(
+        VERIFY_RUN_STAGE_TOTAL,
+        "stage" => stage.to_owned(),
+        "result" => result.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Increment `copperclaw_verify_gate_pending_stages_total{pending}` — a todo
+/// completion was refused by the multi-stage verify gate; `pending` buckets the
+/// count of stages still missing/failing since the last dirty mark as `"1"` or
+/// `"2+"` (coarse enough to stay low-cardinality while distinguishing "one more
+/// stage to go" from "barely started"). Emitted from
+/// `copperclaw-mcp/src/tools/todo.rs` (the completion gate), alongside the
+/// existing `inc_verify_gate_completion("refused_dirty")`.
+pub fn inc_verify_gate_pending_stages(pending: &str) {
+    counter!(VERIFY_GATE_PENDING_STAGES_TOTAL, "pending" => pending.to_owned()).increment(1);
+}
+
+/// Record `copperclaw_verify_stages_declared` — the number of stages parsed
+/// out of a project's `.copperclaw/verify` file (1 for a legacy unprefixed
+/// single-line file). Emitted from `copperclaw-mcp/src/tools/verify_gate.rs`
+/// wherever the file is parsed into its stage list.
+pub fn observe_verify_stages_declared(count: u64) {
+    #[allow(clippy::cast_precision_loss)]
+    histogram!(VERIFY_STAGES_DECLARED).record(count as f64);
+}
+
+// ── Q3 — diagnostics tool runs by tool + outcome ───────────────────────────
+pub const DIAGNOSTICS_RUN_TOTAL: &str = "copperclaw_diagnostics_run_total";
+
+/// Increment `copperclaw_diagnostics_run_total{tool, outcome}` — a
+/// `diagnostics` tool call attempted to run one linter/typechecker; `tool` is
+/// `eslint|tsc|ruff`, `outcome` is `ran|not_available|error`. Emitted from
+/// `copperclaw-mcp/src/tools/diagnostics.rs`.
+pub fn inc_diagnostics_run(tool: &str, outcome: &str) {
+    counter!(
+        DIAGNOSTICS_RUN_TOTAL,
+        "tool" => tool.to_owned(),
+        "outcome" => outcome.to_owned(),
+    )
+    .increment(1);
+}
+
+// ── Q6 — enforced self-review gate ─────────────────────────────────────────
+pub const REVIEW_GATE_COMPLETION_TOTAL: &str = "copperclaw_review_gate_completion_total";
+pub const SELF_REVIEW_FINDINGS: &str = "copperclaw_self_review_findings";
+pub const SELF_REVIEW_SUBMISSION_TOTAL: &str = "copperclaw_self_review_submission_total";
+
+/// Increment `copperclaw_review_gate_completion_total{outcome}` — a final/
+/// delivery todo completion crossed the self-review gate; `outcome` is
+/// `refused_never_reviewed|refused_dirty|passed|blocked_cycle_cap`. Mirrors
+/// the verify-gate-completion counter ([`inc_verify_gate_completion`]) one
+/// layer up the delivery pipeline. Emitted from
+/// `copperclaw-mcp/src/tools/todo.rs` (the final-todo review gate).
+pub fn inc_review_gate_completion(outcome: &str) {
+    counter!(REVIEW_GATE_COMPLETION_TOTAL, "outcome" => outcome.to_owned()).increment(1);
+}
+
+/// Record `copperclaw_self_review_findings` — the number of structured
+/// findings submitted in one `self_review` call (0 for an explicit
+/// `no_findings`). Emitted from `copperclaw-mcp/src/tools/self_review.rs`.
+pub fn observe_self_review_findings(count: u64) {
+    #[allow(clippy::cast_precision_loss)]
+    histogram!(SELF_REVIEW_FINDINGS).record(count as f64);
+}
+
+/// Increment `copperclaw_self_review_submission_total{kind}` — one
+/// `self_review` findings submission landed; `kind` is `no_findings` or
+/// `findings` (the has-findings/no-findings split the card asked for, as a
+/// counter alongside the histogram so a raw ratio is a one-line `PromQL` query).
+/// Emitted from `copperclaw-mcp/src/tools/self_review.rs`.
+pub fn inc_self_review_submission(kind: &str) {
+    counter!(SELF_REVIEW_SUBMISSION_TOTAL, "kind" => kind.to_owned()).increment(1);
+}
+
+// ── Q7 — delegate_batch contract presence + post-join dirty outcome ───────
+pub const DELEGATE_BATCH_CONTRACT_TOTAL: &str = "copperclaw_delegate_batch_contract_total";
+pub const DELEGATE_BATCH_POST_JOIN_DIRTY_TOTAL: &str =
+    "copperclaw_delegate_batch_post_join_dirty_total";
+
+/// Increment `copperclaw_delegate_batch_contract_total{present}` — a
+/// `delegate_batch` call's optional shared `contract` arg was present
+/// (`"true"`) or absent (`"false"`). Emitted from
+/// `copperclaw-mcp/src/tools/agents.rs` (`delegate_batch`).
+pub fn inc_delegate_batch_contract(present: bool) {
+    counter!(
+        DELEGATE_BATCH_CONTRACT_TOTAL,
+        "present" => if present { "true" } else { "false" },
+    )
+    .increment(1);
+}
+
+/// Increment `copperclaw_delegate_batch_post_join_dirty_total{outcome}` — the
+/// post-join integration-verify dirty-mark decision for a `delegate_batch`
+/// parent project; `outcome` is `marked` (the parent's `.copperclaw/verify`
+/// exists and was marked dirty so the merged union must re-pass all stages),
+/// `skipped_no_project` (the parent path isn't a recognized project),
+/// `skipped_no_verify` (no `.copperclaw/verify` file to gate on),
+/// `skipped_gate_off` (`verify_gate=off` for the group), or
+/// `skipped_all_spawn_failed` (every worker failed to spawn — nothing merged,
+/// so nothing to re-verify). Emitted from
+/// `copperclaw-mcp/src/tools/agents.rs` (`delegate_batch` post-join).
+pub fn inc_delegate_batch_post_join_dirty(outcome: &str) {
+    counter!(
+        DELEGATE_BATCH_POST_JOIN_DIRTY_TOTAL,
+        "outcome" => outcome.to_owned(),
+    )
+    .increment(1);
+}
+
+// ── Q8 — compaction digest sections pinned per round ───────────────────────
+pub const COMPACTION_FILE_INVENTORY_COUNT: &str = "copperclaw_compaction_file_inventory_count";
+pub const COMPACTION_FILE_INVENTORY_BYTES: &str = "copperclaw_compaction_file_inventory_bytes";
+pub const COMPACTION_VERIFY_STAGES_PINNED: &str = "copperclaw_compaction_verify_stages_pinned";
+pub const COMPACTION_DECISIONS_TAIL_LINES: &str = "copperclaw_compaction_decisions_tail_lines";
+
+/// Record `copperclaw_compaction_file_inventory_count` — the number of files
+/// listed in a compaction's pinned project file inventory (`git ls-files`,
+/// capped). Emitted from `copperclaw-runner/src/compaction.rs`
+/// (`build_project_facts_header`).
+pub fn observe_compaction_file_inventory_count(count: u64) {
+    #[allow(clippy::cast_precision_loss)]
+    histogram!(COMPACTION_FILE_INVENTORY_COUNT).record(count as f64);
+}
+
+/// Record `copperclaw_compaction_file_inventory_bytes` — the byte size of the
+/// pinned file-inventory text within the facts header. Emitted from
+/// `copperclaw-runner/src/compaction.rs` (`build_project_facts_header`).
+pub fn observe_compaction_file_inventory_bytes(bytes: usize) {
+    #[allow(clippy::cast_precision_loss)]
+    histogram!(COMPACTION_FILE_INVENTORY_BYTES).record(bytes as f64);
+}
+
+/// Record `copperclaw_compaction_verify_stages_pinned` — the number of Q2
+/// verify stages pinned verbatim into a compaction's facts header (0 for a
+/// project with no `.copperclaw/verify`). Emitted from
+/// `copperclaw-runner/src/compaction.rs` (`build_project_facts_header`).
+pub fn observe_compaction_verify_stages_pinned(count: u64) {
+    #[allow(clippy::cast_precision_loss)]
+    histogram!(COMPACTION_VERIFY_STAGES_PINNED).record(count as f64);
+}
+
+/// Record `copperclaw_compaction_decisions_tail_lines` — the number of lines
+/// from `<project>/.copperclaw/DECISIONS.md` pinned into a compaction's facts
+/// header (0 when the project has no decisions log — compacts exactly as
+/// before Q8). Emitted from `copperclaw-runner/src/compaction.rs`
+/// (`build_project_facts_header`).
+pub fn observe_compaction_decisions_tail_lines(count: u64) {
+    #[allow(clippy::cast_precision_loss)]
+    histogram!(COMPACTION_DECISIONS_TAIL_LINES).record(count as f64);
+}
+
+// ── D1/D2 — ui_screenshot calls by outcome/viewport, refusals, chromium
+// singleton lifecycle, capture latency, browser_render/interact by format ───
+pub const UI_SCREENSHOT_TOTAL: &str = "copperclaw_ui_screenshot_total";
+pub const UI_SCREENSHOT_REFUSED_URL_TOTAL: &str = "copperclaw_ui_screenshot_refused_url_total";
+pub const CHROMIUM_SINGLETON_SPAWN_TOTAL: &str = "copperclaw_chromium_singleton_spawn_total";
+pub const CHROMIUM_SINGLETON_IDLE_REAP_TOTAL: &str =
+    "copperclaw_chromium_singleton_idle_reap_total";
+pub const UI_SCREENSHOT_CAPTURE_SECONDS: &str = "copperclaw_ui_screenshot_capture_seconds";
+pub const BROWSER_OUTPUT_FORMAT_TOTAL: &str = "copperclaw_browser_output_format_total";
+
+/// Increment `copperclaw_ui_screenshot_total{outcome, viewport}` — one
+/// `ui_screenshot` call; `outcome` is
+/// `ok|blocked_non_loopback|chromium_missing|driver_error|oversize|downgraded`,
+/// `viewport` is `desktop|mobile`. Emitted from
+/// `copperclaw-mcp/src/tools/ui_screenshot.rs`.
+pub fn inc_ui_screenshot(outcome: &str, viewport: &str) {
+    counter!(
+        UI_SCREENSHOT_TOTAL,
+        "outcome" => outcome.to_owned(),
+        "viewport" => viewport.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Increment `copperclaw_ui_screenshot_refused_url_total` — a `ui_screenshot`
+/// (or `ui_inspect`) call was refused because its `url` arg was not
+/// loopback (`127.0.0.1`/`localhost`). Dedicated counter distinct from the
+/// generic `outcome="blocked_non_loopback"` label above, so a refused-URL rate
+/// alarm doesn't require decomposing the labeled counter. Emitted from
+/// `copperclaw-mcp/src/tools/ui_screenshot.rs` and
+/// `copperclaw-mcp/src/tools/ui_inspect.rs`.
+pub fn inc_ui_screenshot_refused_url() {
+    counter!(UI_SCREENSHOT_REFUSED_URL_TOTAL).increment(1);
+}
+
+/// Increment `copperclaw_chromium_singleton_spawn_total{result}` — the
+/// in-container chromium singleton (D1's lazy-per-session launcher) started a
+/// new headless instance; `result` is `ok|error`. Emitted from
+/// `copperclaw-browser/src/incontainer.rs`.
+pub fn inc_chromium_singleton_spawn(result: &str) {
+    counter!(CHROMIUM_SINGLETON_SPAWN_TOTAL, "result" => result.to_owned()).increment(1);
+}
+
+/// Increment `copperclaw_chromium_singleton_idle_reap_total` — the
+/// in-container chromium singleton was torn down after sitting idle past its
+/// reap threshold. Emitted from `copperclaw-browser/src/incontainer.rs`.
+pub fn inc_chromium_singleton_idle_reap() {
+    counter!(CHROMIUM_SINGLETON_IDLE_REAP_TOTAL).increment(1);
+}
+
+/// Record `copperclaw_ui_screenshot_capture_seconds` — navigate/wait→PNG (or
+/// JPEG) bytes-in-hand span for one `ui_screenshot` call. Emitted from
+/// `copperclaw-mcp/src/tools/ui_screenshot.rs`.
+pub fn observe_ui_screenshot_capture_seconds(secs: f64) {
+    histogram!(UI_SCREENSHOT_CAPTURE_SECONDS).record(secs);
+}
+
+/// Increment `copperclaw_browser_output_format_total{tool, format}` — a
+/// screenshot-capable tool call's chosen (or downgraded-to) output format;
+/// `tool` is `ui_screenshot|browser_render|browser_interact`, `format` is
+/// `png|jpeg`. Emitted from `copperclaw-mcp/src/tools/ui_screenshot.rs`,
+/// `copperclaw-mcp/src/tools/browser_render.rs`, and
+/// `copperclaw-mcp/src/tools/browser_interact.rs`.
+pub fn inc_browser_output_format(tool: &str, format: &str) {
+    counter!(
+        BROWSER_OUTPUT_FORMAT_TOTAL,
+        "tool" => tool.to_owned(),
+        "format" => format.to_owned(),
+    )
+    .increment(1);
+}
+
+// ── D4 — see→fix cycles + ritual screenshot delivery (proxy — see gap note) ─
+// D4's own acceptance criteria are prompt-level (the model looks at the
+// image, runs the frontend-design critique checklist, edits, re-screenshots)
+// — that critique/edit step has no runtime marker at all (it's a habit
+// taught by static prompt text, not a tool call), so it is NOT independently
+// emittable. Both metrics below are the closest HONEST proxies, not a direct
+// measurement of "did the model actually look and think":
+//   - `SEE_FIX_SCREENSHOTS_PER_BUILD` counts `ui_screenshot` calls within one
+//     inbound (>=2 is CONSISTENT WITH a see->fix cycle — an initial shot plus
+//     a re-shot — but doesn't prove a critique happened in between).
+//   - `RITUAL_SCREENSHOT_DELIVERY_TOTAL` only ever emits `"delivered"` (a
+//     `send_file` call whose path is a `ui_screenshot`-saved image). The
+//     card's other wished outcome, `"omitted"` (a ready-card went out with
+//     NO screenshot, on a project that has a UI), is NOT emitted: detecting
+//     it requires correlating two facts across the same inbound turn — "a
+//     `send_card` fired" AND "no screenshot `send_file` fired" AND "the
+//     project has a UI" — and neither `send_card` nor `send_file` carries a
+//     "this is the ready card" / provenance tag today (`SendCardSpec` and
+//     `SendFileSpec` in `copperclaw-mcp/src/context.rs` are undifferentiated
+//     from any other card/file send). Wiring that distinction would mean
+//     threading new per-turn state through `TurnResult` AND teaching
+//     `send_card`/`send_file` to tag ready-card sends — a materially bigger
+//     change than a metrics rider should make unilaterally. Documented gap;
+//     the positive signal (`"delivered"`) is still directly useful (its rate
+//     over total coding-project deliveries is the proxy for the negative).
+pub const SEE_FIX_SCREENSHOTS_PER_BUILD: &str = "copperclaw_see_fix_screenshots_per_build";
+pub const RITUAL_SCREENSHOT_DELIVERY_TOTAL: &str = "copperclaw_ritual_screenshot_delivery_total";
+
+/// Record `copperclaw_see_fix_screenshots_per_build` — the number of
+/// `ui_screenshot` calls observed within one inbound's tool loop (proxy for
+/// see->fix cycle count — see the gap note above). Emitted from
+/// `copperclaw-runner/src/run/drive_turn.rs` (`drive_turn`), once per inbound,
+/// only when at least one `ui_screenshot` call occurred.
+pub fn observe_see_fix_screenshots_per_build(count: u64) {
+    #[allow(clippy::cast_precision_loss)]
+    histogram!(SEE_FIX_SCREENSHOTS_PER_BUILD).record(count as f64);
+}
+
+/// Increment `copperclaw_ritual_screenshot_delivery_total{outcome}` — today
+/// only ever called with `outcome="delivered"` (a `send_file` call whose
+/// `path` arg is a `ui_screenshot`-saved image under
+/// `.copperclaw/screenshots/`). The card's other wished outcome, `"omitted"`,
+/// is a documented gap — see the section note above for why it isn't cleanly
+/// emittable without much bigger plumbing. Emitted from
+/// `copperclaw-mcp/src/tools/core.rs` (`send_file::handle`).
+pub fn inc_ritual_screenshot_delivery(outcome: &str) {
+    counter!(RITUAL_SCREENSHOT_DELIVERY_TOTAL, "outcome" => outcome.to_owned()).increment(1);
+}
+
+// ── D5 — ui_inspect calls by outcome + console errors surfaced ────────────
+pub const UI_INSPECT_TOTAL: &str = "copperclaw_ui_inspect_total";
+pub const UI_INSPECT_CONSOLE_ERRORS: &str = "copperclaw_ui_inspect_console_errors";
+
+/// Increment `copperclaw_ui_inspect_total{outcome}` — one `ui_inspect` call;
+/// `outcome` is `success|refused_url|chromium_missing`. Emitted from
+/// `copperclaw-mcp/src/tools/ui_inspect.rs`.
+pub fn inc_ui_inspect(outcome: &str) {
+    counter!(UI_INSPECT_TOTAL, "outcome" => outcome.to_owned()).increment(1);
+}
+
+/// Record `copperclaw_ui_inspect_console_errors` — the number of buffered
+/// console errors surfaced by one `ui_inspect` call (0 when the page logged
+/// none). Emitted from `copperclaw-mcp/src/tools/ui_inspect.rs`.
+pub fn observe_ui_inspect_console_errors(count: u64) {
+    #[allow(clippy::cast_precision_loss)]
+    histogram!(UI_INSPECT_CONSOLE_ERRORS).record(count as f64);
+}
+
 // ── Address parsing ────────────────────────────────────────────────────────
 
 /// Parse `COPPERCLAW_METRICS_ADDR`.  Accepts:
@@ -2289,6 +2649,194 @@ mod tests {
         assert!(
             body.contains(SHARED_RENDERER_ADOPTION) && body.contains("channel_type=\"slack\""),
             "missing shared-renderer adoption gauge:\n{body}"
+        );
+    }
+
+    // ── M20 metrics-rider (card M1) coverage ───────────────────────────────
+
+    /// Every new M20 metric name const, so the prefix / double-underscore
+    /// invariants extend to the rider's additions.
+    const M20_METRIC_NAMES: &[&str] = &[
+        IMAGE_BUNDLE_VERSION,
+        PINNED_BINARY_FETCH_TOTAL,
+        VERIFY_RUN_STAGE_TOTAL,
+        VERIFY_GATE_PENDING_STAGES_TOTAL,
+        VERIFY_STAGES_DECLARED,
+        DIAGNOSTICS_RUN_TOTAL,
+        REVIEW_GATE_COMPLETION_TOTAL,
+        SELF_REVIEW_FINDINGS,
+        SELF_REVIEW_SUBMISSION_TOTAL,
+        DELEGATE_BATCH_CONTRACT_TOTAL,
+        DELEGATE_BATCH_POST_JOIN_DIRTY_TOTAL,
+        COMPACTION_FILE_INVENTORY_COUNT,
+        COMPACTION_FILE_INVENTORY_BYTES,
+        COMPACTION_VERIFY_STAGES_PINNED,
+        COMPACTION_DECISIONS_TAIL_LINES,
+        UI_SCREENSHOT_TOTAL,
+        UI_SCREENSHOT_REFUSED_URL_TOTAL,
+        CHROMIUM_SINGLETON_SPAWN_TOTAL,
+        CHROMIUM_SINGLETON_IDLE_REAP_TOTAL,
+        UI_SCREENSHOT_CAPTURE_SECONDS,
+        BROWSER_OUTPUT_FORMAT_TOTAL,
+        SEE_FIX_SCREENSHOTS_PER_BUILD,
+        RITUAL_SCREENSHOT_DELIVERY_TOTAL,
+        UI_INSPECT_TOTAL,
+        UI_INSPECT_CONSOLE_ERRORS,
+    ];
+
+    #[test]
+    fn m20_metric_names_have_copperclaw_prefix_no_double_underscore() {
+        for name in M20_METRIC_NAMES {
+            assert!(
+                name.starts_with("copperclaw_"),
+                "metric name {name:?} does not start with 'copperclaw_'"
+            );
+            assert!(
+                !name.contains("__"),
+                "metric name {name:?} must not contain double underscores"
+            );
+        }
+    }
+
+    #[test]
+    fn m20_counter_names_end_with_total() {
+        for name in M20_METRIC_NAMES {
+            if name.contains("_seconds")
+                || name.contains("_bytes")
+                || name.contains("_declared")
+                || name.contains("_findings")
+                || name.contains("_pinned")
+                || name.contains("_lines")
+                || name.contains("_count")
+                || name.contains("_per_build")
+                || name.contains("_errors")
+                || name == &IMAGE_BUNDLE_VERSION
+            {
+                // histograms / gauges: exempt from the `_total` suffix rule.
+                continue;
+            }
+            assert!(
+                name.ends_with("_total"),
+                "counter {name:?} does not end with '_total'"
+            );
+        }
+    }
+
+    #[test]
+    fn m20_helpers_compile_and_do_not_panic() {
+        // No recorder installed → all of these no-op; smoke test that every
+        // rider helper is callable with its intended argument shape.
+        set_image_bundle_version("prototyping", "ruff", "0.15.22");
+        inc_pinned_binary_fetch("ruff", "cache_hit");
+        inc_pinned_binary_fetch("ruff", "fetch_ok");
+        inc_pinned_binary_fetch("ruff", "checksum_fail");
+        inc_pinned_binary_fetch("ruff", "arch_unsupported");
+        inc_pinned_binary_fetch("ruff", "fetch_failed");
+        inc_verify_run_stage("lint", "pass");
+        inc_verify_run_stage("typecheck", "fail");
+        inc_verify_gate_pending_stages("1");
+        inc_verify_gate_pending_stages("2+");
+        observe_verify_stages_declared(3);
+        inc_diagnostics_run("eslint", "ran");
+        inc_diagnostics_run("tsc", "not_available");
+        inc_diagnostics_run("ruff", "error");
+        inc_review_gate_completion("refused_never_reviewed");
+        inc_review_gate_completion("refused_dirty");
+        inc_review_gate_completion("passed");
+        inc_review_gate_completion("blocked_cycle_cap");
+        observe_self_review_findings(4);
+        inc_self_review_submission("no_findings");
+        inc_self_review_submission("findings");
+        inc_delegate_batch_contract(true);
+        inc_delegate_batch_contract(false);
+        inc_delegate_batch_post_join_dirty("marked");
+        inc_delegate_batch_post_join_dirty("skipped_no_project");
+        inc_delegate_batch_post_join_dirty("skipped_no_verify");
+        inc_delegate_batch_post_join_dirty("skipped_gate_off");
+        inc_delegate_batch_post_join_dirty("skipped_all_spawn_failed");
+        observe_compaction_file_inventory_count(42);
+        observe_compaction_file_inventory_bytes(2048);
+        observe_compaction_verify_stages_pinned(2);
+        observe_compaction_decisions_tail_lines(10);
+        inc_ui_screenshot("ok", "desktop");
+        inc_ui_screenshot("downgraded", "mobile");
+        inc_ui_screenshot_refused_url();
+        inc_chromium_singleton_spawn("ok");
+        inc_chromium_singleton_spawn("error");
+        inc_chromium_singleton_idle_reap();
+        observe_ui_screenshot_capture_seconds(0.8);
+        inc_browser_output_format("ui_screenshot", "png");
+        inc_browser_output_format("browser_render", "jpeg");
+        inc_browser_output_format("browser_interact", "png");
+        observe_see_fix_screenshots_per_build(2);
+        inc_ritual_screenshot_delivery("delivered");
+        inc_ui_inspect("success");
+        inc_ui_inspect("refused_url");
+        inc_ui_inspect("chromium_missing");
+        observe_ui_inspect_console_errors(0);
+        observe_ui_inspect_console_errors(3);
+    }
+
+    #[test]
+    fn m20_labeled_counter_renders() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            set_image_bundle_version("prototyping", "ruff", "0.15.22");
+            inc_pinned_binary_fetch("ruff", "checksum_fail");
+            inc_verify_run_stage("lint", "pass");
+            inc_verify_gate_pending_stages("2+");
+            inc_diagnostics_run("tsc", "not_available");
+            inc_review_gate_completion("refused_never_reviewed");
+            inc_delegate_batch_contract(true);
+            inc_delegate_batch_post_join_dirty("marked");
+            inc_ui_screenshot("chromium_missing", "mobile");
+            inc_ui_inspect("success");
+        });
+        let body = handle.render();
+        assert!(
+            body.contains(IMAGE_BUNDLE_VERSION) && body.contains("pinned_binary=\"ruff\""),
+            "missing image bundle version gauge:\n{body}"
+        );
+        assert!(
+            body.contains(PINNED_BINARY_FETCH_TOTAL) && body.contains("outcome=\"checksum_fail\""),
+            "missing pinned binary fetch outcome:\n{body}"
+        );
+        assert!(
+            body.contains(VERIFY_RUN_STAGE_TOTAL) && body.contains("stage=\"lint\""),
+            "missing verify run stage:\n{body}"
+        );
+        assert!(
+            body.contains(VERIFY_GATE_PENDING_STAGES_TOTAL) && body.contains("pending=\"2+\""),
+            "missing verify gate pending stages:\n{body}"
+        );
+        assert!(
+            body.contains(DIAGNOSTICS_RUN_TOTAL) && body.contains("tool=\"tsc\""),
+            "missing diagnostics run:\n{body}"
+        );
+        assert!(
+            body.contains(REVIEW_GATE_COMPLETION_TOTAL)
+                && body.contains("outcome=\"refused_never_reviewed\""),
+            "missing review gate completion:\n{body}"
+        );
+        assert!(
+            body.contains(DELEGATE_BATCH_CONTRACT_TOTAL) && body.contains("present=\"true\""),
+            "missing delegate batch contract:\n{body}"
+        );
+        assert!(
+            body.contains(DELEGATE_BATCH_POST_JOIN_DIRTY_TOTAL)
+                && body.contains("outcome=\"marked\""),
+            "missing delegate batch post-join dirty:\n{body}"
+        );
+        assert!(
+            body.contains(UI_SCREENSHOT_TOTAL)
+                && body.contains("outcome=\"chromium_missing\"")
+                && body.contains("viewport=\"mobile\""),
+            "missing ui_screenshot counter:\n{body}"
+        );
+        assert!(
+            body.contains(UI_INSPECT_TOTAL) && body.contains("outcome=\"success\""),
+            "missing ui_inspect counter:\n{body}"
         );
     }
 }

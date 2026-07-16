@@ -494,8 +494,18 @@ impl ChromiumSingleton {
             // respawn on the same port.
         }
         let port = DEFAULT_CDP_PORT;
-        let child = spawn_chromium(binary, port)?;
-        wait_ready(port, Duration::from_secs(15)).await?;
+        let child = match spawn_chromium(binary, port) {
+            Ok(c) => c,
+            Err(e) => {
+                copperclaw_metrics::inc_chromium_singleton_spawn("error");
+                return Err(e);
+            }
+        };
+        if let Err(e) = wait_ready(port, Duration::from_secs(15)).await {
+            copperclaw_metrics::inc_chromium_singleton_spawn("error");
+            return Err(e);
+        }
+        copperclaw_metrics::inc_chromium_singleton_spawn("ok");
         *guard = Some(RunningChromium {
             child,
             port,
@@ -521,6 +531,7 @@ impl ChromiumSingleton {
                     if let Some(mut running) = guard.take() {
                         let _ = running.child.start_kill();
                         let _ = running.child.wait().await;
+                        copperclaw_metrics::inc_chromium_singleton_idle_reap();
                         tracing::info!(
                             port = running.port,
                             "ui_screenshot: idle-reaped the local chromium process"

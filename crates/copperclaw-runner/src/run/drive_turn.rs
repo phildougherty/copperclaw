@@ -298,6 +298,14 @@ pub(super) async fn drive_turn(
     // result once the loop resolves (only consulted on a `Failed`
     // outcome — i.e. a turn that ended without a user-facing reply).
     let mut blocker_run = BlockerRun::default();
+    // M20 D4 (M1 proxy): tally of `ui_screenshot` calls made during this
+    // inbound. D4's actual acceptance criterion (a full screenshot -> look
+    // -> critique -> edit -> re-screenshot cycle) is a prompt-level habit
+    // with no runtime marker for "the model looked at it and critiqued" —
+    // that step is not independently observable. This tally is the closest
+    // honest proxy: >=2 calls in one inbound is consistent with a see->fix
+    // cycle (an initial shot plus a re-shot after edits).
+    let mut ui_screenshot_calls: u32 = 0;
     let mut result = drive_turn_inner(
         deps,
         history,
@@ -305,6 +313,7 @@ pub(super) async fn drive_turn(
         context_block,
         &hud,
         &mut blocker_run,
+        &mut ui_screenshot_calls,
     )
     .await;
     let ok = matches!(
@@ -319,6 +328,9 @@ pub(super) async fn drive_turn(
     // curated wall card instead of the generic apology.
     if let Ok(tr) = &mut result {
         tr.blocker = blocker_run.tail_blocker();
+    }
+    if ui_screenshot_calls > 0 {
+        copperclaw_metrics::observe_see_fix_screenshots_per_build(u64::from(ui_screenshot_calls));
     }
     hud.finalize(ok).await;
     result
@@ -336,6 +348,7 @@ async fn drive_turn_inner(
     context_block: Option<&str>,
     hud: &TaskHud,
     blocker_run: &mut BlockerRun,
+    ui_screenshot_calls: &mut u32,
 ) -> Result<TurnResult> {
     let mut continuation: Option<String> = previous_continuation.map(str::to_string);
     // Reset per-turn context state (the coarse-provenance taint flag)
@@ -565,6 +578,9 @@ async fn drive_turn_inner(
         for (call, (content, images, is_error)) in output.tool_calls.iter().zip(batch) {
             cumulative_tool_runs += 1;
             last_tool_name = Some(call.name.clone());
+            if call.name == "ui_screenshot" {
+                *ui_screenshot_calls += 1;
+            }
             batch_all_ok &= !is_error;
             // F2: fold this result into the tail-run tracker in call
             // order — a run of same-blocker denials at the tail of a
