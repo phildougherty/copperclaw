@@ -138,6 +138,16 @@ async fn slack_event_message_round_trip() {
     run_fixture("slack", "event-message").await;
 }
 
+/// M18 C4a acceptance: a Slack `url_private` file is staged by the adapter
+/// (bot-token download, size-capped) and materialized by the router into
+/// the resolved session's inbox at the container-visible `/data/inbox/...`
+/// path; a second, oversized file still yields the `too_large` system
+/// fallback. See the fixture's README.md.
+#[tokio::test]
+async fn slack_inbound_file_attachment_round_trip() {
+    run_fixture("slack", "inbound-file-attachment").await;
+}
+
 #[tokio::test]
 async fn cli_multi_turn_round_trip() {
     run_fixture("cli", "multi-turn").await;
@@ -146,6 +156,37 @@ async fn cli_multi_turn_round_trip() {
 #[tokio::test]
 async fn discord_inbound_message_round_trip() {
     run_fixture("discord", "inbound-message").await;
+}
+
+/// M18 C4b acceptance: a discord CDN attachment is staged by the adapter →
+/// router-materialized into the resolved session's inbox with a
+/// container-visible `/data/inbox/...` path; a second, oversized attachment
+/// still yields the `too_large` system fallback. See the fixture's README.md.
+#[tokio::test]
+async fn discord_inbound_file_attachment_round_trip() {
+    run_fixture("discord", "inbound-file-attachment").await;
+}
+
+/// M18 C4b acceptance, file-readability half: read the materialized bytes
+/// back off disk at the exact host path `container_manager::spawn::build_spec`
+/// bind-mounts as `/data` in production — the closest an in-process harness
+/// can get to "a runner reads the file at /data/inbox/...".
+#[tokio::test]
+async fn discord_inbound_file_attachment_file_readable_from_session_dir() {
+    let harness = run_fixture_into_harness("discord", "inbound-file-attachment").await;
+    let (ag, sess) = harness.touched_sessions[0];
+    let on_disk = harness
+        .tempdir
+        .path()
+        .join("sessions")
+        .join(ag.as_uuid().to_string())
+        .join(sess.as_uuid().to_string())
+        .join("inbox")
+        .join("dc-doc-001")
+        .join("spec.csv");
+    let bytes = std::fs::read(&on_disk)
+        .unwrap_or_else(|e| panic!("materialized attachment missing at {on_disk:?}: {e}"));
+    assert_eq!(bytes, b"id,qty\n1,2\n");
 }
 
 #[tokio::test]

@@ -1,0 +1,30 @@
+{
+  "channel_type": "discord",
+  "platform_id": "c1",
+  "thread_id": null,
+  "message": {
+    "id": "dc-doc-001",
+    "kind": "chat",
+    "content": {
+      "text": "here is the spec",
+      "embeds": [],
+      "attachments": [],
+      "attachment": {
+        "kind": "discord.attachment",
+        "filename": "spec.csv",
+        "mime_type": "text/csv",
+        "staged_path": "fixture://spec.csv",
+        "size": 11
+      }
+    },
+    "timestamp": "2026-01-01T00:00:00Z",
+    "is_mention": false,
+    "is_group": true
+  },
+  "reply_to": null,
+  "sender": {
+    "channel_type": "discord",
+    "identity": "u1",
+    "display_name": "Alice"
+  }
+}

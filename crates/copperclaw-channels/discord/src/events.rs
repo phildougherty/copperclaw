@@ -22,15 +22,58 @@
 //! This matches the slim mapping the spec asks for and keeps replies
 //! addressing the same Discord channel id the message came from.
 
+use crate::rest::DiscordRest;
 use chrono::Utc;
 use copperclaw_channels_core::AdapterError;
+use copperclaw_channels_core::inbound_file::{
+    STAGED_PATH_KEY, STAGING_SUBDIR, sanitize_filename, stage_inbound_file,
+};
 use copperclaw_types::{
     ChannelType, InboundEvent, InboundMessage, MessageKind, ReplyTo, SenderIdentity,
 };
 use serde_json::{Map, Value, json};
+use std::path::{Path, PathBuf};
 
 /// Channel-type string registered by this crate (`"discord"`).
 pub const CHANNEL_TYPE_STR: &str = "discord";
+
+/// Largest image we inline as base64 into the inbound message so a
+/// vision-capable model sees the picture without a tool read. Mirrors the
+/// Telegram precedent (`telegram/src/ingress/mod.rs`); larger or non-image
+/// attachments keep the path-only (staged) form.
+const MAX_INLINE_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Settings the ingress layer needs to download + stage inbound attachments
+/// per the channels-core inbound-file contract.
+#[derive(Debug, Clone)]
+pub struct AttachmentSettings {
+    /// When true, file-bearing messages have their first attachment fetched
+    /// from the Discord CDN and staged for the router. When false, the raw
+    /// `content.attachments` URL metadata is forwarded untouched.
+    pub attachment_download: bool,
+    /// Refuse to download anything larger than this many bytes; oversized
+    /// attachments fall back to a `MessageKind::System` `too_large` row.
+    pub max_attachment_bytes: u64,
+    /// Per-channel data directory; downloads are STAGED under
+    /// `data_dir/staging/<unique>/<filename>` and surfaced on the attachment
+    /// as `staged_path`. The router moves the bytes into the resolved
+    /// session's `inbox/<msg_id>/<filename>` at route time and rewrites the
+    /// attachment `path` to the container-visible `/data/inbox/...`.
+    pub data_dir: PathBuf,
+}
+
+/// One inbound Discord attachment lifted from `d.attachments[i]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscordAttachment {
+    /// Public CDN URL to fetch the bytes from.
+    url: String,
+    /// Sanitized single-path-component filename to stage under.
+    filename: String,
+    /// Discord-reported `content_type`, if any.
+    content_type: Option<String>,
+    /// Discord-reported `size` in bytes (authoritative pre-download check).
+    reported_size: Option<u64>,
+}
 
 /// Convert a `MESSAGE_CREATE` dispatch payload (the `d` field of a gateway
 /// frame) into an `InboundEvent`.
@@ -123,6 +166,220 @@ pub fn message_create_to_inbound(
         reply_to,
         sender,
     })
+}
+
+/// Convert a `MESSAGE_CREATE` payload into an `InboundEvent`, additionally
+/// downloading and staging the message's first attachment when
+/// `settings.attachment_download` is set.
+///
+/// This is the async superset of [`message_create_to_inbound`]: it builds the
+/// same base event, then — per the C4b inbound-file work — fetches the first
+/// attachment from the Discord CDN, enforces `max_attachment_bytes`, and
+/// stages it via [`stage_inbound_file`] so the router can materialize it into
+/// the resolved session's inbox. Discord messages can carry several
+/// attachments, but the router's session-local materialization acts on a
+/// single `content.attachment` (the frozen C3 contract), so — like Telegram —
+/// we stage the first one; the raw `content.attachments` array is preserved
+/// for metadata.
+///
+/// System-row taxonomy (mirrors Telegram): an oversized attachment yields
+/// `MessageKind::System` with `content.attachment.reason = "too_large"`; a
+/// download error yields `reason = "download_failed"`. Neither is ever a
+/// silent drop.
+pub async fn message_create_to_inbound_downloaded(
+    d: &Value,
+    bot_user_id: Option<&str>,
+    rest: &DiscordRest,
+    settings: &AttachmentSettings,
+) -> Result<InboundEvent, AdapterError> {
+    let mut event = message_create_to_inbound(d, bot_user_id)?;
+    if !settings.attachment_download {
+        return Ok(event);
+    }
+    // `message_create_to_inbound` already validated that `d` is an object.
+    let Some(obj) = d.as_object() else {
+        return Ok(event);
+    };
+    let Some(att) = pick_attachment(obj) else {
+        return Ok(event);
+    };
+    apply_attachment(&mut event, &att, rest, settings).await;
+    Ok(event)
+}
+
+/// Pick the first attachment carrying a usable CDN `url` from
+/// `d.attachments`.
+fn pick_attachment(obj: &Map<String, Value>) -> Option<DiscordAttachment> {
+    let arr = obj.get("attachments").and_then(Value::as_array)?;
+    arr.iter().find_map(|entry| {
+        let e = entry.as_object()?;
+        let url = e.get("url").and_then(Value::as_str)?;
+        if url.is_empty() {
+            return None;
+        }
+        Some(DiscordAttachment {
+            url: url.to_owned(),
+            filename: sanitize_filename(
+                e.get("filename").and_then(Value::as_str),
+                "attachment.bin",
+            ),
+            content_type: e
+                .get("content_type")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            reported_size: e.get("size").and_then(Value::as_u64),
+        })
+    })
+}
+
+/// Download, size-check, and stage `att`, mutating `event` in place. On
+/// success sets `content.attachment` (with `staged_path`, no `path`) and
+/// keeps `kind = Chat`; on too-large / failure switches `kind` to `System`
+/// and records the reason.
+async fn apply_attachment(
+    event: &mut InboundEvent,
+    att: &DiscordAttachment,
+    rest: &DiscordRest,
+    settings: &AttachmentSettings,
+) {
+    // Cheap pre-check against the platform-reported size before we fetch.
+    if let Some(size) = att.reported_size {
+        if size > settings.max_attachment_bytes {
+            set_too_large(event, att, settings.max_attachment_bytes, Some(size));
+            return;
+        }
+    }
+    let bytes = match rest.download_cdn_file(&att.url).await {
+        Ok(b) => b,
+        Err(error) => {
+            set_download_failed(event, att, &error);
+            return;
+        }
+    };
+    if bytes.len() as u64 > settings.max_attachment_bytes {
+        set_too_large(
+            event,
+            att,
+            settings.max_attachment_bytes,
+            Some(bytes.len() as u64),
+        );
+        return;
+    }
+    let staged = match stage_inbound_file(
+        &settings.data_dir.join(STAGING_SUBDIR),
+        &att.filename,
+        &bytes,
+    )
+    .await
+    {
+        Ok(p) => p,
+        Err(error) => {
+            set_download_failed(event, att, &error);
+            return;
+        }
+    };
+    set_staged(event, att, &staged, bytes.len() as u64).await;
+}
+
+/// Base `content.attachment` metadata common to every outcome.
+fn attachment_meta(att: &DiscordAttachment) -> Map<String, Value> {
+    let mut o = Map::new();
+    o.insert(
+        "kind".to_owned(),
+        Value::String("discord.attachment".to_owned()),
+    );
+    o.insert("filename".to_owned(), Value::String(att.filename.clone()));
+    o.insert(
+        "mime_type".to_owned(),
+        att.content_type.clone().map_or(Value::Null, Value::String),
+    );
+    o
+}
+
+/// Replace `content.attachment` on `event` (leaving `text` / `embeds` /
+/// `attachments` intact).
+fn set_content_attachment(event: &mut InboundEvent, att_obj: Map<String, Value>) {
+    if let Some(content) = event.message.content.as_object_mut() {
+        content.insert("attachment".to_owned(), Value::Object(att_obj));
+    }
+}
+
+/// Success: staged file present. Sets `staged_path` (never `path`) and, for
+/// small images, an inline `data_base64` for vision parity.
+async fn set_staged(
+    event: &mut InboundEvent,
+    att: &DiscordAttachment,
+    staged_path: &Path,
+    actual_size: u64,
+) {
+    let mut o = attachment_meta(att);
+    o.insert(
+        STAGED_PATH_KEY.to_owned(),
+        Value::String(staged_path.to_string_lossy().into_owned()),
+    );
+    o.insert("size".to_owned(), Value::from(actual_size));
+    inline_image_base64(&mut o, att, staged_path, actual_size).await;
+    set_content_attachment(event, o);
+    // kind stays Chat.
+}
+
+/// Oversized fallback: `MessageKind::System`, `reason = "too_large"`.
+fn set_too_large(
+    event: &mut InboundEvent,
+    att: &DiscordAttachment,
+    limit: u64,
+    reported: Option<u64>,
+) {
+    let mut o = attachment_meta(att);
+    o.insert("reason".to_owned(), Value::String("too_large".to_owned()));
+    o.insert("limit".to_owned(), Value::from(limit));
+    if let Some(r) = reported {
+        o.insert("reported_size".to_owned(), Value::from(r));
+    }
+    set_content_attachment(event, o);
+    event.message.kind = MessageKind::System;
+}
+
+/// Download-failure fallback: `MessageKind::System`,
+/// `reason = "download_failed"`, with the error surfaced verbatim.
+fn set_download_failed(event: &mut InboundEvent, att: &DiscordAttachment, error: &AdapterError) {
+    let mut o = attachment_meta(att);
+    o.insert(
+        "reason".to_owned(),
+        Value::String("download_failed".to_owned()),
+    );
+    o.insert("error".to_owned(), Value::String(format!("{error}")));
+    set_content_attachment(event, o);
+    event.message.kind = MessageKind::System;
+}
+
+/// If `att` is an image within the size cap, read the staged file and add a
+/// `data_base64` field so the runner can lift it into a vision content block.
+/// Best-effort: a read failure just leaves the path-only form.
+async fn inline_image_base64(
+    att_obj: &mut Map<String, Value>,
+    att: &DiscordAttachment,
+    path: &Path,
+    size: u64,
+) {
+    let is_image = att
+        .content_type
+        .as_deref()
+        .is_some_and(|m| m.starts_with("image/"));
+    if !is_image || size > MAX_INLINE_IMAGE_BYTES {
+        return;
+    }
+    match tokio::fs::read(path).await {
+        Ok(bytes) => {
+            att_obj.insert(
+                "data_base64".to_owned(),
+                Value::String(copperclaw_types::encode_base64(&bytes)),
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(), "failed to inline inbound discord image");
+        }
+    }
 }
 
 /// Discord interaction `type` values relevant to this adapter.
@@ -313,6 +570,277 @@ fn extract_string(obj: &Map<String, Value>, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use reqwest::Client;
+    use tempfile::TempDir;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ---- C4b: inbound-attachment download + staging ----
+
+    fn attach_settings(dir: &Path) -> AttachmentSettings {
+        AttachmentSettings {
+            attachment_download: true,
+            max_attachment_bytes: crate::config::DEFAULT_MAX_ATTACHMENT_BYTES,
+            data_dir: dir.to_path_buf(),
+        }
+    }
+
+    fn rest_for(server: &MockServer) -> DiscordRest {
+        DiscordRest::new(Client::new(), "tok", server.uri())
+    }
+
+    /// Build a `MESSAGE_CREATE` payload with a single attachment whose `url`
+    /// points at `server`'s `/cdn/<name>` path.
+    fn payload_with_attachment(
+        server: &MockServer,
+        name: &str,
+        content_type: Option<&str>,
+        size: Option<u64>,
+    ) -> Value {
+        let mut att = json!({
+            "id": "att-1",
+            "filename": name,
+            "url": format!("{}/cdn/{name}", server.uri()),
+        });
+        if let Some(ct) = content_type {
+            att["content_type"] = json!(ct);
+        }
+        if let Some(s) = size {
+            att["size"] = json!(s);
+        }
+        json!({
+            "id": "m-att",
+            "channel_id": "c1",
+            "guild_id": "g1",
+            "content": "here is the file",
+            "author": { "id": "u1", "username": "alice", "global_name": "Alice" },
+            "mentions": [],
+            "embeds": [],
+            "attachments": [att]
+        })
+    }
+
+    async fn mount_cdn(server: &MockServer, name: &str, bytes: Vec<u8>) {
+        Mock::given(method("GET"))
+            .and(path(format!("/cdn/{name}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn attachment_download_stages_and_sets_staged_path_not_path() {
+        let server = MockServer::start().await;
+        mount_cdn(&server, "spec.csv", b"id,qty\n1,2\n".to_vec()).await;
+        let dir = TempDir::new().unwrap();
+        let payload = payload_with_attachment(&server, "spec.csv", Some("text/csv"), Some(11));
+        let evt = message_create_to_inbound_downloaded(
+            &payload,
+            None,
+            &rest_for(&server),
+            &attach_settings(dir.path()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(evt.message.kind, MessageKind::Chat);
+        let att = &evt.message.content["attachment"];
+        assert_eq!(att["kind"], "discord.attachment");
+        assert_eq!(att["filename"], "spec.csv");
+        assert_eq!(att["mime_type"], "text/csv");
+        assert_eq!(att["size"], 11);
+        // Contract: adapters set staged_path, never path.
+        assert!(
+            att.get("path").is_none(),
+            "adapters must not set attachment.path: {att}"
+        );
+        let staged = att[STAGED_PATH_KEY].as_str().unwrap();
+        let staged_path = Path::new(staged);
+        assert!(
+            staged_path.starts_with(dir.path().join(STAGING_SUBDIR)),
+            "staged under <data_dir>/staging: {staged}"
+        );
+        assert_eq!(std::fs::read(staged_path).unwrap(), b"id,qty\n1,2\n");
+        // The raw attachments array is preserved for metadata.
+        assert_eq!(
+            evt.message.content["attachments"][0]["filename"],
+            "spec.csv"
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_download_disabled_leaves_urls_untouched() {
+        let server = MockServer::start().await;
+        // No CDN mock — download must never be attempted.
+        let dir = TempDir::new().unwrap();
+        let mut settings = attach_settings(dir.path());
+        settings.attachment_download = false;
+        let payload = payload_with_attachment(&server, "spec.csv", Some("text/csv"), Some(11));
+        let evt =
+            message_create_to_inbound_downloaded(&payload, None, &rest_for(&server), &settings)
+                .await
+                .unwrap();
+        assert_eq!(evt.message.kind, MessageKind::Chat);
+        assert!(evt.message.content.get("attachment").is_none());
+        assert_eq!(
+            evt.message.content["attachments"][0]["filename"],
+            "spec.csv"
+        );
+    }
+
+    #[tokio::test]
+    async fn attachment_oversized_by_reported_size_yields_too_large_system_row() {
+        let server = MockServer::start().await;
+        // No CDN mock — we must reject before fetching.
+        let dir = TempDir::new().unwrap();
+        let mut settings = attach_settings(dir.path());
+        settings.max_attachment_bytes = 4;
+        let payload =
+            payload_with_attachment(&server, "big.bin", Some("application/zip"), Some(999));
+        let evt =
+            message_create_to_inbound_downloaded(&payload, None, &rest_for(&server), &settings)
+                .await
+                .unwrap();
+        assert_eq!(evt.message.kind, MessageKind::System);
+        let att = &evt.message.content["attachment"];
+        assert_eq!(att["reason"], "too_large");
+        assert_eq!(att["limit"], 4);
+        assert_eq!(att["reported_size"], 999);
+    }
+
+    #[tokio::test]
+    async fn attachment_oversized_after_body_read_yields_too_large() {
+        let server = MockServer::start().await;
+        mount_cdn(&server, "big.bin", vec![0u8; 32]).await;
+        let dir = TempDir::new().unwrap();
+        let mut settings = attach_settings(dir.path());
+        settings.max_attachment_bytes = 16;
+        // No reported size, so the cap is only enforceable after download.
+        let payload = payload_with_attachment(&server, "big.bin", None, None);
+        let evt =
+            message_create_to_inbound_downloaded(&payload, None, &rest_for(&server), &settings)
+                .await
+                .unwrap();
+        assert_eq!(evt.message.kind, MessageKind::System);
+        assert_eq!(evt.message.content["attachment"]["reason"], "too_large");
+    }
+
+    #[tokio::test]
+    async fn attachment_download_failure_yields_download_failed_system_row() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/cdn/spec.csv"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let dir = TempDir::new().unwrap();
+        let payload = payload_with_attachment(&server, "spec.csv", Some("text/csv"), Some(11));
+        let evt = message_create_to_inbound_downloaded(
+            &payload,
+            None,
+            &rest_for(&server),
+            &attach_settings(dir.path()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(evt.message.kind, MessageKind::System);
+        let att = &evt.message.content["attachment"];
+        assert_eq!(att["reason"], "download_failed");
+        assert!(att["error"].as_str().unwrap().contains("503"));
+    }
+
+    #[tokio::test]
+    async fn small_image_attachment_inlines_data_base64() {
+        let server = MockServer::start().await;
+        mount_cdn(&server, "pic.png", b"\x89PNGfake".to_vec()).await;
+        let dir = TempDir::new().unwrap();
+        let payload = payload_with_attachment(&server, "pic.png", Some("image/png"), Some(8));
+        let evt = message_create_to_inbound_downloaded(
+            &payload,
+            None,
+            &rest_for(&server),
+            &attach_settings(dir.path()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(evt.message.kind, MessageKind::Chat);
+        let att = &evt.message.content["attachment"];
+        let b64 = att["data_base64"].as_str().expect("data_base64 present");
+        assert_eq!(
+            b64,
+            copperclaw_types::encode_base64(b"\x89PNGfake"),
+            "inline base64 must be the raw image bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_image_attachment_has_no_data_base64() {
+        let server = MockServer::start().await;
+        mount_cdn(&server, "spec.csv", b"id,qty\n1,2\n".to_vec()).await;
+        let dir = TempDir::new().unwrap();
+        let payload = payload_with_attachment(&server, "spec.csv", Some("text/csv"), Some(11));
+        let evt = message_create_to_inbound_downloaded(
+            &payload,
+            None,
+            &rest_for(&server),
+            &attach_settings(dir.path()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            evt.message.content["attachment"]
+                .get("data_base64")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn message_without_attachments_passes_through() {
+        let server = MockServer::start().await;
+        let dir = TempDir::new().unwrap();
+        let evt = message_create_to_inbound_downloaded(
+            &sample_payload(),
+            None,
+            &rest_for(&server),
+            &attach_settings(dir.path()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(evt.message.kind, MessageKind::Chat);
+        assert!(evt.message.content.get("attachment").is_none());
+    }
+
+    #[tokio::test]
+    async fn attachment_hostile_filename_is_sanitized_when_staged() {
+        let server = MockServer::start().await;
+        mount_cdn(&server, "evil", b"x".to_vec()).await;
+        let dir = TempDir::new().unwrap();
+        // The CDN url path is /cdn/evil, but the reported filename is hostile.
+        let mut att = json!({
+            "id": "att-1",
+            "filename": "../../etc/passwd",
+            "url": format!("{}/cdn/evil", server.uri()),
+            "size": 1,
+        });
+        att["content_type"] = json!("application/octet-stream");
+        let payload = json!({
+            "id": "m-att", "channel_id": "c1", "guild_id": "g1",
+            "content": "", "author": { "id": "u1", "username": "a" },
+            "mentions": [], "embeds": [], "attachments": [att]
+        });
+        let evt = message_create_to_inbound_downloaded(
+            &payload,
+            None,
+            &rest_for(&server),
+            &attach_settings(dir.path()),
+        )
+        .await
+        .unwrap();
+        let att = &evt.message.content["attachment"];
+        assert_eq!(att["filename"], "etc_passwd");
+        let staged = Path::new(att[STAGED_PATH_KEY].as_str().unwrap());
+        assert!(staged.starts_with(dir.path().join(STAGING_SUBDIR)));
+        assert_eq!(staged.file_name().unwrap().to_str().unwrap(), "etc_passwd");
+    }
 
     fn sample_payload() -> Value {
         json!({

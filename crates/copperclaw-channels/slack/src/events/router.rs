@@ -13,7 +13,9 @@
 //!   agent sees the tap as if the user typed the value, mirroring the
 //!   Telegram `callback_query` pattern.
 
-use crate::events::types::{MessageEvent, SlackEvent, SlackEventEnvelope};
+use crate::api::SlackApi;
+use crate::config::DEFAULT_MAX_ATTACHMENT_BYTES;
+use crate::events::types::{MessageEvent, SlackEvent, SlackEventEnvelope, SlackFile};
 use crate::signature::verify_signature;
 use axum::{
     Router,
@@ -24,13 +26,25 @@ use axum::{
     routing::post,
 };
 use chrono::{TimeZone, Utc};
+use copperclaw_channels_core::AdapterError;
+use copperclaw_channels_core::inbound_file::{
+    FALLBACK_FILENAME, STAGED_PATH_KEY, STAGING_SUBDIR, sanitize_filename, stage_inbound_file,
+};
 use copperclaw_types::{
     ChannelType, InboundEvent, InboundMessage, MessageKind, ReplyTo, SenderIdentity,
 };
 use serde_json::{Value, json};
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc::Sender};
+
+/// Largest image we inline as base64 into the inbound message, mirroring
+/// the Telegram adapter's cap. The base64 rides in the transcript
+/// (re-sent every turn until compaction) and a tiled vision model gains
+/// nothing past a few megapixels — so cap it and leave larger images
+/// path-only for the agent to read with tools.
+const MAX_INLINE_IMAGE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Maximum number of recent `event_id`s to keep for duplicate suppression.
 pub const DEDUP_CAPACITY: usize = 256;
@@ -77,6 +91,21 @@ pub struct SlackEventsState {
     /// Override for "now" in seconds — only used by tests for deterministic
     /// signature drift checks.
     pub now_secs_override: Option<i64>,
+    /// Web API client used to download inbound `url_private` files with the
+    /// bot token. `None` disables inbound-file handling (files on a message
+    /// are ignored) — the default until the factory wires it via
+    /// [`SlackEventsState::with_attachments`].
+    pub api: Option<SlackApi>,
+    /// Cap on inbound file size; larger files fall back to a `too_large`
+    /// system row instead of being downloaded.
+    pub max_attachment_bytes: u64,
+    /// Per-channel data directory. Inbound downloads are STAGED under
+    /// `data_dir/staging/<unique>/<filename>` and surfaced on the
+    /// attachment as `staged_path`, per the channels-core inbound-file
+    /// contract ([`copperclaw_channels_core::inbound_file`]); the router
+    /// materializes them into the resolved session at route time. `None`
+    /// disables inbound-file handling.
+    pub data_dir: Option<PathBuf>,
 }
 
 impl SlackEventsState {
@@ -94,7 +123,28 @@ impl SlackEventsState {
             bot_user_id: Arc::new(bot_user_id),
             channel_type,
             now_secs_override: None,
+            api: None,
+            max_attachment_bytes: DEFAULT_MAX_ATTACHMENT_BYTES,
+            data_dir: None,
         }
+    }
+
+    /// Enable inbound-file handling: messages carrying `files[]` have their
+    /// first file downloaded from `url_private` (bot-token auth), size-capped
+    /// at `max_attachment_bytes`, and staged under `data_dir` for the router
+    /// to materialize into the resolved session. Without this the adapter
+    /// ignores inbound files (pre-C4a behaviour).
+    #[must_use]
+    pub fn with_attachments(
+        mut self,
+        api: SlackApi,
+        max_attachment_bytes: u64,
+        data_dir: impl Into<PathBuf>,
+    ) -> Self {
+        self.api = Some(api);
+        self.max_attachment_bytes = max_attachment_bytes;
+        self.data_dir = Some(data_dir.into());
+        self
     }
 
     fn now_secs(&self) -> i64 {
@@ -147,8 +197,8 @@ async fn handle_events(
                 return StatusCode::OK.into_response();
             }
             let event = match cb.event {
-                SlackEvent::Message(m) => convert_message(&state, &m, false),
-                SlackEvent::AppMention(m) => convert_message(&state, &m, true),
+                SlackEvent::Message(m) => convert_message(&state, &m, false).await,
+                SlackEvent::AppMention(m) => convert_message(&state, &m, true).await,
                 SlackEvent::Other => return StatusCode::OK.into_response(),
             };
             if let Err(err) = state.inbound_tx.send(event).await {
@@ -379,7 +429,7 @@ fn hex_digit(b: u8) -> Result<u8, ()> {
     }
 }
 
-fn convert_message(
+async fn convert_message(
     state: &SlackEventsState,
     m: &MessageEvent,
     is_app_mention: bool,
@@ -388,6 +438,39 @@ fn convert_message(
     if let Some(blocks) = m.blocks.clone() {
         content["blocks"] = blocks;
     }
+
+    // Inbound-file handling (M18 C4a). When file downloads are enabled
+    // (the factory wired an API client + staging dir) and the message
+    // carries an upload, download its bytes with the bot token, enforce
+    // the size cap, and stage per the channels-core inbound-file
+    // contract. Success surfaces `content.attachment` (with `staged_path`,
+    // never `path` — the router owns that key); the size/transport
+    // failure paths downgrade the event to a `MessageKind::System` row
+    // with the same `too_large` / `download_failed` taxonomy the Telegram
+    // adapter emits, so a failed download is never a silent drop.
+    //
+    // Slack messages can carry multiple files; we handle the first (the
+    // common "here's the CSV/spec" case) — mirroring the single-attachment
+    // model the Telegram ingress uses.
+    let mut kind = MessageKind::Chat;
+    if let (Some(api), Some(data_dir)) = (state.api.as_ref(), state.data_dir.as_ref()) {
+        if let Some(file) = m.files.as_ref().and_then(|files| files.first()) {
+            match download_file(api, data_dir, state.max_attachment_bytes, file).await {
+                FileOutcome::Ok { attachment } => {
+                    content["attachment"] = Value::Object(attachment);
+                }
+                FileOutcome::TooLarge { reported } => {
+                    kind = MessageKind::System;
+                    content = too_large_content(file, state.max_attachment_bytes, reported);
+                }
+                FileOutcome::Failed { error } => {
+                    kind = MessageKind::System;
+                    content = download_failed_content(file, &error);
+                }
+            }
+        }
+    }
+
     let is_mention = if is_app_mention {
         Some(true)
     } else {
@@ -428,7 +511,7 @@ fn convert_message(
         thread_id: m.thread_ts.clone(),
         message: InboundMessage {
             id: m.ts.clone(),
-            kind: MessageKind::Chat,
+            kind,
             content,
             timestamp,
             is_mention,
@@ -437,6 +520,165 @@ fn convert_message(
         reply_to,
         sender,
     }
+}
+
+/// Outcome of downloading one inbound Slack file.
+enum FileOutcome {
+    /// Downloaded + staged; the map is the `content.attachment` object
+    /// (carries `staged_path`, never `path`).
+    Ok {
+        attachment: serde_json::Map<String, Value>,
+    },
+    /// Reported or actual size exceeded `max_attachment_bytes`. `reported`
+    /// is the byte count we compared against the cap, when known.
+    TooLarge { reported: Option<u64> },
+    /// The download (or staging write) failed; the error is surfaced
+    /// verbatim in the `download_failed` system row.
+    Failed { error: AdapterError },
+}
+
+/// Download a single Slack file from its `url_private` link and stage it
+/// per the channels-core inbound-file contract. Enforces the size cap on
+/// both the Slack-reported size (pre-download) and the actual byte count
+/// (post-download), mirroring the Telegram ingress checks.
+async fn download_file(
+    api: &SlackApi,
+    data_dir: &Path,
+    max_attachment_bytes: u64,
+    file: &SlackFile,
+) -> FileOutcome {
+    if let Some(size) = file.size {
+        if size > max_attachment_bytes {
+            return FileOutcome::TooLarge {
+                reported: Some(size),
+            };
+        }
+    }
+    let Some(url) = file.download_url() else {
+        return FileOutcome::Failed {
+            error: AdapterError::Transport("slack file has no url_private".to_owned()),
+        };
+    };
+    let bytes = match api.download_file(url).await {
+        Ok(b) => b,
+        Err(error) => return FileOutcome::Failed { error },
+    };
+    if bytes.len() as u64 > max_attachment_bytes {
+        return FileOutcome::TooLarge {
+            reported: Some(bytes.len() as u64),
+        };
+    }
+    let filename = sanitize_filename(file.name.as_deref(), FALLBACK_FILENAME);
+    // Stage per the channels-core inbound-file contract: the router owns
+    // the final `<session>/inbox/<msg_id>/<filename>` placement (and the
+    // cleanup of the staged copy) because only it knows the resolved
+    // session at route time.
+    match stage_inbound_file(&data_dir.join(STAGING_SUBDIR), &filename, &bytes).await {
+        Ok(path) => {
+            let mut attachment = attachment_json(file, &filename, &path, bytes.len() as u64);
+            inline_image_base64(&mut attachment, file, &bytes);
+            FileOutcome::Ok { attachment }
+        }
+        Err(error) => FileOutcome::Failed { error },
+    }
+}
+
+/// Build the `content.attachment` object for a staged Slack download. Per
+/// the inbound-file contract it carries `staged_path` (the host-side
+/// staging location) and NO `path` key — the router sets `path` to the
+/// container-visible `/data/inbox/...` location at materialization time.
+fn attachment_json(
+    file: &SlackFile,
+    filename: &str,
+    staged_path: &Path,
+    actual_size: u64,
+) -> serde_json::Map<String, Value> {
+    let mut obj = serde_json::Map::new();
+    obj.insert("kind".to_owned(), Value::String("slack.file".to_owned()));
+    if let Some(id) = file.id.as_deref() {
+        obj.insert("file_id".to_owned(), Value::String(id.to_owned()));
+    }
+    obj.insert("filename".to_owned(), Value::String(filename.to_owned()));
+    obj.insert(
+        STAGED_PATH_KEY.to_owned(),
+        Value::String(staged_path.to_string_lossy().into_owned()),
+    );
+    obj.insert(
+        "mime_type".to_owned(),
+        file.mimetype.clone().map_or(Value::Null, Value::String),
+    );
+    obj.insert("size".to_owned(), Value::from(actual_size));
+    obj
+}
+
+/// If `file` is an image within the size cap, add a `data_base64` field to
+/// the attachment so the runner can lift it into a vision content block —
+/// vision parity with the Telegram adapter's `inline_image_base64`. Larger
+/// or non-image files keep the path-only form.
+fn inline_image_base64(
+    attachment: &mut serde_json::Map<String, Value>,
+    file: &SlackFile,
+    bytes: &[u8],
+) {
+    let is_image = file
+        .mimetype
+        .as_deref()
+        .is_some_and(|m| m.starts_with("image/"));
+    if !is_image || bytes.len() as u64 > MAX_INLINE_IMAGE_BYTES {
+        return;
+    }
+    attachment.insert(
+        "data_base64".to_owned(),
+        Value::String(copperclaw_types::encode_base64(bytes)),
+    );
+}
+
+/// Metadata-only content for the `too_large` system-row fallback (nothing
+/// was staged). Mirrors the Telegram adapter's shape.
+fn too_large_content(file: &SlackFile, limit: u64, reported: Option<u64>) -> Value {
+    let mut obj = file_metadata(file);
+    obj.insert("reason".to_owned(), Value::String("too_large".to_owned()));
+    obj.insert("limit".to_owned(), Value::from(limit));
+    if let Some(r) = reported {
+        obj.insert("reported_size".to_owned(), Value::from(r));
+    }
+    Value::Object(obj)
+}
+
+/// Metadata-only content for the `download_failed` system-row fallback.
+fn download_failed_content(file: &SlackFile, error: &AdapterError) -> Value {
+    let mut obj = file_metadata(file);
+    obj.insert(
+        "reason".to_owned(),
+        Value::String("download_failed".to_owned()),
+    );
+    obj.insert("error".to_owned(), Value::String(format!("{error}")));
+    Value::Object(obj)
+}
+
+/// Shared metadata block for the system-row fallbacks: the Slack file id,
+/// name, mime type, and reported size, echoed so the host can log / alert
+/// on what was dropped.
+fn file_metadata(file: &SlackFile) -> serde_json::Map<String, Value> {
+    let mut obj = serde_json::Map::new();
+    obj.insert("kind".to_owned(), Value::String("slack.file".to_owned()));
+    obj.insert(
+        "file_id".to_owned(),
+        file.id.clone().map_or(Value::Null, Value::String),
+    );
+    obj.insert(
+        "file_name".to_owned(),
+        file.name.clone().map_or(Value::Null, Value::String),
+    );
+    obj.insert(
+        "mime_type".to_owned(),
+        file.mimetype.clone().map_or(Value::Null, Value::String),
+    );
+    obj.insert(
+        "file_size".to_owned(),
+        file.size.map_or(Value::Null, Value::from),
+    );
+    obj
 }
 
 /// Convert Slack's `ts` (`<seconds>.<microseconds>`) into a `DateTime<Utc>`.
@@ -460,6 +702,8 @@ mod tests {
     use serde_json::Value;
     use tokio::sync::mpsc;
     use tower::ServiceExt;
+    use wiremock::matchers::{header, method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const SECRET: &str = "test-secret";
     const TS: &str = "1700000000";
@@ -1085,5 +1329,285 @@ mod tests {
         let now = s.now_secs();
         let real = Utc::now().timestamp();
         assert!((now - real).abs() <= 5);
+    }
+
+    // ---- M18 C4a: inbound file download + staging ----
+
+    /// State with inbound-file downloads wired to a mock Slack server +
+    /// staging dir, plus the deterministic `now_secs` override so signed
+    /// requests validate.
+    fn make_state_with_attachments(
+        server_uri: &str,
+        data_dir: &std::path::Path,
+        max_bytes: u64,
+    ) -> (SlackEventsState, mpsc::Receiver<InboundEvent>) {
+        let (tx, rx) = mpsc::channel::<InboundEvent>(16);
+        let mut s = SlackEventsState::new(SECRET, tx, None, ChannelType::new("slack"))
+            .with_attachments(
+                SlackApi::new(server_uri, "xoxb-test"),
+                max_bytes,
+                data_dir.to_path_buf(),
+            );
+        s.now_secs_override = Some(TS.parse().unwrap());
+        (s, rx)
+    }
+
+    /// A signed `event_callback` body for a `message` event carrying a
+    /// single file with the given `url_private`, name, mimetype, and
+    /// (optional) reported size.
+    fn message_with_file_body(
+        url_private: &str,
+        name: &str,
+        mimetype: &str,
+        size: Option<u64>,
+    ) -> Vec<u8> {
+        let mut file = json!({
+            "id": "F1",
+            "name": name,
+            "mimetype": mimetype,
+            "url_private": url_private,
+        });
+        if let Some(s) = size {
+            file["size"] = json!(s);
+        }
+        serde_json::to_vec(&json!({
+            "type":"event_callback",
+            "event_id":"EvFile",
+            "event":{
+                "type":"message",
+                "ts":"1700000100.000001",
+                "channel":"C1",
+                "user":"U1",
+                "text":"here is the spec",
+                "files":[file]
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn inbound_file_download_stages_and_sets_staged_path_not_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/files/spec.csv"))
+            // Slack requires the bot token as a bearer header on url_private.
+            .and(header("authorization", "Bearer xoxb-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"id,qty\n1,2\n".to_vec()))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut rx) =
+            make_state_with_attachments(&server.uri(), dir.path(), DEFAULT_MAX_ATTACHMENT_BYTES);
+        let app = build_events_router("/slack/events", state.clone());
+        let url = format!("{}/files/spec.csv", server.uri());
+        let body = message_with_file_body(&url, "spec.csv", "text/csv", Some(11));
+        let resp = app
+            .oneshot(signed_request(&state, "/slack/events", &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let evt = rx.recv().await.unwrap();
+        assert_eq!(evt.message.kind, MessageKind::Chat);
+        // Text is preserved alongside the staged attachment.
+        assert_eq!(evt.message.content["text"], "here is the spec");
+        let att = &evt.message.content["attachment"];
+        assert_eq!(att["kind"], "slack.file");
+        assert_eq!(att["file_id"], "F1");
+        assert_eq!(att["filename"], "spec.csv");
+        assert_eq!(att["mime_type"], "text/csv");
+        assert_eq!(att["size"], 11);
+        // Contract: the adapter STAGES the download and never sets `path`
+        // (the router owns that key at materialization time).
+        assert!(
+            att.get("path").is_none(),
+            "adapters must not set attachment.path: {att}"
+        );
+        let staged = att["staged_path"].as_str().unwrap();
+        let staged_path = std::path::Path::new(staged);
+        assert!(
+            staged_path.starts_with(dir.path().join("staging")),
+            "staged under <data_dir>/staging: {staged}"
+        );
+        assert_eq!(std::fs::read(staged_path).unwrap(), b"id,qty\n1,2\n");
+    }
+
+    #[tokio::test]
+    async fn inbound_file_oversized_by_reported_size_falls_back_to_system() {
+        // Reported size exceeds the cap → never download.
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut rx) = make_state_with_attachments(&server.uri(), dir.path(), 4);
+        let app = build_events_router("/slack/events", state.clone());
+        let url = format!("{}/files/big.bin", server.uri());
+        let body = message_with_file_body(&url, "big.bin", "application/octet-stream", Some(1024));
+        let _ = app
+            .oneshot(signed_request(&state, "/slack/events", &body))
+            .await
+            .unwrap();
+        let evt = rx.recv().await.unwrap();
+        assert_eq!(evt.message.kind, MessageKind::System);
+        assert_eq!(evt.message.content["reason"], "too_large");
+        assert_eq!(evt.message.content["limit"], 4);
+        assert_eq!(evt.message.content["reported_size"], 1024);
+        assert_eq!(evt.message.content["file_name"], "big.bin");
+        // No download call was made.
+        assert!(
+            server.received_requests().await.unwrap().is_empty(),
+            "must not download an over-cap file"
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_file_oversized_after_body_read_falls_back_to_system() {
+        // No reported size; the actual bytes exceed the cap.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/files/big.bin"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 32]))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut rx) = make_state_with_attachments(&server.uri(), dir.path(), 16);
+        let app = build_events_router("/slack/events", state.clone());
+        let url = format!("{}/files/big.bin", server.uri());
+        let body = message_with_file_body(&url, "big.bin", "application/octet-stream", None);
+        let _ = app
+            .oneshot(signed_request(&state, "/slack/events", &body))
+            .await
+            .unwrap();
+        let evt = rx.recv().await.unwrap();
+        assert_eq!(evt.message.kind, MessageKind::System);
+        assert_eq!(evt.message.content["reason"], "too_large");
+        assert_eq!(evt.message.content["reported_size"], 32);
+    }
+
+    #[tokio::test]
+    async fn inbound_file_download_failure_falls_back_to_system_with_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/files/spec.csv"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("upstream"))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut rx) =
+            make_state_with_attachments(&server.uri(), dir.path(), DEFAULT_MAX_ATTACHMENT_BYTES);
+        let app = build_events_router("/slack/events", state.clone());
+        let url = format!("{}/files/spec.csv", server.uri());
+        let body = message_with_file_body(&url, "spec.csv", "text/csv", Some(11));
+        let _ = app
+            .oneshot(signed_request(&state, "/slack/events", &body))
+            .await
+            .unwrap();
+        let evt = rx.recv().await.unwrap();
+        assert_eq!(evt.message.kind, MessageKind::System);
+        assert_eq!(evt.message.content["reason"], "download_failed");
+        let err = evt.message.content["error"].as_str().unwrap();
+        assert!(err.contains("503"), "got `{err}`");
+    }
+
+    #[tokio::test]
+    async fn inbound_file_missing_url_private_is_download_failed_not_silent_drop() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut rx) =
+            make_state_with_attachments(&server.uri(), dir.path(), DEFAULT_MAX_ATTACHMENT_BYTES);
+        let app = build_events_router("/slack/events", state.clone());
+        // File object with no url_private / url_private_download.
+        let body = serde_json::to_vec(&json!({
+            "type":"event_callback",
+            "event_id":"EvNoUrl",
+            "event":{
+                "type":"message",
+                "ts":"1700000101.000001",
+                "channel":"C1",
+                "user":"U1",
+                "text":"oops",
+                "files":[{"id":"F9","name":"ghost.txt","mimetype":"text/plain"}]
+            }
+        }))
+        .unwrap();
+        let _ = app
+            .oneshot(signed_request(&state, "/slack/events", &body))
+            .await
+            .unwrap();
+        let evt = rx.recv().await.unwrap();
+        assert_eq!(evt.message.kind, MessageKind::System);
+        assert_eq!(evt.message.content["reason"], "download_failed");
+    }
+
+    #[tokio::test]
+    async fn inbound_small_image_inlines_data_base64() {
+        let server = MockServer::start().await;
+        let png = b"\x89PNG\r\n\x1a\nfake-image-bytes".to_vec();
+        Mock::given(method("GET"))
+            .and(wm_path("/files/pic.png"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(png.clone()))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut rx) =
+            make_state_with_attachments(&server.uri(), dir.path(), DEFAULT_MAX_ATTACHMENT_BYTES);
+        let app = build_events_router("/slack/events", state.clone());
+        let url = format!("{}/files/pic.png", server.uri());
+        let body = message_with_file_body(&url, "pic.png", "image/png", Some(png.len() as u64));
+        let _ = app
+            .oneshot(signed_request(&state, "/slack/events", &body))
+            .await
+            .unwrap();
+        let evt = rx.recv().await.unwrap();
+        let att = &evt.message.content["attachment"];
+        assert_eq!(att["kind"], "slack.file");
+        // Vision parity: the image bytes ride inline as base64.
+        assert_eq!(
+            att["data_base64"].as_str().unwrap(),
+            copperclaw_types::encode_base64(&png)
+        );
+    }
+
+    #[tokio::test]
+    async fn non_image_file_does_not_inline_data_base64() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(wm_path("/files/spec.csv"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"a,b\n".to_vec()))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let (state, mut rx) =
+            make_state_with_attachments(&server.uri(), dir.path(), DEFAULT_MAX_ATTACHMENT_BYTES);
+        let app = build_events_router("/slack/events", state.clone());
+        let url = format!("{}/files/spec.csv", server.uri());
+        let body = message_with_file_body(&url, "spec.csv", "text/csv", Some(4));
+        let _ = app
+            .oneshot(signed_request(&state, "/slack/events", &body))
+            .await
+            .unwrap();
+        let evt = rx.recv().await.unwrap();
+        let att = &evt.message.content["attachment"];
+        assert!(att.get("data_base64").is_none());
+    }
+
+    #[tokio::test]
+    async fn files_ignored_when_attachments_not_wired() {
+        // Backward compat: without with_attachments the adapter ignores
+        // files entirely (pre-C4a behaviour) — a plain Chat event, no
+        // attachment, and no download attempt.
+        let (state, mut rx) = make_state(None);
+        let app = build_events_router("/slack/events", state.clone());
+        let body = message_with_file_body(
+            "https://files.slack.test/x",
+            "spec.csv",
+            "text/csv",
+            Some(11),
+        );
+        let _ = app
+            .oneshot(signed_request(&state, "/slack/events", &body))
+            .await
+            .unwrap();
+        let evt = rx.recv().await.unwrap();
+        assert_eq!(evt.message.kind, MessageKind::Chat);
+        assert!(evt.message.content.get("attachment").is_none());
+        assert_eq!(evt.message.content["text"], "here is the spec");
     }
 }

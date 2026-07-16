@@ -68,15 +68,43 @@ evidence, not vibes. Recipes:
   `curl`, confirm a real response.
 - **Tests exist:** run `pytest` / `npm test` / equivalent. "It
   compiles" is not the bar.
-- **Use the project's *canonical* build, not an ad-hoc script.** Run
-  the whole-package build the way anyone else would — `go build ./...`,
-  `cargo build`, `npm run build`. A custom check that compiles one file
-  at a time can pass while `go build ./...` fails (e.g. two `main`
-  functions in one package). If you tell the user `go run main.go`,
-  that exact command has to work.
+- **Use the project's *canonical* build, not an ad-hoc script**
+  (`go build ./...`, `cargo build`, `npm run build`) — a one-file check
+  can pass while the whole-package build fails (e.g. two `main`
+  functions in one package). Whatever command you tell the user to run
+  has to work.
 
 If you couldn't run it, **say so**. "I wrote X but couldn't run it
 because Y" is honest. "Done" without evidence isn't.
+
+## The verify contract — `.copperclaw/verify` and the completion gate
+
+Verification is *enforced*, not trusted. On your **first edit inside a
+`/data/<project>`**, record its one-line check command in
+`/data/<project>/.copperclaw/verify` — a single shell line (`npm test`,
+`cargo check`, `python -m pytest`, `go build ./...`, or a smoke `curl`).
+A per-group `check_command` config can override it.
+
+Any edit (or non-verify `shell` command) inside a project marks it
+**dirty**. While dirty, `todo_update(status="completed")` is refused with
+a structured error naming the project, its recorded verify command, and
+fix-cycles remaining, e.g.:
+
+    cannot mark todo 3 completed: `/data/app` has unverified changes
+    since its last edit (recorded verify command: `npm test`). Run the
+    verify command via `shell` and confirm it passes before retrying
+    (2 fix cycle(s) remaining before this todo auto-blocks instead).
+
+Clear it by running **exactly** that command via `shell` with `cwd` set
+to the project dir (`{command:"npm test", cwd:"/data/app"}`). Exit 0
+clears dirty and the completion goes through; a nonzero exit records a
+fix cycle and feeds the failure back. After **2** failed cycles the todo
+auto-transitions to `blocked` (with the failure attached) rather than
+completing — never silently done, never stuck refusing. If no command is
+recorded the error tells you so — write one to `.copperclaw/verify`. A
+group that never touches a `/data/<project>` never trips the gate.
+Reading a truncated build log's END: [[testing]]/[[debug]] (`tail_bytes`,
+paged `read_file`).
 
 ## Delivering artifacts to the operator
 
@@ -90,10 +118,20 @@ you do one of these. Pick one for every artifact you produce:
    corresponding to `/data`. Include that path verbatim in your
    reply so the operator can `cd` to it. Good for many-file
    projects (entire repo, build output, etc.).
+3. **A live preview link** — when the thing you built serves HTTP,
+   `expose_preview` the running server and send the URL verbatim so the
+   operator can open it from their phone. See [[preview]].
 
-Without either, you've effectively built nothing the operator can
+Without one of these, you've effectively built nothing the operator can
 use. Saying "the files are at `/data/foo.html`" is wrong — `/data`
 is the *container*'s path, not the operator's.
+
+**End every build with this delivery — the mandatory final step.** The
+last todo is the hand-off: for a multi-file build, ship one zip
+(`git archive` drops `.git`/`node_modules` — see [[send-file]]) plus the
+`artifact_path` path, and the preview link when the app serves HTTP. That
+"prototype ready" close is the goal. (A richer close card is forthcoming
+— P3; until then, deliver with the tools above.)
 
 ## Don't fabricate
 

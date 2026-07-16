@@ -299,6 +299,30 @@ impl DiscordRest {
         Ok(())
     }
 
+    /// GET an inbound attachment from the Discord CDN.
+    ///
+    /// Discord CDN URLs (`cdn.discordapp.com` / `media.discordapp.net`) are
+    /// public — unlike Slack's `url_private`, they carry no auth requirement
+    /// (recent CDN URLs embed a signed `?ex=…&is=…&hm=…` query that grants
+    /// access), so we deliberately send **no** bot `Authorization` header.
+    /// Returns the raw bytes on 2xx; non-2xx maps through [`check_response`]
+    /// (401/403 → `Auth`, 429 → `Rate`, other 4xx → `BadRequest`, 5xx →
+    /// `Transport`).
+    pub async fn download_cdn_file(&self, url: &str) -> Result<Vec<u8>, AdapterError> {
+        let resp = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| AdapterError::Transport(format!("download_cdn_file: {e}")))?;
+        let resp = check_response(resp).await?;
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| AdapterError::Transport(format!("download_cdn_file body read: {e}")))?;
+        Ok(bytes.to_vec())
+    }
+
     /// `POST /users/@me/channels { recipient_id }`.
     ///
     /// Returns the platform id (`id`) of the freshly opened DM channel.
@@ -806,6 +830,58 @@ mod tests {
             .create_interaction_response_ack("int-1", "tok-1")
             .await
             .unwrap_err();
+        assert!(matches!(err, AdapterError::Transport(_)));
+    }
+
+    #[tokio::test]
+    async fn download_cdn_file_returns_bytes_without_auth_header() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attachments/1/2/spec.csv"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"id,qty\n1,2\n".to_vec()))
+            .mount(&server)
+            .await;
+        let r = client(&server);
+        let url = format!("{}/attachments/1/2/spec.csv", server.uri());
+        let bytes = r.download_cdn_file(&url).await.unwrap();
+        assert_eq!(bytes, b"id,qty\n1,2\n");
+        // The CDN GET must NOT carry the bot Authorization header.
+        let reqs = server.received_requests().await.unwrap();
+        let req = reqs
+            .iter()
+            .find(|q| q.url.path() == "/attachments/1/2/spec.csv")
+            .expect("cdn request");
+        assert!(
+            req.headers.get("authorization").is_none(),
+            "CDN download must not send a bot auth header"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_cdn_file_404_maps_to_bad_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attachments/gone.bin"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let r = client(&server);
+        let url = format!("{}/attachments/gone.bin", server.uri());
+        let err = r.download_cdn_file(&url).await.unwrap_err();
+        assert!(matches!(err, AdapterError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn download_cdn_file_5xx_maps_to_transport() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attachments/oops.bin"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        let r = client(&server);
+        let url = format!("{}/attachments/oops.bin", server.uri());
+        let err = r.download_cdn_file(&url).await.unwrap_err();
         assert!(matches!(err, AdapterError::Transport(_)));
     }
 

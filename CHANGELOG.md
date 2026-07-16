@@ -34,6 +34,66 @@ adheres to [Semantic Versioning](https://semver.org/).
   pure-chat session with no project/todo state gets no header (byte-identical
   to pre-R4). `CompactionCfg` gains a `data_root` field (the `/data` mount)
   as the header's source root.
+### Added (M18 C4b — discord inbound files, 2026-07-15)
+
+- Discord now downloads inbound message attachments from the CDN and stages
+  them per the C3 inbound-file contract, so "here's the file, build around
+  it" actually reaches the agent's `/data/inbox/...`. The Discord adapter
+  (`crates/copperclaw-channels/discord/src/{events,rest,config,adapter,factory}.rs`)
+  gains `DiscordRest::download_cdn_file` (a public, auth-header-free GET —
+  Discord CDN URLs are pre-signed, unlike Slack's `url_private`) and
+  `events::message_create_to_inbound_downloaded`, which fetches the first
+  attachment, enforces the new `max_attachment_bytes` config (default
+  25 MiB, Discord's non-Nitro cap), stages via
+  `copperclaw_channels_core::inbound_file::stage_inbound_file` (setting
+  `staged_path`, never `path`), and inlines small images as `data_base64`
+  for vision parity with Telegram. Oversized files yield a `too_large`
+  system row and download errors a `download_failed` row — never a silent
+  drop. Opt-out via `attachment_download: false`. New replay fixture
+  `fixtures/discord/inbound-file-attachment/` (registered as
+  `discord_inbound_file_attachment_round_trip` +
+  `..._file_readable_from_session_dir` in
+  `crates/copperclaw-host/tests/replay.rs`) mirrors the C3 telegram fixture.
+### Added (M18 C4a — Slack inbound files, 2026-07-15)
+
+- The Slack adapter now receives inbound files. Previously
+  `crates/copperclaw-channels/slack/src/events/router.rs` ignored a
+  message's `files[]` entirely, so "here's the CSV/spec, build around it"
+  never reached the agent. The events router now downloads a message's
+  first file from its `url_private` link with the bot token
+  (`Authorization: Bearer <bot-token>`, wired via the new
+  `SlackApi::download_file`), enforces the same `max_attachment_bytes`
+  config as Telegram (new `SlackConfig` field, default 20 MB), and stages
+  the bytes per the C3 channels-core inbound-file contract
+  (`stage_inbound_file` → `content.attachment.staged_path`, never `path` —
+  the router owns materialization into `/data/inbox/<msg_id>/<file>`).
+  Small images additionally inline `data_base64` for vision parity with
+  Telegram's `inline_image_base64`. Download/size failures downgrade to a
+  `MessageKind::System` row with the same `too_large` / `download_failed`
+  taxonomy Telegram emits — never a silent drop. New replay fixture
+  `fixtures/slack/inbound-file-attachment/` (registered as
+  `slack_inbound_file_attachment_round_trip` in
+  `crates/copperclaw-host/tests/replay.rs`) mirrors the C3 Telegram
+  fixture; the `url_private` download itself is unit-tested against a mock
+  Slack server in the adapter crate.
+
+### Changed (M18 P2 — skills refresh for the verify + delivery contract, 2026-07-15)
+
+- Updated five agent-facing skills to teach the post-M18 coding workflow
+  instead of the pre-M18 one (`skills/{coding-task,testing,debug,preview,send-file}/SKILL.md`):
+  the R3 verification contract (record a project's one-line check command
+  in `/data/<project>/.copperclaw/verify`, or via a per-group
+  `check_command` override; the `todo_update(status="completed")`
+  completion gate refuses while a project is dirty, quoting the actual
+  refusal wording, and auto-`blocked`s after two fix cycles), T1's
+  `shell tail_bytes` idiom for reading the END of a truncated build log,
+  T1's paged `read_file` (`mode:"lines"` + `offset`/`limit` +
+  `total_lines`), and the artifact-delivery close (`send_file` a
+  `git archive` zip, the `artifact_path` host path, and an
+  `expose_preview` link) as the mandatory final build step. The fuller
+  P3 "prototype ready" `send_card` ritual is noted as forthcoming rather
+  than taught, since P3 is not yet implemented. Skills are docs but
+  operator-visible: stale skills actively teach the pre-M18 workflow.
 
 ### Added (M18 X1 — golden-path program fixture, 2026-07-15)
 
