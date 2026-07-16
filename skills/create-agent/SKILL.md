@@ -49,6 +49,33 @@ its workspace in `instructions`, e.g. "implement X under `/workspace` and
 commit on your branch" (writable) or "review the code under `/parent`"
 (read-only).
 
+## `delegate_batch`: a shared contract for fan-out builds
+
+`delegate` and `delegate_batch` reuse this exact worktree/merge machinery
+(own container, writable `sib/<id>` worktree, contained — reports only to
+you, never to the user's chat). `delegate_batch` fans out several workers
+in parallel and BLOCKS until all report. The golden pattern for a
+multi-worker build:
+
+1. **Write a contract first.** Before fanning out, author a short shared
+   brief — interfaces, a file-ownership map, naming conventions — and pass
+   it as `contract`. It's prepended VERBATIM to every worker's
+   `instructions`, and each worker is told to persist it to
+   `.copperclaw/CONTRACT.md` in its own `/workspace` before its first edit,
+   so the brief survives that worker's own compaction.
+2. **One component per worker.** Split by file/module ownership (the
+   contract's ownership map) so workers never touch the same files —
+   incompatible shapes are the biggest quality gap in fan-out builds.
+3. **Verify the union.** Pass `project` (the directory you're building
+   in, the same one you `cd`'d into). If it has a recorded
+   `.copperclaw/verify` (see [[coding-task]]), the join marks it dirty —
+   the integration todo can't complete until every stage re-passes on the
+   MERGED tree, not just each worker's isolated branch. A worker's own
+   green verify only proves its branch in isolation.
+
+Both `contract` and `project` are optional; omitting either is
+byte-identical to calling `delegate_batch` without them.
+
 ## Schema
 
 ```json
