@@ -6,6 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (M18 — Task HUD no-op edit / Telegram "message is not modified", 2026-07-16)
+
+- The H1 Task HUD and R6 progressive-final-answer edit a pinned status
+  message in place through the same edit anchor. When two edits render
+  byte-identical content (two tool batches finishing within one
+  rendered-time tick, a finalize matching the last live frame, an idle
+  ticker frame), Telegram's `editMessageText` 400s with `Bad Request:
+  message is not modified: …` and `host-delivery` logged the row as a
+  `non-retryable failure` — non-fatal but spurious noise and a bogus
+  "failed" delivery. Two-part fix:
+  - **Primary — don't emit a redundant edit.** `crates/copperclaw-runner/src/run/hud.rs`
+    now fingerprints each composed HUD frame (the serialised breadcrumb —
+    exactly what the delivery loop renders) and records the last-emitted
+    fingerprint per anchor in `Shared`. Every edit path (batch edits in
+    `emit_live_update`, the background elapsed-clock ticker, the finalize
+    collapse) skips the emit when the new frame is byte-identical to the
+    last one sent; first posts always go through, and any real change
+    (clock tick, tool-count bump, activity flip) emits normally. The HUD
+    content, cadence, and edit anchor are unchanged — only genuine no-op
+    edits are suppressed.
+  - **Safety net — treat "message is not modified" as success.**
+    `crates/copperclaw-channels/telegram/src/api.rs`'s
+    `edit_message_text_with_mode` (the single chokepoint every edit funnels
+    through: `edit_message`, `deliver_breadcrumb`, `deliver_todo_list`,
+    progressive `edit_message`) now detects the specific `message is not
+    modified` BadRequest and returns `Ok(())` instead of surfacing an
+    `Adapter(BadRequest(…))` error, so `host-delivery` never marks such a
+    row failed. Matched narrowly on the description — every other 400 still
+    errors.
+
 ### Fixed (M18 — todo store parallel-batch write race, 2026-07-16)
 
 - `crates/copperclaw-mcp/src/tools/todo.rs`: the `todo_*` store's

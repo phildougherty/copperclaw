@@ -492,7 +492,23 @@ impl TelegramApi {
             .await
             .map_err(|e| map_send_err(&e))?;
         let raw = read_body(resp).await?;
-        decode_envelope::<Value>(raw).map(|_| ())
+        match decode_envelope::<Value>(raw) {
+            Ok(_) => Ok(()),
+            // Telegram 400s an `editMessageText` whose new text + reply
+            // markup are byte-identical to the current message ("message
+            // is not modified"). The Task HUD / progressive-final-answer
+            // edit anchors re-render the same content on occasion (two
+            // tool batches finishing within one rendered-time tick, a
+            // finalize matching the last live update), and that produces
+            // exactly this rejection. It is a benign no-op — the pinned
+            // message already shows the intended text — NOT a delivery
+            // failure, so swallow it rather than let host-delivery mark
+            // the outbound row failed and log spurious noise. Matched
+            // narrowly on the description so every OTHER 400 still
+            // surfaces as an error.
+            Err(AdapterError::BadRequest(desc)) if is_message_not_modified(&desc) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// `setMessageReaction` — react to a message with a single emoji.
@@ -614,6 +630,17 @@ impl TelegramApi {
 
 fn map_send_err(err: &reqwest::Error) -> AdapterError {
     AdapterError::Transport(format!("telegram http error: {err}"))
+}
+
+/// True when a Telegram `editMessageText` `BadRequest` is the benign
+/// "message is not modified" rejection — the new content is byte-identical
+/// to the message's current content, so the edit is a no-op. We treat this
+/// as success (see [`TelegramApi::edit_message_text_with_mode`]). Matched
+/// narrowly (case-insensitive substring) so every OTHER 400 description
+/// still surfaces as an error.
+fn is_message_not_modified(desc: &str) -> bool {
+    desc.to_ascii_lowercase()
+        .contains("message is not modified")
 }
 
 /// Map an HTTP failure response from the file-download endpoint into the
@@ -1093,6 +1120,72 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AdapterError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn edit_message_not_modified_is_treated_as_success() {
+        // Telegram rejects an edit whose new content is byte-identical to
+        // the current message with a 400 "message is not modified". The
+        // adapter must swallow that specific rejection as a benign no-op
+        // (Ok) so host-delivery never marks the HUD/progressive edit row
+        // a failed delivery.
+        let s = server().await;
+        Mock::given(method("POST"))
+            .and(path("/bottok/editMessageText"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: message is not modified: specified new message \
+                                content and reply markup are exactly the same as a current \
+                                content and reply markup of the message"
+            })))
+            .mount(&s)
+            .await;
+        api(&s.uri(), "tok")
+            .edit_message_text("chat-1", "42", "same text")
+            .await
+            .expect("`message is not modified` must resolve to Ok(())");
+    }
+
+    #[tokio::test]
+    async fn edit_message_other_bad_request_still_errors() {
+        // Only the "message is not modified" description is swallowed; any
+        // OTHER 400 must still surface as a BadRequest so real failures are
+        // not masked.
+        let s = server().await;
+        Mock::given(method("POST"))
+            .and(path("/bottok/editMessageText"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: message to edit not found"
+            })))
+            .mount(&s)
+            .await;
+        let err = api(&s.uri(), "tok")
+            .edit_message_text("chat-1", "42", "new text")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AdapterError::BadRequest(_)),
+            "a non-`not modified` 400 must still error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_message_success() {
+        let s = server().await;
+        Mock::given(method("POST"))
+            .and(path("/bottok/editMessageText"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "result": { "message_id": 42 }
+            })))
+            .mount(&s)
+            .await;
+        api(&s.uri(), "tok")
+            .edit_message_text("chat-1", "42", "updated text")
+            .await
+            .expect("a normal edit must succeed");
     }
 
     #[tokio::test]

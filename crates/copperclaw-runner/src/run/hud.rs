@@ -100,6 +100,15 @@ struct Shared {
     /// True once the final collapse edit went out; later emits (ticker
     /// races) are suppressed.
     finalized: bool,
+    /// Fingerprint of the last HUD frame actually emitted for this
+    /// anchor (see [`frame_fingerprint`]). Guards against a redundant
+    /// in-place edit whose rendered content is byte-identical to what
+    /// was last sent — Telegram (and some other adapters) 400 such a
+    /// no-op edit with "message is not modified". `None` until the first
+    /// emit. Every emit path (batch edits, the background ticker, the
+    /// finalize collapse) consults + updates this so the suppression
+    /// spans all of them.
+    last_emitted: Option<String>,
 }
 
 /// Per-inbound Task HUD driver. Constructed at `drive_turn` entry,
@@ -344,10 +353,14 @@ impl TaskHud {
             steps: Vec::new(),
         };
         match self.behavior {
-            // Collapse the live HUD in place.
+            // Collapse the live HUD in place. Skip if the collapse frame
+            // is byte-identical to the last live frame already on screen
+            // (a no-op edit Telegram would 400 on).
             Behavior::Live if posted => {
-                copperclaw_metrics::inc_hud_edits(&self.agent_group, "finalize");
-                self.ctx.emit_task_hud(&breadcrumb, false).await;
+                if record_and_should_emit(&self.shared, &breadcrumb, false) {
+                    copperclaw_metrics::inc_hud_edits(&self.agent_group, "finalize");
+                    self.ctx.emit_task_hud(&breadcrumb, false).await;
+                }
             }
             // `final`: the one-liner is the only HUD emission at all.
             Behavior::FinalOnly => {
@@ -364,6 +377,12 @@ impl TaskHud {
         let Some((breadcrumb, first)) = self.compose_running_frame() else {
             return;
         };
+        // Suppress an in-place edit whose rendered content is byte-identical
+        // to the last frame sent for this anchor — it would be a no-op the
+        // adapter (Telegram) 400s on. First posts always go through.
+        if !record_and_should_emit(&self.shared, &breadcrumb, first) {
+            return;
+        }
         if first {
             copperclaw_metrics::inc_hud_post(&self.agent_group);
         } else {
@@ -403,6 +422,12 @@ impl TaskHud {
                 let Some((frame, _first)) = running_frame(&shared, started_at, &todo_path) else {
                     break;
                 };
+                // A ticker frame that hasn't changed since the last emit
+                // (nothing ran and the rendered clock didn't advance) would
+                // be a no-op edit — suppress it.
+                if !record_and_should_emit(&shared, &frame, false) {
+                    continue;
+                }
                 copperclaw_metrics::inc_hud_edits(&agent_group, "ticker");
                 ctx.emit_task_hud(&frame, false).await;
             }
@@ -496,6 +521,40 @@ fn running_frame(
         steps: Vec::new(),
     };
     Some((breadcrumb, first))
+}
+
+/// Fingerprint one composed HUD frame for no-op-edit suppression. Two
+/// frames with equal fingerprints carry identical breadcrumb content and
+/// therefore render (deterministically, in the delivery loop) to
+/// byte-identical platform text — so an in-place edit to the second is a
+/// no-op that Telegram rejects with "message is not modified". Uses the
+/// serialised breadcrumb (the exact payload handed to the delivery loop)
+/// so the fingerprint tracks precisely what would be rendered.
+fn frame_fingerprint(breadcrumb: &Breadcrumb) -> String {
+    serde_json::to_string(breadcrumb).unwrap_or_default()
+}
+
+/// Decide whether a composed HUD frame should actually be emitted,
+/// recording it as the last-emitted content for this anchor when so.
+///
+/// A `first` post is always emitted (it opens a fresh message, never an
+/// edit). A subsequent edit is SUPPRESSED only when its rendered content
+/// is byte-identical to the frame last sent for this same anchor — the
+/// redundant no-op edit Telegram 400s on. Any real content change (the
+/// common case: the elapsed clock ticks, the tool count grows, the
+/// activity line flips) emits normally. Best-effort: a poisoned lock
+/// emits rather than suppress, so the guard can never silence a real
+/// update.
+fn record_and_should_emit(shared: &StdMutex<Shared>, breadcrumb: &Breadcrumb, first: bool) -> bool {
+    let Ok(mut s) = shared.lock() else {
+        return true;
+    };
+    let fp = frame_fingerprint(breadcrumb);
+    if !first && s.last_emitted.as_deref() == Some(fp.as_str()) {
+        return false;
+    }
+    s.last_emitted = Some(fp);
+    true
 }
 
 /// `M:SS` wall-clock rendering (`83` → `1:23`).
@@ -605,6 +664,7 @@ mod tests {
             note: Some("steering noted".into()),
             posted: true,
             finalized: false,
+            last_emitted: None,
         });
         let started = Instant::now();
         let (frame, first) = running_frame(&shared, started, &todo_path).unwrap();
@@ -636,10 +696,68 @@ mod tests {
             note: None,
             posted: true,
             finalized: true,
+            last_emitted: None,
         });
         assert!(
             running_frame(&shared, Instant::now(), &todo_path).is_none(),
             "no frame may be composed after the final collapse"
+        );
+    }
+
+    #[test]
+    fn redundant_edit_is_suppressed_but_changed_edit_still_emits() {
+        // The H1/R6 no-op-edit guard: two consecutive emits of identical
+        // rendered content produce only ONE edit (the second is
+        // suppressed), while a changed frame still edits. This is what
+        // keeps the pinned Task HUD from firing an `editMessageText` that
+        // Telegram would 400 with "message is not modified".
+        let shared = StdMutex::new(Shared::default());
+        let frame_a = Breadcrumb {
+            tool_name: TASK_HUD_TOOL.to_owned(),
+            detail: Some("step 1/2: build the UI".into()),
+            status: BreadcrumbStatus::Running,
+            summary: Some("2 tool calls | 0:30".into()),
+            steps: Vec::new(),
+        };
+        // First post always emits (it opens the message, not an edit).
+        assert!(record_and_should_emit(&shared, &frame_a, true));
+        // An edit with byte-identical content is a no-op — suppress it.
+        assert!(
+            !record_and_should_emit(&shared, &frame_a, false),
+            "a byte-identical edit must be suppressed"
+        );
+        // A frame with changed content still edits.
+        let frame_b = Breadcrumb {
+            summary: Some("3 tool calls | 0:31".into()),
+            ..frame_a.clone()
+        };
+        assert!(
+            record_and_should_emit(&shared, &frame_b, false),
+            "a changed frame must still edit"
+        );
+        // ...and repeating that same changed frame is suppressed again.
+        assert!(
+            !record_and_should_emit(&shared, &frame_b, false),
+            "a repeat of the last-emitted frame must be suppressed"
+        );
+    }
+
+    #[test]
+    fn first_post_is_never_suppressed_even_if_repeated() {
+        // A `first: true` emit opens a fresh message, never an edit, so it
+        // must always go through regardless of the recorded fingerprint.
+        let shared = StdMutex::new(Shared::default());
+        let frame = Breadcrumb {
+            tool_name: TASK_HUD_TOOL.to_owned(),
+            detail: None,
+            status: BreadcrumbStatus::Running,
+            summary: Some("1 tool call | 0:05".into()),
+            steps: Vec::new(),
+        };
+        assert!(record_and_should_emit(&shared, &frame, true));
+        assert!(
+            record_and_should_emit(&shared, &frame, true),
+            "a first post is always emitted"
         );
     }
 
