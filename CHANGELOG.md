@@ -115,6 +115,30 @@ adheres to [Semantic Versioning](https://semver.org/).
     `[reduced formatting]`) so a body that trips a Graph formatting rejection can
     be redelivered as plain text.
 
+### Added (M19 X-rider Wave 1 — feedback replay fixtures, 2026-07-16)
+
+- Locked the new Wave-1 feedback surfaces in the replay harness
+  (`crates/copperclaw-host/tests/replay.rs` + `fixtures/`):
+  - **F1 matrix live HUD edit** — `fixtures/matrix/hud-live-edit`: on matrix
+    (now genuinely edit-capable) the Task HUD posts one breadcrumb chip and
+    edits it in place, never re-posting. A new manifest flag
+    `model_rich_breadcrumbs` makes the harness's `CappedAdapter` model matrix's
+    real edit-in-place `deliver_breadcrumb`; the test asserts exactly one
+    breadcrumb post and ≥1 edit, all addressed to that single anchor.
+  - **F4 blocked-todo rendering** — `fixtures/telegram/blocked-todo`: a todo
+    that genuinely auto-blocks (dirty project at the fix-cycle cap) renders on
+    the delivered checklist with the `[!]` glyph + reason and a `1 blocked`
+    footer, never the in-progress glyph. Driven under `COPPERCLAW_DATA_ROOT`
+    via a subprocess re-exec (the X2 verify-gate pattern).
+  - **F5 thinking-frame emission** — two `#[tokio::test(start_paused = true)]`
+    tests drive the real `run_loop` under a paused clock: a pure-reasoning
+    turn on an edit-capable channel posts one "thinking…" HUD frame after the
+    threshold and finalizes it, and a sub-threshold turn stays byte-stable
+    (posts nothing). Verified as a targeted paused-clock test rather than a
+    replay fixture because the frame is wall-clock-driven pre-first-tool and
+    the replay harness has no timing seam; needs tokio's `test-util` dev-dep
+    (mirrors the runner crate's F5 tests).
+
 ### Added (M19 F4 — `blocked` todo state visible to users, 2026-07-16)
 
 - The runner has a real `TodoStatus::Blocked` (+ `blocked_reason`) for a step

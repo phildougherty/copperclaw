@@ -117,6 +117,26 @@ pub struct Manifest {
     /// with no final text. `None` keeps the existing default of 5.
     #[serde(default)]
     pub max_tool_turns: Option<usize>,
+    /// M19 F1: model the harness's wrapped `MockAdapter` as an
+    /// edit-capable *rich* adapter for the Task HUD breadcrumb surface.
+    ///
+    /// The bare `MockAdapter` overrides neither `deliver_breadcrumb` nor
+    /// the rich surfaces, so every HUD frame degrades to a fresh plain
+    /// `deliver` (a re-post) — the exact new-message spam the M18 HUD and
+    /// M19 F1 exist to kill. Real edit-capable adapters (telegram, slack,
+    /// matrix, …) instead post the chip once and `editMessageText` it in
+    /// place on every later frame. When this is `true` the harness's
+    /// `CappedAdapter` faithfully models that contract: the first
+    /// `deliver_breadcrumb` (no `existing_message_id`) is a post recorded
+    /// as a `Breadcrumb`-kind delivery returning a stable anchor id, and
+    /// every later frame (`existing_message_id = Some(anchor)`) is routed
+    /// through the inner mock's `edit_message` so it lands in
+    /// `MockAdapter::edits()` targeting that one anchor — proving the HUD
+    /// edits one message in place rather than re-posting. Only F1's
+    /// `matrix/hud-live-edit` fixture sets this; every other fixture keeps
+    /// the byte-identical degrade-to-text behaviour. Default `false`.
+    #[serde(default)]
+    pub model_rich_breadcrumbs: bool,
 }
 
 /// Script one `MockAdapter::fail_next_deliver` call. `kind` decides the

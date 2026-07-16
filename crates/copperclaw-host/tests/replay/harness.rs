@@ -189,7 +189,11 @@ impl ReplayHarness {
                 .get(ct.as_str())
                 .copied()
                 .or_else(|| default_cap_for(ct.as_str()));
-            let wrapped: Arc<dyn ChannelAdapter> = Arc::new(CappedAdapter::new(mock.clone(), cap));
+            let wrapped: Arc<dyn ChannelAdapter> = Arc::new(CappedAdapter::new(
+                mock.clone(),
+                cap,
+                fixture.manifest.model_rich_breadcrumbs,
+            ));
             initial.push((ct.clone(), wrapped));
             adapters.push((ct, mock));
         }
@@ -1449,13 +1453,22 @@ fn default_cap_for(channel_type: &str) -> Option<usize> {
 struct CappedAdapter {
     inner: Arc<MockAdapter>,
     max_message_chars: Option<usize>,
+    /// M19 F1: when true, model an edit-capable rich adapter for the
+    /// HUD breadcrumb surface (post once, edit in place) instead of the
+    /// bare-mock degrade-to-text. See `Manifest::model_rich_breadcrumbs`.
+    model_rich_breadcrumbs: bool,
 }
 
 impl CappedAdapter {
-    fn new(inner: Arc<MockAdapter>, max_message_chars: Option<usize>) -> Self {
+    fn new(
+        inner: Arc<MockAdapter>,
+        max_message_chars: Option<usize>,
+        model_rich_breadcrumbs: bool,
+    ) -> Self {
         Self {
             inner,
             max_message_chars,
+            model_rich_breadcrumbs,
         }
     }
 }
@@ -1509,6 +1522,51 @@ impl ChannelAdapter for CappedAdapter {
         self.inner
             .deliver_card(platform_id, thread_id, card, to)
             .await
+    }
+
+    async fn deliver_breadcrumb(
+        &self,
+        platform_id: &str,
+        thread_id: Option<&str>,
+        breadcrumb: &copperclaw_channels_core::Breadcrumb,
+        existing_message_id: Option<&str>,
+    ) -> Result<Option<String>, AdapterError> {
+        // Default (bare-mock) behaviour: degrade to a plain text deliver,
+        // ignoring `existing_message_id` — every frame re-posts. This is
+        // what the real `MockAdapter` does via the trait default.
+        if !self.model_rich_breadcrumbs {
+            return self
+                .inner
+                .deliver_breadcrumb(platform_id, thread_id, breadcrumb, existing_message_id)
+                .await;
+        }
+        // M19 F1: edit-capable rich-adapter modelling. The HUD posts the
+        // chip once (no anchor) and edits it in place on every later frame
+        // (`existing_message_id = Some(anchor)`).
+        let text = breadcrumb.to_text_fallback();
+        match existing_message_id {
+            // First frame: post. Record it as a `Breadcrumb`-kind delivery
+            // so `snapshot_delivered` shows exactly one HUD post, and return
+            // the mock's stable id as the anchor future edits target.
+            None => {
+                let msg = OutboundMessage {
+                    kind: copperclaw_types::MessageKind::Breadcrumb,
+                    content: serde_json::json!({ "text": text }),
+                    files: vec![],
+                };
+                self.inner.deliver(platform_id, thread_id, &msg).await
+            }
+            // Later frame: edit the anchor in place. Route through the inner
+            // mock's `edit_message` so it lands in `MockAdapter::edits()`,
+            // and return the SAME anchor so the delivery loop keeps editing
+            // the one chip (never re-posts).
+            Some(anchor) => {
+                self.inner
+                    .edit_message(platform_id, thread_id, anchor, &text)
+                    .await?;
+                Ok(Some(anchor.to_owned()))
+            }
+        }
     }
 
     async fn open_dm(&self, user_id: &str) -> Result<Option<DmHandle>, AdapterError> {
