@@ -343,6 +343,116 @@ impl ChannelAdapter for TeamsAdapter {
         Ok(None)
     }
 
+    /// Edit a previously delivered message in place via Microsoft Graph
+    /// `PATCH .../messages/{id}` (channel post or chat message, resolved
+    /// from `platform_id`). `external_id` is the Graph `chatMessage` id
+    /// returned by the original `deliver`. This is the Teams answer to
+    /// Slack's `chat.update` / Telegram's `editMessageText`: it lets the
+    /// M18 Task HUD self-edit one status message instead of posting a
+    /// fresh one per tool batch. It also places `teams` in
+    /// `EDIT_CAPABLE_CHANNELS` (see `channels/core/src/capabilities.rs`)
+    /// so the delivery loop actually routes HUD edits here rather than
+    /// degrading them to new-message spam.
+    async fn edit_message(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        external_id: &str,
+        new_text: &str,
+    ) -> Result<(), AdapterError> {
+        let ct = self.channel_type().as_str();
+        let target = TeamsTarget::parse(platform_id)?;
+        let result = match &target {
+            TeamsTarget::Channel {
+                team_id,
+                channel_id,
+            } => {
+                self.api
+                    .edit_channel_message(team_id, channel_id, external_id, new_text)
+                    .await
+            }
+            TeamsTarget::Chat { chat_id } => {
+                self.api
+                    .edit_chat_message(chat_id, external_id, new_text)
+                    .await
+            }
+        };
+        match result {
+            Ok(()) => {
+                copperclaw_metrics::inc_hud_edit(ct, "ok");
+                copperclaw_metrics::inc_adapter_edit_message(ct, "ok");
+                Ok(())
+            }
+            Err(e) => {
+                copperclaw_metrics::inc_hud_edit(ct, "error");
+                copperclaw_metrics::inc_adapter_edit_message(ct, "error");
+                Err(e)
+            }
+        }
+    }
+
+    /// React to a message with an emoji via Microsoft Graph
+    /// `POST .../messages/{id}/setReaction`. `emoji` is a shortcode
+    /// (e.g. `thumbsup`, `heart`) mapped to a Graph `reactionType` by
+    /// [`shortcode_to_reaction_type`]; unmapped shortcodes surface as
+    /// `Unsupported` rather than being silently dropped. Mirrors the
+    /// structured `reaction` system action so both the host-driven trait
+    /// path and the outbound-row path reach the same Graph endpoint.
+    async fn add_reaction(
+        &self,
+        platform_id: &str,
+        _thread_id: Option<&str>,
+        external_id: &str,
+        emoji: &str,
+    ) -> Result<(), AdapterError> {
+        let target = TeamsTarget::parse(platform_id)?;
+        let reaction_type = shortcode_to_reaction_type(emoji).ok_or_else(|| {
+            AdapterError::Unsupported(format!("teams does not support reaction `{emoji}`"))
+        })?;
+        match &target {
+            TeamsTarget::Channel {
+                team_id,
+                channel_id,
+            } => {
+                self.api
+                    .set_channel_reaction(team_id, channel_id, external_id, reaction_type)
+                    .await
+            }
+            TeamsTarget::Chat { chat_id } => {
+                self.api
+                    .set_chat_reaction(chat_id, external_id, reaction_type)
+                    .await
+            }
+        }
+    }
+
+    /// Strip Teams-specific rich formatting from an outbound message so a
+    /// body that tripped a Graph formatting rejection can be redelivered
+    /// as plain text. Teams's rich shape is the `html` content field (it
+    /// takes precedence over `text` in [`Self::deliver_chat`]); removing
+    /// it forces the plain-`text` path. The visible text is preserved and
+    /// marked `[reduced formatting]` so the downgrade is legible. Returns
+    /// `None` when there was no `html` field to strip (nothing to
+    /// recover — fail fast rather than degrade silently).
+    fn plain_text_fallback(&self, msg: &OutboundMessage) -> Option<OutboundMessage> {
+        let obj = msg.content.as_object()?;
+        if !obj.contains_key("html") {
+            return None;
+        }
+        let text = obj.get("text").and_then(Value::as_str).unwrap_or("");
+        let mut new_obj = obj.clone();
+        new_obj.remove("html");
+        new_obj.insert(
+            "text".to_owned(),
+            Value::String(format!("[reduced formatting] {text}")),
+        );
+        Some(OutboundMessage {
+            kind: msg.kind,
+            content: Value::Object(new_obj),
+            files: msg.files.clone(),
+        })
+    }
+
     /// Render and deliver a [`Card`] natively as a Microsoft Teams
     /// Adaptive Card attachment (`application/vnd.microsoft.card.adaptive`).
     ///
@@ -1028,6 +1138,186 @@ mod tests {
         let server = MockServer::start().await;
         let adapter = adapter_for(&server);
         assert!(adapter.open_dm("U1").await.unwrap().is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // U2: trait `edit_message` / `add_reaction` overrides + plain-text
+    // fallback. The trait methods are what the host delivery loop calls
+    // (dispatch.rs), and `teams` is now in EDIT_CAPABLE_CHANNELS — so the
+    // HUD self-edits one message rather than posting a fresh one per
+    // batch.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn edit_message_channel_patches_in_place() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/teams/T1/channels/C1/messages/MID"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let adapter = adapter_for(&server);
+        adapter
+            .edit_message("team/T1/channel/C1", None, "MID", "updated")
+            .await
+            .unwrap();
+        // Exactly one PATCH — no fresh POST.
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].method.as_str(), "PATCH");
+    }
+
+    #[tokio::test]
+    async fn edit_message_chat_patches_in_place() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/chats/CHAT1/messages/MID"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let adapter = adapter_for(&server);
+        adapter
+            .edit_message("chat/CHAT1", None, "MID", "updated")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn edit_message_edits_same_message_n_times_not_n_posts() {
+        // The live-HUD guarantee: N status updates become N in-place PATCHes
+        // against the same message id, never N fresh POSTs.
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/teams/T1/channels/C1/messages/HUD"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let adapter = adapter_for(&server);
+        for i in 0..5 {
+            adapter
+                .edit_message("team/T1/channel/C1", None, "HUD", &format!("step {i}"))
+                .await
+                .unwrap();
+        }
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 5, "five edits should be five PATCHes");
+        assert!(reqs.iter().all(|r| r.method.as_str() == "PATCH"));
+        assert!(
+            reqs.iter()
+                .all(|r| r.url.path() == "/teams/T1/channels/C1/messages/HUD"),
+            "all edits target the same message id"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_message_bad_platform_id_is_bad_request() {
+        let server = MockServer::start().await;
+        let adapter = adapter_for(&server);
+        match adapter.edit_message("nope", None, "MID", "x").await {
+            Err(AdapterError::BadRequest(_)) => {}
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_message_propagates_api_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/teams/T1/channels/C1/messages/MID"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("nope"))
+            .mount(&server)
+            .await;
+        let adapter = adapter_for(&server);
+        match adapter
+            .edit_message("team/T1/channel/C1", None, "MID", "x")
+            .await
+        {
+            Err(AdapterError::Auth(_)) => {}
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_reaction_channel_calls_set_reaction() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/teams/T1/channels/C1/messages/MID/setReaction"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let adapter = adapter_for(&server);
+        adapter
+            .add_reaction("team/T1/channel/C1", None, "MID", "thumbsup")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_reaction_chat_calls_set_reaction() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chats/CHAT1/messages/MID/setReaction"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let adapter = adapter_for(&server);
+        adapter
+            .add_reaction("chat/CHAT1", None, "MID", "heart")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn add_reaction_unknown_emoji_is_unsupported() {
+        let server = MockServer::start().await;
+        let adapter = adapter_for(&server);
+        match adapter
+            .add_reaction("team/T1/channel/C1", None, "MID", "unicorn")
+            .await
+        {
+            Err(AdapterError::Unsupported(m)) => assert!(m.contains("unicorn")),
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn add_reaction_bad_platform_id_is_bad_request() {
+        let server = MockServer::start().await;
+        let adapter = adapter_for(&server);
+        match adapter.add_reaction("nope", None, "MID", "like").await {
+            Err(AdapterError::BadRequest(_)) => {}
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_text_fallback_strips_html_field() {
+        let server = MockServer::start().await;
+        let adapter = adapter_for(&server);
+        let msg = OutboundMessage {
+            kind: MessageKind::Chat,
+            content: json!({"text": "rich body", "html": "<p>rich body</p>"}),
+            files: vec![],
+        };
+        let fallback = adapter.plain_text_fallback(&msg).expect("teams fallback");
+        assert!(fallback.content.get("html").is_none());
+        assert_eq!(
+            fallback.content["text"].as_str().unwrap(),
+            "[reduced formatting] rich body"
+        );
+        assert_eq!(fallback.kind, MessageKind::Chat);
+    }
+
+    #[tokio::test]
+    async fn plain_text_fallback_none_without_html() {
+        let server = MockServer::start().await;
+        let adapter = adapter_for(&server);
+        let msg = OutboundMessage {
+            kind: MessageKind::Chat,
+            content: json!({"text": "plain only"}),
+            files: vec![],
+        };
+        assert!(adapter.plain_text_fallback(&msg).is_none());
     }
 
     #[tokio::test]
