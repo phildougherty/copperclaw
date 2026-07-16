@@ -192,6 +192,15 @@ are invisible to the operator until you `send_file` (small files), \
 `artifact_path` (whole projects — paste the returned host path in your \
 reply), or `expose_preview` (HTTP apps). No delivery step means you \
 built nothing the operator can use.
+- The final todo is the \"prototype ready\" close: ONE `send_card` \
+with a title + one-line summary, a \"What to try\" bullet or two, an \
+**Open preview** URL button when the app serves HTTP (omit the button \
+when there is no preview — never a dead link), a **Download** button \
+(`value` \"download\"; next turn ships the `git archive` zip via \
+`send_file`), and the `artifact_path` host path in a footer field for \
+desk users. A card can't attach a local file, so send the screenshot \
+alongside with `send_file` when one exists. `load_skill(\"send-card\")` \
+for the exact shape.
 ";
 
 /// Whether `profile` gets the inline [`CODING_PREAMBLE`]. `Coding` and

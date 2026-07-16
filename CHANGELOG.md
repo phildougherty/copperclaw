@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (M18 P3 — the "prototype ready" ritual, 2026-07-16)
+
+- Every build now ends with one concrete `send_card` hand-off instead of
+  whatever prose the model chose, so a "build me X" run finishes with a
+  coherent demo the operator can open, download, and steer.
+  - `crates/copperclaw-host/src/container_manager/prompt.rs`: the static
+    `CODING_PREAMBLE` floor block (active only for `Coding` / `Full` profiles)
+    gains one closing bullet mandating the ritual card — title + one-line
+    summary, a "What to try" bullet, an **Open preview** URL button (only when
+    the app serves HTTP), a **Download** button (`value: "download"`, answered
+    next turn with the `git archive` zip via `send_file`), the `artifact_path`
+    host path in a footer field, and the screenshot sent alongside via
+    `send_file` (a card can't attach a local file — `image_url` must be
+    http(s)). The block stays a compile-time const, so the prompt-cache prefix
+    is unchanged per spawn and `Messaging` / `Minimal` profiles gain zero bytes
+    (pinned by the existing cache-stability / zero-new-bytes tests).
+  - `skills/coding-task/SKILL.md`: dropped the "a richer close card is
+    forthcoming — P3" hedge and taught the actual `send_card` ritual as the
+    mandatory final step, with capability-based degradation (no preview → no
+    button, no screenshot → no PNG; never a dead link); trimmed the surrounding
+    delivery prose to stay under the 8 KiB skill-body cap.
+  - `skills/send-card/SKILL.md`: added a worked "prototype ready" close example
+    (URL + `value` buttons, artifact-path field, screenshot-alongside note) and
+    the degradation rules, rather than duplicating the schema into coding-task.
+
 ### Added (M18 G1 — in-chat approvals, 2026-07-16)
 
 - Approval cards can now be resolved by tapping **Approve** / **Deny** from
