@@ -6,6 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M19 U1 — Signal rich-surface floor)
+
+- The Signal adapter now renders five of the six portable rich surfaces
+  natively instead of falling through to the plain-text trait default, so
+  the Task HUD, diffs, todo lists, reasoning, and errors arrive as
+  structured Signal plaintext rather than bare prose. New renderers live in
+  `crates/copperclaw-channels/signal/src/render.rs`; the `deliver_*`
+  overrides are in `crates/copperclaw-channels/signal/src/adapter.rs`.
+  - **`deliver_breadcrumb` (marquee win) — in-place edit.** A compact
+    `[status] tool · detail — summary` chip; the runner's completion emit
+    is fed through signal-cli's `sendEditMessage` so `[running] shell ·
+    cargo check` becomes `[done] … — passed (0.4s)` on the *same* message
+    instead of stacking a fresh line on every tool boundary. Subsequent
+    edits keep targeting the original timestamp; a non-numeric id or edit
+    failure degrades gracefully to a fresh chip.
+  - **`deliver_todo_list` — in-place edit.** A `title (done/total)`
+    checklist with ASCII `[x]`/`[~]`/`[ ]` glyphs, edited in place via
+    `sendEditMessage` when the prior chip id is known. Signal has no pin
+    API, so `pin_hint` is a silent no-op.
+  - **`deliver_diff`** — a glanceable `path (+a / -r)` header plus unified
+    hunks with `+`/`-` gutters, fence-free (Signal renders backticks
+    literally) and without the redundant `--- a/` / `+++ b/` git header.
+  - **`deliver_thinking`** — a `reasoning (model)` header + plain body
+    lines with no `> ` quote markers (Signal shows them literally);
+    redacted blocks emit only the placeholder, never the raw blob.
+  - **`deliver_error`** — an `[ERROR: kind] title` banner, summary, an
+    indented `details:` block, and a retry footer, all markdown-free.
+  - `deliver_collapsible` is intentionally left on the trait default:
+    Signal has no disclosure/expandable primitive, so the fallback
+    (summary + preview + `…(N more lines)`) is already the optimal
+    markdown-free plaintext shape and carries no in-place-edit id to
+    improve on.
+
 ### Fixed (M18 — Task HUD no-op edit / Telegram "message is not modified", 2026-07-16)
 
 - The H1 Task HUD and R6 progressive-final-answer edit a pinned status
