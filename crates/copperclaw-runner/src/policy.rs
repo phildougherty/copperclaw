@@ -150,6 +150,18 @@ const SELF_MOD_TOOLS: &[&str] = &["install_packages", "add_mcp_server", "save_sk
 /// `untrusted`).
 const MEMORY_WRITE_TOOLS: &[&str] = &["memory_save"];
 
+/// Browser tools that perform *writes* to a remote page (M19 A2). Read-only
+/// `browser_render` observes; `browser_interact` clicks / types / submits
+/// forms against external sites, so it is classified as mutating here: a
+/// [`SenderRole::Guest`] sender is denied it (see [`is_mutating`]) — a guest
+/// must not be able to drive an outward-facing, write-capable browser.
+/// Deliberately NOT in [`PROFILE_TOOL_LISTS`]: like `browser_render`, this tool
+/// is only registered when its opt-in flag is set, so it can never appear in
+/// the default `build_tool_set()` inventory the drift guard checks against; it
+/// stays `Full`-profile-only via the open allow-list, exactly as its read-only
+/// sibling does.
+const BROWSER_WRITE_TOOLS: &[&str] = &["browser_interact"];
+
 /// Tools that take a **credentialed external action** — they reach outside the
 /// container over the network (the egress path the credential broker meters)
 /// to fetch data, run a search, install packages, or attach a remote MCP
@@ -396,6 +408,7 @@ fn is_mutating(tool: &str) -> bool {
         || CODING_TOOLS.contains(&tool)
         || SELF_MOD_TOOLS.contains(&tool)
         || MEMORY_WRITE_TOOLS.contains(&tool)
+        || BROWSER_WRITE_TOOLS.contains(&tool)
 }
 
 /// Outcome of a policy evaluation.
@@ -927,6 +940,22 @@ mod tests {
         // A full member can write.
         let member = ToolPolicy::new(ToolProfile::Full, None);
         assert!(member.evaluate("memory_save").is_allow());
+    }
+
+    #[test]
+    fn browser_interact_is_mutating_and_denied_to_guests() {
+        // A2 security follow-up F1: browser_interact clicks/types/submits forms
+        // against external pages, so a guest (read-only) sender is denied it
+        // even under the open Full profile. Read-only browser_render is not a
+        // write and stays available to whoever the profile admits.
+        assert!(is_mutating("browser_interact"));
+        assert!(!is_mutating("browser_render"));
+        let guest = ToolPolicy::new(ToolProfile::Full, Some(SenderRole::Guest));
+        assert!(!guest.evaluate("browser_interact").is_allow());
+        // A full member can drive the interactive browser (when the opt-in
+        // flag is set and the tool is registered).
+        let member = ToolPolicy::new(ToolProfile::Full, None);
+        assert!(member.evaluate("browser_interact").is_allow());
     }
 
     #[test]

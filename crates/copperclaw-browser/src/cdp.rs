@@ -287,7 +287,7 @@ impl CdpBrowserDriver {
     async fn do_click(&self, selector: &str) -> Result<(), BrowserError> {
         let expr = format!(
             "(function(){{const el=document.querySelector({sel});\
-             if(!el){{throw new Error('no element for selector {sel}');}}\
+             if(!el){{throw new Error(\"no element for selector \"+{sel});}}\
              el.scrollIntoView({{block:'center'}});el.click();return true;}})()",
             sel = js_string(selector)
         );
@@ -299,7 +299,7 @@ impl CdpBrowserDriver {
     async fn do_type(&self, selector: &str, text: &str) -> Result<(), BrowserError> {
         let expr = format!(
             "(function(){{const el=document.querySelector({sel});\
-             if(!el){{throw new Error('no element for selector {sel}');}}\
+             if(!el){{throw new Error(\"no element for selector \"+{sel});}}\
              el.focus();if('value' in el){{el.value={txt};}}else{{el.textContent={txt};}}\
              el.dispatchEvent(new Event('input',{{bubbles:true}}));\
              el.dispatchEvent(new Event('change',{{bubbles:true}}));return true;}})()",
@@ -319,7 +319,7 @@ impl CdpBrowserDriver {
         let expr = match selector {
             Some(sel) => format!(
                 "(function(){{const el=document.querySelector({sel});\
-                 if(!el){{throw new Error('no element for selector {sel}');}}\
+                 if(!el){{throw new Error(\"no element for selector \"+{sel});}}\
                  el.scrollIntoView({{block:'center'}});return true;}})()",
                 sel = js_string(sel)
             ),
@@ -1207,6 +1207,36 @@ mod tests {
                 .iter()
                 .any(|e| e.starts_with("!!document.querySelector(\".done\")")),
             "wait expr must poll presence: {exprs:?}"
+        );
+        // A2 security follow-up F2: a SINGLE-quote in the selector must not break
+        // out of the thrown Error string. The selector is JSON-encoded into a
+        // double-quoted JS string literal, and the error message concatenates
+        // that literal (`"..."+sel`) rather than splicing the raw selector into
+        // a single-quoted `Error('...')`. So the hostile selector — including
+        // its `');` — must appear only WITHIN one complete double-quoted literal,
+        // never as bare code, and no single-quoted `Error('` literal may exist.
+        driver
+            .act(&InteractiveAction::Click {
+                selector: "#x');globalThis.pwned=1//".into(),
+            })
+            .await
+            .unwrap();
+        let exprs = transport.exprs.lock().unwrap().clone();
+        let click = exprs
+            .iter()
+            .find(|e| e.contains("globalThis.pwned=1"))
+            .expect("the hostile-selector click expr should be recorded");
+        // The whole selector rides inside one double-quoted JSON literal, so its
+        // single-quote is inert data, not a string terminator.
+        assert!(
+            click.contains("\"#x');globalThis.pwned=1//\""),
+            "hostile selector must be one escaped double-quoted literal: {click}"
+        );
+        // The Error message never uses a single-quoted literal the selector
+        // could terminate.
+        assert!(
+            !click.contains("Error('"),
+            "error message must not splice the selector into a single-quoted literal: {click}"
         );
     }
 
