@@ -251,6 +251,13 @@ impl ContainerManager {
 
         let cfg_row = container_configs::get(&self.central, session.agent_group_id)
             .map_err(ManagerError::Db)?;
+        // E2: fleet-visibility gauge of each group's active image profile.
+        copperclaw_metrics::set_group_image_profile(
+            &session.agent_group_id.to_string(),
+            cfg_row
+                .as_ref()
+                .map_or("minimal", |c| c.image_profile.as_str()),
+        );
         let runner_cfg =
             self.runner_config_for(session, cfg_row.as_ref(), Some(paths.root.as_path()));
         let runner_json = serde_json::to_vec_pretty(&runner_cfg).map_err(ManagerError::Json)?;
@@ -316,9 +323,11 @@ impl ContainerManager {
                 );
                 base_tag
             } else {
+                let img_profile = cfg.image_profile.as_str();
                 match self.rebuild_image(session.agent_group_id, cfg).await {
                     Ok(new_tag) => {
                         self.rebuild_backoff.record_success(session.agent_group_id);
+                        copperclaw_metrics::inc_image_rebuild(img_profile, "ok");
                         new_tag
                     }
                     Err(err) if !base_tag.is_empty() => {
@@ -332,11 +341,13 @@ impl ContainerManager {
                             "image rebuild failed; spawning on last-known-good tag and backing off"
                         );
                         copperclaw_metrics::inc_image_rebuild_failed();
+                        copperclaw_metrics::inc_image_rebuild(img_profile, "failed");
                         base_tag
                     }
                     Err(err) => {
                         self.rebuild_backoff.record_failure(session.agent_group_id);
                         copperclaw_metrics::inc_image_rebuild_failed();
+                        copperclaw_metrics::inc_image_rebuild(img_profile, "failed");
                         return Err(err);
                     }
                 }
@@ -1302,8 +1313,16 @@ fn apply_parent_workspace(
     };
 
     let sibling_sid = session.id.as_uuid().to_string();
+    // R7: time the `git worktree add` that provisions a delegate's writable
+    // parent-repo worktree on first spawn (only when one is actually created).
+    let wt_started = std::time::Instant::now();
     let worktree = resolve_parent_repo_root(&parent_root)
         .and_then(|repo_root| provision_parent_worktree(&repo_root, &sibling_sid));
+    if worktree.is_some() {
+        copperclaw_metrics::observe_delegate_worktree_provision_seconds(
+            wt_started.elapsed().as_secs_f64(),
+        );
+    }
     if let Some(wt) = worktree {
         // toctou redux: both parent-derived sources are host-controlled
         // paths under the sessions root. Validate each before mounting; a

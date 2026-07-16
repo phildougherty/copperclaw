@@ -37,8 +37,24 @@ pub enum Flavor {
     Plain,
 }
 
+impl Flavor {
+    /// Stable `snake_case` label for the `flavor` metric label on
+    /// `copperclaw_markdown_render_total` / `_unbalanced_marker_total`.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Flavor::Html => "html",
+            Flavor::Discord => "discord",
+            Flavor::Slack => "slack",
+            Flavor::Mattermost => "mattermost",
+            Flavor::WhatsApp => "whatsapp",
+            Flavor::Plain => "plain",
+        }
+    }
+}
+
 /// Render canonical `markdown` into the on-the-wire text for `flavor`.
 pub fn render(markdown: &str, flavor: Flavor) -> String {
+    copperclaw_metrics::inc_markdown_render(flavor.label());
     let lines: Vec<&str> = markdown.split('\n').collect();
     let mut out: Vec<String> = Vec::with_capacity(lines.len());
     let mut i = 0;
@@ -133,7 +149,7 @@ fn render_text_line(out: &mut Vec<String>, line: &str, flavor: Flavor) {
         };
         let mut s = String::from(indent);
         s.push_str(bullet);
-        render_inline(&parse_inline(content), flavor, &mut s);
+        render_inline(&parse_inline(content, flavor), flavor, &mut s);
         out.push(s);
         return;
     }
@@ -142,7 +158,7 @@ fn render_text_line(out: &mut Vec<String>, line: &str, flavor: Flavor) {
         let mut s = String::from(indent);
         s.push_str(marker);
         s.push(' ');
-        render_inline(&parse_inline(content), flavor, &mut s);
+        render_inline(&parse_inline(content, flavor), flavor, &mut s);
         out.push(s);
         return;
     }
@@ -152,7 +168,7 @@ fn render_text_line(out: &mut Vec<String>, line: &str, flavor: Flavor) {
     }
     // Plain paragraph line: preserve leading indent, render inline.
     let mut s = String::from(indent);
-    render_inline(&parse_inline(rest), flavor, &mut s);
+    render_inline(&parse_inline(rest, flavor), flavor, &mut s);
     out.push(s);
 }
 
@@ -167,7 +183,7 @@ fn heading(rest: &str) -> Option<(usize, &str)> {
 }
 
 fn render_heading(level: usize, content: &str, flavor: Flavor) -> String {
-    let nodes = parse_inline(content);
+    let nodes = parse_inline(content, flavor);
     match flavor {
         Flavor::Html => {
             let mut s = String::from("<b>");
@@ -224,7 +240,7 @@ fn blockquote(rest: &str) -> Option<&str> {
 }
 
 fn render_blockquote(content: &str, flavor: Flavor) -> String {
-    let nodes = parse_inline(content);
+    let nodes = parse_inline(content, flavor);
     if flavor == Flavor::Html {
         let mut s = String::from("<blockquote>");
         render_inline(&nodes, flavor, &mut s);
@@ -248,12 +264,12 @@ enum Inline {
     Link { text: Vec<Inline>, url: String },
 }
 
-fn parse_inline(s: &str) -> Vec<Inline> {
+fn parse_inline(s: &str, flavor: Flavor) -> Vec<Inline> {
     let chars: Vec<char> = s.chars().collect();
-    parse_span(&chars)
+    parse_span(&chars, flavor)
 }
 
-fn parse_span(chars: &[char]) -> Vec<Inline> {
+fn parse_span(chars: &[char], flavor: Flavor) -> Vec<Inline> {
     let mut nodes: Vec<Inline> = Vec::new();
     let mut text = String::new();
     let mut i = 0;
@@ -272,7 +288,7 @@ fn parse_span(chars: &[char]) -> Vec<Inline> {
         if (c == '*' || c == '_') && chars.get(i + 1) == Some(&c) {
             if let Some(close) = find_double(chars, i + 2, c) {
                 flush(&mut nodes, &mut text);
-                nodes.push(Inline::Bold(parse_span(&chars[i + 2..close])));
+                nodes.push(Inline::Bold(parse_span(&chars[i + 2..close], flavor)));
                 i = close + 2;
                 continue;
             }
@@ -281,7 +297,7 @@ fn parse_span(chars: &[char]) -> Vec<Inline> {
         if c == '~' && chars.get(i + 1) == Some(&'~') {
             if let Some(close) = find_double(chars, i + 2, '~') {
                 flush(&mut nodes, &mut text);
-                nodes.push(Inline::Strike(parse_span(&chars[i + 2..close])));
+                nodes.push(Inline::Strike(parse_span(&chars[i + 2..close], flavor)));
                 i = close + 2;
                 continue;
             }
@@ -290,7 +306,7 @@ fn parse_span(chars: &[char]) -> Vec<Inline> {
         if c == '*' || c == '_' {
             if let Some(close) = find_italic_close(chars, i, c) {
                 flush(&mut nodes, &mut text);
-                nodes.push(Inline::Italic(parse_span(&chars[i + 1..close])));
+                nodes.push(Inline::Italic(parse_span(&chars[i + 1..close], flavor)));
                 i = close + 1;
                 continue;
             }
@@ -299,12 +315,18 @@ fn parse_span(chars: &[char]) -> Vec<Inline> {
         if c == '[' {
             if let Some((text_end, url_start, url_end)) = parse_link(chars, i) {
                 flush(&mut nodes, &mut text);
-                let inner = parse_span(&chars[i + 1..text_end]);
+                let inner = parse_span(&chars[i + 1..text_end], flavor);
                 let url: String = chars[url_start..url_end].iter().collect();
                 nodes.push(Inline::Link { text: inner, url });
                 i = url_end + 1;
                 continue;
             }
+        }
+        // A formatting marker char that reached here found no matching close
+        // above: it is emitted literally (the forgiving unbalanced-marker
+        // path C5b's metric wish measures).
+        if matches!(c, '`' | '*' | '_' | '~') {
+            copperclaw_metrics::inc_markdown_unbalanced_marker(flavor.label());
         }
         text.push(c);
         i += 1;

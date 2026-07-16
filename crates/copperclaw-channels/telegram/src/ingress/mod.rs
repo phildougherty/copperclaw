@@ -202,6 +202,8 @@ async fn message_to_event(
         let descriptor = attachment.expect("just checked");
         match download_one(api, settings, &descriptor).await {
             DownloadOutcome::Ok { path, size } => {
+                copperclaw_metrics::inc_inbound_file(channel_type.as_str(), "ok");
+                copperclaw_metrics::observe_inbound_file_bytes(channel_type.as_str(), size);
                 let mut content_obj = serde_json::Map::new();
                 content_obj.insert("text".to_owned(), Value::String(caption_or_text.clone()));
                 let mut att = attachment_json(&descriptor, &path, size);
@@ -214,6 +216,7 @@ async fn message_to_event(
                 (MessageKind::Chat, Value::Object(content_obj))
             }
             DownloadOutcome::TooLarge { reported } => {
+                copperclaw_metrics::inc_inbound_file(channel_type.as_str(), "too_large");
                 let mut v = legacy_metadata_value(&descriptor);
                 if let Value::Object(obj) = &mut v {
                     obj.insert("reason".to_owned(), Value::String("too_large".to_owned()));
@@ -228,6 +231,7 @@ async fn message_to_event(
                 (MessageKind::System, v)
             }
             DownloadOutcome::Failed { error } => {
+                copperclaw_metrics::inc_inbound_file(channel_type.as_str(), "download_failed");
                 let mut v = legacy_metadata_value(&descriptor);
                 if let Value::Object(obj) = &mut v {
                     obj.insert(

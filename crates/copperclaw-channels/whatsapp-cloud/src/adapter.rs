@@ -250,6 +250,7 @@ impl ChannelAdapter for WhatsappCloudAdapter {
         card: &Card,
         _to: Option<&str>,
     ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type().as_str(), "card");
         self.send_rendered(platform_id, thread_id, &render::render_card(card))
             .await
     }
@@ -261,6 +262,7 @@ impl ChannelAdapter for WhatsappCloudAdapter {
         thread_id: Option<&str>,
         diff: &DiffCard,
     ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type().as_str(), "diff");
         self.send_rendered(platform_id, thread_id, &render::render_diff(diff))
             .await
     }
@@ -274,6 +276,7 @@ impl ChannelAdapter for WhatsappCloudAdapter {
         summary: &str,
         preview_lines: &[String],
     ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type().as_str(), "collapsible");
         let body = render::render_collapsible(text, summary, preview_lines);
         self.send_rendered(platform_id, thread_id, &body).await
     }
@@ -290,6 +293,7 @@ impl ChannelAdapter for WhatsappCloudAdapter {
         _existing_message_id: Option<&str>,
         _pin_hint: bool,
     ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type().as_str(), "todo");
         self.send_rendered(platform_id, thread_id, &render::render_todo_list(list))
             .await
     }
@@ -301,6 +305,7 @@ impl ChannelAdapter for WhatsappCloudAdapter {
         thread_id: Option<&str>,
         thinking: &ThinkingBlock,
     ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type().as_str(), "thinking");
         self.send_rendered(platform_id, thread_id, &render::render_thinking(thinking))
             .await
     }
@@ -312,6 +317,7 @@ impl ChannelAdapter for WhatsappCloudAdapter {
         thread_id: Option<&str>,
         err: &ErrorCard,
     ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type().as_str(), "error");
         self.send_rendered(platform_id, thread_id, &render::render_error(err))
             .await
     }

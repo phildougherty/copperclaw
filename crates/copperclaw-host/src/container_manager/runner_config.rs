@@ -337,6 +337,8 @@ impl ContainerManager {
             parsed
         });
 
+        let effective_tool_profile = parsed_tool_profile.unwrap_or_default();
+        let profile_label = effective_tool_profile.as_str();
         let system = assemble_system_prompt_with_catalogue(
             self.cfg.skills_dir.as_deref(),
             self.cfg.groups_dir.as_deref(),
@@ -348,10 +350,14 @@ impl ContainerManager {
             assistant_name.as_deref(),
             &model,
             effective_mode,
-            parsed_tool_profile.unwrap_or_default(),
+            effective_tool_profile,
             catalogue_for_prompt.as_deref(),
             exclude_names,
         );
+        // P1: attribute the spawn to its tool profile + record the assembled
+        // system-prompt byte size (per profile).
+        copperclaw_metrics::inc_session_spawned_profile(profile_label);
+        copperclaw_metrics::observe_system_prompt_bytes(profile_label, system.len());
 
         // Pick the api_key_env that matches the wire format. Ollama
         // native doesn't authenticate (or uses its own bearer in front

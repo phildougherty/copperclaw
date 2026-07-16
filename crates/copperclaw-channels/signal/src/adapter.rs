@@ -347,8 +347,19 @@ impl ChannelAdapter for SignalAdapter {
                 "signal: edit target id `{external_id}` is not a valid timestamp"
             ))
         })?;
-        api::send_edit(&self.transport, &target, ts, new_text).await?;
-        Ok(())
+        let ct = self.channel_type().as_str();
+        match api::send_edit(&self.transport, &target, ts, new_text).await {
+            Ok(_) => {
+                copperclaw_metrics::inc_hud_edit(ct, "ok");
+                copperclaw_metrics::inc_adapter_edit_message(ct, "ok");
+                Ok(())
+            }
+            Err(e) => {
+                copperclaw_metrics::inc_hud_edit(ct, "error");
+                copperclaw_metrics::inc_adapter_edit_message(ct, "error");
+                Err(e)
+            }
+        }
     }
 
     /// Native card — clean Signal plaintext (no Markdown, which Signal
@@ -364,6 +375,7 @@ impl ChannelAdapter for SignalAdapter {
         card: &Card,
         _to: Option<&str>,
     ) -> Result<Option<String>, AdapterError> {
+        copperclaw_metrics::inc_adapter_rich_render(self.channel_type().as_str(), "card");
         let target = parse_platform_id(platform_id)?;
         let text = render::render_card(card);
         api::send_text(&self.transport, &target, &text).await

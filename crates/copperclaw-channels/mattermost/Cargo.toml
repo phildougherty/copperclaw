@@ -19,6 +19,7 @@ thiserror              = { workspace = true }
 chrono                 = { workspace = true }
 bytes                  = { workspace = true }
 uuid                   = { workspace = true }
+copperclaw-metrics.workspace = true
 
 [dev-dependencies]
 tower    = { workspace = true }

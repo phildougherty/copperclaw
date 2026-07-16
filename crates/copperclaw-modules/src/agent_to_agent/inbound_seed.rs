@@ -29,6 +29,9 @@ impl CreateAgentHandler {
         agent_group_id: Option<AgentGroupId>,
         detail: Option<&str>,
     ) {
+        // R7: mirror every create_agent / delegate spawn-gate outcome, labelled
+        // by tier, so delegate vs create_agent usage is comparable.
+        copperclaw_metrics::inc_delegate_spawn(self.deps.profile.action_name(), status.as_str());
         let Some(parent) = parent else {
             info!(
                 ?status,

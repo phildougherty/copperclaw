@@ -648,6 +648,7 @@ pub mod update {
                 if let Some(project_root) = dirty.first() {
                     let cycles = crate::tools::verify_gate::fix_cycles(project_root).await;
                     if cycles < crate::tools::verify_gate::FIX_CYCLE_CAP {
+                        copperclaw_metrics::inc_verify_gate_completion("refused_dirty");
                         let cmd_hint = match crate::tools::verify_gate::recorded_verify_command(
                             project_root,
                             ctx.check_command_override().as_deref(),
@@ -677,6 +678,10 @@ pub mod update {
                     // refusing forever.
                     effective_status = Some(TodoStatus::Blocked);
                     blocked_reason = crate::tools::verify_gate::last_failure(project_root).await;
+                    copperclaw_metrics::inc_verify_gate_completion("blocked_cycle_cap");
+                } else {
+                    // Gate enabled and no project is dirty: completion passes.
+                    copperclaw_metrics::inc_verify_gate_completion("passed");
                 }
             }
         }

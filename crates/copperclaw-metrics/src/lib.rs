@@ -405,6 +405,680 @@ pub fn clear_degraded_state(reason: &str) {
     gauge!(DEGRADED_STATE, "reason" => reason.to_owned()).set(0.0);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// M18 metrics rider (card M1) — one sweep of the metric "wishes" recorded in the
+// merged M18 PRs (#24-#54). Names/labels mirror each PR's wish verbatim; the
+// emission call sites live in the crate each wish named. Grouped by source card.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── C1 (#24) — Slack typing / HUD-capability decisions ─────────────────────
+pub const SLACK_TYPING_SKIPPED_TOTAL: &str = "copperclaw_slack_typing_skipped_total";
+pub const SLACK_TYPING_SET_STATUS_TOTAL: &str = "copperclaw_slack_typing_set_status_total";
+pub const SLACK_HUD_DECISION_TOTAL: &str = "copperclaw_slack_hud_decision_total";
+
+/// Increment `copperclaw_slack_typing_skipped_total{reason}` — the slack adapter
+/// declined to set a typing indicator (e.g. `reason="non_assistant_surface"`).
+pub fn inc_slack_typing_skipped(reason: &str) {
+    counter!(SLACK_TYPING_SKIPPED_TOTAL, "reason" => reason.to_owned()).increment(1);
+}
+
+/// Increment `copperclaw_slack_typing_set_status_total{result}` — outcome of a
+/// slack assistant set-status ("is typing…") call (`ok|bad_request|error`).
+pub fn inc_slack_typing_set_status(result: &str) {
+    counter!(SLACK_TYPING_SET_STATUS_TOTAL, "result" => result.to_owned()).increment(1);
+}
+
+/// Increment `copperclaw_slack_hud_decision_total{typing_indicator_visible}` —
+/// how the HUD typing-capability predicate resolved for a surface.
+pub fn inc_slack_hud_decision(typing_indicator_visible: bool) {
+    counter!(
+        SLACK_HUD_DECISION_TOTAL,
+        "typing_indicator_visible" => if typing_indicator_visible { "true" } else { "false" },
+    )
+    .increment(1);
+}
+
+// ── T1 (#25) — shell truncation / read_file windowing ──────────────────────
+pub const SHELL_TRUNCATED_TOTAL: &str = "copperclaw_shell_truncated_total";
+pub const SHELL_TRUNCATED_BYTES: &str = "copperclaw_shell_truncated_bytes";
+pub const READ_FILE_LINES_MODE_TOTAL: &str = "copperclaw_read_file_lines_mode_total";
+pub const READ_FILE_PAGES: &str = "copperclaw_read_file_pages";
+
+/// Increment `copperclaw_shell_truncated_total{mode}` — a shell tool stream was
+/// capped; `mode` is `head` or `tail`.
+pub fn inc_shell_truncated(mode: &str) {
+    counter!(SHELL_TRUNCATED_TOTAL, "mode" => mode.to_owned()).increment(1);
+}
+
+/// Record `copperclaw_shell_truncated_bytes` — the pre-cap byte size of a shell
+/// stream that was truncated (tunes the shell output cap).
+pub fn observe_shell_truncated_bytes(bytes: usize) {
+    #[allow(clippy::cast_precision_loss)]
+    histogram!(SHELL_TRUNCATED_BYTES).record(bytes as f64);
+}
+
+/// Increment `copperclaw_read_file_lines_mode_total` — a `read_file` call used
+/// lines mode (vs bytes mode).
+pub fn inc_read_file_lines_mode() {
+    counter!(READ_FILE_LINES_MODE_TOTAL).increment(1);
+}
+
+/// Record `copperclaw_read_file_pages` — how many windowed reads it would take
+/// to read the whole file at the requested line limit (pages-per-file).
+pub fn observe_read_file_pages(pages: u64) {
+    #[allow(clippy::cast_precision_loss)]
+    histogram!(READ_FILE_PAGES).record(pages as f64);
+}
+
+// ── P1 (#26) — spawn tool-profile / skill loading ──────────────────────────
+pub const SESSIONS_SPAWNED_PROFILE_TOTAL: &str = "copperclaw_sessions_spawned_profile_total";
+pub const SYSTEM_PROMPT_BYTES: &str = "copperclaw_system_prompt_bytes";
+pub const LOAD_SKILL_TOTAL: &str = "copperclaw_load_skill_total";
+
+/// Increment `copperclaw_sessions_spawned_profile_total{profile}` — one session
+/// spawn, attributed to its resolved tool profile.
+pub fn inc_session_spawned_profile(profile: &str) {
+    counter!(SESSIONS_SPAWNED_PROFILE_TOTAL, "profile" => profile.to_owned()).increment(1);
+}
+
+/// Record `copperclaw_system_prompt_bytes{profile}` — assembled system-prompt
+/// byte size for a spawn, labelled by tool profile.
+pub fn observe_system_prompt_bytes(profile: &str, bytes: usize) {
+    #[allow(clippy::cast_precision_loss)]
+    histogram!(SYSTEM_PROMPT_BYTES, "profile" => profile.to_owned()).record(bytes as f64);
+}
+
+/// Increment `copperclaw_load_skill_total{skill, mode}` — a `load_skill` call;
+/// `mode` is `inline` (host in inline-skills mode) or `callable` (catalogue).
+pub fn inc_load_skill(skill: &str, mode: &str) {
+    counter!(
+        LOAD_SKILL_TOTAL,
+        "skill" => skill.to_owned(),
+        "mode" => mode.to_owned(),
+    )
+    .increment(1);
+}
+
+// ── R0 (#27) — policy denials / unknown tools ──────────────────────────────
+pub const POLICY_DENIED_TOTAL: &str = "copperclaw_policy_denied_total";
+pub const UNKNOWN_TOOL_TOTAL: &str = "copperclaw_unknown_tool_total";
+
+/// Increment `copperclaw_policy_denied_total{layer, tool}` — a tool call refused
+/// by a policy layer (`role|skill|profile|provenance|deny_list|allow_list`).
+pub fn inc_policy_denied(layer: &str, tool: &str) {
+    counter!(
+        POLICY_DENIED_TOTAL,
+        "layer" => layer.to_owned(),
+        "tool" => tool.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Increment `copperclaw_unknown_tool_total{tool}` — the MCP dispatch table had
+/// no entry for the requested tool name.
+pub fn inc_unknown_tool(tool: &str) {
+    counter!(UNKNOWN_TOOL_TOTAL, "tool" => tool.to_owned()).increment(1);
+}
+
+// ── C2 (#28) / C5b (#53) — fence-aware chunk splitting ─────────────────────
+pub const DELIVERY_FENCE_SPLIT_TOTAL: &str = "copperclaw_delivery_fence_split_total";
+pub const DELIVERY_FENCE_UNBALANCED_INPUT_TOTAL: &str =
+    "copperclaw_delivery_fence_unbalanced_input_total";
+
+/// Increment `copperclaw_delivery_fence_split_total{channel_type, kind}` — the
+/// markdown chunk splitter closed and reopened a code fence across a boundary;
+/// `kind` is the fence kind (`backtick|pre`).
+pub fn inc_delivery_fence_split(channel_type: &str, kind: &str) {
+    counter!(
+        DELIVERY_FENCE_SPLIT_TOTAL,
+        "channel_type" => channel_type.to_owned(),
+        "kind" => kind.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Increment `copperclaw_delivery_fence_unbalanced_input_total{channel_type}` —
+/// the splitter saw an unbalanced (never-closed) fence in its input.
+pub fn inc_delivery_fence_unbalanced_input(channel_type: &str) {
+    counter!(
+        DELIVERY_FENCE_UNBALANCED_INPUT_TOTAL,
+        "channel_type" => channel_type.to_owned(),
+    )
+    .increment(1);
+}
+
+// ── C5b (#53) — shared markdown renderer ───────────────────────────────────
+pub const MARKDOWN_RENDER_TOTAL: &str = "copperclaw_markdown_render_total";
+pub const MARKDOWN_UNBALANCED_MARKER_TOTAL: &str = "copperclaw_markdown_unbalanced_marker_total";
+
+/// Increment `copperclaw_markdown_render_total{flavor}` — one render through the
+/// shared per-platform markdown renderer.
+pub fn inc_markdown_render(flavor: &str) {
+    counter!(MARKDOWN_RENDER_TOTAL, "flavor" => flavor.to_owned()).increment(1);
+}
+
+/// Increment `copperclaw_markdown_unbalanced_marker_total{flavor}` — the render
+/// hit the forgiving path for an unbalanced inline marker (emitted literally).
+pub fn inc_markdown_unbalanced_marker(flavor: &str) {
+    counter!(MARKDOWN_UNBALANCED_MARKER_TOTAL, "flavor" => flavor.to_owned()).increment(1);
+}
+
+// ── R1 (#29) — slash commands / control rows / status timing ───────────────
+pub const SLASH_COMMANDS_TOTAL: &str = "copperclaw_slash_commands_total";
+pub const CONTROL_ROWS_WRITTEN_TOTAL: &str = "copperclaw_control_rows_written_total";
+pub const STATUS_ANSWER_SECONDS: &str = "copperclaw_status_answer_seconds";
+
+/// Increment `copperclaw_slash_commands_total{command, channel_type}` — a slash
+/// command (`stop|status|compact|clear`) was detected on an inbound.
+pub fn inc_slash_command(command: &str, channel_type: &str) {
+    counter!(
+        SLASH_COMMANDS_TOTAL,
+        "command" => command.to_owned(),
+        "channel_type" => channel_type.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Increment `copperclaw_control_rows_written_total{command}` — a control row
+/// (e.g. a `/stop`) was persisted to the inbound queue for the runner to
+/// consume. (Adapted from the wished `control_rows_pending` gauge: the consumer
+/// is a separate process, so there is no in-registry decrement to make a gauge
+/// meaningful — this counts control rows written.)
+pub fn inc_control_rows_written(command: &str) {
+    counter!(CONTROL_ROWS_WRITTEN_TOTAL, "command" => command.to_owned()).increment(1);
+}
+
+/// Record `copperclaw_status_answer_seconds` — wall-clock to synthesize a
+/// host-side `/status` reply.
+pub fn observe_status_answer_seconds(secs: f64) {
+    histogram!(STATUS_ANSWER_SECONDS).record(secs);
+}
+
+// ── H1 (#30) — Task HUD lifecycle ──────────────────────────────────────────
+pub const HUD_POSTS_TOTAL: &str = "copperclaw_hud_posts_total";
+pub const HUD_EDITS_TOTAL: &str = "copperclaw_hud_edits_total";
+pub const HUD_DEGRADED_TOTAL: &str = "copperclaw_hud_degraded_total";
+pub const HUD_FINALIZE_SECONDS: &str = "copperclaw_hud_finalize_seconds";
+
+/// Increment `copperclaw_hud_posts_total{agent_group}` — the HUD posted its
+/// first (or final-only) message for a turn.
+pub fn inc_hud_post(agent_group: &str) {
+    counter!(HUD_POSTS_TOTAL, "agent_group" => agent_group.to_owned()).increment(1);
+}
+
+/// Increment `copperclaw_hud_edits_total{agent_group, trigger}` — an in-place
+/// HUD edit fired; `trigger` is `batch_start|batch_end|ticker|finalize`.
+pub fn inc_hud_edits(agent_group: &str, trigger: &str) {
+    counter!(
+        HUD_EDITS_TOTAL,
+        "agent_group" => agent_group.to_owned(),
+        "trigger" => trigger.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Increment `copperclaw_hud_degraded_total{channel_type, reason}` — the HUD
+/// fell back to status-rows instead of a live self-editing message.
+pub fn inc_hud_degraded(channel_type: &str, reason: &str) {
+    counter!(
+        HUD_DEGRADED_TOTAL,
+        "channel_type" => channel_type.to_owned(),
+        "reason" => reason.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Record `copperclaw_hud_finalize_seconds` — turn duration at HUD finalize.
+pub fn observe_hud_finalize_seconds(secs: f64) {
+    histogram!(HUD_FINALIZE_SECONDS).record(secs);
+}
+
+// ── R2 (#31) — mid-turn steering ───────────────────────────────────────────
+pub const MIDTURN_CONTROL_TOTAL: &str = "copperclaw_midturn_control_total";
+
+/// Increment `copperclaw_midturn_control_total{agent_group, kind}` — a mid-turn
+/// `/stop` was honored (`kind="stop"`) or interjections were consumed
+/// (`kind="interjection"`).
+pub fn inc_midturn_control(agent_group: &str, kind: &str) {
+    counter!(
+        MIDTURN_CONTROL_TOTAL,
+        "agent_group" => agent_group.to_owned(),
+        "kind" => kind.to_owned(),
+    )
+    .increment(1);
+}
+
+// ── R3 (#32) / X2 (#48) — verify gate ──────────────────────────────────────
+pub const VERIFY_GATE_COMPLETION_TOTAL: &str = "copperclaw_verify_gate_completion_total";
+pub const VERIFY_GATE_FIX_CYCLES: &str = "copperclaw_verify_gate_fix_cycles";
+pub const VERIFY_RUN_TOTAL: &str = "copperclaw_verify_run_total";
+
+/// Increment `copperclaw_verify_gate_completion_total{outcome}` — a todo
+/// completion crossed the verify gate; `outcome` is
+/// `refused_dirty|blocked_cycle_cap|passed`.
+pub fn inc_verify_gate_completion(outcome: &str) {
+    counter!(VERIFY_GATE_COMPLETION_TOTAL, "outcome" => outcome.to_owned()).increment(1);
+}
+
+/// Record `copperclaw_verify_gate_fix_cycles` — the fix-cycle count at the
+/// moment a project's dirty marker is cleared by a passing verify run.
+pub fn observe_verify_gate_fix_cycles(cycles: u32) {
+    histogram!(VERIFY_GATE_FIX_CYCLES).record(f64::from(cycles));
+}
+
+/// Increment `copperclaw_verify_run_total{result}` — a matched verify command
+/// ran; `result` is `pass` or `fail`.
+pub fn inc_verify_run(result: &str) {
+    counter!(VERIFY_RUN_TOTAL, "result" => result.to_owned()).increment(1);
+}
+
+// ── C3/C4 (#33/#37/#38) — inbound attachment materialization ───────────────
+pub const INBOUND_FILES_TOTAL: &str = "copperclaw_inbound_files_total";
+pub const INBOUND_FILE_BYTES: &str = "copperclaw_inbound_file_bytes";
+
+/// Increment `copperclaw_inbound_files_total{channel, outcome}` — an inbound
+/// attachment was materialized; `outcome` is `ok|too_large|download_failed`.
+pub fn inc_inbound_file(channel: &str, outcome: &str) {
+    counter!(
+        INBOUND_FILES_TOTAL,
+        "channel" => channel.to_owned(),
+        "outcome" => outcome.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Record `copperclaw_inbound_file_bytes{channel}` — downloaded attachment size
+/// (tunes `max_attachment_bytes` defaults).
+pub fn observe_inbound_file_bytes(channel: &str, bytes: u64) {
+    #[allow(clippy::cast_precision_loss)]
+    histogram!(INBOUND_FILE_BYTES, "channel" => channel.to_owned()).record(bytes as f64);
+}
+
+// ── X1 (#34) — preview-expose serve/timeout ────────────────────────────────
+pub const PREVIEW_EXPOSE_TOTAL: &str = "copperclaw_preview_expose_total";
+
+/// Increment `copperclaw_preview_expose_total{outcome}` — a preview-expose MCP
+/// call was `served` or timed out (`timeout`).
+pub fn inc_preview_expose(outcome: &str) {
+    counter!(PREVIEW_EXPOSE_TOTAL, "outcome" => outcome.to_owned()).increment(1);
+}
+
+// ── R4 (#39) — compaction ──────────────────────────────────────────────────
+pub const COMPACTION_TRIGGERED_TOTAL: &str = "copperclaw_compaction_triggered_total";
+pub const COMPACTION_ESTIMATED_TOKENS: &str = "copperclaw_compaction_estimated_tokens";
+pub const COMPACTION_FACTS_HEADER_BYTES: &str = "copperclaw_compaction_facts_header_bytes";
+
+/// Increment `copperclaw_compaction_triggered_total{profile}` — the auto
+/// token-threshold compaction fired.
+pub fn inc_compaction_triggered(profile: &str) {
+    counter!(COMPACTION_TRIGGERED_TOTAL, "profile" => profile.to_owned()).increment(1);
+}
+
+/// Record `copperclaw_compaction_estimated_tokens` — the estimated history token
+/// count at the moment compaction triggered.
+pub fn observe_compaction_estimated_tokens(tokens: u64) {
+    #[allow(clippy::cast_precision_loss)]
+    histogram!(COMPACTION_ESTIMATED_TOKENS).record(tokens as f64);
+}
+
+/// Record `copperclaw_compaction_facts_header_bytes` — byte size of the project
+/// facts header carried across a compaction (only when one is present).
+pub fn observe_compaction_facts_header_bytes(bytes: usize) {
+    #[allow(clippy::cast_precision_loss)]
+    histogram!(COMPACTION_FACTS_HEADER_BYTES).record(bytes as f64);
+}
+
+// ── V1 (#41) — preview proxy WebSocket bridge ──────────────────────────────
+pub const PREVIEW_WS_UPGRADES_TOTAL: &str = "copperclaw_preview_ws_upgrades_total";
+pub const PREVIEW_WS_ACTIVE: &str = "copperclaw_preview_ws_active";
+pub const PREVIEW_WS_FRAMES_TOTAL: &str = "copperclaw_preview_ws_frames_total";
+pub const PREVIEW_WS_BYTES_TOTAL: &str = "copperclaw_preview_ws_bytes_total";
+pub const PREVIEW_WS_SESSION_SECONDS: &str = "copperclaw_preview_ws_session_seconds";
+
+/// Increment `copperclaw_preview_ws_upgrades_total{result}` — a WebSocket
+/// upgrade through the preview proxy; `result` is `ok|refused|upstream_502`.
+pub fn inc_preview_ws_upgrade(result: &str) {
+    counter!(PREVIEW_WS_UPGRADES_TOTAL, "result" => result.to_owned()).increment(1);
+}
+
+/// Adjust `copperclaw_preview_ws_active` — currently-open preview WS bridges.
+pub fn inc_preview_ws_active() {
+    gauge!(PREVIEW_WS_ACTIVE).increment(1.0);
+}
+
+/// Adjust `copperclaw_preview_ws_active` down when a bridge closes.
+pub fn dec_preview_ws_active() {
+    gauge!(PREVIEW_WS_ACTIVE).decrement(1.0);
+}
+
+/// Increment `copperclaw_preview_ws_frames_total{direction}` — one bridged
+/// frame; `direction` is `browser_to_container|container_to_browser`.
+pub fn inc_preview_ws_frame(direction: &str) {
+    counter!(PREVIEW_WS_FRAMES_TOTAL, "direction" => direction.to_owned()).increment(1);
+}
+
+/// Add to `copperclaw_preview_ws_bytes_total{direction}` — bridged payload bytes.
+pub fn add_preview_ws_bytes(direction: &str, bytes: u64) {
+    counter!(PREVIEW_WS_BYTES_TOTAL, "direction" => direction.to_owned()).increment(bytes);
+}
+
+/// Record `copperclaw_preview_ws_session_seconds` — bridge lifetime.
+pub fn observe_preview_ws_session_seconds(secs: f64) {
+    histogram!(PREVIEW_WS_SESSION_SECONDS).record(secs);
+}
+
+// ── V3 (#42) — headless-browser render ─────────────────────────────────────
+pub const BROWSER_RENDER_TOTAL: &str = "copperclaw_browser_render_total";
+pub const BROWSER_CHILD_SPAWN_TOTAL: &str = "copperclaw_browser_child_spawn_total";
+pub const BROWSER_CHILD_TEARDOWN_TOTAL: &str = "copperclaw_browser_child_teardown_total";
+pub const BROWSER_RENDER_DURATION_SECONDS: &str = "copperclaw_browser_render_duration_seconds";
+pub const BROWSER_CDP_CONNECT_FAILURES_TOTAL: &str =
+    "copperclaw_browser_cdp_connect_failures_total";
+pub const BROWSER_SSRF_BLOCK_TOTAL: &str = "copperclaw_browser_ssrf_block_total";
+
+/// Increment `copperclaw_browser_render_total{mode, outcome}` — a browser render;
+/// `mode` is `screenshot`/`dom_text`/`aria`, `outcome` is
+/// `ok|blocked|driver_error|unavailable`.
+pub fn inc_browser_render(mode: &str, outcome: &str) {
+    counter!(
+        BROWSER_RENDER_TOTAL,
+        "mode" => mode.to_owned(),
+        "outcome" => outcome.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Increment `copperclaw_browser_child_spawn_total{result}` — browser child
+/// container spawn (`ok|error`).
+pub fn inc_browser_child_spawn(result: &str) {
+    counter!(BROWSER_CHILD_SPAWN_TOTAL, "result" => result.to_owned()).increment(1);
+}
+
+/// Increment `copperclaw_browser_child_teardown_total{result}` — browser child
+/// container teardown (`ok|error`); errors surface leaked children.
+pub fn inc_browser_child_teardown(result: &str) {
+    counter!(BROWSER_CHILD_TEARDOWN_TOTAL, "result" => result.to_owned()).increment(1);
+}
+
+/// Record `copperclaw_browser_render_duration_seconds` — navigate→artifact span.
+pub fn observe_browser_render_duration_seconds(secs: f64) {
+    histogram!(BROWSER_RENDER_DURATION_SECONDS).record(secs);
+}
+
+/// Increment `copperclaw_browser_cdp_connect_failures_total` — CDP connect to
+/// the browser child failed (image/port misconfiguration signal).
+pub fn inc_browser_cdp_connect_failure() {
+    counter!(BROWSER_CDP_CONNECT_FAILURES_TOTAL).increment(1);
+}
+
+/// Increment `copperclaw_browser_ssrf_block_total{stage}` — an SSRF guard
+/// refused a target; `stage` is `target_preflight|redirect_hop`.
+pub fn inc_browser_ssrf_block(stage: &str) {
+    counter!(BROWSER_SSRF_BLOCK_TOTAL, "stage" => stage.to_owned()).increment(1);
+}
+
+// ── V4 (#47) — screenshot-the-preview ──────────────────────────────────────
+pub const BROWSER_RENDER_SCREENSHOTS_TOTAL: &str = "copperclaw_browser_render_screenshots_total";
+pub const BROWSER_RENDER_PREVIEW_ALLOW_INJECTED_TOTAL: &str =
+    "copperclaw_browser_render_preview_allow_injected_total";
+pub const BROWSER_SCREENSHOT_DURATION_SECONDS: &str =
+    "copperclaw_browser_screenshot_duration_seconds";
+
+/// Increment `copperclaw_browser_render_screenshots_total{result}` — a
+/// screenshot-mode render (`ok|blocked|driver_error`).
+pub fn inc_browser_render_screenshot(result: &str) {
+    counter!(BROWSER_RENDER_SCREENSHOTS_TOTAL, "result" => result.to_owned()).increment(1);
+}
+
+/// Increment `copperclaw_browser_render_preview_allow_injected_total` — the
+/// preview host:port egress-allow injection fired (vs target-only).
+pub fn inc_browser_render_preview_allow_injected() {
+    counter!(BROWSER_RENDER_PREVIEW_ALLOW_INJECTED_TOTAL).increment(1);
+}
+
+/// Record `copperclaw_browser_screenshot_duration_seconds` — spawn→PNG-on-disk.
+pub fn observe_browser_screenshot_duration_seconds(secs: f64) {
+    histogram!(BROWSER_SCREENSHOT_DURATION_SECONDS).record(secs);
+}
+
+// ── V2 (#51) — preview enablement + tombstone recovery ─────────────────────
+pub const PREVIEW_ENABLE_CARD_TOTAL: &str = "copperclaw_preview_enable_card_total";
+pub const PREVIEW_TOMBSTONE_RECOVERY_TOTAL: &str = "copperclaw_preview_tombstone_recovery_total";
+pub const PREVIEW_TOMBSTONED: &str = "copperclaw_preview_tombstoned";
+
+/// Increment `copperclaw_preview_enable_card_total{outcome}` — a one-tap
+/// enable-preview approval card lifecycle event; `outcome` is
+/// `raised|skipped_already_pending|skipped_no_dispatcher|skipped_no_messaging_group|approved|denied`.
+pub fn inc_preview_enable_card(outcome: &str) {
+    counter!(PREVIEW_ENABLE_CARD_TOTAL, "outcome" => outcome.to_owned()).increment(1);
+}
+
+/// Increment `copperclaw_preview_tombstone_recovery_total{outcome}` — a
+/// tombstoned preview recovery attempt; `outcome` is
+/// `recovered|terminal_spent|terminal_container_gone`.
+pub fn inc_preview_tombstone_recovery(outcome: &str) {
+    counter!(PREVIEW_TOMBSTONE_RECOVERY_TOTAL, "outcome" => outcome.to_owned()).increment(1);
+}
+
+/// Adjust `copperclaw_preview_tombstoned` — currently-tombstoned previews.
+pub fn inc_preview_tombstoned() {
+    gauge!(PREVIEW_TOMBSTONED).increment(1.0);
+}
+
+/// Adjust `copperclaw_preview_tombstoned` down on recovery or teardown.
+pub fn dec_preview_tombstoned() {
+    gauge!(PREVIEW_TOMBSTONED).decrement(1.0);
+}
+
+// ── E2 (#43) — image profile / prototyping bakes ───────────────────────────
+pub const IMAGE_REBUILD_TOTAL: &str = "copperclaw_image_rebuild_total";
+pub const GROUP_IMAGE_PROFILE: &str = "copperclaw_group_image_profile";
+
+/// Increment `copperclaw_image_rebuild_total{image_profile, result}` — a session
+/// image rebuild attributed by profile (`minimal|prototyping`); `result` is
+/// `ok|failed`. (The legacy unlabeled `copperclaw_image_rebuild_failed_total`
+/// via [`inc_image_rebuild_failed`] is retained alongside.)
+pub fn inc_image_rebuild(image_profile: &str, result: &str) {
+    counter!(
+        IMAGE_REBUILD_TOTAL,
+        "image_profile" => image_profile.to_owned(),
+        "result" => result.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Set `copperclaw_group_image_profile{agent_group_id, image_profile}` to 1 —
+/// fleet visibility on which groups run which image profile.
+pub fn set_group_image_profile(agent_group_id: &str, image_profile: &str) {
+    gauge!(
+        GROUP_IMAGE_PROFILE,
+        "agent_group_id" => agent_group_id.to_owned(),
+        "image_profile" => image_profile.to_owned(),
+    )
+    .set(1.0);
+}
+
+// ── R5 (#44) — hot provider failover ───────────────────────────────────────
+pub const PROVIDER_FAILOVER_TOTAL: &str = "copperclaw_provider_failover_total";
+pub const PROVIDER_FAILOVER_CHAIN_EXHAUSTED_TOTAL: &str =
+    "copperclaw_provider_failover_chain_exhausted_total";
+
+/// Increment `copperclaw_provider_failover_total{from, to}` — a mid-turn hot
+/// failover switched from a failed provider to the next serving one.
+pub fn inc_provider_failover(from: &str, to: &str) {
+    counter!(
+        PROVIDER_FAILOVER_TOTAL,
+        "from" => from.to_owned(),
+        "to" => to.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Increment `copperclaw_provider_failover_chain_exhausted_total{provider}` —
+/// the whole failover chain was exhausted and the turn hit the apology.
+pub fn inc_provider_failover_chain_exhausted(provider: &str) {
+    counter!(
+        PROVIDER_FAILOVER_CHAIN_EXHAUSTED_TOTAL,
+        "provider" => provider.to_owned(),
+    )
+    .increment(1);
+}
+
+// ── G1 (#45) — in-chat approval taps ───────────────────────────────────────
+pub const APPROVAL_TAPS_TOTAL: &str = "copperclaw_approval_taps_total";
+
+/// Increment `copperclaw_approval_taps_total{outcome}` — an in-chat approval
+/// tap resolution; `outcome` is `approved|denied|unauthorized|race_noop`.
+pub fn inc_approval_tap(outcome: &str) {
+    counter!(APPROVAL_TAPS_TOTAL, "outcome" => outcome.to_owned()).increment(1);
+}
+
+// ── E1 (#49) — session-local package installs ──────────────────────────────
+pub const SESSION_INSTALL_TOTAL: &str = "copperclaw_session_install_total";
+pub const SESSION_INSTALL_SECONDS: &str = "copperclaw_session_install_seconds";
+pub const SESSION_INSTALL_IMAGE_SCOPE_REJECTED_TOTAL: &str =
+    "copperclaw_session_install_image_scope_rejected_total";
+pub const SESSION_INSTALL_EGRESS_HINT_TOTAL: &str = "copperclaw_session_install_egress_hint_total";
+
+/// Increment `copperclaw_session_install_total{ecosystem, outcome}` — a
+/// session-scope install; `ecosystem` is `pip|npm`, `outcome` is
+/// `ok|egress_blocked|toolchain_missing|other`.
+pub fn inc_session_install(ecosystem: &str, outcome: &str) {
+    counter!(
+        SESSION_INSTALL_TOTAL,
+        "ecosystem" => ecosystem.to_owned(),
+        "outcome" => outcome.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Record `copperclaw_session_install_seconds` — session install wall-clock
+/// (registry latency signal).
+pub fn observe_session_install_seconds(secs: f64) {
+    histogram!(SESSION_INSTALL_SECONDS).record(secs);
+}
+
+/// Increment `copperclaw_session_install_image_scope_rejected_total` — a
+/// `scope:"image"` install carrying pip packages was rejected (a prompt/skill
+/// teaching gap signal).
+pub fn inc_session_install_image_scope_rejected() {
+    counter!(SESSION_INSTALL_IMAGE_SCOPE_REJECTED_TOTAL).increment(1);
+}
+
+/// Increment `copperclaw_session_install_egress_hint_total{ecosystem}` — a
+/// session install failed with an egress-denial hint surfaced to the model.
+pub fn inc_session_install_egress_hint(ecosystem: &str) {
+    counter!(
+        SESSION_INSTALL_EGRESS_HINT_TOTAL,
+        "ecosystem" => ecosystem.to_owned(),
+    )
+    .increment(1);
+}
+
+// ── R6 (#50) — progressive final answers ───────────────────────────────────
+pub const PROGRESSIVE_FINAL_TOTAL: &str = "copperclaw_progressive_final_total";
+pub const PROGRESSIVE_FINAL_STEPS: &str = "copperclaw_progressive_final_steps";
+pub const PROGRESSIVE_FINAL_SKIPPED_TOTAL: &str = "copperclaw_progressive_final_skipped_total";
+pub const PROGRESSIVE_FINAL_ANSWER_CHARS: &str = "copperclaw_progressive_final_answer_chars";
+
+/// Increment `copperclaw_progressive_final_total{agent_group, outcome}` — the
+/// final-answer reveal path fired (`grown`) or fell through (`single_emit`).
+pub fn inc_progressive_final(agent_group: &str, outcome: &str) {
+    counter!(
+        PROGRESSIVE_FINAL_TOTAL,
+        "agent_group" => agent_group.to_owned(),
+        "outcome" => outcome.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Record `copperclaw_progressive_final_steps` — edit steps per grown answer.
+pub fn observe_progressive_final_steps(steps: u64) {
+    #[allow(clippy::cast_precision_loss)]
+    histogram!(PROGRESSIVE_FINAL_STEPS).record(steps as f64);
+}
+
+/// Increment `copperclaw_progressive_final_skipped_total{reason}` — which gate
+/// arm declined growth (`bare_adapter|short_turn|short_answer|expander_scale`).
+pub fn inc_progressive_final_skipped(reason: &str) {
+    counter!(PROGRESSIVE_FINAL_SKIPPED_TOTAL, "reason" => reason.to_owned()).increment(1);
+}
+
+/// Record `copperclaw_progressive_final_answer_chars` — grown-answer length.
+pub fn observe_progressive_final_answer_chars(chars: u64) {
+    #[allow(clippy::cast_precision_loss)]
+    histogram!(PROGRESSIVE_FINAL_ANSWER_CHARS).record(chars as f64);
+}
+
+// ── C5 (#52) — adapter rich-render / HUD self-edit ─────────────────────────
+pub const ADAPTER_RICH_RENDER_TOTAL: &str = "copperclaw_adapter_rich_render_total";
+pub const HUD_EDIT_TOTAL: &str = "copperclaw_hud_edit_total";
+pub const ADAPTER_EDIT_MESSAGE_TOTAL: &str = "copperclaw_adapter_edit_message_total";
+
+/// Increment `copperclaw_adapter_rich_render_total{channel_type, surface}` — a
+/// channel rendered a native rich surface; `surface` is
+/// `card|diff|todo|thinking|error|collapsible`.
+pub fn inc_adapter_rich_render(channel_type: &str, surface: &str) {
+    counter!(
+        ADAPTER_RICH_RENDER_TOTAL,
+        "channel_type" => channel_type.to_owned(),
+        "surface" => surface.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Increment `copperclaw_hud_edit_total{channel_type, result}` — an adapter-level
+/// HUD self-edit attempt; `result` is `ok|error|unsupported_fallthrough`.
+pub fn inc_hud_edit(channel_type: &str, result: &str) {
+    counter!(
+        HUD_EDIT_TOTAL,
+        "channel_type" => channel_type.to_owned(),
+        "result" => result.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Increment `copperclaw_adapter_edit_message_total{channel_type, result}` — the
+/// low-level adapter edit API call (`ok|error`).
+pub fn inc_adapter_edit_message(channel_type: &str, result: &str) {
+    counter!(
+        ADAPTER_EDIT_MESSAGE_TOTAL,
+        "channel_type" => channel_type.to_owned(),
+        "result" => result.to_owned(),
+    )
+    .increment(1);
+}
+
+// ── R7 (#54) — delegate spawns ─────────────────────────────────────────────
+pub const DELEGATE_SPAWN_TOTAL: &str = "copperclaw_delegate_spawn_total";
+pub const DELEGATE_DEPTH_REJECTIONS_TOTAL: &str = "copperclaw_delegate_depth_rejections_total";
+pub const DELEGATE_WORKTREE_PROVISION_SECONDS: &str =
+    "copperclaw_delegate_worktree_provision_seconds";
+
+/// Increment `copperclaw_delegate_spawn_total{tier, outcome}` — a `create_agent` /
+/// delegate spawn gate outcome; `tier` is `create_agent|delegate`, `outcome` is
+/// `created|denied|rejected|invalid`.
+pub fn inc_delegate_spawn(tier: &str, outcome: &str) {
+    counter!(
+        DELEGATE_SPAWN_TOTAL,
+        "tier" => tier.to_owned(),
+        "outcome" => outcome.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Increment `copperclaw_delegate_depth_rejections_total{tier}` — a spawn
+/// rejected by the nesting depth cap.
+pub fn inc_delegate_depth_rejection(tier: &str) {
+    counter!(DELEGATE_DEPTH_REJECTIONS_TOTAL, "tier" => tier.to_owned()).increment(1);
+}
+
+/// Record `copperclaw_delegate_worktree_provision_seconds` — `git worktree add`
+/// latency when a delegate's writable parent-repo worktree is provisioned.
+pub fn observe_delegate_worktree_provision_seconds(secs: f64) {
+    histogram!(DELEGATE_WORKTREE_PROVISION_SECONDS).record(secs);
+}
+
 // ── Address parsing ────────────────────────────────────────────────────────
 
 /// Parse `COPPERCLAW_METRICS_ADDR`.  Accepts:
@@ -949,5 +1623,228 @@ mod tests {
                 "label {label:?} must be snake_case ASCII"
             );
         }
+    }
+
+    // ── M18 metrics-rider (card M1) coverage ───────────────────────────────
+
+    /// Every new M18 metric name const, so the prefix / double-underscore
+    /// invariants extend to the rider's additions.
+    const M18_METRIC_NAMES: &[&str] = &[
+        SLACK_TYPING_SKIPPED_TOTAL,
+        SLACK_TYPING_SET_STATUS_TOTAL,
+        SLACK_HUD_DECISION_TOTAL,
+        SHELL_TRUNCATED_TOTAL,
+        SHELL_TRUNCATED_BYTES,
+        READ_FILE_LINES_MODE_TOTAL,
+        READ_FILE_PAGES,
+        SESSIONS_SPAWNED_PROFILE_TOTAL,
+        SYSTEM_PROMPT_BYTES,
+        LOAD_SKILL_TOTAL,
+        POLICY_DENIED_TOTAL,
+        UNKNOWN_TOOL_TOTAL,
+        DELIVERY_FENCE_SPLIT_TOTAL,
+        DELIVERY_FENCE_UNBALANCED_INPUT_TOTAL,
+        MARKDOWN_RENDER_TOTAL,
+        MARKDOWN_UNBALANCED_MARKER_TOTAL,
+        SLASH_COMMANDS_TOTAL,
+        CONTROL_ROWS_WRITTEN_TOTAL,
+        STATUS_ANSWER_SECONDS,
+        HUD_POSTS_TOTAL,
+        HUD_EDITS_TOTAL,
+        HUD_DEGRADED_TOTAL,
+        HUD_FINALIZE_SECONDS,
+        MIDTURN_CONTROL_TOTAL,
+        VERIFY_GATE_COMPLETION_TOTAL,
+        VERIFY_GATE_FIX_CYCLES,
+        VERIFY_RUN_TOTAL,
+        INBOUND_FILES_TOTAL,
+        INBOUND_FILE_BYTES,
+        PREVIEW_EXPOSE_TOTAL,
+        COMPACTION_TRIGGERED_TOTAL,
+        COMPACTION_ESTIMATED_TOKENS,
+        COMPACTION_FACTS_HEADER_BYTES,
+        PREVIEW_WS_UPGRADES_TOTAL,
+        PREVIEW_WS_ACTIVE,
+        PREVIEW_WS_FRAMES_TOTAL,
+        PREVIEW_WS_BYTES_TOTAL,
+        PREVIEW_WS_SESSION_SECONDS,
+        BROWSER_RENDER_TOTAL,
+        BROWSER_CHILD_SPAWN_TOTAL,
+        BROWSER_CHILD_TEARDOWN_TOTAL,
+        BROWSER_RENDER_DURATION_SECONDS,
+        BROWSER_CDP_CONNECT_FAILURES_TOTAL,
+        BROWSER_SSRF_BLOCK_TOTAL,
+        BROWSER_RENDER_SCREENSHOTS_TOTAL,
+        BROWSER_RENDER_PREVIEW_ALLOW_INJECTED_TOTAL,
+        BROWSER_SCREENSHOT_DURATION_SECONDS,
+        PREVIEW_ENABLE_CARD_TOTAL,
+        PREVIEW_TOMBSTONE_RECOVERY_TOTAL,
+        PREVIEW_TOMBSTONED,
+        IMAGE_REBUILD_TOTAL,
+        GROUP_IMAGE_PROFILE,
+        PROVIDER_FAILOVER_TOTAL,
+        PROVIDER_FAILOVER_CHAIN_EXHAUSTED_TOTAL,
+        APPROVAL_TAPS_TOTAL,
+        SESSION_INSTALL_TOTAL,
+        SESSION_INSTALL_SECONDS,
+        SESSION_INSTALL_IMAGE_SCOPE_REJECTED_TOTAL,
+        SESSION_INSTALL_EGRESS_HINT_TOTAL,
+        PROGRESSIVE_FINAL_TOTAL,
+        PROGRESSIVE_FINAL_STEPS,
+        PROGRESSIVE_FINAL_SKIPPED_TOTAL,
+        PROGRESSIVE_FINAL_ANSWER_CHARS,
+        ADAPTER_RICH_RENDER_TOTAL,
+        HUD_EDIT_TOTAL,
+        ADAPTER_EDIT_MESSAGE_TOTAL,
+        DELEGATE_SPAWN_TOTAL,
+        DELEGATE_DEPTH_REJECTIONS_TOTAL,
+        DELEGATE_WORKTREE_PROVISION_SECONDS,
+    ];
+
+    #[test]
+    fn m18_metric_names_have_copperclaw_prefix_no_double_underscore() {
+        for name in M18_METRIC_NAMES {
+            assert!(
+                name.starts_with("copperclaw_"),
+                "metric name {name:?} does not start with 'copperclaw_'"
+            );
+            assert!(
+                !name.contains("__"),
+                "metric name {name:?} must not contain double underscores"
+            );
+        }
+    }
+
+    #[test]
+    fn m18_counter_names_end_with_total() {
+        for name in M18_METRIC_NAMES {
+            if name.contains("_seconds")
+                || name.contains("_bytes")
+                || name.contains("_tokens")
+                || name.contains("_chars")
+                || name.contains("_steps")
+                || name.contains("_pages")
+                || name.contains("_fix_cycles")
+                || name.ends_with("_active")
+                || name.ends_with("_tombstoned")
+                || name == &GROUP_IMAGE_PROFILE
+            {
+                // histograms / gauges: exempt from the `_total` suffix rule.
+                continue;
+            }
+            assert!(
+                name.ends_with("_total"),
+                "counter {name:?} does not end with '_total'"
+            );
+        }
+    }
+
+    #[test]
+    fn m18_helpers_compile_and_do_not_panic() {
+        // No recorder installed → all of these no-op; this is a smoke test that
+        // every rider helper is callable with its intended argument shape.
+        inc_slack_typing_skipped("non_assistant_surface");
+        inc_slack_typing_set_status("ok");
+        inc_slack_hud_decision(true);
+        inc_shell_truncated("head");
+        observe_shell_truncated_bytes(4096);
+        inc_read_file_lines_mode();
+        observe_read_file_pages(3);
+        inc_session_spawned_profile("coding");
+        observe_system_prompt_bytes("coding", 12_345);
+        inc_load_skill("coding-task", "inline");
+        inc_policy_denied("profile", "shell");
+        inc_unknown_tool("frobnicate");
+        inc_delivery_fence_split("telegram", "backtick");
+        inc_delivery_fence_unbalanced_input("telegram");
+        inc_markdown_render("slack");
+        inc_markdown_unbalanced_marker("slack");
+        inc_slash_command("stop", "cli");
+        inc_control_rows_written("stop");
+        observe_status_answer_seconds(0.01);
+        inc_hud_post("ag-1");
+        inc_hud_edits("ag-1", "ticker");
+        inc_hud_degraded("signal", "no_message_edit");
+        observe_hud_finalize_seconds(12.5);
+        inc_midturn_control("ag-1", "stop");
+        inc_verify_gate_completion("passed");
+        observe_verify_gate_fix_cycles(2);
+        inc_verify_run("pass");
+        inc_inbound_file("slack", "ok");
+        observe_inbound_file_bytes("slack", 1024);
+        inc_preview_expose("served");
+        inc_compaction_triggered("coding");
+        observe_compaction_estimated_tokens(120_000);
+        observe_compaction_facts_header_bytes(2048);
+        inc_preview_ws_upgrade("ok");
+        inc_preview_ws_active();
+        dec_preview_ws_active();
+        inc_preview_ws_frame("browser_to_container");
+        add_preview_ws_bytes("container_to_browser", 512);
+        observe_preview_ws_session_seconds(30.0);
+        inc_browser_render("screenshot", "ok");
+        inc_browser_child_spawn("ok");
+        inc_browser_child_teardown("error");
+        observe_browser_render_duration_seconds(1.5);
+        inc_browser_cdp_connect_failure();
+        inc_browser_ssrf_block("target_preflight");
+        inc_browser_render_screenshot("ok");
+        inc_browser_render_preview_allow_injected();
+        observe_browser_screenshot_duration_seconds(2.0);
+        inc_preview_enable_card("raised");
+        inc_preview_tombstone_recovery("recovered");
+        inc_preview_tombstoned();
+        dec_preview_tombstoned();
+        inc_image_rebuild("prototyping", "ok");
+        set_group_image_profile("ag-1", "prototyping");
+        inc_provider_failover("anthropic", "openai");
+        inc_provider_failover_chain_exhausted("openai");
+        inc_approval_tap("approved");
+        inc_session_install("pip", "ok");
+        observe_session_install_seconds(4.2);
+        inc_session_install_image_scope_rejected();
+        inc_session_install_egress_hint("npm");
+        inc_progressive_final("ag-1", "grown");
+        observe_progressive_final_steps(6);
+        inc_progressive_final_skipped("short_answer");
+        observe_progressive_final_answer_chars(800);
+        inc_adapter_rich_render("mattermost", "card");
+        inc_hud_edit("signal", "ok");
+        inc_adapter_edit_message("signal", "ok");
+        inc_delegate_spawn("delegate", "created");
+        inc_delegate_depth_rejection("delegate");
+        observe_delegate_worktree_provision_seconds(0.3);
+    }
+
+    #[test]
+    fn m18_labeled_counter_renders() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            inc_delegate_spawn("delegate", "created");
+            inc_delegate_spawn("create_agent", "denied");
+            inc_approval_tap("unauthorized");
+        });
+        let body = handle.render();
+        assert!(
+            body.contains(DELEGATE_SPAWN_TOTAL),
+            "missing delegate:\n{body}"
+        );
+        assert!(
+            body.contains("tier=\"delegate\""),
+            "missing tier label:\n{body}"
+        );
+        assert!(
+            body.contains("outcome=\"created\""),
+            "missing outcome label:\n{body}"
+        );
+        assert!(
+            body.contains(APPROVAL_TAPS_TOTAL),
+            "missing approval:\n{body}"
+        );
+        assert!(
+            body.contains("outcome=\"unauthorized\""),
+            "missing approval outcome:\n{body}"
+        );
     }
 }

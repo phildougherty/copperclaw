@@ -31,9 +31,17 @@ use super::fence::scan_fence_spans;
 ///    outruns the cap.
 ///
 /// Every emitted chunk therefore parses with balanced fences.
-pub fn split_into_chunks(text: &str, max: usize) -> Vec<String> {
+///
+/// `channel_type` labels the fence metrics (C2/C5b:
+/// `copperclaw_delivery_fence_split_total{channel_type,kind}` and
+/// `copperclaw_delivery_fence_unbalanced_input_total{channel_type}`) with the
+/// calling channel; it does not affect the chunking itself.
+pub fn split_into_chunks(text: &str, max: usize, channel_type: &str) -> Vec<String> {
     let chars: Vec<char> = text.chars().collect();
     let spans = scan_fence_spans(&chars);
+    if spans.iter().any(|s| !s.closed) {
+        copperclaw_metrics::inc_delivery_fence_unbalanced_input(channel_type);
+    }
     let mut out: Vec<String> = Vec::new();
     let mut start = 0usize;
     // Reopen line for a fence the previous chunk had to close mid-block.
@@ -88,6 +96,10 @@ pub fn split_into_chunks(text: &str, max: usize) -> Vec<String> {
                         .map_or((content_end, content_end), |j| (j, j + 1));
                     let body: String = chars[start..body_end].iter().collect();
                     out.push(format!("{prefix}{body}{closer}"));
+                    copperclaw_metrics::inc_delivery_fence_split(
+                        channel_type,
+                        span.kind.kind_label(),
+                    );
                     reopen = Some(span.kind.reopen());
                     fence_resume = Some(next_start);
                 }
@@ -163,7 +175,7 @@ mod tests {
     /// fences. Returns the chunks for case-specific assertions. This is
     /// the renderer-side mirror of `host-delivery`'s C2 splitter table.
     fn split_balanced(text: &str, max: usize) -> Vec<String> {
-        let chunks = split_into_chunks(text, max);
+        let chunks = split_into_chunks(text, max, "test");
         for (i, c) in chunks.iter().enumerate() {
             assert!(
                 c.chars().count() <= max,
@@ -298,13 +310,16 @@ mod tests {
     fn split_counts_chars_not_bytes() {
         // A CJK char is 3 bytes in UTF-8 but counts as 1 toward the cap.
         let text = "漢".repeat(20);
-        let chunks = split_into_chunks(&text, 10);
+        let chunks = split_into_chunks(&text, 10, "test");
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].chars().count(), 10);
     }
 
     #[test]
     fn split_short_text_returns_single_chunk() {
-        assert_eq!(split_into_chunks("short", 100), vec!["short".to_string()]);
+        assert_eq!(
+            split_into_chunks("short", 100, "test"),
+            vec!["short".to_string()]
+        );
     }
 }

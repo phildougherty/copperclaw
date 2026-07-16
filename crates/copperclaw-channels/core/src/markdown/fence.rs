@@ -62,6 +62,15 @@ impl FenceKind {
             FenceKind::Pre { opener } => opener.clone(),
         }
     }
+
+    /// Stable `snake_case` label for the `kind` metric label on
+    /// `copperclaw_delivery_fence_split_total`.
+    pub(crate) fn kind_label(&self) -> &'static str {
+        match self {
+            FenceKind::Backtick { .. } => "backtick",
+            FenceKind::Pre { .. } => "pre",
+        }
+    }
 }
 
 /// One fenced region of a scanned text, in char indices.

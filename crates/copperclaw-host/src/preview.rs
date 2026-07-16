@@ -219,6 +219,7 @@ impl ProxyState {
         let mut inner = self.inner.lock().unwrap();
         if inner.phase == PreviewPhase::Live {
             inner.phase = PreviewPhase::Tombstone;
+            copperclaw_metrics::inc_preview_tombstoned();
         }
     }
 
@@ -235,11 +236,13 @@ impl ProxyState {
                 return true;
             }
             if inner.recovery_used {
+                copperclaw_metrics::inc_preview_tombstone_recovery("terminal_spent");
                 return false;
             }
         }
         // Container still up? (async — must not hold the inner lock across it.)
         let Ok(Some(ip)) = self.runtime.container_ip(&self.container_name).await else {
+            copperclaw_metrics::inc_preview_tombstone_recovery("terminal_container_gone");
             return false;
         };
         let mut inner = self.inner.lock().unwrap();
@@ -247,12 +250,15 @@ impl ProxyState {
             return true;
         }
         if inner.recovery_used {
+            copperclaw_metrics::inc_preview_tombstone_recovery("terminal_spent");
             return false;
         }
         inner.recovery_used = true;
         inner.upstream = format!("http://{ip}:{}", self.container_port);
         inner.phase = PreviewPhase::Live;
         drop(inner);
+        copperclaw_metrics::inc_preview_tombstone_recovery("recovered");
+        copperclaw_metrics::dec_preview_tombstoned();
         *self.last_activity.lock().unwrap() = Instant::now();
         write_preview_audit(
             &self.central,
@@ -278,9 +284,13 @@ impl ProxyState {
         };
         {
             let mut inner = self.inner.lock().unwrap();
+            let was_tombstone = inner.phase == PreviewPhase::Tombstone;
             inner.recovery_used = false;
             inner.upstream = format!("http://{ip}:{}", self.container_port);
             inner.phase = PreviewPhase::Live;
+            if was_tombstone {
+                copperclaw_metrics::dec_preview_tombstoned();
+            }
         }
         *self.last_activity.lock().unwrap() = Instant::now();
         write_preview_audit(
@@ -439,6 +449,11 @@ impl PreviewManager {
         };
         match removed {
             Some(entry) => {
+                // V2: keep the tombstoned gauge balanced when a tombstoned
+                // preview is fully torn down (rather than recovered).
+                if entry.proxy.phase() == PreviewPhase::Tombstone {
+                    copperclaw_metrics::dec_preview_tombstoned();
+                }
                 entry.cancel.cancel();
                 self.audit(
                     entry.session_id,
@@ -518,6 +533,7 @@ impl PreviewManager {
                     .iter()
                     .any(|r| r.agent_group_id == Some(ag) && r.is_actionable_at(now))
                 {
+                    copperclaw_metrics::inc_preview_enable_card("skipped_already_pending");
                     return;
                 }
             }
@@ -531,6 +547,7 @@ impl PreviewManager {
         }
 
         let Some(dispatcher) = self.approval_dispatcher.get() else {
+            copperclaw_metrics::inc_preview_enable_card("skipped_no_dispatcher");
             info!(
                 agent_group_id = %ag.as_uuid(),
                 "preview: no approval dispatcher wired; skipping enable-preview card"
@@ -548,6 +565,7 @@ impl PreviewManager {
             }
         };
         let Some(wiring) = wirings.first() else {
+            copperclaw_metrics::inc_preview_enable_card("skipped_no_messaging_group");
             info!(agent_group_id = %ag.as_uuid(), "preview: agent group has no messaging groups; skipping enable-preview card");
             return;
         };
@@ -609,6 +627,7 @@ impl PreviewManager {
             files: vec![],
         };
         dispatcher.dispatch(&target, &card);
+        copperclaw_metrics::inc_preview_enable_card("raised");
         info!(
             agent_group_id = %ag.as_uuid(),
             approval_id = %approval_id,
@@ -1010,7 +1029,13 @@ async fn proxy_handler(State(state): State<Arc<ProxyState>>, req: Request) -> Re
     // Every other request must present the matching cookie.
     match cookie_token(req.headers()) {
         Some(tok) if constant_time_eq(&tok, &state.token) => {}
-        _ => return forbidden(),
+        _ => {
+            // V1: a cookieless WS upgrade is refused here (before proxy_ws).
+            if is_upgrade(req.headers()) {
+                copperclaw_metrics::inc_preview_ws_upgrade("refused");
+            }
+            return forbidden();
+        }
     }
 
     // WebSocket / protocol upgrade: bridge it to the container app. The cookie
@@ -1157,6 +1182,7 @@ fn ws_upstream_url(http_upstream: &str, path_and_query: &str) -> String {
 /// A 502 for a failed upstream WebSocket handshake, mirroring the HTTP path's
 /// bad-gateway copy.
 fn bad_gateway_ws(err: &str) -> Response {
+    copperclaw_metrics::inc_preview_ws_upgrade("upstream_502");
     warn!(error = err, "preview WebSocket upstream connect failed");
     (
         StatusCode::BAD_GATEWAY,
@@ -1218,6 +1244,7 @@ async fn proxy_ws(state: &ProxyState, req: Request) -> Response {
         Some(proto) => ws.protocols([proto]),
         None => ws,
     };
+    copperclaw_metrics::inc_preview_ws_upgrade("ok");
     ws.on_upgrade(move |client_ws| bridge_ws(client_ws, upstream_ws, last_activity))
 }
 
@@ -1232,6 +1259,10 @@ async fn bridge_ws(
     mut upstream: UpstreamWs,
     last_activity: Arc<StdMutex<Instant>>,
 ) {
+    // V1: meter the live bridge — active count, per-direction frames/bytes,
+    // and total lifetime.
+    copperclaw_metrics::inc_preview_ws_active();
+    let bridge_started = Instant::now();
     let mut activity = tokio::time::interval(PREVIEW_WS_ACTIVITY_TICK);
     activity.set_missed_tick_behavior(MissedTickBehavior::Delay);
     loop {
@@ -1244,6 +1275,11 @@ async fn bridge_ws(
                     Some(Ok(msg)) => {
                         *last_activity.lock().unwrap() = Instant::now();
                         let ts_msg = axum_msg_to_tungstenite(msg);
+                        copperclaw_metrics::inc_preview_ws_frame("browser_to_container");
+                        copperclaw_metrics::add_preview_ws_bytes(
+                            "browser_to_container",
+                            ts_msg.len() as u64,
+                        );
                         let closing = matches!(ts_msg, TungsteniteMessage::Close(_));
                         if upstream.send(ts_msg).await.is_err() {
                             break;
@@ -1259,6 +1295,11 @@ async fn bridge_ws(
                 match from_upstream {
                     Some(Ok(msg)) => {
                         *last_activity.lock().unwrap() = Instant::now();
+                        copperclaw_metrics::inc_preview_ws_frame("container_to_browser");
+                        copperclaw_metrics::add_preview_ws_bytes(
+                            "container_to_browser",
+                            msg.len() as u64,
+                        );
                         let Some(ax_msg) = tungstenite_msg_to_axum(msg) else {
                             continue;
                         };
@@ -1275,6 +1316,8 @@ async fn bridge_ws(
             }
         }
     }
+    copperclaw_metrics::dec_preview_ws_active();
+    copperclaw_metrics::observe_preview_ws_session_seconds(bridge_started.elapsed().as_secs_f64());
     let _ = client.close().await;
     let _ = upstream.close(None).await;
 }

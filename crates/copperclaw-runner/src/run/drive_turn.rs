@@ -431,7 +431,12 @@ async fn drive_turn_inner(
             // case (bare adapter, sub-30s turn, short/huge answer) falls
             // through to today's single terminal emit, byte-identical.
             let answer = crate::tools::strip_reasoning_blocks(&output.text);
+            let progressive_ag = deps.agent_group_id.to_string();
             if super::progressive::should_grow(hud.answer_edit_capable(), hud.elapsed(), &answer) {
+                copperclaw_metrics::inc_progressive_final(&progressive_ag, "grown");
+                copperclaw_metrics::observe_progressive_final_answer_chars(
+                    answer.chars().count() as u64
+                );
                 super::progressive::grow_final_answer(
                     deps,
                     answer,
@@ -442,6 +447,14 @@ async fn drive_turn_inner(
                     continuation,
                     outcome: TurnOutcome::Done,
                 });
+            }
+            copperclaw_metrics::inc_progressive_final(&progressive_ag, "single_emit");
+            if let Some(reason) = super::progressive::grow_skip_reason(
+                hud.answer_edit_capable(),
+                hud.elapsed(),
+                &answer,
+            ) {
+                copperclaw_metrics::inc_progressive_final_skipped(reason);
             }
             let spec = copperclaw_mcp::SendMessageSpec {
                 to: None,
@@ -700,6 +713,7 @@ async fn check_mid_turn_steering(
     }
 
     if let Some(stop_row) = peeked.iter().find(|r| is_stop_control_row(r)) {
+        copperclaw_metrics::inc_midturn_control(&deps.agent_group_id.to_string(), "stop");
         mark_mid_turn_row_completed(deps, stop_row.id).await;
         let plural = if cumulative_tool_runs == 1 { "" } else { "s" };
         let stopped_text = format!(
@@ -723,6 +737,7 @@ async fn check_mid_turn_steering(
         .filter(|r| r.kind == copperclaw_types::MessageKind::Chat)
         .collect();
     if !interjections.is_empty() {
+        copperclaw_metrics::inc_midturn_control(&deps.agent_group_id.to_string(), "interjection");
         let formatted = crate::formatter::format_messages(interjections.clone());
         history.push(HistoryMessage::User {
             content: format!(

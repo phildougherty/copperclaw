@@ -242,9 +242,11 @@ async fn apply_attachment(
     rest: &DiscordRest,
     settings: &AttachmentSettings,
 ) {
+    let channel = event.channel_type.as_str().to_owned();
     // Cheap pre-check against the platform-reported size before we fetch.
     if let Some(size) = att.reported_size {
         if size > settings.max_attachment_bytes {
+            copperclaw_metrics::inc_inbound_file(&channel, "too_large");
             set_too_large(event, att, settings.max_attachment_bytes, Some(size));
             return;
         }
@@ -252,11 +254,13 @@ async fn apply_attachment(
     let bytes = match rest.download_cdn_file(&att.url).await {
         Ok(b) => b,
         Err(error) => {
+            copperclaw_metrics::inc_inbound_file(&channel, "download_failed");
             set_download_failed(event, att, &error);
             return;
         }
     };
     if bytes.len() as u64 > settings.max_attachment_bytes {
+        copperclaw_metrics::inc_inbound_file(&channel, "too_large");
         set_too_large(
             event,
             att,
@@ -274,10 +278,13 @@ async fn apply_attachment(
     {
         Ok(p) => p,
         Err(error) => {
+            copperclaw_metrics::inc_inbound_file(&channel, "download_failed");
             set_download_failed(event, att, &error);
             return;
         }
     };
+    copperclaw_metrics::inc_inbound_file(&channel, "ok");
+    copperclaw_metrics::observe_inbound_file_bytes(&channel, bytes.len() as u64);
     set_staged(event, att, &staged, bytes.len() as u64).await;
 }
 

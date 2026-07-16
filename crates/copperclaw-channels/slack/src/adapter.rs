@@ -130,9 +130,11 @@ impl ChannelAdapter for SlackAdapter {
         // (the M18 Task HUD, card H1, uses that to force
         // `hud_mode=full` + a tighter edit cadence on these surfaces).
         let Some(thread) = thread_id else {
+            copperclaw_metrics::inc_slack_typing_skipped("no_thread");
             return Ok(());
         };
         if !is_assistant_thread_surface(platform_id, Some(thread)) {
+            copperclaw_metrics::inc_slack_typing_skipped("non_assistant_surface");
             return Ok(());
         }
         // Best effort — `assistant.threads.setStatus` returns an error
@@ -143,8 +145,18 @@ impl ChannelAdapter for SlackAdapter {
             .set_assistant_status(platform_id, thread, "is typing...")
             .await
         {
-            Ok(()) | Err(AdapterError::BadRequest(_)) => Ok(()),
-            Err(other) => Err(other),
+            Ok(()) => {
+                copperclaw_metrics::inc_slack_typing_set_status("ok");
+                Ok(())
+            }
+            Err(AdapterError::BadRequest(_)) => {
+                copperclaw_metrics::inc_slack_typing_set_status("bad_request");
+                Ok(())
+            }
+            Err(other) => {
+                copperclaw_metrics::inc_slack_typing_set_status("error");
+                Err(other)
+            }
         }
     }
 
@@ -157,7 +169,9 @@ impl ChannelAdapter for SlackAdapter {
     /// edit cadence on surfaces where Slack contributes no liveness
     /// signal of its own.
     fn typing_indicator_visible(&self, platform_id: &str, thread_id: Option<&str>) -> bool {
-        is_assistant_thread_surface(platform_id, thread_id)
+        let visible = is_assistant_thread_surface(platform_id, thread_id);
+        copperclaw_metrics::inc_slack_hud_decision(visible);
+        visible
     }
 
     async fn deliver(

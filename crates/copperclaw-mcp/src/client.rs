@@ -383,9 +383,13 @@ impl FilteredMcpClient {
         input: serde_json::Value,
     ) -> Result<serde_json::Value, McpError> {
         if let Err(rej) = self.filter.check(name) {
+            let reason = filter_reason_token(rej);
+            // R0: the mcp deny/allow filter is a policy layer; label it by the
+            // rejection reason (`denied` / `not_allowed`) crossed with the tool.
+            copperclaw_metrics::inc_policy_denied(reason, name);
             return Err(McpError::ToolFiltered {
                 tool: name.to_owned(),
-                reason: filter_reason_token(rej),
+                reason,
             });
         }
         self.inner.call_tool(name, input).await

@@ -79,17 +79,22 @@ pub async fn render_live(
     // SSRF target pre-flight BEFORE we spend a container spawn on it. The
     // orchestration re-runs this (idempotent classification) and additionally
     // re-guards every redirect hop the page follows.
-    guard
-        .guard_target(&req.url)
-        .await
-        .map_err(BrowserError::Blocked)?;
+    guard.guard_target(&req.url).await.map_err(|e| {
+        copperclaw_metrics::inc_browser_ssrf_block("target_preflight");
+        BrowserError::Blocked(e)
+    })?;
 
     // Spawn the locked-down child container. THIS is the previously-deferred
     // `runtime.spawn` call (leg b).
-    runtime
-        .spawn(spec)
-        .await
-        .map_err(|e| BrowserError::Container(format!("spawn browser child `{name}`: {e}")))?;
+    match runtime.spawn(spec).await {
+        Ok(_) => copperclaw_metrics::inc_browser_child_spawn("ok"),
+        Err(e) => {
+            copperclaw_metrics::inc_browser_child_spawn("error");
+            return Err(BrowserError::Container(format!(
+                "spawn browser child `{name}`: {e}"
+            )));
+        }
+    }
 
     // Everything after the spawn must tear the container down, success or
     // failure — do it via an inner fn whose result we return after cleanup.
@@ -97,8 +102,12 @@ pub async fn render_live(
 
     // Best-effort teardown; the container is labelled for the orphan sweep, so
     // even a failed remove here is eventually reclaimed.
-    if let Err(e) = runtime.remove(&name).await {
-        tracing::warn!(container = %name, error = %e, "browser child teardown failed (orphan sweep will reclaim)");
+    match runtime.remove(&name).await {
+        Ok(()) => copperclaw_metrics::inc_browser_child_teardown("ok"),
+        Err(e) => {
+            copperclaw_metrics::inc_browser_child_teardown("error");
+            tracing::warn!(container = %name, error = %e, "browser child teardown failed (orphan sweep will reclaim)");
+        }
     }
 
     outcome
@@ -127,12 +136,17 @@ async fn render_after_spawn(
         })?;
 
     let http_base = format!("http://{ip}:{}", opts.cdp_port);
-    let transport = connector.connect(&http_base).await?;
+    let transport = connector.connect(&http_base).await.inspect_err(|_e| {
+        copperclaw_metrics::inc_browser_cdp_connect_failure();
+    })?;
     let driver = CdpBrowserDriver::new(transport, opts.screenshot_dir.clone(), opts.nav_timeout);
 
     // Reuse the exact SSRF orchestration: target pre-flight + per-redirect
     // re-guard + untrusted provenance tagging.
-    orchestrate(req, guard, &driver).await
+    let started = std::time::Instant::now();
+    let out = orchestrate(req, guard, &driver).await;
+    copperclaw_metrics::observe_browser_render_duration_seconds(started.elapsed().as_secs_f64());
+    out
 }
 
 /// The production [`CdpConnector`]: discovers a page-level CDP WebSocket via the

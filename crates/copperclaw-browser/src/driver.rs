@@ -79,10 +79,13 @@ pub async fn render(
     req.validate()?;
 
     // 1. SSRF pre-flight on the navigation target (async; resolves the host).
-    guard
-        .guard_target(&req.url)
-        .await
-        .map_err(BrowserError::Blocked)?;
+    //    In the live path `render_live` already ran (and metered) this before
+    //    spending a spawn, so a block there returns early and this idempotent
+    //    re-check stays Ok — the counter here catches direct `render` callers.
+    guard.guard_target(&req.url).await.map_err(|e| {
+        copperclaw_metrics::inc_browser_ssrf_block("target_preflight");
+        BrowserError::Blocked(e)
+    })?;
 
     // 2. Drive the read-only render.
     let DriverRender {
@@ -95,7 +98,10 @@ pub async fn render(
     //    whole render if ANY hop lands in a blocked range, before the artifact
     //    is trusted/returned.
     for hop in &navigation.redirect_chain {
-        guard.guard_redirect(hop).map_err(BrowserError::Blocked)?;
+        guard.guard_redirect(hop).map_err(|e| {
+            copperclaw_metrics::inc_browser_ssrf_block("redirect_hop");
+            BrowserError::Blocked(e)
+        })?;
     }
 
     // 4. Wrap as an UNTRUSTED-tagged output. Browser content is external,
