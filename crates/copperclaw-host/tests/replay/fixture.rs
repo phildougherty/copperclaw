@@ -108,6 +108,15 @@ pub struct Manifest {
     /// return. Default false (the legacy one-turn behaviour).
     #[serde(default)]
     pub runner_drain: bool,
+    /// Override the runner's per-inbound tool-turn depth cap
+    /// (`RunnerDeps::max_tool_turns`, hardcoded to 5 in the harness's
+    /// `run_one_turn` for every other fixture). A scripted turn
+    /// sequence with more than 5 sequential tool rounds (e.g. the X1
+    /// golden-path fixture: scaffold, verify, expose preview, ritual
+    /// card) needs a higher cap or the runner would stop mid-sequence
+    /// with no final text. `None` keeps the existing default of 5.
+    #[serde(default)]
+    pub max_tool_turns: Option<usize>,
 }
 
 /// Script one `MockAdapter::fail_next_deliver` call. `kind` decides the

@@ -1,0 +1,35 @@
+{
+  "events": [
+    {
+      "type": "message_start",
+      "message": {
+        "id": "msg_golden_002"
+      }
+    },
+    {
+      "type": "content_block_start",
+      "index": 0,
+      "content_block": {
+        "type": "tool_use",
+        "id": "toolu_golden_002",
+        "name": "write_file",
+        "input": {}
+      }
+    },
+    {
+      "type": "content_block_delta",
+      "index": 0,
+      "delta": {
+        "type": "input_json_delta",
+        "partial_json": "{\"path\": \"/tmp/copperclaw-x1-golden/todo-app/app.py\", \"content\": \"\\\"\\\"\\\"Tiny in-memory HTTP todo app (stdlib only).\\\"\\\"\\\"\\nimport json\\nfrom http.server import BaseHTTPRequestHandler, HTTPServer\\n\\nTODOS = []\\n\\n\\nclass Handler(BaseHTTPRequestHandler):\\n    def _send_json(self, status, payload):\\n        body = json.dumps(payload).encode(\\\"utf-8\\\")\\n        self.send_response(status)\\n        self.send_header(\\\"Content-Type\\\", \\\"application/json\\\")\\n        self.send_header(\\\"Content-Length\\\", str(len(body)))\\n        self.end_headers()\\n        self.wfile.write(body)\\n\\n    def do_GET(self):\\n        if self.path == \\\"/todos\\\":\\n            self._send_json(200, TODOS)\\n        else:\\n            self._send_json(404, {\\\"error\\\": \\\"not found\\\"})\\n\\n    def do_POST(self):\\n        if self.path == \\\"/todos\\\":\\n            length = int(self.headers.get(\\\"Content-Length\\\", 0))\\n            raw = self.rfile.read(length) if length else b\\\"{}\\\"\\n            body = json.loads(raw or b\\\"{}\\\")\\n            text = body.get(\\\"text\\\", \\\"\\\").strip()\\n            if not text:\\n                self._send_json(400, {\\\"error\\\": \\\"text is required\\\"})\\n                return\\n            item = {\\\"id\\\": len(TODOS) + 1, \\\"text\\\": text, \\\"done\\\": False}\\n            TODOS.append(item)\\n            self._send_json(201, item)\\n        else:\\n            self._send_json(404, {\\\"error\\\": \\\"not found\\\"})\\n\\n\\ndef main():\\n    HTTPServer((\\\"0.0.0.0\\\", 8000), Handler).serve_forever()\\n\\n\\nif __name__ == \\\"__main__\\\":\\n    main()\\n\"}"
+      }
+    },
+    {
+      "type": "content_block_stop",
+      "index": 0
+    },
+    {
+      "type": "message_stop"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "events": [
+    {"type": "message_start", "message": {"id": "msg_golden_004"}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_golden_004", "name": "shell", "input": {}}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"command\": \"python3 -m py_compile app.py && echo VERIFY_OK\", \"cwd\": \"/tmp/copperclaw-x1-golden/todo-app\"}"}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_stop"}
+  ]
+}

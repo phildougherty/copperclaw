@@ -6,6 +6,59 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M18 X1 — golden-path program fixture, 2026-07-15)
+
+- New replay fixture `fixtures/cli/prototype-golden/` (registered as
+  `cli_prototype_golden_path` in `crates/copperclaw-host/tests/replay.rs`):
+  the M18 program's acceptance test. A scripted 8-round tool loop drives
+  "build me a tiny HTTP todo app" end to end through the real
+  inbound → router → runner → outbound → delivery pipeline: `git init` a
+  project, scaffold + verify (`python3 -m py_compile`) a small stdlib-only
+  Python HTTP todo server, commit, expose a mock-brokered preview
+  (`expose_preview`), send the P3 ritual `send_card`, and close with a
+  summary. Byte-stable `expected/*.jsonl` committed; every later card that
+  changes this path updates the fixture in its own PR per the program plan.
+- Two harness additions in-lane for the card (`crates/copperclaw-host/tests/replay/{fixture.rs,harness.rs}`):
+  `manifest.gates: ["preview"]` wires a deterministic `FixturePreviewBroker`
+  onto `DeliveryService` (via the already-public `set_preview_broker`, the
+  same seam `copperclaw-host-delivery`'s own unit tests use) and advertises
+  the M17 `expose_preview` / `close_preview` tools to the per-step runner;
+  a background delivery-poller now runs for the duration of a preview-
+  gated turn so the M17 external-MCP relay's 120s blocking poll
+  (`EXTERNAL_MCP_DEADLINE_SECS`) actually gets serviced within the same
+  turn instead of always timing out (the harness's normal per-step
+  sequencing runs the whole turn before ever calling `deliver_session`,
+  which production's concurrent delivery loop doesn't have to worry
+  about). `manifest.max_tool_turns` is now overridable per fixture
+  (default unchanged at 5) for scripted sequences with more tool rounds.
+- **Two explicit, diagnosed limitations** (see `fixtures/cli/prototype-golden/README.md`
+  for the full writeup) — the fixture does NOT exercise the R3
+  verification gate or the H1 live Task HUD, and why not:
+  - `verify_gate.rs`'s `data_root()` and `todo.rs`'s `todo_path()`
+    hardcode the literal `/data` container mount, with only a
+    `#[cfg(test)]`-gated override invisible to `copperclaw-host`'s
+    separate integration-test binary — and `/data` is a real, unwritable,
+    root-owned path on every host that would run this test suite. The
+    smallest fix (un-gating the existing override, `#[doc(hidden)] pub`,
+    zero production call sites) was attempted and reverted after the
+    security review correctly flagged it as a genuine capability
+    weakening needing the user's own explicit sign-off — out of this
+    card's authorization. Root cause of R3's own "build-verify-loop"
+    e2e fixture being left as an incomplete stretch goal; a `test-support`
+    Cargo feature or an unconditional env-var override (mirroring the
+    shell tool's already-shipped, non-test-gated `COPPERCLAW_SHELL_STATE_FILE`)
+    is the right, small, explicitly-authorized follow-up.
+  - `cli` is not in `capabilities::EDIT_CAPABLE_CHANNELS`, so the HUD's
+    `Behavior` is always `StatusRows` there (never `Live`/`FinalOnly`),
+    and even that fallback's 60s-gated heartbeat has no "done in M:SS"
+    finalize arm — a live/finalized HUD fixture needs an edit-capable
+    channel (telegram/slack/discord/matrix/webex), not cli.
+- **Metrics wish (for M1):** a counter for preview-expose calls serviced
+  vs. timed out (label: `outcome=served|timeout`) would make the M17
+  relay's real-world latency visible in `cclaw usage` — this fixture's
+  own diagnosis of the 120s blocking-poll behavior is exactly the kind
+  of thing such a counter would have surfaced sooner.
+
 ### Fixed (inbound-file contract: session-local materialization — M18 C3, 2026-07-15)
 
 - **Non-image inbound attachments (documents, audio, video, ...) are now actually reachable by the agent.** Telegram previously downloaded attachments straight into the *channel's own* `data_dir/inbox/<msg_id>/` and put that host path in `content.attachment.path`, but the container only mounts the *session* directory at `/data` — so any file besides an inlined-base64 image was unreachable by the agent it had just been told about. New contract in `crates/copperclaw-channels/core/src/inbound_file.rs`: adapters download into a per-file staging temp dir (`stage_inbound_file`) and surface `content.attachment.staged_path` — never `path`, which is now exclusively a router-set key. The **router**, which is the first place that knows the resolved session, materializes the staged bytes at route time into `<session_dir>/inbox/<msg_id>/<safe_name>` (`Router::materialized_content` in `crates/copperclaw-host-router/src/route.rs`, via the hardened `copperclaw_db::attachments::extract_to_inbox` — `O_EXCL|O_NOFOLLOW`, canonicalized-path containment check), strips `staged_path`, and rewrites `attachment.path` to the container-visible `/data/inbox/<msg_id>/<safe_name>`. Both the message id and the filename are re-sanitized router-side (defense in depth) so a hostile `../../etc` id or `../../evil.sh` filename still lands inside the session inbox. The staged source file (and its unique per-download directory) is always removed after the fanout completes, regardless of route outcome (delivered, dropped, debounced, pending, or errored), so adapters never need to garbage-collect staging themselves. A materialization failure (staged file vanished, disk error) never drops the message — the attachment keeps its metadata, loses `staged_path`, gains an `error` note, and the message text still reaches the agent. Telegram (`crates/copperclaw-channels/telegram/src/ingress/mod.rs` and friends) fully migrates to the contract; the `too_large` / `download_failed` system-row fallbacks are unchanged. New e2e replay fixture `fixtures/telegram/inbound-document-attachment/` pins the acceptance: a document attachment materializes to the container path in `messages_in`, and an oversized document still yields the `too_large` system row (`crates/copperclaw-host/tests/replay.rs`).

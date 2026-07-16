@@ -515,3 +515,16 @@ async fn telegram_rate_limited_retry_honours_retry_after() {
         "rate-limit fixture finished in {elapsed:?}, expected >= 1000 ms"
     );
 }
+
+/// M18 X1: the program-acceptance golden-path fixture. "build me a tiny
+/// HTTP todo app" drives an 8-round scripted tool loop (git init,
+/// scaffold + verify a stdlib Python HTTP todo server, commit, expose a
+/// mock-brokered preview, send the P3 ritual card, close with a summary).
+/// See `fixtures/cli/prototype-golden/README.md` for the two pieces of
+/// the card's acceptance line this fixture can NOT honestly exercise
+/// (the R3 verify-gate and the H1 live HUD) and the precise, diagnosed
+/// reason for each.
+#[tokio::test]
+async fn cli_prototype_golden_path() {
+    run_fixture("cli", "prototype-golden").await;
+}
