@@ -53,12 +53,17 @@ impl ChannelFactory for SlackFactory {
             }
         };
         let ct = ChannelType::new(CHANNEL_TYPE_STR);
+        // Wire inbound-file downloads (M18 C4a): the events router downloads
+        // a message's first `url_private` file with the bot token, size-caps
+        // it, and stages it under `data_dir` for the router to materialize
+        // into the resolved session (channels-core inbound-file contract).
         let state = SlackEventsState::new(
             cfg.signing_secret.clone(),
             setup.inbound_tx,
             bot_user_id,
             ct.clone(),
-        );
+        )
+        .with_attachments(api.clone(), cfg.max_attachment_bytes, setup.data_dir);
         let router = build_events_router(&cfg.webhook.path, state);
         let addr: SocketAddr = format!("{}:{}", cfg.webhook.host, cfg.webhook.port)
             .parse()

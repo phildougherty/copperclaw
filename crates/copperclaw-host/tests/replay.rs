@@ -138,6 +138,16 @@ async fn slack_event_message_round_trip() {
     run_fixture("slack", "event-message").await;
 }
 
+/// M18 C4a acceptance: a Slack `url_private` file is staged by the adapter
+/// (bot-token download, size-capped) and materialized by the router into
+/// the resolved session's inbox at the container-visible `/data/inbox/...`
+/// path; a second, oversized file still yields the `too_large` system
+/// fallback. See the fixture's README.md.
+#[tokio::test]
+async fn slack_inbound_file_attachment_round_trip() {
+    run_fixture("slack", "inbound-file-attachment").await;
+}
+
 #[tokio::test]
 async fn cli_multi_turn_round_trip() {
     run_fixture("cli", "multi-turn").await;

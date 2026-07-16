@@ -458,6 +458,44 @@ impl SlackApi {
         Ok(())
     }
 
+    /// Download an inbound file from its Slack `url_private` link.
+    ///
+    /// Slack requires the bot token as an `Authorization: Bearer <token>`
+    /// header on `url_private` / `url_private_download` URLs — the same
+    /// token the Web API calls use — so we reuse [`Self::bot_token`] here.
+    /// Unlike the Web API endpoints these URLs return the raw file bytes
+    /// (not a `{"ok": ...}` envelope), so we only inspect the HTTP status:
+    /// `429` maps to [`AdapterError::Rate`] and any other non-2xx to
+    /// [`AdapterError::Transport`] with the status echoed for logging.
+    pub async fn download_file(&self, url: &str) -> Result<Vec<u8>, AdapterError> {
+        let resp = self
+            .client
+            .get(url)
+            .bearer_auth(&self.bot_token)
+            .send()
+            .await
+            .map_err(|e| transport(&e))?;
+        let status = resp.status();
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok());
+            return Err(AdapterError::Rate { retry_after });
+        }
+        if !status.is_success() {
+            return Err(AdapterError::Transport(format!(
+                "slack url_private download returned {status}"
+            )));
+        }
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| AdapterError::Transport(format!("slack file body read failed: {e}")))?;
+        Ok(bytes.to_vec())
+    }
+
     /// Step 1 of file upload v2: get an external upload URL + file id.
     pub async fn files_get_upload_url_external(
         &self,
