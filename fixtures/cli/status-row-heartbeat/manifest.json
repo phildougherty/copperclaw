@@ -1,0 +1,21 @@
+{
+  "name": "cli-status-row-heartbeat",
+  "channel": "cli",
+  "description": "M21 S6: one inbound, three Claude turns (tool_use, tool_use, final text) with the harness test clock advanced 61s then 90s as the scripted LLM calls are served. Pins the bare-channel Task HUD status-row legs deterministically: the 60s first-fire ('61s in ... I'll keep going.') and the 150s softening ('151s in ... taking longer than usual') — previously unfixturable without a real 60s wall-clock wait (the M18 X2 known gap).",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "provider_responses": [
+    {"kind": "success", "file": "001-turn.json", "advance_clock_ms": 61000},
+    {"kind": "success", "file": "002-turn.json", "advance_clock_ms": 90000},
+    {"kind": "success", "file": "003-turn.json"}
+  ],
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

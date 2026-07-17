@@ -116,6 +116,40 @@ adheres to [Semantic Versioning](https://semver.org/).
   read out; new `install_env_nonempty_keys()` in
   `crates/copperclaw-cclaw/src/lib.rs`) and report the source
   (`tavily (.env)` vs `tavily (shell env)`).
+### Added (M21 S6 — test-clock seam for the runner's timed surfaces)
+
+- **`Clock` seam in the runner** (`crates/copperclaw-runner/src/clock.rs`,
+  new): a minimal injectable monotonic-time trait — `SystemClock` (real
+  time, the production default) and `TestClock` (frozen; advanced by hand,
+  shared across clones) — carried as `RunnerDeps.clock`
+  (`crates/copperclaw-runner/src/run/mod.rs`). The Task HUD
+  (`crates/copperclaw-runner/src/run/hud.rs`) now reads every elapsed-time
+  decision through it: the elapsed clock on live frames and finalize, the
+  R6 progressive-final gate (`TaskHud::elapsed`), the bare-channel 60s
+  status-row cadence, and the 150s softening threshold. At the default
+  real clock all timing behavior is byte-identical; the seam exists so
+  timed legs are testable without wall-clock waits, and later M21 timed
+  surfaces (backoffs, TTLs, spawn thresholds) should read the same clock
+  instead of growing their own.
+- **Replay-harness clock advancement**
+  (`crates/copperclaw-host/tests/replay/harness.rs`,
+  `crates/copperclaw-host/tests/replay/fixture.rs`): the harness now owns
+  a shared `TestClock` injected into every per-step runner, advanceable
+  programmatically (`ReplayHarness::advance_clock`, for between-step
+  time) or declaratively via a new `advance_clock_ms` key on
+  `provider_responses` manifest entries (the wiremock responder advances
+  the clock as the scripted LLM call is served — the only hook that lands
+  *inside* a single turn's tool loop). Built for the M21 X-riders to pin
+  timed legs deterministically.
+- **The M18 X2 known gap is closed**: the HUD StatusRows 60s first-fire
+  and 150s softening — unfixturable since M18 because they needed a real
+  60s wait — are now pinned twice: unit-level in
+  `crates/copperclaw-runner/src/run/hud.rs`
+  (`status_rows_60s_first_fire_and_150s_softening_pinned_by_test_clock`)
+  and end-to-end by the new `fixtures/cli/status-row-heartbeat/` replay
+  fixture, whose expected streams assert the exact "61s in ... I'll keep
+  going." and "151s in ... taking longer than usual" rows byte-for-byte
+  with zero real waiting.
 
 ### Security (M20 D1/D5 — recorded security-review pass for the in-container vision tools, 2026-07-16)
 

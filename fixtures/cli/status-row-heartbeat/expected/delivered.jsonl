@@ -1,0 +1,3 @@
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"Still working on this — 61s in, 1 tool call so far (latest: shell). I'll keep going."},"files":0}
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"Still working on this — 151s in, 2 tool calls so far (latest: shell). This is taking longer than usual, but I'm still going."},"files":0}
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"Both slow steps are done."},"files":0}

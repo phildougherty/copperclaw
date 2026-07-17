@@ -244,6 +244,9 @@ async fn main() -> Result<()> {
         // the runner can switch to one mid-turn without any further env
         // lookups. Empty for groups with no fallback chain configured.
         failover_chain: build_failover_chain(&cfg, &env),
+        // M21 S6: production always runs the real clock; only tests and
+        // the replay harness inject a TestClock.
+        clock: std::sync::Arc::new(copperclaw_runner::SystemClock),
     };
 
     tracing::info!(

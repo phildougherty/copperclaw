@@ -12,6 +12,7 @@
 //!
 //! [`AgentProvider`]: copperclaw_providers::AgentProvider
 
+pub mod clock;
 pub mod compaction;
 pub mod config;
 pub mod destinations;
@@ -23,6 +24,12 @@ pub mod state;
 pub mod subagent;
 pub mod tools;
 
+// M21 S6 test-clock seam: `Clock` is the trait the runner's timed
+// surfaces read wall time through, `SystemClock` the production default,
+// `TestClock` the manually-advanced test double the replay harness
+// injects to pin timed legs (e.g. the HUD's 60s status-row cadence)
+// without real waits.
+pub use clock::{Clock, SystemClock, TestClock};
 pub use compaction::{CompactionCfg, compact, estimate_tokens};
 pub use config::{RunnerConfig, RunnerConfigFile};
 pub use destinations::{ResolvedRoute, resolve_recipient};

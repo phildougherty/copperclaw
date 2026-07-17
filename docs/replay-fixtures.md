@@ -139,6 +139,21 @@ one Claude turn. If the container makes a tool call, the fixture
 includes a follow-up `claude/NNN+1-turn.json` with the tool-result
 continuation.
 
+Failure-mode fixtures can override the in-order default with an
+explicit `provider_responses` plan in the manifest (see
+`ProviderResponseSpec` in `crates/copperclaw-host/tests/replay/fixture.rs`
+for the full key list: scripted errors, timeouts, per-call file
+selection). Since M21 S6 any entry may also set `advance_clock_ms`:
+when that scripted call is served, the harness advances the shared
+runner `TestClock` (`copperclaw-runner/src/clock.rs`) injected into
+every per-step runner's `RunnerDeps.clock`. This is how a fixture
+makes time pass *inside* a single turn's tool loop, which the runner's
+timed legs (e.g. the Task HUD's 60s status-row cadence and 150s
+softening — see `fixtures/cli/status-row-heartbeat/`) need; the clock
+is frozen apart from explicit advances, so elapsed renderings in
+expected streams are exact. Tests driving the harness directly can
+instead call `ReplayHarness::advance_clock` between steps.
+
 ### `expected/*.jsonl`
 
 After the replay completes, the harness diffs:

@@ -480,6 +480,37 @@ async fn cli_tool_use_shell() {
     run_fixture("cli", "tool-use-shell").await;
 }
 
+/// M21 S6: the previously-unfixturable bare-channel Task HUD timed legs
+/// (the M18 X2 known gap), pinned deterministically via the harness's
+/// test-clock seam. The fixture's `provider_responses` advance the
+/// shared runner `TestClock` mid-turn (61s while serving the first
+/// scripted `tool_use` call, another 90s on the second), so the two
+/// tool-batch boundaries land at exactly 61s and 151s of "wall" time
+/// with zero real waiting. The expected streams pin the 60s first-fire
+/// status row ("61s in ... I'll keep going.") and the 150s softening
+/// ("151s in ... taking longer than usual") byte-for-byte.
+#[tokio::test]
+async fn cli_status_row_heartbeat_pins_60s_and_150s_legs() {
+    let harness = run_fixture_into_harness("cli", "status-row-heartbeat").await;
+    // Belt-and-braces over the JSONL diff: exactly two heartbeat rows
+    // were delivered, in cadence order, and only the second is softened.
+    let mock = mock_for(&harness, "cli");
+    let heartbeats: Vec<String> = mock
+        .deliveries()
+        .iter()
+        .filter_map(|d| d.message.content["text"].as_str().map(str::to_owned))
+        .filter(|t| t.starts_with("Still working on this"))
+        .collect();
+    assert_eq!(heartbeats.len(), 2, "one row per elapsed 60s window");
+    assert!(heartbeats[0].contains("61s in") && heartbeats[0].ends_with("I'll keep going."));
+    assert!(
+        heartbeats[1].contains("151s in")
+            && heartbeats[1].contains("This is taking longer than usual"),
+        "the 150s leg softens: {}",
+        heartbeats[1]
+    );
+}
+
 /// Empty-content LLM response: runner completes the inbound without
 /// emitting a chat outbound. Pins the no-content branch in `drive_turn`
 /// so a regression that crashed on empty responses would surface.

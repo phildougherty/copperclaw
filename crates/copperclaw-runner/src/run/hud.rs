@@ -40,6 +40,7 @@ use copperclaw_mcp::ToolContext;
 
 use super::RunnerDeps;
 use super::drive_turn::PendingToolCall;
+use crate::clock::Clock;
 use crate::config::HudMode;
 use crate::tools::TASK_HUD_TOOL;
 
@@ -161,6 +162,12 @@ pub(super) struct TaskHud {
     /// cadence stays at [`STATUS_INTERVAL`] regardless of how long
     /// individual tool calls take.
     last_status_emit_at: StdMutex<Instant>,
+    /// M21 S6: the clock every elapsed-time read in this driver goes
+    /// through ([`RunnerDeps::clock`]). Production is the real clock
+    /// ([`crate::clock::SystemClock`]); deterministic tests inject a
+    /// [`crate::clock::TestClock`] so the 60s status-row leg and the
+    /// 150s softening are reachable without wall-clock waits.
+    clock: Arc<dyn Clock>,
 }
 
 impl TaskHud {
@@ -223,7 +230,7 @@ impl TaskHud {
             };
             copperclaw_metrics::inc_hud_degraded(ct, reason);
         }
-        let now = Instant::now();
+        let now = deps.clock.now();
         Self {
             behavior,
             answer_edit_capable,
@@ -235,6 +242,7 @@ impl TaskHud {
             edit_interval,
             ticker: StdMutex::new(None),
             last_status_emit_at: StdMutex::new(now),
+            clock: Arc::clone(&deps.clock),
         }
     }
 
@@ -268,9 +276,10 @@ impl TaskHud {
     /// R6: wall-clock elapsed since `drive_turn` entry. Threaded into
     /// the progressive-final gate (>30s turns only) so it reads the ONE
     /// clock the HUD already tracks (`started_at`) rather than the
-    /// caller re-deriving its own.
+    /// caller re-deriving its own. Reads through the S6 clock seam so
+    /// the run loop's timed gates advance with a test clock too.
     pub(super) fn elapsed(&self) -> Duration {
-        self.started_at.elapsed()
+        self.clock.now().saturating_duration_since(self.started_at)
     }
 
     /// A tool batch is about to execute. Live HUD: post (first batch) or
@@ -358,8 +367,9 @@ impl TaskHud {
             // collapses below, so the thinking frame never dangles.)
             return;
         }
-        copperclaw_metrics::observe_hud_finalize_seconds(self.started_at.elapsed().as_secs_f64());
-        let elapsed = fmt_mmss(self.started_at.elapsed().as_secs());
+        let elapsed_total = self.elapsed();
+        copperclaw_metrics::observe_hud_finalize_seconds(elapsed_total.as_secs_f64());
+        let elapsed = fmt_mmss(elapsed_total.as_secs());
         let plural = if tool_runs == 1 { "" } else { "s" };
         // F5: a pure-reasoning turn collapses its "thinking…" frame to a
         // clean "done in M:SS" (the "0 tool calls" tail would read oddly).
@@ -423,7 +433,12 @@ impl TaskHud {
     /// store + the wall clock, flipping `posted` when this is the first
     /// frame. `None` when the HUD is already finalized (ticker race).
     fn compose_running_frame(&self) -> Option<(Breadcrumb, bool)> {
-        running_frame(&self.shared, self.started_at, &self.todo_path)
+        running_frame(
+            &self.shared,
+            self.started_at,
+            self.clock.now(),
+            &self.todo_path,
+        )
     }
 
     /// F5: arm the background HUD task at turn start (live HUD only).
@@ -454,12 +469,15 @@ impl TaskHud {
         let started_at = self.started_at;
         let interval = self.edit_interval;
         let agent_group = self.agent_group.clone();
+        let clock = Arc::clone(&self.clock);
         *guard = Some(tokio::spawn(async move {
             // Pre-first-tool wait: hold off the initial post so fast turns
             // (which finalize before this elapses) never post.
             tokio::time::sleep(THINKING_THRESHOLD).await;
             loop {
-                let Some((frame, first)) = running_frame(&shared, started_at, &todo_path) else {
+                let Some((frame, first)) =
+                    running_frame(&shared, started_at, clock.now(), &todo_path)
+                else {
                     break;
                 };
                 // Suppress a frame byte-identical to the last one sent (a
@@ -495,20 +513,21 @@ impl TaskHud {
     /// usual, still going" reassurance so the run degrades gracefully
     /// toward the 5-minute apology instead of cliff-edging into it.
     async fn maybe_emit_status_row(&self, tool_runs: usize, last_tool: Option<&str>) {
+        let now = self.clock.now();
         let due = self
             .last_status_emit_at
             .lock()
-            .map(|at| at.elapsed() >= STATUS_INTERVAL)
+            .map(|at| now.saturating_duration_since(*at) >= STATUS_INTERVAL)
             .unwrap_or(false);
         if !due {
             return;
         }
-        let elapsed_secs = self.started_at.elapsed().as_secs();
+        let elapsed_secs = now.saturating_duration_since(self.started_at).as_secs();
         let todo_step = current_todo_step(&self.todo_path);
         let status = compose_status_row(elapsed_secs, tool_runs, last_tool, todo_step);
         self.ctx.emit_status(&status).await;
         if let Ok(mut at) = self.last_status_emit_at.lock() {
-            *at = Instant::now();
+            *at = self.clock.now();
         }
     }
 }
@@ -555,12 +574,15 @@ impl Drop for TaskHud {
 }
 
 /// Compose one Running-state HUD frame from shared state + the todo
-/// store + the wall clock. Marks the HUD `posted` and returns whether
-/// this was the first frame. `None` once finalized (ticker race) — the
-/// caller stops emitting.
+/// store + the wall clock. `now` comes from the caller's [`Clock`] (the
+/// S6 seam) so the elapsed rendering is deterministic under a test
+/// clock. Marks the HUD `posted` and returns whether this was the first
+/// frame. `None` once finalized (ticker race) — the caller stops
+/// emitting.
 fn running_frame(
     shared: &StdMutex<Shared>,
     started_at: Instant,
+    now: Instant,
     todo_path: &Path,
 ) -> Option<(Breadcrumb, bool)> {
     let (first, tool_runs, activity, note) = {
@@ -572,7 +594,7 @@ fn running_frame(
         s.posted = true;
         (first, s.tool_runs, s.activity.clone(), s.note.take())
     };
-    let elapsed = fmt_mmss(started_at.elapsed().as_secs());
+    let elapsed = fmt_mmss(now.saturating_duration_since(started_at).as_secs());
     let plural = if tool_runs == 1 { "" } else { "s" };
     // F5: before the first tool runs the frame is the pre-first-tool
     // "thinking…" wait (posted by the armed background task after
@@ -854,7 +876,7 @@ mod tests {
             last_emitted: None,
         });
         let started = Instant::now();
-        let (frame, first) = running_frame(&shared, started, &todo_path).unwrap();
+        let (frame, first) = running_frame(&shared, started, Instant::now(), &todo_path).unwrap();
         assert!(!first, "HUD was already posted");
         let summary = frame.summary.as_deref().unwrap();
         assert!(
@@ -862,7 +884,7 @@ mod tests {
             "note must ride the next edit; got: {summary}"
         );
         // Next frame: the note is one-shot.
-        let (frame2, _) = running_frame(&shared, started, &todo_path).unwrap();
+        let (frame2, _) = running_frame(&shared, started, Instant::now(), &todo_path).unwrap();
         assert!(
             !frame2
                 .summary
@@ -886,7 +908,7 @@ mod tests {
             last_emitted: None,
         });
         assert!(
-            running_frame(&shared, Instant::now(), &todo_path).is_none(),
+            running_frame(&shared, Instant::now(), Instant::now(), &todo_path).is_none(),
             "no frame may be composed after the final collapse"
         );
     }
@@ -1135,6 +1157,94 @@ mod tests {
             hud_rows(&outbound).await.is_empty(),
             "a sub-threshold turn must post nothing"
         );
+    }
+
+    // ── S6: the test-clock seam pins the StatusRows timed legs ──────────
+    //
+    // Before M21 S6 these legs were unfixturable (the M18 X2 known gap):
+    // `maybe_emit_status_row` read `Instant::elapsed()` directly, so the
+    // 60s first-fire needed a real 60-second wall-clock wait. With the
+    // injected TestClock the whole cadence is traversed deterministically.
+
+    use crate::clock::TestClock;
+
+    #[tokio::test]
+    async fn status_rows_60s_first_fire_and_150s_softening_pinned_by_test_clock() {
+        // cli has no message-edit API, so the HUD degrades to the
+        // bare-channel StatusRows behaviour under the default hud_mode.
+        let (_tmp, outbound, mut deps) = deps_for_channel("cli", crate::config::HudMode::default());
+        let clock = TestClock::new();
+        deps.clock = Arc::new(clock.clone());
+        let hud = TaskHud::new(&deps);
+        assert_eq!(hud.behavior, Behavior::StatusRows, "cli is a bare channel");
+
+        // 30s in: a finishing batch is under the 60s cadence — silence.
+        clock.advance(Duration::from_secs(30));
+        hud.on_batch_end(1, Some("shell"), true).await;
+        assert!(
+            hud_rows(&outbound).await.is_empty(),
+            "no status row may fire before the 60s interval"
+        );
+
+        // 61s in: the first status row fires with the plain tail.
+        clock.advance(Duration::from_secs(31));
+        hud.on_batch_end(2, Some("shell"), true).await;
+        let rows = hud_rows(&outbound).await;
+        assert_eq!(rows.len(), 1, "exactly one row at the 60s first fire");
+        assert_eq!(rows[0].kind, MessageKind::Chat, "status rows are Chat rows");
+        let text = rows[0].content["text"].as_str().unwrap();
+        assert!(
+            text.contains("61s in") && text.contains("2 tool calls"),
+            "elapsed + count read the test clock/state: {text}"
+        );
+        assert!(
+            text.ends_with("I'll keep going."),
+            "plain tail pre-150s: {text}"
+        );
+        assert!(
+            !text.contains("taking longer"),
+            "no premature softening: {text}"
+        );
+
+        // 91s in — only 30s after the last emit: the cadence anchor was
+        // bumped at the first fire, so this batch stays silent.
+        clock.advance(Duration::from_secs(30));
+        hud.on_batch_end(3, Some("shell"), true).await;
+        assert_eq!(
+            hud_rows(&outbound).await.len(),
+            1,
+            "the 60s cadence must hold between rows"
+        );
+
+        // 151s in: due again AND past INTERMEDIATE_STATUS_AFTER — the
+        // row softens to the "taking longer than usual" reassurance.
+        clock.advance(Duration::from_secs(60));
+        hud.on_batch_end(4, Some("cargo"), true).await;
+        let rows = hud_rows(&outbound).await;
+        assert_eq!(rows.len(), 2, "second row at the softened 150s leg");
+        let text = rows[1].content["text"].as_str().unwrap();
+        assert!(
+            text.contains("151s in"),
+            "softened row reads the clock: {text}"
+        );
+        assert!(
+            text.contains("This is taking longer than usual, but I'm still going."),
+            "past 150s the reassurance softens: {text}"
+        );
+    }
+
+    #[test]
+    fn hud_elapsed_reads_the_injected_clock() {
+        // `TaskHud::elapsed` feeds the run loop's timed gates (the R6
+        // progressive-final >30s check); it must advance with the seam.
+        let (_tmp, _outbound, mut deps) =
+            deps_for_channel("cli", crate::config::HudMode::default());
+        let clock = TestClock::new();
+        deps.clock = Arc::new(clock.clone());
+        let hud = TaskHud::new(&deps);
+        assert_eq!(hud.elapsed(), Duration::ZERO, "no advance -> no elapsed");
+        clock.advance(Duration::from_secs(45));
+        assert_eq!(hud.elapsed(), Duration::from_secs(45));
     }
 
     #[tokio::test(start_paused = true)]
