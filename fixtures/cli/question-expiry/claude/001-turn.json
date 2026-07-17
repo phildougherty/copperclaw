@@ -1,0 +1,10 @@
+{
+  "events": [
+    {"type": "message_start", "message": {"id": "msg_m21f2_question_001"}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_m21f2_ask_001", "name": "ask_user_question", "input": {}}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"title\":\"Tabs or spaces?\","}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "\"options\":[\"tabs\",\"spaces\"]}"}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_stop"}
+  ]
+}

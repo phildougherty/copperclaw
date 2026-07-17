@@ -1,0 +1,9 @@
+{
+  "events": [
+    {"type": "message_start", "message": {"id": "msg_m21f2_question_002"}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "I've asked which indentation you want. Pick one and I'll continue."}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_stop"}
+  ]
+}

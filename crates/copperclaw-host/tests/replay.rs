@@ -2648,6 +2648,158 @@ async fn cli_stuck_tool_restart_delivers_single_apology_end_to_end() {
     assert_eq!(apology_rows[0].in_reply_to, Some(msg_id));
 }
 
+/// M21 F2: expire `ask_user_question` out loud — ask -> expire -> user
+/// replies later -> conversation resumes normally, end to end through
+/// the replay pipeline over `fixtures/cli/question-expiry/`.
+///
+/// Step 1 (fixture): the scripted turn calls `ask_user_question`; the
+/// runner's System row routes through the harness-installed
+/// `InteractiveModule` (the production delivery-action path), so the
+/// question card reaches the cli `MockAdapter` and the pending question
+/// is recorded with its ask-time origin.
+///
+/// Expiry (test-side): host-side sweep timing runs on wall/tokio time —
+/// NOT the runner `TestClock` — so a fixture cannot advance the 24h TTL
+/// (see `fixtures/README-m21-wave1.md`, reachability item 2). The
+/// module handle here is built with a ZERO TTL so the ask is already
+/// lapsed when the real `SweepService` pass runs; TTL *selection*
+/// precision is pinned by the paused-time crate tests in
+/// `copperclaw-host-sweep` (`run_once_surfaces_expired_questions_when_
+/// store_wired`) and `copperclaw-modules` (`sweep_expiry_selection_
+/// honors_the_ttl_boundary`). The sweep pass must surface the lapse
+/// exactly once: a terminal edit stamping the delivered card with the
+/// expiry note (typed adapter edit — no live buttons left behind), plus
+/// a `trigger = 0` synthetic no-answer result in the session inbox.
+///
+/// Step 2 (fixture): the user's late reply spawns a normal turn whose
+/// provider request must carry the synthetic `ask_user_question_result`
+/// — the agent's next turn sees the no-answer result — and the reply is
+/// delivered normally. The expected JSONL streams pin every row,
+/// including the sweep-written edit note and result row.
+///
+/// Regenerate expected streams with
+/// `COPPERCLAW_M21F2_GENERATE=1 cargo test ... cli_question_expiry`.
+#[tokio::test]
+async fn cli_question_expiry_surfaces_lapse_and_resumes_on_reply() {
+    use copperclaw_host_sweep::service::FilesystemSessionRoot;
+    use copperclaw_host_sweep::{EXPIRED_QUESTION_TEXT, SweepService};
+    use copperclaw_modules::InteractiveModule;
+    use std::sync::Arc;
+
+    let generate = std::env::var_os("COPPERCLAW_M21F2_GENERATE").is_some();
+    let path = fixture_path("cli", "question-expiry");
+    assert!(
+        path.exists(),
+        "fixture missing at {} — see docs/replay-fixtures.md",
+        path.display()
+    );
+    let fixture = Fixture::load(&path).expect("load question-expiry fixture");
+    let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+
+    // Production wiring in miniature: one InteractiveModule installed
+    // into the delivery service, a state-sharing clone handed to the
+    // sweep (`boot.rs` does exactly this via `set_question_store`).
+    let interactive = InteractiveModule::with_timeout(chrono::Duration::zero());
+    harness
+        .install_interactive_module(&interactive)
+        .await
+        .expect("install InteractiveModule");
+
+    // ── Step 1: ask ──
+    harness.run_steps(0, 1).await.expect("drive ask step");
+    assert_eq!(
+        interactive.pending().len(),
+        1,
+        "the delivered ask must record one pending question"
+    );
+    let mock = Arc::clone(mock_for(&harness, "cli"));
+    let cards = mock
+        .deliveries()
+        .iter()
+        .filter(|d| d.message.content.get("card").is_some())
+        .count();
+    assert_eq!(cards, 1, "the question card must reach the adapter");
+
+    // ── Expiry: one real sweep pass over the shared question set ──
+    let sweep = SweepService::new(
+        harness.central.clone(),
+        Arc::new(FilesystemSessionRoot::new(harness.tempdir.path())),
+    );
+    sweep.set_question_store(interactive.clone());
+    let report = sweep.run_once().expect("sweep pass");
+    assert_eq!(report.questions_expired.len(), 1, "one lapsed question");
+    assert!(report.questions_expired[0].note_emitted);
+    assert!(!report.questions_expired[0].resolved_by_reply);
+    assert!(interactive.pending().is_empty(), "terminal in module state");
+
+    // Second pass byte-quiet: the lapse is surfaced exactly once.
+    let report2 = sweep.run_once().expect("second sweep pass");
+    assert!(report2.questions_expired.is_empty());
+
+    // Deliver the expiry note: the cli MockAdapter supports the typed
+    // edit API, so the card is stamped terminal IN PLACE.
+    let (_ag, sess) = harness.touched_sessions[0];
+    let session = copperclaw_db::tables::sessions::get(&harness.central, sess).unwrap();
+    harness
+        .delivery
+        .process_session_once(&session)
+        .await
+        .expect("deliver expiry note");
+    let edits = mock.edits();
+    assert_eq!(edits.len(), 1, "exactly one terminal card edit");
+    assert_eq!(
+        edits[0].new_text, EXPIRED_QUESTION_TEXT,
+        "the edit carries the expiry note copy"
+    );
+
+    // ── Step 2: the user replies later; conversation resumes ──
+    harness
+        .run_steps(1, 2)
+        .await
+        .expect("drive late-reply step");
+
+    if generate {
+        harness.dump_expected_jsonl();
+        return;
+    }
+
+    // Byte-stable pipeline diff (includes the sweep-written edit note in
+    // messages-out and the synthetic result row in messages-in).
+    let diff = harness.compare().expect("compare");
+    assert!(diff.is_clean(), "{diff}");
+
+    // The agent's next turn saw the no-answer result: the last provider
+    // request body contains the synthetic ask_user_question_result.
+    let reqs = harness
+        .anthropic_server
+        .received_requests()
+        .await
+        .expect("wiremock request log");
+    let last_body =
+        String::from_utf8_lossy(&reqs.last().expect("provider calls").body).into_owned();
+    assert!(
+        last_body.contains("ask_user_question_result"),
+        "final turn's prompt must carry the synthetic no-answer result: {last_body}"
+    );
+    assert!(
+        last_body.contains("expired"),
+        "the result must be marked expired: {last_body}"
+    );
+    assert!(
+        last_body.contains("spaces please"),
+        "the late reply must ride the same turn: {last_body}"
+    );
+
+    // And the reply itself was delivered normally after the expiry.
+    let final_replies = mock
+        .deliveries()
+        .iter()
+        .filter_map(|d| d.message.content.get("text").and_then(|t| t.as_str()))
+        .filter(|t| t.contains("Spaces it is"))
+        .count();
+    assert_eq!(final_replies, 1, "conversation resumes normally");
+}
+
 /// M21 S3 (X-rider W1): delivery retry counters survive a service
 /// restart, with exactly-once dead-lettering — at the pipeline level,
 /// against a runner-produced outbound row, using the harness's

@@ -18,7 +18,9 @@ use crate::context::{
 use crate::error::ModuleError;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
-use copperclaw_types::{ChannelType, MessageKind, OutboundMessage};
+use copperclaw_types::{
+    AgentGroupId, ChannelType, MessageId, MessageKind, OutboundMessage, SessionId,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -34,6 +36,28 @@ impl QuestionId {
     }
 }
 
+/// Where a question came from and where its card went — captured at ask
+/// time so the sweep's question-expiry check (M21 F2) can surface a
+/// lapsed question back to the right session and channel. Every field is
+/// optional because tests (and hypothetical non-delivery callers) may
+/// register questions without a live outbound row; the expiry check
+/// degrades gracefully when origin data is missing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuestionOrigin {
+    /// Session whose outbound row carried the `ask_user_question` action.
+    pub session_id: Option<SessionId>,
+    /// Agent group owning that session (needed to open per-session DBs).
+    pub agent_group_id: Option<AgentGroupId>,
+    /// The `messages_out` id of the System row that rendered the card.
+    /// The sweep resolves this to a `seq` so the expiry edit can stamp
+    /// the delivered card terminal in place.
+    pub message_out_id: Option<MessageId>,
+    /// Channel routing the card was dispatched with.
+    pub channel_type: Option<ChannelType>,
+    pub platform_id: Option<String>,
+    pub thread_id: Option<String>,
+}
+
 /// A question awaiting a reply.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingQuestion {
@@ -43,6 +67,9 @@ pub struct PendingQuestion {
     pub asked_at: DateTime<Utc>,
     pub timeout_at: DateTime<Utc>,
     pub answered: Option<String>,
+    /// Ask-time provenance for expiry surfacing (M21 F2).
+    #[serde(default)]
+    pub origin: QuestionOrigin,
 }
 
 impl PendingQuestion {
@@ -59,6 +86,14 @@ struct State {
 }
 
 /// Interactive module.
+///
+/// Cheap to clone: clones share the same underlying pending-question
+/// state (the state lives behind an `Arc`). The host relies on this to
+/// hand one handle to the module installer (which registers the
+/// `ask_user_question` delivery action) and a second handle to the
+/// sweep service, whose question-expiry check calls
+/// [`Self::sweep_expired`] against the same live set (M21 F2).
+#[derive(Clone)]
 pub struct InteractiveModule {
     state: Arc<Mutex<State>>,
     default_timeout: Duration,
@@ -83,12 +118,16 @@ impl InteractiveModule {
         self.default_timeout
     }
 
-    /// Register a new pending question.
+    /// Register a new pending question. `origin` records where the ask
+    /// came from so a later expiry can be surfaced back to the same
+    /// session and channel; pass `QuestionOrigin::default()` when no
+    /// outbound-row context exists (tests).
     pub fn ask(
         &self,
         id: QuestionId,
         title: String,
         options: Vec<String>,
+        origin: QuestionOrigin,
         now: DateTime<Utc>,
     ) -> PendingQuestion {
         let q = PendingQuestion {
@@ -98,6 +137,7 @@ impl InteractiveModule {
             asked_at: now,
             timeout_at: now + self.default_timeout,
             answered: None,
+            origin,
         };
         self.state.lock().unwrap().pending.insert(id, q.clone());
         q
@@ -132,19 +172,29 @@ impl InteractiveModule {
             .collect()
     }
 
-    /// Sweep expired questions. Returns the list of expired ids (removed
-    /// from state).
-    pub fn sweep_expired(&self, now: DateTime<Utc>) -> Vec<QuestionId> {
+    /// Sweep expired questions: every unanswered question whose
+    /// `timeout_at` has passed is removed from the pending set and
+    /// returned as a full snapshot (M21 F2 — the sweep's expiry check
+    /// needs the title + origin to surface the lapse, not just the id).
+    /// Answered questions are never selected, and questions still inside
+    /// their TTL are untouched. Idempotent: a second call at the same
+    /// instant returns an empty list.
+    pub fn sweep_expired(&self, now: DateTime<Utc>) -> Vec<PendingQuestion> {
         let mut state = self.state.lock().unwrap();
-        let expired: Vec<QuestionId> = state
+        let expired_ids: Vec<QuestionId> = state
             .pending
             .iter()
             .filter(|(_, q)| q.is_expired(now))
             .map(|(id, _)| id.clone())
             .collect();
-        for id in &expired {
-            state.pending.remove(id);
+        let mut expired = Vec::with_capacity(expired_ids.len());
+        for id in &expired_ids {
+            if let Some(q) = state.pending.remove(id) {
+                expired.push(q);
+            }
         }
+        // Deterministic order for callers that surface each expiry.
+        expired.sort_by(|a, b| a.asked_at.cmp(&b.asked_at).then(a.id.0.cmp(&b.id.0)));
         expired
     }
 }
@@ -195,6 +245,21 @@ impl DeliveryActionHandler for AskHandler {
         }
         let now = Utc::now();
         let qid = QuestionId(id.clone());
+        let dispatch = dispatch_from_payload(&input.payload);
+        // Capture ask-time provenance so the sweep's expiry check can
+        // route the "this question expired" surfacing (M21 F2). The
+        // routing prefers an explicit payload `to` override (that is
+        // where the card actually goes) and falls back to the target
+        // the delivery service resolved for the row.
+        let routed = dispatch.as_ref().unwrap_or(&input.target);
+        let origin = QuestionOrigin {
+            session_id: input.session_id,
+            agent_group_id: input.target.agent_group_id,
+            message_out_id: input.row_id,
+            channel_type: routed.channel_type.clone(),
+            platform_id: routed.platform_id.clone(),
+            thread_id: routed.thread_id.clone(),
+        };
         let q = PendingQuestion {
             id: qid.clone(),
             title: title.clone(),
@@ -202,9 +267,9 @@ impl DeliveryActionHandler for AskHandler {
             asked_at: now,
             timeout_at: now + self.default_timeout,
             answered: None,
+            origin,
         };
         self.state.lock().unwrap().pending.insert(qid, q);
-        let dispatch = dispatch_from_payload(&input.payload);
         Ok(DeliveryActionOutput {
             dispatch,
             message: Some(OutboundMessage {
@@ -361,6 +426,7 @@ mod tests {
             id.clone(),
             "?".into(),
             vec!["yes".into(), "no".into()],
+            QuestionOrigin::default(),
             now(),
         );
         assert_eq!(q.options.len(), 2);
@@ -374,7 +440,13 @@ mod tests {
     fn double_answer_returns_false() {
         let m = InteractiveModule::default();
         let id = QuestionId::new("q-2");
-        m.ask(id.clone(), "?".into(), vec!["a".into()], now());
+        m.ask(
+            id.clone(),
+            "?".into(),
+            vec!["a".into()],
+            QuestionOrigin::default(),
+            now(),
+        );
         assert!(m.answer(&id, "a".into()));
         assert!(!m.answer(&id, "a".into()));
     }
@@ -388,8 +460,20 @@ mod tests {
     #[test]
     fn pending_lists_all() {
         let m = InteractiveModule::default();
-        m.ask(QuestionId::new("q-1"), "?".into(), vec!["a".into()], now());
-        m.ask(QuestionId::new("q-2"), "?".into(), vec!["b".into()], now());
+        m.ask(
+            QuestionId::new("q-1"),
+            "?".into(),
+            vec!["a".into()],
+            QuestionOrigin::default(),
+            now(),
+        );
+        m.ask(
+            QuestionId::new("q-2"),
+            "?".into(),
+            vec!["b".into()],
+            QuestionOrigin::default(),
+            now(),
+        );
         assert_eq!(m.pending().len(), 2);
     }
 
@@ -398,11 +482,21 @@ mod tests {
         let m = InteractiveModule::with_timeout(Duration::milliseconds(100));
         let id = QuestionId::new("q-1");
         let t0 = now();
-        m.ask(id.clone(), "?".into(), vec!["a".into()], t0);
+        m.ask(
+            id.clone(),
+            "?".into(),
+            vec!["a".into()],
+            QuestionOrigin::default(),
+            t0,
+        );
         let later = t0 + Duration::seconds(1);
         let expired = m.sweep_expired(later);
-        assert_eq!(expired, vec![id]);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, id);
+        assert_eq!(expired[0].title, "?");
         assert!(m.pending().is_empty());
+        // Idempotent: nothing left to sweep.
+        assert!(m.sweep_expired(later).is_empty());
     }
 
     #[test]
@@ -410,11 +504,102 @@ mod tests {
         let m = InteractiveModule::with_timeout(Duration::milliseconds(100));
         let id = QuestionId::new("q-1");
         let t0 = now();
-        m.ask(id.clone(), "?".into(), vec!["a".into()], t0);
+        m.ask(
+            id.clone(),
+            "?".into(),
+            vec!["a".into()],
+            QuestionOrigin::default(),
+            t0,
+        );
         m.answer(&id, "a".into());
         let later = t0 + Duration::seconds(1);
         assert!(m.sweep_expired(later).is_empty());
         assert_eq!(m.pending().len(), 1);
+    }
+
+    /// TTL honored precisely: a question one second SHY of its timeout is
+    /// untouched; the same sweep instant one second LATER selects it.
+    #[test]
+    fn sweep_expiry_selection_honors_the_ttl_boundary() {
+        let m = InteractiveModule::with_timeout(Duration::seconds(60));
+        let id = QuestionId::new("q-ttl");
+        let t0 = now();
+        m.ask(
+            id.clone(),
+            "pick".into(),
+            vec!["a".into()],
+            QuestionOrigin::default(),
+            t0,
+        );
+        assert!(
+            m.sweep_expired(t0 + Duration::seconds(59)).is_empty(),
+            "inside the TTL the question must not be selected",
+        );
+        assert_eq!(m.pending().len(), 1);
+        let expired = m.sweep_expired(t0 + Duration::seconds(60));
+        assert_eq!(expired.len(), 1, "at the TTL boundary it lapses");
+        assert_eq!(expired[0].id, id);
+    }
+
+    /// A mixed pending set: only the lapsed unanswered question is
+    /// swept; the fresh one and the answered-but-old one both survive.
+    #[test]
+    fn sweep_selects_only_lapsed_unanswered_questions() {
+        let m = InteractiveModule::with_timeout(Duration::seconds(10));
+        let t0 = now();
+        let lapsed = QuestionId::new("q-lapsed");
+        m.ask(
+            lapsed.clone(),
+            "old".into(),
+            vec!["a".into()],
+            QuestionOrigin::default(),
+            t0,
+        );
+        let answered = QuestionId::new("q-answered");
+        m.ask(
+            answered.clone(),
+            "answered".into(),
+            vec!["a".into()],
+            QuestionOrigin::default(),
+            t0,
+        );
+        m.answer(&answered, "a".into());
+        let fresh = QuestionId::new("q-fresh");
+        m.ask(
+            fresh.clone(),
+            "fresh".into(),
+            vec!["a".into()],
+            QuestionOrigin::default(),
+            t0 + Duration::seconds(30),
+        );
+        let expired = m.sweep_expired(t0 + Duration::seconds(20));
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, lapsed);
+        let mut left: Vec<String> = m.pending().into_iter().map(|q| q.id.0).collect();
+        left.sort();
+        assert_eq!(left, vec!["q-answered".to_string(), "q-fresh".to_string()]);
+    }
+
+    /// Clones share pending state — the seam boot relies on to hand one
+    /// handle to the module installer and one to the sweep (M21 F2).
+    #[test]
+    fn clones_share_pending_state() {
+        let m = InteractiveModule::with_timeout(Duration::seconds(1));
+        let sweeper = m.clone();
+        let t0 = now();
+        m.ask(
+            QuestionId::new("q-shared"),
+            "?".into(),
+            vec!["a".into()],
+            QuestionOrigin::default(),
+            t0,
+        );
+        let expired = sweeper.sweep_expired(t0 + Duration::seconds(2));
+        assert_eq!(expired.len(), 1, "clone must see the original's ask");
+        assert!(
+            m.pending().is_empty(),
+            "sweep through the clone drains both"
+        );
     }
 
     #[test]
@@ -427,6 +612,7 @@ mod tests {
             asked_at: now,
             timeout_at: now + Duration::seconds(10),
             answered: None,
+            origin: QuestionOrigin::default(),
         };
         assert!(!q.is_expired(now));
         assert!(q.is_expired(now + Duration::seconds(11)));
@@ -481,7 +667,13 @@ mod tests {
         assert_eq!(dispatch.platform_id.as_deref(), Some("U-1"));
         let msg = out.message.unwrap();
         assert_eq!(msg.content["card"]["question_id"], "q-abc");
-        assert!(m.get(&QuestionId::new("q-abc")).is_some());
+        let stored = m.get(&QuestionId::new("q-abc")).unwrap();
+        // Origin routing follows the explicit payload `to` override.
+        assert_eq!(
+            stored.origin.channel_type.as_ref().map(ChannelType::as_str),
+            Some("slack")
+        );
+        assert_eq!(stored.origin.platform_id.as_deref(), Some("U-1"));
     }
 
     #[tokio::test]
@@ -497,6 +689,9 @@ mod tests {
             .iter()
             .find(|(n, _)| n == "ask_user_question")
             .unwrap();
+        let session_id = SessionId::new();
+        let agent_group_id = AgentGroupId::new();
+        let row_id = MessageId::new();
         let out = handler
             .handle(DeliveryActionInput {
                 action: "ask_user_question".into(),
@@ -509,15 +704,26 @@ mod tests {
                     channel_type: Some("telegram".into()),
                     platform_id: Some("chat-1".into()),
                     thread_id: None,
-                    agent_group_id: None,
+                    agent_group_id: Some(agent_group_id),
                 },
-                session_id: None,
-                row_id: None,
+                session_id: Some(session_id),
+                row_id: Some(row_id),
             })
             .unwrap();
         let msg = out.message.expect("question card must be built");
         assert_eq!(msg.content["card"]["question_id"], "q_runner");
-        assert!(m.get(&QuestionId::new("q_runner")).is_some());
+        let stored = m.get(&QuestionId::new("q_runner")).unwrap();
+        // With no payload `to`, the origin captures the resolved target
+        // plus the delivery-threaded session / row identifiers — the
+        // provenance the sweep's expiry check routes with (M21 F2).
+        assert_eq!(stored.origin.session_id, Some(session_id));
+        assert_eq!(stored.origin.agent_group_id, Some(agent_group_id));
+        assert_eq!(stored.origin.message_out_id, Some(row_id));
+        assert_eq!(
+            stored.origin.channel_type.as_ref().map(ChannelType::as_str),
+            Some("telegram")
+        );
+        assert_eq!(stored.origin.platform_id.as_deref(), Some("chat-1"));
     }
 
     #[tokio::test]

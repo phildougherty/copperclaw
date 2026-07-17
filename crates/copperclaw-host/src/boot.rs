@@ -578,7 +578,17 @@ pub fn assemble(
 
 /// Install the built-in module set against `host_ctx`. Each module that
 /// fails to install is logged and skipped.
-pub async fn install_modules(host_ctx: Arc<HostContext>, data_root: PathBuf) {
+///
+/// Returns a shared handle onto the installed [`InteractiveModule`]
+/// (clones share pending-question state) so the caller can wire it into
+/// the sweep's question-expiry check (M21 F2 — see
+/// `SweepService::set_question_store`). Callers that don't run a sweep
+/// (tests) can ignore the return value.
+pub async fn install_modules(host_ctx: Arc<HostContext>, data_root: PathBuf) -> InteractiveModule {
+    // Built outside the module list so a state-sharing clone survives
+    // for the sweep seam; `Box::new(interactive.clone())` below installs
+    // the same underlying pending-question state.
+    let interactive = InteractiveModule::default();
     let modules: Vec<Box<dyn Module>> = vec![
         Box::new(TypingModule::new(TypingConfig::default())),
         // Register with a LIVE host root (the sessions dir all per-session
@@ -624,7 +634,7 @@ pub async fn install_modules(host_ctx: Arc<HostContext>, data_root: PathBuf) {
             .with_new_pending_notifier(build_pending_notifier(host_ctx.central().clone()))
             .with_pairing_notifier(build_pairing_notifier(host_ctx.central().clone())),
         ),
-        Box::new(InteractiveModule::default()),
+        Box::new(interactive.clone()),
         Box::new(SchedulingModule::with_store(Arc::new(
             SqliteTaskStore::new(host_ctx.central().clone()),
         ))),
@@ -674,6 +684,7 @@ pub async fn install_modules(host_ctx: Arc<HostContext>, data_root: PathBuf) {
             warn!(module = name, ?err, "module install failed; continuing");
         }
     }
+    interactive
 }
 
 /// Full host entry point used by `copperclaw run`.
@@ -763,9 +774,14 @@ pub async fn run_host(
     let health_outcome: Option<crate::image_health::HealthDegradedReason> =
         run_boot_image_health_check(&cfg, &state.central).await;
 
-    // 10. Install modules.
+    // 10. Install modules. The returned handle shares the installed
+    // InteractiveModule's pending-question state; wiring it into the
+    // sweep turns on the question-expiry check (M21 F2) so an
+    // unanswered `ask_user_question` past its TTL is surfaced out loud
+    // instead of silently evaporating.
     let host_ctx = HostContext::for_router(Arc::clone(&state.router), Arc::clone(&state.delivery));
-    install_modules(Arc::clone(&host_ctx), cfg.data_dir.clone()).await;
+    let interactive = install_modules(Arc::clone(&host_ctx), cfg.data_dir.clone()).await;
+    state.sweep.set_question_store(interactive);
 
     // 11-13c. Background loops, registered through the M21 S1 supervisor
     // (`crate::supervisor`) instead of bare `tokio::spawn`s: a panic (or an
