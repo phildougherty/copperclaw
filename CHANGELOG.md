@@ -6,6 +6,54 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M21 S2: stuck-tool actuator — detected stuck sessions get restarted, 2026-07-17)
+
+- **Stuck tools are finally recovered, not just logged.** The sweep has
+  always detected a tool running past its timeout
+  (`crates/copperclaw-host-sweep/src/checks/stuck.rs`), but the
+  detection went nowhere — `SweepReport.stuck_sessions` was only a log
+  field, and the crash path could never fire because the runner keeps
+  its heartbeat fresh during tool dispatch (deliberately: the process IS
+  alive). A hung tool therefore wedged the session forever. Now a new
+  `StuckActuator` trait (`crates/copperclaw-host-sweep/src/actuator.rs`)
+  is injected into `SweepService` at boot
+  (`crates/copperclaw-host/src/boot.rs`) and implemented by the
+  container manager as a new `ReconcileAction::StuckRestart`
+  (`crates/copperclaw-host/src/container_manager/{classify.rs,
+  stuck_actuator.rs}`): the container is torn down, the user gets the
+  existing crash-restart apology ("Hit a snag mid-task..."), the stale
+  tool-state row is cleared so the sweep does not re-fire against the
+  fresh container, and the session respawns on the next inbound.
+  **Default-behavior change:** sessions that previously wedged forever
+  are now restarted automatically — but only past the unconditional
+  30-minute `ABSOLUTE_CEILING_MS`; detections past the 60s claim
+  threshold (or a tool's declared timeout) remain observe-only, so
+  long-but-legitimate tools are never killed. `stuck::check` now
+  returns a `StuckSeverity` (`ClaimThreshold` observe-only vs
+  `AbsoluteCeiling` actuated) and `SweepReport` gains a
+  `stuck_past_ceiling` subset field.
+- **Stuck restarts participate in the S4 crash-loop backoff.** A
+  session whose tool wedges immediately after every respawn is
+  respawned at increasing intervals (5s -> 15s -> 60s -> 300s cap, same
+  per-session tracker as crash restarts) instead of hot-looping on the
+  60s sweep cadence. Stuck restarts do NOT increment
+  `copperclaw_containers_crashed_total` (a deliberate recovery is not a
+  crash); a dedicated stuck-restarts-by-reason series is an M1 metrics
+  wish.
+
+### Fixed (M21 S2: apology copy no longer claims the operator was notified, 2026-07-17)
+
+- **The stuck-inbound apology and the degraded-mode apology no longer
+  claim "The operator has been notified"** — nothing of the sort
+  happened (the only signals were a log line and a metric). Per M21
+  decision (d), the honest copy in
+  `crates/copperclaw-host-sweep/src/checks/apology.rs` and
+  `crates/copperclaw-host/src/image_health.rs` now tells the user to
+  tell their operator if the problem persists, and that `cclaw doctor`
+  on the host will show what's wrong. O4 (opt-in operator alerts) will
+  conditionally restore the notified claim once it is actually true;
+  tests pin that no apology copy contains "notified" until then.
+
 ### Added (M21 S5: forever-pending outbound rows are bounded, 2026-07-17)
 
 - **A 24h age ceiling for outbound rows whose channel has no live

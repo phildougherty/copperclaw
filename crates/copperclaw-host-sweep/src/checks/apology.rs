@@ -55,11 +55,19 @@ pub const APOLOGY_TRIES_MARKER: i64 = 99;
 /// still bounded so we don't choke on a very large backlog.
 const APOLOGY_SCAN_LIMIT: i64 = 50;
 
-/// User-facing text. Kept verbatim per the task brief — no operator
-/// jargon ("OCI runtime error", "heartbeat stale") leaks into the user
-/// view. The operator-facing detail lives in the log line + metric.
+/// User-facing text. No operator jargon ("OCI runtime error",
+/// "heartbeat stale") leaks into the user view — the operator-facing
+/// detail lives in the log line + metric.
+///
+/// M21 S2 (decision (d)): this copy used to claim "The operator has
+/// been notified" when nothing of the sort happened — the only signal
+/// was a log line and a counter. Until O4 wires a real alert path, the
+/// honest version tells the user what THEY can do (nudge their
+/// operator) and what the operator should run (`cclaw doctor`). O4
+/// conditionally restores the notified claim once it is finally true.
 pub(crate) const APOLOGY_TEXT: &str = "I'm having trouble processing your message right now (the agent's container isn't responding). \
-     The operator has been notified. Please try again in a few minutes.";
+     Please try again in a few minutes. If this keeps happening, tell your operator — \
+     running `cclaw doctor` on the host will show what's wrong.";
 
 /// One row visible to the apology check inside `messages_in`. Mirrors
 /// the subset of [`copperclaw_types::MessageInRow`] we actually look at.
@@ -226,7 +234,7 @@ pub fn check(
                 kind: ErrorCardKind::Internal,
                 details: Some(
                     "agent container unresponsive (heartbeat stale or never spawned); \
-                     operator notified via log + metrics"
+                     diagnose with `cclaw doctor` on the host"
                         .to_string(),
                 ),
                 retryable: true,
@@ -491,6 +499,56 @@ mod tests {
             .unwrap();
         insert_in(pool.conn_mut(), &msg).unwrap();
         id
+    }
+
+    /// M21 S2 (decision (d)): until O4 wires a real alert path, no
+    /// apology copy may claim the operator has been notified — nothing
+    /// notifies anyone. The honest copy tells the user to nudge their
+    /// operator and points the operator at `cclaw doctor`.
+    #[test]
+    fn apology_copy_does_not_claim_operator_notification() {
+        let lower = APOLOGY_TEXT.to_lowercase();
+        assert!(
+            !lower.contains("notified"),
+            "apology copy must not claim operator notification until O4: {APOLOGY_TEXT:?}",
+        );
+        assert!(
+            lower.contains("tell your operator"),
+            "apology copy should tell the user to escalate: {APOLOGY_TEXT:?}",
+        );
+        assert!(
+            APOLOGY_TEXT.contains("cclaw doctor"),
+            "apology copy should point at `cclaw doctor`: {APOLOGY_TEXT:?}",
+        );
+    }
+
+    /// Same rule for the serialized `ErrorCard`: neither the summary nor
+    /// the operator-facing `details` may claim notification.
+    #[test]
+    fn emitted_error_card_never_claims_notification() {
+        let (_c, root, sess, now, tracker) = fixture();
+        let _ = insert_stuck_chat(
+            &root,
+            &sess,
+            ChDuration::minutes(6),
+            "tg-1",
+            "telegram",
+            None,
+            now,
+        );
+        let emits = check(&root, &tracker, &sess, now).unwrap();
+        assert_eq!(emits.len(), 1);
+        let outbound = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
+        let rows = messages_out::list_due(outbound.conn()).unwrap();
+        let apology = rows
+            .iter()
+            .find(|r| r.kind == MessageKind::Error)
+            .expect("expected an apology error row");
+        let serialized = serde_json::to_string(&apology.content).unwrap();
+        assert!(
+            !serialized.to_lowercase().contains("notified"),
+            "no part of the apology card may claim notification: {serialized}",
+        );
     }
 
     #[test]

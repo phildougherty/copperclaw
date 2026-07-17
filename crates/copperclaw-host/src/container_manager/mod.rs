@@ -47,6 +47,7 @@ pub mod prompt;
 pub mod provider_failover;
 pub mod runner_config;
 pub mod spawn;
+pub mod stuck_actuator;
 pub mod tasks_snapshot;
 
 pub use broker::{

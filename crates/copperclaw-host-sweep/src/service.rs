@@ -2,8 +2,10 @@
 //! [`crate::SWEEP_POLL_MS`] tick and produces a [`SweepReport`] describing
 //! sessions that need host attention.
 
+use crate::actuator::StuckActuator;
 use crate::checks::apology::ApologyEmit;
 use crate::checks::condition_checkin::{self, ConditionContext, ConditionStore};
+use crate::checks::stuck::StuckSeverity;
 use crate::checks::{apology, heartbeat, processing, recurrence, scheduling, stuck, wake};
 use crate::clock::{Clock, SystemClock};
 use crate::error::SweepError;
@@ -142,6 +144,14 @@ pub struct SeriesFanout {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SweepReport {
     pub stuck_sessions: Vec<SessionId>,
+    /// M21 S2: the subset of [`Self::stuck_sessions`] whose active tool
+    /// ran past [`crate::ABSOLUTE_CEILING_MS`]. These are the sessions
+    /// the injected [`StuckActuator`] restarts; claim-threshold
+    /// detections stay in `stuck_sessions` only (observe-only). Being a
+    /// strict subset, this field is deliberately excluded from
+    /// [`Self::is_empty`] / [`Self::total`] so entries are not counted
+    /// twice.
+    pub stuck_past_ceiling: Vec<SessionId>,
     pub recurrences_fired: Vec<SeriesFanout>,
     pub processing_acks_reset: Vec<MessageReset>,
     pub woken_sessions: Vec<SessionId>,
@@ -197,6 +207,14 @@ pub struct SweepService {
     /// so the condition-check-in is a strict no-op until populated and
     /// the sweep's existing behaviour is unchanged.
     condition_store: Arc<ConditionStore>,
+    /// M21 S2 (decision (a)): restart authority for sessions whose
+    /// active tool ran past [`crate::ABSOLUTE_CEILING_MS`]. Injected
+    /// once at boot via [`Self::set_stuck_actuator`] (the host's
+    /// container manager is built after the sweep, so this is a
+    /// set-once slot rather than a constructor argument). Unset — the
+    /// default, and every pre-S2 test — keeps ceiling detections
+    /// observe-only, exactly the old behaviour.
+    stuck_actuator: std::sync::OnceLock<Arc<dyn StuckActuator>>,
 }
 
 impl SweepService {
@@ -208,6 +226,7 @@ impl SweepService {
             clock: Arc::new(SystemClock),
             spawn_tracker: Arc::new(SpawnAttemptTracker::new()),
             condition_store: Arc::new(ConditionStore::new()),
+            stuck_actuator: std::sync::OnceLock::new(),
         }
     }
 
@@ -224,6 +243,7 @@ impl SweepService {
             clock,
             spawn_tracker: Arc::new(SpawnAttemptTracker::new()),
             condition_store: Arc::new(ConditionStore::new()),
+            stuck_actuator: std::sync::OnceLock::new(),
         }
     }
 
@@ -273,6 +293,77 @@ impl SweepService {
         &self.spawn_tracker
     }
 
+    /// Inject the stuck-tool restart actuator (M21 S2, decision (a)).
+    /// Called once at boot after the host builds its container manager;
+    /// a second call is ignored with a warning (the actuator is a
+    /// boot-time wiring decision, not a runtime toggle). Takes `&self`
+    /// because the service is already behind an `Arc` by the time the
+    /// manager exists — the sweep loop's first pass fires a full
+    /// [`crate::SWEEP_POLL_MS`] after boot, long after this returns.
+    pub fn set_stuck_actuator(&self, actuator: Arc<dyn StuckActuator>) {
+        if self.stuck_actuator.set(actuator).is_err() {
+            tracing::warn!(
+                target: "copperclaw_host_sweep",
+                "stuck actuator already wired; ignoring second injection",
+            );
+        }
+    }
+
+    /// Drive the injected [`StuckActuator`] for every session the pass
+    /// found past the absolute ceiling. Returns the number of restarts
+    /// the actuator accepted. With no actuator wired (tests, a host
+    /// booted without a container manager) this is a no-op beyond a
+    /// debug log — detections stay observe-only, the pre-S2 behaviour.
+    ///
+    /// Failures are logged and skipped rather than aborting the batch:
+    /// the stuck detection re-fires on the next pass until the session's
+    /// tool state clears, so a failed restart retries naturally.
+    pub async fn actuate_stuck(&self, report: &SweepReport) -> usize {
+        if report.stuck_past_ceiling.is_empty() {
+            return 0;
+        }
+        let Some(actuator) = self.stuck_actuator.get() else {
+            tracing::debug!(
+                target: "copperclaw_host_sweep",
+                sessions = report.stuck_past_ceiling.len(),
+                "stuck sessions past absolute ceiling but no actuator wired; observe-only",
+            );
+            return 0;
+        };
+        let mut restarted = 0;
+        for session_id in &report.stuck_past_ceiling {
+            match actuator.restart_stuck(*session_id).await {
+                Ok(()) => {
+                    restarted += 1;
+                    tracing::info!(
+                        target: "copperclaw_host_sweep",
+                        session = %session_id,
+                        "stuck-tool restart requested (tool past absolute ceiling)",
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: "copperclaw_host_sweep",
+                        session = %session_id,
+                        error = %err,
+                        "stuck-tool restart failed; will retry next sweep pass",
+                    );
+                }
+            }
+        }
+        restarted
+    }
+
+    /// [`Self::run_once`] followed by [`Self::actuate_stuck`] — the
+    /// full sweep pass as the production loop runs it. Split so tests
+    /// (and the replay harness) can still call the pure `run_once`
+    /// without triggering restarts.
+    pub async fn run_once_actuated(&self) -> Result<SweepReport, SweepError> {
+        let report = self.run_once()?;
+        self.actuate_stuck(&report).await;
+        Ok(report)
+    }
+
     /// Tick `run_once` every [`crate::SWEEP_POLL_MS`] until `shutdown` is
     /// cancelled. Errors are logged but do not abort the loop.
     pub async fn run_loop(self: Arc<Self>, shutdown: CancellationToken) {
@@ -281,12 +372,13 @@ impl SweepService {
             tokio::select! {
                 () = shutdown.cancelled() => break,
                 () = tokio::time::sleep(interval) => {
-                    match self.run_once() {
+                    match self.run_once_actuated().await {
                         Ok(report) => {
                             if !report.is_empty() {
                                 tracing::info!(
                                     target: "copperclaw_host_sweep",
                                     stuck = report.stuck_sessions.len(),
+                                    stuck_past_ceiling = report.stuck_past_ceiling.len(),
                                     recurrences = report.recurrences_fired.len(),
                                     acks_reset = report.processing_acks_reset.len(),
                                     woken = report.woken_sessions.len(),
@@ -418,8 +510,13 @@ impl SweepService {
                 &session.id,
                 now,
             ) {
-                Ok(true) => report.stuck_sessions.push(session.id),
-                Ok(false) => {}
+                Ok(Some(severity)) => {
+                    report.stuck_sessions.push(session.id);
+                    if severity == StuckSeverity::AbsoluteCeiling {
+                        report.stuck_past_ceiling.push(session.id);
+                    }
+                }
+                Ok(None) => {}
                 Err(e) => tracing::warn!(
                     target: "copperclaw_host_sweep",
                     session = %session.id,
@@ -514,6 +611,144 @@ mod tests {
         assert_eq!(report.total(), 0);
     }
 
+    /// Test double for the M21 S2 actuator: records every requested
+    /// restart; optionally fails for one session to prove a failed
+    /// restart doesn't abort the batch.
+    struct RecordingActuator {
+        calls: std::sync::Mutex<Vec<SessionId>>,
+        fail_for: Option<SessionId>,
+    }
+
+    impl RecordingActuator {
+        fn new() -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                fail_for: None,
+            }
+        }
+
+        fn failing_for(session: SessionId) -> Self {
+            Self {
+                calls: std::sync::Mutex::new(Vec::new()),
+                fail_for: Some(session),
+            }
+        }
+
+        fn calls(&self) -> Vec<SessionId> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::actuator::StuckActuator for RecordingActuator {
+        async fn restart_stuck(
+            &self,
+            session_id: SessionId,
+        ) -> Result<(), crate::actuator::ActuatorError> {
+            self.calls.lock().unwrap().push(session_id);
+            if self.fail_for == Some(session_id) {
+                return Err("injected restart failure".into());
+            }
+            Ok(())
+        }
+    }
+
+    /// The S2 acceptance split: a tool past the 30-minute absolute
+    /// ceiling is actuated; a tool merely past the 60s claim threshold
+    /// is reported but NOT actuated (observe-only).
+    #[tokio::test]
+    async fn actuator_fires_only_past_the_ceiling() {
+        let central = fresh_central();
+        let now = chrono::Utc.with_ymd_and_hms(2026, 5, 21, 12, 0, 0).unwrap();
+        let clock = Arc::new(MockClock::new(now));
+        let root = Arc::new(MemSessionRoot::new());
+
+        // Past the claim threshold (5 min) but under the ceiling.
+        let floor_stuck = seed_running_session(&central);
+        seed_stuck_tool(&root, &floor_stuck, now - ChDuration::minutes(5));
+
+        // Past the 30-minute absolute ceiling.
+        let ceiling_stuck = seed_running_session(&central);
+        seed_stuck_tool(&root, &ceiling_stuck, now - ChDuration::minutes(31));
+
+        let svc = SweepService::with_clock(central, root, clock);
+        let actuator = Arc::new(RecordingActuator::new());
+        svc.set_stuck_actuator(Arc::clone(&actuator) as Arc<dyn crate::actuator::StuckActuator>);
+
+        let report = svc.run_once_actuated().await.unwrap();
+
+        // Both are stuck; only the ceiling one is in the actuator list.
+        assert!(report.stuck_sessions.contains(&floor_stuck.id));
+        assert!(report.stuck_sessions.contains(&ceiling_stuck.id));
+        assert_eq!(report.stuck_past_ceiling, vec![ceiling_stuck.id]);
+
+        // And the actuator saw exactly the ceiling session.
+        assert_eq!(actuator.calls(), vec![ceiling_stuck.id]);
+    }
+
+    /// With no actuator wired (the default, and every pre-S2 caller),
+    /// ceiling detections stay observe-only — no panic, no restart.
+    #[tokio::test]
+    async fn ceiling_detection_without_actuator_is_observe_only() {
+        let central = fresh_central();
+        let now = chrono::Utc.with_ymd_and_hms(2026, 5, 21, 12, 0, 0).unwrap();
+        let clock = Arc::new(MockClock::new(now));
+        let root = Arc::new(MemSessionRoot::new());
+        let stuck = seed_running_session(&central);
+        seed_stuck_tool(&root, &stuck, now - ChDuration::minutes(31));
+
+        let svc = SweepService::with_clock(central, root, clock);
+        let report = svc.run_once_actuated().await.unwrap();
+        assert_eq!(report.stuck_past_ceiling, vec![stuck.id]);
+        assert_eq!(svc.actuate_stuck(&report).await, 0);
+    }
+
+    /// One failing restart must not abort the rest of the batch; the
+    /// return value counts only the accepted restarts.
+    #[tokio::test]
+    async fn actuator_failure_does_not_abort_the_batch() {
+        let central = fresh_central();
+        let now = chrono::Utc.with_ymd_and_hms(2026, 5, 21, 12, 0, 0).unwrap();
+        let clock = Arc::new(MockClock::new(now));
+        let root = Arc::new(MemSessionRoot::new());
+        let a = seed_running_session(&central);
+        seed_stuck_tool(&root, &a, now - ChDuration::minutes(31));
+        let b = seed_running_session(&central);
+        seed_stuck_tool(&root, &b, now - ChDuration::minutes(45));
+
+        let svc = SweepService::with_clock(central, root, clock);
+        let actuator = Arc::new(RecordingActuator::failing_for(a.id));
+        svc.set_stuck_actuator(Arc::clone(&actuator) as Arc<dyn crate::actuator::StuckActuator>);
+
+        let report = svc.run_once().unwrap();
+        assert_eq!(report.stuck_past_ceiling.len(), 2);
+        let restarted = svc.actuate_stuck(&report).await;
+        assert_eq!(restarted, 1, "only the non-failing session counts");
+        assert_eq!(actuator.calls().len(), 2, "both sessions were attempted");
+    }
+
+    /// The actuator slot is set-once: a second injection is ignored so
+    /// a misbehaving caller can't swap restart authority at runtime.
+    #[tokio::test]
+    async fn second_actuator_injection_is_ignored() {
+        let central = fresh_central();
+        let now = chrono::Utc.with_ymd_and_hms(2026, 5, 21, 12, 0, 0).unwrap();
+        let clock = Arc::new(MockClock::new(now));
+        let root = Arc::new(MemSessionRoot::new());
+        let stuck = seed_running_session(&central);
+        seed_stuck_tool(&root, &stuck, now - ChDuration::minutes(31));
+
+        let svc = SweepService::with_clock(central, root, clock);
+        let first = Arc::new(RecordingActuator::new());
+        let second = Arc::new(RecordingActuator::new());
+        svc.set_stuck_actuator(Arc::clone(&first) as Arc<dyn crate::actuator::StuckActuator>);
+        svc.set_stuck_actuator(Arc::clone(&second) as Arc<dyn crate::actuator::StuckActuator>);
+
+        let _ = svc.run_once_actuated().await.unwrap();
+        assert_eq!(first.calls(), vec![stuck.id], "first injection wins");
+        assert!(second.calls().is_empty(), "second injection is inert");
+    }
+
     #[tokio::test]
     async fn run_once_populates_each_branch() {
         let central = fresh_central();
@@ -542,6 +777,12 @@ mod tests {
         let report = svc.run_once().unwrap();
 
         assert!(report.stuck_sessions.contains(&stuck.id), "stuck branch");
+        // 5 minutes is past the claim threshold but well under the
+        // 30-minute absolute ceiling: observe-only, never actuated.
+        assert!(
+            report.stuck_past_ceiling.is_empty(),
+            "claim-threshold detections must stay out of the actuator list",
+        );
         assert!(
             report.heartbeat_stale.contains(&stale_hb.id),
             "heartbeat branch",

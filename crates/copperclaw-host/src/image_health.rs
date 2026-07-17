@@ -601,9 +601,15 @@ pub async fn check_boot_image_digest(
 /// Per-session apology text written to every session with a pending
 /// chat inbound when the host enters degraded mode. Plain ASCII, no
 /// emojis — matches the project's "no emojis" rule.
+///
+/// M21 S2 (decision (d)): this copy used to claim "The operator has
+/// been notified" when the only signals were a log line and a metric
+/// gauge. Until O4 wires a real alert path, the honest version tells
+/// the user to escalate themselves and points the operator at
+/// `cclaw doctor` (whose image checks name the exact failure).
 pub const DEGRADED_APOLOGY_TEXT: &str = "The agent is temporarily degraded \
      — the container image is missing or out of date. \
-     The operator has been notified.";
+     Tell your operator — running `cclaw doctor` on the host will show what's wrong.";
 
 /// Transition the host into degraded mode after the boot-time image
 /// health check has failed. The host still starts up so the admin
@@ -942,6 +948,21 @@ pub(crate) mod tests {
             }
             other => panic!("expected Failed, got {other:?}"),
         }
+    }
+
+    /// M21 S2 (decision (d)): no apology copy may claim the operator
+    /// has been notified until O4 wires a real alert path.
+    #[test]
+    fn degraded_apology_copy_does_not_claim_operator_notification() {
+        assert!(
+            !DEGRADED_APOLOGY_TEXT.to_lowercase().contains("notified"),
+            "degraded copy must not claim operator notification until O4: \
+             {DEGRADED_APOLOGY_TEXT:?}",
+        );
+        assert!(
+            DEGRADED_APOLOGY_TEXT.contains("cclaw doctor"),
+            "degraded copy should point at `cclaw doctor`: {DEGRADED_APOLOGY_TEXT:?}",
+        );
     }
 
     #[test]

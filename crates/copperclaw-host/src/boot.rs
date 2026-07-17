@@ -908,6 +908,23 @@ pub async fn run_host(
         None => (None, None),
     };
 
+    // 13c-pre. M21 S2 (decision (a)): hand the container manager to the
+    // sweep as its stuck-tool actuator. The sweep detects tools past the
+    // absolute ceiling from per-session DB state; the manager owns
+    // container lifecycle, so each detection is actuated through the
+    // manager's `ReconcileAction::StuckRestart` rather than the sweep
+    // touching the runtime directly (single-writer ownership). Wired
+    // here — after the sweep loop is already registered — because the
+    // manager is built later in the boot sequence; safe, since the
+    // sweep's first pass fires a full SWEEP_POLL_MS after boot. A host
+    // booted without a manager (no image tag) keeps ceiling detections
+    // observe-only, exactly the pre-S2 behaviour.
+    if let Some(mgr) = manager_handle.as_ref() {
+        state
+            .sweep
+            .set_stuck_actuator(Arc::clone(mgr) as Arc<dyn copperclaw_host_sweep::StuckActuator>);
+    }
+
     // 13c. If the boot-time image health check flagged the host as
     // degraded, flip the manager into refuse-spawn mode now so the
     // poll loop never tries to spawn against the stale image.
