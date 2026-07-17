@@ -582,6 +582,14 @@ async fn drive_turn_inner(
                 *ui_screenshot_calls += 1;
             }
             batch_all_ok &= !is_error;
+            if is_error {
+                // The error text otherwise lives only in the model-facing
+                // tool_result (gone after compaction) — the HUD breadcrumb
+                // renders "last: <tool> failed" with no reason, so this is
+                // the one operator-visible record of WHY a tool failed.
+                let reason: String = content.chars().take(240).collect();
+                tracing::warn!(tool_turn, tool = %call.name, reason, "tool call failed");
+            }
             // F2: fold this result into the tail-run tracker in call
             // order — a run of same-blocker denials at the tail of a
             // silent turn surfaces one curated wall card at finalize.

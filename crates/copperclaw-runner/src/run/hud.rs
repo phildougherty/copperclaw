@@ -667,10 +667,17 @@ struct TodoEntry {
 }
 
 /// Current todo step line for the HUD (`step 2/5: build the UI`), read
-/// best-effort from the session's todo store. Preference order: the
-/// first `in_progress` item, else the first `pending` item. `None` when
-/// the store is missing, unparseable, or empty — the HUD simply omits
-/// the segment.
+/// best-effort from the session's todo store. The "current" item is the
+/// first `in_progress`/`pending` item AFTER the last `completed` one —
+/// an early item stuck `in_progress` (its completion refused by the
+/// evidence gate and never retried) must not pin the label while later
+/// steps advance past it. Seen live 2026-07-16: a 13-minute Telegram
+/// build whose label read "step 1/11: Scaffold vite..." from start to
+/// finish because items 1-2 were stranded `in_progress`. When nothing
+/// active follows the last completed item, falls back to the whole-list
+/// scan (first `in_progress`, else first `pending`). `None` when the
+/// store is missing, unparseable, or empty — the HUD simply omits the
+/// segment.
 fn current_todo_step(path: &Path) -> Option<String> {
     let bytes = std::fs::read(path).ok()?;
     let items: Vec<TodoEntry> = serde_json::from_slice(&bytes).ok()?;
@@ -679,9 +686,15 @@ fn current_todo_step(path: &Path) -> Option<String> {
     }
     let total = items.len();
     let completed = items.iter().filter(|i| i.status == "completed").count();
-    let current = items
+    let start = items
         .iter()
-        .find(|i| i.status == "in_progress")
+        .rposition(|i| i.status == "completed")
+        .map_or(0, |p| p + 1);
+    let is_active = |i: &&TodoEntry| i.status == "in_progress" || i.status == "pending";
+    let current = items[start..]
+        .iter()
+        .find(is_active)
+        .or_else(|| items.iter().find(|i| i.status == "in_progress"))
         .or_else(|| items.iter().find(|i| i.status == "pending"))?;
     // Step number = completed + 1 (the one being worked), clamped to total.
     let step_no = (completed + 1).min(total);
@@ -782,6 +795,48 @@ mod tests {
         )
         .unwrap();
         assert_eq!(current_todo_step(&path).as_deref(), Some("step 2/2: ship"));
+    }
+
+    #[test]
+    fn current_todo_step_skips_items_stranded_before_the_last_completed() {
+        // Regression, live 2026-07-16: items 1-2 stayed `in_progress`
+        // (their completion was refused by the evidence gate and never
+        // retried) while items 3-9 completed — the HUD label read
+        // "step 1/11: Scaffold vite..." for the whole 13-minute run.
+        // The current item must be the first ACTIVE one after the last
+        // completed item, not the first in_progress in the whole list.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("agent_todos.json");
+        std::fs::write(
+            &path,
+            r#"[
+                {"id":1,"text":"scaffold","status":"in_progress","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},
+                {"id":2,"text":"seed data","status":"in_progress","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},
+                {"id":3,"text":"build shell","status":"completed","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},
+                {"id":4,"text":"ship preview","status":"pending","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            current_todo_step(&path).as_deref(),
+            Some("step 2/4: ship preview"),
+            "stranded early in_progress items must not pin the label"
+        );
+        // Nothing active after the last completed item: fall back to the
+        // whole-list scan so a stuck item still beats showing nothing.
+        std::fs::write(
+            &path,
+            r#"[
+                {"id":1,"text":"scaffold","status":"in_progress","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"},
+                {"id":2,"text":"build shell","status":"completed","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}
+            ]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            current_todo_step(&path).as_deref(),
+            Some("step 2/2: scaffold"),
+            "fall back to the stranded item when nothing follows the last completed"
+        );
     }
 
     #[test]

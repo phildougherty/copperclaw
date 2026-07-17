@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (task-HUD step label no longer pinned by a stranded todo, 2026-07-16)
+
+- **The task HUD's `step X/N: <text>` label now tracks the first active item
+  AFTER the last completed one.** Found reviewing a live Telegram build
+  (2026-07-16): the agent's completion of todos 1-2 was refused by the
+  evidence gate (correctly — no verification yet) and never retried, so both
+  sat `in_progress` while items 3-9 completed — and the HUD label read
+  "step 1/11: Scaffold vite..." for the entire 13-minute run because
+  `current_todo_step()` picked the FIRST `in_progress` item. It now scans
+  from just past the last `completed` item, falling back to the old
+  whole-list preference (first `in_progress`, else first `pending`) when
+  nothing active follows it. `crates/copperclaw-runner/src/run/hud.rs`, with
+  a regression test mirroring the live shape.
+
+- **Tool-call failures are now visible in the runner log.** The same session
+  showed `last: todo_update failed` / `last: ui_screenshot failed` HUD
+  breadcrumbs with no recoverable reason anywhere: the error text lives only
+  in the model-facing `tool_result` (gone after compaction) and the runner
+  logged nothing. `drive_turn` now emits one `WARN` per failed tool call
+  (`tool`, first 240 chars of the error as `reason`, `tool_turn`) so
+  operators can answer "WHY did that tool fail" from `docker logs` /
+  `copperclaw logs` after the fact.
+  `crates/copperclaw-runner/src/run/drive_turn.rs`.
+
 ### Changed (web_search exempt from the taint half of the provenance gate, 2026-07-16)
 
 - **`web_search` no longer self-locks on tainted turns.** Found live in a
