@@ -39,9 +39,20 @@ copperclaw-metrics.workspace = true
 sha2 = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+# Test-only: `test-util` unlocks tokio's paused-clock controls
+# (`start_paused`, `time::advance`) so the connection-cache idle-reap tests
+# run with zero real waits (M21 F4).
+tokio = { workspace = true, features = ["test-util"] }
 wiremock = "0.6"
 tempfile = "3"
+
+# M21 F4: the connection-cache integration proof drives a real stdio MCP
+# server (this test binary re-executed in stub mode), so it needs raw
+# ownership of stdout — libtest's harness would interleave its own output
+# into the MCP stream.
+[[test]]
+name = "external_cache_stub"
+harness = false
 
 [lints]
 workspace = true

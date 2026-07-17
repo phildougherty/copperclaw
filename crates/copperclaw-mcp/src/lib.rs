@@ -22,6 +22,7 @@ pub mod client;
 pub mod context;
 pub mod error;
 pub mod external;
+pub mod external_cache;
 pub mod filter;
 pub mod server;
 pub mod tools;
@@ -40,6 +41,7 @@ pub use context::{
 };
 pub use error::{McpError, ToolError};
 pub use external::{call_external_tool, connect_filtered};
+pub use external_cache::{DEFAULT_IDLE_TTL, McpConnectionCache, call_external_tool_cached};
 pub use filter::{ALLOWED_TOOLS_KEY, DENIED_TOOLS_KEY, FilterRejection, ToolFilter};
 
 pub use server::{CopperclawServer, build_server};

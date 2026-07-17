@@ -909,6 +909,10 @@ impl DeliveryService {
         // but routes to the tunnel broker instead of the preview broker.
         let tunnel_broker = self.tunnel_broker.get().map(Arc::clone);
         let preview_session = SessionInfoLite::new(sess.id, sess.agent_group_id);
+        // M21 F4: the session id scopes the external-MCP connection cache —
+        // connections are reused across this session's calls, never shared
+        // across sessions.
+        let mcp_scope = sess.id.as_uuid().to_string();
 
         // Claim the guard and hand everything to a detached task. The guard is
         // cleared on drop (including panic), so a wedged task can't permanently
@@ -931,7 +935,7 @@ impl DeliveryService {
                     )
                     .await
                 } else {
-                    Self::execute_mcp_call_bounded(&servers, &req).await
+                    Self::execute_mcp_call_bounded(&servers, &req, &mcp_scope).await
                 };
                 match inbound_pool.connect() {
                     Ok(inb) => {
@@ -1063,8 +1067,9 @@ impl DeliveryService {
     async fn execute_mcp_call_bounded(
         servers: &serde_json::Value,
         req: &mcp_calls::McpCallRequest,
+        session_scope: &str,
     ) -> mcp_calls::McpCallResponse {
-        let fut = Self::execute_mcp_call(servers, req);
+        let fut = Self::execute_mcp_call(servers, req, session_scope);
         match tokio::time::timeout(Duration::from_secs(HOST_MCP_CALL_DEADLINE_SECS), fut).await {
             Ok(resp) => resp,
             Err(_) => mcp_calls::McpCallResponse {
@@ -1083,9 +1088,15 @@ impl DeliveryService {
     /// host-written response row. Every failure mode (missing server, connect
     /// failure, filter-denied, remote error) becomes an `is_error` response —
     /// the runner's blocking poll is never left unanswered.
+    ///
+    /// Connections are reused across a session's sequential calls (M21 F4):
+    /// `session_scope` keys `copperclaw-mcp`'s per-session connection cache,
+    /// which idle-reaps and transparently retries a dead cached connection
+    /// once on a fresh one before erroring.
     async fn execute_mcp_call(
         servers: &serde_json::Value,
         req: &mcp_calls::McpCallRequest,
+        session_scope: &str,
     ) -> mcp_calls::McpCallResponse {
         let Some(entry) = servers.get(&req.server) else {
             return mcp_calls::McpCallResponse {
@@ -1097,7 +1108,14 @@ impl DeliveryService {
                 ),
             };
         };
-        match copperclaw_mcp::call_external_tool(entry, &req.tool, req.input.clone()).await {
+        match copperclaw_mcp::call_external_tool_cached(
+            session_scope,
+            entry,
+            &req.tool,
+            req.input.clone(),
+        )
+        .await
+        {
             Ok(value) => {
                 let is_error = value
                     .get("is_error")
@@ -7842,7 +7860,7 @@ mod tests {
             tool: "forecast".into(),
             input: serde_json::json!({}),
         };
-        let resp = DeliveryService::execute_mcp_call(&servers, &req).await;
+        let resp = DeliveryService::execute_mcp_call(&servers, &req, "test-scope-r1").await;
         assert!(resp.is_error);
         assert!(resp.result.contains("ghost"), "got: {}", resp.result);
         assert_eq!(resp.request_id, "r1");
@@ -7861,7 +7879,7 @@ mod tests {
             tool: "forecast".into(),
             input: serde_json::json!({}),
         };
-        let resp = DeliveryService::execute_mcp_call(&servers, &req).await;
+        let resp = DeliveryService::execute_mcp_call(&servers, &req, "test-scope-r2").await;
         assert!(resp.is_error);
         assert!(resp.result.contains("forecast"), "got: {}", resp.result);
     }

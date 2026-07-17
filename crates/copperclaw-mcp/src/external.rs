@@ -8,11 +8,12 @@
 //! transport-selection + filter-wrap implementation and the two callers can
 //! never drift.
 //!
-//! "Connect per call" is deliberate: the host keeps no live in-memory
-//! connection registry (it is stateless poll-from-DB by design), so
-//! [`call_external_tool`] connects the one named server, calls the one tool
-//! through its filter, and drops the connection. A short-lived connection
-//! cache is a later optimization, not a correctness requirement.
+//! [`call_external_tool`] is the *uncached* primitive: it connects the one
+//! named server, calls the one tool through its filter, and drops the
+//! connection. The hot host-proxied tool-call path uses
+//! [`crate::external_cache::call_external_tool_cached`] instead (M21 F4),
+//! which reuses a per-session connection keyed by server config and falls
+//! back to exactly this fresh-connect behavior on a miss.
 
 use std::collections::HashMap;
 
