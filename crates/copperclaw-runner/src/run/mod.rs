@@ -13,6 +13,7 @@ pub(super) mod blocker;
 pub mod delegate_batch;
 pub(super) mod drive_turn;
 pub mod external_mcp;
+pub(super) mod failover_health;
 pub(super) mod formatting;
 pub mod hud;
 pub mod preview;
@@ -43,8 +44,14 @@ use crate::compaction::{CompactionCfg, compact, estimate_tokens};
 use crate::formatter::format_messages;
 use crate::state::{load_state, save_state};
 
-use self::drive_turn::{TurnOutcome, drive_turn};
+use self::drive_turn::{TurnOutcome, drive_turn_with_health};
+use self::failover_health::FailoverHealth;
 use self::provider_call::touch_heartbeat;
+// The 4-arg `drive_turn` wrapper (session-scoped health created per call) is
+// used only by the runner's own tests; production drives through
+// `drive_turn_with_health` with the loop-scoped `FailoverHealth`.
+#[cfg(test)]
+use self::drive_turn::drive_turn;
 
 /// Default poll interval (ms) while the loop is idle.
 pub const POLL_INTERVAL_MS: u64 = 1000;
@@ -655,6 +662,14 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
     let mut turns_run: usize = 0;
     let mut first_poll = true;
 
+    // M21 O3: live provider-health for the failover chain, created ONCE per
+    // session and shared across every turn, so a primary that dies mid-session
+    // is skipped on the NEXT call (not re-tried every turn until respawn) and a
+    // primary that recovers is restored after the re-probe window — without a
+    // container respawn. Byte-identical for the common single-provider case
+    // (`select_start` always returns 0, no transitions).
+    let failover_health = FailoverHealth::from_deps(&deps);
+
     loop {
         if let Some(limit) = deps.max_turns {
             if turns_run >= limit {
@@ -854,11 +869,12 @@ pub async fn run_loop(deps: RunnerDeps) -> Result<()> {
             }
         }
 
-        let turn = drive_turn(
+        let turn = drive_turn_with_health(
             &deps,
             &mut state.history,
             state.continuation.as_deref(),
             context_block.as_deref(),
+            &failover_health,
         )
         .await?;
         state.continuation = turn.continuation.or(state.continuation);

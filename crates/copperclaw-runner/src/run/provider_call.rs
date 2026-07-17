@@ -7,11 +7,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use copperclaw_providers::{AgentProvider, AgentQuery, ProviderError, QueryInput};
+use copperclaw_providers::{AgentProvider, AgentQuery, DegradeReason, ProviderError, QueryInput};
 use copperclaw_types::ProviderEvent;
 use tokio::time::{sleep, timeout};
 
 use super::drive_turn::{LlmTurnOutput, PendingToolCall, TurnOutcome};
+use super::failover_health::FailoverHealth;
 use super::hud::TaskHud;
 use super::{RunnerDeps, clear_current_tool, emit_usage_report, set_current_tool};
 
@@ -98,12 +99,23 @@ fn format_provider_failure_reason(err: &ProviderError) -> String {
 /// callers and tests that don't care about channel context aren't
 /// forced to populate the field. `hud` is the inbound's Task HUD, used
 /// to surface the "switched to <provider>" note on a mid-turn failover.
+///
+/// M21 O3: `health` is the session's live [`FailoverHealth`]. The runner
+/// re-consults it here, at every provider-call construction, to decide which
+/// candidate to START on — a primary that died on an earlier call (this turn
+/// or an earlier inbound) is skipped until its cooldown lapses, and a
+/// recovered primary is restored — instead of blindly re-trying the primary
+/// every call. Terminal failures/successes are recorded back into `health`
+/// so the NEXT call routes correctly. For a single-provider chain
+/// `select_start` is always 0 and no transition ever fires, so the
+/// no-failover path is byte-identical.
 pub(super) async fn run_llm_turn(
     deps: &RunnerDeps,
     history: &[copperclaw_providers::HistoryMessage],
     previous_continuation: Option<&str>,
     context_block: Option<&str>,
     hud: &TaskHud,
+    health: &FailoverHealth,
 ) -> Result<LlmTurnOutput> {
     // Shrink the replayed transcript: stub stale, oversized tool-result
     // bodies (old file reads, command stdout, diffs) so they aren't
@@ -123,7 +135,16 @@ pub(super) async fn run_llm_turn(
 
     // Candidate sequence: primary at index 0, then the fallback chain.
     let total_candidates = 1 + deps.failover_chain.len();
-    for idx in 0..total_candidates {
+    // M21 O3: consult live chain health to decide which candidate this call
+    // STARTS on. `select_start` returns 0 (the primary) for a healthy or
+    // single-provider chain — byte-identical to the historical walk — but a
+    // primary degraded by an earlier call is skipped here until its cooldown
+    // lapses, and once it does the primary is selected again (restored). We
+    // still walk forward through the remaining candidates on a mid-call
+    // failure, exactly as before.
+    let now = chrono::Utc::now();
+    let start_idx = health.select_start(now).min(total_candidates - 1);
+    for idx in start_idx..total_candidates {
         let (provider, model, provider_name): (&dyn AgentProvider, &str, &str) = if idx == 0 {
             (
                 deps.provider.as_ref(),
@@ -138,6 +159,23 @@ pub(super) async fn run_llm_turn(
                 e.provider_name.as_str(),
             )
         };
+
+        // M21 O3: announce a provider transition — a mid-call failover OR a
+        // cross-call switch that health moved the start point to — with the
+        // EXISTING "switched to <provider>" HUD note and the failover metric.
+        // `enter_candidate` returns None on the session's first candidate and
+        // whenever the serving provider is unchanged, so a steady chain never
+        // spams notes.
+        if let Some(t) = health.enter_candidate(idx) {
+            hud.add_note(&format!("switched to {}", t.to));
+            // Reuse the existing transition counter (M18 R5). M1 metric wish:
+            // a dedicated live-failover counter that distinguishes a *degrade*
+            // (moving to a higher-index fallback) from a *restore* (moving
+            // back toward the primary after re-probe), plus a gauge of the
+            // currently-active chain position, so operators can see live
+            // failover activity separately from spawn-time selection.
+            copperclaw_metrics::inc_provider_failover(&t.from, &t.to);
+        }
 
         let input = QueryInput {
             system: deps.system.clone(),
@@ -186,6 +224,16 @@ pub(super) async fn run_llm_turn(
                 .usage_fail_reason
                 .clone()
                 .unwrap_or_else(|| "provider stream ended with an error event".to_string());
+            // M21 O3: degrade this candidate in live health so the NEXT
+            // call's `select_start` routes around it for the cooldown window.
+            // Classify with the SAME `DegradeReason::from_error_text` the host
+            // uses on `agent_turns.error`, so only resilience-relevant
+            // failures degrade the chain — a 4xx bad-request never does. When
+            // the classifier returns None we still fail over within this call
+            // (unchanged), we just don't record a cooldown.
+            if let Some(reason) = DegradeReason::from_error_text(&usage_reason) {
+                health.record_failure(idx, reason, turn_started_at);
+            }
             emit_usage_report(
                 deps,
                 provider_name,
@@ -210,10 +258,12 @@ pub(super) async fn run_llm_turn(
                 return Ok(attempt.out);
             }
 
-            // Switch to the next healthy entry and retry the SAME call.
+            // Fail over to the next candidate and retry the SAME call. The
+            // "switched to <provider>" HUD note + failover metric are emitted
+            // by `enter_candidate` at the top of the next iteration (M21 O3
+            // unified both the mid-call and cross-call transition surfaces
+            // there), so we only log here.
             let next = &deps.failover_chain[idx];
-            // R5: count the hot failover switch (failed provider → next serving).
-            copperclaw_metrics::inc_provider_failover(provider_name, &next.provider_name);
             tracing::warn!(
                 failed_provider = provider_name,
                 failed_model = model,
@@ -221,15 +271,16 @@ pub(super) async fn run_llm_turn(
                 next_model = %next.model,
                 "provider exhausted its retries; failing over to next healthy entry"
             );
-            // Note the switch on the Task HUD so the user isn't confused by
-            // a mid-run style change (H1 HUD note, R2/R5 hook).
-            hud.add_note(&format!("switched to {}", next.provider_name));
             continue;
         }
 
-        // Success against this candidate. Surface the per-call token counts
-        // on the returned output so `drive_turn` can accumulate them across
-        // the tool loop for the per-task ceiling.
+        // Success against this candidate. Restore it to healthy in live
+        // health (the "restore on recovery" half — a no-op when it was
+        // already healthy) so a re-probed primary is preferred again.
+        health.record_success(idx);
+        // Surface the per-call token counts on the returned output so
+        // `drive_turn` can accumulate them across the tool loop for the
+        // per-task ceiling.
         let mut out = attempt.out;
         out.input_tokens = attempt.input_tokens;
         out.output_tokens = attempt.output_tokens;
@@ -1308,8 +1359,11 @@ mod tests {
             provider_name: "ollama".into(),
         }];
         let hud = TaskHud::new(&deps);
+        let health = FailoverHealth::from_deps(&deps);
 
-        let out = run_llm_turn(&deps, &[], None, None, &hud).await.unwrap();
+        let out = run_llm_turn(&deps, &[], None, None, &hud, &health)
+            .await
+            .unwrap();
         assert!(!out.failed, "the fallback served the turn, not a failure");
         assert_eq!(out.text, "built by the fallback");
 
@@ -1346,8 +1400,11 @@ mod tests {
             provider_name: "ollama".into(),
         }];
         let hud = TaskHud::new(&deps);
+        let health = FailoverHealth::from_deps(&deps);
 
-        let out = run_llm_turn(&deps, &[], None, None, &hud).await.unwrap();
+        let out = run_llm_turn(&deps, &[], None, None, &hud, &health)
+            .await
+            .unwrap();
         assert!(out.failed, "whole chain exhausted → terminal failure");
         assert!(
             out.failure_reason
@@ -1366,12 +1423,127 @@ mod tests {
         let (deps, _tmp, _paths) = failover_deps(primary, "model-a");
         assert!(deps.failover_chain.is_empty());
         let hud = TaskHud::new(&deps);
+        let health = FailoverHealth::from_deps(&deps);
 
-        let out = run_llm_turn(&deps, &[], None, None, &hud).await.unwrap();
+        let out = run_llm_turn(&deps, &[], None, None, &hud, &health)
+            .await
+            .unwrap();
         assert!(out.failed);
         assert!(
             hud.note_for_test().is_none(),
             "no failover note without a chain"
         );
+    }
+
+    /// A provider that fails its query with a resilience-relevant error
+    /// (server 5xx) so `DegradeReason::from_error_text` classifies it and the
+    /// live health machinery degrades the entry. Counts invocations so a test
+    /// can prove a dead candidate was SKIPPED on a later call.
+    struct CountingServerErrorProvider {
+        name: &'static str,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl AgentProvider for CountingServerErrorProvider {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+        async fn query(
+            &self,
+            _input: QueryInput,
+        ) -> std::result::Result<Box<dyn AgentQuery>, ProviderError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(ProviderError::Api {
+                status: 503,
+                message: "upstream down".into(),
+            })
+        }
+        fn is_session_invalid(&self, _err: &ProviderError) -> bool {
+            false
+        }
+    }
+
+    /// M21 O3 acceptance: once the primary has died mid-session (a recorded
+    /// resilience failure), the NEXT call skips it entirely and serves off the
+    /// fallback — WITHOUT any container respawn. Proven by the primary's query
+    /// never being invoked on the second call.
+    #[tokio::test]
+    async fn dead_primary_is_skipped_on_next_call() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let primary: Arc<dyn AgentProvider> = Arc::new(CountingServerErrorProvider {
+            name: "anthropic",
+            calls: calls.clone(),
+        });
+        let (mut deps, _tmp, _paths) = failover_deps(primary, "model-a");
+        deps.failover_chain = vec![FailoverProvider {
+            provider: ScriptedProvider::new(vec![vec![ProviderEvent::Result {
+                text: Some("served by the fallback".into()),
+            }]]),
+            model: "model-b".into(),
+            provider_name: "ollama".into(),
+        }];
+        let health = FailoverHealth::from_deps(&deps);
+
+        // Pre-degrade the primary as if it died on an earlier call this
+        // session (cooldown_until is 2 minutes in the future, so it is not
+        // yet re-probe-eligible).
+        health.record_failure(0, DegradeReason::ServerError, chrono::Utc::now());
+
+        let hud = TaskHud::new(&deps);
+        let out = run_llm_turn(&deps, &[], None, None, &hud, &health)
+            .await
+            .unwrap();
+
+        assert!(!out.failed, "the healthy fallback served the turn");
+        assert_eq!(out.text, "served by the fallback");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the dead primary must not be queried at all on the next call"
+        );
+    }
+
+    /// M21 O3 acceptance: after the re-probe window elapses, the primary is
+    /// restored — the call starts on it again and (on success) it is promoted
+    /// back to healthy, with a "switched to" note announcing the restore.
+    #[tokio::test]
+    async fn recovered_primary_is_restored_after_reprobe_window() {
+        let primary: Arc<dyn AgentProvider> =
+            ScriptedProvider::new(vec![vec![ProviderEvent::Result {
+                text: Some("primary is back".into()),
+            }]]);
+        let (mut deps, _tmp, _paths) = failover_deps(primary, "model-a");
+        deps.failover_chain = vec![FailoverProvider {
+            provider: Arc::new(FailingProvider { name: "ollama" }),
+            model: "model-b".into(),
+            provider_name: "ollama".into(),
+        }];
+        let health = FailoverHealth::from_deps(&deps);
+
+        // Simulate the earlier degraded state: the session was serving the
+        // fallback, and the primary's failure is now OLDER than the re-probe
+        // window, so it is eligible again.
+        assert_eq!(
+            health.enter_candidate(1),
+            None,
+            "seed the last-served provider to the fallback"
+        );
+        health.record_failure(
+            0,
+            DegradeReason::ServerError,
+            chrono::Utc::now() - chrono::Duration::minutes(3),
+        );
+
+        let hud = TaskHud::new(&deps);
+        let out = run_llm_turn(&deps, &[], None, None, &hud, &health)
+            .await
+            .unwrap();
+
+        assert!(!out.failed, "the restored primary served the turn");
+        assert_eq!(out.text, "primary is back");
+        // The primary here is a `ScriptedProvider` (name "scripted"); the
+        // restore is announced with the existing switch note.
+        assert_eq!(hud.note_for_test().as_deref(), Some("switched to scripted"),);
     }
 }
