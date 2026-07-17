@@ -6,6 +6,41 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (web_search exempt from the taint half of the provenance gate, 2026-07-16)
+
+- **`web_search` no longer self-locks on tainted turns.** Found live in a
+  telegram smoke test: the FIRST `web_search` succeeded, its results (untrusted
+  web content) tainted the turn, and the M16 provenance gate then denied every
+  follow-up `web_search` in the same turn as "a credentialed external action on
+  a tainted turn" — iterative research (search, read, refine, search again) was
+  structurally impossible. `web_search` is now EXEMPT from the **taint** half of
+  the gate, by the same local-vs-attacker-chosen boundary as the M19 A7 LAN
+  preview exemption: a search query egresses only to the operator-configured
+  provider endpoint (`TAVILY_API_KEY` et al), never to an attacker-chosen one,
+  so a poisoned turn cannot use it to route the agent's credentials at an
+  attacker target — the worst it can do is choose a query string the attacker
+  never sees. New `PROVIDER_PINNED_SEARCH_TOOLS` tight allow-list +
+  `is_provider_pinned_search()` in `crates/copperclaw-runner/src/policy.rs`;
+  the rule for future entries is documented there: never add a tool whose call
+  arguments can name an endpoint. Unchanged: the **autonomy** half still blocks
+  `web_search` on autonomous/heartbeat turns; search results still taint the
+  turn, so `web_fetch`, external MCP tools, and `make_preview_public` remain
+  gated behind fresh approval; all profile/skill/role layers untouched. New
+  unit tests pin the exemption and the still-blocked neighbours.
+
+### Fixed (cclaw doctor: env-var checks now consult the install's .env, 2026-07-16)
+
+- **`cclaw doctor` no longer reports a configured web-search provider as
+  missing.** The `web-search` and `anthropic-key` checks only read the cclaw
+  shell's env, so a `TAVILY_API_KEY` living in the install's `.env` (the normal
+  setup-written case — the host reads it at boot and forwards it into session
+  containers) reported "no web_search providers configured", sending the
+  operator down the wrong debugging path. Both checks now also parse
+  `<install_root>/.env` for non-empty keys (presence only — values are never
+  read out; new `install_env_nonempty_keys()` in
+  `crates/copperclaw-cclaw/src/lib.rs`) and report the source
+  (`tavily (.env)` vs `tavily (shell env)`).
+
 ### Security (M20 D1/D5 — recorded security-review pass for the in-container vision tools, 2026-07-16)
 
 - **Reviewed and PASSED** the two M20 cards that change the default posture:

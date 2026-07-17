@@ -716,6 +716,31 @@ fn resolve_install_root() -> Option<std::path::PathBuf> {
     })
 }
 
+/// Key names with a non-empty value in the install's `.env`, for doctor's
+/// env-var courtesy checks. Presence only — values are never read out of
+/// this function. Tolerates `export KEY=...`, quoted values, comments, and
+/// a missing file (empty set).
+fn install_env_nonempty_keys() -> std::collections::HashSet<String> {
+    let Some(root) = resolve_install_root() else {
+        return std::collections::HashSet::new();
+    };
+    let Ok(body) = std::fs::read_to_string(root.join(".env")) else {
+        return std::collections::HashSet::new();
+    };
+    body.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let line = line.strip_prefix("export ").unwrap_or(line);
+            let (key, value) = line.split_once('=')?;
+            let value = value.trim().trim_matches('"').trim_matches('\'');
+            (!value.is_empty()).then(|| key.trim().to_string())
+        })
+        .collect()
+}
+
 /// `cclaw health` — one-shot operator probe. Lists session-state
 /// counts (running / idle / stopped) and the last 5 audit entries
 /// so the operator can see at a glance whether the host is alive
@@ -1086,11 +1111,13 @@ where
         }
     }
 
-    // 7. Env-var sanity (local checks, no transport call). These
-    //    look at the cclaw client's env which is the operator's env;
-    //    the host inherits the same env when launched from a
-    //    setup-written `.env` file, so a missing var here is almost
-    //    certainly the same one the host saw on boot.
+    // 7. Env-var sanity (local checks, no transport call). The host reads
+    //    its keys from its own env / the install's `.env` at boot — the
+    //    cclaw shell's env is only a proxy. Check BOTH so a key that lives
+    //    only in `.env` (the normal setup-written case) reads as configured
+    //    instead of producing a misleading "unset" (found live 2026-07-16:
+    //    a configured TAVILY_API_KEY reported as "no providers").
+    let env_file_keys = install_env_nonempty_keys();
     if std::env::var("ANTHROPIC_API_KEY")
         .map(|s| !s.is_empty())
         .unwrap_or(false)
@@ -1099,17 +1126,23 @@ where
             "anthropic-key",
             "ANTHROPIC_API_KEY is set in this shell's env",
         ));
+    } else if env_file_keys.contains("ANTHROPIC_API_KEY") {
+        checks.push(Check::ok(
+            "anthropic-key",
+            "ANTHROPIC_API_KEY is set in the install's .env (the host reads it at boot)",
+        ));
     } else {
         checks.push(Check::warn(
             "anthropic-key",
-            "ANTHROPIC_API_KEY is unset in this shell — the host reads it from its own env / .env, so this is only conclusive when you launched `copperclaw run` from this shell",
+            "ANTHROPIC_API_KEY is unset in this shell and in the install's .env — the host may still have it from the env it was launched with",
             Some("set ANTHROPIC_API_KEY in the install's .env (typically under $XDG_DATA_HOME/copperclaw/.env on Linux)"),
         ));
     }
 
     // 8. Web-search providers (informational only — none configured
-    //    is a perfectly valid install).
-    let providers: Vec<&'static str> = [
+    //    is a perfectly valid install). Keys in the install's `.env`
+    //    count: the host forwards them into session containers at spawn.
+    let providers: Vec<String> = [
         ("TAVILY_API_KEY", "tavily"),
         ("EXA_API_KEY", "exa"),
         ("BRAVE_SEARCH_API_KEY", "brave"),
@@ -1117,16 +1150,20 @@ where
     ]
     .iter()
     .filter_map(|(var, name)| {
-        std::env::var(var)
-            .ok()
-            .filter(|s| !s.is_empty())
-            .map(|_| *name)
+        let in_shell = std::env::var(var).ok().filter(|s| !s.is_empty()).is_some();
+        if in_shell {
+            Some(format!("{name} (shell env)"))
+        } else if env_file_keys.contains(*var) {
+            Some(format!("{name} (.env)"))
+        } else {
+            None
+        }
     })
     .collect();
     if providers.is_empty() {
         checks.push(Check::ok(
             "web-search",
-            "no web_search providers configured (the tool will surface a friendly error if the agent calls it)",
+            "no web_search providers configured in this shell or the install's .env (the tool will surface a friendly error if the agent calls it)",
         ));
     } else {
         checks.push(Check::ok(

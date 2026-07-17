@@ -389,23 +389,34 @@ mod tests {
     async fn untrusted_context_blocks_credentialed_external_at_dispatch() {
         // Headline Phase 3 case wired end-to-end through the dispatch gate:
         // once the turn is tainted (as a web_fetch body would), a credentialed
-        // external action (web_search) is blocked absent fresh approval — even
+        // external action (web_fetch) is blocked absent fresh approval — even
         // though the Full profile would otherwise allow it.
         let (_tmp, deps, ctx) = deps_with_runner_ctx();
-        // Clean turn: web_search dispatches (it'll fail downstream without a
+        // Clean turn: web_fetch dispatches (it'll fail downstream without a
         // network stub, but NOT with a policy deny — that's what we assert).
-        let (clean, _i, _e) = invoke_tool(&deps, &call("web_search")).await;
+        let (clean, _i, _e) = invoke_tool(&deps, &call("web_fetch")).await;
         assert!(
             !clean.contains("untrusted-provenance"),
             "a clean turn must not be gated; got: {clean}"
         );
         // Taint the turn the way a web_fetch body does.
         ctx.mark_untrusted_context("web_fetch:https://evil.example");
-        let (blocked, _i, is_error) = invoke_tool(&deps, &call("web_search")).await;
+        let (blocked, _i, is_error) = invoke_tool(&deps, &call("web_fetch")).await;
         assert!(is_error);
         assert!(
             blocked.contains("untrusted-provenance"),
             "tainted turn must block credentialed external action; got: {blocked}"
+        );
+        // `web_search` is provider-pinned (taint-exempt) and stays reachable
+        // on the tainted turn — see PROVIDER_PINNED_SEARCH_TOOLS.
+        let (search, _i, _e) = invoke_tool(
+            &deps,
+            &call_with("web_search", serde_json::json!({"query": "x"})),
+        )
+        .await;
+        assert!(
+            !search.contains("untrusted-provenance"),
+            "web_search must stay reachable on a tainted turn; got: {search}"
         );
         // Non-credentialed tools still pass on a tainted turn.
         let (mem, _i, _e) = invoke_tool(
@@ -458,17 +469,19 @@ mod tests {
             blocked.contains("untrusted-provenance"),
             "tainted turn must block credentialed external action; got: {blocked}"
         );
-        // A second web_search is likewise blocked now (it is itself a
-        // credentialed external action, and the turn is tainted).
-        let (blocked2, _i, is_error2) = invoke_tool(
+        // A second web_search stays REACHABLE on its own taint — it is
+        // provider-pinned (no attacker-chosen endpoint), so iterative research
+        // (search, read, refine, search again) is possible in one turn. It
+        // still fails downstream without a provider key, but NOT with a
+        // policy deny — see PROVIDER_PINNED_SEARCH_TOOLS.
+        let (followup, _i, _e2) = invoke_tool(
             &deps,
             &call_with("web_search", serde_json::json!({"query": "again"})),
         )
         .await;
-        assert!(is_error2);
         assert!(
-            blocked2.contains("untrusted-provenance"),
-            "a tainted turn must block a follow-up web_search too; got: {blocked2}"
+            !followup.contains("untrusted-provenance"),
+            "a follow-up web_search must not be taint-gated; got: {followup}"
         );
         // Non-credentialed tools stay reachable on the tainted turn.
         let (mem, _i, _e) = invoke_tool(

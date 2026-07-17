@@ -229,6 +229,12 @@ const BROWSER_WRITE_TOOLS: &[&str] = &["browser_interact"];
 /// only the in-tree ones that egress on the broker's dime.
 const CREDENTIALED_EXTERNAL_TOOLS: &[&str] = &[
     "web_fetch",
+    // `web_search` rides the **autonomy** half of this gate only — it is
+    // EXEMPT from the **taint** half (see [`PROVIDER_PINNED_SEARCH_TOOLS`]).
+    // A search query egresses solely to the operator-configured provider
+    // endpoint, never to an attacker-chosen one, so a tainted turn cannot use
+    // it to route the agent's credentials at an attacker target the way a
+    // `web_fetch` URL can.
     "web_search",
     "install_packages",
     "add_mcp_server",
@@ -277,6 +283,39 @@ const CREDENTIALED_EXTERNAL_TOOLS: &[&str] = &[
 /// allow-list of the two LAN verbs (never a "preview*"-style prefix match)
 /// ensures a future public verb cannot silently inherit the taint exemption.
 const LAN_PREVIEW_TOOLS: &[&str] = &["expose_preview", "close_preview"];
+
+/// Provider-pinned search verbs EXEMPT from the coarse **taint** gate, by the
+/// same local-vs-attacker-chosen boundary as [`LAN_PREVIEW_TOOLS`] (M19 A7).
+///
+/// The confused-deputy defence the taint gate implements is about a
+/// prompt-injected turn routing the agent's credentials or context at an
+/// **attacker-chosen endpoint** — a `web_fetch` URL, a public tunnel, an
+/// external MCP server. A `web_search` call has no attacker-chosen endpoint:
+/// the query goes only to the operator-configured provider (`TAVILY_API_KEY`
+/// et al — see `docs/web-search.md`), an endpoint the operator trusted with an
+/// API key at setup time. The worst a poisoned turn can do is choose the query
+/// string, which the attacker cannot observe.
+///
+/// Without this exemption the tool self-locks: the FIRST search's results are
+/// untrusted content and taint the turn, so every FOLLOW-UP search in the same
+/// turn was denied — iterative research (search, read, refine, search again)
+/// was structurally impossible (found live, 2026-07-16 telegram smoke test).
+///
+/// What still applies to `web_search`:
+///   - the **autonomy** half of the gate (an autonomous/heartbeat turn may not
+///     search — no human present; see [`CREDENTIALED_EXTERNAL_TOOLS`]);
+///   - every positive allow-list layer (profile ceiling, skill allowed-tools);
+///   - result provenance: search results still come back untrusted and still
+///     taint the turn, so `web_fetch` and every other outward credentialed
+///     action remain gated behind fresh approval.
+///
+/// CONTRAST — deliberately NOT exempt: `web_fetch` (attacker-chosen URL is the
+/// canonical exfil channel — query strings carry data to hosts the attacker
+/// reads), external MCP tools (`mcp__*`, attacker may choose arguments to a
+/// server that reaches arbitrary systems), and `make_preview_public`. Keep
+/// this list a tight allow-list of provider-pinned search verbs; never add a
+/// tool whose call arguments can name an endpoint.
+const PROVIDER_PINNED_SEARCH_TOOLS: &[&str] = &["web_search"];
 
 /// Every tool-name list this policy references, labelled for diagnostics.
 ///
@@ -331,6 +370,16 @@ pub fn is_credentialed_external(tool: &str) -> bool {
 #[must_use]
 pub fn is_lan_preview(tool: &str) -> bool {
     LAN_PREVIEW_TOOLS.contains(&tool)
+}
+
+/// True when `tool` is a provider-pinned search verb EXEMPT from the coarse
+/// **taint** gate (see [`PROVIDER_PINNED_SEARCH_TOOLS`]). The autonomy gate and
+/// all positive allow-list layers still apply — only the taint block is lifted,
+/// because the call's egress endpoint is operator-configured, never
+/// attacker-chosen.
+#[must_use]
+pub fn is_provider_pinned_search(tool: &str) -> bool {
+    PROVIDER_PINNED_SEARCH_TOOLS.contains(&tool)
 }
 
 /// A group's tool profile: the positive allow-list the agent is scoped
@@ -643,14 +692,23 @@ impl ToolPolicy {
             // A tainted turn (context touched untrusted-provenance content,
             // e.g. a web_fetch body or an untrusted memory hit) blocks
             // credentialed external actions until a FRESH approval clears it —
-            // EXCEPT LAN-only preview verbs (M19 A7). Exposing a preview
-            // reachable only on the operator's own LAN is a *local surface*, not
-            // an outward credentialed action, so a web-tainted "research then
-            // build" turn can show the operator the app it just built without a
-            // fresh approval. Public/tunnel verbs (e.g. `make_preview_public`,
-            // A3) are NOT in `is_lan_preview` and stay fully taint-gated. The
-            // autonomy block above still bites on these LAN verbs.
-            if self.trust.tainted && !self.trust.approved && !is_lan_preview(tool) {
+            // EXCEPT LAN-only preview verbs (M19 A7) and provider-pinned
+            // search verbs. Exposing a preview reachable only on the
+            // operator's own LAN is a *local surface*, not an outward
+            // credentialed action, so a web-tainted "research then build" turn
+            // can show the operator the app it just built without a fresh
+            // approval. A `web_search` egresses only to the operator-configured
+            // provider — no attacker-chosen endpoint — so iterative research
+            // (whose own first search taints the turn) stays possible; see
+            // [`PROVIDER_PINNED_SEARCH_TOOLS`]. Public/tunnel verbs (e.g.
+            // `make_preview_public`, A3) are in neither exemption and stay
+            // fully taint-gated. The autonomy block above still bites on every
+            // exempt verb.
+            if self.trust.tainted
+                && !self.trust.approved
+                && !is_lan_preview(tool)
+                && !is_provider_pinned_search(tool)
+            {
                 copperclaw_metrics::inc_policy_denied("provenance", tool);
                 return PolicyDecision::Deny(format!(
                     "Tool `{tool}` takes a credentialed external action, but this turn's context contains untrusted-provenance content (e.g. a fetched page or an untrusted memory entry). Fresh approval is required before a credentialed external action can run on a tainted turn."
@@ -1033,6 +1091,46 @@ mod tests {
     }
 
     #[test]
+    fn tainted_turn_allows_provider_pinned_search_but_not_fetch() {
+        // The taint exemption for provider-pinned search: web_search egresses
+        // only to the operator-configured provider, so a turn tainted by its
+        // OWN first search's results can keep searching (iterative research),
+        // while web_fetch (attacker-chosen URL) and external MCP tools stay
+        // blocked until fresh approval.
+        assert!(is_provider_pinned_search("web_search"));
+        assert!(!is_provider_pinned_search("web_fetch"));
+        assert!(!is_provider_pinned_search("mcp__weather__forecast"));
+        assert!(!is_provider_pinned_search("make_preview_public"));
+        let tainted = ToolPolicy::new(ToolProfile::Full, None).with_trust(TurnTrust {
+            tainted: true,
+            approved: false,
+            autonomous: false,
+        });
+        assert!(
+            tainted.evaluate("web_search").is_allow(),
+            "a tainted turn must still allow provider-pinned search"
+        );
+        assert!(!tainted.evaluate("web_fetch").is_allow());
+        assert!(!tainted.evaluate("mcp__weather__forecast").is_allow());
+        assert!(!tainted.evaluate("make_preview_public").is_allow());
+    }
+
+    #[test]
+    fn autonomous_turn_still_blocks_provider_pinned_search() {
+        // Only the taint half is lifted — an autonomous (heartbeat/scheduled)
+        // turn may not search: no human is present to authorise egress on the
+        // broker's dime.
+        let auto = ToolPolicy::new(ToolProfile::Full, None).with_trust(TurnTrust {
+            tainted: false,
+            approved: false,
+            autonomous: true,
+        });
+        let d = auto.evaluate("web_search");
+        assert!(!d.is_allow());
+        assert!(d.deny_reason().unwrap().contains("autonomous"));
+    }
+
+    #[test]
     fn fresh_approval_clears_taint_for_credentialed_external() {
         let approved = ToolPolicy::new(ToolProfile::Full, None).with_trust(TurnTrust {
             tainted: true,
@@ -1262,17 +1360,15 @@ mod tests {
         );
         // On a tainted turn without approval it is blocked, exactly like
         // `web_fetch` — the outward-facing contrast to `expose_preview`.
+        // (`web_search` left this list when it became a provider-pinned
+        // search exemption — see `PROVIDER_PINNED_SEARCH_TOOLS` and
+        // `tainted_turn_allows_provider_pinned_search_but_not_fetch`.)
         let tainted = ToolPolicy::new(ToolProfile::Full, None).with_trust(TurnTrust {
             tainted: true,
             approved: false,
             autonomous: false,
         });
-        for t in [
-            "make_preview_public",
-            "web_fetch",
-            "web_search",
-            "add_mcp_server",
-        ] {
+        for t in ["make_preview_public", "web_fetch", "add_mcp_server"] {
             assert!(is_credentialed_external(t) && !is_lan_preview(t));
             let d = tainted.evaluate(t);
             assert!(!d.is_allow(), "{t} must stay taint-gated");
