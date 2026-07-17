@@ -6,6 +6,53 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M21 Wave-1 X-rider: recovery fixtures, 2026-07-17)
+
+- **Replay-level pin for the hung-tool recovery sequence.** New fixture
+  `fixtures/cli/stuck-tool-restart/` + registered test
+  `cli_stuck_tool_restart_delivers_single_apology_end_to_end`
+  (`crates/copperclaw-host/tests/replay.rs`): a real pipeline-created
+  session is put into the exact mid-hang state a wedged runner leaves
+  behind (running container, fresh heartbeat, in-flight `Processing`
+  ack, `container_state` tool row 31 minutes old), then one actuated
+  sweep pass (`SweepService::run_once_actuated` with the real
+  `ContainerManager` as `StuckActuator`, mock runtime) must fire the
+  `StuckRestart` and the single "snag ... restarted" apology must reach
+  the channel adapter through the real `DeliveryService` — the wire leg
+  S2's own crate tests stop short of. A second sweep + delivery pass is
+  asserted byte-quiet, and the apology copy is asserted honest (no
+  "operator has been notified" until O4 wires real alerts).
+- **Replay-level pin for delivery-retry persistence (migration 029).**
+  New fixture `fixtures/cli/delivery-retry-restart/` + registered test
+  `cli_delivery_retry_restart_resumes_and_dead_letters_once`: a
+  runner-produced chat row fails its first delivery via a scripted
+  transport error, then the delivery service is killed and recreated
+  before EVERY subsequent attempt — three failures across three service
+  lifetimes must exhaust `MAX_DELIVERY_ATTEMPTS` (a restart must never
+  reset the budget), dead-letter exactly once (one
+  `delivered{status=failed}` record + one ErrorCard), deliver the
+  "Could not deliver message" card to the adapter exactly once, and
+  stay terminal across yet another restart.
+- **Replay-harness restart seam.** `ReplayHarness::restart_delivery()`
+  (`crates/copperclaw-host/tests/replay/harness.rs`) rebuilds the
+  `DeliveryService` — fresh in-memory retry cache, primed-session set,
+  in-flight guards — plus a fresh `MockAdapter` set over the same
+  central DB and per-session files, mirroring what a real host restart
+  preserves. This is the harness extension the S3 card deferred to the
+  X-rider; adapter-set construction is factored into a shared
+  `build_adapter_set` so a restarted service registers a byte-identical
+  topology.
+- **Wave-1 coverage map.** `fixtures/README-m21-wave1.md` maps every
+  Wave-1 acceptance behavior (S1 loop supervision, S2 stuck restart, S3
+  retry persistence, S4 OOM/backoff, S5 no-adapter expiry, S6 clock
+  seam) to the test that pins it, and documents — per the plan's
+  "documented, not skipped silently" rule — the five things a replay
+  fixture genuinely cannot reach (host-side tokio/wall-clock timers, a
+  truly hanging in-process tool, supervised-loop panic injection, OOM
+  exit-status inspection, manifest-driven service restarts) and where
+  each is pinned instead. `docs/replay-fixtures.md` gains the
+  runner-clock-reach caveat and the restart seam.
+
 ### Added (M21 S2: stuck-tool actuator — detected stuck sessions get restarted, 2026-07-17)
 
 - **Stuck tools are finally recovered, not just logged.** The sweep has

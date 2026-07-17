@@ -2412,3 +2412,442 @@ async fn cli_prototype_public_share_ritual_card_has_public_button() {
         "the public link must be an https tunnel URL, not the LAN address: {card_text}",
     );
 }
+
+// ─── M21 Wave-1 X-rider: recovery fixtures ───────────────────────────────────
+//
+// Lock the "nothing dies silently" wave into the replay test set. Two
+// behaviours are genuinely reachable at the pipeline level and are pinned
+// here (hung-tool -> StuckRestart -> single apology delivered; delivery
+// retry counters surviving a service restart with exactly-once
+// dead-lettering). The other two Wave-1 acceptance behaviours (loop-panic
+// -> supervisor restart; OOM classification + backoff) are pinned by the
+// implementing cards' own tests and mapped — with the reachability
+// analysis — in `fixtures/README-m21-wave1.md`.
+
+/// Fixture-authoring gate for the M21 Wave-1 X-rider fixtures. When
+/// `COPPERCLAW_M21X1_GENERATE` is set the harness regenerates
+/// `expected/*.jsonl` from a real run and the caller returns before
+/// asserting. Never taken under a normal `cargo test`.
+async fn m21x1_maybe_generate(channel: &str, scenario: &str) -> bool {
+    if std::env::var_os("COPPERCLAW_M21X1_GENERATE").is_none() {
+        return false;
+    }
+    let path = fixture_path(channel, scenario);
+    let fixture = Fixture::load(&path).expect("load fixture");
+    let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+    harness.run().await.expect("run harness");
+    harness.dump_expected_jsonl();
+    true
+}
+
+/// M21 S2 (X-rider W1): the hung-tool recovery sequence, end to end
+/// through the replay pipeline — the leg S2's own mock-runtime
+/// integration test (`stuck_actuator.rs`) stops short of: the apology
+/// actually REACHING the channel adapter through the real
+/// `DeliveryService`.
+///
+/// The fixture drives one normal turn (real router-created session +
+/// routing). The test then reproduces exactly the mid-hang state
+/// production would be in: session `Running`, heartbeat fresh (the
+/// runner process IS alive — the shape the crash path can never catch,
+/// decision (a)), one in-flight inbound with a `Processing` ack, and a
+/// `container_state` tool row started 31 minutes ago — past the sweep's
+/// unconditional 30-minute `ABSOLUTE_CEILING_MS`. One actuated sweep
+/// pass (`SweepService` with the real `ContainerManager` wired as
+/// `StuckActuator`, mock runtime) must issue the `StuckRestart`, clear
+/// the tool state, stop the container, and write exactly one apology —
+/// which the harness's delivery service then hands to the cli
+/// `MockAdapter`. A second sweep + delivery pass stays byte-quiet
+/// (dedup): no re-detection, no second apology on the wire.
+#[tokio::test]
+async fn cli_stuck_tool_restart_delivers_single_apology_end_to_end() {
+    use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
+    use copperclaw_db::tables::{container_state, messages_in, messages_out, processing_ack};
+    use copperclaw_host::container_manager::{
+        ContainerManager, DEFAULT_HEARTBEAT_STALE_SECS, DEFAULT_IDLE_TIMEOUT_SECS,
+        DEFAULT_STOP_GRACE_SECS, ManagerConfig,
+    };
+    use copperclaw_host_sweep::service::FilesystemSessionRoot;
+    use copperclaw_host_sweep::{StuckActuator, SweepService};
+    use copperclaw_types::{ChannelType, ContainerStatus, MessageId, MessageKind};
+    use std::sync::Arc;
+
+    if m21x1_maybe_generate("cli", "stuck-tool-restart").await {
+        return;
+    }
+    let harness = run_fixture_into_harness("cli", "stuck-tool-restart").await;
+    let (ag, sess) = harness.touched_sessions[0];
+    let paths = SessionPaths::new(harness.tempdir.path(), ag, sess);
+
+    // ── Reproduce the mid-hang state after the baseline turn ──
+    // Session running (the harness already marked it so at route time;
+    // be explicit) with a FRESH heartbeat: the runner is alive during a
+    // hung tool, so heartbeat-based crash detection never fires.
+    copperclaw_db::tables::sessions::mark_container_running(&harness.central, sess).unwrap();
+    std::fs::write(&paths.heartbeat, b"").unwrap();
+
+    // The in-flight inbound the hung tool was working on. Recent
+    // timestamp so the sweep's own PendingTooLong apology stays out —
+    // the crash-restart apology machinery is what must fire.
+    let msg_id = MessageId::new();
+    {
+        let conn = open_inbound(&paths).unwrap();
+        messages_in::insert(
+            &conn,
+            &messages_in::WriteInbound {
+                id: msg_id,
+                kind: MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "how is the build going?"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("stdin".into()),
+                channel_type: Some(ChannelType::new(ChannelType::CLI)),
+                thread_id: None,
+                source_session_id: None,
+                reply_to: None,
+                is_group: None,
+            },
+        )
+        .unwrap();
+    }
+    let outbound = open_outbound(&paths).unwrap();
+    processing_ack::insert(
+        &outbound,
+        msg_id,
+        processing_ack::ProcessingStatus::Processing,
+    )
+    .unwrap();
+    // The hung tool: 31 minutes into a declared 1-hour timeout — past
+    // the unconditional 30-minute ceiling but INSIDE its declared
+    // budget, so only the ceiling path (not the claim threshold) fires.
+    let now = chrono::Utc::now();
+    container_state::set(
+        &outbound,
+        &container_state::ContainerState {
+            current_tool: Some("bash".into()),
+            tool_declared_timeout_ms: Some(3_600_000),
+            tool_started_at: Some(now - chrono::Duration::minutes(31)),
+            updated_at: Some(now),
+        },
+    )
+    .unwrap();
+
+    // ── One actuated sweep pass: detection + StuckRestart ──
+    let cfg = ManagerConfig {
+        install_slug: "replay".into(),
+        data_dir: harness.tempdir.path().to_path_buf(),
+        default_image_tag: "copperclaw/session:replay".into(),
+        default_provider: "anthropic".into(),
+        default_model: "claude-sonnet-4-6".into(),
+        default_effort: None,
+        anthropic_api_key: Some("harness".into()),
+        anthropic_base_url: Some(harness.anthropic_server.uri()),
+        idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+        heartbeat_stale_secs: DEFAULT_HEARTBEAT_STALE_SECS,
+        stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
+        skills_dir: None,
+        groups_dir: None,
+        skills_mode: copperclaw_host::SkillsMode::default(),
+        gpu_passthrough: false,
+        forward_env: Vec::new(),
+        egress_mode: copperclaw_container_rt::EgressMode::AllowAll,
+    };
+    let mgr = Arc::new(ContainerManager::new(
+        harness.central.clone(),
+        Arc::new(crate::harness::HarnessRuntime::default()),
+        cfg,
+    ));
+    let sweep = SweepService::new(
+        harness.central.clone(),
+        Arc::new(FilesystemSessionRoot::new(harness.tempdir.path())),
+    );
+    sweep.set_stuck_actuator(Arc::clone(&mgr) as Arc<dyn StuckActuator>);
+    let report = sweep.run_once_actuated().await.unwrap();
+    assert_eq!(
+        report.stuck_past_ceiling,
+        vec![sess],
+        "the hung tool must be detected past the absolute ceiling"
+    );
+
+    // The restart landed through the manager: container stopped, the
+    // triggering tool state cleared so the next pass cannot re-fire.
+    let updated = copperclaw_db::tables::sessions::get(&harness.central, sess).unwrap();
+    assert!(
+        matches!(updated.container_status, ContainerStatus::Stopped),
+        "StuckRestart must stop the container: {:?}",
+        updated.container_status
+    );
+    let state = container_state::get(&outbound).unwrap().unwrap();
+    assert!(state.current_tool.is_none(), "tool state must be cleared");
+
+    // ── The apology reaches the WIRE, exactly once ──
+    harness
+        .delivery
+        .process_session_once(&updated)
+        .await
+        .unwrap();
+    let mock = mock_for(&harness, "cli");
+    let apologies: Vec<String> = mock
+        .deliveries()
+        .iter()
+        .filter(|d| d.message.kind.as_str() == "chat")
+        .filter_map(|d| d.message.content.get("text").and_then(|t| t.as_str()))
+        .filter(|t| t.contains("snag") && t.contains("restart"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        apologies.len(),
+        1,
+        "exactly one recovery apology must be delivered: {:?}",
+        mock.deliveries()
+    );
+    // Honest copy (decision (d), landed with S2): the apology must not
+    // claim operator notification until O4 actually wires it.
+    assert!(
+        !apologies[0].contains("operator has been notified"),
+        "pre-O4 apology copy must not claim operator notification: {}",
+        apologies[0]
+    );
+
+    // ── Second sweep + delivery pass: byte-quiet ──
+    let report2 = sweep.run_once_actuated().await.unwrap();
+    assert!(
+        report2.stuck_past_ceiling.is_empty(),
+        "cleared tool state must not re-detect"
+    );
+    harness
+        .delivery
+        .process_session_once(&updated)
+        .await
+        .unwrap();
+    let apology_count = mock
+        .deliveries()
+        .iter()
+        .filter_map(|d| d.message.content.get("text").and_then(|t| t.as_str()))
+        .filter(|t| t.contains("snag") && t.contains("restart"))
+        .count();
+    assert_eq!(apology_count, 1, "the apology stays deduped on the wire");
+    // Corroborate against the outbound DB: exactly one apology row, in
+    // reply to the wedged inbound.
+    let apology_rows: Vec<_> = messages_out::list_due(&outbound)
+        .unwrap()
+        .into_iter()
+        .filter(|r| {
+            r.kind == MessageKind::Chat
+                && r.content
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(|t| t.contains("snag"))
+        })
+        .collect();
+    assert_eq!(apology_rows.len(), 1);
+    assert_eq!(apology_rows[0].in_reply_to, Some(msg_id));
+}
+
+/// M21 S3 (X-rider W1): delivery retry counters survive a service
+/// restart, with exactly-once dead-lettering — at the pipeline level,
+/// against a runner-produced outbound row, using the harness's
+/// `restart_delivery` seam (fresh `DeliveryService` + adapters over the
+/// same central DB and per-session files, exactly what a real host
+/// restart preserves).
+///
+/// Attempt 1 happens inside the fixture run (a scripted transport
+/// failure via `pre_delivery_failures`), persisting `tries = 1` and a
+/// wall-clock `not_before` window ON THE ROW (migration 029). The test
+/// then restarts the delivery service before each subsequent attempt —
+/// so every attempt is served by a service that must re-prime its retry
+/// cache from the row. Three failures across three service lifetimes
+/// exhaust `MAX_DELIVERY_ATTEMPTS` (3): if a restart reset the budget,
+/// the third attempt would defer instead of dead-lettering and every
+/// assertion below fails. Exhaustion dead-letters exactly once (one
+/// terminal `delivered{status=failed}` record + one ErrorCard — the
+/// no-adapter expiry path, not retry exhaustion, is what feeds the
+/// central dropped-messages table), the failure card reaches the user
+/// exactly once, and a further restart + pass changes nothing.
+///
+/// (The window between attempts is elapsed by rewinding the PERSISTED
+/// `not_before` — legitimate here because each restarted service reads
+/// the window from the row, which is precisely the S3 contract under
+/// test. Real sleeps would test the same thing slowly and jittery.)
+#[tokio::test]
+async fn cli_delivery_retry_restart_resumes_and_dead_letters_once() {
+    use copperclaw_channels_core::AdapterError;
+    use copperclaw_db::session::{SessionPaths, open_inbound_rw_no_mmap, open_outbound};
+    use copperclaw_db::tables::{delivered, messages_out};
+    use copperclaw_types::MessageKind;
+    use std::sync::Arc;
+
+    /// Read the row's persisted retry state and rewind its `not_before`
+    /// window into the past — "the host was down longer than the backoff
+    /// window". Returns the persisted attempt count.
+    fn rewind_window(paths: &SessionPaths) -> u32 {
+        let conn = open_outbound(paths).unwrap();
+        let persisted = messages_out::list_retry_state(&conn).unwrap();
+        assert_eq!(persisted.len(), 1, "one row mid-retry: {persisted:?}");
+        messages_out::set_retry_state(
+            &conn,
+            persisted[0].id,
+            persisted[0].tries,
+            Some(chrono::Utc::now() - chrono::Duration::seconds(5)),
+        )
+        .unwrap();
+        persisted[0].tries
+    }
+
+    if m21x1_maybe_generate("cli", "delivery-retry-restart").await {
+        return;
+    }
+    let mut harness = run_fixture_into_harness("cli", "delivery-retry-restart").await;
+    let (ag, sess) = harness.touched_sessions[0];
+    let session = copperclaw_db::tables::sessions::get(&harness.central, sess).unwrap();
+    let paths = SessionPaths::new(harness.tempdir.path(), ag, sess);
+
+    // ── Attempt 1 (inside the fixture run) failed and PERSISTED ──
+    assert!(
+        mock_for(&harness, "cli").deliveries().is_empty(),
+        "the scripted transport failure means nothing was delivered"
+    );
+    {
+        let conn = open_outbound(&paths).unwrap();
+        let persisted = messages_out::list_retry_state(&conn).unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].tries, 1, "attempt count persisted on the row");
+        assert!(
+            persisted[0].not_before.is_some(),
+            "backoff window persisted as wall-clock not_before"
+        );
+    }
+
+    // ── Restart 1: the resumed service picks up at tries=1, attempt 2 fails ──
+    assert_eq!(rewind_window(&paths), 1);
+    harness.restart_delivery();
+    let mock2 = Arc::clone(mock_for(&harness, "cli"));
+    mock2.fail_next_deliver(AdapterError::Transport("502 after restart".into()));
+    let _ = harness
+        .delivery
+        .process_session_once(&session)
+        .await
+        .unwrap();
+    assert!(
+        mock2.deliveries().is_empty(),
+        "attempt 2 failed on the wire"
+    );
+    assert_eq!(
+        rewind_window(&paths),
+        2,
+        "the restarted service resumed at the persisted count (1 -> 2), not at 0"
+    );
+
+    // ── Restart 2: attempt 3 exhausts the budget — dead-letter exactly once ──
+    harness.restart_delivery();
+    let mock3 = Arc::clone(mock_for(&harness, "cli"));
+    mock3.fail_next_deliver(AdapterError::Transport("502 final".into()));
+    let rpt = harness
+        .delivery
+        .process_session_once(&session)
+        .await
+        .unwrap();
+    assert_eq!(
+        rpt.failed, 1,
+        "third failure across three service lifetimes exhausts MAX_DELIVERY_ATTEMPTS"
+    );
+    assert!(
+        mock3.deliveries().is_empty(),
+        "the exhausting attempt failed; nothing reached the wire this pass"
+    );
+    {
+        let in_conn = open_inbound_rw_no_mmap(&paths).unwrap();
+        let failed: Vec<_> = delivered::list(&in_conn)
+            .unwrap()
+            .into_iter()
+            .filter(|d| d.status == "failed")
+            .collect();
+        assert_eq!(
+            failed.len(),
+            1,
+            "exactly one delivered{{status=failed}} row"
+        );
+        let out_conn = open_outbound(&paths).unwrap();
+        let error_rows = messages_out::list_due(&out_conn)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == MessageKind::Error)
+            .count();
+        assert_eq!(error_rows, 1, "exactly one delivery-failure ErrorCard row");
+    }
+
+    // ── Restart 3: the user hears about the failure exactly once, and
+    // the terminal state is stable across yet another restart ──
+    harness.restart_delivery();
+    let mock4 = Arc::clone(mock_for(&harness, "cli"));
+    let rpt = harness
+        .delivery
+        .process_session_once(&session)
+        .await
+        .unwrap();
+    assert_eq!(rpt.failed, 0, "no re-dead-letter after a further restart");
+    assert_eq!(
+        rpt.delivered, 1,
+        "the delivery-failure ErrorCard reaches the wire (once)"
+    );
+    let cards: Vec<String> = mock4
+        .deliveries()
+        .iter()
+        .filter_map(|d| d.message.content.get("text").and_then(|t| t.as_str()))
+        .filter(|t| t.contains("Could not deliver message"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        cards.len(),
+        1,
+        "exactly one failure card on the wire: {:?}",
+        mock4.deliveries()
+    );
+    // A second pass on the final service adds nothing: the failed row
+    // and the delivered card are both terminal.
+    let rpt2 = harness
+        .delivery
+        .process_session_once(&session)
+        .await
+        .unwrap();
+    assert_eq!(rpt2.failed, 0);
+    assert_eq!(rpt2.delivered, 0, "terminal state: nothing left to deliver");
+    assert_eq!(mock4.deliveries().len(), 1, "no re-delivery of the card");
+    // The poisoned chat text itself never reached any adapter incarnation.
+    assert!(
+        mock3
+            .deliveries()
+            .iter()
+            .chain(mock4.deliveries().iter())
+            .all(|d| d
+                .message
+                .content
+                .get("text")
+                .and_then(|t| t.as_str())
+                .is_none_or(|t| !t.contains("Hi across the restart!"))),
+        "the dead-lettered chat text must never reach the wire"
+    );
+    {
+        let in_conn = open_inbound_rw_no_mmap(&paths).unwrap();
+        let failed = delivered::list(&in_conn)
+            .unwrap()
+            .into_iter()
+            .filter(|d| d.status == "failed")
+            .count();
+        assert_eq!(failed, 1, "dead-letter stays exactly-once across restarts");
+        let out_conn = open_outbound(&paths).unwrap();
+        let error_rows = messages_out::list_due(&out_conn)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == MessageKind::Error)
+            .count();
+        assert_eq!(
+            error_rows, 1,
+            "ErrorCard stays exactly-once across restarts"
+        );
+    }
+}

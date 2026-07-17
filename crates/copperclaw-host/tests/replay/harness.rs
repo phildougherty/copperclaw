@@ -197,43 +197,7 @@ impl ReplayHarness {
         // Pre-register a deterministic `MockAdapter` for every channel
         // type we expect a fixture to drive. The order is fixed so
         // `snapshot_delivered` aggregates in a stable order across runs.
-        let mut channel_types: Vec<ChannelType> = vec![
-            ChannelType::new(ChannelType::CLI),
-            ChannelType::new("telegram"),
-            ChannelType::new("slack"),
-        ];
-        // Ensure the fixture's own channel is present even if it's some
-        // future name (e.g. "discord") not in the built-in list.
-        let fixture_ct = ChannelType::new(fixture.manifest.channel.as_str());
-        if !channel_types.iter().any(|ct| ct == &fixture_ct) {
-            channel_types.push(fixture_ct);
-        }
-
-        let mut adapters: Vec<(ChannelType, Arc<MockAdapter>)> = Vec::new();
-        let mut initial: Vec<(ChannelType, Arc<dyn ChannelAdapter>)> = Vec::new();
-        for ct in channel_types {
-            let mock = Arc::new(MockAdapter::new(ct.as_str()));
-            // Per-channel max_message_chars cap. The manifest can
-            // override; otherwise apply the built-in defaults so the
-            // long-message-split fixtures trigger the splitter even
-            // without an explicit override. Channels not in the
-            // default-cap list report `None` (splitter disabled —
-            // matches the trait default).
-            let cap = fixture
-                .manifest
-                .adapter_caps
-                .get(ct.as_str())
-                .copied()
-                .or_else(|| default_cap_for(ct.as_str()));
-            let wrapped: Arc<dyn ChannelAdapter> = Arc::new(CappedAdapter::new(
-                mock.clone(),
-                cap,
-                fixture.manifest.model_rich_breadcrumbs,
-                fixture.manifest.model_rich_cards,
-            ));
-            initial.push((ct.clone(), wrapped));
-            adapters.push((ct, mock));
-        }
+        let (adapters, initial) = build_adapter_set(&fixture);
         let delivery =
             DeliveryService::with_default_dispatcher(central.clone(), delivery_root, initial);
 
@@ -303,6 +267,39 @@ impl ReplayHarness {
     /// mid-turn (inside one runner's tool loop).
     pub fn advance_clock(&self, by: Duration) {
         self.clock.advance(by);
+    }
+
+    /// M21 S3 / Wave-1 X-rider: simulate a host restart of the outbound
+    /// delivery half. Rebuilds the [`DeliveryService`] — fresh in-memory
+    /// retry cache, primed-session set, and in-flight guards — plus a
+    /// fresh set of `MockAdapter`s, over the SAME central DB and the SAME
+    /// on-disk per-session root. What survives the "restart" is exactly
+    /// what survives a real one: the central DB and the per-session DB
+    /// files (including the migration-029 `tries` / `not_before` retry
+    /// columns on `messages_out`). Prior `MockAdapter` handles (and their
+    /// recorded deliveries) are replaced wholesale — clone the `Arc`s out
+    /// of [`Self::adapters`] first if a test needs the pre-restart log.
+    ///
+    /// Mirrors `copperclaw_host_delivery::test_support::restart_service`
+    /// at the harness level so replay-registered tests can pin the S3
+    /// restart-resume and exactly-once dead-letter contracts against
+    /// pipeline-produced rows instead of hand-inserted ones.
+    pub fn restart_delivery(&mut self) {
+        let delivery_root: Arc<dyn DeliverySessionRoot> =
+            Arc::new(DeliveryRoot::new(self.tempdir.path().to_path_buf()));
+        let (adapters, initial) = build_adapter_set(&self.fixture);
+        let delivery =
+            DeliveryService::with_default_dispatcher(self.central.clone(), delivery_root, initial);
+        // Keep gate wiring parity with `new()` so a restarted service
+        // behaves identically for preview/tunnel-gated fixtures.
+        if self.use_preview_gate {
+            delivery.set_preview_broker(Arc::new(FixturePreviewBroker));
+        }
+        if self.use_tunnel_gate {
+            delivery.set_tunnel_broker(Arc::new(FixtureTunnelBroker));
+        }
+        self.adapters = adapters;
+        self.delivery = delivery;
     }
 
     /// Drive every `inbound/*.json` event through the pipeline. After
@@ -1299,6 +1296,61 @@ async fn wait_for_inbound_drain(paths: SessionPaths) -> Result<()> {
     }
 }
 
+/// Build the harness's deterministic per-channel `MockAdapter` set: the
+/// built-in cli/telegram/slack trio plus the fixture's own channel, each
+/// wrapped in a [`CappedAdapter`] carrying the manifest's cap / rich-
+/// surface modelling flags. Returns both the raw mock handles (for test
+/// assertions) and the wrapped `ChannelAdapter` list (for the
+/// `DeliveryService`). Shared by [`ReplayHarness::new`] and
+/// [`ReplayHarness::restart_delivery`] so a restarted service registers
+/// a byte-identical adapter topology.
+#[allow(clippy::type_complexity)]
+fn build_adapter_set(
+    fixture: &Fixture,
+) -> (
+    Vec<(ChannelType, Arc<MockAdapter>)>,
+    Vec<(ChannelType, Arc<dyn ChannelAdapter>)>,
+) {
+    let mut channel_types: Vec<ChannelType> = vec![
+        ChannelType::new(ChannelType::CLI),
+        ChannelType::new("telegram"),
+        ChannelType::new("slack"),
+    ];
+    // Ensure the fixture's own channel is present even if it's some
+    // future name (e.g. "discord") not in the built-in list.
+    let fixture_ct = ChannelType::new(fixture.manifest.channel.as_str());
+    if !channel_types.iter().any(|ct| ct == &fixture_ct) {
+        channel_types.push(fixture_ct);
+    }
+
+    let mut adapters: Vec<(ChannelType, Arc<MockAdapter>)> = Vec::new();
+    let mut initial: Vec<(ChannelType, Arc<dyn ChannelAdapter>)> = Vec::new();
+    for ct in channel_types {
+        let mock = Arc::new(MockAdapter::new(ct.as_str()));
+        // Per-channel max_message_chars cap. The manifest can
+        // override; otherwise apply the built-in defaults so the
+        // long-message-split fixtures trigger the splitter even
+        // without an explicit override. Channels not in the
+        // default-cap list report `None` (splitter disabled —
+        // matches the trait default).
+        let cap = fixture
+            .manifest
+            .adapter_caps
+            .get(ct.as_str())
+            .copied()
+            .or_else(|| default_cap_for(ct.as_str()));
+        let wrapped: Arc<dyn ChannelAdapter> = Arc::new(CappedAdapter::new(
+            mock.clone(),
+            cap,
+            fixture.manifest.model_rich_breadcrumbs,
+            fixture.manifest.model_rich_cards,
+        ));
+        initial.push((ct.clone(), wrapped));
+        adapters.push((ct, mock));
+    }
+    (adapters, initial)
+}
+
 fn encode_sse(turn: &ClaudeTurn) -> String {
     let mut out = String::new();
     for ev in &turn.events {
@@ -1445,14 +1497,15 @@ impl copperclaw_modules::ModuleContext for HarnessModuleContext {
     }
 }
 
-/// No-op runtime for the budget-gate fixture. The gate fires before
-/// the manager ever asks the runtime to spawn, so the only methods
-/// that matter are `remove` (called by `maybe_spawn` defensively) and
-/// `stop` (never called on this code path). Every method records nothing
-/// and returns success; the harness asserts via `messages_out` rather
-/// than runtime telemetry.
+/// No-op runtime for the budget-gate fixture (and, since the M21 Wave-1
+/// X-rider, the stuck-tool restart test's `ContainerManager`). The gate
+/// fires before the manager ever asks the runtime to spawn, so the only
+/// methods that matter are `remove` (called by `maybe_spawn` defensively)
+/// and `stop` (never called on this code path). Every method records
+/// nothing and returns success; the harness asserts via `messages_out`
+/// rather than runtime telemetry.
 #[derive(Debug, Default)]
-struct HarnessRuntime {
+pub struct HarnessRuntime {
     spawn_calls: StdMutex<Vec<String>>,
 }
 
