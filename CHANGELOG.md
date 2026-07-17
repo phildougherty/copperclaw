@@ -6,6 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M21 Wave-3 X-rider: operator-surface fixtures, 2026-07-17)
+
+- **New replay fixture `fixtures/cli/operator-alert-delivery/` + registered
+  test `cli_operator_alert_delivered_and_silent_when_unconfigured`**
+  (`crates/copperclaw-host/tests/replay.rs`) pins the M21 O4 opt-in
+  operator-alert destination end to end through the REAL delivery pipeline:
+  a loop-death event (the S1 supervisor `run_degraded_watch` seam) enqueues
+  one alert row that reaches the cli `MockAdapter` at the operator's OWN
+  configured target (not the chat's `stdin`, proving `resolve_target` routes
+  on the row's own fields) exactly once; and a DISABLED `OperatorAlerts`
+  firing the same event produces zero new outbound and nothing on the wire
+  (secure-by-default). O4's own unit tests pin enqueue/dedup/rate-limit/
+  disabled-default/degraded-watch; this fixture adds the leg they omit — the
+  wire.
+- **New cross-card integration test
+  `crates/copperclaw-host/tests/wave3_quarantine_doctor.rs`
+  (`o2_quarantine_artifact_is_read_by_the_o1_doctor_contract_and_excluded_from_sweeps`)**
+  pins the M21 O2 → O1 seam from a neutral crate that sees both lanes: a REAL
+  `SweepService` pass detects → quarantines → excludes a genuinely-corrupted
+  `outbound.db`, and the sidecar artifact O2 produced is asserted to satisfy
+  O1's DOCUMENTED `cclaw doctor` reader contract exactly (sibling path
+  `sessions/<ag>/<session_uuid>.quarantined` + the `detail` key), reproducing
+  O1's scan over O2's real bytes — closing the writer↔reader gap the two
+  cards' hand-written literals would otherwise leave open.
+- **`fixtures/README-m21-wave3.md`** — the Wave-3 coverage map: every O1–O4
+  acceptance behavior mapped to its pinning test (replay fixture vs. layered
+  crate test), plus the honest "not fixture-reachable" list explaining why
+  each of doctor rows (O1), quarantine (O2), and mid-session failover (O3)
+  is pinned at its own layer rather than through the replay harness.
+
 ### Added (M21 O2: DB integrity — rotating quick_check + quarantine sidecar, 2026-07-17)
 
 - **The sweep now finds DB corruption instead of silently skipping it**

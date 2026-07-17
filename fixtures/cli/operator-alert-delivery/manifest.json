@@ -1,0 +1,16 @@
+{
+  "name": "cli-operator-alert-delivery",
+  "channel": "cli",
+  "description": "M21 O4 (X-rider W3): baseline turn establishing one Active carrier session for the operator-alert enqueue -> real DeliveryService -> wire test. The loop-death alert enqueue, delivery, and the disabled-default silence are driven by the registered test on top of this fixture's byte-stable streams.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}
