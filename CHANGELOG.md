@@ -6,6 +6,27 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed (M21 F3: host-restart recovery notice, 2026-07-17)
+
+- **A host restart mid-turn is no longer silent.** Boot's reset of stale
+  `container_status=running` rows (`crates/copperclaw-host/src/boot.rs`,
+  now extracted as `reset_stale_running_sessions`) used to drop an
+  in-flight turn with no explanation, ever — unlike the live
+  `CrashRestart` path, which apologizes immediately. Each reset session
+  now runs through
+  `crates/copperclaw-host/src/container_manager/classify.rs::emit_boot_recovery_notice`,
+  which reuses the crash-restart apology machinery (same
+  `processing_ack` scan, same `CRASH_RESTART_APOLOGY_TEXT` copy — no
+  duplicated string, same dedupe stamps): liveness-gated so a clean idle
+  restart never fires it (both pending unprocessed inbound AND an
+  in-flight `Processing` claim are required), and deduped to exactly one
+  notice per affected session per boot — not per inbound row, not per
+  repeat pass, and the claim flip + `tries` stamp keep the sweep's
+  `pending_too_long` apology and stale-claim reset out afterwards. The
+  interrupted inbound stays `pending`, so the respawned runner picks the
+  turn back up (no crash-loop backoff applies — a host restart is not a
+  container crash).
+
 ### Added (M21 F1: cold-start feedback — typing from message one, one slow-spawn notice, 2026-07-17)
 
 - **One slow-spawn notice.** A container spawn attempt that runs past

@@ -9,7 +9,7 @@ use copperclaw_db::tables::messages_out::{WriteOutbound, insert as insert_outbou
 use copperclaw_db::tables::processing_ack::{self, ProcessingStatus};
 use copperclaw_db::tables::{messages_in, sessions};
 use copperclaw_host_sweep::APOLOGY_TRIES_MARKER;
-use copperclaw_types::{ChannelType, ContainerStatus, MessageId, MessageKind, Session};
+use copperclaw_types::{ChannelType, ContainerStatus, MessageId, MessageKind, Session, SessionId};
 use rusqlite::{OptionalExtension, params};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -96,8 +96,9 @@ impl ContainerManager {
     /// `container_status`, the inbound pending count, the heartbeat
     /// file's mtime, and the `last_active` timestamp. Pure: takes no
     /// async work and no DB writes so the state machine is unit-
-    /// testable.
-    pub(super) fn classify(&self, session: &Session) -> ReconcileAction {
+    /// testable. `pub(crate)` (not `pub(super)`) so the M21 F3 boot
+    /// tests can assert a reset session classifies as `Spawn`.
+    pub(crate) fn classify(&self, session: &Session) -> ReconcileAction {
         let paths = SessionPaths::new(&self.cfg.data_dir, session.agent_group_id, session.id);
         let pending = Self::has_pending_inbound(&paths).unwrap_or(false);
         match session.container_status {
@@ -654,6 +655,102 @@ fn emit_crash_restart_apologies(
         "crash-restart apologies emitted"
     );
     Ok(())
+}
+
+/// M21 F3: emit the host-restart recovery notice for one session during
+/// the boot reset (`boot.rs::reset_stale_running_sessions`). When the
+/// host itself dies mid-turn, boot flips the stale `running` row back to
+/// `stopped` — but, unlike the live [`ReconcileAction::CrashRestart`]
+/// path, nothing used to tell the user: the turn silently vanished and
+/// the re-queued inbound processed later with no explanation.
+///
+/// This reuses the crash-restart apology machinery wholesale — the same
+/// `processing_ack` scan, the same dedupe stamps, and the same copy
+/// ([`CRASH_RESTART_APOLOGY_TEXT`], not a duplicate string) — with one
+/// deliberate difference: at most ONE notice per session per boot, even
+/// when several inbound rows were in flight. A host restart is a single
+/// event from the user's point of view; one apology per queued message
+/// would read as a malfunction.
+///
+/// Liveness-gated so a clean idle restart never fires it. Both gates
+/// must pass:
+///
+/// 1. the session has pending unprocessed inbound (`count_due > 0` — the
+///    same predicate the manager's respawn path uses), and
+/// 2. at least one `processing_ack` claim is still `processing` — i.e. a
+///    runner had actually picked a turn up when the host went down. A
+///    message that merely arrived while the host was off has no claim
+///    and will process normally on spawn; no apology is owed.
+///
+/// Dedup is the crash path's own: every in-flight claim is flipped to
+/// `Failed` (so a second boot pass — and the sweep's stale-claim reset —
+/// finds nothing) and its inbound row is stamped
+/// `tries = APOLOGY_TRIES_MARKER` (so the sweep's `pending_too_long`
+/// apology also stays out). The inbound rows are left `pending`, so the
+/// respawned runner picks the turn back up.
+///
+/// Returns `Ok(true)` when a notice row was written.
+pub fn emit_boot_recovery_notice(
+    paths: &SessionPaths,
+    session_id: SessionId,
+) -> Result<bool, ManagerError> {
+    let inbound = open_inbound(paths).map_err(ManagerError::Db)?;
+    if messages_in::count_due(&inbound).map_err(ManagerError::Db)? == 0 {
+        return Ok(false);
+    }
+    let outbound = open_outbound(paths).map_err(ManagerError::Db)?;
+    let processing = list_processing_acks(&outbound)?;
+    if processing.is_empty() {
+        return Ok(false);
+    }
+
+    let now = chrono::Utc::now();
+    let mut notice_written = false;
+    for message_id in processing {
+        let routing = lookup_inbound_routing(&inbound, message_id)?;
+        if !notice_written {
+            if let Some(routing) = &routing {
+                let notice = WriteOutbound {
+                    id: MessageId::new(),
+                    in_reply_to: Some(routing.message_id),
+                    timestamp: now,
+                    deliver_after: None,
+                    recurrence: None,
+                    kind: MessageKind::Chat,
+                    channel_type: Some(routing.channel_type.clone()),
+                    platform_id: Some(routing.platform_id.clone()),
+                    thread_id: routing.thread_id.clone(),
+                    content: serde_json::json!({ "text": CRASH_RESTART_APOLOGY_TEXT }),
+                };
+                insert_outbound(&outbound, &notice).map_err(ManagerError::Db)?;
+                notice_written = true;
+            }
+        }
+
+        // Same dedupe stamps as `emit_crash_restart_apologies`: the
+        // tries marker keeps the sweep's `pending_too_long` apology
+        // out, and the Failed claim keeps both a repeat boot pass and
+        // the sweep's stale-claim reset out. Rows without routing are
+        // stamped too so they aren't rescanned forever.
+        mark_inbound_tries(&inbound, message_id)?;
+        if let Err(err) =
+            processing_ack::update_status(&outbound, message_id, ProcessingStatus::Failed)
+        {
+            warn!(
+                session = %session_id.as_uuid(),
+                message = %message_id.as_uuid(),
+                ?err,
+                "could not mark processing_ack Failed; sweep may double-fire"
+            );
+        }
+    }
+
+    info!(
+        session = %session_id.as_uuid(),
+        notice_written,
+        "boot recovery: in-flight turn found at host restart"
+    );
+    Ok(notice_written)
 }
 
 /// Emit the once-per-episode OOM `ErrorCard` (M21 S4): a

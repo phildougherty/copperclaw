@@ -423,6 +423,65 @@ pub fn migrate_sessions_layout(data_dir: &std::path::Path) {
     info!(migrated, skipped, "sessions layout migration complete");
 }
 
+/// Boot step 9b: reset stale `container_status=running` rows left
+/// behind by the previous host process, and (M21 F3) tell the affected
+/// users about it.
+///
+/// After the orphan cleanup the previous run's containers no longer
+/// exist, but the sessions table may still claim they're alive. Without
+/// the reset the container manager skips those sessions forever because
+/// it only spawns for `container_status=stopped`.
+///
+/// The reset used to be silent — a user whose turn was in flight when
+/// the host restarted watched the agent drop the turn with no
+/// explanation, ever. Now each reset session runs through
+/// [`crate::container_manager::classify::emit_boot_recovery_notice`],
+/// which reuses the live crash-restart apology machinery: liveness-gated
+/// (a clean idle restart — no pending inbound, or no in-flight
+/// `processing_ack` claim — emits nothing) and deduped (one notice per
+/// affected session per boot; the claim flip + tries stamp keep both a
+/// repeat pass and the sweep's apology paths out). The pending inbound
+/// itself is left untouched, so the respawned runner picks the turn
+/// back up.
+///
+/// Every failure in here is logged and skipped — boot must not abort
+/// over one session's broken per-session DB.
+pub fn reset_stale_running_sessions(central: &CentralDb, sessions_root: &std::path::Path) {
+    let running = match copperclaw_db::tables::sessions::list_running(central) {
+        Ok(running) => running,
+        Err(err) => {
+            warn!(?err, "could not list running sessions for boot reset");
+            return;
+        }
+    };
+    let mut notices = 0usize;
+    for s in &running {
+        if let Err(err) = copperclaw_db::tables::sessions::mark_container_stopped(central, s.id) {
+            warn!(session = %s.id.as_uuid(), ?err, "reset to stopped failed");
+        }
+        let paths =
+            copperclaw_db::session::SessionPaths::new(sessions_root, s.agent_group_id, s.id);
+        match crate::container_manager::classify::emit_boot_recovery_notice(&paths, s.id) {
+            Ok(true) => notices += 1,
+            Ok(false) => {}
+            Err(err) => {
+                warn!(
+                    session = %s.id.as_uuid(),
+                    ?err,
+                    "boot recovery notice failed; continuing"
+                );
+            }
+        }
+    }
+    if !running.is_empty() {
+        info!(
+            count = running.len(),
+            recovery_notices = notices,
+            "reset stale running sessions after orphan cleanup"
+        );
+    }
+}
+
 /// Construct the assembled host state. Exposed for tests so they can poke
 /// individual pieces without spinning up the full event loop.
 pub struct HostState {
@@ -688,26 +747,10 @@ pub async fn run_host(
     // 9. Assemble core services.
     let state = assemble(&cfg, adapters)?;
 
-    // 9b. Reset stale `container_status=running` rows. After the orphan
-    // cleanup above, the previous-run's containers no longer exist,
-    // but the sessions table may still claim they're alive. Without
-    // this reset the container manager skips those sessions forever
-    // because it only spawns for `container_status=stopped`.
-    if let Ok(running) = copperclaw_db::tables::sessions::list_running(&state.central) {
-        for s in &running {
-            if let Err(err) =
-                copperclaw_db::tables::sessions::mark_container_stopped(&state.central, s.id)
-            {
-                warn!(session = %s.id.as_uuid(), ?err, "reset to stopped failed");
-            }
-        }
-        if !running.is_empty() {
-            info!(
-                count = running.len(),
-                "reset stale running sessions after orphan cleanup"
-            );
-        }
-    }
+    // 9b. Reset stale `container_status=running` rows (and, M21 F3,
+    // emit one recovery notice per session whose turn was in flight
+    // when the previous host process died).
+    reset_stale_running_sessions(&state.central, &cfg.sessions_root());
 
     // 9c. Boot-time image health check. Reads the configured default
     // image tag and verifies it (a) exists locally, (b) carries an
@@ -2339,5 +2382,303 @@ mod tests {
         let active =
             dm_pairing_codes::list(&db, Some(dm_pairing_codes::PairingStatus::Active)).unwrap();
         assert_eq!(active.len(), MAX_ACTIVE_CODES_PER_CHANNEL);
+    }
+
+    // -----------------------------------------------------------------------
+    // M21 F3: boot-restart recovery notice (reset_stale_running_sessions)
+    // -----------------------------------------------------------------------
+
+    mod boot_recovery {
+        use super::*;
+        use crate::container_manager::classify::CRASH_RESTART_APOLOGY_TEXT;
+        use crate::container_manager::config::{ManagerConfig, SkillsMode};
+        use crate::container_manager::spawn::{
+            DEFAULT_HEARTBEAT_STALE_SECS, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_STOP_GRACE_SECS,
+        };
+        use crate::container_manager::{ContainerManager, ReconcileAction};
+        use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
+        use copperclaw_db::tables::agent_groups::{CreateAgentGroup, create as create_ag};
+        use copperclaw_db::tables::sessions::{self, CreateSession, create as create_session};
+        use copperclaw_db::tables::{messages_in, messages_out, processing_ack};
+        use copperclaw_types::{ChannelType, ContainerStatus, MessageId, MessageKind, Session};
+
+        fn fixture_running_session(central: &CentralDb) -> Session {
+            let ag = create_ag(
+                central,
+                CreateAgentGroup {
+                    name: "recovery".into(),
+                    folder: "recovery".into(),
+                    agent_provider: None,
+                },
+            )
+            .unwrap();
+            let session = create_session(
+                central,
+                CreateSession {
+                    agent_group_id: ag.id,
+                    messaging_group_id: None,
+                    thread_id: None,
+                    agent_provider: None,
+                    source_session_id: None,
+                },
+            )
+            .unwrap();
+            sessions::mark_container_running(central, session.id).unwrap();
+            sessions::get(central, session.id).unwrap()
+        }
+
+        /// Seed one chat-routed pending inbound, `age` old, and return
+        /// its id.
+        fn seed_routed_inbound(
+            paths: &SessionPaths,
+            text: &str,
+            age: chrono::Duration,
+        ) -> MessageId {
+            let msg_id = MessageId::new();
+            let conn = open_inbound(paths).unwrap();
+            messages_in::insert(
+                &conn,
+                &messages_in::WriteInbound {
+                    id: msg_id,
+                    kind: MessageKind::Chat,
+                    timestamp: chrono::Utc::now() - age,
+                    content: serde_json::json!({ "text": text }),
+                    trigger: true,
+                    on_wake: false,
+                    process_after: None,
+                    recurrence: None,
+                    series_id: None,
+                    platform_id: Some("tg-42".into()),
+                    channel_type: Some(ChannelType::new("telegram")),
+                    thread_id: Some("thread-7".into()),
+                    source_session_id: None,
+                    reply_to: None,
+                    is_group: None,
+                },
+            )
+            .unwrap();
+            msg_id
+        }
+
+        /// Mark the inbound as picked up by a runner — the in-flight
+        /// shape a host restart interrupts.
+        fn claim_processing(paths: &SessionPaths, msg_id: MessageId) {
+            let outbound = open_outbound(paths).unwrap();
+            processing_ack::insert(
+                &outbound,
+                msg_id,
+                processing_ack::ProcessingStatus::Processing,
+            )
+            .unwrap();
+        }
+
+        fn chat_rows(paths: &SessionPaths) -> Vec<copperclaw_types::MessageOutRow> {
+            let outbound = open_outbound(paths).unwrap();
+            messages_out::list_due(&outbound)
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.kind == MessageKind::Chat)
+                .collect()
+        }
+
+        fn manager_cfg(data_dir: PathBuf) -> ManagerConfig {
+            ManagerConfig {
+                install_slug: "test".into(),
+                data_dir,
+                default_image_tag: "copperclaw/session:test".into(),
+                default_provider: "anthropic".into(),
+                default_model: "claude-sonnet-4-6".into(),
+                default_effort: None,
+                anthropic_api_key: Some("sk-test".into()),
+                anthropic_base_url: None,
+                idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
+                heartbeat_stale_secs: DEFAULT_HEARTBEAT_STALE_SECS,
+                stop_grace_secs: DEFAULT_STOP_GRACE_SECS,
+                skills_dir: None,
+                groups_dir: None,
+                skills_mode: SkillsMode::Inline,
+                gpu_passthrough: false,
+                forward_env: Vec::new(),
+                egress_mode: copperclaw_container_rt::EgressMode::AllowAll,
+            }
+        }
+
+        /// The F3 integration acceptance, happy path: a host restart
+        /// with a turn in flight (session `running`, pending inbound,
+        /// `processing_ack = processing`) emits exactly one recovery
+        /// notice — the live crash path's copy, routed at the inbound —
+        /// and the re-queued inbound still processes: it stays due, and
+        /// the manager classifies the reset session as `Spawn` with no
+        /// backoff (a host restart is not a container crash).
+        #[tokio::test(start_paused = true)]
+        async fn restart_with_turn_in_flight_emits_one_notice_and_requeues() {
+            let tmp = tempfile::tempdir().unwrap();
+            let central = CentralDb::open_in_memory().unwrap();
+            let session = fixture_running_session(&central);
+            let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+            paths.ensure_dirs().unwrap();
+            let msg_id = seed_routed_inbound(&paths, "build the thing", chrono::Duration::zero());
+            claim_processing(&paths, msg_id);
+
+            reset_stale_running_sessions(&central, tmp.path());
+
+            // Reset landed: the session is spawnable again.
+            let updated = sessions::get(&central, session.id).unwrap();
+            assert!(matches!(updated.container_status, ContainerStatus::Stopped));
+
+            // Exactly one recovery notice, reusing the crash-restart
+            // copy (no duplicated string), routed at the in-flight
+            // inbound.
+            let rows = chat_rows(&paths);
+            assert_eq!(rows.len(), 1, "exactly one recovery notice");
+            let notice = &rows[0];
+            assert_eq!(notice.in_reply_to, Some(msg_id));
+            assert_eq!(
+                notice.channel_type.as_ref().map(ChannelType::as_str),
+                Some("telegram")
+            );
+            assert_eq!(notice.platform_id.as_deref(), Some("tg-42"));
+            assert_eq!(notice.thread_id.as_deref(), Some("thread-7"));
+            assert_eq!(
+                notice
+                    .content
+                    .get("text")
+                    .and_then(serde_json::Value::as_str),
+                Some(CRASH_RESTART_APOLOGY_TEXT),
+                "the notice must reuse the crash-restart apology text"
+            );
+
+            // The claim is Failed (the boot path owns the turn now) but
+            // the inbound row is still due, so the respawned runner
+            // picks it back up.
+            let outbound = open_outbound(&paths).unwrap();
+            let claim = processing_ack::get(&outbound, msg_id).unwrap().unwrap();
+            assert_eq!(claim.status, processing_ack::ProcessingStatus::Failed);
+            let inbound = open_inbound(&paths).unwrap();
+            assert_eq!(messages_in::count_due(&inbound).unwrap(), 1);
+
+            // And the manager will actually respawn: no crash-loop
+            // backoff applies to a host restart.
+            let mgr = ContainerManager::new(
+                central.clone(),
+                Arc::new(crate::tests::NoopRuntime::default()),
+                manager_cfg(tmp.path().to_path_buf()),
+            );
+            assert_eq!(
+                mgr.classify(&updated),
+                ReconcileAction::Spawn,
+                "re-queued inbound must spawn immediately"
+            );
+        }
+
+        /// A clean idle restart — the session was `running` but had no
+        /// pending inbound and no in-flight claim — resets quietly. No
+        /// notice.
+        #[tokio::test(start_paused = true)]
+        async fn restart_with_no_in_flight_work_emits_no_notice() {
+            let tmp = tempfile::tempdir().unwrap();
+            let central = CentralDb::open_in_memory().unwrap();
+            let session = fixture_running_session(&central);
+            let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+            paths.ensure_dirs().unwrap();
+
+            reset_stale_running_sessions(&central, tmp.path());
+
+            let updated = sessions::get(&central, session.id).unwrap();
+            assert!(matches!(updated.container_status, ContainerStatus::Stopped));
+            assert!(chat_rows(&paths).is_empty(), "no notice for an idle reset");
+        }
+
+        /// Pending inbound that was never picked up (it arrived while
+        /// the host was down, or sat unclaimed) is not an interrupted
+        /// turn: it will process normally on spawn, so no apology is
+        /// owed and no dedupe stamps may be left on the row.
+        #[tokio::test(start_paused = true)]
+        async fn restart_with_unclaimed_pending_inbound_emits_no_notice() {
+            let tmp = tempfile::tempdir().unwrap();
+            let central = CentralDb::open_in_memory().unwrap();
+            let session = fixture_running_session(&central);
+            let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+            paths.ensure_dirs().unwrap();
+            let msg_id = seed_routed_inbound(&paths, "hello?", chrono::Duration::zero());
+            // No processing_ack claim: no runner ever picked this up.
+
+            reset_stale_running_sessions(&central, tmp.path());
+
+            assert!(chat_rows(&paths).is_empty(), "no turn in flight, no notice");
+            // Row untouched: still due, tries not stamped.
+            let inbound = open_inbound(&paths).unwrap();
+            assert_eq!(messages_in::count_due(&inbound).unwrap(), 1);
+            let tries: i64 = inbound
+                .query_row(
+                    "SELECT tries FROM messages_in WHERE id = ?1",
+                    rusqlite::params![msg_id.as_uuid().to_string()],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(tries, 0, "unclaimed rows must not be stamped");
+        }
+
+        /// The dedup acceptance: with several inbound rows in flight
+        /// the notice still fires once per affected session per boot —
+        /// not per inbound row, not per repeat pass, and not again from
+        /// the sweep's apology path (the rows are old enough that the
+        /// `pending_too_long` apology WOULD fire were the tries stamp
+        /// absent).
+        #[tokio::test(start_paused = true)]
+        async fn notice_fires_once_per_session_not_per_row_pass_or_sweep() {
+            use copperclaw_host_sweep::SweepService;
+            use copperclaw_host_sweep::service::FilesystemSessionRoot;
+
+            let tmp = tempfile::tempdir().unwrap();
+            let central = CentralDb::open_in_memory().unwrap();
+            let session = fixture_running_session(&central);
+            let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+            paths.ensure_dirs().unwrap();
+            // Two in-flight rows, both past the sweep's 5-minute
+            // apology threshold.
+            let first = seed_routed_inbound(&paths, "step one", chrono::Duration::minutes(10));
+            let second = seed_routed_inbound(&paths, "step two", chrono::Duration::minutes(9));
+            claim_processing(&paths, first);
+            claim_processing(&paths, second);
+
+            reset_stale_running_sessions(&central, tmp.path());
+            assert_eq!(
+                chat_rows(&paths).len(),
+                1,
+                "one notice per session, not per inbound row"
+            );
+
+            // Both rows carry the dedupe stamps even though only one
+            // notice was written.
+            let outbound = open_outbound(&paths).unwrap();
+            for id in [first, second] {
+                let claim = processing_ack::get(&outbound, id).unwrap().unwrap();
+                assert_eq!(claim.status, processing_ack::ProcessingStatus::Failed);
+            }
+
+            // A repeat pass over the same state (the session wedged
+            // `running` again before anything processed) finds no
+            // in-flight claims and stays quiet.
+            sessions::mark_container_running(&central, session.id).unwrap();
+            reset_stale_running_sessions(&central, tmp.path());
+            assert_eq!(chat_rows(&paths).len(), 1, "repeat pass adds nothing");
+
+            // A sweep pass stays out too: the tries stamp keeps the
+            // pending_too_long apology away from these old rows, and
+            // the Failed claims keep the stale-claim reset out.
+            sessions::mark_container_stopped(&central, session.id).unwrap();
+            let sweep = SweepService::new(
+                central.clone(),
+                Arc::new(FilesystemSessionRoot::new(tmp.path())),
+            );
+            sweep.run_once_actuated().await.unwrap();
+            let all_rows = messages_out::list_due(&open_outbound(&paths).unwrap()).unwrap();
+            assert_eq!(
+                all_rows.len(),
+                1,
+                "sweep pass must not add apologies on top of the boot notice: {all_rows:?}"
+            );
+        }
     }
 }
