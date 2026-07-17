@@ -233,6 +233,14 @@ pub struct ContainerManager {
     /// keeps the pure polling loop — the poll cadence remains the crash-safe
     /// fallback either way.
     pub(crate) wake: Option<Arc<tokio::sync::Notify>>,
+    /// M21 O4 (decision (d)): opt-in operator-alert enqueuer. `None` (the
+    /// default, and every test constructor that doesn't wire it) means the
+    /// crash-loop/OOM and spawn-failure-streak call sites fire nothing beyond
+    /// their existing log + metric — zero behavior change. When wired (via
+    /// [`Self::with_operator_alerts`], from `boot.rs`) AND a destination is
+    /// configured, those thresholds enqueue one deduped, rate-limited alert
+    /// row through the existing delivery pipeline.
+    pub(crate) operator_alerts: Option<Arc<crate::operator_alerts::OperatorAlerts>>,
 }
 
 impl ContainerManager {
@@ -263,8 +271,25 @@ impl ContainerManager {
             spawn_activity: Arc::new(cold_start::SpawnActivity::new()),
             crash_loop: crash_loop::CrashLoopTracker::new(),
             wake: None,
+            operator_alerts: None,
             cfg,
         }
+    }
+
+    /// Wire the opt-in operator-alert enqueuer (M21 O4) into the manager. The
+    /// boot sequence hands the same `Arc<OperatorAlerts>` it registers the
+    /// supervisor degraded-watch loop with, so the crash-loop/OOM and
+    /// spawn-failure-streak thresholds can push a deduped, rate-limited alert
+    /// to the configured operator destination. Mutates `self` so boot can
+    /// attach it after building the manager. `None` (the default) is a no-op:
+    /// the thresholds keep their pre-O4 log + metric behaviour.
+    #[must_use]
+    pub fn with_operator_alerts(
+        mut self,
+        alerts: Arc<crate::operator_alerts::OperatorAlerts>,
+    ) -> Self {
+        self.operator_alerts = Some(alerts);
+        self
     }
 
     /// Wire the M17 session-preview manager so container stop / removal tears
@@ -417,6 +442,37 @@ impl ContainerManager {
         }
         copperclaw_metrics::inc_secrets_rotated();
         changed
+    }
+
+    /// M21 O4: fire one operator alert when a session's spawn-failure streak
+    /// crosses [`SpawnAttemptTracker`]'s threshold. Fired on the exact
+    /// crossing (`attempts == SPAWN_FAIL_THRESHOLD`) so it is once-per-streak:
+    /// a successful spawn clears the tracker, so the next streak re-crosses and
+    /// re-arms. `OperatorAlerts::fire`'s own dedup is belt-and-suspenders. A
+    /// no-op when alerts are unwired or their destination is unconfigured.
+    pub(crate) fn alert_spawn_failure(
+        &self,
+        session: &copperclaw_types::Session,
+        attempts: u32,
+        reason: spawn::SpawnFailureReason,
+    ) {
+        if attempts != copperclaw_host_sweep::SPAWN_FAIL_THRESHOLD {
+            return;
+        }
+        let Some(alerts) = self.operator_alerts.as_ref() else {
+            return;
+        };
+        alerts.fire(
+            crate::operator_alerts::AlertSeverity::Warning,
+            &format!("spawn_fail:{}", session.id.as_uuid()),
+            &format!(
+                "A session container has failed to spawn {attempts} times in a row \
+                 (reason: {}); the session cannot come up. Agent group {}. \
+                 See `cclaw doctor`.",
+                reason.as_str(),
+                session.agent_group_id.as_uuid()
+            ),
+        );
     }
 
     /// Poll loop. Returns when `shutdown` is cancelled.

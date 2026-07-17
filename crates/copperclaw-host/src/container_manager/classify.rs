@@ -416,6 +416,25 @@ impl ContainerManager {
                     "OOM crash-loop error card emitted"
                 );
             }
+            // M21 O4 (decision (d)): the OOM threshold is a once-per-episode
+            // signal (`emit_oom_card` is true exactly once per episode), so
+            // push it to the operator too when the opt-in alert destination is
+            // wired + configured. A no-op otherwise. Dedup key is per-session
+            // so a fleet of OOMing sessions each alerts independently but only
+            // once per episode.
+            if let Some(alerts) = self.operator_alerts.as_ref() {
+                alerts.fire(
+                    crate::operator_alerts::AlertSeverity::Warning,
+                    &format!("oom:{}", session.id.as_uuid()),
+                    &format!(
+                        "A session keeps running out of memory ({} OOM kills this episode); \
+                         restarts are backing off but the task will likely keep failing. \
+                         An operator can raise `memory_mb` for agent group {}.",
+                        record.oom_count,
+                        session.agent_group_id.as_uuid()
+                    ),
+                );
+            }
         }
         Ok(())
     }

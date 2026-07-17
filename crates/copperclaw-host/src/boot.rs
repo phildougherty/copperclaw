@@ -794,6 +794,44 @@ pub async fn run_host(
     // WITHOUT that token firing.
     let mut supervisor = crate::supervisor::Supervisor::new(shutdown.clone());
 
+    // 10b. M21 O4 (decision (d)): opt-in operator-alert enqueuer. Reads the
+    // `COPPERCLAW_OPERATOR_ALERT_*` env vars for a push destination; with none
+    // configured it is disabled and produces ZERO new outbound (only the
+    // existing log + metric). Shared, by Arc, between the supervisor
+    // degraded-watch loop registered just below and the container manager
+    // built later (crash-loop/OOM + spawn-failure-streak call sites). Uses the
+    // live sessions root so its alert rows ride the same delivery pipeline the
+    // rest of the host already drains.
+    let operator_alerts = Arc::new(crate::operator_alerts::OperatorAlerts::from_env(
+        state.central.clone(),
+        cfg.sessions_root(),
+    ));
+    if operator_alerts.is_enabled() {
+        info!("operator alerts enabled (COPPERCLAW_OPERATOR_ALERT_* configured)");
+    } else {
+        info!(
+            "operator alerts disabled (set COPPERCLAW_OPERATOR_ALERT_CHANNEL + \
+             COPPERCLAW_OPERATOR_ALERT_TARGET to enable); no new outbound will be produced"
+        );
+    }
+
+    // 10c. Supervisor permanent-failure → operator alert (M21 O4 hooking the
+    // S1 degraded-watch seam). Registered as a supervised loop so a panic here
+    // restarts on the same backoff curve as every other loop; each (re)start
+    // mints a fresh `degraded_watch()` receiver. Fires exactly one Critical
+    // alert when the supervisor-wide degraded flag flips to `true`.
+    {
+        let alerts = Arc::clone(&operator_alerts);
+        let status = supervisor.status();
+        let sd = shutdown.clone();
+        supervisor.register("operator_alert_watch", move || {
+            let alerts = Arc::clone(&alerts);
+            let rx = status.degraded_watch();
+            let sd = sd.clone();
+            async move { alerts.run_degraded_watch(rx, sd).await }
+        });
+    }
+
     // 11. Inbound consumer. The receiver survives restarts behind a shared
     // Mutex: each incarnation locks it for its lifetime (a panic releases
     // the lock through unwinding), so a restarted consumer resumes the same
@@ -971,6 +1009,10 @@ pub async fn run_host(
         // M21 F1: the same spawn-activity registry the typing ticker
         // reads, so mid-spawn sessions pulse typing from message one.
         Arc::clone(&spawn_activity),
+        // M21 O4: the same operator-alert enqueuer the degraded-watch loop
+        // uses, so the crash-loop/OOM + spawn-failure-streak thresholds push
+        // to the configured operator destination.
+        Arc::clone(&operator_alerts),
     );
     let (manager_task, manager_handle): (
         Option<tokio::task::JoinHandle<()>>,
@@ -1186,6 +1228,7 @@ fn spawn_container_manager(
     preview: Arc<crate::preview::PreviewManager>,
     inbound_wake: Arc<tokio::sync::Notify>,
     spawn_activity: Arc<crate::container_manager::SpawnActivity>,
+    operator_alerts: Arc<crate::operator_alerts::OperatorAlerts>,
 ) -> Option<SpawnedManager> {
     let Some(image_tag) = cfg.default_image_tag.clone() else {
         warn!(
@@ -1265,7 +1308,8 @@ fn spawn_container_manager(
             .with_spawn_tracker(spawn_tracker)
             .with_preview(preview)
             .with_wake_notify(inbound_wake)
-            .with_spawn_activity(spawn_activity);
+            .with_spawn_activity(spawn_activity)
+            .with_operator_alerts(operator_alerts);
     if let Some((broker_state, broker_base_url)) = broker {
         manager = manager.with_broker(broker_state, broker_base_url);
     }
