@@ -775,6 +775,213 @@ pub fn entry() -> ToolEntry {
     }
 }
 
+// ── M22 C1: post-edit verify hook ────────────────────────────────────────
+//
+// After a successful `edit_file`/`multi_edit`/`apply_patch`/`write_file`
+// mutation, run the SAME format/typecheck logic this module already owns,
+// scoped to JUST the touched file (not the whole repo — that stays the
+// on-demand `diagnostics` tool's job), and hand the caller a concise digest
+// to append to the tool result. The point is feedback IN THE LOOP: a type
+// or lint break surfaces to the *model* on its next turn instead of leaking
+// to the user. On a clean edit the digest is absent — no spam.
+//
+// This runs the same toolchain commands the agent can already invoke by
+// hand via `shell`/`diagnostics`; it does not expand the trust boundary,
+// it only auto-invokes an already-available check on the file just written
+// (see `docs/plans/m22-security-reviews.md`, C1).
+
+/// Env var operators set to disable the post-edit verify hook. Default ON
+/// (opt-out only, per the card). Any of `0`/`false`/`off`/`no`
+/// (case-insensitive, whitespace-trimmed) turns it off; anything else —
+/// including unset — leaves it on.
+const POST_EDIT_VERIFY_ENV: &str = "COPPERCLAW_POST_EDIT_VERIFY";
+
+/// Cap on how many full diagnostics the post-edit digest carries. Smaller
+/// than [`DEFAULT_MAX_DIAGNOSTICS`] on purpose — this fires after EVERY
+/// edit and lives in conversation history, so it stays terse; the model can
+/// call the full `diagnostics` tool when it wants the complete list.
+const POST_EDIT_MAX_DIAGNOSTICS: usize = 10;
+
+/// Interpret the [`POST_EDIT_VERIFY_ENV`] value. Pure so it's unit-testable
+/// without mutating the process environment (forbidden under edition-2024
+/// `unsafe`-free rules).
+fn parse_post_edit_verify_flag(raw: Option<&str>) -> bool {
+    match raw {
+        None => true,
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+    }
+}
+
+/// Test-only in-process override for [`post_edit_verify_enabled`]. Lets the
+/// suite force the gate without touching env vars.
+#[cfg(test)]
+static POST_EDIT_VERIFY_TEST_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<bool>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn post_edit_verify_test_override_set(v: Option<bool>) {
+    let cell = POST_EDIT_VERIFY_TEST_OVERRIDE.get_or_init(|| std::sync::Mutex::new(None));
+    *cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = v;
+}
+
+/// Whether the post-edit verify hook is enabled for this session. Default
+/// ON; reads [`POST_EDIT_VERIFY_ENV`] at call time (mirroring how
+/// `diagnostics`/`ui_screenshot` probe the environment lazily rather than at
+/// registration).
+fn post_edit_verify_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(cell) = POST_EDIT_VERIFY_TEST_OVERRIDE.get() {
+        if let Some(v) = *cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return v;
+        }
+    }
+    parse_post_edit_verify_flag(std::env::var(POST_EDIT_VERIFY_ENV).ok().as_deref())
+}
+
+/// Pick the single applicable checker for a touched file from its
+/// extension. `None` when no toolchain this module knows about applies
+/// (a `.md`, a `.rs`, a `.toml`, …) — the graceful "nothing to check"
+/// path, never an error.
+fn tool_for_extension(path: &Path) -> Option<DiagTool> {
+    match path.extension().and_then(|e| e.to_str()) {
+        Some("ts" | "tsx" | "mts" | "cts") => Some(DiagTool::Tsc),
+        Some("js" | "jsx" | "mjs" | "cjs") => Some(DiagTool::Eslint),
+        Some("py" | "pyi") => Some(DiagTool::Ruff),
+        _ => None,
+    }
+}
+
+/// Run one checker over a SINGLE file, from its parent directory so config
+/// discovery (eslint/ruff/tsc) and path relativisation both key off a short
+/// bare filename. Reuses this module's parsers verbatim.
+async fn run_tool_on_file(
+    tool: DiagTool,
+    dir: &Path,
+    file_name: &str,
+) -> Result<Vec<Diagnostic>, String> {
+    let args: Vec<String> = match tool {
+        DiagTool::Eslint => vec![file_name.to_string(), "-f".to_string(), "json".to_string()],
+        DiagTool::Tsc => vec![
+            "--noEmit".to_string(),
+            "--pretty".to_string(),
+            "false".to_string(),
+            file_name.to_string(),
+        ],
+        DiagTool::Ruff => vec![
+            "check".to_string(),
+            "--output-format".to_string(),
+            "json".to_string(),
+            file_name.to_string(),
+        ],
+    };
+
+    let mut cmd = tokio::process::Command::new(tool.binary());
+    cmd.args(&args)
+        .current_dir(dir)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to launch {}: {e}", tool.binary()))?;
+    let output = match tokio::time::timeout(TOOL_TIMEOUT, child.wait_with_output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(format!("{} wait failed: {e}", tool.binary())),
+        Err(_) => {
+            return Err(format!(
+                "{} timed out after {}s",
+                tool.binary(),
+                TOOL_TIMEOUT.as_secs()
+            ));
+        }
+    };
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    match tool {
+        DiagTool::Eslint => parse_eslint_json(&stdout, dir)
+            .map_err(|e| format!("{e}; stderr: {}", truncate_note(&stderr, ERROR_NOTE_CAP))),
+        DiagTool::Tsc => Ok(parse_tsc_output(&stdout, dir)),
+        DiagTool::Ruff => parse_ruff_json(&stdout, dir)
+            .map_err(|e| format!("{e}; stderr: {}", truncate_note(&stderr, ERROR_NOTE_CAP))),
+    }
+}
+
+/// Fold parsed diagnostics into the concise post-edit digest, or `None`
+/// when the file is clean (no diagnostics — the common case, kept silent).
+/// Pure, so it's unit-tested directly against hand-built `Diagnostic`
+/// lists — the acceptance criteria ("a bad edit yields a non-empty digest",
+/// "a clean edit yields none") land here without needing a real linter.
+fn build_post_edit_digest(tool: DiagTool, file: &str, diagnostics: &[Diagnostic]) -> Option<Value> {
+    if diagnostics.is_empty() {
+        return None;
+    }
+    let errors = diagnostics.iter().filter(|d| d.severity == "error").count() as u64;
+    let warnings = diagnostics.len() as u64 - errors;
+    let diagnostics_truncated = diagnostics.len() > POST_EDIT_MAX_DIAGNOSTICS;
+    let shown: Vec<&Diagnostic> = diagnostics.iter().take(POST_EDIT_MAX_DIAGNOSTICS).collect();
+    Some(json!({
+        "hook": "post_edit_verify",
+        "tool": tool.name(),
+        "file": file,
+        "errors": errors,
+        "warnings": warnings,
+        "diagnostics": shown,
+        "diagnostics_truncated": diagnostics_truncated,
+        "note": format!(
+            "post-edit verify ran `{}` on this file and found {errors} error(s), {warnings} \
+             warning(s). Fix them before continuing — this check runs automatically after each \
+             edit (opt out with {POST_EDIT_VERIFY_ENV}=0).",
+            tool.name(),
+        ),
+    }))
+}
+
+/// The public hook: after a successful mutation to `path`, run the
+/// applicable checker over just that file and return a concise digest to
+/// append to the tool result. Returns `None` — silently, never an error —
+/// when the hook is disabled, no toolchain applies to the file type, the
+/// checker binary isn't installed in this image, the run couldn't be
+/// parsed, or the file is clean. Best-effort by design: a hiccup here must
+/// never turn a successful edit into a failure.
+pub async fn post_edit_verify(path: &str) -> Option<Value> {
+    if !post_edit_verify_enabled() {
+        return None;
+    }
+    let file = Path::new(path);
+    let tool = tool_for_extension(file)?;
+    if !probe_binary(tool.binary()).await {
+        return None;
+    }
+    let dir = file
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
+    let file_name = file.file_name()?.to_string_lossy().into_owned();
+    let diagnostics = run_tool_on_file(tool, &dir, &file_name).await.ok()?;
+    build_post_edit_digest(tool, &file_name, &diagnostics)
+}
+
+/// Convenience wiring shared by all four mutation tools
+/// (`edit_file`/`multi_edit`/`apply_patch`/`write_file`): run
+/// [`post_edit_verify`] for `path` and, when it yields a digest, insert it
+/// under `post_edit_diagnostics` in the tool's result object. No-op when
+/// the digest is absent, so a clean edit's result shape is unchanged.
+pub async fn append_post_edit_digest(out: &mut Value, path: &str) {
+    if let Some(digest) = post_edit_verify(path).await {
+        if let Some(map) = out.as_object_mut() {
+            map.insert("post_edit_diagnostics".into(), digest);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1155,6 +1362,176 @@ mod tests {
                 .unwrap()
                 >= 1
         );
+    }
+
+    // ── M22 C1: post-edit verify hook ────────────────────────────────────
+
+    fn diag(file: &str, severity: &str, rule: &str, message: &str) -> Diagnostic {
+        Diagnostic {
+            file: file.to_string(),
+            line: 1,
+            column: 7,
+            severity: severity.to_string(),
+            rule: Some(rule.to_string()),
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn post_edit_flag_defaults_on_and_honours_opt_out() {
+        assert!(parse_post_edit_verify_flag(None));
+        assert!(parse_post_edit_verify_flag(Some("1")));
+        assert!(parse_post_edit_verify_flag(Some("true")));
+        assert!(parse_post_edit_verify_flag(Some("anything-else")));
+        for off in ["0", "false", "off", "no", "  OFF ", "False"] {
+            assert!(
+                !parse_post_edit_verify_flag(Some(off)),
+                "`{off}` should disable the hook"
+            );
+        }
+    }
+
+    #[test]
+    fn post_edit_test_override_forces_gate() {
+        post_edit_verify_test_override_set(Some(false));
+        assert!(!post_edit_verify_enabled());
+        post_edit_verify_test_override_set(Some(true));
+        assert!(post_edit_verify_enabled());
+        post_edit_verify_test_override_set(None);
+    }
+
+    #[test]
+    fn tool_for_extension_maps_known_source_types() {
+        assert_eq!(tool_for_extension(Path::new("a.ts")), Some(DiagTool::Tsc));
+        assert_eq!(tool_for_extension(Path::new("a.tsx")), Some(DiagTool::Tsc));
+        assert_eq!(
+            tool_for_extension(Path::new("a.js")),
+            Some(DiagTool::Eslint)
+        );
+        assert_eq!(
+            tool_for_extension(Path::new("a.mjs")),
+            Some(DiagTool::Eslint)
+        );
+        assert_eq!(tool_for_extension(Path::new("a.py")), Some(DiagTool::Ruff));
+        // No toolchain applies → None, never an error (the .md / .rs case).
+        assert_eq!(tool_for_extension(Path::new("README.md")), None);
+        assert_eq!(tool_for_extension(Path::new("main.rs")), None);
+        assert_eq!(tool_for_extension(Path::new("Cargo.toml")), None);
+        assert_eq!(tool_for_extension(Path::new("Makefile")), None);
+    }
+
+    /// Acceptance: a bad edit yields a NON-EMPTY digest.
+    #[test]
+    fn bad_edit_yields_nonempty_digest() {
+        let diags = vec![diag(
+            "index.ts",
+            "error",
+            "TS2322",
+            "Type 'string' is not assignable to type 'number'.",
+        )];
+        let digest =
+            build_post_edit_digest(DiagTool::Tsc, "index.ts", &diags).expect("digest present");
+        assert_eq!(digest["hook"], "post_edit_verify");
+        assert_eq!(digest["tool"], "tsc");
+        assert_eq!(digest["file"], "index.ts");
+        assert_eq!(digest["errors"], 1);
+        assert_eq!(digest["warnings"], 0);
+        assert_eq!(digest["diagnostics"].as_array().unwrap().len(), 1);
+        assert_eq!(digest["diagnostics_truncated"], false);
+        assert!(
+            digest["note"]
+                .as_str()
+                .unwrap()
+                .contains("post-edit verify")
+        );
+    }
+
+    /// Acceptance: a clean edit yields NO digest (absent, not empty).
+    #[test]
+    fn clean_edit_yields_no_digest() {
+        assert!(build_post_edit_digest(DiagTool::Ruff, "app.py", &[]).is_none());
+    }
+
+    #[test]
+    fn digest_counts_errors_and_warnings_and_caps_the_list() {
+        let mut diags = Vec::new();
+        // 12 errors + 3 warnings → totals uncapped, list capped at 10.
+        for i in 0..12 {
+            diags.push(diag("index.ts", "error", "TS2322", &format!("err {i}")));
+        }
+        for i in 0..3 {
+            diags.push(diag("index.ts", "warning", "TS6133", &format!("warn {i}")));
+        }
+        let digest = build_post_edit_digest(DiagTool::Tsc, "index.ts", &diags).unwrap();
+        assert_eq!(digest["errors"], 12);
+        assert_eq!(digest["warnings"], 3);
+        assert_eq!(
+            digest["diagnostics"].as_array().unwrap().len(),
+            POST_EDIT_MAX_DIAGNOSTICS
+        );
+        assert_eq!(digest["diagnostics_truncated"], true);
+    }
+
+    /// The recorded-digest fixture (acceptance: "Fixture: recorded
+    /// diagnostics digest"): building the digest for a canonical tsc type
+    /// error must match the golden JSON checked in under `fixtures/`. This
+    /// pins the exact shape/wording the model sees fed back next turn.
+    #[test]
+    fn digest_matches_recorded_fixture() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fixtures/diagnostics/post-edit-digest/recorded-digest.json");
+        let recorded: Value =
+            serde_json::from_str(&std::fs::read_to_string(&fixture).unwrap()).unwrap();
+        let diags = vec![diag(
+            "index.ts",
+            "error",
+            "TS2322",
+            "Type 'string' is not assignable to type 'number'.",
+        )];
+        let digest = build_post_edit_digest(DiagTool::Tsc, "index.ts", &diags).unwrap();
+        assert_eq!(digest, recorded, "post-edit digest drifted from fixture");
+    }
+
+    #[tokio::test]
+    async fn append_post_edit_digest_is_noop_for_unsupported_type() {
+        // A `.md` file has no applicable checker → the result object is
+        // returned byte-identical (no `post_edit_diagnostics` key).
+        let mut out = json!({ "path": "/tmp/notes.md", "bytes_written": 3 });
+        let before = out.clone();
+        append_post_edit_digest(&mut out, "/tmp/notes.md").await;
+        assert_eq!(out, before);
+    }
+
+    #[tokio::test]
+    async fn post_edit_verify_is_none_when_disabled() {
+        post_edit_verify_test_override_set(Some(false));
+        // Even a would-be-checked extension returns None when opted out.
+        assert!(post_edit_verify("/tmp/whatever.py").await.is_none());
+        post_edit_verify_test_override_set(None);
+    }
+
+    #[tokio::test]
+    async fn post_edit_verify_is_none_for_unsupported_extension() {
+        // Independent of any installed toolchain: `.md` maps to no tool.
+        assert!(post_edit_verify("/tmp/readme.md").await.is_none());
+    }
+
+    /// Live end-to-end: a real `ruff` run through the post-edit hook against
+    /// a `.py` file with an unused import must produce a non-empty digest.
+    /// `#[ignore]`d like the other live diagnostics tests — needs `ruff` on
+    /// PATH (the `prototyping` image); opt in with
+    /// `--ignored post_edit_verify_live_ruff`.
+    #[tokio::test]
+    #[ignore = "requires a real `ruff` on PATH (the prototyping image); opt in with --ignored"]
+    async fn post_edit_verify_live_ruff() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.py");
+        write(&path, "import os\n\nprint('hi')\n");
+        let digest = post_edit_verify(&path.to_string_lossy())
+            .await
+            .expect("ruff should flag the unused import");
+        assert_eq!(digest["tool"], "ruff");
+        assert!(digest["errors"].as_u64().unwrap() >= 1);
     }
 
     /// Parse the single text block a `success_json`-shaped `CallToolResult`

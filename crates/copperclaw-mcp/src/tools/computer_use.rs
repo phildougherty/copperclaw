@@ -1076,12 +1076,17 @@ pub mod write_file {
                 ctx.emit_diff(card).await;
             }
         }
-        crate::tools::verify_gate::mark_dirty_for_write(ctx, &path.display().to_string()).await;
-        Ok(success_json(&json!({
-            "path": path.display().to_string(),
+        let display = path.display().to_string();
+        crate::tools::verify_gate::mark_dirty_for_write(ctx, &display).await;
+        // M22 C1: append the post-edit verify digest (see `edit_file`) so a
+        // freshly written file's type/lint breakage feeds back to the model.
+        let mut out = json!({
+            "path": display,
             "bytes_written": bytes.len(),
             "appended": input.append,
-        })))
+        });
+        crate::tools::diagnostics::append_post_edit_digest(&mut out, &display).await;
+        Ok(success_json(&out))
     }
 
     struct Handler;
