@@ -1745,6 +1745,307 @@ pub fn observe_ui_inspect_console_errors(count: u64) {
     histogram!(UI_INSPECT_CONSOLE_ERRORS).record(count as f64);
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// M21 metrics rider (card M1) — one sweep of the metric "wishes" the merged M21
+// cards (S1-S6, F1-F4, O2-O4) recorded in their PR descriptions, code comments
+// (`// M1 metric wish:`), and the plan's `## M1. Metrics rider` section. No
+// other M21 card touches this crate; names/labels mirror each card's wish where
+// one exists. The emit call sites live in the crate each wish named (noted per
+// helper). Grouped by card.
+// ════════════════════════════════════════════════════════════════════════════
+
+// ── S1 — background-loop liveness gauges + restart counts ──────────────────
+pub const SUPERVISED_LOOP_ALIVE: &str = "copperclaw_supervised_loop_alive";
+pub const SUPERVISED_LOOP_DEGRADED: &str = "copperclaw_supervised_loop_degraded";
+pub const SUPERVISED_LOOP_RESTARTS_TOTAL: &str = "copperclaw_supervised_loop_restarts_total";
+
+/// Set `copperclaw_supervised_loop_alive{loop}` to 1 (a running incarnation)
+/// or 0 (drained on shutdown or between a crash and its backoff respawn) — the
+/// per-loop liveness gauge O1's `cclaw doctor` reads to spot a dead background
+/// loop. Emitted from `copperclaw-host/src/supervisor.rs` on every loop
+/// state transition (`mark_started` / `mark_stopped` / `record_unexpected_exit`)
+/// and refreshed at status-read time (`snapshot`, which applies the lazy
+/// healthy-reset first).
+pub fn set_supervised_loop_alive(loop_name: &str, alive: bool) {
+    gauge!(SUPERVISED_LOOP_ALIVE, "loop" => loop_name.to_owned()).set(f64::from(u8::from(alive)));
+}
+
+/// Set `copperclaw_supervised_loop_degraded{loop}` to 1 once a loop's restart
+/// streak has exhausted the backoff curve (it keeps dying), 0 once it heals
+/// past the reset window. Emitted from `copperclaw-host/src/supervisor.rs`
+/// alongside [`set_supervised_loop_alive`].
+pub fn set_supervised_loop_degraded(loop_name: &str, degraded: bool) {
+    gauge!(SUPERVISED_LOOP_DEGRADED, "loop" => loop_name.to_owned())
+        .set(f64::from(u8::from(degraded)));
+}
+
+/// Increment `copperclaw_supervised_loop_restarts_total{loop, reason}` — a
+/// supervised background loop exited unexpectedly and is being restarted;
+/// `reason` is `panicked` or `returned` (a bare return outside shutdown).
+/// Distinct from the liveness gauge: this is the monotonic restart count O1
+/// surfaces. Emitted from `copperclaw-host/src/supervisor.rs` (the driver's
+/// unexpected-exit arm).
+pub fn inc_supervised_loop_restart(loop_name: &str, reason: &str) {
+    counter!(
+        SUPERVISED_LOOP_RESTARTS_TOTAL,
+        "loop" => loop_name.to_owned(),
+        "reason" => reason.to_owned(),
+    )
+    .increment(1);
+}
+
+// ── S2 — container restarts by reason ──────────────────────────────────────
+pub const CONTAINER_RESTART_TOTAL: &str = "copperclaw_container_restart_total";
+
+/// Increment `copperclaw_container_restart_total{reason}` — the container
+/// manager tore down and will respawn a session's container; `reason` is
+/// `crash` (stale/dead heartbeat) or `stuck_tool` (S2 — the sweep found a tool
+/// past the absolute ceiling; the runner is alive but wedged). Gives the S2
+/// stuck restart its own series, distinct from the crash-only
+/// [`inc_containers_crashed`] (a deliberate recovery is not a crash). Emitted
+/// from `copperclaw-host/src/container_manager/classify.rs` (`restart_container`).
+pub fn inc_container_restart(reason: &str) {
+    counter!(CONTAINER_RESTART_TOTAL, "reason" => reason.to_owned()).increment(1);
+}
+
+// ── S3/S5 — delivery retry resumes + dead-letters by reason ────────────────
+pub const DELIVERY_RETRY_RESUMED_TOTAL: &str = "copperclaw_delivery_retry_resumed_total";
+pub const DELIVERY_DEAD_LETTER_TOTAL: &str = "copperclaw_delivery_dead_letter_total";
+
+/// Reason label values for `copperclaw_delivery_dead_letter_total`. Use these
+/// constants at call sites so a typo is a compile error.
+/// The row burned its full retry budget (adapter kept failing).
+pub const DEAD_LETTER_REASON_RETRY_EXHAUSTED: &str = "retry_exhausted";
+/// The row's channel had no live adapter past the age ceiling (S5).
+pub const DEAD_LETTER_REASON_NO_ADAPTER: &str = "no_adapter";
+
+/// Increment `copperclaw_delivery_retry_resumed_total` — the delivery loop
+/// rehydrated a still-pending outbound row's persisted retry counter
+/// (migration 029 `tries`/`not_before`) after a host restart, so the attempt
+/// budget resumes where it left off instead of restarting from zero (S3).
+/// Counted once per row with a nonzero persisted attempt count. Emitted from
+/// `copperclaw-host-delivery/src/service.rs` (`prime_retry_cache`).
+pub fn inc_delivery_retry_resumed() {
+    counter!(DELIVERY_RETRY_RESUMED_TOTAL).increment(1);
+}
+
+/// Increment `copperclaw_delivery_dead_letter_total{reason}` — one outbound row
+/// was dead-lettered (recorded `delivered{status="failed"}`, and for the
+/// no-adapter case a central `outbound_dropped_messages` row); `reason` is one
+/// of [`DEAD_LETTER_REASON_RETRY_EXHAUSTED`] or [`DEAD_LETTER_REASON_NO_ADAPTER`].
+/// A by-reason companion to the channel-labelled [`inc_delivery_failed`].
+/// Emitted from `copperclaw-host-delivery/src/service.rs` (`record_exhausted_row`
+/// and `record_no_adapter_expired`).
+pub fn inc_delivery_dead_letter(reason: &str) {
+    counter!(DELIVERY_DEAD_LETTER_TOTAL, "reason" => reason.to_owned()).increment(1);
+}
+
+// ── S4 — OOM kills + crash-loop backoff level ──────────────────────────────
+pub const CONTAINER_OOM_KILLS_TOTAL: &str = "copperclaw_container_oom_kills_total";
+pub const CRASH_BACKOFF_LEVEL: &str = "copperclaw_crash_backoff_level";
+
+/// Increment `copperclaw_container_oom_kills_total` — a session container was
+/// classified as OOM-killed (Docker `State.OOMKilled` or exit 137) at
+/// crash-restart time. The user-facing "keeps running out of memory" card fires
+/// once per episode; this counter meters every OOM kill. Emitted from
+/// `copperclaw-host/src/container_manager/classify.rs` (`restart_container`).
+pub fn inc_container_oom_kill() {
+    counter!(CONTAINER_OOM_KILLS_TOTAL).increment(1);
+}
+
+/// Record `copperclaw_crash_backoff_level` — the crash-loop streak position
+/// (1-based) a session reached when a crash/stuck restart was recorded, i.e.
+/// how deep into the respawn backoff curve (5s→15s→60s→300s cap) the episode
+/// got. A distribution skewed toward the cap means sessions are crash-looping.
+/// Emitted from `copperclaw-host/src/container_manager/classify.rs`
+/// (`restart_container`, one observation per recorded crash).
+pub fn observe_crash_backoff_level(streak: u32) {
+    histogram!(CRASH_BACKOFF_LEVEL).record(f64::from(streak));
+}
+
+// ── F1 — slow-spawn notices (the spawn-duration histogram already exists as
+// `copperclaw_container_spawn_seconds`, observed in spawn.rs) ───────────────
+pub const SLOW_SPAWN_NOTICES_TOTAL: &str = "copperclaw_slow_spawn_notices_total";
+
+/// Increment `copperclaw_slow_spawn_notices_total` — the one-per-episode
+/// slow-spawn watchdog posted its "setting things up" notice to the user
+/// because a cold spawn ran past the notice threshold (~first image build/pull).
+/// Emitted from `copperclaw-host/src/container_manager/cold_start.rs`
+/// (`post_slow_spawn_notice`, on a successfully-enqueued notice).
+pub fn inc_slow_spawn_notice() {
+    counter!(SLOW_SPAWN_NOTICES_TOTAL).increment(1);
+}
+
+// ── F2 — ask_user_question expiries ────────────────────────────────────────
+pub const QUESTION_EXPIRIES_TOTAL: &str = "copperclaw_question_expiries_total";
+
+/// Increment `copperclaw_question_expiries_total{outcome}` — the sweep found an
+/// `ask_user_question` whose TTL lapsed; `outcome` is `surfaced` (a terminal
+/// note + synthetic no-answer result were written) or `resolved_by_reply` (the
+/// user de-facto answered after the ask, so the lapse resolved silently).
+/// Emitted from `copperclaw-host-sweep/src/service.rs` (`run_once`, from the
+/// F2 question-expiry check's report).
+pub fn inc_question_expiry(outcome: &str) {
+    counter!(QUESTION_EXPIRIES_TOTAL, "outcome" => outcome.to_owned()).increment(1);
+}
+
+// ── F3 — boot/host-restart recovery notices ────────────────────────────────
+pub const RECOVERY_NOTICES_TOTAL: &str = "copperclaw_recovery_notices_total";
+
+/// Increment `copperclaw_recovery_notices_total` — a boot-time recovery notice
+/// (the "sorry, I was restarted mid-task" apology) was written for a session
+/// that had an in-flight turn when the host went down. Emitted from
+/// `copperclaw-host/src/boot.rs` (the stale-running-session reset path, once
+/// per notice written).
+pub fn inc_recovery_notice() {
+    counter!(RECOVERY_NOTICES_TOTAL).increment(1);
+}
+
+// ── F4 — external-MCP connection cache hit/miss ────────────────────────────
+pub const MCP_CONNECTION_CACHE_TOTAL: &str = "copperclaw_mcp_connection_cache_total";
+pub const MCP_CONNECTION_REAPED_TOTAL: &str = "copperclaw_mcp_connection_reaped_total";
+
+/// Increment `copperclaw_mcp_connection_cache_total{outcome}` — one external
+/// MCP tool call consulted the connection cache; `outcome` is `hit` (a live
+/// cached connection was reused), `miss` (no cached connection — connect
+/// fresh), or `dead_retry` (a cached connection was found dead under us,
+/// evicted, and the call retried once on a fresh connection). Emitted from
+/// `copperclaw-mcp/src/external_cache.rs` (`call_with`).
+pub fn inc_mcp_connection_cache(outcome: &str) {
+    counter!(MCP_CONNECTION_CACHE_TOTAL, "outcome" => outcome.to_owned()).increment(1);
+}
+
+/// Add `n` to `copperclaw_mcp_connection_reaped_total` — idle external MCP
+/// connections closed by the lazy/background reaper (past their idle TTL).
+/// Emitted from `copperclaw-mcp/src/external_cache.rs` (`reap_idle`, when it
+/// closed at least one connection).
+pub fn add_mcp_connections_reaped(n: u64) {
+    counter!(MCP_CONNECTION_REAPED_TOTAL).increment(n);
+}
+
+// ── O2 — integrity quick-check outcomes + quarantines ──────────────────────
+pub const INTEGRITY_QUICK_CHECK_TOTAL: &str = "copperclaw_integrity_quick_check_total";
+pub const INTEGRITY_QUARANTINES_TOTAL: &str = "copperclaw_integrity_quarantines_total";
+pub const INTEGRITY_QUARANTINED_SESSIONS: &str = "copperclaw_integrity_quarantined_sessions";
+
+/// Scope label values for `copperclaw_integrity_quick_check_total`.
+pub const INTEGRITY_SCOPE_SESSION: &str = "session";
+pub const INTEGRITY_SCOPE_CENTRAL: &str = "central";
+
+/// Increment `copperclaw_integrity_quick_check_total{scope, outcome}` — one
+/// `SQLite` `quick_check` probe ran; `scope` is [`INTEGRITY_SCOPE_SESSION`] (a
+/// per-session DB, one per db probed) or [`INTEGRITY_SCOPE_CENTRAL`] (the
+/// central DB); `outcome` is `healthy`, `missing` (not yet materialised — not
+/// corruption), or `corrupt`. Emitted from
+/// `copperclaw-host-sweep/src/checks/integrity.rs` (session) and
+/// `copperclaw-host-sweep/src/service.rs` (central).
+pub fn inc_integrity_quick_check(scope: &str, outcome: &str) {
+    counter!(
+        INTEGRITY_QUICK_CHECK_TOTAL,
+        "scope" => scope.to_owned(),
+        "outcome" => outcome.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Increment `copperclaw_integrity_quarantines_total` — a session's per-session
+/// DB failed `quick_check`, its `.quarantined` sidecar was written, and the
+/// session was excluded from further sweeps. Emitted from
+/// `copperclaw-host-sweep/src/checks/integrity.rs` (`check_and_quarantine`).
+pub fn inc_integrity_quarantines() {
+    counter!(INTEGRITY_QUARANTINES_TOTAL).increment(1);
+}
+
+/// Set `copperclaw_integrity_quarantined_sessions` — the current count of
+/// quarantined (sweep-excluded) sessions observed this sweep pass (already
+/// quarantined + newly quarantined this pass). A gauge, not a counter: it
+/// reflects the live excluded population. Emitted from
+/// `copperclaw-host-sweep/src/service.rs` (`run_once`, once per pass).
+pub fn set_integrity_quarantined_sessions(count: u64) {
+    #[allow(clippy::cast_precision_loss)]
+    gauge!(INTEGRITY_QUARANTINED_SESSIONS).set(count as f64);
+}
+
+// ── O3 — live provider-failover transitions (degrade vs restore) ───────────
+pub const PROVIDER_FAILOVER_TRANSITION_TOTAL: &str =
+    "copperclaw_provider_failover_transition_total";
+pub const PROVIDER_FAILOVER_ACTIVE_POSITION: &str = "copperclaw_provider_failover_active_position";
+
+/// Direction label values for `copperclaw_provider_failover_transition_total`.
+/// Moved to a higher-index fallback (a provider failed).
+pub const FAILOVER_DIRECTION_DEGRADE: &str = "degrade";
+/// Moved back toward the primary (an earlier-degraded provider re-probed OK).
+pub const FAILOVER_DIRECTION_RESTORE: &str = "restore";
+
+/// Increment `copperclaw_provider_failover_transition_total{direction, from, to}`
+/// — the runner's live failover moved the serving provider; `direction` is
+/// [`FAILOVER_DIRECTION_DEGRADE`] (to a higher-index fallback) or
+/// [`FAILOVER_DIRECTION_RESTORE`] (back toward the primary). Distinguishes live
+/// failover activity from the spawn-time selection the pre-existing
+/// [`inc_provider_failover`] counts. Emitted from
+/// `copperclaw-runner/src/run/provider_call.rs`.
+pub fn inc_provider_failover_transition(direction: &str, from: &str, to: &str) {
+    counter!(
+        PROVIDER_FAILOVER_TRANSITION_TOTAL,
+        "direction" => direction.to_owned(),
+        "from" => from.to_owned(),
+        "to" => to.to_owned(),
+    )
+    .increment(1);
+}
+
+/// Set `copperclaw_provider_failover_active_position` — the chain index (0 =
+/// primary) of the provider currently serving this session's turn. One runner
+/// process serves one session, so a plain gauge is unambiguous per process.
+/// Emitted from `copperclaw-runner/src/run/provider_call.rs` on entering each
+/// candidate.
+pub fn set_provider_failover_active_position(position: usize) {
+    #[allow(clippy::cast_precision_loss)]
+    gauge!(PROVIDER_FAILOVER_ACTIVE_POSITION).set(position as f64);
+}
+
+// ── O4 — operator alerts by severity + outcome ─────────────────────────────
+pub const OPERATOR_ALERTS_TOTAL: &str = "copperclaw_operator_alerts_total";
+
+/// Outcome label values for `copperclaw_operator_alerts_total`.
+/// Enqueued for delivery to the operator destination.
+pub const ALERT_OUTCOME_SENT: &str = "sent";
+/// No operator destination configured — log-only.
+pub const ALERT_OUTCOME_SUPPRESSED_DISABLED: &str = "suppressed_disabled";
+/// Same episode already alerted within the re-alert window.
+pub const ALERT_OUTCOME_SUPPRESSED_DEDUPED: &str = "suppressed_deduped";
+/// Alert-flood rate limit tripped.
+pub const ALERT_OUTCOME_SUPPRESSED_RATE_LIMITED: &str = "suppressed_rate_limited";
+/// No active session row to carry the outbound alert (fail-closed).
+pub const ALERT_OUTCOME_NO_CARRIER: &str = "no_carrier";
+/// A DB error dropped the enqueue (fail-closed).
+pub const ALERT_OUTCOME_ENQUEUE_FAILED: &str = "enqueue_failed";
+
+/// Increment `copperclaw_operator_alerts_total{severity, outcome}` — one
+/// `OperatorAlerts::fire` decision; `severity` is the alert's severity token
+/// and `outcome` is one of the `ALERT_OUTCOME_*` constants. Emitted from
+/// `copperclaw-host/src/operator_alerts.rs` (`fire`).
+pub fn inc_operator_alert(severity: &str, outcome: &str) {
+    counter!(
+        OPERATOR_ALERTS_TOTAL,
+        "severity" => severity.to_owned(),
+        "outcome" => outcome.to_owned(),
+    )
+    .increment(1);
+}
+
+// ── Long-wished: sweep last-run wall-clock ─────────────────────────────────
+pub const SWEEP_LAST_RUN_TIMESTAMP: &str = "copperclaw_sweep_last_run_timestamp";
+
+/// Set `copperclaw_sweep_last_run_timestamp` to the Unix time (seconds) of the
+/// last completed sweep pass — an alert on `time() - <this>` catches a wedged
+/// or dead sweep loop (complements the S1 loop-liveness gauge). Emitted from
+/// `copperclaw-host-sweep/src/service.rs` (end of `run_once`).
+pub fn set_sweep_last_run_timestamp(unix_secs: i64) {
+    #[allow(clippy::cast_precision_loss)]
+    gauge!(SWEEP_LAST_RUN_TIMESTAMP).set(unix_secs as f64);
+}
+
 // ── Address parsing ────────────────────────────────────────────────────────
 
 /// Parse `COPPERCLAW_METRICS_ADDR`.  Accepts:
@@ -2837,6 +3138,184 @@ mod tests {
         assert!(
             body.contains(UI_INSPECT_TOTAL) && body.contains("outcome=\"success\""),
             "missing ui_inspect counter:\n{body}"
+        );
+    }
+
+    // ── M21 metrics-rider (card M1) coverage ───────────────────────────────
+
+    /// Every new M21 metric name const, so the prefix / double-underscore
+    /// invariants extend to the rider's additions.
+    const M21_METRIC_NAMES: &[&str] = &[
+        SUPERVISED_LOOP_ALIVE,
+        SUPERVISED_LOOP_DEGRADED,
+        SUPERVISED_LOOP_RESTARTS_TOTAL,
+        CONTAINER_RESTART_TOTAL,
+        DELIVERY_RETRY_RESUMED_TOTAL,
+        DELIVERY_DEAD_LETTER_TOTAL,
+        CONTAINER_OOM_KILLS_TOTAL,
+        CRASH_BACKOFF_LEVEL,
+        SLOW_SPAWN_NOTICES_TOTAL,
+        QUESTION_EXPIRIES_TOTAL,
+        RECOVERY_NOTICES_TOTAL,
+        MCP_CONNECTION_CACHE_TOTAL,
+        MCP_CONNECTION_REAPED_TOTAL,
+        INTEGRITY_QUICK_CHECK_TOTAL,
+        INTEGRITY_QUARANTINES_TOTAL,
+        INTEGRITY_QUARANTINED_SESSIONS,
+        PROVIDER_FAILOVER_TRANSITION_TOTAL,
+        PROVIDER_FAILOVER_ACTIVE_POSITION,
+        OPERATOR_ALERTS_TOTAL,
+        SWEEP_LAST_RUN_TIMESTAMP,
+    ];
+
+    #[test]
+    fn m21_metric_names_have_copperclaw_prefix_no_double_underscore() {
+        for name in M21_METRIC_NAMES {
+            assert!(
+                name.starts_with("copperclaw_"),
+                "metric name {name:?} does not start with 'copperclaw_'"
+            );
+            assert!(
+                !name.contains("__"),
+                "metric name {name:?} must not contain double underscores"
+            );
+        }
+    }
+
+    #[test]
+    fn m21_counter_names_end_with_total() {
+        for name in M21_METRIC_NAMES {
+            if name == &SUPERVISED_LOOP_ALIVE
+                || name == &SUPERVISED_LOOP_DEGRADED
+                || name == &CRASH_BACKOFF_LEVEL
+                || name == &INTEGRITY_QUARANTINED_SESSIONS
+                || name == &PROVIDER_FAILOVER_ACTIVE_POSITION
+                || name == &SWEEP_LAST_RUN_TIMESTAMP
+            {
+                // gauges / histograms: exempt from the `_total` suffix rule.
+                continue;
+            }
+            assert!(
+                name.ends_with("_total"),
+                "counter {name:?} does not end with '_total'"
+            );
+        }
+    }
+
+    #[test]
+    fn m21_helpers_compile_and_do_not_panic() {
+        // No recorder installed → all of these no-op; smoke test that every
+        // rider helper is callable with its intended argument shape.
+        set_supervised_loop_alive("sweep", true);
+        set_supervised_loop_alive("sweep", false);
+        set_supervised_loop_degraded("sweep", true);
+        set_supervised_loop_degraded("sweep", false);
+        inc_supervised_loop_restart("sweep", "panicked");
+        inc_supervised_loop_restart("delivery", "returned");
+        inc_container_restart("crash");
+        inc_container_restart("stuck_tool");
+        inc_delivery_retry_resumed();
+        inc_delivery_dead_letter(DEAD_LETTER_REASON_RETRY_EXHAUSTED);
+        inc_delivery_dead_letter(DEAD_LETTER_REASON_NO_ADAPTER);
+        inc_container_oom_kill();
+        observe_crash_backoff_level(1);
+        observe_crash_backoff_level(4);
+        inc_slow_spawn_notice();
+        inc_question_expiry("surfaced");
+        inc_question_expiry("resolved_by_reply");
+        inc_recovery_notice();
+        inc_mcp_connection_cache("hit");
+        inc_mcp_connection_cache("miss");
+        inc_mcp_connection_cache("dead_retry");
+        add_mcp_connections_reaped(2);
+        inc_integrity_quick_check(INTEGRITY_SCOPE_SESSION, "healthy");
+        inc_integrity_quick_check(INTEGRITY_SCOPE_SESSION, "missing");
+        inc_integrity_quick_check(INTEGRITY_SCOPE_CENTRAL, "corrupt");
+        inc_integrity_quarantines();
+        set_integrity_quarantined_sessions(3);
+        inc_provider_failover_transition(FAILOVER_DIRECTION_DEGRADE, "anthropic", "ollama");
+        inc_provider_failover_transition(FAILOVER_DIRECTION_RESTORE, "ollama", "anthropic");
+        set_provider_failover_active_position(1);
+        inc_operator_alert("warning", ALERT_OUTCOME_SENT);
+        inc_operator_alert("critical", ALERT_OUTCOME_SUPPRESSED_DISABLED);
+        inc_operator_alert("warning", ALERT_OUTCOME_SUPPRESSED_DEDUPED);
+        inc_operator_alert("warning", ALERT_OUTCOME_SUPPRESSED_RATE_LIMITED);
+        inc_operator_alert("warning", ALERT_OUTCOME_NO_CARRIER);
+        inc_operator_alert("warning", ALERT_OUTCOME_ENQUEUE_FAILED);
+        set_sweep_last_run_timestamp(1_700_000_000);
+    }
+
+    #[test]
+    fn m21_labeled_series_render() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            set_supervised_loop_alive("sweep", true);
+            inc_supervised_loop_restart("sweep", "panicked");
+            inc_container_restart("stuck_tool");
+            inc_delivery_dead_letter(DEAD_LETTER_REASON_NO_ADAPTER);
+            inc_container_oom_kill();
+            inc_question_expiry("surfaced");
+            inc_mcp_connection_cache("hit");
+            inc_integrity_quick_check(INTEGRITY_SCOPE_SESSION, "corrupt");
+            set_integrity_quarantined_sessions(2);
+            inc_provider_failover_transition(FAILOVER_DIRECTION_DEGRADE, "anthropic", "ollama");
+            inc_operator_alert("warning", ALERT_OUTCOME_SENT);
+            set_sweep_last_run_timestamp(1_700_000_000);
+        });
+        let body = handle.render();
+        assert!(
+            body.contains(SUPERVISED_LOOP_ALIVE) && body.contains("loop=\"sweep\""),
+            "missing supervised loop alive gauge:\n{body}"
+        );
+        assert!(
+            body.contains(SUPERVISED_LOOP_RESTARTS_TOTAL) && body.contains("reason=\"panicked\""),
+            "missing supervised loop restart counter:\n{body}"
+        );
+        assert!(
+            body.contains(CONTAINER_RESTART_TOTAL) && body.contains("reason=\"stuck_tool\""),
+            "missing container restart-by-reason counter:\n{body}"
+        );
+        assert!(
+            body.contains(DELIVERY_DEAD_LETTER_TOTAL) && body.contains("reason=\"no_adapter\""),
+            "missing delivery dead-letter counter:\n{body}"
+        );
+        assert!(
+            body.contains(CONTAINER_OOM_KILLS_TOTAL),
+            "missing OOM kill counter:\n{body}"
+        );
+        assert!(
+            body.contains(QUESTION_EXPIRIES_TOTAL) && body.contains("outcome=\"surfaced\""),
+            "missing question expiry counter:\n{body}"
+        );
+        assert!(
+            body.contains(MCP_CONNECTION_CACHE_TOTAL) && body.contains("outcome=\"hit\""),
+            "missing MCP connection cache counter:\n{body}"
+        );
+        assert!(
+            body.contains(INTEGRITY_QUICK_CHECK_TOTAL)
+                && body.contains("scope=\"session\"")
+                && body.contains("outcome=\"corrupt\""),
+            "missing integrity quick-check counter:\n{body}"
+        );
+        assert!(
+            body.contains(INTEGRITY_QUARANTINED_SESSIONS),
+            "missing quarantined-sessions gauge:\n{body}"
+        );
+        assert!(
+            body.contains(PROVIDER_FAILOVER_TRANSITION_TOTAL)
+                && body.contains("direction=\"degrade\""),
+            "missing failover transition counter:\n{body}"
+        );
+        assert!(
+            body.contains(OPERATOR_ALERTS_TOTAL)
+                && body.contains("severity=\"warning\"")
+                && body.contains("outcome=\"sent\""),
+            "missing operator alert counter:\n{body}"
+        );
+        assert!(
+            body.contains(SWEEP_LAST_RUN_TIMESTAMP),
+            "missing sweep last-run timestamp gauge:\n{body}"
         );
     }
 }

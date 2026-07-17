@@ -30,7 +30,7 @@ and the endpoint stays off; the rest of the host runs normally.
 
 ### What is exported
 
-~140 metric families, all prefixed `copperclaw_`. Every family is
+~160 metric families, all prefixed `copperclaw_`. Every family is
 registered through a named helper in
 `crates/copperclaw-metrics/src/lib.rs` — that file is the
 authoritative registry; the tables below group the families by
@@ -237,6 +237,34 @@ are histograms; gauges are marked in the tables.
 | `copperclaw_secrets_rotated_total` | — | SIGHUP secret rotations. |
 | `copperclaw_degraded_state` (gauge) | `reason` | 1 while a subsystem is flagged degraded, 0 when cleared. |
 
+#### Stability + operator surfaces (M21)
+
+Added by the M21 stability program (S/F/O cards); the metric definitions
+and helper docs live in `crates/copperclaw-metrics/src/lib.rs`.
+
+| Name | Labels | Meaning |
+|---|---|---|
+| `copperclaw_supervised_loop_alive` (gauge) | `loop` | 1 while a supervised background loop is running, 0 while drained or awaiting a backoff respawn (S1). |
+| `copperclaw_supervised_loop_degraded` (gauge) | `loop` | 1 once a loop has exhausted its restart backoff curve, 0 once it heals (S1). |
+| `copperclaw_supervised_loop_restarts_total` | `loop`, `reason` | A supervised loop was restarted after an unexpected exit (`reason` = `panicked\|returned`) (S1). |
+| `copperclaw_container_restart_total` | `reason` | A session container was torn down for respawn: `crash` (dead heartbeat) or `stuck_tool` (wedged past the ceiling) (S2). |
+| `copperclaw_container_oom_kills_total` | — | A session container was classified as OOM-killed at crash-restart time (S4). |
+| `copperclaw_crash_backoff_level` (histogram) | — | The crash-loop streak position reached (how deep into the 5s→300s backoff curve) per recorded crash (S4). |
+| `copperclaw_delivery_retry_resumed_total` | — | A pending outbound row's persisted retry counter resumed after a host restart instead of restarting from zero (S3). |
+| `copperclaw_delivery_dead_letter_total` | `reason` | An outbound row was dead-lettered: `retry_exhausted` (S3) or `no_adapter` (channel had no live adapter past the age ceiling, S5). |
+| `copperclaw_slow_spawn_notices_total` | — | The one-per-episode "setting things up" slow-spawn notice was posted to a user during a cold spawn (F1). The spawn-phase duration is `copperclaw_container_spawn_seconds`. |
+| `copperclaw_question_expiries_total` | `outcome` | An `ask_user_question` TTL lapsed: `surfaced` (terminal note + no-answer result written) or `resolved_by_reply` (user answered after the ask; resolved silently) (F2). |
+| `copperclaw_recovery_notices_total` | — | A boot-time "I was restarted mid-task" recovery notice was written for a session with an in-flight turn (F3). |
+| `copperclaw_mcp_connection_cache_total` | `outcome` | External-MCP connection cache access: `hit`, `miss`, or `dead_retry` (cached connection found dead, evicted, retried once) (F4). |
+| `copperclaw_mcp_connection_reaped_total` | — | Idle external-MCP connections closed by the reaper past their idle TTL (F4). |
+| `copperclaw_integrity_quick_check_total` | `scope`, `outcome` | A SQLite `quick_check` probe ran; `scope` = `session\|central`, `outcome` = `healthy\|missing\|corrupt` (O2). |
+| `copperclaw_integrity_quarantines_total` | — | A session's per-session DB failed `quick_check` and was quarantined + sweep-excluded (O2). |
+| `copperclaw_integrity_quarantined_sessions` (gauge) | — | Current count of quarantined (sweep-excluded) sessions, observed each sweep pass (O2). |
+| `copperclaw_provider_failover_transition_total` | `direction`, `from`, `to` | A live provider failover moved the serving provider: `direction` = `degrade` (to a fallback) or `restore` (back toward primary) (O3). |
+| `copperclaw_provider_failover_active_position` (gauge) | — | Chain index (0 = primary) of the provider currently serving this session's turn (O3; one runner process = one session). |
+| `copperclaw_operator_alerts_total` | `severity`, `outcome` | An operator-alert decision; `outcome` = `sent\|suppressed_disabled\|suppressed_deduped\|suppressed_rate_limited\|no_carrier\|enqueue_failed` (O4). |
+| `copperclaw_sweep_last_run_timestamp` (gauge) | — | Unix time (seconds) of the last completed sweep pass — alert on `time() - <this>` to catch a wedged sweep loop. |
+
 ### Recommended alerts
 
 - `rate(copperclaw_containers_crashed_total[5m]) > 0` — runners dying;
@@ -276,6 +304,43 @@ are histograms; gauges are marked in the tables.
   `rate(copperclaw_edit_drift_fallthrough_total[1h])` — quality
   regressions in the outbound rendering path; not urgent, but a
   sustained rise usually means an adapter capability drifted.
+- `min(copperclaw_supervised_loop_alive) == 0` or
+  `max(copperclaw_supervised_loop_degraded) > 0` — a background loop is
+  down or has exhausted its restart backoff (S1). Pair with
+  `rate(copperclaw_supervised_loop_restarts_total[15m]) > 0` and check
+  `cclaw doctor` / the host log for the panic reason.
+- `time() - copperclaw_sweep_last_run_timestamp > 180` — the 60s sweep
+  loop has not completed a pass in 3 minutes; stuck-session detection,
+  recurrence fan-out, and GC are stalled. Complements the S1 liveness
+  gauge for the sweep loop specifically.
+- `rate(copperclaw_container_oom_kills_total[15m]) > 0` — sessions are
+  being OOM-killed; raise `memory_mb` for the affected agent group.
+  Watch `copperclaw_crash_backoff_level` skewing toward the cap for a
+  crash-loop that backoff alone won't fix.
+- `rate(copperclaw_container_restart_total{reason="stuck_tool"}[1h]) > 0`
+  — tools are wedging past the absolute ceiling and the sweep is
+  restarting their containers (S2); correlate with the session
+  transcripts.
+- `rate(copperclaw_delivery_dead_letter_total[1h]) > 0` — outbound rows
+  are being dead-lettered. `reason="no_adapter"` means a channel has no
+  live adapter (wire/fix it, then `cclaw dropped-messages replay`);
+  `reason="retry_exhausted"` means an adapter kept failing.
+- `rate(copperclaw_integrity_quarantines_total[1h]) > 0` or
+  `copperclaw_integrity_quarantined_sessions > 0` — a per-session DB was
+  found corrupt and quarantined (O2). A `corrupt` sample on the central
+  scope of `copperclaw_integrity_quick_check_total{scope="central"}` is
+  more serious — the central DB needs an operator restore from backup.
+- `rate(copperclaw_provider_failover_transition_total{direction="degrade"}[15m]) > 0`
+  — live failover is degrading off the primary provider (O3); pair with
+  `copperclaw_provider_failover_chain_exhausted_total` and the
+  `copperclaw_provider_failover_active_position` gauge to see whether the
+  chain is holding.
+- `sum by (severity) (rate(copperclaw_operator_alerts_total{outcome!="sent"}[1h])) > 0`
+  — operator alerts are being suppressed rather than delivered (O4). A
+  sustained `suppressed_disabled` means the alert destination is not
+  configured (`COPPERCLAW_OPERATOR_ALERT_CHANNEL` / `_TARGET`);
+  `no_carrier` / `enqueue_failed` mean the alert pipe couldn't place the
+  outbound row.
 
 ### Scrape config
 

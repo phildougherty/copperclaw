@@ -184,25 +184,28 @@ impl McpConnectionCache {
     ) -> Result<Value, McpError> {
         let reaped = self.reap_idle();
         if reaped > 0 {
+            // M21 F4 (M1 rider): reaped-connection count.
+            copperclaw_metrics::add_mcp_connections_reaped(reaped as u64);
             debug!(reaped, "reaped idle external MCP connections");
         }
         let key = CacheKey::new(scope, entry);
         let Some(client) = self.checkout(&key) else {
             // Miss: byte-identical to the uncached path — connect fresh, call
-            // once, propagate any error unchanged. M1 metric wish: cache miss.
+            // once, propagate any error unchanged.
+            copperclaw_metrics::inc_mcp_connection_cache("miss");
             debug!(scope, tool, "external MCP connection cache miss");
             return self
                 .connect_and_call(connector, key, entry, tool, input)
                 .await;
         };
-        // Hit. M1 metric wish: cache hit.
+        copperclaw_metrics::inc_mcp_connection_cache("hit");
         debug!(scope, tool, "external MCP connection cache hit");
         match client.call_tool(tool, input.clone()).await {
             Err(err) if is_connection_dead(&err) => {
                 // The cached connection died under us (server restart, child
                 // exit, broken pipe). Evict it and retry exactly once on a
                 // fresh connection; any failure from here surfaces as-is.
-                // M1 metric wish: dead-connection retry.
+                copperclaw_metrics::inc_mcp_connection_cache("dead_retry");
                 debug!(
                     scope,
                     tool,
@@ -240,7 +243,9 @@ impl McpConnectionCache {
 
     /// Evict every connection idle for at least the TTL. Returns the number
     /// evicted. Called lazily on each cache access and periodically by the
-    /// background reaper. M1 metric wish: reaped-connection count.
+    /// background reaper. The M21 M1 rider meters the reaped-connection count
+    /// via `copperclaw_mcp_connection_reaped_total` at the `call_with` call
+    /// site (which has the count in hand).
     pub fn reap_idle(&self) -> usize {
         let now = Instant::now();
         let mut map = self.lock();

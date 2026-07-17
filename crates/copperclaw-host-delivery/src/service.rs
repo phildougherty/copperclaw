@@ -3025,6 +3025,12 @@ impl DeliveryService {
                     }
                     _ => now,
                 };
+                // M21 S3 (M1 rider): a persisted, non-zero attempt count is a
+                // genuine resume across a host restart (a fresh row starts at
+                // 0 and is not counted).
+                if state.tries > 0 {
+                    copperclaw_metrics::inc_delivery_retry_resumed();
+                }
                 vacant.insert(RetryState {
                     tries: state.tries,
                     not_before,
@@ -3062,6 +3068,10 @@ impl DeliveryService {
             .as_ref()
             .map_or_else(|| "unknown".to_owned(), |ct| ct.as_str().to_owned());
         copperclaw_metrics::inc_delivery_failed(&channel_label);
+        // M21 S3 (M1 rider): dead-letter by reason (retry budget exhausted).
+        copperclaw_metrics::inc_delivery_dead_letter(
+            copperclaw_metrics::DEAD_LETTER_REASON_RETRY_EXHAUSTED,
+        );
         // Best-effort: emit an Error-kind outbound row addressed back at
         // the originating channel so the next delivery pass renders it
         // visibly to the user. Swallow errors — an emit failure here can't
@@ -3153,6 +3163,10 @@ impl DeliveryService {
         delivered::insert(&in_conn, row.id, None, "failed")?;
         self.retries.remove(key);
         copperclaw_metrics::inc_delivery_failed(channel_type.as_str());
+        // M21 S5 (M1 rider): dead-letter by reason (no live adapter).
+        copperclaw_metrics::inc_delivery_dead_letter(
+            copperclaw_metrics::DEAD_LETTER_REASON_NO_ADAPTER,
+        );
         Ok(())
     }
 

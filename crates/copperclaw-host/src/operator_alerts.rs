@@ -17,8 +17,9 @@
 //!   alert reaches the operator's channel regardless of which session's
 //!   `outbound.db` physically carried it.
 //! - **Disabled by default.** With no destination configured, [`fire`] does
-//!   nothing but the existing log line + the M1 metric wish — ZERO new
-//!   outbound, zero behavior change. This is the secure-by-default posture:
+//!   nothing but the existing log line + the M1 metric (outcome
+//!   `suppressed_disabled`) — ZERO new outbound, zero behavior change. This
+//!   is the secure-by-default posture:
 //!   the platform never emits a new outward message unless an operator with
 //!   host filesystem access explicitly opted in.
 //!
@@ -98,11 +99,11 @@
 //!    };
 //!    ```
 //!
-//! ## M1 metric wishes (recorded here + in the PR)
+//! ## M1 metric (wired by the M21 M1 rider)
 //!
-//! Per the O4 plan wish ("operator alerts by severity"):
-//! `// M1 metric wish:` `copperclaw_operator_alerts_total{severity, outcome}`
-//! where `outcome ∈ {sent, suppressed_disabled, suppressed_deduped,
+//! Per the O4 plan wish ("operator alerts by severity"), [`OperatorAlerts::fire`]
+//! emits `copperclaw_operator_alerts_total{severity, outcome}` where
+//! `outcome ∈ {sent, suppressed_disabled, suppressed_deduped,
 //! suppressed_rate_limited, no_carrier, enqueue_failed}` — one counter that
 //! captures both the delivered alerts (by severity) and every suppression
 //! reason an operator would want to alert on.
@@ -296,14 +297,17 @@ impl OperatorAlerts {
     /// `dedup_key` names the *episode* (not the pass): repeats within
     /// [`RE_ALERT_WINDOW`] are suppressed so a persisting condition re-alerts
     /// at most once per window. Disabled (no destination) ⇒ this is a log
-    /// line + the M1 metric wish and nothing else: ZERO new outbound.
+    /// line + the operator-alerts metric and nothing else: ZERO new outbound.
     ///
     /// Never panics and never propagates an error — a bad destination or a DB
     /// hiccup is logged and dropped (fail-closed).
     pub fn fire(&self, severity: AlertSeverity, dedup_key: &str, message: &str) {
         let Some(dest) = self.dest.as_ref() else {
             // Disabled: the pre-O4 behaviour — log + metric only. No outbound.
-            // M1 metric wish: copperclaw_operator_alerts_total{severity, outcome="suppressed_disabled"}
+            copperclaw_metrics::inc_operator_alert(
+                severity.as_str(),
+                copperclaw_metrics::ALERT_OUTCOME_SUPPRESSED_DISABLED,
+            );
             info!(
                 severity = severity.as_str(),
                 dedup_key,
@@ -314,14 +318,20 @@ impl OperatorAlerts {
 
         match self.decide(dedup_key, Instant::now()) {
             Err(Suppressed::Deduped) => {
-                // M1 metric wish: copperclaw_operator_alerts_total{severity, outcome="suppressed_deduped"}
+                copperclaw_metrics::inc_operator_alert(
+                    severity.as_str(),
+                    copperclaw_metrics::ALERT_OUTCOME_SUPPRESSED_DEDUPED,
+                );
                 info!(
                     severity = severity.as_str(),
                     dedup_key, "operator alert deduped (already alerted this episode)"
                 );
             }
             Err(Suppressed::RateLimited) => {
-                // M1 metric wish: copperclaw_operator_alerts_total{severity, outcome="suppressed_rate_limited"}
+                copperclaw_metrics::inc_operator_alert(
+                    severity.as_str(),
+                    copperclaw_metrics::ALERT_OUTCOME_SUPPRESSED_RATE_LIMITED,
+                );
                 warn!(
                     severity = severity.as_str(),
                     dedup_key,
@@ -331,7 +341,10 @@ impl OperatorAlerts {
             }
             Ok(()) => match self.enqueue(dest, severity, message) {
                 Ok(()) => {
-                    // M1 metric wish: copperclaw_operator_alerts_total{severity, outcome="sent"}
+                    copperclaw_metrics::inc_operator_alert(
+                        severity.as_str(),
+                        copperclaw_metrics::ALERT_OUTCOME_SENT,
+                    );
                     info!(
                         severity = severity.as_str(),
                         dedup_key,
@@ -340,7 +353,10 @@ impl OperatorAlerts {
                     );
                 }
                 Err(EnqueueError::NoCarrier) => {
-                    // M1 metric wish: copperclaw_operator_alerts_total{severity, outcome="no_carrier"}
+                    copperclaw_metrics::inc_operator_alert(
+                        severity.as_str(),
+                        copperclaw_metrics::ALERT_OUTCOME_NO_CARRIER,
+                    );
                     warn!(
                         severity = severity.as_str(),
                         dedup_key,
@@ -348,7 +364,10 @@ impl OperatorAlerts {
                     );
                 }
                 Err(EnqueueError::Db(err)) => {
-                    // M1 metric wish: copperclaw_operator_alerts_total{severity, outcome="enqueue_failed"}
+                    copperclaw_metrics::inc_operator_alert(
+                        severity.as_str(),
+                        copperclaw_metrics::ALERT_OUTCOME_ENQUEUE_FAILED,
+                    );
                     warn!(
                         severity = severity.as_str(),
                         dedup_key,

@@ -190,8 +190,10 @@ impl ContainerManager {
 /// missing routing target or a DB error is logged and swallowed; the
 /// notice is feedback, never a gate.
 ///
-/// Metric wish (M1): a slow-spawn notice counter, alongside a
-/// spawn-phase duration histogram.
+/// M21 F1 (M1 rider): the `copperclaw_slow_spawn_notices_total` counter is
+/// incremented on a successful post below; the spawn-phase duration histogram
+/// is the pre-existing `copperclaw_container_spawn_seconds`, observed in
+/// `spawn.rs`.
 fn post_slow_spawn_notice(paths: &SessionPaths, session: SessionId) {
     let routing = match open_inbound(paths)
         .and_then(|conn| copperclaw_db::tables::session_routing::read(&conn))
@@ -229,6 +231,7 @@ fn post_slow_spawn_notice(paths: &SessionPaths, session: SessionId) {
         .and_then(|conn| copperclaw_db::tables::messages_out::insert(&conn, &row))
     {
         Ok(_) => {
+            copperclaw_metrics::inc_slow_spawn_notice();
             info!(
                 session = %session.as_uuid(),
                 channel_type = ?routing.channel_type,
