@@ -39,6 +39,31 @@ adheres to [Semantic Versioning](https://semver.org/).
   ErrorCard, never more. No new user surface.
 
 ### Changed (README + observability doc refreshed to the current surface, 2026-07-16)
+### Added (M21 S1: host background loops are supervised, 2026-07-17)
+
+- **Every host background loop is now supervised — a panic no longer
+  silently kills the subsystem.** New
+  `crates/copperclaw-host/src/supervisor.rs`: a `JoinSet`-based supervisor
+  with named tasks. A loop that panics (or returns while the host is
+  running) is logged at ERROR and restarted on the decision-(e) backoff
+  curve (5s -> 15s -> 60s -> 300s cap, streak reset after 10 minutes
+  healthy); a loop that exceeds the curve flips a supervisor-wide degraded
+  flag (exposed as a `watch` channel — the seam M21 O4 hooks for operator
+  alerts) but keeps retrying at the cap. `boot.rs` registers the inbound
+  consumer, both delivery loops (active + sweep), the sweep loop, the
+  typing ticker, and the todo watcher through it; previously each was a
+  bare `tokio::spawn` awaited only at shutdown, so a panic left the
+  subsystem dead — indistinguishable from idle — until the process exited.
+  Loops keep their own internal error handling; shutdown drain semantics
+  are unchanged (same token, same 30s deadline).
+- **New `host.status` admin-socket command** —
+  `crates/copperclaw-host/src/handlers/host_status.rs` reports per-loop
+  liveness, lifetime restart counts, current restart streak, last exit
+  reason, uptime, and the degraded flag. M21 O1 teaches `cclaw doctor` to
+  read it; until then it is a complete, callable surface (listed in
+  `socket.rs`'s new `HOST_LOCAL_COMMANDS` so the dispatch-table parity
+  test still catches drift). `HandlerCtx` gained an optional supervisor
+  handle (`with_supervisor`) threaded through `serve_listener`.
 
 - **`README.md` caught up with M16-M20.** The stale numbers are fixed
   (~7,700 tests, 51 tools + opt-in browser + 3 preview verbs, 11 of 21

@@ -24,6 +24,7 @@ pub mod orphans;
 pub mod preview;
 pub mod sessions;
 pub mod socket;
+pub mod supervisor;
 pub mod todo_watcher;
 pub mod typing_ticker;
 
