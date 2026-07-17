@@ -14,7 +14,7 @@ use copperclaw_db::central::CentralDb;
 use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
 use copperclaw_db::tables::{
     agent_groups, container_configs, delivered, mcp_calls, messages_in, messages_out,
-    pending_approvals, session_routing, sessions,
+    outbound_dropped_messages, pending_approvals, session_routing, sessions,
 };
 use copperclaw_modules::{
     DeliveryActionHandler, DeliveryActionInput, DeliveryDispatcher, DispatchTarget, PreviewBroker,
@@ -53,6 +53,20 @@ pub const HOST_MCP_CALL_DEADLINE_SECS: u64 = 90;
 pub const PREVIEW_SERVER: &str = "__preview";
 /// Base value for exponential backoff between retries.
 pub const BACKOFF_BASE_MS: u64 = 5_000;
+/// Age ceiling (hours) for a pending outbound row whose channel has no live
+/// adapter (M21 S5). Below the ceiling the row stays pending — the adapter
+/// may simply not have been wired yet this boot; past it the row is
+/// dead-lettered into the central `outbound_dropped_messages` table with
+/// reason [`NO_ADAPTER_DROP_REASON`], so a permanently-unconfigured or
+/// removed channel can't accumulate unbounded pending outbound that nothing
+/// drains and nothing reports. Recoverable: `cclaw dropped-messages replay`
+/// re-queues the row once the channel is configured.
+pub const NO_ADAPTER_MAX_AGE_HOURS: i64 = 24;
+/// Reason prefix recorded in `outbound_dropped_messages.last_error` for rows
+/// dead-lettered by the no-adapter age ceiling (M21 S5). Operator tooling
+/// (`cclaw doctor`, M21 O1) can match this prefix to distinguish no-adapter
+/// dead letters from adapter-failure ones.
+pub const NO_ADAPTER_DROP_REASON: &str = "no_adapter";
 
 /// A pair `(session_id, message_out_id)` used to dedupe concurrent attempts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -259,6 +273,18 @@ fn backoff_delay_ms(tries: u32) -> u64 {
     scaled.min(ABSOLUTE_CEILING_MS)
 }
 
+/// True when a pending outbound row addressed at a channel with no live
+/// adapter has aged past the [`NO_ADAPTER_MAX_AGE_HOURS`] ceiling (M21 S5).
+/// Age is measured from the row's own `timestamp` (when the runner emitted
+/// it) against wall-clock `now`; a future-dated timestamp (clock skew) is
+/// never expired.
+fn no_adapter_expired(
+    row_timestamp: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    now.signed_duration_since(row_timestamp) >= chrono::Duration::hours(NO_ADAPTER_MAX_AGE_HOURS)
+}
+
 /// Flatten the `content` array from an [`copperclaw_mcp::call_external_tool`]
 /// result (the serialized rmcp `CallToolResult` content blocks) into plain
 /// model-facing text. Text blocks are joined with blank lines; non-text blocks
@@ -323,6 +349,14 @@ pub struct DeliveryService {
     /// in [`DeliveryService::prime_retry_cache`]; a fresh service instance
     /// (i.e. a host restart) starts empty and re-primes from the rows.
     retries_primed: DashSet<SessionId>,
+    /// Per-session count of pending outbound rows currently deferred because
+    /// their channel has no live adapter (M21 S5). Refreshed on every
+    /// processing pass of the session — set while such rows are waiting
+    /// (below the [`NO_ADAPTER_MAX_AGE_HOURS`] ceiling), cleared once they
+    /// deliver or dead-letter — so the aggregate read by
+    /// [`DeliveryService::no_adapter_backlog`] is a rolling snapshot of the
+    /// no-adapter backlog.
+    no_adapter_backlog: DashMap<SessionId, usize>,
     dispatcher: Arc<dyn DeliveryDispatcher>,
     /// When `true`, a failed `install_packages` / `add_mcp_server`
     /// apply is surfaced as a `DeliveryError::SystemAction` so the
@@ -406,6 +440,7 @@ impl DeliveryService {
             inflight: DashMap::new(),
             retries: DashMap::new(),
             retries_primed: DashSet::new(),
+            no_adapter_backlog: DashMap::new(),
             dispatcher,
             selfmod_hard_fail: AtomicBool::new(selfmod_hard_fail_from_env()),
             todo_locks: DashMap::new(),
@@ -451,6 +486,7 @@ impl DeliveryService {
             inflight: DashMap::new(),
             retries: DashMap::new(),
             retries_primed: DashSet::new(),
+            no_adapter_backlog: DashMap::new(),
             dispatcher,
             selfmod_hard_fail: AtomicBool::new(selfmod_hard_fail_from_env()),
             todo_locks: DashMap::new(),
@@ -517,6 +553,23 @@ impl DeliveryService {
         self.inflight.len()
     }
 
+    /// Number of pending outbound rows currently deferred because their
+    /// channel has no live adapter, aggregated across sessions (M21 S5).
+    ///
+    /// Rows below the [`NO_ADAPTER_MAX_AGE_HOURS`] ceiling wait here for the
+    /// channel to come up; rows past it are dead-lettered with reason
+    /// [`NO_ADAPTER_DROP_REASON`]. A persistently non-zero value means a
+    /// channel is unconfigured (or was removed) while sessions still address
+    /// outbound at it.
+    ///
+    /// O1/S1 handoff: the S1 admin-socket status handler (lane H) is the
+    /// intended surface for this count — it reads this method and exposes it
+    /// so `cclaw doctor` (M21 O1) can flag a no-adapter backlog. Until S1
+    /// lands, this method is the only read side.
+    pub fn no_adapter_backlog(&self) -> usize {
+        self.no_adapter_backlog.iter().map(|e| *e.value()).sum()
+    }
+
     /// Whether the service was started with `COPPERCLAW_SELFMOD_HARD_FAIL`
     /// enabled. Exposed for tests and for `cclaw doctor` to report.
     pub fn selfmod_hard_fail(&self) -> bool {
@@ -580,6 +633,10 @@ impl DeliveryService {
         self.prime_retry_cache(sess, &outbound_pool, &delivered_ids)?;
 
         let now = Instant::now();
+        // Rows deferred this pass because their channel has no live adapter
+        // (M21 S5) — becomes this session's slice of the no-adapter backlog
+        // gauge after the loop.
+        let mut no_adapter_pending: usize = 0;
         for row in rows {
             if delivered_ids.contains(&row.id) {
                 continue;
@@ -711,9 +768,33 @@ impl DeliveryService {
                     warn!(reason, ?row.id, "system action failed");
                 }
                 Err(DeliveryError::NoAdapter(ct)) => {
-                    // No adapter -> leave row alone, count as deferred.
-                    report.deferred += 1;
-                    warn!(channel = %ct, ?row.id, "no adapter; leaving row pending");
+                    // No live adapter for the row's channel. Below the age
+                    // ceiling the row stays pending — the adapter may simply
+                    // not have been wired yet this boot. Past it the row is
+                    // dead-lettered (M21 S5) so a permanently-unconfigured or
+                    // removed channel can't accumulate unbounded pending
+                    // outbound that nothing drains and nothing reports.
+                    if no_adapter_expired(row.timestamp, chrono::Utc::now()) {
+                        self.record_no_adapter_expired(
+                            sess,
+                            &row,
+                            &key,
+                            &ct,
+                            routing.as_ref(),
+                            &inbound_pool,
+                        )?;
+                        report.failed += 1;
+                        warn!(
+                            channel = %ct,
+                            ?row.id,
+                            age_ceiling_hours = NO_ADAPTER_MAX_AGE_HOURS,
+                            "no adapter past age ceiling; dead-lettering row"
+                        );
+                    } else {
+                        no_adapter_pending += 1;
+                        report.deferred += 1;
+                        warn!(channel = %ct, ?row.id, "no adapter; leaving row pending");
+                    }
                 }
                 Err(DeliveryError::NoRoute(_)) => {
                     let in_conn = inbound_pool.connect()?;
@@ -733,6 +814,16 @@ impl DeliveryService {
                     warn!(?err, ?row.id, "non-retryable failure, marking failed");
                 }
             }
+        }
+
+        // Refresh this session's slice of the no-adapter backlog gauge
+        // (M21 S5): set while rows wait on a missing adapter, cleared once
+        // they deliver or dead-letter, so `no_adapter_backlog()` stays a
+        // rolling snapshot rather than a monotonic counter.
+        if no_adapter_pending > 0 {
+            self.no_adapter_backlog.insert(sess.id, no_adapter_pending);
+        } else {
+            self.no_adapter_backlog.remove(&sess.id);
         }
 
         // Host-proxied external MCP tool calls: drain any requests the runner
@@ -2964,6 +3055,89 @@ impl DeliveryService {
         Ok(())
     }
 
+    /// Dead-letter one pending outbound row whose channel has had no live
+    /// adapter for longer than [`NO_ADAPTER_MAX_AGE_HOURS`] (M21 S5): write
+    /// a central `outbound_dropped_messages` row with reason
+    /// [`NO_ADAPTER_DROP_REASON`] so the failure is visible in
+    /// `cclaw dropped-messages outbound-list` and recoverable with
+    /// `cclaw dropped-messages replay` once the channel is configured, then
+    /// record `delivered{status="failed"}` so the row stops being polled.
+    ///
+    /// Deliberately NO user-facing `ErrorCard` here (contrast
+    /// [`Self::record_exhausted_row`]): these rows by definition have no
+    /// deliverable channel, and an Error row addressed back at the same dead
+    /// channel would itself sit pending for the ceiling and then
+    /// dead-letter — garbage begetting garbage.
+    ///
+    /// Ephemeral UI kinds (breadcrumb / `todo_list` / diff / error /
+    /// thinking) are failed WITHOUT a central dead-letter row: the
+    /// `outbound_dropped_messages` table only round-trips the replayable
+    /// kinds (chat / task / webhook / system / agent / card — an
+    /// out-of-vocabulary kind would poison `outbound-list` for every row),
+    /// and replaying hours-stale UI chrome is meaningless. For those, the
+    /// terminal `failed` record plus the log line is the whole story.
+    fn record_no_adapter_expired(
+        &self,
+        sess: &Session,
+        row: &MessageOutRow,
+        key: &DeliveryKey,
+        channel_type: &ChannelType,
+        routing: Option<&copperclaw_types::routing::SessionRouting>,
+        inbound_pool: &SessionPool,
+    ) -> Result<(), DeliveryError> {
+        let replayable = matches!(
+            row.kind,
+            MessageKind::Chat
+                | MessageKind::Task
+                | MessageKind::Webhook
+                | MessageKind::System
+                | MessageKind::Agent
+                | MessageKind::Card
+        );
+        if replayable {
+            // Same channel/platform fallback order as `resolve_target` so
+            // the dead-letter row carries the destination a replay needs.
+            let platform_id = row
+                .platform_id
+                .clone()
+                .or_else(|| routing.and_then(|r| r.platform_id.clone()));
+            let thread_id = row
+                .thread_id
+                .clone()
+                .or_else(|| routing.and_then(|r| r.thread_id.clone()));
+            let last_error = format!(
+                "{NO_ADAPTER_DROP_REASON}: no live adapter for channel '{ct}' for over \
+                 {NO_ADAPTER_MAX_AGE_HOURS}h; replay with `cclaw dropped-messages replay` \
+                 once the channel is configured",
+                ct = channel_type.as_str(),
+            );
+            // Dead-letter FIRST, terminal record second: if the `failed`
+            // write below errors, the next pass repeats both (at worst a
+            // duplicate dead-letter row an operator can see and delete),
+            // whereas the reverse order could mark the row terminal and then
+            // lose the only replayable copy.
+            outbound_dropped_messages::insert(
+                &self.central,
+                outbound_dropped_messages::InsertOutboundDropped {
+                    session_id: sess.id,
+                    agent_group_id: sess.agent_group_id,
+                    message_out_id: row.id,
+                    channel_type: Some(channel_type.clone()),
+                    platform_id,
+                    thread_id,
+                    kind: row.kind,
+                    content: row.content.clone(),
+                    last_error,
+                },
+            )?;
+        }
+        let in_conn = inbound_pool.connect()?;
+        delivered::insert(&in_conn, row.id, None, "failed")?;
+        self.retries.remove(key);
+        copperclaw_metrics::inc_delivery_failed(channel_type.as_str());
+        Ok(())
+    }
+
     /// Snapshot of sessions visible to the active loop (status=Active,
     /// container=Running).
     pub fn list_running_sessions(&self) -> Result<Vec<Session>, DeliveryError> {
@@ -4600,6 +4774,253 @@ mod tests {
             .filter(|r| r.kind == MessageKind::Error)
             .count();
         assert_eq!(error_rows, 1, "dead-letter ErrorCard emitted exactly once");
+    }
+
+    #[test]
+    fn no_adapter_ceiling_math() {
+        // Unit: the 24h age ceiling (M21 S5). Below the ceiling not
+        // expired; at and past it expired; a future-dated row (clock
+        // skew) never expires.
+        let now = Utc::now();
+        assert!(!no_adapter_expired(now, now), "fresh row is not expired");
+        assert!(
+            !no_adapter_expired(
+                now - chrono::Duration::hours(NO_ADAPTER_MAX_AGE_HOURS)
+                    + chrono::Duration::seconds(1),
+                now
+            ),
+            "one second inside the ceiling is not expired"
+        );
+        assert!(
+            no_adapter_expired(now - chrono::Duration::hours(NO_ADAPTER_MAX_AGE_HOURS), now),
+            "exactly at the ceiling is expired"
+        );
+        assert!(
+            no_adapter_expired(
+                now - chrono::Duration::hours(NO_ADAPTER_MAX_AGE_HOURS + 1),
+                now
+            ),
+            "past the ceiling is expired"
+        );
+        assert!(
+            !no_adapter_expired(now + chrono::Duration::hours(1), now),
+            "a future-dated timestamp is never expired"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_adapter_rows_below_ceiling_stay_pending() {
+        // A row addressed at a channel with no live adapter but younger
+        // than the age ceiling is untouched: still pending, no terminal
+        // record, no dead letter — only counted deferred and in the
+        // no-adapter backlog.
+        let (service, _root, sess, _mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let mut row = make_row(MessageKind::Chat, json!({"text": "hi"}));
+        row.channel_type = Some(ChannelType::new("ghost"));
+        write_row(&out_pool, &row);
+
+        for pass in 0..2 {
+            let rpt = service.process_session_once(&sess).await.unwrap();
+            assert_eq!(rpt.deferred, 1, "pass {pass}: row defers");
+            assert_eq!(rpt.failed, 0, "pass {pass}: row is not failed");
+            assert_eq!(rpt.delivered, 0, "pass {pass}: nothing delivered");
+        }
+
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let in_conn = in_pool.connect().unwrap();
+        assert!(
+            delivered::list(&in_conn).unwrap().is_empty(),
+            "no terminal record below the ceiling"
+        );
+        assert!(
+            outbound_dropped_messages::list(service.central(), None, None)
+                .unwrap()
+                .is_empty(),
+            "no dead letter below the ceiling"
+        );
+        let out_conn = out_pool.connect().unwrap();
+        assert_eq!(
+            messages_out::list_due(&out_conn).unwrap().len(),
+            1,
+            "the row is still pending in messages_out"
+        );
+        assert_eq!(service.no_adapter_backlog(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_adapter_rows_expire_into_dead_letters_and_replay() {
+        // Integration (M21 S5 acceptance): an unconfigured channel's rows
+        // expire into `outbound_dropped_messages` with reason `no_adapter`
+        // — exactly once, with no user-facing ErrorCard — and replay
+        // cleanly once the adapter exists.
+        let (service, _root, sess, _mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let mut row = make_row(MessageKind::Chat, json!({"text": "belated hello"}));
+        row.channel_type = Some(ChannelType::new("ghost"));
+        row.timestamp = Utc::now() - chrono::Duration::hours(NO_ADAPTER_MAX_AGE_HOURS + 1);
+        write_row(&out_pool, &row);
+
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.failed, 1, "aged no-adapter row dead-letters");
+        assert_eq!(rpt.deferred, 0);
+
+        // Dead letter recorded centrally with the no_adapter reason and the
+        // full routing + content a replay needs.
+        let drops = outbound_dropped_messages::list(service.central(), None, None).unwrap();
+        assert_eq!(drops.len(), 1);
+        let drop = &drops[0];
+        assert!(
+            drop.last_error.starts_with(NO_ADAPTER_DROP_REASON),
+            "reason prefix is `no_adapter`, got: {}",
+            drop.last_error
+        );
+        assert_eq!(drop.message_out_id, row.id);
+        assert_eq!(drop.channel_type, Some(ChannelType::new("ghost")));
+        assert_eq!(drop.platform_id.as_deref(), Some("plat-1"));
+        assert_eq!(drop.kind, MessageKind::Chat);
+        assert_eq!(drop.content, json!({"text": "belated hello"}));
+
+        // Terminal record written; backlog cleared; NO ErrorCard emitted
+        // (these rows by definition have no deliverable channel).
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        {
+            let in_conn = in_pool.connect().unwrap();
+            let listed = delivered::list(&in_conn).unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].status, "failed");
+        }
+        assert_eq!(service.no_adapter_backlog(), 0);
+        {
+            let out_conn = out_pool.connect().unwrap();
+            let error_rows = messages_out::list_due(&out_conn)
+                .unwrap()
+                .into_iter()
+                .filter(|r| r.kind == MessageKind::Error)
+                .count();
+            assert_eq!(
+                error_rows, 0,
+                "no user-facing ErrorCard for no_adapter drops"
+            );
+        }
+
+        // Exactly once: a second pass adds nothing.
+        let rpt2 = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt2.failed, 0);
+        assert_eq!(
+            outbound_dropped_messages::list(service.central(), None, None)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Replay once the adapter exists — mirror the
+        // `dropped-messages.replay` handler: re-insert a fresh copy of the
+        // message from the dead-letter record, then delete the record.
+        let ghost = Arc::new(MockAdapter::new("ghost"));
+        service.register_adapter(ChannelType::new("ghost"), ghost.clone());
+        let replayed = WriteOutbound {
+            id: MessageId::new(),
+            in_reply_to: None,
+            timestamp: Utc::now(),
+            deliver_after: None,
+            recurrence: None,
+            kind: drop.kind,
+            platform_id: drop.platform_id.clone(),
+            channel_type: drop.channel_type.clone(),
+            thread_id: drop.thread_id.clone(),
+            content: drop.content.clone(),
+        };
+        write_row(&out_pool, &replayed);
+        assert!(outbound_dropped_messages::delete(service.central(), drop.id).unwrap());
+
+        let rpt3 = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt3.delivered, 1, "replayed row delivers cleanly");
+        assert_eq!(rpt3.failed, 0);
+        let deliveries = ghost.deliveries();
+        assert_eq!(deliveries.len(), 1);
+        assert!(
+            outbound_dropped_messages::list(service.central(), None, None)
+                .unwrap()
+                .is_empty(),
+            "dead letter consumed by the replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_adapter_backlog_counts_and_clears() {
+        // The backlog gauge reflects the rows currently waiting on a
+        // missing adapter and drops back to zero once they deliver.
+        let (service, _root, sess, _mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        for text in ["one", "two"] {
+            let mut row = make_row(MessageKind::Chat, json!({ "text": text }));
+            row.channel_type = Some(ChannelType::new("ghost"));
+            write_row(&out_pool, &row);
+        }
+        assert_eq!(service.no_adapter_backlog(), 0, "empty before any pass");
+
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.deferred, 2);
+        assert_eq!(service.no_adapter_backlog(), 2);
+
+        // Wire the adapter: the rows drain and the backlog clears.
+        let ghost = Arc::new(MockAdapter::new("ghost"));
+        service.register_adapter(ChannelType::new("ghost"), ghost.clone());
+        let rpt2 = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt2.delivered, 2);
+        assert_eq!(service.no_adapter_backlog(), 0);
+        assert_eq!(ghost.deliveries().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn no_adapter_expiry_of_ui_chrome_kind_skips_dead_letter() {
+        // Ephemeral UI kinds (here: Error) past the ceiling are failed
+        // terminally but NOT dead-lettered — `outbound_dropped_messages`
+        // only round-trips replayable kinds, and replaying hours-stale UI
+        // chrome is meaningless.
+        let (service, _root, sess, _mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let card = ErrorCard::new(ErrorCardKind::Delivery, "stale chrome");
+        let mut row = make_row(MessageKind::Error, json!({ "error": card }));
+        row.channel_type = Some(ChannelType::new("ghost"));
+        row.timestamp = Utc::now() - chrono::Duration::hours(NO_ADAPTER_MAX_AGE_HOURS + 1);
+        write_row(&out_pool, &row);
+
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.failed, 1, "aged UI-chrome row is failed terminally");
+        assert!(
+            outbound_dropped_messages::list(service.central(), None, None)
+                .unwrap()
+                .is_empty(),
+            "no dead letter for a non-replayable kind"
+        );
+        let in_pool = service
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let in_conn = in_pool.connect().unwrap();
+        let listed = delivered::list(&in_conn).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, "failed");
     }
 
     #[tokio::test]
