@@ -6,6 +6,7 @@
 //!
 //! - [`migrate`] — embedded SQL migration runner (central + per-session).
 //! - [`central`] — pooled connection wrapper for `data/copperclaw.db`.
+//! - [`integrity`] — read-only `PRAGMA quick_check` probing (M21 O2).
 //! - [`session`] — per-session `inbound.db` / `outbound.db` openers and
 //!   filesystem helpers.
 //! - [`attachments`] — safety-checked attachment extraction.
@@ -14,6 +15,7 @@
 
 pub mod attachments;
 pub mod central;
+pub mod integrity;
 pub mod memory;
 pub mod migrate;
 pub mod session;

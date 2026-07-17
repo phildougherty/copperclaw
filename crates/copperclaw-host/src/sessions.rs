@@ -148,6 +148,14 @@ impl sweep::SessionRoot for FsSessionRoot {
     fn heartbeat_path(&self, agent_group_id: &AgentGroupId, session_id: &SessionId) -> PathBuf {
         self.paths(*agent_group_id, *session_id).heartbeat
     }
+
+    fn session_paths(
+        &self,
+        agent_group_id: &AgentGroupId,
+        session_id: &SessionId,
+    ) -> copperclaw_db::session::SessionPaths {
+        self.paths(*agent_group_id, *session_id)
+    }
 }
 
 #[cfg(test)]
