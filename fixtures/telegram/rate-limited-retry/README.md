@@ -44,3 +44,14 @@ A direct numeric assertion on the backoff window's exact value (e.g.
 accessor; the closest the harness can do today is observe second-tick
 behaviour at known sleep offsets. See the parent-agent's gap notes for
 the API addition that would let a fixture pin the exact window length.
+
+Also not pinned here: retry-state *persistence* (M21 S3, migration 029).
+Since S3 the `retries` map is a write-through cache over the row's
+`tries` / `not_before` columns, so the deferral this fixture exercises
+now also leaves `tries = 1` and a wall-clock window on the row. The
+harness cannot restart the `DeliveryService` mid-fixture, so the
+restart-resume and exactly-once dead-letter contracts are pinned by
+unit/integration tests in `crates/copperclaw-host-delivery/src/service.rs`
+(`restart_resumes_persisted_attempt_count`,
+`persisted_exhaustion_dead_letters_without_a_fresh_attempt`); the Wave-1
+X-rider owns a replay-level restart fixture.

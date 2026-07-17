@@ -6,6 +6,38 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M21 S3: delivery retry state persists across host restarts, 2026-07-17)
+
+- **Migration 029 (`029_messages_out_retry_state.sql`, session-outbound
+  set): `tries` + `not_before` columns on per-session
+  `outbound.db::messages_out`.** Delivery retry state previously lived
+  only in an in-memory `DashMap` on the host's `DeliveryService`, so a
+  host restart wiped attempt counters and backoff windows —
+  `MAX_DELIVERY_ATTEMPTS=3` was really "3 per host lifetime". New
+  accessors `messages_out::set_retry_state` / `list_retry_state` in
+  `crates/copperclaw-db/src/tables/messages_out.rs`; a fresh-vs-migrated
+  `PRAGMA table_info` diff test guards the session-outbound schema in
+  `crates/copperclaw-db/src/migrate.rs`.
+
+### Fixed (M21 S3: retry budgets and backoff windows survive restarts, 2026-07-17)
+
+- **A poisoned outbound row can no longer retry unboundedly across host
+  restarts, and a row mid-backoff no longer fires immediately on boot.**
+  `crates/copperclaw-host-delivery/src/service.rs`: the `retries` map is
+  now a write-through cache — every `bump_retry` mirrors the counter and
+  the wall-clock window onto the row (best-effort; in-memory state stays
+  authoritative within a lifetime), and the cache is primed lazily from
+  the persisted columns on the first poll of each session after boot
+  (persisted windows are honoured with their remaining span, capped at
+  the 30-minute ceiling).
+- **Exhaustion dead-letters exactly once across restarts.** The final
+  bump persists the exhausted count before the `failed` record lands; a
+  new persisted-exhaustion guard in `process_session_once` dead-letters
+  a row that already spent its budget in a prior host lifetime without
+  burning another adapter attempt — one `delivered{status="failed"}` row
+  (the `cclaw dropped-messages` artefact) and one delivery-failure
+  ErrorCard, never more. No new user surface.
+
 ### Changed (README + observability doc refreshed to the current surface, 2026-07-16)
 
 - **`README.md` caught up with M16-M20.** The stale numbers are fixed
