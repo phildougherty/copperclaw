@@ -10,6 +10,7 @@ use copperclaw_providers::HistoryMessage;
 
 use super::RunnerDeps;
 use super::blocker::{BlockerCategory, BlockerRun};
+use super::failover_health::FailoverHealth;
 use super::hud::TaskHud;
 use super::provider_call::{HeartbeatTicker, run_llm_turn};
 use super::reaction;
@@ -278,11 +279,33 @@ impl ToolLoopGuard {
 /// keeps the historical behaviour where the model sees only the
 /// pre-baked system prompt — tests that don't care about channel
 /// shape can leave it unset.
+/// Convenience wrapper that constructs a fresh (per-call) [`FailoverHealth`]
+/// from `deps` and drives one inbound. Used by the runner's own tests, which
+/// exercise a single inbound and don't need cross-inbound health continuity.
+/// Production drives through [`drive_turn_with_health`] with the
+/// session-scoped health `run_loop` owns, so a dead/recovered provider is
+/// remembered across turns and inbounds.
+#[cfg(test)]
 pub(super) async fn drive_turn(
     deps: &RunnerDeps,
     history: &mut Vec<HistoryMessage>,
     previous_continuation: Option<&str>,
     context_block: Option<&str>,
+) -> Result<TurnResult> {
+    let health = FailoverHealth::from_deps(deps);
+    drive_turn_with_health(deps, history, previous_continuation, context_block, &health).await
+}
+
+/// Drive one inbound to completion, consulting `health` (the session's live
+/// provider-health for M21 O3) at every provider-call construction so
+/// mid-session failover and recovery persist across the tool loop and across
+/// inbounds.
+pub(super) async fn drive_turn_with_health(
+    deps: &RunnerDeps,
+    history: &mut Vec<HistoryMessage>,
+    previous_continuation: Option<&str>,
+    context_block: Option<&str>,
+    health: &FailoverHealth,
 ) -> Result<TurnResult> {
     // One Task HUD per inbound: posted at the first tool call, edited
     // in place around every tool batch (plus a wall-clock ticker), then
@@ -314,6 +337,7 @@ pub(super) async fn drive_turn(
         &hud,
         &mut blocker_run,
         &mut ui_screenshot_calls,
+        health,
     )
     .await;
     let ok = matches!(
@@ -340,7 +364,11 @@ pub(super) async fn drive_turn(
 // is intrinsic to the state machine (one branch per `TurnOutcome` shape
 // times the parse-error vs invoke-tool fork). Splitting further would
 // just push the locals into a struct with no readability win.
-#[allow(clippy::too_many_lines)]
+// Argument count is intrinsic too: the per-inbound HUD, blocker run,
+// screenshot tally, and (M21 O3) session failover-health are all distinct
+// pieces of turn state the orchestrator threads through — bundling them into
+// a struct would just move the plumbing without removing it.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn drive_turn_inner(
     deps: &RunnerDeps,
     history: &mut Vec<HistoryMessage>,
@@ -349,6 +377,7 @@ async fn drive_turn_inner(
     hud: &TaskHud,
     blocker_run: &mut BlockerRun,
     ui_screenshot_calls: &mut u32,
+    health: &FailoverHealth,
 ) -> Result<TurnResult> {
     let mut continuation: Option<String> = previous_continuation.map(str::to_string);
     // Reset per-turn context state (the coarse-provenance taint flag)
@@ -391,8 +420,15 @@ async fn drive_turn_inner(
     };
 
     for tool_turn in 0..deps.max_tool_turns.max(1) {
-        let output =
-            run_llm_turn(deps, history, continuation.as_deref(), context_block, hud).await?;
+        let output = run_llm_turn(
+            deps,
+            history,
+            continuation.as_deref(),
+            context_block,
+            hud,
+            health,
+        )
+        .await?;
         continuation = output.continuation.or(continuation);
         // Accumulate this round-trip's billed tokens before any
         // early-return below so the per-task total reflects every call

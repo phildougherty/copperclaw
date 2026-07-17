@@ -6,6 +6,40 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (M21 O3: live provider failover chain, mid-session, 2026-07-17)
+
+- **The runner's provider failover chain is now live across the whole
+  session, not just applied at spawn.** Previously provider health was
+  hydrated once by the host at container spawn and written into
+  `runner.json`; in-session the runner walked its pre-built
+  `failover_chain` linearly from the primary on *every* call, so a
+  primary that died mid-session burned a per-turn retry against it until
+  the next respawn and a primary that recovered was never restored. New
+  session-scoped `crates/copperclaw-runner/src/run/failover_health.rs`
+  (`FailoverHealth`) re-consults the chain's health at **every**
+  provider-call construction, reusing the existing cooldown / re-probe
+  machinery in `copperclaw-providers`'s `FallbackChain` (the same
+  semantics the host applies at spawn). `run_llm_turn`
+  (`crates/copperclaw-runner/src/run/provider_call.rs`) now asks
+  `select_start` which candidate to begin on: a candidate degraded by an
+  earlier call (this turn or an earlier inbound) is skipped until its
+  cooldown lapses, and once it lapses the primary is selected again and,
+  on a successful turn, promoted back to healthy. Failures are classified
+  with the same `DegradeReason::from_error_text` the host uses on
+  `agent_turns.error`, so only resilience-relevant errors (429/5xx/
+  overload/transport) degrade the chain — a 4xx bad-request never does.
+  Provider transitions — mid-call failover and the new cross-call
+  restore/degrade — are surfaced through the existing "switched to
+  <provider>" HUD note (now emitted once per real transition via
+  `FailoverHealth::enter_candidate`, deduped so a steady chain never
+  spams notes). The host-side spawn snapshot
+  (`crates/copperclaw-host/src/container_manager/provider_failover.rs`)
+  is unchanged, and a single-provider chain (`failover_chain` empty) is
+  byte-identical: `select_start` is always 0 and no transition ever
+  fires. `run_loop` owns one `FailoverHealth` per session and threads it
+  through `drive_turn_with_health`; the per-call `drive_turn` wrapper
+  (test-only) keeps the runner's existing tests untouched.
+
 ### Added (M21 Wave-2 X-rider: feedback fixtures, 2026-07-17)
 
 - **Two new replay fixtures pin the Wave-2 "user is never in the dark"
