@@ -49,6 +49,11 @@ use super::RunnerDeps;
 pub struct Transition {
     pub from: String,
     pub to: String,
+    /// M21 O3 (M1 rider): `true` when the switch moved to a higher-index
+    /// fallback (a degrade — a provider failed), `false` when it moved back
+    /// toward the primary (a restore — an earlier-degraded provider re-probed
+    /// OK). Drives the `direction` label on the live-failover metric.
+    pub degrade: bool,
 }
 
 /// Session-scoped live health for the runner's provider failover chain.
@@ -71,6 +76,10 @@ struct Inner {
     /// Provider name the user was last told is serving; `None` until the
     /// first candidate is entered. Drives the cross-call transition note.
     active: Option<String>,
+    /// Chain index of the last-entered candidate; `None` until the first
+    /// candidate is entered. Lets [`FailoverHealth::enter_candidate`] label a
+    /// transition as a degrade (higher index) or restore (lower index).
+    active_idx: Option<usize>,
 }
 
 impl FailoverHealth {
@@ -98,6 +107,7 @@ impl FailoverHealth {
             inner: Mutex::new(Inner {
                 health: HealthMap::new(),
                 active: None,
+                active_idx: None,
             }),
         }
     }
@@ -137,8 +147,15 @@ impl FailoverHealth {
         let name = self.chain.entries[idx].provider.clone();
         let mut g = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         let prev = g.active.replace(name.clone());
+        let prev_idx = g.active_idx.replace(idx);
         match prev {
-            Some(from) if from != name => Some(Transition { from, to: name }),
+            // `prev_idx` is `Some` whenever `prev` is (both are set together),
+            // so `unwrap_or(0)` is only the unreachable first-candidate case.
+            Some(from) if from != name => Some(Transition {
+                from,
+                to: name,
+                degrade: idx > prev_idx.unwrap_or(0),
+            }),
             _ => None,
         }
     }
@@ -240,20 +257,24 @@ mod tests {
         assert_eq!(fh.enter_candidate(0), None);
         // Re-entering the same provider: no note.
         assert_eq!(fh.enter_candidate(0), None);
-        // Switching to the fallback: a transition the caller surfaces.
+        // Switching to the fallback: a transition the caller surfaces (a
+        // degrade — moving to a higher chain index).
         assert_eq!(
             fh.enter_candidate(1),
             Some(Transition {
                 from: "anthropic".to_string(),
                 to: "ollama".to_string(),
+                degrade: true,
             })
         );
-        // Switching back to the primary (recovery): the reverse transition.
+        // Switching back to the primary (recovery): the reverse transition (a
+        // restore — moving to a lower chain index).
         assert_eq!(
             fh.enter_candidate(0),
             Some(Transition {
                 from: "ollama".to_string(),
                 to: "anthropic".to_string(),
+                degrade: false,
             })
         );
     }

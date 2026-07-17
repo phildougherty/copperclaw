@@ -88,6 +88,16 @@ impl ExitKind {
             Self::Panicked(msg) => format!("panicked: {msg}"),
         }
     }
+
+    /// Low-cardinality reason token for the M21 S1 restart metric (the
+    /// panic payload is deliberately excluded — it would explode label
+    /// cardinality).
+    fn metric_reason(&self) -> &'static str {
+        match self {
+            Self::Returned => "returned",
+            Self::Panicked(_) => "panicked",
+        }
+    }
 }
 
 /// Per-loop bookkeeping. Times use `tokio::time::Instant` so a paused test
@@ -172,6 +182,11 @@ impl SupervisorStatus {
         let mut tasks = self.tasks.lock().expect("supervisor status lock");
         for t in tasks.iter_mut() {
             heal_if_window_elapsed(t, now);
+            // M21 S1 (M1 rider): refresh the gauges at status-read time so a
+            // lazy healthy-reset (degraded → healthy without a further exit)
+            // is reflected for scrapers, not just at the next transition.
+            copperclaw_metrics::set_supervised_loop_alive(t.name, t.alive);
+            copperclaw_metrics::set_supervised_loop_degraded(t.name, t.degraded);
         }
         let out = tasks
             .iter()
@@ -220,12 +235,16 @@ impl SupervisorStatus {
         let t = &mut tasks[idx];
         t.alive = true;
         t.started_at = now;
+        // M21 S1 (M1 rider): per-loop liveness gauge.
+        copperclaw_metrics::set_supervised_loop_alive(t.name, true);
     }
 
     /// The loop drained during shutdown — an expected exit.
     fn mark_stopped(&self, idx: usize) {
         let mut tasks = self.tasks.lock().expect("supervisor status lock");
         tasks[idx].alive = false;
+        // M21 S1 (M1 rider): per-loop liveness gauge.
+        copperclaw_metrics::set_supervised_loop_alive(tasks[idx].name, false);
     }
 
     /// Record an unexpected exit and compute the restart backoff. Applies
@@ -251,6 +270,10 @@ impl SupervisorStatus {
             t.degraded = true;
         }
         let out = (BACKOFF_STEPS[step], t.restarts_total, t.degraded);
+        // M21 S1 (M1 rider): the incarnation is down until its backoff
+        // respawn; publish liveness + degraded gauges for this loop.
+        copperclaw_metrics::set_supervised_loop_alive(t.name, false);
+        copperclaw_metrics::set_supervised_loop_degraded(t.name, t.degraded);
         let any_degraded = tasks.iter().any(|task| task.degraded);
         drop(tasks);
         self.publish_degraded(any_degraded);
@@ -408,6 +431,8 @@ async fn drive(
         // respawn.
         let (delay, restarts, degraded) =
             status.record_unexpected_exit(idx, exit.describe(), Instant::now());
+        // M21 S1 (M1 rider): monotonic restart count by loop + reason.
+        copperclaw_metrics::inc_supervised_loop_restart(name, exit.metric_reason());
         error!(
             loop_name = name,
             reason = %exit.describe(),

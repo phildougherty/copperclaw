@@ -621,9 +621,17 @@ impl SweepService {
                 return (false, false);
             }
         };
-        // M1 metric wish: integrity_quick_check_total{scope="central",
-        // outcome} — increment by Healthy / Corrupt.
-        match copperclaw_db::integrity::quick_check_conn(&conn) {
+        // M21 O2 (M1 rider): central-DB integrity quick-check outcome.
+        let central_outcome = copperclaw_db::integrity::quick_check_conn(&conn);
+        copperclaw_metrics::inc_integrity_quick_check(
+            copperclaw_metrics::INTEGRITY_SCOPE_CENTRAL,
+            match &central_outcome {
+                copperclaw_db::integrity::QuickCheckOutcome::Healthy => "healthy",
+                copperclaw_db::integrity::QuickCheckOutcome::Missing => "missing",
+                copperclaw_db::integrity::QuickCheckOutcome::Corrupt(_) => "corrupt",
+            },
+        );
+        match central_outcome {
             copperclaw_db::integrity::QuickCheckOutcome::Healthy
             | copperclaw_db::integrity::QuickCheckOutcome::Missing => (true, false),
             copperclaw_db::integrity::QuickCheckOutcome::Corrupt(detail) => {
@@ -720,8 +728,9 @@ impl SweepService {
                 &session.agent_group_id,
                 &session.id,
             ) {
-                // M1 metric wish: integrity_quarantined_sessions (gauge) —
-                // observe the current excluded population.
+                // M21 O2 (M1 rider): the excluded population feeds the
+                // integrity_quarantined_sessions gauge, set once at the end of
+                // the pass from the report.
                 report.integrity_excluded.push(session.id);
                 continue;
             }
@@ -860,6 +869,24 @@ impl SweepService {
                 ),
             }
         }
+
+        // M21 M1 rider: pass-level metrics driven by the assembled report.
+        // Quarantined-sessions gauge = already-excluded + newly quarantined
+        // this pass (the live sweep-excluded population).
+        copperclaw_metrics::set_integrity_quarantined_sessions(
+            (report.integrity_excluded.len() + report.integrity_quarantined.len()) as u64,
+        );
+        // F2: question expiries by outcome.
+        for q in &report.questions_expired {
+            copperclaw_metrics::inc_question_expiry(if q.resolved_by_reply {
+                "resolved_by_reply"
+            } else {
+                "surfaced"
+            });
+        }
+        // Long-wished: last successful sweep-pass wall clock, for a
+        // "sweep is wedged" alert (`time() - <this>`).
+        copperclaw_metrics::set_sweep_last_run_timestamp(now.timestamp());
 
         Ok(report)
     }

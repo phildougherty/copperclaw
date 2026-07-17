@@ -462,7 +462,11 @@ pub fn reset_stale_running_sessions(central: &CentralDb, sessions_root: &std::pa
         let paths =
             copperclaw_db::session::SessionPaths::new(sessions_root, s.agent_group_id, s.id);
         match crate::container_manager::classify::emit_boot_recovery_notice(&paths, s.id) {
-            Ok(true) => notices += 1,
+            Ok(true) => {
+                notices += 1;
+                // M21 F3 (M1 rider): boot/host-restart recovery notice written.
+                copperclaw_metrics::inc_recovery_notice();
+            }
             Ok(false) => {}
             Err(err) => {
                 warn!(

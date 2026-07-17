@@ -363,10 +363,16 @@ impl ContainerManager {
         //    The crashed-containers metric fires only for genuine
         //    crashes — a stuck-tool restart is a deliberate recovery,
         //    and counting it as a crash would be the same flavour of lie
-        //    S2's copy fix removes. Stuck restarts get their own series
-        //    when the M1 metrics rider lands (wish: stuck restarts by
-        //    reason); until then the log line below is the signal.
+        //    S2's copy fix removes. Stuck restarts get their own series via
+        //    the M21 M1 restart-by-reason counter below (distinct from the
+        //    crash-only crashed-containers counter).
         sessions::mark_container_stopped(&self.central, session.id).map_err(ManagerError::Db)?;
+        // M21 S2 (M1 rider): restarts by reason — crash vs deliberate
+        // stuck-tool recovery.
+        copperclaw_metrics::inc_container_restart(match reason {
+            RestartReason::Crash => "crash",
+            RestartReason::StuckTool => "stuck_tool",
+        });
         match reason {
             RestartReason::Crash => {
                 copperclaw_metrics::inc_containers_crashed();
@@ -391,6 +397,11 @@ impl ContainerManager {
         let record = self
             .crash_loop
             .record_crash(session.id, cause, tokio::time::Instant::now());
+        // M21 S4 (M1 rider): OOM kills + how deep the respawn backoff got.
+        if cause == CrashCause::OomKill {
+            copperclaw_metrics::inc_container_oom_kill();
+        }
+        copperclaw_metrics::observe_crash_backoff_level(record.streak);
         warn!(
             session = %session.id.as_uuid(),
             cause = cause.as_str(),

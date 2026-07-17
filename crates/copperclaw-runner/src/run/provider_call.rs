@@ -166,15 +166,24 @@ pub(super) async fn run_llm_turn(
         // `enter_candidate` returns None on the session's first candidate and
         // whenever the serving provider is unchanged, so a steady chain never
         // spams notes.
+        // M21 O3 (M1 rider): gauge the currently-serving chain position on
+        // every candidate entry (0 = primary), so it tracks reality even when
+        // there is no transition to announce.
+        copperclaw_metrics::set_provider_failover_active_position(idx);
         if let Some(t) = health.enter_candidate(idx) {
             hud.add_note(&format!("switched to {}", t.to));
-            // Reuse the existing transition counter (M18 R5). M1 metric wish:
-            // a dedicated live-failover counter that distinguishes a *degrade*
+            // Reuse the existing transition counter (M18 R5) AND the M21 O3
+            // dedicated live-failover counter that distinguishes a *degrade*
             // (moving to a higher-index fallback) from a *restore* (moving
-            // back toward the primary after re-probe), plus a gauge of the
-            // currently-active chain position, so operators can see live
-            // failover activity separately from spawn-time selection.
+            // back toward the primary after re-probe), so operators can see
+            // live failover activity separately from spawn-time selection.
             copperclaw_metrics::inc_provider_failover(&t.from, &t.to);
+            let direction = if t.degrade {
+                copperclaw_metrics::FAILOVER_DIRECTION_DEGRADE
+            } else {
+                copperclaw_metrics::FAILOVER_DIRECTION_RESTORE
+            };
+            copperclaw_metrics::inc_provider_failover_transition(direction, &t.from, &t.to);
         }
 
         let input = QueryInput {

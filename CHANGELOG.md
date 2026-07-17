@@ -6,6 +6,69 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M21 M1 — metrics rider: sweep the M21 metric wishes into `copperclaw-metrics`, 2026-07-17)
+
+- One card, absolute last in the M21 program, sweeps every metric "wish" the
+  merged M21 cards (S1–S6, F1–F4, O2–O4) recorded — in `// M1 metric wish:`
+  code comments, PR/CHANGELOG prose, and the plan's `## M1. Metrics rider`
+  section — into `crates/copperclaw-metrics/src/lib.rs` as named
+  counter/gauge/histogram helpers (following the crate's established
+  convention), and wires the emit/observe call at each card's real call site.
+  `copperclaw-metrics` is the only crate that gains metric *definitions*; the
+  other touched crates gain only the emit call (+ one struct-field addition on
+  `FailoverHealth::Transition` to carry the degrade/restore direction). New
+  name-prefix, `_total`-suffix, no-panic smoke, and labeled-render tests cover
+  the additions.
+- **S1** — `copperclaw_supervised_loop_alive` + `_degraded` gauges (per `loop`)
+  and `copperclaw_supervised_loop_restarts_total{loop, reason}`, from
+  `copperclaw-host/src/supervisor.rs` (loop state transitions + `snapshot`
+  refresh + the driver's unexpected-exit arm).
+- **S2** — `copperclaw_container_restart_total{reason}` (`crash` vs
+  `stuck_tool`), from `copperclaw-host/src/container_manager/classify.rs`
+  (`restart_container`); the stuck restart finally gets its own series distinct
+  from the crash-only `copperclaw_containers_crashed_total`.
+- **S4** — `copperclaw_container_oom_kills_total` + the
+  `copperclaw_crash_backoff_level` histogram, from the same `restart_container`
+  path (per recorded crash).
+- **S3/S5** — `copperclaw_delivery_retry_resumed_total` (persisted retry state
+  rehydrated after a host restart, from `prime_retry_cache`) and
+  `copperclaw_delivery_dead_letter_total{reason}` (`retry_exhausted` from
+  `record_exhausted_row`, `no_adapter` from `record_no_adapter_expired`), all in
+  `copperclaw-host-delivery/src/service.rs`.
+- **F1** — `copperclaw_slow_spawn_notices_total`, from
+  `copperclaw-host/src/container_manager/cold_start.rs`
+  (`post_slow_spawn_notice`). The spawn-phase duration histogram
+  (`copperclaw_container_spawn_seconds`) already existed and is unchanged.
+- **F2** — `copperclaw_question_expiries_total{outcome}`
+  (`surfaced` / `resolved_by_reply`), from
+  `copperclaw-host-sweep/src/service.rs` (`run_once`, from the F2 report).
+- **F3** — `copperclaw_recovery_notices_total`, from
+  `copperclaw-host/src/boot.rs` (the stale-running-session reset path).
+- **F4** — `copperclaw_mcp_connection_cache_total{outcome}`
+  (`hit`/`miss`/`dead_retry`) + `copperclaw_mcp_connection_reaped_total`, from
+  `copperclaw-mcp/src/external_cache.rs` (`call_with`).
+- **O2** — `copperclaw_integrity_quick_check_total{scope, outcome}`,
+  `copperclaw_integrity_quarantines_total`, and the
+  `copperclaw_integrity_quarantined_sessions` gauge, from
+  `copperclaw-host-sweep/src/checks/integrity.rs` (session scope + quarantine)
+  and `.../service.rs` (central scope + the pass-level gauge).
+- **O3** — `copperclaw_provider_failover_transition_total{direction, from, to}`
+  (`degrade` vs `restore`) + the `copperclaw_provider_failover_active_position`
+  gauge, from `copperclaw-runner/src/run/provider_call.rs`; `FailoverHealth`
+  now tracks the last-entered chain index to label the direction.
+- **O4** — `copperclaw_operator_alerts_total{severity, outcome}` where
+  `outcome ∈ {sent, suppressed_disabled, suppressed_deduped,
+  suppressed_rate_limited, no_carrier, enqueue_failed}`, from all six arms of
+  `copperclaw-host/src/operator_alerts.rs::fire`.
+- **Long-wished** — the `copperclaw_sweep_last_run_timestamp` gauge (Unix
+  seconds of the last completed sweep pass), from
+  `copperclaw-host-sweep/src/service.rs` (`run_once`); alert on
+  `time() - <this>` to catch a wedged sweep loop.
+- **`docs/observability.md`** gains a "Stability + operator surfaces (M21)"
+  metric table for all of the above and eight new recommended alerts (loop
+  liveness, wedged sweep, OOM, stuck-tool restarts, dead-letters, integrity
+  quarantines, failover degrade, suppressed operator alerts).
+
 ### Added (M21 Wave-3 X-rider: operator-surface fixtures, 2026-07-17)
 
 - **New replay fixture `fixtures/cli/operator-alert-delivery/` + registered

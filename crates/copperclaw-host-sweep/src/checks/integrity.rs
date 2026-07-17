@@ -164,14 +164,22 @@ pub fn check_and_quarantine(
         ("outbound.db", &paths.outbound_db),
         ("inbound.db", &paths.inbound_db),
     ] {
-        // M1 metric wish: integrity_quick_check_total{scope="session",
-        // outcome} — increment per db probed by Healthy / Missing / Corrupt.
-        match quick_check(db_path) {
+        // M21 O2 (M1 rider): integrity quick-check outcome per db probed.
+        let outcome = quick_check(db_path);
+        copperclaw_metrics::inc_integrity_quick_check(
+            copperclaw_metrics::INTEGRITY_SCOPE_SESSION,
+            match &outcome {
+                QuickCheckOutcome::Healthy => "healthy",
+                QuickCheckOutcome::Missing => "missing",
+                QuickCheckOutcome::Corrupt(_) => "corrupt",
+            },
+        );
+        match outcome {
             QuickCheckOutcome::Healthy | QuickCheckOutcome::Missing => {}
             QuickCheckOutcome::Corrupt(detail) => {
                 write_sidecar(&sidecar_path_for(&paths.root), db_name, &detail, now)?;
-                // M1 metric wish: integrity_quarantines_total — increment
-                // once per session quarantined.
+                // M21 O2 (M1 rider): one quarantine recorded.
+                copperclaw_metrics::inc_integrity_quarantines();
                 return Ok(Some(IntegrityFinding {
                     session_id: *session_id,
                     db: db_name,
