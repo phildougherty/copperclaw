@@ -3587,3 +3587,244 @@ async fn cli_restart_recovery_notice_delivered_exactly_once() {
     let diff = harness.compare().expect("compare");
     assert!(diff.is_clean(), "{diff}");
 }
+
+// ── M21 Wave-3 X-rider (operator-surface fixtures) ──────────────────
+//
+// One replay-registered end-to-end test lives here: the O4 opt-in
+// operator-alert destination, enqueue -> real `DeliveryService` -> wire,
+// for a loop-death event, plus the secure-by-default silence when no
+// destination is configured. The other three Wave-3 acceptance behaviours
+// (O1 doctor rows, O2 quarantine sidecar/exclusion, O3 mid-session
+// failover) are not reachable through the inbound->...->delivery replay
+// pipeline; they are pinned by focused tests at the right layer and mapped
+// — with the reachability analysis — in `fixtures/README-m21-wave3.md`.
+// The O2->O1 cross-card seam (sweep quarantine artifact <-> doctor reader
+// contract) is pinned by `tests/wave3_quarantine_doctor.rs`.
+
+/// Fixture-authoring gate for the M21 Wave-3 X-rider fixture: when
+/// `COPPERCLAW_M21X3_GENERATE` is set the caller regenerates
+/// `expected/*.jsonl` from a real baseline run and returns before
+/// asserting. Never taken under a normal `cargo test`.
+fn m21x3_generate() -> bool {
+    std::env::var_os("COPPERCLAW_M21X3_GENERATE").is_some()
+}
+
+/// M21 O4 (X-rider W3): the opt-in operator-alert destination, end to end
+/// through the replay pipeline over `fixtures/cli/operator-alert-delivery/`
+/// — the leg O4's own unit tests (`operator_alerts.rs`) stop short of: the
+/// enqueued alert row actually REACHING the channel adapter through the
+/// real `DeliveryService`, routed to the operator's OWN configured target,
+/// exactly once — and the secure-by-default silence when unconfigured.
+///
+/// The fixture drives one normal turn, leaving exactly one `Active`
+/// carrier session (the one `OperatorAlerts::pick_carrier` selects). The
+/// test then, on top of the byte-stable baseline:
+///
+/// 1. **Silence when unconfigured.** A DISABLED `OperatorAlerts` fires a
+///    loop-death alert; a delivery pass follows. Zero alert rows, zero
+///    operator-target deliveries — the pre-O4 log+metric-only world.
+/// 2. **Enqueue -> delivery for a loop-death event.** A CONFIGURED
+///    `OperatorAlerts` (cli channel, distinct `operator-cli` target) is
+///    driven through the REAL S1 permanent-failure seam
+///    (`run_degraded_watch`): flipping the supervisor `degraded` watch to
+///    `true` enqueues exactly one alert row into the carrier's
+///    `outbound.db`, carrying its OWN routing.
+/// 3. A real `DeliveryService::process_session_once` pass hands it to the
+///    cli `MockAdapter` at `operator-cli` (not the chat's `stdin`, proving
+///    `resolve_target` routes on the row's own fields); a second pass is
+///    quiet — delivered exactly once.
+///
+/// The enqueue-side semantics (dedup, rate-limit, disabled-default, the
+/// degraded-watch fire-once) are pinned exhaustively by O4's own unit
+/// tests; this test adds the one leg they omit — the wire.
+///
+/// Regenerate expected streams with
+/// `COPPERCLAW_M21X3_GENERATE=1 cargo test -p copperclaw-host --test replay cli_operator_alert -- --nocapture`.
+#[tokio::test]
+async fn cli_operator_alert_delivered_and_silent_when_unconfigured() {
+    use copperclaw_db::session::{SessionPaths, open_outbound};
+    use copperclaw_db::tables::{messages_out, sessions};
+    use copperclaw_host::operator_alerts::{AlertDestination, AlertSeverity, OperatorAlerts};
+    use copperclaw_types::ChannelType;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    const OPERATOR_TARGET: &str = "operator-cli";
+    const LOOP_DEATH_KEY: &str = "supervisor.degraded";
+
+    /// Alert rows (cli channel, the operator target) in the carrier's
+    /// `outbound.db`.
+    fn alert_rows(paths: &SessionPaths) -> usize {
+        let conn = open_outbound(paths).unwrap();
+        messages_out::list_due(&conn)
+            .unwrap()
+            .into_iter()
+            .filter(|r| {
+                r.channel_type.as_ref().map(ChannelType::as_str) == Some("cli")
+                    && r.platform_id.as_deref() == Some(OPERATOR_TARGET)
+            })
+            .count()
+    }
+
+    let path = fixture_path("cli", "operator-alert-delivery");
+    assert!(
+        path.exists(),
+        "fixture missing at {} — see docs/replay-fixtures.md",
+        path.display()
+    );
+    let fixture = Fixture::load(&path).expect("load operator-alert-delivery fixture");
+    let mut harness = ReplayHarness::new(fixture).await.expect("boot harness");
+    harness.run().await.expect("run baseline turn");
+
+    if m21x3_generate() {
+        harness.dump_expected_jsonl();
+        return;
+    }
+    let diff = harness.compare().expect("compare");
+    assert!(diff.is_clean(), "{diff}");
+
+    let (ag, sess) = harness.touched_sessions[0];
+    let carrier_paths = SessionPaths::new(harness.tempdir.path(), ag, sess);
+    let carrier = sessions::get(&harness.central, sess).unwrap();
+    let mock = Arc::clone(mock_for(&harness, "cli"));
+
+    // Deliveries that reached the OPERATOR target (distinct from the
+    // chat's `stdin`, so the baseline reply is never miscounted here).
+    let to_operator = |mock: &copperclaw_channels_core::testing::MockAdapter| {
+        mock.deliveries()
+            .into_iter()
+            .filter(|d| d.platform_id == OPERATOR_TARGET)
+            .count()
+    };
+    assert_eq!(
+        alert_rows(&carrier_paths),
+        0,
+        "no alert rows before O4 fires"
+    );
+    assert_eq!(to_operator(&mock), 0, "nothing at the operator target yet");
+
+    // ── 1. Silence when unconfigured (secure-by-default). ──
+    let disabled = OperatorAlerts::with_destination(
+        harness.central.clone(),
+        harness.tempdir.path().to_path_buf(),
+        None,
+    );
+    assert!(!disabled.is_enabled());
+    disabled.fire(
+        AlertSeverity::Critical,
+        LOOP_DEATH_KEY,
+        "the sweep loop exceeded its restart budget",
+    );
+    assert_eq!(
+        alert_rows(&carrier_paths),
+        0,
+        "a disabled destination must enqueue zero new outbound"
+    );
+    harness
+        .delivery
+        .process_session_once(&carrier)
+        .await
+        .expect("delivery pass after disabled fire");
+    assert_eq!(
+        to_operator(&mock),
+        0,
+        "nothing reaches the operator target when unconfigured"
+    );
+
+    // ── 2. Configured: a loop-death event enqueues exactly one alert. ──
+    let dest = AlertDestination {
+        channel_type: ChannelType::new("cli"),
+        platform_id: OPERATOR_TARGET.into(),
+        thread_id: None,
+    };
+    let alerts = Arc::new(OperatorAlerts::with_destination(
+        harness.central.clone(),
+        harness.tempdir.path().to_path_buf(),
+        Some(dest),
+    ));
+    assert!(alerts.is_enabled());
+
+    // Drive the REAL S1 permanent-failure seam: a supervised loop
+    // exceeding its restart budget flips the `degraded` watch to true.
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let shutdown = CancellationToken::new();
+    let watch = tokio::spawn(Arc::clone(&alerts).run_degraded_watch(rx, shutdown.clone()));
+    tx.send(true).expect("flip degraded (loop death)");
+    for _ in 0..200 {
+        if alert_rows(&carrier_paths) == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    shutdown.cancel();
+    let _ = watch.await;
+    assert_eq!(
+        alert_rows(&carrier_paths),
+        1,
+        "a loop-death event enqueues exactly one alert row"
+    );
+
+    // ── 3. The alert reaches the operator target through real delivery. ──
+    harness
+        .delivery
+        .process_session_once(&carrier)
+        .await
+        .expect("deliver the alert");
+    assert_eq!(
+        to_operator(&mock),
+        1,
+        "the alert reaches the operator target exactly once"
+    );
+    // It landed on the cli `MockAdapter` (channel routing from the row's own
+    // `channel_type=cli`) at the operator target (platform routing from the
+    // row's own `platform_id`) — not the session's `stdin` — so
+    // `resolve_target` chose the alert row's OWN routing fields.
+    let alert = mock
+        .deliveries()
+        .into_iter()
+        .find(|d| d.platform_id == OPERATOR_TARGET)
+        .expect("operator delivery present");
+    let text = alert
+        .message
+        .content
+        .get("text")
+        .and_then(|t| t.as_str())
+        .expect("alert body");
+    assert!(
+        text.contains("[copperclaw critical]"),
+        "severity-prefixed body: {text}"
+    );
+    assert!(
+        text.contains("degraded"),
+        "the loop-death copy names the degraded host: {text}"
+    );
+
+    // A second delivery pass is quiet: delivered exactly once.
+    harness
+        .delivery
+        .process_session_once(&carrier)
+        .await
+        .expect("second delivery pass");
+    assert_eq!(
+        to_operator(&mock),
+        1,
+        "the alert stays exactly-once on the wire"
+    );
+
+    // The baseline chat reply stayed on `stdin` — the alert's OWN routing,
+    // not the carrier session's, chose the operator target.
+    let stdin_replies = mock
+        .deliveries()
+        .into_iter()
+        .filter(|d| {
+            d.platform_id == "stdin"
+                && d.message.content.get("text").and_then(|t| t.as_str())
+                    == Some("All systems nominal.")
+        })
+        .count();
+    assert_eq!(
+        stdin_replies, 1,
+        "the chat reply and the alert stayed on separate targets"
+    );
+}
