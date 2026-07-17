@@ -24,7 +24,7 @@ use copperclaw_types::{
     AgentGroupId, ChannelType, ContainerStatus, MessageId, MessageKind, MessageOutRow,
     OutboundMessage, Session, SessionId, SessionStatus,
 };
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use rusqlite::{Connection, OptionalExtension};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -182,6 +182,16 @@ impl DeliveryReport {
 }
 
 /// Track in-memory retry state for in-flight messages.
+///
+/// Since M21 S3 this map is a **write-through cache** over the `tries` /
+/// `not_before` columns on the row itself (migration 029): every
+/// [`DeliveryService::bump_retry`] mirrors the counter and the wall-clock
+/// backoff window onto the row, and the cache is primed lazily from the
+/// persisted columns on the first poll of each session
+/// ([`DeliveryService::prime_retry_cache`]), so attempt budgets and
+/// backoff windows survive a host restart. `chunks_sent` /
+/// `first_chunk_pid` stay in-memory only — a restart mid-split re-sends
+/// the row's chunks from the top, the pre-existing behavior.
 #[derive(Debug, Clone)]
 struct RetryState {
     /// Number of attempts already made (>= 1).
@@ -308,6 +318,11 @@ pub struct DeliveryService {
     actions: DashMap<String, Arc<dyn DeliveryActionHandler>>,
     inflight: DashMap<DeliveryKey, Instant>,
     retries: DashMap<DeliveryKey, RetryState>,
+    /// Sessions whose persisted retry state (migration 029) has been loaded
+    /// into `retries` this host lifetime. Guards the lazy one-shot priming
+    /// in [`DeliveryService::prime_retry_cache`]; a fresh service instance
+    /// (i.e. a host restart) starts empty and re-primes from the rows.
+    retries_primed: DashSet<SessionId>,
     dispatcher: Arc<dyn DeliveryDispatcher>,
     /// When `true`, a failed `install_packages` / `add_mcp_server`
     /// apply is surfaced as a `DeliveryError::SystemAction` so the
@@ -390,6 +405,7 @@ impl DeliveryService {
             actions: DashMap::new(),
             inflight: DashMap::new(),
             retries: DashMap::new(),
+            retries_primed: DashSet::new(),
             dispatcher,
             selfmod_hard_fail: AtomicBool::new(selfmod_hard_fail_from_env()),
             todo_locks: DashMap::new(),
@@ -434,6 +450,7 @@ impl DeliveryService {
             actions: DashMap::new(),
             inflight: DashMap::new(),
             retries: DashMap::new(),
+            retries_primed: DashSet::new(),
             dispatcher,
             selfmod_hard_fail: AtomicBool::new(selfmod_hard_fail_from_env()),
             todo_locks: DashMap::new(),
@@ -556,6 +573,12 @@ impl DeliveryService {
             (rows, delivered_ids, routing)
         };
 
+        // Prime the in-memory retry cache from the persisted `tries` /
+        // `not_before` columns (M21 S3) on the first poll of this session
+        // this host lifetime — attempt budgets and backoff windows survive
+        // a restart instead of resetting to zero.
+        self.prime_retry_cache(sess, &outbound_pool, &delivered_ids)?;
+
         let now = Instant::now();
         for row in rows {
             if delivered_ids.contains(&row.id) {
@@ -615,6 +638,32 @@ impl DeliveryService {
                 }
             }
 
+            // Persisted-exhaustion guard (M21 S3). A row whose PERSISTED
+            // attempt counter already reached the budget in a prior host
+            // lifetime (the host died between the final bump and the
+            // `failed` record) is dead-lettered now, without burning
+            // another attempt — this is what makes exhaustion dead-letter
+            // exactly once across restarts. Within one lifetime this never
+            // fires: `bump_retry` returning `Fail` records the failure and
+            // removes the entry in the same pass, under the same claim.
+            if self
+                .retries
+                .get(&key)
+                .is_some_and(|r| r.tries >= MAX_DELIVERY_ATTEMPTS)
+            {
+                self.inflight.remove(&key);
+                self.record_exhausted_row(
+                    sess,
+                    &row,
+                    &key,
+                    &inbound_pool,
+                    "retry budget exhausted before a host restart",
+                )?;
+                report.failed += 1;
+                warn!(?row.id, "persisted retry budget exhausted, marking failed");
+                continue;
+            }
+
             let result = self
                 .process_row(sess, &row, routing.as_ref(), &inbound_pool)
                 .await;
@@ -632,40 +681,22 @@ impl DeliveryService {
                     copperclaw_metrics::inc_messages_outbound(&channel_label);
                 }
                 Err(err) if err.is_retryable() => {
-                    let outcome = self.bump_retry(&key, err.retry_after_secs());
+                    let outcome = self.bump_retry(&key, err.retry_after_secs(), &outbound_pool);
                     match outcome {
                         DeferOutcome::Defer => {
                             report.deferred += 1;
                             debug!(?err, ?row.id, "deferring retryable delivery failure");
                         }
                         DeferOutcome::Fail => {
-                            let in_conn = inbound_pool.connect()?;
-                            // Keep the `failed` row insertion — operators
-                            // rely on `cclaw dropped-messages` reading
-                            // these. Slice-3.3 ADDS a user-visible
-                            // ErrorCard on top so the user actually sees
-                            // that their message didn't get out.
-                            delivered::insert(&in_conn, row.id, None, "failed")?;
-                            self.retries.remove(&key);
+                            self.record_exhausted_row(
+                                sess,
+                                &row,
+                                &key,
+                                &inbound_pool,
+                                &err.to_string(),
+                            )?;
                             report.failed += 1;
-                            copperclaw_metrics::inc_delivery_failed(&channel_label);
                             warn!(?err, ?row.id, "exhausted retry budget, marking failed");
-                            // Best-effort: emit an Error-kind outbound
-                            // row addressed back at the originating
-                            // channel so the next delivery pass renders
-                            // it visibly to the user. Swallow errors —
-                            // an emit failure here can't be allowed to
-                            // poison the delivery loop, and the `failed`
-                            // row above is the load-bearing record.
-                            if let Err(emit_err) =
-                                self.emit_delivery_failure_error_card(sess, &row, &err.to_string())
-                            {
-                                warn!(
-                                    ?emit_err,
-                                    ?row.id,
-                                    "could not emit retry-exhaustion ErrorCard"
-                                );
-                            }
                         }
                     }
                 }
@@ -2785,34 +2816,152 @@ impl DeliveryService {
         None
     }
 
-    fn bump_retry(&self, key: &DeliveryKey, retry_after_secs: Option<u64>) -> DeferOutcome {
+    fn bump_retry(
+        &self,
+        key: &DeliveryKey,
+        retry_after_secs: Option<u64>,
+        outbound_pool: &SessionPool,
+    ) -> DeferOutcome {
         let now = Instant::now();
-        // `or_insert` only initialises when the entry is absent — partial-
-        // split progress (`chunks_sent`, `first_chunk_pid`) recorded by
-        // `dispatch_chat` BEFORE the failing chunk survives the bump, which
-        // is exactly what we need so the next retry skips the already-
-        // delivered chunks instead of re-sending them.
-        let mut entry = self.retries.entry(*key).or_insert(RetryState {
-            tries: 0,
-            not_before: now,
-            chunks_sent: 0,
-            first_chunk_pid: None,
-        });
-        entry.tries += 1;
-        if entry.tries >= MAX_DELIVERY_ATTEMPTS {
-            return DeferOutcome::Fail;
-        }
-        // Honour the adapter's `retry_after` hint when present (Telegram /
-        // Slack / GitHub / Linear / Webex all parse it from `Retry-After`
-        // or the platform's equivalent). Cap at the absolute ceiling so a
-        // pathological hint can't park a row for hours. Fall back to the
-        // fixed exponential schedule when no hint is given.
-        let delay = match retry_after_secs {
-            Some(s) => s.saturating_mul(1_000).min(ABSOLUTE_CEILING_MS),
-            None => backoff_delay_ms(entry.tries),
+        let (tries, delay_ms, outcome) = {
+            // `or_insert` only initialises when the entry is absent — partial-
+            // split progress (`chunks_sent`, `first_chunk_pid`) recorded by
+            // `dispatch_chat` BEFORE the failing chunk survives the bump, which
+            // is exactly what we need so the next retry skips the already-
+            // delivered chunks instead of re-sending them.
+            let mut entry = self.retries.entry(*key).or_insert(RetryState {
+                tries: 0,
+                not_before: now,
+                chunks_sent: 0,
+                first_chunk_pid: None,
+            });
+            entry.tries += 1;
+            if entry.tries >= MAX_DELIVERY_ATTEMPTS {
+                (entry.tries, None, DeferOutcome::Fail)
+            } else {
+                // Honour the adapter's `retry_after` hint when present (Telegram /
+                // Slack / GitHub / Linear / Webex all parse it from `Retry-After`
+                // or the platform's equivalent). Cap at the absolute ceiling so a
+                // pathological hint can't park a row for hours. Fall back to the
+                // fixed exponential schedule when no hint is given.
+                let delay = match retry_after_secs {
+                    Some(s) => s.saturating_mul(1_000).min(ABSOLUTE_CEILING_MS),
+                    None => backoff_delay_ms(entry.tries),
+                };
+                entry.not_before = now + Duration::from_millis(delay);
+                (entry.tries, Some(delay), DeferOutcome::Defer)
+            }
         };
-        entry.not_before = now + Duration::from_millis(delay);
-        DeferOutcome::Defer
+        // Write-through (M21 S3): mirror the counter and the wall-clock
+        // backoff window onto the row (migration 029) so a host restart
+        // resumes at the persisted count instead of resetting. Runs after
+        // the entry guard is dropped so the DashMap shard lock is never
+        // held across DB IO. Best-effort — the in-memory entry stays
+        // authoritative for this lifetime, and a bookkeeping write failure
+        // must not poison the delivery pass. The final bump (`Fail`)
+        // persists the exhausted count with NO window: if the host dies
+        // before the `failed` record lands, the persisted-exhaustion guard
+        // in `process_session_once` dead-letters the row on the next boot
+        // without burning another attempt.
+        let wall_not_before = delay_ms.map(|ms| {
+            chrono::Utc::now()
+                + chrono::Duration::milliseconds(i64::try_from(ms).unwrap_or(i64::MAX))
+        });
+        let persisted = outbound_pool.connect().and_then(|conn| {
+            messages_out::set_retry_state(&conn, key.msg_id, tries, wall_not_before)
+                .map_err(DeliveryError::from)
+        });
+        if let Err(err) = persisted {
+            warn!(?err, msg_id = ?key.msg_id, "could not persist delivery retry state");
+        }
+        outcome
+    }
+
+    /// Load persisted retry state (M21 S3, migration 029) into the in-memory
+    /// `retries` cache — once per session per host lifetime, on the first
+    /// poll. Wall-clock `not_before` windows are converted to monotonic
+    /// deadlines: a window still in the future keeps its remaining span
+    /// (capped at the absolute ceiling so a pathological persisted value
+    /// can't park a row for hours); an elapsed window becomes retry-now.
+    /// Rows already recorded in `delivered` are terminal and skipped, as is
+    /// any key the cache already holds (same-lifetime state is fresher).
+    fn prime_retry_cache(
+        &self,
+        sess: &Session,
+        outbound_pool: &SessionPool,
+        delivered_ids: &std::collections::HashSet<MessageId>,
+    ) -> Result<(), DeliveryError> {
+        if self.retries_primed.contains(&sess.id) {
+            return Ok(());
+        }
+        let persisted = {
+            let out_conn = outbound_pool.connect()?;
+            messages_out::list_retry_state(&out_conn)?
+        };
+        let now_wall = chrono::Utc::now();
+        let now = Instant::now();
+        for state in persisted {
+            if delivered_ids.contains(&state.id) {
+                continue;
+            }
+            let key = DeliveryKey::new(sess.id, state.id);
+            if let dashmap::mapref::entry::Entry::Vacant(vacant) = self.retries.entry(key) {
+                let not_before = match state.not_before {
+                    Some(t) if t > now_wall => {
+                        let remaining = (t - now_wall)
+                            .to_std()
+                            .unwrap_or_default()
+                            .min(Duration::from_millis(ABSOLUTE_CEILING_MS));
+                        now + remaining
+                    }
+                    _ => now,
+                };
+                vacant.insert(RetryState {
+                    tries: state.tries,
+                    not_before,
+                    chunks_sent: 0,
+                    first_chunk_pid: None,
+                });
+            }
+        }
+        // Marked only after a fully successful load so a transient DB error
+        // above (propagated via `?`) retries the priming on the next pass.
+        self.retries_primed.insert(sess.id);
+        Ok(())
+    }
+
+    /// Dead-letter one outbound row that exhausted its retry budget: record
+    /// `delivered{status="failed"}` (the load-bearing artefact operators
+    /// read via `cclaw dropped-messages`), clear the in-memory retry entry,
+    /// bump the failure metric, and best-effort emit the delivery-failure
+    /// `ErrorCard` back at the originating channel. Shared by the in-lifetime
+    /// exhaustion path (`bump_retry` returning `Fail`) and the M21 S3
+    /// persisted-exhaustion guard that fires after a host restart.
+    fn record_exhausted_row(
+        &self,
+        sess: &Session,
+        row: &MessageOutRow,
+        key: &DeliveryKey,
+        inbound_pool: &SessionPool,
+        reason: &str,
+    ) -> Result<(), DeliveryError> {
+        let in_conn = inbound_pool.connect()?;
+        delivered::insert(&in_conn, row.id, None, "failed")?;
+        self.retries.remove(key);
+        let channel_label = row
+            .channel_type
+            .as_ref()
+            .map_or_else(|| "unknown".to_owned(), |ct| ct.as_str().to_owned());
+        copperclaw_metrics::inc_delivery_failed(&channel_label);
+        // Best-effort: emit an Error-kind outbound row addressed back at
+        // the originating channel so the next delivery pass renders it
+        // visibly to the user. Swallow errors — an emit failure here can't
+        // be allowed to poison the delivery loop, and the `failed` row
+        // above is the load-bearing record.
+        if let Err(emit_err) = self.emit_delivery_failure_error_card(sess, row, reason) {
+            warn!(?emit_err, ?row.id, "could not emit retry-exhaustion ErrorCard");
+        }
+        Ok(())
     }
 
     /// Snapshot of sessions visible to the active loop (status=Active,
@@ -4232,6 +4381,259 @@ mod tests {
         // adapter error so operators can grep for the failure mode.
         assert!(card.summary.contains("retry budget"));
         assert!(card.summary.contains("502"));
+    }
+
+    // ------------------------------------------------------------------
+    // M21 S3 — persisted retry state (migration 029). The in-memory
+    // retries map is a write-through cache over the row's `tries` /
+    // `not_before` columns, primed lazily on the first poll of a session
+    // so attempt budgets and backoff windows survive a host restart.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn bump_retry_writes_through_to_the_row() {
+        // A retryable failure must mirror the attempt counter and the
+        // wall-clock backoff window onto the outbound row itself.
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let row = make_row(MessageKind::Chat, json!({"text":"hi"}));
+        write_row(&out_pool, &row);
+        mock.fail_next_deliver(AdapterError::Rate {
+            retry_after: Some(10),
+        });
+        let before = Utc::now();
+        let _ = service.process_session_once(&sess).await.unwrap();
+
+        let out_conn = out_pool.connect().unwrap();
+        let persisted = messages_out::list_retry_state(&out_conn).unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].id, row.id);
+        assert_eq!(persisted[0].tries, 1);
+        let not_before = persisted[0].not_before.expect("window persisted");
+        let delay = not_before - before;
+        assert!(
+            delay >= chrono::Duration::milliseconds(9_500)
+                && delay <= chrono::Duration::milliseconds(10_500),
+            "expected ~10s persisted window, got {delay}",
+        );
+    }
+
+    #[tokio::test]
+    async fn priming_honors_persisted_not_before() {
+        // A row parked mid-backoff when the host went down must NOT fire
+        // immediately on boot: the first poll primes the cache from the
+        // row and the remaining window is honoured.
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let row = make_row(MessageKind::Chat, json!({"text":"hi"}));
+        write_row(&out_pool, &row);
+        {
+            let out_conn = out_pool.connect().unwrap();
+            messages_out::set_retry_state(
+                &out_conn,
+                row.id,
+                1,
+                Some(Utc::now() + chrono::Duration::hours(1)),
+            )
+            .unwrap();
+        }
+
+        // "Boot": a fresh service over the same DBs (empty caches).
+        let (restarted, mock2) = crate::test_support::restart_service(&service);
+        drop(mock);
+        let rpt = restarted.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.deferred, 1, "row mid-backoff must defer, not fire");
+        assert_eq!(rpt.delivered, 0);
+        assert!(
+            mock2.deliveries().is_empty(),
+            "no attempt inside the persisted window"
+        );
+
+        // The primed cache carries the persisted attempt count.
+        let key = DeliveryKey::new(sess.id, row.id);
+        {
+            let entry = restarted.retries.get(&key).expect("cache primed");
+            assert_eq!(entry.tries, 1);
+        }
+
+        // Once the (in-memory) window is popped, the retry proceeds.
+        if let Some(mut entry) = restarted.retries.get_mut(&key) {
+            entry.not_before = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now);
+        }
+        let rpt2 = restarted.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt2.delivered, 1);
+        assert_eq!(mock2.deliveries().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restart_resumes_persisted_attempt_count() {
+        // Integration: kill and restart the delivery service mid-retry.
+        // Two failed attempts before the "restart" plus one after must
+        // exhaust MAX_DELIVERY_ATTEMPTS (3) — the restart must NOT reset
+        // the budget — and exhaustion must dead-letter exactly once: one
+        // delivered{status="failed"} row and one ErrorCard.
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let row = make_row(MessageKind::Chat, json!({"text":"hi"}));
+        write_row(&out_pool, &row);
+
+        let key = DeliveryKey::new(sess.id, row.id);
+        for _ in 0..(MAX_DELIVERY_ATTEMPTS - 1) {
+            mock.fail_next_deliver(AdapterError::Transport("502".into()));
+            if let Some(mut entry) = service.retries.get_mut(&key) {
+                entry.not_before = Instant::now()
+                    .checked_sub(Duration::from_secs(1))
+                    .unwrap_or_else(Instant::now);
+            }
+            let _ = service.process_session_once(&sess).await.unwrap();
+        }
+        {
+            let out_conn = out_pool.connect().unwrap();
+            let persisted = messages_out::list_retry_state(&out_conn).unwrap();
+            assert_eq!(persisted.len(), 1);
+            assert_eq!(persisted[0].tries, MAX_DELIVERY_ATTEMPTS - 1);
+            // Simulate downtime longer than the backoff window: rewind the
+            // persisted window into the past, counter untouched.
+            messages_out::set_retry_state(
+                &out_conn,
+                row.id,
+                MAX_DELIVERY_ATTEMPTS - 1,
+                Some(Utc::now() - chrono::Duration::seconds(1)),
+            )
+            .unwrap();
+        }
+
+        // "Restart": fresh service, fresh adapter, same DBs.
+        let (restarted, mock2) = crate::test_support::restart_service(&service);
+        drop(service);
+        drop(mock);
+        mock2.fail_next_deliver(AdapterError::Transport("502 again".into()));
+        let rpt = restarted.process_session_once(&sess).await.unwrap();
+        assert_eq!(
+            rpt.failed, 1,
+            "third attempt after restart must exhaust the persisted budget"
+        );
+        assert_eq!(
+            mock2.deliveries().len(),
+            0,
+            "the exhausting attempt failed; nothing delivered"
+        );
+
+        // Exactly one failed record...
+        let in_pool = restarted
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let in_conn = in_pool.connect().unwrap();
+        let listed = delivered::list(&in_conn).unwrap();
+        let failed: Vec<_> = listed.iter().filter(|d| d.status == "failed").collect();
+        assert_eq!(
+            failed.len(),
+            1,
+            "exactly one delivered{{status=failed}} row"
+        );
+        // ...and exactly one ErrorCard, even across further passes.
+        let _ = restarted.process_session_once(&sess).await.unwrap();
+        let out_conn = out_pool.connect().unwrap();
+        let error_rows = messages_out::list_due(&out_conn)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == MessageKind::Error)
+            .count();
+        assert_eq!(error_rows, 1, "exactly one ErrorCard across the restart");
+    }
+
+    #[tokio::test]
+    async fn persisted_exhaustion_dead_letters_without_a_fresh_attempt() {
+        // The host died between the final bump (tries persisted at the
+        // budget) and the `failed` record. On the next boot the row must be
+        // dead-lettered WITHOUT burning a fourth adapter attempt, and only
+        // once.
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let row = make_row(MessageKind::Chat, json!({"text":"hi"}));
+        write_row(&out_pool, &row);
+        {
+            let out_conn = out_pool.connect().unwrap();
+            messages_out::set_retry_state(&out_conn, row.id, MAX_DELIVERY_ATTEMPTS, None).unwrap();
+        }
+
+        let (restarted, mock2) = crate::test_support::restart_service(&service);
+        drop(mock);
+        let rpt = restarted.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.failed, 1);
+        assert!(
+            mock2.deliveries().is_empty(),
+            "an exhausted row must not get another adapter attempt"
+        );
+
+        let in_pool = restarted
+            .session_paths
+            .inbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let in_conn = in_pool.connect().unwrap();
+        let listed = delivered::list(&in_conn).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].status, "failed");
+
+        // A second pass changes nothing: the delivered record is terminal.
+        let rpt2 = restarted.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt2.failed, 0);
+        let out_conn = out_pool.connect().unwrap();
+        let error_rows = messages_out::list_due(&out_conn)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == MessageKind::Error)
+            .count();
+        assert_eq!(error_rows, 1, "dead-letter ErrorCard emitted exactly once");
+    }
+
+    #[tokio::test]
+    async fn priming_skips_rows_already_delivered() {
+        // Terminal rows (present in `delivered`) keep their historical
+        // `tries` audit trail on the row, but must not be primed back into
+        // the live retry cache after a restart.
+        let (service, _root, sess, mock) = make_service().await;
+        let out_pool = service
+            .session_paths
+            .outbound_pool(&sess.agent_group_id, &sess.id)
+            .unwrap();
+        let row = make_row(MessageKind::Chat, json!({"text":"hi"}));
+        write_row(&out_pool, &row);
+        // One rate-limited attempt (persists tries=1), then success.
+        mock.fail_next_deliver(AdapterError::Rate {
+            retry_after: Some(1),
+        });
+        let _ = service.process_session_once(&sess).await.unwrap();
+        let key = DeliveryKey::new(sess.id, row.id);
+        if let Some(mut entry) = service.retries.get_mut(&key) {
+            entry.not_before = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now);
+        }
+        let rpt = service.process_session_once(&sess).await.unwrap();
+        assert_eq!(rpt.delivered, 1);
+
+        let (restarted, _mock2) = crate::test_support::restart_service(&service);
+        let _ = restarted.process_session_once(&sess).await.unwrap();
+        assert!(
+            !restarted.retries.contains_key(&key),
+            "delivered row must not re-enter the retry cache on priming"
+        );
     }
 
     #[tokio::test]

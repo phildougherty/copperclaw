@@ -141,6 +141,13 @@ const SESSION_OUTBOUND: &[Migration] = &[
         name: "023_session_mcp_call_requests",
         sql: include_str!("../migrations/023_session_mcp_call_requests.sql"),
     },
+    // Host-written delivery retry state (M21 S3): `tries` + `not_before`
+    // on `messages_out` so attempt counters and backoff windows survive
+    // a host restart.
+    Migration {
+        name: "029_messages_out_retry_state",
+        sql: include_str!("../migrations/029_messages_out_retry_state.sql"),
+    },
 ];
 
 const MEMORY: &[Migration] = &[Migration {
@@ -454,6 +461,123 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1, "FTS5 MATCH should find the inserted row");
+    }
+
+    #[test]
+    fn migration_029_adds_retry_columns_with_defaults() {
+        // Migration 029 layers `tries` / `not_before` onto the pre-existing
+        // `messages_out` table (migration 003) without disturbing existing
+        // rows: a row inserted with only the original columns must read back
+        // with `tries = 0` and `not_before = NULL`, so an outbound row
+        // carried across the migration is treated as never-attempted.
+        let mut conn = fresh();
+        run_migrations(&mut conn, MigrationSet::SessionOutbound).unwrap();
+
+        let cols: std::collections::HashSet<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(messages_out)").unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            rows
+        };
+        assert!(cols.contains("tries"), "missing tries");
+        assert!(cols.contains("not_before"), "missing not_before");
+
+        conn.execute(
+            "INSERT INTO messages_out
+               (id, seq, timestamp, kind, content)
+             VALUES ('legacy', 1, '2026-01-01T00:00:00Z', 'chat', '{}')",
+            [],
+        )
+        .unwrap();
+        let (tries, not_before): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT tries, not_before FROM messages_out WHERE id = 'legacy'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tries, 0);
+        assert_eq!(not_before, None);
+    }
+
+    /// Full column layout of a table as reported by `PRAGMA table_info`:
+    /// (cid, name, type, notnull, default, pk) per column.
+    fn table_info(
+        conn: &Connection,
+        table: &str,
+    ) -> Vec<(i64, String, String, i64, Option<String>, i64)> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .unwrap();
+        rows.collect::<Result<_, _>>().unwrap()
+    }
+
+    #[test]
+    fn session_outbound_fresh_and_migrated_schemas_agree() {
+        // A fresh install (all SESSION_OUTBOUND migrations in one run) and a
+        // migrated install (an old DB carrying every migration but the
+        // newest, then topped up by `run_migrations`) must land on the same
+        // `messages_out` layout — the PRAGMA-diff guard against a future
+        // migration that edits a released file instead of adding a new one.
+        let mut fresh_db = fresh();
+        run_migrations(&mut fresh_db, MigrationSet::SessionOutbound).unwrap();
+
+        // Simulate the old install: apply all but the last migration the
+        // same way the runner does (recorded in schema_version), then let
+        // `run_migrations` bring it current.
+        let mut old_db = fresh();
+        old_db
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_version (
+                   version INTEGER PRIMARY KEY AUTOINCREMENT,
+                   name    TEXT NOT NULL UNIQUE,
+                   applied TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        let (last, older) = SESSION_OUTBOUND.split_last().unwrap();
+        assert_eq!(
+            last.name, "029_messages_out_retry_state",
+            "test assumes 029 is the newest session-outbound migration; update it"
+        );
+        for m in older {
+            old_db.execute_batch(m.sql).unwrap();
+            old_db
+                .execute(
+                    "INSERT INTO schema_version (name, applied) VALUES (?1, '2026-01-01T00:00:00Z')",
+                    params![m.name],
+                )
+                .unwrap();
+        }
+        run_migrations(&mut old_db, MigrationSet::SessionOutbound).unwrap();
+
+        for table in [
+            "messages_out",
+            "processing_ack",
+            "session_state",
+            "container_state",
+        ] {
+            assert_eq!(
+                table_info(&fresh_db, table),
+                table_info(&old_db, table),
+                "fresh vs migrated column layout diverged for `{table}`"
+            );
+        }
     }
 
     #[test]

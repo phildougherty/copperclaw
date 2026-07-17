@@ -118,6 +118,34 @@ pub async fn make_service() -> (
     (service, tmp, session, mock)
 }
 
+/// Simulate a host restart: build a NEW `DeliveryService` (fresh in-memory
+/// maps — retry cache, primed set, in-flight guards) over the SAME central
+/// DB handle and the SAME on-disk session root as `old`, with a fresh
+/// `MockAdapter` registered as channel `"mock"`. What persists across the
+/// "restart" is exactly what persists across a real one: the central DB and
+/// the per-session DB files.
+pub fn restart_service(old: &DeliveryService) -> (Arc<DeliveryService>, Arc<MockAdapter>) {
+    let mock = Arc::new(MockAdapter::new("mock"));
+    let adapters: DashMap<ChannelType, Arc<dyn ChannelAdapter>> = DashMap::new();
+    adapters.insert(
+        ChannelType::new("mock"),
+        mock.clone() as Arc<dyn ChannelAdapter>,
+    );
+    let resolver_map = Arc::new(adapters.clone());
+    let resolver: AdapterResolver = {
+        let map = Arc::clone(&resolver_map);
+        Arc::new(move |ct| map.get(ct).map(|r| r.clone()))
+    };
+    let dispatcher: Arc<dyn DeliveryDispatcher> = Arc::new(HostDispatcher::new(resolver));
+    let service = DeliveryService::new(
+        old.central().clone(),
+        Arc::clone(old.session_paths()),
+        adapters,
+        dispatcher,
+    );
+    (service, mock)
+}
+
 /// Insert a default chat row into the supplied outbound pool.
 pub fn write_chat_row(pool: &SessionPool) {
     let row = WriteOutbound {
