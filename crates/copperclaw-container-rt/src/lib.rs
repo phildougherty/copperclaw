@@ -84,6 +84,24 @@ impl RtError {
     }
 }
 
+/// Terminal state of a (possibly still-present but no longer running)
+/// container, as reported by the backend's inspect surface. Consumed by
+/// the host's crash-restart path to tell an OOM kill (`State.OOMKilled`
+/// / exit 137) apart from a generic crash before the container is
+/// removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerExitStatus {
+    /// The main process's exit code, when the backend reports one.
+    /// 137 = SIGKILL, which for a memory-limited container almost
+    /// always means the kernel OOM killer (Docker sets `OOMKilled`
+    /// alongside it, but cgroup-v2 child-process kills can surface as
+    /// a bare 137 with the flag unset).
+    pub exit_code: Option<i64>,
+    /// Docker's `State.OOMKilled` — true when the kernel OOM killer
+    /// terminated the container's main process.
+    pub oom_killed: bool,
+}
+
 /// Container-runtime trait. Both backends implement this; see crate
 /// docs for the contract.
 #[async_trait]
@@ -140,6 +158,21 @@ pub trait ContainerRuntime: Send + Sync {
     /// [`crate::attest::DigestComparison::Unknown`], not a mismatch.
     async fn image_digest(&self, tag: &str) -> Result<Option<String>, RtError> {
         let _ = tag;
+        Ok(None)
+    }
+
+    /// Report the named container's terminal state (exit code +
+    /// `State.OOMKilled`), or `Ok(None)` when the backend can't inspect
+    /// it or the container is already gone. Used by the host's
+    /// crash-restart path — BEFORE the container is removed — to
+    /// classify an OOM kill distinctly from a generic crash.
+    ///
+    /// Default impl returns `Ok(None)` — backends without an inspect
+    /// surface (`AppleContainerRuntime` today, in-process test stubs)
+    /// report "unknown" rather than failing; the host treats an unknown
+    /// status as a generic crash. Concrete runtimes (Docker) override.
+    async fn exit_status(&self, name: &str) -> Result<Option<ContainerExitStatus>, RtError> {
+        let _ = name;
         Ok(None)
     }
 

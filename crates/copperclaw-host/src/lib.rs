@@ -44,7 +44,8 @@ pub(crate) mod tests {
 
     use async_trait::async_trait;
     use copperclaw_container_rt::{
-        ContainerHandle, ContainerRuntime, ContainerSpec, ImageBuildSpec, RtError,
+        ContainerExitStatus, ContainerHandle, ContainerRuntime, ContainerSpec, ImageBuildSpec,
+        RtError,
     };
     use std::sync::Mutex;
     use std::time::Duration;
@@ -69,6 +70,11 @@ pub(crate) mod tests {
         /// report a PID" path that defers the egress apply with no target; set
         /// it to assert the PID is threaded into the deny-default apply path.
         pub host_pid: Mutex<Option<i32>>,
+        /// Terminal state the runtime reports for any container via
+        /// `exit_status`. `None` (the default) exercises the "runtime can't
+        /// inspect" path that classifies every crash as generic; set it to
+        /// drive the M21 S4 OOM-kill classification.
+        pub exit_status: Mutex<Option<ContainerExitStatus>>,
     }
 
     impl NoopRuntime {
@@ -92,6 +98,14 @@ pub(crate) mod tests {
         #[must_use]
         pub fn with_host_pid(self, pid: i32) -> Self {
             *self.host_pid.lock().unwrap() = Some(pid);
+            self
+        }
+
+        /// Pre-load the terminal state the runtime reports for any container
+        /// (M21 S4 OOM-classification tests).
+        #[must_use]
+        pub fn with_exit_status(self, status: ContainerExitStatus) -> Self {
+            *self.exit_status.lock().unwrap() = Some(status);
             self
         }
 
@@ -167,6 +181,10 @@ pub(crate) mod tests {
 
         async fn container_pid(&self, _name: &str) -> Result<Option<i32>, RtError> {
             Ok(*self.host_pid.lock().unwrap())
+        }
+
+        async fn exit_status(&self, _name: &str) -> Result<Option<ContainerExitStatus>, RtError> {
+            Ok(*self.exit_status.lock().unwrap())
         }
     }
 

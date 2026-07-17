@@ -1,7 +1,9 @@
 //! Reconcile-loop classifier: decide what to do with a session this tick.
 
+use super::crash_loop::CrashCause;
 use super::spawn::container_name;
 use super::{ContainerManager, ManagerError};
+use copperclaw_channels_core::{ErrorCard, ErrorCardKind};
 use copperclaw_db::session::{SessionPaths, open_inbound, open_outbound};
 use copperclaw_db::tables::messages_out::{WriteOutbound, insert as insert_outbound};
 use copperclaw_db::tables::processing_ack::{self, ProcessingStatus};
@@ -26,6 +28,20 @@ pub(crate) const CRASH_RESTART_APOLOGY_TEXT: &str = "Hit a snag mid-task and nee
 /// crash-log file. ~200 covers the typical panic + immediate context
 /// without bloating the session dir on a busy box.
 const CRASH_LOG_TAIL_LINES: u32 = 200;
+
+/// Title of the once-per-episode OOM `ErrorCard` (M21 S4).
+const OOM_CARD_TITLE: &str = "Task keeps running out of memory";
+
+/// Summary of the once-per-episode OOM `ErrorCard`. Emitted after
+/// [`super::crash_loop::OOM_CARD_THRESHOLD`] OOM kills within one
+/// crash-loop episode so the user learns the real cause instead of
+/// watching an endless string of generic restart apologies. Names the
+/// operator-side fix (`memory_mb`) concretely, per the house style of
+/// actionable failure copy.
+pub(crate) const OOM_CARD_SUMMARY: &str = "This task keeps crashing because the agent's container \
+     runs out of memory. Restarts are being spaced out, but the task will likely keep failing at \
+     the same point. An operator can raise the container's memory limit (the memory_mb field in \
+     this group's container config, e.g. via `cclaw groups config edit <group-id>`).";
 
 /// What the reconcile loop wants to do with a session this tick.
 #[derive(Debug, PartialEq, Eq)]
@@ -60,7 +76,25 @@ impl ContainerManager {
         match session.container_status {
             ContainerStatus::Stopped => {
                 if pending {
-                    ReconcileAction::Spawn
+                    // M21 S4: a session inside its crash-restart backoff
+                    // window stays Stopped this tick — the teardown +
+                    // apology already happened in `apply_crash_restart`;
+                    // only the respawn is deferred. Sessions that never
+                    // crashed have no tracker entry and spawn exactly as
+                    // before.
+                    if let Some(remaining) = self
+                        .crash_loop
+                        .spawn_delay_remaining(session.id, tokio::time::Instant::now())
+                    {
+                        debug!(
+                            session = %session.id.as_uuid(),
+                            remaining_secs = remaining.as_secs(),
+                            "respawn deferred by crash-loop backoff"
+                        );
+                        ReconcileAction::Noop
+                    } else {
+                        ReconcileAction::Spawn
+                    }
                 } else {
                     ReconcileAction::Noop
                 }
@@ -175,7 +209,14 @@ impl ContainerManager {
     /// doesn't double-fire), and stamps `messages_in.tries =
     /// APOLOGY_TRIES_MARKER` so the host-sweep `apology`
     /// `PendingTooLong` path also stays out. Finally marks the session
-    /// container `Stopped` so the next reconcile tick respawns.
+    /// container `Stopped` so a later reconcile tick respawns.
+    ///
+    /// M21 S4 additions (decision (e)): the container's exit status is
+    /// inspected before removal to classify OOM kills distinctly, the
+    /// crash is recorded against the per-session
+    /// [`super::crash_loop::CrashLoopTracker`] (deferring the respawn on
+    /// the 5s/15s/60s/300s curve via `classify`'s Stopped-arm gate), and
+    /// the third OOM kill in an episode emits one user-facing `ErrorCard`.
     ///
     /// Idempotent: a second pass finds no `processing_ack` rows in
     /// `processing` status (the first pass marked them `Failed`) and
@@ -190,6 +231,24 @@ impl ContainerManager {
         //    non-fatal — operators still have host logs + the apology
         //    row even if we can't archive the runner's last words.
         capture_crash_log(&*self.runtime, &name, &paths).await;
+
+        // 1a. Inspect the container's terminal state BEFORE removal so an
+        //     OOM kill (Docker `State.OOMKilled` / exit 137) classifies
+        //     distinctly from a generic crash (M21 S4, decision (e)).
+        //     Best-effort: an inspect failure or an already-gone container
+        //     degrades to a generic crash — never guess OOM.
+        let exit_status = match self.runtime.exit_status(&name).await {
+            Ok(status) => status,
+            Err(err) => {
+                debug!(
+                    container = %name,
+                    ?err,
+                    "could not inspect container exit status; classifying as generic crash"
+                );
+                None
+            }
+        };
+        let cause = CrashCause::from_exit_status(exit_status.as_ref());
 
         // 1b. Tear down the session's previews before the container is
         //     removed — the crashed container's bridge IP is dead and may be
@@ -229,6 +288,41 @@ impl ContainerManager {
             session = %session.id.as_uuid(),
             "heartbeat stale; running → stopped (will respawn)"
         );
+
+        // 5. M21 S4 (decision (e)): record the crash against the
+        //    per-session backoff/OOM tracker. The respawn is deferred by
+        //    `classify`'s Stopped-arm gate until the backoff elapses;
+        //    the third OOM kill in an episode emits the single
+        //    user-facing "keeps running out of memory" ErrorCard.
+        let record = self
+            .crash_loop
+            .record_crash(session.id, cause, tokio::time::Instant::now());
+        warn!(
+            session = %session.id.as_uuid(),
+            cause = cause.as_str(),
+            crash_streak = record.streak,
+            oom_count = record.oom_count,
+            respawn_backoff_secs = record.delay.as_secs(),
+            "crash-restart recorded; respawn deferred by backoff"
+        );
+        if record.emit_oom_card {
+            if let Err(err) = emit_oom_error_card(&paths) {
+                // Non-fatal, same posture as the apology emit above: the
+                // session is already Stopped and the backoff recorded;
+                // the log line is the fallback signal.
+                warn!(
+                    session = %session.id.as_uuid(),
+                    ?err,
+                    "could not emit OOM crash-loop error card"
+                );
+            } else {
+                info!(
+                    session = %session.id.as_uuid(),
+                    oom_count = record.oom_count,
+                    "OOM crash-loop error card emitted"
+                );
+            }
+        }
         Ok(())
     }
 
@@ -456,6 +550,85 @@ fn emit_crash_restart_apologies(
         "crash-restart apologies emitted"
     );
     Ok(())
+}
+
+/// Emit the once-per-episode OOM `ErrorCard` (M21 S4): a
+/// `MessageKind::Error` outbound row telling the user the task keeps
+/// running out of memory and an operator can raise `memory_mb`.
+///
+/// Routing comes from the most recent chat-routed inbound row rather
+/// than the in-flight `processing_ack` scan the apology path uses —
+/// by the third OOM the first crash pass already marked those claims
+/// `Failed`, so the apology scan would come up empty. When the session
+/// has no chat-routed inbound at all (agent-to-agent, system-only)
+/// there is nowhere to send the card and we skip, mirroring the
+/// apology path's missing-routing posture. The caller's per-episode
+/// dedup flag is already set either way, so a skipped card is not
+/// retried every crash.
+fn emit_oom_error_card(paths: &SessionPaths) -> Result<(), ManagerError> {
+    let inbound = open_inbound(paths).map_err(ManagerError::Db)?;
+    let Some(routing) = latest_routed_inbound(&inbound)? else {
+        info!("OOM crash-loop card skipped: session has no chat-routed inbound");
+        return Ok(());
+    };
+    let outbound = open_outbound(paths).map_err(ManagerError::Db)?;
+    let card = ErrorCard::new(ErrorCardKind::Internal, OOM_CARD_SUMMARY).with_title(OOM_CARD_TITLE);
+    let write = WriteOutbound {
+        id: MessageId::new(),
+        in_reply_to: Some(routing.message_id),
+        timestamp: chrono::Utc::now(),
+        deliver_after: None,
+        recurrence: None,
+        kind: MessageKind::Error,
+        channel_type: Some(routing.channel_type),
+        platform_id: Some(routing.platform_id),
+        thread_id: routing.thread_id,
+        content: serde_json::json!({ "error": card }),
+    };
+    insert_outbound(&outbound, &write).map_err(ManagerError::Db)?;
+    Ok(())
+}
+
+/// The most recent inbound row that carries real channel routing
+/// (non-empty `channel_type` + `platform_id`), or `None` when the
+/// session has never seen a chat-routed inbound.
+fn latest_routed_inbound(
+    inbound: &rusqlite::Connection,
+) -> Result<Option<InFlightRouting>, ManagerError> {
+    let row: Option<(String, String, String, Option<String>)> = inbound
+        .query_row(
+            "SELECT id, channel_type, platform_id, thread_id FROM messages_in
+             WHERE channel_type IS NOT NULL AND channel_type != ''
+               AND platform_id IS NOT NULL AND platform_id != ''
+             ORDER BY timestamp DESC, seq DESC LIMIT 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| ManagerError::Db(copperclaw_db::DbError::from(e)))?;
+    let Some((id_str, channel_type, platform_id, thread_id)) = row else {
+        return Ok(None);
+    };
+    let Ok(uuid) = uuid::Uuid::parse_str(&id_str) else {
+        warn!(
+            raw = id_str,
+            "skipping unparseable messages_in.id for OOM card routing"
+        );
+        return Ok(None);
+    };
+    Ok(Some(InFlightRouting {
+        message_id: MessageId(uuid),
+        channel_type: ChannelType::from(channel_type),
+        platform_id,
+        thread_id,
+    }))
 }
 
 /// Read every `processing_ack` row currently in `processing` status.
@@ -1037,6 +1210,268 @@ mod tests {
         // And the session still flips to Stopped so the next tick respawns.
         let updated = sessions::get(&db, session.id).unwrap();
         assert!(matches!(updated.container_status, ContainerStatus::Stopped));
+    }
+
+    // ── M21 S4: crash-loop backoff + OOM classification ──────────────
+
+    /// Backdate the session's heartbeat file so `classify` sees a stale
+    /// runner (the crash condition).
+    fn stale_heartbeat(paths: &SessionPaths) {
+        std::fs::write(&paths.heartbeat, b"").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(240);
+        filetime::set_file_mtime(&paths.heartbeat, filetime::FileTime::from_system_time(old))
+            .unwrap();
+    }
+
+    /// Seed one chat-routed inbound row so the Stopped session wants to
+    /// respawn (and the OOM card has routing to land on).
+    fn seed_routed_inbound(paths: &SessionPaths) -> MessageId {
+        let msg_id = MessageId::new();
+        let conn = open_inbound(paths).unwrap();
+        messages_in::insert(
+            &conn,
+            &messages_in::WriteInbound {
+                id: msg_id,
+                kind: MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "build the thing"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("tg-42".into()),
+                channel_type: Some(ChannelType::new("telegram")),
+                thread_id: Some("thread-7".into()),
+                source_session_id: None,
+                reply_to: None,
+                is_group: None,
+            },
+        )
+        .unwrap();
+        msg_id
+    }
+
+    /// Count `MessageKind::Error` rows currently in the outbound DB.
+    fn count_error_rows(outbound: &rusqlite::Connection) -> usize {
+        copperclaw_db::tables::messages_out::list_due(outbound)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.kind == MessageKind::Error)
+            .count()
+    }
+
+    /// The heart of the S4 backoff acceptance: a crash-looping session
+    /// is respawned at INCREASING intervals (5s, then 15s), not
+    /// hot-looped once per reconcile tick. Paused tokio clock — zero
+    /// real waits.
+    #[tokio::test(start_paused = true)]
+    async fn crash_loop_defers_respawn_at_increasing_intervals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mgr, db) = make_mgr(&tmp);
+        let mut session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        seed_routed_inbound(&paths);
+
+        // Crash 1.
+        sessions::mark_container_running(&db, session.id).unwrap();
+        session.container_status = ContainerStatus::Running;
+        stale_heartbeat(&paths);
+        assert_eq!(mgr.classify(&session), ReconcileAction::CrashRestart);
+        mgr.apply(&session, ReconcileAction::CrashRestart)
+            .await
+            .unwrap();
+        session.container_status = ContainerStatus::Stopped;
+
+        // Inside the first (5s) window: no respawn, despite pending
+        // inbound. Before S4 this classified Spawn immediately — the
+        // hot loop.
+        assert_eq!(
+            mgr.classify(&session),
+            ReconcileAction::Noop,
+            "respawn must be deferred right after the crash"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(4)).await;
+        assert_eq!(
+            mgr.classify(&session),
+            ReconcileAction::Noop,
+            "still inside the 5s backoff window"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        assert_eq!(
+            mgr.classify(&session),
+            ReconcileAction::Spawn,
+            "first backoff (5s) elapsed"
+        );
+
+        // Crash 2: the interval escalates to 15s.
+        sessions::mark_container_running(&db, session.id).unwrap();
+        session.container_status = ContainerStatus::Running;
+        stale_heartbeat(&paths);
+        mgr.apply(&session, ReconcileAction::CrashRestart)
+            .await
+            .unwrap();
+        session.container_status = ContainerStatus::Stopped;
+
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        assert_eq!(
+            mgr.classify(&session),
+            ReconcileAction::Noop,
+            "6s < the escalated 15s window: still deferred"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        assert_eq!(
+            mgr.classify(&session),
+            ReconcileAction::Spawn,
+            "second backoff (15s) elapsed"
+        );
+
+        // A session that never crashed is untouched by the gate. (Same
+        // group — `fixture_session` would collide on the unique group
+        // folder.)
+        let mut other = create_session(
+            &db,
+            CreateSession {
+                agent_group_id: session.agent_group_id,
+                messaging_group_id: None,
+                thread_id: None,
+                agent_provider: None,
+                source_session_id: None,
+            },
+        )
+        .unwrap();
+        other.container_status = ContainerStatus::Stopped;
+        let other_paths = SessionPaths::new(tmp.path(), other.agent_group_id, other.id);
+        other_paths.ensure_dirs().unwrap();
+        seed_routed_inbound(&other_paths);
+        assert_eq!(
+            mgr.classify(&other),
+            ReconcileAction::Spawn,
+            "never-crashed sessions spawn exactly as before"
+        );
+    }
+
+    /// Three OOM kills in one episode emit exactly ONE ErrorCard; a
+    /// fourth OOM does not add another. The card carries the routing of
+    /// the session's latest chat inbound and names memory_mb.
+    #[tokio::test(start_paused = true)]
+    async fn oom_crash_loop_emits_error_card_exactly_once_per_episode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let runtime = std::sync::Arc::new(crate::tests::NoopRuntime::default().with_exit_status(
+            copperclaw_container_rt::ContainerExitStatus {
+                exit_code: Some(137),
+                oom_killed: true,
+            },
+        ));
+        let mgr = ContainerManager::new(db.clone(), runtime, manager_cfg(tmp.path().to_path_buf()));
+        let mut session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        let msg_id = seed_routed_inbound(&paths);
+        let outbound = open_outbound(&paths).unwrap();
+
+        for crash in 1u32..=4 {
+            sessions::mark_container_running(&db, session.id).unwrap();
+            session.container_status = ContainerStatus::Running;
+            mgr.apply(&session, ReconcileAction::CrashRestart)
+                .await
+                .unwrap();
+            let expected = usize::from(crash >= 3);
+            assert_eq!(
+                count_error_rows(&outbound),
+                expected,
+                "after OOM crash {crash}: exactly one card from the third on, never two"
+            );
+        }
+
+        // The card is well-formed: internal kind, memory_mb guidance,
+        // routed at the latest chat inbound.
+        let card_row = copperclaw_db::tables::messages_out::list_due(&outbound)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.kind == MessageKind::Error)
+            .expect("one OOM error card");
+        assert_eq!(card_row.in_reply_to, Some(msg_id));
+        assert_eq!(
+            card_row.channel_type.as_ref().map(ChannelType::as_str),
+            Some("telegram")
+        );
+        assert_eq!(card_row.platform_id.as_deref(), Some("tg-42"));
+        assert_eq!(card_row.thread_id.as_deref(), Some("thread-7"));
+        let card: copperclaw_channels_core::ErrorCard =
+            serde_json::from_value(card_row.content["error"].clone()).unwrap();
+        assert_eq!(card.kind, copperclaw_channels_core::ErrorCardKind::Internal);
+        assert!(card.validate().is_ok(), "card must pass schema validation");
+        assert!(
+            card.summary.contains("out of memory") && card.summary.contains("memory_mb"),
+            "summary names the cause and the operator fix: {}",
+            card.summary
+        );
+    }
+
+    /// Generic (non-OOM) crashes never emit the OOM card, no matter how
+    /// many pile up — their user surface stays exactly the pre-S4
+    /// apology machinery.
+    #[tokio::test(start_paused = true)]
+    async fn generic_crash_loop_never_emits_oom_card() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Default NoopRuntime: exit_status reports None (uninspectable),
+        // which must classify as a generic crash.
+        let (mgr, db) = make_mgr(&tmp);
+        let mut session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        seed_routed_inbound(&paths);
+        let outbound = open_outbound(&paths).unwrap();
+
+        for _ in 0..4 {
+            sessions::mark_container_running(&db, session.id).unwrap();
+            session.container_status = ContainerStatus::Running;
+            mgr.apply(&session, ReconcileAction::CrashRestart)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            count_error_rows(&outbound),
+            0,
+            "generic crashes must never surface the OOM card"
+        );
+        // The session still lands Stopped for the (backed-off) respawn.
+        let updated = sessions::get(&db, session.id).unwrap();
+        assert!(matches!(updated.container_status, ContainerStatus::Stopped));
+    }
+
+    /// A session with no chat-routed inbound (agent-to-agent / system
+    /// only) has nowhere to send the OOM card: the emit is skipped
+    /// cleanly and never retried within the episode.
+    #[tokio::test(start_paused = true)]
+    async fn oom_card_skipped_without_chat_routing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        let runtime = std::sync::Arc::new(crate::tests::NoopRuntime::default().with_exit_status(
+            copperclaw_container_rt::ContainerExitStatus {
+                exit_code: Some(137),
+                oom_killed: false,
+            },
+        ));
+        let mgr = ContainerManager::new(db.clone(), runtime, manager_cfg(tmp.path().to_path_buf()));
+        let mut session = fixture_session(&db);
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        // No inbound rows at all.
+        let _ = open_inbound(&paths).unwrap();
+        let outbound = open_outbound(&paths).unwrap();
+
+        for _ in 0..4 {
+            sessions::mark_container_running(&db, session.id).unwrap();
+            session.container_status = ContainerStatus::Running;
+            mgr.apply(&session, ReconcileAction::CrashRestart)
+                .await
+                .unwrap();
+        }
+        assert_eq!(count_error_rows(&outbound), 0, "no routing, no card");
     }
 
     /// An in-flight processing_ack row whose inbound has NO channel

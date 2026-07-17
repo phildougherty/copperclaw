@@ -39,6 +39,7 @@ pub mod broker_server;
 pub mod budgets;
 pub mod classify;
 pub mod config;
+pub mod crash_loop;
 pub mod egress;
 pub mod mcp_tools;
 pub mod mount_guard;
@@ -67,11 +68,12 @@ pub use prompt::{
 pub use spawn::{
     CODING_SKILL_NAMES, CONTAINER_RUNNER_PATH, CONTAINER_SESSION_DIR, DEFAULT_HEARTBEAT_STALE_SECS,
     DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_STOP_GRACE_SECS, POLL_INTERVAL_MS, RUNNER_CONFIG_FILENAME,
-    RebuildBackoff, resolve_rebuild_base,
+    RebuildBackoff, SpawnFailureReason, classify_spawn_failure, resolve_rebuild_base,
 };
 pub use tasks_snapshot::TASKS_SNAPSHOT_FILENAME;
 
 pub use classify::ReconcileAction;
+pub use crash_loop::{CrashCause, CrashLoopTracker, OOM_CARD_THRESHOLD};
 
 use self::config::read_env_file;
 use copperclaw_container_rt::{ContainerRuntime, RtError};
@@ -204,6 +206,12 @@ pub struct ContainerManager {
     /// worse, may be reassigned), so its proxies must not outlive it. `None`
     /// (the default, and every test constructor) is a no-op.
     pub(crate) preview: Option<Arc<crate::preview::PreviewManager>>,
+    /// M21 S4 crash-loop bookkeeping (decision (e)): per-session
+    /// exponential respawn backoff for crash restarts plus per-episode
+    /// OOM counting/dedup for the single "keeps running out of memory"
+    /// `ErrorCard`. In-memory only — a host restart resets it (boot's
+    /// recovery path re-baselines everything anyway).
+    pub(crate) crash_loop: crash_loop::CrashLoopTracker,
     /// Event-driven wake accelerator. When wired (via
     /// [`Self::with_wake_notify`], from the router's
     /// `inbound_wake` handle), [`Self::run_loop`] awaits it alongside the
@@ -242,6 +250,7 @@ impl ContainerManager {
             broker: None,
             broker_base_url: None,
             preview: None,
+            crash_loop: crash_loop::CrashLoopTracker::new(),
             wake: None,
             cfg,
         }

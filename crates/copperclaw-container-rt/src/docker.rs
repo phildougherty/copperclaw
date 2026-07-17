@@ -32,7 +32,7 @@ use crate::build::ImageBuildSpec;
 use crate::spec::{
     ContainerHandle, ContainerSpec, EgressMode, Mount, ResourceLimits, SandboxProfile,
 };
-use crate::{ContainerRuntime, RtError};
+use crate::{ContainerExitStatus, ContainerRuntime, RtError};
 
 /// Bollard-backed Docker runtime.
 pub struct DockerRuntime {
@@ -290,6 +290,25 @@ impl ContainerRuntime for DockerRuntime {
         Ok(buf)
     }
 
+    async fn exit_status(&self, name: &str) -> Result<Option<ContainerExitStatus>, RtError> {
+        match self
+            .docker
+            .inspect_container(name, None::<InspectContainerOptions>)
+            .await
+        {
+            Ok(info) => Ok(exit_status_from_inspect(&info)),
+            // 404 = the container is gone (operator `docker rm -f`, daemon
+            // reaped it); report "unknown" rather than erroring so the
+            // crash-restart classifier degrades to a generic crash.
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => Ok(None),
+            Err(e) => Err(RtError::Container(format!(
+                "inspect container {name} exit status: {e}"
+            ))),
+        }
+    }
+
     async fn container_pid(&self, name: &str) -> Result<Option<i32>, RtError> {
         match self
             .docker
@@ -349,6 +368,25 @@ pub(crate) fn pid_from_inspect(info: &ContainerInspectResponse) -> Option<i32> {
         return None;
     }
     i32::try_from(pid).ok()
+}
+
+/// Extract the terminal state (exit code + `State.OOMKilled`) from a
+/// Docker [`ContainerInspectResponse`].
+///
+/// Returns `None` when the response has no `State` at all (nothing to
+/// classify). A present `State` with a missing `OOMKilled` flag folds
+/// the flag to `false` — the host's classifier then falls back to the
+/// exit-137 heuristic. Pure, so it is unit-tested against a constructed
+/// inspect response without a daemon.
+#[must_use]
+pub(crate) fn exit_status_from_inspect(
+    info: &ContainerInspectResponse,
+) -> Option<ContainerExitStatus> {
+    let state = info.state.as_ref()?;
+    Some(ContainerExitStatus {
+        exit_code: state.exit_code,
+        oom_killed: state.oom_killed.unwrap_or(false),
+    })
 }
 
 /// Extract the container's bridge IP from a Docker
@@ -1327,6 +1365,77 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(pid_from_inspect(&info), None);
+    }
+
+    // ---- exit-status surfacing (OOM / crash classification) -------------
+
+    #[test]
+    fn exit_status_from_inspect_reads_oom_killed_and_exit_code() {
+        // An OOM-killed container's inspect carries State.OOMKilled=true and
+        // ExitCode=137 — the two signals the host's crash classifier keys on.
+        let info = ContainerInspectResponse {
+            state: Some(bollard::models::ContainerState {
+                exit_code: Some(137),
+                oom_killed: Some(true),
+                running: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            exit_status_from_inspect(&info),
+            Some(ContainerExitStatus {
+                exit_code: Some(137),
+                oom_killed: true,
+            })
+        );
+    }
+
+    #[test]
+    fn exit_status_from_inspect_missing_state_is_none() {
+        assert_eq!(
+            exit_status_from_inspect(&ContainerInspectResponse::default()),
+            None
+        );
+    }
+
+    #[test]
+    fn exit_status_from_inspect_missing_oom_flag_folds_to_false() {
+        // State present but no OOMKilled field: the flag folds to false; the
+        // exit code still surfaces so the host can apply its 137 heuristic.
+        let info = ContainerInspectResponse {
+            state: Some(bollard::models::ContainerState {
+                exit_code: Some(1),
+                oom_killed: None,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            exit_status_from_inspect(&info),
+            Some(ContainerExitStatus {
+                exit_code: Some(1),
+                oom_killed: false,
+            })
+        );
+    }
+
+    #[test]
+    fn exit_status_from_inspect_deserialised_from_docker_json() {
+        // The exact wire shape `docker inspect` returns for an OOM-killed
+        // container must deserialise and classify.
+        let json = serde_json::json!({
+            "Id": "deadbeef",
+            "State": { "Status": "exited", "Running": false, "OOMKilled": true, "ExitCode": 137 }
+        });
+        let info: ContainerInspectResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            exit_status_from_inspect(&info),
+            Some(ContainerExitStatus {
+                exit_code: Some(137),
+                oom_killed: true,
+            })
+        );
     }
 
     #[test]
