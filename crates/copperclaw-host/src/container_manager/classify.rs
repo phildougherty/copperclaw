@@ -43,6 +43,21 @@ pub(crate) const OOM_CARD_SUMMARY: &str = "This task keeps crashing because the 
      the same point. An operator can raise the container's memory limit (the memory_mb field in \
      this group's container config, e.g. via `cclaw groups config edit <group-id>`).";
 
+/// Why [`ContainerManager::restart_container`] is tearing a session's
+/// container down. Drives the log wording, the crashed-containers
+/// metric (crashes only), the exit-status inspection (crashes only —
+/// a stuck container is still alive), and the stuck-tool state clear
+/// (stuck restarts only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RestartReason {
+    /// Heartbeat stale or missing — the runner process is presumed
+    /// dead ([`ReconcileAction::CrashRestart`]).
+    Crash,
+    /// M21 S2: the sweep found a tool past the absolute ceiling; the
+    /// runner is alive but wedged ([`ReconcileAction::StuckRestart`]).
+    StuckTool,
+}
+
 /// What the reconcile loop wants to do with a session this tick.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReconcileAction {
@@ -62,6 +77,18 @@ pub enum ReconcileAction {
     /// `Running` session's heartbeat is stale — the runner has likely
     /// crashed. Stop best-effort and reset to `Stopped` for respawn.
     CrashRestart,
+    /// M21 S2 (decision (a)): the sweep detected a tool running past
+    /// its absolute ceiling
+    /// (`copperclaw_host_sweep::ABSOLUTE_CEILING_MS`). The runner
+    /// process is alive (its heartbeat stays fresh across tool
+    /// dispatch — deliberately, see decision (a)), so [`Self::classify`]
+    /// never produces this variant; it arrives exclusively through the
+    /// manager's `StuckActuator` implementation
+    /// ([`super::stuck_actuator`]). The teardown rides the same
+    /// machinery as [`Self::CrashRestart`] (log capture, apologies,
+    /// crash-loop backoff) plus a tool-state clear so the sweep does
+    /// not re-fire against the fresh container.
+    StuckRestart,
 }
 
 impl ContainerManager {
@@ -78,7 +105,7 @@ impl ContainerManager {
                 if pending {
                     // M21 S4: a session inside its crash-restart backoff
                     // window stays Stopped this tick — the teardown +
-                    // apology already happened in `apply_crash_restart`;
+                    // apology already happened in `restart_container`;
                     // only the respawn is deferred. Sessions that never
                     // crashed have no tracker entry and spawn exactly as
                     // before.
@@ -196,20 +223,27 @@ impl ContainerManager {
                 Ok(())
             }
             ReconcileAction::CrashRestart => {
-                self.apply_crash_restart(session).await?;
+                self.restart_container(session, RestartReason::Crash)
+                    .await?;
+                Ok(())
+            }
+            ReconcileAction::StuckRestart => {
+                self.restart_container(session, RestartReason::StuckTool)
+                    .await?;
                 Ok(())
             }
         }
     }
 
-    /// Body of [`ReconcileAction::CrashRestart`]. Captures container
-    /// logs to a crash-log file, removes the container, emits a chat
-    /// apology for every in-flight `processing_ack` row, marks those
-    /// rows as Failed (so the host-sweep `processing` reset path
-    /// doesn't double-fire), and stamps `messages_in.tries =
-    /// APOLOGY_TRIES_MARKER` so the host-sweep `apology`
-    /// `PendingTooLong` path also stays out. Finally marks the session
-    /// container `Stopped` so a later reconcile tick respawns.
+    /// Body of [`ReconcileAction::CrashRestart`] and (M21 S2)
+    /// [`ReconcileAction::StuckRestart`]. Captures container logs to a
+    /// crash-log file, removes the container, emits a chat apology for
+    /// every in-flight `processing_ack` row, marks those rows as Failed
+    /// (so the host-sweep `processing` reset path doesn't double-fire),
+    /// and stamps `messages_in.tries = APOLOGY_TRIES_MARKER` so the
+    /// host-sweep `apology` `PendingTooLong` path also stays out.
+    /// Finally marks the session container `Stopped` so a later
+    /// reconcile tick respawns.
     ///
     /// M21 S4 additions (decision (e)): the container's exit status is
     /// inspected before removal to classify OOM kills distinctly, the
@@ -218,11 +252,29 @@ impl ContainerManager {
     /// the 5s/15s/60s/300s curve via `classify`'s Stopped-arm gate), and
     /// the third OOM kill in an episode emits one user-facing `ErrorCard`.
     ///
+    /// M21 S2 additions: `reason` distinguishes a genuine crash
+    /// (heartbeat stale/missing — the runner is presumed dead) from a
+    /// stuck-tool restart (the runner is alive but a tool ran past the
+    /// sweep's absolute ceiling). A stuck restart skips the exit-status
+    /// inspection (the container is still running; there is no terminal
+    /// state, and a hung tool is never an OOM by construction), clears
+    /// the `container_state` tool row that triggered the detection (so
+    /// the next sweep pass doesn't re-fire against the fresh
+    /// container), and leaves `copperclaw_containers_crashed_total`
+    /// untouched — a deliberate restart is not a crash. Both reasons
+    /// participate in the S4 crash-loop backoff: a session whose tool
+    /// wedges immediately after every respawn must not hot-loop on the
+    /// 60s sweep cadence.
+    ///
     /// Idempotent: a second pass finds no `processing_ack` rows in
     /// `processing` status (the first pass marked them `Failed`) and
     /// the inbound rows are at `tries=99`, so no duplicate apology is
     /// emitted.
-    pub(super) async fn apply_crash_restart(&self, session: &Session) -> Result<(), ManagerError> {
+    pub(super) async fn restart_container(
+        &self,
+        session: &Session,
+        reason: RestartReason,
+    ) -> Result<(), ManagerError> {
         let name = container_name(session.agent_group_id, session.id);
         let paths = SessionPaths::new(&self.cfg.data_dir, session.agent_group_id, session.id);
 
@@ -236,19 +288,26 @@ impl ContainerManager {
         //     OOM kill (Docker `State.OOMKilled` / exit 137) classifies
         //     distinctly from a generic crash (M21 S4, decision (e)).
         //     Best-effort: an inspect failure or an already-gone container
-        //     degrades to a generic crash — never guess OOM.
-        let exit_status = match self.runtime.exit_status(&name).await {
-            Ok(status) => status,
-            Err(err) => {
-                debug!(
-                    container = %name,
-                    ?err,
-                    "could not inspect container exit status; classifying as generic crash"
-                );
-                None
+        //     degrades to a generic crash — never guess OOM. Skipped for
+        //     stuck-tool restarts: the container is still alive there, so
+        //     it has no terminal state to inspect.
+        let cause = match reason {
+            RestartReason::Crash => {
+                let exit_status = match self.runtime.exit_status(&name).await {
+                    Ok(status) => status,
+                    Err(err) => {
+                        debug!(
+                            container = %name,
+                            ?err,
+                            "could not inspect container exit status; classifying as generic crash"
+                        );
+                        None
+                    }
+                };
+                CrashCause::from_exit_status(exit_status.as_ref())
             }
+            RestartReason::StuckTool => CrashCause::Generic,
         };
-        let cause = CrashCause::from_exit_status(exit_status.as_ref());
 
         // 1b. Tear down the session's previews before the container is
         //     removed — the crashed container's bridge IP is dead and may be
@@ -264,6 +323,24 @@ impl ContainerManager {
         //    404 as success, so it's safe to call even when the
         //    container is already gone.
         let _ = self.runtime.remove(&name).await;
+
+        // 2a. M21 S2, stuck restarts only: clear the `container_state`
+        //     tool row that triggered the sweep's detection. Without
+        //     this, the stale `tool_started_at` (already past the
+        //     ceiling) would re-flag the session as stuck on every
+        //     subsequent sweep pass and re-restart the fresh container
+        //     as soon as it came up. Best-effort with a warn: if the
+        //     clear fails, the actuator re-fires next pass — a repeat
+        //     restart, not a wedge.
+        if matches!(reason, RestartReason::StuckTool) {
+            if let Err(err) = clear_stuck_tool_state(&paths) {
+                warn!(
+                    session = %session.id.as_uuid(),
+                    ?err,
+                    "could not clear stuck tool state; sweep may re-fire the restart"
+                );
+            }
+        }
 
         // 3. Emit one chat apology per in-flight processing_ack row so
         //    the user knows the agent didn't ghost them. The host-sweep
@@ -282,12 +359,28 @@ impl ContainerManager {
         }
 
         // 4. Existing behaviour: flip the session row + metric + warn.
+        //    The crashed-containers metric fires only for genuine
+        //    crashes — a stuck-tool restart is a deliberate recovery,
+        //    and counting it as a crash would be the same flavour of lie
+        //    S2's copy fix removes. Stuck restarts get their own series
+        //    when the M1 metrics rider lands (wish: stuck restarts by
+        //    reason); until then the log line below is the signal.
         sessions::mark_container_stopped(&self.central, session.id).map_err(ManagerError::Db)?;
-        copperclaw_metrics::inc_containers_crashed();
-        warn!(
-            session = %session.id.as_uuid(),
-            "heartbeat stale; running → stopped (will respawn)"
-        );
+        match reason {
+            RestartReason::Crash => {
+                copperclaw_metrics::inc_containers_crashed();
+                warn!(
+                    session = %session.id.as_uuid(),
+                    "heartbeat stale; running → stopped (will respawn)"
+                );
+            }
+            RestartReason::StuckTool => {
+                warn!(
+                    session = %session.id.as_uuid(),
+                    "stuck tool past absolute ceiling; running → stopped (will respawn)"
+                );
+            }
+        }
 
         // 5. M21 S4 (decision (e)): record the crash against the
         //    per-session backoff/OOM tracker. The respawn is deferred by
@@ -471,6 +564,17 @@ async fn capture_crash_log(
             "could not write crash log file"
         );
     }
+}
+
+/// M21 S2: null out the `container_state` tool fields in the session's
+/// `outbound.db` after a stuck-tool restart. The stale row (its
+/// `tool_started_at` is past the ceiling by definition) is what the
+/// sweep's detection reads; clearing it is the dedupe that stops the
+/// actuator re-firing against the freshly-respawned container. The
+/// new runner writes fresh state on its next tool dispatch.
+fn clear_stuck_tool_state(paths: &SessionPaths) -> Result<(), ManagerError> {
+    let outbound = open_outbound(paths).map_err(ManagerError::Db)?;
+    copperclaw_db::tables::container_state::clear_tool(&outbound).map_err(ManagerError::Db)
 }
 
 /// Scan in-flight `processing_ack` claims, emit one chat apology per

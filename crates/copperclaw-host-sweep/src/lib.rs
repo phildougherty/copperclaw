@@ -6,6 +6,7 @@
 //! [`SweepReport`] describing sessions that need attention so the host
 //! can translate the report into container operations.
 
+pub mod actuator;
 pub mod checks;
 pub mod clock;
 pub mod error;
@@ -16,11 +17,13 @@ pub mod task_store;
 #[cfg(test)]
 mod test_support;
 
+pub use actuator::{ActuatorError, StuckActuator};
 pub use checks::apology::{APOLOGY_TRIES_MARKER, ApologyEmit, ApologyReason};
 pub use checks::condition_checkin::{
     CHECKIN_AUDIT_COMMAND, Condition, ConditionContext, ConditionKind, ConditionStore,
     ContextSampler,
 };
+pub use checks::stuck::StuckSeverity;
 pub use clock::{Clock, SystemClock};
 pub use error::SweepError;
 pub use service::{

@@ -6,6 +6,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 copperclaw-types = { workspace = true }
 copperclaw-db = { workspace = true }
 copperclaw-modules = { workspace = true }

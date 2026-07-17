@@ -113,7 +113,9 @@ struct Entry {
 
 /// Thread-safe per-session crash-loop tracker. Owned by the
 /// `ContainerManager`; consulted by `classify` (spawn gating) and
-/// updated by `apply_crash_restart`.
+/// updated by `restart_container` (crash and stuck-tool restarts both
+/// record here — M21 S2 rides the same backoff so a repeatedly-stuck
+/// session cannot hot-loop).
 #[derive(Default)]
 pub struct CrashLoopTracker {
     inner: Mutex<HashMap<SessionId, Entry>>,

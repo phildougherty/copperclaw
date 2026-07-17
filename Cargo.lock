@@ -1153,6 +1153,7 @@ dependencies = [
 name = "copperclaw-host-sweep"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "copperclaw-channels-core",
  "copperclaw-db",
