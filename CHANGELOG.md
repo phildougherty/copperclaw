@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M21 S5: forever-pending outbound rows are bounded, 2026-07-17)
+
+- **A 24h age ceiling for outbound rows whose channel has no live
+  adapter.** `crates/copperclaw-host-delivery/src/service.rs` previously
+  left such rows pending forever ("deferred" every pass), so a
+  permanently-unconfigured or removed channel accumulated unbounded
+  pending outbound that nothing drained and nothing reported. Now a
+  pending row older than `NO_ADAPTER_MAX_AGE_HOURS` (24h) is
+  dead-lettered into the central `outbound_dropped_messages` table with
+  reason prefix `no_adapter` (visible in `cclaw dropped-messages
+  outbound-list`, recoverable with `cclaw dropped-messages replay` once
+  the channel is configured) and terminally marked
+  `delivered{status="failed"}`. Deliberately no user-facing ErrorCard —
+  these rows by definition have no deliverable channel. Ephemeral UI
+  kinds (breadcrumb / todo_list / diff / error / thinking) are failed
+  without a dead-letter row: they are not replayable and stale UI chrome
+  is meaningless to re-send.
+- **`DeliveryService::no_adapter_backlog()` — a queryable count of rows
+  currently waiting on a missing adapter**, refreshed per processing
+  pass (per-session slices, cleared when the rows deliver or
+  dead-letter). O1/S1 handoff: the M21 S1 admin-socket status handler
+  (lane H, built in parallel) is the intended surface for this count so
+  `cclaw doctor` (O1) can flag a no-adapter backlog; until then this
+  method is the only read side.
+
 ### Added (M21 S3: delivery retry state persists across host restarts, 2026-07-17)
 
 - **Migration 029 (`029_messages_out_retry_state.sql`, session-outbound

@@ -31,7 +31,13 @@
 //! Delays are capped at [`ABSOLUTE_CEILING_MS`] (30 minutes). Non-retryable
 //! adapter errors mark the row as `failed` immediately. Rows that have no
 //! registered adapter are left in place (the row is not consumed) so a
-//! subsequent host reboot with the adapter registered can deliver them.
+//! subsequent host reboot with the adapter registered can deliver them —
+//! but only up to an age ceiling of [`NO_ADAPTER_MAX_AGE_HOURS`] (24h,
+//! M21 S5): past it the row is dead-lettered into the central
+//! `outbound_dropped_messages` table with reason [`NO_ADAPTER_DROP_REASON`]
+//! and can be re-queued with `cclaw dropped-messages replay` once the
+//! channel exists. The current count of rows waiting on a missing adapter
+//! is readable via [`DeliveryService::no_adapter_backlog`].
 
 pub mod dispatch;
 pub mod error;
@@ -47,7 +53,7 @@ pub use dispatch::{AdapterResolver, HostDispatcher};
 pub use error::DeliveryError;
 pub use service::{
     ABSOLUTE_CEILING_MS, ACTIVE_POLL_MS, BACKOFF_BASE_MS, DeliveryKey, DeliveryReport,
-    DeliveryService, FsSessionRoot, MAX_DELIVERY_ATTEMPTS, PREVIEW_SERVER, SWEEP_POLL_MS,
-    SessionPool, SessionRoot,
+    DeliveryService, FsSessionRoot, MAX_DELIVERY_ATTEMPTS, NO_ADAPTER_DROP_REASON,
+    NO_ADAPTER_MAX_AGE_HOURS, PREVIEW_SERVER, SWEEP_POLL_MS, SessionPool, SessionRoot,
 };
 pub use system_actions::{ParsedAction, parse_system_content};
