@@ -199,6 +199,14 @@ pub struct PreDeliveryFailure {
 ///   `message` (default `"service unavailable"`).
 /// - `"timeout"` — never respond. Combined with a tight per-step budget
 ///   on the test side this simulates an upstream that hangs.
+///
+/// M21 S6: any entry may additionally set `advance_clock_ms` — when the
+/// i-th scripted call is served, the harness advances its shared runner
+/// [`TestClock`](copperclaw_runner::TestClock) by that many
+/// milliseconds. This is the declarative hook for making time pass
+/// *mid-turn* (inside one runner's tool loop), which is what the Task
+/// HUD's 60s status-row cadence and 150s softening legs need; no real
+/// wall-clock wait occurs.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderResponseSpec {
     pub kind: String,
@@ -210,6 +218,8 @@ pub struct ProviderResponseSpec {
     pub message: Option<String>,
     #[serde(default)]
     pub delay_ms: Option<u64>,
+    #[serde(default)]
+    pub advance_clock_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

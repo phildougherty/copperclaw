@@ -374,6 +374,8 @@ async fn run_one_turn(
         check_command_override: None,
         // Single-provider e2e — no R5 failover chain.
         failover_chain: Vec::new(),
+        // Real time — this e2e doesn't exercise the S6 timed legs.
+        clock: Arc::new(copperclaw_runner::SystemClock),
     };
     run_loop(deps).await.context("runner one-turn")?;
     Ok(())

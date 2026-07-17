@@ -477,6 +477,16 @@ pub struct RunnerDeps {
     /// behaviour byte-identical. See
     /// [`provider_call::run_llm_turn`] for the walk.
     pub failover_chain: Vec<provider_call::FailoverProvider>,
+    /// M21 S6 test-clock seam: the monotonic clock the runner's timed
+    /// surfaces read through — today the Task HUD's elapsed clock, the
+    /// bare-channel 60s status-row cadence, and the 150s softening
+    /// threshold (see [`hud::TaskHud`]); later M21 timed legs (backoffs,
+    /// TTLs) should read the same clock. Default
+    /// [`crate::clock::SystemClock`] (real time — byte-identical to the
+    /// pre-seam behaviour); deterministic tests and the replay harness
+    /// inject a [`crate::clock::TestClock`] and advance it by hand so
+    /// timed legs no longer need real waits.
+    pub clock: Arc<dyn crate::clock::Clock>,
 }
 
 /// Default per-tool-call deadline. Comfortably above an `npm install`
@@ -567,6 +577,9 @@ impl RunnerDeps {
             // No in-turn failover by default: tests that exercise the R5
             // walk populate this explicitly.
             failover_chain: Vec::new(),
+            // Real time by default — the S6 seam only changes behaviour
+            // when a test injects a TestClock explicitly.
+            clock: Arc::new(crate::clock::SystemClock),
         }
     }
 }

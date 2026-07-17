@@ -71,7 +71,9 @@ use copperclaw_modules::{
     PublicTunnelReply, SessionInfoLite,
 };
 use copperclaw_providers::AnthropicProvider;
-use copperclaw_runner::{RunnerDeps, RunnerToolCtx, compaction::CompactionCfg, run_loop};
+use copperclaw_runner::{
+    RunnerDeps, RunnerToolCtx, TestClock, compaction::CompactionCfg, run_loop,
+};
 use copperclaw_types::{
     AgentGroupId, ChannelType, Effort, InboundEvent, OutboundMessage, SessionId, SessionStatus,
 };
@@ -120,6 +122,20 @@ pub struct ReplayHarness {
     /// `compare()` finds other mismatches; otherwise they're treated as
     /// expected for the fixture.
     pub runner_errors: Vec<String>,
+    /// M21 S6 test-clock seam: the manually-advanced clock injected into
+    /// every per-step runner's `RunnerDeps.clock`. The runner's timed
+    /// surfaces (the Task HUD's elapsed clock, the bare-channel 60s
+    /// status-row cadence, the 150s softening) read through it, so a
+    /// fixture can traverse timed legs deterministically — no real
+    /// waits. Advance it either programmatically via
+    /// [`ReplayHarness::advance_clock`] (between steps) or declaratively
+    /// via `advance_clock_ms` on a `provider_responses` entry (mid-turn:
+    /// the wiremock responder advances the clock when that scripted LLM
+    /// call is served, which is the only way to land inside a single
+    /// turn's tool loop). The clock is frozen apart from explicit
+    /// advances, so elapsed-time renderings in expected streams (e.g.
+    /// "61s in") are exact and byte-stable.
+    pub clock: Arc<TestClock>,
     /// True when the manifest's `gates` includes `"approvals"`. Tracked
     /// so `run()` can install the module exactly once before driving
     /// inbound events.
@@ -221,11 +237,16 @@ impl ReplayHarness {
         let delivery =
             DeliveryService::with_default_dispatcher(central.clone(), delivery_root, initial);
 
+        // S6: one shared test clock per harness — every per-step runner
+        // reads elapsed time through it, and `provider_responses` entries
+        // with `advance_clock_ms` advance it from the wiremock responder.
+        let clock = Arc::new(TestClock::new());
+
         let anthropic_server = MockServer::start().await;
         if fixture.manifest.provider_responses.is_empty() {
             mount_claude_turns(&anthropic_server, &fixture.claude_turns).await;
         } else {
-            mount_provider_responses(&anthropic_server, &fixture).await?;
+            mount_provider_responses(&anthropic_server, &fixture, &clock).await?;
         }
 
         let use_approvals_gate = fixture
@@ -266,12 +287,22 @@ impl ReplayHarness {
             touched_sessions: Vec::new(),
             played_inbound: Vec::new(),
             runner_errors: Vec::new(),
+            clock,
             use_approvals_gate,
             use_budget_gate,
             use_preview_gate,
             use_tunnel_gate,
             container_manager: tokio::sync::Mutex::new(None),
         })
+    }
+
+    /// S6: advance the shared runner test clock by `by`. Visible to any
+    /// in-flight and every future per-step runner immediately. Use this
+    /// from X-rider tests that need time to pass *between* steps; use
+    /// `advance_clock_ms` on a `provider_responses` entry to advance
+    /// mid-turn (inside one runner's tool loop).
+    pub fn advance_clock(&self, by: Duration) {
+        self.clock.advance(by);
     }
 
     /// Drive every `inbound/*.json` event through the pipeline. After
@@ -802,6 +833,11 @@ impl ReplayHarness {
             check_command_override: None,
             // Replay fixtures run a single provider — no R5 failover chain.
             failover_chain: Vec::new(),
+            // S6: the harness's shared, manually-advanced clock, so
+            // fixtures can pin the runner's timed legs (HUD status-row
+            // cadence and softening) without real waits. `Arc<TestClock>`
+            // unsizes to the `Arc<dyn Clock>` the deps carry.
+            clock: self.clock.clone(),
         };
         // The M17 preview relay (`expose_preview` / `close_preview`) writes
         // a request row to `outbound.db::mcp_call_requests` and BLOCK-POLLS
@@ -1102,19 +1138,50 @@ impl ReplayHarness {
 ///
 /// Each mock has `up_to_n_times(1)` and a unique priority so the i-th
 /// upstream request consumes the i-th scripted response in order.
-async fn mount_provider_responses(server: &MockServer, fixture: &Fixture) -> Result<()> {
+///
+/// S6: an entry with `advance_clock_ms` set advances the harness's
+/// shared runner [`TestClock`] by that much at the moment the scripted
+/// call is served — the declarative way for a fixture to make time pass
+/// *inside* a single runner turn's tool loop (between `TaskHud`
+/// construction and the batch-end status-row check), which no
+/// between-step hook can reach.
+async fn mount_provider_responses(
+    server: &MockServer,
+    fixture: &Fixture,
+    clock: &Arc<TestClock>,
+) -> Result<()> {
     for (i, spec) in fixture.manifest.provider_responses.iter().enumerate() {
         let pri = u8::try_from(i + 1).unwrap_or(u8::MAX);
         let response = build_provider_response(spec, fixture, i)?;
-        Mock::given(method("POST"))
-            .and(path("/v1/messages"))
-            .respond_with(response)
-            .up_to_n_times(1)
-            .with_priority(pri)
-            .mount(server)
-            .await;
+        let mock = Mock::given(method("POST")).and(path("/v1/messages"));
+        let mock = match spec.advance_clock_ms {
+            Some(ms) => mock.respond_with(ClockAdvancingResponder {
+                template: response,
+                clock: Arc::clone(clock),
+                advance: Duration::from_millis(ms),
+            }),
+            None => mock.respond_with(response),
+        };
+        mock.up_to_n_times(1).with_priority(pri).mount(server).await;
     }
     Ok(())
+}
+
+/// S6: a wiremock responder that advances the harness's shared runner
+/// [`TestClock`] as a side effect of serving its scripted response.
+/// Mounted with `up_to_n_times(1)`, so each advancement fires exactly
+/// once per `provider_responses` entry.
+struct ClockAdvancingResponder {
+    template: ResponseTemplate,
+    clock: Arc<TestClock>,
+    advance: Duration,
+}
+
+impl wiremock::Respond for ClockAdvancingResponder {
+    fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+        self.clock.advance(self.advance);
+        self.template.clone()
+    }
 }
 
 fn build_provider_response(
