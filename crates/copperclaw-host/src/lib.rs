@@ -20,6 +20,7 @@ pub mod daemon;
 pub mod handlers;
 pub mod image_health;
 pub mod log_redact;
+pub mod operator_alerts;
 pub mod orphans;
 pub mod preview;
 pub mod sessions;

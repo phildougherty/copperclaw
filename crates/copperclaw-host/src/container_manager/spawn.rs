@@ -401,6 +401,7 @@ impl ContainerManager {
                         attempts,
                         "image rebuild in cooldown with no fallback tag; spawn failed"
                     );
+                    self.alert_spawn_failure(session, attempts, SpawnFailureReason::ImageBuild);
                     return Err(ManagerError::Spawn(RtError::Container(
                         "image rebuild in cooldown and no fallback tag is configured".into(),
                     )));
@@ -453,6 +454,7 @@ impl ContainerManager {
                             ?err,
                             "image rebuild failed with no fallback tag; spawn failed"
                         );
+                        self.alert_spawn_failure(session, attempts, SpawnFailureReason::ImageBuild);
                         return Err(err);
                     }
                 }
@@ -485,13 +487,15 @@ impl ContainerManager {
                 // token (M21 S4) tells a missing/unpullable image apart
                 // from a generic runtime failure in the logs.
                 let attempts = self.spawn_tracker.record_failure(session.id);
+                let reason = classify_spawn_failure(&err);
                 warn!(
                     session = %session.id.as_uuid(),
                     attempts,
-                    reason = classify_spawn_failure(&err).as_str(),
+                    reason = reason.as_str(),
                     ?err,
                     "runtime spawn failed; bumped spawn-attempt counter",
                 );
+                self.alert_spawn_failure(session, attempts, reason);
                 return Err(ManagerError::Spawn(err));
             }
         };

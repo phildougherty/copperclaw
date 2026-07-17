@@ -37,6 +37,63 @@ adheres to [Semantic Versioning](https://semver.org/).
   `SessionRoot::session_paths` trait method exposes the per-session
   filesystem layout to the check.
 
+### Added (M21 O4: opt-in operator alert destination, 2026-07-17)
+
+- **The host can now push critical events to an operator's channel —
+  opt-in, off by default.** New `crates/copperclaw-host/src/operator_alerts.rs`
+  (`OperatorAlerts::fire(severity, dedup_key, message)`) enqueues
+  rate-limited, deduped system alert rows through the EXISTING outbound
+  delivery pipeline (`messages_out` → the delivery loops → the channel
+  adapters) — no new notification infrastructure (decision (d)). The
+  destination is configured via the host `.env`
+  (`COPPERCLAW_OPERATOR_ALERT_CHANNEL` + `COPPERCLAW_OPERATOR_ALERT_TARGET`,
+  optional `COPPERCLAW_OPERATOR_ALERT_THREAD`); the row carries that
+  channel/platform/thread as its own routing, so the delivery loop routes
+  it to the operator regardless of which active session's `outbound.db`
+  physically carried it. Wired call sites (lane H): supervisor
+  permanent-failure via the S1 `degraded_watch` seam (a new supervised
+  `operator_alert_watch` loop in `boot.rs`), the S4 OOM crash-loop
+  threshold (`container_manager/classify.rs`), and spawn-failure streaks
+  crossing `SPAWN_FAIL_THRESHOLD` (`container_manager/spawn.rs`, via
+  `ContainerManager::alert_spawn_failure`).
+- **Disabled by default = zero behavior change.** With no destination
+  configured, `fire` does only the pre-O4 log line + metric — ZERO new
+  outbound. Dedup keys name the *episode* (e.g. `oom:<session>`,
+  `supervisor.degraded`), so a condition persisting across sweep passes
+  alerts at most once per `RE_ALERT_WINDOW` (15 min) instead of once per
+  pass; a global token cap (`RATE_LIMIT_MAX` = 20 per `RATE_LIMIT_WINDOW`
+  = 5 min) bounds a fleet-wide burst. A missing carrier session or a DB
+  error is logged and dropped — a misconfigured destination never crashes
+  the host (fail-closed).
+
+### Changed (M21 O4)
+
+- `ContainerManager` gained `with_operator_alerts(...)`; `boot.rs`'s
+  `spawn_container_manager` threads the shared `Arc<OperatorAlerts>` so the
+  crash-loop/OOM and spawn-failure-streak thresholds and the supervisor
+  degraded-watch loop all push through the same enqueuer. Two call sites
+  remain for the coordinator to wire at integration (documented in
+  `operator_alerts.rs`): the O2 quarantine site (lane W) and the
+  conditional "the operator has been notified" apology-copy restore in
+  `copperclaw-host-sweep/src/checks/apology.rs`.
+
+### Security review (M21 O4 — new config surface + new outbound path)
+
+- **Opt-in / default-off:** no destination ⇒ no new outbound at all; the
+  platform never emits a new outward message unless explicitly configured.
+- **Who can configure it:** only the host operator, via the install `.env`
+  — an agent or chat user cannot set it, and editing `.env` already
+  requires host access, so this is not a privilege escalation.
+- **No flood amplification:** episode dedup + the global token cap prevent
+  a crash-loop or fleet-wide fault from being amplified into an outbound
+  storm against the operator's channel.
+- **No secret / PII leakage:** alert bodies are host-authored control-plane
+  copy naming a session UUID + a component; they carry no provider keys, no
+  user message content, and nothing not already visible in `cclaw doctor` /
+  the host log.
+- **Fail-closed:** a bad/unavailable destination logs at WARN and drops the
+  alert; it never wedges or crashes the host.
+
 ### Added (M21 Wave-2 X-rider: feedback fixtures, 2026-07-17)
 
 - **Two new replay fixtures pin the Wave-2 "user is never in the dark"
