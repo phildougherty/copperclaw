@@ -1,0 +1,17 @@
+{
+  "name": "cli-slow-spawn-notice",
+  "channel": "cli",
+  "description": "M21 F1 (Wave-2 X-rider): first message to a fresh session -> spawn-phase typing pulses while the container spawn is held, exactly one slow-spawn notice past the 20s threshold (paused-clock section driven by the registered test), then the released spawn's turn processes the same inbound and replies normally.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "\"in_reply_to\":(\"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\"|null)": "\"in_reply_to\":\"<IRT>\"",
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

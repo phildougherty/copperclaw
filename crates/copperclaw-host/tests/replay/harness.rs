@@ -482,6 +482,63 @@ impl ReplayHarness {
         Ok(())
     }
 
+    /// M21 F1 (Wave-2 X-rider, slow-spawn fixture): route fixture step
+    /// `step` through the router and seed `session_routing`, WITHOUT the
+    /// per-step runner, the delivery pass, or `mark_container_running` —
+    /// leaving exactly the state a cold container spawn sees: a
+    /// `Stopped` session with due inbound and a reply target. The
+    /// registered test then drives the real
+    /// `ContainerManager::maybe_spawn` (held runtime), the typing
+    /// ticker, and the slow-spawn watchdog over that state, and finally
+    /// completes the deferred step via
+    /// [`Self::run_turn_and_deliver`]. Only `RouteOutcome::Delivered`
+    /// is meaningful for a cold-spawn scenario; anything else is a
+    /// fixture-authoring error.
+    pub async fn route_step_cold(&mut self, step: usize) -> Result<(AgentGroupId, SessionId)> {
+        let mut event = self
+            .fixture
+            .inbound
+            .get(step)
+            .cloned()
+            .ok_or_else(|| anyhow!("route_step_cold: no inbound step {step}"))?;
+        self.stage_fixture_files(&mut event, step)?;
+        self.played_inbound.push(event.clone());
+        let outcome = self
+            .router
+            .route(event.clone())
+            .await
+            .context("router.route (cold)")?;
+        let RouteOutcome::Delivered { sessions } = outcome else {
+            anyhow::bail!("route_step_cold expects RouteOutcome::Delivered, got {outcome:?}");
+        };
+        let d = sessions
+            .first()
+            .ok_or_else(|| anyhow!("route_step_cold: route delivered to no session"))?;
+        if !self
+            .touched_sessions
+            .iter()
+            .any(|(_, s)| *s == d.session_id)
+        {
+            self.touched_sessions.push((d.agent_group_id, d.session_id));
+        }
+        self.seed_session_routing(d.agent_group_id, d.session_id, &event)?;
+        Ok((d.agent_group_id, d.session_id))
+    }
+
+    /// M21 Wave-2 X-rider: run one in-process runner turn and drain the
+    /// session's outbound through the delivery service — the tail of the
+    /// normal per-step pipeline, exposed so a registered test can defer
+    /// it past imperative host-side work (a held cold spawn, a
+    /// boot-recovery pass) and still let the fixture's scripted turn
+    /// process the pending inbound afterwards.
+    pub async fn run_turn_and_deliver(&mut self, ag: AgentGroupId, sess: SessionId) -> Result<()> {
+        if let Err(err) = self.run_one_turn(ag, sess).await {
+            self.runner_errors.push(err.to_string());
+            tracing::warn!(error = %err, "runner errored on deferred turn (captured)");
+        }
+        self.deliver_session(ag, sess).await
+    }
+
     /// Inbound-file contract support (M18 C3): a fixture's inbound event
     /// may carry `content.attachment.staged_path = "fixture://<name>"`.
     /// Before routing, the harness copies `fixtures/<channel>/<scenario>/

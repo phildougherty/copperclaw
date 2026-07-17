@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M21 Wave-2 X-rider: feedback fixtures, 2026-07-17)
+
+- **Two new replay fixtures pin the Wave-2 "user is never in the dark"
+  behaviors end to end.** `fixtures/cli/slow-spawn-notice/` +
+  `cli_slow_spawn_typing_and_single_notice_end_to_end` drives the real
+  `ContainerManager::maybe_spawn` over a held-spawn runtime and the real
+  `TypingTicker::run_loop` reading the shared `SpawnActivity` registry:
+  typing pulses through the production dispatcher before the runner is
+  up, exactly one slow-spawn notice crosses the 20s threshold (none
+  below it, none on a further three minutes held), and the notice
+  reaches the wire once before the deferred turn answers the same
+  pending inbound. `fixtures/cli/restart-recovery-notice/` +
+  `cli_restart_recovery_notice_delivered_exactly_once` runs the real
+  `boot::reset_stale_running_sessions` step and asserts the recovery
+  notice is delivered exactly once. New test-only harness seams in
+  `crates/copperclaw-host/tests/replay/harness.rs`
+  (`ReplayHarness::route_step_cold`, `run_turn_and_deliver`) expose the
+  cold-spawn state and the deferred pipeline tail; the slow-spawn test
+  brackets its timer-only spawn-phase leg in `tokio::time::pause()`
+  since F1's watchdog runs on host tokio time the fixture manifest
+  cannot advance. `fixtures/README-m21-wave2.md` is the coverage map
+  (behavior to pinning test, plus the not-fixture-reachable list with
+  reasons); F2's `fixtures/cli/question-expiry/` is folded in, not
+  duplicated.
+
 ### Added (M21 F4: external-MCP connection caching, 2026-07-17)
 
 - **External MCP connections are now reused across a session's tool
