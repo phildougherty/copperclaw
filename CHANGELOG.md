@@ -30,6 +30,46 @@ adheres to [Semantic Versioning](https://semver.org/).
   (lane H, built in parallel) is the intended surface for this count so
   `cclaw doctor` (O1) can flag a no-adapter backlog; until then this
   method is the only read side.
+### Added (M21 S4: OOM and crash-loop classification with backoff, 2026-07-17)
+
+- **OOM kills are now classified distinctly from generic crashes.** New
+  `ContainerRuntime::exit_status` method in
+  `crates/copperclaw-container-rt/src/lib.rs` (Docker override inspects
+  `State.OOMKilled` + `State.ExitCode`; other backends default to
+  "unknown"). The crash-restart path
+  (`crates/copperclaw-host/src/container_manager/classify.rs`) inspects
+  the container before removal and classifies exit 137 /
+  `State.OOMKilled` as an OOM kill — previously indistinguishable from
+  any other crash.
+- **One user-facing `ErrorCard` per OOM episode.** After 3 OOM kills
+  within a crash-loop episode the user gets a single "Task keeps running
+  out of memory" card naming the operator fix (`memory_mb` in the
+  group's container config) instead of an endless string of generic
+  restart apologies. Deduped per episode (new
+  `crates/copperclaw-host/src/container_manager/crash_loop.rs`); the
+  dedup re-arms only after the session stays healthy for 10 minutes.
+- **Image build/pull failure is a modeled spawn-failure class.** New
+  `SpawnFailureReason` (`image_build` / `image_missing` / `runtime`) in
+  `crates/copperclaw-host/src/container_manager/spawn.rs`; an image
+  rebuild failure with no fallback tag now records into the shared
+  `SpawnAttemptTracker`, so the sweep's "container never came up"
+  apology can finally fire for a group whose image cannot be built —
+  previously that path returned an error without ever feeding the
+  tracker, leaving the group silently dark.
+
+### Fixed (M21 S4: crash restarts back off instead of hot-looping, 2026-07-17)
+
+- **A crash-looping session no longer respawns once per reconcile tick
+  forever.** `ContainerManager` now keeps a per-session in-memory
+  crash-loop tracker
+  (`crates/copperclaw-host/src/container_manager/crash_loop.rs`) on the
+  same decision-(e) curve as the S1 loop supervisor (5s -> 15s -> 60s ->
+  300s cap, streak reset after 10 minutes healthy). The crash-restart
+  teardown (log capture, container removal, immediate apology) is
+  unchanged and immediate; only the respawn is deferred, via a gate in
+  `classify`'s Stopped-arm. Deliberately not persisted across host
+  restarts — boot's recovery re-baselines every session. Non-OOM crash
+  behavior is otherwise byte-identical.
 
 ### Added (M21 S3: delivery retry state persists across host restarts, 2026-07-17)
 

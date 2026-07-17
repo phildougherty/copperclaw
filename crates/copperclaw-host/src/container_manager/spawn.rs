@@ -91,6 +91,65 @@ pub const DEFAULT_HEARTBEAT_STALE_SECS: u64 = 120;
 /// 5s is enough for the runner to flush an in-flight HTTP call.
 pub const DEFAULT_STOP_GRACE_SECS: u64 = 5;
 
+/// Distinct spawn-failure classes (M21 S4). Before this enum every
+/// failed spawn looked the same in the logs, and an image build/pull
+/// failure with no fallback tag did not feed the
+/// [`copperclaw_host_sweep::SpawnAttemptTracker`] at all — so the
+/// sweep's "container never came up" apology could never fire for a
+/// session whose image simply could not be produced. Every class now
+/// records into the tracker and logs its reason token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnFailureReason {
+    /// The image rebuild (`install_packages` / profile change / first
+    /// build) failed and no last-known-good tag existed to fall back
+    /// to, or the rebuild is in cooldown with no fallback tag.
+    ImageBuild,
+    /// The runtime reported the session image missing at
+    /// container-create time — a never-built / never-pulled / pruned
+    /// image (Docker's "No such image", pull access / manifest
+    /// failures).
+    ImageMissing,
+    /// Any other runtime spawn failure (daemon down, name conflict
+    /// that survived the pre-remove, resource exhaustion, ...).
+    Runtime,
+}
+
+impl SpawnFailureReason {
+    /// Stable lowercase token for logs (and the M1 metrics rider).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ImageBuild => "image_build",
+            Self::ImageMissing => "image_missing",
+            Self::Runtime => "runtime",
+        }
+    }
+}
+
+/// Classify a `runtime.spawn` error into a [`SpawnFailureReason`].
+/// Pure so it is unit-testable; the message heuristics cover Docker's
+/// missing-image / failed-pull shapes, which bollard surfaces as
+/// generic `Container` errors rather than `NotFound`.
+#[must_use]
+pub fn classify_spawn_failure(err: &RtError) -> SpawnFailureReason {
+    match err {
+        RtError::NotFound(_) => SpawnFailureReason::ImageMissing,
+        RtError::Container(msg) => {
+            let lower = msg.to_ascii_lowercase();
+            if lower.contains("no such image")
+                || lower.contains("pull access denied")
+                || lower.contains("manifest unknown")
+                || lower.contains("manifest for")
+            {
+                SpawnFailureReason::ImageMissing
+            } else {
+                SpawnFailureReason::Runtime
+            }
+        }
+        _ => SpawnFailureReason::Runtime,
+    }
+}
+
 /// Verify that the host's `heartbeat_stale_secs` leaves the runner room
 /// to fail a provider call before being declared dead. The runner's
 /// `HeartbeatTicker` fires every 5s and a provider attempt can block
@@ -321,6 +380,18 @@ impl ContainerManager {
                 // unblock by fixing the config and waiting out the
                 // backoff window, or the backoff expires naturally.
                 if base_tag.is_empty() {
+                    // Feed the spawn-attempt tracker (M21 S4): with no
+                    // image to fall back to this session cannot come up,
+                    // and the sweep's apology check should learn that
+                    // instead of the group going silently dark.
+                    let attempts = self.spawn_tracker.record_failure(session.id);
+                    warn!(
+                        session = %session.id.as_uuid(),
+                        agent_group = %session.agent_group_id.as_uuid(),
+                        reason = SpawnFailureReason::ImageBuild.as_str(),
+                        attempts,
+                        "image rebuild in cooldown with no fallback tag; spawn failed"
+                    );
                     return Err(ManagerError::Spawn(RtError::Container(
                         "image rebuild in cooldown and no fallback tag is configured".into(),
                     )));
@@ -358,6 +429,21 @@ impl ContainerManager {
                         self.rebuild_backoff.record_failure(session.agent_group_id);
                         copperclaw_metrics::inc_image_rebuild_failed();
                         copperclaw_metrics::inc_image_rebuild(img_profile, "failed");
+                        // Feed the spawn-attempt tracker (M21 S4): an
+                        // image build/pull failure with no fallback tag is
+                        // a spawn failure — without this record the
+                        // sweep's "container never came up" apology could
+                        // never fire for a group whose image cannot be
+                        // built.
+                        let attempts = self.spawn_tracker.record_failure(session.id);
+                        warn!(
+                            session = %session.id.as_uuid(),
+                            agent_group = %session.agent_group_id.as_uuid(),
+                            reason = SpawnFailureReason::ImageBuild.as_str(),
+                            attempts,
+                            ?err,
+                            "image rebuild failed with no fallback tag; spawn failed"
+                        );
                         return Err(err);
                     }
                 }
@@ -386,11 +472,14 @@ impl ContainerManager {
                 // Bump the spawn-attempt tracker so the sweep's apology
                 // check can decide whether to notify the user that the
                 // container can't come up. The tracker is process-local
-                // and cleared on a successful spawn below.
+                // and cleared on a successful spawn below. The reason
+                // token (M21 S4) tells a missing/unpullable image apart
+                // from a generic runtime failure in the logs.
                 let attempts = self.spawn_tracker.record_failure(session.id);
                 warn!(
                     session = %session.id.as_uuid(),
                     attempts,
+                    reason = classify_spawn_failure(&err).as_str(),
                     ?err,
                     "runtime spawn failed; bumped spawn-attempt counter",
                 );
@@ -3523,6 +3612,143 @@ mod tests {
         assert!(
             args["image_tag"].as_str().is_some_and(|s| !s.is_empty()),
             "image_tag must be recorded"
+        );
+    }
+
+    // ── spawn-failure classification (M21 S4) ──────────────────────
+
+    /// The pure classifier maps runtime errors onto stable reason
+    /// tokens: a 404/missing-image is `image_missing`, everything else
+    /// on the spawn path is `runtime`.
+    #[test]
+    fn spawn_failure_classification_maps_error_shapes() {
+        assert_eq!(
+            classify_spawn_failure(&RtError::NotFound("no such container".into())),
+            SpawnFailureReason::ImageMissing
+        );
+        // Docker surfaces a missing image at create time as a generic
+        // Container error, not NotFound — the message heuristic catches it.
+        assert_eq!(
+            classify_spawn_failure(&RtError::Container(
+                "create: No such image: copperclaw/session:test".into()
+            )),
+            SpawnFailureReason::ImageMissing
+        );
+        assert_eq!(
+            classify_spawn_failure(&RtError::Container(
+                "pull access denied for copperclaw/session".into()
+            )),
+            SpawnFailureReason::ImageMissing
+        );
+        assert_eq!(
+            classify_spawn_failure(&RtError::Container("manifest unknown".into())),
+            SpawnFailureReason::ImageMissing
+        );
+        assert_eq!(
+            classify_spawn_failure(&RtError::Container("name already in use".into())),
+            SpawnFailureReason::Runtime
+        );
+        assert_eq!(
+            classify_spawn_failure(&RtError::Unavailable("daemon down".into())),
+            SpawnFailureReason::Runtime
+        );
+    }
+
+    #[test]
+    fn spawn_failure_reason_tokens_are_stable() {
+        assert_eq!(SpawnFailureReason::ImageBuild.as_str(), "image_build");
+        assert_eq!(SpawnFailureReason::ImageMissing.as_str(), "image_missing");
+        assert_eq!(SpawnFailureReason::Runtime.as_str(), "runtime");
+    }
+
+    /// An image rebuild failure with NO fallback tag now records a
+    /// spawn failure into the shared `SpawnAttemptTracker` — before S4
+    /// it returned an error without recording, so the sweep's
+    /// "container never came up" apology could never fire for a group
+    /// whose image cannot be built.
+    #[tokio::test]
+    async fn image_build_failure_without_fallback_feeds_spawn_tracker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = CentralDb::open_in_memory().unwrap();
+        // Build fails on the first runtime call; the rebuild is the
+        // first runtime call maybe_spawn makes on this path.
+        let runtime = std::sync::Arc::new(
+            crate::tests::NoopRuntime::default()
+                .fail_with(RtError::Container("build stream error".into())),
+        );
+        // Empty default tag: no last-known-good image to fall back to.
+        let mut cfg = manager_cfg(tmp.path().to_path_buf());
+        cfg.default_image_tag = String::new();
+        let mgr = ContainerManager::new(db.clone(), runtime, cfg);
+        let session = fixture_session(&db);
+        // A config row whose fingerprint is out of date (None) forces a
+        // rebuild; image_tag None means the only fallback is the (empty)
+        // host default.
+        container_configs::upsert(
+            &db,
+            container_configs::UpsertContainerConfig {
+                agent_group_id: session.agent_group_id,
+                provider: None,
+                model: None,
+                effort: None,
+                image_tag: None,
+                assistant_name: None,
+                max_messages_per_prompt: None,
+                skills: container_configs::SkillsSelector::All,
+                mcp_servers: serde_json::json!({}),
+                packages_apt: vec!["cowsay".into()],
+                packages_npm: vec![],
+                additional_mounts: serde_json::json!([]),
+                cli_scope: container_configs::CliScope::Group,
+                config_fingerprint: None,
+                egress_allow: vec![],
+                resource_limits: serde_json::json!({}),
+                coding_enabled: false,
+                surface_thinking: false,
+                tool_profile: None,
+                preview_enabled: false,
+                preview_bind: None,
+                check_command: None,
+                verify_gate: true,
+                image_profile: copperclaw_types::ImageProfile::Minimal,
+            },
+        )
+        .unwrap();
+        // Pending inbound so maybe_spawn proceeds past the gates.
+        let paths = SessionPaths::new(tmp.path(), session.agent_group_id, session.id);
+        paths.ensure_dirs().unwrap();
+        let conn = open_inbound(&paths).unwrap();
+        messages_in::insert(
+            &conn,
+            &messages_in::WriteInbound {
+                id: copperclaw_types::MessageId::new(),
+                kind: copperclaw_types::MessageKind::Chat,
+                timestamp: chrono::Utc::now(),
+                content: serde_json::json!({"text": "hi"}),
+                trigger: true,
+                on_wake: false,
+                process_after: None,
+                recurrence: None,
+                series_id: None,
+                platform_id: Some("stdin".into()),
+                channel_type: Some(copperclaw_types::ChannelType::new("cli")),
+                thread_id: None,
+                source_session_id: None,
+                reply_to: None,
+                is_group: None,
+            },
+        )
+        .unwrap();
+
+        let err = mgr
+            .maybe_spawn(&session)
+            .await
+            .expect_err("build failure with no fallback must fail the spawn");
+        assert!(matches!(err, ManagerError::Spawn(_)), "got {err:?}");
+        assert_eq!(
+            mgr.spawn_tracker().failure_count(session.id),
+            1,
+            "the build failure must feed the spawn-attempt tracker"
         );
     }
 
