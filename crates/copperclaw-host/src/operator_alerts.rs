@@ -489,6 +489,29 @@ impl OperatorAlerts {
     }
 }
 
+/// M21 O4 cross-lane seam: `copperclaw-host-sweep` fires operator alerts
+/// (the O2 quarantine event) and reads the enabled flag (the conditional
+/// apology copy) through its own [`copperclaw_host_sweep::OperatorAlertSink`]
+/// trait — it cannot name this crate. The host wires its `OperatorAlerts`
+/// in via `SweepService::set_operator_alerts` at boot; because the impl is
+/// on `OperatorAlerts`, an `Arc<OperatorAlerts>` coerces straight to
+/// `Arc<dyn OperatorAlertSink>`. The `&str` severity token is mapped to the
+/// crate's own [`AlertSeverity`] (unknown ⇒ `Critical`, per `from_token`).
+impl copperclaw_host_sweep::OperatorAlertSink for OperatorAlerts {
+    fn fire(&self, severity: &str, dedup_key: &str, message: &str) {
+        OperatorAlerts::fire(
+            self,
+            AlertSeverity::from_token(severity),
+            dedup_key,
+            message,
+        );
+    }
+
+    fn is_enabled(&self) -> bool {
+        OperatorAlerts::is_enabled(self)
+    }
+}
+
 /// Why [`OperatorAlerts::enqueue`] could not write the row. Both variants are
 /// fail-closed at the [`OperatorAlerts::fire`] boundary — logged, never
 /// propagated.

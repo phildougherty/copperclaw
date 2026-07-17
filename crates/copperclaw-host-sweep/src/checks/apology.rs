@@ -69,6 +69,14 @@ pub(crate) const APOLOGY_TEXT: &str = "I'm having trouble processing your messag
      Please try again in a few minutes. If this keeps happening, tell your operator — \
      running `cclaw doctor` on the host will show what's wrong.";
 
+/// M21 O4 (decision (d)): the truthful variant, used only when an operator
+/// alert destination is wired and enabled (`OperatorAlertSink::is_enabled`).
+/// Once O4 actually pushes to an operator, restoring "the operator has been
+/// notified" is honest again — the claim S2 removed while it was a lie. With
+/// no destination configured the sweep keeps [`APOLOGY_TEXT`].
+pub(crate) const APOLOGY_NOTIFIED_TEXT: &str = "I'm having trouble processing your message right now (the agent's container isn't responding). \
+     Please try again in a few minutes — the operator has been notified.";
+
 /// One row visible to the apology check inside `messages_in`. Mirrors
 /// the subset of [`copperclaw_types::MessageInRow`] we actually look at.
 #[derive(Debug, Clone)]
@@ -139,7 +147,16 @@ pub fn check(
     spawn_tracker: &SpawnAttemptTracker,
     session: &Session,
     now: DateTime<Utc>,
+    operator_notified: bool,
 ) -> Result<Vec<ApologyEmit>, SweepError> {
+    // M21 O4: pick the truthful copy only when an operator-alert
+    // destination is actually wired (the caller passes
+    // `SweepService::operator_alerts_enabled`). Off ⇒ the S2 honest text.
+    let apology_text = if operator_notified {
+        APOLOGY_NOTIFIED_TEXT
+    } else {
+        APOLOGY_TEXT
+    };
     let mut emits = Vec::new();
     let spawn_failed = matches!(session.container_status, ContainerStatus::Stopped)
         && spawn_tracker.is_exhausted(session.id);
@@ -230,7 +247,7 @@ pub fn check(
             // operationally distinct but user-cosmetically identical.
             let card = ErrorCard {
                 title: "I couldn't process your message".to_string(),
-                summary: APOLOGY_TEXT.to_string(),
+                summary: apology_text.to_string(),
                 kind: ErrorCardKind::Internal,
                 details: Some(
                     "agent container unresponsive (heartbeat stale or never spawned); \
@@ -269,7 +286,7 @@ pub fn check(
                 platform_id: None,
                 thread_id: None,
                 content: serde_json::json!({
-                    "text": APOLOGY_TEXT,
+                    "text": apology_text,
                     "to": { "kind": "agent", "session_id": source },
                 }),
             }
@@ -536,7 +553,7 @@ mod tests {
             None,
             now,
         );
-        let emits = check(&root, &tracker, &sess, now).unwrap();
+        let emits = check(&root, &tracker, &sess, now, false).unwrap();
         assert_eq!(emits.len(), 1);
         let outbound = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
         let rows = messages_out::list_due(outbound.conn()).unwrap();
@@ -551,12 +568,52 @@ mod tests {
         );
     }
 
+    /// M21 O4 (decision (d)): once an operator-alert destination is wired
+    /// (`operator_notified = true`), the truthful "the operator has been
+    /// notified" copy is restored — the claim S2 removed while it was a
+    /// lie. The static [`APOLOGY_TEXT`] constant is untouched (the S2 test
+    /// above still guards it); only the runtime-selected copy changes.
+    #[test]
+    fn emitted_error_card_claims_notification_when_operator_alerts_enabled() {
+        let notified = APOLOGY_NOTIFIED_TEXT.to_lowercase();
+        assert!(
+            notified.contains("the operator has been notified"),
+            "notified copy must claim notification: {APOLOGY_NOTIFIED_TEXT:?}",
+        );
+
+        let (_c, root, sess, now, tracker) = fixture();
+        let _ = insert_stuck_chat(
+            &root,
+            &sess,
+            ChDuration::minutes(6),
+            "tg-1",
+            "telegram",
+            None,
+            now,
+        );
+        let emits = check(&root, &tracker, &sess, now, true).unwrap();
+        assert_eq!(emits.len(), 1);
+        let outbound = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
+        let rows = messages_out::list_due(outbound.conn()).unwrap();
+        let apology = rows
+            .iter()
+            .find(|r| r.kind == MessageKind::Error)
+            .expect("expected an apology error row");
+        let serialized = serde_json::to_string(&apology.content).unwrap();
+        assert!(
+            serialized
+                .to_lowercase()
+                .contains("the operator has been notified"),
+            "with operator alerts wired the card claims notification: {serialized}",
+        );
+    }
+
     #[test]
     fn no_pending_rows_no_emits() {
         let (_c, root, sess, now, tracker) = fixture();
         // Touch the inbound pool so the table exists for the SELECT.
         let _ = root.inbound_pool(&sess.agent_group_id, &sess.id).unwrap();
-        let emits = check(&root, &tracker, &sess, now).unwrap();
+        let emits = check(&root, &tracker, &sess, now, false).unwrap();
         assert!(emits.is_empty());
     }
 
@@ -576,7 +633,7 @@ mod tests {
             now,
         );
 
-        let emits = check(&root, &tracker, &sess, now).unwrap();
+        let emits = check(&root, &tracker, &sess, now, false).unwrap();
         assert_eq!(emits.len(), 1);
         assert_eq!(emits[0].message_id, id);
         assert_eq!(emits[0].reason, ApologyReason::PendingTooLong);
@@ -626,7 +683,7 @@ mod tests {
             now,
         );
 
-        let emits = check(&root, &tracker, &sess, now).unwrap();
+        let emits = check(&root, &tracker, &sess, now, false).unwrap();
         assert!(emits.is_empty(), "no apology expected below 5 min");
 
         // And no error apology row landed in outbound.
@@ -657,10 +714,10 @@ mod tests {
             now,
         );
 
-        let first = check(&root, &tracker, &sess, now).unwrap();
+        let first = check(&root, &tracker, &sess, now, false).unwrap();
         assert_eq!(first.len(), 1, "first sweep should emit one apology");
 
-        let second = check(&root, &tracker, &sess, now).unwrap();
+        let second = check(&root, &tracker, &sess, now, false).unwrap();
         assert!(second.is_empty(), "second sweep should emit nothing");
 
         let outbound = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
@@ -688,7 +745,7 @@ mod tests {
             now,
         );
 
-        let emits = check(&root, &tracker, &sess, now).unwrap();
+        let emits = check(&root, &tracker, &sess, now, false).unwrap();
         assert_eq!(emits.len(), 1);
 
         let outbound = root.outbound_pool(&sess.agent_group_id, &sess.id).unwrap();
@@ -737,7 +794,7 @@ mod tests {
         };
         insert_in(pool.conn_mut(), &msg).unwrap();
         drop(pool);
-        let emits = check(&root, &tracker, &sess, now).unwrap();
+        let emits = check(&root, &tracker, &sess, now, false).unwrap();
         assert!(emits.is_empty());
     }
 
@@ -767,7 +824,7 @@ mod tests {
         }
         assert!(tracker.is_exhausted(sess.id));
 
-        let emits = check(&root, &tracker, &sess, now).unwrap();
+        let emits = check(&root, &tracker, &sess, now, false).unwrap();
         assert_eq!(emits.len(), 1);
         assert_eq!(emits[0].message_id, id);
         assert_eq!(emits[0].reason, ApologyReason::ContainerSpawnFailed);
@@ -801,7 +858,7 @@ mod tests {
         // Only two failures — under the threshold of 3.
         tracker.record_failure(sess.id);
         tracker.record_failure(sess.id);
-        let emits = check(&root, &tracker, &sess, now).unwrap();
+        let emits = check(&root, &tracker, &sess, now, false).unwrap();
         assert!(
             emits.is_empty(),
             "no apology until spawn tracker is exhausted",
@@ -836,7 +893,7 @@ mod tests {
         insert_in(pool.conn_mut(), &msg).unwrap();
         drop(pool);
 
-        let emits = check(&root, &tracker, &sess, now).unwrap();
+        let emits = check(&root, &tracker, &sess, now, false).unwrap();
         assert!(emits.is_empty());
         let inbound = root.inbound_pool(&sess.agent_group_id, &sess.id).unwrap();
         assert!(apology_marker_present(inbound.conn(), id).unwrap());
@@ -876,7 +933,7 @@ mod tests {
         .unwrap();
         drop(outbound_pool);
 
-        let emits = check(&root, &tracker, &sess, now).unwrap();
+        let emits = check(&root, &tracker, &sess, now, false).unwrap();
         assert!(
             emits.is_empty(),
             "apology should be suppressed when ack=processing + container Running, got: {emits:?}",
@@ -933,7 +990,7 @@ mod tests {
         sessions_tbl::mark_container_stopped(&central, sess.id).unwrap();
         sess = sessions_tbl::get(&central, sess.id).unwrap();
 
-        let emits = check(&root, &tracker, &sess, now).unwrap();
+        let emits = check(&root, &tracker, &sess, now, false).unwrap();
         assert_eq!(
             emits.len(),
             1,
@@ -970,7 +1027,7 @@ mod tests {
             processing_ack::insert(outbound_pool.conn_mut(), id, terminal).unwrap();
             drop(outbound_pool);
 
-            let emits = check(&root, &tracker, &sess, now).unwrap();
+            let emits = check(&root, &tracker, &sess, now, false).unwrap();
             assert_eq!(
                 emits.len(),
                 1,

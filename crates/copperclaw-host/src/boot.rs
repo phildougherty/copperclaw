@@ -815,6 +815,16 @@ pub async fn run_host(
         );
     }
 
+    // 10b-ii. M21 O4 out-of-lane call sites (coordinator wiring): inject the
+    // alerter into the sweep so the O2 quarantine event fires a critical alert
+    // and the `checks::apology` copy can conditionally restore the truthful
+    // "the operator has been notified" line. Set-once, mirrors
+    // `set_stuck_actuator`; with no destination configured every sweep-side
+    // call is a no-op (the pre-O4 behaviour).
+    state.sweep.set_operator_alerts(
+        Arc::clone(&operator_alerts) as Arc<dyn copperclaw_host_sweep::OperatorAlertSink>
+    );
+
     // 10c. Supervisor permanent-failure → operator alert (M21 O4 hooking the
     // S1 degraded-watch seam). Registered as a supervised loop so a panic here
     // restarts on the same backoff curve as every other loop; each (re)start

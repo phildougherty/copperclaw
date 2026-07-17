@@ -3,6 +3,7 @@
 //! sessions that need host attention.
 
 use crate::actuator::StuckActuator;
+use crate::alert_sink::OperatorAlertSink;
 use crate::checks::apology::ApologyEmit;
 use crate::checks::condition_checkin::{self, ConditionContext, ConditionStore};
 use crate::checks::integrity::{INTEGRITY_ROTATION_SLOTS, IntegrityFinding};
@@ -286,6 +287,12 @@ pub struct SweepService {
     /// M21 O2: instant of the last central-DB `quick_check`, or `None`
     /// before the first (boot) check. Gates the daily central cadence.
     central_integrity_last: std::sync::Mutex<Option<DateTime<Utc>>>,
+    /// M21 O4 (decision (d)): opt-in operator-alert push, injected once at
+    /// boot via [`Self::set_operator_alerts`] (the host builds its
+    /// `OperatorAlerts` after the sweep, so this is a set-once slot).
+    /// Unset — the default, and every test — makes the quarantine alert a
+    /// no-op and keeps the apology copy on the S2 honest text.
+    operator_alerts: std::sync::OnceLock<Arc<dyn OperatorAlertSink>>,
 }
 
 impl SweepService {
@@ -301,6 +308,7 @@ impl SweepService {
             question_store: std::sync::OnceLock::new(),
             integrity_pass: std::sync::atomic::AtomicU64::new(0),
             central_integrity_last: std::sync::Mutex::new(None),
+            operator_alerts: std::sync::OnceLock::new(),
         }
     }
 
@@ -321,6 +329,7 @@ impl SweepService {
             question_store: std::sync::OnceLock::new(),
             integrity_pass: std::sync::atomic::AtomicU64::new(0),
             central_integrity_last: std::sync::Mutex::new(None),
+            operator_alerts: std::sync::OnceLock::new(),
         }
     }
 
@@ -401,6 +410,50 @@ impl SweepService {
         }
     }
 
+    /// Inject the opt-in operator-alert sink (M21 O4, decision (d)).
+    /// Called once at boot after the host builds its `OperatorAlerts`;
+    /// mirrors [`Self::set_stuck_actuator`] (set-once, a second injection
+    /// is ignored with a warning). Unset — the default, and every test —
+    /// keeps the quarantine alert a no-op and the apology copy on the S2
+    /// honest text.
+    pub fn set_operator_alerts(&self, alerts: Arc<dyn OperatorAlertSink>) {
+        if self.operator_alerts.set(alerts).is_err() {
+            tracing::warn!(
+                target: "copperclaw_host_sweep",
+                "operator-alert sink already wired; ignoring second injection",
+            );
+        }
+    }
+
+    /// Whether an operator-alert destination is wired and enabled. Gates
+    /// the apology copy's truthful "the operator has been notified" line
+    /// (M21 O4). False with no sink wired — the pre-O4 default.
+    pub fn operator_alerts_enabled(&self) -> bool {
+        self.operator_alerts
+            .get()
+            .is_some_and(|sink| sink.is_enabled())
+    }
+
+    /// Fire one operator alert per session newly quarantined this pass
+    /// (M21 O4 quarantine call site). No sink wired ⇒ a no-op; the host
+    /// side dedups on the `quarantine:<session>` key so a session stays
+    /// quarantined without re-alerting every pass. Called from
+    /// [`Self::run_once_actuated`] — the pure `run_once` stays
+    /// side-effect-free for tests and the replay harness.
+    fn alert_quarantines(&self, report: &SweepReport) {
+        let Some(sink) = self.operator_alerts.get() else {
+            return;
+        };
+        for finding in &report.integrity_quarantined {
+            sink.fire(
+                "critical",
+                &format!("quarantine:{}", finding.session_id),
+                "A per-session database was quarantined for corruption; that session is \
+                 excluded from sweeps until an operator intervenes. See `cclaw doctor`.",
+            );
+        }
+    }
+
     /// Drive the injected [`StuckActuator`] for every session the pass
     /// found past the absolute ceiling. Returns the number of restarts
     /// the actuator accepted. With no actuator wired (tests, a host
@@ -452,6 +505,7 @@ impl SweepService {
     /// without triggering restarts.
     pub async fn run_once_actuated(&self) -> Result<SweepReport, SweepError> {
         let report = self.run_once()?;
+        self.alert_quarantines(&report);
         self.actuate_stuck(&report).await;
         Ok(report)
     }
@@ -795,6 +849,7 @@ impl SweepService {
                 self.spawn_tracker.as_ref(),
                 &session,
                 now,
+                self.operator_alerts_enabled(),
             ) {
                 Ok(mut emits) => report.apologies_emitted.append(&mut emits),
                 Err(e) => tracing::warn!(
@@ -833,6 +888,73 @@ mod tests {
         let report = svc.run_once().unwrap();
         assert!(report.is_empty());
         assert_eq!(report.total(), 0);
+    }
+
+    /// Test double for the M21 O4 operator-alert sink: records every
+    /// `fire` and reports itself enabled.
+    struct RecordingSink {
+        fired: std::sync::Mutex<Vec<(String, String, String)>>,
+    }
+    impl RecordingSink {
+        fn new() -> Self {
+            Self {
+                fired: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+    impl OperatorAlertSink for RecordingSink {
+        fn fire(&self, severity: &str, dedup_key: &str, message: &str) {
+            self.fired.lock().unwrap().push((
+                severity.to_string(),
+                dedup_key.to_string(),
+                message.to_string(),
+            ));
+        }
+        fn is_enabled(&self) -> bool {
+            true
+        }
+    }
+
+    /// M21 O4 quarantine call site: a session newly quarantined this pass
+    /// fires exactly one critical alert keyed on `quarantine:<session>`.
+    #[test]
+    fn quarantine_fires_one_operator_alert_per_finding() {
+        let svc = SweepService::new(fresh_central(), Arc::new(MemSessionRoot::new()));
+        let sink = Arc::new(RecordingSink::new());
+        svc.set_operator_alerts(Arc::clone(&sink) as Arc<dyn OperatorAlertSink>);
+        let session_id = SessionId::new();
+        let report = SweepReport {
+            integrity_quarantined: vec![IntegrityFinding {
+                session_id,
+                db: "outbound.db",
+                detail: "database disk image is malformed".to_string(),
+            }],
+            ..Default::default()
+        };
+        svc.alert_quarantines(&report);
+        let fired = sink.fired.lock().unwrap();
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].0, "critical");
+        assert_eq!(fired[0].1, format!("quarantine:{session_id}"));
+        assert!(fired[0].2.contains("quarantined"));
+    }
+
+    /// No sink wired ⇒ the quarantine alert is a silent no-op (pre-O4
+    /// behaviour) and `operator_alerts_enabled` is false.
+    #[test]
+    fn quarantine_without_sink_is_a_noop() {
+        let svc = SweepService::new(fresh_central(), Arc::new(MemSessionRoot::new()));
+        assert!(!svc.operator_alerts_enabled());
+        let report = SweepReport {
+            integrity_quarantined: vec![IntegrityFinding {
+                session_id: SessionId::new(),
+                db: "inbound.db",
+                detail: "corrupt".to_string(),
+            }],
+            ..Default::default()
+        };
+        // Must not panic with no sink wired.
+        svc.alert_quarantines(&report);
     }
 
     /// Test double for the M21 S2 actuator: records every requested

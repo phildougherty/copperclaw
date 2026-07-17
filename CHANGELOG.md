@@ -71,11 +71,19 @@ adheres to [Semantic Versioning](https://semver.org/).
 - `ContainerManager` gained `with_operator_alerts(...)`; `boot.rs`'s
   `spawn_container_manager` threads the shared `Arc<OperatorAlerts>` so the
   crash-loop/OOM and spawn-failure-streak thresholds and the supervisor
-  degraded-watch loop all push through the same enqueuer. Two call sites
-  remain for the coordinator to wire at integration (documented in
-  `operator_alerts.rs`): the O2 quarantine site (lane W) and the
-  conditional "the operator has been notified" apology-copy restore in
-  `copperclaw-host-sweep/src/checks/apology.rs`.
+  degraded-watch loop all push through the same enqueuer.
+- **O4 out-of-lane call sites wired at integration.** A minimal
+  `OperatorAlertSink` trait now lives in `copperclaw-host-sweep`
+  (`crates/copperclaw-host-sweep/src/alert_sink.rs`) — the sweep cannot
+  name `copperclaw-host`, so the host injects its `OperatorAlerts` (which
+  impls the trait) via `SweepService::set_operator_alerts` at boot,
+  mirroring the S2 `set_stuck_actuator` seam. The O2 quarantine event now
+  fires one critical alert per newly-quarantined session (deduped host-side
+  on `quarantine:<session>`), and the `checks::apology` copy conditionally
+  restores the truthful "the operator has been notified" line (new
+  `APOLOGY_NOTIFIED_TEXT`) when a destination is enabled — the static
+  `APOLOGY_TEXT` the S2 honest-copy test guards is untouched. With no
+  destination configured both sites are no-ops (pre-O4 behaviour).
 
 ### Security review (M21 O4 — new config surface + new outbound path)
 

@@ -7,6 +7,7 @@
 //! can translate the report into container operations.
 
 pub mod actuator;
+pub mod alert_sink;
 pub mod checks;
 pub mod clock;
 pub mod error;
@@ -18,6 +19,7 @@ pub mod task_store;
 mod test_support;
 
 pub use actuator::{ActuatorError, StuckActuator};
+pub use alert_sink::OperatorAlertSink;
 pub use checks::apology::{APOLOGY_TRIES_MARKER, ApologyEmit, ApologyReason};
 pub use checks::condition_checkin::{
     CHECKIN_AUDIT_COMMAND, Condition, ConditionContext, ConditionKind, ConditionStore,
