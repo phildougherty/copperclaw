@@ -6,6 +6,58 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M21 F2: expire `ask_user_question` out loud, 2026-07-17)
+
+- **Unanswered questions now expire out loud instead of silently
+  evaporating.** `InteractiveModule::sweep_expired`
+  (`crates/copperclaw-modules/src/interactive.rs`) existed since the
+  module landed but no sweep loop ever called it: a question past its
+  24h TTL vanished from module state while the card sat in chat with
+  live option buttons and the asking agent never learned no answer was
+  coming. A new sweep check
+  (`crates/copperclaw-host-sweep/src/checks/questions.rs`) wires the
+  module's expiry into every sweep pass, mirroring the polished
+  approval-expiry pattern (`handlers/approvals.rs::expire_and_edit_cards`):
+  each lapsed question gets ONE terminal user-facing note — an `edit`
+  System row keyed at the original ask row's seq, so edit-capable
+  channels replace the card in place ("This question expired before
+  anyone answered — just reply and I'll pick it up from there.", no
+  live buttons left behind; edit-less channels fall back to the
+  standard `"(edit) ..."` chat line) — plus a `trigger = 0` synthetic
+  `ask_user_question_result` (`status = "expired"`) inbound row, so the
+  agent's next turn sees the no-answer result instead of waiting
+  forever. Questions the user de-facto answered (any chat inbound after
+  the ask — replies land as ordinary inbounds the runner already
+  handled) are resolved silently; questions inside their TTL are
+  untouched.
+- **Ask-time provenance on pending questions.** `PendingQuestion` gains
+  a `QuestionOrigin` (session, agent group, ask-row id, channel
+  routing), captured by the `ask_user_question` delivery action from
+  the delivery service's threaded context — this is what lets the
+  sweep route the expiry surfacing without new DB state.
+  `InteractiveModule` is now `Clone` (clones share pending state);
+  `boot::install_modules` (`crates/copperclaw-host/src/boot.rs`)
+  returns the shared handle and `run_host` injects it via the new
+  set-once `SweepService::set_question_store` seam (unset — every
+  pre-F2 caller — the check is a strict no-op).
+- **Replay fixture for the full lapse cycle.** New fixture
+  `fixtures/cli/question-expiry/` + registered test
+  `cli_question_expiry_surfaces_lapse_and_resumes_on_reply`
+  (`crates/copperclaw-host/tests/replay.rs`): ask -> question card on
+  the wire -> real `SweepService` pass surfaces the lapse exactly once
+  (typed adapter edit stamps the card terminal; second pass byte-quiet)
+  -> the user's late reply resumes normally with the synthetic
+  no-answer result visible in the turn's provider request. Host-side
+  sweep timing is wall-clock (not the runner `TestClock`), so the test
+  drives the TTL with a zero-TTL module handle and the TTL-selection
+  boundary is pinned by paused-time crate tests instead — documented in
+  the fixture README per the Wave-1 reachability map. Harness seams
+  added for it: `ReplayHarness::run_steps` (drive a subrange of inbound
+  steps so a test can interleave a sweep pass between them),
+  `ReplayHarness::install_interactive_module`, and module
+  delivery-action registrations now forward to the harness
+  `DeliveryService` (mirroring the host's `HostContext`).
+
 ### Added (M21 Wave-1 X-rider: recovery fixtures, 2026-07-17)
 
 - **Replay-level pin for the hung-tool recovery sequence.** New fixture

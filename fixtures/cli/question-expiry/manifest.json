@@ -1,0 +1,17 @@
+{
+  "name": "cli-question-expiry",
+  "channel": "cli",
+  "description": "M21 F2: ask_user_question -> question card delivered -> TTL lapses (sweep pass driven by the registered test) -> one terminal expiry note stamps the card + a synthetic no-answer result lands in the session inbox -> the user's late reply resumes the conversation normally, with the agent's next turn seeing the no-answer result.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "\"in_reply_to\":(\"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\"|null)": "\"in_reply_to\":\"<IRT>\"",
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

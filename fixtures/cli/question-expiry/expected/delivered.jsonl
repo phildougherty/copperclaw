@@ -1,0 +1,3 @@
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"card":{"type":"question","question_id":"q_<UUID>","title":"Tabs or spaces?","options":["tabs","spaces"]}},"files":0}
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"I've asked which indentation you want. Pick one and I'll continue."},"files":0}
+{"channel_type":"cli","platform_id":"stdin","thread_id":null,"kind":"chat","content":{"text":"Spaces it is. Setting up the config with space indentation now."},"files":0}

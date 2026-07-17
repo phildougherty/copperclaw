@@ -23,6 +23,7 @@ pub use checks::condition_checkin::{
     CHECKIN_AUDIT_COMMAND, Condition, ConditionContext, ConditionKind, ConditionStore,
     ContextSampler,
 };
+pub use checks::questions::{EXPIRED_QUESTION_TEXT, QuestionExpiryEmit};
 pub use checks::stuck::StuckSeverity;
 pub use clock::{Clock, SystemClock};
 pub use error::SweepError;

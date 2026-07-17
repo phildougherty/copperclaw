@@ -67,8 +67,8 @@ use copperclaw_host_router::{
 use copperclaw_host_sweep::service::FilesystemSessionRoot as SweepRoot;
 use copperclaw_host_sweep::{SessionRoot as SweepSessionRoot, SweepService};
 use copperclaw_modules::{
-    ApprovalsModule, Module, PreviewBroker, PreviewError, PreviewExposed, PublicTunnelBroker,
-    PublicTunnelReply, SessionInfoLite,
+    ApprovalsModule, InteractiveModule, Module, PreviewBroker, PreviewError, PreviewExposed,
+    PublicTunnelBroker, PublicTunnelReply, SessionInfoLite,
 };
 use copperclaw_providers::AnthropicProvider;
 use copperclaw_runner::{
@@ -331,8 +331,28 @@ impl ReplayHarness {
         // succeeds" by listing exactly one entry here.
         self.apply_pre_delivery_failures()?;
 
-        let events: Vec<InboundEvent> = self.fixture.inbound.clone();
-        for (step, mut event) in events.into_iter().enumerate() {
+        self.run_steps(0, self.fixture.inbound.len()).await
+    }
+
+    /// M21 F2 (question-expiry fixture): drive a contiguous subrange
+    /// `[start, end)` of the fixture's `inbound/*.json` steps through
+    /// the same per-step pipeline `run()` uses, WITHOUT the run-level
+    /// setup (gates, `inbound.sql`, `trigger_sweep`,
+    /// `pre_delivery_failures` — none of which the callers of this seam
+    /// use). Lets a registered test interleave imperative host-side work
+    /// (e.g. a sweep pass) BETWEEN two fixture steps while the fixture
+    /// keeps ownership of every pipeline half and the byte-stable
+    /// expected streams. `run()` delegates here for the full range, so
+    /// classic fixtures are behaviour-identical.
+    pub async fn run_steps(&mut self, start: usize, end: usize) -> Result<()> {
+        anyhow::ensure!(
+            start <= end && end <= self.fixture.inbound.len(),
+            "run_steps range {start}..{end} out of bounds for {} inbound steps",
+            self.fixture.inbound.len(),
+        );
+        let events: Vec<InboundEvent> = self.fixture.inbound[start..end].to_vec();
+        for (offset, mut event) in events.into_iter().enumerate() {
+            let step = start + offset;
             self.stage_fixture_files(&mut event, step)?;
             self.played_inbound.push(event.clone());
             let outcome = self
@@ -567,6 +587,7 @@ impl ReplayHarness {
         let ctx: Arc<dyn copperclaw_modules::ModuleContext> = Arc::new(HarnessModuleContext::new(
             Arc::clone(&self.router),
             dispatcher,
+            Arc::clone(&self.delivery),
         ));
         module
             .install(ctx)
@@ -582,6 +603,26 @@ impl ReplayHarness {
         );
         self.router.hooks().set_approval_interceptor(interceptor);
         Ok(())
+    }
+
+    /// M21 F2: install an [`InteractiveModule`] against the harness's
+    /// delivery service so `ask_user_question` System rows render a
+    /// question card and record a pending question, exactly as
+    /// `boot::install_modules` wires in production. The caller keeps a
+    /// state-sharing clone of `module` (clones share pending-question
+    /// state) to drive a `SweepService::set_question_store` expiry pass
+    /// against the same live set.
+    pub async fn install_interactive_module(&self, module: &InteractiveModule) -> Result<()> {
+        let dispatcher = self.delivery.dispatcher();
+        let ctx: Arc<dyn copperclaw_modules::ModuleContext> = Arc::new(HarnessModuleContext::new(
+            Arc::clone(&self.router),
+            dispatcher,
+            Arc::clone(&self.delivery),
+        ));
+        module
+            .install(ctx)
+            .await
+            .map_err(|e| anyhow!("install InteractiveModule: {e}"))
     }
 
     /// Apply the fixture's `inbound.sql` (if any) to every active
@@ -1454,14 +1495,25 @@ fn _ensure_session_status_in_scope(_s: SessionStatus) {}
 struct HarnessModuleContext {
     router: Arc<Router>,
     dispatcher: Arc<dyn copperclaw_modules::DeliveryDispatcher>,
+    /// Registration target for module delivery actions (M21 F2): the
+    /// harness's live `DeliveryService`, so an installed module's
+    /// actions (e.g. `InteractiveModule`'s `ask_user_question`) route
+    /// exactly as in production. Mirrors the host's
+    /// `HostContext::register_delivery_action` forwarding.
+    delivery: Arc<DeliveryService>,
 }
 
 impl HarnessModuleContext {
     fn new(
         router: Arc<Router>,
         dispatcher: Arc<dyn copperclaw_modules::DeliveryDispatcher>,
+        delivery: Arc<DeliveryService>,
     ) -> Self {
-        Self { router, dispatcher }
+        Self {
+            router,
+            dispatcher,
+            delivery,
+        }
     }
 }
 
@@ -1484,13 +1536,15 @@ impl copperclaw_modules::ModuleContext for HarnessModuleContext {
     }
     fn register_delivery_action(
         &self,
-        _name: &str,
-        _h: Arc<dyn copperclaw_modules::context::DeliveryActionHandler>,
+        name: &str,
+        h: Arc<dyn copperclaw_modules::context::DeliveryActionHandler>,
     ) {
-        // The harness's delivery service is constructed via
-        // `with_default_dispatcher` with no built-in action handlers.
-        // The approvals fixture doesn't exercise the `approval_card`
-        // action so it's safe to ignore the registration here.
+        // Forward onto the harness's `DeliveryService`, mirroring the
+        // host's `HostContext::register_delivery_action`. The question-
+        // expiry fixture (M21 F2) needs the `InteractiveModule` actions
+        // live so the `ask_user_question` System row renders a card and
+        // records the pending question exactly as in production.
+        self.delivery.register_action(name, h);
     }
     fn on_delivery_adapter_ready(&self, cb: copperclaw_modules::context::DeliveryReadyCallback) {
         cb(Arc::clone(&self.dispatcher));

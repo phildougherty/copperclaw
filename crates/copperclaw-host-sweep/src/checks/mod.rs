@@ -6,6 +6,7 @@ pub mod apology;
 pub mod condition_checkin;
 pub mod heartbeat;
 pub mod processing;
+pub mod questions;
 pub mod recurrence;
 pub mod scheduling;
 pub mod stuck;

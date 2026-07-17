@@ -168,6 +168,16 @@ also call `ReplayHarness::restart_delivery()` — kill and recreate the
 a test can pin restart-resume semantics (see
 `fixtures/cli/delivery-retry-restart/`).
 
+Since M21 F2 two more direct-drive seams exist:
+`ReplayHarness::run_steps(start, end)` drives a contiguous subrange of
+the fixture's inbound steps (`run()` delegates to it for the full
+range), so a registered test can interleave imperative host-side work
+— e.g. a `SweepService` pass — BETWEEN two fixture steps; and
+`ReplayHarness::install_interactive_module(&module)` installs an
+`InteractiveModule` against the harness delivery service (module
+delivery-action registrations now forward to it, mirroring the host's
+`HostContext`). See `fixtures/cli/question-expiry/` for both in use.
+
 ### `expected/*.jsonl`
 
 After the replay completes, the harness diffs:

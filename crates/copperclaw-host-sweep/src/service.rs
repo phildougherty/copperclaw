@@ -5,8 +5,11 @@
 use crate::actuator::StuckActuator;
 use crate::checks::apology::ApologyEmit;
 use crate::checks::condition_checkin::{self, ConditionContext, ConditionStore};
+use crate::checks::questions::QuestionExpiryEmit;
 use crate::checks::stuck::StuckSeverity;
-use crate::checks::{apology, heartbeat, processing, recurrence, scheduling, stuck, wake};
+use crate::checks::{
+    apology, heartbeat, processing, questions, recurrence, scheduling, stuck, wake,
+};
 use crate::clock::{Clock, SystemClock};
 use crate::error::SweepError;
 use crate::spawn_tracker::SpawnAttemptTracker;
@@ -165,6 +168,11 @@ pub struct SweepReport {
     /// check during this pass. Empty in the common case where every
     /// session is healthy.
     pub apologies_emitted: Vec<ApologyEmit>,
+    /// M21 F2: one entry per `ask_user_question` whose TTL lapsed this
+    /// pass (expiry note + synthetic no-answer result written, or the
+    /// lapse resolved silently by a later reply). Empty unless a
+    /// question store is wired via [`SweepService::set_question_store`].
+    pub questions_expired: Vec<QuestionExpiryEmit>,
 }
 
 impl SweepReport {
@@ -177,6 +185,7 @@ impl SweepReport {
             && self.heartbeat_stale.is_empty()
             && self.apologies_emitted.is_empty()
             && self.condition_checkins_fired.is_empty()
+            && self.questions_expired.is_empty()
     }
 
     /// Total number of items across all check categories.
@@ -188,6 +197,7 @@ impl SweepReport {
             + self.heartbeat_stale.len()
             + self.apologies_emitted.len()
             + self.condition_checkins_fired.len()
+            + self.questions_expired.len()
     }
 }
 
@@ -215,6 +225,14 @@ pub struct SweepService {
     /// default, and every pre-S2 test — keeps ceiling detections
     /// observe-only, exactly the old behaviour.
     stuck_actuator: std::sync::OnceLock<Arc<dyn StuckActuator>>,
+    /// M21 F2: shared handle onto the host's [`InteractiveModule`]
+    /// (clones share pending-question state), injected once at boot via
+    /// [`Self::set_question_store`] after module install. The
+    /// question-expiry check reads lapsed questions through it. Unset —
+    /// the default, and every pre-F2 test — the check is a no-op and
+    /// unanswered questions keep the old (silent-evaporation) behaviour
+    /// only in hosts that never wire the store.
+    question_store: std::sync::OnceLock<copperclaw_modules::InteractiveModule>,
 }
 
 impl SweepService {
@@ -227,6 +245,7 @@ impl SweepService {
             spawn_tracker: Arc::new(SpawnAttemptTracker::new()),
             condition_store: Arc::new(ConditionStore::new()),
             stuck_actuator: std::sync::OnceLock::new(),
+            question_store: std::sync::OnceLock::new(),
         }
     }
 
@@ -244,6 +263,7 @@ impl SweepService {
             spawn_tracker: Arc::new(SpawnAttemptTracker::new()),
             condition_store: Arc::new(ConditionStore::new()),
             stuck_actuator: std::sync::OnceLock::new(),
+            question_store: std::sync::OnceLock::new(),
         }
     }
 
@@ -305,6 +325,21 @@ impl SweepService {
             tracing::warn!(
                 target: "copperclaw_host_sweep",
                 "stuck actuator already wired; ignoring second injection",
+            );
+        }
+    }
+
+    /// Inject the shared question store (M21 F2). Called once at boot
+    /// after `install_modules` builds the host's `InteractiveModule`;
+    /// the handle is a cheap clone sharing the module's live
+    /// pending-question state. Mirrors [`Self::set_stuck_actuator`]:
+    /// set-once, second injections are ignored with a warning, and the
+    /// unset default keeps the question-expiry check a strict no-op.
+    pub fn set_question_store(&self, store: copperclaw_modules::InteractiveModule) {
+        if self.question_store.set(store).is_err() {
+            tracing::warn!(
+                target: "copperclaw_host_sweep",
+                "question store already wired; ignoring second injection",
             );
         }
     }
@@ -385,6 +420,7 @@ impl SweepService {
                                     heartbeat_stale = report.heartbeat_stale.len(),
                                     apologies = report.apologies_emitted.len(),
                                     condition_checkins = report.condition_checkins_fired.len(),
+                                    questions_expired = report.questions_expired.len(),
                                     "sweep pass produced report",
                                 );
                             }
@@ -482,6 +518,15 @@ impl SweepService {
                 error = %e,
                 "condition-check-in fan-out failed",
             ),
+        }
+
+        // Global: question expiry (M21 F2). The store carries each
+        // question's origin (session + routing captured at ask time),
+        // so this runs once per pass rather than per session. No store
+        // wired (tests, hosts without module install) => strict no-op.
+        if let Some(store) = self.question_store.get() {
+            let mut expired = questions::check(self.session_paths.as_ref(), store, now);
+            report.questions_expired.append(&mut expired);
         }
 
         for session in sessions {
@@ -791,6 +836,131 @@ mod tests {
         assert_eq!(report.processing_acks_reset[0].session_id, ack.id);
         assert!(report.woken_sessions.contains(&due.id), "wake branch");
         assert_eq!(report.recurrences_fired.len(), 1, "recurrence branch");
+    }
+
+    /// M21 F2 at the service level: with a wired question store, a
+    /// question inside its TTL is untouched by one pass and surfaced by
+    /// a later pass once the (mock) clock crosses the deadline. Zero
+    /// real waits — the sweep clock is the seam.
+    #[tokio::test]
+    async fn run_once_surfaces_expired_questions_when_store_wired() {
+        use copperclaw_modules::{InteractiveModule, QuestionId, QuestionOrigin};
+
+        let central = fresh_central();
+        let t0 = chrono::Utc.with_ymd_and_hms(2026, 7, 17, 12, 0, 0).unwrap();
+        let clock = Arc::new(MockClock::new(t0 + ChDuration::hours(23)));
+        let root = Arc::new(MemSessionRoot::new());
+        let session = seed_running_session(&central);
+
+        let store = InteractiveModule::default(); // 24h TTL
+        store.ask(
+            QuestionId::new("q_svc"),
+            "Deploy now?".into(),
+            vec!["yes".into(), "no".into()],
+            QuestionOrigin {
+                session_id: Some(session.id),
+                agent_group_id: Some(session.agent_group_id),
+                message_out_id: None,
+                channel_type: Some(copperclaw_types::ChannelType::new("cli")),
+                platform_id: Some("stdin".into()),
+                thread_id: None,
+            },
+            t0,
+        );
+        // Materialise the per-session DBs so the check can read/write.
+        let _ = root
+            .inbound_pool(&session.agent_group_id, &session.id)
+            .unwrap();
+        let _ = root
+            .outbound_pool(&session.agent_group_id, &session.id)
+            .unwrap();
+
+        let svc = SweepService::with_clock(central, root, clock.clone());
+        svc.set_question_store(store.clone());
+
+        // 23h in: inside the TTL, untouched.
+        let report = svc.run_once().unwrap();
+        assert!(report.questions_expired.is_empty(), "inside TTL: no-op");
+        assert_eq!(store.pending().len(), 1);
+
+        // 25h in: expired, surfaced exactly once, terminal in state.
+        clock.advance(ChDuration::hours(2));
+        let report = svc.run_once().unwrap();
+        assert_eq!(report.questions_expired.len(), 1);
+        assert_eq!(report.questions_expired[0].question_id, "q_svc");
+        assert!(report.questions_expired[0].note_emitted);
+        assert!(!report.is_empty());
+        // total() counts the expiry (the session's missing heartbeat
+        // file also reports stale here — incidental to this test).
+        assert!(report.total() >= 1);
+        assert!(store.pending().is_empty());
+
+        // Next pass is quiet again.
+        let report = svc.run_once().unwrap();
+        assert!(report.questions_expired.is_empty());
+    }
+
+    /// No store wired (the default and every pre-F2 caller): the check
+    /// never runs and the report field stays empty.
+    #[tokio::test]
+    async fn run_once_without_question_store_reports_no_question_expiries() {
+        let central = fresh_central();
+        let root = Arc::new(MemSessionRoot::new());
+        let _session = seed_running_session(&central);
+        let svc = SweepService::new(central, root);
+        let report = svc.run_once().unwrap();
+        assert!(report.questions_expired.is_empty());
+    }
+
+    /// The store slot is set-once, mirroring the actuator slot.
+    #[tokio::test]
+    async fn second_question_store_injection_is_ignored() {
+        use copperclaw_modules::{InteractiveModule, QuestionId, QuestionOrigin};
+
+        let central = fresh_central();
+        let t0 = chrono::Utc.with_ymd_and_hms(2026, 7, 17, 12, 0, 0).unwrap();
+        let clock = Arc::new(MockClock::new(t0 + ChDuration::hours(25)));
+        let root = Arc::new(MemSessionRoot::new());
+        let session = seed_running_session(&central);
+
+        let first = InteractiveModule::default();
+        first.ask(
+            QuestionId::new("q_first"),
+            "?".into(),
+            vec!["a".into()],
+            QuestionOrigin {
+                session_id: Some(session.id),
+                agent_group_id: Some(session.agent_group_id),
+                message_out_id: None,
+                channel_type: None,
+                platform_id: None,
+                thread_id: None,
+            },
+            t0,
+        );
+        let second = InteractiveModule::default();
+        second.ask(
+            QuestionId::new("q_second"),
+            "?".into(),
+            vec!["a".into()],
+            QuestionOrigin::default(),
+            t0,
+        );
+        let _ = root
+            .inbound_pool(&session.agent_group_id, &session.id)
+            .unwrap();
+
+        let svc = SweepService::with_clock(central, root, clock);
+        svc.set_question_store(first);
+        svc.set_question_store(second.clone());
+
+        let report = svc.run_once().unwrap();
+        assert_eq!(report.questions_expired.len(), 1);
+        assert_eq!(
+            report.questions_expired[0].question_id, "q_first",
+            "first injection wins",
+        );
+        assert_eq!(second.pending().len(), 1, "second injection is inert");
     }
 
     #[tokio::test]

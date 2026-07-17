@@ -53,7 +53,7 @@ pub use context::{
     TypingOutcome,
 };
 pub use error::ModuleError;
-pub use interactive::{InteractiveModule, PendingQuestion, QuestionId};
+pub use interactive::{InteractiveModule, PendingQuestion, QuestionId, QuestionOrigin};
 pub use mount_security::{MountError, MountSecurityModule, validate_mount_target};
 pub use permissions::{
     PermissionOp, PermissionsModule, Role, ToolProfile, check as permissions_check,
