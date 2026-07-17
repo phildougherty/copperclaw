@@ -38,22 +38,45 @@ agent> Boxes hold the world,
   ephemeral and restartable. State lives in SQLite files on a
   bind-mount (`inbound.db` written by the host, `outbound.db` written
   by the container) plus a central identity / wiring DB.
-- **36 in-tree tools the model can call**, grouped: messaging
+- **51 in-tree tools the model can call** (plus an opt-in interactive
+  browser and three host-brokered preview verbs), grouped: messaging
   (`send_message` / `send_file` / `edit_message` / `add_reaction` /
   `ask_user_question` / `send_card`), scheduling (`schedule_task` and
   five companions — backed by a real cron-evaluating sweep loop in
-  the host), self-modification (`install_packages`, `add_mcp_server`,
-  `create_agent`), computer use (`shell`, `read_file`, `write_file`,
-  `edit_file`, `web_fetch`, `grep`, `glob`, `artifact_path`), read-only
-  git inspection (`git_status` / `git_log` / `git_diff` / `git_blame`,
+  the host), delegation (`delegate` / `delegate_batch` write-capable
+  build workers, `explore` read-only subagent, `create_agent`),
+  self-modification (`install_packages`, `add_mcp_server`,
+  `save_skill`), computer use (`shell`, `read_file`, `write_file`,
+  `edit_file`, `multi_edit`, `apply_patch`, `copy_file`, `web_fetch`,
+  `grep`, `glob`, `artifact_path`), read-only git inspection
+  (`git_status` / `git_log` / `git_diff` / `git_blame`,
   libgit2-backed), `web_search` (Tavily / Exa / Brave / SerpAPI, auto-
-  routes on configured key), `explore` (read-only in-process subagent),
-  `load_skill`, a per-session todo scratchpad, and session-control
-  (`compact_now`, `clear_history`).
-- **Multiple providers.** Anthropic native, Anthropic-compatible
-  gateways (OpenRouter / internal proxies — set `ANTHROPIC_BASE_URL`),
-  Ollama (native `/api/chat` NDJSON or an Anthropic-compatible shim),
-  and Codex via subprocess bridge.
+  routes on configured key), vision + browser (`view_image`,
+  `browser_render`, `ui_screenshot`, `ui_inspect`), code quality
+  (`diagnostics`, `self_review`), web preview (`expose_preview` /
+  `close_preview` / `make_preview_public`), persistent memory
+  (`memory_save` / `memory_search` / `memory_get`), `load_skill`, a
+  per-session todo scratchpad, and session-control (`compact_now`,
+  `clear_history`). See [Agent tools](#agent-tools) below.
+- **Watchable builds.** Long tasks drive a self-editing task HUD
+  (step counter, todo state, blocker cards) instead of dead air, and
+  final answers reveal progressively. Finished web apps are served to
+  the user via `expose_preview` — optionally through a public tunnel —
+  and the agent screenshots its own UI (`ui_screenshot` /
+  `ui_inspect`) and fixes what it sees before an enforced self-review
+  gate signs off on delivery.
+- **Multiple providers, with failover.** Anthropic native (with
+  prompt caching), Anthropic-compatible gateways (OpenRouter /
+  internal proxies — set `ANTHROPIC_BASE_URL`), Ollama (native
+  `/api/chat` NDJSON or an Anthropic-compatible shim), and Codex or
+  OpenCode via subprocess bridges. An ordered fallback chain tracks
+  per-provider health (rate-limit cooldowns, down detection, re-probe)
+  and rotates across multiple keys, including mid-session failover.
+- **Hardened container boundary.** A tool policy engine with a
+  provenance/taint gate on untrusted input, opt-in deny-default
+  egress with per-group allow-lists, per-group mention gating and DM
+  pairing, and a credential broker that keeps long-lived secrets out
+  of the container environment.
 - **Operator surface.** Per-group token budgets and turn-rate caps,
   sender approvals (with in-channel prompts), dead-letter inspection
   and replay, audit log of every host-side mutation, Prometheus
@@ -67,13 +90,14 @@ agent> Boxes hold the world,
   most webhook channels bind `127.0.0.1` (telegram + slack default to
   `0.0.0.0` — see [`docs/webhooks-tls.md`](docs/webhooks-tls.md)),
   budgets / metrics / log-rotation all opt-in.
-- **Test coverage.** ~5200 passing tests, no failing.
+- **Test coverage.** ~7,700 passing tests, no failing.
   `cargo clippy --workspace --all-targets -- -D warnings` clean, fmt +
   clippy + test run on Linux and macOS in CI. The replay-fixture
   harness pins the inbound-route → runner → outbound-deliver pipeline
-  against byte-stable expected output for a small set of channels
-  (cli, telegram, slack, discord, matrix, github, webhooks); the
-  other 14 channels rely on per-adapter unit tests for now.
+  against byte-stable expected output for 11 of the 21 channels
+  (cli, telegram, slack, discord, matrix, teams, gchat, signal,
+  deltachat, github, webhooks); the other 10 rely on per-adapter
+  unit tests for now.
 
 ## What's rough
 
@@ -92,16 +116,9 @@ Honest list of things that exist but aren't polished:
 - **Setup's `channel` step only has an interactive pairing wizard for
   Telegram.** Slack / Discord / etc. land via post-setup
   `cclaw messaging-groups create` + `cclaw wirings create`.
-- **A few `cclaw` subcommands ship without descriptive `--help`
-  text** (`messaging-groups`, `wirings`, `users`, `roles`,
-  `members`, `destinations`). The flags work; the help is sparse.
 - **`docs/cutover.md` describes a migrator that copies only the
   central DB** — per-session DBs (history, attachments) must be
   rsynced separately if you want to preserve them across the cutover.
-- **`cclaw approvals`** ships `list`, `get`, and `approve --channel
-  --identity` (sender approvals); there is no generic
-  `cclaw approvals approve <id>` / `deny <id>` yet for the other
-  approval families (channel / install / MCP).
 
 See [`docs/plans/`](docs/plans/) for tracked follow-ups.
 
@@ -290,7 +307,8 @@ container via `ANTHROPIC_API_KEY` and `ANTHROPIC_BASE_URL`.
 
 At the `channel` setup step, pick `cli` (default — works out of the
 box) or `telegram` (the only channel with an interactive pairing
-wizard today). Selecting `telegram` walks you through creating a bot
+wizard today; `slack` / `discord` are accepted as choices but
+currently just point you at the post-setup pairing commands below). Selecting `telegram` walks you through creating a bot
 with `@BotFather`, validates the token format, calls Telegram's
 `getMe` to confirm the credentials, and offers to capture the first
 chat id by polling `getUpdates` for ~60 seconds while you send
@@ -355,7 +373,8 @@ for the trait template.
 
 ## Agent tools
 
-The runner inside each container exposes 36 tools to the model:
+The runner inside each container exposes 51 tools to the model, plus
+an opt-in interactive browser and three host-brokered preview verbs:
 
 **Messaging.** `send_message`, `send_file`, `edit_message`,
 `add_reaction`, `ask_user_question`, `send_card`.
@@ -367,21 +386,47 @@ evaluated, recurring tasks re-arm, one-shots transition to
 `completed`). Agents do not need to maintain a "background loop" —
 the scheduler is the loop.
 
-**Self-modification.** `install_packages` (apt / npm — image rebuilds
-on next spawn), `add_mcp_server` (MCP transport registration),
-`create_agent` (spin up a sibling agent group, depth-capped).
+**Delegation.** `delegate` (a write-capable middle-tier build worker
+for a scoped subtask), `delegate_batch` (parallel fan-out of delegate
+workers with a post-join integration verify), `create_agent` (spin up
+a sibling agent group, depth-capped), and `explore` (see below).
+
+**Self-modification.** `install_packages` (apt / npm — installed
+session-locally so it works *this* turn; the image rebuilds on next
+spawn), `add_mcp_server` (MCP transport registration), `save_skill`
+(agent-authored persistent skills that survive the session).
 
 **Computer use.** `shell` (bash inside the container, 60s default
 timeout, 64 KiB output cap, persistent cwd + env across calls),
 `read_file` (UTF-8 lossy on bad bytes, 1 MiB cap), `write_file`
 (auto-mkdir-p, create or append), `edit_file` (unique-match string-
-replacement; atomic via temp + rename; preserves mode), `web_fetch`
-(HTTP GET/POST, 256 KiB body cap, 30s default; HTML auto-converts to
-markdown), `grep` (regex search with `.gitignore`-aware traversal,
-structured `{path, line, text}` rows, default cap 100 / ceiling 1000),
-`glob` (gitignore-style glob, sorted paths, default cap 1000 /
-ceiling 10000), `artifact_path` (returns the host-side path of the
-session bind-mount so the operator can find files the agent built).
+replacement; atomic via temp + rename; preserves mode), `multi_edit`
+(several replacements in one call), `apply_patch` (unified-diff
+application), `copy_file`, `web_fetch` (HTTP GET/POST, 256 KiB body
+cap, 30s default; HTML auto-converts to markdown), `grep` (regex
+search with `.gitignore`-aware traversal, structured
+`{path, line, text}` rows, default cap 100 / ceiling 1000), `glob`
+(gitignore-style glob, sorted paths, default cap 1000 / ceiling
+10000), `artifact_path` (returns the host-side path of the session
+bind-mount so the operator can find files the agent built).
+
+**Vision + browser.** `view_image` (put an image from disk in front
+of the model), `browser_render` (headless read-only render of a URL
+via the bundled Chromium), `ui_screenshot` (screenshot the agent's
+own running app, with viewport / format / quality control),
+`ui_inspect` (console errors + element geometry from the running
+page — the "see → fix" loop for web builds). An interactive browser
+(`browser_interact`) is opt-in via `COPPERCLAW_BROWSER_ENABLED` +
+`COPPERCLAW_BROWSER_INTERACTIVE`.
+
+**Code quality.** `diagnostics` (structured lint / typecheck output)
+and `self_review` — an enforced review gate the runner requires
+before final delivery on coding tasks.
+
+**Web preview.** `expose_preview`, `close_preview`,
+`make_preview_public` — host-brokered verbs that serve an app running
+in the session container to the user, optionally through a public
+tunnel (`COPPERCLAW_PUBLIC_TUNNEL_ENABLED`).
 
 **Git inspection.** `git_status`, `git_log`, `git_diff`, `git_blame` —
 read-only structured access to a libgit2-backed repository view (no
@@ -391,8 +436,9 @@ intentionally absent — hand those back to the operator.
 **Web search.** `web_search` with a normalised
 `{title, url, snippet, published?, score?}` shape, routing
 automatically based on which key is configured: `TAVILY_API_KEY`,
-`EXA_API_KEY`, `BRAVE_SEARCH_API_KEY`, or `SERPAPI_API_KEY`. Per-call
-result cap 1–25 (default 10), UTF-8-safe snippet truncation at 4 KiB.
+`EXA_API_KEY`, `BRAVE_SEARCH_API_KEY`, or `SERPAPI_API_KEY` (pin one
+with `COPPERCLAW_WEB_SEARCH_PROVIDER`). Per-call result cap 1–25
+(default 10), UTF-8-safe snippet truncation at 4 KiB.
 
 **Lightweight subagent.** `explore` opens a bounded LLM loop against
 the same upstream the parent uses, with a caller-supplied `task`
@@ -417,11 +463,12 @@ coding-specific.
 conversation immediately rather than waiting for the threshold) and
 `clear_history` (drop conversation state without losing the session).
 
-**Persistent memory (opt-in via `COPPERCLAW_GROUPS_DIR`).** When the
-host is configured with a groups dir, each agent group also gets
-`<groups_dir>/<id>/memory/` bind-mounted at `/data/memory/`. Agents
-read and write memory files via the existing `read_file` /
-`write_file` tools — no new tool required.
+**Persistent memory.** `memory_save`, `memory_search`, `memory_get` —
+cross-session memory backed by the per-group memory dir
+(`<groups_dir>/<id>/memory/`, bind-mounted at `/data/memory/` when
+`COPPERCLAW_GROUPS_DIR` is configured). The memory files stay plain
+markdown on disk, so they're also reachable through the ordinary
+`read_file` / `write_file` tools.
 
 Every agent also receives a universal base preamble + an
 `# Environment` block (today's date, session id, agent group id,
@@ -462,7 +509,9 @@ cclaw roles grant <user> admin        # role grants on the central DB
 cclaw members add <agent-group> <user>  # group membership
 
 cclaw approvals list                  # pending approvals (all families)
-cclaw approvals approve --channel telegram --identity 12345
+cclaw approvals approve-id <id>       # approve any family by row id
+cclaw approvals deny <id>
+cclaw approvals approve --channel telegram --identity 12345   # sender approvals
 
 cclaw usage --since 24h               # per-group token rollup
 cclaw budgets set --agent-group-id <id> --daily-tokens 100000
@@ -571,9 +620,21 @@ populated copy; production overrides go in your service unit.
 | `COPPERCLAW_DEFAULT_PROVIDER` | Provider name for sessions whose group hasn't pinned one. |
 | `COPPERCLAW_DEFAULT_IMAGE_TAG` | Default container image tag when no `container_configs` row pins one. |
 | `COPPERCLAW_CONTAINER_GPU` | Set to `1` to enable Nvidia GPU passthrough on session containers (requires nvidia-container-toolkit on the host). Off by default. |
+| `COPPERCLAW_DEFAULT_MODEL` / `COPPERCLAW_DEFAULT_TEMPERATURE` | Model + sampling defaults for groups that don't pin their own (~0.3 steadies tool-calling on small local models). |
+| `COPPERCLAW_MAX_TASK_TOKENS` | Per-task token budget enforced by the runner. |
+| `COPPERCLAW_EGRESS_MODE` | Container egress posture — set to enable deny-default egress with per-group allow-lists. |
+| `COPPERCLAW_BROWSER_ENABLED` / `COPPERCLAW_BROWSER_INTERACTIVE` | Opt in to the interactive browser tool (`browser_interact`). |
+| `COPPERCLAW_PUBLIC_TUNNEL_ENABLED` | Allow `make_preview_public` to open a public tunnel to a session preview. |
+| `COPPERCLAW_HUD_MODE` | Task-HUD display mode for long-running tasks. |
+| `COPPERCLAW_WEB_SEARCH_PROVIDER` | Pin a `web_search` backend instead of key-based auto-routing. |
+| `COPPERCLAW_REQUIRE_MENTION_GROUPS` / `COPPERCLAW_REQUIRE_MENTION_DMS` | Mention gating for group chats / DMs (defaults: required in groups, off in DMs). |
 | `TAVILY_API_KEY` / `EXA_API_KEY` / `BRAVE_SEARCH_API_KEY` / `SERPAPI_API_KEY` | Forwarded into the container so `web_search` auto-selects a backend. |
 | `COPPERCLAW_CODEX_BINARY` | Runner-side: absolute path to the Codex CLI inside the container. Read by the runner only when `provider == "codex"`. Defaults to `/usr/local/bin/codex`. Host forwards this through. |
 | `COPPERCLAW_CODEX_ARGS` | Runner-side: comma-separated extra args appended to every Codex spawn (e.g. `--json,--no-color`). Defaults to `--json`. |
+
+The table lists the keys most installs touch — it is not exhaustive
+(runner deadlines, compaction thresholds, breadcrumb styling, and
+other tuning knobs live in the source next to their subsystems).
 
 A SIGHUP on the host re-reads the `.env` file, updates the forwarded
 keys, and increments the `copperclaw_secrets_rotated_total` metric
@@ -591,19 +652,18 @@ Opt-in Prometheus endpoint:
 COPPERCLAW_METRICS_ADDR=127.0.0.1:9090 copperclaw run
 ```
 
-Counters: `copperclaw_messages_inbound_total`,
-`copperclaw_messages_outbound_total`,
-`copperclaw_containers_spawned_total`,
-`copperclaw_containers_crashed_total`,
-`copperclaw_delivery_failed_total`,
-`copperclaw_image_rebuild_failed_total`,
-`copperclaw_secrets_rotated_total`,
-`copperclaw_budget_exhausted_total{agent_group_id, gate}`,
-`copperclaw_budget_exhausted_replies_total{agent_group_id}`,
-`copperclaw_budget_exhausted_suppressed_total{agent_group_id}`.
-
-Histograms: `copperclaw_llm_call_seconds`, `copperclaw_llm_tokens_input`,
-`copperclaw_llm_tokens_output`, `copperclaw_container_spawn_seconds`.
+The endpoint exports ~130 metric families covering the whole
+pipeline: message in/out counts, container lifecycle and spawn
+timing, LLM latency and token histograms, delivery failures, budget
+gates, provider failover, delegation, task-HUD edits, previews and
+tunnels, browser / vision tool activity, verify and self-review
+gates, compaction, and egress / credential-broker activity.
+Headliners: `copperclaw_messages_inbound_total` /
+`_outbound_total`, `copperclaw_containers_spawned_total` /
+`_crashed_total`, `copperclaw_delivery_failed_total`,
+`copperclaw_llm_call_seconds`, `copperclaw_llm_tokens_input` /
+`_output`, `copperclaw_budget_exhausted_total`,
+`copperclaw_provider_failover_total`.
 
 Log rotation (also opt-in):
 
@@ -681,6 +741,10 @@ user:
   `skills/testing/` — bundle for agents doing coding work. Off by
   default — flip on per agent group with `cclaw groups enable-coding
   <id>`, off again with `cclaw groups disable-coding <id>`.
+- `skills/frontend-design/`, `skills/web-app-scaffold/`,
+  `skills/native-ui/`, `skills/preview/` — design critique, prototype
+  scaffolding, native-card and web-preview guidance for the
+  "build me X" flow.
 
 Drop a new directory with a `SKILL.md` (YAML frontmatter + markdown
 body) into `skills/` and the next container boot picks it up — no
@@ -724,9 +788,9 @@ guard, dead-letter replay, metrics endpoint) but has not been
 hardened against any specific production deployment.
 
 What's solid: the inbound-route → runner → outbound-deliver pipeline,
-covered by ~5200 passing tests and a replay-fixture harness against
-byte-stable expected output (for 7 of the 21 channels — the other 14
-rely on unit tests). The 36-tool MCP surface has a coverage test
+covered by ~7,700 passing tests and a replay-fixture harness against
+byte-stable expected output (for 11 of the 21 channels — the other 10
+rely on unit tests). The 51-tool MCP surface has a coverage test
 asserting every registered tool is mentioned in at least one skill.
 
 What's not solid yet: the [What's rough](#whats-rough) list above.

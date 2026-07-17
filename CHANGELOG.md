@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed (README + observability doc refreshed to the current surface, 2026-07-16)
+
+- **`README.md` caught up with M16-M20.** The stale numbers are fixed
+  (~7,700 tests, 51 tools + opt-in browser + 3 preview verbs, 11 of 21
+  channels fixture-covered) and the features the last five programs
+  shipped are now described: delegation (`delegate` / `delegate_batch`),
+  vision + browser tools, web preview + public tunnel, code-quality
+  gates (`diagnostics`, `self_review`), memory tools, `save_skill`, the
+  task HUD / progressive reveal, provider failover with prompt caching,
+  the OpenCode provider, and the M16 hardening surface. Two fixed
+  "What's rough" items removed (generic `cclaw approvals approve-id` /
+  `deny` now exist; the sparse `--help` text is descriptive now); the
+  config table gained the notable post-M16 env keys.
+- **`docs/observability.md` now documents all ~140 metric families**,
+  grouped by subsystem with labels and meaning extracted from the
+  `copperclaw-metrics` helper docs (the doc previously covered 13). New
+  recommended alerts: `degraded_state`, failover-chain exhaustion,
+  stuck-inbound apologies, SSRF blocks, and the outbound-rendering
+  quality counters.
+
 ### Fixed (task-HUD step label no longer pinned by a stranded todo, 2026-07-16)
 
 - **The task HUD's `step X/N: <text>` label now tracks the first active item
