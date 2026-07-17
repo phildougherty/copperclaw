@@ -6,6 +6,47 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M21 O1: `cclaw doctor` learns everything Wave 1 recovers from, 2026-07-17)
+
+- **`cclaw doctor` gained six new check rows** covering the failure modes
+  the M21 stability program adds recovery paths for — before this an
+  operator running doctor against a host with (say) a dead delivery loop or
+  a corrupt per-session DB got an all-green report. Every new FAIL prints a
+  `fix:` line naming a real command (house rule); the empty failover chain
+  is a WARN with the config pointer, not a FAIL. All rows and helpers live
+  in `crates/copperclaw-cclaw/src/lib.rs`:
+  - `container-runtime` — probes the Docker socket the host connects to
+    (`DOCKER_HOST` or `/var/run/docker.sock`). FAIL fix: start the daemon
+    and `docker info`.
+  - `host-loops` — reads the M21 S1 supervisor via the `host.status`
+    admin-socket handler; a dead/degraded loop or the supervisor-wide
+    degraded flag is a FAIL (fix: `copperclaw stop && copperclaw start`;
+    check `copperclaw logs`). A host build without the supervisor
+    (`unavailable`) or any transport error is skipped, not a crash.
+  - `stuck-sessions` — stats `<data>/sessions/<ag>/<sess>/.heartbeat` for
+    every running session; a heartbeat gone stale past the sweep's 90s
+    ceiling (wedged/crashed runner) is a FAIL (fix: `cclaw sessions delete
+    <id>` / `cclaw groups restart <id>`). A missing heartbeat is not
+    counted (avoids false alarms on cold starts).
+  - `provider-chain` — reads `groups.provider.status` per group; an empty
+    chain is a WARN (`cclaw groups provider set-chain …`), a configured
+    chain whose every entry is degraded and still cooling is a FAIL
+    (`cclaw groups provider status <id>`), honoring the failover
+    cooldown/re-probe semantics.
+  - `dead-letter` — reads `dropped-messages.outbound-list`; any
+    undeliverable outbound backlog (including S5 `no_adapter` rows) is a
+    FAIL pointing at `cclaw dropped-messages replay <id>` (auto-replay
+    stays rejected).
+  - `db-integrity` — scans the session tree for O2's `.quarantined`
+    sidecars and read-only `quick_check`s the central DB; a quarantined
+    session (fix: `cclaw sessions delete <id>`) or corrupt central DB
+    (fix: `cclaw db restore <path>`) is a FAIL.
+- The new transport calls are issued after the existing doctor checks and
+  every new check degrades to skip/WARN (never FAIL) when its call errors,
+  so the existing check rows stay byte-identical and a legacy host reads
+  clean. New dependencies for the cclaw crate: `chrono` (provider cooldown
+  parsing) and `rusqlite` (read-only central-DB `quick_check`).
+
 ### Added (M21 Wave-2 X-rider: feedback fixtures, 2026-07-17)
 
 - **Two new replay fixtures pin the Wave-2 "user is never in the dark"

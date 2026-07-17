@@ -1256,6 +1256,123 @@ where
     //     incident. This closes that gap.
     checks.push(disk_space_check());
 
+    // ---------------------------------------------------------------------
+    // M21 O1 — "doctor learns everything Wave 1 recovers from". Each of the
+    // rows below detects a failure mode that the M21 stability program adds
+    // a *recovery* path for; before this card an operator running `cclaw
+    // doctor` against a host with (say) a dead delivery loop or a corrupt
+    // per-session DB got an all-green report. Every new FAIL prints a `fix:`
+    // line naming a real command (house rule). The new transport calls are
+    // deliberately issued AFTER the existing ones so the pre-existing
+    // sequential-transport tests still map their seeded responses to the
+    // original checks; every new check degrades to a skip/WARN (never a
+    // FAIL) when its transport call errors, so a legacy host that lacks a
+    // handler reads clean rather than alarming.
+
+    // 11. Container-runtime reachability. The host talks to Docker over its
+    //     socket (bollard, `Docker::connect_with_socket_defaults`); if the
+    //     daemon is down, every container spawn fails and no session can
+    //     start. cclaw is co-located with the host, so we probe the same
+    //     socket directly.
+    checks.push(runtime_check_from(&probe_runtime()));
+
+    // 12. Background-loop liveness + host degraded mode (M21 S1 supervisor).
+    //     Read via the `host.status` admin-socket handler. A dead or
+    //     degraded loop is invisible to logs-at-a-glance — this is the row
+    //     that catches it. `unavailable` (a host build without the
+    //     supervisor) and any transport error are treated as skip, not a
+    //     crash, per the O1 card.
+    // `Err` (no supervisor / legacy host / unreachable) is skipped, not a
+    // crash, per the O1 card.
+    if let Ok(status) = transport
+        .call("host.status", serde_json::json!({}), caller.clone())
+        .await
+    {
+        checks.push(host_loops_check(&status));
+    }
+
+    // 13. Stuck / heartbeat-stale sessions. The runner touches
+    //     `<session_root>/.heartbeat` continuously while alive; a *running*
+    //     session whose heartbeat has gone stale is exactly the wedged /
+    //     crashed-runner case S1/S2 recover from. We list running sessions
+    //     over the socket, then stat their heartbeat files locally (cclaw is
+    //     co-located). Skipped whole if the runtime data root can't be
+    //     resolved or the session list errors.
+    if let Some(data_root) = doctor_data_root() {
+        if let Ok(running) = transport
+            .call(
+                "sessions.list",
+                serde_json::json!({"status": "running"}),
+                caller.clone(),
+            )
+            .await
+        {
+            let rows = running.as_array().cloned().unwrap_or_default();
+            checks.push(stuck_sessions_check(
+                &data_root,
+                &rows,
+                std::time::SystemTime::now(),
+            ));
+        }
+    }
+
+    // 14. Provider-chain health (M16 Phase 4 failover, made live by O3). An
+    //     EMPTY chain is the inert "no resilience configured" default — a
+    //     WARN with a config pointer, never a FAIL. A configured chain whose
+    //     every entry is currently unhealthy (degraded + still in cooldown)
+    //     IS a FAIL: the group has no provider it can reach.
+    {
+        let now = chrono::Utc::now();
+        let mut states: Vec<(String, ChainState)> = Vec::new();
+        if let Some(rows) = groups.as_array() {
+            for g in rows {
+                let Some(id) = g.get("id").and_then(serde_json::Value::as_str) else {
+                    continue;
+                };
+                if let Ok(status) = transport
+                    .call(
+                        "groups.provider.status",
+                        serde_json::json!({"id": id}),
+                        caller.clone(),
+                    )
+                    .await
+                {
+                    states.push((id.to_string(), group_chain_state(&status, now)));
+                }
+            }
+        }
+        if let Some(check) = provider_chain_check(&states) {
+            checks.push(check);
+        }
+    }
+
+    // 15. Dead-letter / `no_adapter` outbound backlog (M21 S3/S5). Outbound
+    //     rows whose channel has no live adapter, or that exhausted their
+    //     delivery retries, land in the outbound dead-letter table. They are
+    //     recoverable ONLY by an explicit replay (auto-replay is a standing
+    //     rejection), so a non-empty backlog is a FAIL pointing at the
+    //     replay command.
+    if let Ok(dl) = transport
+        .call(
+            "dropped-messages.outbound-list",
+            serde_json::json!({}),
+            caller.clone(),
+        )
+        .await
+    {
+        checks.push(dead_letter_check(&dl));
+    }
+
+    // 16. DB integrity (M21 O2). O2 quarantines a corrupt per-session DB by
+    //     writing a `.quarantined` sidecar next to it and excluding the
+    //     session from sweeps; a quarantined session is otherwise silently
+    //     dead. Doctor is the surface O2 relies on to make that visible: we
+    //     scan the session tree for the sidecar and also `quick_check` the
+    //     central DB. Local filesystem + read-only SQLite — no transport.
+    if let Some(data_root) = doctor_data_root() {
+        checks.push(db_integrity_check(&data_root));
+    }
+
     finalise_doctor(&checks, as_json, palette)
 }
 
@@ -1459,6 +1576,511 @@ fn finalise_doctor(checks: &[Check], as_json: bool, palette: Palette) -> RunOutp
         out.push_str("\nall checks passed; install is ready for `cclaw chat`\n");
         RunOutput::success(out)
     }
+}
+
+// ===========================================================================
+// M21 O1 — doctor checks for the Wave-1 recovery matrix.
+//
+// Each `*_check` below is a pure classifier over already-fetched inputs (a
+// probe result, a JSON response, or a resolved path) so both the healthy and
+// failing branches are unit-testable without a live host — mirroring the
+// `disk_check_bytes` split above. The only impure pieces are `probe_runtime`
+// and `doctor_data_root`; both carry a `#[cfg(test)]` override so the
+// full-flow doctor tests stay deterministic regardless of the test box's
+// Docker daemon or filesystem.
+// ===========================================================================
+
+/// Outcome of probing the container runtime (Docker) for reachability.
+#[derive(Debug, Clone)]
+enum RuntimeProbe {
+    /// The runtime endpoint accepted a connection; the string labels it
+    /// (socket path or TCP address) for the detail line.
+    Reachable(String),
+    /// The endpoint could not be reached: `(endpoint, error)`.
+    Unreachable(String, String),
+}
+
+/// Build the `container-runtime` row from a probe result. A host that can't
+/// reach Docker can spawn no session containers at all, so an unreachable
+/// runtime is a FAIL with the daemon-check command.
+fn runtime_check_from(probe: &RuntimeProbe) -> Check {
+    match probe {
+        RuntimeProbe::Reachable(endpoint) => Check::ok(
+            "container-runtime",
+            format!("container runtime reachable ({endpoint})"),
+        ),
+        RuntimeProbe::Unreachable(endpoint, err) => Check::fail(
+            "container-runtime",
+            format!("cannot reach the container runtime at {endpoint}: {err}"),
+            Some(
+                "start the Docker daemon (`sudo systemctl start docker`, or launch Docker Desktop) and verify with `docker info`",
+            ),
+        ),
+    }
+}
+
+/// Probe the Docker daemon the host talks to. Honors `DOCKER_HOST`
+/// (`unix://` / `tcp://`), else the default `/var/run/docker.sock` — the
+/// same endpoint `Docker::connect_with_socket_defaults` uses in
+/// `copperclaw-container-rt`. A successful connect is the reachability
+/// signal; we intentionally do not issue an API call, so a wedged-but-up
+/// daemon still reads reachable (the host's own `version()` probe covers
+/// that deeper case at spawn time).
+#[cfg(not(test))]
+fn probe_runtime() -> RuntimeProbe {
+    match std::env::var("DOCKER_HOST").ok().filter(|s| !s.is_empty()) {
+        Some(h) if h.starts_with("tcp://") => probe_runtime_tcp(h.trim_start_matches("tcp://")),
+        Some(h) => probe_runtime_unix(h.trim_start_matches("unix://")),
+        None => probe_runtime_unix("/var/run/docker.sock"),
+    }
+}
+
+#[cfg(not(test))]
+fn probe_runtime_unix(path: &str) -> RuntimeProbe {
+    match std::os::unix::net::UnixStream::connect(path) {
+        Ok(_) => RuntimeProbe::Reachable(path.to_string()),
+        Err(e) => RuntimeProbe::Unreachable(path.to_string(), e.to_string()),
+    }
+}
+
+#[cfg(not(test))]
+fn probe_runtime_tcp(addr: &str) -> RuntimeProbe {
+    use std::net::ToSocketAddrs as _;
+    let timeout = std::time::Duration::from_secs(2);
+    match addr.to_socket_addrs().map(|mut it| it.next()) {
+        Ok(Some(sa)) => match std::net::TcpStream::connect_timeout(&sa, timeout) {
+            Ok(_) => RuntimeProbe::Reachable(addr.to_string()),
+            Err(e) => RuntimeProbe::Unreachable(addr.to_string(), e.to_string()),
+        },
+        Ok(None) => RuntimeProbe::Unreachable(addr.to_string(), "no address resolved".to_string()),
+        Err(e) => RuntimeProbe::Unreachable(addr.to_string(), e.to_string()),
+    }
+}
+
+/// Runtime data root (`<install_root>/data`) for the filesystem-backed
+/// doctor checks (heartbeat staleness, quarantine sidecars, central-DB
+/// integrity). `None` when the install root can't be resolved — the
+/// dependent rows are skipped rather than guessed.
+#[cfg(not(test))]
+fn doctor_data_root() -> Option<std::path::PathBuf> {
+    resolve_install_root().map(|r| r.join("data"))
+}
+
+// Test seams for the two impure probes. Mirror the `DISK_OVERRIDE` pattern:
+// thread-local, test-only, so the full-flow doctor tests are independent of
+// the test box's Docker daemon and filesystem. `probe_runtime` defaults to
+// reachable and `doctor_data_root` to `None` (filesystem checks skipped), so
+// the pre-existing transport-seeded doctor tests only ever gain a single
+// `container-runtime` OK row.
+#[cfg(test)]
+thread_local! {
+    static RUNTIME_OVERRIDE: std::cell::RefCell<RuntimeProbe> =
+        std::cell::RefCell::new(RuntimeProbe::Reachable("<test>".to_string()));
+    static DATA_ROOT_OVERRIDE: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_runtime_override(probe: RuntimeProbe) {
+    RUNTIME_OVERRIDE.with(|c| *c.borrow_mut() = probe);
+}
+
+#[cfg(test)]
+fn probe_runtime() -> RuntimeProbe {
+    RUNTIME_OVERRIDE.with(|c| c.borrow().clone())
+}
+
+#[cfg(test)]
+fn set_data_root_override(root: Option<std::path::PathBuf>) {
+    DATA_ROOT_OVERRIDE.with(|c| *c.borrow_mut() = root);
+}
+
+#[cfg(test)]
+fn doctor_data_root() -> Option<std::path::PathBuf> {
+    DATA_ROOT_OVERRIDE.with(|c| c.borrow().clone())
+}
+
+/// Build the `host-loops` row from a `host.status` (S1 supervisor) response.
+/// FAIL when the supervisor-wide degraded flag is set, or any supervised
+/// loop is not alive / individually degraded — the silent-death surface this
+/// program exists to close; OK otherwise.
+fn host_loops_check(status: &serde_json::Value) -> Check {
+    let degraded = status
+        .get("degraded")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let loops = status
+        .get("loops")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut broken: Vec<String> = Vec::new();
+    for l in &loops {
+        let name = l
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        let alive = l
+            .get("alive")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let loop_degraded = l
+            .get("degraded")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !alive {
+            broken.push(format!("{name} (dead)"));
+        } else if loop_degraded {
+            broken.push(format!("{name} (degraded)"));
+        }
+    }
+    if degraded || !broken.is_empty() {
+        let detail = if broken.is_empty() {
+            "host supervisor is in degraded mode".to_string()
+        } else {
+            format!("stalled background loop(s): {}", broken.join(", "))
+        };
+        Check::fail(
+            "host-loops",
+            detail,
+            Some(
+                "restart the host: `copperclaw stop && copperclaw start`; then check `copperclaw logs`",
+            ),
+        )
+    } else {
+        Check::ok(
+            "host-loops",
+            format!(
+                "{} background loop(s) alive; host not degraded",
+                loops.len()
+            ),
+        )
+    }
+}
+
+/// Heartbeat staleness ceiling for the `stuck-sessions` row, in
+/// milliseconds. Mirrors `copperclaw_host_sweep::HEARTBEAT_STALE_MS` (90s)
+/// so doctor's notion of "stale" agrees with the sweep's recovery trigger.
+/// cclaw does not depend on the sweep crate; kept in sync by this comment.
+const DOCTOR_HEARTBEAT_STALE_MS: u64 = 90_000;
+
+/// Build the `stuck-sessions` row. For each running session, stat
+/// `<data_root>/sessions/<agent_group>/<session>/.heartbeat`; a heartbeat
+/// present but older than [`DOCTOR_HEARTBEAT_STALE_MS`] means the runner has
+/// stopped touching it — the wedged / crashed-runner case S1/S2 recover
+/// from. A *missing* heartbeat is not counted: a just-spawned session may
+/// not have written one yet, and doctor should not cry wolf on every cold
+/// start.
+fn stuck_sessions_check(
+    data_root: &std::path::Path,
+    running: &[serde_json::Value],
+    now: std::time::SystemTime,
+) -> Check {
+    let stale_after = std::time::Duration::from_millis(DOCTOR_HEARTBEAT_STALE_MS);
+    let mut stale: Vec<String> = Vec::new();
+    for s in running {
+        let (Some(ag), Some(id)) = (
+            s.get("agent_group_id").and_then(serde_json::Value::as_str),
+            s.get("id").and_then(serde_json::Value::as_str),
+        ) else {
+            continue;
+        };
+        let heartbeat = data_root
+            .join("sessions")
+            .join(ag)
+            .join(id)
+            .join(".heartbeat");
+        let Ok(mtime) = std::fs::metadata(&heartbeat).and_then(|m| m.modified()) else {
+            continue; // missing / unreadable heartbeat: skip (see doc comment)
+        };
+        if now.duration_since(mtime).is_ok_and(|d| d > stale_after) {
+            stale.push(id.to_string());
+        }
+    }
+    if stale.is_empty() {
+        Check::ok(
+            "stuck-sessions",
+            format!("{} running session(s); none heartbeat-stale", running.len()),
+        )
+    } else {
+        Check::fail(
+            "stuck-sessions",
+            format!(
+                "{} running session(s) with stale heartbeats (wedged/crashed runner): {}",
+                stale.len(),
+                stale.join(", ")
+            ),
+            Some(
+                "reset the session: `cclaw sessions delete <session-id>` (or restart the group: `cclaw groups restart <group-id>`)",
+            ),
+        )
+    }
+}
+
+/// Per-group provider-chain health, distilled from a
+/// `groups.provider.status` response for the [`provider_chain_check`] row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainState {
+    /// No fallback chain configured — the inert single-provider default
+    /// (`FallbackChain::is_empty` in `copperclaw-providers`).
+    NoChain,
+    /// A chain is configured and at least one entry is currently usable.
+    Healthy,
+    /// A chain is configured but every entry is degraded and still cooling
+    /// down: the group has no provider it can reach right now.
+    AllUnhealthy,
+}
+
+/// Whether one health row reports a currently-usable provider: `healthy`, or
+/// degraded but past its `cooldown_until` (the failover selector re-probes —
+/// treats as healthy — once the cooldown elapses).
+fn provider_row_usable(h: &serde_json::Value, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let status = h
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("healthy");
+    if status == "healthy" {
+        return true;
+    }
+    match h.get("cooldown_until").and_then(serde_json::Value::as_str) {
+        Some(ts) => chrono::DateTime::parse_from_rfc3339(ts)
+            .is_ok_and(|d| d.with_timezone(&chrono::Utc) <= now),
+        None => false,
+    }
+}
+
+/// Reduce one `groups.provider.status` response to a [`ChainState`]. A chain
+/// entry is usable when it has no health row (never failed) or at least one
+/// usable key; the chain is [`ChainState::AllUnhealthy`] only when no entry
+/// is usable.
+fn group_chain_state(status: &serde_json::Value, now: chrono::DateTime<chrono::Utc>) -> ChainState {
+    let Some(entries) = status
+        .get("chain")
+        .and_then(serde_json::Value::as_array)
+        .filter(|e| !e.is_empty())
+    else {
+        return ChainState::NoChain;
+    };
+    let health = status
+        .get("health")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let any_usable = entries.iter().any(|e| {
+        let provider = e.get("provider").and_then(serde_json::Value::as_str);
+        let model = e.get("model").and_then(serde_json::Value::as_str);
+        let rows: Vec<&serde_json::Value> = health
+            .iter()
+            .filter(|h| {
+                h.get("provider").and_then(serde_json::Value::as_str) == provider
+                    && h.get("model").and_then(serde_json::Value::as_str) == model
+            })
+            .collect();
+        rows.is_empty() || rows.iter().any(|h| provider_row_usable(h, now))
+    });
+    if any_usable {
+        ChainState::Healthy
+    } else {
+        ChainState::AllUnhealthy
+    }
+}
+
+/// Build the `provider-chain` row from per-group [`ChainState`]s, or `None`
+/// when there are no group states (every status call errored). An empty
+/// chain across all groups is a WARN (the inert default has no fallback for
+/// a dead primary), never a FAIL; a group whose whole chain is unhealthy is
+/// a FAIL.
+fn provider_chain_check(states: &[(String, ChainState)]) -> Option<Check> {
+    if states.is_empty() {
+        return None;
+    }
+    let dead: Vec<&str> = states
+        .iter()
+        .filter(|(_, s)| *s == ChainState::AllUnhealthy)
+        .map(|(id, _)| id.as_str())
+        .collect();
+    if !dead.is_empty() {
+        return Some(Check::fail(
+            "provider-chain",
+            format!(
+                "provider chain has no reachable provider for group(s): {}",
+                dead.join(", ")
+            ),
+            Some(
+                "inspect health + credentials: `cclaw groups provider status <group-id>`; verify the chain's API keys / endpoints",
+            ),
+        ));
+    }
+    let configured = states
+        .iter()
+        .filter(|(_, s)| *s == ChainState::Healthy)
+        .count();
+    if configured == 0 {
+        return Some(Check::warn(
+            "provider-chain",
+            "no provider fallback chain configured (single-provider default; a dead primary has no fallback)",
+            Some(
+                "configure a fallback chain: `cclaw groups provider set-chain <group-id> --chain <json>`",
+            ),
+        ));
+    }
+    Some(Check::ok(
+        "provider-chain",
+        format!("{configured} group(s) with a healthy provider chain"),
+    ))
+}
+
+/// Build the `dead-letter` row from a `dropped-messages.outbound-list`
+/// response. Any undeliverable outbound backlog is a FAIL: these rows drain
+/// only via an explicit replay (auto-replay is a standing rejection). Rows
+/// whose failure was `no_adapter` (S5) are called out — they clear only once
+/// the channel is (re)configured.
+fn dead_letter_check(rows: &serde_json::Value) -> Check {
+    let rows = rows.as_array().cloned().unwrap_or_default();
+    let total = rows.len();
+    if total == 0 {
+        return Check::ok("dead-letter", "no undeliverable outbound messages");
+    }
+    let no_adapter = rows
+        .iter()
+        .filter(|r| {
+            r.get("last_error")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|e| e.contains("no_adapter"))
+        })
+        .count();
+    let detail = if no_adapter > 0 {
+        format!("{total} undeliverable outbound message(s) ({no_adapter} with no channel adapter)")
+    } else {
+        format!("{total} undeliverable outbound message(s)")
+    };
+    Check::fail(
+        "dead-letter",
+        detail,
+        Some(
+            "inspect with `cclaw dropped-messages outbound-list`, then replay once the channel is back: `cclaw dropped-messages replay <id>`",
+        ),
+    )
+}
+
+/// Quarantine sidecar filename written by O2 next to a corrupt per-session
+/// DB. Kept in sync with
+/// `copperclaw_host_sweep::checks::integrity::QUARANTINE_SIDECAR_NAME`
+/// (cclaw does not depend on the sweep crate). Existence alone means the
+/// session is quarantined; the body is additive-only JSON parsed defensively
+/// for the optional `detail` field.
+const QUARANTINE_SIDECAR_NAME: &str = ".quarantined";
+
+/// Walk the session tree for O2 quarantine sidecars. Returns
+/// `(session_uuid, detail)` per quarantined session. Best-effort: an
+/// unreadable dir or sidecar is skipped, not fatal.
+fn scan_quarantined_sessions(data_root: &std::path::Path) -> Vec<(String, Option<String>)> {
+    let mut out = Vec::new();
+    let Ok(agents) = std::fs::read_dir(data_root.join("sessions")) else {
+        return out;
+    };
+    for agent in agents.flatten() {
+        let Ok(sessions) = std::fs::read_dir(agent.path()) else {
+            continue;
+        };
+        for session in sessions.flatten() {
+            let sidecar = session.path().join(QUARANTINE_SIDECAR_NAME);
+            if !sidecar.exists() {
+                continue;
+            }
+            let detail = std::fs::read_to_string(&sidecar).ok().and_then(|body| {
+                serde_json::from_str::<serde_json::Value>(&body)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("detail")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string)
+                    })
+            });
+            out.push((session.file_name().to_string_lossy().into_owned(), detail));
+        }
+    }
+    out
+}
+
+/// Read-only `PRAGMA quick_check` on the central DB. Returns `Some(detail)`
+/// on corruption (or an open/query failure of an existing file), `None` when
+/// the DB is healthy or simply absent (a fresh install). Opens read-only —
+/// never creates or mutates the file. (Local re-implementation of O2's
+/// `copperclaw_db::integrity::quick_check`, which cclaw does not depend on.)
+fn central_db_integrity(path: &std::path::Path) -> Option<String> {
+    if !path.exists() {
+        return None;
+    }
+    let conn = match rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) {
+        Ok(c) => c,
+        Err(e) => return Some(format!("open failed: {e}")),
+    };
+    let mut stmt = match conn.prepare("PRAGMA quick_check") {
+        Ok(s) => s,
+        Err(e) => return Some(format!("quick_check prepare failed: {e}")),
+    };
+    let rows = match stmt.query_map([], |r| r.get::<_, String>(0)) {
+        Ok(it) => it,
+        Err(e) => return Some(format!("quick_check query failed: {e}")),
+    };
+    let mut lines = Vec::new();
+    for row in rows {
+        match row {
+            Ok(s) => lines.push(s),
+            Err(e) => return Some(format!("quick_check row error: {e}")),
+        }
+    }
+    if lines.len() == 1 && lines[0] == "ok" {
+        None
+    } else {
+        Some(lines.join("; "))
+    }
+}
+
+/// Build the `db-integrity` row. Scans the session tree for O2 quarantine
+/// sidecars and `quick_check`s the central DB; any quarantined session or a
+/// corrupt central DB is a FAIL. Purely local (filesystem + read-only
+/// `SQLite`) — no transport.
+fn db_integrity_check(data_root: &std::path::Path) -> Check {
+    if let Some(detail) = central_db_integrity(&data_root.join("copperclaw.db")) {
+        return Check::fail(
+            "db-integrity",
+            format!("central DB failed integrity check: {detail}"),
+            Some(
+                "stop the host and restore from a backup: `cclaw db restore <backup-path>` (see `cclaw db backup`)",
+            ),
+        );
+    }
+    let quarantined = scan_quarantined_sessions(data_root);
+    if quarantined.is_empty() {
+        return Check::ok(
+            "db-integrity",
+            "central DB healthy; no quarantined sessions",
+        );
+    }
+    let sample: Vec<String> = quarantined
+        .iter()
+        .take(3)
+        .map(|(id, detail)| match detail {
+            Some(d) => format!("{id} ({d})"),
+            None => id.clone(),
+        })
+        .collect();
+    Check::fail(
+        "db-integrity",
+        format!(
+            "{} session(s) quarantined for DB corruption: {}",
+            quarantined.len(),
+            sample.join(", ")
+        ),
+        Some(
+            "reset each quarantined session: `cclaw sessions delete <session-id>` (back up `<data>/sessions/<ag>/<session>/` first)",
+        ),
+    )
 }
 
 /// `cclaw completions <shell>` — render the clap-generated completion
@@ -3296,6 +3918,345 @@ mod tests {
         let payload: serde_json::Value =
             serde_json::from_str(out.stderr.trim()).expect("--json fail must still emit JSON");
         assert_eq!(payload["status"], "fail");
+    }
+
+    // --- M21 O1: Wave-1 recovery-matrix doctor rows --------------------
+    // Each new check gets a healthy AND a failing unit case (and the
+    // failing case's `fix:` line names a real command / config key), plus
+    // two full-flow tests proving the rows appear and the existing rows are
+    // untouched.
+
+    #[test]
+    fn container_runtime_check_ok_and_fail() {
+        let ok = runtime_check_from(&RuntimeProbe::Reachable("/var/run/docker.sock".into()));
+        assert_eq!(ok.level, CheckLevel::Ok);
+        assert_eq!(ok.name, "container-runtime");
+
+        let bad = runtime_check_from(&RuntimeProbe::Unreachable(
+            "/var/run/docker.sock".into(),
+            "connection refused".into(),
+        ));
+        assert_eq!(bad.level, CheckLevel::Fail);
+        let fix = bad.fix.expect("fail row must carry a fix");
+        assert!(
+            fix.contains("docker info"),
+            "fix names a real command: {fix}"
+        );
+    }
+
+    #[test]
+    fn host_loops_check_ok_dead_and_degraded() {
+        let healthy = json!({
+            "degraded": false,
+            "loops": [
+                {"name": "sweep", "alive": true, "degraded": false},
+                {"name": "delivery", "alive": true, "degraded": false},
+            ],
+        });
+        let ok = host_loops_check(&healthy);
+        assert_eq!(ok.level, CheckLevel::Ok);
+        assert!(ok.detail.contains("2 background loop(s) alive"));
+
+        let dead = json!({
+            "degraded": false,
+            "loops": [{"name": "sweep", "alive": false, "degraded": false}],
+        });
+        let f = host_loops_check(&dead);
+        assert_eq!(f.level, CheckLevel::Fail);
+        assert!(f.detail.contains("sweep (dead)"));
+        let fix = f.fix.expect("fail row must carry a fix");
+        assert!(
+            fix.contains("copperclaw stop && copperclaw start"),
+            "fix names a real command: {fix}"
+        );
+
+        // The supervisor-wide degraded flag alone is a FAIL even when every
+        // listed loop reports alive.
+        let degraded = json!({
+            "degraded": true,
+            "loops": [{"name": "sweep", "alive": true, "degraded": false}],
+        });
+        assert_eq!(host_loops_check(&degraded).level, CheckLevel::Fail);
+    }
+
+    #[test]
+    fn stuck_sessions_check_fresh_and_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let ag = "11111111-1111-1111-1111-111111111111";
+        let sess = "22222222-2222-2222-2222-222222222222";
+        let sess_dir = root.join("sessions").join(ag).join(sess);
+        std::fs::create_dir_all(&sess_dir).unwrap();
+        std::fs::write(sess_dir.join(".heartbeat"), b"").unwrap();
+        let running = vec![json!({"id": sess, "agent_group_id": ag})];
+
+        // Just-written heartbeat, real `now` → fresh → OK.
+        let ok = stuck_sessions_check(root, &running, std::time::SystemTime::now());
+        assert_eq!(ok.level, CheckLevel::Ok, "detail: {}", ok.detail);
+
+        // Advance `now` well past the staleness ceiling → the same heartbeat
+        // reads as stale → FAIL with a real recovery command.
+        let later = std::time::SystemTime::now()
+            + std::time::Duration::from_millis(DOCTOR_HEARTBEAT_STALE_MS + 60_000);
+        let f = stuck_sessions_check(root, &running, later);
+        assert_eq!(f.level, CheckLevel::Fail);
+        assert!(f.detail.contains(sess));
+        let fix = f.fix.expect("fail row must carry a fix");
+        assert!(
+            fix.contains("cclaw sessions delete") || fix.contains("cclaw groups restart"),
+            "fix names a real command: {fix}"
+        );
+    }
+
+    #[test]
+    fn stuck_sessions_missing_heartbeat_is_not_counted() {
+        // A running session that has not yet written a heartbeat must not be
+        // reported stuck (avoid crying wolf on cold starts).
+        let tmp = tempfile::tempdir().unwrap();
+        let running = vec![json!({
+            "id": "22222222-2222-2222-2222-222222222222",
+            "agent_group_id": "11111111-1111-1111-1111-111111111111",
+        })];
+        let now = std::time::SystemTime::now()
+            + std::time::Duration::from_millis(DOCTOR_HEARTBEAT_STALE_MS + 60_000);
+        assert_eq!(
+            stuck_sessions_check(tmp.path(), &running, now).level,
+            CheckLevel::Ok
+        );
+    }
+
+    #[test]
+    fn provider_chain_states_and_row() {
+        let now = chrono::Utc::now();
+        // No chain → NoChain; aggregated → WARN with the config pointer.
+        let none = json!({"chain": null, "health": []});
+        assert_eq!(group_chain_state(&none, now), ChainState::NoChain);
+        let warn =
+            provider_chain_check(&[("ag-1".into(), ChainState::NoChain)]).expect("row present");
+        assert_eq!(warn.level, CheckLevel::Warn);
+        let fix = warn.fix.expect("warn row carries a config pointer");
+        assert!(
+            fix.contains("cclaw groups provider set-chain"),
+            "fix names a real command: {fix}"
+        );
+
+        // Configured chain, no failing health rows → Healthy → OK.
+        let healthy = json!({
+            "chain": [{"provider": "anthropic", "model": "m1"}],
+            "health": [],
+        });
+        assert_eq!(group_chain_state(&healthy, now), ChainState::Healthy);
+        assert_eq!(
+            provider_chain_check(&[("ag-1".into(), ChainState::Healthy)])
+                .unwrap()
+                .level,
+            CheckLevel::Ok
+        );
+
+        // Every entry degraded and still cooling → AllUnhealthy → FAIL.
+        let future = (now + chrono::Duration::minutes(5)).to_rfc3339();
+        let dead = json!({
+            "chain": [{"provider": "anthropic", "model": "m1"}],
+            "health": [{"provider": "anthropic", "model": "m1", "status": "down",
+                        "cooldown_until": future}],
+        });
+        assert_eq!(group_chain_state(&dead, now), ChainState::AllUnhealthy);
+        let f = provider_chain_check(&[("ag-1".into(), ChainState::AllUnhealthy)]).unwrap();
+        assert_eq!(f.level, CheckLevel::Fail);
+        let fix = f.fix.expect("fail row must carry a fix");
+        assert!(
+            fix.contains("cclaw groups provider status"),
+            "fix names a real command: {fix}"
+        );
+
+        // A degraded entry whose cooldown has elapsed is re-probe-eligible →
+        // treated healthy again.
+        let past = (now - chrono::Duration::minutes(5)).to_rfc3339();
+        let recovered = json!({
+            "chain": [{"provider": "anthropic", "model": "m1"}],
+            "health": [{"provider": "anthropic", "model": "m1", "status": "down",
+                        "cooldown_until": past}],
+        });
+        assert_eq!(group_chain_state(&recovered, now), ChainState::Healthy);
+    }
+
+    #[test]
+    fn provider_chain_check_empty_states_is_skipped() {
+        assert!(provider_chain_check(&[]).is_none());
+    }
+
+    #[test]
+    fn dead_letter_check_empty_and_backlog() {
+        assert_eq!(
+            dead_letter_check(&json!([])).level,
+            CheckLevel::Ok,
+            "empty backlog is OK"
+        );
+
+        let backlog = json!([
+            {"id": "d1", "last_error": "no_adapter: cli"},
+            {"id": "d2", "last_error": "timeout"},
+        ]);
+        let f = dead_letter_check(&backlog);
+        assert_eq!(f.level, CheckLevel::Fail);
+        assert!(f.detail.contains("2 undeliverable"));
+        assert!(f.detail.contains("1 with no channel adapter"));
+        let fix = f.fix.expect("fail row must carry a fix");
+        assert!(
+            fix.contains("cclaw dropped-messages replay"),
+            "fix names a real command: {fix}"
+        );
+    }
+
+    #[test]
+    fn db_integrity_check_clean_quarantine_and_corrupt_central() {
+        // Clean data root: no central DB, no sessions → OK.
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            db_integrity_check(tmp.path()).level,
+            CheckLevel::Ok,
+            "clean install is OK"
+        );
+
+        // A quarantine sidecar → FAIL surfacing the detail + a reset command.
+        let sess = "33333333-3333-3333-3333-333333333333";
+        let sess_dir = tmp.path().join("sessions").join("ag").join(sess);
+        std::fs::create_dir_all(&sess_dir).unwrap();
+        std::fs::write(
+            sess_dir.join(".quarantined"),
+            r#"{"reason":"quick_check","db":"outbound.db","detail":"database disk image is malformed","detected_at":"2026-07-17T00:00:00Z","future_key":"ignored"}"#,
+        )
+        .unwrap();
+        let f = db_integrity_check(tmp.path());
+        assert_eq!(f.level, CheckLevel::Fail);
+        assert!(f.detail.contains(sess));
+        assert!(f.detail.contains("database disk image is malformed"));
+        let fix = f.fix.expect("fail row must carry a fix");
+        assert!(
+            fix.contains("cclaw sessions delete"),
+            "fix names a real command: {fix}"
+        );
+
+        // A corrupt central DB takes precedence and names the restore command.
+        let tmp2 = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp2.path().join("copperclaw.db"),
+            b"not a sqlite database at all",
+        )
+        .unwrap();
+        let cf = db_integrity_check(tmp2.path());
+        assert_eq!(cf.level, CheckLevel::Fail);
+        assert!(cf.detail.contains("central DB"));
+        let fix = cf.fix.expect("fail row must carry a fix");
+        assert!(
+            fix.contains("cclaw db restore"),
+            "fix names a real command: {fix}"
+        );
+    }
+
+    /// Full-flow: with a live supervisor, running sessions, provider chains,
+    /// a dead-letter backlog and a quarantined session all present, every new
+    /// FAIL/WARN row appears with its `fix:` line — and the existing rows are
+    /// still emitted byte-for-byte (host-reachable / agent-group / etc.).
+    #[tokio::test]
+    async fn doctor_full_flow_surfaces_all_new_failing_rows() {
+        set_runtime_override(RuntimeProbe::Unreachable(
+            "/var/run/docker.sock".into(),
+            "connection refused".into(),
+        ));
+        let tmp = tempfile::tempdir().unwrap();
+        // A quarantined session for the db-integrity row.
+        let qdir = tmp.path().join("sessions").join("ag").join("sess-q");
+        std::fs::create_dir_all(&qdir).unwrap();
+        std::fs::write(qdir.join(".quarantined"), r#"{"reason":"quick_check"}"#).unwrap();
+        set_data_root_override(Some(tmp.path().to_path_buf()));
+
+        let future = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
+        let t = MapTransport::new(vec![
+            ("groups.list", Ok(json!([{"id": "ag-1"}]))),
+            ("wirings.list", Ok(json!([{"id": "w-1"}]))),
+            ("sessions.list", Ok(json!([]))), // active list (row 4) + running list both map here
+            ("audit.list", Ok(json!([]))),
+            ("dropped-messages.list", Ok(json!([]))),
+            (
+                "host.status",
+                Ok(json!({"degraded": false,
+                          "loops": [{"name": "sweep", "alive": false, "degraded": false}]})),
+            ),
+            (
+                "groups.provider.status",
+                Ok(json!({"chain": [{"provider": "anthropic", "model": "m1"}],
+                          "health": [{"provider": "anthropic", "model": "m1",
+                                      "status": "down", "cooldown_until": future}]})),
+            ),
+            (
+                "dropped-messages.outbound-list",
+                Ok(json!([{"id": "d1", "last_error": "no_adapter: cli"}])),
+            ),
+        ]);
+        let out = run_cli(["cclaw", "doctor"], &t).await;
+        let combined = format!("{}{}", out.stdout, out.stderr);
+        // Existing rows still present.
+        assert!(combined.contains("host-reachable"));
+        assert!(combined.contains("agent-group"));
+        // New rows, all failing here.
+        assert!(combined.contains("container-runtime"));
+        assert!(combined.contains("host-loops"));
+        assert!(combined.contains("provider-chain"));
+        assert!(combined.contains("dead-letter"));
+        assert!(combined.contains("db-integrity"));
+        assert!(combined.contains("FAIL"));
+        assert!(combined.contains("docker info"));
+        assert!(combined.contains("cclaw dropped-messages replay"));
+        // FAIL sends the whole report to stderr.
+        assert!(out.stderr.contains("FAIL"));
+
+        // Reset thread-locals so sibling tests on a reused thread see defaults.
+        set_runtime_override(RuntimeProbe::Reachable("<test>".into()));
+        set_data_root_override(None);
+    }
+
+    /// Full-flow healthy path: reachable runtime, live loops, a healthy
+    /// provider chain, no backlog, no quarantine → every new row is OK/skip
+    /// and the report exits clean.
+    #[tokio::test]
+    async fn doctor_full_flow_all_new_rows_healthy() {
+        set_runtime_override(RuntimeProbe::Reachable("/var/run/docker.sock".into()));
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("sessions")).unwrap();
+        set_data_root_override(Some(tmp.path().to_path_buf()));
+
+        let t = MapTransport::new(vec![
+            ("groups.list", Ok(json!([{"id": "ag-1"}]))),
+            ("wirings.list", Ok(json!([{"id": "w-1"}]))),
+            ("sessions.list", Ok(json!([]))),
+            ("audit.list", Ok(json!([]))),
+            ("dropped-messages.list", Ok(json!([]))),
+            (
+                "host.status",
+                Ok(json!({"degraded": false,
+                          "loops": [{"name": "sweep", "alive": true, "degraded": false}]})),
+            ),
+            (
+                "groups.provider.status",
+                Ok(json!({"chain": [{"provider": "anthropic", "model": "m1"}], "health": []})),
+            ),
+            ("dropped-messages.outbound-list", Ok(json!([]))),
+        ]);
+        let out = run_cli(["cclaw", "doctor"], &t).await;
+        assert!(
+            out.stderr.is_empty(),
+            "healthy doctor must not FAIL: {:?}",
+            out.stderr
+        );
+        assert!(out.stdout.contains("container-runtime"));
+        assert!(out.stdout.contains("host-loops"));
+        assert!(out.stdout.contains("provider-chain"));
+        assert!(out.stdout.contains("dead-letter"));
+        assert!(out.stdout.contains("db-integrity"));
+        assert!(!out.stdout.contains("FAIL"));
+
+        set_data_root_override(None);
     }
 
     // --- chat --------------------------------------------------------------
