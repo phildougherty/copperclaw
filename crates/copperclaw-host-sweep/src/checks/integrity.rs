@@ -12,17 +12,27 @@
 //! ## Quarantine sidecar — the on-disk contract (read by O1's `cclaw doctor`)
 //!
 //! When a session's DB fails `quick_check`, this check writes a sidecar
-//! file next to the session's databases. The path convention is **stable
-//! and documented** because another card (O1) reads it to surface
-//! quarantines in `cclaw doctor` without a new admin verb:
+//! file as a **sibling of the session directory**, inside the (host-only)
+//! agent-group directory. The path convention is **stable and documented**
+//! because another card (O1) reads it to surface quarantines in
+//! `cclaw doctor` without a new admin verb:
 //!
 //! ```text
-//! <data_root>/sessions/<agent_group_uuid>/<session_uuid>/.quarantined
+//! <data_root>/sessions/<agent_group_uuid>/<session_uuid>.quarantined
 //! ```
 //!
-//! i.e. [`QUARANTINE_SIDECAR_NAME`] inside the session root directory
-//! ([`copperclaw_db::session::SessionPaths::root`]), a sibling of
-//! `inbound.db`, `outbound.db`, and `.heartbeat`.
+//! i.e. the session-directory name ([`copperclaw_db::session::SessionPaths::root`])
+//! with [`QUARANTINE_SIDECAR_NAME`] (`.quarantined`) appended, placed
+//! *beside* the session directory rather than inside it.
+//!
+//! **Security (why a sibling, not a child).** The session directory itself
+//! is bind-mounted read-write into the untrusted agent's container as
+//! `/data`. A marker *inside* that directory could be forged by the agent
+//! (a simple `touch /data/.quarantined`) to opt its own session out of all
+//! host sweep supervision — including the S2 stuck-container restart
+//! actuator — silently. The parent agent-group directory is never mounted
+//! into any container, so a sibling marker there is host-authoritative: the
+//! sandboxed agent cannot create, delete, or forge it.
 //!
 //! The file **contents** are a single line of UTF-8 JSON:
 //!
@@ -51,8 +61,11 @@ use chrono::{DateTime, Utc};
 use copperclaw_db::integrity::{QuickCheckOutcome, quick_check};
 use copperclaw_types::{AgentGroupId, SessionId};
 
-/// Filename of the quarantine sidecar, written inside the session root
-/// directory. See the module docs for the full path + contents contract.
+/// Suffix appended to the session-directory name to form the quarantine
+/// sidecar, written as a SIBLING of the session directory (inside the
+/// host-only agent-group directory, never the container-writable session
+/// dir itself). See the module docs for the full path + contents contract
+/// and the security rationale for the sibling placement.
 pub const QUARANTINE_SIDECAR_NAME: &str = ".quarantined";
 
 /// Number of rotation slots the per-session integrity check cycles
@@ -92,15 +105,31 @@ pub fn rotation_slot(session_id: &SessionId, slots: u64) -> u64 {
     u64::try_from(rem).unwrap_or(0)
 }
 
-/// Absolute path of a session's quarantine sidecar.
+/// Absolute path of a session's quarantine sidecar — a SIBLING of the
+/// session directory (`<session_dir>.quarantined`) in the host-only
+/// agent-group directory, deliberately NOT a child of the
+/// container-writable session directory. See [`sidecar_path_for`].
 pub fn sidecar_path(
     root: &dyn SessionRoot,
     agent_group_id: &AgentGroupId,
     session_id: &SessionId,
 ) -> std::path::PathBuf {
-    root.session_paths(agent_group_id, session_id)
-        .root
-        .join(QUARANTINE_SIDECAR_NAME)
+    sidecar_path_for(&root.session_paths(agent_group_id, session_id).root)
+}
+
+/// The quarantine sidecar path for a given session directory: the session
+/// directory's own path with [`QUARANTINE_SIDECAR_NAME`] appended, so the
+/// marker is a sibling in the parent (agent-group) directory. The parent is
+/// never bind-mounted into a container, so the sandboxed agent cannot forge,
+/// delete, or observe it — unlike the session directory, which IS its
+/// writable `/data`.
+pub fn sidecar_path_for(session_dir: &std::path::Path) -> std::path::PathBuf {
+    let mut name = session_dir.file_name().unwrap_or_default().to_os_string();
+    name.push(QUARANTINE_SIDECAR_NAME);
+    match session_dir.parent() {
+        Some(parent) => parent.join(name),
+        None => std::path::PathBuf::from(name),
+    }
 }
 
 /// True if the session already carries a quarantine sidecar and must be
@@ -140,7 +169,7 @@ pub fn check_and_quarantine(
         match quick_check(db_path) {
             QuickCheckOutcome::Healthy | QuickCheckOutcome::Missing => {}
             QuickCheckOutcome::Corrupt(detail) => {
-                write_sidecar(&paths.root, db_name, &detail, now)?;
+                write_sidecar(&sidecar_path_for(&paths.root), db_name, &detail, now)?;
                 // M1 metric wish: integrity_quarantines_total — increment
                 // once per session quarantined.
                 return Ok(Some(IntegrityFinding {
@@ -154,14 +183,20 @@ pub fn check_and_quarantine(
     Ok(None)
 }
 
-/// Write the quarantine sidecar (see the module docs for the format).
+/// Write the quarantine sidecar at `sidecar` (see the module docs for the
+/// format). `sidecar` is the host-only sibling path from
+/// [`sidecar_path_for`]; its parent (the agent-group directory) already
+/// exists in every real deployment, but we `create_dir_all` it defensively
+/// so the write never fails on a fresh tree.
 fn write_sidecar(
-    session_root: &std::path::Path,
+    sidecar: &std::path::Path,
     db: &str,
     detail: &str,
     now: DateTime<Utc>,
 ) -> Result<(), SweepError> {
-    std::fs::create_dir_all(session_root)?;
+    if let Some(parent) = sidecar.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
     let body = serde_json::json!({
         "reason": "quick_check",
         "db": db,
@@ -171,7 +206,7 @@ fn write_sidecar(
     // `to_string` (not pretty) keeps the sidecar a single line.
     let line =
         serde_json::to_string(&body).unwrap_or_else(|_| "{\"reason\":\"quick_check\"}".into());
-    std::fs::write(session_root.join(QUARANTINE_SIDECAR_NAME), line)?;
+    std::fs::write(sidecar, line)?;
     Ok(())
 }
 
@@ -273,5 +308,45 @@ mod tests {
         assert_eq!(v["db"], "outbound.db");
         assert!(v["detail"].as_str().is_some());
         assert!(v["detected_at"].as_str().is_some());
+    }
+
+    /// Security regression (review finding, MEDIUM): the quarantine marker
+    /// must live OUTSIDE the session directory, because that directory is
+    /// bind-mounted read-write into the untrusted agent's container as
+    /// `/data`. A marker the agent can write would let it opt its own
+    /// session out of all host sweep supervision (incl. the S2 stuck
+    /// actuator) with a bare `touch /data/.quarantined`. So: the sidecar is
+    /// a sibling, and a marker forged INSIDE the session dir is NOT honored.
+    #[test]
+    fn quarantine_marker_lives_outside_the_container_writable_session_dir() {
+        let central = CentralDb::open_in_memory().unwrap();
+        let root = MemSessionRoot::new();
+        let session = seed_running_session(&central);
+        let _ = root
+            .outbound_pool(&session.agent_group_id, &session.id)
+            .unwrap();
+        let session_dir = root
+            .session_paths(&session.agent_group_id, &session.id)
+            .root;
+        let sidecar = sidecar_path(&root, &session.agent_group_id, &session.id);
+
+        // Sibling of the session dir, never a child of it.
+        assert!(
+            !sidecar.starts_with(&session_dir),
+            "quarantine marker must not live inside the container-writable session dir: {sidecar:?}",
+        );
+        assert_eq!(
+            sidecar.parent(),
+            session_dir.parent(),
+            "marker must be a sibling in the (host-only) agent-group dir",
+        );
+
+        // An agent forging `.quarantined` inside its own /data must NOT be
+        // honored as a host quarantine.
+        std::fs::write(session_dir.join(QUARANTINE_SIDECAR_NAME), "{}").unwrap();
+        assert!(
+            !is_quarantined(&root, &session.agent_group_id, &session.id),
+            "a marker inside the container-writable session dir must not count as quarantined",
+        );
     }
 }

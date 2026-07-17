@@ -21,8 +21,13 @@ adheres to [Semantic Versioning](https://semver.org/).
   pays one probe per rotation rather than one per pass.
 - **Corrupt per-session DBs are quarantined via an on-disk sidecar that
   survives restarts.** On corruption the check writes
-  `<data_root>/sessions/<agent_group_uuid>/<session_uuid>/.quarantined`
-  (`QUARANTINE_SIDECAR_NAME`) — a single line of JSON
+  `<data_root>/sessions/<agent_group_uuid>/<session_uuid>.quarantined`
+  — a SIBLING of the session directory (in the host-only agent-group dir),
+  deliberately NOT inside the session dir, which is bind-mounted read-write
+  into the untrusted agent's container as `/data`; a marker there could be
+  forged by the agent (`touch /data/.quarantined`) to opt its own session
+  out of all host sweep supervision. The sibling marker is
+  host-authoritative. It is a single line of JSON
   (`{"reason":"quick_check","db":"inbound.db|outbound.db","detail":...,
   "detected_at":<rfc3339>}`) — logs ONE escalating ERROR line, and
   excludes the session from all sweep work thereafter (replacing today's

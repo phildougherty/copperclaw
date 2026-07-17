@@ -1963,16 +1963,23 @@ fn dead_letter_check(rows: &serde_json::Value) -> Check {
     )
 }
 
-/// Quarantine sidecar filename written by O2 next to a corrupt per-session
-/// DB. Kept in sync with
+/// Quarantine sidecar suffix written by O2. Kept in sync with
 /// `copperclaw_host_sweep::checks::integrity::QUARANTINE_SIDECAR_NAME`
-/// (cclaw does not depend on the sweep crate). Existence alone means the
-/// session is quarantined; the body is additive-only JSON parsed defensively
-/// for the optional `detail` field.
+/// (cclaw does not depend on the sweep crate). O2 writes the marker as a
+/// SIBLING of the session directory —
+/// `<data_root>/sessions/<agent_group>/<session_uuid>.quarantined` — not
+/// inside it, because the session dir is bind-mounted read-write into the
+/// untrusted agent's container as `/data` and a marker there could be
+/// forged by the agent. Existence alone means the session is quarantined;
+/// the body is additive-only JSON parsed defensively for the optional
+/// `detail` field.
 const QUARANTINE_SIDECAR_NAME: &str = ".quarantined";
 
 /// Walk the session tree for O2 quarantine sidecars. Returns
-/// `(session_uuid, detail)` per quarantined session. Best-effort: an
+/// `(session_uuid, detail)` per quarantined session. The markers are
+/// sibling files (`<session_uuid>.quarantined`) alongside the session
+/// directories in each agent-group dir — NOT files inside the session dirs
+/// (those are the container-writable `/data` mounts). Best-effort: an
 /// unreadable dir or sidecar is skipped, not fatal.
 fn scan_quarantined_sessions(data_root: &std::path::Path) -> Vec<(String, Option<String>)> {
     let mut out = Vec::new();
@@ -1980,15 +1987,21 @@ fn scan_quarantined_sessions(data_root: &std::path::Path) -> Vec<(String, Option
         return out;
     };
     for agent in agents.flatten() {
-        let Ok(sessions) = std::fs::read_dir(agent.path()) else {
+        let Ok(entries) = std::fs::read_dir(agent.path()) else {
             continue;
         };
-        for session in sessions.flatten() {
-            let sidecar = session.path().join(QUARANTINE_SIDECAR_NAME);
-            if !sidecar.exists() {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+            // Sibling marker: `<session_uuid>.quarantined`. Plain session
+            // directories (no suffix) are skipped by the strip.
+            let Some(session_uuid) = name.strip_suffix(QUARANTINE_SIDECAR_NAME) else {
+                continue;
+            };
+            if session_uuid.is_empty() {
                 continue;
             }
-            let detail = std::fs::read_to_string(&sidecar).ok().and_then(|body| {
+            let detail = std::fs::read_to_string(entry.path()).ok().and_then(|body| {
                 serde_json::from_str::<serde_json::Value>(&body)
                     .ok()
                     .and_then(|v| {
@@ -1997,7 +2010,7 @@ fn scan_quarantined_sessions(data_root: &std::path::Path) -> Vec<(String, Option
                             .map(str::to_string)
                     })
             });
-            out.push((session.file_name().to_string_lossy().into_owned(), detail));
+            out.push((session_uuid.to_string(), detail));
         }
     }
     out
@@ -4119,11 +4132,13 @@ mod tests {
         );
 
         // A quarantine sidecar → FAIL surfacing the detail + a reset command.
+        // The marker is a SIBLING of the session dir (host-only), named
+        // `<session_uuid>.quarantined`, per O2's hardened on-disk contract.
         let sess = "33333333-3333-3333-3333-333333333333";
-        let sess_dir = tmp.path().join("sessions").join("ag").join(sess);
-        std::fs::create_dir_all(&sess_dir).unwrap();
+        let agent_dir = tmp.path().join("sessions").join("ag");
+        std::fs::create_dir_all(&agent_dir).unwrap();
         std::fs::write(
-            sess_dir.join(".quarantined"),
+            agent_dir.join(format!("{sess}.quarantined")),
             r#"{"reason":"quick_check","db":"outbound.db","detail":"database disk image is malformed","detected_at":"2026-07-17T00:00:00Z","future_key":"ignored"}"#,
         )
         .unwrap();
@@ -4165,10 +4180,15 @@ mod tests {
             "connection refused".into(),
         ));
         let tmp = tempfile::tempdir().unwrap();
-        // A quarantined session for the db-integrity row.
-        let qdir = tmp.path().join("sessions").join("ag").join("sess-q");
-        std::fs::create_dir_all(&qdir).unwrap();
-        std::fs::write(qdir.join(".quarantined"), r#"{"reason":"quick_check"}"#).unwrap();
+        // A quarantined session for the db-integrity row: sibling marker
+        // (`<session_uuid>.quarantined`) in the agent-group dir.
+        let agent_dir = tmp.path().join("sessions").join("ag");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("sess-q.quarantined"),
+            r#"{"reason":"quick_check"}"#,
+        )
+        .unwrap();
         set_data_root_override(Some(tmp.path().to_path_buf()));
 
         let future = (chrono::Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();
