@@ -6,6 +6,37 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added (M21 O2: DB integrity — rotating quick_check + quarantine sidecar, 2026-07-17)
+
+- **The sweep now finds DB corruption instead of silently skipping it**
+  (M21 O2, decision (f)). New read-only `PRAGMA quick_check` helpers in
+  `crates/copperclaw-db/src/integrity.rs` (`quick_check(path)` /
+  `quick_check_conn(&conn)` returning `QuickCheckOutcome::{Healthy,
+  Missing,Corrupt(detail)}`, additive, no migration) and a new sweep
+  check `crates/copperclaw-host-sweep/src/checks/integrity.rs`. The
+  central DB is `quick_check`ed at boot and once per day; per-session
+  DBs are `quick_check`ed on a rotating subset each pass
+  (`INTEGRITY_ROTATION_SLOTS = 60`, keyed on the session UUID's low
+  bits), so the whole fleet is covered every 60 passes and a healthy DB
+  pays one probe per rotation rather than one per pass.
+- **Corrupt per-session DBs are quarantined via an on-disk sidecar that
+  survives restarts.** On corruption the check writes
+  `<data_root>/sessions/<agent_group_uuid>/<session_uuid>/.quarantined`
+  (`QUARANTINE_SIDECAR_NAME`) — a single line of JSON
+  (`{"reason":"quick_check","db":"inbound.db|outbound.db","detail":...,
+  "detected_at":<rfc3339>}`) — logs ONE escalating ERROR line, and
+  excludes the session from all sweep work thereafter (replacing today's
+  silent per-pass log-and-swallow in every downstream check). Because the
+  marker is a plain file, quarantine survives a host restart with no
+  in-memory state to rebuild, and `cclaw doctor` (O1) reads the same
+  sidecar to surface it — no new `cclaw` verb. Central-DB corruption is
+  not quarantinable (the host depends on it); it is logged at ERROR and
+  surfaced in the `SweepReport` for doctor. New `SweepReport` fields:
+  `integrity_quarantined`, `integrity_checked`, `integrity_excluded`,
+  `central_integrity_checked`, `central_integrity_corrupt`. A new
+  `SessionRoot::session_paths` trait method exposes the per-session
+  filesystem layout to the check.
+
 ### Added (M21 Wave-2 X-rider: feedback fixtures, 2026-07-17)
 
 - **Two new replay fixtures pin the Wave-2 "user is never in the dark"

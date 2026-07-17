@@ -5,10 +5,11 @@
 use crate::actuator::StuckActuator;
 use crate::checks::apology::ApologyEmit;
 use crate::checks::condition_checkin::{self, ConditionContext, ConditionStore};
+use crate::checks::integrity::{INTEGRITY_ROTATION_SLOTS, IntegrityFinding};
 use crate::checks::questions::QuestionExpiryEmit;
 use crate::checks::stuck::StuckSeverity;
 use crate::checks::{
-    apology, heartbeat, processing, questions, recurrence, scheduling, stuck, wake,
+    apology, heartbeat, integrity, processing, questions, recurrence, scheduling, stuck, wake,
 };
 use crate::clock::{Clock, SystemClock};
 use crate::error::SweepError;
@@ -70,6 +71,15 @@ pub trait SessionRoot: Send + Sync {
         session_id: &SessionId,
     ) -> Result<SessionPool, SweepError>;
     fn heartbeat_path(&self, agent_group_id: &AgentGroupId, session_id: &SessionId) -> PathBuf;
+    /// Full filesystem layout for a session: the on-disk DB paths and the
+    /// session root directory. The M21 O2 integrity check reads the DB
+    /// paths (read-only `quick_check`) and writes its quarantine sidecar
+    /// into the root dir — see [`crate::checks::integrity`].
+    fn session_paths(
+        &self,
+        agent_group_id: &AgentGroupId,
+        session_id: &SessionId,
+    ) -> copperclaw_db::session::SessionPaths;
 }
 
 /// Production [`SessionRoot`] backed by `copperclaw_db::session`. Each call
@@ -119,6 +129,14 @@ impl SessionRoot for FilesystemSessionRoot {
     fn heartbeat_path(&self, agent_group_id: &AgentGroupId, session_id: &SessionId) -> PathBuf {
         copperclaw_db::session::SessionPaths::new(&self.data_root, *agent_group_id, *session_id)
             .heartbeat
+    }
+
+    fn session_paths(
+        &self,
+        agent_group_id: &AgentGroupId,
+        session_id: &SessionId,
+    ) -> copperclaw_db::session::SessionPaths {
+        copperclaw_db::session::SessionPaths::new(&self.data_root, *agent_group_id, *session_id)
     }
 }
 
@@ -173,6 +191,30 @@ pub struct SweepReport {
     /// lapse resolved silently by a later reply). Empty unless a
     /// question store is wired via [`SweepService::set_question_store`].
     pub questions_expired: Vec<QuestionExpiryEmit>,
+    /// M21 O2: sessions newly quarantined this pass — a rotating
+    /// `quick_check` found their per-session DB corrupt, a
+    /// `.quarantined` sidecar was written, and the session is now
+    /// excluded from sweeps. A real, escalating event: counted in
+    /// [`Self::is_empty`] / [`Self::total`].
+    pub integrity_quarantined: Vec<IntegrityFinding>,
+    /// M21 O2: sessions whose per-session DBs were `quick_check`ed this
+    /// pass (this pass's rotation slot) and found healthy. Purely
+    /// observational — deliberately excluded from [`Self::is_empty`] /
+    /// [`Self::total`] so a routine integrity rotation does not make
+    /// every pass "non-empty".
+    pub integrity_checked: Vec<SessionId>,
+    /// M21 O2: already-quarantined sessions skipped this pass (their
+    /// sidecar predates this pass). Observational; excluded from
+    /// [`Self::is_empty`] / [`Self::total`].
+    pub integrity_excluded: Vec<SessionId>,
+    /// M21 O2: true if the central DB was `quick_check`ed this pass (at
+    /// boot, then daily). Observational.
+    pub central_integrity_checked: bool,
+    /// M21 O2: true if a central-DB `quick_check` this pass found
+    /// corruption. Serious and unrecoverable by quarantine (the whole
+    /// host depends on the central DB) — logged at ERROR and counted in
+    /// [`Self::is_empty`].
+    pub central_integrity_corrupt: bool,
 }
 
 impl SweepReport {
@@ -186,6 +228,8 @@ impl SweepReport {
             && self.apologies_emitted.is_empty()
             && self.condition_checkins_fired.is_empty()
             && self.questions_expired.is_empty()
+            && self.integrity_quarantined.is_empty()
+            && !self.central_integrity_corrupt
     }
 
     /// Total number of items across all check categories.
@@ -198,6 +242,7 @@ impl SweepReport {
             + self.apologies_emitted.len()
             + self.condition_checkins_fired.len()
             + self.questions_expired.len()
+            + self.integrity_quarantined.len()
     }
 }
 
@@ -233,6 +278,14 @@ pub struct SweepService {
     /// unanswered questions keep the old (silent-evaporation) behaviour
     /// only in hosts that never wire the store.
     question_store: std::sync::OnceLock<copperclaw_modules::InteractiveModule>,
+    /// M21 O2: monotonically-increasing sweep-pass counter. Selects the
+    /// per-session integrity rotation slot for the pass (`pass %
+    /// INTEGRITY_ROTATION_SLOTS`) so a healthy DB pays one `quick_check`
+    /// per full rotation, not one per pass. Pass 0 is boot.
+    integrity_pass: std::sync::atomic::AtomicU64,
+    /// M21 O2: instant of the last central-DB `quick_check`, or `None`
+    /// before the first (boot) check. Gates the daily central cadence.
+    central_integrity_last: std::sync::Mutex<Option<DateTime<Utc>>>,
 }
 
 impl SweepService {
@@ -246,6 +299,8 @@ impl SweepService {
             condition_store: Arc::new(ConditionStore::new()),
             stuck_actuator: std::sync::OnceLock::new(),
             question_store: std::sync::OnceLock::new(),
+            integrity_pass: std::sync::atomic::AtomicU64::new(0),
+            central_integrity_last: std::sync::Mutex::new(None),
         }
     }
 
@@ -264,6 +319,8 @@ impl SweepService {
             condition_store: Arc::new(ConditionStore::new()),
             stuck_actuator: std::sync::OnceLock::new(),
             question_store: std::sync::OnceLock::new(),
+            integrity_pass: std::sync::atomic::AtomicU64::new(0),
+            central_integrity_last: std::sync::Mutex::new(None),
         }
     }
 
@@ -421,6 +478,8 @@ impl SweepService {
                                     apologies = report.apologies_emitted.len(),
                                     condition_checkins = report.condition_checkins_fired.len(),
                                     questions_expired = report.questions_expired.len(),
+                                    integrity_quarantined = report.integrity_quarantined.len(),
+                                    central_integrity_corrupt = report.central_integrity_corrupt,
                                     "sweep pass produced report",
                                 );
                             }
@@ -472,6 +531,59 @@ impl SweepService {
         }
     }
 
+    /// M21 O2: run a central-DB `quick_check` if due — at boot (the first
+    /// pass) and once per day thereafter. Returns `(checked, corrupt)`.
+    /// Central corruption cannot be quarantined (the whole host depends on
+    /// the central DB), so it is logged at ERROR and surfaced in the
+    /// report for `cclaw doctor`; recovery is an operator action.
+    fn check_central_integrity(&self, now: DateTime<Utc>) -> (bool, bool) {
+        let day = chrono::Duration::days(1);
+        {
+            let last = self
+                .central_integrity_last
+                .lock()
+                .expect("central integrity mutex poisoned");
+            if let Some(prev) = *last {
+                if now.signed_duration_since(prev) < day {
+                    return (false, false);
+                }
+            }
+        }
+        // Due: run the check. Record the attempt time regardless of
+        // outcome so a corrupt central DB is not re-probed every pass.
+        *self
+            .central_integrity_last
+            .lock()
+            .expect("central integrity mutex poisoned") = Some(now);
+
+        let conn = match self.central.conn() {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    target: "copperclaw_host_sweep",
+                    error = %e,
+                    "central integrity check skipped: could not borrow central connection",
+                );
+                return (false, false);
+            }
+        };
+        // M1 metric wish: integrity_quick_check_total{scope="central",
+        // outcome} — increment by Healthy / Corrupt.
+        match copperclaw_db::integrity::quick_check_conn(&conn) {
+            copperclaw_db::integrity::QuickCheckOutcome::Healthy
+            | copperclaw_db::integrity::QuickCheckOutcome::Missing => (true, false),
+            copperclaw_db::integrity::QuickCheckOutcome::Corrupt(detail) => {
+                tracing::error!(
+                    target: "copperclaw_host_sweep",
+                    detail = %detail,
+                    "central DB failed quick_check — this is not recoverable by quarantine; \
+                     an operator must restore from backup (cclaw doctor will surface it)",
+                );
+                (true, true)
+            }
+        }
+    }
+
     /// Run a single sweep pass and return a populated [`SweepReport`].
     ///
     /// Errors during one session's check are logged and skipped — the pass
@@ -483,6 +595,20 @@ impl SweepService {
         let sessions = copperclaw_db::tables::sessions::list_active(&self.central)?;
 
         let mut report = SweepReport::default();
+
+        // M21 O2: which pass is this, and thus which per-session integrity
+        // rotation slot does it check? `fetch_add` returns the pre-increment
+        // value, so the first pass is 0 (boot).
+        let pass = self
+            .integrity_pass
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let integrity_slot = pass % INTEGRITY_ROTATION_SLOTS;
+
+        // Global: central-DB integrity (boot + daily). Independent of the
+        // per-session rotation below.
+        let (central_checked, central_corrupt) = self.check_central_integrity(now);
+        report.central_integrity_checked = central_checked;
+        report.central_integrity_corrupt = central_corrupt;
 
         // Global: scan the central `tasks` table for due scheduled
         // tasks, synthesise wake inbounds, and re-arm / mark completed.
@@ -530,6 +656,59 @@ impl SweepService {
         }
 
         for session in sessions {
+            // M21 O2: a session already quarantined (its `.quarantined`
+            // sidecar predates this pass, surviving any host restart) is
+            // excluded from ALL sweep work. This replaces today's silent
+            // per-pass log-and-swallow in every downstream check: the loud
+            // escalation happened once, at quarantine time.
+            if integrity::is_quarantined(
+                self.session_paths.as_ref(),
+                &session.agent_group_id,
+                &session.id,
+            ) {
+                // M1 metric wish: integrity_quarantined_sessions (gauge) —
+                // observe the current excluded population.
+                report.integrity_excluded.push(session.id);
+                continue;
+            }
+
+            // M21 O2: rotating integrity probe. Only sessions in this
+            // pass's slot pay the `quick_check` cost, so a healthy DB is
+            // probed once per full rotation, not once per pass. A newly
+            // corrupt DB is quarantined here and excluded from the rest of
+            // this pass's checks (so a corrupt DB never reaches the checks
+            // that would otherwise fail-and-swallow it).
+            if integrity::rotation_slot(&session.id, INTEGRITY_ROTATION_SLOTS) == integrity_slot {
+                match integrity::check_and_quarantine(
+                    self.session_paths.as_ref(),
+                    &session.agent_group_id,
+                    &session.id,
+                    now,
+                ) {
+                    Ok(Some(finding)) => {
+                        // ONE escalating log line per quarantine (decision
+                        // (f)) — replaces the old silent per-pass skip.
+                        tracing::error!(
+                            target: "copperclaw_host_sweep",
+                            session = %session.id,
+                            db = finding.db,
+                            detail = %finding.detail,
+                            "session DB failed quick_check — quarantined and excluded from sweeps \
+                             (cclaw doctor will surface it)",
+                        );
+                        report.integrity_quarantined.push(finding);
+                        continue;
+                    }
+                    Ok(None) => report.integrity_checked.push(session.id),
+                    Err(e) => tracing::warn!(
+                        target: "copperclaw_host_sweep",
+                        session = %session.id,
+                        error = %e,
+                        "integrity check could not write quarantine sidecar; will retry",
+                    ),
+                }
+            }
+
             // Heartbeat is checked even for non-running containers because
             // a session whose container died silently won't have a fresh
             // heartbeat.
@@ -961,6 +1140,151 @@ mod tests {
             "first injection wins",
         );
         assert_eq!(second.pending().len(), 1, "second injection is inert");
+    }
+
+    /// M21 O2 acceptance: over one full rotation of
+    /// `INTEGRITY_ROTATION_SLOTS` passes, every healthy session's DB is
+    /// `quick_check`ed exactly once — one probe per rotation slot, NOT one
+    /// per pass.
+    #[tokio::test]
+    async fn integrity_rotation_checks_each_healthy_session_once_per_rotation() {
+        let central = fresh_central();
+        let root = Arc::new(MemSessionRoot::new());
+        // Seed a handful of sessions with materialised (healthy) DBs.
+        let mut ids = Vec::new();
+        for _ in 0..8 {
+            let s = seed_running_session(&central);
+            let _ = root.outbound_pool(&s.agent_group_id, &s.id).unwrap();
+            let _ = root.inbound_pool(&s.agent_group_id, &s.id).unwrap();
+            ids.push(s.id);
+        }
+        let svc = SweepService::new(central, root);
+
+        let mut checks: std::collections::HashMap<SessionId, usize> =
+            ids.iter().map(|id| (*id, 0usize)).collect();
+        for _ in 0..INTEGRITY_ROTATION_SLOTS {
+            let report = svc.run_once().unwrap();
+            for id in report.integrity_checked {
+                *checks.get_mut(&id).unwrap() += 1;
+            }
+            assert!(
+                report.integrity_quarantined.is_empty(),
+                "healthy: no quarantine"
+            );
+        }
+        for id in &ids {
+            assert_eq!(
+                checks[id], 1,
+                "each healthy session is quick_checked exactly once per rotation, not per pass",
+            );
+        }
+    }
+
+    /// M21 O2 acceptance: a deliberately-corrupted per-session DB is
+    /// detected on its rotation slot, quarantined (sidecar written), and
+    /// excluded from subsequent sweeps.
+    #[tokio::test]
+    async fn corrupt_session_is_detected_quarantined_and_excluded() {
+        use crate::test_support::corrupt_session_db;
+        let central = fresh_central();
+        let root = Arc::new(MemSessionRoot::new());
+        let session = seed_running_session(&central);
+        corrupt_session_db(&root, &session, "outbound.db");
+
+        let dyn_root: Arc<dyn SessionRoot> = root.clone();
+        let svc = SweepService::new(central, dyn_root);
+
+        // Run a full rotation; the session's slot is hit exactly once, and
+        // that pass quarantines it.
+        let mut quarantined_passes = 0;
+        for _ in 0..INTEGRITY_ROTATION_SLOTS {
+            let report = svc.run_once().unwrap();
+            if report
+                .integrity_quarantined
+                .iter()
+                .any(|f| f.session_id == session.id)
+            {
+                quarantined_passes += 1;
+            }
+        }
+        assert_eq!(quarantined_passes, 1, "quarantined exactly once");
+        assert!(crate::checks::integrity::is_quarantined(
+            root.as_ref(),
+            &session.agent_group_id,
+            &session.id,
+        ));
+
+        // Every subsequent pass excludes it: never checked, never
+        // quarantined again, never reaching the heartbeat/stuck/etc checks.
+        let report = svc.run_once().unwrap();
+        assert!(report.integrity_excluded.contains(&session.id));
+        assert!(!report.integrity_checked.contains(&session.id));
+        assert!(report.integrity_quarantined.is_empty());
+        assert!(
+            !report.heartbeat_stale.contains(&session.id),
+            "excluded sessions must not reach downstream checks",
+        );
+    }
+
+    /// M21 O2 acceptance: quarantine is a file, so it survives a host
+    /// restart. A brand-new `SweepService` (fresh in-memory rotation
+    /// state) built over the same on-disk root still excludes the
+    /// previously-quarantined session from pass one.
+    #[tokio::test]
+    async fn quarantine_survives_a_restart() {
+        use crate::test_support::corrupt_session_db;
+        let central = fresh_central();
+        let root = Arc::new(MemSessionRoot::new());
+        let session = seed_running_session(&central);
+        corrupt_session_db(&root, &session, "inbound.db");
+
+        // First host lifetime: quarantine it.
+        let dyn_root: Arc<dyn SessionRoot> = root.clone();
+        let svc1 = SweepService::new(central.clone(), dyn_root);
+        for _ in 0..INTEGRITY_ROTATION_SLOTS {
+            let _ = svc1.run_once().unwrap();
+        }
+        assert!(crate::checks::integrity::is_quarantined(
+            root.as_ref(),
+            &session.agent_group_id,
+            &session.id,
+        ));
+        drop(svc1);
+
+        // "Restart": a fresh service over the same on-disk root. Its very
+        // first pass (pass 0) must already exclude the session — the
+        // sidecar file, not in-memory state, is the source of truth.
+        let dyn_root2: Arc<dyn SessionRoot> = root.clone();
+        let svc2 = SweepService::new(central, dyn_root2);
+        let report = svc2.run_once().unwrap();
+        assert!(report.integrity_excluded.contains(&session.id));
+        assert!(!report.integrity_checked.contains(&session.id));
+    }
+
+    /// M21 O2: the central DB is `quick_check`ed at boot (pass 0) and then
+    /// only once per day, not every pass.
+    #[tokio::test]
+    async fn central_integrity_runs_at_boot_then_daily() {
+        let central = fresh_central();
+        let t0 = chrono::Utc.with_ymd_and_hms(2026, 7, 17, 0, 0, 0).unwrap();
+        let clock = Arc::new(MockClock::new(t0));
+        let root = Arc::new(MemSessionRoot::new());
+        let svc = SweepService::with_clock(central, root, clock.clone());
+
+        // Pass 0 (boot): checked, healthy.
+        let r = svc.run_once().unwrap();
+        assert!(r.central_integrity_checked, "boot check runs");
+        assert!(!r.central_integrity_corrupt);
+
+        // A few minutes later: not due again.
+        clock.advance(ChDuration::minutes(5));
+        let r = svc.run_once().unwrap();
+        assert!(!r.central_integrity_checked, "not due within a day");
+
+        // A day later: due again.
+        clock.advance(ChDuration::hours(24));
+        let r = svc.run_once().unwrap();
+        assert!(r.central_integrity_checked, "daily cadence re-fires");
     }
 
     #[tokio::test]

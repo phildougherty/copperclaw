@@ -114,6 +114,14 @@ impl SessionRoot for MemSessionRoot {
         copperclaw_db::session::SessionPaths::new(self.tmp.path(), *agent_group_id, *session_id)
             .heartbeat
     }
+
+    fn session_paths(
+        &self,
+        agent_group_id: &AgentGroupId,
+        session_id: &SessionId,
+    ) -> copperclaw_db::session::SessionPaths {
+        copperclaw_db::session::SessionPaths::new(self.tmp.path(), *agent_group_id, *session_id)
+    }
 }
 
 /// Create an `agent_group` + session in the central DB, mark the
@@ -155,6 +163,37 @@ pub fn seed_stuck_tool(root: &MemSessionRoot, session: &Session, started_at: Dat
             tool_started_at: Some(started_at),
             updated_at: Some(Utc::now()),
         },
+    )
+    .unwrap();
+}
+
+/// Corrupt one of a session's per-session DB files (`inbound.db` or
+/// `outbound.db`) by materialising it, then overwriting it (and dropping
+/// any WAL sidecars) with bytes that are not a valid `SQLite` database. Used
+/// by the M21 O2 integrity tests.
+pub fn corrupt_session_db(root: &MemSessionRoot, session: &Session, db: &str) {
+    // Materialise both DBs first so the session dir + files exist.
+    let _ = root
+        .outbound_pool(&session.agent_group_id, &session.id)
+        .unwrap();
+    let _ = root
+        .inbound_pool(&session.agent_group_id, &session.id)
+        .unwrap();
+    let paths = root.session_paths(&session.agent_group_id, &session.id);
+    let target = match db {
+        "inbound.db" => paths.inbound_db.clone(),
+        "outbound.db" => paths.outbound_db.clone(),
+        other => panic!("unknown db file: {other}"),
+    };
+    // Drop WAL sidecars so the garbage file is authoritative.
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = target.clone().into_os_string();
+        sidecar.push(suffix);
+        let _ = std::fs::remove_file(std::path::PathBuf::from(sidecar));
+    }
+    std::fs::write(
+        &target,
+        b"not a sqlite database at all -- corrupted for the test",
     )
     .unwrap();
 }
