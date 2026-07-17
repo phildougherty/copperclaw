@@ -154,6 +154,20 @@ is frozen apart from explicit advances, so elapsed renderings in
 expected streams are exact. Tests driving the harness directly can
 instead call `ReplayHarness::advance_clock` between steps.
 
+Note the reach of that clock: it is injected into the RUNNER's
+`RunnerDeps.clock` only. Host-side timers — the sweep cadence, the
+S4 crash-loop backoff, the S1 supervisor backoff — run on tokio/wall
+time and are NOT traversable from a fixture; they are pinned by
+paused-clock crate tests instead. `fixtures/README-m21-wave1.md`
+carries the full reachability map.
+
+Since the M21 Wave-1 X-rider, tests driving the harness directly can
+also call `ReplayHarness::restart_delivery()` — kill and recreate the
+`DeliveryService` (fresh in-memory retry cache and a fresh
+`MockAdapter` set) over the same central DB and per-session files, so
+a test can pin restart-resume semantics (see
+`fixtures/cli/delivery-retry-restart/`).
+
 ### `expected/*.jsonl`
 
 After the replay completes, the harness diffs:

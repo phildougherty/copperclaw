@@ -1,0 +1,16 @@
+{
+  "name": "cli-stuck-tool-restart",
+  "channel": "cli",
+  "description": "M21 S2 (X-rider W1): baseline turn for the hung-tool -> StuckRestart -> single-apology end-to-end test. The stuck state, actuated sweep pass, and apology delivery are driven by the registered test on top of this fixture's byte-stable streams.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

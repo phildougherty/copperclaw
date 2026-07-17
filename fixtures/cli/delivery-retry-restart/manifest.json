@@ -1,0 +1,19 @@
+{
+  "name": "cli-delivery-retry-restart",
+  "channel": "cli",
+  "description": "M21 S3 (X-rider W1): one inbound turn whose reply hits a scripted transport failure on its first delivery attempt, leaving persisted retry state (tries=1 + a wall-clock not_before window) on the messages_out row. The registered test then kills and recreates the DeliveryService across the remaining attempts to pin restart-resume and exactly-once dead-lettering.",
+  "schema": 1,
+  "replay": {
+    "mode": "direct",
+    "step_timeout_ms": 5000
+  },
+  "pre_delivery_failures": [
+    {"channel": "cli", "kind": "transport", "message": "502 replay blip"}
+  ],
+  "substitutions": {
+    "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}": "<UUID>",
+    "\"timestamp\":\"[^\"]+\"": "\"timestamp\":\"<TS>\"",
+    "\"started_at\":\"[^\"]+\"": "\"started_at\":\"<TS>\"",
+    "\"ended_at\":\"[^\"]+\"": "\"ended_at\":\"<TS>\""
+  }
+}

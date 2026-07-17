@@ -49,9 +49,10 @@ Also not pinned here: retry-state *persistence* (M21 S3, migration 029).
 Since S3 the `retries` map is a write-through cache over the row's
 `tries` / `not_before` columns, so the deferral this fixture exercises
 now also leaves `tries = 1` and a wall-clock window on the row. The
-harness cannot restart the `DeliveryService` mid-fixture, so the
 restart-resume and exactly-once dead-letter contracts are pinned by
 unit/integration tests in `crates/copperclaw-host-delivery/src/service.rs`
 (`restart_resumes_persisted_attempt_count`,
-`persisted_exhaustion_dead_letters_without_a_fresh_attempt`); the Wave-1
-X-rider owns a replay-level restart fixture.
+`persisted_exhaustion_dead_letters_without_a_fresh_attempt`) and — since
+the Wave-1 X-rider landed `ReplayHarness::restart_delivery` — at the
+replay level by `fixtures/cli/delivery-retry-restart/` (see its README
+and `fixtures/README-m21-wave1.md`).
